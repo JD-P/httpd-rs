@@ -15085,8 +15085,10 @@ mod pass11_kernel_tests {
     }
 
     fn load_text_direct(text: &str) -> Config {
-        let dir = std::env::temp_dir().join(format!("vapache-pass11-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let fixture = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("vapache-pass11-{}-{fixture}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
         std::fs::write(&path, format!("{}{text}", TEST_CAPABILITIES)).unwrap();

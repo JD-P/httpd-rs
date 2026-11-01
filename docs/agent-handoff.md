@@ -54,7 +54,8 @@ differential oracle by the python suites.
   number 293 is that metric minus the pre-existing 19 private helpers,
   plus this session's additions — keep the same counting intent).
   - Never lower a `sinks.*` count, never add entries to
-  `proof_debt.assumptions` (budget 6/6 is full).
+  `proof_debt.assumptions` (currently 5/6; do not spend the remaining slot
+  without documenting a genuinely new external boundary).
   - Add one row per closed finding to `docs/adversarial-closure.md` and the
   matching regression to `tests/adversarial_regressions.py`.
 * **Do not run `cargo fmt` on the whole repo** — the tree is not globally

@@ -1099,6 +1099,338 @@ pub fn parse_http_authority_port(value: &[u8]) -> (port: Option<u16>)
     }
 }
 
+fn parse_ipv4_embedded(input: &[u8]) -> (address: Option<u32>)
+    ensures
+        match address {
+            Some(_) => input@.len() > 0
+                && forall|i: int| 0 <= i < input@.len()
+                    ==> ascii_digit(input@[i]) || input@[i] == b'.',
+            None => true,
+        },
+{
+    if input.len() == 0 {
+        return None;
+    }
+    let mut value: u32 = 0;
+    let mut part: usize = 0;
+    let mut cursor: usize = 0;
+    while part < 4
+        invariant
+            part <= 4,
+            cursor <= input.len(),
+            part == 4 ==> cursor == input.len(),
+            forall|i: int| 0 <= i < cursor
+                ==> ascii_digit(input@[i]) || input@[i] == b'.',
+        decreases 4 - part,
+    {
+        let start = cursor;
+        let mut octet: u16 = 0;
+        while cursor < input.len() && input[cursor] != b'.'
+            invariant
+                start <= cursor <= input.len(),
+                octet <= 255,
+                forall|i: int| 0 <= i < start
+                    ==> ascii_digit(input@[i]) || input@[i] == b'.',
+                forall|i: int| start <= i < cursor ==> ascii_digit(input@[i]),
+            decreases input.len() - cursor,
+        {
+            let byte = input[cursor];
+            if byte < b'0' || byte > b'9' || cursor - start >= 3 {
+                return None;
+            }
+            octet = octet * 10 + (byte - b'0') as u16;
+            if octet > 255 {
+                return None;
+            }
+            cursor = cursor + 1;
+        }
+        if cursor == start {
+            return None;
+        }
+        // RFC 3986 dec-octet has no multi-digit leading-zero form. Reject it
+        // so an embedded IPv4 address has one textual/numeric interpretation.
+        if cursor - start > 1 && input[start] == b'0' {
+            return None;
+        }
+        value = (value << 8) | octet as u32;
+        part = part + 1;
+        if part < 4 {
+            if cursor >= input.len() || input[cursor] != b'.' {
+                return None;
+            }
+            cursor = cursor + 1;
+        } else if cursor != input.len() {
+            return None;
+        }
+    }
+    assert(cursor == input.len());
+    Some(value)
+}
+
+/// Strict IPv6 parser used by HTTP authorities. It supports compressed forms
+/// and the final dotted-IPv4 form, returning the exact 128-bit address so no
+/// standard-library string parser remains on the security boundary.
+pub fn parse_http_ipv6_literal(input: &[u8]) -> (address: Option<u128>)
+    ensures
+        match address {
+            Some(_) => input@.len() >= 2
+                && forall|i: int| 0 <= i < input@.len()
+                    ==> is_hex_byte(input@[i]) || input@[i] == b':' || input@[i] == b'.',
+            None => true,
+        },
+{
+    if input.len() < 2 {
+        return None;
+    }
+    let mut words: Vec<u16> = Vec::new();
+    let mut compressed_at: Option<usize> = None;
+    let mut cursor: usize = 0;
+    if input[0] == b':' {
+        if input[1] != b':' {
+            return None;
+        }
+        compressed_at = Some(0);
+        cursor = 2;
+    }
+    while cursor < input.len()
+        invariant
+            cursor <= input.len(),
+            words.len() <= 8,
+            forall|i: int| 0 <= i < cursor
+                ==> is_hex_byte(input@[i]) || input@[i] == b':' || input@[i] == b'.',
+            match compressed_at {
+                Some(position) => position <= words.len(),
+                None => true,
+            },
+        decreases input.len() - cursor,
+    {
+        let start = cursor;
+        let mut dotted = false;
+        while cursor < input.len() && input[cursor] != b':'
+            invariant
+                start <= cursor <= input.len(),
+                forall|i: int| 0 <= i < start
+                    ==> is_hex_byte(input@[i]) || input@[i] == b':' || input@[i] == b'.',
+            decreases input.len() - cursor,
+        {
+            if input[cursor] == b'.' {
+                dotted = true;
+            }
+            cursor = cursor + 1;
+        }
+        if dotted {
+            if cursor != input.len() || words.len() > 6 {
+                return None;
+            }
+            let ipv4 = match parse_ipv4_embedded(&input[start..cursor]) {
+                Some(value) => value,
+                None => return None,
+            };
+            assert forall|i: int| start <= i < cursor implies
+                is_hex_byte(input@[i]) || input@[i] == b':' || input@[i] == b'.' by {
+                assert(input@[i] == input@.subrange(start as int, cursor as int)[i - start]);
+            }
+            words.push((ipv4 >> 16) as u16);
+            words.push((ipv4 & 0xffff) as u16);
+        } else {
+            if cursor == start || cursor - start > 4 || words.len() >= 8 {
+                return None;
+            }
+            let value = match parse_chunk_size_hex(&input[start..cursor]) {
+                Some(value) if value <= u16::MAX as u64 => value,
+                _ => return None,
+            };
+            assert forall|i: int| start <= i < cursor implies
+                is_hex_byte(input@[i]) || input@[i] == b':' || input@[i] == b'.' by {
+                assert(input@[i] == input@.subrange(start as int, cursor as int)[i - start]);
+            }
+            words.push(value as u16);
+        }
+        assert forall|i: int| 0 <= i < cursor implies
+            is_hex_byte(input@[i]) || input@[i] == b':' || input@[i] == b'.' by {}
+        if cursor < input.len() {
+            if cursor + 1 < input.len() && input[cursor + 1] == b':' {
+                if compressed_at.is_some() {
+                    return None;
+                }
+                compressed_at = Some(words.len());
+                cursor = cursor + 2;
+            } else {
+                cursor = cursor + 1;
+                if cursor == input.len() {
+                    return None;
+                }
+            }
+        }
+    }
+    assert(cursor == input.len());
+    let zeros = match compressed_at {
+        Some(_) => {
+            if words.len() >= 8 {
+                return None;
+            }
+            8 - words.len()
+        }
+        None => {
+            if words.len() != 8 {
+                return None;
+            }
+            0
+        }
+    };
+    let gap = compressed_at.unwrap_or(words.len());
+    let mut address: u128 = 0;
+    let mut position: usize = 0;
+    while position < 8
+        invariant
+            position <= 8,
+            words.len() <= 8,
+            gap <= words.len(),
+            gap + zeros <= 8,
+            input@.len() >= 2,
+            forall|i: int| 0 <= i < input@.len()
+                ==> is_hex_byte(input@[i]) || input@[i] == b':' || input@[i] == b'.',
+        decreases 8 - position,
+    {
+        let word = if position < gap {
+            words[position]
+        } else if position < gap + zeros {
+            0
+        } else {
+            let source = position - zeros;
+            if source >= words.len() {
+                return None;
+            }
+            words[source]
+        };
+        address = (address << 16) | word as u128;
+        position = position + 1;
+    }
+    Some(address)
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum HttpAuthorityHost {
+    RegName(Vec<u8>),
+    Ipv6(u128),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ParsedHttpAuthority {
+    pub host: HttpAuthorityHost,
+    pub port: u16,
+}
+
+fn lower_authority_host(input: &[u8]) -> (out: Vec<u8>)
+    ensures out@.len() == input@.len(),
+{
+    let mut out = Vec::with_capacity(input.len());
+    let mut i: usize = 0;
+    while i < input.len()
+        invariant i <= input.len(), out@.len() == i,
+        decreases input.len() - i,
+    {
+        let byte = input[i];
+        out.push(if byte >= b'A' && byte <= b'Z' { byte + 32 } else { byte });
+        i = i + 1;
+    }
+    out
+}
+
+/// Parse the complete authority shape, host syntax, IP literal and effective
+/// port in one executable verified function. Downstream code receives a typed
+/// host and never repeats bracket/colon/string splitting.
+pub fn parse_http_authority_endpoint(
+    value: &[u8],
+    default_port: u16,
+) -> (parsed: Option<ParsedHttpAuthority>)
+    ensures
+        match parsed {
+            Some(_) => http_authority_visible_spec(value@),
+            None => true,
+        },
+{
+    if !http_authority_visible_admit(value) {
+        return None;
+    }
+    if value[0] == b'[' {
+        let mut close: usize = 1;
+        while close < value.len() && value[close] != b']'
+            invariant 1 <= close <= value.len(),
+            decreases value.len() - close,
+        {
+            close = close + 1;
+        }
+        if close == value.len() || close == 1 {
+            return None;
+        }
+        let host = match parse_http_ipv6_literal(&value[1..close]) {
+            Some(address) => address,
+            None => return None,
+        };
+        let suffix = close + 1;
+        let port = if suffix == value.len() {
+            default_port
+        } else {
+            if value[suffix] != b':' {
+                return None;
+            }
+            match parse_http_authority_port(&value[suffix + 1..]) {
+                Some(port) => port,
+                None => return None,
+            }
+        };
+        return Some(ParsedHttpAuthority {
+            host: HttpAuthorityHost::Ipv6(host),
+            port,
+        });
+    }
+
+    let mut colon: Option<usize> = None;
+    let mut i: usize = 0;
+    while i < value.len()
+        invariant
+            i <= value.len(),
+            match colon {
+                Some(index) => index < i,
+                None => true,
+            },
+        decreases value.len() - i,
+    {
+        let byte = value[i];
+        if byte == b'[' || byte == b']' || byte == b'@' || byte == b'/'
+            || byte == b'\\' || byte == b'?' || byte == b'#'
+        {
+            return None;
+        }
+        if byte == b':' {
+            if colon.is_some() {
+                return None;
+            }
+            colon = Some(i);
+        }
+        i = i + 1;
+    }
+    let (host_end, port) = match colon {
+        Some(index) => {
+            let port = match parse_http_authority_port(&value[index + 1..]) {
+                Some(port) => port,
+                None => return None,
+            };
+            (index, port)
+        }
+        None => (value.len(), default_port),
+    };
+    let host = &value[..host_end];
+    if !http_reg_name_admit(host) {
+        return None;
+    }
+    Some(ParsedHttpAuthority {
+        host: HttpAuthorityHost::RegName(lower_authority_host(host)),
+        port,
+    })
+}
+
 /// The external-URL decision used by rewrite target resolution.  A target is
 /// external if it is scheme-relative (`//...`) or an HTTP(S) URL, matching
 /// Apache's case-insensitive scheme handling.
@@ -4480,6 +4812,61 @@ pub fn proxy_path_representation_admit(
     true
 }
 
+/// Concrete evidence tying the path authorized at the front end to the exact
+/// path selected for the upstream.  Keeping both byte strings in the
+/// capability prevents a later proxy retarget from reusing a boolean
+/// "representation checked" bit for a different path pair.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ProxyRepresentationWitness {
+    pub front_path: Vec<u8>,
+    pub upstream_path: Vec<u8>,
+}
+
+pub fn proxy_representation_witness(
+    front_path: &[u8],
+    upstream_path: &[u8],
+) -> (witness: Option<ProxyRepresentationWitness>)
+    ensures
+        match witness {
+            Some(value) => {
+                &&& value.front_path@ == front_path@
+                &&& value.upstream_path@ == upstream_path@
+                &&& proxy_path_representation_spec(
+                    value.front_path@,
+                    value.upstream_path@,
+                )
+            }
+            None => !proxy_path_representation_spec(front_path@, upstream_path@),
+        },
+{
+    if !proxy_path_representation_admit(front_path, upstream_path) {
+        return None;
+    }
+    Some(ProxyRepresentationWitness {
+        front_path: copy_slice(front_path),
+        upstream_path: copy_slice(upstream_path),
+    })
+}
+
+/// Revalidate a stored witness against the exact path pair reaching a sink.
+/// This is deliberately stronger than re-running the delimiter predicate:
+/// both identities must be byte-for-byte identical to those originally
+/// witnessed.
+pub fn proxy_representation_witness_matches(
+    witness: &ProxyRepresentationWitness,
+    front_path: &[u8],
+    upstream_path: &[u8],
+) -> (matches: bool)
+    ensures
+        matches == (witness.front_path@ == front_path@
+            && witness.upstream_path@ == upstream_path@
+            && proxy_path_representation_spec(front_path@, upstream_path@)),
+{
+    bytes_eq(witness.front_path.as_slice(), front_path)
+        && bytes_eq(witness.upstream_path.as_slice(), upstream_path)
+        && proxy_path_representation_admit(front_path, upstream_path)
+}
+
 /// P12-A: prefix routes are component-aware, while a prefix that already
 /// ends in `/` (including the root route) directly owns its descendants.
 pub open spec fn proxy_prefix_match_spec(
@@ -4693,8 +5080,111 @@ pub fn proxy_response_header_admit(name: &[u8], value: &[u8]) -> (ok: bool)
     proxy_header_admit(name, value)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProxyResponseFraming {
+    NoBody,
+    Length(u64),
+    Chunked,
+    Eof,
+}
+
+pub open spec fn proxy_response_has_no_body(head_request: bool, status: u16) -> bool {
+    head_request || status == 204 || status == 304 || (100 <= status && status < 200)
+}
+
+/// Decide upstream response framing from the complete admitted field list.
+/// Duplicate or malformed Content-Length/Transfer-Encoding, multiple transfer
+/// codings, and every CL+TE combination fail before a body reader is selected.
+pub fn proxy_response_framing(
+    head_request: bool,
+    status: u16,
+    headers: &[(Vec<u8>, Vec<u8>)],
+) -> (framing: Option<ProxyResponseFraming>)
+    ensures
+        match framing {
+            Some(ProxyResponseFraming::NoBody) => proxy_response_has_no_body(head_request, status),
+            Some(ProxyResponseFraming::Length(_))
+            | Some(ProxyResponseFraming::Chunked)
+            | Some(ProxyResponseFraming::Eof) => !proxy_response_has_no_body(head_request, status),
+            None => true,
+        },
+{
+    let mut content_length: Option<u64> = None;
+    let mut transfer_encoding: bool = false;
+    let mut i: usize = 0;
+    while i < headers.len()
+        invariant i <= headers.len(),
+        decreases headers.len() - i,
+    {
+        let name = &headers[i].0;
+        let value = &headers[i].1;
+        if bytes_eq(name, b"content-length") {
+            if content_length.is_some() {
+                return None;
+            }
+            let (start, end) = trim_range(value);
+            content_length = match parse_decimal_u64(&value[start..end]) {
+                Some(length) => Some(length),
+                None => return None,
+            };
+        } else if bytes_eq(name, b"transfer-encoding") {
+            if transfer_encoding {
+                return None;
+            }
+            let (start, end) = trim_range(value);
+            if !eq_ignore_ascii_case(&value[start..end], b"chunked") {
+                return None;
+            }
+            transfer_encoding = true;
+        }
+        i = i + 1;
+    }
+    if content_length.is_some() && transfer_encoding {
+        return None;
+    }
+    // RFC 9110 forbids both framing fields on informational and 204
+    // responses. HEAD and 304 may carry metadata describing the selected
+    // representation, but it never selects a body reader for this message.
+    if (status == 204 || (status >= 100 && status < 200))
+        && (content_length.is_some() || transfer_encoding)
+    {
+        return None;
+    }
+    if head_request || status == 204 || status == 304 || (status >= 100 && status < 200) {
+        return Some(ProxyResponseFraming::NoBody);
+    }
+    if transfer_encoding {
+        Some(ProxyResponseFraming::Chunked)
+    } else {
+        match content_length {
+            Some(length) => Some(ProxyResponseFraming::Length(length)),
+            None => Some(ProxyResponseFraming::Eof),
+        }
+    }
+}
+
 pub open spec fn is_hex_byte(b: u8) -> bool {
     (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F')
+}
+
+pub open spec fn hex_digit_nat(b: u8) -> int {
+    match hex_val(b) {
+        Some(value) => value as int,
+        None => 0,
+    }
+}
+
+/// Mathematical value of the first `end` hexadecimal digits.  The executable
+/// parser refines this unbounded-integer fold whenever the result fits u64.
+pub open spec fn hex_prefix_value_spec(input: Seq<u8>, end: int) -> int
+    recommends 0 <= end <= input.len(),
+    decreases end,
+{
+    if end <= 0 {
+        0
+    } else {
+        hex_prefix_value_spec(input, end - 1) * 16 + hex_digit_nat(input[end - 1])
+    }
 }
 
 /// Checked hexadecimal parser used for HTTP chunk sizes. An accepted value
@@ -4702,8 +5192,9 @@ pub open spec fn is_hex_byte(b: u8) -> bool {
 pub fn parse_chunk_size_hex(input: &[u8]) -> (out: Option<u64>)
     ensures
         match out {
-            Some(_) => input@.len() > 0
-                && forall|i: int| 0 <= i < input@.len() ==> is_hex_byte(input@[i]),
+            Some(value) => input@.len() > 0
+                && (forall|i: int| 0 <= i < input@.len() ==> is_hex_byte(input@[i]))
+                && value as int == hex_prefix_value_spec(input@, input@.len() as int),
             None => true,
         },
 {
@@ -4716,6 +5207,7 @@ pub fn parse_chunk_size_hex(input: &[u8]) -> (out: Option<u64>)
         invariant
             i <= input.len(),
             forall|j: int| 0 <= j < i ==> is_hex_byte(input@[j]),
+            value as int == hex_prefix_value_spec(input@, i as int),
         decreases input.len() - i,
     {
         let digit = match hex_val_exec(input[i]) {
@@ -4727,6 +5219,7 @@ pub fn parse_chunk_size_hex(input: &[u8]) -> (out: Option<u64>)
         }
         assert(value <= (u64::MAX - digit) / 16);
         assert(value * 16 <= u64::MAX - digit);
+        assert(digit as int == hex_digit_nat(input@[i as int]));
         value = value * 16 + digit;
         i = i + 1;
     }
@@ -4995,12 +5488,16 @@ pub fn chunk_framing_budget_step(
     }
 }
 
+pub open spec fn trailer_name_forbidden_spec(name: Seq<u8>) -> bool {
+    eq_ignore_ascii_case_spec(name, b"content-length"@)
+        || eq_ignore_ascii_case_spec(name, b"transfer-encoding"@)
+        || eq_ignore_ascii_case_spec(name, b"host"@)
+        || eq_ignore_ascii_case_spec(name, b"trailer"@)
+}
+
 fn trailer_name_forbidden(name: &[u8]) -> (forbidden: bool)
     ensures
-        forbidden == (eq_ignore_ascii_case_spec(name@, b"content-length"@)
-            || eq_ignore_ascii_case_spec(name@, b"transfer-encoding"@)
-            || eq_ignore_ascii_case_spec(name@, b"host"@)
-            || eq_ignore_ascii_case_spec(name@, b"trailer"@)),
+        forbidden == trailer_name_forbidden_spec(name@),
 {
     eq_ignore_ascii_case(name, b"content-length")
         || eq_ignore_ascii_case(name, b"transfer-encoding")
@@ -5015,6 +5512,7 @@ pub fn http_trailer_field_admit(line: &[u8]) -> (ok: bool)
     ensures
         ok ==> exists|colon: int| 0 < colon < line@.len()
             && valid_header_name(line@.subrange(0, colon))
+            && !trailer_name_forbidden_spec(line@.subrange(0, colon))
             && valid_header_value(line@.subrange(colon + 1, line@.len() as int)),
 {
     let mut colon: usize = 0;
@@ -6620,15 +7118,30 @@ pub open spec fn etag_opaque_byte(b: u8) -> bool {
     b == 0x21 || (b >= 0x23 && b <= 0x7e) || b >= 0x80
 }
 
+pub open spec fn weak_etag_bounds_valid_spec(
+    value: Seq<u8>,
+    start: int,
+    end: int,
+) -> bool {
+    0 < start <= end < value.len()
+        && value[start - 1] == b'"'
+        && value[end] == b'"'
+        && forall|i: int| start <= i < end ==> etag_opaque_byte(value[i])
+}
+
+pub open spec fn weak_etag_valid_spec(value: Seq<u8>) -> bool {
+    exists|start: int, end: int|
+        #[trigger] weak_etag_bounds_valid_spec(value, start, end)
+}
+
 fn weak_etag_opaque_bounds(value: &[u8]) -> (bounds: Option<(usize, usize)>)
     ensures
         match bounds {
-            Some((start, end)) => {
-                &&& 0 < start <= end < value@.len()
-                &&& value@[start as int - 1] == b'"'
-                &&& value@[end as int] == b'"'
-                &&& forall|i: int| start <= i < end ==> etag_opaque_byte(value@[i])
-            }
+            Some((start, end)) => weak_etag_bounds_valid_spec(
+                value@,
+                start as int,
+                end as int,
+            ),
             None => true,
         },
 {
@@ -6678,6 +7191,8 @@ pub fn cache_weak_etag_match(stored: &[u8], candidate: &[u8]) -> (matched: bool)
                 && stored@.subrange(a, b) == candidate@.subrange(c, d)
                 && (forall|i: int| a <= i < b ==> etag_opaque_byte(stored@[i]))
                 && (forall|i: int| c <= i < d ==> etag_opaque_byte(candidate@[i])),
+        matched ==> weak_etag_valid_spec(stored@),
+        matched ==> weak_etag_valid_spec(candidate@),
 {
     let (stored_start, stored_end) = match weak_etag_opaque_bounds(stored) {
         Some(bounds) => bounds,
@@ -6708,6 +7223,91 @@ pub fn cache_if_none_match_star(value: &[u8]) -> (matched: bool)
                 && value@.subrange(witness_start, witness_end) == b"*"@);
     }
     matched
+}
+
+pub open spec fn cache_if_none_match_star_witness_spec(value: Seq<u8>) -> bool {
+    exists|start: int, end: int|
+        0 <= start < end <= value.len()
+            && value.subrange(start, end) == b"*"@
+}
+
+/// Parse the complete If-None-Match field as either `*` or a strict
+/// comma-delimited entity-tag list.  Commas inside an opaque quoted tag are
+/// data, not separators; any malformed member invalidates the whole list.
+pub fn cache_if_none_match_matches(value: &[u8], stored: &[u8]) -> (matched: bool)
+    ensures
+        matched ==> cache_if_none_match_star_witness_spec(value@)
+            || weak_etag_valid_spec(stored@),
+{
+    if cache_if_none_match_star(value) {
+        return true;
+    }
+
+    let mut cursor: usize = 0;
+    let mut matched: bool = false;
+    while cursor < value.len()
+        invariant
+            cursor <= value.len(),
+            matched ==> weak_etag_valid_spec(stored@),
+        decreases value.len() - cursor,
+    {
+        let _iteration_start = cursor;
+        while cursor < value.len() && is_ows_exec(value[cursor])
+            invariant _iteration_start <= cursor <= value.len(),
+            decreases value.len() - cursor,
+        {
+            cursor = cursor + 1;
+        }
+        if cursor == value.len() {
+            return false;
+        }
+
+        let candidate_start = cursor;
+        if cursor + 1 < value.len() && value[cursor] == b'W' && value[cursor + 1] == b'/' {
+            cursor = cursor + 2;
+        }
+        if cursor >= value.len() || value[cursor] != b'"' {
+            return false;
+        }
+        cursor = cursor + 1;
+        while cursor < value.len() && value[cursor] != b'"'
+            invariant
+                _iteration_start <= candidate_start < cursor <= value.len(),
+            decreases value.len() - cursor,
+        {
+            cursor = cursor + 1;
+        }
+        if cursor == value.len() {
+            return false;
+        }
+        cursor = cursor + 1;
+        let candidate_end = cursor;
+        let candidate = &value[candidate_start..candidate_end];
+        // Self-comparison is the executable syntax admission for one entity
+        // tag. It rejects controls, stray quotes and a malformed weak marker.
+        if !cache_weak_etag_match(candidate, candidate) {
+            return false;
+        }
+        if cache_weak_etag_match(stored, candidate) {
+            matched = true;
+        }
+
+        while cursor < value.len() && is_ows_exec(value[cursor])
+            invariant _iteration_start < cursor <= value.len(),
+            decreases value.len() - cursor,
+        {
+            cursor = cursor + 1;
+        }
+        if cursor == value.len() {
+            return matched;
+        }
+        if value[cursor] != b',' {
+            return false;
+        }
+        cursor = cursor + 1;
+        assert(_iteration_start < cursor);
+    }
+    false
 }
 
 pub open spec fn cache_conditional_hit_spec(
@@ -8798,6 +9398,42 @@ pub struct H2ControlBudgetResult {
     pub admitted: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2ControlEvent {
+    Settings,
+    Ping,
+    Priority,
+    WindowUpdate { increment: u32 },
+}
+
+pub open spec fn h2_control_event_cost_spec(event: H2ControlEvent) -> u64 {
+    match event {
+        H2ControlEvent::Settings => 16,
+        H2ControlEvent::Ping | H2ControlEvent::Priority => 1,
+        H2ControlEvent::WindowUpdate { increment } => if increment < 1024 { 1 } else { 0 },
+    }
+}
+
+pub fn h2_control_event_cost(event: H2ControlEvent) -> (cost: u64)
+    ensures cost == h2_control_event_cost_spec(event),
+{
+    match event {
+        H2ControlEvent::Settings => 16,
+        H2ControlEvent::Ping | H2ControlEvent::Priority => 1,
+        H2ControlEvent::WindowUpdate { increment } => if increment < 1024 { 1 } else { 0 },
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct H2ControlEventResult {
+    pub available: u64,
+    pub admitted: bool,
+    /// Whole seconds that the runtime must advance its refill epoch. Keeping
+    /// this in the verified transition prevents time from being charged twice.
+    pub refill_seconds: u64,
+    pub cost: u64,
+}
+
 /// Refill and consume one HTTP/2 control-frame token budget transition. All
 /// multiplication/addition is checked, overflow saturates only to the fixed
 /// burst ceiling, and a backward/zero elapsed time contributes no tokens.
@@ -8832,6 +9468,38 @@ pub fn h2_control_budget_step(
             available: refilled - cost,
             admitted: true,
         }
+    }
+}
+
+/// Complete event transition: assign the protocol event's cost, apply exactly
+/// one elapsed-time refill, and return the epoch advance consumed by runtime.
+pub fn h2_control_event_step(
+    available: u64,
+    elapsed_seconds: u64,
+    event: H2ControlEvent,
+    burst: u64,
+    refill_per_second: u64,
+) -> (out: H2ControlEventResult)
+    ensures
+        out.cost == h2_control_event_cost_spec(event),
+        out.refill_seconds == elapsed_seconds,
+        out.available <= burst,
+        out.admitted ==> out.cost <= burst && out.available <= burst - out.cost,
+        !out.admitted ==> out.cost > out.available,
+{
+    let cost = h2_control_event_cost(event);
+    let budget = h2_control_budget_step(
+        available,
+        elapsed_seconds,
+        cost,
+        burst,
+        refill_per_second,
+    );
+    H2ControlEventResult {
+        available: budget.available,
+        admitted: budget.admitted,
+        refill_seconds: elapsed_seconds,
+        cost,
     }
 }
 

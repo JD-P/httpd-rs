@@ -56,7 +56,9 @@ All 23 proxy rows are out of `not_covered`, and none remain partial:
 - `CVE-2024-38477` — Rust proxy state has no nullable-pointer dereference and
   framing/buffers are bounded.
 
-The formal `ProxyTarget`/framing refinement is still future work.
+The response-framing refinement and exact front/upstream path witness are now
+executable Verus kernels consumed by the runtime. A full semantic refinement
+of every upstream application's path interpretation remains future work.
 
 ## HTTP/2
 

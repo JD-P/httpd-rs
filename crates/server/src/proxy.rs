@@ -1642,23 +1642,26 @@ where
             "ambiguous or invalid websocket target path",
         ));
     }
-    let binding = target.binding_key();
-    let Some(backend_bound) = grant.bind_backend(resource, binding.clone()) else {
+    let Some(bound) = grant.bind_proxy(
+        resource,
+        &target.backend.host,
+        target.backend.port,
+        target.backend.tls,
+        &target.path,
+    ) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "access grant does not cover websocket target",
         ));
     };
-    let mut expected = resource.clone();
-    expected.backend_target = Some(binding);
-    let Some(bound) = backend_bound.bind_representation(&expected) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "access grant does not cover websocket representation",
-        ));
-    };
-    if !bound.require_sink(&expected, vapache_verified::TransformSink::Proxy)
-        || resource.proxy_url.as_deref() != Some(target.proxy_url.as_str())
+    let expected = bound.key().clone();
+    if !bound.require_proxy_sink(
+        &expected,
+        &target.backend.host,
+        target.backend.port,
+        target.backend.tls,
+        &target.path,
+    ) || resource.proxy_url.as_deref() != Some(target.proxy_url.as_str())
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -2097,10 +2100,7 @@ fn proxy_once_budgeted(
         ));
     }
     let mut headers: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut content_length: Option<usize> = None;
-    let mut saw_content_length = false;
-    let mut chunked = false;
-    let mut saw_transfer_encoding = false;
+    let mut framing_headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut connection_header_tokens: Vec<String> = Vec::new();
     let mut header_count = 0usize;
     let mut head_bytes = status_line.len();
@@ -2140,6 +2140,7 @@ fn proxy_once_budgeted(
                 "invalid proxy response header",
             ));
         }
+        framing_headers.push((name.to_ascii_lowercase(), value.to_vec()));
         let name = String::from_utf8(name.to_ascii_lowercase()).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2147,44 +2148,9 @@ fn proxy_once_budgeted(
             )
         })?;
         if name == "content-length" {
-            if saw_content_length {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "duplicate Content-Length from proxy",
-                ));
-            }
-            saw_content_length = true;
-            let value = std::str::from_utf8(value).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "bad Content-Length from proxy",
-                )
-            })?;
-            content_length = Some(value.parse().map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "bad Content-Length from proxy",
-                )
-            })?);
             continue;
         }
         if name == "transfer-encoding" {
-            if saw_transfer_encoding {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "duplicate Transfer-Encoding from proxy",
-                ));
-            }
-            saw_transfer_encoding = true;
-            let mut encodings = value.split(|byte| *byte == b',').map(trim_ascii_bytes);
-            let first = encodings.next().unwrap_or(b"");
-            if !first.eq_ignore_ascii_case(b"chunked") || encodings.next().is_some() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "unsupported Transfer-Encoding from proxy",
-                ));
-            }
-            chunked = true;
             continue;
         }
         if name == "connection" {
@@ -2218,20 +2184,31 @@ fn proxy_once_budgeted(
             .iter()
             .any(|token| token.eq_ignore_ascii_case(name))
     });
-    if saw_content_length && saw_transfer_encoding {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "proxy response has both Content-Length and Transfer-Encoding",
-        ));
-    }
+    let framing =
+        crate::verified::proxy_response_framing(req.method == "HEAD", status, &framing_headers)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ambiguous proxy response framing",
+                )
+            })?;
+    let (no_body, content_length, chunked) = match framing {
+        crate::verified::ProxyResponseFraming::NoBody => (true, None, false),
+        crate::verified::ProxyResponseFraming::Length(length) => {
+            let length = usize::try_from(length).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::FileTooLarge, "proxy body too large")
+            })?;
+            (false, Some(length), false)
+        }
+        crate::verified::ProxyResponseFraming::Chunked => (false, None, true),
+        crate::verified::ProxyResponseFraming::Eof => (false, None, false),
+    };
     if (300..400).contains(&status) {
         // Apache's proxy reverse rules also cover relative Location values.
         if let Some((_, value)) = headers.iter_mut().find(|(n, _)| n == "location") {
             rewrite_location(value, &target.reverse);
         }
     }
-    let no_body =
-        req.method == "HEAD" || status == 204 || status == 304 || (100..200).contains(&status);
     if !no_body && content_length.is_some_and(|length| length > MAX_PROXY_BODY) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::FileTooLarge,
@@ -2509,16 +2486,22 @@ fn authorize_failover(
     );
     next_resource.identity = identity.map(|i| i.user);
     let grant = crate::access::grant_if_allowed(access, next_resource.clone())?;
-    let binding = target.binding_key();
-    if !proxy_path_identity_safe(url_path, &target.path) {
-        return None;
-    }
-    let backend_bound = grant.bind_backend(&next_resource, binding.clone())?;
-    let mut expected = next_resource;
-    expected.backend_target = Some(binding);
-    let bound = backend_bound.bind_representation(&expected)?;
+    let bound = grant.bind_proxy(
+        &next_resource,
+        &target.backend.host,
+        target.backend.port,
+        target.backend.tls,
+        &target.path,
+    )?;
+    let expected = bound.key().clone();
     debug_assert!(
-        bound.require_sink(&expected, vapache_verified::TransformSink::Proxy),
+        bound.require_proxy_sink(
+            &expected,
+            &target.backend.host,
+            target.backend.port,
+            target.backend.tls,
+            &target.path,
+        ),
         "failover grant does not cover bound backend"
     );
     Some((next_scope, bound, expected))
@@ -2553,8 +2536,13 @@ pub fn execute(
             local_ip,
         );
     }
-    let binding = target.binding_key();
-    let Some(backend_bound) = grant.bind_backend(resource, binding.clone()) else {
+    let Some(bound) = grant.bind_proxy(
+        resource,
+        &target.backend.host,
+        target.backend.port,
+        target.backend.tls,
+        &target.path,
+    ) else {
         return error(
             cfg,
             vhost,
@@ -2567,23 +2555,14 @@ pub fn execute(
             local_ip,
         );
     };
-    let mut active_resource = resource.clone();
-    active_resource.backend_target = Some(binding);
-    let Some(bound) = backend_bound.bind_representation(&active_resource) else {
-        return error(
-            cfg,
-            vhost,
-            scope,
-            req,
-            url_path,
-            local_port,
-            host,
-            peer.ip(),
-            local_ip,
-        );
-    };
-    if !bound.require_sink(&active_resource, vapache_verified::TransformSink::Proxy)
-        || resource.proxy_url.as_deref() != Some(target.proxy_url.as_str())
+    let mut active_resource = bound.key().clone();
+    if !bound.require_proxy_sink(
+        &active_resource,
+        &target.backend.host,
+        target.backend.port,
+        target.backend.tls,
+        &target.path,
+    ) || resource.proxy_url.as_deref() != Some(target.proxy_url.as_str())
     {
         return error(
             cfg,
@@ -2606,14 +2585,27 @@ pub fn execute(
         // The grant used by the sink must name the exact member currently
         // selected.  A balancer failover replaces both together.
         let binding = current.binding_key();
-        let mut expected = active_resource.clone();
-        expected.backend_target = Some(binding.clone());
-        debug_assert!(
-            active_grant.require_sink(&expected, vapache_verified::TransformSink::Proxy)
-                && active_resource.proxy_url.as_deref() == Some(current.proxy_url.as_str())
-                && active_resource.backend_target.as_deref() == Some(binding.as_str()),
-            "proxy failover grant/identity drift"
-        );
+        if !active_grant.require_proxy_sink(
+            &active_resource,
+            &current.backend.host,
+            current.backend.port,
+            current.backend.tls,
+            &current.path,
+        ) || active_resource.proxy_url.as_deref() != Some(current.proxy_url.as_str())
+            || active_resource.backend_target.as_deref() != Some(binding.as_str())
+        {
+            return error(
+                cfg,
+                vhost,
+                &active_scope,
+                req,
+                url_path,
+                local_port,
+                host,
+                peer.ip(),
+                local_ip,
+            );
+        }
         tried.insert(backend_key(&current.backend));
         let (result, request_may_have_started) =
             match connect(&current.backend, &active_scope, timeout) {
@@ -4495,6 +4487,38 @@ mod coverage_tests {
         }
         huge.push_str("\r\n");
         invalid(huge, "headers too large");
+    }
+
+    #[test]
+    fn proxy_framing_kernel_validates_no_body_responses_too() {
+        use vapache_verified::ProxyResponseFraming;
+
+        let length = vec![(b"content-length".to_vec(), b"12".to_vec())];
+        assert_eq!(
+            vapache_verified::proxy_response_framing(false, 200, &length),
+            Some(ProxyResponseFraming::Length(12))
+        );
+        assert_eq!(
+            vapache_verified::proxy_response_framing(true, 200, &length),
+            Some(ProxyResponseFraming::NoBody)
+        );
+        let ambiguous = vec![
+            (b"content-length".to_vec(), b"12".to_vec()),
+            (b"transfer-encoding".to_vec(), b"chunked".to_vec()),
+        ];
+        assert_eq!(
+            vapache_verified::proxy_response_framing(true, 200, &ambiguous),
+            None
+        );
+        let malformed = vec![(b"content-length".to_vec(), b"12, 12".to_vec())];
+        assert_eq!(
+            vapache_verified::proxy_response_framing(false, 204, &malformed),
+            None
+        );
+        assert_eq!(
+            vapache_verified::proxy_response_framing(false, 204, &length),
+            None
+        );
     }
 
     #[test]

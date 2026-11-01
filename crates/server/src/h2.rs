@@ -2204,6 +2204,41 @@ mod tests {
     }
 
     #[test]
+    fn h2_control_events_assign_cost_and_refill_once() {
+        use vapache_verified::H2ControlEvent::{Ping, Priority, Settings, WindowUpdate};
+
+        let settings = vapache_verified::h2_control_event_step(256, 0, Settings, 256, 2);
+        assert_eq!(settings.cost, 16);
+        assert_eq!(settings.available, 240);
+        assert!(settings.admitted);
+
+        let ping = vapache_verified::h2_control_event_step(0, 1, Ping, 256, 2);
+        assert_eq!(ping.refill_seconds, 1);
+        assert_eq!(ping.cost, 1);
+        assert_eq!(ping.available, 1);
+        assert!(ping.admitted);
+        let priority = vapache_verified::h2_control_event_step(ping.available, 0, Priority, 256, 2);
+        assert_eq!(priority.available, 0);
+        assert!(priority.admitted);
+        assert!(!vapache_verified::h2_control_event_step(0, 0, Ping, 256, 2).admitted);
+
+        let tiny =
+            vapache_verified::h2_control_event_step(1, 0, WindowUpdate { increment: 1023 }, 256, 2);
+        assert_eq!(tiny.cost, 1);
+        assert_eq!(tiny.available, 0);
+        let useful = vapache_verified::h2_control_event_step(
+            0,
+            u64::MAX,
+            WindowUpdate { increment: 1024 },
+            256,
+            2,
+        );
+        assert_eq!(useful.cost, 0);
+        assert_eq!(useful.available, 256);
+        assert!(useful.admitted);
+    }
+
+    #[test]
     fn h2_stream_admission_rejects_active_or_pending_ids() {
         let active = [1u64, 3];
         let pending = [2u64, 5];

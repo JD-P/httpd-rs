@@ -426,52 +426,18 @@ pub fn parse_u64(s: &[u8]) -> Option<u64> {
 
 /// Parse an HTTP authority into one unambiguous routing identity.
 ///
-/// The request parser used to accept almost any visible bytes in `Host` and
-/// several call sites then interpreted colons, brackets, or URI delimiters in
-/// different ways.  Keep the parser deliberately small and strict: bracketed
-/// IPv6 literals are normalized with the standard library, registered names
-/// use the RFC 3986 `reg-name` alphabet, userinfo/path/query/fragment syntax is
-/// rejected, and an explicit port must fit in `u16`.
+/// The verified parser owns bracket/colon splitting, IPv6 syntax, registered
+/// names and checked ports. This wrapper only renders its typed host result;
+/// no downstream string parser gets a second interpretation of the authority.
 pub fn parse_http_authority(value: &[u8], default_port: u16) -> Option<(String, u16)> {
-    if !crate::verified::http_authority_visible_admit(value) {
-        return None;
-    }
-    let value = std::str::from_utf8(value).ok()?;
-
-    if let Some(rest) = value.strip_prefix('[') {
-        let close = rest.find(']')?;
-        let literal = &rest[..close];
-        let host = literal.parse::<std::net::Ipv6Addr>().ok()?.to_string();
-        let suffix = &rest[close + 1..];
-        let port = if suffix.is_empty() {
-            default_port
-        } else {
-            crate::verified::parse_http_authority_port(suffix.strip_prefix(':')?.as_bytes())?
-        };
-        return Some((host, port));
-    }
-
-    if value.contains(['[', ']', '@', '/', '\\', '?', '#']) {
-        return None;
-    }
-    let (host, port) = match value.rsplit_once(':') {
-        Some((host, port)) => {
-            // An unbracketed IPv6 literal and an empty/malformed port are
-            // both ambiguous at every downstream authority consumer.
-            if host.contains(':') {
-                return None;
-            }
-            (
-                host,
-                crate::verified::parse_http_authority_port(port.as_bytes())?,
-            )
+    let parsed = crate::verified::parse_http_authority_endpoint(value, default_port)?;
+    let host = match parsed.host {
+        crate::verified::HttpAuthorityHost::RegName(bytes) => String::from_utf8(bytes).ok()?,
+        crate::verified::HttpAuthorityHost::Ipv6(address) => {
+            std::net::Ipv6Addr::from(address).to_string()
         }
-        None => (value, default_port),
     };
-    if !crate::verified::http_reg_name_admit(host.as_bytes()) {
-        return None;
-    }
-    Some((host.to_ascii_lowercase(), port))
+    Some((host, parsed.port))
 }
 
 #[cfg(test)]
@@ -517,6 +483,29 @@ mod tests {
             Some(("::1".into(), 443))
         );
         assert_eq!(
+            parse_http_authority(b"[::ffff:192.0.2.128]", 80),
+            Some(("::ffff:192.0.2.128".into(), 80))
+        );
+        assert_eq!(
+            parse_http_authority(b"[2001:db8:0:1:1:1:1:1]", 443),
+            Some(("2001:db8:0:1:1:1:1:1".into(), 443))
+        );
+        for literal in [
+            "::",
+            "1::",
+            "::1",
+            "1:2:3:4:5:6:7:8",
+            "::192.0.2.1",
+            "1:2:3:4:5:6:192.0.2.1",
+        ] {
+            let authority = format!("[{literal}]");
+            let expected = literal.parse::<std::net::Ipv6Addr>().unwrap().to_string();
+            assert_eq!(
+                parse_http_authority(authority.as_bytes(), 80),
+                Some((expected, 80))
+            );
+        }
+        assert_eq!(
             parse_http_authority(b"under_score.test", 80),
             Some(("under_score.test".into(), 80))
         );
@@ -534,6 +523,12 @@ mod tests {
             b"example.test#fragment".as_slice(),
             b"2001:db8::1".as_slice(),
             b"[not-ipv6]".as_slice(),
+            b"[1:2:3:4:5:6:7]".as_slice(),
+            b"[1:2:3:4:5:6:7:8:9]".as_slice(),
+            b"[1::2::3]".as_slice(),
+            b"[::ffff:192.0.2.999]".as_slice(),
+            b"[::ffff:192.0.2]".as_slice(),
+            b"[::ffff:192.168.001.1]".as_slice(),
             b"bad%escape".as_slice(),
             b"bad%2".as_slice(),
             b"bad%2g".as_slice(),

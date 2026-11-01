@@ -86,8 +86,6 @@ struct DynConnection<'a, B: Buf = Bytes> {
 
 const CONTROL_FRAME_BURST: u64 = 256;
 const CONTROL_FRAME_REFILL_PER_SECOND: u64 = 2;
-const SETTINGS_FRAME_COST: u64 = 16;
-const TINY_WINDOW_UPDATE: u32 = 1024;
 
 #[derive(Debug)]
 struct ControlFrameBudget {
@@ -107,24 +105,24 @@ impl ControlFrameBudget {
         }
     }
 
-    fn consume(&mut self, cost: u64) -> bool {
-        self.consume_at(cost, Instant::now())
+    fn consume(&mut self, event: vapache_verified::H2ControlEvent) -> bool {
+        self.consume_at(event, Instant::now())
     }
 
-    fn consume_at(&mut self, cost: u64, now: Instant) -> bool {
+    fn consume_at(&mut self, event: vapache_verified::H2ControlEvent, now: Instant) -> bool {
         let seconds = now.saturating_duration_since(self.last_refill).as_secs();
-        let transition = vapache_verified::h2_control_budget_step(
+        let transition = vapache_verified::h2_control_event_step(
             self.available,
             seconds,
-            cost,
+            event,
             CONTROL_FRAME_BURST,
             CONTROL_FRAME_REFILL_PER_SECOND,
         );
         self.available = transition.available;
-        if seconds != 0 {
+        if transition.refill_seconds != 0 {
             self.last_refill = self
                 .last_refill
-                .checked_add(Duration::from_secs(seconds))
+                .checked_add(Duration::from_secs(transition.refill_seconds))
                 .unwrap_or(now);
         }
         transition.admitted
@@ -642,7 +640,10 @@ where
             }
             Some(Settings(frame)) => {
                 tracing::trace!(?frame, "recv SETTINGS");
-                if !self.control_frame_budget.consume(SETTINGS_FRAME_COST) {
+                if !self
+                    .control_frame_budget
+                    .consume(vapache_verified::H2ControlEvent::Settings)
+                {
                     return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
                 }
                 return Ok(ReceivedFrame::Settings(frame));
@@ -658,7 +659,10 @@ where
             }
             Some(Ping(frame)) => {
                 tracing::trace!(?frame, "recv PING");
-                if !self.control_frame_budget.consume(1) {
+                if !self
+                    .control_frame_budget
+                    .consume(vapache_verified::H2ControlEvent::Ping)
+                {
                     return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
                 }
                 let status = self.ping_pong.recv_ping(frame);
@@ -674,8 +678,11 @@ where
             }
             Some(WindowUpdate(frame)) => {
                 tracing::trace!(?frame, "recv WINDOW_UPDATE");
-                if frame.size_increment() < TINY_WINDOW_UPDATE
-                    && !self.control_frame_budget.consume(1)
+                if !self.control_frame_budget.consume(
+                    vapache_verified::H2ControlEvent::WindowUpdate {
+                        increment: frame.size_increment(),
+                    },
+                )
                 {
                     return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
                 }
@@ -683,7 +690,10 @@ where
             }
             Some(Priority(frame)) => {
                 tracing::trace!(?frame, "recv PRIORITY");
-                if !self.control_frame_budget.consume(1) {
+                if !self
+                    .control_frame_budget
+                    .consume(vapache_verified::H2ControlEvent::Priority)
+                {
                     return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
                 }
                 // TODO: handle
@@ -802,18 +812,26 @@ mod tests {
     fn control_frame_budget_bounds_bursts_and_refills_slowly() {
         let start = Instant::now();
         let mut budget = ControlFrameBudget::new_at(start);
-        for _ in 0..(CONTROL_FRAME_BURST / SETTINGS_FRAME_COST) {
-            assert!(budget.consume_at(SETTINGS_FRAME_COST, start));
+        for _ in 0..(CONTROL_FRAME_BURST / 16) {
+            assert!(budget.consume_at(vapache_verified::H2ControlEvent::Settings, start));
         }
-        assert!(!budget.consume_at(1, start));
+        assert!(!budget.consume_at(vapache_verified::H2ControlEvent::Ping, start));
         assert!(budget.consume_at(
-            CONTROL_FRAME_REFILL_PER_SECOND,
+            vapache_verified::H2ControlEvent::Ping,
             start + Duration::from_secs(1)
         ));
-        assert!(!budget.consume_at(1, start + Duration::from_secs(1)));
         assert!(budget.consume_at(
-            CONTROL_FRAME_BURST,
+            vapache_verified::H2ControlEvent::Ping,
+            start + Duration::from_secs(1)
+        ));
+        assert!(!budget.consume_at(
+            vapache_verified::H2ControlEvent::Ping,
+            start + Duration::from_secs(1)
+        ));
+        assert!(budget.consume_at(
+            vapache_verified::H2ControlEvent::WindowUpdate { increment: 65_535 },
             start + Duration::from_secs((CONTROL_FRAME_BURST * 2) as u64)
         ));
+        assert_eq!(budget.available, CONTROL_FRAME_BURST);
     }
 }

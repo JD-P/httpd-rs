@@ -55,6 +55,47 @@ pub struct ResourceKey {
     pub policy_fingerprint: Option<[u8; 32]>,
 }
 
+#[derive(Clone, Debug)]
+struct ProxyRepresentationBinding {
+    witness: vapache_verified::ProxyRepresentationWitness,
+    backend_target: String,
+}
+
+impl ProxyRepresentationBinding {
+    fn matches_stored_key(&self, key: &ResourceKey) -> bool {
+        key.backend_target.as_deref() == Some(self.backend_target.as_str())
+            && vapache_verified::proxy_representation_witness_matches(
+                &self.witness,
+                key.url_path.as_bytes(),
+                self.witness.upstream_path.as_slice(),
+            )
+    }
+
+    fn matches_target(
+        &self,
+        key: &ResourceKey,
+        host: &str,
+        port: u16,
+        tls: bool,
+        upstream_path: &str,
+    ) -> bool {
+        let target = vapache_verified::proxy_target_key(
+            host.as_bytes(),
+            port,
+            tls,
+            upstream_path.as_bytes(),
+        );
+        let target: String = target.iter().map(|byte| format!("{byte:02x}")).collect();
+        target == self.backend_target
+            && key.backend_target.as_deref() == Some(target.as_str())
+            && vapache_verified::proxy_representation_witness_matches(
+                &self.witness,
+                key.url_path.as_bytes(),
+                upstream_path.as_bytes(),
+            )
+    }
+}
+
 fn vhost_id(vhost: Option<&crate::config::VHost>) -> usize {
     vhost
         .map(|v| v as *const crate::config::VHost as usize)
@@ -128,6 +169,10 @@ impl ResourceKey {
 pub struct AccessGrant {
     key: ResourceKey,
     pipeline: vapache_verified::TransformCapability,
+    /// Exact front-end/upstream path pair witnessed when a proxy target is
+    /// bound. A boolean pipeline bit alone cannot prevent reuse after a
+    /// retarget, so the sink checks this concrete evidence as well.
+    proxy_representation: Option<ProxyRepresentationBinding>,
     /// Test-only grants are intentionally wildcard; production grants are
     /// always constructed with a concrete key.
     wildcard: bool,
@@ -147,7 +192,32 @@ impl AccessGrant {
     /// verified capability additionally enforces the sink-specific inode,
     /// backend and cache-policy bindings.
     pub fn require_sink(&self, key: &ResourceKey, sink: vapache_verified::TransformSink) -> bool {
-        vapache_verified::transform_sink_admit(self.require(key), self.pipeline, sink)
+        let exact_representation = sink != vapache_verified::TransformSink::Proxy
+            || self
+                .proxy_representation
+                .as_ref()
+                .is_some_and(|binding| binding.matches_stored_key(key));
+        exact_representation
+            && vapache_verified::transform_sink_admit(self.require(key), self.pipeline, sink)
+    }
+
+    /// Proxy-specific final sink gate. In addition to the stored resource key,
+    /// compare the concrete endpoint and upstream path about to be used. This
+    /// keeps a later target variable from drifting away from the witnessed
+    /// representation even when the grant itself is unchanged.
+    pub(crate) fn require_proxy_sink(
+        &self,
+        key: &ResourceKey,
+        host: &str,
+        port: u16,
+        tls: bool,
+        upstream_path: &str,
+    ) -> bool {
+        self.require_sink(key, vapache_verified::TransformSink::Proxy)
+            && self
+                .proxy_representation
+                .as_ref()
+                .is_some_and(|binding| binding.matches_target(key, host, port, tls, upstream_path))
     }
 
     /// Bind a grant that already covers `resource` to the exact outbound
@@ -165,20 +235,47 @@ impl AccessGrant {
         Some(AccessGrant {
             key,
             pipeline: vapache_verified::transform_bind_backend(self.pipeline),
+            proxy_representation: self.proxy_representation.clone(),
             wildcard: self.wildcard,
         })
     }
 
-    /// Bind a proxy grant to the checked front-end/backend path
-    /// representation. Endpoint binding alone is insufficient because some
-    /// upstream frameworks reinterpret path-parameter delimiters.
-    pub(crate) fn bind_representation(&self, resource: &ResourceKey) -> Option<AccessGrant> {
+    /// Bind the exact proxy endpoint and the exact authorized/upstream path
+    /// pair as one operation. Endpoint binding alone is insufficient because
+    /// some upstream frameworks reinterpret path-parameter delimiters.
+    pub(crate) fn bind_proxy(
+        &self,
+        resource: &ResourceKey,
+        host: &str,
+        port: u16,
+        tls: bool,
+        upstream_path: &str,
+    ) -> Option<AccessGrant> {
         if !self.require(resource) {
             return None;
         }
+        let witness = vapache_verified::proxy_representation_witness(
+            resource.url_path.as_bytes(),
+            upstream_path.as_bytes(),
+        )?;
+        let target = vapache_verified::proxy_target_key(
+            host.as_bytes(),
+            port,
+            tls,
+            upstream_path.as_bytes(),
+        );
+        let backend_target: String = target.iter().map(|byte| format!("{byte:02x}")).collect();
+        let mut key = resource.clone();
+        key.backend_target = Some(backend_target.clone());
         Some(AccessGrant {
-            key: resource.clone(),
-            pipeline: vapache_verified::transform_bind_representation(self.pipeline),
+            key,
+            pipeline: vapache_verified::transform_bind_representation(
+                vapache_verified::transform_bind_backend(self.pipeline),
+            ),
+            proxy_representation: Some(ProxyRepresentationBinding {
+                witness,
+                backend_target,
+            }),
             wildcard: self.wildcard,
         })
     }
@@ -198,6 +295,7 @@ impl AccessGrant {
         Some(AccessGrant {
             key,
             pipeline: vapache_verified::transform_bind_inode(self.pipeline),
+            proxy_representation: self.proxy_representation.clone(),
             wildcard: self.wildcard,
         })
     }
@@ -212,6 +310,7 @@ pub(crate) fn grant_if_allowed(access: Access, key: ResourceKey) -> Option<Acces
         Access::Allowed => Some(AccessGrant {
             pipeline: authorized_pipeline(&key),
             key,
+            proxy_representation: None,
             wildcard: false,
         }),
         _ => None,
@@ -247,6 +346,7 @@ pub fn test_grant() -> AccessGrant {
             representation_bound: true,
             policy_bound: true,
         },
+        proxy_representation: None,
         wildcard: true,
     }
 }
@@ -264,6 +364,7 @@ pub(crate) fn check_grant(
         Access::Allowed => Ok(AccessGrant {
             pipeline: authorized_pipeline(&key),
             key,
+            proxy_representation: None,
             wildcard: false,
         }),
         other => Err(other),
@@ -1454,15 +1555,34 @@ mod tests {
         assert!(!grant.require_sink(&key, vapache_verified::TransformSink::StaticFile));
         assert!(!grant.require_sink(&key, vapache_verified::TransformSink::Proxy));
 
-        let proxy_backend = grant
-            .bind_backend(&key, "proxy-backend".into())
-            .expect("proxy backend bound");
-        let proxy_key = proxy_backend.key().clone();
-        assert!(!proxy_backend.require_sink(&proxy_key, vapache_verified::TransformSink::Proxy));
-        let proxy_bound = proxy_backend
-            .bind_representation(&proxy_key)
-            .expect("proxy representation bound");
-        assert!(proxy_bound.require_sink(&proxy_key, vapache_verified::TransformSink::Proxy));
+        let proxy_bound = grant
+            .bind_proxy(&key, "backend.test", 8080, false, "/upstream.php")
+            .expect("proxy endpoint and representation bound");
+        let proxy_key = proxy_bound.key().clone();
+        assert!(proxy_bound.require_proxy_sink(
+            &proxy_key,
+            "backend.test",
+            8080,
+            false,
+            "/upstream.php"
+        ));
+        assert!(!proxy_bound.require_proxy_sink(
+            &proxy_key,
+            "backend.test",
+            8080,
+            false,
+            "/different-upstream.php"
+        ));
+        let mut retargeted_front = proxy_key.clone();
+        retargeted_front.url_path = "/different.php".into();
+        assert!(
+            !proxy_bound.require_sink(&retargeted_front, vapache_verified::TransformSink::Proxy)
+        );
+        let mut retargeted_backend = proxy_key;
+        retargeted_backend.backend_target = Some("different-backend".into());
+        assert!(
+            !proxy_bound.require_sink(&retargeted_backend, vapache_verified::TransformSink::Proxy)
+        );
 
         let meta = std::fs::metadata("/proc/self/exe").expect("self metadata");
         let file_bound = grant.bind_file(&key, &meta).expect("file bound");

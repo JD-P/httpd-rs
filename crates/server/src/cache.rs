@@ -958,63 +958,13 @@ fn vary_matches(entry: &Entry, req: &Request) -> bool {
         .all(|(name, expected)| req.header(name).unwrap_or(b"") == expected.as_slice())
 }
 
-fn if_none_match_matches(value: &[u8], stored: &[u8]) -> bool {
-    if crate::verified::cache_if_none_match_star(value) {
-        return true;
-    }
-
-    let mut cursor = 0usize;
-    let mut matched = false;
-    loop {
-        while cursor < value.len() && matches!(value[cursor], b' ' | b'\t') {
-            cursor += 1;
-        }
-        if cursor == value.len() {
-            return false;
-        }
-
-        let candidate_start = cursor;
-        if value[cursor..].starts_with(b"W/") {
-            cursor += 2;
-        }
-        if value.get(cursor) != Some(&b'"') {
-            return false;
-        }
-        cursor += 1;
-        while cursor < value.len() && value[cursor] != b'"' {
-            cursor += 1;
-        }
-        if cursor == value.len() {
-            return false;
-        }
-        cursor += 1;
-        let candidate = &value[candidate_start..cursor];
-        // Comparing a candidate with itself is also the verified syntax gate.
-        // In particular, commas inside the quoted opaque tag are data, not
-        // list separators.
-        if !crate::verified::cache_weak_etag_match(candidate, candidate) {
-            return false;
-        }
-        matched |= crate::verified::cache_weak_etag_match(stored, candidate);
-
-        while cursor < value.len() && matches!(value[cursor], b' ' | b'\t') {
-            cursor += 1;
-        }
-        if cursor == value.len() {
-            return matched;
-        }
-        if value[cursor] != b',' {
-            return false;
-        }
-        cursor += 1;
-    }
-}
-
 fn conditional_hit(req: &Request, entry: &Entry, response: &mut Response) -> bool {
     let if_none_match = req.header("if-none-match");
-    let if_none_match_matches = if_none_match.is_some_and(|inm| {
-        crate::verified::cache_if_none_match_star(inm)
-            || header(&entry.headers, "etag").is_some_and(|etag| if_none_match_matches(inm, etag))
+    let if_none_match_matches = if_none_match.is_some_and(|value| {
+        crate::verified::cache_if_none_match_matches(
+            value,
+            header(&entry.headers, "etag").unwrap_or(b""),
+        )
     });
     let if_modified_since_matches = if if_none_match.is_none() {
         req.header("if-modified-since").is_some_and(|ims| {
@@ -3985,6 +3935,16 @@ CacheIgnoreQueryString On\n\
             &comma_entry,
             &mut invalid_list_response
         ));
+        for malformed in [
+            b"\"tag,part\",".as_slice(),
+            b", \"tag,part\"".as_slice(),
+            b"\"other\", , \"tag,part\"".as_slice(),
+        ] {
+            let mut request = test_request();
+            request.headers.insert("if-none-match", malformed.to_vec());
+            let mut response = Response::bytes(200, "text/plain", b"body".to_vec());
+            assert!(!conditional_hit(&request, &comma_entry, &mut response));
+        }
 
         let mut star_req = test_request();
         star_req.headers.insert("if-none-match", b"*".to_vec());

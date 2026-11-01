@@ -1719,7 +1719,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **546 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **576 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1776,13 +1776,14 @@ construction: there is no second production interleaver.
   groups all consume verified kernels.  Leaf evaluators that consult regex,
   filesystem, IP or request state remain explicit assumptions.
 - `path_under_base`, `rewrite_filesystem_admit`,
-  `proxy_path_representation_admit`, `proxy_request_line_admit`,
+  `proxy_representation_witness`, `proxy_request_line_admit`,
   `proxy_header_admit`, `proxy_response_status_line_parse` and
-  `proxy_response_header_admit`. Alias, rewrite and FastCGI targets use the
+  `proxy_response_header_admit`/`proxy_response_framing`. Alias, rewrite and FastCGI targets use the
   component-aware containment predicate (`/srv/www2` is not below `/srv/www`);
-  the proxy boundary admits the path representation, outbound method, target,
-  version and every request header immediately before `write_all`, then checks
-  the upstream status and fields before interpreting response framing.
+  the proxy boundary retains the exact authorized/upstream path pair, admits
+  the outbound method, target, version and every request header immediately
+  before `write_all`, then checks the complete upstream status/field set before
+  choosing one unambiguous response framing mode.
 - `TransformCapability`, `transform_retarget`, `transform_authorize`,
   `transform_bind_inode`, `transform_bind_backend`,
   `transform_bind_representation` and
@@ -1794,14 +1795,17 @@ construction: there is no second production interleaver.
 - `parse_chunk_size_hex`, `chunk_extension_admit`,
   `chunk_framing_budget_step` and `http_trailer_field_admit`. Request bodies
   and proxy responses share the exact checked hexadecimal/extension/trailer
-  grammar and the overflow-free count/framing-byte transition.
-- `h2_header_field_admit` and `h2_control_budget_step`. The HTTP/2 adapter
+  grammar; accepted hexadecimal bytes are tied to their mathematical value,
+  framing/routing trailers are excluded, and the count/framing-byte transition
+  is overflow-free.
+- `h2_header_field_admit` and `h2_control_event_step`. The HTTP/2 adapter
   rechecks connection-specific fields at its downgrade boundary, and the
-  vendored codec consumes the verified refill/consume transition for SETTINGS,
-  PING, PRIORITY and tiny WINDOW_UPDATE work.
-- `cache_weak_etag_match`, `cache_if_none_match_star` and
+  vendored codec maps concrete SETTINGS, PING, PRIORITY and WINDOW_UPDATE
+  events through one verified event-cost/refill/epoch transition.
+- `cache_weak_etag_match`, `cache_if_none_match_matches` and
   `cache_conditional_hit_admit`. Cache validators use RFC weak comparison,
-  keep commas inside quoted opaque tags, reject malformed lists, and prove
+  scan the complete comma list, keep commas inside quoted opaque tags, reject
+  empty/trailing/malformed members, and prove
   that `If-None-Match` suppresses `If-Modified-Since` even on a non-match.
 - `descriptor_snapshot_admit`. Access-file cache lookup/parsing and
   `RewriteMap prg` executable capture consume opened descriptors and require
@@ -2015,10 +2019,13 @@ construction: there is no second production interleaver.
   rejected at configuration load.
 - `first_true_index`.  Virtual-host candidate selection uses the verified
   first-match policy.
-- `ipv4_in_net` / `ipv6_in_net`, `remoteip_next_internal` and
+- `parse_http_authority_endpoint`/`parse_http_ipv6_literal`, `ipv4_in_net` /
+  `ipv6_in_net`, `remoteip_next_internal` and
   `remoteip_candidate_admit`. RemoteIP network membership, the internal/trusted
   proxy transition and the external-private-address refusal use verified
-  functions. Literal IP/authority parsing remains an explicit assumption.
+  functions. Authority bracket/colon splitting, registered-name normalization,
+  ports and compressed or embedded-IPv4 IPv6 literals are parsed in the
+  verified crate; runtime only renders the typed result.
 
 `crates/server/src/access.rs` also exposes an `AccessGrant` capability with a
 concrete `ResourceKey` (vhost, method, URL, filesystem path, proxy target,
@@ -2151,14 +2158,14 @@ The current ledger (2026-11-01) is:
 
 - weighted obligations: **36.0 / 67.0 (53.7%)** if partial obligations receive
   half credit;
-- proof debt: **6 / 6** — 0 named unverified security components, 0 partially
-  bound sinks, 6 assumptions and 0 accepted unmodeled security-directive
+- proof debt: **5 / 6** — 0 named unverified security components, 0 partially
+  bound sinks, 5 assumptions and 0 accepted unmodeled security-directive
   classes;
 - sinks: **8/8** grant-required, **8/8** path/target-bound, **5/8**
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **546 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **576 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops
