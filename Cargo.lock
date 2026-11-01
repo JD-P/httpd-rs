@@ -381,6 +381,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "vapache-verified",
 ]
 
 [[package]]

@@ -115,6 +115,10 @@ version = "0.1.35"
 features = ["std"]
 default-features = false
 
+[dependencies.vapache-verified]
+version = "0.1.0"
+path = "../../crates/verified"
+
 [dev-dependencies.env_logger]
 version = "0.10"
 default-features = false

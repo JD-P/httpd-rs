@@ -305,10 +305,7 @@ fn declared_content_length(headers: &crate::http::Headers) -> Result<Option<u64>
 }
 
 fn forbidden_h2_header(name: &str, value: &[u8]) -> bool {
-    matches!(
-        name,
-        "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade"
-    ) || (name == "te" && !value.eq_ignore_ascii_case(b"trailers"))
+    !crate::verified::h2_header_field_admit(name.as_bytes(), value)
 }
 
 async fn read_body(
@@ -2016,6 +2013,8 @@ mod tests {
         assert!(forbidden_h2_header("te", b"gzip"));
         assert!(!forbidden_h2_header("te", b"trailers"));
         assert!(!forbidden_h2_header("x-test", b"value"));
+        assert!(forbidden_h2_header("bad name", b"value"));
+        assert!(forbidden_h2_header("x-test", b"bad\x01value"));
     }
 
     async fn raw_malformed_request_is_rejected(mut hpack: Vec<u8>) {

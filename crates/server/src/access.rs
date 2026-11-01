@@ -169,6 +169,20 @@ impl AccessGrant {
         })
     }
 
+    /// Bind a proxy grant to the checked front-end/backend path
+    /// representation. Endpoint binding alone is insufficient because some
+    /// upstream frameworks reinterpret path-parameter delimiters.
+    pub(crate) fn bind_representation(&self, resource: &ResourceKey) -> Option<AccessGrant> {
+        if !self.require(resource) {
+            return None;
+        }
+        Some(AccessGrant {
+            key: resource.clone(),
+            pipeline: vapache_verified::transform_bind_representation(self.pipeline),
+            wildcard: self.wildcard,
+        })
+    }
+
     /// Bind a grant that already covers `resource` to the opened inode.
     pub(crate) fn bind_file(
         &self,
@@ -230,6 +244,7 @@ pub fn test_grant() -> AccessGrant {
             authorized: true,
             inode_bound: true,
             backend_bound: true,
+            representation_bound: true,
             policy_bound: true,
         },
         wildcard: true,
@@ -1438,6 +1453,16 @@ mod tests {
         .expect("allowed");
         assert!(!grant.require_sink(&key, vapache_verified::TransformSink::StaticFile));
         assert!(!grant.require_sink(&key, vapache_verified::TransformSink::Proxy));
+
+        let proxy_backend = grant
+            .bind_backend(&key, "proxy-backend".into())
+            .expect("proxy backend bound");
+        let proxy_key = proxy_backend.key().clone();
+        assert!(!proxy_backend.require_sink(&proxy_key, vapache_verified::TransformSink::Proxy));
+        let proxy_bound = proxy_backend
+            .bind_representation(&proxy_key)
+            .expect("proxy representation bound");
+        assert!(proxy_bound.require_sink(&proxy_key, vapache_verified::TransformSink::Proxy));
 
         let meta = std::fs::metadata("/proc/self/exe").expect("self metadata");
         let file_bound = grant.bind_file(&key, &meta).expect("file bound");

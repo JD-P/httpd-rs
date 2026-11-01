@@ -40,43 +40,38 @@ const MAX_REQUEST_TRAILER_BYTES: usize = 64 * 1024;
 /// decoded body bytes.  A decoded-size limit alone still permits hundreds of
 /// millions of one-byte chunks (the root cause class behind Envoy
 /// CVE-2020-8659).  This limit is shared with the proxy response decoder.
-const MAX_CHUNKS_PER_MESSAGE: usize = 65_536;
-const MAX_CHUNK_FRAMING_BYTES: usize = 1024 * 1024;
+const MAX_CHUNKS_PER_MESSAGE: u64 = 65_536;
+const MAX_CHUNK_FRAMING_BYTES: u64 = 1024 * 1024;
 
 #[derive(Default)]
 pub(crate) struct ChunkFramingBudget {
-    chunks: usize,
-    bytes: usize,
+    chunks: u64,
+    bytes: u64,
 }
 
 impl ChunkFramingBudget {
     /// Charge a complete chunk-size line and its CRLF.  Data chunks also have
     /// a CRLF after their payload; trailers have their own independent bound.
     pub(crate) fn charge(&mut self, line_len: usize, data_chunk: bool) -> io::Result<()> {
-        self.chunks = self
-            .chunks
-            .checked_add(1)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "too many HTTP chunks"))?;
-        let framing = line_len
-            .checked_add(2)
-            .and_then(|bytes| bytes.checked_add(if data_chunk { 2 } else { 0 }))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk framing too large"))?;
-        self.bytes = self
-            .bytes
-            .checked_add(framing)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk framing too large"))?;
-        if self.chunks > MAX_CHUNKS_PER_MESSAGE {
+        let line_len = u64::try_from(line_len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk framing too large"))?;
+        let Some(next) = crate::verified::chunk_framing_budget_step(
+            crate::verified::ChunkFramingState {
+                chunks: self.chunks,
+                bytes: self.bytes,
+            },
+            line_len,
+            data_chunk,
+            MAX_CHUNKS_PER_MESSAGE,
+            MAX_CHUNK_FRAMING_BYTES,
+        ) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "too many HTTP chunks",
+                "chunk framing budget exceeded",
             ));
-        }
-        if self.bytes > MAX_CHUNK_FRAMING_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "chunk framing too large",
-            ));
-        }
+        };
+        self.chunks = next.chunks;
+        self.bytes = next.bytes;
         Ok(())
     }
 }
@@ -869,115 +864,12 @@ pub(crate) fn parse_chunk_size_line(line: &[u8]) -> Option<u64> {
     while index < line.len() && line[index].is_ascii_hexdigit() {
         index += 1;
     }
-    if index == 0 {
-        return None;
-    }
-    let size = crate::util::parse_hex_u64(&line[..index])?;
-    loop {
-        while index < line.len() && matches!(line[index], b' ' | b'\t') {
-            index += 1;
-        }
-        if index == line.len() {
-            return Some(size);
-        }
-        if line[index] != b';' {
-            return None;
-        }
-        index += 1;
-        while index < line.len() && matches!(line[index], b' ' | b'\t') {
-            index += 1;
-        }
-        let name_start = index;
-        while index < line.len() && !matches!(line[index], b' ' | b'\t' | b'=' | b';') {
-            index += 1;
-        }
-        if !crate::verified::valid_token(&line[name_start..index]) {
-            return None;
-        }
-        while index < line.len() && matches!(line[index], b' ' | b'\t') {
-            index += 1;
-        }
-        if index < line.len() && line[index] == b'=' {
-            index += 1;
-            while index < line.len() && matches!(line[index], b' ' | b'\t') {
-                index += 1;
-            }
-            if index == line.len() {
-                return None;
-            }
-            if line[index] == b'"' {
-                index += 1;
-                let mut closed = false;
-                while index < line.len() {
-                    let byte = line[index];
-                    if byte == b'"' {
-                        index += 1;
-                        closed = true;
-                        break;
-                    }
-                    if byte == b'\\' {
-                        index += 1;
-                        let escaped = *line.get(index)?;
-                        if !(escaped == b'\t'
-                            || escaped == b' '
-                            || (0x21..=0x7e).contains(&escaped)
-                            || escaped >= 0x80)
-                        {
-                            return None;
-                        }
-                    } else if !(byte == b'\t'
-                        || byte == b' '
-                        || byte == b'!'
-                        || (0x23..=0x5b).contains(&byte)
-                        || (0x5d..=0x7e).contains(&byte)
-                        || byte >= 0x80)
-                    {
-                        return None;
-                    }
-                    index += 1;
-                }
-                if !closed {
-                    return None;
-                }
-            } else {
-                let value_start = index;
-                while index < line.len() && !matches!(line[index], b' ' | b'\t' | b';') {
-                    index += 1;
-                }
-                if !crate::verified::valid_token(&line[value_start..index]) {
-                    return None;
-                }
-            }
-            while index < line.len() && matches!(line[index], b' ' | b'\t') {
-                index += 1;
-            }
-        }
-        if index < line.len() && line[index] != b';' {
-            return None;
-        }
-    }
+    let size = crate::verified::parse_chunk_size_hex(&line[..index])?;
+    crate::verified::chunk_extension_admit(&line[index..]).then_some(size)
 }
 
 pub(crate) fn valid_trailer_field(line: &[u8]) -> bool {
-    let Some(colon) = line.iter().position(|byte| *byte == b':') else {
-        return false;
-    };
-    let name = &line[..colon];
-    if !crate::verified::valid_token(name)
-        || [
-            b"content-length".as_slice(),
-            b"transfer-encoding",
-            b"host",
-            b"trailer",
-        ]
-        .iter()
-        .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
-    {
-        return false;
-    }
-    line[colon + 1..]
-        .iter()
-        .all(|byte| *byte == b'\t' || (*byte >= 0x20 && *byte != 0x7f))
+    crate::verified::http_trailer_field_admit(line)
 }
 
 fn read_chunked_to_writer_budgeted<R: Read, W: Write>(
@@ -2156,7 +2048,9 @@ mod tests {
         }
         for invalid in [
             b" 1".as_slice(),
+            b"1 ".as_slice(),
             b"1x".as_slice(),
+            b"10000000000000000".as_slice(),
             b"1;".as_slice(),
             b"1;;x".as_slice(),
             b"1;name=".as_slice(),
@@ -2225,7 +2119,7 @@ mod tests {
         let mut byte_budget = ChunkFramingBudget::default();
         assert_eq!(
             byte_budget
-                .charge(MAX_CHUNK_FRAMING_BYTES, false)
+                .charge(MAX_CHUNK_FRAMING_BYTES as usize, false)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData

@@ -84,14 +84,14 @@ struct DynConnection<'a, B: Buf = Bytes> {
     control_frame_budget: &'a mut ControlFrameBudget,
 }
 
-const CONTROL_FRAME_BURST: usize = 256;
-const CONTROL_FRAME_REFILL_PER_SECOND: usize = 2;
-const SETTINGS_FRAME_COST: usize = 16;
+const CONTROL_FRAME_BURST: u64 = 256;
+const CONTROL_FRAME_REFILL_PER_SECOND: u64 = 2;
+const SETTINGS_FRAME_COST: u64 = 16;
 const TINY_WINDOW_UPDATE: u32 = 1024;
 
 #[derive(Debug)]
 struct ControlFrameBudget {
-    available: usize,
+    available: u64,
     last_refill: Instant,
 }
 
@@ -107,30 +107,27 @@ impl ControlFrameBudget {
         }
     }
 
-    fn consume(&mut self, cost: usize) -> bool {
+    fn consume(&mut self, cost: u64) -> bool {
         self.consume_at(cost, Instant::now())
     }
 
-    fn consume_at(&mut self, cost: usize, now: Instant) -> bool {
+    fn consume_at(&mut self, cost: u64, now: Instant) -> bool {
         let seconds = now.saturating_duration_since(self.last_refill).as_secs();
+        let transition = vapache_verified::h2_control_budget_step(
+            self.available,
+            seconds,
+            cost,
+            CONTROL_FRAME_BURST,
+            CONTROL_FRAME_REFILL_PER_SECOND,
+        );
+        self.available = transition.available;
         if seconds != 0 {
-            let refill = usize::try_from(seconds)
-                .unwrap_or(usize::MAX)
-                .saturating_mul(CONTROL_FRAME_REFILL_PER_SECOND);
-            self.available = self
-                .available
-                .saturating_add(refill)
-                .min(CONTROL_FRAME_BURST);
             self.last_refill = self
                 .last_refill
                 .checked_add(Duration::from_secs(seconds))
                 .unwrap_or(now);
         }
-        if cost > self.available {
-            return false;
-        }
-        self.available -= cost;
-        true
+        transition.admitted
     }
 }
 

@@ -433,10 +433,10 @@ pub fn parse_u64(s: &[u8]) -> Option<u64> {
 /// use the RFC 3986 `reg-name` alphabet, userinfo/path/query/fragment syntax is
 /// rejected, and an explicit port must fit in `u16`.
 pub fn parse_http_authority(value: &[u8], default_port: u16) -> Option<(String, u16)> {
-    let value = std::str::from_utf8(value).ok()?;
-    if value.is_empty() || value.bytes().any(|byte| byte <= b' ' || byte >= 0x7f) {
+    if !crate::verified::http_authority_visible_admit(value) {
         return None;
     }
+    let value = std::str::from_utf8(value).ok()?;
 
     if let Some(rest) = value.strip_prefix('[') {
         let close = rest.find(']')?;
@@ -446,7 +446,7 @@ pub fn parse_http_authority(value: &[u8], default_port: u16) -> Option<(String, 
         let port = if suffix.is_empty() {
             default_port
         } else {
-            parse_authority_port(suffix.strip_prefix(':')?)?
+            crate::verified::parse_http_authority_port(suffix.strip_prefix(':')?.as_bytes())?
         };
         return Some((host, port));
     }
@@ -461,59 +461,17 @@ pub fn parse_http_authority(value: &[u8], default_port: u16) -> Option<(String, 
             if host.contains(':') {
                 return None;
             }
-            (host, parse_authority_port(port)?)
+            (
+                host,
+                crate::verified::parse_http_authority_port(port.as_bytes())?,
+            )
         }
         None => (value, default_port),
     };
-    if host.is_empty() || !valid_reg_name(host.as_bytes()) {
+    if !crate::verified::http_reg_name_admit(host.as_bytes()) {
         return None;
     }
     Some((host.to_ascii_lowercase(), port))
-}
-
-fn parse_authority_port(value: &str) -> Option<u16> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    value.parse().ok()
-}
-
-fn valid_reg_name(value: &[u8]) -> bool {
-    let mut index = 0usize;
-    while index < value.len() {
-        let byte = value[index];
-        let ordinary = byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'-' | b'.'
-                    | b'_'
-                    | b'~'
-                    | b'!'
-                    | b'$'
-                    | b'&'
-                    | b'\''
-                    | b'('
-                    | b')'
-                    | b'*'
-                    | b'+'
-                    | b','
-                    | b';'
-                    | b'='
-            );
-        if ordinary {
-            index += 1;
-            continue;
-        }
-        if byte != b'%'
-            || index + 2 >= value.len()
-            || !value[index + 1].is_ascii_hexdigit()
-            || !value[index + 2].is_ascii_hexdigit()
-        {
-            return false;
-        }
-        index += 3;
-    }
-    true
 }
 
 #[cfg(test)]
@@ -562,6 +520,10 @@ mod tests {
             parse_http_authority(b"under_score.test", 80),
             Some(("under_score.test".into(), 80))
         );
+        assert_eq!(
+            parse_http_authority(b"percent%2Dname.test:0", 80),
+            Some(("percent%2dname.test".into(), 0))
+        );
         for invalid in [
             b"".as_slice(),
             b"example.test:".as_slice(),
@@ -573,7 +535,10 @@ mod tests {
             b"2001:db8::1".as_slice(),
             b"[not-ipv6]".as_slice(),
             b"bad%escape".as_slice(),
+            b"bad%2".as_slice(),
+            b"bad%2g".as_slice(),
             b"white space".as_slice(),
+            b"control\x7f.test".as_slice(),
         ] {
             assert_eq!(parse_http_authority(invalid, 80), None, "{invalid:?}");
         }

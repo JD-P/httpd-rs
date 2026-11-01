@@ -64,7 +64,7 @@ pub open spec fn header_value_ok(s: Seq<u8>) -> bool {
     forall|i: int| 0 <= i < s.len() ==> header_value_byte_ok(s[i])
 }
 
-spec fn hex_val(b: u8) -> Option<u8> {
+pub open spec fn hex_val(b: u8) -> Option<u8> {
     if b >= b'0' && b <= b'9' {
         Some((b - b'0') as u8)
     } else if b >= b'a' && b <= b'f' {
@@ -981,6 +981,124 @@ pub fn authority_endpoint_equal(
         && left_tls == right_tls
 }
 
+/// Bytes admitted to the HTTP authority parser are visible ASCII.  This
+/// excludes every whitespace/control delimiter before the runtime projects
+/// the value into host and port components.
+pub open spec fn http_authority_visible_spec(value: Seq<u8>) -> bool {
+    value.len() > 0
+        && forall|i: int| 0 <= i < value.len() ==> 0x20 < value[i] && value[i] < 0x7f
+}
+
+pub fn http_authority_visible_admit(value: &[u8]) -> (ok: bool)
+    ensures ok == http_authority_visible_spec(value@),
+{
+    if value.len() == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < value.len()
+        invariant
+            i <= value.len(),
+            forall|j: int| 0 <= j < i ==> 0x20 < value@[j] && value@[j] < 0x7f,
+        decreases value.len() - i,
+    {
+        if value[i] <= 0x20 || value[i] >= 0x7f {
+            return false;
+        }
+        i = i + 1;
+    }
+    assert(http_authority_visible_spec(value@));
+    true
+}
+
+pub open spec fn http_reg_name_byte(b: u8) -> bool {
+    ||| (b >= b'a' && b <= b'z')
+    ||| (b >= b'A' && b <= b'Z')
+    ||| (b >= b'0' && b <= b'9')
+    ||| b == b'-' || b == b'.' || b == b'_' || b == b'~' || b == b'!'
+    ||| b == b'$' || b == b'&' || b == b'\'' || b == b'(' || b == b')'
+    ||| b == b'*' || b == b'+' || b == b',' || b == b';' || b == b'='
+}
+
+pub open spec fn http_reg_name_from_spec(value: Seq<u8>, i: int) -> bool
+    decreases value.len() - i,
+{
+    if i >= value.len() {
+        true
+    } else if http_reg_name_byte(value[i]) {
+        http_reg_name_from_spec(value, i + 1)
+    } else {
+        value[i] == b'%'
+            && i + 2 < value.len()
+            && hex_val(value[i + 1]).is_some()
+            && hex_val(value[i + 2]).is_some()
+            && http_reg_name_from_spec(value, i + 3)
+    }
+}
+
+pub open spec fn http_reg_name_spec(value: Seq<u8>) -> bool {
+    value.len() > 0 && http_reg_name_from_spec(value, 0)
+}
+
+fn http_reg_name_from_exec(value: &[u8], i: usize) -> (ok: bool)
+    requires i <= value.len(),
+    ensures ok == http_reg_name_from_spec(value@, i as int),
+    decreases value.len() - i,
+{
+    if i >= value.len() {
+        return true;
+    }
+    let b = value[i];
+    let ordinary = (b >= b'a' && b <= b'z')
+        || (b >= b'A' && b <= b'Z')
+        || (b >= b'0' && b <= b'9')
+        || b == b'-' || b == b'.' || b == b'_' || b == b'~' || b == b'!'
+        || b == b'$' || b == b'&' || b == b'\'' || b == b'(' || b == b')'
+        || b == b'*' || b == b'+' || b == b',' || b == b';' || b == b'=';
+    if ordinary {
+        http_reg_name_from_exec(value, i + 1)
+    } else if b == b'%' {
+        if value.len() - i < 3 {
+            false
+        } else if hex_val_exec(value[i + 1]).is_some()
+            && hex_val_exec(value[i + 2]).is_some()
+        {
+            http_reg_name_from_exec(value, i + 3)
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
+/// RFC 3986 registered-name admission. Percent escapes are consumed as one
+/// three-byte unit, so a delimiter can never be manufactured by a partial
+/// escape at a later parsing layer.
+pub fn http_reg_name_admit(value: &[u8]) -> (ok: bool)
+    ensures ok == http_reg_name_spec(value@),
+{
+    value.len() > 0 && http_reg_name_from_exec(value, 0)
+}
+
+/// Parse an explicit authority port with checked decimal arithmetic.  The
+/// returned type makes overflow beyond the protocol's u16 port space
+/// impossible for every downstream authority consumer.
+pub fn parse_http_authority_port(value: &[u8]) -> (port: Option<u16>)
+    ensures
+        match port {
+            Some(_) => value@.len() > 0
+                && forall|i: int| 0 <= i < value@.len()
+                    ==> b'0' <= value@[i] && value@[i] <= b'9',
+            None => true,
+        },
+{
+    match parse_decimal_u64(value) {
+        Some(parsed) if parsed <= u16::MAX as u64 => Some(parsed as u16),
+        _ => None,
+    }
+}
+
 /// The external-URL decision used by rewrite target resolution.  A target is
 /// external if it is scheme-relative (`//...`) or an HTTP(S) URL, matching
 /// Apache's case-insensitive scheme handling.
@@ -1095,6 +1213,10 @@ pub struct TransformCapability {
     pub authorized: bool,
     pub inode_bound: bool,
     pub backend_bound: bool,
+    /// The authorized front-end path and serialized backend path have passed
+    /// the same representation-safety gate. This is distinct from binding
+    /// the backend endpoint itself.
+    pub representation_bound: bool,
     pub policy_bound: bool,
 }
 
@@ -1231,6 +1353,7 @@ pub open spec fn transform_retarget_spec() -> TransformCapability {
         authorized: false,
         inode_bound: false,
         backend_bound: false,
+        representation_bound: false,
         policy_bound: false,
     }
 }
@@ -1246,6 +1369,7 @@ pub fn transform_retarget() -> (state: TransformCapability)
         authorized: false,
         inode_bound: false,
         backend_bound: false,
+        representation_bound: false,
         policy_bound: false,
     }
 }
@@ -1256,6 +1380,7 @@ pub open spec fn transform_authorize_spec(policy_bound: bool) -> TransformCapabi
         authorized: true,
         inode_bound: false,
         backend_bound: false,
+        representation_bound: false,
         policy_bound,
     }
 }
@@ -1270,6 +1395,7 @@ pub fn transform_authorize(policy_bound: bool) -> (state: TransformCapability)
         authorized: true,
         inode_bound: false,
         backend_bound: false,
+        representation_bound: false,
         policy_bound,
     }
 }
@@ -1298,6 +1424,18 @@ pub fn transform_bind_backend(state: TransformCapability) -> (out: TransformCapa
     TransformCapability { backend_bound: true, ..state }
 }
 
+pub open spec fn transform_bind_representation_spec(
+    state: TransformCapability,
+) -> TransformCapability {
+    TransformCapability { representation_bound: true, ..state }
+}
+
+pub fn transform_bind_representation(state: TransformCapability) -> (out: TransformCapability)
+    ensures out == transform_bind_representation_spec(state),
+{
+    TransformCapability { representation_bound: true, ..state }
+}
+
 pub open spec fn transform_sink_needs_inode(sink: TransformSink) -> bool {
     match sink {
         TransformSink::StaticFile
@@ -1318,6 +1456,13 @@ pub open spec fn transform_sink_needs_backend(sink: TransformSink) -> bool {
 pub open spec fn transform_sink_needs_policy(sink: TransformSink) -> bool {
     match sink {
         TransformSink::Cache => true,
+        _ => false,
+    }
+}
+
+pub open spec fn transform_sink_needs_representation(sink: TransformSink) -> bool {
+    match sink {
+        TransformSink::Proxy => true,
         _ => false,
     }
 }
@@ -1352,6 +1497,15 @@ pub fn transform_sink_requires_policy(sink: TransformSink) -> (needed: bool)
     }
 }
 
+pub fn transform_sink_requires_representation(sink: TransformSink) -> (needed: bool)
+    ensures needed == transform_sink_needs_representation(sink),
+{
+    match sink {
+        TransformSink::Proxy => true,
+        _ => false,
+    }
+}
+
 pub open spec fn transform_sink_admit_spec(
     same_resource: bool,
     state: TransformCapability,
@@ -1362,6 +1516,7 @@ pub open spec fn transform_sink_admit_spec(
         && state.authorized
         && (!transform_sink_needs_inode(sink) || state.inode_bound)
         && (!transform_sink_needs_backend(sink) || state.backend_bound)
+        && (!transform_sink_needs_representation(sink) || state.representation_bound)
         && (!transform_sink_needs_policy(sink) || state.policy_bound)
 }
 
@@ -1379,6 +1534,7 @@ pub fn transform_sink_admit(
         && state.authorized
         && (!transform_sink_requires_inode(sink) || state.inode_bound)
         && (!transform_sink_requires_backend(sink) || state.backend_bound)
+        && (!transform_sink_requires_representation(sink) || state.representation_bound)
         && (!transform_sink_requires_policy(sink) || state.policy_bound)
 }
 
@@ -1416,6 +1572,16 @@ pub proof fn transform_backend_sink_implies_backend_bound(
 )
     requires transform_sink_needs_backend(sink),
     ensures transform_sink_admit_spec(same_resource, state, sink) ==> state.backend_bound,
+{
+}
+
+pub proof fn transform_proxy_sink_implies_representation_bound(
+    same_resource: bool,
+    state: TransformCapability,
+)
+    ensures
+        transform_sink_admit_spec(same_resource, state, TransformSink::Proxy)
+            ==> state.representation_bound,
 {
 }
 
@@ -4268,6 +4434,52 @@ pub open spec fn valid_target(s: Seq<u8>) -> bool {
     s.len() > 0 && all_target_bytes(s)
 }
 
+/// A generic reverse proxy cannot know whether an upstream strips semicolon
+/// matrix parameters before routing. Both the authorized front-end identity
+/// and the path serialized to the backend must therefore exclude that
+/// representation-changing delimiter before the proxy sink is bound.
+pub open spec fn proxy_path_representation_spec(
+    front_path: Seq<u8>,
+    upstream_path: Seq<u8>,
+) -> bool {
+    (forall|i: int| 0 <= i < front_path.len() ==> front_path[i] != b';')
+        && (forall|i: int| 0 <= i < upstream_path.len() ==> upstream_path[i] != b';')
+}
+
+pub fn proxy_path_representation_admit(
+    front_path: &[u8],
+    upstream_path: &[u8],
+) -> (ok: bool)
+    ensures ok == proxy_path_representation_spec(front_path@, upstream_path@),
+{
+    let mut i: usize = 0;
+    while i < front_path.len()
+        invariant
+            i <= front_path.len(),
+            forall|j: int| 0 <= j < i ==> front_path@[j] != b';',
+        decreases front_path.len() - i,
+    {
+        if front_path[i] == b';' {
+            return false;
+        }
+        i = i + 1;
+    }
+    let mut j: usize = 0;
+    while j < upstream_path.len()
+        invariant
+            j <= upstream_path.len(),
+            forall|k: int| 0 <= k < j ==> upstream_path@[k] != b';',
+        decreases upstream_path.len() - j,
+    {
+        if upstream_path[j] == b';' {
+            return false;
+        }
+        j = j + 1;
+    }
+    assert(proxy_path_representation_spec(front_path@, upstream_path@));
+    true
+}
+
 /// P12-A: prefix routes are component-aware, while a prefix that already
 /// ends in `/` (including the root route) directly owns its descendants.
 pub open spec fn proxy_prefix_match_spec(
@@ -4403,6 +4615,429 @@ pub fn proxy_header_admit(name: &[u8], value: &[u8]) -> (ok: bool)
         i = i + 1;
     }
     assert(valid_header_value(value@));
+    true
+}
+
+/// Parse the complete upstream HTTP/1 status line. Only HTTP/1.0 and 1.1,
+/// exactly one SP before a three-digit status, and an optional SP-prefixed
+/// visible reason phrase are accepted.
+pub fn proxy_response_status_line_parse(line: &[u8]) -> (status: Option<u16>)
+    ensures
+        match status {
+            Some(code) => {
+                &&& 100 <= code <= 599
+                &&& line@.len() >= 12
+                &&& (line@.subrange(0, 9) == b"HTTP/1.1 "@
+                    || line@.subrange(0, 9) == b"HTTP/1.0 "@)
+                &&& forall|i: int| 9 <= i < 12 ==> b'0' <= line@[i] && line@[i] <= b'9'
+                &&& (line@.len() == 12 || (line@[12] == b' '
+                    && forall|i: int| 13 <= i < line@.len()
+                        ==> header_value_byte_ok(line@[i])))
+            }
+            None => true,
+        },
+{
+    if line.len() < 12 {
+        return None;
+    }
+    let version = &line[..9];
+    if !bytes_eq(version, b"HTTP/1.1 ") && !bytes_eq(version, b"HTTP/1.0 ") {
+        return None;
+    }
+    let mut i: usize = 9;
+    while i < 12
+        invariant
+            9 <= i <= 12,
+            12 <= line.len(),
+            forall|j: int| 9 <= j < i ==> b'0' <= line@[j] && line@[j] <= b'9',
+        decreases 12 - i,
+    {
+        if line[i] < b'0' || line[i] > b'9' {
+            return None;
+        }
+        i = i + 1;
+    }
+    if line.len() > 12 {
+        if line[12] != b' ' {
+            return None;
+        }
+        let mut j: usize = 13;
+        while j < line.len()
+            invariant
+                13 <= j <= line.len(),
+                forall|k: int| 13 <= k < j ==> header_value_byte_ok(line@[k]),
+            decreases line.len() - j,
+        {
+            let byte = line[j];
+            if !(byte == b'\t' || (byte >= 0x20 && byte != 0x7f)) {
+                return None;
+            }
+            j = j + 1;
+        }
+    }
+    let code = ((line[9] - b'0') as u16) * 100
+        + ((line[10] - b'0') as u16) * 10
+        + (line[11] - b'0') as u16;
+    if code < 100 || code > 599 {
+        None
+    } else {
+        Some(code)
+    }
+}
+
+/// Exact upstream field gate. The caller passes the bytes before the colon
+/// without trimming, so whitespace before `:` is rejected as a non-token.
+pub fn proxy_response_header_admit(name: &[u8], value: &[u8]) -> (ok: bool)
+    ensures ok == (valid_header_name(name@) && valid_header_value(value@)),
+{
+    proxy_header_admit(name, value)
+}
+
+pub open spec fn is_hex_byte(b: u8) -> bool {
+    (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F')
+}
+
+/// Checked hexadecimal parser used for HTTP chunk sizes. An accepted value
+/// cannot wrap u64 and every consumed byte is an ASCII hexadecimal digit.
+pub fn parse_chunk_size_hex(input: &[u8]) -> (out: Option<u64>)
+    ensures
+        match out {
+            Some(_) => input@.len() > 0
+                && forall|i: int| 0 <= i < input@.len() ==> is_hex_byte(input@[i]),
+            None => true,
+        },
+{
+    if input.len() == 0 {
+        return None;
+    }
+    let mut value: u64 = 0;
+    let mut i: usize = 0;
+    while i < input.len()
+        invariant
+            i <= input.len(),
+            forall|j: int| 0 <= j < i ==> is_hex_byte(input@[j]),
+        decreases input.len() - i,
+    {
+        let digit = match hex_val_exec(input[i]) {
+            Some(digit) => digit as u64,
+            None => return None,
+        };
+        if value > (u64::MAX - digit) / 16 {
+            return None;
+        }
+        assert(value <= (u64::MAX - digit) / 16);
+        assert(value * 16 <= u64::MAX - digit);
+        value = value * 16 + digit;
+        i = i + 1;
+    }
+    Some(value)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChunkExtensionState {
+    AfterSize,
+    BeforeSemicolon,
+    BeforeName,
+    Name,
+    AfterName,
+    BeforeValue,
+    TokenValue,
+    AfterValue,
+    Quoted,
+    QuotedEscape,
+}
+
+pub open spec fn chunk_qdtext_byte(b: u8) -> bool {
+    b == b'\t' || b == b' ' || b == b'!' || (b >= 0x23 && b <= 0x5b)
+        || (b >= 0x5d && b <= 0x7e) || b >= 0x80
+}
+
+pub open spec fn chunk_quoted_pair_byte(b: u8) -> bool {
+    b == b'\t' || b == b' ' || (b >= 0x21 && b <= 0x7e) || b >= 0x80
+}
+
+pub open spec fn chunk_extension_accepting(state: ChunkExtensionState) -> bool {
+    match state {
+        ChunkExtensionState::AfterSize
+        | ChunkExtensionState::Name
+        | ChunkExtensionState::TokenValue
+        | ChunkExtensionState::AfterValue => true,
+        _ => false,
+    }
+}
+
+pub open spec fn chunk_extension_step_spec(
+    state: ChunkExtensionState,
+    byte: u8,
+) -> Option<ChunkExtensionState> {
+    match state {
+        ChunkExtensionState::AfterSize => {
+            if byte == b';' { Some(ChunkExtensionState::BeforeName) }
+            else if is_ows(byte) { Some(ChunkExtensionState::BeforeSemicolon) }
+            else { None }
+        }
+        ChunkExtensionState::BeforeSemicolon => {
+            if byte == b';' { Some(ChunkExtensionState::BeforeName) }
+            else if is_ows(byte) { Some(ChunkExtensionState::BeforeSemicolon) }
+            else { None }
+        }
+        ChunkExtensionState::BeforeName => {
+            if is_ows(byte) { Some(ChunkExtensionState::BeforeName) }
+            else if is_tchar(byte) { Some(ChunkExtensionState::Name) }
+            else { None }
+        }
+        ChunkExtensionState::Name => {
+            if is_tchar(byte) { Some(ChunkExtensionState::Name) }
+            else if is_ows(byte) { Some(ChunkExtensionState::AfterName) }
+            else if byte == b'=' { Some(ChunkExtensionState::BeforeValue) }
+            else if byte == b';' { Some(ChunkExtensionState::BeforeName) }
+            else { None }
+        }
+        ChunkExtensionState::AfterName => {
+            if is_ows(byte) { Some(ChunkExtensionState::AfterName) }
+            else if byte == b'=' { Some(ChunkExtensionState::BeforeValue) }
+            else if byte == b';' { Some(ChunkExtensionState::BeforeName) }
+            else { None }
+        }
+        ChunkExtensionState::BeforeValue => {
+            if is_ows(byte) { Some(ChunkExtensionState::BeforeValue) }
+            else if byte == b'"' { Some(ChunkExtensionState::Quoted) }
+            else if is_tchar(byte) { Some(ChunkExtensionState::TokenValue) }
+            else { None }
+        }
+        ChunkExtensionState::TokenValue => {
+            if is_tchar(byte) { Some(ChunkExtensionState::TokenValue) }
+            else if is_ows(byte) { Some(ChunkExtensionState::AfterValue) }
+            else if byte == b';' { Some(ChunkExtensionState::BeforeName) }
+            else { None }
+        }
+        ChunkExtensionState::AfterValue => {
+            if is_ows(byte) { Some(ChunkExtensionState::AfterValue) }
+            else if byte == b';' { Some(ChunkExtensionState::BeforeName) }
+            else { None }
+        }
+        ChunkExtensionState::Quoted => {
+            if byte == b'"' { Some(ChunkExtensionState::AfterValue) }
+            else if byte == b'\\' { Some(ChunkExtensionState::QuotedEscape) }
+            else if chunk_qdtext_byte(byte) { Some(ChunkExtensionState::Quoted) }
+            else { None }
+        }
+        ChunkExtensionState::QuotedEscape => {
+            if chunk_quoted_pair_byte(byte) { Some(ChunkExtensionState::Quoted) }
+            else { None }
+        }
+    }
+}
+
+fn chunk_extension_step_exec(
+    state: ChunkExtensionState,
+    byte: u8,
+) -> (next: Option<ChunkExtensionState>)
+    ensures next == chunk_extension_step_spec(state, byte),
+{
+    match state {
+        ChunkExtensionState::AfterSize => {
+            if byte == b';' { Some(ChunkExtensionState::BeforeName) }
+            else if is_ows_exec(byte) { Some(ChunkExtensionState::BeforeSemicolon) }
+            else { None }
+        }
+        ChunkExtensionState::BeforeSemicolon => {
+            if byte == b';' { Some(ChunkExtensionState::BeforeName) }
+            else if is_ows_exec(byte) { Some(ChunkExtensionState::BeforeSemicolon) }
+            else { None }
+        }
+        ChunkExtensionState::BeforeName => {
+            if is_ows_exec(byte) { Some(ChunkExtensionState::BeforeName) }
+            else if tchar_ok(byte) { Some(ChunkExtensionState::Name) }
+            else { None }
+        }
+        ChunkExtensionState::Name => {
+            if tchar_ok(byte) { Some(ChunkExtensionState::Name) }
+            else if is_ows_exec(byte) { Some(ChunkExtensionState::AfterName) }
+            else if byte == b'=' { Some(ChunkExtensionState::BeforeValue) }
+            else if byte == b';' { Some(ChunkExtensionState::BeforeName) }
+            else { None }
+        }
+        ChunkExtensionState::AfterName => {
+            if is_ows_exec(byte) { Some(ChunkExtensionState::AfterName) }
+            else if byte == b'=' { Some(ChunkExtensionState::BeforeValue) }
+            else if byte == b';' { Some(ChunkExtensionState::BeforeName) }
+            else { None }
+        }
+        ChunkExtensionState::BeforeValue => {
+            if is_ows_exec(byte) { Some(ChunkExtensionState::BeforeValue) }
+            else if byte == b'"' { Some(ChunkExtensionState::Quoted) }
+            else if tchar_ok(byte) { Some(ChunkExtensionState::TokenValue) }
+            else { None }
+        }
+        ChunkExtensionState::TokenValue => {
+            if tchar_ok(byte) { Some(ChunkExtensionState::TokenValue) }
+            else if is_ows_exec(byte) { Some(ChunkExtensionState::AfterValue) }
+            else if byte == b';' { Some(ChunkExtensionState::BeforeName) }
+            else { None }
+        }
+        ChunkExtensionState::AfterValue => {
+            if is_ows_exec(byte) { Some(ChunkExtensionState::AfterValue) }
+            else if byte == b';' { Some(ChunkExtensionState::BeforeName) }
+            else { None }
+        }
+        ChunkExtensionState::Quoted => {
+            if byte == b'"' { Some(ChunkExtensionState::AfterValue) }
+            else if byte == b'\\' { Some(ChunkExtensionState::QuotedEscape) }
+            else if byte == b'\t' || byte == b' ' || byte == b'!'
+                || (byte >= 0x23 && byte <= 0x5b)
+                || (byte >= 0x5d && byte <= 0x7e) || byte >= 0x80
+            { Some(ChunkExtensionState::Quoted) }
+            else { None }
+        }
+        ChunkExtensionState::QuotedEscape => {
+            if byte == b'\t' || byte == b' ' || (byte >= 0x21 && byte <= 0x7e)
+                || byte >= 0x80
+            { Some(ChunkExtensionState::Quoted) }
+            else { None }
+        }
+    }
+}
+
+pub open spec fn chunk_extension_walk_spec(
+    input: Seq<u8>,
+    i: int,
+    state: ChunkExtensionState,
+) -> bool
+    decreases input.len() - i,
+{
+    if i >= input.len() {
+        chunk_extension_accepting(state)
+    } else {
+        match chunk_extension_step_spec(state, input[i]) {
+            Some(next) => chunk_extension_walk_spec(input, i + 1, next),
+            None => false,
+        }
+    }
+}
+
+fn chunk_extension_walk_exec(
+    input: &[u8],
+    i: usize,
+    state: ChunkExtensionState,
+) -> (ok: bool)
+    requires i <= input.len(),
+    ensures ok == chunk_extension_walk_spec(input@, i as int, state),
+    decreases input.len() - i,
+{
+    if i >= input.len() {
+        return match state {
+            ChunkExtensionState::AfterSize
+            | ChunkExtensionState::Name
+            | ChunkExtensionState::TokenValue
+            | ChunkExtensionState::AfterValue => true,
+            _ => false,
+        };
+    }
+    match chunk_extension_step_exec(state, input[i]) {
+        Some(next) => chunk_extension_walk_exec(input, i + 1, next),
+        None => false,
+    }
+}
+
+pub fn chunk_extension_admit(input: &[u8]) -> (ok: bool)
+    ensures
+        ok == chunk_extension_walk_spec(input@, 0, ChunkExtensionState::AfterSize),
+{
+    chunk_extension_walk_exec(input, 0, ChunkExtensionState::AfterSize)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChunkFramingState {
+    pub chunks: u64,
+    pub bytes: u64,
+}
+
+/// One overflow-free transition of the chunk framing budget. The runtime
+/// consumes this transition for both request bodies and proxy responses.
+pub fn chunk_framing_budget_step(
+    state: ChunkFramingState,
+    line_len: u64,
+    data_chunk: bool,
+    max_chunks: u64,
+    max_bytes: u64,
+) -> (next: Option<ChunkFramingState>)
+    ensures
+        match next {
+            Some(out) => out.chunks <= max_chunks && out.bytes <= max_bytes
+                && out.chunks == state.chunks + 1
+                && out.bytes >= state.bytes,
+            None => true,
+        },
+{
+    let chunks = match state.chunks.checked_add(1) {
+        Some(value) => value,
+        None => return None,
+    };
+    let mut framing = match line_len.checked_add(2) {
+        Some(value) => value,
+        None => return None,
+    };
+    if data_chunk {
+        framing = match framing.checked_add(2) {
+            Some(value) => value,
+            None => return None,
+        };
+    }
+    let bytes = match state.bytes.checked_add(framing) {
+        Some(value) => value,
+        None => return None,
+    };
+    if chunks > max_chunks || bytes > max_bytes {
+        None
+    } else {
+        Some(ChunkFramingState { chunks, bytes })
+    }
+}
+
+fn trailer_name_forbidden(name: &[u8]) -> (forbidden: bool)
+    ensures
+        forbidden == (eq_ignore_ascii_case_spec(name@, b"content-length"@)
+            || eq_ignore_ascii_case_spec(name@, b"transfer-encoding"@)
+            || eq_ignore_ascii_case_spec(name@, b"host"@)
+            || eq_ignore_ascii_case_spec(name@, b"trailer"@)),
+{
+    eq_ignore_ascii_case(name, b"content-length")
+        || eq_ignore_ascii_case(name, b"transfer-encoding")
+        || eq_ignore_ascii_case(name, b"host")
+        || eq_ignore_ascii_case(name, b"trailer")
+}
+
+/// Trailer fields share one verified syntax gate. Message-framing and routing
+/// fields are forbidden because applying them after the body would create a
+/// second interpretation of the request or response.
+pub fn http_trailer_field_admit(line: &[u8]) -> (ok: bool)
+    ensures
+        ok ==> exists|colon: int| 0 < colon < line@.len()
+            && valid_header_name(line@.subrange(0, colon))
+            && valid_header_value(line@.subrange(colon + 1, line@.len() as int)),
+{
+    let mut colon: usize = 0;
+    while colon < line.len() && line[colon] != b':'
+        invariant
+            colon <= line.len(),
+            forall|i: int| 0 <= i < colon ==> line@[i] != b':',
+        decreases line.len() - colon,
+    {
+        colon = colon + 1;
+    }
+    if colon == line.len() {
+        return false;
+    }
+    let name = &line[..colon];
+    let value = &line[colon + 1..];
+    if trailer_name_forbidden(name) {
+        return false;
+    }
+    if !proxy_header_admit(name, value) {
+        return false;
+    }
+    assert(0 < colon);
     true
 }
 
@@ -5980,6 +6615,124 @@ pub fn cgi_env_entry_admit(
 // ---------------------------------------------------------------------------
 // HTTP cache lookup policy
 // ---------------------------------------------------------------------------
+
+pub open spec fn etag_opaque_byte(b: u8) -> bool {
+    b == 0x21 || (b >= 0x23 && b <= 0x7e) || b >= 0x80
+}
+
+fn weak_etag_opaque_bounds(value: &[u8]) -> (bounds: Option<(usize, usize)>)
+    ensures
+        match bounds {
+            Some((start, end)) => {
+                &&& 0 < start <= end < value@.len()
+                &&& value@[start as int - 1] == b'"'
+                &&& value@[end as int] == b'"'
+                &&& forall|i: int| start <= i < end ==> etag_opaque_byte(value@[i])
+            }
+            None => true,
+        },
+{
+    let (trimmed_start, trimmed_end) = trim_range(value);
+    let mut tag_start = trimmed_start;
+    if trimmed_end - trimmed_start >= 2
+        && value[trimmed_start] == b'W'
+        && value[trimmed_start + 1] == b'/'
+    {
+        tag_start = trimmed_start + 2;
+    }
+    assert(tag_start <= trimmed_end);
+    if trimmed_end - tag_start < 2
+        || value[tag_start] != b'"'
+        || value[trimmed_end - 1] != b'"'
+    {
+        return None;
+    }
+    let opaque_start = tag_start + 1;
+    let opaque_end = trimmed_end - 1;
+    let mut i = opaque_start;
+    while i < opaque_end
+        invariant
+            opaque_start <= i <= opaque_end,
+            opaque_end < value.len(),
+            value@[opaque_start as int - 1] == b'"',
+            value@[opaque_end as int] == b'"',
+            forall|j: int| opaque_start <= j < i ==> etag_opaque_byte(value@[j]),
+        decreases opaque_end - i,
+    {
+        let byte = value[i];
+        if !(byte == 0x21 || (byte >= 0x23 && byte <= 0x7e) || byte >= 0x80) {
+            return None;
+        }
+        i = i + 1;
+    }
+    Some((opaque_start, opaque_end))
+}
+
+/// RFC weak comparison strips an optional uppercase `W/` marker and compares
+/// the complete validated opaque tags byte-for-byte.
+pub fn cache_weak_etag_match(stored: &[u8], candidate: &[u8]) -> (matched: bool)
+    ensures
+        matched ==> exists|a: int, b: int, c: int, d: int|
+            0 < a <= b < stored@.len()
+                && 0 < c <= d < candidate@.len()
+                && stored@.subrange(a, b) == candidate@.subrange(c, d)
+                && (forall|i: int| a <= i < b ==> etag_opaque_byte(stored@[i]))
+                && (forall|i: int| c <= i < d ==> etag_opaque_byte(candidate@[i])),
+{
+    let (stored_start, stored_end) = match weak_etag_opaque_bounds(stored) {
+        Some(bounds) => bounds,
+        None => return false,
+    };
+    let (candidate_start, candidate_end) = match weak_etag_opaque_bounds(candidate) {
+        Some(bounds) => bounds,
+        None => return false,
+    };
+    bytes_eq(
+        &stored[stored_start..stored_end],
+        &candidate[candidate_start..candidate_end],
+    )
+}
+
+pub fn cache_if_none_match_star(value: &[u8]) -> (matched: bool)
+    ensures
+        matched ==> exists|start: int, end: int|
+            0 <= start < end <= value@.len()
+                && value@.subrange(start, end) == b"*"@,
+{
+    let (start, end) = trim_range(value);
+    let matched = bytes_eq(&value[start..end], b"*");
+    if matched {
+        assert(value@.subrange(start as int, end as int) == b"*"@);
+        assert(exists|witness_start: int, witness_end: int|
+            0 <= witness_start < witness_end <= value@.len()
+                && value@.subrange(witness_start, witness_end) == b"*"@);
+    }
+    matched
+}
+
+pub open spec fn cache_conditional_hit_spec(
+    if_none_match_present: bool,
+    if_none_match_matches: bool,
+    if_modified_since_matches: bool,
+) -> bool {
+    if if_none_match_present { if_none_match_matches } else { if_modified_since_matches }
+}
+
+/// If-None-Match has absolute precedence over If-Modified-Since, including
+/// when the supplied validator does not match.
+pub fn cache_conditional_hit_admit(
+    if_none_match_present: bool,
+    if_none_match_matches: bool,
+    if_modified_since_matches: bool,
+) -> (hit: bool)
+    ensures hit == cache_conditional_hit_spec(
+        if_none_match_present,
+        if_none_match_matches,
+        if_modified_since_matches,
+    ),
+{
+    if if_none_match_present { if_none_match_matches } else { if_modified_since_matches }
+}
 
 /// One cache lookup is admissible only when the key and policy match, the
 /// entry belongs to the current configuration generation, the stored `Vary`
@@ -8009,6 +8762,77 @@ pub fn h2_target_admit(len: u64, limit: u64) -> (ok: bool)
     ensures ok == (len <= limit)
 {
     len <= limit
+}
+
+pub open spec fn h2_header_field_spec(name: Seq<u8>, value: Seq<u8>) -> bool {
+    valid_header_name(name)
+        && valid_header_value(value)
+        && !eq_ignore_ascii_case_spec(name, b"connection"@)
+        && !eq_ignore_ascii_case_spec(name, b"proxy-connection"@)
+        && !eq_ignore_ascii_case_spec(name, b"keep-alive"@)
+        && !eq_ignore_ascii_case_spec(name, b"transfer-encoding"@)
+        && !eq_ignore_ascii_case_spec(name, b"upgrade"@)
+        && (!eq_ignore_ascii_case_spec(name, b"te"@)
+            || eq_ignore_ascii_case_spec(value, b"trailers"@))
+}
+
+/// RFC 9113 connection-specific field gate, consumed at the HTTP/2 to
+/// dispatcher/downgrade boundary even if the h2 codec has already rejected
+/// the same fields.
+pub fn h2_header_field_admit(name: &[u8], value: &[u8]) -> (ok: bool)
+    ensures ok == h2_header_field_spec(name@, value@),
+{
+    proxy_header_admit(name, value)
+        && !eq_ignore_ascii_case(name, b"connection")
+        && !eq_ignore_ascii_case(name, b"proxy-connection")
+        && !eq_ignore_ascii_case(name, b"keep-alive")
+        && !eq_ignore_ascii_case(name, b"transfer-encoding")
+        && !eq_ignore_ascii_case(name, b"upgrade")
+        && (!eq_ignore_ascii_case(name, b"te")
+            || eq_ignore_ascii_case(value, b"trailers"))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct H2ControlBudgetResult {
+    pub available: u64,
+    pub admitted: bool,
+}
+
+/// Refill and consume one HTTP/2 control-frame token budget transition. All
+/// multiplication/addition is checked, overflow saturates only to the fixed
+/// burst ceiling, and a backward/zero elapsed time contributes no tokens.
+pub fn h2_control_budget_step(
+    available: u64,
+    elapsed_seconds: u64,
+    cost: u64,
+    burst: u64,
+    refill_per_second: u64,
+) -> (out: H2ControlBudgetResult)
+    ensures
+        out.available <= burst,
+        out.admitted ==> cost <= burst && out.available <= burst - cost,
+        !out.admitted ==> cost > out.available,
+{
+    let capped = if available > burst { burst } else { available };
+    let refill = match elapsed_seconds.checked_mul(refill_per_second) {
+        Some(value) => value,
+        None => u64::MAX,
+    };
+    let refilled = match capped.checked_add(refill) {
+        Some(value) => if value > burst { burst } else { value },
+        None => burst,
+    };
+    if cost > refilled {
+        H2ControlBudgetResult {
+            available: refilled,
+            admitted: false,
+        }
+    } else {
+        H2ControlBudgetResult {
+            available: refilled - cost,
+            admitted: true,
+        }
+    }
 }
 
 /// HTTP/2 regular requests must carry the pseudo-header identity that HTTP/1

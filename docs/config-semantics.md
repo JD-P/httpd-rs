@@ -407,7 +407,10 @@ and `bind_backend` produce the bound grant required by every sink.
 `AccessGrant` also carries the executable `TransformCapability` state. Every
 protected sink calls `require_sink`, which admits the operation only when the
 key is exact, the current target was authorized, and the sink-specific inode,
-backend or cache-policy capability is present.
+backend, proxy-representation or cache-policy capability is present. A proxy
+endpoint binding alone is insufficient: the representation capability is
+minted only after both the authorized front path and serialized upstream path
+pass the verified ambiguity gate.
 
 ### I11 — Reauthorize every target-changing transform
 
@@ -848,7 +851,11 @@ or inject an upstream header. Reverse-proxy and WebSocket targets containing a
 semicolon path parameter are rejected before connection: generic front-end
 policy cannot know whether an upstream strips matrix parameters before routing,
 so forwarding that representation would give the two hops different resource
-identities.
+identities. The response boundary is symmetric: the status line and every
+field consume `proxy_response_status_line_parse` and
+`proxy_response_header_admit` before framing headers are interpreted, while
+chunk sizes, extensions and trailers use the same verified grammar as inbound
+HTTP/1 bodies.
 
 ### I29 — `.htaccess` directive disposition closure
 
@@ -1712,7 +1719,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **498 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **546 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1768,18 +1775,34 @@ construction: there is no second production interleaver.
   comparisons, `-strmatch`/`-fnmatch` globbing and rewrite `[OR]` condition
   groups all consume verified kernels.  Leaf evaluators that consult regex,
   filesystem, IP or request state remain explicit assumptions.
-- `path_under_base`, `rewrite_filesystem_admit`, `proxy_request_line_admit`
-  and `proxy_header_admit`.  Alias, rewrite and FastCGI targets use the
+- `path_under_base`, `rewrite_filesystem_admit`,
+  `proxy_path_representation_admit`, `proxy_request_line_admit`,
+  `proxy_header_admit`, `proxy_response_status_line_parse` and
+  `proxy_response_header_admit`. Alias, rewrite and FastCGI targets use the
   component-aware containment predicate (`/srv/www2` is not below `/srv/www`);
-  the proxy serializer admits the outbound method, target, version and every
-  header through the same token/header predicates immediately before
-  `write_all`.
+  the proxy boundary admits the path representation, outbound method, target,
+  version and every request header immediately before `write_all`, then checks
+  the upstream status and fields before interpreting response framing.
 - `TransformCapability`, `transform_retarget`, `transform_authorize`,
-  `transform_bind_inode`, `transform_bind_backend` and
+  `transform_bind_inode`, `transform_bind_backend`,
+  `transform_bind_representation` and
   `transform_sink_admit`. `AccessGrant` carries this state and every protected
   body/tunnel/cache sink consumes it through `require_sink`. The proofs show
   retargeting cannot sink without reauthorization and that every file,
-  backend or cache sink has its required concrete binding.
+  backend, proxy representation or cache sink has its required concrete
+  binding.
+- `parse_chunk_size_hex`, `chunk_extension_admit`,
+  `chunk_framing_budget_step` and `http_trailer_field_admit`. Request bodies
+  and proxy responses share the exact checked hexadecimal/extension/trailer
+  grammar and the overflow-free count/framing-byte transition.
+- `h2_header_field_admit` and `h2_control_budget_step`. The HTTP/2 adapter
+  rechecks connection-specific fields at its downgrade boundary, and the
+  vendored codec consumes the verified refill/consume transition for SETTINGS,
+  PING, PRIORITY and tiny WINDOW_UPDATE work.
+- `cache_weak_etag_match`, `cache_if_none_match_star` and
+  `cache_conditional_hit_admit`. Cache validators use RFC weak comparison,
+  keep commas inside quoted opaque tags, reject malformed lists, and prove
+  that `If-None-Match` suppresses `If-Modified-Since` even on a non-match.
 - `descriptor_snapshot_admit`. Access-file cache lookup/parsing and
   `RewriteMap prg` executable capture consume opened descriptors and require
   stable regular-file identity, version metadata and bounded size before
@@ -2135,7 +2158,7 @@ The current ledger (2026-11-01) is:
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **510 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **546 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

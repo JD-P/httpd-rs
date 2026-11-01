@@ -910,8 +910,11 @@ fn encode_proxy_path(path: &str) -> String {
 /// which can turn `/public/..;x/admin` into `/admin` after Vapache has already
 /// routed and authorized the former identity.  Refuse that ambiguous boundary
 /// instead of forwarding one byte representation under two security names.
-fn proxy_path_identity_safe(path: &str) -> bool {
-    !path.as_bytes().contains(&b';')
+fn proxy_path_identity_safe(front_path: &str, upstream_path: &str) -> bool {
+    crate::verified::proxy_path_representation_admit(
+        front_path.as_bytes(),
+        upstream_path.as_bytes(),
+    )
 }
 
 /// Final serialization gate for an upstream request head.  Every value that
@@ -1089,25 +1092,7 @@ fn read_line(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
 }
 
 fn parse_proxy_status_line(line: &[u8]) -> Option<u16> {
-    if line.len() < 12
-        || (!line.starts_with(b"HTTP/1.1 ") && !line.starts_with(b"HTTP/1.0 "))
-        || !line[9..12].iter().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    if line.len() > 12 {
-        if line[12] != b' ' {
-            return None;
-        }
-        if !line[13..]
-            .iter()
-            .all(|byte| *byte == b'\t' || (*byte >= 0x20 && *byte != 0x7f))
-        {
-            return None;
-        }
-    }
-    let status = std::str::from_utf8(&line[9..12]).ok()?.parse().ok()?;
-    (100..=599).contains(&status).then_some(status)
+    crate::verified::proxy_response_status_line_parse(line)
 }
 
 fn read_chunked(reader: &mut impl BufRead, out: &mut impl ProxyBodySink) -> std::io::Result<()> {
@@ -1649,8 +1634,16 @@ pub async fn websocket_async<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    if !proxy_path_identity_safe(&resource.url_path, &target.path)
+        || target.path.bytes().any(|byte| byte < b' ' || byte == 0x7f)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ambiguous or invalid websocket target path",
+        ));
+    }
     let binding = target.binding_key();
-    let Some(bound) = grant.bind_backend(resource, binding.clone()) else {
+    let Some(backend_bound) = grant.bind_backend(resource, binding.clone()) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "access grant does not cover websocket target",
@@ -1658,20 +1651,18 @@ where
     };
     let mut expected = resource.clone();
     expected.backend_target = Some(binding);
+    let Some(bound) = backend_bound.bind_representation(&expected) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "access grant does not cover websocket representation",
+        ));
+    };
     if !bound.require_sink(&expected, vapache_verified::TransformSink::Proxy)
         || resource.proxy_url.as_deref() != Some(target.proxy_url.as_str())
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "access grant does not cover websocket target",
-        ));
-    }
-    if !proxy_path_identity_safe(&target.path)
-        || target.path.bytes().any(|byte| byte < b' ' || byte == 0x7f)
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "ambiguous or invalid websocket target path",
         ));
     }
     let client_ip = crate::access::canonical_ip(peer.ip());
@@ -2015,7 +2006,7 @@ fn proxy_once_budgeted(
     https: bool,
     host: &str,
 ) -> std::io::Result<(Response, Option<Box<dyn ReadWrite>>)> {
-    if !proxy_path_identity_safe(&target.path) {
+    if !proxy_path_identity_safe(&target.path, &target.path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "ambiguous proxy target path",
@@ -2143,10 +2134,10 @@ fn proxy_once_budgeted(
         // shape from stricter downstream recipients.
         let name = &line[..colon];
         let value = trim_ascii_bytes(&line[colon + 1..]);
-        if !crate::verified::valid_token(name) {
+        if !crate::verified::proxy_response_header_admit(name, value) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "invalid proxy response header name",
+                "invalid proxy response header",
             ));
         }
         let name = String::from_utf8(name.to_ascii_lowercase()).map_err(|_| {
@@ -2519,9 +2510,13 @@ fn authorize_failover(
     next_resource.identity = identity.map(|i| i.user);
     let grant = crate::access::grant_if_allowed(access, next_resource.clone())?;
     let binding = target.binding_key();
-    let bound = grant.bind_backend(&next_resource, binding.clone())?;
+    if !proxy_path_identity_safe(url_path, &target.path) {
+        return None;
+    }
+    let backend_bound = grant.bind_backend(&next_resource, binding.clone())?;
     let mut expected = next_resource;
     expected.backend_target = Some(binding);
+    let bound = backend_bound.bind_representation(&expected)?;
     debug_assert!(
         bound.require_sink(&expected, vapache_verified::TransformSink::Proxy),
         "failover grant does not cover bound backend"
@@ -2544,7 +2539,7 @@ pub fn execute(
     grant: &crate::access::AccessGrant,
     resource: &crate::access::ResourceKey,
 ) -> Response {
-    if !proxy_path_identity_safe(url_path) || !proxy_path_identity_safe(&target.path) {
+    if !proxy_path_identity_safe(url_path, &target.path) {
         return crate::files::error_response(
             cfg,
             vhost,
@@ -2559,7 +2554,7 @@ pub fn execute(
         );
     }
     let binding = target.binding_key();
-    let Some(bound) = grant.bind_backend(resource, binding.clone()) else {
+    let Some(backend_bound) = grant.bind_backend(resource, binding.clone()) else {
         return error(
             cfg,
             vhost,
@@ -2574,6 +2569,19 @@ pub fn execute(
     };
     let mut active_resource = resource.clone();
     active_resource.backend_target = Some(binding);
+    let Some(bound) = backend_bound.bind_representation(&active_resource) else {
+        return error(
+            cfg,
+            vhost,
+            scope,
+            req,
+            url_path,
+            local_port,
+            host,
+            peer.ip(),
+            local_ip,
+        );
+    };
     if !bound.require_sink(&active_resource, vapache_verified::TransformSink::Proxy)
         || resource.proxy_url.as_deref() != Some(target.proxy_url.as_str())
     {
@@ -3655,9 +3663,15 @@ mod more_tests {
     fn proxy_path_is_encoded_exactly_once() {
         assert_eq!(encode_proxy_path("/a%2Fb?x#y"), "/a%252Fb%3Fx%23y");
         assert_eq!(encode_proxy_path("/space here"), "/space%20here");
-        assert!(proxy_path_identity_safe("/ordinary/path"));
-        assert!(!proxy_path_identity_safe("/admin;role=user"));
-        assert!(!proxy_path_identity_safe("/public/..;x/admin"));
+        assert!(proxy_path_identity_safe("/ordinary/path", "/backend/path"));
+        assert!(!proxy_path_identity_safe(
+            "/admin;role=user",
+            "/backend/path"
+        ));
+        assert!(!proxy_path_identity_safe(
+            "/public/path",
+            "/public/..;x/admin"
+        ));
     }
 
     #[test]
@@ -4421,6 +4435,10 @@ mod coverage_tests {
         invalid("HTTP/1.1 100 Continue\r\n\r\n", "interim");
         invalid("HTTP/1.1 200 OK\r\nNoColon\r\n\r\n", "malformed header");
         invalid("HTTP/1.1 200 OK\r\nBad Name: x\r\n\r\n", "bad header name");
+        invalid(
+            "HTTP/1.1 200 OK\r\nX-Test: bad\x01value\r\n\r\n",
+            "bad header value",
+        );
         invalid(
             "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
             "duplicate length",

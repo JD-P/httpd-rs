@@ -958,67 +958,88 @@ fn vary_matches(entry: &Entry, req: &Request) -> bool {
         .all(|(name, expected)| req.header(name).unwrap_or(b"") == expected.as_slice())
 }
 
-fn trim_ows(mut value: &[u8]) -> &[u8] {
-    while value
-        .first()
-        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
-    {
-        value = &value[1..];
+fn if_none_match_matches(value: &[u8], stored: &[u8]) -> bool {
+    if crate::verified::cache_if_none_match_star(value) {
+        return true;
     }
-    while value
-        .last()
-        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
-    {
-        value = &value[..value.len() - 1];
-    }
-    value
-}
 
-fn weak_etag_opaque(value: &[u8]) -> Option<&[u8]> {
-    let value = trim_ows(value);
-    let value = value.strip_prefix(b"W/").unwrap_or(value);
-    if value.len() < 2 || value.first() != Some(&b'"') || value.last() != Some(&b'"') {
-        return None;
+    let mut cursor = 0usize;
+    let mut matched = false;
+    loop {
+        while cursor < value.len() && matches!(value[cursor], b' ' | b'\t') {
+            cursor += 1;
+        }
+        if cursor == value.len() {
+            return false;
+        }
+
+        let candidate_start = cursor;
+        if value[cursor..].starts_with(b"W/") {
+            cursor += 2;
+        }
+        if value.get(cursor) != Some(&b'"') {
+            return false;
+        }
+        cursor += 1;
+        while cursor < value.len() && value[cursor] != b'"' {
+            cursor += 1;
+        }
+        if cursor == value.len() {
+            return false;
+        }
+        cursor += 1;
+        let candidate = &value[candidate_start..cursor];
+        // Comparing a candidate with itself is also the verified syntax gate.
+        // In particular, commas inside the quoted opaque tag are data, not
+        // list separators.
+        if !crate::verified::cache_weak_etag_match(candidate, candidate) {
+            return false;
+        }
+        matched |= crate::verified::cache_weak_etag_match(stored, candidate);
+
+        while cursor < value.len() && matches!(value[cursor], b' ' | b'\t') {
+            cursor += 1;
+        }
+        if cursor == value.len() {
+            return matched;
+        }
+        if value[cursor] != b',' {
+            return false;
+        }
+        cursor += 1;
     }
-    let opaque = &value[1..value.len() - 1];
-    opaque
-        .iter()
-        .all(|byte| *byte == 0x21 || (0x23..=0x7e).contains(byte) || *byte >= 0x80)
-        .then_some(opaque)
 }
 
 fn conditional_hit(req: &Request, entry: &Entry, response: &mut Response) -> bool {
-    if let Some(inm) = req.header("if-none-match") {
-        let etag = header(&entry.headers, "etag");
-        let matched = trim_ows(inm) == b"*"
-            || etag.and_then(weak_etag_opaque).is_some_and(|etag| {
-                inm.split(|byte| *byte == b',')
-                    .filter_map(weak_etag_opaque)
-                    .any(|candidate| candidate == etag)
-            });
-        if matched {
-            response.status = 304;
-            response.body = Body::Empty;
-            return true;
-        }
-        // RFC 9110 gives If-None-Match precedence even when it does not
-        // match. Falling through to an older If-Modified-Since value can
-        // incorrectly turn a changed representation into a 304.
-        return false;
-    }
-    if let Some(ims) = req.header("if-modified-since") {
-        if let (Some(since), Some(last)) = (
-            parse_http_date(ims),
-            header(&entry.headers, "last-modified").and_then(parse_http_date),
-        ) {
-            if last <= since {
-                response.status = 304;
-                response.body = Body::Empty;
-                return true;
+    let if_none_match = req.header("if-none-match");
+    let if_none_match_matches = if_none_match.is_some_and(|inm| {
+        crate::verified::cache_if_none_match_star(inm)
+            || header(&entry.headers, "etag").is_some_and(|etag| if_none_match_matches(inm, etag))
+    });
+    let if_modified_since_matches = if if_none_match.is_none() {
+        req.header("if-modified-since").is_some_and(|ims| {
+            if let (Some(since), Some(last)) = (
+                parse_http_date(ims),
+                header(&entry.headers, "last-modified").and_then(parse_http_date),
+            ) {
+                last <= since
+            } else {
+                false
             }
-        }
+        })
+    } else {
+        false
+    };
+    let hit = crate::verified::cache_conditional_hit_admit(
+        if_none_match.is_some(),
+        if_none_match_matches,
+        if_modified_since_matches,
+    );
+    if hit {
+        response.status = 304;
+        response.body = Body::Empty;
     }
-    false
+    hit
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3936,6 +3957,34 @@ CacheIgnoreQueryString On\n\
             &mut weak_response
         ));
         assert_eq!(weak_response.status, 304);
+
+        let comma_entry = Entry {
+            headers: vec![("etag".into(), b"\"tag,part\"".to_vec())],
+            ..disk_entry(b"body", unix_now() + 60)
+        };
+        let mut comma_req = test_request();
+        comma_req.headers.insert(
+            "if-none-match",
+            b"\"other\", W/\"tag,part\", \"last\"".to_vec(),
+        );
+        let mut comma_response = Response::bytes(200, "text/plain", b"body".to_vec());
+        assert!(conditional_hit(
+            &comma_req,
+            &comma_entry,
+            &mut comma_response
+        ));
+        assert_eq!(comma_response.status, 304);
+
+        let mut invalid_list_req = comma_req.clone();
+        invalid_list_req
+            .headers
+            .insert("if-none-match", b"invalid, \"tag,part\"".to_vec());
+        let mut invalid_list_response = Response::bytes(200, "text/plain", b"body".to_vec());
+        assert!(!conditional_hit(
+            &invalid_list_req,
+            &comma_entry,
+            &mut invalid_list_response
+        ));
 
         let mut star_req = test_request();
         star_req.headers.insert("if-none-match", b"*".to_vec());
