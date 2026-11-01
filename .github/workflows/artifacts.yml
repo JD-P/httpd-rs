@@ -94,6 +94,7 @@ jobs:
             export DEBIAN_FRONTEND=noninteractive
             apt-get update >/dev/null
             apt-get install -y --no-install-recommends apache2 curl >/dev/null
+            a2enmod ssl >/dev/null
             config_digest() {
               {
                 find /etc/apache2 -xdev -printf "%P %y %m %u:%g %l\n" | sort
@@ -136,6 +137,104 @@ jobs:
             fi
             cmp /tmp/served.html /var/www/html/index.html
             test "$before" = "$(config_digest)"
+          '
+
+      - name: Validate the stock Debian 13 SSL configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/release:/release:ro" debian:13-slim bash -c '
+            set -euo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update >/dev/null
+            apt-get install -y --no-install-recommends apache2 curl openssl >/dev/null
+            a2enmod ssl >/dev/null
+            install -d -m 0700 \
+              /etc/letsencrypt/archive/example.test \
+              /etc/letsencrypt/live/example.test
+            openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+              -subj /CN=example.test \
+              -keyout /etc/letsencrypt/archive/example.test/privkey1.pem \
+              -out /etc/letsencrypt/archive/example.test/fullchain1.pem \
+              >/dev/null 2>&1
+            chmod 0600 /etc/letsencrypt/archive/example.test/privkey1.pem
+            ln -s ../../archive/example.test/fullchain1.pem \
+              /etc/letsencrypt/live/example.test/fullchain.pem
+            ln -s ../../archive/example.test/privkey1.pem \
+              /etc/letsencrypt/live/example.test/privkey.pem
+            printf "%s\n" \
+              "<VirtualHost *:443>" \
+              "ServerName example.test" \
+              "DocumentRoot /var/www/html" \
+              "SSLEngine On" \
+              "SSLCertificateFile /etc/letsencrypt/live/example.test/fullchain.pem" \
+              "SSLCertificateKeyFile /etc/letsencrypt/live/example.test/privkey.pem" \
+              "<Directory /var/www/html>" \
+              "Require all granted" \
+              "</Directory>" \
+              "</VirtualHost>" \
+              >/etc/apache2/sites-available/vapache-certbot.conf
+            a2ensite vapache-certbot >/dev/null
+            dpkg -i /release/vapache_*.deb
+            /usr/sbin/vapachectl configtest
+            /usr/sbin/vapachectl foreground >/tmp/vapache-tls.log 2>&1 &
+            server_pid=$!
+            cleanup() {
+              kill "$server_pid" >/dev/null 2>&1 || true
+              wait "$server_pid" >/dev/null 2>&1 || true
+            }
+            trap cleanup EXIT
+            ready=0
+            for attempt in $(seq 1 100); do
+              if curl --noproxy "*" --insecure --fail --silent \
+                --resolve example.test:443:127.0.0.1 \
+                https://example.test/ -o /tmp/served-tls.html; then
+                ready=1
+                break
+              fi
+              if ! kill -0 "$server_pid" 2>/dev/null; then
+                cat /tmp/vapache-tls.log >&2
+                exit 1
+              fi
+              sleep 0.1
+            done
+            test "$ready" -eq 1
+            cmp /tmp/served-tls.html /var/www/html/index.html
+            openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+              -subj /CN=example.test \
+              -keyout /etc/letsencrypt/archive/example.test/privkey2.pem \
+              -out /etc/letsencrypt/archive/example.test/fullchain2.pem \
+              >/dev/null 2>&1
+            chmod 0600 /etc/letsencrypt/archive/example.test/privkey2.pem
+            ln -s ../../archive/example.test/fullchain2.pem \
+              /etc/letsencrypt/live/example.test/fullchain.pem.new
+            ln -s ../../archive/example.test/privkey2.pem \
+              /etc/letsencrypt/live/example.test/privkey.pem.new
+            mv -Tf /etc/letsencrypt/live/example.test/fullchain.pem.new \
+              /etc/letsencrypt/live/example.test/fullchain.pem
+            mv -Tf /etc/letsencrypt/live/example.test/privkey.pem.new \
+              /etc/letsencrypt/live/example.test/privkey.pem
+            expected_fingerprint=$(openssl x509 \
+              -in /etc/letsencrypt/archive/example.test/fullchain2.pem \
+              -noout -fingerprint -sha256)
+            /usr/sbin/vapachectl graceful
+            rotated=0
+            for attempt in $(seq 1 100); do
+              presented_fingerprint=$(printf "" \
+                | openssl s_client -connect 127.0.0.1:443 \
+                    -servername example.test 2>/dev/null \
+                | openssl x509 -noout -fingerprint -sha256)
+              if [ "$presented_fingerprint" = "$expected_fingerprint" ]; then
+                rotated=1
+                break
+              fi
+              if ! kill -0 "$server_pid" 2>/dev/null; then
+                cat /tmp/vapache-tls.log >&2
+                exit 1
+              fi
+              sleep 0.1
+            done
+            test "$rotated" -eq 1
           '
 
       - name: Upload binary and Linux packages

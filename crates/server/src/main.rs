@@ -510,7 +510,10 @@ fn read_bounded_text(path: &Path, limit: u64) -> Result<String, String> {
     String::from_utf8(data).map_err(|_| format!("{} is not valid UTF-8", path.display()))
 }
 
-fn process_identity(pid: i32) -> Result<ProcessIdentity, String> {
+fn process_identity_with_executable_fallback(
+    pid: i32,
+    executable_fallback: Option<(u64, u64)>,
+) -> Result<ProcessIdentity, String> {
     if pid <= 1 {
         return Err(format!("refusing unsafe pid {pid}"));
     }
@@ -527,8 +530,22 @@ fn process_identity(pid: i32) -> Result<ProcessIdentity, String> {
         .map_err(|_| format!("invalid process start time for pid {pid}"))?;
     let process = std::fs::metadata(format!("/proc/{pid}"))
         .map_err(|error| format!("cannot inspect pid {pid}: {error}"))?;
-    let executable = std::fs::metadata(format!("/proc/{pid}/exe"))
-        .map_err(|error| format!("cannot inspect executable for pid {pid}: {error}"))?;
+    let (executable_dev, executable_ino) = match std::fs::metadata(format!("/proc/{pid}/exe")) {
+        Ok(executable) => (executable.dev(), executable.ino()),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            // A daemon that changed uid and disabled dumpability cannot
+            // have /proc/<pid>/exe inspected by a containerized root
+            // process without CAP_SYS_PTRACE. The pidfd already pins the
+            // target, and PID/start-time/UID/boot-ID are still read live;
+            // only the executable tuple falls back to the root-owned
+            // identity record written by that daemon generation.
+            executable_fallback
+                .ok_or_else(|| format!("cannot inspect executable for pid {pid}: {error}"))?
+        }
+        Err(error) => {
+            return Err(format!("cannot inspect executable for pid {pid}: {error}"));
+        }
+    };
     let boot_id = read_bounded_text(Path::new("/proc/sys/kernel/random/boot_id"), 128)?
         .trim()
         .to_string();
@@ -539,10 +556,14 @@ fn process_identity(pid: i32) -> Result<ProcessIdentity, String> {
         pid,
         start_time,
         uid: process.uid(),
-        executable_dev: executable.dev(),
-        executable_ino: executable.ino(),
+        executable_dev,
+        executable_ino,
         boot_id,
     })
+}
+
+fn process_identity(pid: i32) -> Result<ProcessIdentity, String> {
+    process_identity_with_executable_fallback(pid, None)
 }
 
 fn serialize_process_identity(identity: &ProcessIdentity) -> String {
@@ -706,7 +727,10 @@ fn open_verified_pid(
         ));
     }
     let pidfd = unsafe { std::fs::File::from_raw_fd(fd) };
-    let actual = process_identity(expected.pid)?;
+    let actual = process_identity_with_executable_fallback(
+        expected.pid,
+        Some((expected.executable_dev, expected.executable_ino)),
+    )?;
     if !vapache_verified::pid_control_admit(
         expected.pid as i64,
         actual.pid as i64,
@@ -1292,16 +1316,20 @@ fn main() {
         // usage counters so the aggregate limits remain process-wide across
         // both configuration generations.
         new_cfg.resource_budget = cfg.resource_budget.clone();
-        let new_logger = match Logger::new(&new_cfg) {
-            Ok(l) => {
-                let l = Arc::new(l);
-                l.prepare_permissions(&new_cfg);
-                l
-            }
-            Err(e) => {
-                logger.error(&format!("reload rejected: cannot prepare logger: {e}"));
-                logger.error("reload rejected; continuing with previous configuration");
-                continue;
+        let new_logger = if logger.configuration_matches(&new_cfg) {
+            logger.clone()
+        } else {
+            match Logger::new(&new_cfg) {
+                Ok(l) => {
+                    let l = Arc::new(l);
+                    l.prepare_permissions(&new_cfg);
+                    l
+                }
+                Err(e) => {
+                    logger.error(&format!("reload rejected: cannot prepare logger: {e}"));
+                    logger.error("reload rejected; continuing with previous configuration");
+                    continue;
+                }
             }
         };
         let mut new_bound = match server::rebind(&new_cfg, &bound) {

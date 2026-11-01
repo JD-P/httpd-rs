@@ -2330,6 +2330,18 @@ fn parse_http_protocols(args: &[String]) -> Result<Vec<HttpProtocol>, String> {
     Ok(protocols)
 }
 
+/// Modern Linux distributions keep `/var/run` as a compatibility symlink to
+/// `/run`. Privileged output creation intentionally refuses parent symlinks,
+/// so normalize Apache's conventional PID location before it reaches that
+/// boundary instead of weakening the boundary itself.
+fn normalize_pid_path(path: PathBuf) -> PathBuf {
+    if let Ok(relative) = path.strip_prefix("/var/run") {
+        Path::new("/run").join(relative)
+    } else {
+        path
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SslConfig {
     pub engine: bool,
@@ -2341,6 +2353,9 @@ pub struct SslConfig {
     pub chain_file: Option<PathBuf>,
     pub protocols: Option<String>,
     pub cipher_suite: Option<String>,
+    pub session_cache: Option<bool>,
+    pub session_cache_timeout: Option<Duration>,
+    pub session_tickets: Option<bool>,
     pub verify_client: Option<ClientVerify>,
     pub ca_file: Option<PathBuf>,
     pub stapling: bool,
@@ -2371,6 +2386,15 @@ impl SslConfig {
         }
         if self.cipher_suite.is_none() {
             self.cipher_suite = parent.cipher_suite.clone();
+        }
+        if self.session_cache.is_none() {
+            self.session_cache = parent.session_cache;
+        }
+        if self.session_cache_timeout.is_none() {
+            self.session_cache_timeout = parent.session_cache_timeout;
+        }
+        if self.session_tickets.is_none() {
+            self.session_tickets = parent.session_tickets;
         }
         if self.verify_client.is_none() {
             self.verify_client = parent.verify_client;
@@ -3859,7 +3883,7 @@ impl Compile {
             listeners: Vec::new(),
             user: "www-data".into(),
             group: "www-data".into(),
-            pid_file: PathBuf::from("/var/run/apache2/apache2.pid"),
+            pid_file: PathBuf::from("/run/apache2/apache2.pid"),
             error_log: "logs/error.log".into(),
             log_level: "warn".into(),
             keep_alive: true,
@@ -6326,11 +6350,11 @@ impl Compile {
             "group" => self.cfg.group = first(),
             "pidfile" => {
                 let path = PathBuf::from(first());
-                self.cfg.pid_file = if path.is_absolute() {
+                self.cfg.pid_file = normalize_pid_path(if path.is_absolute() {
                     path
                 } else {
                     self.cfg.server_root.join(path)
-                };
+                });
             }
             "errorlog" => {
                 let p = first();
@@ -6653,8 +6677,135 @@ impl Compile {
                 }
             }
             "defaultruntimedir" => {}
+            "sslrandomseed" => {
+                let valid_context = args.first().is_some_and(|value| {
+                    matches!(value.to_ascii_lowercase().as_str(), "startup" | "connect")
+                });
+                let valid_source = args.get(1).is_some_and(|value| {
+                    let normalized = value.to_ascii_lowercase();
+                    normalized == "builtin"
+                        || ["file:", "exec:", "egd:"].iter().any(|prefix| {
+                            normalized.starts_with(prefix) && normalized.len() > prefix.len()
+                        })
+                });
+                let valid_bytes = args
+                    .get(2)
+                    .is_none_or(|value| crate::util::parse_u64(value.as_bytes()).is_some());
+                if !(2..=3).contains(&args.len()) || !valid_context || !valid_source || !valid_bytes
+                {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "SSLRandomSeed requires startup|connect, a builtin/file:/exec:/egd: source, and optional byte count".into(),
+                    });
+                }
+                // Rustls obtains cryptographic randomness directly from the
+                // OS. Apache's OpenSSL PRNG seed sources must never be opened
+                // or executed by this process.
+            }
+            "sslpassphrasedialog" => {
+                if args.len() != 1 {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "SSLPassPhraseDialog requires exactly one argument".into(),
+                    });
+                } else {
+                    self.warn(format!(
+                        "{}:{}: SSLPassPhraseDialog is unnecessary with Rustls; encrypted private keys remain unsupported",
+                        loc.file, loc.line
+                    ));
+                }
+            }
+            "sslsessioncache" => {
+                let value = first();
+                let enabled = if value.eq_ignore_ascii_case("none")
+                    || value.eq_ignore_ascii_case("nonenotnull")
+                {
+                    Some(false)
+                } else if value
+                    .split_once(':')
+                    .is_some_and(|(provider, target)| !provider.is_empty() && !target.is_empty())
+                {
+                    Some(true)
+                } else {
+                    None
+                };
+                if args.len() != 1 || enabled.is_none() {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "SSLSessionCache requires none or a provider:target value".into(),
+                    });
+                } else {
+                    let target = if let Some(i) = self.current_vhost {
+                        &mut self.vhosts_raw[i].ssl
+                    } else {
+                        &mut self.cfg.ssl
+                    };
+                    target.session_cache = enabled;
+                    if enabled == Some(true) {
+                        self.warn(format!(
+                            "{}:{}: SSLSessionCache uses Rustls' bounded in-process cache; the Apache provider path is ignored",
+                            loc.file, loc.line
+                        ));
+                    }
+                }
+            }
+            "sslsessioncachetimeout" => {
+                let timeout = (args.len() == 1)
+                    .then(|| crate::util::parse_u64(first().as_bytes()))
+                    .flatten();
+                if let Some(seconds) = timeout {
+                    let target = if let Some(i) = self.current_vhost {
+                        &mut self.vhosts_raw[i].ssl
+                    } else {
+                        &mut self.cfg.ssl
+                    };
+                    target.session_cache_timeout = Some(Duration::from_secs(seconds));
+                } else {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "SSLSessionCacheTimeout requires one non-negative integer".into(),
+                    });
+                }
+            }
+            "sslsessiontickets" => {
+                let enabled = match first().to_ascii_lowercase().as_str() {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => None,
+                };
+                if args.len() != 1 || enabled.is_none() {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "SSLSessionTickets requires On or Off".into(),
+                    });
+                } else {
+                    let target = if let Some(i) = self.current_vhost {
+                        &mut self.vhosts_raw[i].ssl
+                    } else {
+                        &mut self.cfg.ssl
+                    };
+                    target.session_tickets = enabled;
+                }
+            }
             "sslengine" => {
-                let on = !first().eq_ignore_ascii_case("off");
+                let on = match (args.len(), first().to_ascii_lowercase()) {
+                    (1, value) if value == "on" => true,
+                    (1, value) if value == "off" => false,
+                    _ => {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: "SSLEngine requires exactly On or Off; optional TLS upgrade is unsupported"
+                                .into(),
+                        });
+                        return;
+                    }
+                };
                 if let Some(i) = self.current_vhost {
                     self.vhosts_raw[i].ssl.engine = on;
                     self.vhosts_raw[i].ssl.engine_set = true;
@@ -6664,6 +6815,14 @@ impl Compile {
                 }
             }
             "sslcertificatefile" | "sslcertificatekeyfile" | "sslcertificatechainfile" => {
+                if args.len() != 1 || first().is_empty() {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("{name} requires exactly one non-empty path"),
+                    });
+                    return;
+                }
                 let p = PathBuf::from(first());
                 let full = if p.is_absolute() {
                     p
@@ -6682,7 +6841,18 @@ impl Compile {
                 }
             }
             "sslusestapling" => {
-                let on = first().eq_ignore_ascii_case("on");
+                let on = match (args.len(), first().to_ascii_lowercase()) {
+                    (1, value) if value == "on" => true,
+                    (1, value) if value == "off" => false,
+                    _ => {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: "SSLUseStapling requires exactly On or Off".into(),
+                        });
+                        return;
+                    }
+                };
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
@@ -6692,6 +6862,15 @@ impl Compile {
                 target.stapling_set = true;
             }
             "sslstaplingforceurl" => {
+                if args.len() != 1 || !crate::ocsp::supported_responder_url(&first()) {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "SSLStaplingForceURL requires one supported http:// responder URL"
+                            .into(),
+                    });
+                    return;
+                }
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
@@ -6700,32 +6879,70 @@ impl Compile {
                 target.stapling_force_url = Some(first());
             }
             "sslstaplingrespondertimeout" => {
+                let Some(n) = (args.len() == 1)
+                    .then(|| crate::util::parse_u64(first().as_bytes()))
+                    .flatten()
+                else {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "SSLStaplingResponderTimeout requires one non-negative integer".into(),
+                    });
+                    return;
+                };
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
                     &mut self.cfg.ssl
                 };
-                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
-                    target.stapling_responder_timeout = Duration::from_secs(n.max(1));
-                }
+                target.stapling_responder_timeout = Duration::from_secs(n.max(1));
             }
             "sslstaplingstandardcachetimeout" => {
+                let Some(n) = (args.len() == 1)
+                    .then(|| crate::util::parse_u64(first().as_bytes()))
+                    .flatten()
+                else {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "SSLStaplingStandardCacheTimeout requires one non-negative integer"
+                            .into(),
+                    });
+                    return;
+                };
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
                     &mut self.cfg.ssl
                 };
-                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
-                    target.stapling_standard_cache_timeout = Duration::from_secs(n.max(1));
-                }
+                target.stapling_standard_cache_timeout = Duration::from_secs(n.max(1));
             }
             "sslstaplingreturnrespondererrors" => {
+                let enabled = match (args.len(), first().to_ascii_lowercase()) {
+                    (1, value) if value == "on" => true,
+                    (1, value) if value == "off" => false,
+                    _ => {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: "SSLStaplingReturnResponderErrors requires exactly On or Off"
+                                .into(),
+                        });
+                        return;
+                    }
+                };
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
                     &mut self.cfg.ssl
                 };
-                target.stapling_return_responder_errors = first().eq_ignore_ascii_case("on");
+                target.stapling_return_responder_errors = enabled;
+                if enabled {
+                    self.warn(format!(
+                        "{}:{}: Vapache staples only successful, signed OCSP responses even when SSLStaplingReturnResponderErrors is On",
+                        loc.file, loc.line
+                    ));
+                }
             }
             "sslstaplingcache" => {}
             "sslproxycacertificatefile" => {
@@ -6825,6 +7042,14 @@ impl Compile {
                 self.cfg.health_templates.insert(name.clone(), template);
             }
             "sslverifyclient" => {
+                if args.len() != 1 {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "SSLVerifyClient requires exactly one argument".into(),
+                    });
+                    return;
+                }
                 let raw = first().to_ascii_lowercase();
                 let verify = match raw.as_str() {
                     "none" => ClientVerify::None,
@@ -6856,6 +7081,14 @@ impl Compile {
                 target.verify_client = Some(verify);
             }
             "sslcacertificatefile" => {
+                if args.len() != 1 || first().is_empty() {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "SSLCACertificateFile requires exactly one non-empty path".into(),
+                    });
+                    return;
+                }
                 let p = PathBuf::from(first());
                 let full = if p.is_absolute() {
                     p
@@ -6870,6 +7103,14 @@ impl Compile {
                 target.ca_file = Some(full);
             }
             "sslprotocol" => {
+                if args.is_empty() {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "SSLProtocol requires at least one protocol token".into(),
+                    });
+                    return;
+                }
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
@@ -9120,6 +9361,13 @@ mod tests {
             config.pid_file,
             std::env::temp_dir().join("run/vapached.pid")
         );
+
+        let config = load_text(
+            "Listen 127.0.0.1:0\nPidFile /var/run/apache2/apache2.pid\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(config.pid_file, Path::new("/run/apache2/apache2.pid"));
     }
 
     #[test]
@@ -9528,6 +9776,59 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
             Some(std::path::Path::new("/etc/ssl/key.pem"))
         );
         assert!(v.ssl.protocols.as_deref().unwrap().contains("TLSv1.1"));
+    }
+
+    #[test]
+    fn stock_debian_ssl_module_configuration_is_supported() {
+        let cfg = "Listen 127.0.0.1:443 https\n\
+SSLRandomSeed startup builtin\n\
+SSLRandomSeed startup file:/dev/urandom 512\n\
+SSLRandomSeed connect builtin\n\
+SSLRandomSeed connect file:/dev/urandom 512\n\
+SSLPassPhraseDialog exec:/usr/share/apache2/ask-for-passphrase\n\
+SSLSessionCache shmcb:/run/apache2/ssl_scache(512000)\n\
+SSLSessionCacheTimeout 300\n\
+SSLSessionTickets Off\n";
+
+        for strict in [false, true] {
+            let parsed = load_text(cfg, strict).unwrap();
+            assert_eq!(parsed.ssl.session_cache, Some(true));
+            assert_eq!(
+                parsed.ssl.session_cache_timeout,
+                Some(Duration::from_secs(300))
+            );
+            assert_eq!(parsed.ssl.session_tickets, Some(false));
+            assert!(parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("SSLPassPhraseDialog")));
+            assert!(parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("bounded in-process cache")));
+        }
+    }
+
+    #[test]
+    fn malformed_ssl_session_and_seed_directives_fail_closed() {
+        let invalid = [
+            "SSLRandomSeed later builtin",
+            "SSLRandomSeed startup relative-file",
+            "SSLRandomSeed startup file:",
+            "SSLRandomSeed startup file:/dev/urandom many",
+            "SSLPassPhraseDialog builtin extra",
+            "SSLSessionCache shmcb:",
+            "SSLSessionCacheTimeout forever",
+            "SSLSessionTickets Maybe",
+        ];
+        for directive in invalid {
+            for strict in [false, true] {
+                assert!(
+                    load_text(&format!("Listen 127.0.0.1:443\n{directive}\n"), strict).is_err(),
+                    "{directive} must fail (strict={strict})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -12901,7 +13202,19 @@ Require all granted\n\
         err("SSLRequireSSL\n");
         err("SSLRequire true\n");
         err("SecRuleEngine On\n");
+        err("SSLEngine optional\n");
+        err("SSLEngine On extra\n");
+        err("SSLCertificateFile\n");
+        err("SSLCertificateKeyFile one two\n");
+        err("SSLUseStapling maybe\n");
+        err("SSLStaplingForceURL https://example.test/ocsp\n");
+        err("SSLStaplingResponderTimeout later\n");
+        err("SSLStaplingStandardCacheTimeout 1 2\n");
+        err("SSLStaplingReturnResponderErrors maybe\n");
         err("SSLVerifyClient maybe\n");
+        err("SSLVerifyClient none extra\n");
+        err("SSLCACertificateFile\n");
+        err("SSLProtocol\n");
         err("AuthBasicProvider ldap\n");
         err("<Directory /x>\nAuthBasicProvider ldap\n</Directory>\n");
 

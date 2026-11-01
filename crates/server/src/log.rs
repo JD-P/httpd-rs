@@ -233,6 +233,47 @@ impl Logger {
         })
     }
 
+    /// A graceful reload does not need to reopen log files when its effective
+    /// logging configuration is unchanged. This matters after privilege drop:
+    /// an inherited descriptor remains writable even when an absolute Apache
+    /// log directory is intentionally not traversable by the service account.
+    pub fn configuration_matches(&self, cfg: &Config) -> bool {
+        if self.error_path != cfg.error_log
+            || self.root != cfg.server_root
+            || self.level != Level::parse(&cfg.log_level)
+        {
+            return false;
+        }
+        let mut expected = Vec::new();
+        let mut add = |cl: &CustomLog, vhost: Option<usize>| {
+            let format = if cl.format.starts_with('"') && cl.format.ends_with('"') {
+                cl.format[1..cl.format.len() - 1].to_string()
+            } else {
+                cfg.log_formats
+                    .get(&cl.format)
+                    .cloned()
+                    .unwrap_or_else(|| cl.format.clone())
+            };
+            expected.push((cl.path.clone(), format, vhost));
+        };
+        for custom in &cfg.custom_logs {
+            add(custom, None);
+        }
+        for (index, vhost) in cfg.vhosts.iter().enumerate() {
+            for custom in &vhost.custom_logs {
+                add(custom, Some(index));
+            }
+        }
+        self.access.len() == expected.len()
+            && self
+                .access
+                .iter()
+                .zip(expected)
+                .all(|(actual, (path, format, vhost))| {
+                    actual.path == path && actual.format == format && actual.vhost == vhost
+                })
+    }
+
     /// Hand configured log files/directories to the account the daemon will
     /// drop to.  Called while still root, so reloads and SIGUSR1 can reopen
     /// logs after privilege dropping.
@@ -810,6 +851,15 @@ mod tests {
         });
         let logger = Logger::new(&cfg).unwrap();
         assert_eq!(logger.access_log_count(), 4);
+        assert!(logger.configuration_matches(&cfg));
+        let mut changed_logging = cfg.clone();
+        changed_logging.log_level = "debug".into();
+        assert!(!logger.configuration_matches(&changed_logging));
+        let mut changed_format = cfg.clone();
+        changed_format
+            .log_formats
+            .insert("common".into(), "%h %s".into());
+        assert!(!logger.configuration_matches(&changed_format));
         assert!(logger.wants_access_log());
         logger.prepare_permissions(&cfg);
         logger.log(Level::Debug, "test", "filtered");

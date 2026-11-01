@@ -1039,7 +1039,7 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | Autoindex | at most 4096 examined directory records (including filtered names), 4096 rendered entries and 4 MiB of generated HTML |
 | DNS authorization | eight resolver workers, queue length 64, two-second caller deadline and bounded copied host operands |
 | Expression `file()` | confined regular descriptor, `O_NONBLOCK`/`O_NOFOLLOW`, 64 KiB read ceiling |
-| Administrative inputs | no-symlink regular descriptors with stable before/after metadata; retained root trust and service-nonwritable parents across reload; authentication databases additionally require strict UTF-8 and service-immutable parents/files unless `MutableAuthFiles` is enabled; 4 MiB per configuration/certificate/TypesConfig/auth file, 1 MiB per key/envvars file, existing RewriteMap limit, and 16 MiB aggregate configuration text |
+| Administrative inputs | regular descriptors with stable before/after metadata; symlinks are forbidden except for a root-owned final TLS-material link between root-owned non-writable trees (the Certbot `live` → `archive` shape); retained root trust and service-nonwritable parents across reload; authentication databases additionally require strict UTF-8 and service-immutable parents/files unless `MutableAuthFiles` is enabled; 4 MiB per configuration/certificate/TypesConfig/auth file, 1 MiB per key/envvars file, existing RewriteMap limit, and 16 MiB aggregate configuration text |
 
 A malformed or over-limit stream produces an error response or connection
 close; request-spool exhaustion specifically produces `503` and releases its

@@ -36,6 +36,103 @@ struct PrivilegedFileBroker {
 
 static PRIVILEGED_FILE_BROKER: OnceLock<Mutex<PrivilegedFileBroker>> = OnceLock::new();
 
+struct ExpiringSession {
+    value: Vec<u8>,
+    expires: Instant,
+}
+
+struct ExpiringSessionCache {
+    entries: Mutex<HashMap<Vec<u8>, ExpiringSession>>,
+    capacity: usize,
+    timeout: Duration,
+}
+
+impl ExpiringSessionCache {
+    fn new(capacity: usize, timeout: Duration) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            capacity,
+            timeout,
+        }
+    }
+
+    fn prune_expired(entries: &mut HashMap<Vec<u8>, ExpiringSession>, now: Instant) {
+        entries.retain(|_, entry| entry.expires > now);
+    }
+}
+
+// Session values contain traffic secrets. Keep Debug output deliberately
+// structural so an error report can never disclose cached key material.
+impl std::fmt::Debug for ExpiringSessionCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        formatter
+            .debug_struct("ExpiringSessionCache")
+            .field("entries", &count)
+            .field("capacity", &self.capacity)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl rustls::server::StoresServerSessions for ExpiringSessionCache {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        if !self.can_cache() {
+            return false;
+        }
+        let now = Instant::now();
+        let Some(expires) = now.checked_add(self.timeout) else {
+            return false;
+        };
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Self::prune_expired(&mut entries, now);
+        if !entries.contains_key(&key) && entries.len() >= self.capacity {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires)
+                .map(|(key, _)| key.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(key, ExpiringSession { value, expires });
+        true
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let now = Instant::now();
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if entries.get(key).is_some_and(|entry| entry.expires <= now) {
+            entries.remove(key);
+            return None;
+        }
+        entries.get(key).map(|entry| entry.value.clone())
+    }
+
+    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let entry = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(key)?;
+        (entry.expires > Instant::now()).then_some(entry.value)
+    }
+
+    fn can_cache(&self) -> bool {
+        self.capacity > 0 && !self.timeout.is_zero()
+    }
+}
+
 fn tls_file_specs(cfg: &Config) -> Vec<(PathBuf, u64)> {
     fn add(specs: &mut HashMap<PathBuf, u64>, path: &Option<PathBuf>, limit: u64) {
         if let Some(path) = path {
@@ -250,9 +347,18 @@ fn install_broker_seccomp() -> std::io::Result<()> {
     let allowed = [
         libc::SYS_read,
         libc::SYS_write,
+        // Rust's static-musl UnixStream implementation uses recvfrom/sendto
+        // for the already-connected broker socket where glibc uses read/write.
+        // The broker retains no other socket descriptor and cannot create one.
+        libc::SYS_recvfrom,
+        libc::SYS_sendto,
         libc::SYS_close,
+        // Static musl uses open for File::open("/"); glibc uses openat. The
+        // certificate path itself is still resolved by the openat2 policy.
+        libc::SYS_open,
         libc::SYS_openat,
         libc::SYS_openat2,
+        libc::SYS_readlinkat,
         libc::SYS_fstat,
         libc::SYS_newfstatat,
         libc::SYS_statx,
@@ -326,7 +432,7 @@ fn privileged_broker_loop(stream: &mut UnixStream, specs: &[(PathBuf, u64)], ser
             .and_then(|(path, limit)| {
                 crate::files::validate_admin_parents(path, service_uid)
                     .map_err(|error| format!("unsafe TLS path {}: {error}", path.display()))?;
-                crate::files::read_admin_file_with_trust(
+                crate::files::read_admin_file_following_root_owned_final_symlink(
                     path,
                     *limit,
                     crate::files::AdminFileTrust::RootOwned,
@@ -356,7 +462,12 @@ fn privileged_broker_loop(stream: &mut UnixStream, specs: &[(PathBuf, u64)], ser
 
 fn read_tls_admin_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
     let Some(broker) = PRIVILEGED_FILE_BROKER.get() else {
-        return crate::files::read_admin_file(path, max_bytes).map_err(|error| error.to_string());
+        return crate::files::read_admin_file_following_root_owned_final_symlink(
+            path,
+            max_bytes,
+            crate::files::AdminFileTrust::for_current_process(),
+        )
+        .map_err(|error| error.to_string());
     };
     let mut broker = broker.lock().unwrap_or_else(|error| error.into_inner());
     let Some(id) = broker.paths.get(path).copied() else {
@@ -479,6 +590,27 @@ fn wildcard_name_matches(name: &str, suffix: &str) -> bool {
 }
 
 impl SniResolver {
+    fn add_name(&mut self, raw: &str, key: SharedKey) {
+        let name = normalize_name(raw);
+        if name.is_empty() || name == "*" || name.starts_with('_') {
+            return;
+        }
+        if let Some(suffix) = name.strip_prefix("*.") {
+            if !suffix.is_empty() {
+                self.wildcards.push((suffix.to_string(), key));
+            }
+        } else if let Some(suffix) = name.strip_prefix('.') {
+            if !suffix.is_empty() {
+                self.wildcards.push((suffix.to_string(), key));
+            }
+        } else {
+            // Apache selects the first virtual host for a duplicate name.
+            // Keeping the first certificate makes the TLS and HTTP routing
+            // decisions agree instead of presenting a later vhost's key.
+            self.names.entry(name).or_insert(key);
+        }
+    }
+
     fn select_key(&self, name: Option<&str>) -> Arc<CertifiedKey> {
         let Some(name) = name else {
             return current_key(&self.default);
@@ -808,6 +940,30 @@ fn ensure_uniform_protocol_policy(policies: &[&SslConfig], port: u16) -> Result<
     Ok(())
 }
 
+fn ensure_uniform_resumption_policy(policies: &[&SslConfig], port: u16) -> Result<(), String> {
+    let Some(first) = policies.first() else {
+        return Ok(());
+    };
+    let expected = (
+        first.session_cache.unwrap_or(true),
+        first.session_cache_timeout,
+        first.session_tickets.unwrap_or(true),
+    );
+    for ssl in policies.iter().skip(1) {
+        if (
+            ssl.session_cache.unwrap_or(true),
+            ssl.session_cache_timeout,
+            ssl.session_tickets.unwrap_or(true),
+        ) != expected
+        {
+            return Err(format!(
+                "TLS port {port} has virtual hosts with different session-resumption policies; use separate Listen directives"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// ALPN is selected before the HTTP Host header is available. Every TLS
 /// virtual host on one listener must therefore offer the same application
 /// protocols, or an HTTP/1.1-only vhost could still be exposed to h2.
@@ -849,27 +1005,35 @@ pub(crate) fn prepare_server_config(
     local_ip: Option<IpAddr>,
 ) -> Result<PreparedServerConfig, String> {
     let provider = Arc::new(ring::default_provider());
-    let mut vhosts: Vec<&VHost> = cfg
+    let mut applicable_vhosts: Vec<&VHost> = cfg
         .vhosts
         .iter()
-        .filter(|v| v.ssl.engine && vhost_applies(v, port, local_ip))
+        .filter(|v| vhost_applies(v, port, local_ip))
         .collect();
     if let Some(ip) = local_ip {
-        let exact_available = vhosts
+        let exact_available = applicable_vhosts
             .iter()
             .any(|v| Config::vhost_address_is_specific(v, ip, port));
-        vhosts.retain(|v| !exact_available || Config::vhost_address_is_specific(v, ip, port));
+        applicable_vhosts
+            .retain(|v| !exact_available || Config::vhost_address_is_specific(v, ip, port));
     }
-    let global_only = cfg.ssl.engine && vhosts.is_empty();
-    if vhosts.is_empty() && !global_only {
+    let global_only = cfg.ssl.engine && applicable_vhosts.is_empty();
+    if !global_only && !applicable_vhosts.iter().any(|v| v.ssl.engine) {
         return Ok(PreparedServerConfig {
             config: None,
             refreshes: Vec::new(),
         });
     }
+    if !global_only && applicable_vhosts.iter().any(|v| !v.ssl.engine) {
+        return Err(format!(
+            "TLS port {port} has virtual hosts with different SSLEngine policies; use separate Listen directives so an SSL-disabled host cannot inherit another host's TLS configuration"
+        ));
+    }
+    let mut vhosts = applicable_vhosts;
     let policies: Vec<&SslConfig> = vhosts.iter().map(|v| &v.ssl).collect();
     ensure_uniform_client_policy(&policies, port)?;
     ensure_uniform_protocol_policy(&policies, port)?;
+    ensure_uniform_resumption_policy(&policies, port)?;
     let application_protocols: Vec<&[HttpProtocol]> =
         vhosts.iter().map(|v| v.protocols.as_slice()).collect();
     ensure_uniform_application_protocols(&application_protocols, port)?;
@@ -925,21 +1089,7 @@ pub(crate) fn prepare_server_config(
             }
             names.extend(v.aliases.iter().cloned());
             for raw in names {
-                let name = normalize_name(&raw);
-                if name.is_empty() || name == "*" || name.starts_with('_') {
-                    continue;
-                }
-                if let Some(suffix) = name.strip_prefix("*.") {
-                    if !suffix.is_empty() {
-                        resolver.wildcards.push((suffix.to_string(), key.clone()));
-                    }
-                } else if let Some(suffix) = name.strip_prefix('.') {
-                    if !suffix.is_empty() {
-                        resolver.wildcards.push((suffix.to_string(), key.clone()));
-                    }
-                } else {
-                    resolver.names.insert(name, key.clone());
-                }
+                resolver.add_name(&raw, key.clone());
             }
         }
     }
@@ -977,6 +1127,17 @@ pub(crate) fn prepare_server_config(
         .map_err(|e| format!("invalid TLS protocol configuration: {e}"))?
         .with_client_cert_verifier(verifier)
         .with_cert_resolver(Arc::new(resolver));
+    if default_ssl.session_cache == Some(false) {
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    } else if let Some(timeout) = default_ssl.session_cache_timeout {
+        config.session_storage = Arc::new(ExpiringSessionCache::new(256, timeout));
+    }
+    if default_ssl.session_tickets == Some(false) {
+        // Rustls already disables stateless TLS 1.2 tickets. This also turns
+        // off its stateful TLS 1.3 NewSessionTicket messages, conservatively
+        // honoring Apache's broader SSLSessionTickets Off policy.
+        config.send_tls13_tickets = 0;
+    }
     config.alpn_protocols = default_protocols
         .iter()
         .map(|protocol| protocol.alpn().to_vec())
@@ -990,6 +1151,7 @@ pub(crate) fn prepare_server_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::server::StoresServerSessions as _;
     use std::os::fd::IntoRawFd;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
@@ -1262,6 +1424,55 @@ mod tests {
     }
 
     #[test]
+    fn session_cache_is_bounded_consumable_and_redacted() {
+        let cache = ExpiringSessionCache::new(2, Duration::from_secs(60));
+        assert!(cache.can_cache());
+        assert!(cache.put(b"client-a".to_vec(), b"secret-a".to_vec()));
+        assert!(cache.put(b"client-b".to_vec(), b"secret-b".to_vec()));
+        assert!(cache.put(b"client-c".to_vec(), b"secret-c".to_vec()));
+        assert!(cache.entries.lock().unwrap().len() <= 2);
+        assert_eq!(cache.get(b"client-c"), Some(b"secret-c".to_vec()));
+        assert_eq!(cache.take(b"client-c"), Some(b"secret-c".to_vec()));
+        assert_eq!(cache.take(b"client-c"), None);
+
+        let debug = format!("{cache:?}");
+        assert!(!debug.contains("client"));
+        assert!(!debug.contains("secret"));
+
+        let disabled = ExpiringSessionCache::new(2, Duration::ZERO);
+        assert!(!disabled.can_cache());
+        assert!(!disabled.put(b"client".to_vec(), b"secret".to_vec()));
+    }
+
+    #[test]
+    fn vhosts_cannot_share_a_listener_with_different_resumption_policy() {
+        let first = SslConfig {
+            session_cache: Some(true),
+            session_cache_timeout: Some(Duration::from_secs(300)),
+            session_tickets: Some(false),
+            ..SslConfig::default()
+        };
+        let same = first.clone();
+        let explicit_on = SslConfig {
+            session_cache: Some(true),
+            session_cache_timeout: Some(Duration::from_secs(300)),
+            session_tickets: Some(true),
+            ..SslConfig::default()
+        };
+        let implicit_on = SslConfig {
+            session_cache_timeout: Some(Duration::from_secs(300)),
+            ..SslConfig::default()
+        };
+        let different = SslConfig {
+            session_cache_timeout: Some(Duration::from_secs(600)),
+            ..first.clone()
+        };
+        assert!(ensure_uniform_resumption_policy(&[&first, &same], 443).is_ok());
+        assert!(ensure_uniform_resumption_policy(&[&explicit_on, &implicit_on], 443).is_ok());
+        assert!(ensure_uniform_resumption_policy(&[&first, &different], 443).is_err());
+    }
+
+    #[test]
     fn sni_names_are_normalized() {
         assert_eq!(normalize_name("Example.COM:443"), "example.com");
         assert_eq!(normalize_name("[::1]:443"), "::1");
@@ -1502,6 +1713,18 @@ mod tests {
             &default_key
         ));
 
+        let mut duplicates = SniResolver {
+            default: first.clone(),
+            names: HashMap::new(),
+            wildcards: Vec::new(),
+        };
+        duplicates.add_name("duplicate.test", first.clone());
+        duplicates.add_name("DUPLICATE.TEST.", second.clone());
+        assert!(Arc::ptr_eq(
+            &duplicates.select_key(Some("duplicate.test")),
+            &default_key
+        ));
+
         assert_eq!(client_policy_mode(&SslConfig::default()), 0);
         assert_eq!(
             client_policy_mode(&SslConfig {
@@ -1549,6 +1772,25 @@ mod tests {
             global_tls.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
+
+        let resumption = test_config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:443\nSSLEngine on\nSSLCertificateFile \"{cert_s}\"\nSSLCertificateKeyFile \"{key_s}\"\nSSLSessionCache shmcb:/run/apache2/ssl_scache(512000)\nSSLSessionCacheTimeout 300\nSSLSessionTickets Off\n"
+            ),
+        );
+        let resumption_tls = server_config(&resumption, 443, None).unwrap().unwrap();
+        assert!(resumption_tls.session_storage.can_cache());
+        assert_eq!(resumption_tls.send_tls13_tickets, 0);
+
+        let no_cache = test_config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:443\nSSLEngine on\nSSLCertificateFile \"{cert_s}\"\nSSLCertificateKeyFile \"{key_s}\"\nSSLSessionCache none\n"
+            ),
+        );
+        let no_cache_tls = server_config(&no_cache, 443, None).unwrap().unwrap();
+        assert!(!no_cache_tls.session_storage.can_cache());
 
         let http1_only = test_config(
             &dir,
@@ -1604,6 +1846,26 @@ mod tests {
             .unwrap_err()
             .contains("different Protocols policies"));
 
+        let engine_mismatch = test_config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:443\n\
+                 <VirtualHost *:443>\n\
+                     ServerName enabled.test\n\
+                     SSLEngine on\n\
+                     SSLCertificateFile \"{cert_s}\"\n\
+                     SSLCertificateKeyFile \"{key_s}\"\n\
+                 </VirtualHost>\n\
+                 <VirtualHost *:443>\n\
+                     ServerName disabled.test\n\
+                     SSLEngine off\n\
+                 </VirtualHost>\n"
+            ),
+        );
+        assert!(server_config(&engine_mismatch, 443, None)
+            .unwrap_err()
+            .contains("different SSLEngine policies"));
+
         let address_bound = test_config(
             &dir,
             &format!(
@@ -1633,6 +1895,32 @@ mod tests {
         assert!(server_config(&address_bound, 443, Some(other))
             .unwrap()
             .is_some());
+
+        let address_disabled = test_config(
+            &dir,
+            &format!(
+                "Listen 0.0.0.0:443\n\
+                 <VirtualHost 127.0.0.1:443>\n\
+                     ServerName disabled.test\n\
+                     SSLEngine off\n\
+                 </VirtualHost>\n\
+                 <VirtualHost *:443>\n\
+                     ServerName public.test\n\
+                     SSLEngine on\n\
+                     SSLCertificateFile \"{cert_s}\"\n\
+                     SSLCertificateKeyFile \"{key_s}\"\n\
+                 </VirtualHost>\n"
+            ),
+        );
+        assert!(server_config(&address_disabled, 443, Some(loopback))
+            .unwrap()
+            .is_none());
+        assert!(server_config(&address_disabled, 443, Some(other))
+            .unwrap()
+            .is_some());
+        assert!(server_config(&address_disabled, 443, None)
+            .unwrap_err()
+            .contains("different SSLEngine policies"));
 
         for mode in ["optional", "require"] {
             let cfg = test_config(

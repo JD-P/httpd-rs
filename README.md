@@ -89,6 +89,9 @@ Implemented today:
   A root-started daemon retains a minimal pre-thread TLS file broker whose
   numeric allowlist is fixed by the startup configuration, so SIGHUP can
   rotate root-only keys without restoring arbitrary root pathname access.
+  Certbot's standard root-owned `live/<name>/*.pem` final symlinks into its
+  root-owned `archive/<name>` tree are supported; parent or chained symlinks
+  remain forbidden.
   The broker closes every unrelated descriptor and standard stream, disables
   dumps and privilege acquisition, installs tight core/file/descriptor/CPU/
   address-space limits, and runs under a read-only seccomp syscall allowlist.
@@ -209,10 +212,11 @@ Implemented today:
 - Privileged startup refuses uid/gid 0 and fails when an unprivileged launch
   does not already match the configured identity. Configuration/includes,
   TLS material, environment files, `TypesConfig`, and file-backed rewrite maps
-  are regular, no-symlink administrative inputs with per-file bounds and
-  stable descriptor snapshots; their parent chains cannot be writable by the
-  service identity, including empty optional-include directories. Aggregate
-  configuration text is capped at 16 MiB.
+  are regular administrative inputs with per-file bounds and stable descriptor
+  snapshots; their parent chains cannot be writable by the service identity,
+  including empty optional-include directories. Administrative inputs do not
+  follow symlinks except for the narrowly checked Certbot final-link shape
+  described above. Aggregate configuration text is capped at 16 MiB.
 - Unsupported security-sensitive directives (`SSLRequire*`,
   `SecRuleEngine On`) fail closed even in
   compatibility mode rather than silently weakening access or TLS policy.
@@ -288,6 +292,23 @@ any capability opt-ins already implied by the Apache configuration into a
 root-controlled runtime snapshot; it never edits the source configuration.
 Set `VAPACHE_AUTO_CAPABILITIES=0` to retain the raw binary's explicit opt-in
 requirement. See `packaging/README.md` for the installed file layout.
+
+### Certbot
+
+Vapache reads the usual `SSLCertificateFile` and `SSLCertificateKeyFile`
+paths, including Certbot's `/etc/letsencrypt/live/...` links. A graceful reload
+atomically validates and adopts renewed certificate/key pairs while existing
+connections finish on the old TLS generation:
+
+```sh
+sudo systemctl reload vapache.service
+```
+
+Certbot does not know that `vapache.service` replaced the Apache daemon. Use a
+webroot, DNS, or other non-Apache authenticator, and install a Certbot deploy
+hook that runs the reload command after a successful renewal. Do not leave an
+Apache-plugin renewal configured to start or reload `apache2.service` while
+Vapache owns ports 80/443.
 
 ## Verify
 

@@ -303,6 +303,10 @@ fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
     Some((host, port, path))
 }
 
+pub(crate) fn supported_responder_url(url: &str) -> bool {
+    parse_http_url(url).is_some()
+}
+
 fn read_http_line(reader: &mut impl BufRead) -> Option<String> {
     let mut line = Vec::new();
     let n = reader.read_until(b'\n', &mut line).ok()?;

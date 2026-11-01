@@ -149,7 +149,10 @@ pub fn rebind(cfg: &Config, previous: &[Bound]) -> io::Result<Vec<Bound>> {
             pending_tls: Some(pending_tls),
         });
     }
-    crate::ocsp::prepare_cache_dir(&cfg.server_root.join(".vapache-ocsp-cache"))?;
+    // The OCSP cache is a privileged startup resource prepared by `bind`.
+    // Reload runs after privilege drop and must not try to recreate a
+    // root-owned cache directory; cache misses and refresh persistence already
+    // fail softly while every response is validated before use.
     Ok(out)
 }
 
@@ -767,9 +770,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 query: &req.query,
                 peer: peer.ip(),
                 port: local_port,
-                https: crate::expr::request_is_https()
-                    || local_port == 443
-                    || vhost.map(|v| v.ssl.engine).unwrap_or(cfg.ssl.engine),
+                https: tls,
                 server_name: &server_name_for_public(&cfg, &req, &local_ip, local_port),
             };
             let mut rewritten_target = None;
@@ -1503,9 +1504,7 @@ fn dispatch_inner_request(
         local_port,
         if host.is_empty() { None } else { Some(host) },
     );
-    let https_for_cache = crate::expr::request_is_https()
-        || local_port == 443
-        || vhost.map(|v| v.ssl.engine).unwrap_or(cfg.ssl.engine);
+    let https_for_cache = crate::expr::request_is_https();
     let server_name_for_cache = server_name_for(cfg, req, local_ip, local_port);
     let _server_name_guard = crate::expr::set_server_name(&server_name_for_cache);
     let allow_encoded = cfg.encoded_slashes == EncodedSlashes::On;
@@ -2322,7 +2321,7 @@ fn dispatch_inner(
     // unchanged, that exact scope can authorize the original URL again instead
     // of rebuilding the same plan and access-file layers from disk.
     let mut original_scope_snapshot: Option<Scope> = None;
-    let https = local_port == 443 || vhost.map(|v| v.ssl.engine).unwrap_or(cfg.ssl.engine);
+    let https = crate::expr::request_is_https();
     let (mut root, mut rel, mut script_alias);
     let mut fs_path;
     let mut scope;
@@ -3975,9 +3974,7 @@ fn run_fastcgi(
         remote_port: peer.port(),
         local_ip,
         local_port,
-        https: crate::expr::request_is_https()
-            || local_port == 443
-            || vhost.map(|v| v.ssl.engine).unwrap_or(cfg.ssl.engine),
+        https: crate::expr::request_is_https(),
         server_name,
         host: server_name,
         follow_symlinks: true,
@@ -4102,9 +4099,7 @@ fn run_cgi(
         remote_port: peer.port(),
         local_ip,
         local_port,
-        https: crate::expr::request_is_https()
-            || local_port == 443
-            || vhost.map(|v| v.ssl.engine).unwrap_or(cfg.ssl.engine),
+        https: crate::expr::request_is_https(),
         server_name,
         host: server_name,
         follow_symlinks: follow,
@@ -4470,6 +4465,26 @@ mod tests {
 
     fn cov_peer() -> SocketAddr {
         "127.0.0.1:12345".parse().unwrap()
+    }
+
+    #[test]
+    fn actual_connection_tls_state_controls_absolute_redirect_scheme() {
+        let dir = cov_dir("connection-scheme");
+        std::fs::create_dir(dir.join("www/directory")).unwrap();
+        let cfg = cov_config(&dir, "");
+        let mut req = cov_req("GET", "/directory");
+        req.headers.insert("host", b"example.test".to_vec());
+
+        let clear = dispatch_with_scheme(&cfg, &req, cov_peer(), "127.0.0.1", 443, false);
+        assert!(clear.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("location") && value == b"http://example.test/directory/"
+        }));
+
+        let tls = dispatch_with_scheme(&cfg, &req, cov_peer(), "127.0.0.1", 8443, true);
+        assert!(tls.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("location") && value == b"https://example.test/directory/"
+        }));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[derive(Default)]

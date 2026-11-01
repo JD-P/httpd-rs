@@ -181,6 +181,115 @@ pub fn read_admin_file_with_trust(
     Ok(data)
 }
 
+/// Read an administrative input while permitting the one symlink shape used
+/// by Certbot: a root-owned final link below a root-owned, non-writable tree,
+/// pointing to a root-owned regular file in another such tree. Parent
+/// symlinks and chained final symlinks remain forbidden.
+///
+/// General configuration and privileged output paths deliberately continue
+/// to use `read_admin_file_with_trust`/`open_admin_path` and never follow a
+/// symlink. This exception is only for callers that explicitly opt into
+/// certificate-style atomic rotation.
+pub fn read_admin_file_following_root_owned_final_symlink(
+    path: &Path,
+    max_bytes: u64,
+    trust: AdminFileTrust,
+) -> io::Result<Vec<u8>> {
+    let direct_error = match read_admin_file_with_trust(path, max_bytes, trust) {
+        Ok(data) => return Ok(data),
+        Err(error) => error,
+    };
+    if trust != AdminFileTrust::RootOwned {
+        return Err(direct_error);
+    }
+
+    validate_root_owned_admin_parents(path)?;
+    // RESOLVE_NO_SYMLINKS plus O_PATH|O_NOFOLLOW returns a descriptor for a
+    // final symlink, but still rejects every symlink in its parent path.
+    let link = match open_admin_path(path, libc::O_PATH, 0) {
+        Ok(link) => link,
+        Err(_) => return Err(direct_error),
+    };
+    let metadata = link.metadata()?;
+    if !metadata.file_type().is_symlink() || metadata.uid() != 0 {
+        return Err(direct_error);
+    }
+    let target = read_pinned_symlink(&link)?;
+    // The privileged TLS broker deliberately has room for only four file
+    // descriptors. Once the target bytes are pinned to this inode, release
+    // the link descriptor before walking the independently root-owned target
+    // tree so the nested openat2 validation stays within that ceiling.
+    drop(link);
+    let target = final_admin_symlink_target(path, &target)?;
+    validate_root_owned_admin_parents(&target)?;
+    read_admin_file_with_trust(&target, max_bytes, AdminFileTrust::RootOwned)
+}
+
+fn final_admin_symlink_target(path: &Path, target: &Path) -> io::Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "administrative symlink path is not absolute",
+        ));
+    }
+    let combined = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        path.parent()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?
+            .join(target)
+    };
+    let mut normalized = PathBuf::from("/");
+    for component in combined.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(value) => normalized.push(value),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(io::Error::from_raw_os_error(libc::EXDEV));
+                }
+            }
+            std::path::Component::Prefix(_) => {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn validate_root_owned_admin_parents(path: &Path) -> io::Result<()> {
+    validate_admin_parents(path, u32::MAX)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let root = File::open("/")?;
+    if root.metadata()?.uid() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "administrative symlink tree root is not owned by root",
+        ));
+    }
+    let mut current = PathBuf::from("/");
+    for component in parent.components() {
+        match component {
+            std::path::Component::RootDir => continue,
+            std::path::Component::Normal(value) => current.push(value),
+            _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+        let directory = open_admin_path(&current, libc::O_PATH | libc::O_DIRECTORY, 0)?;
+        if directory.metadata()?.uid() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "administrative symlink path component {} is not owned by root",
+                    current.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Reject an absolute administrative output whose directory entry could be
 /// replaced by the account the daemon later runs as. Group-writable parents
 /// are rejected conservatively because NSS supplementary group membership is
@@ -2673,6 +2782,68 @@ mod tests {
         let fifo = root.join("input-fifo");
         make_test_fifo(&fifo).unwrap();
         assert!(read_admin_file(&fifo, 4).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn final_admin_symlink_targets_are_normalized_without_escaping_root() {
+        assert_eq!(
+            final_admin_symlink_target(
+                Path::new("/etc/letsencrypt/live/example.test/fullchain.pem"),
+                Path::new("../../archive/example.test/fullchain1.pem")
+            )
+            .unwrap(),
+            Path::new("/etc/letsencrypt/archive/example.test/fullchain1.pem")
+        );
+        assert!(final_admin_symlink_target(Path::new("/link"), Path::new("../../escape")).is_err());
+    }
+
+    #[test]
+    fn root_owned_final_admin_symlink_supports_certbot_rotation_shape() {
+        if effective_uid() != 0 {
+            return;
+        }
+        let root = PathBuf::from(format!(
+            "/run/vapache-certbot-link-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let archive = root.join("archive/example.test");
+        let live = root.join("live/example.test");
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let version = archive.join("fullchain1.pem");
+        std::fs::write(&version, b"certificate").unwrap();
+        let current = live.join("fullchain.pem");
+        std::os::unix::fs::symlink("../../archive/example.test/fullchain1.pem", &current).unwrap();
+
+        assert_eq!(
+            read_admin_file_following_root_owned_final_symlink(
+                &current,
+                64,
+                AdminFileTrust::RootOwned
+            )
+            .unwrap(),
+            b"certificate"
+        );
+        assert!(read_admin_file_with_trust(&current, 64, AdminFileTrust::RootOwned).is_err());
+
+        let chained = archive.join("fullchain2.pem");
+        std::os::unix::fs::symlink("fullchain1.pem", &chained).unwrap();
+        let chained_current = live.join("chained.pem");
+        std::os::unix::fs::symlink(
+            "../../archive/example.test/fullchain2.pem",
+            &chained_current,
+        )
+        .unwrap();
+        assert!(read_admin_file_following_root_owned_final_symlink(
+            &chained_current,
+            64,
+            AdminFileTrust::RootOwned
+        )
+        .is_err());
+
         let _ = std::fs::remove_dir_all(root);
     }
 

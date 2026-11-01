@@ -144,6 +144,11 @@ snapshot_configuration() {
         rm -rf -- "$staging"
         exit 1
     fi
+    # The daemon loads this snapshot once as root, then must traverse it again
+    # after dropping privileges for a graceful reload. Keep it root-owned and
+    # non-writable while allowing the service identity to reach readable
+    # configuration files below it.
+    chmod 0755 "$staging"
     chmod -R go-w "$staging"
     if [ ! -f "$staging/$relative_config" ]; then
         echo "vapachectl: configuration snapshot is missing $relative_config" >&2
