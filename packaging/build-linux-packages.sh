@@ -75,6 +75,12 @@ archive_root="$work_dir/vapache-${version}-linux-x86_64-musl"
 install -Dm 0755 "$binary" "$archive_root/usr/sbin/vapached"
 install -Dm 0755 "$script_dir/vapachectl" "$archive_root/usr/sbin/vapachectl"
 install -Dm 0755 "$script_dir/vapache-switch" "$archive_root/usr/sbin/vapache-switch"
+install -Dm 0755 "$script_dir/vapache-certbot-apachectl" \
+    "$archive_root/usr/lib/vapache/certbot-apachectl"
+install -Dm 0755 "$script_dir/vapache-certbot-deploy-hook" \
+    "$archive_root/usr/lib/vapache/certbot-deploy-hook"
+install -Dm 0755 "$script_dir/vapache-certbot-cleanup" \
+    "$archive_root/usr/lib/vapache/certbot-cleanup"
 install -Dm 0644 "$script_dir/vapache.service" \
     "$archive_root/usr/lib/systemd/system/vapache.service"
 install -Dm 0644 "$repo_root/README.md" "$archive_root/usr/share/doc/vapache/README.md"
@@ -91,6 +97,12 @@ deb_root="$work_dir/deb"
 install -Dm 0755 "$binary" "$deb_root/usr/sbin/vapached"
 install -Dm 0755 "$script_dir/vapachectl" "$deb_root/usr/sbin/vapachectl"
 install -Dm 0755 "$script_dir/vapache-switch" "$deb_root/usr/sbin/vapache-switch"
+install -Dm 0755 "$script_dir/vapache-certbot-apachectl" \
+    "$deb_root/usr/lib/vapache/certbot-apachectl"
+install -Dm 0755 "$script_dir/vapache-certbot-deploy-hook" \
+    "$deb_root/usr/lib/vapache/certbot-deploy-hook"
+install -Dm 0755 "$script_dir/vapache-certbot-cleanup" \
+    "$deb_root/usr/lib/vapache/certbot-cleanup"
 install -Dm 0644 "$script_dir/vapache.service" \
     "$deb_root/usr/lib/systemd/system/vapache.service"
 install -Dm 0644 "$repo_root/README.md" "$deb_root/usr/share/doc/vapache/README.md"
@@ -131,6 +143,10 @@ set -e
 if [ "${1:-}" = remove ] && command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now vapache.service >/dev/null 2>&1 || true
 fi
+if [ "${1:-}" = remove ] && [ -x /usr/lib/vapache/certbot-cleanup ]; then
+    /usr/lib/vapache/certbot-cleanup || \
+        echo "vapache: warning: could not clean Certbot integration" >&2
+fi
 exit 0
 EOF
 cat >"$deb_root/DEBIAN/postrm" <<'EOF'
@@ -149,6 +165,12 @@ mkdir -p "$rpm_top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 install -m 0755 "$binary" "$rpm_top/SOURCES/vapached"
 install -m 0755 "$script_dir/vapachectl" "$rpm_top/SOURCES/vapachectl"
 install -m 0755 "$script_dir/vapache-switch" "$rpm_top/SOURCES/vapache-switch"
+install -m 0755 "$script_dir/vapache-certbot-apachectl" \
+    "$rpm_top/SOURCES/vapache-certbot-apachectl"
+install -m 0755 "$script_dir/vapache-certbot-deploy-hook" \
+    "$rpm_top/SOURCES/vapache-certbot-deploy-hook"
+install -m 0755 "$script_dir/vapache-certbot-cleanup" \
+    "$rpm_top/SOURCES/vapache-certbot-cleanup"
 install -m 0644 "$script_dir/vapache.service" "$rpm_top/SOURCES/vapache.service"
 install -m 0644 "$repo_root/README.md" "$rpm_top/SOURCES/README.md"
 install -m 0644 "$script_dir/README.md" "$rpm_top/SOURCES/PACKAGING.md"
@@ -163,10 +185,13 @@ URL:            https://github.com/JD-P/vapache
 Source0:        vapached
 Source1:        vapachectl
 Source2:        vapache-switch
-Source3:        vapache.service
-Source4:        README.md
-Source5:        PACKAGING.md
-Source6:        LICENSE
+Source3:        vapache-certbot-apachectl
+Source4:        vapache-certbot-deploy-hook
+Source5:        vapache-certbot-cleanup
+Source6:        vapache.service
+Source7:        README.md
+Source8:        PACKAGING.md
+Source9:        LICENSE
 BuildArch:      x86_64
 AutoReqProv:    no
 Suggests:       httpd
@@ -185,10 +210,13 @@ untouched until the administrator explicitly runs vapache-switch.
 install -Dm 0755 %{SOURCE0} %{buildroot}/usr/sbin/vapached
 install -Dm 0755 %{SOURCE1} %{buildroot}/usr/sbin/vapachectl
 install -Dm 0755 %{SOURCE2} %{buildroot}/usr/sbin/vapache-switch
-install -Dm 0644 %{SOURCE3} %{buildroot}/usr/lib/systemd/system/vapache.service
-install -Dm 0644 %{SOURCE4} %{buildroot}/usr/share/doc/vapache/README.md
-install -Dm 0644 %{SOURCE5} %{buildroot}/usr/share/doc/vapache/PACKAGING.md
-install -Dm 0644 %{SOURCE6} %{buildroot}/usr/share/licenses/vapache/LICENSE
+install -Dm 0755 %{SOURCE3} %{buildroot}/usr/lib/vapache/certbot-apachectl
+install -Dm 0755 %{SOURCE4} %{buildroot}/usr/lib/vapache/certbot-deploy-hook
+install -Dm 0755 %{SOURCE5} %{buildroot}/usr/lib/vapache/certbot-cleanup
+install -Dm 0644 %{SOURCE6} %{buildroot}/usr/lib/systemd/system/vapache.service
+install -Dm 0644 %{SOURCE7} %{buildroot}/usr/share/doc/vapache/README.md
+install -Dm 0644 %{SOURCE8} %{buildroot}/usr/share/doc/vapache/PACKAGING.md
+install -Dm 0644 %{SOURCE9} %{buildroot}/usr/share/licenses/vapache/LICENSE
 
 %post
 if command -v systemctl >/dev/null 2>&1; then
@@ -205,6 +233,10 @@ fi
 if [ \$1 -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now vapache.service >/dev/null 2>&1 || :
 fi
+if [ \$1 -eq 0 ] && [ -x /usr/lib/vapache/certbot-cleanup ]; then
+    /usr/lib/vapache/certbot-cleanup || \
+        echo "vapache: warning: could not clean Certbot integration" >&2
+fi
 
 %postun
 if command -v systemctl >/dev/null 2>&1; then
@@ -215,6 +247,9 @@ fi
 %attr(0755,root,root) /usr/sbin/vapached
 %attr(0755,root,root) /usr/sbin/vapachectl
 %attr(0755,root,root) /usr/sbin/vapache-switch
+%attr(0755,root,root) /usr/lib/vapache/certbot-apachectl
+%attr(0755,root,root) /usr/lib/vapache/certbot-deploy-hook
+%attr(0755,root,root) /usr/lib/vapache/certbot-cleanup
 %attr(0644,root,root) /usr/lib/systemd/system/vapache.service
 %doc /usr/share/doc/vapache/README.md
 %doc /usr/share/doc/vapache/PACKAGING.md

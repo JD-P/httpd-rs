@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+# Certbot runs deploy hooks only after a lineage has actually changed. Do not
+# start Vapache or interfere with Apache when Vapache is not the active server.
+if command -v systemctl >/dev/null 2>&1 \
+    && systemctl is-active --quiet vapache.service 2>/dev/null; then
+    systemctl reload vapache.service
+fi

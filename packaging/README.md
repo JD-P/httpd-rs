@@ -5,6 +5,9 @@ The `vapache` packages install:
 - `/usr/sbin/vapached` — the server;
 - `/usr/sbin/vapachectl` — an Apache-layout-aware control wrapper;
 - `/usr/sbin/vapache-switch` — an explicit, interactive service switch;
+- `/usr/lib/vapache/certbot-apachectl` — a Certbot Apache-plugin control shim;
+- `/usr/lib/vapache/certbot-deploy-hook` — a conditional Vapache reload hook;
+- `/usr/lib/vapache/certbot-cleanup` — the package-removal integration cleanup;
 - `/usr/lib/systemd/system/vapache.service` — the systemd service unit; and
 - documentation below `/usr/share/doc/vapache`.
 
@@ -32,6 +35,28 @@ Installation does not enable or start vapache and does not stop Apache. Run
 shows which Apache service it found, asks for confirmation, and only then
 disables/stops Apache and enables/starts vapache. If vapache fails to start,
 the helper restores Apache's previous active/enabled state.
+
+When a Certbot installation or configuration exists, `vapache-switch` installs
+a deploy hook that reloads Vapache only while `vapache.service` is active.
+Renewal configurations using `authenticator = apache` or `installer = apache`
+are updated to select `/usr/lib/vapache/certbot-apachectl`. The same path is set
+in Certbot's `cli.ini`, so new `certbot --apache` commands select it too. The shim
+uses the real Apache control utility only for read-only version/module/include
+discovery and Apache syntax validation, also requires Vapache's config test
+while Vapache is active, and sends lifecycle commands to whichever daemon is
+active. It does not replace an Apache-owned executable. Certbot-driven Vapache
+lifecycle changes use a systemd restart because the first certificate can
+introduce a new privileged port 443 listener; ordinary deploy-hook renewals
+retain a graceful reload. For a new certificate, invoke Certbot with:
+
+```sh
+sudo certbot --apache -d example.com
+```
+
+Without first running `vapache-switch`, pass
+`--apache-ctl /usr/lib/vapache/certbot-apachectl` explicitly.
+Package removal deletes only these exact Vapache settings and hook from
+Certbot's configuration, so it does not leave a dangling control path.
 
 The release binary targets `x86_64-unknown-linux-musl` and is a static PIE. It
 therefore has no glibc version floor. Vapache still requires Linux 5.6 or newer

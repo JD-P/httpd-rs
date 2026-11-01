@@ -2353,6 +2353,7 @@ pub struct SslConfig {
     pub chain_file: Option<PathBuf>,
     pub protocols: Option<String>,
     pub cipher_suite: Option<String>,
+    pub honor_cipher_order: Option<bool>,
     pub session_cache: Option<bool>,
     pub session_cache_timeout: Option<Duration>,
     pub session_tickets: Option<bool>,
@@ -2386,6 +2387,9 @@ impl SslConfig {
         }
         if self.cipher_suite.is_none() {
             self.cipher_suite = parent.cipher_suite.clone();
+        }
+        if self.honor_cipher_order.is_none() {
+            self.honor_cipher_order = parent.honor_cipher_order;
         }
         if self.session_cache.is_none() {
             self.session_cache = parent.session_cache;
@@ -5774,6 +5778,20 @@ impl Compile {
                 let base = scope.rewrite_policy.rewrite_base.as_deref().unwrap_or("/");
                 match parse_rewrite_rule(args, base, false) {
                     Ok(mut rule) => {
+                        // Certbot's Apache HTTP-01 performer writes this exact
+                        // trusted server-context rule. Apache classifies its
+                        // absolute substitution as a filesystem path, while
+                        // Vapache deliberately permits such rewrites only
+                        // inside the current mapping root. Add an equivalent
+                        // regex Alias so the established alias confinement and
+                        // target <Directory>/<Location> authorization remain
+                        // the boundary; do not relax arbitrary absolute
+                        // rewrite targets (CVE-2024-38475).
+                        let certbot_http01_alias = args.len() == 3
+                            && args[0] == r"^/\.well-known/acme-challenge/([A-Za-z0-9-_=]+)$"
+                            && args[2].eq_ignore_ascii_case("[END]")
+                            && rule.substitution == "/var/lib/letsencrypt/http_challenges/$1"
+                            && scope.rewrite_policy.pending_rewrite_conds.is_empty();
                         if let Some(handler) = rule.flags.handler.as_deref() {
                             if handler.eq_ignore_ascii_case("cgi-script") {
                                 self.require_capability(
@@ -5807,6 +5825,14 @@ impl Compile {
                         }
                         rule.conditions =
                             std::mem::take(&mut scope.rewrite_policy.pending_rewrite_conds);
+                        if certbot_http01_alias {
+                            scope.mapping_policy.aliases.push(Alias::regex(
+                                rule.pattern.clone(),
+                                rule.substitution.clone(),
+                                false,
+                                &self.cfg.server_root,
+                            ));
+                        }
                         scope.rewrite_policy.rewrite_rules.push(rule);
                     }
                     Err(e) => self.errors.push(ConfigError {
@@ -6791,6 +6817,44 @@ impl Compile {
                     };
                     target.session_tickets = enabled;
                 }
+            }
+            "sslhonorcipherorder" => {
+                let enabled = match (args.len(), first().to_ascii_lowercase()) {
+                    (1, value) if value == "on" => Some(true),
+                    (1, value) if value == "off" => Some(false),
+                    _ => None,
+                };
+                if let Some(enabled) = enabled {
+                    let target = if let Some(i) = self.current_vhost {
+                        &mut self.vhosts_raw[i].ssl
+                    } else {
+                        &mut self.cfg.ssl
+                    };
+                    target.honor_cipher_order = Some(enabled);
+                } else {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "SSLHonorCipherOrder requires exactly On or Off".into(),
+                    });
+                }
+            }
+            "ssloptions" => {
+                if args.is_empty()
+                    || args
+                        .iter()
+                        .any(|value| !value.eq_ignore_ascii_case("+StrictRequire"))
+                {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "only SSLOptions +StrictRequire is supported".into(),
+                    });
+                }
+                // StrictRequire changes how mod_ssl's legacy SSLRequire
+                // access check interacts with Satisfy. Vapache rejects both
+                // directives instead of approximating them, so accepting the
+                // strengthening flag itself cannot weaken request policy.
             }
             "sslengine" => {
                 let on = match (args.len(), first().to_ascii_lowercase()) {
@@ -9788,7 +9852,9 @@ SSLRandomSeed connect file:/dev/urandom 512\n\
 SSLPassPhraseDialog exec:/usr/share/apache2/ask-for-passphrase\n\
 SSLSessionCache shmcb:/run/apache2/ssl_scache(512000)\n\
 SSLSessionCacheTimeout 300\n\
-SSLSessionTickets Off\n";
+SSLSessionTickets Off\n\
+SSLHonorCipherOrder Off\n\
+SSLOptions +StrictRequire\n";
 
         for strict in [false, true] {
             let parsed = load_text(cfg, strict).unwrap();
@@ -9798,6 +9864,7 @@ SSLSessionTickets Off\n";
                 Some(Duration::from_secs(300))
             );
             assert_eq!(parsed.ssl.session_tickets, Some(false));
+            assert_eq!(parsed.ssl.honor_cipher_order, Some(false));
             assert!(parsed
                 .warnings
                 .iter()
@@ -9820,6 +9887,9 @@ SSLSessionTickets Off\n";
             "SSLSessionCache shmcb:",
             "SSLSessionCacheTimeout forever",
             "SSLSessionTickets Maybe",
+            "SSLHonorCipherOrder Prefer",
+            "SSLOptions -StrictRequire",
+            "SSLOptions +StrictRequire +StdEnvVars",
         ];
         for directive in invalid {
             for strict in [false, true] {
@@ -10239,6 +10309,39 @@ SSLSessionTickets Off\n";
         let s = c.effective_scope(Some(v), Path::new("/srv/vhost/file"), "/global");
         assert_eq!(s.rewrite_policy.rewrite_rules.len(), 1);
         assert_eq!(s.rewrite_policy.rewrite_rules[0].substitution, "/vhost.txt");
+    }
+
+    #[test]
+    fn certbot_http01_rewrite_gets_a_confined_regex_mapping_root() {
+        let c = load_text(
+            "Listen 127.0.0.1:80\n\
+             RewriteEngine On\n\
+             RewriteRule ^/\\.well-known/acme-challenge/([A-Za-z0-9-_=]+)$ /var/lib/letsencrypt/http_challenges/$1 [END]\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(c.global.rewrite_policy.rewrite_rules.len(), 1);
+        assert_eq!(c.global.mapping_policy.aliases.len(), 1);
+        let alias = &c.global.mapping_policy.aliases[0];
+        assert!(alias.regex.is_some());
+        assert_eq!(
+            alias.fs_path,
+            Path::new("/var/lib/letsencrypt/http_challenges")
+        );
+        assert_eq!(
+            alias.target_template.as_deref(),
+            Some("/var/lib/letsencrypt/http_challenges/$1")
+        );
+
+        let unrelated = load_text(
+            "Listen 127.0.0.1:80\n\
+             RewriteEngine On\n\
+             RewriteRule ^/download/(.+)$ /srv/files/$1 [END]\n\
+             RewriteRule ^/\\.well-known/acme-challenge/([A-Za-z0-9-_=]+)$ /srv/files/$1 [END]\n",
+            false,
+        )
+        .unwrap();
+        assert!(unrelated.global.mapping_policy.aliases.is_empty());
     }
 
     #[test]
@@ -13207,6 +13310,8 @@ Require all granted\n\
         err("SSLCertificateFile\n");
         err("SSLCertificateKeyFile one two\n");
         err("SSLUseStapling maybe\n");
+        err("SSLHonorCipherOrder maybe\n");
+        err("SSLOptions +StdEnvVars\n");
         err("SSLStaplingForceURL https://example.test/ocsp\n");
         err("SSLStaplingResponderTimeout later\n");
         err("SSLStaplingStandardCacheTimeout 1 2\n");

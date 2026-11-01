@@ -304,11 +304,21 @@ connections finish on the old TLS generation:
 sudo systemctl reload vapache.service
 ```
 
-Certbot does not know that `vapache.service` replaced the Apache daemon. Use a
-webroot, DNS, or other non-Apache authenticator, and install a Certbot deploy
-hook that runs the reload command after a successful renewal. Do not leave an
-Apache-plugin renewal configured to start or reload `apache2.service` while
-Vapache owns ports 80/443.
+The packaged `vapache-switch` detects existing Certbot lineages, installs a
+conditional deploy hook, and routes Apache-plugin lineages through a dedicated
+control shim without replacing Apache's `apache2ctl`. It records the shim in
+Certbot's global configuration, so ordinary Apache-plugin commands work:
+
+```sh
+sudo certbot --apache -d example.com
+```
+
+The shim retains Apache's read-only configuration discovery, requires both
+Apache and Vapache syntax checks while Vapache is active, and maps Certbot's
+reload request to a root-started `vapache.service` restart so a newly added
+port 443 listener can bind. Webroot and DNS authenticators remain supported.
+If `vapache-switch` has not been run, pass
+`--apache-ctl /usr/lib/vapache/certbot-apachectl` explicitly.
 
 ## Verify
 

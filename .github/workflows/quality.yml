@@ -50,6 +50,8 @@ jobs:
         run: |
           python3 tests/verification_status.py
           python3 tests/cve_matrix.py --check
+      - name: Certbot Apache control command routing
+        run: tests/certbot_apache_shim.sh
 
   verus:
     runs-on: ubuntu-24.04

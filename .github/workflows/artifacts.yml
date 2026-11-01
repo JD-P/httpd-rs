@@ -237,6 +237,10 @@ jobs:
             test "$rotated" -eq 1
           '
 
+      - name: Validate Certbot's Apache installer against Vapache
+        shell: bash
+        run: tests/certbot_apache_integration.sh release/vapache_*.deb
+
       - name: Upload binary and Linux packages
         uses: actions/upload-artifact@v4
         with:

@@ -940,6 +940,23 @@ fn ensure_uniform_protocol_policy(policies: &[&SslConfig], port: u16) -> Result<
     Ok(())
 }
 
+fn ensure_uniform_cipher_preference(policies: &[&SslConfig], port: u16) -> Result<(), String> {
+    let Some(first) = policies.first() else {
+        return Ok(());
+    };
+    let expected = first.honor_cipher_order.unwrap_or(false);
+    if policies
+        .iter()
+        .skip(1)
+        .any(|ssl| ssl.honor_cipher_order.unwrap_or(false) != expected)
+    {
+        return Err(format!(
+            "TLS port {port} has virtual hosts with different SSLHonorCipherOrder policies; use separate Listen directives"
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_uniform_resumption_policy(policies: &[&SslConfig], port: u16) -> Result<(), String> {
     let Some(first) = policies.first() else {
         return Ok(());
@@ -1033,6 +1050,7 @@ pub(crate) fn prepare_server_config(
     let policies: Vec<&SslConfig> = vhosts.iter().map(|v| &v.ssl).collect();
     ensure_uniform_client_policy(&policies, port)?;
     ensure_uniform_protocol_policy(&policies, port)?;
+    ensure_uniform_cipher_preference(&policies, port)?;
     ensure_uniform_resumption_policy(&policies, port)?;
     let application_protocols: Vec<&[HttpProtocol]> =
         vhosts.iter().map(|v| v.protocols.as_slice()).collect();
@@ -1138,6 +1156,7 @@ pub(crate) fn prepare_server_config(
         // honoring Apache's broader SSLSessionTickets Off policy.
         config.send_tls13_tickets = 0;
     }
+    config.ignore_client_order = default_ssl.honor_cipher_order.unwrap_or(false);
     config.alpn_protocols = default_protocols
         .iter()
         .map(|protocol| protocol.alpn().to_vec())
@@ -1473,6 +1492,23 @@ mod tests {
     }
 
     #[test]
+    fn vhosts_cannot_share_a_listener_with_different_cipher_preference() {
+        let client_order = SslConfig {
+            honor_cipher_order: Some(false),
+            ..SslConfig::default()
+        };
+        let implicit_client_order = SslConfig::default();
+        let server_order = SslConfig {
+            honor_cipher_order: Some(true),
+            ..SslConfig::default()
+        };
+        assert!(
+            ensure_uniform_cipher_preference(&[&client_order, &implicit_client_order], 443).is_ok()
+        );
+        assert!(ensure_uniform_cipher_preference(&[&client_order, &server_order], 443).is_err());
+    }
+
+    #[test]
     fn sni_names_are_normalized() {
         assert_eq!(normalize_name("Example.COM:443"), "example.com");
         assert_eq!(normalize_name("[::1]:443"), "::1");
@@ -1791,6 +1827,17 @@ mod tests {
         );
         let no_cache_tls = server_config(&no_cache, 443, None).unwrap().unwrap();
         assert!(!no_cache_tls.session_storage.can_cache());
+
+        let server_cipher_order = test_config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:443\nSSLEngine on\nSSLCertificateFile \"{cert_s}\"\nSSLCertificateKeyFile \"{key_s}\"\nSSLHonorCipherOrder On\nSSLOptions +StrictRequire\n"
+            ),
+        );
+        let server_cipher_order_tls = server_config(&server_cipher_order, 443, None)
+            .unwrap()
+            .unwrap();
+        assert!(server_cipher_order_tls.ignore_client_order);
 
         let http1_only = test_config(
             &dir,
