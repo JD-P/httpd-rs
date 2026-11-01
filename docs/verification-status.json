@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "updated": "2026-10-30",
+  "updated": "2026-11-01",
   "verus": {
-    "verified_functions": 508,
+    "verified_functions": 510,
     "errors": 0
   },
   "obligations": [

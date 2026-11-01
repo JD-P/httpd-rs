@@ -934,21 +934,51 @@ fn strip_port(s: &[u8]) -> (out: Vec<u8>)
     }
 }
 
-/// Authority comparison for internalizing an absolute rewrite URL.  Exact
-/// host:port equality is accepted, and the optional decimal port may be
-/// dropped from both sides.  The compare is ASCII-case-insensitive, matching
-/// the existing rewrite behavior.
+/// Legacy textual authority comparison. Ports are part of the authority:
+/// silently dropping them made `example:80` equal to `example:443`, which can
+/// internalize a rewrite intended for a different security endpoint.
 pub fn rewrite_authority_equal(authority: &[u8], host: &[u8]) -> (equal: bool)
-    ensures
-        equal == (eq_ignore_ascii_case_spec(authority@, host@)
-            || eq_ignore_ascii_case_spec(
-                strip_port_spec(authority@),
-                strip_port_spec(host@),
-            )),
+    ensures equal == eq_ignore_ascii_case_spec(authority@, host@),
 {
-    let authority_host = strip_port(authority);
-    let request_host = strip_port(host);
-    eq_ignore_ascii_case(authority, host) || eq_ignore_ascii_case(&authority_host, &request_host)
+    eq_ignore_ascii_case(authority, host)
+}
+
+/// Endpoint identity used for absolute-form requests and rewrite URL
+/// internalization.  Scheme, effective port, and normalized host must all
+/// agree; no layer is allowed to discard one of those dimensions.
+pub open spec fn authority_endpoint_equal_spec(
+    left_host: Seq<u8>,
+    left_port: u16,
+    left_tls: bool,
+    right_host: Seq<u8>,
+    right_port: u16,
+    right_tls: bool,
+) -> bool {
+    eq_ignore_ascii_case_spec(left_host, right_host)
+        && left_port == right_port
+        && left_tls == right_tls
+}
+
+pub fn authority_endpoint_equal(
+    left_host: &[u8],
+    left_port: u16,
+    left_tls: bool,
+    right_host: &[u8],
+    right_port: u16,
+    right_tls: bool,
+) -> (equal: bool)
+    ensures equal == authority_endpoint_equal_spec(
+        left_host@,
+        left_port,
+        left_tls,
+        right_host@,
+        right_port,
+        right_tls,
+    ),
+{
+    eq_ignore_ascii_case(left_host, right_host)
+        && left_port == right_port
+        && left_tls == right_tls
 }
 
 /// The external-URL decision used by rewrite target resolution.  A target is
@@ -4976,6 +5006,7 @@ fn request_framing(
         assert(version == HttpVersion::Http11);
         let mut coding_count: usize = 0;
         let mut only_chunked: bool = true;
+        let mut valid_coding_list: bool = true;
         let mut hi: usize = 0;
         while hi < headers.len()
             invariant hi <= headers.len(),
@@ -4998,7 +5029,12 @@ fn request_framing(
                     let sub = &value[vi..ve];
                     let (ts, te) = trim_range(sub);
                     let tok = &sub[ts..te];
-                    if te > ts {
+                    if te == ts {
+                        // Empty list members (`chunked,`, `,chunked`, `,,`)
+                        // are not transfer-codings. Accepting them creates a
+                        // parser differential with stricter intermediaries.
+                        valid_coding_list = false;
+                    } else {
                         if coding_count == 0 {
                             coding_count = 1;
                         } else {
@@ -5016,7 +5052,7 @@ fn request_framing(
             }
             hi = hi + 1;
         }
-        if coding_count != 1 || !only_chunked {
+        if coding_count != 1 || !only_chunked || !valid_coding_list {
             return Err(HeadError::UnsupportedTransferCoding);
         }
         assert(te_seen);
@@ -7982,14 +8018,18 @@ pub fn h2_target_admit(len: u64, limit: u64) -> (ok: bool)
 pub open spec fn h2_request_target_spec(
     is_connect: bool,
     has_scheme: bool,
+    scheme_matches_transport: bool,
     has_authority: bool,
+    authority_valid: bool,
     has_path: bool,
     path_nonempty: bool,
     has_fragment: bool,
 ) -> bool {
     !is_connect
         && has_scheme
+        && scheme_matches_transport
         && has_authority
+        && authority_valid
         && has_path
         && path_nonempty
         && !has_fragment
@@ -7998,7 +8038,9 @@ pub open spec fn h2_request_target_spec(
 pub fn h2_request_target_admit(
     is_connect: bool,
     has_scheme: bool,
+    scheme_matches_transport: bool,
     has_authority: bool,
+    authority_valid: bool,
     has_path: bool,
     path_nonempty: bool,
     has_fragment: bool,
@@ -8007,7 +8049,9 @@ pub fn h2_request_target_admit(
         ok == h2_request_target_spec(
             is_connect,
             has_scheme,
+            scheme_matches_transport,
             has_authority,
+            authority_valid,
             has_path,
             path_nonempty,
             has_fragment,
@@ -8015,7 +8059,9 @@ pub fn h2_request_target_admit(
 {
     !is_connect
         && has_scheme
+        && scheme_matches_transport
         && has_authority
+        && authority_valid
         && has_path
         && path_nonempty
         && !has_fragment
@@ -8024,17 +8070,22 @@ pub fn h2_request_target_admit(
 pub proof fn h2_request_target_rejects_ambiguous_identity(
     is_connect: bool,
     has_scheme: bool,
+    scheme_matches_transport: bool,
     has_authority: bool,
+    authority_valid: bool,
     has_path: bool,
     path_nonempty: bool,
     has_fragment: bool,
 )
     ensures
-        is_connect || !has_scheme || !has_authority || !has_path || !path_nonempty || has_fragment
+        is_connect || !has_scheme || !scheme_matches_transport || !has_authority
+            || !authority_valid || !has_path || !path_nonempty || has_fragment
             ==> !h2_request_target_spec(
                 is_connect,
                 has_scheme,
+                scheme_matches_transport,
                 has_authority,
+                authority_valid,
                 has_path,
                 path_nonempty,
                 has_fragment,

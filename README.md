@@ -78,7 +78,8 @@ Implemented today:
   default their parent chain and file must be outside the service identity's
   mutation authority; deployments that intentionally update them as the
   service account must opt in with `VapacheCapability MutableAuthFiles On`.
-  Plaintext and unknown hash formats fail closed.
+  SHA/SSHA and MD5-crypt outputs are compared in constant time; bcrypt uses
+  its verifier. Plaintext and unknown hash formats fail closed.
 - TLS 1.2/1.3 via Rustls with `SSLEngine`, certificate chains, SNI virtual-host
   certificate selection, ALPN and `-t` certificate validation on startup.
   `Protocols http/1.1` disables HTTP/2 at the ALPN boundary; TLS virtual hosts
@@ -190,6 +191,11 @@ Implemented today:
   request bodies are spooled before forwarding. Proxy responses are capped at
   64 MiB and local CGI output at 8 MiB. Request and proxy chunk sizes, trailer
   counts/bytes, proxy head sizes and CGI/FastCGI output are explicitly bounded.
+  Chunk framing has an independent 65,536-chunk/1 MiB overhead budget, so a
+  tiny-chunk flood cannot evade a decoded-body byte limit. Reverse-proxy and
+  WebSocket paths containing semicolon path parameters fail closed rather
+  than authorizing one path identity and forwarding another to a servlet-style
+  backend.
 - Process-wide overload control: at most 256 HTTP/2 streams (64 per source),
   64 WebSocket tunnels (8 per effective client), and 32 accepted connections
   per source (or half of a smaller `MaxRequestWorkers` budget), plus 128 MiB
@@ -208,7 +214,9 @@ Implemented today:
   instead of being mistaken for a single end user. HTTP/1 response writes,
   including zero-copy static-file sends, use a non-blocking absolute deadline
   derived from `Timeout`; a client that stops reading cannot pin a connection
-  worker beyond that budget.
+  worker beyond that budget. HTTP/2 additionally rate-bounds SETTINGS, PING,
+  PRIORITY and tiny WINDOW_UPDATE processing with a refillable per-connection
+  control-frame budget.
 - Privileged startup refuses uid/gid 0 and fails when an unprivileged launch
   does not already match the configured identity. Configuration/includes,
   TLS material, environment files, `TypesConfig`, and file-backed rewrite maps
@@ -328,7 +336,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **508 verified functions, 0 errors** (percent-decoding,
+Current result: **510 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -624,6 +632,39 @@ python3 tests/cve_matrix.py --check
 
 This is a static triage, not a claim that every CVE has a working PoC replay.
 
+### Cross-server CVE root-cause audit
+
+The NVD histories for nginx, IIS/HTTP.sys, lighttpd, HAProxy, Tomcat/Coyote,
+Jetty, Squid, Varnish, Apache Traffic Server, LiteSpeed/OpenLiteSpeed and Envoy
+are also compared per CVE against Vapache's actual feature boundary and
+implementation:
+
+- **1,047 distinct CVEs** across the eleven product families,
+- **370** mapped to a concrete Vapache prevention,
+- **54** rejected by an explicit fail-closed capability boundary,
+- **580** tied to a feature or platform Vapache does not implement,
+- **41** deliberately left partial pending an exact trigger/invariant, and
+- **2** retained as NVD source-data conflicts with no prevention claim.
+
+Together with the existing 371-row Apache HTTP Server ledger, this covers
+**1,412 unique CVE IDs** across twelve server/proxy families (six IDs occur in
+both source sets).
+
+The complete machine-readable ledger is
+`docs/cve/cross-server-cve-matrix.json` (and `.csv`); the high/critical open
+set is in `docs/cve/cross-server-cve-matrix.md`. The normalized NVD snapshot,
+including publication/modification dates, CVSS, vulnerable CPEs and advisory
+links, is `docs/cve/cross-server-nvd.json`. Validate it with:
+
+```sh
+python3 tests/cross_server_cve_matrix.py --check
+```
+
+This audit directly produced independent chunk-framing work limits,
+constant-time legacy password comparisons, an HTTP/2 control-frame token
+bucket and fail-closed semicolon handling at reverse-proxy path boundaries.
+`partial` is an open review item, not a safety claim.
+
 For a specific request, the compiled policy can be inspected without starting
 the server:
 
@@ -658,9 +699,9 @@ failure races and privileged-kernel failures are excluded from that metric.
 
 Latest snapshot: **20,020/20,548 executable server production lines (97.43%)**;
 the new aggregate-resource module is **62/62 (100%)**. The current suite is
-515 Rust library tests, 8 CLI unit tests, 3 CLI lifecycle
-integration tests, 165 conformance tests and 339 fixed configuration cases.
-The separate Verus gate proves 498 functions with 0 errors; proof-only code is
+542 Rust library tests, 8 CLI unit tests, 26 Rust integration/property tests,
+165 conformance tests and 339 fixed configuration cases.
+The separate Verus gate proves 510 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

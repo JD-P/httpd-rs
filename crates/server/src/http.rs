@@ -7,7 +7,7 @@
 //! parsing rules that httpd's own security advisories keep returning to.
 
 use crate::resource::{ResidentLease, ResourceBudget, SpoolLease};
-use crate::util::{trim_ascii, with_http_date_now};
+use crate::util::with_http_date_now;
 use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -36,6 +36,50 @@ pub(crate) const REQUEST_BODY_SPOOL_PREFIX: u64 = 64 * 1024;
 /// Bound request trailers the same way the proxy reader does.
 const MAX_REQUEST_TRAILERS: usize = 64;
 const MAX_REQUEST_TRAILER_BYTES: usize = 64 * 1024;
+/// Bound work that is proportional to HTTP/1 chunk framing rather than to
+/// decoded body bytes.  A decoded-size limit alone still permits hundreds of
+/// millions of one-byte chunks (the root cause class behind Envoy
+/// CVE-2020-8659).  This limit is shared with the proxy response decoder.
+const MAX_CHUNKS_PER_MESSAGE: usize = 65_536;
+const MAX_CHUNK_FRAMING_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+pub(crate) struct ChunkFramingBudget {
+    chunks: usize,
+    bytes: usize,
+}
+
+impl ChunkFramingBudget {
+    /// Charge a complete chunk-size line and its CRLF.  Data chunks also have
+    /// a CRLF after their payload; trailers have their own independent bound.
+    pub(crate) fn charge(&mut self, line_len: usize, data_chunk: bool) -> io::Result<()> {
+        self.chunks = self
+            .chunks
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "too many HTTP chunks"))?;
+        let framing = line_len
+            .checked_add(2)
+            .and_then(|bytes| bytes.checked_add(if data_chunk { 2 } else { 0 }))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk framing too large"))?;
+        self.bytes = self
+            .bytes
+            .checked_add(framing)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk framing too large"))?;
+        if self.chunks > MAX_CHUNKS_PER_MESSAGE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "too many HTTP chunks",
+            ));
+        }
+        if self.bytes > MAX_CHUNK_FRAMING_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk framing too large",
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Version {
@@ -432,6 +476,8 @@ pub struct Limits {
     pub resource_budget: std::sync::Arc<ResourceBudget>,
     pub max_spool_bytes: u64,
     pub max_spool_files: u64,
+    /// Transport identity used to validate absolute-form request targets.
+    pub https: bool,
     pub allow_absolute_request_target: bool,
     pub allow_request_trailers: bool,
 }
@@ -450,6 +496,7 @@ impl Default for Limits {
             resource_budget: std::sync::Arc::new(ResourceBudget::default()),
             max_spool_bytes: 1024 * 1024 * 1024,
             max_spool_files: 128,
+            https: false,
             allow_absolute_request_target: false,
             allow_request_trailers: false,
         }
@@ -460,6 +507,70 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
     // Strict CRLF CRLF.  Bare-LF tolerance is intentionally not provided:
     // split-parser differentials are a recurring smuggling vector.
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+fn absolute_target_authority(target: &[u8]) -> Option<(bool, &[u8])> {
+    let (tls, start) = if target.starts_with(b"http://") {
+        (false, 7)
+    } else if target.starts_with(b"https://") {
+        (true, 8)
+    } else {
+        return None;
+    };
+    let end = target[start..]
+        .iter()
+        .position(|byte| *byte == b'/')
+        .map(|offset| start + offset)
+        .unwrap_or(target.len());
+    Some((tls, &target[start..end]))
+}
+
+fn validate_request_authority(req: &mut Request, limits: &Limits) -> Result<(), ParseError> {
+    let transport_default = if limits.https { 443 } else { 80 };
+    let parsed_host = match req.header("host") {
+        Some(host) => Some(
+            crate::util::parse_http_authority(host, transport_default)
+                .ok_or(ParseError::BadRequest("invalid Host header"))?,
+        ),
+        None => None,
+    };
+    let Some((target_tls, authority)) = absolute_target_authority(&req.target) else {
+        return Ok(());
+    };
+    if !vapache_verified::capability_admit(limits.allow_absolute_request_target, true) {
+        return Err(ParseError::BadRequest(
+            "absolute-form request target is disabled",
+        ));
+    }
+    let target_default = if target_tls { 443 } else { 80 };
+    let (target_host, target_port) =
+        crate::util::parse_http_authority(authority, target_default)
+            .ok_or(ParseError::BadRequest("invalid absolute URI authority"))?;
+    if target_tls != limits.https {
+        return Err(ParseError::BadRequest(
+            "absolute URI scheme does not match the connection",
+        ));
+    }
+    if let Some((host, port)) = parsed_host {
+        if !vapache_verified::authority_endpoint_equal(
+            target_host.as_bytes(),
+            target_port,
+            target_tls,
+            host.as_bytes(),
+            port,
+            limits.https,
+        ) {
+            return Err(ParseError::BadRequest(
+                "absolute URI authority does not match Host",
+            ));
+        }
+    } else {
+        // HTTP/1.0 did not require Host.  Once absolute-form is explicitly
+        // enabled, expose its authoritative identity to vhost/cache/policy
+        // consumers instead of silently falling back to the default vhost.
+        req.headers.push("host", authority.to_vec());
+    }
+    Ok(())
 }
 
 /// Read one complete request from a keep-alive connection.
@@ -526,12 +637,7 @@ pub fn read_request<R: Read + Write>(
     // Parse directly from the connection buffer; the verified parser returns
     // owned request fields and does not retain a borrow of the head.
     let mut req = parse_head(&buf[..head_end], limits)?;
-    let absolute_target = req.target.starts_with(b"http://") || req.target.starts_with(b"https://");
-    if !vapache_verified::capability_admit(limits.allow_absolute_request_target, absolute_target) {
-        return Err(ReadError::Parse(ParseError::BadRequest(
-            "absolute-form request target is disabled",
-        )));
-    }
+    validate_request_authority(&mut req, limits)?;
     buf.drain(..head_end);
 
     let framing = req.framing;
@@ -754,6 +860,126 @@ fn read_chunked_to_file_budgeted<R: Read>(
     read_chunked_to_writer_budgeted(stream, buf, file, max, deadline, lease, allow_trailers)
 }
 
+/// Parse one RFC 9112 chunk-size line, including the complete chunk-extension
+/// grammar.  Ignoring everything after the first semicolon makes invalid
+/// extensions look valid to this server while a front proxy may reject or
+/// delimit them differently—the primitive behind CVE-2026-24880.
+pub(crate) fn parse_chunk_size_line(line: &[u8]) -> Option<u64> {
+    let mut index = 0usize;
+    while index < line.len() && line[index].is_ascii_hexdigit() {
+        index += 1;
+    }
+    if index == 0 {
+        return None;
+    }
+    let size = crate::util::parse_hex_u64(&line[..index])?;
+    loop {
+        while index < line.len() && matches!(line[index], b' ' | b'\t') {
+            index += 1;
+        }
+        if index == line.len() {
+            return Some(size);
+        }
+        if line[index] != b';' {
+            return None;
+        }
+        index += 1;
+        while index < line.len() && matches!(line[index], b' ' | b'\t') {
+            index += 1;
+        }
+        let name_start = index;
+        while index < line.len() && !matches!(line[index], b' ' | b'\t' | b'=' | b';') {
+            index += 1;
+        }
+        if !crate::verified::valid_token(&line[name_start..index]) {
+            return None;
+        }
+        while index < line.len() && matches!(line[index], b' ' | b'\t') {
+            index += 1;
+        }
+        if index < line.len() && line[index] == b'=' {
+            index += 1;
+            while index < line.len() && matches!(line[index], b' ' | b'\t') {
+                index += 1;
+            }
+            if index == line.len() {
+                return None;
+            }
+            if line[index] == b'"' {
+                index += 1;
+                let mut closed = false;
+                while index < line.len() {
+                    let byte = line[index];
+                    if byte == b'"' {
+                        index += 1;
+                        closed = true;
+                        break;
+                    }
+                    if byte == b'\\' {
+                        index += 1;
+                        let escaped = *line.get(index)?;
+                        if !(escaped == b'\t'
+                            || escaped == b' '
+                            || (0x21..=0x7e).contains(&escaped)
+                            || escaped >= 0x80)
+                        {
+                            return None;
+                        }
+                    } else if !(byte == b'\t'
+                        || byte == b' '
+                        || byte == b'!'
+                        || (0x23..=0x5b).contains(&byte)
+                        || (0x5d..=0x7e).contains(&byte)
+                        || byte >= 0x80)
+                    {
+                        return None;
+                    }
+                    index += 1;
+                }
+                if !closed {
+                    return None;
+                }
+            } else {
+                let value_start = index;
+                while index < line.len() && !matches!(line[index], b' ' | b'\t' | b';') {
+                    index += 1;
+                }
+                if !crate::verified::valid_token(&line[value_start..index]) {
+                    return None;
+                }
+            }
+            while index < line.len() && matches!(line[index], b' ' | b'\t') {
+                index += 1;
+            }
+        }
+        if index < line.len() && line[index] != b';' {
+            return None;
+        }
+    }
+}
+
+pub(crate) fn valid_trailer_field(line: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    let name = &line[..colon];
+    if !crate::verified::valid_token(name)
+        || [
+            b"content-length".as_slice(),
+            b"transfer-encoding",
+            b"host",
+            b"trailer",
+        ]
+        .iter()
+        .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+    {
+        return false;
+    }
+    line[colon + 1..]
+        .iter()
+        .all(|byte| *byte == b'\t' || (*byte >= 0x20 && *byte != 0x7f))
+}
+
 fn read_chunked_to_writer_budgeted<R: Read, W: Write>(
     stream: &mut R,
     buf: &mut Vec<u8>,
@@ -764,6 +990,7 @@ fn read_chunked_to_writer_budgeted<R: Read, W: Write>(
     allow_trailers: bool,
 ) -> io::Result<u64> {
     let mut total = 0u64;
+    let mut framing_budget = ChunkFramingBudget::default();
     loop {
         if Instant::now() > deadline {
             return Err(io::Error::new(
@@ -772,9 +999,9 @@ fn read_chunked_to_writer_budgeted<R: Read, W: Write>(
             ));
         }
         let line = read_line_until(stream, buf, 1024, Some(deadline))?;
-        let size_part = line.split(|b| *b == b';').next().unwrap_or(&line);
-        let size = crate::util::parse_hex_u64(trim_ascii(size_part))
+        let size = parse_chunk_size_line(&line)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+        framing_budget.charge(line.len(), size != 0)?;
         if size == 0 {
             // Trailer fields are part of the request body deadline.  Without
             // an explicit check a client can send a zero-size chunk and then
@@ -796,6 +1023,12 @@ fn read_chunked_to_writer_budgeted<R: Read, W: Write>(
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "request trailers are disabled",
+                    ));
+                }
+                if !valid_trailer_field(&t) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid request trailer",
                     ));
                 }
                 trailer_count += 1;
@@ -854,11 +1087,11 @@ fn read_chunked_to_writer_budgeted<R: Read, W: Write>(
             }
         }
         let mut crlf = [0u8; 2];
-        if buf.len() >= 2 {
-            crlf.copy_from_slice(&buf[..2]);
-            buf.drain(..2);
-        } else {
-            stream.read_exact(&mut crlf)?;
+        let buffered = buf.len().min(2);
+        crlf[..buffered].copy_from_slice(&buf[..buffered]);
+        buf.drain(..buffered);
+        if buffered < 2 {
+            stream.read_exact(&mut crlf[buffered..])?;
         }
         if crlf != *b"\r\n" {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad chunk crlf"));
@@ -1594,6 +1827,8 @@ mod tests {
             &b"POST /x HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
             b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: nope\r\n\r\n",
             b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
+            b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: ,chunked\r\n\r\n",
+            b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked,\r\n\r\n",
         ] {
             assert!(parse_head(raw, &limits()).is_err());
         }
@@ -1907,6 +2142,97 @@ mod tests {
     }
 
     #[test]
+    fn chunk_extensions_and_trailers_are_strictly_parsed() {
+        for (line, expected) in [
+            (b"a".as_slice(), Some(10)),
+            (b"A;name=value".as_slice(), Some(10)),
+            (
+                b"a ; name = \"quoted\\\" value\" ; next".as_slice(),
+                Some(10),
+            ),
+            (b"0;done".as_slice(), Some(0)),
+        ] {
+            assert_eq!(parse_chunk_size_line(line), expected, "{line:?}");
+        }
+        for invalid in [
+            b" 1".as_slice(),
+            b"1x".as_slice(),
+            b"1;".as_slice(),
+            b"1;;x".as_slice(),
+            b"1;name=".as_slice(),
+            b"1;name=bad=value".as_slice(),
+            b"1;name=\"unterminated".as_slice(),
+            b"1;name=\"bad\rvalue\"".as_slice(),
+            b"1;na(me=value".as_slice(),
+        ] {
+            assert_eq!(parse_chunk_size_line(invalid), None, "{invalid:?}");
+        }
+        assert!(valid_trailer_field(b"X-Checksum: yes"));
+        assert!(!valid_trailer_field(b" folded"));
+        assert!(!valid_trailer_field(b"Content-Length: 1"));
+        assert!(!valid_trailer_field(b"Bad Name: value"));
+
+        let mut enabled = limits();
+        enabled.allow_request_trailers = true;
+        for invalid in [
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1;\r\nx\r\n0\r\n\r\n"
+                .as_slice(),
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 1\r\n\r\n"
+                .as_slice(),
+        ] {
+            assert!(read_request(
+                &mut std::io::Cursor::new(invalid.to_vec()),
+                &mut Vec::new(),
+                &enabled,
+                |_| {},
+            )
+            .is_err());
+        }
+
+        // Exercise a chunk delimiter split with exactly one byte already in
+        // the connection buffer. The reader must preserve that byte while it
+        // fetches the LF, rather than consuming two new bytes and desyncing.
+        let mut buffered = b"4\r\nbody\r".to_vec();
+        let mut rest = std::io::Cursor::new(b"\n0\r\n\r\n".to_vec());
+        let mut body = Vec::new();
+        assert_eq!(
+            read_chunked_to_writer_budgeted(
+                &mut rest,
+                &mut buffered,
+                &mut body,
+                16,
+                Instant::now() + Duration::from_secs(1),
+                None,
+                false,
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(body, b"body");
+    }
+
+    #[test]
+    fn chunk_framing_work_is_bounded_independently_of_body_bytes() {
+        let mut count_budget = ChunkFramingBudget::default();
+        for _ in 0..MAX_CHUNKS_PER_MESSAGE {
+            count_budget.charge(1, true).unwrap();
+        }
+        assert_eq!(
+            count_budget.charge(1, true).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut byte_budget = ChunkFramingBudget::default();
+        assert_eq!(
+            byte_budget
+                .charge(MAX_CHUNK_FRAMING_BYTES, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn absolute_targets_and_request_trailers_require_capabilities() {
         let absolute = b"GET http://example.test/a HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec();
         let mut default_limits = limits();
@@ -1930,6 +2256,40 @@ mod tests {
         )
         .unwrap()
         .is_some());
+
+        for rejected in [
+            b"GET http://example.test/a HTTP/1.1\r\nHost: other.test\r\n\r\n".as_slice(),
+            b"GET http://example.test:81/a HTTP/1.1\r\nHost: example.test\r\n\r\n".as_slice(),
+            b"GET https://example.test/a HTTP/1.1\r\nHost: example.test\r\n\r\n".as_slice(),
+            b"GET http://user@example.test/a HTTP/1.1\r\nHost: example.test\r\n\r\n".as_slice(),
+        ] {
+            assert!(read_request(
+                &mut std::io::Cursor::new(rejected.to_vec()),
+                &mut Vec::new(),
+                &default_limits,
+                |_| {},
+            )
+            .is_err());
+        }
+        let h10 = b"GET http://example.test/a HTTP/1.0\r\n\r\n".to_vec();
+        let req = read_request(
+            &mut std::io::Cursor::new(h10),
+            &mut Vec::new(),
+            &default_limits,
+            |_| {},
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(req.header("host"), Some(b"example.test".as_slice()));
+
+        let malformed_host = b"GET / HTTP/1.1\r\nHost: example.test#other\r\n\r\n".to_vec();
+        assert!(read_request(
+            &mut std::io::Cursor::new(malformed_host),
+            &mut Vec::new(),
+            &limits(),
+            |_| {},
+        )
+        .is_err());
 
         let trailers = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\nX-Checksum: yes\r\n\r\n";
         let mut default_limits = limits();

@@ -11,7 +11,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
 
 /// An H2 connection
@@ -54,6 +54,12 @@ where
     /// Connection settings
     settings: Settings,
 
+    /// Token bucket for peer-controlled frames whose processing cost is not
+    /// proportional to their wire size.  This covers the SETTINGS, PING,
+    /// PRIORITY and tiny WINDOW_UPDATE flood families without imposing a
+    /// lifetime limit on a healthy long-lived connection.
+    control_frame_budget: ControlFrameBudget,
+
     /// Stream state handler
     streams: Streams<B, P>,
 
@@ -74,6 +80,58 @@ struct DynConnection<'a, B: Buf = Bytes> {
     error: &'a mut Option<frame::GoAway>,
 
     ping_pong: &'a mut PingPong,
+
+    control_frame_budget: &'a mut ControlFrameBudget,
+}
+
+const CONTROL_FRAME_BURST: usize = 256;
+const CONTROL_FRAME_REFILL_PER_SECOND: usize = 2;
+const SETTINGS_FRAME_COST: usize = 16;
+const TINY_WINDOW_UPDATE: u32 = 1024;
+
+#[derive(Debug)]
+struct ControlFrameBudget {
+    available: usize,
+    last_refill: Instant,
+}
+
+impl ControlFrameBudget {
+    fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    fn new_at(now: Instant) -> Self {
+        Self {
+            available: CONTROL_FRAME_BURST,
+            last_refill: now,
+        }
+    }
+
+    fn consume(&mut self, cost: usize) -> bool {
+        self.consume_at(cost, Instant::now())
+    }
+
+    fn consume_at(&mut self, cost: usize, now: Instant) -> bool {
+        let seconds = now.saturating_duration_since(self.last_refill).as_secs();
+        if seconds != 0 {
+            let refill = usize::try_from(seconds)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(CONTROL_FRAME_REFILL_PER_SECOND);
+            self.available = self
+                .available
+                .saturating_add(refill)
+                .min(CONTROL_FRAME_BURST);
+            self.last_refill = self
+                .last_refill
+                .checked_add(Duration::from_secs(seconds))
+                .unwrap_or(now);
+        }
+        if cost > self.available {
+            return false;
+        }
+        self.available -= cost;
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +224,7 @@ where
                 pending_refusal: None,
                 ping_pong: PingPong::new(),
                 settings: Settings::new(config.settings),
+                control_frame_budget: ControlFrameBudget::new(),
                 streams,
                 span,
                 _phantom: PhantomData,
@@ -425,6 +484,7 @@ where
             streams,
             error,
             ping_pong,
+            control_frame_budget,
             ..
         } = self;
         let streams = streams.as_dyn();
@@ -434,6 +494,7 @@ where
             streams,
             error,
             ping_pong,
+            control_frame_budget,
         }
     }
 }
@@ -584,6 +645,9 @@ where
             }
             Some(Settings(frame)) => {
                 tracing::trace!(?frame, "recv SETTINGS");
+                if !self.control_frame_budget.consume(SETTINGS_FRAME_COST) {
+                    return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
+                }
                 return Ok(ReceivedFrame::Settings(frame));
             }
             Some(GoAway(frame)) => {
@@ -597,6 +661,9 @@ where
             }
             Some(Ping(frame)) => {
                 tracing::trace!(?frame, "recv PING");
+                if !self.control_frame_budget.consume(1) {
+                    return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
+                }
                 let status = self.ping_pong.recv_ping(frame);
                 if status.is_shutdown() {
                     assert!(
@@ -610,10 +677,18 @@ where
             }
             Some(WindowUpdate(frame)) => {
                 tracing::trace!(?frame, "recv WINDOW_UPDATE");
+                if frame.size_increment() < TINY_WINDOW_UPDATE
+                    && !self.control_frame_budget.consume(1)
+                {
+                    return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
+                }
                 self.streams.recv_window_update(frame)?;
             }
             Some(Priority(frame)) => {
                 tracing::trace!(?frame, "recv PRIORITY");
+                if !self.control_frame_budget.consume(1) {
+                    return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
+                }
                 // TODO: handle
             }
             None => {
@@ -724,5 +799,24 @@ mod tests {
             DataFrameBudget::Configured(123).resolve(Some(MAX_WINDOW_SIZE)),
             123
         );
+    }
+
+    #[test]
+    fn control_frame_budget_bounds_bursts_and_refills_slowly() {
+        let start = Instant::now();
+        let mut budget = ControlFrameBudget::new_at(start);
+        for _ in 0..(CONTROL_FRAME_BURST / SETTINGS_FRAME_COST) {
+            assert!(budget.consume_at(SETTINGS_FRAME_COST, start));
+        }
+        assert!(!budget.consume_at(1, start));
+        assert!(budget.consume_at(
+            CONTROL_FRAME_REFILL_PER_SECOND,
+            start + Duration::from_secs(1)
+        ));
+        assert!(!budget.consume_at(1, start + Duration::from_secs(1)));
+        assert!(budget.consume_at(
+            CONTROL_FRAME_BURST,
+            start + Duration::from_secs((CONTROL_FRAME_BURST * 2) as u64)
+        ));
     }
 }

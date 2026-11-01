@@ -424,6 +424,98 @@ pub fn parse_u64(s: &[u8]) -> Option<u64> {
     Some(v)
 }
 
+/// Parse an HTTP authority into one unambiguous routing identity.
+///
+/// The request parser used to accept almost any visible bytes in `Host` and
+/// several call sites then interpreted colons, brackets, or URI delimiters in
+/// different ways.  Keep the parser deliberately small and strict: bracketed
+/// IPv6 literals are normalized with the standard library, registered names
+/// use the RFC 3986 `reg-name` alphabet, userinfo/path/query/fragment syntax is
+/// rejected, and an explicit port must fit in `u16`.
+pub fn parse_http_authority(value: &[u8], default_port: u16) -> Option<(String, u16)> {
+    let value = std::str::from_utf8(value).ok()?;
+    if value.is_empty() || value.bytes().any(|byte| byte <= b' ' || byte >= 0x7f) {
+        return None;
+    }
+
+    if let Some(rest) = value.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let literal = &rest[..close];
+        let host = literal.parse::<std::net::Ipv6Addr>().ok()?.to_string();
+        let suffix = &rest[close + 1..];
+        let port = if suffix.is_empty() {
+            default_port
+        } else {
+            parse_authority_port(suffix.strip_prefix(':')?)?
+        };
+        return Some((host, port));
+    }
+
+    if value.contains(['[', ']', '@', '/', '\\', '?', '#']) {
+        return None;
+    }
+    let (host, port) = match value.rsplit_once(':') {
+        Some((host, port)) => {
+            // An unbracketed IPv6 literal and an empty/malformed port are
+            // both ambiguous at every downstream authority consumer.
+            if host.contains(':') {
+                return None;
+            }
+            (host, parse_authority_port(port)?)
+        }
+        None => (value, default_port),
+    };
+    if host.is_empty() || !valid_reg_name(host.as_bytes()) {
+        return None;
+    }
+    Some((host.to_ascii_lowercase(), port))
+}
+
+fn parse_authority_port(value: &str) -> Option<u16> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn valid_reg_name(value: &[u8]) -> bool {
+    let mut index = 0usize;
+    while index < value.len() {
+        let byte = value[index];
+        let ordinary = byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+            );
+        if ordinary {
+            index += 1;
+            continue;
+        }
+        if byte != b'%'
+            || index + 2 >= value.len()
+            || !value[index + 1].is_ascii_hexdigit()
+            || !value[index + 2].is_ascii_hexdigit()
+        {
+            return false;
+        }
+        index += 3;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +542,41 @@ mod tests {
             Some(784_111_777)
         );
         assert_eq!(parse_http_date(b"garbage"), None);
+    }
+
+    #[test]
+    fn authority_parser_has_one_host_and_port_identity() {
+        assert_eq!(
+            parse_http_authority(b"Example.TEST", 80),
+            Some(("example.test".into(), 80))
+        );
+        assert_eq!(
+            parse_http_authority(b"example.test:8443", 443),
+            Some(("example.test".into(), 8443))
+        );
+        assert_eq!(
+            parse_http_authority(b"[0:0::1]:443", 80),
+            Some(("::1".into(), 443))
+        );
+        assert_eq!(
+            parse_http_authority(b"under_score.test", 80),
+            Some(("under_score.test".into(), 80))
+        );
+        for invalid in [
+            b"".as_slice(),
+            b"example.test:".as_slice(),
+            b"example.test:99999".as_slice(),
+            b"user@example.test".as_slice(),
+            b"example.test/path".as_slice(),
+            b"example.test?query".as_slice(),
+            b"example.test#fragment".as_slice(),
+            b"2001:db8::1".as_slice(),
+            b"[not-ipv6]".as_slice(),
+            b"bad%escape".as_slice(),
+            b"white space".as_slice(),
+        ] {
+            assert_eq!(parse_http_authority(invalid, 80), None, "{invalid:?}");
+        }
     }
 
     #[test]

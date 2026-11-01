@@ -1557,10 +1557,17 @@ fn escape_redirect_location(value: &str) -> String {
 }
 
 fn same_host_internal(ctx: &Context<'_>, req: &Request, url: &str) -> Option<String> {
-    let rest = if let Some(rest) = url.strip_prefix("//") {
-        rest
+    let (target_tls, rest) = if let Some(rest) = url.strip_prefix("//") {
+        (ctx.https, rest)
     } else {
-        url.split_once("://")?.1
+        let (scheme, rest) = url.split_once("://")?;
+        if scheme.eq_ignore_ascii_case("http") {
+            (false, rest)
+        } else if scheme.eq_ignore_ascii_case("https") {
+            (true, rest)
+        } else {
+            return None;
+        }
     };
     let (authority, path) = match rest.split_once('/') {
         Some((authority, path)) => (authority, format!("/{path}")),
@@ -1570,7 +1577,20 @@ fn same_host_internal(ctx: &Context<'_>, req: &Request, url: &str) -> Option<Str
         .header_str("host")
         .map(str::to_string)
         .unwrap_or_else(|| format!("{}:{}", ctx.server_name, ctx.port));
-    if vapache_verified::rewrite_authority_equal(authority.as_bytes(), host.as_bytes()) {
+    let target_default = if target_tls { 443 } else { 80 };
+    let request_default = if ctx.https { 443 } else { 80 };
+    let (target_host, target_port) =
+        crate::util::parse_http_authority(authority.as_bytes(), target_default)?;
+    let (request_host, request_port) =
+        crate::util::parse_http_authority(host.as_bytes(), request_default)?;
+    if vapache_verified::authority_endpoint_equal(
+        target_host.as_bytes(),
+        target_port,
+        target_tls,
+        request_host.as_bytes(),
+        request_port,
+        ctx.https,
+    ) {
         Some(path)
     } else {
         None
@@ -1912,9 +1932,9 @@ mod tests {
     fn rewrite_authority_comparison_handles_case_and_ports() {
         assert!(vapache_verified::rewrite_authority_equal(
             b"LOCALHOST:80",
-            b"localhost"
+            b"localhost:80"
         ));
-        assert!(vapache_verified::rewrite_authority_equal(
+        assert!(!vapache_verified::rewrite_authority_equal(
             b"localhost:80",
             b"localhost:443"
         ));
@@ -3588,6 +3608,8 @@ mod tests {
             same_host_internal(&c, &host_req, "http://localhost:80").as_deref(),
             Some("/")
         );
+        assert!(same_host_internal(&c, &host_req, "https://localhost:80/path").is_none());
+        assert!(same_host_internal(&c, &host_req, "http://localhost:443/path").is_none());
         assert!(same_host_internal(&c, &host_req, "http://other.test/x").is_none());
         let no_host = req();
         assert!(same_host_internal(&c, &no_host, "http://localhost:80/x").is_some());

@@ -1145,6 +1145,7 @@ dependencies = [
  "rustls",
  "rustls-webpki",
  "sha1",
+ "subtle",
  "tokio",
  "tokio-rustls",
  "vapache-pcre2",

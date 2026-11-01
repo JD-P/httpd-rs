@@ -905,6 +905,15 @@ fn encode_proxy_path(path: &str) -> String {
     out
 }
 
+/// A reverse proxy cannot infer how every upstream interprets semicolon path
+/// parameters.  Servlet containers commonly strip them from each segment,
+/// which can turn `/public/..;x/admin` into `/admin` after Vapache has already
+/// routed and authorized the former identity.  Refuse that ambiguous boundary
+/// instead of forwarding one byte representation under two security names.
+fn proxy_path_identity_safe(path: &str) -> bool {
+    !path.as_bytes().contains(&b';')
+}
+
 /// Final serialization gate for an upstream request head.  Every value that
 /// can come from configuration, a rewrite or a request is checked with the
 /// same token/header predicates used for native responses before `write_all`.
@@ -1079,13 +1088,36 @@ fn read_line(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
     Ok(line)
 }
 
+fn parse_proxy_status_line(line: &[u8]) -> Option<u16> {
+    if line.len() < 12
+        || (!line.starts_with(b"HTTP/1.1 ") && !line.starts_with(b"HTTP/1.0 "))
+        || !line[9..12].iter().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    if line.len() > 12 {
+        if line[12] != b' ' {
+            return None;
+        }
+        if !line[13..]
+            .iter()
+            .all(|byte| *byte == b'\t' || (*byte >= 0x20 && *byte != 0x7f))
+        {
+            return None;
+        }
+    }
+    let status = std::str::from_utf8(&line[9..12]).ok()?.parse().ok()?;
+    (100..=599).contains(&status).then_some(status)
+}
+
 fn read_chunked(reader: &mut impl BufRead, out: &mut impl ProxyBodySink) -> std::io::Result<()> {
+    let mut framing_budget = crate::http::ChunkFramingBudget::default();
     loop {
         let line = read_line(reader)?;
-        let line = std::str::from_utf8(&line)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk"))?;
-        let size = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk"))?;
+        let size = crate::http::parse_chunk_size_line(&line)
+            .and_then(|size| usize::try_from(size).ok())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk"))?;
+        framing_budget.charge(line.len(), size != 0)?;
         if size == 0 {
             // Bound both trailer bytes and count; an untrusted backend must
             // not be able to turn trailers into an unbounded read.
@@ -1095,6 +1127,12 @@ fn read_chunked(reader: &mut impl BufRead, out: &mut impl ProxyBodySink) -> std:
                 let line = read_line(reader)?;
                 if line.is_empty() {
                     return Ok(());
+                }
+                if !crate::http::valid_trailer_field(&line) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid proxy trailer",
+                    ));
                 }
                 trailer_count += 1;
                 trailer_bytes = trailer_bytes.saturating_add(line.len() + 2);
@@ -1628,10 +1666,12 @@ where
             "access grant does not cover websocket target",
         ));
     }
-    if target.path.bytes().any(|byte| byte < b' ' || byte == 0x7f) {
+    if !proxy_path_identity_safe(&target.path)
+        || target.path.bytes().any(|byte| byte < b' ' || byte == 0x7f)
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "invalid websocket target path",
+            "ambiguous or invalid websocket target path",
         ));
     }
     let client_ip = crate::access::canonical_ip(peer.ip());
@@ -1975,6 +2015,12 @@ fn proxy_once_budgeted(
     https: bool,
     host: &str,
 ) -> std::io::Result<(Response, Option<Box<dyn ReadWrite>>)> {
+    if !proxy_path_identity_safe(&target.path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ambiguous proxy target path",
+        ));
+    }
     let mut path = encode_proxy_path(&target.path).into_bytes();
     if !req.query.is_empty() {
         path.push(b'?');
@@ -2047,23 +2093,8 @@ fn proxy_once_budgeted(
 
     let mut reader = BufReader::new(stream);
     let status_line = read_line(&mut reader)?;
-    let status_text = std::str::from_utf8(&status_line)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad status"))?;
-    let mut bits = status_text.split_whitespace();
-    let _version = bits
-        .next()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad status"))?
-        .to_string();
-    let status: u16 = bits
-        .next()
-        .and_then(|s| s.parse().ok())
+    let status = parse_proxy_status_line(&status_line)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad status"))?;
-    if !(100..=599).contains(&status) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "bad status",
-        ));
-    }
     // A normal proxy response cannot be an interim/upgrade response.  The
     // WebSocket path has a separate exact 101 handshake.  Refusing these here
     // prevents a backend from smuggling a second response through the body
@@ -2107,7 +2138,10 @@ fn proxy_once_budgeted(
                 "malformed proxy response header",
             ));
         };
-        let name = trim_ascii_bytes(&line[..colon]);
+        // RFC 9112 forbids whitespace between a field name and its colon.
+        // Trimming here would make this proxy accept a different message
+        // shape from stricter downstream recipients.
+        let name = &line[..colon];
         let value = trim_ascii_bytes(&line[colon + 1..]);
         if !crate::verified::valid_token(name) {
             return Err(std::io::Error::new(
@@ -2510,6 +2544,20 @@ pub fn execute(
     grant: &crate::access::AccessGrant,
     resource: &crate::access::ResourceKey,
 ) -> Response {
+    if !proxy_path_identity_safe(url_path) || !proxy_path_identity_safe(&target.path) {
+        return crate::files::error_response(
+            cfg,
+            vhost,
+            scope,
+            400,
+            req,
+            url_path,
+            local_port,
+            host,
+            peer.ip(),
+            local_ip,
+        );
+    }
     let binding = target.binding_key();
     let Some(bound) = grant.bind_backend(resource, binding.clone()) else {
         return error(
@@ -3607,6 +3655,9 @@ mod more_tests {
     fn proxy_path_is_encoded_exactly_once() {
         assert_eq!(encode_proxy_path("/a%2Fb?x#y"), "/a%252Fb%3Fx%23y");
         assert_eq!(encode_proxy_path("/space here"), "/space%20here");
+        assert!(proxy_path_identity_safe("/ordinary/path"));
+        assert!(!proxy_path_identity_safe("/admin;role=user"));
+        assert!(!proxy_path_identity_safe("/public/..;x/admin"));
     }
 
     #[test]
@@ -4095,6 +4146,25 @@ mod coverage_tests {
         assert!(read_chunked(&mut too_large, &mut Vec::new()).is_err());
         let mut trailer = Cursor::new(b"0\r\nX: y\r\n\r\n".to_vec());
         read_chunked(&mut trailer, &mut Vec::new()).unwrap();
+        for wire in [
+            b"1;\r\nx\r\n0\r\n\r\n".as_slice(),
+            b"1;name=\"unterminated\r\nx\r\n0\r\n\r\n".as_slice(),
+            b"0\r\nContent-Length: 1\r\n\r\n".as_slice(),
+        ] {
+            assert!(read_chunked(&mut Cursor::new(wire.to_vec()), &mut Vec::new()).is_err());
+        }
+
+        assert_eq!(parse_proxy_status_line(b"HTTP/1.1 200 OK"), Some(200));
+        assert_eq!(parse_proxy_status_line(b"HTTP/1.0 599"), Some(599));
+        for invalid in [
+            b"garbage 200 OK".as_slice(),
+            b"HTTP/2.0 200 OK".as_slice(),
+            b"HTTP/1.1 20 OK".as_slice(),
+            b"HTTP/1.1 200\tOK".as_slice(),
+            b"HTTP/1.1 200 bad\rreason".as_slice(),
+        ] {
+            assert_eq!(parse_proxy_status_line(invalid), None, "{invalid:?}");
+        }
     }
 
     #[test]
@@ -4341,6 +4411,12 @@ mod coverage_tests {
     #[test]
     fn proxy_response_error_paths() {
         invalid("HTTP/1.1\r\n\r\n", "missing status");
+        invalid("garbage 200 OK\r\n\r\n", "invalid version");
+        invalid("HTTP/1.1 200\tOK\r\n\r\n", "invalid status delimiter");
+        invalid(
+            "HTTP/1.1 200 OK\r\nContent-Length : 0\r\n\r\n",
+            "whitespace before response header colon",
+        );
         invalid("HTTP/1.1 99 Nope\r\n\r\n", "status range");
         invalid("HTTP/1.1 100 Continue\r\n\r\n", "interim");
         invalid("HTTP/1.1 200 OK\r\nNoColon\r\n\r\n", "malformed header");

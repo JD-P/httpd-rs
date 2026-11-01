@@ -958,20 +958,53 @@ fn vary_matches(entry: &Entry, req: &Request) -> bool {
         .all(|(name, expected)| req.header(name).unwrap_or(b"") == expected.as_slice())
 }
 
+fn trim_ows(mut value: &[u8]) -> &[u8] {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[1..];
+    }
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn weak_etag_opaque(value: &[u8]) -> Option<&[u8]> {
+    let value = trim_ows(value);
+    let value = value.strip_prefix(b"W/").unwrap_or(value);
+    if value.len() < 2 || value.first() != Some(&b'"') || value.last() != Some(&b'"') {
+        return None;
+    }
+    let opaque = &value[1..value.len() - 1];
+    opaque
+        .iter()
+        .all(|byte| *byte == 0x21 || (0x23..=0x7e).contains(byte) || *byte >= 0x80)
+        .then_some(opaque)
+}
+
 fn conditional_hit(req: &Request, entry: &Entry, response: &mut Response) -> bool {
     if let Some(inm) = req.header("if-none-match") {
-        if let Some(etag) = header(&entry.headers, "etag") {
-            let raw = String::from_utf8_lossy(etag);
-            let matched = String::from_utf8_lossy(inm).split(',').any(|v| {
-                let v = v.trim();
-                v == raw || v == "*" || v.strip_prefix("W/") == Some(raw.as_ref())
+        let etag = header(&entry.headers, "etag");
+        let matched = trim_ows(inm) == b"*"
+            || etag.and_then(weak_etag_opaque).is_some_and(|etag| {
+                inm.split(|byte| *byte == b',')
+                    .filter_map(weak_etag_opaque)
+                    .any(|candidate| candidate == etag)
             });
-            if matched {
-                response.status = 304;
-                response.body = Body::Empty;
-                return true;
-            }
+        if matched {
+            response.status = 304;
+            response.body = Body::Empty;
+            return true;
         }
+        // RFC 9110 gives If-None-Match precedence even when it does not
+        // match. Falling through to an older If-Modified-Since value can
+        // incorrectly turn a changed representation into a 304.
+        return false;
     }
     if let Some(ims) = req.header("if-modified-since") {
         if let (Some(since), Some(last)) = (
@@ -3875,6 +3908,55 @@ CacheIgnoreQueryString On\n\
         let mut ims_response = Response::bytes(200, "text/plain", b"body".to_vec());
         assert!(conditional_hit(&ims_req, &ims_entry, &mut ims_response));
         assert_eq!(ims_response.status, 304);
+
+        let mut precedence_req = ims_req.clone();
+        precedence_req
+            .headers
+            .insert("if-none-match", b"\"different\"".to_vec());
+        let mut precedence_response = Response::bytes(200, "text/plain", b"body".to_vec());
+        assert!(!conditional_hit(
+            &precedence_req,
+            &ims_entry,
+            &mut precedence_response
+        ));
+        assert_eq!(precedence_response.status, 200);
+
+        let weak_entry = Entry {
+            headers: vec![("etag".into(), b"W/\"tag\"".to_vec())],
+            ..disk_entry(b"body", unix_now() + 60)
+        };
+        let mut strong_req = test_request();
+        strong_req
+            .headers
+            .insert("if-none-match", b"\"tag\"".to_vec());
+        let mut weak_response = Response::bytes(200, "text/plain", b"body".to_vec());
+        assert!(conditional_hit(
+            &strong_req,
+            &weak_entry,
+            &mut weak_response
+        ));
+        assert_eq!(weak_response.status, 304);
+
+        let mut star_req = test_request();
+        star_req.headers.insert("if-none-match", b"*".to_vec());
+        let mut star_response = Response::bytes(200, "text/plain", b"body".to_vec());
+        assert!(conditional_hit(&star_req, &ims_entry, &mut star_response));
+        assert_eq!(star_response.status, 304);
+
+        let malformed_entry = Entry {
+            headers: vec![("etag".into(), b"tag".to_vec())],
+            ..disk_entry(b"body", unix_now() + 60)
+        };
+        let mut malformed_req = test_request();
+        malformed_req
+            .headers
+            .insert("if-none-match", b"W/tag, \"other".to_vec());
+        let mut malformed_response = Response::bytes(200, "text/plain", b"body".to_vec());
+        assert!(!conditional_hit(
+            &malformed_req,
+            &malformed_entry,
+            &mut malformed_response
+        ));
 
         let expires_future = vec![(
             "expires".into(),

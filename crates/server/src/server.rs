@@ -602,6 +602,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
         resource_budget: cfg.resource_budget.clone(),
         max_spool_bytes: cfg.max_spool_bytes,
         max_spool_files: cfg.max_spool_files,
+        https: tls,
         allow_absolute_request_target: cfg.capability_enabled(Capability::AbsoluteRequestTarget),
         allow_request_trailers: cfg.capability_enabled(Capability::RequestTrailers),
     };

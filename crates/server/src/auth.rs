@@ -20,6 +20,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 
 const MAX_PASSWORD_FILE: u64 = 4 * 1024 * 1024;
 const MAX_AUTH_CACHE_BYTES: usize = 16 * 1024 * 1024;
@@ -305,7 +306,10 @@ fn verify_password(password: &[u8], stored: &str) -> bool {
         else {
             return false;
         };
-        return Sha1::digest(password).as_slice() == expected.as_slice();
+        if expected.len() != 20 {
+            return false;
+        }
+        return bool::from(Sha1::digest(password).as_slice().ct_eq(expected.as_slice()));
     }
     if let Some(encoded) = stored.strip_prefix("{SSHA}") {
         let Ok(decoded) = STANDARD
@@ -320,7 +324,7 @@ fn verify_password(password: &[u8], stored: &str) -> bool {
         let mut h = Sha1::new();
         h.update(password);
         h.update(&decoded[20..]);
-        return h.finalize().as_slice() == &decoded[..20];
+        return bool::from(h.finalize().as_slice().ct_eq(&decoded[..20]));
     }
     if stored.starts_with("$apr1$") {
         let Some(_expensive) = crate::resource::try_expensive() else {
@@ -370,7 +374,7 @@ fn md5_crypt_matches(password: &[u8], stored: &str, magic: &str) -> bool {
         return false;
     }
     let computed = md5_crypt(password, salt, magic);
-    computed == stored
+    bool::from(computed.as_bytes().ct_eq(stored.as_bytes()))
 }
 
 fn md5_crypt(password: &[u8], salt: &[u8], magic: &str) -> String {

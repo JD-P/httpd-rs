@@ -563,15 +563,15 @@ be steered by the client Host header.
 Every untrusted stream has an explicit limit and a deadline:
 
 ```text
-request body + chunked trailers : byte/count/deadline bounds
+request body + chunk framing/trailers: decoded-byte, chunk-count, framing-byte, trailer and deadline bounds
 CGI/FastCGI body                : spool above threshold; do not materialize LimitRequestBody
 CGI output/stderr               : capped
-proxy response head/body/trailer: capped
+proxy response head/body/chunk/trailer: decoded-byte, chunk-count, framing-byte and trailer caps
 proxy chunk arithmetic          : checked_add and MAX_PROXY_BODY
 proxy DNS / TLS CA              : bounded queue/deadline; CA parsed once per generation
 accepted connections            : MaxRequestWorkers plus per-source half-budget/32 cap
 HTTP/1 response writes          : absolute Timeout deadline; non-blocking send/poll
-HTTP/2 streams                  : 256 process slots, 64 per source
+HTTP/2 streams/control frames   : stream quotas plus refillable per-connection control-frame work budget
 WebSocket tunnels               : 64 process slots, 8 per effective client, plus idle/write deadline
 handlers/descriptors            : only stdio + script fd cross exec
 ```
@@ -844,7 +844,11 @@ immediately before `write_all` by the verified `proxy_request_line_admit`
 (method token, visible target, exact `HTTP/1.1`) and `proxy_header_admit`
 (token name, CTL-free value) kernels.
 Configuration- or rewrite-derived text therefore cannot split the request line
-or inject an upstream header.
+or inject an upstream header. Reverse-proxy and WebSocket targets containing a
+semicolon path parameter are rejected before connection: generic front-end
+policy cannot know whether an upstream strips matrix parameters before routing,
+so forwarding that representation would give the two hops different resource
+identities.
 
 ### I29 — `.htaccess` directive disposition closure
 
@@ -1023,10 +1027,10 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | Stream | Explicit bound |
 |---|---|
 | HTTP/1 request line/head | `LimitRequestLine`, `LimitRequestFields`, `LimitRequestFieldSize`, total head cap |
-| HTTP/1 request body | `LimitRequestBody`, hard absolute body deadline; fixed bodies no larger than 1 MiB stay resident, while known-larger and chunked bodies provide a 64 KiB actual-byte prefix before an `O_EXCL`, mode-0600 spool file is acquired; the shared quota reserves only bytes actually received |
+| HTTP/1 request body | `LimitRequestBody`, hard absolute body deadline, at most 65,536 chunks and 1 MiB of chunk framing independent of decoded size; fixed bodies no larger than 1 MiB stay resident, while known-larger and chunked bodies provide a 64 KiB actual-byte prefix before an `O_EXCL`, mode-0600 spool file is acquired; the shared quota reserves only bytes actually received |
 | HTTP/1 chunked trailers | trailer count and byte budget within the same hard body deadline |
 | Proxy response head | line, header-count and total-head caps |
-| Proxy response body | fixed-length/chunked/EOF body capped at 64 MiB; large fixed bodies stream, chunked/EOF bodies spill to the shared unlinked-file tier above 256 KiB, and oversize responses do not trigger balancer failover amplification |
+| Proxy response body | fixed-length/chunked/EOF body capped at 64 MiB; chunked responses additionally allow at most 65,536 chunks and 1 MiB of framing; large fixed bodies stream, chunked/EOF bodies spill to the shared unlinked-file tier above 256 KiB, and oversize responses do not trigger balancer failover amplification |
 | Proxy trailers | trailer count and byte budget |
 | CGI worker protocol | path/env/body field caps, env-count cap, body spool above threshold |
 | CGI stdout/stderr | 8 MiB stdout and 64 KiB stderr caps, process-wide resident-byte accounting, watchdog deadline, process-group kill |
@@ -1034,7 +1038,7 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | FastCGI response head | bounded prefix/header scan before body streaming |
 | Aggregate dynamic I/O | RAII byte/file reservations across request, response, CGI-worker and FastCGI/proxy spools; 128 MiB request and response resident ceilings; shared CGI/FastCGI concurrency slots; 32 blocking reads |
 | HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error |
-| HTTP/2 | verified settings, header-state, flow-control and reset budgets; at most 32 streams per connection, 64 per validated effective-client quota key and 256 process-wide, each with a 64 KiB resident request-body prefix before using the shared request-spool quota. Response file/stream reads wait for assigned flow-control capacity, use at most 64 KiB per chunk, retain response-resident accounting until h2 releases the chunk, and hold blocking-read leases only during the actual read |
+| HTTP/2 | verified settings, header-state, flow-control and reset budgets; a refillable connection token bucket bounds SETTINGS, PING, PRIORITY and tiny WINDOW_UPDATE work; at most 32 streams per connection, 64 per validated effective-client quota key and 256 process-wide, each with a 64 KiB resident request-body prefix before using the shared request-spool quota. Response file/stream reads wait for assigned flow-control capacity, use at most 64 KiB per chunk, retain response-resident accounting until h2 releases the chunk, and hold blocking-read leases only during the actual read |
 | Compression/PCRE/password hashing | fixed input/cost bounds and a shared 32-operation CPU-work admission gate; optional compression falls back to identity under pressure |
 | Autoindex | at most 4096 examined directory records (including filtered names), 4096 rendered entries and 4 MiB of generated HTML |
 | DNS authorization | eight resolver workers, queue length 64, two-second caller deadline and bounded copied host operands |
@@ -1916,7 +1920,9 @@ construction: there is no second production interleaver.
   count and rendered-byte growth, so checked subtraction establishes the
   configured ceiling before allocation.
 - `bcrypt_cost_admit` rejects bcrypt costs outside 4..=17 before invoking the
-  password library. `expr_regex_size_admit` binds compatibility-pattern and
+  password library. SHA/SSHA and MD5-crypt verification compares the complete
+  fixed representation in constant time, while bcrypt uses its verifier.
+  `expr_regex_size_admit` binds compatibility-pattern and
   subject sizes to 64 KiB; `regex_match_resource_admit` additionally proves
   the overflow-free pattern-times-subject ceiling, while compile/capture
   limits and global expensive-work admission bound memory and concurrency.
@@ -2118,7 +2124,7 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus
 ```
 
-The current ledger (2026-10-29) is:
+The current ledger (2026-11-01) is:
 
 - weighted obligations: **36.0 / 67.0 (53.7%)** if partial obligations receive
   half credit;
@@ -2129,7 +2135,7 @@ The current ledger (2026-10-29) is:
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **498 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **510 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops
@@ -2234,7 +2240,9 @@ excludes test-only code from the denominator.
   invariant to remain a deployment assumption; never map writable content to
   FastCGI.
 
-## 13. Apache CVE triage
+## 13. CVE root-cause triage
+
+### Apache HTTP Server
 
 The NVD CPE `apache:http_server` snapshot is triaged in
 `docs/cve/apache2-cve-matrix.json` (371 CVEs).  The current result is:
@@ -2257,3 +2265,30 @@ python3 tests/cve_matrix.py --check
 
 This is a static per-CVE triage, not a claim that a working PoC replay exists
 for every row.
+
+### Other widely deployed servers and proxies
+
+`docs/cve/cross-server-nvd.json` snapshots the NVD histories for nginx,
+IIS/HTTP.sys, lighttpd, HAProxy, Tomcat/Coyote, Jetty, Squid, Varnish, Apache
+Traffic Server, LiteSpeed/OpenLiteSpeed and Envoy. The **1,047 distinct CVEs**
+are compared individually against Vapache's feature inventory, invariants and
+implementation evidence in `docs/cve/cross-server-cve-matrix.json`:
+
+- 370 prevented by a concrete design/implementation property,
+- 54 rejected at an explicit fail-closed capability boundary,
+- 580 not applicable because the affected feature/platform is absent,
+- 41 partial and therefore still open, and
+- 2 NVD description/CPE conflicts retained as `needs_review`.
+
+The source snapshot preserves dates, CVSS vectors, exact vulnerable CPEs and
+advisory links. Each result records whether it came from an explicit
+advisory/patch override or a conservative description/feature rule. Validate
+the generated JSON, CSV and high-risk report with:
+
+```sh
+python3 tests/cross_server_cve_matrix.py --check
+```
+
+This matrix is not a proof that Vapache cannot have an independent bug in a
+similar subsystem. In particular, `partial` and `needs_review` make no
+prevention claim.

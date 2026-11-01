@@ -123,17 +123,31 @@ struct H2RequestBody {
     len: u64,
 }
 
-fn request_target(method: &str, uri: &http::Uri) -> Option<Vec<u8>> {
+fn request_target(method: &str, uri: &http::Uri, https: bool) -> Option<Vec<u8>> {
     // Accessors synthesize `/` for an absolute URI whose stored
     // `path_and_query` is absent.  Inspect the raw URI parts so a missing
     // HTTP/2 :path cannot silently become a request for the server root.
     let parts = uri.clone().into_parts();
     let path = parts.path_and_query.as_ref();
     let serialized = uri.to_string();
+    let scheme_matches = parts.scheme.as_ref().is_some_and(|scheme| {
+        scheme
+            .as_str()
+            .eq_ignore_ascii_case(if https { "https" } else { "http" })
+    });
+    let authority_valid = parts.authority.as_ref().is_some_and(|authority| {
+        crate::util::parse_http_authority(
+            authority.as_str().as_bytes(),
+            if https { 443 } else { 80 },
+        )
+        .is_some()
+    });
     let admitted = vapache_verified::h2_request_target_admit(
         method.eq_ignore_ascii_case("CONNECT"),
         parts.scheme.is_some(),
+        scheme_matches,
         parts.authority.is_some(),
+        authority_valid,
         path.is_some(),
         path.is_some_and(|value| !value.as_str().is_empty()),
         serialized.as_bytes().contains(&b'#'),
@@ -288,6 +302,13 @@ fn declared_content_length(headers: &crate::http::Headers) -> Result<Option<u64>
         }
     }
     Ok(declared)
+}
+
+fn forbidden_h2_header(name: &str, value: &[u8]) -> bool {
+    matches!(
+        name,
+        "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade"
+    ) || (name == "te" && !value.eq_ignore_ascii_case(b"trailers"))
 }
 
 async fn read_body(
@@ -640,7 +661,7 @@ async fn handle_stream(
     let (parts, recv) = request.into_parts();
     let method = parts.method.as_str().to_string();
     let uri = parts.uri.clone();
-    let Some(target) = request_target(&method, &uri) else {
+    let Some(target) = request_target(&method, &uri, true) else {
         return send_response(
             respond,
             &cfg,
@@ -705,6 +726,21 @@ async fn handle_stream(
         header_budget = next;
         header_count = header_count.saturating_add(1);
         largest_field = largest_field.max(field_len);
+
+        // RFC 9113 forbids connection-specific fields.  The h2 codec rejects
+        // them today, but keep the downgrade boundary explicit in the
+        // adapter so a dependency behavior change cannot reintroduce the
+        // Transfer-Encoding smuggling primitive (CVE-2026-58150).
+        if forbidden_h2_header(name.as_str(), value.as_bytes()) {
+            let _ = send_response(
+                respond,
+                &cfg,
+                bad(400, "connection-specific HTTP/2 header"),
+                false,
+            )
+            .await;
+            return true;
+        }
 
         // :authority is authoritative in HTTP/2.  Ignore any legacy Host
         // header so a conflicting pair cannot select a different vhost than
@@ -1950,21 +1986,36 @@ mod tests {
     fn request_targets_require_complete_pseudo_header_identity() {
         let good: http::Uri = "https://example.test/path?q=1".parse().unwrap();
         assert_eq!(
-            request_target("GET", &good).as_deref(),
+            request_target("GET", &good, true).as_deref(),
             Some(b"/path?q=1".as_slice())
         );
+        assert!(request_target("GET", &good, false).is_none());
 
         // h2/http normalize an absent :path to `/` before the application
         // adapter sees it.  The exploitable no-:path/no-:authority shape is
         // still rejected because the authority identity is absent.
         let missing_target_identity: http::Uri = "/".parse().unwrap();
-        assert!(request_target("GET", &missing_target_identity).is_none());
+        assert!(request_target("GET", &missing_target_identity, true).is_none());
         let missing_authority: http::Uri = "/path".parse().unwrap();
-        assert!(request_target("GET", &missing_authority).is_none());
-        assert!(request_target("CONNECT", &good).is_none());
+        assert!(request_target("GET", &missing_authority, true).is_none());
+        assert!(request_target("CONNECT", &good, true).is_none());
         assert!(!vapache_verified::h2_request_target_admit(
-            false, true, true, true, true, true,
+            false, true, true, true, false, true, true, false,
         ));
+        let bad_port: http::Uri = "https://example.test:99999/path".parse().unwrap();
+        assert!(request_target("GET", &bad_port, true).is_none());
+        for name in [
+            "connection",
+            "proxy-connection",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            assert!(forbidden_h2_header(name, b"anything"), "{name}");
+        }
+        assert!(forbidden_h2_header("te", b"gzip"));
+        assert!(!forbidden_h2_header("te", b"trailers"));
+        assert!(!forbidden_h2_header("x-test", b"value"));
     }
 
     async fn raw_malformed_request_is_rejected(mut hpack: Vec<u8>) {
