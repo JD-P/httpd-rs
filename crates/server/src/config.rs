@@ -71,6 +71,26 @@ pub enum ServerTokens {
     Prod,
 }
 
+fn version_prefix(components: usize) -> String {
+    crate::VERSION
+        .split('.')
+        .take(components)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn server_software_for_tokens(tokens: ServerTokens) -> String {
+    match tokens {
+        ServerTokens::Full | ServerTokens::Os => {
+            format!("{} (Linux)", crate::SERVER_SOFTWARE)
+        }
+        ServerTokens::Minimal => crate::SERVER_SOFTWARE.into(),
+        ServerTokens::Minor => format!("vapache/{}", version_prefix(2)),
+        ServerTokens::Major => format!("vapache/{}", version_prefix(1)),
+        ServerTokens::Prod => "vapache".into(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerSignature {
     Off,
@@ -3943,7 +3963,7 @@ impl Compile {
             default_charset: None,
             use_canonical_name: false,
             hostname_lookups: false,
-            server_software: "Apache".into(),
+            server_software: server_software_for_tokens(ServerTokens::Full),
             ssl: SslConfig::default(),
             cache: CacheConfig::default(),
             admin_file_trust,
@@ -6520,17 +6540,7 @@ impl Compile {
                     "prod" => ServerTokens::Prod,
                     _ => ServerTokens::Full,
                 };
-                self.cfg.server_software = match self.cfg.server_tokens {
-                    ServerTokens::Full => format!(
-                        "Apache/2.4.62 (Debian) vapache/{}",
-                        env!("CARGO_PKG_VERSION")
-                    ),
-                    ServerTokens::Os => "Apache/2.4.62 (Debian)".into(),
-                    ServerTokens::Minimal => "Apache/2.4.62".into(),
-                    ServerTokens::Minor => "Apache/2.4".into(),
-                    ServerTokens::Major => "Apache/2".into(),
-                    ServerTokens::Prod => "Apache".into(),
-                };
+                self.cfg.server_software = server_software_for_tokens(self.cfg.server_tokens);
             }
             "serversignature" => {
                 self.cfg.server_signature = match first().to_ascii_lowercase().as_str() {
@@ -12839,7 +12849,7 @@ RewriteOptions Inherit\n"
         assert_eq!(c.server_name.as_deref(), Some("www.example.test"));
         assert_eq!(c.server_admin, "admin@example.test");
         assert_eq!(c.server_tokens, ServerTokens::Prod);
-        assert_eq!(c.server_software, "Apache");
+        assert_eq!(c.server_software, "vapache");
         assert_eq!(c.server_signature, ServerSignature::Email);
         assert!(!c.trace_enable);
         assert_eq!(c.limit_request_line, 1000);
@@ -13199,21 +13209,30 @@ Require all granted\n\
             Some(Path::new("/tmp/rel/cert.pem"))
         );
 
+        let full = format!("vapache/{} (Linux)", crate::VERSION);
+        let minimal = format!("vapache/{}", crate::VERSION);
+        let minor = format!("vapache/{}", version_prefix(2));
+        let major = format!("vapache/{}", version_prefix(1));
+        let defaults = load_text("Listen 127.0.0.1:0\n", false).unwrap();
+        assert_eq!(defaults.server_tokens, ServerTokens::Full);
+        assert_eq!(defaults.server_software, full);
         for (value, expected) in [
-            ("OS", "Apache/2.4.62 (Debian)"),
-            ("Minimal", "Apache/2.4.62"),
-            ("Minor", "Apache/2.4"),
-            ("Major", "Apache/2"),
-            ("Prod", "Apache"),
+            ("Full", full.as_str()),
+            ("OS", full.as_str()),
+            ("Minimal", minimal.as_str()),
+            ("Minor", minor.as_str()),
+            ("Major", major.as_str()),
+            ("Prod", "vapache"),
         ] {
             let cfg = format!("Listen 127.0.0.1:0\nServerTokens {value}\n");
             let c = load_text(&cfg, false).unwrap();
             assert_eq!(c.server_software, expected);
         }
-        for value in ["Full", "Unknown"] {
+        for value in ["Unknown"] {
             let cfg = format!("Listen 127.0.0.1:0\nServerTokens {value}\n");
             let c = load_text(&cfg, false).unwrap();
             assert_eq!(c.server_tokens, ServerTokens::Full);
+            assert_eq!(c.server_software, full);
         }
         let c = load_text(
             "Listen 127.0.0.1:0\nUseCanonicalName On\nServerSignature Off\n",
