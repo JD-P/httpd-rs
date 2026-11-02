@@ -1667,6 +1667,7 @@ mod tests {
     #[cfg(feature = "fault-injection")]
     #[test]
     fn injected_cgi_spawn_failure_is_propagated() {
+        let _fault_guard = crate::fault::test_guard();
         let dir = tempdir("spawn-failpoint");
         let path = script(
             &dir,

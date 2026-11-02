@@ -202,13 +202,21 @@ Implemented today:
   proxy). HTTP/1 sockets do not receive a blocking worker until their first
   complete, valid request head identifies the effective client; workers are
   then limited to 32 per effective source (or half of a smaller
-  `MaxRequestWorkers` budget). Slow first-request bodies may occupy at most a
-  quarter of the worker pool, keep-alive is shed before the last quarter is
+  `MaxRequestWorkers` budget). HTTP/1 connections run on a reusable blocking
+  pool, and `MaxRequestWorkers`/`ServerLimit` are rejected above the 512-worker
+  implementation ceiling. Every keep-alive request body enters the slow-body
+  reserve, which may occupy at most a quarter of the worker pool; keep-alive is shed before the last quarter is
   consumed, and stalled large HTTP/1 responses share the 32-slot blocking-I/O
   budget. Listener acceptance rotates and is capped per ready-listener batch,
   so a busy listener cannot starve another. These limits sit alongside 128 MiB
   each of retained request and response bytes, 32 blocking response reads,
-  and 32 concurrent CPU-heavy regex/hash/compression/access-file operations. DNS
+  and 32 concurrent CPU-heavy regex/hash/compression/access-file operations.
+  TLS handshakes are capped at 64 concurrent (4 per source), 128 per second
+  process-wide and 64 per source per second. `RewriteMap prg:` is limited to
+  eight calls per request, eight concurrent helpers and 64 starts per second.
+  Access/error lines stop at 128 KiB and log/stderr writers do not queue the
+  worker population. Disk-cache administrative walks stop after depth 32 or
+  32,768 records and invalidate fail closed by generation. DNS
   authorization and outbound proxy resolution use bounded worker queues and
   deadlines; WebSocket tunnels have an independent idle/write deadline.
   Autoindex scans at most 4096 directory records and renders at most 4 MiB. Request
@@ -226,7 +234,8 @@ Implemented today:
   HTTP/2 additionally requires the client preface, initial SETTINGS, and first
   request head before the request-header deadline, and rate-bounds SETTINGS,
   PING, PRIORITY and every WINDOW_UPDATE with a refillable per-connection
-  control-frame budget.
+  control-frame budget; the useful-update class has a 4,096-frame burst and
+  refills at 2,048 frames per second.
 - Privileged startup refuses uid/gid 0 and fails when an unprivileged launch
   does not already match the configured identity. Configuration/includes,
   TLS material, environment files, `TypesConfig`, and file-backed rewrite maps
@@ -354,7 +363,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **602 verified functions, 0 errors** (percent-decoding,
+Current result: **603 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -530,7 +539,7 @@ Current ledger: **53.7% weighted obligations**, **5/6 proof debt**,
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **108 adversarial replay cases** covering the findings classes,
-and **602 Verus functions with 0 errors** (including the I3 fast-path
+and **603 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -724,9 +733,9 @@ failure races and privileged-kernel failures are excluded from that metric.
 
 Latest snapshot: **20,020/20,548 executable server production lines (97.43%)**;
 the new aggregate-resource module is **62/62 (100%)**. The current suite is
-563 Rust library tests, 8 CLI unit tests, 26 Rust integration/property tests,
+570 Rust library tests, 8 CLI unit tests, 26 Rust integration/property tests,
 165 conformance tests and 333 fixed configuration cases.
-The separate Verus gate proves 602 functions with 0 errors; proof-only code is
+The separate Verus gate proves 603 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

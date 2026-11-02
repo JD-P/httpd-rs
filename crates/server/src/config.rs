@@ -35,6 +35,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+/// Vapache has one process-wide HTTP/1 worker pool rather than Apache's
+/// multi-process MPM topology.  Keep configuration compatibility within the
+/// largest pool this implementation can safely provide; accepting a larger
+/// Apache `ServerLimit` would otherwise turn a configuration value into an
+/// effectively unbounded thread/HTTP2-connection ceiling.
+pub const MAX_IMPLEMENTED_REQUEST_WORKERS: usize = 512;
+
 const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CONFIG_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TYPES_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
@@ -7535,6 +7542,13 @@ impl Compile {
                 if let Some(n) = self.u32_arg(loc, name, args) {
                     if n == 0 {
                         self.directive_error(loc, "MaxRequestWorkers must be greater than zero");
+                    } else if n as usize > MAX_IMPLEMENTED_REQUEST_WORKERS {
+                        self.directive_error(
+                            loc,
+                            format!(
+                                "MaxRequestWorkers exceeds Vapache's implementation limit of {MAX_IMPLEMENTED_REQUEST_WORKERS}"
+                            ),
+                        );
                     } else if self.server_limit.is_some_and(|limit| n as usize > limit) {
                         self.directive_error(loc, "MaxRequestWorkers exceeds ServerLimit");
                     } else {
@@ -7547,6 +7561,13 @@ impl Compile {
                 if let Some(n) = self.u32_arg(loc, name, args) {
                     if n == 0 {
                         self.directive_error(loc, "ServerLimit must be greater than zero");
+                    } else if n as usize > MAX_IMPLEMENTED_REQUEST_WORKERS {
+                        self.directive_error(
+                            loc,
+                            format!(
+                                "ServerLimit exceeds Vapache's implementation limit of {MAX_IMPLEMENTED_REQUEST_WORKERS}"
+                            ),
+                        );
                     } else {
                         let limit = n as usize;
                         if self.max_request_workers_set && self.cfg.max_request_workers > limit {
@@ -16836,6 +16857,37 @@ mod pass11_kernel_tests {
             let path = dir.join("invalid.conf");
             std::fs::write(&path, format!("Listen 127.0.0.1:0\n{text}")).unwrap();
             assert!(Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).is_err());
+        }
+    }
+
+    #[test]
+    fn request_worker_configuration_has_an_implementation_ceiling() {
+        let cfg = load_text_direct(&format!(
+            "Listen 127.0.0.1:0\nServerLimit {MAX_IMPLEMENTED_REQUEST_WORKERS}\nMaxRequestWorkers {MAX_IMPLEMENTED_REQUEST_WORKERS}\n"
+        ));
+        assert_eq!(cfg.max_request_workers, MAX_IMPLEMENTED_REQUEST_WORKERS);
+
+        for text in [
+            format!(
+                "ServerLimit {}\nMaxRequestWorkers 1\n",
+                MAX_IMPLEMENTED_REQUEST_WORKERS + 1
+            ),
+            format!(
+                "ServerLimit {MAX_IMPLEMENTED_REQUEST_WORKERS}\nMaxRequestWorkers {}\n",
+                MAX_IMPLEMENTED_REQUEST_WORKERS + 1
+            ),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "vapache-worker-ceiling-{}-{}",
+                std::process::id(),
+                text.len()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("invalid.conf");
+            std::fs::write(&path, format!("Listen 127.0.0.1:0\n{text}")).unwrap();
+            assert!(Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).is_err());
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 

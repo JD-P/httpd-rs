@@ -4584,6 +4584,52 @@ pub fn escape_log_bytes(input: &[u8]) -> (out: Vec<u8>)
     out
 }
 
+/// The runtime logger uses this variant for request-derived fields.  It
+/// preserves the same escaping guarantee while refusing to materialize a
+/// conversion that would cross the caller's complete-line ceiling.
+pub fn escape_log_bytes_bounded(input: &[u8], limit: usize) -> (out: Vec<u8>)
+    ensures
+        no_crlf_nul(out@),
+        out@.len() <= limit,
+{
+    let mut out: Vec<u8> = Vec::new();
+    let mut i: usize = 0;
+    while i < input.len()
+        invariant
+            0 <= i <= input.len(),
+            no_crlf_nul(out@),
+            out@.len() <= limit,
+        decreases input.len() - i,
+    {
+        let b = input[i];
+        let needed: usize = if b == b'"' || b == b'\\' {
+            2
+        } else if b < 0x20 || b == 0x7f {
+            4
+        } else {
+            1
+        };
+        if needed > limit - out.len() {
+            break;
+        }
+        if b == b'"' || b == b'\\' {
+            out.push(b'\\');
+            out.push(b);
+        } else if b < 0x20 || b == 0x7f {
+            let hi = hex_digit(b / 16);
+            let lo = hex_digit(b % 16);
+            out.push(b'\\');
+            out.push(b'x');
+            out.push(hi);
+            out.push(lo);
+        } else {
+            out.push(b);
+        }
+        i = i + 1;
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Header sanitization
 // ---------------------------------------------------------------------------

@@ -3127,6 +3127,7 @@ mod more_tests {
     #[cfg(feature = "fault-injection")]
     #[test]
     fn injected_proxy_connect_failure_is_propagated() {
+        let _fault_guard = crate::fault::test_guard();
         let backend = HttpBackend {
             host: "127.0.0.1".into(),
             port: 80,

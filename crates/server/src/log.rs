@@ -6,13 +6,71 @@
 use crate::config::{Config, CustomLog};
 use crate::util::{http_date, unix_now};
 use std::cell::RefCell;
-use std::fmt::Write as _;
-use std::io::Write;
+use std::fmt::{self, Write as _};
+use std::io::{self, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// One request must never expand a configured LogFormat into an allocation or
+/// disk write large enough to become its own denial-of-service primitive.
+const MAX_LOG_LINE_BYTES: usize = 128 * 1024;
+const MAX_STDERR_MESSAGE_BYTES: usize = MAX_LOG_LINE_BYTES / 4;
+static STDERR_WRITER_BUSY: AtomicBool = AtomicBool::new(false);
+static LOG_WRITER_BUSY: AtomicBool = AtomicBool::new(false);
+
+struct WriterGuard(&'static AtomicBool);
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn try_writer(gate: &'static AtomicBool) -> Option<WriterGuard> {
+    gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        .then_some(WriterGuard(gate))
+}
+
+struct BoundedMessage(String);
+
+impl fmt::Write for BoundedMessage {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let remaining = MAX_STDERR_MESSAGE_BYTES.saturating_sub(self.0.len());
+        if remaining == 0 {
+            return Err(fmt::Error);
+        }
+        let mut end = value.len().min(remaining);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.0.push_str(&value[..end]);
+        (end == value.len()).then_some(()).ok_or(fmt::Error)
+    }
+}
+
+/// Request and background diagnostics must not queue the worker population on
+/// a blocked inherited stderr pipe. The one writer that owns the descriptor is
+/// bounded; concurrent messages are deliberately dropped during overload.
+pub fn bounded_stderr(arguments: fmt::Arguments<'_>) {
+    let Some(_guard) = try_writer(&STDERR_WRITER_BUSY) else {
+        return;
+    };
+    let mut message = BoundedMessage(String::new());
+    let _ = fmt::write(&mut message, arguments);
+    let escaped = vapache_verified::escape_log_bytes_bounded(
+        message.0.as_bytes(),
+        MAX_LOG_LINE_BYTES.saturating_sub(1),
+    );
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(&escaped);
+    let _ = stderr.write_all(b"\n");
+    let _ = stderr.flush();
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
@@ -343,7 +401,10 @@ impl Logger {
         // Error-log messages can contain request-derived text.  Escape terminal
         // controls so a hostile request cannot inject escape sequences into a
         // terminal viewing the error log (CVE-2003-0020).
-        let escaped = vapache_verified::escape_log_bytes(msg.as_bytes());
+        let escaped = vapache_verified::escape_log_bytes_bounded(
+            msg.as_bytes(),
+            MAX_LOG_LINE_BYTES.saturating_sub(1024),
+        );
         let msg = String::from_utf8_lossy(&escaped);
         let line = format!(
             "[{} {}] [{}:{}] [pid {}] {}\n",
@@ -354,7 +415,14 @@ impl Logger {
             std::process::id(),
             msg
         );
-        if let Ok(mut w) = self.error.lock() {
+        // Never queue request workers behind a filesystem-stalled logger. One
+        // process-wide configured-log writer may block in the kernel;
+        // concurrent messages are dropped under that overload instead of
+        // consuming the worker pool.
+        let Some(_writer_guard) = try_writer(&LOG_WRITER_BUSY) else {
+            return;
+        };
+        if let Ok(mut w) = self.error.try_lock() {
             let _ = w.write_all(line.as_bytes());
             let _ = w.flush();
         }
@@ -390,7 +458,10 @@ impl Logger {
                 }
                 line.clear();
                 format_access_into(&mut line, &log.format, e);
-                if let Ok(mut w) = log.writer.lock() {
+                let Some(_writer_guard) = try_writer(&LOG_WRITER_BUSY) else {
+                    continue;
+                };
+                if let Ok(mut w) = log.writer.try_lock() {
                     let _ = w.write_all(&line);
                     let _ = w.write_all(b"\n");
                     let _ = w.flush();
@@ -407,11 +478,15 @@ fn escape_log(s: &str) -> String {
 }
 
 fn escape_log_into(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&vapache_verified::escape_log_bytes(bytes));
+    let remaining = MAX_LOG_LINE_BYTES.saturating_sub(out.len());
+    out.extend_from_slice(&vapache_verified::escape_log_bytes_bounded(
+        bytes, remaining,
+    ));
 }
 
 fn push_str(out: &mut Vec<u8>, value: &str) {
-    out.extend_from_slice(value.as_bytes());
+    let remaining = MAX_LOG_LINE_BYTES.saturating_sub(out.len());
+    out.extend_from_slice(&value.as_bytes()[..value.len().min(remaining)]);
 }
 thread_local! {
     /// `%t` only changes once per second; format it once per connection thread.
@@ -455,7 +530,7 @@ fn format_access_bytes(fmt: &str, e: &AccessEntry) -> Vec<u8> {
 fn format_access_into(out: &mut Vec<u8>, fmt: &str, e: &AccessEntry) {
     let b = fmt.as_bytes();
     let mut i = 0;
-    while i < b.len() {
+    while i < b.len() && out.len() < MAX_LOG_LINE_BYTES {
         if b[i] != b'%' {
             out.push(b[i]);
             i += 1;
@@ -590,6 +665,7 @@ fn format_access_into(out: &mut Vec<u8>, fmt: &str, e: &AccessEntry) {
             }
         }
     }
+    out.truncate(MAX_LOG_LINE_BYTES);
 }
 
 fn format_time_into(out: &mut Vec<u8>, arg: &str, started: Instant) {
@@ -689,6 +765,19 @@ mod tests {
     #[test]
     fn escape_control() {
         assert_eq!(escape_log("a\"\n\x01b"), "a\\\"\\x0a\\x01b");
+
+        let mut message = BoundedMessage(String::new());
+        assert!(message
+            .write_str(&"é".repeat(MAX_STDERR_MESSAGE_BYTES))
+            .is_err());
+        assert!(message.0.is_char_boundary(message.0.len()));
+        assert!(message.0.len() <= MAX_STDERR_MESSAGE_BYTES);
+
+        static TEST_GATE: AtomicBool = AtomicBool::new(false);
+        let first = try_writer(&TEST_GATE).unwrap();
+        assert!(try_writer(&TEST_GATE).is_none());
+        drop(first);
+        assert!(try_writer(&TEST_GATE).is_some());
     }
 
     #[test]
@@ -742,6 +831,11 @@ mod tests {
             format_access_bytes("%r|%U|%q|%u", &raw),
             b"GET /raw?x=\xff\xfe HTTP/1.1|/raw|?x=\xff\xfe|alice"
         );
+
+        let repeated = "%r".repeat(MAX_LOG_LINE_BYTES);
+        let bounded = format_access_bytes(&repeated, &raw);
+        assert_eq!(bounded.len(), MAX_LOG_LINE_BYTES);
+        assert!(!bounded.contains(&b'\n'));
     }
 
     #[test]

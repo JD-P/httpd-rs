@@ -602,7 +602,16 @@ pub fn read_request<R: Read + Write>(
     limits: &Limits,
     on_headers: impl FnOnce(&mut R),
 ) -> Result<Option<Request>, ReadError> {
-    read_request_with_reservation(stream, buf, limits, on_headers, None)
+    read_request_with_reservation(
+        stream,
+        buf,
+        limits,
+        |stream, _request| {
+            on_headers(stream);
+            Ok(())
+        },
+        None,
+    )
 }
 
 /// Continue parsing a head already read and charged by asynchronous
@@ -613,7 +622,7 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
     stream: &mut R,
     buf: &mut Vec<u8>,
     limits: &Limits,
-    on_headers: impl FnOnce(&mut R),
+    on_headers: impl FnOnce(&mut R, &Request) -> io::Result<()>,
     reservation: Option<ResidentLease>,
 ) -> Result<Option<Request>, ReadError> {
     let prefix_precharged = reservation.is_some();
@@ -680,7 +689,10 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
     buf.drain(..head_end);
 
     let framing = req.framing;
-    on_headers(stream);
+    // Admission that depends on parsed framing (for example the process-wide
+    // slow-body reserve) must happen after the complete head is validated but
+    // before a 100 response or any body byte is consumed.
+    on_headers(stream, &req)?;
 
     if req.expect_continue && framing != BodyFraming::None {
         // The client is waiting for this before sending the body.

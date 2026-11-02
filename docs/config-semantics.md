@@ -578,12 +578,14 @@ proxy response head/body/chunk/trailer: decoded-byte, chunk-count, framing-byte 
 proxy chunk arithmetic          : checked_add and MAX_PROXY_BODY
 proxy DNS / TLS CA              : bounded queue/deadline; CA parsed once per generation
 pre-request sockets              : async bounded pool; header/TLS/H2-preface deadline and per-transport cap
-HTTP/1 blocking workers          : MaxRequestWorkers plus effective-client half-budget/32 cap
-slow first-request bodies        : at most one quarter of HTTP/1 workers
+TLS handshakes                   : 64 concurrent, 4/source, 128/second and 64/source/second
+HTTP/1 blocking workers          : reusable pool; MaxRequestWorkers/effective-client caps; configuration ceiling 512
+slow request bodies              : every keep-alive request enters a one-quarter-worker reserve
 ready listeners                  : rotating order plus 64-accept batch cap
 HTTP/1 response writes          : progress-renewed Timeout stall deadline; non-blocking send/poll
-HTTP/2 streams/control frames   : preface/initial-head deadline, stream quotas and every control frame charged to a refillable budget
+HTTP/2 streams/control frames   : preface/initial-head deadline, stream quotas and every control frame charged; useful WINDOW_UPDATE is 4096 burst/2048 per second
 WebSocket tunnels               : 64 process slots, 8 per effective client, plus idle/write deadline
+logs / RewriteMap prg / cache   : 128 KiB lines and non-queuing writers; 8-request/8-concurrent/64-per-second helpers; iterative depth/record-bounded cache walks
 handlers/descriptors            : only stdio + script fd cross exec
 ```
 
@@ -1750,7 +1752,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **602 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **603 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1837,6 +1839,9 @@ construction: there is no second production interleaver.
   rechecks connection-specific fields at its downgrade boundary, and the
   vendored codec maps concrete SETTINGS, PING, PRIORITY and WINDOW_UPDATE
   events through one verified event-cost/refill/epoch transition.
+- `escape_log_bytes_bounded`. Request-derived logging consumes the executable
+  escaping loop with a caller-supplied complete-line ceiling; the proof keeps
+  output within that ceiling and excludes CR, LF and NUL.
 - `cache_weak_etag_match`, `cache_if_none_match_matches` and
   `cache_conditional_hit_admit`. Cache validators use RFC weak comparison,
   scan the complete comma list, keep commas inside quoted opaque tags, reject

@@ -10,7 +10,7 @@ use std::io;
 mod enabled {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     #[derive(Clone, Copy)]
     struct Failure {
@@ -21,6 +21,31 @@ mod enabled {
     fn plan() -> &'static Mutex<HashMap<String, Failure>> {
         static PLAN: OnceLock<Mutex<HashMap<String, Failure>>> = OnceLock::new();
         PLAN.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn test_serial() -> &'static Mutex<()> {
+        static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+        SERIAL.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Serialize tests that mutate the process-wide injection plan. Different
+    /// boundary names are not enough: `clear` intentionally clears all names.
+    pub struct TestGuard {
+        _serial: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for TestGuard {
+        fn drop(&mut self) {
+            clear();
+        }
+    }
+
+    pub fn test_guard() -> TestGuard {
+        let serial = test_serial()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        clear();
+        TestGuard { _serial: serial }
     }
 
     /// Fail the named boundary after `after` successful checks.
@@ -60,7 +85,7 @@ mod enabled {
 }
 
 #[cfg(feature = "fault-injection")]
-pub use enabled::{clear, configure, hit};
+pub use enabled::{clear, configure, hit, test_guard, TestGuard};
 
 #[cfg(not(feature = "fault-injection"))]
 #[inline]

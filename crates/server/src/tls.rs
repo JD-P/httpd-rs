@@ -1379,6 +1379,7 @@ mod tests {
     #[cfg(feature = "fault-injection")]
     #[test]
     fn injected_certificate_and_key_reads_fail_closed() {
+        let _fault_guard = crate::fault::test_guard();
         let dir = tempdir("read-failpoints");
         let cert = dir.join("cert.pem");
         let key = dir.join("key.pem");

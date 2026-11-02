@@ -20,6 +20,15 @@
 //! I/O and policy are separated so that the pure kernels can be verified and
 //! the syscall boundary can be audited independently.
 
+// Library diagnostics can run on request and background workers. Keep every
+// existing call site on the bounded, overload-safe stderr path; the CLI binary
+// still reports startup failures synchronously before request processing.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        crate::log::bounded_stderr(format_args!($($arg)*));
+    }};
+}
+
 pub mod access;
 pub mod auth;
 pub mod cache;

@@ -32,12 +32,77 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const PRG_MAP_TIMEOUT: Duration = Duration::from_secs(2);
 const PRG_MAP_MAX_OUTPUT: usize = 8 * 1024;
+/// Eight program lookups consume the complete per-request policy-work budget.
+/// Spawning a process is orders of magnitude more expensive than a byte or
+/// matcher cell and must not be represented as constant-cost string lookup.
+const PRG_MAP_WORK_COST: u64 = 2 * 1024 * 1024;
+const MAX_CONCURRENT_PRG_MAPS: usize = 8;
+const MAX_PRG_MAPS_PER_SECOND: usize = 64;
+static ACTIVE_PRG_MAPS: AtomicUsize = AtomicUsize::new(0);
+static PRG_MAP_RATE: OnceLock<Mutex<PrgMapRate>> = OnceLock::new();
 const MAX_REWRITE_OUTPUT_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct PrgMapRate {
+    window_started: Option<Instant>,
+    used: usize,
+}
+
+impl PrgMapRate {
+    fn admit_at(&mut self, now: Instant) -> bool {
+        if self
+            .window_started
+            .is_none_or(|start| now.saturating_duration_since(start) >= Duration::from_secs(1))
+        {
+            self.window_started = Some(now);
+            self.used = 0;
+        }
+        if !vapache_verified::connection_admit(self.used as u64, MAX_PRG_MAPS_PER_SECOND as u64) {
+            return false;
+        }
+        self.used += 1;
+        true
+    }
+}
+
+struct PrgMapLease;
+
+impl Drop for PrgMapLease {
+    fn drop(&mut self) {
+        ACTIVE_PRG_MAPS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_prg_map() -> Option<PrgMapLease> {
+    let mut active = ACTIVE_PRG_MAPS.load(Ordering::Acquire);
+    loop {
+        if !vapache_verified::connection_admit(active as u64, MAX_CONCURRENT_PRG_MAPS as u64) {
+            return None;
+        }
+        match ACTIVE_PRG_MAPS.compare_exchange_weak(
+            active,
+            active.saturating_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(observed) => active = observed,
+        }
+    }
+    let lease = PrgMapLease;
+    let admitted = PRG_MAP_RATE
+        .get_or_init(|| Mutex::new(PrgMapRate::default()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .admit_at(Instant::now());
+    admitted.then_some(lease)
+}
 
 fn append_rewrite_output(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
     if !vapache_verified::bounded_expansion_append_admit(
@@ -1286,7 +1351,12 @@ fn variable_value(
             && rewrite_map_lookup(maps, n.split_once(':').unwrap().0).is_some() =>
         {
             let (map_name, key) = n.split_once(':').unwrap();
-            map_value(rewrite_map_lookup(maps, map_name), key)
+            let map = rewrite_map_lookup(maps, map_name);
+            if matches!(map, Some(RewriteMap::Prg(_))) {
+                req.charge_policy_work(PRG_MAP_WORK_COST)
+                    .map_err(str::to_string)?;
+            }
+            map_value(map, key)
         }
         "THE_REQUEST" => format!(
             "{} {} {}",
@@ -1353,6 +1423,18 @@ fn write_prg_key(stdin: &mut impl Write, key: &str) -> bool {
 }
 
 fn run_prg_map(program: &RewriteProgram, key: &str) -> String {
+    if !program.binding_intact() {
+        return String::new();
+    }
+    // A prg lookup creates both a helper process and a stdout reader thread.
+    // Give it a dedicated concurrency/rate boundary in addition to the shared
+    // expensive-operation budget so fast helpers cannot become a fork storm.
+    let Some(_prg) = try_prg_map() else {
+        return String::new();
+    };
+    let Some(_expensive) = crate::resource::try_expensive() else {
+        return String::new();
+    };
     run_prg_map_timeout(program, key, PRG_MAP_TIMEOUT)
 }
 
@@ -3450,6 +3532,13 @@ mod tests {
             variable_value("prg:abc", &r, &c, "/old", b"", &maps, &[]).unwrap(),
             "abc"
         );
+        for _ in 1..crate::resource::MAX_POLICY_WORK_UNITS / PRG_MAP_WORK_COST {
+            assert_eq!(
+                variable_value("prg:abc", &r, &c, "/old", b"", &maps, &[]).unwrap(),
+                "abc"
+            );
+        }
+        assert!(variable_value("prg:abc", &r, &c, "/old", b"", &maps, &[]).is_err());
         assert_eq!(
             variable_value("int:abc", &r, &c, "/old", b"", &maps, &[]).unwrap(),
             "ABC"
@@ -3677,6 +3766,17 @@ mod tests {
         assert!(same_host_internal(&c, &host_req, "http://other.test/x").is_none());
         let no_host = req();
         assert!(same_host_internal(&c, &no_host, "http://localhost:80/x").is_some());
+    }
+
+    #[test]
+    fn program_rewrite_map_rate_is_finite_and_refills() {
+        let now = Instant::now();
+        let mut rate = PrgMapRate::default();
+        for _ in 0..MAX_PRG_MAPS_PER_SECOND {
+            assert!(rate.admit_at(now));
+        }
+        assert!(!rate.admit_at(now));
+        assert!(rate.admit_at(now + Duration::from_secs(1)));
     }
 
     #[test]

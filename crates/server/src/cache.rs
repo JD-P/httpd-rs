@@ -38,6 +38,11 @@ const MAX_VARIANTS_PER_KEY: usize = 32;
 /// another full copy resident provides little benefit and magnifies RSS.
 const MAX_MEMORY_BODY: usize = 64 * 1024;
 const MAX_DISK_META_BYTES: u64 = 1024 * 1024;
+/// Administrative cache walks must remain bounded even if the configured
+/// directory is polluted by another local service or a previous broken
+/// release. A normal entry uses two files below a shallow hash hierarchy.
+const MAX_DISK_SCAN_RECORDS: usize = MAX_DISK_ENTRIES * 8;
+const MAX_DISK_SCAN_DEPTH: usize = 32;
 /// Full-strength policy/request digest.  The previous 64-bit fingerprint was
 /// collision-prone for an attacker who can vary request headers and force
 /// variants of one cache key.  A SHA-256 digest is still compared exactly.
@@ -265,16 +270,25 @@ fn write_cache_temp(path: &Path, data: &[u8]) -> io::Result<()> {
     file.write_all(data)
 }
 
-fn scan_disk_usage(root: &Path) -> DiskUsageState {
+fn scan_disk_usage(root: &Path) -> Option<DiskUsageState> {
     let mut state = DiskUsageState::default();
-    fn walk(dir: &Path, state: &mut DiskUsageState) {
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut scanned = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_DISK_SCAN_DEPTH {
+            return None;
+        }
         let Ok(read) = fs::read_dir(dir) else {
-            return;
+            continue;
         };
         for entry in read.flatten() {
+            scanned = scanned.checked_add(1)?;
+            if scanned > MAX_DISK_SCAN_RECORDS {
+                return None;
+            }
             let path = entry.path();
             match entry.file_type() {
-                Ok(ft) if ft.is_dir() => walk(&path, state),
+                Ok(ft) if ft.is_dir() => stack.push((path, depth + 1)),
                 Ok(ft) if ft.is_file() => {
                     let Some(stem) = disk_stem(&path) else {
                         continue;
@@ -285,7 +299,7 @@ fn scan_disk_usage(root: &Path) -> DiskUsageState {
                         continue; // coverage:ignore-line - filesystem race
                     };
                     let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    record_disk_file(state, stem.clone(), meta.len(), modified);
+                    record_disk_file(&mut state, stem.clone(), meta.len(), modified);
                     if path
                         .extension()
                         .is_some_and(|extension| extension == "meta")
@@ -298,9 +312,8 @@ fn scan_disk_usage(root: &Path) -> DiskUsageState {
             }
         }
     }
-    walk(root, &mut state);
     state.total = state.stems.values().map(|(size, _)| *size).sum();
-    state
+    Some(state)
 }
 
 fn remove_disk_stem(cfg: &Config, stem: &Path) {
@@ -1395,9 +1408,15 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
         return;
     }
     let mut roots = disk_usage().lock().unwrap_or_else(|e| e.into_inner());
+    if !roots.contains_key(root) {
+        let Some(scanned) = scan_disk_usage(root) else {
+            return;
+        };
+        roots.insert(root.clone(), scanned);
+    }
     let usage = roots
-        .entry(root.clone())
-        .or_insert_with(|| scan_disk_usage(root));
+        .get_mut(root)
+        .expect("bounded disk scan inserted cache usage");
     let old_size = usage.stems.get(&stem).map(|(size, _)| *size).unwrap_or(0);
     let old_count = usize::from(old_size > 0);
     let mut projected = vapache_verified::cache_disk_projected(usage.total, old_size, incoming);
@@ -1651,14 +1670,23 @@ fn invalidate_disk(cfg: &Config) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(root);
-    fn remove_cache_files(dir: &std::path::Path) {
-        let Ok(read) = fs::read_dir(dir) else {
-            return;
+    let mut stack = vec![(root.clone(), 0usize)];
+    let mut scanned = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_DISK_SCAN_DEPTH {
+            break;
+        }
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
         };
         for entry in read.flatten() {
+            scanned = scanned.saturating_add(1);
+            if scanned > MAX_DISK_SCAN_RECORDS {
+                return;
+            }
             let path = entry.path();
             match entry.file_type() {
-                Ok(ft) if ft.is_dir() => remove_cache_files(&path),
+                Ok(ft) if ft.is_dir() => stack.push((path, depth + 1)),
                 Ok(ft) if ft.is_file() => {
                     let name = entry.file_name();
                     let name = name.to_string_lossy();
@@ -1674,7 +1702,6 @@ fn invalidate_disk(cfg: &Config) {
             }
         }
     }
-    remove_cache_files(root);
 }
 
 /// Remove only disk entries whose embedded, complete key has the selected
@@ -1688,9 +1715,21 @@ fn invalidate_disk_prefix(cfg: &Config, prefix: &[u8]) {
     // requests select matching stems in memory instead of recursively walking
     // and rereading every metadata file.
     let mut roots = disk_usage().lock().unwrap_or_else(|e| e.into_inner());
+    if !roots.contains_key(root) {
+        let Some(scanned) = scan_disk_usage(root) else {
+            // A bounded scan could not establish which persisted entries are
+            // affected. Advance the generation so none of them can be served,
+            // and release the bounded in-memory cache as the fail-closed path.
+            drop(roots);
+            bump_epoch();
+            *entries().lock().unwrap_or_else(|e| e.into_inner()) = MemoryCache::default();
+            return;
+        };
+        roots.insert(root.clone(), scanned);
+    }
     let usage = roots
-        .entry(root.clone())
-        .or_insert_with(|| scan_disk_usage(root));
+        .get_mut(root)
+        .expect("bounded disk scan inserted cache usage");
     let victims: Vec<PathBuf> = usage
         .stems
         .keys()
@@ -3565,7 +3604,7 @@ CacheIgnoreQueryString On\n\
         fs::write(cache_root.join("nested/beta.body.tmp"), b"tmp").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink("alpha.body", cache_root.join("link")).unwrap();
-        let usage = scan_disk_usage(&cache_root);
+        let usage = scan_disk_usage(&cache_root).unwrap();
         assert!(usage.total >= 11);
         assert_eq!(usage.stems.len(), 2);
         let mut recorded = DiskUsageState::default();
@@ -3582,7 +3621,10 @@ CacheIgnoreQueryString On\n\
             SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
         );
         assert_eq!(recorded.stems[Path::new("manual")].0, 5);
-        assert_eq!(scan_disk_usage(&cache_root.join("missing")).total, 0);
+        assert_eq!(
+            scan_disk_usage(&cache_root.join("missing")).unwrap().total,
+            0
+        );
         assert!(disk_stem(Path::new("plain")).is_none());
         assert_eq!(disk_stem(Path::new("x.body")).unwrap(), PathBuf::from("x"));
         assert_eq!(disk_stem(Path::new("x.meta")).unwrap(), PathBuf::from("x"));
@@ -4013,6 +4055,20 @@ CacheIgnoreQueryString On\n\
         assert!(disk_load(&cfg, legacy_key).is_none());
         assert!(!legacy_stem.with_extension("body").exists());
         assert!(!legacy_stem.with_extension("meta").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_cache_scan_rejects_excessive_directory_depth() {
+        let (dir, cfg) = disk_test_config("bounded-scan-depth");
+        let root = cfg.cache.root.as_ref().unwrap();
+        let mut nested = root.clone();
+        for _ in 0..=MAX_DISK_SCAN_DEPTH {
+            nested.push("d");
+            fs::create_dir_all(&nested).unwrap();
+        }
+        fs::write(nested.join("entry.body"), b"body").unwrap();
+        assert!(scan_disk_usage(root).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

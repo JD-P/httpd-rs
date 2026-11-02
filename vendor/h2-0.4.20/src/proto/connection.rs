@@ -94,8 +94,13 @@ struct DynConnection<'a, B: Buf = Bytes> {
 
 const CONTROL_FRAME_BURST: u64 = 256;
 const CONTROL_FRAME_REFILL_PER_SECOND: u64 = 2;
-const WINDOW_UPDATE_BURST: u64 = 16_384;
-const WINDOW_UPDATE_REFILL_PER_SECOND: u64 = 8_192;
+// A 4K burst permits ordinary clients to complete tens of MiB at full speed,
+// while the sustained rate covers roughly 16 MiB/s when clients release both
+// stream and connection capacity per 16 KiB DATA frame.  Smaller increments
+// are not useful enough to justify this higher-throughput class.
+const WINDOW_UPDATE_BURST: u64 = 4_096;
+const WINDOW_UPDATE_REFILL_PER_SECOND: u64 = 2_048;
+const USEFUL_WINDOW_UPDATE_MIN: u32 = 16 * 1024;
 
 #[derive(Debug)]
 struct ControlFrameBudget {
@@ -708,7 +713,7 @@ where
             Some(WindowUpdate(frame)) => {
                 tracing::trace!(?frame, "recv WINDOW_UPDATE");
                 let increment = frame.size_increment();
-                let budget = if increment < 1024 {
+                let budget = if increment < USEFUL_WINDOW_UPDATE_MIN {
                     &mut *self.control_frame_budget
                 } else {
                     &mut *self.window_update_budget

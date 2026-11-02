@@ -36,6 +36,7 @@ fn fragmented(input: &[u8]) -> Fragmented<'_> {
 
 #[test]
 fn injected_header_failures_retry_eintr_and_reject_other_errors() {
+    let _fault_guard = vapached::fault::test_guard();
     let wire = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
 
     vapached::fault::configure("http.head.read", 0, io::ErrorKind::Interrupted);
@@ -64,6 +65,7 @@ fn injected_header_failures_retry_eintr_and_reject_other_errors() {
 
 #[test]
 fn injected_secure_open_failure_never_returns_a_file() {
+    let _fault_guard = vapached::fault::test_guard();
     let root = std::env::temp_dir().join(format!("vapache-failpoint-open-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
@@ -86,6 +88,7 @@ fn injected_secure_open_failure_never_returns_a_file() {
 
 #[test]
 fn injected_fixed_body_read_failure_is_propagated() {
+    let _fault_guard = vapached::fault::test_guard();
     let wire = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody";
     vapached::fault::configure("http.body.read", 0, io::ErrorKind::ConnectionReset);
     let result = read_request(
@@ -101,6 +104,7 @@ fn injected_fixed_body_read_failure_is_propagated() {
 
 #[test]
 fn injected_chunk_line_and_data_failures_are_propagated() {
+    let _fault_guard = vapached::fault::test_guard();
     let wire = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\n";
     for boundary in ["http.chunk.line", "http.chunk.read"] {
         vapached::fault::configure(boundary, 0, io::ErrorKind::ConnectionReset);
