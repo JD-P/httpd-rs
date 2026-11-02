@@ -197,27 +197,35 @@ Implemented today:
   than authorizing one path identity and forwarding another to a servlet-style
   backend.
 - Process-wide overload control: at most 256 HTTP/2 streams (64 per source),
-  64 WebSocket tunnels (8 per effective client), and 32 accepted connections
-  per source (or half of a smaller `MaxRequestWorkers` budget), plus 128 MiB
-  each of retained request and response bytes and 32 blocking
-  response reads, and 32
-  concurrent CPU-heavy regex/hash/compression/access-file operations. DNS
+  64 WebSocket tunnels (8 per effective client), and a bounded asynchronous
+  pre-request pool (8 sockets per transport source, or 32 for a configured
+  proxy). HTTP/1 sockets do not receive a blocking worker until their first
+  complete, valid request head identifies the effective client; workers are
+  then limited to 32 per effective source (or half of a smaller
+  `MaxRequestWorkers` budget). Slow first-request bodies may occupy at most a
+  quarter of the worker pool, keep-alive is shed before the last quarter is
+  consumed, and stalled large HTTP/1 responses share the 32-slot blocking-I/O
+  budget. Listener acceptance rotates and is capped per ready-listener batch,
+  so a busy listener cannot starve another. These limits sit alongside 128 MiB
+  each of retained request and response bytes, 32 blocking response reads,
+  and 32 concurrent CPU-heavy regex/hash/compression/access-file operations. DNS
   authorization and outbound proxy resolution use bounded worker queues and
   deadlines; WebSocket tunnels have an independent idle/write deadline.
   Autoindex scans at most 4096 directory records and renders at most 4 MiB. Request
   policy, access-file, password-file and disk-cache metadata indexes are
   byte/count bounded and evict individual entries rather than clearing or
   rescanning an attacker-amplifiable working set. Per-client identities use
-  exact IPv4 addresses and verified IPv6 `/64` keys; HTTP/2 and WebSocket
-  quotas use the validated `RemoteIPHeader` identity, while an explicitly
-  trusted transport proxy remains bounded by the process-wide worker ceiling
-  instead of being mistaken for a single end user. HTTP/1 response writes,
+  exact IPv4 addresses and verified IPv6 `/64` keys; HTTP/1 workers, HTTP/2
+  streams and WebSocket quotas use the validated `RemoteIPHeader` identity.
+  A trusted transport proxy gets a slightly larger pre-header allowance but
+  cannot bypass downstream per-client worker accounting. HTTP/1 response writes,
   including zero-copy static-file sends, use a non-blocking stall deadline
   derived from `Timeout` and renew it only after byte progress; a client that
   stops reading cannot pin a connection worker, while a progressing download
   is not truncated merely because its total duration exceeds `Timeout`.
-  HTTP/2 additionally rate-bounds SETTINGS, PING,
-  PRIORITY and tiny WINDOW_UPDATE processing with a refillable per-connection
+  HTTP/2 additionally requires the client preface, initial SETTINGS, and first
+  request head before the request-header deadline, and rate-bounds SETTINGS,
+  PING, PRIORITY and every WINDOW_UPDATE with a refillable per-connection
   control-frame budget.
 - Privileged startup refuses uid/gid 0 and fails when an unprivileged launch
   does not already match the configured identity. Configuration/includes,

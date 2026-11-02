@@ -10080,7 +10080,10 @@ pub open spec fn h2_control_event_cost_spec(event: H2ControlEvent) -> u64 {
     match event {
         H2ControlEvent::Settings => 16,
         H2ControlEvent::Ping | H2ControlEvent::Priority => 1,
-        H2ControlEvent::WindowUpdate { increment } => if increment < 1024 { 1 } else { 0 },
+        // Every frame consumes parser/state-machine work.  Treating a large
+        // increment as "useful" must not create a zero-cost control-frame
+        // flood path; flow-control validity is checked separately.
+        H2ControlEvent::WindowUpdate { increment: _ } => 1,
     }
 }
 
@@ -10090,7 +10093,7 @@ pub fn h2_control_event_cost(event: H2ControlEvent) -> (cost: u64)
     match event {
         H2ControlEvent::Settings => 16,
         H2ControlEvent::Ping | H2ControlEvent::Priority => 1,
-        H2ControlEvent::WindowUpdate { increment } => if increment < 1024 { 1 } else { 0 },
+        H2ControlEvent::WindowUpdate { increment: _ } => 1,
     }
 }
 

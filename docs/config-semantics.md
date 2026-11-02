@@ -577,9 +577,12 @@ CGI output/stderr               : capped
 proxy response head/body/chunk/trailer: decoded-byte, chunk-count, framing-byte and trailer caps
 proxy chunk arithmetic          : checked_add and MAX_PROXY_BODY
 proxy DNS / TLS CA              : bounded queue/deadline; CA parsed once per generation
-accepted connections            : MaxRequestWorkers plus per-source half-budget/32 cap
+pre-request sockets              : async bounded pool; header/TLS/H2-preface deadline and per-transport cap
+HTTP/1 blocking workers          : MaxRequestWorkers plus effective-client half-budget/32 cap
+slow first-request bodies        : at most one quarter of HTTP/1 workers
+ready listeners                  : rotating order plus 64-accept batch cap
 HTTP/1 response writes          : progress-renewed Timeout stall deadline; non-blocking send/poll
-HTTP/2 streams/control frames   : stream quotas plus refillable per-connection control-frame work budget
+HTTP/2 streams/control frames   : preface/initial-head deadline, stream quotas and every control frame charged to a refillable budget
 WebSocket tunnels               : 64 process slots, 8 per effective client, plus idle/write deadline
 handlers/descriptors            : only stdio + script fd cross exec
 ```

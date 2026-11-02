@@ -56,9 +56,15 @@ where
 
     /// Token bucket for peer-controlled frames whose processing cost is not
     /// proportional to their wire size.  This covers the SETTINGS, PING,
-    /// PRIORITY and tiny WINDOW_UPDATE flood families without imposing a
+    /// PRIORITY and WINDOW_UPDATE flood families without imposing a
     /// lifetime limit on a healthy long-lived connection.
     control_frame_budget: ControlFrameBudget,
+
+    /// Useful flow-control updates occur once per received DATA frame on some
+    /// clients, so they need a finite but substantially higher-throughput
+    /// bucket than unsolicited control traffic. Tiny increments stay on the
+    /// strict bucket because they can multiply frame work per response byte.
+    window_update_budget: ControlFrameBudget,
 
     /// Stream state handler
     streams: Streams<B, P>,
@@ -82,15 +88,21 @@ struct DynConnection<'a, B: Buf = Bytes> {
     ping_pong: &'a mut PingPong,
 
     control_frame_budget: &'a mut ControlFrameBudget,
+
+    window_update_budget: &'a mut ControlFrameBudget,
 }
 
 const CONTROL_FRAME_BURST: u64 = 256;
 const CONTROL_FRAME_REFILL_PER_SECOND: u64 = 2;
+const WINDOW_UPDATE_BURST: u64 = 16_384;
+const WINDOW_UPDATE_REFILL_PER_SECOND: u64 = 8_192;
 
 #[derive(Debug)]
 struct ControlFrameBudget {
     available: u64,
     last_refill: Instant,
+    burst: u64,
+    refill_per_second: u64,
 }
 
 impl ControlFrameBudget {
@@ -99,9 +111,23 @@ impl ControlFrameBudget {
     }
 
     fn new_at(now: Instant) -> Self {
+        Self::with_limits(now, CONTROL_FRAME_BURST, CONTROL_FRAME_REFILL_PER_SECOND)
+    }
+
+    fn new_window_updates() -> Self {
+        Self::with_limits(
+            Instant::now(),
+            WINDOW_UPDATE_BURST,
+            WINDOW_UPDATE_REFILL_PER_SECOND,
+        )
+    }
+
+    fn with_limits(now: Instant, burst: u64, refill_per_second: u64) -> Self {
         Self {
-            available: CONTROL_FRAME_BURST,
+            available: burst,
             last_refill: now,
+            burst,
+            refill_per_second,
         }
     }
 
@@ -115,8 +141,8 @@ impl ControlFrameBudget {
             self.available,
             seconds,
             event,
-            CONTROL_FRAME_BURST,
-            CONTROL_FRAME_REFILL_PER_SECOND,
+            self.burst,
+            self.refill_per_second,
         );
         self.available = transition.available;
         if transition.refill_seconds != 0 {
@@ -220,6 +246,7 @@ where
                 ping_pong: PingPong::new(),
                 settings: Settings::new(config.settings),
                 control_frame_budget: ControlFrameBudget::new(),
+                window_update_budget: ControlFrameBudget::new_window_updates(),
                 streams,
                 span,
                 _phantom: PhantomData,
@@ -480,6 +507,7 @@ where
             error,
             ping_pong,
             control_frame_budget,
+            window_update_budget,
             ..
         } = self;
         let streams = streams.as_dyn();
@@ -490,6 +518,7 @@ where
             error,
             ping_pong,
             control_frame_budget,
+            window_update_budget,
         }
     }
 }
@@ -678,12 +707,13 @@ where
             }
             Some(WindowUpdate(frame)) => {
                 tracing::trace!(?frame, "recv WINDOW_UPDATE");
-                if !self.control_frame_budget.consume(
-                    vapache_verified::H2ControlEvent::WindowUpdate {
-                        increment: frame.size_increment(),
-                    },
-                )
-                {
+                let increment = frame.size_increment();
+                let budget = if increment < 1024 {
+                    &mut *self.control_frame_budget
+                } else {
+                    &mut *self.window_update_budget
+                };
+                if !budget.consume(vapache_verified::H2ControlEvent::WindowUpdate { increment }) {
                     return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
                 }
                 self.streams.recv_window_update(frame)?;
@@ -832,6 +862,30 @@ mod tests {
             vapache_verified::H2ControlEvent::WindowUpdate { increment: 65_535 },
             start + Duration::from_secs((CONTROL_FRAME_BURST * 2) as u64)
         ));
-        assert_eq!(budget.available, CONTROL_FRAME_BURST);
+        assert_eq!(budget.available, CONTROL_FRAME_BURST - 1);
+    }
+
+    #[test]
+    fn useful_window_updates_have_a_finite_transfer_rate_budget() {
+        let start = Instant::now();
+        let mut budget = ControlFrameBudget::with_limits(
+            start,
+            WINDOW_UPDATE_BURST,
+            WINDOW_UPDATE_REFILL_PER_SECOND,
+        );
+        for _ in 0..WINDOW_UPDATE_BURST {
+            assert!(budget.consume_at(
+                vapache_verified::H2ControlEvent::WindowUpdate { increment: 16_384 },
+                start,
+            ));
+        }
+        assert!(!budget.consume_at(
+            vapache_verified::H2ControlEvent::WindowUpdate { increment: 16_384 },
+            start,
+        ));
+        assert!(budget.consume_at(
+            vapache_verified::H2ControlEvent::WindowUpdate { increment: 16_384 },
+            start + Duration::from_secs(1),
+        ));
     }
 }

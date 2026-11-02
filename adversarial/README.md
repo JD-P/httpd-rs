@@ -54,6 +54,7 @@ prevents re-deriving them from scratch.
 | `p28/exploit_p28.py` | Pass-28 upload-access evaluator battery (8 verdicts): A1–A3 `RewriteRule $1`-repetition growth to 1.07 GB RSS in 6 s and `memory allocation of N bytes failed` under `RLIMIT_AS` (Apache `403`, 1.9 MB); B1–B3 `Require expr` header/`file()` expansion to >500 MB with allocator abort (Apache `500`, flat); C1–C2 27 KB/90 KB `.htaccess` section nesting stack-overflow aborts (Apache `200`, alive). Loopback only; fixtures under `/tmp/opencode/p28-harness` |
 | `findings_p28.md` | Pass-28 write-ups (P28-A/B/C): unbounded rewrite substitution growth, expression value expansion and access-file section nesting |
 | `dos-resource-budget-followup.md` | Post-P28 DoS review: CVE-2011-4415-style `SetEnvIf` amplification, request-wide matcher/policy work and expansion budgets, access-program breadth limits, and generated-response-header admission |
+| `dos-connection-admission-followup.md` | Post-P28 connection DoS follow-up: asynchronous first-head admission, H2 preface deadline, worker/source reserves, fair listener batches, and complete control-frame charging |
 
 ## Pre-adversarial gate
 

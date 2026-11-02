@@ -885,11 +885,37 @@ async fn handle_stream(
         framing: crate::verified::BodyFraming::None,
     };
     let peer = cfg.client_addr(peer, &req);
-    let (resp, remote_user) = match early {
-        Some(resp) => (resp, None),
-        None => crate::server::dispatch_with_scheme_and_identity(
-            &cfg, &req, peer, &local_ip, local_port, true,
-        ),
+    let (req, resp, remote_user) = match early {
+        Some(resp) => (req, resp, None),
+        None => match cfg.resource_budget.try_blocking_read() {
+            Err(_) => (req, bad(503, "request execution capacity exhausted"), None),
+            Ok(dispatch_lease) => {
+                // Request dispatch performs blocking filesystem and policy
+                // work.  Keep it off the shared async admission/H2 runtime,
+                // and bound the blocking pool with the same process-wide
+                // lease used by the other blocking I/O paths.
+                let dispatch_cfg = cfg.clone();
+                let dispatch_local_ip = local_ip.clone();
+                let dispatched = tokio::task::spawn_blocking(move || {
+                    let _dispatch_lease = dispatch_lease;
+                    let result = crate::server::dispatch_with_scheme_and_identity(
+                        &dispatch_cfg,
+                        &req,
+                        peer,
+                        &dispatch_local_ip,
+                        local_port,
+                        true,
+                    );
+                    (req, result)
+                })
+                .await;
+                let Ok((req, (resp, remote_user))) = dispatched else {
+                    logger.error("HTTP/2 request dispatcher task failed");
+                    return true;
+                };
+                (req, resp, remote_user)
+            }
+        },
     };
     let head_only = req.is_head();
     let status = resp.status;
@@ -990,27 +1016,33 @@ pub fn fuzz_h2_frames(data: &[u8]) {
     });
 }
 
-pub async fn serve(
+pub async fn serve<G, F>(
     cfg: Arc<Config>,
     logger: Arc<Logger>,
     tls: TlsStream<TcpStream>,
     peer: SocketAddr,
     local_ip: String,
     local_port: u16,
-) -> io::Result<()> {
-    serve_io(cfg, logger, tls, peer, local_ip, local_port).await
+    on_ready: F,
+) -> io::Result<()>
+where
+    F: FnOnce() -> io::Result<G>,
+{
+    serve_io(cfg, logger, tls, peer, local_ip, local_port, on_ready).await
 }
 
-async fn serve_io<T>(
+async fn serve_io<T, G, F>(
     cfg: Arc<Config>,
     logger: Arc<Logger>,
     io: T,
     peer: SocketAddr,
     local_ip: String,
     local_port: u16,
+    on_ready: F,
 ) -> io::Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+    F: FnOnce() -> io::Result<G>,
 {
     let settings = vapache_verified::h2_settings();
     let mut builder = h2::server::Builder::new();
@@ -1027,10 +1059,22 @@ where
         .max_pending_accept_reset_streams(settings.max_reset_streams as usize)
         .reset_stream_duration(H2_RESET_RECLAIM)
         .max_send_buffer_size(settings.max_send_buffer as usize);
-    let mut conn = builder
-        .handshake(io)
+    let preface_timeout = cfg
+        .request_header_timeout
+        .max(std::time::Duration::from_secs(1));
+    let mut conn = tokio::time::timeout(preface_timeout, builder.handshake(io))
         .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP/2 preface timed out"))?
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    // h2's server handshake consumes the 24-byte connection preface but does
+    // not wait for the client's mandatory initial SETTINGS. Keep this socket
+    // in lightweight admission until `accept` has processed SETTINGS and the
+    // first request head. This is deliberately stronger than timing SETTINGS
+    // alone: an idle post-SETTINGS peer cannot occupy an established slot.
+    let mut ready_callback = Some(on_ready);
+    let mut established_guard: Option<G> = None;
+    let initial_request_deadline = tokio::time::sleep(preface_timeout);
+    tokio::pin!(initial_request_deadline);
 
     // The same verified budget is used for every accepted stream.  The h2
     // crate still owns frame parsing and its own reset counters; this loop
@@ -1047,6 +1091,12 @@ where
     loop {
         tokio::select! {
             biased;
+            _ = &mut initial_request_deadline, if ready_callback.is_some() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "HTTP/2 initial SETTINGS/request head timed out",
+                ));
+            }
             Some(event) = events_rx.recv() => {
                 match event {
                     H2TaskEvent::Ended { stream_id, reset } => {
@@ -1104,6 +1154,9 @@ where
                 };
                 let (request, mut respond) =
                     result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                if let Some(callback) = ready_callback.take() {
+                    established_guard = Some(callback()?);
+                }
                 let stream_id = respond.stream_id().as_u32() as u64;
                 let process_stream = match cfg.resource_budget.try_h2_stream() {
                     Ok(lease) => lease,
@@ -1165,6 +1218,7 @@ where
             }
         }
     }
+    drop(established_guard);
     Ok(())
 }
 
@@ -1579,6 +1633,7 @@ mod tests {
                 "127.0.0.1:12345".parse().unwrap(),
                 "127.0.0.1".into(),
                 443,
+                || Ok(()),
             ));
             let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
             let driver = tokio::spawn(async move { connection.await });
@@ -1618,6 +1673,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn h2_preface_and_initial_settings_must_arrive_before_header_deadline() {
+        let (cfg, logger, dir) = test_config("preface-timeout");
+        let mut short = (*cfg).clone();
+        short.request_header_timeout = std::time::Duration::ZERO;
+        let cfg = Arc::new(short);
+        for preface in [None, Some(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..])] {
+            let (mut client_io, server_io) = tokio::io::duplex(1024);
+            if let Some(preface) = preface {
+                client_io.write_all(preface).await.unwrap();
+            }
+            let admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let admitted_by_callback = admitted.clone();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                serve_io(
+                    cfg.clone(),
+                    logger.clone(),
+                    server_io,
+                    "127.0.0.1:12345".parse().unwrap(),
+                    "127.0.0.1".into(),
+                    443,
+                    move || {
+                        admitted_by_callback.store(true, std::sync::atomic::Ordering::Release);
+                        Ok(())
+                    },
+                ),
+            )
+            .await
+            .expect("incomplete HTTP/2 setup did not time out")
+            .unwrap_err();
+            assert_eq!(result.kind(), io::ErrorKind::TimedOut);
+            assert!(!admitted.load(std::sync::atomic::Ordering::Acquire));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn h2_connection_idle_and_stream_timeouts_close_cleanly() {
         let (cfg, logger, dir) = test_config("serve-timeouts");
         let mut short = (*cfg).clone();
@@ -1633,6 +1725,7 @@ mod tests {
             "127.0.0.1:12345".parse().unwrap(),
             "127.0.0.1".into(),
             443,
+            || Ok(()),
         ));
         let (_client, connection) = h2::client::handshake(client_io).await.unwrap();
         let driver = tokio::spawn(async move { connection.await });
@@ -1654,6 +1747,7 @@ mod tests {
             "127.0.0.1:12345".parse().unwrap(),
             "127.0.0.1".into(),
             443,
+            || Ok(()),
         ));
         let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
         let driver = tokio::spawn(async move { connection.await });
@@ -2255,8 +2349,8 @@ mod tests {
             256,
             2,
         );
-        assert_eq!(useful.cost, 0);
-        assert_eq!(useful.available, 256);
+        assert_eq!(useful.cost, 1);
+        assert_eq!(useful.available, 255);
         assert!(useful.admitted);
     }
 

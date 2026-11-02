@@ -602,10 +602,28 @@ pub fn read_request<R: Read + Write>(
     limits: &Limits,
     on_headers: impl FnOnce(&mut R),
 ) -> Result<Option<Request>, ReadError> {
-    let mut request_resident = limits.resource_budget.try_request_bytes();
+    read_request_with_reservation(stream, buf, limits, on_headers, None)
+}
+
+/// Continue parsing a head already read and charged by asynchronous
+/// connection admission.  The reservation is transferred into the returned
+/// request, so the raw head, parser copies and body all remain covered by one
+/// process-wide resident-byte lease without double-charging the prefix.
+pub(crate) fn read_request_with_reservation<R: Read + Write>(
+    stream: &mut R,
+    buf: &mut Vec<u8>,
+    limits: &Limits,
+    on_headers: impl FnOnce(&mut R),
+    reservation: Option<ResidentLease>,
+) -> Result<Option<Request>, ReadError> {
+    let prefix_precharged = reservation.is_some();
+    let mut request_resident =
+        reservation.unwrap_or_else(|| limits.resource_budget.try_request_bytes());
     // Pipelined bytes left by the previous request remain resident while this
     // request is dispatched, so they enter the new request's reservation.
-    request_resident.reserve(buf.len() as u64)?;
+    if !prefix_precharged {
+        request_resident.reserve(buf.len() as u64)?;
+    }
     let header_started = Instant::now();
     let head_end = loop {
         if let Some(end) = find_head_end(buf) {
@@ -651,7 +669,9 @@ pub fn read_request<R: Read + Write>(
     // Charge before the verified parser creates owned copies of the target
     // and headers.  The factor of two conservatively covers both the retained
     // connection bytes and the owned representation during parsing.
-    request_resident.reserve(head_end as u64)?;
+    if !prefix_precharged {
+        request_resident.reserve(head_end as u64)?;
+    }
 
     // Parse directly from the connection buffer; the verified parser returns
     // owned request fields and does not retain a borrow of the head.
@@ -1110,6 +1130,17 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
         expect_continue,
         framing,
     })
+}
+
+/// Validate the first request head while its socket is still owned by the
+/// asynchronous admission stage.  This keeps malformed heads and slow
+/// pre-request clients out of the blocking worker pool.  The worker parses the
+/// retained bytes again when it consumes the request; this preflight copy is
+/// deliberately short-lived and bounded by `MAX_HEAD_TOTAL`.
+pub(crate) fn preflight_request_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
+    let mut request = parse_head(head, limits)?;
+    validate_request_authority(&mut request, limits)?;
+    Ok(request)
 }
 
 /// Map a rejection from the verified request-head parser to the wire-level
