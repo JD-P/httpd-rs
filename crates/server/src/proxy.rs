@@ -2802,7 +2802,7 @@ pub fn execute(
             );
         }
     };
-    let Ok(_dynamic_lease) = cfg.resource_budget.try_dynamic_descriptors_in(
+    let Ok(lease) = cfg.resource_budget.try_dynamic_descriptors_in(
         resource_context,
         cfg.max_dynamic_requests,
         1,
@@ -2820,6 +2820,7 @@ pub fn execute(
             local_ip,
         );
     };
+    let mut dynamic_lease = Some(lease);
     let Some(bound) = grant.bind_proxy(
         resource,
         &target.backend.host,
@@ -2932,7 +2933,7 @@ pub fn execute(
             Err(e) => (Err(e), false),
         };
         match result {
-            Ok(response) => {
+            Ok(mut response) => {
                 let failed_status =
                     current.balancer.is_some() && current.fail_on_status.contains(&response.status);
                 if failed_status {
@@ -2943,6 +2944,13 @@ pub fn execute(
                         true,
                         proxy_method_is_idempotent(&req.method),
                     ) {
+                        if matches!(response.body, Body::Stream { .. }) {
+                            response.hold_dynamic(
+                                dynamic_lease
+                                    .take()
+                                    .expect("proxy stream retained its backend lease"),
+                            );
+                        }
                         return response;
                     }
                     if let Some(name) = &current.balancer {
@@ -2952,6 +2960,13 @@ pub fn execute(
                         );
                     }
                     let Some(next) = alternate_target(cfg, &current, &tried, req) else {
+                        if matches!(response.body, Body::Stream { .. }) {
+                            response.hold_dynamic(
+                                dynamic_lease
+                                    .take()
+                                    .expect("proxy stream retained its backend lease"),
+                            );
+                        }
                         return response;
                     };
                     let (next_scope, next_grant, next_resource) = match authorize_failover(
@@ -2985,6 +3000,13 @@ pub fn execute(
                     active_resource = next_resource;
                     current = next;
                     continue;
+                }
+                if matches!(response.body, Body::Stream { .. }) {
+                    response.hold_dynamic(
+                        dynamic_lease
+                            .take()
+                            .expect("proxy stream retained its backend lease"),
+                    );
                 }
                 return response;
             }

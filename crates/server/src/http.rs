@@ -13,7 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -116,6 +116,11 @@ pub struct Headers {
     // The validated source identity and request-local resource ledger travel
     // with every clone/internal rewrite of this request.
     request_scope: Option<crate::resource::RequestScope>,
+    // A body probe executes the ordinary mapping/rewrite/authorization flow
+    // but stops before an authorized content handler performs side effects.
+    // It lives in the request rather than thread-local state so internal
+    // rewrites and cloned requests cannot accidentally escape the probe.
+    body_probe: bool,
 }
 
 impl Headers {
@@ -191,6 +196,14 @@ impl Headers {
 
     pub(crate) fn request_scope(&self) -> Option<&crate::resource::RequestScope> {
         self.request_scope.as_ref()
+    }
+
+    pub(crate) fn set_body_probe(&mut self, enabled: bool) {
+        self.body_probe = enabled;
+    }
+
+    pub(crate) fn is_body_probe(&self) -> bool {
+        self.body_probe
     }
 }
 
@@ -492,6 +505,14 @@ impl Request {
     pub(crate) fn request_scope(&self) -> Option<&crate::resource::RequestScope> {
         self.headers.request_scope()
     }
+
+    pub(crate) fn body_probe(&self) -> bool {
+        self.headers.is_body_probe()
+    }
+
+    pub(crate) fn set_body_probe(&mut self, enabled: bool) {
+        self.headers.set_body_probe(enabled);
+    }
 }
 
 #[derive(Debug)]
@@ -694,7 +715,34 @@ pub fn read_request<R: Read + Write>(
 /// connection admission.  The reservation is transferred into the returned
 /// request, so the raw head, parser copies and body all remain covered by one
 /// process-wide resident-byte lease without double-charging the prefix.
-pub(crate) fn read_request_with_reservation<R: Read + Write>(
+pub(crate) struct ParsedRequestHead {
+    request: Request,
+    resident: ResidentLease,
+}
+
+impl ParsedRequestHead {
+    pub(crate) fn request(&self) -> &Request {
+        &self.request
+    }
+
+    pub(crate) fn request_mut(&mut self) -> &mut Request {
+        &mut self.request
+    }
+
+    pub(crate) fn into_parts(self) -> (Request, ResidentLease) {
+        (self.request, self.resident)
+    }
+
+    pub(crate) fn finish_without_body(mut self) -> Request {
+        self.request.headers.hold_resident(self.resident);
+        self.request
+    }
+}
+
+/// Parse and authorize one complete request head without consuming any body
+/// bytes or emitting `100 Continue`. The returned object owns the request's
+/// resident reservation until a later body or no-body phase takes ownership.
+pub(crate) fn read_request_head_with_reservation<R: Read + Write>(
     stream: &mut R,
     buf: &mut Vec<u8>,
     limits: &Limits,
@@ -703,7 +751,7 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
         &Request,
     ) -> Result<Option<crate::resource::ResourceContext>, ReadError>,
     reservation: Option<ResidentLease>,
-) -> Result<Option<Request>, ReadError> {
+) -> Result<Option<ParsedRequestHead>, ReadError> {
     let prefix_precharged = reservation.is_some();
     let mut request_resident = match reservation {
         Some(reservation) => reservation,
@@ -775,17 +823,37 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
     validate_request_authority(&mut req, limits)?;
     buf.drain(..head_end);
 
-    let framing = req.framing;
     // Admission that depends on parsed framing (for example the process-wide
     // slow-body reserve) must happen after the complete head is validated but
     // before a 100 response or any body byte is consumed.
     let resource_context = on_headers(stream, &req)?;
-    let spool_context = resource_context.clone();
     if let Some(context) = resource_context {
         request_resident.attribute_context(context.clone())?;
         req.headers
             .bind_request_scope(crate::resource::RequestScope::new(context));
     }
+
+    if let BodyFraming::Length(length) = req.framing {
+        if length > limits.body {
+            return Err(ReadError::Parse(ParseError::PayloadTooLarge));
+        }
+    }
+
+    Ok(Some(ParsedRequestHead {
+        request: req,
+        resident: request_resident,
+    }))
+}
+
+pub(crate) fn read_request_body<R: Read + Write>(
+    stream: &mut R,
+    buf: &mut Vec<u8>,
+    limits: &Limits,
+    head: ParsedRequestHead,
+) -> Result<Request, ReadError> {
+    let (mut req, mut request_resident) = head.into_parts();
+    let framing = req.framing;
+    let spool_context = req.resource_context().cloned();
 
     if req.expect_continue && framing != BodyFraming::None {
         // The client is waiting for this before sending the body.
@@ -796,9 +864,6 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
     match framing {
         BodyFraming::None => {}
         BodyFraming::Length(n) => {
-            if n > limits.body {
-                return Err(ReadError::Parse(ParseError::PayloadTooLarge));
-            }
             // This is an absolute deadline.  Deriving it from an untrusted
             // Content-Length let a huge declaration extend a worker lease for
             // hours even when the peer sent no body bytes.
@@ -901,7 +966,290 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
         }
     }
     req.headers.hold_resident(request_resident);
-    Ok(Some(req))
+    Ok(req)
+}
+
+fn push_body_without_blocking_runtime(
+    body: &mut BodyAccumulator,
+    resident: &mut ResidentLease,
+    bytes: &[u8],
+) -> io::Result<()> {
+    if matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    ) {
+        tokio::task::block_in_place(|| body.push_with_resident(bytes, resident))
+    } else {
+        body.push_with_resident(bytes, resident)
+    }
+}
+
+async fn async_read_with_deadline<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+    bytes: &mut [u8],
+    deadline: Instant,
+) -> io::Result<usize> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))?;
+    tokio::time::timeout(remaining, tokio::io::AsyncReadExt::read(stream, bytes))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))?
+}
+
+async fn async_read_line_until<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    max: usize,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    loop {
+        if let Some(position) = buf.windows(2).position(|window| window == b"\r\n") {
+            if position > max {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+            }
+            let line = buf[..position].to_vec();
+            buf.drain(..position + 2);
+            return Ok(line);
+        }
+        if buf.len() > max.saturating_add(2) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+        }
+        let mut chunk = [0u8; 8 * 1024];
+        crate::fault::hit("http.chunk.line")?;
+        let read = async_read_with_deadline(stream, &mut chunk, deadline).await?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "EOF in chunked body",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Consume a body after the route and authorization probe has selected a
+/// handler that actually needs it. Socket waits are asynchronous; bounded
+/// spool-file writes temporarily leave the runtime worker through
+/// `block_in_place` and remain protected by the body/spool leases.
+pub(crate) async fn read_request_body_async<S>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    limits: &Limits,
+    head: ParsedRequestHead,
+) -> Result<Request, ReadError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut req, mut request_resident) = head.into_parts();
+    let framing = req.framing;
+    let context = req.resource_context().cloned();
+    let scope = req.request_scope().cloned();
+    let deadline = Instant::now()
+        .checked_add(limits.body_timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))?;
+    let started = Instant::now();
+
+    if req.expect_continue && framing != BodyFraming::None {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))?;
+        tokio::time::timeout(remaining, async {
+            tokio::io::AsyncWriteExt::write_all(stream, b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+            tokio::io::AsyncWriteExt::flush(stream).await
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))??;
+    }
+
+    let memory_limit = match framing {
+        BodyFraming::Length(length) if length <= MAX_REQUEST_BODY_IN_MEMORY => {
+            MAX_REQUEST_BODY_IN_MEMORY
+        }
+        BodyFraming::None => MAX_REQUEST_BODY_IN_MEMORY,
+        BodyFraming::Length(_) | BodyFraming::Chunked => REQUEST_BODY_SPOOL_PREFIX,
+    };
+    let mut body = BodyAccumulator::new_in(
+        memory_limit,
+        limits.resource_budget.clone(),
+        limits.max_spool_bytes,
+        limits.max_spool_files,
+        context,
+    );
+
+    match framing {
+        BodyFraming::None => {}
+        BodyFraming::Length(length) => {
+            let take = usize::try_from(length.min(buf.len() as u64)).unwrap_or(buf.len());
+            push_body_without_blocking_runtime(&mut body, &mut request_resident, &buf[..take])?;
+            buf.drain(..take);
+            let mut remaining = length.saturating_sub(take as u64);
+            let mut chunk = vec![0u8; 64 * 1024];
+            while remaining > 0 {
+                if scope.as_ref().is_some_and(|scope| scope.is_cancelled()) {
+                    return Err(ReadError::Io(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "request scope cancelled",
+                    )));
+                }
+                let want = remaining.min(chunk.len() as u64) as usize;
+                crate::fault::hit("http.body.read")?;
+                let read = async_read_with_deadline(stream, &mut chunk[..want], deadline).await?;
+                if read == 0 {
+                    return Err(ReadError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "EOF in request body",
+                    )));
+                }
+                push_body_without_blocking_runtime(
+                    &mut body,
+                    &mut request_resident,
+                    &chunk[..read],
+                )?;
+                remaining -= read as u64;
+                if !minimum_read_rate_ok(
+                    started,
+                    length.saturating_sub(remaining),
+                    limits.body_min_rate,
+                ) {
+                    return Err(ReadError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "request body minimum rate not met",
+                    )));
+                }
+            }
+        }
+        BodyFraming::Chunked => {
+            let mut total = 0u64;
+            let mut framing_budget = ChunkFramingBudget::default();
+            loop {
+                if scope.as_ref().is_some_and(|scope| scope.is_cancelled()) {
+                    return Err(ReadError::Io(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "request scope cancelled",
+                    )));
+                }
+                let line = async_read_line_until(stream, buf, 1024, deadline).await?;
+                let size = parse_chunk_size_line(&line)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+                framing_budget.charge(line.len(), size != 0)?;
+                if size == 0 {
+                    let mut trailer_count = 0usize;
+                    let mut trailer_bytes = 0usize;
+                    loop {
+                        let trailer = async_read_line_until(stream, buf, 8190, deadline).await?;
+                        if trailer.is_empty() {
+                            break;
+                        }
+                        if !vapache_verified::capability_admit(limits.allow_request_trailers, true)
+                        {
+                            return Err(ReadError::Parse(ParseError::BadRequest(
+                                "request trailers are disabled",
+                            )));
+                        }
+                        if !valid_trailer_field(&trailer) {
+                            return Err(ReadError::Parse(ParseError::BadRequest(
+                                "invalid request trailer",
+                            )));
+                        }
+                        trailer_count += 1;
+                        trailer_bytes = trailer_bytes.saturating_add(trailer.len() + 2);
+                        if trailer_count > MAX_REQUEST_TRAILERS
+                            || trailer_bytes > MAX_REQUEST_TRAILER_BYTES
+                        {
+                            return Err(ReadError::Parse(ParseError::BadRequest(
+                                "request trailers are too large",
+                            )));
+                        }
+                    }
+                    break;
+                }
+                if total.saturating_add(size) > limits.body {
+                    return Err(ReadError::Parse(ParseError::PayloadTooLarge));
+                }
+                let mut remaining = size;
+                while remaining > 0 {
+                    if !buf.is_empty() {
+                        let take =
+                            usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());
+                        push_body_without_blocking_runtime(
+                            &mut body,
+                            &mut request_resident,
+                            &buf[..take],
+                        )?;
+                        buf.drain(..take);
+                        remaining -= take as u64;
+                        total += take as u64;
+                    } else {
+                        let mut chunk = [0u8; 8 * 1024];
+                        let want = usize::try_from(remaining.min(chunk.len() as u64))
+                            .unwrap_or(chunk.len());
+                        crate::fault::hit("http.chunk.read")?;
+                        let read =
+                            async_read_with_deadline(stream, &mut chunk[..want], deadline).await?;
+                        if read == 0 {
+                            return Err(ReadError::Io(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "EOF in chunked body",
+                            )));
+                        }
+                        push_body_without_blocking_runtime(
+                            &mut body,
+                            &mut request_resident,
+                            &chunk[..read],
+                        )?;
+                        remaining -= read as u64;
+                        total += read as u64;
+                    }
+                    if !minimum_read_rate_ok(started, total, limits.body_min_rate) {
+                        return Err(ReadError::Io(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "request body minimum rate not met",
+                        )));
+                    }
+                }
+                while buf.len() < 2 {
+                    let mut crlf = [0u8; 2];
+                    let read = async_read_with_deadline(stream, &mut crlf, deadline).await?;
+                    if read == 0 {
+                        return Err(ReadError::Io(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "EOF after chunk data",
+                        )));
+                    }
+                    buf.extend_from_slice(&crlf[..read]);
+                }
+                if &buf[..2] != b"\r\n" {
+                    return Err(ReadError::Parse(ParseError::BadRequest("bad chunk CRLF")));
+                }
+                buf.drain(..2);
+            }
+        }
+    }
+
+    let (bytes, spool) = body.finish();
+    req.body = bytes;
+    req.body_spool = spool;
+    req.headers.hold_resident(request_resident);
+    Ok(req)
+}
+
+pub(crate) fn read_request_with_reservation<R: Read + Write>(
+    stream: &mut R,
+    buf: &mut Vec<u8>,
+    limits: &Limits,
+    on_headers: impl FnOnce(
+        &mut R,
+        &Request,
+    ) -> Result<Option<crate::resource::ResourceContext>, ReadError>,
+    reservation: Option<ResidentLease>,
+) -> Result<Option<Request>, ReadError> {
+    let Some(head) =
+        read_request_head_with_reservation(stream, buf, limits, on_headers, reservation)?
+    else {
+        return Ok(None);
+    };
+    read_request_body(stream, buf, limits, head).map(Some)
 }
 
 const SPOOL_ATTEMPTS: u64 = 16;
@@ -1264,6 +1612,7 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
             resident_lease: None,
             policy_budget: std::sync::Arc::new(crate::resource::RequestPolicyBudget::default()),
             request_scope: None,
+            body_probe: false,
         },
         body: Vec::new(),
         body_spool: None,
@@ -1354,6 +1703,22 @@ pub struct Response {
     pub body: Body,
     spool_lease: Option<SpoolLease>,
     resident_lease: Option<ResidentLease>,
+    flow: ResponseFlow,
+    descriptor_leases: Vec<crate::resource::DescriptorLease>,
+    dynamic_lease: Option<crate::resource::DynamicLease>,
+}
+
+enum ResponseFlow {
+    Normal,
+    BodyRequired(Option<BodyContinuation>),
+}
+
+pub(crate) type BodyContinuation =
+    Box<dyn FnOnce(&crate::config::Config, &mut Request) -> Response + Send>;
+
+struct ResponseOwnership {
+    _descriptor_leases: Vec<crate::resource::DescriptorLease>,
+    _dynamic_lease: Option<crate::resource::DynamicLease>,
 }
 
 pub const MAX_RESPONSE_HEADERS: usize = 256;
@@ -1383,7 +1748,56 @@ impl Response {
             body: Body::Empty,
             spool_lease: None,
             resident_lease: None,
+            flow: ResponseFlow::Normal,
+            descriptor_leases: Vec::new(),
+            dynamic_lease: None,
         }
+    }
+
+    pub(crate) fn body_required(continuation: BodyContinuation) -> Self {
+        let mut response = Self::new(204);
+        response.flow = ResponseFlow::BodyRequired(Some(continuation));
+        response
+    }
+
+    pub(crate) fn requires_body(&self) -> bool {
+        matches!(self.flow, ResponseFlow::BodyRequired(_))
+    }
+
+    pub(crate) fn take_body_continuation(&mut self) -> Option<BodyContinuation> {
+        match &mut self.flow {
+            ResponseFlow::BodyRequired(continuation) => continuation.take(),
+            ResponseFlow::Normal => None,
+        }
+    }
+
+    pub(crate) fn hold_descriptor(&mut self, lease: crate::resource::DescriptorLease) {
+        self.descriptor_leases.push(lease);
+    }
+
+    pub(crate) fn hold_dynamic(&mut self, lease: crate::resource::DynamicLease) {
+        self.dynamic_lease = Some(lease);
+    }
+
+    fn take_output_ownership(&mut self) -> ResponseOwnership {
+        ResponseOwnership {
+            _descriptor_leases: std::mem::take(&mut self.descriptor_leases),
+            _dynamic_lease: self.dynamic_lease.take(),
+        }
+    }
+
+    /// Attach exact ownership accounting to a response that keeps an open
+    /// file descriptor until its body has been sent. Calling this more than
+    /// once is idempotent, which lets every protocol adapter enforce the
+    /// invariant at its final response boundary.
+    pub(crate) fn ensure_file_descriptor(
+        &mut self,
+        budget: &std::sync::Arc<ResourceBudget>,
+    ) -> io::Result<()> {
+        if matches!(self.body, Body::File { .. }) && self.descriptor_leases.is_empty() {
+            self.hold_descriptor(budget.try_descriptor()?);
+        }
+        Ok(())
     }
 
     pub fn bytes(status: u16, content_type: &str, body: Vec<u8>) -> Self {
@@ -1798,13 +2212,10 @@ fn sendfile_until(
     Ok(())
 }
 
-/// Serialize a response and send its body.  Returns the number of body bytes
-/// actually sent (used for `%O` accounting).
-pub fn write_response<W: ResponseWrite>(
-    stream: &mut W,
+fn serialize_response_head(
     resp: &mut Response,
     opts: &ResponseOptions,
-) -> io::Result<u64> {
+) -> io::Result<(Vec<u8>, bool, u64)> {
     if !response_headers_admitted(resp) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1833,20 +2244,7 @@ pub fn write_response<W: ResponseWrite>(
             .iter()
             .any(|(n, _)| n.eq_ignore_ascii_case("content-length"));
 
-    // Coalesce the response head with small bodies into one write.  For static
-    // files this avoids a separate header packet/syscall; larger files still
-    // use sendfile.  The limits keep CGI/error bodies from being double-buffered
-    // without bound.
-    const INLINE_BYTES_LIMIT: u64 = 64 * 1024;
-    const INLINE_FILE_LIMIT: u64 = 16 * 1024;
-    let inline_body = !opts.head_only
-        && !no_body_status
-        && match &resp.body {
-            Body::Bytes(_) => body_len <= INLINE_BYTES_LIMIT,
-            Body::File { len, .. } => *len > 0 && *len <= INLINE_FILE_LIMIT,
-            Body::Empty | Body::Stream { .. } => false,
-        };
-    let mut head = Vec::with_capacity(512 + if inline_body { body_len as usize } else { 0 });
+    let mut head = Vec::with_capacity(512);
     head.extend_from_slice(b"HTTP/1.1 ");
     push_decimal(&mut head, status as u64);
     head.push(b' ');
@@ -1904,6 +2302,31 @@ pub fn write_response<W: ResponseWrite>(
         head.extend_from_slice(b"Connection: keep-alive\r\n");
     }
     head.extend_from_slice(b"\r\n");
+
+    Ok((head, no_body_status, body_len))
+}
+
+/// Serialize a response and send its body.  Returns the number of body bytes
+/// actually sent (used for `%O` accounting).
+pub fn write_response<W: ResponseWrite>(
+    stream: &mut W,
+    resp: &mut Response,
+    opts: &ResponseOptions,
+) -> io::Result<u64> {
+    let (mut head, no_body_status, body_len) = serialize_response_head(resp, opts)?;
+    // Coalesce the response head with small bodies into one write.  For static
+    // files this avoids a separate header packet/syscall; larger files still
+    // use sendfile.  The limits keep CGI/error bodies from being double-buffered
+    // without bound.
+    const INLINE_BYTES_LIMIT: u64 = 64 * 1024;
+    const INLINE_FILE_LIMIT: u64 = 16 * 1024;
+    let inline_body = !opts.head_only
+        && !no_body_status
+        && match &resp.body {
+            Body::Bytes(_) => body_len <= INLINE_BYTES_LIMIT,
+            Body::File { len, .. } => *len > 0 && *len <= INLINE_FILE_LIMIT,
+            Body::Empty | Body::Stream { .. } => false,
+        };
 
     if inline_body {
         let mut sent = 0u64;
@@ -2015,6 +2438,192 @@ pub fn write_response<W: ResponseWrite>(
     }
     stream.set_write_deadline(Some(stall_deadline(opts.write_timeout)?));
     stream.flush()?;
+    Ok(sent)
+}
+
+/// Maximum body bytes one writable wake may transfer before yielding. This is
+/// deliberately smaller than Linux's maximum sendfile count: an always-ready
+/// large download must not monopolize a Tokio worker or starve timeout/cancel
+/// processing for other connections.
+pub(crate) const ASYNC_OUTPUT_QUANTUM: usize = 256 * 1024;
+
+async fn async_write_progress<W>(
+    stream: &mut W,
+    mut bytes: &[u8],
+    timeout: Duration,
+    scope: Option<&crate::resource::RequestScope>,
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    while !bytes.is_empty() {
+        if scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "request scope cancelled",
+            ));
+        }
+        let quantum = bytes.len().min(ASYNC_OUTPUT_QUANTUM);
+        let written = tokio::time::timeout(
+            timeout,
+            tokio::io::AsyncWriteExt::write(stream, &bytes[..quantum]),
+        )
+        .await
+        .map_err(|_| write_timeout_error())??;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "response socket wrote zero bytes",
+            ));
+        }
+        bytes = &bytes[written..];
+        tokio::task::yield_now().await;
+    }
+    Ok(())
+}
+
+async fn async_read_stream_chunk(
+    reader: Box<dyn Read + Send>,
+    want: usize,
+    context: Option<crate::resource::ResourceContext>,
+    ownership: ResponseOwnership,
+) -> io::Result<(Box<dyn Read + Send>, Vec<u8>, usize, ResponseOwnership)> {
+    let lease = match context.as_ref() {
+        Some(context) => Some(context.budget().try_response_body_read_in(context)?),
+        None => None,
+    };
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        let mut reader = reader;
+        let mut bytes = vec![0u8; want];
+        let read = reader.read(&mut bytes)?;
+        bytes.truncate(read);
+        Ok((reader, bytes, read, ownership))
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("response body reader failed: {error}")))?
+}
+
+async fn async_read_file_chunk(
+    file: File,
+    offset: u64,
+    want: usize,
+    context: Option<crate::resource::ResourceContext>,
+    ownership: ResponseOwnership,
+) -> io::Result<(File, Vec<u8>, usize, ResponseOwnership)> {
+    let lease = match context.as_ref() {
+        Some(context) => Some(context.budget().try_response_body_read_in(context)?),
+        None => None,
+    };
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        let mut bytes = vec![0u8; want];
+        let read = file.read_at(&mut bytes, offset)?;
+        bytes.truncate(read);
+        Ok((file, bytes, read, ownership))
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("response file reader failed: {error}")))?
+}
+
+/// Event-driven HTTP/1 output. Response generation may use blocking workers,
+/// but downstream writability, file reads and streaming-body reads do not hold
+/// a request-worker lease. The `Response` retains all descriptor/spool/backend
+/// guards until this future completes or is cancelled.
+pub(crate) async fn write_response_async<W>(
+    stream: &mut W,
+    resp: &mut Response,
+    opts: &ResponseOptions<'_>,
+    scope: Option<&crate::resource::RequestScope>,
+) -> io::Result<u64>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let (head, no_body_status, _) = serialize_response_head(resp, opts)?;
+    async_write_progress(stream, &head, opts.write_timeout, scope).await?;
+    if opts.head_only || no_body_status {
+        tokio::time::timeout(opts.write_timeout, tokio::io::AsyncWriteExt::flush(stream))
+            .await
+            .map_err(|_| write_timeout_error())??;
+        return Ok(0);
+    }
+
+    let body = std::mem::replace(&mut resp.body, Body::Empty);
+    // Ownership follows the file/upstream reader into each blocking read. If
+    // the async output future is cancelled while `spawn_blocking` is running,
+    // the exact descriptor/backend permits therefore remain held until the
+    // kernel object itself leaves that task.
+    let mut ownership = resp.take_output_ownership();
+    let mut sent = 0u64;
+    match body {
+        Body::Empty => {}
+        Body::Bytes(bytes) => {
+            async_write_progress(stream, &bytes, opts.write_timeout, scope).await?;
+            sent = bytes.len() as u64;
+        }
+        Body::File {
+            file,
+            mut offset,
+            mut len,
+        } => {
+            let mut file = file;
+            let context = scope.map(|scope| scope.context().clone());
+            while len > 0 {
+                if scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "request scope cancelled",
+                    ));
+                }
+                let want = len.min(64 * 1024) as usize;
+                let (next_file, chunk, read, next_ownership) =
+                    async_read_file_chunk(file, offset, want, context.clone(), ownership).await?;
+                file = next_file;
+                ownership = next_ownership;
+                if read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short file response body",
+                    ));
+                }
+                async_write_progress(stream, &chunk, opts.write_timeout, scope).await?;
+                sent += read as u64;
+                len -= read as u64;
+                offset = offset.saturating_add(read as u64);
+            }
+        }
+        Body::Stream {
+            mut reader,
+            mut len,
+        } => {
+            let context = scope.map(|scope| scope.context().clone());
+            while len > 0 {
+                if scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "request scope cancelled",
+                    ));
+                }
+                let want = len.min(64 * 1024) as usize;
+                let (next_reader, bytes, read, next_ownership) =
+                    async_read_stream_chunk(reader, want, context.clone(), ownership).await?;
+                reader = next_reader;
+                ownership = next_ownership;
+                if read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short streamed response body",
+                    ));
+                }
+                async_write_progress(stream, &bytes, opts.write_timeout, scope).await?;
+                sent += read as u64;
+                len -= read as u64;
+            }
+        }
+    }
+    tokio::time::timeout(opts.write_timeout, tokio::io::AsyncWriteExt::flush(stream))
+        .await
+        .map_err(|_| write_timeout_error())??;
     Ok(sent)
 }
 
@@ -2682,8 +3291,7 @@ mod tests {
                 reader: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
                 len: 7,
             },
-            spool_lease: None,
-            resident_lease: None,
+            ..Response::new(200)
         };
         assert_eq!(stream.body_len(), 7);
     }
@@ -2724,6 +3332,158 @@ mod tests {
         assert!(budget.extended_usage().2 >= 100 + 256 + "Content-Type".len() as u64);
         drop(response);
         assert_eq!(budget.extended_usage().2, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lazy_async_body_emits_continue_only_after_the_head_phase() {
+        let budget = std::sync::Arc::new(ResourceBudget::default());
+        let mut limits = Limits::default();
+        limits.resource_budget = budget.clone();
+        let context = budget.context("127.0.0.1".parse().unwrap());
+        let mut parser = std::io::Cursor::new(Vec::<u8>::new());
+        let mut buffered = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n".to_vec();
+        let head = read_request_head_with_reservation(
+            &mut parser,
+            &mut buffered,
+            &limits,
+            |_, _| Ok(Some(context)),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(parser.into_inner().is_empty(), "head phase emitted 100");
+
+        let (mut server, mut client) = tokio::io::duplex(1024);
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"body")
+            .await
+            .unwrap();
+        let request = read_request_body_async(&mut server, &mut buffered, &limits, head)
+            .await
+            .unwrap();
+        assert_eq!(request.body, b"body");
+        let expected = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let mut actual = vec![0; expected.len()];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut actual)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_chunk_body_preserves_pipelined_bytes() {
+        let budget = std::sync::Arc::new(ResourceBudget::default());
+        let mut limits = Limits::default();
+        limits.resource_budget = budget.clone();
+        let context = budget.context("127.0.0.1".parse().unwrap());
+        let mut parser = std::io::Cursor::new(Vec::<u8>::new());
+        let mut buffered =
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+                .to_vec();
+        let head = read_request_head_with_reservation(
+            &mut parser,
+            &mut buffered,
+            &limits,
+            |_, _| Ok(Some(context)),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let (mut server, mut client) = tokio::io::duplex(1024);
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"4\r\nbody\r\n0\r\n\r\nGET /next")
+            .await
+            .unwrap();
+        let request = read_request_body_async(&mut server, &mut buffered, &limits, head)
+            .await
+            .unwrap();
+        assert_eq!(request.body, b"body");
+        assert_eq!(buffered, b"GET /next");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_output_pump_transfers_large_bodies_in_bounded_quanta() {
+        let (mut server, mut client) = tokio::io::duplex(8 * 1024);
+        let body = vec![b'x'; ASYNC_OUTPUT_QUANTUM * 3 + 17];
+        let expected = body.len();
+        let writer = tokio::spawn(async move {
+            let mut response = Response::bytes(200, "application/octet-stream", body);
+            write_response_async(&mut server, &mut response, &response_options(), None)
+                .await
+                .unwrap()
+        });
+        let mut wire = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut wire)
+            .await
+            .unwrap();
+        let sent = writer.await.unwrap();
+        assert_eq!(sent, expected as u64);
+        let split = wire
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert_eq!(&wire[split..], vec![b'x'; expected]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_output_keeps_backend_ownership_with_blocking_read() {
+        struct BlockingReader {
+            started: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+
+        impl Read for BlockingReader {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                let _ = self.started.try_send(());
+                self.release
+                    .recv()
+                    .map_err(|_| io::Error::other("test release channel closed"))?;
+                bytes[0] = b'x';
+                Ok(1)
+            }
+        }
+
+        let budget = std::sync::Arc::new(ResourceBudget::default());
+        let context = budget.context("127.0.0.1".parse().unwrap());
+        let dynamic = budget.try_dynamic_descriptors_in(&context, 8, 1).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let reader = BlockingReader {
+            started: started_tx,
+            release: release_rx,
+        };
+        let (mut server, _client) = tokio::io::duplex(8 * 1024);
+        let output = tokio::spawn(async move {
+            let mut response = Response::new(200);
+            response.body = Body::Stream {
+                reader: Box::new(reader),
+                len: 1,
+            };
+            response.hold_dynamic(dynamic);
+            write_response_async(&mut server, &mut response, &response_options(), None).await
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap();
+
+        output.abort();
+        assert!(output.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::DynamicBackend),
+            1,
+            "cancelling output released the backend while its reader still owned it"
+        );
+        release_tx.send(()).unwrap();
+        for _ in 0..100 {
+            if budget.slot_usage(crate::resource::SlotKind::DynamicBackend) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::DynamicBackend),
+            0
+        );
     }
 
     struct TestWriter {
@@ -2822,8 +3582,7 @@ mod tests {
                 offset: 0,
                 len: 9,
             },
-            spool_lease: None,
-            resident_lease: None,
+            ..Response::new(200)
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -2885,8 +3644,7 @@ mod tests {
                 reader: Box::new(std::io::Cursor::new(vec![b's'; 10])),
                 len: 10,
             },
-            spool_lease: None,
-            resident_lease: None,
+            ..Response::new(200)
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -2903,8 +3661,7 @@ mod tests {
                 reader: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
                 len: 10,
             },
-            spool_lease: None,
-            resident_lease: None,
+            ..Response::new(200)
         };
         assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
 
@@ -2921,8 +3678,7 @@ mod tests {
                 offset: 0,
                 len: 32 * 1024,
             },
-            spool_lease: None,
-            resident_lease: None,
+            ..Response::new(200)
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -2942,8 +3698,7 @@ mod tests {
                 offset: 0,
                 len: 32 * 1024,
             },
-            spool_lease: None,
-            resident_lease: None,
+            ..Response::new(200)
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -2965,8 +3720,7 @@ mod tests {
                 offset: 0,
                 len: 32 * 1024,
             },
-            spool_lease: None,
-            resident_lease: None,
+            ..Response::new(200)
         };
         assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
 
@@ -2983,8 +3737,7 @@ mod tests {
                 offset: 0,
                 len: 0,
             },
-            spool_lease: None,
-            resident_lease: None,
+            ..Response::new(200)
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -3047,8 +3800,7 @@ mod tests {
                 offset: 0,
                 len: 32 * 1024,
             },
-            spool_lease: None,
-            resident_lease: None,
+            ..Response::new(200)
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -3427,8 +4179,7 @@ mod tests {
                 offset: 0,
                 len: 32 * 1024,
             },
-            spool_lease: None,
-            resident_lease: None,
+            ..Response::new(200)
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -3448,8 +4199,7 @@ mod tests {
                 offset: 0,
                 len: 32 * 1024,
             },
-            spool_lease: None,
-            resident_lease: None,
+            ..Response::new(200)
         };
         assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
         drop(writer);
@@ -3471,8 +4221,7 @@ mod tests {
                     offset: 0,
                     len: 32 * 1024 * 1024,
                 },
-                spool_lease: None,
-                resident_lease: None,
+                ..Response::new(200)
             };
             let mut opts = response_options();
             opts.write_timeout = Duration::from_millis(200);

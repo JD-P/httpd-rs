@@ -1066,7 +1066,7 @@ impl ResourceBudget {
     /// ceiling leaves enough capacity for logs, reloads and accepted sockets
     /// already racing through admission; resumption at the lower watermark
     /// prevents poll/accept oscillation.
-    pub(crate) fn listener_pressure_high(&self, pending_limit: u64) -> bool {
+    pub(crate) fn listener_pressure_high(&self, pending_limit: u64, worker_limit: u64) -> bool {
         let fd_index = PhysicalKind::FileDescriptor.index();
         let descriptors = self.physical_process[fd_index].load(Ordering::Acquire);
         let descriptor_high = self.physical_limits[fd_index]
@@ -1075,16 +1075,31 @@ impl ResourceBudget {
             / 10;
         let pending = self.slot_usage(SlotKind::PendingConnection);
         let pending_high = pending_limit.saturating_mul(9).saturating_add(9) / 10;
-        descriptors >= descriptor_high.max(1) || pending >= pending_high.max(1)
+        let workers = self.slot_usage(SlotKind::RequestWorker);
+        // A full worker pool is not, by itself, a reason to stop accepting:
+        // accepting one connection lets us return a bounded 503 instead of
+        // leaving it parked indefinitely in the kernel backlog.  Pause only
+        // once an admitted connection is already waiting behind that full
+        // pool. This keeps the overload queue bounded while preserving prompt
+        // failure for the first excess client.
+        let worker_backlog = workers >= worker_limit.max(1) && pending > 0;
+        descriptors >= descriptor_high.max(1) || pending >= pending_high.max(1) || worker_backlog
     }
 
-    pub(crate) fn listener_pressure_below_low(&self, pending_limit: u64) -> bool {
+    pub(crate) fn listener_pressure_below_low(
+        &self,
+        pending_limit: u64,
+        worker_limit: u64,
+    ) -> bool {
         let fd_index = PhysicalKind::FileDescriptor.index();
         let descriptors = self.physical_process[fd_index].load(Ordering::Acquire);
         let descriptor_low = self.physical_limits[fd_index].saturating_mul(3) / 4;
         let pending = self.slot_usage(SlotKind::PendingConnection);
         let pending_low = pending_limit.saturating_mul(3) / 4;
-        descriptors <= descriptor_low && pending <= pending_low
+        let workers = self.slot_usage(SlotKind::RequestWorker);
+        let worker_low = worker_limit.saturating_mul(3) / 4;
+        let worker_backlog_cleared = pending == 0 || workers <= worker_low;
+        descriptors <= descriptor_low && pending <= pending_low && worker_backlog_cleared
     }
 
     fn release_physical_one(&self, kind: PhysicalKind, amount: u64) {
@@ -1974,13 +1989,13 @@ mod tests {
         let first = budget.try_descriptor().unwrap();
         let second = budget.try_descriptor().unwrap();
         let third = budget.try_descriptor().unwrap();
-        assert!(!budget.listener_pressure_high(64));
+        assert!(!budget.listener_pressure_high(64, 64));
         let fourth = budget.try_descriptor().unwrap();
-        assert!(budget.listener_pressure_high(64));
-        assert!(!budget.listener_pressure_below_low(64));
+        assert!(budget.listener_pressure_high(64, 64));
+        assert!(!budget.listener_pressure_below_low(64, 64));
         assert!(budget.try_descriptor().is_err());
         drop(fourth);
-        assert!(budget.listener_pressure_below_low(64));
+        assert!(budget.listener_pressure_below_low(64, 64));
         drop((first, second, third));
         assert_eq!(
             budget.physical_process[PhysicalKind::FileDescriptor.index()].load(Ordering::Acquire),

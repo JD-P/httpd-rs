@@ -3332,6 +3332,88 @@ pub proof fn response_body_read_lease_excludes_client_occupancy()
 {
 }
 
+/// Protocol-independent request lifecycle used by the HTTP/1 and HTTP/2
+/// adapters.  In particular, body acquisition is reachable only after the
+/// policy route selects a body-consuming handler, while an early denial can
+/// advance directly to output without accepting attacker-controlled DATA.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RequestPhase {
+    Head,
+    Body,
+    Dispatch,
+    Output,
+    Closed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RequestPhaseEvent {
+    RouteNeedsBody,
+    RouteReady,
+    EarlyResponse,
+    BodyComplete,
+    BodyErrorResponse,
+    DispatchComplete,
+    OutputComplete,
+    Cancel,
+}
+
+pub open spec fn request_phase_step_spec(
+    phase: RequestPhase,
+    event: RequestPhaseEvent,
+) -> Option<RequestPhase> {
+    match (phase, event) {
+        (RequestPhase::Head, RequestPhaseEvent::RouteNeedsBody) => Some(RequestPhase::Body),
+        (RequestPhase::Head, RequestPhaseEvent::RouteReady) => Some(RequestPhase::Dispatch),
+        (RequestPhase::Head, RequestPhaseEvent::EarlyResponse) => Some(RequestPhase::Output),
+        (RequestPhase::Body, RequestPhaseEvent::BodyComplete) => Some(RequestPhase::Dispatch),
+        (RequestPhase::Body, RequestPhaseEvent::BodyErrorResponse) => Some(RequestPhase::Output),
+        (RequestPhase::Dispatch, RequestPhaseEvent::DispatchComplete) => Some(RequestPhase::Output),
+        (RequestPhase::Head, RequestPhaseEvent::Cancel)
+        | (RequestPhase::Body, RequestPhaseEvent::Cancel)
+        | (RequestPhase::Dispatch, RequestPhaseEvent::Cancel)
+        | (RequestPhase::Output, RequestPhaseEvent::Cancel)
+        | (RequestPhase::Output, RequestPhaseEvent::OutputComplete) => Some(RequestPhase::Closed),
+        _ => None,
+    }
+}
+
+pub fn request_phase_step(
+    phase: RequestPhase,
+    event: RequestPhaseEvent,
+) -> (next: Option<RequestPhase>)
+    ensures next == request_phase_step_spec(phase, event),
+{
+    match (phase, event) {
+        (RequestPhase::Head, RequestPhaseEvent::RouteNeedsBody) => Some(RequestPhase::Body),
+        (RequestPhase::Head, RequestPhaseEvent::RouteReady) => Some(RequestPhase::Dispatch),
+        (RequestPhase::Head, RequestPhaseEvent::EarlyResponse) => Some(RequestPhase::Output),
+        (RequestPhase::Body, RequestPhaseEvent::BodyComplete) => Some(RequestPhase::Dispatch),
+        (RequestPhase::Body, RequestPhaseEvent::BodyErrorResponse) => Some(RequestPhase::Output),
+        (RequestPhase::Dispatch, RequestPhaseEvent::DispatchComplete) => Some(RequestPhase::Output),
+        (RequestPhase::Head, RequestPhaseEvent::Cancel)
+        | (RequestPhase::Body, RequestPhaseEvent::Cancel)
+        | (RequestPhase::Dispatch, RequestPhaseEvent::Cancel)
+        | (RequestPhase::Output, RequestPhaseEvent::Cancel)
+        | (RequestPhase::Output, RequestPhaseEvent::OutputComplete) => Some(RequestPhase::Closed),
+        _ => None,
+    }
+}
+
+pub proof fn request_body_requires_route_selection(
+    phase: RequestPhase,
+    event: RequestPhaseEvent,
+)
+    ensures
+        request_phase_step_spec(phase, event) == Some(RequestPhase::Body)
+            ==> phase == RequestPhase::Head && event == RequestPhaseEvent::RouteNeedsBody,
+{
+}
+
+pub proof fn request_closed_phase_is_absorbing(event: RequestPhaseEvent)
+    ensures request_phase_step_spec(RequestPhase::Closed, event).is_none(),
+{
+}
+
 /// Overflow-free length transition for regex capture substitution. Runtime
 /// expansion allocates only after this transition admits the resulting value.
 pub fn capture_expansion_len(

@@ -206,8 +206,13 @@ Implemented today:
   pool, and `MaxRequestWorkers`/`ServerLimit` are rejected above the 512-worker
   implementation ceiling. Every keep-alive request body enters the slow-body
   reserve, which may occupy at most a quarter of the worker pool; keep-alive is shed before the last quarter is
-  consumed, and stalled large HTTP/1 responses share the 32-slot blocking-I/O
-  budget. Listener acceptance rotates and is capped per ready-listener batch,
+  consumed. Request workers are released before lazy body socket waits and
+  before the asynchronous output pump. Routing and authorization produce a
+  one-shot prepared handler before an upload is accepted, so rewrites and
+  authentication are not repeated after the body arrives. File/upstream reads
+  use short 64 KiB permits and downstream writes use a 256 KiB fairness
+  quantum. Listener acceptance rotates, pauses once saturated workers have an
+  admitted connection queued, and is capped per ready-listener batch,
   so a busy listener cannot starve another. These limits sit alongside 128 MiB
   each of retained request and response bytes, 32 blocking response reads,
   and 32 concurrent CPU-heavy regex/hash/compression/access-file operations.
@@ -363,10 +368,11 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **630 verified functions, 0 errors** (percent-decoding,
+Current result: **635 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
-arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
+arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
+lifecycle, HTTP/2 method/head/body admission,
 the stream/reset budget model, the stream-ID admission/lifecycle model and the
 idempotent early-reset purge model, and the TLS listener client-certificate
 policy identity, the append-only container/list merge model, the rewrite target
@@ -733,9 +739,9 @@ failure races and privileged-kernel failures are excluded from that metric.
 
 Latest snapshot: **20,020/20,548 executable server production lines (97.43%)**;
 the new aggregate-resource module is **62/62 (100%)**. The current suite is
-595 Rust library tests, 8 CLI unit tests, 26 Rust integration/property tests,
+616 Rust library tests, 8 CLI unit tests, 26 Rust integration/property tests,
 167 conformance tests and 333 fixed configuration cases.
-The separate Verus gate proves 630 functions with 0 errors; proof-only code is
+The separate Verus gate proves 635 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

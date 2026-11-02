@@ -1072,7 +1072,8 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | FastCGI path/records | each `PATH_INFO` filesystem prefix consumes the fail-sticky request-work budget; synthesized paths pass the shared 256-component/512-KiB cumulative-prefix gate; fixed record/header sizes, stdout spool cap and stderr cap |
 | FastCGI response head | bounded prefix/header scan before body streaming |
 | Aggregate dynamic I/O | RAII byte/file reservations across request, response, CGI-worker and FastCGI/proxy spools; each client may retain at most one quarter of configured spool bytes/files; 128 MiB request and response resident ceilings with a 32 MiB retained/transient response share per client; shared CGI/FastCGI concurrency slots; 32 response-body descriptor reads and 8 per client, held only for the read syscall and never for dispatch or a downstream socket wait |
-| HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error |
+| Request phase lifecycle | HTTP/1 and HTTP/2 route and authorize before accepting a body; a body-consuming route returns an owned one-shot handler continuation, so rewrites/authentication are not repeated and cannot select a different sink after upload. Request-worker permits cover head/policy compilation and handler dispatch, but not body socket waits or output waits. Body errors transition to bounded error output/cancellation, and route-selected CGI descriptors remain exactly charged while the continuation waits for its body |
+| HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error; the event-driven output pump holds no request-worker lease, reads file/upstream bodies under short 64 KiB descriptor-read permits, yields after at most 256 KiB of writable progress, and retains response/descriptor/backend ownership through completion or cancellation |
 | HTTP/2 | verified settings, header-state, flow-control and reset budgets; a refillable connection token bucket bounds SETTINGS, PING, PRIORITY and tiny WINDOW_UPDATE work; at most 32 streams per connection, 64 per validated effective-client quota key and 256 process-wide, acquired client-first so rejection cannot retain a global slot. Each request has a 64 KiB resident body prefix before using the shared request-spool quota and enforces body `MinRate` inside its hard deadline. Dispatch uses the bounded blocking pool without consuming response-read permits. Response file/stream reads wait for assigned flow-control capacity, use at most 64 KiB per chunk, retain response-resident accounting until h2 releases every queued chunk/byte slice, and hold response-body read permits only during the actual read. Send deadlines renew on flow-control progress; connection idle expiry runs only when no stream is active |
 | Compression/PCRE/password hashing | fixed input/cost bounds and a shared 32-operation CPU-work admission gate; optional compression falls back to identity under pressure |
 | Autoindex | at most 4096 examined directory records (including filtered names), 4096 rendered entries and 4 MiB of generated HTML |
@@ -1762,13 +1763,17 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **630 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **635 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
   `crates/server/src/access.rs` calls these for
   `<RequireAll>`/`<RequireAny>`/`<RequireNone>`; the multi-provider
   `<RequireNone>` path aggregates positive hits with OR before negation.
+- `RequestPhase`, `RequestPhaseEvent` and `request_phase_step`, consumed by
+  both protocol adapters.  The transition proof makes body acquisition
+  reachable only after routing selects a body-consuming sink; early policy
+  responses bypass body input, and output/cancellation terminate the request.
 - `ipv4_mapped_to_v4`, consumed by `access::canonical_ip` at the connection
   and RemoteIP boundaries; `vhost_address_admit` and
   `vhost_address_precedence`, consumed by `Config::select_vhost` and the TLS

@@ -3423,6 +3423,10 @@ mod tests {
     #[test]
     fn maps_backrefs_and_url_helpers() {
         use std::collections::HashMap;
+        let test_budget = std::sync::Arc::new(crate::resource::ResourceBudget::default());
+        let _resource_context = crate::resource::enter_resource_context(
+            test_budget.context(std::net::IpAddr::from([127, 0, 0, 1])),
+        );
         let r = req();
         let root = Path::new("/tmp");
         let old_path = root.join("old");
@@ -3790,6 +3794,10 @@ mod tests {
     fn rewrite_program_replacement_fails_closed() {
         use std::os::unix::fs::PermissionsExt;
 
+        let test_budget = std::sync::Arc::new(crate::resource::ResourceBudget::default());
+        let _resource_context = crate::resource::enter_resource_context(
+            test_budget.context(std::net::IpAddr::from([127, 0, 0, 1])),
+        );
         let dir = std::env::temp_dir().join(format!("vapache-prg-binding-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();

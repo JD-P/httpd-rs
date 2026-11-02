@@ -514,6 +514,9 @@ async fn send_response(
     if !crate::http::response_headers_admitted(&resp) {
         resp = Response::policy_error();
     }
+    if resp.ensure_file_descriptor(&cfg.resource_budget).is_err() {
+        resp = Response::memory_overload();
+    }
     if resp.attribute_spool_client(client).is_err() {
         resp = Response::memory_overload();
     }
@@ -1019,94 +1022,16 @@ async fn handle_stream(
             // coverage:ignore-stop
         }
     };
-    let has_body = declared.unwrap_or(0) > 0 || !recv.is_end_stream();
-    if has_body && !cfg.body_handlers_possible() {
-        let mut response = if matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
-            bad(
-                400,
-                "request body is not accepted by a static-only configuration",
-            )
-        } else {
-            bad(405, "method not allowed for a static resource")
-        };
-        if response.status == 405 {
-            response
-                .headers
-                .push(("Allow".into(), b"GET, HEAD, OPTIONS".to_vec()));
-        }
-        return send_response(respond, &cfg, quota_peer.ip(), response, false)
-            .await
-            .is_err();
-    }
-    let max_body = cfg.limit_request_body.min(crate::http::MAX_BODY_BUFFERED);
-    let body_timeout = cfg
-        .request_body_timeout
-        .max(std::time::Duration::from_secs(1));
-    let body_result = {
-        let body_future = read_body(
-            recv,
-            max_body,
-            body_timeout,
-            cfg.request_body_min_rate,
-            cfg.resource_budget.clone(),
-            cfg.max_spool_bytes,
-            cfg.max_spool_files,
-            resource_context.clone(),
-            &mut request_resident,
-        );
-        tokio::pin!(body_future);
-        // `SendResponse::poll_reset` is the h2 API for a client RST_STREAM
-        // before response headers.  Race it against body consumption so a
-        // reset that arrives while the body is still open is projected into
-        // the connection budget even if no DATA error is surfaced.
-        let mut reset_watch = std::future::poll_fn(|cx| respond.poll_reset(cx));
-        tokio::select! {
-            biased;
-            _ = &mut reset_watch => return true,
-            result = &mut body_future => result,
-        }
-    };
-    let (body, early) = match body_result {
-        Ok(body) => (body, None),
-        // The biased `poll_reset` arm above observes this state first.
-        Err(H2ReadFailure::Reset) => return true, // coverage:ignore-line - reset-watch invariant
-        Err(H2ReadFailure::Response(resp)) => (
-            H2RequestBody {
-                bytes: Vec::new(),
-                spool: None,
-                len: 0,
-            },
-            Some(resp),
-        ),
-    };
-    if let Some(declared) = declared {
-        if declared != body.len && early.is_none() {
-            // h2 enforces the declared DATA length before clean end-of-stream.
-            // coverage:ignore-start - upstream h2 framing invariant
-            return send_response(
-                respond,
-                &cfg,
-                quota_peer.ip(),
-                bad(400, "Content-Length mismatch"),
-                false,
-            )
-            .await
-            .is_err();
-            // coverage:ignore-stop
-        }
-    }
-
     headers.bind_request_scope(crate::resource::RequestScope::new(resource_context));
-    headers.hold_resident(request_resident);
-    let req = Request {
+    let mut req = Request {
         method,
         target,
         raw_path,
         query,
         version: Version::Http2,
         headers,
-        body: body.bytes,
-        body_spool: body.spool,
+        body: Vec::new(),
+        body_spool: None,
         keep_alive: true,
         expect_continue: false,
         // HTTP/2 framing is handled by the h2 crate before a `Request` exists.
@@ -1122,8 +1047,151 @@ async fn handle_stream(
         respond.send_reset(h2::Reason::PROTOCOL_ERROR);
         return true;
     }
+
+    let has_body = declared.unwrap_or(0) > 0 || !recv.is_end_stream();
+    let mut phase = vapache_verified::RequestPhase::Head;
+    let mut early = None;
+    let mut early_remote_user = None;
+    let mut body_continuation = None;
+    let mut body_remote_user = None;
+    let mut recv = Some(recv);
+    if has_body {
+        // Route, rewrite and authorization complete before DATA is accepted.
+        // This is the HTTP/2 projection of the same lazy-body transition used
+        // by HTTP/1 (and, importantly, it happens before allocating a spool).
+        let probe_cfg = cfg.clone();
+        let probe_local_ip = local_ip.clone();
+        let mut probe_req = req;
+        let probed = tokio::task::spawn_blocking(move || {
+            let decision = crate::server::probe_request_body(
+                &probe_cfg,
+                &mut probe_req,
+                peer,
+                &probe_local_ip,
+                local_port,
+                true,
+            );
+            (probe_req, decision)
+        })
+        .await;
+        match probed {
+            Ok((
+                returned_req,
+                crate::server::BodyRouteDecision::Read {
+                    continuation,
+                    remote_user,
+                },
+            )) => {
+                req = returned_req;
+                phase = vapache_verified::request_phase_step(
+                    phase,
+                    vapache_verified::RequestPhaseEvent::RouteNeedsBody,
+                )
+                .expect("HTTP/2 body route phase transition");
+                body_continuation = Some(continuation);
+                body_remote_user = remote_user;
+            }
+            Ok((
+                returned_req,
+                crate::server::BodyRouteDecision::Respond(response, remote_user),
+            )) => {
+                req = returned_req;
+                phase = vapache_verified::request_phase_step(
+                    phase,
+                    vapache_verified::RequestPhaseEvent::EarlyResponse,
+                )
+                .expect("HTTP/2 early response phase transition");
+                early = Some(response);
+                early_remote_user = remote_user;
+                // Dropping the receive half discards already queued DATA and
+                // stops returning stream-level credit for further upload.
+                drop(recv.take());
+            }
+            Err(_) => {
+                logger.error("HTTP/2 request probe task failed");
+                return true;
+            }
+        }
+    }
+
+    if has_body && early.is_none() {
+        let max_body = cfg.limit_request_body.min(crate::http::MAX_BODY_BUFFERED);
+        let body_timeout = cfg
+            .request_body_timeout
+            .max(std::time::Duration::from_secs(1));
+        let body_result = {
+            let body_future = read_body(
+                recv.take().expect("body route retained its receive stream"),
+                max_body,
+                body_timeout,
+                cfg.request_body_min_rate,
+                cfg.resource_budget.clone(),
+                cfg.max_spool_bytes,
+                cfg.max_spool_files,
+                req.resource_context()
+                    .expect("HTTP/2 request scope was bound")
+                    .clone(),
+                &mut request_resident,
+            );
+            tokio::pin!(body_future);
+            // `SendResponse::poll_reset` is the h2 API for a client RST_STREAM
+            // before response headers. Race it against body consumption so a
+            // reset while DATA is open releases stream capacity promptly.
+            let mut reset_watch = std::future::poll_fn(|cx| respond.poll_reset(cx));
+            tokio::select! {
+                biased;
+                _ = &mut reset_watch => return true,
+                result = &mut body_future => result,
+            }
+        };
+        match body_result {
+            Ok(body) => {
+                if declared.is_some_and(|declared| declared != body.len) {
+                    // h2 enforces this before clean end-of-stream; retain the
+                    // adapter check as a fail-closed dependency boundary.
+                    // coverage:ignore-start - upstream h2 framing invariant
+                    return send_response(
+                        respond,
+                        &cfg,
+                        quota_peer.ip(),
+                        bad(400, "Content-Length mismatch"),
+                        false,
+                    )
+                    .await
+                    .is_err();
+                    // coverage:ignore-stop
+                }
+                req.body = body.bytes;
+                req.body_spool = body.spool;
+                phase = vapache_verified::request_phase_step(
+                    phase,
+                    vapache_verified::RequestPhaseEvent::BodyComplete,
+                )
+                .expect("HTTP/2 body completion phase transition");
+            }
+            // The biased `poll_reset` arm above observes this state first.
+            Err(H2ReadFailure::Reset) => return true, // coverage:ignore-line - reset-watch invariant
+            Err(H2ReadFailure::Response(response)) => {
+                phase = vapache_verified::request_phase_step(
+                    phase,
+                    vapache_verified::RequestPhaseEvent::BodyErrorResponse,
+                )
+                .expect("HTTP/2 body error phase transition");
+                early = Some(response);
+                early_remote_user = body_remote_user.take();
+            }
+        }
+    } else if !has_body {
+        phase = vapache_verified::request_phase_step(
+            phase,
+            vapache_verified::RequestPhaseEvent::RouteReady,
+        )
+        .expect("HTTP/2 bodyless route phase transition");
+    }
+    req.headers.hold_resident(request_resident);
+
     let (req, resp, remote_user) = match early {
-        Some(resp) => (req, resp, None),
+        Some(resp) => (req, resp, early_remote_user),
         None => {
             // Dispatch runs in Tokio's bounded blocking pool. It must not
             // consume the response-body read permits: those protect only the
@@ -1132,21 +1200,40 @@ async fn handle_stream(
             let dispatch_cfg = cfg.clone();
             let dispatch_local_ip = local_ip.clone();
             let dispatched = tokio::task::spawn_blocking(move || {
-                let result = crate::server::dispatch_with_scheme_and_identity(
-                    &dispatch_cfg,
-                    &req,
-                    peer,
-                    &dispatch_local_ip,
-                    local_port,
-                    true,
-                );
-                (req, result)
+                let mut req = req;
+                let (resp, remote_user) = match body_continuation {
+                    Some(continuation) => (
+                        crate::server::execute_body_continuation(
+                            &dispatch_cfg,
+                            &mut req,
+                            peer,
+                            local_port,
+                            true,
+                            continuation,
+                        ),
+                        body_remote_user,
+                    ),
+                    None => crate::server::dispatch_with_scheme_and_identity(
+                        &dispatch_cfg,
+                        &req,
+                        peer,
+                        &dispatch_local_ip,
+                        local_port,
+                        true,
+                    ),
+                };
+                (req, resp, remote_user)
             })
             .await;
-            let Ok((req, (resp, remote_user))) = dispatched else {
+            let Ok((req, resp, remote_user)) = dispatched else {
                 logger.error("HTTP/2 request dispatcher task failed");
                 return true;
             };
+            phase = vapache_verified::request_phase_step(
+                phase,
+                vapache_verified::RequestPhaseEvent::DispatchComplete,
+            )
+            .expect("HTTP/2 dispatch phase transition");
             (req, resp, remote_user)
         }
     };
@@ -1156,12 +1243,24 @@ async fn handle_stream(
     let body_sent = match send_response(respond, &cfg, quota_peer.ip(), resp, head_only).await {
         Ok(n) => n,
         Err(e) => {
+            let closed = vapache_verified::request_phase_step(
+                phase,
+                vapache_verified::RequestPhaseEvent::Cancel,
+            )
+            .expect("HTTP/2 cancellation phase transition");
+            debug_assert_eq!(closed, vapache_verified::RequestPhase::Closed);
             // Peer-close/send failures are already exercised directly by the
             // bounded response sender; this adapter arm only adds logging.
             logger.error(&format!("HTTP/2 stream failed: {e}")); // coverage:ignore-line - peer timing race
             return true; // coverage:ignore-line - peer timing race
         }
     };
+    phase = vapache_verified::request_phase_step(
+        phase,
+        vapache_verified::RequestPhaseEvent::OutputComplete,
+    )
+    .expect("HTTP/2 output phase transition");
+    debug_assert_eq!(phase, vapache_verified::RequestPhase::Closed);
     crate::status::hit(body_sent);
 
     let host = req.header_str("host").unwrap_or("");
@@ -1499,6 +1598,7 @@ mod tests {
                  ServerName localhost\n\
                  DocumentRoot \"{}/www\"\n\
                  ErrorLog \"{}/error.log\"\n\
+                 ProxyPass /__body_test http://127.0.0.1:9/\n\
                  {}\n",
                 dir.display(),
                 dir.display(),
@@ -1507,11 +1607,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut cfg = Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
-        // Most adapter tests exercise body framing independently of route
-        // selection. Mark their fixture as body-capable; static-only early
-        // rejection has dedicated HTTP/1 and configuration coverage.
-        cfg.body_handlers_possible = true;
+        let cfg = Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
         let cfg = Arc::new(cfg);
         let logger = Arc::new(Logger::new(&cfg).unwrap());
         (cfg, logger, dir)
@@ -1695,6 +1791,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn h2_policy_denial_does_not_wait_for_request_data() {
+        let (cfg, logger, dir) = test_config_with_extra(
+            "lazy-policy",
+            "<Location \"/\">\nRequire all denied\n</Location>",
+        );
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (request, respond) = connection.accept().await.unwrap().unwrap();
+            let admission =
+                admit_stream_before_spawn(&cfg, "127.0.0.1:12345".parse().unwrap(), &request)
+                    .unwrap();
+            let handler = handle_stream(
+                cfg,
+                logger,
+                "127.0.0.1:12345".parse().unwrap(),
+                "127.0.0.1".into(),
+                443,
+                request,
+                respond,
+                admission,
+            );
+            tokio::pin!(handler);
+            let reset = loop {
+                tokio::select! {
+                    reset = &mut handler => break reset,
+                    accepted = connection.accept() => {
+                        if accepted.is_none() {
+                            return true;
+                        }
+                    }
+                }
+            };
+            loop {
+                tokio::select! {
+                    _ = &mut done_rx => break,
+                    accepted = connection.accept() => {
+                        if accepted.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+            reset
+        });
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/file.txt")
+            .header("content-length", "1048576")
+            .body(())
+            .unwrap();
+        let (response, send) = client.send_request(request, false).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), response)
+            .await
+            .expect("policy response waited for DATA")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        drop(send);
+        let _ = done_tx.send(());
+        let reset = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server did not finish")
+            .unwrap();
+        assert!(!reset);
+        drop(client);
+        driver.abort();
+        let _ = driver.await;
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn h2_adapter_handles_files_heads_bounds_and_body_errors() {
         let (cfg, logger, dir) = test_config("adapter");
         let read_leases: Vec<_> = (0..crate::resource::MAX_RESPONSE_BODY_READS)
@@ -1846,7 +2016,7 @@ mod tests {
         spool_limited.max_spool_files = 1;
         let request = http::Request::builder()
             .method("POST")
-            .uri("https://localhost/file.txt")
+            .uri("https://localhost/__body_test")
             .body(())
             .unwrap();
         assert_eq!(
@@ -1865,7 +2035,7 @@ mod tests {
         limited.limit_request_body = 2;
         let request = http::Request::builder()
             .method("POST")
-            .uri("https://localhost/file.txt")
+            .uri("https://localhost/__body_test")
             .body(())
             .unwrap();
         assert_eq!(
@@ -2219,7 +2389,7 @@ mod tests {
         let driver = tokio::spawn(async move { connection.await });
         let request = http::Request::builder()
             .method("POST")
-            .uri("https://localhost/file.txt")
+            .uri("https://localhost/__body_test")
             .body(())
             .unwrap();
         let (response, send) = client.send_request(request, false).unwrap();

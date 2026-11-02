@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-02",
   "verus": {
-    "verified_functions": 630,
+    "verified_functions": 635,
     "errors": 0
   },
   "obligations": [

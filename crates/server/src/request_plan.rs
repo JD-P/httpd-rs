@@ -747,11 +747,10 @@ mod tests {
     }
 
     fn load_config(text: &str) -> Config {
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-plan-{}-{}",
-            std::process::id(),
-            text.len()
-        ));
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let fixture = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("vapache-plan-{}-{fixture}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
