@@ -15,6 +15,8 @@ use crate::resource::{ResidentLease, ResourceBudget};
 use crate::util::http_date_now;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, StatusCode};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::os::unix::fs::FileExt;
@@ -327,6 +329,10 @@ async fn read_body(
         max_spool_files,
     );
     let mut budget = vapache_verified::h2_body_init(limit);
+    let mut framing = vapache_verified::ChunkFramingState {
+        chunks: 0,
+        bytes: 0,
+    };
     let started = Instant::now();
     loop {
         // One deadline covers the complete body.  Restarting the timeout for
@@ -353,6 +359,19 @@ async fn read_body(
                 )))
             } // coverage:ignore-stop
         };
+        // DATA payload limits do not bound frame-processing work: a peer can
+        // encode a small body as tens of thousands of one-byte frames. Charge
+        // the nine-byte HTTP/2 frame header and one work unit per delivered
+        // DATA frame, using the same verified budget shape as HTTP/1 chunks.
+        let Some(next_framing) =
+            vapache_verified::chunk_framing_budget_step(framing, 5, true, 65_536, 1024 * 1024)
+        else {
+            return Err(H2ReadFailure::Response(bad(
+                400,
+                "HTTP/2 DATA frame budget exceeded",
+            )));
+        };
+        framing = next_framing;
         let Some(next_budget) = vapache_verified::h2_body_append(budget, chunk.len() as u64) else {
             return Err(H2ReadFailure::Response(bad(413, "request body too large")));
         };
@@ -819,6 +838,23 @@ async fn handle_stream(
             // coverage:ignore-stop
         }
     };
+    let has_body = declared.unwrap_or(0) > 0 || !recv.is_end_stream();
+    if has_body && !cfg.body_handlers_possible() {
+        let mut response = if matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+            bad(
+                400,
+                "request body is not accepted by a static-only configuration",
+            )
+        } else {
+            bad(405, "method not allowed for a static resource")
+        };
+        if response.status == 405 {
+            response
+                .headers
+                .push(("Allow".into(), b"GET, HEAD, OPTIONS".to_vec()));
+        }
+        return send_response(respond, &cfg, response, false).await.is_err();
+    }
     let max_body = cfg.limit_request_body.min(crate::http::MAX_BODY_BUFFERED);
     let body_timeout = cfg
         .request_body_timeout
@@ -1087,8 +1123,16 @@ where
     );
     let mut stream_ids = H2StreamIds::default();
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let mut reset_reclaims: BinaryHeap<Reverse<(Instant, u64)>> = BinaryHeap::new();
     let idle_timeout = cfg.timeout.max(cfg.keep_alive_timeout).max(H2_IDLE_FLOOR);
     loop {
+        let reclaim_deadline = reset_reclaims.peek().map(|entry| entry.0 .0);
+        let reclaim_timer = tokio::time::sleep_until(
+            reclaim_deadline
+                .map(tokio::time::Instant::from_std)
+                .unwrap_or_else(|| tokio::time::Instant::now() + idle_timeout),
+        );
+        tokio::pin!(reclaim_timer);
         tokio::select! {
             biased;
             _ = &mut initial_request_deadline, if ready_callback.is_some() => {
@@ -1122,11 +1166,7 @@ where
                         };
                         budget = next;
                         if reset && stream_ids.schedule_purge(stream_id) {
-                            let tx = events_tx.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(H2_RESET_RECLAIM).await;
-                                let _ = tx.send(H2TaskEvent::Reclaimed { stream_id });
-                            });
+                            reset_reclaims.push(Reverse((Instant::now() + H2_RESET_RECLAIM, stream_id)));
                         }
                     }
                     H2TaskEvent::Reclaimed { stream_id } => {
@@ -1140,6 +1180,26 @@ where
                         ) {
                             budget = next;
                         }
+                    }
+                }
+            }
+            _ = &mut reclaim_timer, if reclaim_deadline.is_some() => {
+                let now = Instant::now();
+                while reset_reclaims
+                    .peek()
+                    .is_some_and(|entry| entry.0.0 <= now)
+                {
+                    let Reverse((_, stream_id)) = reset_reclaims
+                        .pop()
+                        .expect("peeked reset reclaim deadline");
+                    if !stream_ids.reclaim(stream_id) {
+                        continue;
+                    }
+                    if let Some(next) = vapache_verified::h2_budget_step(
+                        budget,
+                        vapache_verified::H2BudgetEvent::Reclaim,
+                    ) {
+                        budget = next;
                     }
                 }
             }
@@ -1256,8 +1316,12 @@ mod tests {
             ),
         )
         .unwrap();
-        let cfg =
-            Arc::new(Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap());
+        let mut cfg = Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        // Most adapter tests exercise body framing independently of route
+        // selection. Mark their fixture as body-capable; static-only early
+        // rejection has dedicated HTTP/1 and configuration coverage.
+        cfg.body_handlers_possible = true;
+        let cfg = Arc::new(cfg);
         let logger = Arc::new(Logger::new(&cfg).unwrap());
         (cfg, logger, dir)
     }
@@ -1319,14 +1383,20 @@ mod tests {
             let mut offset = 0usize;
             while offset < body.len() {
                 send.reserve_capacity(body.len() - offset);
-                let capacity = std::future::poll_fn(|cx| send.poll_capacity(cx))
-                    .await
-                    .expect("HTTP/2 request stream closed")
-                    .expect("HTTP/2 request capacity failed");
+                let Some(capacity) = std::future::poll_fn(|cx| send.poll_capacity(cx)).await else {
+                    break;
+                };
+                let Ok(capacity) = capacity else {
+                    break;
+                };
                 let take = capacity.min(body.len() - offset);
                 let last = offset + take == body.len();
-                send.send_data(Bytes::copy_from_slice(&body[offset..offset + take]), last)
-                    .unwrap();
+                if send
+                    .send_data(Bytes::copy_from_slice(&body[offset..offset + take]), last)
+                    .is_err()
+                {
+                    break;
+                }
                 offset += take;
             }
         }
@@ -1445,6 +1515,31 @@ mod tests {
         let (status, body, _) = round_trip(cfg.clone(), logger.clone(), request, &[]).await;
         assert_eq!(status, 200);
         assert!(body.is_empty());
+
+        let mut static_only = (*cfg).clone();
+        static_only.body_handlers_possible = false;
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/file.txt")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            round_trip(Arc::new(static_only.clone()), logger.clone(), request, b"x")
+                .await
+                .0,
+            400
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/file.txt")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            round_trip(Arc::new(static_only), logger.clone(), request, b"x")
+                .await
+                .0,
+            405
+        );
 
         let mut limited = (*cfg).clone();
         limited.limit_request_line = 2;

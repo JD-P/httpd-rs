@@ -15,8 +15,9 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use sha1::{Digest, Sha1};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::IpAddr;
 use std::os::unix::ffi::OsStrExt;
@@ -24,7 +25,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
 
 const MAX_ENTRIES: usize = 4096;
@@ -88,6 +89,38 @@ struct Entry {
 struct MemoryCache {
     entries: HashMap<String, Vec<Arc<Entry>>>,
     bytes: u64,
+    eviction: VecDeque<(usize, u64, Weak<Entry>)>,
+    locations: HashMap<usize, (u64, String)>,
+    next_generation: u64,
+}
+
+fn memory_entry_id(entry: &Arc<Entry>) -> usize {
+    Arc::as_ptr(entry) as usize
+}
+
+fn untrack_memory_entry(cache: &mut MemoryCache, entry: &Arc<Entry>) {
+    cache.locations.remove(&memory_entry_id(entry));
+}
+
+fn track_memory_entry(cache: &mut MemoryCache, key: &str, entry: &Arc<Entry>) {
+    let id = memory_entry_id(entry);
+    cache.next_generation = cache.next_generation.wrapping_add(1).max(1);
+    let generation = cache.next_generation;
+    cache.locations.insert(id, (generation, key.to_string()));
+    cache
+        .eviction
+        .push_back((id, generation, Arc::downgrade(entry)));
+    // Hot replacement of one key can leave stale weak records. Compact them
+    // occasionally; this work is amortized and bounded independently of key
+    // length because queue records do not clone cache keys.
+    if cache.eviction.len() > MAX_ENTRIES * 8 {
+        let locations = &cache.locations;
+        cache.eviction.retain(|(candidate, generation, _)| {
+            locations
+                .get(candidate)
+                .is_some_and(|(current, _)| current == generation)
+        });
+    }
 }
 
 fn entries() -> &'static Mutex<MemoryCache> {
@@ -114,9 +147,42 @@ fn memory_entry_size(key: &str, entry: &Entry) -> u64 {
 }
 
 fn evict_oldest_memory(cache: &mut MemoryCache) -> bool {
-    // Empty buckets should never survive production insertion, but removing
-    // one here keeps the entry-count invariant self-healing after tests,
-    // upgrades, or a future interrupted mutation.
+    while let Some((id, queued_generation, weak)) = cache.eviction.pop_front() {
+        let Some((current_generation, key)) = cache.locations.get(&id) else {
+            continue;
+        };
+        if *current_generation != queued_generation {
+            continue;
+        }
+        let key = key.clone();
+        cache.locations.remove(&id);
+        let Some(entry) = weak.upgrade() else {
+            continue;
+        };
+        let Some(mut list) = cache.entries.remove(&key) else {
+            continue;
+        };
+        let Some(index) = list
+            .iter()
+            .position(|candidate| Arc::ptr_eq(candidate, &entry))
+        else {
+            if !list.is_empty() {
+                cache.entries.insert(key, list);
+            }
+            continue;
+        };
+        let removed = list.remove(index);
+        cache.bytes = cache
+            .bytes
+            .saturating_sub(memory_entry_size(&key, &removed));
+        if !list.is_empty() {
+            cache.entries.insert(key, list);
+        }
+        return true;
+    }
+    // Production insertions never leave empty buckets. Keep malformed test,
+    // upgrade, or interrupted state self-healing without putting the normal
+    // eviction path back on an O(n) scan.
     if let Some(key) = cache
         .entries
         .iter()
@@ -125,28 +191,7 @@ fn evict_oldest_memory(cache: &mut MemoryCache) -> bool {
         cache.entries.remove(&key);
         return true;
     }
-    let victim = cache
-        .entries
-        .iter()
-        .flat_map(|(key, entries)| {
-            entries
-                .iter()
-                .enumerate()
-                .map(move |(index, entry)| (key.clone(), index, entry.stored))
-        })
-        .min_by_key(|(_, _, stored)| *stored);
-    let Some((key, index, _)) = victim else {
-        return false;
-    };
-    let mut list = cache.entries.remove(&key).unwrap_or_default();
-    let removed = list.remove(index);
-    cache.bytes = cache
-        .bytes
-        .saturating_sub(memory_entry_size(&key, &removed));
-    if !list.is_empty() {
-        cache.entries.insert(key, list);
-    }
-    true
+    false
 }
 
 fn insert_memory(cfg: &Config, key: &str, entry: Arc<Entry>) {
@@ -165,6 +210,10 @@ fn insert_memory_into(cfg: &Config, cache: &mut MemoryCache, key: &str, entry: A
     let mut list = cache.entries.remove(key).unwrap_or_default();
     let mut retained = Vec::with_capacity(list.len().saturating_add(1));
     for old in list.drain(..) {
+        // This key is temporarily outside `entries` while its variants are
+        // filtered. Retire every old queue identity now and assign a fresh
+        // generation to retained variants after global eviction completes.
+        untrack_memory_entry(cache, &old);
         if old.vary == entry.vary {
             cache.bytes = cache.bytes.saturating_sub(memory_entry_size(key, &old));
         } else {
@@ -186,6 +235,9 @@ fn insert_memory_into(cfg: &Config, cache: &mut MemoryCache, key: &str, entry: A
         retained.push(entry);
     }
     if !retained.is_empty() {
+        for retained_entry in &retained {
+            track_memory_entry(cache, key, retained_entry);
+        }
         cache.entries.insert(key.to_string(), retained);
     }
 }
@@ -193,8 +245,13 @@ fn insert_memory_into(cfg: &Config, cache: &mut MemoryCache, key: &str, entry: A
 #[derive(Default)]
 struct DiskUsageState {
     total: u64,
-    /// stem -> (accounted bytes, oldest modification time)
-    stems: HashMap<PathBuf, (u64, SystemTime)>,
+    /// stem -> (accounted bytes, modification time, insertion generation)
+    stems: HashMap<PathBuf, (u64, SystemTime, u64)>,
+    /// Insertion/scan order with timestamps used to discard stale records.
+    /// This makes eviction O(1) amortized instead of sorting the entire cache
+    /// on every unique request key.
+    eviction: VecDeque<(PathBuf, u64)>,
+    next_generation: u64,
     /// Exact key decoded once from the metadata file. `None` denotes corrupt
     /// or legacy metadata and is removed conservatively on invalidation.
     keys: HashMap<PathBuf, Option<Vec<u8>>>,
@@ -203,6 +260,58 @@ struct DiskUsageState {
 fn disk_usage() -> &'static Mutex<HashMap<PathBuf, DiskUsageState>> {
     static USAGE: OnceLock<Mutex<HashMap<PathBuf, DiskUsageState>>> = OnceLock::new();
     USAGE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ensure_disk_usage(root: &Path) -> bool {
+    if disk_usage()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains_key(root)
+    {
+        return true;
+    }
+    // Cold-start scans are bounded, but letting every first request perform
+    // the same walk in parallel would multiply that bound by the worker cap.
+    // Serialize only index construction; steady-state accounting and file I/O
+    // do not use this lock.
+    static SCAN: OnceLock<Mutex<()>> = OnceLock::new();
+    let _scan = SCAN
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if disk_usage()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains_key(root)
+    {
+        return true;
+    }
+    let Some(scanned) = scan_disk_usage(root) else {
+        return false;
+    };
+    disk_usage()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(root.to_path_buf(), scanned);
+    true
+}
+
+/// Serialize writers and readers of one cache stem without putting unrelated
+/// cache keys behind the accounting lock. A fixed set of stripes bounds the
+/// lock table itself, while making the body-then-metadata rename sequence
+/// atomic from the point of view of `disk_load`.
+fn disk_io_locks() -> &'static [Mutex<()>] {
+    const STRIPES: usize = 64;
+    static LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(|| (0..STRIPES).map(|_| Mutex::new(())).collect())
+        .as_slice()
+}
+
+fn disk_io_lock(stem: &Path) -> &Mutex<()> {
+    let mut hasher = DefaultHasher::new();
+    stem.hash(&mut hasher);
+    &disk_io_locks()[hasher.finish() as usize % disk_io_locks().len()]
 }
 
 fn disk_stem(path: &Path) -> Option<PathBuf> {
@@ -225,7 +334,7 @@ fn disk_stem_files(stem: &Path) -> [PathBuf; 4] {
 }
 
 fn record_disk_file(state: &mut DiskUsageState, stem: PathBuf, len: u64, modified: SystemTime) {
-    let slot = state.stems.entry(stem).or_insert((0, modified));
+    let slot = state.stems.entry(stem).or_insert((0, modified, 0));
     slot.0 = slot.0.saturating_add(len);
     if modified < slot.1 {
         slot.1 = modified;
@@ -312,7 +421,20 @@ fn scan_disk_usage(root: &Path) -> Option<DiskUsageState> {
             }
         }
     }
-    state.total = state.stems.values().map(|(size, _)| *size).sum();
+    state.total = state.stems.values().map(|(size, _, _)| *size).sum();
+    let mut ordered: Vec<_> = state
+        .stems
+        .iter()
+        .map(|(stem, (_, modified, _))| (stem.clone(), *modified))
+        .collect();
+    ordered.sort_by_key(|(_, modified)| *modified);
+    for (stem, _) in ordered {
+        state.next_generation = state.next_generation.saturating_add(1);
+        if let Some(entry) = state.stems.get_mut(&stem) {
+            entry.2 = state.next_generation;
+        }
+        state.eviction.push_back((stem, state.next_generation));
+    }
     Some(state)
 }
 
@@ -323,7 +445,7 @@ fn remove_disk_stem(cfg: &Config, stem: &Path) {
     };
     let mut roots = disk_usage().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(usage) = roots.get_mut(root) {
-        if let Some((size, _)) = usage.stems.remove(stem) {
+        if let Some((size, _, _)) = usage.stems.remove(stem) {
             usage.total = usage.total.saturating_sub(size);
         }
         usage.keys.remove(stem);
@@ -1043,6 +1165,7 @@ pub fn lookup(
         for entry in list.drain(..) {
             if entry.expires <= now {
                 cache.bytes = cache.bytes.saturating_sub(memory_entry_size(&key, &entry));
+                untrack_memory_entry(&mut cache, &entry);
                 continue;
             }
             if found.is_none()
@@ -1390,6 +1513,9 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
     let Some(stem) = cache_stem(cfg, key) else {
         return;
     };
+    let _io_guard = disk_io_lock(&stem)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     // `cache_stem` succeeds exactly when the root exists.
     let root = cfg
         .cache
@@ -1407,47 +1533,81 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
     if incoming > cfg.cache.max_disk_size {
         return;
     }
-    let mut roots = disk_usage().lock().unwrap_or_else(|e| e.into_inner());
-    if !roots.contains_key(root) {
-        let Some(scanned) = scan_disk_usage(root) else {
-            return;
-        };
-        roots.insert(root.clone(), scanned);
+    // Establish the initial index without holding the process-wide state lock
+    // across the bounded filesystem walk. A racing store may install an
+    // equivalent index first; `entry().or_insert` keeps that newer state.
+    if !ensure_disk_usage(root) {
+        return;
     }
-    let usage = roots
-        .get_mut(root)
-        .expect("bounded disk scan inserted cache usage");
-    let old_size = usage.stems.get(&stem).map(|(size, _)| *size).unwrap_or(0);
-    let old_count = usize::from(old_size > 0);
-    let mut projected = vapache_verified::cache_disk_projected(usage.total, old_size, incoming);
-    let mut entries = usage
-        .stems
-        .len()
-        .saturating_sub(old_count)
-        .saturating_add(1);
-    if projected > cfg.cache.max_disk_size || entries > MAX_DISK_ENTRIES {
-        let mut victims: Vec<(PathBuf, u64, SystemTime)> = usage
+    let (generation, victims) = {
+        let mut roots = disk_usage().lock().unwrap_or_else(|e| e.into_inner());
+        let usage = roots
+            .get_mut(root)
+            .expect("bounded disk scan inserted cache usage");
+        let old_size = usage
             .stems
-            .iter()
-            .filter(|(candidate, _)| candidate.as_path() != stem)
-            .map(|(candidate, (size, modified))| (candidate.clone(), *size, *modified))
-            .collect();
-        victims.sort_by_key(|(_, _, modified)| *modified);
-        for (victim, size, _) in victims {
-            if projected <= cfg.cache.max_disk_size && entries <= MAX_DISK_ENTRIES {
+            .get(&stem)
+            .map(|(size, _, _)| *size)
+            .unwrap_or(0);
+        let old_count = usize::from(old_size > 0);
+        let mut projected = vapache_verified::cache_disk_projected(usage.total, old_size, incoming);
+        let mut entries = usage
+            .stems
+            .len()
+            .saturating_sub(old_count)
+            .saturating_add(1);
+        let mut victims = Vec::new();
+        while projected > cfg.cache.max_disk_size || entries > MAX_DISK_ENTRIES {
+            let Some((victim, queued_generation)) = usage.eviction.pop_front() else {
                 break;
+            };
+            if victim == stem {
+                continue;
             }
-            remove_disk_stem_files(&victim);
+            let Some((size, _, current_generation)) = usage.stems.get(&victim).copied() else {
+                continue;
+            };
+            if current_generation != queued_generation {
+                continue;
+            }
             if usage.stems.remove(&victim).is_some() {
                 usage.total = usage.total.saturating_sub(size);
                 projected = vapache_verified::cache_disk_evict(projected, size);
                 entries = entries.saturating_sub(1);
+                victims.push(victim.clone());
             }
             usage.keys.remove(&victim);
         }
         if projected > cfg.cache.max_disk_size || entries > MAX_DISK_ENTRIES {
             return;
         }
+        usage.next_generation = usage.next_generation.wrapping_add(1).max(1);
+        let generation = usage.next_generation;
+        let stored = SystemTime::now();
+        usage.total = projected;
+        usage
+            .stems
+            .insert(stem.clone(), (incoming, stored, generation));
+        usage.eviction.push_back((stem.clone(), generation));
+        if usage.eviction.len() > MAX_DISK_ENTRIES * 8 {
+            let (stems, eviction) = (&usage.stems, &mut usage.eviction);
+            eviction.retain(|(candidate, queued_generation)| {
+                stems
+                    .get(candidate)
+                    .is_some_and(|(_, _, current_generation)| {
+                        current_generation == queued_generation
+                    })
+            });
+        }
+        usage
+            .keys
+            .insert(stem.clone(), Some(key.as_bytes().to_vec()));
+        (generation, victims)
+    };
+    // Filesystem I/O happens after releasing the accounting lock. Concurrent
+    // stores reserve their bytes first, so the disk quota remains closed.
+    for victim in victims {
+        remove_disk_stem_files(&victim);
     }
     let body_path = stem.with_extension("body");
     let meta_path = stem.with_extension("meta");
@@ -1456,8 +1616,8 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
     if write_cache_temp(&body_tmp, &entry.body).is_err()
         || write_cache_temp(&meta_tmp, &meta).is_err()
     {
-        let _ = fs::remove_file(&body_tmp);
-        let _ = fs::remove_file(&meta_tmp);
+        remove_disk_stem_files(&stem);
+        release_disk_reservation(root, &stem, generation);
         return;
     }
     if fs::rename(&body_tmp, &body_path).is_err() || fs::rename(&meta_tmp, &meta_path).is_err() {
@@ -1465,6 +1625,7 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
         let _ = fs::remove_file(&meta_tmp);
         let _ = fs::remove_file(&body_path);
         let _ = fs::remove_file(&meta_path);
+        release_disk_reservation(root, &stem, generation);
         return;
     }
     let actual = fs::metadata(&body_path)
@@ -1475,15 +1636,46 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
                 .map(|m| m.len())
                 .unwrap_or(meta.len() as u64),
         );
-    usage.total = vapache_verified::cache_disk_projected(usage.total, old_size, actual);
-    usage
-        .stems
-        .insert(stem.clone(), (actual, SystemTime::now()));
-    usage.keys.insert(stem, Some(key.as_bytes().to_vec()));
+    let mut roots = disk_usage().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(usage) = roots.get_mut(root) else {
+        drop(roots);
+        remove_disk_stem_files(&stem);
+        return;
+    };
+    let Some((reserved, _, current_generation)) = usage.stems.get_mut(&stem) else {
+        drop(roots);
+        remove_disk_stem_files(&stem);
+        return;
+    };
+    if *current_generation != generation {
+        drop(roots);
+        remove_disk_stem_files(&stem);
+        return;
+    }
+    usage.total = usage.total.saturating_sub(*reserved).saturating_add(actual);
+    *reserved = actual;
+}
+
+fn release_disk_reservation(root: &Path, stem: &Path, generation: u64) {
+    let mut roots = disk_usage().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(usage) = roots.get_mut(root) else {
+        return;
+    };
+    let current = usage.stems.get(stem).copied();
+    if let Some((size, _, current_generation)) = current {
+        if current_generation == generation {
+            usage.stems.remove(stem);
+            usage.keys.remove(stem);
+            usage.total = usage.total.saturating_sub(size);
+        }
+    }
 }
 
 fn disk_load(cfg: &Config, key: &str) -> Option<Entry> {
     let stem = cache_stem(cfg, key)?;
+    let _io_guard = disk_io_lock(&stem)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let meta = match read_disk_metadata(&stem.with_extension("meta")) {
         Some(meta) => meta,
         None => {
@@ -1714,40 +1906,41 @@ fn invalidate_disk_prefix(cfg: &Config, prefix: &[u8]) {
     // Build the index at most once per cache generation. Subsequent unsafe
     // requests select matching stems in memory instead of recursively walking
     // and rereading every metadata file.
-    let mut roots = disk_usage().lock().unwrap_or_else(|e| e.into_inner());
-    if !roots.contains_key(root) {
-        let Some(scanned) = scan_disk_usage(root) else {
-            // A bounded scan could not establish which persisted entries are
-            // affected. Advance the generation so none of them can be served,
-            // and release the bounded in-memory cache as the fail-closed path.
-            drop(roots);
-            bump_epoch();
-            *entries().lock().unwrap_or_else(|e| e.into_inner()) = MemoryCache::default();
-            return;
-        };
-        roots.insert(root.clone(), scanned);
+    if !ensure_disk_usage(root) {
+        // A bounded scan could not establish which persisted entries are
+        // affected. Advance the generation so none of them can be served,
+        // and release the bounded in-memory cache as the fail-closed path.
+        bump_epoch();
+        *entries().lock().unwrap_or_else(|e| e.into_inner()) = MemoryCache::default();
+        return;
     }
-    let usage = roots
-        .get_mut(root)
-        .expect("bounded disk scan inserted cache usage");
-    let victims: Vec<PathBuf> = usage
-        .stems
-        .keys()
-        .filter(|stem| {
-            let key = usage.keys.get(*stem).and_then(|key| key.as_deref());
-            vapache_verified::cache_invalidation_remove_admit(
-                key.is_some(),
-                key.is_some_and(|key| key.starts_with(prefix)),
-            )
-        })
-        .cloned()
-        .collect();
+    let victims = {
+        let mut roots = disk_usage().lock().unwrap_or_else(|e| e.into_inner());
+        let usage = roots
+            .get_mut(root)
+            .expect("bounded disk scan inserted cache usage");
+        let victims: Vec<PathBuf> = usage
+            .stems
+            .keys()
+            .filter(|stem| {
+                let key = usage.keys.get(*stem).and_then(|key| key.as_deref());
+                vapache_verified::cache_invalidation_remove_admit(
+                    key.is_some(),
+                    key.is_some_and(|key| key.starts_with(prefix)),
+                )
+            })
+            .cloned()
+            .collect();
+        for stem in &victims {
+            if let Some((size, _, _)) = usage.stems.remove(stem) {
+                usage.total = usage.total.saturating_sub(size);
+            }
+            usage.keys.remove(stem);
+        }
+        victims
+    };
     for stem in victims {
         remove_disk_stem_files(&stem);
-        if let Some((size, _)) = usage.stems.remove(&stem) {
-            usage.total = usage.total.saturating_sub(size);
-        }
-        usage.keys.remove(&stem);
     }
 }
 
@@ -1772,6 +1965,7 @@ pub fn invalidate(cfg: &Config, host: &str, path: &str) {
         if let Some(list) = cache.entries.remove(&key) {
             for entry in list {
                 cache.bytes = cache.bytes.saturating_sub(memory_entry_size(&key, &entry));
+                untrack_memory_entry(&mut cache, &entry);
             }
         }
     }
@@ -3575,6 +3769,38 @@ CacheIgnoreQueryString On\n\
     }
 
     #[test]
+    fn concurrent_same_key_disk_stores_publish_one_complete_entry() {
+        let (dir, mut cfg) = disk_test_config("same-key-store");
+        cfg.cache.max_disk_size = 1_000_000;
+        prepare(&cfg);
+        let cfg = Arc::new(cfg);
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for value in 0..8u8 {
+            let cfg = cfg.clone();
+            let start = start.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                disk_store(
+                    &cfg,
+                    "shared-key",
+                    &disk_entry(&vec![value; 4096], unix_now() + 60),
+                );
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let loaded = disk_load(&cfg, "shared-key").expect("complete concurrent store");
+        assert_eq!(loaded.body.len(), 4096);
+        assert!(loaded.body.iter().all(|byte| *byte == loaded.body[0]));
+        let stem = cache_stem(&cfg, "shared-key").unwrap();
+        assert!(!stem.with_extension("body.tmp").exists());
+        assert!(!stem.with_extension("meta.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn disk_cache_deletes_expired_entries_on_lookup() {
         let (dir, cfg) = disk_test_config("expired");
         disk_store(&cfg, "expired", &disk_entry(b"stale", unix_now() - 1));
@@ -4127,6 +4353,7 @@ CacheIgnoreQueryString On\n\
                 total: u64::MAX,
                 stems: HashMap::new(),
                 keys: HashMap::new(),
+                ..DiskUsageState::default()
             },
         );
         cfg.cache.max_disk_size = 1_000;

@@ -26,6 +26,8 @@ const MAX_ACCESS_SECTION_DEPTH: usize = 64;
 const MAX_ACCESS_INSTRUCTIONS_PER_FILE: usize = 8192;
 const MAX_ACCESS_INSTRUCTIONS_PER_REQUEST: usize = 16_384;
 const MAX_ACCESS_LAYERS: usize = 64;
+const MAX_ACCESS_PATH_COMPONENTS: usize = 256;
+const MAX_ACCESS_ANCESTOR_BYTES: usize = 512 * 1024;
 
 pub fn apply(
     cfg: &Config,
@@ -160,7 +162,7 @@ pub fn apply_req_deferred_with_root(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| access_root_for(cfg, vhost, fs_path));
     let start = walk_start(fs_path);
-    let dirs = ancestor_dirs(start);
+    let dirs = ancestor_dirs(start)?;
     let mut access_layers = 0usize;
     let mut access_instructions = 0usize;
     let can_read_access = cfg.override_enabled && cfg.override_applicable(fs_path);
@@ -300,10 +302,20 @@ fn walk_start(fs_path: &Path) -> &Path {
 /// Every ancestor of `start`, from the filesystem root down to `start`.
 /// Access-file authorization is directory-based, so this list is independent
 /// of `DocumentRoot` and of any alias root (F50).
-fn ancestor_dirs(start: &Path) -> Vec<PathBuf> {
+fn ancestor_dirs(start: &Path) -> Result<Vec<PathBuf>, String> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut cur = Some(start);
+    let mut copied = 0usize;
     while let Some(d) = cur {
+        if dirs.len() >= MAX_ACCESS_PATH_COMPONENTS {
+            return Err("access-file path has too many ancestor components".into());
+        }
+        copied = copied
+            .checked_add(d.as_os_str().as_encoded_bytes().len())
+            .ok_or_else(|| "access-file ancestor work overflow".to_string())?;
+        if copied > MAX_ACCESS_ANCESTOR_BYTES {
+            return Err("access-file ancestor work limit exceeded".into());
+        }
         dirs.push(d.to_path_buf());
         let Some(parent) = d.parent() else {
             break;
@@ -315,7 +327,7 @@ fn ancestor_dirs(start: &Path) -> Vec<PathBuf> {
     // avoids repeated `Path::components` parsing on every request.
     dirs.reverse();
     dirs.dedup();
-    dirs
+    Ok(dirs)
 }
 
 /// Fallback mapping root used only for URL/`RewriteBase` derivation when a
@@ -448,7 +460,7 @@ fn collect_layers_with_root_inner(
         return Ok(Vec::new());
     }
     let start = walk_start(fs_path);
-    let dirs = ancestor_dirs(start);
+    let dirs = ancestor_dirs(start)?;
     let mut layers = Vec::new();
     let mut access_instructions = 0usize;
     for dir in dirs {
@@ -615,7 +627,13 @@ pub fn trace_access_files_with_root(
         return out;
     }
     let start = walk_start(fs_path);
-    let dirs = ancestor_dirs(start);
+    let dirs = match ancestor_dirs(start) {
+        Ok(dirs) => dirs,
+        Err(error) => {
+            out.push(format!("skipped ({error})"));
+            return out;
+        }
+    };
     let mut found = false;
     for dir in dirs {
         if !dir.is_dir() {
@@ -3108,6 +3126,16 @@ mod tests {
         let path = root.join("httpd.conf");
         fs::write(&path, format!("{}{text}", crate::config::TEST_CAPABILITIES)).unwrap();
         Config::load(&path, root, &HashMap::new(), &HashMap::new(), false).unwrap()
+    }
+
+    #[test]
+    fn ancestor_walk_rejects_path_copy_amplification() {
+        let mut path = PathBuf::from("/");
+        for _ in 0..MAX_ACCESS_PATH_COMPONENTS {
+            path.push("x");
+        }
+        assert!(ancestor_dirs(&path).is_err());
+        assert!(ancestor_dirs(Path::new("/one/two/three")).is_ok());
     }
 
     #[test]

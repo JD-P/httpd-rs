@@ -3010,6 +3010,36 @@ pub proof fn resource_budget_rejects_exhausted(used: u64, incoming: u64)
 {
 }
 
+/// Overflow-free length transition for regex capture substitution. Runtime
+/// expansion allocates only after this transition admits the resulting value.
+pub fn capture_expansion_len(
+    current: u64,
+    occurrences: u64,
+    marker_len: u64,
+    value_len: u64,
+    limit: u64,
+) -> (next: Option<u64>)
+    ensures match next { Some(length) => length <= limit, None => true },
+{
+    let removed = match occurrences.checked_mul(marker_len) {
+        Some(value) => value,
+        None => return None,
+    };
+    let added = match occurrences.checked_mul(value_len) {
+        Some(value) => value,
+        None => return None,
+    };
+    let base = match current.checked_sub(removed) {
+        Some(value) => value,
+        None => return None,
+    };
+    let length = match base.checked_add(added) {
+        Some(value) => value,
+        None => return None,
+    };
+    if length > limit { None } else { Some(length) }
+}
+
 /// A request-body prefix remains resident in memory only while the exact
 /// incremental addition fits the per-stream allowance.  Both HTTP adapters
 /// consume this predicate before extending their concrete buffer; rejection

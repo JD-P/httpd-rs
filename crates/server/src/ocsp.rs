@@ -10,11 +10,11 @@ use rustls::pki_types::{CertificateDer, UnixTime};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_OCSP_HTTP_LINE: usize = 16 * 1024;
 const MAX_OCSP_HTTP_HEAD: usize = 64 * 1024;
@@ -308,10 +308,29 @@ pub(crate) fn supported_responder_url(url: &str) -> bool {
 }
 
 fn read_http_line(reader: &mut impl BufRead) -> Option<String> {
-    let mut line = Vec::new();
-    let n = reader.read_until(b'\n', &mut line).ok()?;
-    if n == 0 || line.len() > MAX_OCSP_HTTP_LINE {
-        return None;
+    // Do not use `read_until`: an OCSP peer can otherwise force allocation of
+    // an unbounded line before the post-read size check runs.
+    let mut line = Vec::with_capacity(MAX_OCSP_HTTP_LINE.min(1024));
+    loop {
+        let available = reader.fill_buf().ok()?;
+        if available.is_empty() {
+            return None;
+        }
+        if let Some(end) = available.iter().position(|byte| *byte == b'\n') {
+            let take = end + 1;
+            if line.len().saturating_add(take) > MAX_OCSP_HTTP_LINE {
+                return None;
+            }
+            line.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            break;
+        }
+        if line.len().saturating_add(available.len()) > MAX_OCSP_HTTP_LINE {
+            return None;
+        }
+        let take = available.len();
+        line.extend_from_slice(available);
+        reader.consume(take);
     }
     while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
         line.pop();
@@ -321,16 +340,29 @@ fn read_http_line(reader: &mut impl BufRead) -> Option<String> {
 
 fn fetch_response(url: &str, request: &[u8], timeout: Duration) -> Option<Vec<u8>> {
     let (host, port, path) = parse_http_url(url)?;
+    let deadline = Instant::now() + timeout;
     let mut stream = None;
-    for candidate in (host.as_str(), port).to_socket_addrs().ok()? {
-        if let Ok(s) = TcpStream::connect_timeout(&candidate, timeout) {
+    let addresses = crate::proxy::resolve_backend_addrs(&host, port, timeout).ok()?;
+    for candidate in addresses {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if let Ok(s) = TcpStream::connect_timeout(&candidate, remaining) {
             stream = Some(s);
             break;
         }
     }
-    let mut stream = stream?;
-    stream.set_read_timeout(Some(timeout)).ok()?;
-    stream.set_write_timeout(Some(timeout)).ok()?;
+    let stream = stream?;
+    let quantum = deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_secs(1));
+    if quantum.is_zero() {
+        return None;
+    }
+    stream.set_read_timeout(Some(quantum)).ok()?;
+    stream.set_write_timeout(Some(quantum)).ok()?;
+    let mut stream = OcspDeadlineStream { stream, deadline };
     let head = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/ocsp-request\r\nAccept: application/ocsp-response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         request.len()
@@ -376,6 +408,72 @@ fn fetch_response(url: &str, request: &[u8], timeout: Duration) -> Option<Vec<u8
         }
     }
     Some(body)
+}
+
+struct OcspDeadlineStream {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl Read for OcspDeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "OCSP exchange deadline exceeded",
+                ));
+            }
+            match self.stream.read(buf) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Write for OcspDeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "OCSP exchange deadline exceeded",
+                ));
+            }
+            match self.stream.write(buf) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "OCSP exchange deadline exceeded",
+                ));
+            }
+            match self.stream.flush() {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
 }
 
 fn successful_response(data: &[u8]) -> bool {

@@ -109,9 +109,14 @@ struct AuthFileKey {
 
 #[derive(Default)]
 struct AuthFileCache {
-    entries: HashMap<AuthFileKey, (Arc<String>, usize)>,
+    entries: HashMap<AuthFileKey, (Arc<ParsedAuthFile>, usize)>,
     failures: HashMap<(PathBuf, bool, u32), Instant>,
     bytes: usize,
+}
+
+struct ParsedAuthFile {
+    users: HashMap<String, Option<String>>,
+    groups_by_user: HashMap<String, Vec<String>>,
 }
 
 fn auth_file_cache() -> &'static Mutex<AuthFileCache> {
@@ -132,7 +137,7 @@ fn auth_key(path: &Path, meta: &std::fs::Metadata) -> AuthFileKey {
     }
 }
 
-fn read_small(path: &Path, mutable: bool) -> Option<Arc<String>> {
+fn read_small(path: &Path, mutable: bool) -> Option<Arc<ParsedAuthFile>> {
     let service_uid = crate::files::effective_uid();
     let failure_key = (path.to_path_buf(), mutable, service_uid);
     let now = Instant::now();
@@ -162,7 +167,11 @@ fn read_small(path: &Path, mutable: bool) -> Option<Arc<String>> {
     data
 }
 
-fn read_small_uncached(path: &Path, mutable: bool, service_uid: u32) -> Option<Arc<String>> {
+fn read_small_uncached(
+    path: &Path,
+    mutable: bool,
+    service_uid: u32,
+) -> Option<Arc<ParsedAuthFile>> {
     // O_NONBLOCK is security-significant: opening an attacker-selected FIFO
     // must not park a request worker before the regular-file check runs.
     let file = if mutable {
@@ -184,13 +193,14 @@ fn read_small_uncached(path: &Path, mutable: bool, service_uid: u32) -> Option<A
     {
         return path_names_key(path, &key).then_some(data);
     }
-    let data = Arc::new(read_bounded(&file)?);
+    let raw = read_bounded(&file)?;
+    let (parsed, parsed_weight) = parse_auth_file(&raw)?;
+    let data = Arc::new(parsed);
     let after = file.metadata().ok()?;
     if auth_key(path, &after) != key || !path_names_key(path, &key) {
         return None;
     }
-    let weight = data
-        .len()
+    let weight = parsed_weight
         .saturating_add(path.as_os_str().as_encoded_bytes().len())
         .saturating_add(128);
     if weight <= MAX_AUTH_CACHE_BYTES {
@@ -246,6 +256,59 @@ fn read_bounded(reader: impl Read) -> Option<String> {
     String::from_utf8(data).ok()
 }
 
+fn parse_auth_file(data: &str) -> Option<(ParsedAuthFile, usize)> {
+    let mut users: HashMap<String, Option<String>> = HashMap::new();
+    let mut groups_by_user: HashMap<String, Vec<String>> = HashMap::new();
+    let mut weight = 0usize;
+    for line in data.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.to_string();
+        let value = value.trim_end_matches('\r').to_string();
+        weight = weight
+            .checked_add(name.len())?
+            .checked_add(value.len())?
+            .checked_add(96)?;
+        if weight > MAX_AUTH_CACHE_BYTES {
+            return None;
+        }
+        match users.entry(name.clone()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Some(value.clone()));
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                // Preserve the existing fail-closed duplicate-user behavior.
+                slot.insert(None);
+            }
+        }
+        let group = name.trim().to_string();
+        for member in value.split_whitespace() {
+            weight = weight
+                .checked_add(member.len())?
+                .checked_add(group.len())?
+                .checked_add(64)?;
+            if weight > MAX_AUTH_CACHE_BYTES {
+                return None;
+            }
+            groups_by_user
+                .entry(member.to_string())
+                .or_default()
+                .push(group.clone());
+        }
+    }
+    Some((
+        ParsedAuthFile {
+            users,
+            groups_by_user,
+        },
+        weight,
+    ))
+}
+
 /// Validate a main-configuration authentication database before serving.
 /// Runtime reads repeat every property so later replacement still fails
 /// closed, including for paths introduced by an access file.
@@ -262,39 +325,12 @@ pub fn validate_auth_file(path: &Path, mutable: bool, service_uid: u32) -> Resul
 
 fn lookup_user(path: &Path, user: &str, mutable: bool) -> Option<String> {
     let data = read_small(path, mutable)?;
-    let mut found = None;
-    for line in data.lines() {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((name, hash)) = line.split_once(':') else {
-            continue;
-        };
-        if name == user {
-            if found.is_some() {
-                // Ambiguous duplicate entry: fail rather than pick one.
-                return None;
-            }
-            found = Some(hash.trim_end_matches('\r').to_string());
-        }
-    }
-    found
+    data.users.get(user)?.clone()
 }
 
 fn groups_for(path: &Path, user: &str, mutable: bool) -> Option<Vec<String>> {
-    let Some(data) = read_small(path, mutable) else {
-        return None;
-    };
-    let mut out = Vec::new();
-    for line in data.lines() {
-        let Some((group, members)) = line.split_once(':') else {
-            continue;
-        };
-        if members.split_whitespace().any(|m| m == user) {
-            out.push(group.trim().to_string());
-        }
-    }
-    Some(out)
+    let data = read_small(path, mutable)?;
+    Some(data.groups_by_user.get(user).cloned().unwrap_or_default())
 }
 
 fn verify_password(password: &[u8], stored: &str) -> bool {

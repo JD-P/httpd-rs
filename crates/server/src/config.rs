@@ -2815,6 +2815,9 @@ pub struct Config {
     /// Set when an override-enabled section cannot be represented as a simple
     /// path prefix (for example `<DirectoryMatch>` or a global/vhost scope).
     pub override_anywhere: bool,
+    /// Conservative startup-compiled proof bit used before body ingestion.
+    /// False means no configured route can consume request body bytes.
+    pub(crate) body_handlers_possible: bool,
     pub document_root: PathBuf,
     pub default_charset: Option<String>,
     pub use_canonical_name: bool,
@@ -2836,6 +2839,51 @@ pub struct Config {
 }
 
 impl Config {
+    pub(crate) fn body_handlers_possible(&self) -> bool {
+        self.body_handlers_possible
+    }
+
+    fn compute_body_handlers_possible(&self) -> bool {
+        fn scope_may_consume(scope: &Scope) -> bool {
+            scope
+                .mapping_policy
+                .aliases
+                .iter()
+                .any(|alias| alias.script)
+                || scope
+                    .mapping_policy
+                    .handlers
+                    .iter()
+                    .any(|handler| !handler.remove)
+                || scope
+                    .mapping_policy
+                    .set_handler
+                    .as_ref()
+                    .and_then(SetHandler::name)
+                    .is_some()
+                || !scope.proxy_policy.proxy_passes.is_empty()
+                || !scope.proxy_policy.proxy_rules.is_empty()
+                || scope
+                    .rewrite_policy
+                    .rewrite_rules
+                    .iter()
+                    .any(|rule| rule.flags.proxy || rule.flags.handler.is_some())
+        }
+        fn rules_may_consume(rules: &[ScopeRule]) -> bool {
+            rules
+                .iter()
+                .any(|rule| scope_may_consume(&rule.delta) || rules_may_consume(&rule.nested))
+        }
+        self.override_enabled
+            || scope_may_consume(&self.global)
+            || rules_may_consume(&self.global_rules)
+            || self.vhosts.iter().any(|vhost| {
+                scope_may_consume(&vhost.scope)
+                    || scope_may_consume(&vhost.delta)
+                    || rules_may_consume(&vhost.rules)
+            })
+    }
+
     /// Reject directives whose startup effects cannot be changed by swapping
     /// an in-memory configuration generation. Accepting them would make the
     /// reported configuration disagree with the process identity, pid guard,
@@ -3063,6 +3111,7 @@ impl Config {
                 let (prefixes, anywhere) = c.override_paths();
                 c.override_prefixes = prefixes;
                 c.override_anywhere = anywhere;
+                c.body_handlers_possible = c.compute_body_handlers_possible();
                 Ok(c)
             }
             Err(e) => Err(vec![e]),
@@ -4516,6 +4565,7 @@ impl Compile {
             override_enabled: false,
             override_prefixes: Vec::new(),
             override_anywhere: false,
+            body_handlers_possible: false,
             document_root: server_root.join("htdocs"),
             default_charset: None,
             use_canonical_name: false,

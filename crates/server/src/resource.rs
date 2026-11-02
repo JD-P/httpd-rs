@@ -4,17 +4,19 @@
 //! or short client connection therefore releases its bytes/slot without every
 //! caller having to remember a matching decrement.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug, Default)]
 pub struct ResourceBudget {
     spool_bytes: AtomicU64,
     spool_files: AtomicU64,
     dynamic_requests: AtomicU64,
+    dynamic_clients: Mutex<HashMap<IpAddr, u64>>,
     h2_streams: AtomicU64,
     h2_clients: Mutex<HashMap<IpAddr, u64>>,
     request_bytes: AtomicU64,
@@ -29,6 +31,8 @@ pub struct ResourceBudget {
 /// Keeping this separate from request-worker admission prevents HTTP/2 from
 /// multiplying expensive work by its per-connection stream allowance.
 pub const MAX_EXPENSIVE_OPS: u64 = 32;
+pub const MAX_EXPENSIVE_OPS_PER_CLIENT: u64 = 8;
+pub const MAX_DYNAMIC_REQUESTS_PER_CLIENT: u64 = 8;
 pub const MAX_BLOCKING_READS: u64 = 32;
 pub const MAX_H2_STREAMS: u64 = 256;
 pub const MAX_H2_STREAMS_PER_CLIENT: u64 = 64;
@@ -49,15 +53,31 @@ pub const MAX_POLICY_WORK_UNITS: u64 = 16 * 1024 * 1024;
 pub const MAX_POLICY_EXPANSION_BYTES: u64 = 4 * 1024 * 1024;
 /// No single configuration expansion may monopolize the aggregate budget.
 pub const MAX_POLICY_VALUE_BYTES: u64 = 1024 * 1024;
+/// Process-wide reservation for request-controlled policy values retained by
+/// live requests. The per-request limit alone allowed many concurrent
+/// requests to multiply resident configuration-expansion memory.
+pub const MAX_POLICY_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Monotonic request-local accounting for attacker-influenced policy work.
 /// `Request` clones share this object through `Headers`, including internal
 /// rewrites and the HTTP/2 adapter.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RequestPolicyBudget {
     work: AtomicU64,
     expansion_bytes: AtomicU64,
     failed: AtomicBool,
+}
+
+static POLICY_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+impl Default for RequestPolicyBudget {
+    fn default() -> Self {
+        Self {
+            work: AtomicU64::new(0),
+            expansion_bytes: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
+        }
+    }
 }
 
 impl RequestPolicyBudget {
@@ -76,9 +96,16 @@ impl RequestPolicyBudget {
         if self.failed.load(Ordering::Acquire) {
             return Err("request policy expansion limit exceeded");
         }
-        if amount > MAX_POLICY_VALUE_BYTES
-            || !try_add(&self.expansion_bytes, amount, MAX_POLICY_EXPANSION_BYTES)
-        {
+        if amount > MAX_POLICY_VALUE_BYTES {
+            self.failed.store(true, Ordering::Release);
+            return Err("request policy expansion limit exceeded");
+        }
+        if !try_add(&POLICY_RESIDENT_BYTES, amount, MAX_POLICY_RESIDENT_BYTES) {
+            self.failed.store(true, Ordering::Release);
+            return Err("process policy expansion limit exceeded");
+        }
+        if !try_add(&self.expansion_bytes, amount, MAX_POLICY_EXPANSION_BYTES) {
+            POLICY_RESIDENT_BYTES.fetch_sub(amount, Ordering::AcqRel);
             self.failed.store(true, Ordering::Release);
             return Err("request policy expansion limit exceeded");
         }
@@ -100,6 +127,15 @@ impl RequestPolicyBudget {
     }
 }
 
+impl Drop for RequestPolicyBudget {
+    fn drop(&mut self) {
+        let reserved = self.expansion_bytes.load(Ordering::Acquire);
+        if reserved != 0 {
+            POLICY_RESIDENT_BYTES.fetch_sub(reserved, Ordering::AcqRel);
+        }
+    }
+}
+
 /// Collapse IPv6 interface identifiers into their /64 allocation while
 /// retaining exact IPv4 identities. IPv4-mapped IPv6 is canonicalized first.
 pub fn client_quota_key(client: IpAddr) -> IpAddr {
@@ -112,6 +148,32 @@ pub fn client_quota_key(client: IpAddr) -> IpAddr {
 }
 
 static EXPENSIVE_OPS: AtomicU64 = AtomicU64::new(0);
+static EXPENSIVE_CLIENTS: OnceLock<Mutex<HashMap<IpAddr, u64>>> = OnceLock::new();
+
+thread_local! {
+    static EXPENSIVE_CLIENT: RefCell<Option<IpAddr>> = const { RefCell::new(None) };
+}
+
+pub fn with_expensive_client<T>(client: IpAddr, operation: impl FnOnce() -> T) -> T {
+    let client = client_quota_key(client);
+    EXPENSIVE_CLIENT.with(|current| {
+        let previous = current.replace(Some(client));
+        struct Restore<'a> {
+            slot: &'a RefCell<Option<IpAddr>>,
+            previous: Option<IpAddr>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.slot.replace(self.previous);
+            }
+        }
+        let _restore = Restore {
+            slot: current,
+            previous,
+        };
+        operation()
+    })
+}
 
 fn try_add(counter: &AtomicU64, amount: u64, limit: u64) -> bool {
     try_add_counter(counter, amount, limit)
@@ -197,14 +259,47 @@ impl ResourceBudget {
     }
 
     pub fn try_dynamic(self: &Arc<Self>, limit: u64) -> io::Result<DynamicLease> {
+        self.try_dynamic_inner(limit, None)
+    }
+
+    pub fn try_dynamic_for(
+        self: &Arc<Self>,
+        limit: u64,
+        client: IpAddr,
+    ) -> io::Result<DynamicLease> {
+        self.try_dynamic_inner(limit, Some(client_quota_key(client)))
+    }
+
+    fn try_dynamic_inner(
+        self: &Arc<Self>,
+        limit: u64,
+        client: Option<IpAddr>,
+    ) -> io::Result<DynamicLease> {
         if !try_add(&self.dynamic_requests, 1, limit) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "dynamic backend concurrency limit reached",
             ));
         }
+        if let Some(client) = client {
+            let mut clients = self
+                .dynamic_clients
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let count = clients.entry(client).or_insert(0);
+            if *count >= limit.min(MAX_DYNAMIC_REQUESTS_PER_CLIENT) {
+                drop(clients);
+                self.dynamic_requests.fetch_sub(1, Ordering::AcqRel);
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "per-client dynamic backend limit reached",
+                ));
+            }
+            *count += 1;
+        }
         Ok(DynamicLease {
             budget: self.clone(),
+            client,
             active: true,
         })
     }
@@ -487,16 +582,52 @@ impl Drop for BlockingReadLease {
 
 #[derive(Debug)]
 pub struct ExpensiveLease {
+    client: Option<IpAddr>,
     active: bool,
 }
 
 pub fn try_expensive() -> Option<ExpensiveLease> {
-    try_add(&EXPENSIVE_OPS, 1, MAX_EXPENSIVE_OPS).then_some(ExpensiveLease { active: true })
+    if !try_add(&EXPENSIVE_OPS, 1, MAX_EXPENSIVE_OPS) {
+        return None;
+    }
+    let client = EXPENSIVE_CLIENT.with(|current| *current.borrow());
+    if let Some(client) = client {
+        let mut clients = EXPENSIVE_CLIENTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let count = clients.entry(client).or_insert(0);
+        if *count >= MAX_EXPENSIVE_OPS_PER_CLIENT {
+            if *count == 0 {
+                clients.remove(&client);
+            }
+            drop(clients);
+            EXPENSIVE_OPS.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        *count += 1;
+    }
+    Some(ExpensiveLease {
+        client,
+        active: true,
+    })
 }
 
 impl Drop for ExpensiveLease {
     fn drop(&mut self) {
         if self.active {
+            if let Some(client) = self.client {
+                let mut clients = EXPENSIVE_CLIENTS
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(count) = clients.get_mut(&client) {
+                    *count -= 1;
+                    if *count == 0 {
+                        clients.remove(&client);
+                    }
+                }
+            }
             EXPENSIVE_OPS.fetch_sub(1, Ordering::AcqRel);
             self.active = false;
         }
@@ -542,12 +673,26 @@ impl Drop for SpoolLease {
 #[derive(Debug)]
 pub struct DynamicLease {
     budget: Arc<ResourceBudget>,
+    client: Option<IpAddr>,
     active: bool,
 }
 
 impl Drop for DynamicLease {
     fn drop(&mut self) {
         if self.active {
+            if let Some(client) = self.client {
+                let mut clients = self
+                    .budget
+                    .dynamic_clients
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(count) = clients.get_mut(&client) {
+                    *count -= 1;
+                    if *count == 0 {
+                        clients.remove(&client);
+                    }
+                }
+            }
             self.budget.dynamic_requests.fetch_sub(1, Ordering::AcqRel);
             self.active = false;
         }
@@ -598,6 +743,20 @@ mod tests {
         assert_eq!(budget.usage(), (0, 1, 1));
         drop((second, dynamic));
         assert_eq!(budget.usage(), (0, 0, 0));
+    }
+
+    #[test]
+    fn per_client_dynamic_limit_is_enforced_and_recovers() {
+        let budget = Arc::new(ResourceBudget::default());
+        let first = IpAddr::from([192, 0, 2, 1]);
+        let second = IpAddr::from([198, 51, 100, 1]);
+        let leases: Vec<_> = (0..MAX_DYNAMIC_REQUESTS_PER_CLIENT)
+            .map(|_| budget.try_dynamic_for(64, first).unwrap())
+            .collect();
+        assert!(budget.try_dynamic_for(64, first).is_err());
+        let other = budget.try_dynamic_for(64, second).unwrap();
+        drop((leases, other));
+        assert!(budget.try_dynamic_for(64, first).is_ok());
     }
 
     #[test]
@@ -721,6 +880,21 @@ mod tests {
         let lease = try_expensive().expect("expensive slot");
         drop(lease);
         assert!(try_expensive().is_some());
+    }
+
+    #[test]
+    fn expensive_work_is_fair_per_client_and_recovers() {
+        let first = IpAddr::from([192, 0, 2, 10]);
+        let second = IpAddr::from([192, 0, 2, 11]);
+        with_expensive_client(first, || {
+            let leases: Vec<_> = (0..MAX_EXPENSIVE_OPS_PER_CLIENT)
+                .map(|_| try_expensive().expect("per-client expensive slot"))
+                .collect();
+            assert!(try_expensive().is_none());
+            assert!(with_expensive_client(second, try_expensive).is_some());
+            drop(leases);
+            assert!(try_expensive().is_some());
+        });
     }
 
     #[test]

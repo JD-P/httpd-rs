@@ -31,6 +31,8 @@ const MAX_PROXY_BODY_IN_MEMORY: usize = 256 * 1024;
 const MAX_PROXY_CA_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PROXY_ADDRESSES: usize = 32;
 const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const BACKEND_DNS_TTL: Duration = Duration::from_secs(30);
+const MAX_BACKEND_DNS_CACHE: usize = 256;
 
 struct ProxyBodyCollector {
     memory: Vec<u8>,
@@ -170,6 +172,72 @@ struct HttpBackend {
 
 trait ReadWrite: Read + Write + Send {}
 impl<T: Read + Write + Send> ReadWrite for T {}
+
+struct DeadlineStream {
+    inner: Box<dyn ReadWrite>,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    fn timed_out(&self) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "proxy exchange deadline exceeded",
+        )
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(self.timed_out());
+            }
+            match self.inner.read(buf) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(self.timed_out());
+            }
+            match self.inner.write(buf) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(self.timed_out());
+            }
+            match self.inner.flush() {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Target {
@@ -512,7 +580,8 @@ fn check_health(spec: &HealthSpec) -> bool {
     let mut scope = Scope::default();
     scope.proxy_policy.proxy_ca_file = spec.ca_file.clone();
     let timeout = Duration::from_secs(5);
-    let Ok(stream) = connect(&backend, &scope, timeout) else {
+    let deadline = Instant::now() + timeout;
+    let Ok(stream) = connect(&backend, &scope, timeout, deadline) else {
         return false;
     };
     check_health_stream(stream, spec, &backend)
@@ -835,12 +904,18 @@ pub fn match_target_req(
             .and_then(|m| std::str::from_utf8(m.as_bytes()).ok().map(str::to_owned))
             .unwrap_or_else(|| url_path.to_string());
         let captured = captured.trim_start_matches('/');
-        let replaces = rule.backend.contains("$1");
-        let raw = if replaces {
-            rule.backend.replace("$1", captured)
-        } else {
-            rule.backend.clone()
+        let replaces = (0..caps.len()).any(|index| rule.backend.contains(&format!("${index}")));
+        let Some(raw) = crate::util::expand_regex_captures(&rule.backend, &caps) else {
+            if let Some(req) = req {
+                let _ = req.charge_policy_expansion(u64::MAX);
+            }
+            return None;
         };
+        if let Some(req) = req {
+            if req.charge_policy_expansion(raw.len() as u64).is_err() {
+                return None;
+            }
+        }
         if let Some((backend, path)) =
             resolve_backend(cfg, &raw, if replaces { "" } else { captured }, req, None)
         {
@@ -1067,19 +1142,39 @@ fn request_connection_tokens(req: &Request) -> Vec<String> {
 }
 
 fn read_line(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
-    let mut line = Vec::new();
-    let n = reader.read_until(b'\n', &mut line)?;
-    if n == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "eof",
-        ));
-    }
-    if line.len() > MAX_PROXY_LINE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "proxy line too long",
-        ));
+    // `BufRead::read_until` only reports the limit after allocating the whole
+    // peer-controlled line.  Inspect the reader's existing buffer and refuse
+    // excess bytes before copying them into our allocation instead.
+    let mut line = Vec::with_capacity(MAX_PROXY_LINE.min(1024));
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "eof",
+            ));
+        }
+        if let Some(end) = available.iter().position(|byte| *byte == b'\n') {
+            let take = end + 1;
+            if line.len().saturating_add(take) > MAX_PROXY_LINE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "proxy line too long",
+                ));
+            }
+            line.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            break;
+        }
+        if line.len().saturating_add(available.len()) > MAX_PROXY_LINE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "proxy line too long",
+            ));
+        }
+        let take = available.len();
+        line.extend_from_slice(available);
+        reader.consume(take);
     }
     if !line.ends_with(b"\r\n") {
         return Err(std::io::Error::new(
@@ -1408,6 +1503,12 @@ fn dns_sender() -> &'static SyncSender<DnsJob> {
 }
 
 fn literal_backend_addrs(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    if host.eq_ignore_ascii_case("localhost") {
+        return Some(vec![
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port),
+            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port),
+        ]);
+    }
     host.trim_start_matches('[')
         .trim_end_matches(']')
         .parse::<std::net::IpAddr>()
@@ -1440,7 +1541,13 @@ fn submit_dns(
     Ok(rx)
 }
 
-fn resolve_backend_addrs(
+fn dns_cache() -> &'static Mutex<HashMap<(String, u16), (Instant, Vec<SocketAddr>)>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, u16), (Instant, Vec<SocketAddr>)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn resolve_backend_addrs(
     host: &str,
     port: u16,
     timeout: Duration,
@@ -1448,7 +1555,18 @@ fn resolve_backend_addrs(
     if let Some(addresses) = literal_backend_addrs(host, port) {
         return Ok(addresses);
     }
-    submit_dns(host, port, timeout)?
+    let key = (host.to_ascii_lowercase(), port);
+    let now = Instant::now();
+    if let Some(addresses) = dns_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&key)
+        .filter(|(expires, _)| *expires > now)
+        .map(|(_, addresses)| addresses.clone())
+    {
+        return Ok(addresses);
+    }
+    let addresses = submit_dns(host, port, timeout)?
         .recv_timeout(timeout)
         .map_err(|error| match error {
             mpsc::RecvTimeoutError::Timeout => {
@@ -1457,7 +1575,18 @@ fn resolve_backend_addrs(
             mpsc::RecvTimeoutError::Disconnected => {
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "proxy DNS worker stopped")
             }
-        })?
+        })??;
+    let mut cache = dns_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    cache.retain(|_, (expires, _)| *expires > now);
+    if cache.len() >= MAX_BACKEND_DNS_CACHE {
+        if let Some(victim) = cache.keys().next().cloned() {
+            cache.remove(&victim);
+        }
+    }
+    cache.insert(key, (now + BACKEND_DNS_TTL, addresses.clone()));
+    Ok(addresses)
 }
 
 async fn resolve_backend_addrs_async(
@@ -1468,11 +1597,35 @@ async fn resolve_backend_addrs_async(
     if let Some(addresses) = literal_backend_addrs(host, port) {
         return Ok(addresses);
     }
+    let key = (host.to_ascii_lowercase(), port);
+    let now = Instant::now();
+    if let Some(addresses) = dns_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&key)
+        .filter(|(expires, _)| *expires > now)
+        .map(|(_, addresses)| addresses.clone())
+    {
+        return Ok(addresses);
+    }
     let rx = submit_dns(host, port, timeout)?;
     let deadline = Instant::now() + timeout;
     loop {
         match rx.try_recv() {
-            Ok(result) => return result,
+            Ok(result) => {
+                let addresses = result?;
+                let mut cache = dns_cache()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                cache.retain(|_, (expires, _)| *expires > now);
+                if cache.len() >= MAX_BACKEND_DNS_CACHE {
+                    if let Some(victim) = cache.keys().next().cloned() {
+                        cache.remove(&victim);
+                    }
+                }
+                cache.insert(key, (now + BACKEND_DNS_TTL, addresses.clone()));
+                return Ok(addresses);
+            }
             Err(mpsc::TryRecvError::Disconnected) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
@@ -1885,8 +2038,9 @@ fn connect_tcp(backend: &HttpBackend, timeout: Duration) -> std::io::Result<TcpS
             "proxy connection timeout",
         ));
     }
-    tcp.set_read_timeout(Some(remaining))?;
-    tcp.set_write_timeout(Some(remaining))?;
+    let quantum = remaining.min(Duration::from_secs(1));
+    tcp.set_read_timeout(Some(quantum))?;
+    tcp.set_write_timeout(Some(quantum))?;
     Ok(tcp)
 }
 
@@ -1894,16 +2048,19 @@ fn connect(
     backend: &HttpBackend,
     scope: &Scope,
     timeout: Duration,
+    deadline: Instant,
 ) -> std::io::Result<Box<dyn ReadWrite>> {
     let tcp = connect_tcp(backend, timeout)?;
-    if !backend.tls {
-        return Ok(Box::new(tcp));
-    }
-    let name = ServerName::try_from(backend.host.clone())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad TLS host"))?;
-    let conn = ClientConnection::new(client_config(scope)?, name)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(Box::new(StreamOwned::new(conn, tcp)))
+    let inner: Box<dyn ReadWrite> = if !backend.tls {
+        Box::new(tcp)
+    } else {
+        let name = ServerName::try_from(backend.host.clone())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad TLS host"))?;
+        let conn = ClientConnection::new(client_config(scope)?, name)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Box::new(StreamOwned::new(conn, tcp))
+    };
+    Ok(Box::new(DeadlineStream { inner, deadline }))
 }
 
 fn backend_key(backend: &HttpBackend) -> String {
@@ -2544,6 +2701,23 @@ pub fn execute(
             local_ip,
         );
     }
+    let Ok(_dynamic_lease) = cfg
+        .resource_budget
+        .try_dynamic_for(cfg.max_dynamic_requests, peer.ip())
+    else {
+        return crate::files::error_response(
+            cfg,
+            vhost,
+            scope,
+            503,
+            req,
+            url_path,
+            local_port,
+            host,
+            peer.ip(),
+            local_ip,
+        );
+    };
     let Some(bound) = grant.bind_proxy(
         resource,
         &target.backend.host,
@@ -2585,11 +2759,26 @@ pub fn execute(
         );
     }
     let timeout = cfg.timeout.max(Duration::from_secs(5));
+    let exchange_deadline = Instant::now() + timeout;
     let mut current = target.clone();
     let mut active_scope = scope.clone();
     let mut active_grant = bound;
     let mut tried: HashSet<String> = HashSet::new();
     loop {
+        let remaining = exchange_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return error(
+                cfg,
+                vhost,
+                &active_scope,
+                req,
+                url_path,
+                local_port,
+                host,
+                peer.ip(),
+                local_ip,
+            );
+        }
         // The grant used by the sink must name the exact member currently
         // selected.  A balancer failover replaces both together.
         let binding = current.binding_key();
@@ -2615,27 +2804,31 @@ pub fn execute(
             );
         }
         tried.insert(backend_key(&current.backend));
-        let (result, request_may_have_started) =
-            match connect(&current.backend, &active_scope, timeout) {
-                Ok(stream) => (
-                    proxy_once_budgeted(
-                        stream,
-                        &cfg.resource_budget,
-                        cfg.max_spool_bytes,
-                        cfg.max_spool_files,
-                        &current,
-                        req,
-                        &active_scope,
-                        url_path,
-                        peer,
-                        https,
-                        host,
-                    )
-                    .map(|(response, _)| response),
-                    true,
-                ),
-                Err(e) => (Err(e), false),
-            };
+        let (result, request_may_have_started) = match connect(
+            &current.backend,
+            &active_scope,
+            remaining,
+            exchange_deadline,
+        ) {
+            Ok(stream) => (
+                proxy_once_budgeted(
+                    stream,
+                    &cfg.resource_budget,
+                    cfg.max_spool_bytes,
+                    cfg.max_spool_files,
+                    &current,
+                    req,
+                    &active_scope,
+                    url_path,
+                    peer,
+                    https,
+                    host,
+                )
+                .map(|(response, _)| response),
+                true,
+            ),
+            Err(e) => (Err(e), false),
+        };
         match result {
             Ok(response) => {
                 let failed_status =

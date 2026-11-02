@@ -20,14 +20,15 @@ use crate::http::{Body, Response};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::io::{FromRawFd, RawFd};
 #[cfg(test)]
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const FCGI_VERSION: u8 = 1;
 const FCGI_BEGIN_REQUEST: u8 = 1;
@@ -39,6 +40,8 @@ const FCGI_STDERR: u8 = 7;
 const FCGI_RESPONDER: u16 = 1;
 const DEFAULT_MAX_FASTCGI_OUTPUT: u64 = 64 * 1024 * 1024;
 const FASTCGI_SPOOL_THRESHOLD: usize = 1024 * 1024;
+const MAX_FASTCGI_RECORDS: u64 = 8192;
+const MAX_FASTCGI_FRAMING_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 enum Transport {
@@ -612,17 +615,131 @@ fn validate_unix_endpoint(
     Ok(meta)
 }
 
+fn connect_unix_timeout(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    let bytes = path.as_os_str().as_bytes();
+    let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+        .sun_path
+        .len();
+    if bytes.is_empty() || bytes.len() >= capacity || bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid FastCGI Unix socket path",
+        ));
+    }
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    struct FdGuard(RawFd);
+    impl Drop for FdGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+    let guard = FdGuard(fd);
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            address.sun_path.as_mut_ptr().cast::<u8>(),
+            bytes.len(),
+        );
+    }
+    let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path)
+        .saturating_add(bytes.len())
+        .saturating_add(1) as libc::socklen_t;
+    let connected = unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+            address_len,
+        )
+    };
+    if connected != 0 {
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EINPROGRESS || code == libc::EAGAIN
+        ) {
+            return Err(error);
+        }
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "FastCGI Unix connection deadline exceeded",
+                ));
+            }
+            let wait = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+            let mut poll = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut poll, 1, wait) };
+            if result == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "FastCGI Unix connection deadline exceeded",
+                ));
+            }
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            let mut socket_error: libc::c_int = 0;
+            let mut length = std::mem::size_of_val(&socket_error) as libc::socklen_t;
+            if unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    (&mut socket_error as *mut libc::c_int).cast(),
+                    &mut length,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if socket_error != 0 {
+                return Err(io::Error::from_raw_os_error(socket_error));
+            }
+            break;
+        }
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    std::mem::forget(guard);
+    Ok(unsafe { UnixStream::from_raw_fd(fd) })
+}
+
 fn connect(
     backend: &Backend,
     timeout: Duration,
     policy: Option<&FastCgiStablePathPolicy>,
 ) -> io::Result<Box<dyn ReadWrite>> {
+    let deadline = Instant::now() + timeout;
     match &backend.transport {
         Transport::Unix(path) => {
             let before = policy
                 .map(|policy| validate_unix_endpoint(policy, path))
                 .transpose()?;
-            let s = UnixStream::connect(path)?;
+            let s = connect_unix_timeout(path, deadline)?;
             if let (Some(policy), Some(before)) = (policy, before) {
                 let after = validate_unix_endpoint(policy, path)?;
                 if before.dev() != after.dev()
@@ -636,9 +753,21 @@ fn connect(
                     ));
                 }
             }
-            s.set_read_timeout(Some(timeout))?;
-            s.set_write_timeout(Some(timeout))?;
-            Ok(Box::new(s))
+            let quantum = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(1));
+            if quantum.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "FastCGI Unix connection deadline exceeded",
+                ));
+            }
+            s.set_read_timeout(Some(quantum))?;
+            s.set_write_timeout(Some(quantum))?;
+            Ok(Box::new(DeadlineStream {
+                inner: Box::new(s),
+                deadline,
+            }))
         }
         Transport::Tcp(host, port) => {
             if policy.is_some() {
@@ -648,13 +777,30 @@ fn connect(
                 ));
             }
             let mut last = None;
-            let addrs: Vec<_> = (host.as_str(), *port).to_socket_addrs()?.collect();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let addrs = crate::proxy::resolve_backend_addrs(host, *port, remaining)?;
             for addr in addrs {
-                match TcpStream::connect_timeout(&addr, timeout) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match TcpStream::connect_timeout(&addr, remaining) {
                     Ok(s) => {
-                        s.set_read_timeout(Some(timeout))?;
-                        s.set_write_timeout(Some(timeout))?;
-                        return Ok(Box::new(s));
+                        let quantum = deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_secs(1));
+                        if quantum.is_zero() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "FastCGI connection deadline exceeded",
+                            ));
+                        }
+                        s.set_read_timeout(Some(quantum))?;
+                        s.set_write_timeout(Some(quantum))?;
+                        return Ok(Box::new(DeadlineStream {
+                            inner: Box::new(s),
+                            deadline,
+                        }));
                     }
                     Err(e) => last = Some(e),
                 }
@@ -666,6 +812,72 @@ fn connect(
 
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
+
+struct DeadlineStream {
+    inner: Box<dyn ReadWrite>,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    fn timeout_error(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "FastCGI exchange deadline exceeded",
+        )
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(self.timeout_error());
+            }
+            match self.inner.read(buf) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(self.timeout_error());
+            }
+            match self.inner.write(buf) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(self.timeout_error());
+            }
+            match self.inner.flush() {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+}
 
 fn put_len(out: &mut Vec<u8>, n: usize) {
     if n < 128 {
@@ -905,6 +1117,8 @@ fn read_response_with_budget(
 ) -> io::Result<(Spool, Vec<u8>)> {
     let mut spool = Spool::Memory(Vec::new());
     let mut stderr = Vec::new();
+    let mut records = 0u64;
+    let mut framing_bytes = 0u64;
     loop {
         let mut header = [0u8; 8];
         stream.read_exact(&mut header)?;
@@ -917,6 +1131,26 @@ fn read_response_with_budget(
         let ty = header[1];
         let len = u16::from_be_bytes([header[4], header[5]]) as usize;
         let pad = header[6] as usize;
+        records = records.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "FastCGI record count overflow")
+        })?;
+        let control_bytes = match ty {
+            FCGI_STDOUT => 0,
+            FCGI_STDERR => len.saturating_sub((64 * 1024usize).saturating_sub(stderr.len())) as u64,
+            _ => len as u64,
+        };
+        framing_bytes = framing_bytes
+            .checked_add(8 + pad as u64)
+            .and_then(|bytes| bytes.checked_add(control_bytes))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "FastCGI framing overflow")
+            })?;
+        if records > MAX_FASTCGI_RECORDS || framing_bytes > MAX_FASTCGI_FRAMING_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FastCGI framing budget exceeded",
+            ));
+        }
         let mut content = vec![0u8; len + pad];
         stream.read_exact(&mut content)?;
         content.truncate(len);
@@ -933,9 +1167,10 @@ fn read_response_with_budget(
                 spool.push_budgeted(&content, budget)?;
             }
             FCGI_STDERR => {
-                if stderr.len() + content.len() <= 64 * 1024 {
-                    stderr.extend_from_slice(&content);
-                }
+                let take = content
+                    .len()
+                    .min((64 * 1024usize).saturating_sub(stderr.len()));
+                stderr.extend_from_slice(&content[..take]);
             }
             FCGI_END_REQUEST => return Ok((spool, stderr)),
             _ => {}
@@ -1129,11 +1364,12 @@ fn execute_inner(
     target: &Target,
     binding: Option<&ScriptBinding>,
 ) -> Response {
-    let _dynamic_lease = match base
-        .cfg
-        .resource_budget
-        .try_dynamic(base.cfg.max_dynamic_requests)
-    {
+    let _dynamic_lease = match base.cfg.resource_budget.try_dynamic_for(
+        base.cfg.max_dynamic_requests,
+        base.remote_ip
+            .parse()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+    ) {
         Ok(lease) => lease,
         Err(e) => {
             eprintln!("vapache FastCGI admission error: {e}");
@@ -2209,6 +2445,37 @@ mod tests {
         assert!(sink.0.len() > body.len());
         assert_eq!(sink.0[0], FCGI_VERSION);
         assert!(sink.0.windows(2).any(|w| w == [FCGI_VERSION, FCGI_PARAMS]));
+
+        let mut empty_records = Vec::new();
+        for _ in 0..=MAX_FASTCGI_RECORDS {
+            record(&mut empty_records, FCGI_STDERR, 1, &[]);
+        }
+        let error =
+            read_response_with_limit(&mut Cursor::new(empty_records), DEFAULT_MAX_FASTCGI_OUTPUT)
+                .err()
+                .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut ignored_records = Vec::new();
+        for _ in 0..32 {
+            record(&mut ignored_records, 99, 1, &vec![0; u16::MAX as usize]);
+        }
+        let error = read_response_with_limit(
+            &mut Cursor::new(ignored_records),
+            DEFAULT_MAX_FASTCGI_OUTPUT,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut stderr = Vec::new();
+        for _ in 0..20 {
+            record(&mut stderr, FCGI_STDERR, 1, &vec![b'e'; u16::MAX as usize]);
+        }
+        let error = read_response_with_limit(&mut Cursor::new(stderr), DEFAULT_MAX_FASTCGI_OUTPUT)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     fn spool_from_bytes(data: &[u8]) -> Spool {

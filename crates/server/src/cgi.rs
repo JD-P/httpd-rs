@@ -283,11 +283,12 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
 }
 
 pub fn execute(ctx: &CgiContext) -> Response {
-    let _dynamic_lease = match ctx
-        .cfg
-        .resource_budget
-        .try_dynamic(ctx.cfg.max_dynamic_requests)
-    {
+    let _dynamic_lease = match ctx.cfg.resource_budget.try_dynamic_for(
+        ctx.cfg.max_dynamic_requests,
+        ctx.remote_ip
+            .parse()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+    ) {
         Ok(lease) => lease,
         Err(e) => {
             eprintln!("vapached: CGI admission failed: {e}");

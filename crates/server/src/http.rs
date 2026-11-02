@@ -434,6 +434,7 @@ pub enum ParseError {
     TooManyHeaders,
     VersionNotSupported,
     PayloadTooLarge,
+    MethodNotAllowed,
     LengthRequired,
     NotImplemented(&'static str),
 }
@@ -446,6 +447,7 @@ impl ParseError {
             ParseError::HeadersTooLarge | ParseError::TooManyHeaders => 431,
             ParseError::VersionNotSupported => 505,
             ParseError::PayloadTooLarge => 413,
+            ParseError::MethodNotAllowed => 405,
             ParseError::LengthRequired => 411,
             ParseError::NotImplemented(_) => 501,
         }
@@ -459,6 +461,7 @@ impl ParseError {
             ParseError::TooManyHeaders => "Too Many Request Header Fields".into(),
             ParseError::VersionNotSupported => "HTTP Version Not Supported".into(),
             ParseError::PayloadTooLarge => "Request Entity Too Large".into(),
+            ParseError::MethodNotAllowed => "Method Not Allowed".into(),
             ParseError::LengthRequired => "Length Required".into(),
             ParseError::NotImplemented(m) => format!("Not implemented: {m}"),
         }
@@ -622,7 +625,7 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
     stream: &mut R,
     buf: &mut Vec<u8>,
     limits: &Limits,
-    on_headers: impl FnOnce(&mut R, &Request) -> io::Result<()>,
+    on_headers: impl FnOnce(&mut R, &Request) -> Result<(), ReadError>,
     reservation: Option<ResidentLease>,
 ) -> Result<Option<Request>, ReadError> {
     let prefix_precharged = reservation.is_some();

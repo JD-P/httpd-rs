@@ -856,6 +856,21 @@ fn handle_connection<C: Conn + ResponseWrite>(
             &mut buf,
             &limits,
             |stream, request| {
+                if request_has_body(request) && !cfg.body_handlers_possible() {
+                    // A startup-compiled policy bit proves this generation has
+                    // no CGI/FastCGI/proxy/body-consuming handler. Reject any
+                    // body before reading or spooling it; allowed static
+                    // methods get 400 while unsupported methods retain 405.
+                    return Err(ReadError::Parse(
+                        if matches!(request.method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+                            ParseError::BadRequest(
+                                "request body is not accepted by a static-only configuration",
+                            )
+                        } else {
+                            ParseError::MethodNotAllowed
+                        },
+                    ));
+                }
                 stream.set_read_timeout(Some(cfg.request_body_timeout.max(Duration::from_secs(1))));
                 if request_has_body(request) && body_guard.is_none() {
                     body_guard = Some(
@@ -911,6 +926,10 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 let body = error_body(&e);
                 let mut r =
                     Response::bytes(status, "text/html; charset=iso-8859-1", body.into_bytes());
+                if matches!(e, ParseError::MethodNotAllowed) {
+                    r.headers
+                        .push(("Allow".into(), b"GET, HEAD, OPTIONS".to_vec()));
+                }
                 r.headers.push(("Connection".into(), b"close".to_vec()));
                 let _ = write_response(
                     stream,
@@ -2028,8 +2047,10 @@ pub(crate) fn dispatch_with_scheme_and_identity(
     tls: bool,
 ) -> (Response, Option<String>) {
     crate::auth::reset_request_identity();
-    let response = crate::expr::with_connection(tls, local_port, || {
-        dispatch_inner_request(cfg, req, peer, local_ip, local_port)
+    let response = crate::resource::with_expensive_client(peer.ip(), || {
+        crate::expr::with_connection(tls, local_port, || {
+            dispatch_inner_request(cfg, req, peer, local_ip, local_port)
+        })
     });
     let remote_user = crate::auth::take_request_identity();
     (response, remote_user)
@@ -3419,7 +3440,7 @@ fn dispatch_inner(
 
     // Redirects are evaluated after rewrites but before access control and
     // filesystem mapping, matching Apache's URL translation order.
-    if let Some((red, loc)) = match_redirect(&scope, &url_path) {
+    if let Some((red, loc)) = match_redirect(&scope, &url_path, Some(req)) {
         let loc = if loc.is_empty() {
             String::new()
         } else if loc.starts_with('/') {
@@ -3455,8 +3476,14 @@ fn dispatch_inner(
         );
         return r;
     }
+    if req.policy_budget_failed() {
+        return Response::policy_error();
+    }
 
     let proxy_target = proxy::match_target_req(cfg, &scope, &url_path, Some(req));
+    if req.policy_budget_failed() {
+        return Response::policy_error();
+    }
     let fastcgi_target = fastcgi::match_proxy(&scope, &url_path, &root);
     // Apache resolves prefix and regex proxy routes in configuration order.
     // Selecting FastCGI first regardless of order lets a regex PHP route
@@ -4240,14 +4267,7 @@ pub fn map_path(
         let Some(template) = &a.target_template else {
             continue;
         };
-        let mut expanded = template.clone();
-        for i in (0..caps.len()).rev() {
-            let value = caps
-                .get(i)
-                .map(|m| String::from_utf8_lossy(m.as_bytes()))
-                .unwrap_or_default();
-            expanded = expanded.replace(&format!("${i}"), &value);
-        }
+        let expanded = crate::util::expand_regex_captures(template, &caps)?;
         let target = PathBuf::from(&expanded);
         let target = if target.is_absolute() {
             target
@@ -4336,6 +4356,7 @@ fn alias_remainder(alias: &str, url: &str) -> Option<String> {
 fn match_redirect<'a>(
     scope: &'a Scope,
     url: &str,
+    req: Option<&Request>,
 ) -> Option<(&'a crate::config::Redirect, String)> {
     // Redirect and RedirectMatch share one ordered table, matching Apache's
     // first-match behavior (a later overlapping redirect is unreachable).
@@ -4344,13 +4365,16 @@ fn match_redirect<'a>(
             let Some(caps) = regex.captures(url.as_bytes()) else {
                 continue;
             };
-            let mut location = r.to.clone();
-            for i in (0..caps.len()).rev() {
-                let value = caps
-                    .get(i)
-                    .map(|m| String::from_utf8_lossy(m.as_bytes()))
-                    .unwrap_or_default();
-                location = location.replace(&format!("${i}"), &value);
+            let Some(location) = crate::util::expand_regex_captures(&r.to, &caps) else {
+                if let Some(req) = req {
+                    let _ = req.charge_policy_expansion(u64::MAX);
+                }
+                return None;
+            };
+            if let Some(req) = req {
+                if req.charge_policy_expansion(location.len() as u64).is_err() {
+                    return None;
+                }
             }
             return Some((r, location));
         }
@@ -4864,7 +4888,7 @@ mod tests {
         let (root, rel, _) = map_path(&cfg, None, b"/foo/bar/x").unwrap();
         assert_eq!(root, PathBuf::from("/srv/a"));
         assert_eq!(rel, PathBuf::from("bar/x"));
-        let (red, location) = match_redirect(&cfg.global, "/secret/file").unwrap();
+        let (red, location) = match_redirect(&cfg.global, "/secret/file", None).unwrap();
         assert_eq!(red.status, 404);
         assert!(location.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -5421,7 +5445,7 @@ mod tests {
                 status: 302,
                 regex: None,
             });
-        let (red, loc) = match_redirect(&scope, "/plain").unwrap();
+        let (red, loc) = match_redirect(&scope, "/plain", None).unwrap();
         assert_eq!(red.status, 302);
         assert_eq!(loc, "/dest");
         scope.mapping_policy.redirects.clear();
@@ -5434,9 +5458,9 @@ mod tests {
                 status: 301,
                 regex: None,
             });
-        let (_, loc) = match_redirect(&scope, "/d/x").unwrap();
+        let (_, loc) = match_redirect(&scope, "/d/x", None).unwrap();
         assert_eq!(loc, "/to/x");
-        let (_, loc) = match_redirect(&scope, "/d/").unwrap();
+        let (_, loc) = match_redirect(&scope, "/d/", None).unwrap();
         assert_eq!(loc, "/to/");
         scope.mapping_policy.redirects.clear();
         scope
@@ -5448,9 +5472,9 @@ mod tests {
                 status: 302,
                 regex: None,
             });
-        let (_, loc) = match_redirect(&scope, "/exact").unwrap();
+        let (_, loc) = match_redirect(&scope, "/exact", None).unwrap();
         assert_eq!(loc, "/to");
-        assert!(match_redirect(&scope, "/nothing").is_none());
+        assert!(match_redirect(&scope, "/nothing", None).is_none());
         scope.mapping_policy.redirects.clear();
         scope
             .mapping_policy
@@ -5461,7 +5485,7 @@ mod tests {
                 status: 404,
                 regex: Some(Arc::new(crate::config::compile_regex("^/empty$").unwrap())),
             });
-        let (_, loc) = match_redirect(&scope, "/empty").unwrap();
+        let (_, loc) = match_redirect(&scope, "/empty", None).unwrap();
         assert!(loc.is_empty());
 
         let mut scope = Scope::default();
@@ -5774,6 +5798,7 @@ mod tests {
         let dir = cov_dir("keepalive-body-admission");
         std::fs::write(dir.join("www/file.txt"), "hello\n").unwrap();
         let mut cfg = cov_config(&dir, "");
+        cfg.body_handlers_possible = true;
         cfg.max_request_workers = 4;
         let saturated = try_reserve_body_worker(cfg.max_request_workers).unwrap();
         let request = "GET /file.txt HTTP/1.1\r\nHost: localhost\r\n\r\n\
@@ -5783,6 +5808,27 @@ mod tests {
         assert_eq!(response.matches("HTTP/1.1 200").count(), 1, "{response}");
         assert_eq!(response.matches("HTTP/1.1 503").count(), 1, "{response}");
         drop(saturated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn static_only_post_is_rejected_before_body_ingestion() {
+        let dir = cov_dir("static-body-early-reject");
+        std::fs::write(dir.join("www/file.txt"), "hello\n").unwrap();
+        let cfg = cov_config(&dir, "");
+        assert!(!cfg.body_handlers_possible());
+        let request =
+            "POST /file.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000000000\r\n\r\n";
+        let (response, result) = cov_run_conn(&cfg, request, 80);
+        result.unwrap();
+        assert_eq!(cov_status(&response), 405, "{response}");
+        assert_eq!(cfg.resource_budget.usage(), (0, 0, 0));
+
+        let request = "GET /file.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n";
+        let (response, result) = cov_run_conn(&cfg, request, 80);
+        result.unwrap();
+        assert_eq!(cov_status(&response), 400, "{response}");
+        assert_eq!(cfg.resource_budget.usage(), (0, 0, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5929,6 +5975,7 @@ mod tests {
     fn exhausted_request_spool_returns_503_instead_of_dropping_connection() {
         let dir = cov_dir("spool-503");
         let mut cfg = cov_config(&dir, "");
+        cfg.body_handlers_possible = true;
         cfg.max_spool_bytes = 1024;
         cfg.max_spool_files = 1;
         let body_len = crate::http::MAX_REQUEST_BODY_IN_MEMORY + 1;

@@ -7,6 +7,43 @@
 use std::cell::RefCell;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Maximum pathname/URI-like value produced by a regex-backed configuration
+/// directive. This prevents repeated references to one capture from
+/// multiplying a bounded request target into an unbounded allocation.
+pub const MAX_CAPTURE_EXPANSION_BYTES: usize = 64 * 1024;
+const MAX_CAPTURE_GROUPS: usize = 128;
+
+pub fn expand_regex_captures(
+    template: &str,
+    captures: &regex::bytes::Captures<'_>,
+) -> Option<String> {
+    if template.len() > MAX_CAPTURE_EXPANSION_BYTES || captures.len() > MAX_CAPTURE_GROUPS {
+        return None;
+    }
+    let mut expanded = template.to_string();
+    for index in (0..captures.len()).rev() {
+        let marker = format!("${index}");
+        let value = captures
+            .get(index)
+            .map(|matched| String::from_utf8_lossy(matched.as_bytes()))
+            .unwrap_or_default();
+        let occurrences = expanded.match_indices(&marker).count();
+        if occurrences == 0 {
+            continue;
+        }
+        let next = vapache_verified::capture_expansion_len(
+            expanded.len() as u64,
+            occurrences as u64,
+            marker.len() as u64,
+            value.len() as u64,
+            MAX_CAPTURE_EXPANSION_BYTES as u64,
+        )?;
+        let _next = usize::try_from(next).ok()?;
+        expanded = expanded.replace(&marker, value.as_ref());
+    }
+    Some(expanded)
+}
+
 /// Format a Unix timestamp as an IMF-fixdate (RFC 9110 §5.6.7), e.g.
 /// `Sun, 06 Nov 1994 08:49:37 GMT`.
 pub fn http_date(secs: i64) -> String {
@@ -667,5 +704,18 @@ mod tests {
         assert_eq!(route_prefix_suffix("/", "/child"), Some("child"));
         assert_eq!(route_prefix_suffix("/x", "/xy"), None);
         assert_eq!(route_prefix_suffix("/app/", "/app"), None);
+    }
+
+    #[test]
+    fn capture_expansion_is_bounded_before_replacement() {
+        let regex = regex::bytes::Regex::new("^/(.*)$").unwrap();
+        let input = format!("/{}", "x".repeat(8190));
+        let captures = regex.captures(input.as_bytes()).unwrap();
+        assert_eq!(
+            expand_regex_captures("/safe/$1", &captures).unwrap(),
+            format!("/safe/{}", "x".repeat(8190))
+        );
+        let amplification = "$1".repeat(16);
+        assert!(expand_regex_captures(&amplification, &captures).is_none());
     }
 }
