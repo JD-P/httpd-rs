@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
@@ -282,7 +283,6 @@ const MAX_PENDING_CONNECTIONS: usize = 2_048;
 const MAX_PENDING_PER_CLIENT: usize = 8;
 const MAX_PENDING_PER_TRUSTED_PROXY: usize = 32;
 const ACCEPT_BATCH: usize = 64;
-const LARGE_BLOCKING_RESPONSE: u64 = 64 * 1024;
 const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 64;
 const MAX_TLS_HANDSHAKES_PER_SECOND: usize = 128;
 const MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND: usize = 64;
@@ -831,9 +831,12 @@ fn handle_connection<C: Conn + ResponseWrite>(
     mut initial_body_guard: Option<BodyWorkerGuard>,
 ) -> io::Result<()> {
     let limits = request_limits(cfg, tls);
-    // `Time out` applies to the first request; idle keep-alive connections use
-    // `KeepAliveTimeout`.  Set the socket option once per connection instead of
-    // paying a `setsockopt` on every request.
+    // Configure the transport once rather than paying a setsockopt on every
+    // keep-alive response. The explicit write deadline remains the fallback
+    // on kernels and transports without the progress-wakeup option.
+    stream.configure_progress_wakeups();
+    // `Timeout` applies to the first request; idle keep-alive connections use
+    // `KeepAliveTimeout`.
     stream.set_read_timeout(Some(cfg.request_header_timeout.max(Duration::from_secs(1))));
     let mut served = 0usize;
     loop {
@@ -1189,21 +1192,6 @@ fn handle_connection<C: Conn + ResponseWrite>(
         if !crate::http::response_headers_admitted(&resp) {
             resp = Response::policy_error();
         }
-        // A client that stops reading a large HTTP/1 response retains its
-        // connection worker until the write-stall deadline.  Reuse the shared
-        // blocking-I/O budget so at most 32 such responses can be in flight;
-        // small responses fit in normal socket buffers and do not need a slot.
-        let large_response_lease = if resp.body_len() > LARGE_BLOCKING_RESPONSE {
-            match cfg.resource_budget.try_blocking_read() {
-                Ok(lease) => Some(lease),
-                Err(_) => {
-                    resp = Response::memory_overload();
-                    None
-                }
-            }
-        } else {
-            None
-        };
         if resp.admit_resident(&cfg.resource_budget).is_err() {
             resp = Response::memory_overload();
             let _ = resp.admit_resident(&cfg.resource_budget);
@@ -1234,7 +1222,6 @@ fn handle_connection<C: Conn + ResponseWrite>(
             // next response be read as a continuation of this body.
             Err(_) => return Ok(()),
         };
-        drop(large_response_lease);
         crate::status::hit(body_sent);
         if logger.wants_access_log() {
             let host = host_header(&req).unwrap_or("");
@@ -1387,6 +1374,14 @@ impl Conn for TlsH1 {
     }
 }
 impl ResponseWrite for TlsH1 {
+    fn configure_progress_wakeups(&self) {
+        if let Some(stream) = &self.stream {
+            // Configure the TCP transport without exposing it through
+            // `deadline_fd`, which would let response bytes bypass TLS.
+            let _ = crate::http::configure_response_progress_wakeups(stream.get_ref().0.as_fd());
+        }
+    }
+
     fn set_write_deadline(&mut self, deadline: Option<Instant>) {
         self.write_deadline = deadline;
     }
@@ -5868,6 +5863,51 @@ mod tests {
         result.unwrap();
         assert_eq!(cov_status(&response), 400, "{response}");
         assert_eq!(cfg.resource_budget.usage(), (0, 0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saturated_response_read_budget_does_not_replace_http1_file_response() {
+        let dir = cov_dir("p30-http1-read-scope");
+        let body = vec![b'p'; 100 * 1024];
+        std::fs::write(dir.join("www/large.bin"), &body).unwrap();
+        let cfg = cov_config(&dir, "");
+        let read_leases: Vec<_> = (0..crate::resource::MAX_RESPONSE_BODY_READS)
+            .map(|_| cfg.resource_budget.try_response_body_read().unwrap())
+            .collect();
+        assert!(cfg.resource_budget.try_response_body_read().is_err());
+
+        let mut conn = ScriptConn::new(
+            b"GET /large.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        handle_connection(
+            &cfg,
+            &cov_logger(&cfg),
+            &mut conn,
+            cov_peer(),
+            "127.0.0.1",
+            80,
+            false,
+            Vec::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        let (head, response_body) = conn.output.split_at(
+            conn.output
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .unwrap()
+                + 4,
+        );
+        assert!(head.starts_with(b"HTTP/1.1 200 OK"));
+        assert_eq!(response_body, body);
+        assert_eq!(
+            cfg.resource_budget.extended_usage().3,
+            read_leases.len() as u64
+        );
+        drop(read_leases);
+        assert_eq!(cfg.resource_budget.extended_usage().3, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

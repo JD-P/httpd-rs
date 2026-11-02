@@ -21,7 +21,7 @@ pub struct ResourceBudget {
     h2_clients: Mutex<HashMap<IpAddr, u64>>,
     request_bytes: AtomicU64,
     response_bytes: AtomicU64,
-    blocking_reads: AtomicU64,
+    response_body_reads: AtomicU64,
     websocket_tunnels: AtomicU64,
     websocket_clients: Mutex<HashMap<IpAddr, u64>>,
 }
@@ -33,7 +33,7 @@ pub struct ResourceBudget {
 pub const MAX_EXPENSIVE_OPS: u64 = 32;
 pub const MAX_EXPENSIVE_OPS_PER_CLIENT: u64 = 8;
 pub const MAX_DYNAMIC_REQUESTS_PER_CLIENT: u64 = 8;
-pub const MAX_BLOCKING_READS: u64 = 32;
+pub const MAX_RESPONSE_BODY_READS: u64 = 32;
 pub const MAX_H2_STREAMS: u64 = 256;
 pub const MAX_H2_STREAMS_PER_CLIENT: u64 = 64;
 pub const MAX_REQUEST_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
@@ -365,14 +365,22 @@ impl ResourceBudget {
         )
     }
 
-    pub fn try_blocking_read(self: &Arc<Self>) -> io::Result<BlockingReadLease> {
-        if !try_add(&self.blocking_reads, 1, MAX_BLOCKING_READS) {
+    /// Reserve one short blocking read of a response-body descriptor.
+    ///
+    /// This permit deliberately excludes request dispatch and downstream
+    /// socket waits. Holding it across either boundary lets a client exhaust
+    /// the read capacity without causing any read work (P30-A/A').
+    pub fn try_response_body_read(self: &Arc<Self>) -> io::Result<ResponseBodyReadLease> {
+        debug_assert!(vapache_verified::response_body_read_lease_admit(
+            vapache_verified::ResponseWorkPhase::DescriptorRead,
+        ));
+        if !try_add(&self.response_body_reads, 1, MAX_RESPONSE_BODY_READS) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "process-wide blocking-read limit reached",
+                "process-wide response-body read limit reached",
             ));
         }
-        Ok(BlockingReadLease {
+        Ok(ResponseBodyReadLease {
             budget: self.clone(),
             active: true,
         })
@@ -422,7 +430,7 @@ impl ResourceBudget {
             self.h2_streams.load(Ordering::Acquire),
             self.request_bytes.load(Ordering::Acquire),
             self.response_bytes.load(Ordering::Acquire),
-            self.blocking_reads.load(Ordering::Acquire),
+            self.response_body_reads.load(Ordering::Acquire),
         )
     }
 
@@ -538,7 +546,7 @@ pub struct CombinedH2Lease {
 }
 
 #[derive(Debug)]
-pub struct BlockingReadLease {
+pub struct ResponseBodyReadLease {
     budget: Arc<ResourceBudget>,
     active: bool,
 }
@@ -571,10 +579,12 @@ impl Drop for WebsocketLease {
     }
 }
 
-impl Drop for BlockingReadLease {
+impl Drop for ResponseBodyReadLease {
     fn drop(&mut self) {
         if self.active {
-            self.budget.blocking_reads.fetch_sub(1, Ordering::AcqRel);
+            self.budget
+                .response_body_reads
+                .fetch_sub(1, Ordering::AcqRel);
             self.active = false;
         }
     }
@@ -767,12 +777,24 @@ mod tests {
             .unwrap();
         let mut request = budget.try_request_bytes();
         let mut response = budget.try_response_bytes();
-        let blocking = budget.try_blocking_read().unwrap();
+        let blocking = budget.try_response_body_read().unwrap();
         request.reserve(7).unwrap();
         response.reserve(11).unwrap();
         assert_eq!(budget.extended_usage(), (1, 7, 11, 1));
         drop((stream, request, response, blocking));
         assert_eq!(budget.extended_usage(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn response_body_read_limit_is_exact_and_releases() {
+        let budget = Arc::new(ResourceBudget::default());
+        let leases: Vec<_> = (0..MAX_RESPONSE_BODY_READS)
+            .map(|_| budget.try_response_body_read().unwrap())
+            .collect();
+        assert!(budget.try_response_body_read().is_err());
+        assert_eq!(budget.extended_usage().3, MAX_RESPONSE_BODY_READS);
+        drop(leases);
+        assert_eq!(budget.extended_usage().3, 0);
     }
 
     #[test]

@@ -585,7 +585,7 @@ TLS handshakes                   : 64 concurrent, 4/source, 128/second and 64/so
 HTTP/1 blocking workers          : reusable pool; MaxRequestWorkers/effective-client caps; configuration ceiling 512
 slow request bodies              : every keep-alive request enters a one-quarter-worker reserve
 ready listeners                  : rotating order plus 64-accept batch cap
-HTTP/1 response writes          : progress-renewed Timeout stall deadline; non-blocking send/poll
+HTTP/1 response writes          : progress-renewed Timeout stall deadline; non-blocking send/poll; plain/TLS 64 KiB TCP unsent low-water wakeup; effective-client worker quota (no body-read permit while waiting)
 HTTP/2 streams/control frames   : preface/initial-head deadline, stream quotas and every control frame charged; useful WINDOW_UPDATE is 4096 burst/2048 per second
 WebSocket tunnels               : 64 process slots, 8 per effective client, plus idle/write deadline
 logs / RewriteMap prg / cache   : 128 KiB lines and non-queuing writers; 8-request/8-concurrent/64-per-second helpers; iterative depth/record-bounded cache walks
@@ -600,7 +600,10 @@ against a stall deadline renewed after each successful byte write. TLS writes
 receive the same progress-renewed deadline through the async adapter. Kernel
 `SO_SNDTIMEO` is defense in depth, not the resource boundary: a stalled
 receiver is closed at `Timeout` and its connection-worker reservation is
-released, while a slow receiver that keeps making progress may finish.
+released. On Linux, plain and TLS HTTP/1 transports set `TCP_NOTSENT_LOWAT` to
+cap the queued-unsent region at 64 KiB, so a slow receiver opening its TCP
+receive window wakes the writer, lets the server observe a successful write
+and renews the deadline.
 
 Shell-pattern evaluation is iterative and uses `O(subject)` memory. Access-file
 logical lines and all configuration-originated glob patterns are capped at
@@ -1068,9 +1071,9 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | CGI stdout/stderr | 8 MiB stdout and 64 KiB stderr caps, process-wide resident-byte accounting, watchdog deadline, process-group kill |
 | FastCGI path/records | each `PATH_INFO` filesystem prefix consumes the fail-sticky request-work budget; synthesized paths pass the shared 256-component/512-KiB cumulative-prefix gate; fixed record/header sizes, stdout spool cap and stderr cap |
 | FastCGI response head | bounded prefix/header scan before body streaming |
-| Aggregate dynamic I/O | RAII byte/file reservations across request, response, CGI-worker and FastCGI/proxy spools; 128 MiB request and response resident ceilings; shared CGI/FastCGI concurrency slots; 32 blocking reads |
+| Aggregate dynamic I/O | RAII byte/file reservations across request, response, CGI-worker and FastCGI/proxy spools; 128 MiB request and response resident ceilings; shared CGI/FastCGI concurrency slots; 32 response-body descriptor reads, held only for the read syscall and never for dispatch or a downstream socket wait |
 | HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error |
-| HTTP/2 | verified settings, header-state, flow-control and reset budgets; a refillable connection token bucket bounds SETTINGS, PING, PRIORITY and tiny WINDOW_UPDATE work; at most 32 streams per connection, 64 per validated effective-client quota key and 256 process-wide, each with a 64 KiB resident request-body prefix before using the shared request-spool quota. Response file/stream reads wait for assigned flow-control capacity, use at most 64 KiB per chunk, retain response-resident accounting until h2 releases the chunk, and hold blocking-read leases only during the actual read |
+| HTTP/2 | verified settings, header-state, flow-control and reset budgets; a refillable connection token bucket bounds SETTINGS, PING, PRIORITY and tiny WINDOW_UPDATE work; at most 32 streams per connection, 64 per validated effective-client quota key and 256 process-wide, each with a 64 KiB resident request-body prefix before using the shared request-spool quota. Dispatch uses the bounded blocking pool without consuming response-read permits. Response file/stream reads wait for assigned flow-control capacity, use at most 64 KiB per chunk, retain response-resident accounting until h2 releases the chunk, and hold response-body read permits only during the actual read |
 | Compression/PCRE/password hashing | fixed input/cost bounds and a shared 32-operation CPU-work admission gate; optional compression falls back to identity under pressure |
 | Autoindex | at most 4096 examined directory records (including filtered names), 4096 rendered entries and 4 MiB of generated HTML |
 | DNS authorization | eight resolver workers, queue length 64, two-second caller deadline and bounded copied host operands |
@@ -1846,6 +1849,11 @@ construction: there is no second production interleaver.
   rechecks connection-specific fields at its downgrade boundary, and the
   vendored codec maps concrete SETTINGS, PING, PRIORITY and WINDOW_UPDATE
   events through one verified event-cost/refill/epoch transition.
+- `resource_budget_admit`, `connection_admit` and
+  `response_body_read_lease_admit`. Aggregate counters use overflow-free
+  admission, while the P30 phase classifier permits the response-read counter
+  only for `DescriptorRead` and proves `RequestDispatch` and
+  `ClientWriteWait` are excluded.
 - `escape_log_bytes_bounded`. Request-derived logging consumes the executable
   escaping loop with a caller-supplied complete-line ceiling; the proof keeps
   output within that ceiling and excludes CR, LF and NUL.

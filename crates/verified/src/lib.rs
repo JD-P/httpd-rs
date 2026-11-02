@@ -3016,6 +3016,39 @@ pub proof fn resource_budget_rejects_exhausted(used: u64, incoming: u64)
 {
 }
 
+/// The process-wide response-body read counter protects blocking descriptor
+/// reads only. Request dispatch and downstream socket waits have independent
+/// concurrency/deadline bounds and must never retain this scarce permit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResponseWorkPhase {
+    DescriptorRead,
+    RequestDispatch,
+    ClientWriteWait,
+}
+
+pub open spec fn response_body_read_lease_spec(phase: ResponseWorkPhase) -> bool {
+    match phase {
+        ResponseWorkPhase::DescriptorRead => true,
+        ResponseWorkPhase::RequestDispatch | ResponseWorkPhase::ClientWriteWait => false,
+    }
+}
+
+pub fn response_body_read_lease_admit(phase: ResponseWorkPhase) -> (ok: bool)
+    ensures ok == response_body_read_lease_spec(phase),
+{
+    match phase {
+        ResponseWorkPhase::DescriptorRead => true,
+        ResponseWorkPhase::RequestDispatch | ResponseWorkPhase::ClientWriteWait => false,
+    }
+}
+
+pub proof fn response_body_read_lease_excludes_client_occupancy()
+    ensures
+        !response_body_read_lease_spec(ResponseWorkPhase::RequestDispatch),
+        !response_body_read_lease_spec(ResponseWorkPhase::ClientWriteWait),
+{
+}
+
 /// Overflow-free length transition for regex capture substitution. Runtime
 /// expansion allocates only after this transition admits the resulting value.
 pub fn capture_expansion_len(

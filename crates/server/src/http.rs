@@ -1419,6 +1419,11 @@ pub trait ResponseWrite: Write {
         ))
     }
 
+    /// Configure transport-specific readiness notifications so downstream
+    /// receive progress becomes observable before the stall deadline. This is
+    /// best effort; the explicit deadline remains the safety boundary.
+    fn configure_progress_wakeups(&self) {}
+
     /// Inform encrypted/adapted writers of the current stall deadline. It is
     /// renewed whenever bytes are written; plain sockets are bounded directly
     /// with non-blocking I/O below.
@@ -1436,6 +1441,10 @@ impl ResponseWrite for TcpStream {
 
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         TcpStream::set_nonblocking(self, nonblocking)
+    }
+
+    fn configure_progress_wakeups(&self) {
+        let _ = configure_response_progress_wakeups(self.as_fd());
     }
 }
 
@@ -1497,6 +1506,41 @@ fn stall_deadline(timeout: Duration) -> io::Result<Instant> {
     Instant::now()
         .checked_add(timeout)
         .ok_or_else(write_timeout_error)
+}
+
+/// Keep the kernel's unsent queue small enough that a downstream receive-
+/// window update becomes visible to `poll(POLLOUT)` and the next nonblocking
+/// send. Without this, Linux may retain megabytes of already-queued data: a
+/// slow client can read repeatedly while the server observes no successful
+/// write and expires the progress deadline (P30-B).
+#[cfg(target_os = "linux")]
+const RESPONSE_NOTSENT_LOWAT: libc::c_uint = 64 * 1024;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn configure_response_progress_wakeups(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let value = RESPONSE_NOTSENT_LOWAT;
+    // SAFETY: `fd` is borrowed for this call and `value` points to a live
+    // c_uint of the exact size passed to setsockopt. Non-TCP descriptors
+    // return ENOPROTOOPT and retain the ordinary deadline behavior.
+    let result = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_NOTSENT_LOWAT,
+            (&value as *const libc::c_uint).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn configure_response_progress_wakeups(_fd: BorrowedFd<'_>) -> io::Result<()> {
+    Ok(())
 }
 
 fn write_socket_all(fd: BorrowedFd<'_>, mut bytes: &[u8], timeout: Duration) -> io::Result<()> {
@@ -3251,6 +3295,34 @@ mod tests {
         let (elapsed, result) = outcome.expect("stalled writer exceeded its deadline");
         assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tcp_response_writer_caps_unsent_bytes_for_progress_wakeups() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server.configure_progress_wakeups();
+        let mut response = Response::bytes(200, "text/plain", b"ok".to_vec());
+        write_response(&mut server, &mut response, &response_options()).unwrap();
+
+        let mut value: libc::c_uint = 0;
+        let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: the socket and output pointers remain valid for the call and
+        // `length` describes the exact c_uint output buffer.
+        let result = unsafe {
+            libc::getsockopt(
+                server.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NOTSENT_LOWAT,
+                (&mut value as *mut libc::c_uint).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(value, RESPONSE_NOTSENT_LOWAT);
+        drop(client);
     }
 
     struct ProgressWriter {

@@ -593,7 +593,7 @@ async fn send_response(
                     .await?
                     .min(want);
                 let resident = response_chunk_lease(&cfg.resource_budget, capacity)?;
-                let blocking_read = cfg.resource_budget.try_blocking_read()?;
+                let blocking_read = cfg.resource_budget.try_response_body_read()?;
                 let (next_reader, mut buf, resident, result) =
                     tokio::task::spawn_blocking(move || {
                         let _blocking_read = blocking_read;
@@ -640,7 +640,7 @@ async fn send_response(
                     .min(want);
                 let resident = response_chunk_lease(&cfg.resource_budget, capacity)?;
                 let data = if offload {
-                    let blocking_read = cfg.resource_budget.try_blocking_read()?;
+                    let blocking_read = cfg.resource_budget.try_response_body_read()?;
                     let (next_file, data) = tokio::task::spawn_blocking(move || {
                         let _blocking_read = blocking_read;
                         let data = read_range(&file, pos, capacity, resident);
@@ -943,35 +943,31 @@ async fn handle_stream(
     let peer = cfg.client_addr(peer, &req);
     let (req, resp, remote_user) = match early {
         Some(resp) => (req, resp, None),
-        None => match cfg.resource_budget.try_blocking_read() {
-            Err(_) => (req, bad(503, "request execution capacity exhausted"), None),
-            Ok(dispatch_lease) => {
-                // Request dispatch performs blocking filesystem and policy
-                // work.  Keep it off the shared async admission/H2 runtime,
-                // and bound the blocking pool with the same process-wide
-                // lease used by the other blocking I/O paths.
-                let dispatch_cfg = cfg.clone();
-                let dispatch_local_ip = local_ip.clone();
-                let dispatched = tokio::task::spawn_blocking(move || {
-                    let _dispatch_lease = dispatch_lease;
-                    let result = crate::server::dispatch_with_scheme_and_identity(
-                        &dispatch_cfg,
-                        &req,
-                        peer,
-                        &dispatch_local_ip,
-                        local_port,
-                        true,
-                    );
-                    (req, result)
-                })
-                .await;
-                let Ok((req, (resp, remote_user))) = dispatched else {
-                    logger.error("HTTP/2 request dispatcher task failed");
-                    return true;
-                };
-                (req, resp, remote_user)
-            }
-        },
+        None => {
+            // Dispatch runs in Tokio's bounded blocking pool. It must not
+            // consume the response-body read permits: those protect only the
+            // short descriptor read itself, whereas dispatch duration and
+            // concurrency are already bounded by H2 stream/client quotas.
+            let dispatch_cfg = cfg.clone();
+            let dispatch_local_ip = local_ip.clone();
+            let dispatched = tokio::task::spawn_blocking(move || {
+                let result = crate::server::dispatch_with_scheme_and_identity(
+                    &dispatch_cfg,
+                    &req,
+                    peer,
+                    &dispatch_local_ip,
+                    local_port,
+                    true,
+                );
+                (req, result)
+            })
+            .await;
+            let Ok((req, (resp, remote_user))) = dispatched else {
+                logger.error("HTTP/2 request dispatcher task failed");
+                return true;
+            };
+            (req, resp, remote_user)
+        }
     };
     let head_only = req.is_head();
     let status = resp.status;
@@ -1516,6 +1512,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn h2_adapter_handles_files_heads_bounds_and_body_errors() {
         let (cfg, logger, dir) = test_config("adapter");
+        let read_leases: Vec<_> = (0..crate::resource::MAX_RESPONSE_BODY_READS)
+            .map(|_| cfg.resource_budget.try_response_body_read().unwrap())
+            .collect();
+        assert!(cfg.resource_budget.try_response_body_read().is_err());
         let request = http::Request::builder()
             .method("GET")
             .uri("https://localhost/file.txt?x=1")
@@ -1526,6 +1526,11 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body, b"hello h2");
         assert!(!reset);
+        assert_eq!(
+            cfg.resource_budget.extended_usage().3,
+            read_leases.len() as u64
+        );
+        drop(read_leases);
 
         let request = http::Request::builder()
             .method("HEAD")
