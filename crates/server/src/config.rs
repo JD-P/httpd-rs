@@ -45,6 +45,7 @@ pub const MAX_IMPLEMENTED_REQUEST_WORKERS: usize = 512;
 const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CONFIG_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TYPES_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_CONFIG_SECTION_DEPTH: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct ConfigError {
@@ -2873,9 +2874,14 @@ impl Config {
                     .any(|rule| rule.flags.proxy || rule.flags.handler.is_some())
         }
         fn rules_may_consume(rules: &[ScopeRule]) -> bool {
-            rules
-                .iter()
-                .any(|rule| scope_may_consume(&rule.delta) || rules_may_consume(&rule.nested))
+            let mut pending: Vec<&ScopeRule> = rules.iter().rev().collect();
+            while let Some(rule) = pending.pop() {
+                if scope_may_consume(&rule.delta) {
+                    return true;
+                }
+                pending.extend(rule.nested.iter().rev());
+            }
+            false
         }
         self.override_enabled
             || scope_may_consume(&self.global)
@@ -2915,9 +2921,14 @@ impl Config {
                 })
         }
         fn rules_may_dispatch_cgi(rules: &[ScopeRule]) -> bool {
-            rules.iter().any(|rule| {
-                scope_may_dispatch_cgi(&rule.delta) || rules_may_dispatch_cgi(&rule.nested)
-            })
+            let mut pending: Vec<&ScopeRule> = rules.iter().rev().collect();
+            while let Some(rule) = pending.pop() {
+                if scope_may_dispatch_cgi(&rule.delta) {
+                    return true;
+                }
+                pending.extend(rule.nested.iter().rev());
+            }
+            false
         }
         // An access file can introduce Options/AddHandler/SetHandler at
         // request time, so any enabled override remains conservatively true.
@@ -3636,6 +3647,14 @@ impl ConfigProgram {
                         vapache_verified::ConfigLineKind::SectionStart,
                     )
                     .ok_or("configuration program depth overflow")?;
+                    if !vapache_verified::config_section_depth_admit(
+                        depth,
+                        MAX_CONFIG_SECTION_DEPTH,
+                    ) {
+                        return Err(format!(
+                            "configuration section nesting exceeds {MAX_CONFIG_SECTION_DEPTH}"
+                        ));
+                    }
                     let start = instructions.len();
                     let class = ProgramSectionClass::from_name(&name);
                     instructions.push(ProgramEvent::SectionStart {
@@ -5685,6 +5704,18 @@ impl Compile {
             );
             return;
         }
+        if matches!(name, "cacheenable" | "cachedisable")
+            && !vapache_verified::cache_base_scope_admit(matches!(
+                section,
+                SectionKind::Server | SectionKind::VirtualHost
+            ))
+        {
+            self.directive_error(
+                loc,
+                format!("directive '{name}' is only supported in server or virtual-host context"),
+            );
+            return;
+        }
         if matches!(
             name,
             "servername"
@@ -5700,8 +5731,6 @@ impl Compile {
                 | "proxypass"
                 | "proxypassreverse"
                 | "proxypassmatch"
-                | "cacheenable"
-                | "cachedisable"
                 | "customlog"
                 | "sslengine"
                 | "sslcertificatefile"
@@ -9019,7 +9048,8 @@ pub(crate) fn apply_rules_config(
     url_path: &str,
     fname: &str,
 ) {
-    for rule in rules {
+    let mut pending: Vec<&ScopeRule> = rules.iter().rev().collect();
+    while let Some(rule) = pending.pop() {
         if rule.phase() == RulePhase::Condition {
             continue;
         }
@@ -9027,7 +9057,7 @@ pub(crate) fn apply_rules_config(
             continue;
         }
         merge_rule_delta(s, rule, fs_path, url_path);
-        apply_rules_config(&rule.nested, s, fs_path, url_path, fname);
+        pending.extend(rule.nested.iter().rev());
     }
 }
 
@@ -9039,7 +9069,8 @@ fn apply_rules_config_budgeted(
     fname: &str,
     req: &crate::http::Request,
 ) -> Result<(), &'static str> {
-    for rule in rules {
+    let mut pending: Vec<&ScopeRule> = rules.iter().rev().collect();
+    while let Some(rule) = pending.pop() {
         if rule.phase() == RulePhase::Condition {
             continue;
         }
@@ -9047,7 +9078,7 @@ fn apply_rules_config_budgeted(
             continue;
         }
         merge_rule_delta(s, rule, fs_path, url_path);
-        apply_rules_config_budgeted(&rule.nested, s, fs_path, url_path, fname, req)?;
+        pending.extend(rule.nested.iter().rev());
     }
     Ok(())
 }
@@ -9103,14 +9134,17 @@ pub(crate) fn collect_rules_req(
     rules: &[ScopeRule],
     s: &mut Scope,
     req: &crate::http::Request,
-    peer: IpAddr,
-    docroot: &Path,
+    _peer: IpAddr,
+    _docroot: &Path,
     fs_path: &Path,
     url_path: &str,
     fname: &str,
     deferred: &mut Vec<ScopeRule>,
 ) {
-    for rule in rules {
+    // Preserve the recursive walk's preorder while keeping request stack use
+    // independent of configuration nesting.
+    let mut pending: Vec<&ScopeRule> = rules.iter().rev().collect();
+    while let Some(rule) = pending.pop() {
         let matched = match rule_kind_matches_req(&rule.kind, fs_path, url_path, fname, req) {
             Ok(matched) => matched,
             Err(_) => {
@@ -9126,17 +9160,7 @@ pub(crate) fn collect_rules_req(
             continue;
         }
         merge_rule_delta(s, rule, fs_path, url_path);
-        collect_rules_req(
-            &rule.nested,
-            s,
-            req,
-            peer,
-            docroot,
-            fs_path,
-            url_path,
-            fname,
-            deferred,
-        );
+        pending.extend(rule.nested.iter().rev());
     }
 }
 
@@ -9232,9 +9256,37 @@ pub fn apply_deferred_req(
     fname: &str,
     chain_state: &mut HashMap<usize, bool>,
 ) {
-    for rule in rules {
-        apply_conditional_rule(
+    // A matched conditional applies all of its normal nested rules and then
+    // its nested conditionals before the next sibling. Use an explicit LIFO
+    // worklist to preserve that recursive ordering without consuming one
+    // request-stack frame per section.
+    let mut pending: Vec<&ScopeRule> = rules.iter().rev().collect();
+    while let Some(rule) = pending.pop() {
+        let env = s.authorization_env(req, url_path, peer);
+        let matched = match rule_condition_result(
             rule,
+            req,
+            &env,
+            peer,
+            docroot,
+            url_path,
+            Some(fs_path),
+            chain_state,
+        ) {
+            Ok(matched) => matched,
+            Err(error) => {
+                eprintln!("vapached: conditional expression failed closed: {error}");
+                s.conditional_error = true;
+                continue;
+            }
+        };
+        if !matched {
+            continue;
+        }
+        merge_rule_delta(s, rule, fs_path, url_path);
+        let mut nested = Vec::new();
+        collect_rule_refs_req(
+            &rule.nested,
             s,
             req,
             peer,
@@ -9242,57 +9294,49 @@ pub fn apply_deferred_req(
             fs_path,
             url_path,
             fname,
-            chain_state,
+            &mut nested,
         );
+        nested.sort_by_key(|nested_rule| nested_rule.order);
+        pending.extend(nested.into_iter().rev());
     }
 }
 
+/// Borrowing form used while applying an already-owned deferred tree.  The
+/// public collector must clone conditionals because callers combine rules
+/// from multiple configuration/access-file owners; once that owned list is
+/// being evaluated, cloning every remaining subtree at each nesting level is
+/// unnecessary and can turn a deep tree into quadratic request work.
 #[allow(clippy::too_many_arguments)]
-fn apply_conditional_rule(
-    rule: &ScopeRule,
+fn collect_rule_refs_req<'a>(
+    rules: &'a [ScopeRule],
     s: &mut Scope,
     req: &crate::http::Request,
-    peer: IpAddr,
-    docroot: &Path,
+    _peer: IpAddr,
+    _docroot: &Path,
     fs_path: &Path,
     url_path: &str,
     fname: &str,
-    chain_state: &mut HashMap<usize, bool>,
+    deferred: &mut Vec<&'a ScopeRule>,
 ) {
-    let env = s.authorization_env(req, url_path, peer);
-    let matched = rule_condition_result(
-        rule,
-        req,
-        &env,
-        peer,
-        docroot,
-        url_path,
-        Some(fs_path),
-        chain_state,
-    );
-    let matched = match matched {
-        Ok(matched) => matched,
-        Err(error) => {
-            eprintln!("vapached: conditional expression failed closed: {error}");
-            s.conditional_error = true;
-            return;
+    let mut pending: Vec<&ScopeRule> = rules.iter().rev().collect();
+    while let Some(rule) = pending.pop() {
+        let matched = match rule_kind_matches_req(&rule.kind, fs_path, url_path, fname, req) {
+            Ok(matched) => matched,
+            Err(_) => {
+                s.conditional_error = true;
+                return;
+            }
+        };
+        if !matched {
+            continue;
         }
-    };
-    if !matched {
-        return;
+        if rule.phase() == RulePhase::Condition {
+            deferred.push(rule);
+            continue;
+        }
+        merge_rule_delta(s, rule, fs_path, url_path);
+        pending.extend(rule.nested.iter().rev());
     }
-    merge_rule_delta(s, rule, fs_path, url_path);
-    apply_rules_req(
-        &rule.nested,
-        s,
-        req,
-        peer,
-        docroot,
-        fs_path,
-        url_path,
-        fname,
-        chain_state,
-    );
 }
 
 fn sort_rules(rules: &mut [ScopeRule]) {
@@ -10969,6 +11013,67 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.msg.contains("does not permit an empty argument")));
+
+        let nested_program = |depth: usize| {
+            let loc = SourceLoc {
+                file: "nested.conf".into(),
+                line: 1,
+            };
+            let mut events = Vec::new();
+            for _ in 0..depth {
+                events.push(Event::SectionStart {
+                    name: "ifmodule".into(),
+                    args: vec!["core_module".into()],
+                    loc: loc.clone(),
+                    active: true,
+                    transparent: true,
+                });
+            }
+            for _ in 0..depth {
+                events.push(Event::SectionEnd { loc: loc.clone() });
+            }
+            events
+        };
+        assert!(ConfigProgram::seal(nested_program(MAX_CONFIG_SECTION_DEPTH)).is_ok());
+        let error = ConfigProgram::seal(nested_program(MAX_CONFIG_SECTION_DEPTH + 1)).unwrap_err();
+        assert!(error.contains("section nesting exceeds"), "{error}");
+        assert!(vapache_verified::config_section_depth_admit(
+            MAX_CONFIG_SECTION_DEPTH,
+            MAX_CONFIG_SECTION_DEPTH,
+        ));
+        assert!(!vapache_verified::config_section_depth_admit(
+            MAX_CONFIG_SECTION_DEPTH + 1,
+            MAX_CONFIG_SECTION_DEPTH,
+        ));
+    }
+
+    #[test]
+    fn cache_enable_is_rejected_in_rule_producing_sections() {
+        let errors = load_text(
+            "CacheRoot /tmp/vapache-cache-prefilter\n\
+             <Directory /tmp>\n\
+             <If \"true\">\n\
+             CacheEnable disk /nested\n\
+             </If>\n\
+             </Directory>\n",
+            false,
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|error| {
+            error
+                .msg
+                .contains("only supported in server or virtual-host context")
+        }));
+
+        let cfg = load_text(
+            "CacheRoot /tmp/vapache-cache-prefilter\nCacheEnable disk /cache\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.global.rewrite_policy.cache_enable,
+            vec![("disk".into(), "/cache".into())]
+        );
     }
 
     #[test]

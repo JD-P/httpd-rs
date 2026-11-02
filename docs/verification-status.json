@@ -50,10 +50,10 @@
     },
     {
       "id": "prefilter_sound",
-      "title": "htaccess/cache prefilter over-approximation",
+      "title": "htaccess/cache fast-path over-approximation",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "prefilter_sound proves both boolean implications in Verus: htaccess_may_apply false admits no access-file layer, and a false cache prefilter over an unchanged base enable list keeps cache_enabled false; the path-pattern matcher, recursive rule flattening and parser-to-ActiveLayer refinement remain explicit assumptions"
+      "evidence": "prefilter_sound proves both boolean implications in Verus: htaccess_may_apply false admits no access-file layer, while cache_base_scope_only_sound proves a path outside the inherited base enable list remains disabled when the compiler has excluded CacheEnable from every rule delta. cache_base_scope_admit is consumed at that compiler boundary; the path-pattern matcher and parser-to-ActiveLayer/rule-tree refinement remain explicit assumptions"
     },
     {
       "id": "acl_reachability",

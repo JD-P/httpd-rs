@@ -684,6 +684,26 @@ async fn handle_stream(
     let (parts, recv) = request.into_parts();
     let method = parts.method.as_str().to_string();
     let uri = parts.uri.clone();
+    // Bound the request-controlled authority before parsing it. The complete
+    // head admission below still determines final error precedence for all
+    // fields, but no field parser should receive more than the configured
+    // HTTP/1-compatible per-field limit first.
+    if uri.authority().is_some_and(|authority| {
+        !vapache_verified::h2_field_size_admit(
+            b"host".len() as u64,
+            authority.as_str().len() as u64,
+            cfg.limit_request_field_size as u64,
+        )
+    }) {
+        return send_response(
+            respond,
+            &cfg,
+            bad(431, "request header field too large"),
+            false,
+        )
+        .await
+        .is_err();
+    }
     let Some(target) = request_target(&method, &uri, true) else {
         return send_response(
             respond,
@@ -2309,6 +2329,9 @@ mod tests {
         assert!(!vapache_verified::h2_method_ok(b"GET SPACE"));
         let too_long = [b'A'; 65];
         assert!(!vapache_verified::h2_method_ok(&too_long));
+        assert!(vapache_verified::h2_field_size_admit(4, 6, 10));
+        assert!(!vapache_verified::h2_field_size_admit(4, 7, 10));
+        assert!(!vapache_verified::h2_field_size_admit(11, 0, 10));
         assert_eq!(
             vapache_verified::h2_head_admit(b"GET", 10, 10, 3, 3, 10, 10),
             Accept

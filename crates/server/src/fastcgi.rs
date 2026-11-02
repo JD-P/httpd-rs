@@ -14,9 +14,7 @@
 
 use crate::cgi::{self, CgiContext};
 use crate::config::{Config, FastCgiEndpoint, FastCgiStablePathPolicy, Scope};
-#[cfg(test)]
-use crate::http::Request;
-use crate::http::{Body, Response};
+use crate::http::{Body, Request, Response};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
@@ -68,7 +66,7 @@ impl Backend {
 }
 
 mod lexical_script_path {
-    use super::{script_from_prefix, split_path_info, Backend};
+    use super::{script_from_prefix, split_path_info_with_request, Backend};
     use std::path::{Path, PathBuf};
 
     /// Path identity presented to the FastCGI backend. The tuple field is
@@ -92,8 +90,10 @@ mod lexical_script_path {
             self,
             url_path: &str,
             base: &Path,
+            req: Option<&crate::http::Request>,
         ) -> Option<(Self, String, String)> {
-            let (path, script_name, path_info) = split_path_info(self.0, url_path, base)?;
+            let (path, script_name, path_info) =
+                split_path_info_with_request(self.0, url_path, base, req)?;
             Some((Self(path), script_name, path_info))
         }
 
@@ -347,13 +347,43 @@ fn contained_after_resolving_symlinks(candidate: &Path, base: &Path) -> bool {
 /// configured script base and every selected file is resolved to reject
 /// symlinks that leave that base while preserving the requested script path
 /// for policy evaluation.
+#[cfg(test)]
 fn split_path_info(
     script_filename: PathBuf,
     url_path: &str,
     base: &Path,
 ) -> Option<(PathBuf, String, String)> {
+    split_path_info_with_request(script_filename, url_path, base, None)
+}
+
+fn split_path_info_with_request(
+    script_filename: PathBuf,
+    url_path: &str,
+    base: &Path,
+    req: Option<&Request>,
+) -> Option<(PathBuf, String, String)> {
     let script_filename = clean_script_path(&script_filename);
     if !script_under_base(&script_filename, base) {
+        return None;
+    }
+    // FastCGI paths can be synthesized from regex captures rather than the
+    // ordinary document-root mapping. Admit them against the same global
+    // component/cumulative-prefix bound before doing any filesystem walk.
+    if crate::util::validate_policy_path(&script_filename).is_err() {
+        if let Some(req) = req {
+            let _ = req.charge_policy_work(u64::MAX);
+        }
+        return None;
+    }
+    let charge_probe = |path: &Path| {
+        req.is_none_or(|req| {
+            req.charge_policy_work(
+                (path.as_os_str().as_encoded_bytes().len() as u64).saturating_add(1),
+            )
+            .is_ok()
+        })
+    };
+    if !charge_probe(&script_filename) {
         return None;
     }
     if script_filename.is_file() {
@@ -365,16 +395,18 @@ fn split_path_info(
     let original = script_filename.clone();
     let mut candidate = script_filename;
     let mut suffix = Vec::new();
-    while let Some(parent) = candidate.parent() {
+    loop {
         // Never walk above the configured base, even when an ancestor happens
         // to be a regular file (for example /bin/sh).
-        if !script_under_base(parent, base) {
-            break;
-        }
         if let Some(name) = candidate.file_name() {
             suffix.push(name.to_string_lossy().into_owned());
         }
-        candidate = parent.to_path_buf();
+        if !candidate.pop() || !script_under_base(&candidate, base) {
+            break;
+        }
+        if !charge_probe(&candidate) {
+            return None;
+        }
         if candidate.is_file() {
             if !contained_after_resolving_symlinks(&candidate, base) {
                 return None;
@@ -383,9 +415,6 @@ fn split_path_info(
             let info = format!("/{}", suffix.join("/"));
             let name = url_path.strip_suffix(&info).unwrap_or(url_path).to_string();
             return Some((candidate, name, info));
-        }
-        if candidate.parent().is_none() {
-            break;
         }
     }
     script_under_base(&original, base).then_some((original, url_path.to_string(), String::new()))
@@ -398,8 +427,36 @@ fn prefix_suffix<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
 /// Match a `ProxyPassMatch` (or a prefix `ProxyPass` with a FastCGI backend)
 /// against the final URL path.
 pub fn match_proxy(scope: &Scope, url_path: &str, root: &Path) -> Option<Target> {
+    match_proxy_inner(scope, url_path, root, None)
+}
+
+pub(crate) fn match_proxy_for_request(
+    scope: &Scope,
+    url_path: &str,
+    root: &Path,
+    req: &Request,
+) -> Option<Target> {
+    match_proxy_inner(scope, url_path, root, Some(req))
+}
+
+fn match_proxy_inner(
+    scope: &Scope,
+    url_path: &str,
+    root: &Path,
+    req: Option<&Request>,
+) -> Option<Target> {
     let mut best: Option<Target> = None;
     for rule in &scope.proxy_policy.proxy_passes {
+        if req.is_some_and(|req| {
+            req.charge_policy_work(
+                (rule.prefix.len() as u64)
+                    .saturating_add(url_path.len() as u64)
+                    .saturating_add(1),
+            )
+            .is_err()
+        }) {
+            return None;
+        }
         let Some(suffix) = prefix_suffix(&rule.prefix, url_path) else {
             continue;
         };
@@ -412,7 +469,7 @@ pub fn match_proxy(scope: &Scope, url_path: &str, root: &Path) -> Option<Target>
             continue;
         };
         let Some((script_filename, script_name, path_info)) =
-            script_filename.split_path_info(url_path, &base)
+            script_filename.split_path_info(url_path, &base, req)
         else {
             continue;
         };
@@ -437,6 +494,16 @@ pub fn match_proxy(scope: &Scope, url_path: &str, root: &Path) -> Option<Target>
         }
     }
     for rule in &scope.proxy_policy.proxy_rules {
+        if req.is_some_and(|req| {
+            req.charge_policy_work(
+                (rule.pattern.as_str().len() as u64)
+                    .saturating_add(url_path.len() as u64)
+                    .saturating_add(1),
+            )
+            .is_err()
+        }) {
+            return None;
+        }
         let caps = match rule.pattern.captures(url_path.as_bytes()) {
             Some(c) => c,
             None => continue,
@@ -458,7 +525,7 @@ pub fn match_proxy(scope: &Scope, url_path: &str, root: &Path) -> Option<Target>
             continue;
         };
         let Some((script_filename, script_name, path_info)) =
-            script_filename.split_path_info(url_path, &base)
+            script_filename.split_path_info(url_path, &base, req)
         else {
             continue;
         };
@@ -2202,6 +2269,15 @@ mod tests {
         assert!(target.logical_url.as_deref().unwrap().starts_with("unix:"));
         assert!(match_proxy(&scope, "/escape/../outside/secret.php", &root).is_none());
         assert!(match_proxy(&scope, "/link/link.php", &root).is_none());
+        let budgeted = request("/ok/index.php");
+        assert!(match_proxy_for_request(&scope, "/ok/index.php", &root, &budgeted).is_some());
+        assert!(budgeted.policy_budget().charged_work() > 0);
+        let exhausted = request("/ok/index.php");
+        exhausted
+            .charge_policy_work(crate::resource::MAX_POLICY_WORK_UNITS)
+            .unwrap();
+        assert!(match_proxy_for_request(&scope, "/ok/index.php", &root, &exhausted).is_none());
+        assert!(exhausted.policy_budget_failed());
 
         let mut regex_scope = Scope::default();
         let mut rule = |pattern: &str, backend: &str, order: usize| {

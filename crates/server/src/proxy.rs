@@ -838,6 +838,36 @@ pub fn matches_route(scope: &Scope, url_path: &str) -> bool {
             .any(|rule| rule.pattern.is_match(url_path.as_bytes()))
 }
 
+/// Request-metered route predicate for policy/cache paths that must classify
+/// a proxy without selecting a backend or advancing balancer state.
+pub(crate) fn matches_route_req(
+    scope: &Scope,
+    url_path: &str,
+    req: &Request,
+) -> Result<bool, &'static str> {
+    for rule in &scope.proxy_policy.proxy_passes {
+        req.charge_policy_work(
+            (rule.prefix.len() as u64)
+                .saturating_add(url_path.len() as u64)
+                .saturating_add(1),
+        )?;
+        if prefix_suffix(&rule.prefix, url_path).is_some() {
+            return Ok(true);
+        }
+    }
+    for rule in &scope.proxy_policy.proxy_rules {
+        req.charge_policy_work(
+            (rule.pattern.as_str().len() as u64)
+                .saturating_add(url_path.len() as u64)
+                .saturating_add(1),
+        )?;
+        if rule.pattern.is_match(url_path.as_bytes()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn match_target_req(
     cfg: &Config,
     scope: &Scope,
@@ -846,6 +876,16 @@ pub fn match_target_req(
 ) -> Option<Target> {
     let mut best: Option<Target> = None;
     for rule in &scope.proxy_policy.proxy_passes {
+        if req.is_some_and(|req| {
+            req.charge_policy_work(
+                (rule.prefix.len() as u64)
+                    .saturating_add(url_path.len() as u64)
+                    .saturating_add(1),
+            )
+            .is_err()
+        }) {
+            return None;
+        }
         let Some(suffix) = prefix_suffix(&rule.prefix, url_path) else {
             continue;
         };
@@ -895,6 +935,16 @@ pub fn match_target_req(
         }
     }
     for rule in &scope.proxy_policy.proxy_rules {
+        if req.is_some_and(|req| {
+            req.charge_policy_work(
+                (rule.pattern.as_str().len() as u64)
+                    .saturating_add(url_path.len() as u64)
+                    .saturating_add(1),
+            )
+            .is_err()
+        }) {
+            return None;
+        }
         let Some(caps) = rule.pattern.captures(url_path.as_bytes()) else {
             continue;
         };
@@ -3962,6 +4012,18 @@ mod more_tests {
         let regex_first = match_target(&cfg, &scope, "/app/x").unwrap();
         assert_eq!(regex_first.backend.port, 9002);
         assert_eq!(regex_first.path, "/x");
+        let metered = req("/app/x");
+        assert!(match_target_req(&cfg, &scope, "/app/x", Some(&metered)).is_some());
+        assert!(metered.policy_budget().charged_work() > 0);
+        let classified = req("/app/x");
+        assert!(matches_route_req(&scope, "/app/x", &classified).unwrap());
+        assert!(classified.policy_budget().charged_work() > 0);
+        let exhausted = req("/app/x");
+        exhausted
+            .charge_policy_work(crate::resource::MAX_POLICY_WORK_UNITS)
+            .unwrap();
+        assert!(match_target_req(&cfg, &scope, "/app/x", Some(&exhausted)).is_none());
+        assert!(exhausted.policy_budget_failed());
 
         // Reversing the configuration order reverses the winner even though
         // prefix and regex routes live in separate vectors.

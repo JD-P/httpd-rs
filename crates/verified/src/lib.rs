@@ -1043,33 +1043,39 @@ pub open spec fn http_reg_name_spec(value: Seq<u8>) -> bool {
 fn http_reg_name_from_exec(value: &[u8], i: usize) -> (ok: bool)
     requires i <= value.len(),
     ensures ok == http_reg_name_from_spec(value@, i as int),
-    decreases value.len() - i,
 {
-    if i >= value.len() {
-        return true;
-    }
-    let b = value[i];
-    let ordinary = (b >= b'a' && b <= b'z')
-        || (b >= b'A' && b <= b'Z')
-        || (b >= b'0' && b <= b'9')
-        || b == b'-' || b == b'.' || b == b'_' || b == b'~' || b == b'!'
-        || b == b'$' || b == b'&' || b == b'\'' || b == b'(' || b == b')'
-        || b == b'*' || b == b'+' || b == b',' || b == b';' || b == b'=';
-    if ordinary {
-        http_reg_name_from_exec(value, i + 1)
-    } else if b == b'%' {
-        if value.len() - i < 3 {
-            false
-        } else if hex_val_exec(value[i + 1]).is_some()
-            && hex_val_exec(value[i + 2]).is_some()
-        {
-            http_reg_name_from_exec(value, i + 3)
+    let mut cursor = i;
+    while cursor < value.len()
+        invariant
+            i <= cursor <= value.len(),
+            http_reg_name_from_spec(value@, i as int)
+                == http_reg_name_from_spec(value@, cursor as int),
+        decreases value.len() - cursor,
+    {
+        let b = value[cursor];
+        let ordinary = (b >= b'a' && b <= b'z')
+            || (b >= b'A' && b <= b'Z')
+            || (b >= b'0' && b <= b'9')
+            || b == b'-' || b == b'.' || b == b'_' || b == b'~' || b == b'!'
+            || b == b'$' || b == b'&' || b == b'\'' || b == b'(' || b == b')'
+            || b == b'*' || b == b'+' || b == b',' || b == b';' || b == b'=';
+        if ordinary {
+            cursor = cursor + 1;
+        } else if b == b'%' {
+            if value.len() - cursor < 3 {
+                return false;
+            } else if hex_val_exec(value[cursor + 1]).is_some()
+                && hex_val_exec(value[cursor + 2]).is_some()
+            {
+                cursor = cursor + 3;
+            } else {
+                return false;
+            }
         } else {
-            false
+            return false;
         }
-    } else {
-        false
     }
+    true
 }
 
 /// RFC 3986 registered-name admission. Percent escapes are consumed as one
@@ -3266,14 +3272,21 @@ pub fn rewrite_chain_resume(chained: &[bool], start: usize) -> (resume: usize)
     ensures
         resume == rewrite_chain_resume_spec(chained@, start as int),
         start <= resume <= chained.len(),
-    decreases chained.len() - start,
 {
-    if start >= chained.len() {
-        start
-    } else if chained[start] {
-        rewrite_chain_resume(chained, start + 1)
+    let mut cursor = start;
+    while cursor < chained.len() && chained[cursor]
+        invariant
+            start <= cursor <= chained.len(),
+            rewrite_chain_resume_spec(chained@, start as int)
+                == rewrite_chain_resume_spec(chained@, cursor as int),
+        decreases chained.len() - cursor,
+    {
+        cursor = cursor + 1;
+    }
+    if cursor < chained.len() {
+        cursor + 1
     } else {
-        start + 1
+        cursor
     }
 }
 
@@ -7701,29 +7714,39 @@ pub open spec fn require_none_result_spec(r: PolicyResult) -> PolicyResult {
 /// OR-combine a whole sequence of `<RequireNone>` child results.  The group
 /// fails if *any* provider is satisfied, so a granted child must remain
 /// visible even when a sibling is denied (F46/I43).
-pub open spec fn combine_or_all_spec(rs: Seq<PolicyResult>) -> PolicyResult
-    decreases rs.len(),
+pub open spec fn combine_or_all_from_spec(
+    rs: Seq<PolicyResult>,
+    start: int,
+) -> PolicyResult
+    recommends 0 <= start <= rs.len(),
+    decreases rs.len() - start,
 {
-    if rs.len() == 0 {
+    if start >= rs.len() {
         PolicyResult::Neutral
     } else {
-        combine_or_spec(rs[0], combine_or_all_spec(rs.drop_first()))
+        combine_or_spec(rs[start], combine_or_all_from_spec(rs, start + 1))
     }
+}
+
+pub open spec fn combine_or_all_spec(rs: Seq<PolicyResult>) -> PolicyResult {
+    combine_or_all_from_spec(rs, 0)
 }
 
 pub fn combine_or_all(rs: &[PolicyResult]) -> (out: PolicyResult)
     ensures out == combine_or_all_spec(rs@)
-    decreases rs.len()
 {
-    if rs.is_empty() {
-        PolicyResult::Neutral
-    } else {
-        let first = rs[0];
-        let rest = &rs[1..];
-        assert(rs@ == seq![first] + rest@);
-        let remainder = combine_or_all(rest);
-        combine_or(first, remainder)
+    let mut cursor = rs.len();
+    let mut result = PolicyResult::Neutral;
+    while cursor > 0
+        invariant
+            cursor <= rs.len(),
+            result == combine_or_all_from_spec(rs@, cursor as int),
+        decreases cursor,
+    {
+        cursor = cursor - 1;
+        result = combine_or(rs[cursor], result);
     }
+    result
 }
 
 pub open spec fn require_none_multi_spec(rs: Seq<PolicyResult>) -> PolicyResult {
@@ -8649,39 +8672,48 @@ pub fn expr_compare_ints(op: ExprCompareOp, a: i64, b: i64) -> (out: bool)
 /// Byte-lexicographic order, matching Rust's `str` ordering (UTF-8 byte
 /// comparison).  Stated recursively so the executable comparison and its
 /// specification use the same definition.
-pub open spec fn bytes_lt_spec(a: Seq<u8>, b: Seq<u8>) -> bool
-    decreases a.len() + b.len(),
+pub open spec fn bytes_lt_from_spec(a: Seq<u8>, b: Seq<u8>, start: int) -> bool
+    recommends 0 <= start <= a.len(), 0 <= start <= b.len(),
+    decreases a.len() + b.len() - 2 * start,
 {
-    if a.len() == 0 {
-        b.len() > 0
-    } else if b.len() == 0 {
+    if start >= a.len() {
+        start < b.len()
+    } else if start >= b.len() {
         false
-    } else if a[0] < b[0] {
+    } else if a[start] < b[start] {
         true
-    } else if a[0] > b[0] {
+    } else if a[start] > b[start] {
         false
     } else {
-        bytes_lt_spec(a.skip(1), b.skip(1))
+        bytes_lt_from_spec(a, b, start + 1)
     }
+}
+
+pub open spec fn bytes_lt_spec(a: Seq<u8>, b: Seq<u8>) -> bool {
+    bytes_lt_from_spec(a, b, 0)
 }
 
 fn bytes_lt(a: &[u8], b: &[u8]) -> (out: bool)
     ensures out == bytes_lt_spec(a@, b@),
-    decreases a.len() + b.len(),
 {
-    if a.len() == 0 {
-        return b.len() > 0;
+    let mut cursor = 0usize;
+    while cursor < a.len() && cursor < b.len()
+        invariant
+            cursor <= a.len(),
+            cursor <= b.len(),
+            bytes_lt_spec(a@, b@)
+                == bytes_lt_from_spec(a@, b@, cursor as int),
+        decreases a.len() - cursor,
+    {
+        if a[cursor] < b[cursor] {
+            return true;
+        }
+        if a[cursor] > b[cursor] {
+            return false;
+        }
+        cursor = cursor + 1;
     }
-    if b.len() == 0 {
-        return false;
-    }
-    if a[0] < b[0] {
-        return true;
-    }
-    if a[0] > b[0] {
-        return false;
-    }
-    bytes_lt(&a[1..], &b[1..])
+    cursor == a.len() && cursor < b.len()
 }
 
 pub open spec fn expr_compare_strs_spec(
@@ -8824,17 +8856,51 @@ fn cond_chain_rec(
         i <= matches.len(),
     ensures
         out == cond_chain_from(matches@, ors@, i as int, overall, group, in_group),
-    decreases matches.len() - i,
 {
-    if i >= matches.len() {
-        if in_group { overall && group } else { overall }
-    } else {
-        let next_group = if in_group { group || matches[i] } else { matches[i] };
-        if ors[i] {
-            cond_chain_rec(matches, ors, i + 1, overall, next_group, true)
+    let mut cursor = i;
+    let mut current_overall = overall;
+    let mut current_group = group;
+    let mut current_in_group = in_group;
+    while cursor < matches.len()
+        invariant
+            matches.len() == ors.len(),
+            i <= cursor <= matches.len(),
+            cond_chain_from(
+                matches@,
+                ors@,
+                i as int,
+                overall,
+                group,
+                in_group,
+            ) == cond_chain_from(
+                matches@,
+                ors@,
+                cursor as int,
+                current_overall,
+                current_group,
+                current_in_group,
+            ),
+        decreases matches.len() - cursor,
+    {
+        let next_group = if current_in_group {
+            current_group || matches[cursor]
         } else {
-            cond_chain_rec(matches, ors, i + 1, overall && next_group, false, false)
+            matches[cursor]
+        };
+        if ors[cursor] {
+            current_group = next_group;
+            current_in_group = true;
+        } else {
+            current_overall = current_overall && next_group;
+            current_group = false;
+            current_in_group = false;
         }
+        cursor = cursor + 1;
+    }
+    if current_in_group {
+        current_overall && current_group
+    } else {
+        current_overall
     }
 }
 
@@ -9780,6 +9846,25 @@ pub fn config_program_depth_step(
     }
 }
 
+/// Main-configuration compilation and request-time rule evaluation both
+/// descend the sealed section tree.  Arithmetic-safe depth is not sufficient:
+/// the program must establish a concrete stack/work bound before compilation.
+pub open spec fn config_section_depth_spec(depth: usize, limit: usize) -> bool {
+    depth <= limit
+}
+
+pub fn config_section_depth_admit(depth: usize, limit: usize) -> (ok: bool)
+    ensures ok == config_section_depth_spec(depth, limit),
+{
+    depth <= limit
+}
+
+pub proof fn config_section_depth_overflow_rejected(depth: usize, limit: usize)
+    requires depth > limit,
+    ensures !config_section_depth_spec(depth, limit),
+{
+}
+
 /// Access-file sections are evaluated by a recursive policy compiler.  Its
 /// input program is sealed iteratively and must establish this bound before
 /// any recursive descent begins.
@@ -9982,6 +10067,19 @@ pub fn h2_method_ok(method: &[u8]) -> (ok: bool)
     } else {
         valid_token(method)
     }
+}
+
+/// Admit one decoded HTTP/2 field before any field-specific parser runs.
+/// In particular, `:authority` must not enter the authority parser before
+/// `LimitRequestFieldSize` has bounded its request-controlled input.
+pub open spec fn h2_field_size_spec(name_len: u64, value_len: u64, limit: u64) -> bool {
+    name_len <= limit && value_len <= limit - name_len
+}
+
+pub fn h2_field_size_admit(name_len: u64, value_len: u64, limit: u64) -> (ok: bool)
+    ensures ok == h2_field_size_spec(name_len, value_len, limit),
+{
+    name_len <= limit && value_len <= limit - name_len
 }
 
 /// Decide one complete HTTP/2 head without parsing it twice.
@@ -11059,18 +11157,17 @@ pub proof fn any_cache_prefix_matches_append(a: Seq<u64>, b: Seq<u64>, path: u64
     }
 }
 
-/// Abstract view of `cache::rules_may_enable_cache`: one entry per rule in
-/// preorder, holding the rule's own `CacheEnable` prefixes.  A rule is
-/// "prefilter-positive" when its own list is non-empty; nested rules are
-/// flattened into the same sequence by the runtime prefilter.
-pub open spec fn rules_may_enable_cache_spec(rule_enables: Seq<Seq<u64>>) -> bool
-    decreases rule_enables.len(),
+/// `CacheEnable`/`CacheDisable` are base-scope directives.  The executable
+/// configuration compiler consumes this decision before it can add either
+/// directive to a rule-producing section.
+pub open spec fn cache_base_scope_spec(in_base_scope: bool) -> bool {
+    in_base_scope
+}
+
+pub fn cache_base_scope_admit(in_base_scope: bool) -> (ok: bool)
+    ensures ok == cache_base_scope_spec(in_base_scope),
 {
-    if rule_enables.len() == 0 {
-        false
-    } else {
-        rule_enables[0].len() > 0 || rules_may_enable_cache_spec(rule_enables.drop_first())
-    }
+    in_base_scope
 }
 
 /// Concatenation of every rule's `CacheEnable` prefixes in application order.
@@ -11081,30 +11178,6 @@ pub open spec fn applied_cache_enables(rule_enables: Seq<Seq<u64>>) -> Seq<u64>
         Seq::empty()
     } else {
         rule_enables[0] + applied_cache_enables(rule_enables.drop_first())
-    }
-}
-
-pub proof fn cache_prefilter_false_means_no_enables(rule_enables: Seq<Seq<u64>>)
-    requires !rules_may_enable_cache_spec(rule_enables),
-    ensures forall|i: int| 0 <= i < rule_enables.len() ==> rule_enables[i].len() == 0,
-    decreases rule_enables.len(),
-{
-    if rule_enables.len() == 0 {
-    } else {
-        assert(rules_may_enable_cache_spec(rule_enables)
-            == (rule_enables[0].len() > 0
-                || rules_may_enable_cache_spec(rule_enables.drop_first())));
-        assert(!(rule_enables[0].len() > 0));
-        assert(!rules_may_enable_cache_spec(rule_enables.drop_first()));
-        assert(rule_enables[0].len() == 0);
-        cache_prefilter_false_means_no_enables(rule_enables.drop_first());
-        assert forall|i: int| 0 <= i < rule_enables.len() implies rule_enables[i].len() == 0 by {
-            if i == 0 {
-            } else {
-                assert(rule_enables.drop_first()[i - 1].len() == 0);
-                assert(rule_enables[i] == rule_enables.drop_first()[i - 1]);
-            }
-        }
     }
 }
 
@@ -11132,10 +11205,10 @@ pub open spec fn cache_enabled_spec(
     !any_cache_prefix_matches(cache_disable, path) && any_cache_prefix_matches(cache_enable, path)
 }
 
-/// The cache half of I3: if the inherited scope does not enable the raw
-/// request path and no matching directory/conditional rule can add a
-/// `CacheEnable` prefix, the effective scope cannot enable the cache.
-pub proof fn cache_prefilter_sound(
+/// The cache half of I3: if the inherited base scope does not enable the raw
+/// request path and the compiler has excluded `CacheEnable` from all
+/// rule-producing contexts, the effective scope cannot enable the cache.
+pub proof fn cache_base_scope_only_sound(
     base_enable: Seq<u64>,
     base_disable: Seq<u64>,
     rule_enables: Seq<Seq<u64>>,
@@ -11143,11 +11216,10 @@ pub proof fn cache_prefilter_sound(
 )
     requires
         !any_cache_prefix_matches(base_enable, path),
-        !rules_may_enable_cache_spec(rule_enables),
+        forall|i: int| 0 <= i < rule_enables.len() ==> rule_enables[i].len() == 0,
     ensures
         !cache_enabled_spec(base_enable + applied_cache_enables(rule_enables), base_disable, path),
 {
-    cache_prefilter_false_means_no_enables(rule_enables);
     applied_cache_enables_empty(rule_enables);
     assert(applied_cache_enables(rule_enables) == Seq::<u64>::empty());
     any_cache_prefix_matches_append(base_enable, applied_cache_enables(rule_enables), path);
@@ -11242,7 +11314,8 @@ pub proof fn prefilter_sound(
                 file_present,
             ))
             && ((!any_cache_prefix_matches(base_enable, path)
-                && !rules_may_enable_cache_spec(rule_enables))
+                && (forall|i: int| 0 <= i < rule_enables.len()
+                    ==> rule_enables[i].len() == 0))
                 ==> !cache_enabled_spec(
                     base_enable + applied_cache_enables(rule_enables),
                     base_disable,
@@ -11255,9 +11328,10 @@ pub proof fn prefilter_sound(
         file_present,
     );
     if !any_cache_prefix_matches(base_enable, path)
-        && !rules_may_enable_cache_spec(rule_enables)
+        && (forall|i: int| 0 <= i < rule_enables.len()
+            ==> rule_enables[i].len() == 0)
     {
-        cache_prefilter_sound(base_enable, base_disable, rule_enables, path);
+        cache_base_scope_only_sound(base_enable, base_disable, rule_enables, path);
     }
 }
 

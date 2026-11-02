@@ -334,12 +334,15 @@ htaccess_may_apply(fs_path) == false
 and
 
 ```
-cache prefilter says "not cacheable"
+raw path is outside the base-scope CacheEnable prefixes
   ⇒ cache_enabled(effective_scope, raw_path) == false
 ```
 
-The prefilter must be an over-approximation, never an under-approximation.
-The `/cache/` trailing-slash bug was a violation of this shape.
+`CacheEnable` and `CacheDisable` are rejected in every rule-producing section,
+so only the inherited server/vhost base scope can introduce those prefixes.
+This compiler invariant must remain an over-approximation, never an
+under-approximation. The `/cache/` trailing-slash bug was a violation of this
+shape.
 
 ### I4 — Conditional-last
 
@@ -402,7 +405,7 @@ policy and every sink use the same Resolved
 sink_grant.target == sink_target == resolve(req).target
 ```
 
-The dispatcher, cache prefilter and authorization walk share `map_path()`.
+The dispatcher, cache base-scope gate and authorization walk share `map_path()`.
 `AliasMatch`/`ScriptAliasMatch` are part of that mapping, not a separate
 lookup.  `map_path()` returns an explicit mapping failure when a regex alias
 expands outside its configured base; there is no parent-root fallback.
@@ -604,7 +607,11 @@ logical lines and all configuration-originated glob patterns are capped at
 8190 bytes; request-controlled expression globbing additionally consumes the
 verified pattern-times-subject work admission. Rewrite outputs are capped at
 64 KiB, expression values at 1 MiB with a shared 4 MiB evaluation budget, and
-access-file section nesting at 64 before recursive policy compilation begins.
+main/access-file section nesting at 64 before recursive compilation begins.
+Request-time rule traversal and the executable authority, rewrite-chain,
+authorization-combine, string-compare and condition-chain kernels use explicit
+iterative worklists, so accepted nesting or input length does not consume one
+native stack frame per element.
 
 Resident-byte and compression reservations are made before extending request,
 proxy, autoindex or encoded-response buffers. HTTP/1 retains the reservation
@@ -1054,12 +1061,12 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | HTTP/1 request line/head | `LimitRequestLine`, `LimitRequestFields`, `LimitRequestFieldSize`, total head cap |
 | HTTP/1 request body | `LimitRequestBody`, hard absolute body deadline, at most 65,536 chunks and 1 MiB of chunk framing independent of decoded size; fixed bodies no larger than 1 MiB stay resident, while known-larger and chunked bodies provide a 64 KiB actual-byte prefix before an `O_EXCL`, mode-0600 spool file is acquired; the shared quota reserves only bytes actually received |
 | HTTP/1 chunked trailers | trailer count and byte budget within the same hard body deadline |
-| Proxy response head | line, header-count and total-head caps |
+| Proxy routing/response head | HTTP and FastCGI prefix/regex route scans consume the fail-sticky request-work budget; response line, header-count and total-head caps |
 | Proxy response body | fixed-length/chunked/EOF body capped at 64 MiB; chunked responses additionally allow at most 65,536 chunks and 1 MiB of framing; large fixed bodies stream, chunked/EOF bodies spill to the shared unlinked-file tier above 256 KiB, and oversize responses do not trigger balancer failover amplification |
 | Proxy trailers | trailer count and byte budget |
 | CGI worker protocol | path/env/body field caps, env-count cap, body spool above threshold |
 | CGI stdout/stderr | 8 MiB stdout and 64 KiB stderr caps, process-wide resident-byte accounting, watchdog deadline, process-group kill |
-| FastCGI records | fixed record/header sizes; stdout spool cap; stderr cap |
+| FastCGI path/records | each `PATH_INFO` filesystem prefix consumes the fail-sticky request-work budget; synthesized paths pass the shared 256-component/512-KiB cumulative-prefix gate; fixed record/header sizes, stdout spool cap and stderr cap |
 | FastCGI response head | bounded prefix/header scan before body streaming |
 | Aggregate dynamic I/O | RAII byte/file reservations across request, response, CGI-worker and FastCGI/proxy spools; 128 MiB request and response resident ceilings; shared CGI/FastCGI concurrency slots; 32 blocking reads |
 | HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error |
@@ -1943,8 +1950,9 @@ construction: there is no second production interleaver.
   `AccessProgram`. Both programs establish exact start/end section mates and
   preclassify directive/section identity before compilation. Skipping a false,
   inactive or disallowed section jumps to its exact mate instead of rescanning
-  nested text. `access_section_depth_admit` establishes the recursive access
-  policy compiler's depth ceiling during this iterative seal pass.
+  nested text. `config_section_depth_admit` and
+  `access_section_depth_admit` establish the main/access recursive compiler
+  depth ceilings during these iterative seal passes.
 - `config_section_nesting_allowed`.  The recursive configuration compiler
   checks section transitions through the verified context table. Complex
   directive and pattern payload refinements remain the explicit
@@ -1954,19 +1962,21 @@ construction: there is no second production interleaver.
   `<Files>` rules to the Files bucket, and everything else to the top-level
   scope.
 - `prefilter_sound`.  The I3 fast-path implication is a Verus theorem for both
-  prefilters: `htaccess_may_apply_spec` false admits no access-file layer in
-  the walk, and a false cache rule prefilter over an unchanged inherited
-  `CacheEnable` list keeps `cache_enabled_spec` false.  `cache_prefilter_sound`
-  proves the list/append obligation through an explicit preorder flattening of
-  rule deltas; the path matcher and parser-to-rule-tree refinement remain the
-  stated assumptions.
+  cases: `htaccess_may_apply_spec` false admits no access-file layer in the
+  walk, while `cache_base_scope_admit` is consumed by the compiler to reject
+  `CacheEnable`/`CacheDisable` in every rule-producing context.
+  `cache_base_scope_only_sound` proves that a path outside the inherited base
+  `CacheEnable` list cannot become cache-enabled, so the request path performs
+  no recursive cache-rule scan. The path matcher and parser-to-rule-tree
+  refinement remain the stated assumptions.
 - `first_match_is_first` / `first_match_none_means_no_match`.  For an ordered
   mapping table encoded as its match-bit vector, the selected entry is the
   first true bit and no true bit means no mapping applies.  This is the I14
   first-match theorem; flattening the runtime alias/redirect/proxy tables into
   the vector remains outside Verus.
-- `h2_method_ok`, `h2_head_admit`, `H2BodyState`/`h2_body_append`, and
-  `H2Budget`.  The HTTP/2 adapter calls the verified method/head decision and
+- `h2_method_ok`, `h2_field_size_admit`, `h2_head_admit`,
+  `H2BodyState`/`h2_body_append`, and `H2Budget`. The HTTP/2 adapter bounds
+  `:authority` before authority parsing, calls the verified method/head decision and
   advances a verified body budget as it consumes DATA frames.  `H2Settings`
   fixes the builder limits; `H2HeaderState` bounds the decoded header list;
   and `H2Flow` models connection/stream windows and send-buffer bounds.  The
@@ -2318,10 +2328,10 @@ excludes test-only code from the denominator.
   WebSocket tunnel path.  A few explicit pre-auth error paths still construct
   responses before an access check; those are documented separately.
 - I3 prefilters are now Verus theorems (`prefilter_sound`,
-  `htaccess_prefilter_sound`, `cache_prefilter_sound`) over the boolean/list
-  model.  The path-pattern matcher and the parser-to-flattened-rule-list
-  refinement are still explicit assumptions; the cache lookup also requires an
-  `AccessGrant` at runtime.
+  `htaccess_prefilter_sound`, `cache_base_scope_only_sound`) over the
+  boolean/list model. The path-pattern matcher and the parser-to-flattened-rule-
+  list refinement are still explicit assumptions; the cache lookup also
+  requires an `AccessGrant` at runtime.
 - FastCGI cannot pass its retained script descriptor through the protocol;
   the external backend's open of `SCRIPT_FILENAME` occurs after vapache's
   final pathname-to-inode comparison. Exact `VapacheFastCGIStablePath`

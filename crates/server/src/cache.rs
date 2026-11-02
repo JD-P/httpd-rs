@@ -577,12 +577,10 @@ pub fn request_scope_with_plan(
         .iter()
         .any(|(_, prefix)| prefix_matches(path, prefix));
     if !base_enabled {
-        let rules = vhost
-            .map(|v| v.rules.as_slice())
-            .unwrap_or(cfg.global_rules.as_slice());
-        if !rules_may_enable_cache(rules) {
-            return None;
-        }
+        // CacheEnable is accepted only in server/vhost context. The typed
+        // compiler rejects it in every rule-producing section, so there is no
+        // conditional rule tree to search for a later enablement.
+        return None;
     }
     // Authorizing a document-root path that an Alias never serves would let
     // a cached alias response bypass the alias target's Directory/access-file
@@ -772,6 +770,7 @@ pub fn request_scope_with_plan(
     // query-driven CGI/FastCGI/proxy/server-status/SetHandler response cannot
     // be shared across distinct queries.  Classify every non-default handler,
     // not just the proxy forms known to `match_proxy` (F52/F54/I49/I53).
+    let mut proxy_route_match = None;
     if cfg.cache.ignore_query_string && !req.query.is_empty() {
         let name = fs_path
             .file_name()
@@ -785,11 +784,20 @@ pub fn request_scope_with_plan(
                     && !h.eq_ignore_ascii_case("none")
             })
             .is_some();
-        let dynamic = script_alias
-            || crate::cgi::is_cgi(cfg, &scope, name, false)
-            || handler
-            || crate::fastcgi::match_proxy(&scope, &cache_url_path, &root).is_some()
-            || crate::proxy::matches_route(&scope, &cache_url_path);
+        let fastcgi =
+            crate::fastcgi::match_proxy_for_request(&scope, &cache_url_path, &root, req).is_some();
+        if req.policy_budget_failed() {
+            return None;
+        }
+        let dynamic_without_proxy =
+            script_alias || crate::cgi::is_cgi(cfg, &scope, name, false) || handler || fastcgi;
+        let dynamic = if dynamic_without_proxy {
+            true
+        } else {
+            let matched = crate::proxy::matches_route_req(&scope, &cache_url_path, req).ok()?;
+            proxy_route_match = Some(matched);
+            matched
+        };
         if !vapache_verified::cache_dynamic_handler_admit(handler, dynamic) {
             // `dynamic` includes `handler` as a disjunct, so the verified
             // predicate proves that this fail-closed guard cannot reject.
@@ -827,7 +835,11 @@ pub fn request_scope_with_plan(
     if !scope.method_allowed(&req.method) {
         return None;
     }
-    if crate::proxy::matches_route(&scope, &cache_url_path) {
+    let proxy_route_match = match proxy_route_match {
+        Some(matched) => matched,
+        None => crate::proxy::matches_route_req(&scope, &cache_url_path, req).ok()?,
+    };
+    if proxy_route_match {
         return None;
     }
     let key = base_key(
@@ -849,15 +861,6 @@ pub fn request_scope_with_plan(
         key,
         target: fs_path,
         path: cache_url_path,
-    })
-}
-
-/// Conservative prefilter for `request_scope`: return true when any matching
-/// directory/conditional rule could add a `CacheEnable` directive.  A false
-/// result means the request cannot be served from or stored in the cache.
-fn rules_may_enable_cache(rules: &[crate::config::ScopeRule]) -> bool {
-    rules.iter().any(|rule| {
-        !rule.delta.rewrite_policy.cache_enable.is_empty() || rules_may_enable_cache(&rule.nested)
     })
 }
 

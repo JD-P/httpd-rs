@@ -3515,7 +3515,10 @@ fn dispatch_inner(
     if req.policy_budget_failed() {
         return Response::policy_error();
     }
-    let fastcgi_target = fastcgi::match_proxy(&scope, &url_path, &root);
+    let fastcgi_target = fastcgi::match_proxy_for_request(&scope, &url_path, &root, req);
+    if req.policy_budget_failed() {
+        return Response::policy_error();
+    }
     // Apache resolves prefix and regex proxy routes in configuration order.
     // Selecting FastCGI first regardless of order lets a regex PHP route
     // capture a URL that an earlier `ProxyPass` sends to an upstream gateway.
