@@ -247,15 +247,23 @@ expression forms such as `LogMessage` interpolation, `RewriteMap dbm`, exact
 `[DPI]` path-info discarding in per-directory contexts, some `[NE]`/`[PT]`
 corner cases, `mod_cache_socache`/`mod_file_cache`, Digest/LDAP
 authentication, h2c, and the long tail of Apache modules.
-Unimplemented directives are reported as warnings in compatibility mode. Under
-`--strict-config` every unhandled directive is an error, including
-directives that are recognized but not implemented; strict mode never means
-“only reject unknown names.”  Security-sensitive unimplemented directives
+Unhandled directives are configuration errors in every mode, including
+directives that are recognized as Apache directives but not implemented.
+`--strict-config` remains accepted for deployment compatibility, but normal
+mode no longer converts an unknown or unimplemented directive into a no-op.
+Recognized directives are also rejected when Vapache cannot preserve their
+Apache scope: a per-directory or per-vhost value is never written into a
+process-global field, virtual-host balancers are not exposed globally, and
+mapping directives are refused in contexts where Apache refuses them.
+Security-sensitive unimplemented directives
 (for example `Action`, `ProxyBlock`, `RequestHeader`, `SetEnvIfExpr`,
 `BrowserIPMatch`, `AcceptPathInfo`, `RLimit*`, `TransferLog`, `ScriptLog*`,
 non-file `AuthBasicProvider` values and filter-provider/input-filter
-directives) fail closed even in compatibility mode, and unimplemented
-`.htaccess` directives fail closed with a `500`.
+directives) fail closed at startup, and unimplemented `.htaccess` directives
+fail closed with a `500`. Warnings are reserved for explicitly handled forms
+whose Vapache behavior is equivalent or deliberately stricter, never for a
+discarded policy. `[DPI]` and `[NS]` rewrite flags fail at configuration load
+until their path-info and internal-subrequest semantics are implemented.
 
 ## Build
 
@@ -336,7 +344,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **576 verified functions, 0 errors** (percent-decoding,
+Current result: **590 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -347,7 +355,8 @@ classification/internal-join/same-host authority model, component-aware
 filesystem containment for alias/rewrite/FastCGI targets, the expression
 truthiness/comparison/glob/condition-chain model, the regex dialect admission
 guard, directive disposition, access-layer slot translation, config front-end
-line-kind IR and section-context transitions, rewrite backreference encoding
+quote/escape/tag state machines, bounded argument schemas, line-kind IR and
+sealed section-context transitions, rewrite backreference encoding
 and filesystem-target admission, and the configuration access-plan,
 authorization-merge, Options-merge and `.htaccess` rule-classification kernels
 used by the dispatcher, plus route-prefix matching, handler-extension/removal
@@ -511,7 +520,7 @@ Current ledger: **53.7% weighted obligations**, **5/6 proof debt**,
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **108 adversarial replay cases** covering the findings classes,
-and **576 Verus functions with 0 errors** (including the I3 fast-path
+and **590 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -705,9 +714,9 @@ failure races and privileged-kernel failures are excluded from that metric.
 
 Latest snapshot: **20,020/20,548 executable server production lines (97.43%)**;
 the new aggregate-resource module is **62/62 (100%)**. The current suite is
-542 Rust library tests, 8 CLI unit tests, 26 Rust integration/property tests,
-165 conformance tests and 339 fixed configuration cases.
-The separate Verus gate proves 576 functions with 0 errors; proof-only code is
+545 Rust library tests, 8 CLI unit tests, 26 Rust integration/property tests,
+165 conformance tests and 333 fixed configuration cases.
+The separate Verus gate proves 590 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

@@ -3130,12 +3130,10 @@ DirectoryIndex index.html\n\
 DocumentRoot \"{www}\"\n\
 CacheRoot \"{cache}\"\n\
 CacheEnable disk /\n\
+CacheDisable /disabled\n\
 <Directory \"{www}\">\n\
     Require all granted\n\
     Options -FollowSymLinks +SymLinksIfOwnerMatch\n\
-</Directory>\n\
-<Directory \"{www}/disabled\">\n\
-    CacheDisable /disabled\n\
 </Directory>\n\
 <Directory \"{www}/method\">\n\
     AllowMethods POST\n\
@@ -4058,13 +4056,18 @@ CacheIgnoreQueryString On\n\
         fs::write(root.join("keep.txt"), b"x").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink("keep.txt", root.join("keep-link")).unwrap();
-        clear(&cfg);
+        // `clear()` is the process-global reload transition: it advances the
+        // shared generation as well as cleaning this root. Calling it from a
+        // parallel unit test invalidates unrelated cache fixtures mid-test.
+        // Exercise the filesystem half directly here; reload integration owns
+        // the generation transition.
+        invalidate_disk(&cfg);
+        *entries().lock().unwrap_or_else(|e| e.into_inner()) = MemoryCache::default();
         assert!(!root.join("orphan.body.tmp").exists());
         assert!(root.join("keep.txt").exists());
         assert!(root.join("keep-link").exists());
         let mut no_root = cfg.clone();
         no_root.cache.root = None;
-        clear(&no_root);
         invalidate_disk(&no_root);
         let mut bad_root = no_root;
         bad_root.cache.root = Some(root_file);

@@ -1598,25 +1598,6 @@ CASES = [
         "requests": [("GET", "/ht_requirenone_multi_two/file.txt", None, {})],
     },
     {
-        "name": "nested-if-files-grant",
-        "dir": "nested_if_files_grant",
-        "files": {"secret.txt": "secret\n"},
-        "config": [
-            f'<Directory "{{dir}}">',
-            "    Require all denied",
-            "</Directory>",
-            '<If "%{HTTP:X-Grant} == \'yes\'">',
-            '    <Files "secret.txt">',
-            "        Require all granted",
-            "    </Files>",
-            "</If>",
-        ],
-        "requests": [
-            ("GET", "/nested_if_files_grant/secret.txt", {"X-Grant": "yes"}, {}),
-            ("GET", "/nested_if_files_grant/file.txt", {"X-Grant": "yes"}, {}),
-        ],
-    },
-    {
         "name": "allowmethods-parent-post-get-denied",
         "dir": "am_parent",
         "config": [
@@ -1765,27 +1746,6 @@ CASES = [
             "</Directory>",
         ],
         "requests": [("GET", "/satisfy_child_all/child/file.txt", None, {})],
-    },
-    {
-        "name": "htaccess-if-nested-files-ignored",
-        "dir": "ht_if_nested_files",
-        "files": {
-            ".htaccess": (
-                '<If "%{HTTP:X-Test} == \'yes\'">\n'
-                '    <Files "secret.txt">\n'
-                "        Require all denied\n"
-                "    </Files>\n"
-                "</If>\n"
-            )
-        },
-        "config": [
-            f'<Directory "{{dir}}">',
-            "    AllowOverride All",
-            "</Directory>",
-        ],
-        "requests": [
-            ("GET", "/ht_if_nested_files/secret.txt", {"X-Test": "yes"}, {}),
-        ],
     },
     {
         "name": "limit-inside-location",
@@ -2404,35 +2364,16 @@ def generated_cases():
                     }
                 )
 
-    # Conditional sections with nested authorization.
-    for branch in ("a", "b", "none"):
-        name = f"if-nested-{branch}"
-        headers = {} if branch == "none" else {"X-Branch": branch}
-        out.append(
-            {
-                "name": name,
-                "dir": name,
-                "files": {"secret.txt": "secret\n"},
-                "config": [
-                    f'<Directory "{{dir}}">',
-                    '    <If "%{HTTP:X-Branch} == \'a\'">',
-                    '        <Files "secret.txt">',
-                    "            Require all denied",
-                    "        </Files>",
-                    "    </If>",
-                    "</Directory>",
-                ],
-                "requests": [
-                    ("GET", f"/{name}/file.txt", headers, {}),
-                    ("GET", f"/{name}/secret.txt", headers, {}),
-                ],
-            }
-        )
-
     return out
 
 
 CASES.extend(generated_cases())
+
+# Apache 2.4.69 accepts an unsupported Files section nested inside request-time
+# If, but ordinary direct requests do not evaluate the nested policy. Vapache
+# rejects that construct fail-closed; the rejection belongs to
+# config_validity.py rather than this runtime-equivalence matrix. The
+# .htaccess parser has a direct regression test for the same rule.
 
 
 def section_override_cases():

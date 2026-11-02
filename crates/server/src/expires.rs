@@ -46,6 +46,13 @@ fn duration(spec: &str) -> Option<i64> {
     Some(if base_mod { n | (1 << 62) } else { n })
 }
 
+/// Configuration-time grammar check shared by main configuration and
+/// access-file compilers. Invalid expiry syntax must not be accepted and then
+/// silently omitted when a response is generated.
+pub(crate) fn valid_spec(spec: &str) -> bool {
+    duration(spec).is_some()
+}
+
 fn header<'a>(resp: &'a Response, name: &str) -> Option<&'a [u8]> {
     resp.headers
         .iter()

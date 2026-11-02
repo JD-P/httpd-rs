@@ -7218,6 +7218,10 @@ pub fn cache_if_none_match_star(value: &[u8]) -> (matched: bool)
     let matched = bytes_eq(&value[start..end], b"*");
     if matched {
         assert(value@.subrange(start as int, end as int) == b"*"@);
+        assert(value@.subrange(start as int, end as int).len() == 1);
+        assert(end - start == 1);
+        assert(start < end);
+        assert(end <= value.len());
         assert(exists|witness_start: int, witness_end: int|
             0 <= witness_start < witness_end <= value@.len()
                 && value@.subrange(witness_start, witness_end) == b"*"@);
@@ -8120,48 +8124,44 @@ pub fn config_section_nesting_allowed(
 }
 
 /// Disposition for a directive that was not handled by the parser's main
-/// match.  Security-sensitive names fail closed even in compatibility mode;
-/// a recognised but unimplemented module directive is a warning, and an
-/// unknown directive is a strict-mode error or a compatibility warning.
+/// match. Apache rejects an unknown directive and also rejects a directive
+/// whose implementing module is unavailable. Vapache must not turn either
+/// case into an accepted no-op: doing so can erase an administrator's access,
+/// routing, response-header, logging, or resource policy.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DirectiveDisposition {
     FailClosedSecurity,
-    WarnKnown,
-    FailClosedStrict,
-    WarnUnknown,
+    FailClosedKnown,
+    FailClosedUnknown,
 }
 
 pub open spec fn directive_disposition_spec(
     security: bool,
     known: bool,
-    strict: bool,
+    _strict: bool,
 ) -> DirectiveDisposition {
     if security {
         DirectiveDisposition::FailClosedSecurity
-    } else if strict {
-        DirectiveDisposition::FailClosedStrict
     } else if known {
-        DirectiveDisposition::WarnKnown
+        DirectiveDisposition::FailClosedKnown
     } else {
-        DirectiveDisposition::WarnUnknown
+        DirectiveDisposition::FailClosedUnknown
     }
 }
 
 pub fn directive_disposition(
     security: bool,
     known: bool,
-    strict: bool,
+    _strict: bool,
 ) -> (disposition: DirectiveDisposition)
-    ensures disposition == directive_disposition_spec(security, known, strict),
+    ensures disposition == directive_disposition_spec(security, known, _strict),
 {
     if security {
         DirectiveDisposition::FailClosedSecurity
-    } else if strict {
-        DirectiveDisposition::FailClosedStrict
     } else if known {
-        DirectiveDisposition::WarnKnown
+        DirectiveDisposition::FailClosedKnown
     } else {
-        DirectiveDisposition::WarnUnknown
+        DirectiveDisposition::FailClosedUnknown
     }
 }
 
@@ -8604,12 +8604,11 @@ pub open spec fn host_suffix_spec(host: Seq<u8>, suffix: Seq<u8>) -> bool {
 }
 
 pub open spec fn host_pattern_matches_spec(host: Seq<u8>, pattern: Seq<u8>) -> bool {
-    if pattern.len() >= 2 && pattern[0] == b'*' && pattern[1] == b'.' {
+    if pattern.len() == 1 && pattern[0] == b'*' {
+        true
+    } else if pattern.len() >= 2 && pattern[0] == b'*' && pattern[1] == b'.' {
         let rest = pattern.subrange(2, pattern.len() as int);
-        eq_ignore_ascii_case_spec(host, rest) || host_suffix_spec(host, rest)
-    } else if pattern.len() >= 1 && pattern[0] == b'.' {
-        let rest = pattern.subrange(1, pattern.len() as int);
-        eq_ignore_ascii_case_spec(host, rest) || host_suffix_spec(host, rest)
+        host.len() > rest.len() && host_suffix_spec(host, rest)
     } else {
         eq_ignore_ascii_case_spec(host, pattern)
     }
@@ -8632,26 +8631,17 @@ pub fn host_suffix_matches(host: &[u8], suffix: &[u8]) -> (ok: bool)
     }
 }
 
-/// Exact host or `*.suffix` / `.suffix` matching, with ASCII case folding and
-/// a DNS-label boundary.  The caller trims trailing dots and handles the
-/// Apache `~regex` form separately.
+/// Exact host, `*`, or leading `*.suffix` matching, with ASCII case folding
+/// and a DNS-label boundary. A suffix wildcard requires at least one label,
+/// as it does in Apache; it never aliases the bare suffix.
 pub fn host_pattern_matches(host: &[u8], pattern: &[u8]) -> (ok: bool)
     ensures ok == host_pattern_matches_spec(host@, pattern@)
 {
-    if pattern.len() >= 2 && pattern[0] == b'*' && pattern[1] == b'.' {
+    if pattern.len() == 1 && pattern[0] == b'*' {
+        true
+    } else if pattern.len() >= 2 && pattern[0] == b'*' && pattern[1] == b'.' {
         let rest = &pattern[2..];
-        if eq_ignore_ascii_case(host, rest) {
-            true
-        } else {
-            host_suffix_matches(host, rest)
-        }
-    } else if pattern.len() >= 1 && pattern[0] == b'.' {
-        let rest = &pattern[1..];
-        if eq_ignore_ascii_case(host, rest) {
-            true
-        } else {
-            host_suffix_matches(host, rest)
-        }
+        host.len() > rest.len() && host_suffix_matches(host, rest)
     } else {
         eq_ignore_ascii_case(host, pattern)
     }
@@ -8980,6 +8970,460 @@ pub fn tls_client_policy_equal(
 // Configuration front-end IR
 // ---------------------------------------------------------------------------
 
+/// Byte-level state for the Apache-compatible configuration tokenizer.  The
+/// server drives this transition directly, so quote and escape decisions are
+/// not duplicated in an unverified parser.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigLexState {
+    Between,
+    Unquoted,
+    SingleQuoted,
+    DoubleQuoted,
+    AfterQuoted,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigLexAction {
+    Skip,
+    Begin,
+    Push,
+    PushNext,
+    Finish,
+    CloseQuote,
+    RejectAfterQuote,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ConfigLexStep {
+    pub action: ConfigLexAction,
+    pub state: ConfigLexState,
+    pub advance: u8,
+}
+
+pub open spec fn config_ascii_whitespace_spec(byte: u8) -> bool {
+    byte == b' ' || byte == b'\t' || byte == b'\n'
+        || byte == 0x0b || byte == 0x0c || byte == b'\r'
+}
+
+fn config_ascii_whitespace(byte: u8) -> (whitespace: bool)
+    ensures whitespace == config_ascii_whitespace_spec(byte),
+{
+    byte == b' ' || byte == b'\t' || byte == b'\n'
+        || byte == 0x0b || byte == 0x0c || byte == b'\r'
+}
+
+pub open spec fn config_lex_step_spec(
+    state: ConfigLexState,
+    byte: u8,
+    next: Option<u8>,
+) -> ConfigLexStep {
+    let whitespace = config_ascii_whitespace_spec(byte);
+    match state {
+        ConfigLexState::Between => {
+            if whitespace {
+                ConfigLexStep {
+                    action: ConfigLexAction::Skip,
+                    state: ConfigLexState::Between,
+                    advance: 1,
+                }
+            } else if byte == b'\'' {
+                ConfigLexStep {
+                    action: ConfigLexAction::Begin,
+                    state: ConfigLexState::SingleQuoted,
+                    advance: 1,
+                }
+            } else if byte == b'"' {
+                ConfigLexStep {
+                    action: ConfigLexAction::Begin,
+                    state: ConfigLexState::DoubleQuoted,
+                    advance: 1,
+                }
+            } else {
+                ConfigLexStep {
+                    action: ConfigLexAction::Begin,
+                    state: ConfigLexState::Unquoted,
+                    advance: 0,
+                }
+            }
+        }
+        ConfigLexState::Unquoted => {
+            if whitespace {
+                ConfigLexStep {
+                    action: ConfigLexAction::Finish,
+                    state: ConfigLexState::Between,
+                    advance: 1,
+                }
+            } else if byte == b'\\'
+                && match next {
+                    Some(value) => config_ascii_whitespace_spec(value),
+                    None => false,
+                }
+            {
+                ConfigLexStep {
+                    action: ConfigLexAction::PushNext,
+                    state: ConfigLexState::Unquoted,
+                    advance: 2,
+                }
+            } else {
+                ConfigLexStep {
+                    action: ConfigLexAction::Push,
+                    state: ConfigLexState::Unquoted,
+                    advance: 1,
+                }
+            }
+        }
+        ConfigLexState::SingleQuoted => {
+            if byte == b'\'' {
+                ConfigLexStep {
+                    action: ConfigLexAction::CloseQuote,
+                    state: ConfigLexState::AfterQuoted,
+                    advance: 1,
+                }
+            } else if byte == b'\\' && next == Some(b'\'') {
+                ConfigLexStep {
+                    action: ConfigLexAction::PushNext,
+                    state: ConfigLexState::SingleQuoted,
+                    advance: 2,
+                }
+            } else {
+                ConfigLexStep {
+                    action: ConfigLexAction::Push,
+                    state: ConfigLexState::SingleQuoted,
+                    advance: 1,
+                }
+            }
+        }
+        ConfigLexState::DoubleQuoted => {
+            if byte == b'"' {
+                ConfigLexStep {
+                    action: ConfigLexAction::CloseQuote,
+                    state: ConfigLexState::AfterQuoted,
+                    advance: 1,
+                }
+            } else if byte == b'\\' && next == Some(b'"') {
+                ConfigLexStep {
+                    action: ConfigLexAction::PushNext,
+                    state: ConfigLexState::DoubleQuoted,
+                    advance: 2,
+                }
+            } else {
+                ConfigLexStep {
+                    action: ConfigLexAction::Push,
+                    state: ConfigLexState::DoubleQuoted,
+                    advance: 1,
+                }
+            }
+        }
+        ConfigLexState::AfterQuoted => {
+            if whitespace {
+                ConfigLexStep {
+                    action: ConfigLexAction::Finish,
+                    state: ConfigLexState::Between,
+                    advance: 1,
+                }
+            } else {
+                ConfigLexStep {
+                    action: ConfigLexAction::RejectAfterQuote,
+                    state: ConfigLexState::AfterQuoted,
+                    advance: 1,
+                }
+            }
+        }
+    }
+}
+
+/// Exact tokenizer transition.  `advance == 0` is the deliberate reprocess
+/// step that creates an unquoted token before consuming its first byte;
+/// `advance == 2` is possible only when the next byte exists and is copied.
+pub fn config_lex_step(
+    state: ConfigLexState,
+    byte: u8,
+    next: Option<u8>,
+) -> (step: ConfigLexStep)
+    ensures
+        step == config_lex_step_spec(state, byte, next),
+        step.advance <= 2,
+        step.advance == 2 ==> next.is_some(),
+{
+    let whitespace = config_ascii_whitespace(byte);
+    match state {
+        ConfigLexState::Between => {
+            if whitespace {
+                ConfigLexStep {
+                    action: ConfigLexAction::Skip,
+                    state: ConfigLexState::Between,
+                    advance: 1,
+                }
+            } else if byte == b'\'' {
+                ConfigLexStep {
+                    action: ConfigLexAction::Begin,
+                    state: ConfigLexState::SingleQuoted,
+                    advance: 1,
+                }
+            } else if byte == b'"' {
+                ConfigLexStep {
+                    action: ConfigLexAction::Begin,
+                    state: ConfigLexState::DoubleQuoted,
+                    advance: 1,
+                }
+            } else {
+                ConfigLexStep {
+                    action: ConfigLexAction::Begin,
+                    state: ConfigLexState::Unquoted,
+                    advance: 0,
+                }
+            }
+        }
+        ConfigLexState::Unquoted => {
+            if whitespace {
+                ConfigLexStep {
+                    action: ConfigLexAction::Finish,
+                    state: ConfigLexState::Between,
+                    advance: 1,
+                }
+            } else if byte == b'\\'
+                && match next {
+                    Some(value) => config_ascii_whitespace(value),
+                    None => false,
+                }
+            {
+                ConfigLexStep {
+                    action: ConfigLexAction::PushNext,
+                    state: ConfigLexState::Unquoted,
+                    advance: 2,
+                }
+            } else {
+                ConfigLexStep {
+                    action: ConfigLexAction::Push,
+                    state: ConfigLexState::Unquoted,
+                    advance: 1,
+                }
+            }
+        }
+        ConfigLexState::SingleQuoted => {
+            if byte == b'\'' {
+                ConfigLexStep {
+                    action: ConfigLexAction::CloseQuote,
+                    state: ConfigLexState::AfterQuoted,
+                    advance: 1,
+                }
+            } else if byte == b'\\' && next == Some(b'\'') {
+                ConfigLexStep {
+                    action: ConfigLexAction::PushNext,
+                    state: ConfigLexState::SingleQuoted,
+                    advance: 2,
+                }
+            } else {
+                ConfigLexStep {
+                    action: ConfigLexAction::Push,
+                    state: ConfigLexState::SingleQuoted,
+                    advance: 1,
+                }
+            }
+        }
+        ConfigLexState::DoubleQuoted => {
+            if byte == b'"' {
+                ConfigLexStep {
+                    action: ConfigLexAction::CloseQuote,
+                    state: ConfigLexState::AfterQuoted,
+                    advance: 1,
+                }
+            } else if byte == b'\\' && next == Some(b'"') {
+                ConfigLexStep {
+                    action: ConfigLexAction::PushNext,
+                    state: ConfigLexState::DoubleQuoted,
+                    advance: 2,
+                }
+            } else {
+                ConfigLexStep {
+                    action: ConfigLexAction::Push,
+                    state: ConfigLexState::DoubleQuoted,
+                    advance: 1,
+                }
+            }
+        }
+        ConfigLexState::AfterQuoted => {
+            if whitespace {
+                ConfigLexStep {
+                    action: ConfigLexAction::Finish,
+                    state: ConfigLexState::Between,
+                    advance: 1,
+                }
+            } else {
+                ConfigLexStep {
+                    action: ConfigLexAction::RejectAfterQuote,
+                    state: ConfigLexState::AfterQuoted,
+                    advance: 1,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigLexEof {
+    Complete,
+    Finish,
+    UnterminatedQuote,
+}
+
+pub open spec fn config_lex_eof_spec(state: ConfigLexState) -> ConfigLexEof {
+    match state {
+        ConfigLexState::Between => ConfigLexEof::Complete,
+        ConfigLexState::Unquoted | ConfigLexState::AfterQuoted => ConfigLexEof::Finish,
+        ConfigLexState::SingleQuoted | ConfigLexState::DoubleQuoted => {
+            ConfigLexEof::UnterminatedQuote
+        }
+    }
+}
+
+pub fn config_lex_eof(state: ConfigLexState) -> (action: ConfigLexEof)
+    ensures action == config_lex_eof_spec(state),
+{
+    match state {
+        ConfigLexState::Between => ConfigLexEof::Complete,
+        ConfigLexState::Unquoted | ConfigLexState::AfterQuoted => ConfigLexEof::Finish,
+        ConfigLexState::SingleQuoted | ConfigLexState::DoubleQuoted => {
+            ConfigLexEof::UnterminatedQuote
+        }
+    }
+}
+
+/// Bound the number of materialized arguments without arithmetic wrap.  This
+/// transition is consumed each time the runtime closes a token.
+pub fn config_argument_count_step(count: usize) -> (next: Option<usize>)
+    ensures
+        next == if count < 256 { Some((count + 1) as usize) } else { None },
+        next.is_some() ==> next.unwrap() <= 256,
+{
+    if count < 256 {
+        Some(count + 1)
+    } else {
+        None
+    }
+}
+
+/// Quote state used to find the closing delimiter of a section tag. Apache's
+/// `<IfVersion >= 2.4>` form means the last unquoted `>` wins; an escaped quote
+/// inside an argument must not accidentally end quote protection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigTagQuote {
+    Unquoted,
+    Single,
+    Double,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ConfigTagStep {
+    pub quote: ConfigTagQuote,
+    pub advance: u8,
+    pub delimiter: bool,
+}
+
+pub open spec fn config_tag_step_spec(
+    quote: ConfigTagQuote,
+    byte: u8,
+    next: Option<u8>,
+) -> ConfigTagStep {
+    match quote {
+        ConfigTagQuote::Unquoted => {
+            if byte == b'\'' {
+                ConfigTagStep { quote: ConfigTagQuote::Single, advance: 1, delimiter: false }
+            } else if byte == b'"' {
+                ConfigTagStep { quote: ConfigTagQuote::Double, advance: 1, delimiter: false }
+            } else {
+                ConfigTagStep {
+                    quote: ConfigTagQuote::Unquoted,
+                    advance: 1,
+                    delimiter: byte == b'>',
+                }
+            }
+        }
+        ConfigTagQuote::Single => {
+            if byte == b'\\' && next == Some(b'\'') {
+                ConfigTagStep { quote: ConfigTagQuote::Single, advance: 2, delimiter: false }
+            } else if byte == b'\'' {
+                ConfigTagStep { quote: ConfigTagQuote::Unquoted, advance: 1, delimiter: false }
+            } else {
+                ConfigTagStep { quote: ConfigTagQuote::Single, advance: 1, delimiter: false }
+            }
+        }
+        ConfigTagQuote::Double => {
+            if byte == b'\\' && next == Some(b'"') {
+                ConfigTagStep { quote: ConfigTagQuote::Double, advance: 2, delimiter: false }
+            } else if byte == b'"' {
+                ConfigTagStep { quote: ConfigTagQuote::Unquoted, advance: 1, delimiter: false }
+            } else {
+                ConfigTagStep { quote: ConfigTagQuote::Double, advance: 1, delimiter: false }
+            }
+        }
+    }
+}
+
+pub fn config_tag_step(
+    quote: ConfigTagQuote,
+    byte: u8,
+    next: Option<u8>,
+) -> (step: ConfigTagStep)
+    ensures
+        step == config_tag_step_spec(quote, byte, next),
+        step.advance == 1 || step.advance == 2,
+        step.advance == 2 ==> next.is_some(),
+        step.delimiter ==> quote == ConfigTagQuote::Unquoted && byte == b'>',
+{
+    match quote {
+        ConfigTagQuote::Unquoted => {
+            if byte == b'\'' {
+                ConfigTagStep { quote: ConfigTagQuote::Single, advance: 1, delimiter: false }
+            } else if byte == b'"' {
+                ConfigTagStep { quote: ConfigTagQuote::Double, advance: 1, delimiter: false }
+            } else {
+                ConfigTagStep {
+                    quote: ConfigTagQuote::Unquoted,
+                    advance: 1,
+                    delimiter: byte == b'>',
+                }
+            }
+        }
+        ConfigTagQuote::Single => {
+            if byte == b'\\' && next == Some(b'\'') {
+                ConfigTagStep { quote: ConfigTagQuote::Single, advance: 2, delimiter: false }
+            } else if byte == b'\'' {
+                ConfigTagStep { quote: ConfigTagQuote::Unquoted, advance: 1, delimiter: false }
+            } else {
+                ConfigTagStep { quote: ConfigTagQuote::Single, advance: 1, delimiter: false }
+            }
+        }
+        ConfigTagQuote::Double => {
+            if byte == b'\\' && next == Some(b'"') {
+                ConfigTagStep { quote: ConfigTagQuote::Double, advance: 2, delimiter: false }
+            } else if byte == b'"' {
+                ConfigTagStep { quote: ConfigTagQuote::Unquoted, advance: 1, delimiter: false }
+            } else {
+                ConfigTagStep { quote: ConfigTagQuote::Double, advance: 1, delimiter: false }
+            }
+        }
+    }
+}
+
+/// Arity gate used by typed directive schemas before policy compilation.
+/// `max == None` denotes an unbounded upper arity.
+pub fn config_argument_arity_admit(
+    count: usize,
+    min: usize,
+    max: Option<usize>,
+) -> (ok: bool)
+    ensures ok == (count >= min && match max { Some(bound) => count <= bound, None => true }),
+{
+    count >= min && match max { Some(bound) => count <= bound, None => true }
+}
+
+pub fn config_argument_nonempty_admit(reject_empty: bool, has_empty: bool) -> (ok: bool)
+    ensures ok == (!reject_empty || !has_empty),
+{
+    !reject_empty || !has_empty
+}
+
 /// The three pure line kinds produced by the configuration tokenizer.  This
 /// is the Verus-side anchor for the parser IR; argument payloads and concrete
 /// directive parsing remain in the server front-end until the recursive
@@ -9016,6 +9460,31 @@ pub fn config_line_kind(
         ConfigLineKind::SectionStart
     } else {
         ConfigLineKind::Directive
+    }
+}
+
+/// Structural transition used while sealing the expanded configuration into
+/// an immutable program.  A closing section can never underflow the stack;
+/// an opening section cannot wrap the depth counter.
+pub fn config_program_depth_step(
+    depth: usize,
+    kind: ConfigLineKind,
+) -> (next: Option<usize>)
+    ensures
+        match kind {
+            ConfigLineKind::Directive => next == Some(depth),
+            ConfigLineKind::SectionStart => {
+                next == if depth < usize::MAX { Some((depth + 1) as usize) } else { None }
+            }
+            ConfigLineKind::SectionEnd => {
+                next == if depth > 0 { Some((depth - 1) as usize) } else { None }
+            }
+        },
+{
+    match kind {
+        ConfigLineKind::Directive => Some(depth),
+        ConfigLineKind::SectionStart => depth.checked_add(1),
+        ConfigLineKind::SectionEnd => depth.checked_sub(1),
     }
 }
 

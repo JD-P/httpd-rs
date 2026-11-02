@@ -14,8 +14,11 @@ construction: there is one evaluator, not two.  The phase plan and the
 security-relevant merge decisions are now Verus-checked and consumed by that
 evaluator (counts and exact boundaries in §10a).  Container/list merging,
 directive disposition and `.htaccess` layer-slot translation use verified
-helpers; raw parser tokenization remains the explicit parser-refinement
-assumption.
+helpers. Configuration quote/escape tokenization, section-tag delimiters,
+argument bounds and section-depth transitions now consume executable verified
+kernels. Main and access-file configuration are sealed into immutable programs
+with exact section mates before directive effects are applied. Directive and
+pattern payload translation remains the explicit parser-refinement assumption.
 
 ## Process capability boundary
 
@@ -379,14 +382,15 @@ earlier `ProxyPass`.  The complete route/balancer identity rules are in I32.
 
 ```text
 Accepted(cfg) ==> forall d in directives(cfg): handled(d) or proved_inert(d)
-Strict(cfg)   ==> forall d in directives(cfg): handled(d)
+Unhandled(d) ==> reject(cfg)
 ```
 
 A warning may only mean “proved semantically inert,” never “effectful but
 unsupported.”  In particular, `AliasMatch`, `ScriptAliasMatch`,
 `RedirectMatch`, `RedirectPermanent`, `RedirectTemp` and `RemoveHandler` are
 handled; the remaining mapping/handler directives (`Action`, etc.) fail
-closed in compatibility mode and strict mode rejects every unhandled name.
+closed in every mode; normal mode no longer accepts an unhandled name as a
+warning-only no-op.
 
 ### I10 — One resolved target
 
@@ -1074,20 +1078,34 @@ the process-wide worker ceiling, but is not charged as one ordinary client.
 ### I34 — Main-configuration directive disposition closure
 
 ```text
-recognized(d) -> handled(d) | fail_closed(d) | warned_inert(d)
-security(d) || filter(d) || audit(d) || resource_bound(d) -> fail_closed(d)
-warned_inert(d) -> d is presentation/module-absence only
-Strict(cfg) -> forall unhandled d: reject(cfg)
+recognized(d) -> handled(d) | fail_closed(d)
+unknown(d) -> fail_closed(d)
+warning(d) -> handled_equivalent(d) | deliberately_stricter(d)
 ```
 
 `fail_closed_directives` and the security-family classifier are the explicit
-main-config counterpart of the `.htaccess` registry.  Security, filter, audit
-and resource-limit directives that are not implemented fail startup even in
-compatibility mode.  The remaining compatibility warnings are limited to a
-reviewed presentation/module-absence surface (for example `AddDescription`,
-`UserDir`, `Session*`, `Substitute`, `Charset*`); strict mode rejects every
-unhandled directive.  The disposition matrix test asserts the fail-closed set,
-the explicit warning set and strict-mode rejection.
+main-config counterpart of the `.htaccess` registry. Security, filter, audit,
+resource-limit, presentation, and module directives that are not implemented
+fail startup in every mode. Remaining warnings belong only to handled
+compatibility forms whose behavior is equivalent or deliberately stricter
+(for example Rustls OS randomness in place of `SSLRandomSeed`). The
+disposition matrix asserts closed-world rejection.
+Directive context is part of that disposition. A value represented only by a
+process-global Vapache field is rejected in Apache per-vhost/per-directory
+forms rather than allowing the last scope to overwrite every other scope.
+Mapping, cache-route, TLS and logging directives likewise compile only in a
+context whose effect is represented exactly. `ServerRoot` is processed at
+read time, so it binds subsequent relative `Include` paths as it does in
+Apache. Unsupported section arities and virtual-host-local balancer
+definitions fail before they can acquire global meaning.
+Apache 2.4.69 also accepts the unsupported reverse nesting of a request-time
+`<If>` containing `<Files>`, but ordinary direct requests do not evaluate
+the nested file policy. Vapache rejects that construct in both main
+configuration and `.htaccess`: executing the nested grant would broaden access
+relative to Apache, while accepting it as inert would hide operator policy.
+TLS compatibility directives are validated at the same boundary: malformed
+`SSLProtocol`, `SSLPassPhraseDialog`, session-cache and stapling-cache values
+cannot survive until listener construction or disappear behind a warning.
 
 ### I35 — Single-file alias target split
 
@@ -1719,7 +1737,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **576 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **590 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1886,22 +1904,28 @@ construction: there is no second production interleaver.
   pattern-times-subject work bound and `expr_regex_result` proves that an
   evaluation error cannot grant even through negation. The Rust automata
   backend still supplies matching semantics for the accepted bytecode.
-- `directive_disposition`.  The configuration fallback uses a verified
-  four-way disposition: security-sensitive unhandled directives fail closed;
-  in strict mode every unhandled directive (known or unknown) fails; in
-  compatibility mode known module directives warn and unknown directives
-  warn.  This is the executable form of I9 and prevents `--strict-config`
-  from accepting an effectful but unimplemented directive.
+- `directive_disposition`. The configuration fallback uses a verified
+  three-way fail-closed disposition for security-sensitive, known-but-
+  unimplemented, and unknown directives. This is the executable form of I9;
+  neither normal nor strict mode may accept an effectful no-op.
 - `access_layer_slot`.  Parsed `.htaccess` rules are translated into
   conditional, Files or top-level layer slots by a verified decision used by
   `collect_layers`.
-- `config_line_kind`.  The pure front-end IR classifies a tokenized line as a
-  directive, section start or section end using a verified decision.
-  `config_frontend::parse_line` consumes this classification.
+- `config_lex_step`, `config_lex_eof`, `config_tag_step`,
+  `config_argument_count_step`, `config_argument_arity_admit`,
+  `config_argument_nonempty_admit`, `config_line_kind` and
+  `config_program_depth_step`. The pure front end consumes the verified
+  quote/escape and section-tag transition systems, fails closed at UTF-8 and
+  256-argument boundaries, and classifies each resulting line. Main
+  configuration is sealed into `ConfigProgram`; access files are sealed into
+  `AccessProgram`. Both programs establish exact start/end section mates and
+  preclassify directive/section identity before compilation. Skipping a false,
+  inactive or disallowed section jumps to its exact mate instead of rescanning
+  nested text.
 - `config_section_nesting_allowed`.  The recursive configuration compiler
-  checks section transitions through the verified context table.  Raw
-  tokenization, directive arguments and directive-specific refinements remain
-  the explicit parser-refinement assumption.
+  checks section transitions through the verified context table. Complex
+  directive and pattern payload refinements remain the explicit
+  parser-refinement assumption.
 - `classify_access_rule`.  `htaccess::collect_layers` uses this verified
   partition: condition/non-normal rules go to the deferred conditional bucket,
   `<Files>` rules to the Files bucket, and everything else to the top-level
@@ -2014,9 +2038,12 @@ construction: there is no second production interleaver.
   individual request; Rustls chain validation itself remains an external
   TLS assumption.
 - `host_pattern_matches` / `host_suffix_matches`.  `VHost::matches_name`
-  uses verified exact, `*.suffix` and `.suffix` matching with ASCII case
-  folding and DNS-label boundaries.  Invalid regex `ServerAlias` patterns are
-  rejected at configuration load.
+  uses exact `ServerName` matching and verified exact, `*`, or leading
+  `*.suffix` `ServerAlias` matching with ASCII case folding and DNS-label boundaries. A
+  wildcard requires a preceding label and therefore does not match its bare
+  suffix. Values beginning with `~` remain ordinary Apache names; Vapache does
+  not invent regex virtual-host matching. Other Apache wildcard placements
+  fail at startup until their semantics are implemented.
 - `first_true_index`.  Virtual-host candidate selection uses the verified
   first-match policy.
 - `parse_http_authority_endpoint`/`parse_http_ipv6_literal`, `ipv4_in_net` /
@@ -2054,11 +2081,11 @@ without it, FastCGI is rejected unless `UnstableFastCgiPaths` explicitly
 accepts the equivalent read-only-tree deployment assumption. Writable trees
 must not inherit a FastCGI handler.
 
-Security-sensitive unimplemented directives fail closed in compatibility mode.
+Security-sensitive unimplemented directives fail closed in every mode.
 The classifier covers the auth/TLS/proxy/filter/DAV/LDAP/cache families by
-name prefix, not only an explicit denylist; the warning-only fallback is
-reserved for directives with no access, auth, proxy, filter or path-policy
-effect.
+name prefix, not only an explicit denylist. The general fallback is closed too:
+known-but-unimplemented and unknown directives are startup errors rather than
+warning-only no-ops.
 
 ### Policy-core migration
 
@@ -2096,37 +2123,44 @@ The `ScopePolicy` migration is complete at the runtime-data level: `Scope`
 now stores policy objects for all former fields.  The next formal step is the
 abstract model/projection proof over these policy objects.
 
-### Parser-proof starting point
+### Verified configuration compiler boundary
 
-`crates/server/src/config_frontend.rs` now isolates the pure front-end pieces
-that the proof will target:
+`crates/server/src/config_frontend.rs` isolates the pure front-end pieces:
 
 - logical-line accumulation with source line numbers;
 - Apache-style quoted/escaped tokenization;
 - a small `ConfigLine` IR for directives, section starts and section ends.
 
-Both the configuration parser and the `.htaccess` parser use the shared
-tokenizer; the configuration compiler uses the shared logical-line helper.
-The IR is deliberately free of filesystem access, include expansion, section
-context and directive dispatch.  The config compiler and `.htaccess`
-`parse_block` now consume the IR for line classification, and
-`config_line_kind` plus `config_section_nesting_allowed` are verified and used
-by the runtime.  `OptionsPolicy` and `OverridePolicy` are the first migrated
-policy objects; authorization is the next slice.  The remaining proof work is
-the byte-level tokenizer refinement, directive-argument semantics, and the full
-IR-to-concrete `Scope` mapping; the AccessLayer slot and directive disposition
-boundaries are already verified.
+Both the main configuration parser and `.htaccess` use the shared tokenizer.
+Quote, escape, whitespace, section-tag delimiter, EOF, argument-count,
+argument-arity/nonempty and structural-depth decisions are executable Verus
+kernels used by production. After includes and execute-on-read conditions are
+resolved, main configuration is sealed into an immutable `ConfigProgram` with
+a closed section vocabulary, canonical directive identities, typed payload
+schemas, directive/section arity checks, context checks, and exact section
+mates. Each stable access-file snapshot is likewise sealed into an
+`AccessProgram` before it mutates a `Scope`; malformed syntax inside a skipped
+wrapper therefore cannot evade validation.
+
+The main program is compiled only during startup/reload. An access program is
+compiled only for a new descriptor/version snapshot and the resulting parsed
+layer is cached; the sealed program is not retained on the request hot path.
+The remaining proof work is the full directive/pattern payload-to-policy
+projection and the complete IR-to-`Scope` equivalence theorem. AccessLayer slot
+and directive disposition boundaries are already verified.
 
 ### Remaining refinement boundary
 
 The verified source/depth plan is consumed by the evaluator. Rule-kind phase
 classification, deferred-slot selection and the recursive ordering comparator
-are executable verified decisions. Raw configuration/access-file tokenization,
-directive and pattern payload construction, and standard-library sort
-correctness remain outside mechanical proof; container/list field merging and
-the security disposition/layer-slot translation use verified helpers. The
-parser boundary is covered by the explicit `configuration tokenization and
-directive/pattern payloads refine the executable kind/phase model` assumption.
+are executable verified decisions. Configuration/access-file lexical
+transitions, argument bounds and sealed section structure are executable
+verified decisions too. Directive and pattern payload construction and
+standard-library sort correctness remain outside mechanical proof;
+container/list field merging and the security disposition/layer-slot
+translation use verified helpers. The remaining parser assumption is limited
+to payload parsers refining their typed runtime policy values and the eventual
+whole-program projection theorem.
 
 The authorization decision, access-phase interleaving, Options algebra,
 scalar overrides, `.htaccess` rule classification, expression truthiness,
@@ -2241,7 +2275,8 @@ excludes test-only code from the denominator.
 - Configuration phases and access-file interleaving now run through a verified
   source/depth plan consumed by the single production evaluator. Rule-kind
   phase classification, deferred-slot selection and the recursive ordering
-  comparator also consume executable Verus decisions. Raw parser tokenization,
+  comparator also consume executable Verus decisions. Lexical transitions,
+  argument bounds and immutable section structure are verified and connected;
   directive/pattern payloads and concrete library sorting remain covered by
   the explicit refinement assumption. Container/list field merging, directive
   disposition and `.htaccess` layer-slot translation use verified helpers.

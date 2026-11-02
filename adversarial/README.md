@@ -9,6 +9,7 @@ prevents re-deriving them from scratch.
 
 | Path | Contents |
 |---|---|
+| `apache-if-files-nesting.md` | Apache 2.4.69 configuration-validation bug: unsupported `<Files>`/request-time `<If>` nesting passes configtest but its policy is not evaluated on ordinary requests; source analysis, impact, reproduction, and Vapache disposition |
 | `findings.md` | Pass 3 write-ups (F31–F36, F38) |
 | `findings_p4.md` … `findings_p9.md` | Pass 4–9 write-ups |
 | `findings_p10.md` | Pass 10 write-ups (F60–F69) |

@@ -6,8 +6,11 @@ rejects them.  A permissive parser is not automatically a vulnerability, but
 for access-control directives it is exactly the kind of surprise that turns
 into a bypass.  This harness deliberately uses `-t` only: the question is
 whether the configuration is accepted, not how it behaves after startup.
-The STRICT_CASES rows additionally check that `vapached --strict-config`
-fails where Apache `apache2 -t` fails (H8 promoted directive drops).
+The MALFORMED_CASES rows require Apache, normal Vapache, and strict Vapache to
+reject the same malformed directive. HARDENED_CASES records legacy inputs that
+Apache 2.4 accepts through empty/default/numeric coercions but that Vapache
+deliberately rejects rather than guessing at policy. Compatibility mode must
+never turn either class into an accepted no-op.
 """
 
 import argparse
@@ -22,7 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
-APACHE = shutil.which("apache2") or "/usr/sbin/apache2"
+APACHE = os.environ.get("APACHE", shutil.which("apache2") or "/usr/sbin/apache2")
 MODDIR = Path(
     os.environ.get(
         "APACHE_MODDIR",
@@ -48,6 +51,7 @@ MODULES = [
     "access_compat_module",
     "allowmethods_module",
     "headers_module",
+    "env_module",
     "setenvif_module",
     "auth_basic_module",
     "authn_core_module",
@@ -56,7 +60,18 @@ MODULES = [
     "authz_groupfile_module",
     "rewrite_module",
     "proxy_module",
+    "proxy_balancer_module",
+    "proxy_hcheck_module",
     "expires_module",
+    "filter_module",
+    "deflate_module",
+    "brotli_module",
+    "reqtimeout_module",
+    "remoteip_module",
+    "cache_module",
+    "cache_disk_module",
+    "socache_shmcb_module",
+    "ssl_module",
 ]
 
 VAPACHE_CAPABILITIES = """VapacheCapability AbsoluteRequestTarget On
@@ -186,6 +201,14 @@ CASES = [
         '<Files "x">\n    <Limit POST>\n        Require all denied\n    </Limit>\n</Files>\n',
     ),
     (
+        "legacy Location tilde regex",
+        '<Location ~ "^/private/">\n    Require all denied\n</Location>\n',
+    ),
+    (
+        "legacy Files tilde regex",
+        '<Files ~ "^secret\\.txt$">\n    Require all denied\n</Files>\n',
+    ),
+    (
         "RequireAll inside If at server level",
         "<If \"%{HTTP:X} == 'yes'\">\n    <RequireAll>\n        Require all granted\n    </RequireAll>\n</If>\n",
     ),
@@ -277,11 +300,9 @@ CASES = [
     ),
 ]
 
-# H8: promoted directive drops.  Apache rejects each of these snippets at
-# plain `-t`; vapached in compatible mode keeps loading with a warning (a
-# documented compatibility divergence), but `--strict-config` must refuse to
-# run so the configuration cannot pass a strict deployment unnoticed.
-STRICT_CASES = [
+# Apache rejects each of these snippets at plain `-t`. Vapache must reject
+# them in every mode rather than discarding the malformed policy payload.
+MALFORMED_CASES = [
     ("AddType requires two args", "AddType image/png\n"),
     ("AddHandler requires two args", "AddHandler cgi-script\n"),
     ("Header requires an action pair", "Header set\n"),
@@ -302,6 +323,70 @@ STRICT_CASES = [
         '    BalancerMember "http://127.0.0.1:1"\n'
         "    ProxySet failonstatus=9xx,foo\n"
         "</Proxy>\n",
+    ),
+    ("FileETag unknown keyword", "FileETag Unknown\n"),
+    ("EnableSendfile invalid boolean", "EnableSendfile Maybe\n"),
+    ("DirectorySlash invalid boolean", "DirectorySlash Maybe\n"),
+    ("ExpiresActive invalid boolean", "ExpiresActive Maybe\n"),
+    ("KeepAlive invalid boolean", "KeepAlive Maybe\n"),
+    ("KeepAliveTimeout invalid duration", "KeepAliveTimeout nope\n"),
+    ("HostnameLookups invalid value", "HostnameLookups Maybe\n"),
+    ("ServerTokens invalid value", "ServerTokens Unknown\n"),
+    ("ServerSignature invalid value", "ServerSignature Maybe\n"),
+    ("RequestReadTimeout invalid syntax", "RequestReadTimeout nonsense\n"),
+    ("LimitRequestBody invalid integer", "LimitRequestBody nope\n"),
+    ("AllowEncodedSlashes invalid value", "AllowEncodedSlashes Maybe\n"),
+    ("DeflateCompressionLevel out of range", "DeflateCompressionLevel 100\n"),
+    ("DeflateAlterETag invalid value", "DeflateAlterETag Bogus\n"),
+    ("SSLProtocol unknown token", "SSLProtocol nonsense\n"),
+    ("SSLPassPhraseDialog invalid value", "SSLPassPhraseDialog nonsense\n"),
+    ("SSLStaplingCache invalid value", "SSLStaplingCache nonsense\n"),
+    ("ProxyPass unknown parameter", "ProxyPass /x http://127.0.0.1:1/ unknown=yes\n"),
+    ("ProxyPassReverse requires backend", "ProxyPassReverse /x\n"),
+    ("ProxyPassMatch requires backend", "ProxyPassMatch ^/x$\n"),
+    ("AddOutputFilterByType requires type", "AddOutputFilterByType DEFLATE\n"),
+    ("CustomLog requires format", "CustomLog logs/access.log\n"),
+    ("SetEnv rejects an unquoted extra value", "SetEnv NAME one two\n"),
+    ("ServerRoot rejects an extra value", f'ServerRoot "{BASE}" extra\n'),
+    ("Define rejects an extra value", "Define NAME value extra\n"),
+    ("Undefine requires one name", "Undefine NAME extra\n"),
+    ("LoadModule rejects an extra value", "LoadModule dummy_module nowhere.so extra\n"),
+    ("Include requires one path", f'Include "{BASE}/inc.conf" extra\n'),
+    ("Directory rejects an extra path", "<Directory /x /y>\n</Directory>\n"),
+    ("Location rejects an extra pattern", "<Location /x /y>\n</Location>\n"),
+    ("Files rejects an extra pattern", "<Files x y>\n</Files>\n"),
+    ("Proxy rejects an extra URL", "<Proxy http://a http://b>\n</Proxy>\n"),
+    ("Else rejects operands", "<If true>\n</If>\n<Else ignored>\n</Else>\n"),
+]
+
+# Apache 2.4 currently accepts these legacy coercions/presentation forms. They
+# are not compatibility requirements: Vapache treats each one as ambiguous
+# policy and rejects it in every mode.
+HARDENED_CASES = [
+    ("Options requires an operand", f'<Directory "{DOCROOT}">\nOptions\n</Directory>\n'),
+    ("ExpiresDefault invalid duration", "ExpiresDefault nonsense\n"),
+    ("ErrorDocument rejects a non-error status", "ErrorDocument 200 /error.html\n"),
+    ("Timeout invalid integer", "Timeout nope\n"),
+    ("LimitRequestLine invalid integer", "LimitRequestLine nope\n"),
+    ("IfFile rejects extra operand", "<IfFile first second>\n</IfFile>\n"),
+    ("explicit cipher policy is unsupported", "SSLCipherSuite HIGH\n"),
+    ("conditional Header is unsupported", "Header set X-Test yes env=FLAG\n"),
+    (
+        "conditional CustomLog is unsupported",
+        "CustomLog logs/access.log combined env=FLAG\n",
+    ),
+    ("module-specific LogLevel is unsupported", "LogLevel ssl:info\n"),
+    (
+        "RewriteRule DPI flag is unsupported",
+        "RewriteEngine On\nRewriteRule ^/x$ /y [DPI]\n",
+    ),
+    (
+        "RewriteRule NS flag is unsupported",
+        "RewriteEngine On\nRewriteRule ^/x$ /y [NS]\n",
+    ),
+    (
+        "unsupported nested Files inside If is not evaluated by Apache",
+        '<If "true">\n<Files "secret.txt">\nRequire all granted\n</Files>\n</If>\n',
     ),
 ]
 
@@ -346,8 +431,8 @@ def main():
             if args.verbose or aok != vok:
                 print(f"  apache: {(a.stderr or a.stdout).strip()[-500:]}")
                 print(f"  vapache: {(v.stderr or v.stdout).strip()[-500:]}")
-        strict_failures = 0
-        for name, snippet in STRICT_CASES:
+        malformed_failures = 0
+        for name, snippet in MALFORMED_CASES:
             acfg = BASE / "apache.conf"
             vcfg = BASE / "vapache.conf"
             acfg.write_text(prefix(PORT) + snippet)
@@ -358,21 +443,42 @@ def main():
             aok = a.returncode == 0
             vok = v.returncode == 0
             sok = s.returncode == 0
-            # Expected triple: apache refuses the snippet, vapached warns but
-            # loads in compatible mode, and strict mode refuses as well.
-            bad = (not aok) and vok and sok
-            status = "strict" if not bad else "STRICT-DIFF"
+            # Expected triple: every parser refuses malformed input.
+            bad = aok or vok or sok
+            status = "reject" if not bad else "MALFORMED-DIFF"
             if bad:
-                strict_failures += 1
+                malformed_failures += 1
+            print(f"{status} {name}: apache={aok} vapache={vok} strict={sok}")
+            if args.verbose or bad:
+                print(f"  apache: {(a.stderr or a.stdout).strip()[-400:]}")
+                print(f"  vapache: {(v.stderr or v.stdout).strip()[-300:]}")
+                print(f"  strict: {(s.stderr or s.stdout).strip()[-300:]}")
+        hardened_failures = 0
+        for name, snippet in HARDENED_CASES:
+            acfg = BASE / "apache.conf"
+            vcfg = BASE / "vapache.conf"
+            acfg.write_text(prefix(PORT) + snippet)
+            vcfg.write_text(VAPACHE_CAPABILITIES + prefix(PORT + 1) + snippet)
+            a = run([APACHE, "-t", "-f", str(acfg)])
+            v = run([str(VAPACHED), "-t", "-f", str(vcfg)])
+            s = run([str(VAPACHED), "-t", "--strict-config", "-f", str(vcfg)])
+            aok = a.returncode == 0
+            vok = v.returncode == 0
+            sok = s.returncode == 0
+            bad = vok or sok
+            status = "hardened" if not bad else "HARDENING-REGRESSION"
+            if bad:
+                hardened_failures += 1
             print(f"{status} {name}: apache={aok} vapache={vok} strict={sok}")
             if args.verbose or bad:
                 print(f"  apache: {(a.stderr or a.stdout).strip()[-400:]}")
                 print(f"  vapache: {(v.stderr or v.stdout).strip()[-300:]}")
                 print(f"  strict: {(s.stderr or s.stdout).strip()[-300:]}")
         print(f"\n{failures} context divergence(s)")
-        print(f"{strict_failures} strict refusal divergence(s)")
+        print(f"{malformed_failures} malformed acceptance divergence(s)")
+        print(f"{hardened_failures} hardening regression(s)")
         print(f"tree: {BASE}")
-        return 1 if failures or strict_failures else 0
+        return 1 if failures or malformed_failures or hardened_failures else 0
     finally:
         shutil.rmtree(BASE, ignore_errors=True)
 

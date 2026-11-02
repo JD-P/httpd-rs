@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "updated": "2026-11-01",
+  "updated": "2026-11-02",
   "verus": {
-    "verified_functions": 576,
+    "verified_functions": 590,
     "errors": 0
   },
   "obligations": [
@@ -18,14 +18,14 @@
       "title": "Directory < Files < Location < Condition",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "config_rule_phase, config_deferred_slot and config_rule_precedes are executable specifications consumed through an exhaustive MatchKind projection by phase collection and the recursive nested-rule sorter; config_rule_order_is_asymmetric proves the comparator cannot order a pair both ways. access_plan_interleaves proves the exact source/depth plan consumed by the runtime: DirectoryConfig then optional DirectoryAccess at each root-to-leaf depth, Directory own-path and DirectoryMatch, BaseFiles, FilesConfig then optional FilesAccess at each depth, DirectoryMatch Files, Location, config conditions and access conditions. condition_source_plan_exec is consumed by request_plan when it applies config conditions before access-file conditions, and its proof ties that order to the access-plan tail. Access-file IfFile is evaluated while parsing against an absolute ServerRoot path and its children retain their native Directory/Files phases; iffile_exec_on_read_admit is consumed at that splice. Standard-library sort correctness and parser directive/pattern payload semantics remain outside Verus."
+      "evidence": "config_rule_phase, config_deferred_slot and config_rule_precedes are executable specifications consumed through an exhaustive MatchKind projection by phase collection and the recursive nested-rule sorter; config_rule_order_is_asymmetric proves the comparator cannot order a pair both ways. access_plan_interleaves proves the exact source/depth plan consumed by the runtime: DirectoryConfig then optional DirectoryAccess at each root-to-leaf depth, Directory own-path and DirectoryMatch, BaseFiles, FilesConfig then optional FilesAccess at each depth, DirectoryMatch Files, Location, config conditions and access conditions. condition_source_plan_exec is consumed by request_plan when it applies config conditions before access-file conditions, and its proof ties that order to the access-plan tail. Access-file IfFile is evaluated while parsing against an absolute ServerRoot path and its children retain their native Directory/Files phases; iffile_exec_on_read_admit is consumed at that splice. Main and access-file inputs consume verified lexical/tag/argument/depth kernels and are sealed into immutable programs with exact section mates before effects. Standard-library sort correctness and directive/pattern payload semantics remain outside Verus."
     },
     {
       "id": "htaccess_interleave",
       "title": "per-directory Directory; access-file interleaving",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "AccessStep names config versus access-file provenance and exact depth for both Directory and Files phases; access_plan_exec is the only production iteration plan, and access_plan_interleaves proves its structural equality and suffix. The access walk covers every ancestor whose effective AllowOverride permits a layer and is not bounded by DocumentRoot or an alias target (access_walk_dir_admit, I47). AccessLayer parsing and filesystem discovery remain refinement assumptions."
+      "evidence": "AccessStep names config versus access-file provenance and exact depth for both Directory and Files phases; access_plan_exec is the only production iteration plan, and access_plan_interleaves proves its structural equality and suffix. The access walk covers every ancestor whose effective AllowOverride permits a layer and is not bounded by DocumentRoot or an alias target (access_walk_dir_admit, I47). Every stable descriptor snapshot is lexed through the verified transition kernel and sealed into an AccessProgram with exact section mates before Scope mutation; the resulting layer is cached by file version. Directive payload parsing and filesystem discovery remain refinement assumptions."
     },
     {
       "id": "require_eval_sound",
@@ -137,7 +137,7 @@
       "title": "Every accepted .htaccess directive is modeled, explicitly inert, or rejected",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "htaccess SetEnv/SetEnvIf/UnsetEnv/PassEnv and IndexIgnore populate EnvironmentPolicy/ContentPolicy through the same parser as main config; RequestHeader is rejected instead of accepted as inert; DIRECTIVE_SPECS is the authoritative disposition/category registry and an exhaustive test matrix asserts every entry is effectful, inert or rejected and is gated by AllowOverride None; I34 adds the main-config fail-closed matrix for security, filter, audit and resource-limit directives plus explicit compatibility-inert warnings"
+      "evidence": "htaccess SetEnv/SetEnvIf/UnsetEnv/PassEnv and IndexIgnore populate EnvironmentPolicy/ContentPolicy through the same parser as main config; RequestHeader and every recognized-but-unimplemented metadata/presentation directive are rejected instead of accepted as inert; DIRECTIVE_SPECS is the authoritative disposition/category registry and an exhaustive test matrix asserts every entry is effectful, explicitly equivalent, or rejected and is gated by AllowOverride None; I34 makes known-but-unimplemented and unknown main-config directives fail closed in every mode"
     },
     {
       "id": "autoindex_canonical_directory",
@@ -368,14 +368,14 @@
       "title": ".htaccess <IfFile> tests the operator-supplied path",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "Implemented; agent handoff item H7. The .htaccess <IfFile> arm now tests the operator-supplied argument (SectionStart.args excludes the tag, mirroring the main-config args.first() use), so single-argument <IfFile flag> tests the named file rather than the empty path that forced the section on; a two-word <IfFile a b> tests 'a' and documents the second word as ignored. Apache (local 2.4.69) resolves .htaccess <IfFile> relative paths against ServerRoot while vapached confines .htaccess file probes to relative DocumentRoot paths (F45/I42, CVE-2026-24072/44119), so the differential suite cases were reshaped to relative paths that exist under both roots (tests/config_semantics.py htaccess-*-iffile*, plus the new negative branch htaccess-all-iffile-absent); absolute-path .htaccess <IfFile> stays FALSE (a deliberate fail-closed divergence under the user-approved parity waiver). Unit test: htaccess.rs iffile_tests_the_operator_path_not_a_second_word."
+      "evidence": "Implemented; agent handoff item H7. The .htaccess <IfFile> arm tests exactly one operator-supplied path and the sealed access-program compiler rejects missing or extra operands instead of discarding trailing words. Local Apache 2.4.69 accepts an extra word, so this is tracked as deliberate hardening rather than parity. Apache resolves .htaccess <IfFile> relative paths against ServerRoot while vapached confines .htaccess file probes to relative DocumentRoot paths (F45/I42, CVE-2026-24072/44119); absolute-path .htaccess <IfFile> stays FALSE (a deliberate fail-closed divergence under the user-approved parity waiver)."
     },
     {
       "id": "strict_config_silence",
-      "title": "Strict configuration rejects every silently dropped directive",
+      "title": "Every mode rejects silently dropped directives",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "Implemented; agent handoff item H8. New Compile::strict_failure helper: under --strict-config a silent drop becomes a ConfigError, in compatible mode it logs 'file:line: msg (ignored)'. Promoted: under-argument AddType/AddHandler, Header (action requires an argument pair), ExpiresByType (type + code), ProxyPass (path + backend), unknown Options tokens, unknown RewriteOptions tokens, and unparsable failonstatus entries for ProxyPass and ProxySet/balancer (parse_status_list now returns statuses plus the unparsable remainder instead of shortening silently). Differential coverage: tests/config_validity.py STRICT_CASES - nine rows where apache2 -t fails, vapached compatible -t loads with the ignore warning, and vapached --strict-config fails (AddType/AddHandler/Header/ExpiresByType/ProxyPass arities, unknown Options and RewriteOptions tokens, ProxyPass and ProxySet failonstatus). Unit test: strict_mode_refuses_silently_dropped_directives in config.rs."
+      "evidence": "Implemented and strengthened beyond H8. Recognized malformed payloads, known-but-unimplemented directives, and unknown directives are ConfigError values in normal and strict modes. Typed arity/value/context checks cover main config and .htaccess; failonstatus lists cannot be shortened; malformed SSL protocol/passphrase/cache compatibility values and unsupported Header/CustomLog conditions, module LogLevel, cipher policy, compression tuning, rewrite flags, scoped-to-global mutations, vhost balancers, and ignored section children are rejected. This includes Apache 2.4.69's accepted but unsupported <Files> child inside request-time <If>, which ordinary direct requests do not evaluate and whose grant would otherwise broaden Vapache access relative to Apache. tests/config_validity.py MALFORMED_CASES requires Apache and both Vapache modes to reject shared malformed rows; HARDENED_CASES requires both Vapache modes to reject ambiguous legacy forms that Apache accepts. Unit coverage is malformed_directives_fail_in_every_mode plus the exhaustive access/main disposition matrices."
     },
     {
       "id": "rewrite_scope_conjunction",
@@ -485,7 +485,7 @@
       "the safe-Rust regex automata backend implements its documented regular-language/capture semantics; the PCRE2 compatibility frontend is differentially checked against the test-only 10.46 C oracle",
       "when VapacheCapability UnstableFastCgiPaths is explicitly enabled, an external FastCGI backend opens SCRIPT_FILENAME after vapache's final descriptor/inode check and the deployment must provide the read-only script-tree invariant that VapacheFastCGIStablePath otherwise machine-enforces",
       "h2 wire framing, TLS client-certificate chain validation, and CGI/proxy protocol details are outside the model",
-      "configuration tokenization and directive/pattern payloads refine the executable kind/phase model",
+      "directive and pattern payload parsers refine their typed runtime policy values; configuration lexical quote/escape transitions, tag delimiters, argument bounds/schema gates, and sealed section structure are executable verified kernels consumed by main and access-file compilers",
       "authorization backends implement their stated contracts"
     ],
     "unmodeled_security_directive_classes": [],
@@ -567,6 +567,8 @@
     "Access-file rule slot translation into conditional/Files/top-level layers",
     "Configuration front-end line-kind IR classification",
     "Configuration section-context nesting transition",
+    "Configuration quote/escape tokenizer and section-tag delimiter state machines",
+    "Immutable main/access configuration program sealing with exact section mates and bounded directive argument schemas",
     "Configured-base containment for regex aliases and internal rewrites",
     "FastCGI script and PATH_INFO containment",
     "Descriptor-snapshot admission for access-file regularity, identity, version and size",
@@ -574,7 +576,7 @@
     "CGI/FastCGI authenticated identity environment and exact target-derived environment",
     "Upstream proxy request-head serialization validation",
     "Proxy route order and logical/concrete balancer identity binding",
-    "Main-config directive disposition and explicit compatibility-inert warnings",
+    "Closed-world main-config directive disposition for security, known-unimplemented and unknown names",
     "Framing and resource-bound closure across HTTP, proxy, CGI and FastCGI streams",
     "Exhaustive .htaccess directive disposition and override-category matrix",
     "Mechanized AllowOverride/AllowOverrideList/Nonfatal admission and skip/reject gate",

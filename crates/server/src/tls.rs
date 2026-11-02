@@ -797,7 +797,7 @@ fn spawn_ocsp_refresh(refresh: OcspRefresh) -> std::thread::JoinHandle<()> {
     })
 }
 
-fn protocol_policy(spec: Option<&str>) -> Result<(bool, bool), String> {
+pub(crate) fn protocol_policy(spec: Option<&str>) -> Result<(bool, bool), String> {
     let mut tls12 = true;
     let mut tls13 = true;
     let mut replaced = false;

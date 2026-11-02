@@ -12,7 +12,7 @@ use crate::config::{
     NonfatalMode, Options, Order, OverrideCategories, OverrideCategory, OverrideMode, Require,
     RequireNode, Satisfy, Scope, ScopeRule, VHost,
 };
-use crate::config_frontend::{logical_lines, tokenize_config};
+use crate::config_frontend::logical_lines;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
@@ -891,6 +891,7 @@ fn parse_access_bytes(
     let text = std::str::from_utf8(data)
         .map_err(|_| format!("{}: access file is not valid UTF-8", path.display()))?;
     let lines = logical_lines(text);
+    let program = AccessProgram::seal(&lines)?;
     let mut scope = Scope::default();
     let mut rules = Vec::new();
     scope.rewrite_policy.rewrite_base = Some(identity.url_mount.clone());
@@ -899,7 +900,7 @@ fn parse_access_bytes(
     let mut next_chain = 0usize;
     parse_block(
         cfg,
-        &lines,
+        &program,
         &mut i,
         &mut scope,
         &mut rules,
@@ -1027,6 +1028,119 @@ impl AccessSectionKind {
     }
 }
 
+#[derive(Debug)]
+enum AccessInstruction {
+    Directive {
+        name: String,
+        args: Vec<String>,
+        line: usize,
+        known: bool,
+    },
+    SectionStart {
+        name: String,
+        args: Vec<String>,
+        line: usize,
+        section: Option<AccessSectionKind>,
+        end: usize,
+    },
+    SectionEnd {
+        name: String,
+        line: usize,
+        start: usize,
+    },
+}
+
+/// Immutable access-file program. Parsing and structural validation complete
+/// before any directive mutates a Scope, and every section records its exact
+/// mate for fail-closed, O(1) skipping.
+struct AccessProgram {
+    instructions: Box<[AccessInstruction]>,
+}
+
+impl AccessProgram {
+    fn seal(lines: &[String]) -> Result<Self, String> {
+        let mut instructions = Vec::with_capacity(lines.len());
+        let mut stack: Vec<(String, usize)> = Vec::new();
+        let mut depth = 0usize;
+        for (index, line) in lines.iter().enumerate() {
+            let line_number = index + 1;
+            let line_ir = crate::config_frontend::parse_line(line)
+                .map_err(|error| format!("line {line_number}: {error}"))?;
+            match line_ir {
+                crate::config_frontend::ConfigLine::Directive { name, args } => {
+                    depth = vapache_verified::config_program_depth_step(
+                        depth,
+                        vapache_verified::ConfigLineKind::Directive,
+                    )
+                    .ok_or_else(|| format!("line {line_number}: access program depth overflow"))?;
+                    let known = directive_category(&name).is_some();
+                    instructions.push(AccessInstruction::Directive {
+                        name,
+                        args,
+                        line: line_number,
+                        known,
+                    });
+                }
+                crate::config_frontend::ConfigLine::SectionStart { name, args } => {
+                    depth = vapache_verified::config_program_depth_step(
+                        depth,
+                        vapache_verified::ConfigLineKind::SectionStart,
+                    )
+                    .ok_or_else(|| format!("line {line_number}: access program depth overflow"))?;
+                    let start = instructions.len();
+                    let section = AccessSectionKind::parse(&name);
+                    instructions.push(AccessInstruction::SectionStart {
+                        name: name.clone(),
+                        args,
+                        line: line_number,
+                        section,
+                        end: usize::MAX,
+                    });
+                    stack.push((name, start));
+                }
+                crate::config_frontend::ConfigLine::SectionEnd { name } => {
+                    depth = vapache_verified::config_program_depth_step(
+                        depth,
+                        vapache_verified::ConfigLineKind::SectionEnd,
+                    )
+                    .ok_or_else(|| format!("line {line_number}: unexpected closing </{name}>"))?;
+                    let Some((open, start)) = stack.pop() else {
+                        return Err(format!("line {line_number}: unexpected closing </{name}>"));
+                    };
+                    if open != name {
+                        return Err(format!(
+                            "line {line_number}: closing </{name}> does not match <{open}>"
+                        ));
+                    }
+                    let end = instructions.len();
+                    let AccessInstruction::SectionStart {
+                        end: matching_end, ..
+                    } = &mut instructions[start]
+                    else {
+                        return Err("access program section index is corrupt".into());
+                    };
+                    *matching_end = end;
+                    instructions.push(AccessInstruction::SectionEnd {
+                        name,
+                        line: line_number,
+                        start,
+                    });
+                }
+            }
+        }
+        if depth != 0 {
+            let (name, _) = stack
+                .last()
+                .expect("non-zero verified depth has an open section");
+            return Err(format!("missing closing </{name}>"));
+        }
+        debug_assert!(stack.is_empty());
+        Ok(AccessProgram {
+            instructions: instructions.into_boxed_slice(),
+        })
+    }
+}
+
 /// Admission for access-file section commands. Apache applies the section's
 /// own override mask (or an exact `AllowOverrideList "<Section"` entry)
 /// before examining the directives nested inside it.
@@ -1050,7 +1164,7 @@ fn section_allowed_list(
 
 fn parse_block(
     cfg: &Config,
-    lines: &[String],
+    program: &AccessProgram,
     i: &mut usize,
     scope: &mut Scope,
     rules: &mut Vec<ScopeRule>,
@@ -1063,30 +1177,31 @@ fn parse_block(
     limit: Option<&MethodSet>,
 ) -> Result<(), String> {
     let mut current_chain: Option<usize> = None;
-    while *i < lines.len() {
-        let line = &lines[*i];
+    while *i < program.instructions.len() {
+        let instruction = &program.instructions[*i];
         *i += 1;
-        let line_ir = match crate::config_frontend::parse_line(line) {
-            Ok(line) => line,
-            Err(e) => return Err(format!("line {}: {e}", *i)),
-        };
-        match line_ir {
-            crate::config_frontend::ConfigLine::SectionEnd { name } => {
+        match instruction {
+            AccessInstruction::SectionEnd { name, line, .. } => {
                 return match end {
                     Some(expected) if expected == name => Ok(()),
                     Some(expected) => Err(format!(
-                        "line {}: closing </{name}> does not match <{expected}>",
-                        *i
+                        "line {line}: closing </{name}> does not match <{expected}>"
                     )),
-                    None => Err(format!("line {}: unexpected closing </{name}>", *i)),
+                    None => Err(format!("line {line}: unexpected closing </{name}>")),
                 };
             }
-            crate::config_frontend::ConfigLine::SectionStart { name, args } => {
+            AccessInstruction::SectionStart {
+                name,
+                args,
+                line,
+                section,
+                end: _,
+            } => {
+                let section = *section;
                 // Apache gates the section command itself before it parses
                 // any child directives. AllowOverrideList names are not a
                 // union over arbitrary wrappers: listing `Require` does not
                 // implicitly admit `<Files>`, `<If>` or `<RequireAll>` (P18).
-                let section = AccessSectionKind::parse(&name);
                 let policy_allowed = section
                     .map(|kind| {
                         // Apache's authz-core parser owns nested authorization
@@ -1120,37 +1235,39 @@ fn parse_block(
                     nonfatal.allows_unknown(),
                 ) {
                     1 => {
-                        skip_section(lines, i, &name)?;
+                        skip_section(program, i, &name)?;
                         continue;
                     }
                     2 => {
                         if section.is_some() {
                             return Err(format!(
                                 "line {}: <{name}> is not allowed by AllowOverride",
-                                *i
+                                line
                             ));
                         }
                         return Err(format!(
                             "line {}: unsupported .htaccess section <{name}>",
-                            *i
+                            line
                         ));
                     }
                     _ => {}
                 }
                 let section = section.expect("known section passed the admission gate");
+                validate_section_arity(section, &args)
+                    .map_err(|error| format!("line {line}: {error}"))?;
                 if limit.is_some() && !section.allowed_in_limit() {
                     return Err(format!(
                         "line {}: <{name}> is not allowed inside a method-limited section",
-                        *i
+                        line
                     ));
                 }
                 match section {
                     AccessSectionKind::IfFile => {
                         if require_only {
-                            return Err(format!("line {}: <{name}> is not allowed here", *i));
+                            return Err(format!("line {line}: <{name}> is not allowed here"));
                         }
                         let Some(raw_path) = args.first() else {
-                            return Err(format!("line {}: <IfFile> requires an argument", *i));
+                            return Err(format!("line {line}: <IfFile> requires an argument"));
                         };
                         let (negated, raw_path) = raw_path
                             .strip_prefix('!')
@@ -1177,7 +1294,7 @@ fn parse_block(
                         let mut inner_rules = Vec::new();
                         parse_block(
                             cfg,
-                            lines,
+                            program,
                             i,
                             &mut inner,
                             &mut inner_rules,
@@ -1202,36 +1319,30 @@ fn parse_block(
                         // The wrapper was admitted above; its children still
                         // pass through their own directive/section gates.
                         if require_only {
-                            return Err(format!("line {}: <{name}> is not allowed here", *i));
+                            return Err(format!("line {line}: <{name}> is not allowed here"));
                         }
                         let (branch, chain, condition) = if section == AccessSectionKind::If {
                             let expression = crate::expr::parse(&args.join(" "))
-                                .map_err(|e| format!("line {}: {e}", *i))?;
+                                .map_err(|e| format!("line {line}: {e}"))?;
                             // F63/I63: unknown variables fail closed.
                             crate::expr::validate_vars(&expression)
-                                .map_err(|e| format!("line {}: {e}", *i))?;
+                                .map_err(|e| format!("line {line}: {e}"))?;
                             let chain = *next_chain;
                             *next_chain += 1;
                             current_chain = Some(chain);
                             (ConditionBranch::Normal, Some(chain), Some(expression))
                         } else {
                             let Some(chain) = current_chain else {
-                                return Err(format!("line {}: <{name}> has no preceding <If>", *i));
+                                return Err(format!("line {line}: <{name}> has no preceding <If>"));
                             };
                             if section == AccessSectionKind::ElseIf {
                                 let expression = crate::expr::parse(&args.join(" "))
-                                    .map_err(|e| format!("line {}: {e}", *i))?;
+                                    .map_err(|e| format!("line {line}: {e}"))?;
                                 // F63/I63: unknown variables fail closed.
                                 crate::expr::validate_vars(&expression)
-                                    .map_err(|e| format!("line {}: {e}", *i))?;
+                                    .map_err(|e| format!("line {line}: {e}"))?;
                                 (ConditionBranch::ElseIf, Some(chain), Some(expression))
                             } else {
-                                if args.len() > 1 {
-                                    return Err(format!(
-                                        "line {}: <Else> does not take arguments",
-                                        *i
-                                    ));
-                                }
                                 current_chain = None;
                                 (ConditionBranch::Else, Some(chain), None)
                             }
@@ -1240,7 +1351,7 @@ fn parse_block(
                         let mut inner_rules = Vec::new();
                         parse_block(
                             cfg,
-                            lines,
+                            program,
                             i,
                             &mut inner,
                             &mut inner_rules,
@@ -1252,7 +1363,14 @@ fn parse_block(
                             next_chain,
                             None,
                         )?;
-                        inner_rules.retain(|rule| matches!(rule.kind, MatchKind::Always));
+                        if inner_rules
+                            .iter()
+                            .any(|rule| !matches!(rule.kind, MatchKind::Always))
+                        {
+                            return Err(format!(
+                                "line {line}: nested Files sections inside <{name}> are not supported; refusing policy nesting Apache accepts but does not execute on ordinary requests"
+                            ));
+                        }
                         rules.push(ScopeRule {
                             kind: MatchKind::Always,
                             delta: inner,
@@ -1270,7 +1388,7 @@ fn parse_block(
                         let mut inner_rules = Vec::new();
                         parse_block(
                             cfg,
-                            lines,
+                            program,
                             i,
                             &mut inner,
                             &mut inner_rules,
@@ -1309,8 +1427,7 @@ fn parse_block(
                             };
                             if invalid_negative {
                                 return Err(format!(
-                                    "line {}: <{name}> contains no positive authorization provider",
-                                    *i
+                                    "line {line}: <{name}> contains no positive authorization provider"
                                 ));
                             }
                             let node = match section {
@@ -1321,8 +1438,7 @@ fn parse_block(
                             };
                             if !require_only && require_node_is_negative(&node) {
                                 return Err(format!(
-                                    "line {}: <{name}> has no effect in <RequireAny>",
-                                    *i
+                                    "line {line}: <{name}> has no effect in <RequireAny>"
                                 ));
                             }
                             scope.add_require(node, limit);
@@ -1330,29 +1446,27 @@ fn parse_block(
                     }
                     AccessSectionKind::Limit | AccessSectionKind::LimitExcept => {
                         if require_only {
-                            return Err(format!("line {}: <{name}> is not allowed here", *i));
+                            return Err(format!("line {line}: <{name}> is not allowed here"));
                         }
                         let methods = crate::config::parse_method_set_args(&name, &args, true)
-                            .map_err(|e| format!("line {}: {e}", *i))?;
+                            .map_err(|e| format!("line {line}: {e}"))?;
                         let combined = match limit {
                             Some(outer) => outer.intersect(&methods),
                             None => methods,
                         };
                         if combined.is_empty() {
                             return Err(format!(
-                                "line {}: nested <{name}> excludes every HTTP method",
-                                *i
+                                "line {line}: nested <{name}> excludes every HTTP method"
                             ));
                         }
                         if matches!(limit, Some(outer) if combined == *outer) {
                             return Err(format!(
-                            "line {}: nested <{name}> does not further restrict the enclosing method set",
-                            *i
+                            "line {line}: nested <{name}> does not further restrict the enclosing method set"
                         ));
                         }
                         parse_block(
                             cfg,
-                            lines,
+                            program,
                             i,
                             scope,
                             rules,
@@ -1367,23 +1481,23 @@ fn parse_block(
                     }
                     AccessSectionKind::Files | AccessSectionKind::FilesMatch => {
                         if require_only {
-                            return Err(format!("line {}: <{name}> is not allowed here", *i));
+                            return Err(format!("line {line}: <{name}> is not allowed here"));
                         }
                         let pat = args.join(" ");
                         let kind =
                             if section == AccessSectionKind::Files {
                                 crate::config::compile_files_pattern(&args)
-                                    .map_err(|e| format!("line {}: {e}", *i))?
+                                    .map_err(|e| format!("line {line}: {e}"))?
                             } else {
                                 MatchKind::FilesMatch(crate::config::compile_regex(&pat).map_err(
-                                    |e| format!("line {}: bad FilesMatch regex: {e}", *i),
+                                    |e| format!("line {line}: bad FilesMatch regex: {e}"),
                                 )?)
                             };
                         let mut inner = Scope::default();
                         let mut inner_rules = Vec::new();
                         parse_block(
                             cfg,
-                            lines,
+                            program,
                             i,
                             &mut inner,
                             &mut inner_rules,
@@ -1410,7 +1524,7 @@ fn parse_block(
                         if active {
                             parse_block(
                                 cfg,
-                                lines,
+                                program,
                                 i,
                                 scope,
                                 rules,
@@ -1423,17 +1537,17 @@ fn parse_block(
                                 limit,
                             )?;
                         } else {
-                            skip_section(lines, i, &name)?;
+                            skip_section(program, i, &name)?;
                         }
                     }
                     AccessSectionKind::IfDefine => {
                         let active =
                             named_condition_active(&args, |name| cfg.config_defines.contains(name))
-                                .map_err(|e| format!("line {}: {e}", *i))?;
+                                .map_err(|e| format!("line {line}: {e}"))?;
                         if active {
                             parse_block(
                                 cfg,
-                                lines,
+                                program,
                                 i,
                                 scope,
                                 rules,
@@ -1446,7 +1560,7 @@ fn parse_block(
                                 limit,
                             )?;
                         } else {
-                            skip_section(lines, i, &name)?;
+                            skip_section(program, i, &name)?;
                         }
                     }
                     AccessSectionKind::IfDirective | AccessSectionKind::IfSection => {
@@ -1457,19 +1571,19 @@ fn parse_block(
                                 cfg.section_exists(candidate)
                             }
                         })
-                        .map_err(|e| format!("line {}: {e}", *i))?;
+                        .map_err(|e| format!("line {line}: {e}"))?;
                         if section == AccessSectionKind::IfDirective {
                             let candidate = args
                                 .first()
                                 .map(|arg| arg.trim_start_matches('!'))
                                 .unwrap_or("");
                             cfg.directive_exists(candidate)
-                                .map_err(|e| format!("line {}: {e}", *i))?;
+                                .map_err(|e| format!("line {line}: {e}"))?;
                         }
                         if active {
                             parse_block(
                                 cfg,
-                                lines,
+                                program,
                                 i,
                                 scope,
                                 rules,
@@ -1482,16 +1596,16 @@ fn parse_block(
                                 limit,
                             )?;
                         } else {
-                            skip_section(lines, i, &name)?;
+                            skip_section(program, i, &name)?;
                         }
                     }
                     AccessSectionKind::IfVersion => {
                         let active = crate::config::ifversion_matches(&args)
-                            .map_err(|e| format!("line {}: {e}", *i))?;
+                            .map_err(|e| format!("line {line}: {e}"))?;
                         if active {
                             parse_block(
                                 cfg,
-                                lines,
+                                program,
                                 i,
                                 scope,
                                 rules,
@@ -1504,16 +1618,20 @@ fn parse_block(
                                 limit,
                             )?;
                         } else {
-                            skip_section(lines, i, &name)?;
+                            skip_section(program, i, &name)?;
                         }
                     }
                 }
             }
-            crate::config_frontend::ConfigLine::Directive { name, args } => {
+            AccessInstruction::Directive {
+                name,
+                args,
+                line,
+                known,
+            } => {
                 if require_only && name != "require" {
                     return Err(format!(
-                        "line {}: only Require directives are allowed in a Require section",
-                        *i
+                        "line {line}: only Require directives are allowed in a Require section"
                     ));
                 }
                 if limit.is_some()
@@ -1523,35 +1641,31 @@ fn parse_block(
                     )
                 {
                     return Err(format!(
-                    "line {}: directive '{name}' is not allowed inside a method-limited section",
-                    *i
+                    "line {line}: directive '{name}' is not allowed inside a method-limited section"
                 ));
                 }
                 let policy_allowed = directive_allowed_list(mode, allow_list, &name, &args);
-                let known = directive_category(&name).is_some();
                 match vapache_verified::htaccess_gate_admit(
                     policy_allowed,
-                    known,
+                    *known,
                     nonfatal.allows_override(),
                     nonfatal.allows_unknown(),
                 ) {
                     1 => continue,
                     2 if !policy_allowed => {
                         return Err(format!(
-                            "line {}: directive '{name}' is not allowed by AllowOverride",
-                            *i
+                            "line {line}: directive '{name}' is not allowed by AllowOverride"
                         ));
                     }
                     2 => {
                         return Err(format!(
-                            "line {}: unsupported .htaccess directive '{name}'",
-                            *i
+                            "line {line}: unsupported .htaccess directive '{name}'"
                         ));
                     }
                     _ => {}
                 }
                 apply_directive(cfg, scope, &name, &args, limit, require_only)
-                    .map_err(|e| format!("line {}: {e}", *i))?;
+                    .map_err(|e| format!("line {line}: {e}"))?;
             }
         }
     }
@@ -1561,33 +1675,73 @@ fn parse_block(
     Ok(())
 }
 
-fn skip_section(lines: &[String], i: &mut usize, name: &str) -> Result<(), String> {
-    let mut depth = 1usize;
-    while *i < lines.len() {
-        let line = &lines[*i];
-        *i += 1;
-        let Ok(toks) = tokenize_config(line) else {
-            continue;
+fn validate_section_arity(section: AccessSectionKind, args: &[String]) -> Result<(), String> {
+    let count = args.len();
+    let (min, max) = match section {
+        AccessSectionKind::Else
+        | AccessSectionKind::RequireAll
+        | AccessSectionKind::RequireAny
+        | AccessSectionKind::RequireNone => (0, Some(0)),
+        AccessSectionKind::IfFile
+        | AccessSectionKind::IfModule
+        | AccessSectionKind::IfDefine
+        | AccessSectionKind::IfDirective
+        | AccessSectionKind::IfSection => (1, Some(1)),
+        AccessSectionKind::IfVersion => (1, Some(2)),
+        AccessSectionKind::Files => (1, Some(2)),
+        AccessSectionKind::FilesMatch => (1, Some(1)),
+        AccessSectionKind::If
+        | AccessSectionKind::ElseIf
+        | AccessSectionKind::Limit
+        | AccessSectionKind::LimitExcept => (1, None),
+    };
+    if !vapache_verified::config_argument_arity_admit(count, min, max) {
+        let requirement = match max {
+            Some(max) if max == min => format!("exactly {min}"),
+            Some(max) => format!("between {min} and {max}"),
+            None => format!("at least {min}"),
         };
-        let Some(first) = toks.first() else {
-            continue;
-        };
-        if first.starts_with("</") {
-            let close = first
-                .trim_start_matches("</")
-                .trim_end_matches('>')
-                .to_ascii_lowercase();
-            if close == name && depth == 1 {
-                return Ok(());
-            }
-            if close == name {
-                depth -= 1;
-            }
-        } else if first.starts_with('<') {
-            depth += 1;
-        }
+        return Err(format!(
+            "<{}> requires {requirement} argument(s), got {count}",
+            section.name()
+        ));
     }
-    Err(format!("missing closing </{name}>"))
+    if section == AccessSectionKind::Files && args.first().is_some_and(|arg| arg == "~") {
+        if count < 2 {
+            return Err("<files ~> requires a regular expression".into());
+        }
+    } else if section == AccessSectionKind::Files && count == 2 {
+        return Err("<files> accepts two arguments only in the '<files ~ regex>' form".into());
+    }
+    Ok(())
+}
+
+fn skip_section(program: &AccessProgram, i: &mut usize, name: &str) -> Result<(), String> {
+    let start = i
+        .checked_sub(1)
+        .ok_or_else(|| format!("cannot skip unopened <{name}>"))?;
+    let Some(AccessInstruction::SectionStart {
+        name: open, end, ..
+    }) = program.instructions.get(start)
+    else {
+        return Err(format!("cannot skip unopened <{name}>"));
+    };
+    if open != name {
+        return Err(format!("cannot skip <{name}> from <{open}>"));
+    }
+    let Some(AccessInstruction::SectionEnd {
+        name: close,
+        start: matching_start,
+        ..
+    }) = program.instructions.get(*end)
+    else {
+        return Err(format!("missing closing </{name}>"));
+    };
+    if close != name || *matching_start != start {
+        return Err(format!("mismatched closing </{close}> for <{name}>"));
+    }
+    *i = *end + 1;
+    Ok(())
 }
 
 fn named_condition_active(
@@ -1619,9 +1773,6 @@ fn ifmodule_active(cfg: &Config, args: &[String]) -> Result<bool, String> {
 enum DirectiveDisposition {
     /// The directive must change the parsed scope or add a rule.
     Effectful,
-    /// The directive is accepted only because its effect is genuinely local
-    /// to presentation/metadata and cannot select an access or mapping branch.
-    Inert,
     /// The directive is recognized but refused in `.htaccess`.
     Reject,
 }
@@ -1634,7 +1785,7 @@ const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
     (
         "addcharset",
         OverrideCategory::FileInfo,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Reject,
     ),
     (
         "adddefaultcharset",
@@ -1644,12 +1795,12 @@ const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
     (
         "adddescription",
         OverrideCategory::Indexes,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Reject,
     ),
     (
         "addencoding",
         OverrideCategory::FileInfo,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Reject,
     ),
     (
         "addhandler",
@@ -1664,7 +1815,7 @@ const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
     (
         "addlanguage",
         OverrideCategory::FileInfo,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Reject,
     ),
     (
         "addoutputfilter",
@@ -1694,7 +1845,7 @@ const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
     (
         "authbasicprovider",
         OverrideCategory::AuthConfig,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Effectful,
     ),
     (
         "authgroupfile",
@@ -1754,7 +1905,7 @@ const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
     (
         "deflatebuffersize",
         OverrideCategory::FileInfo,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Reject,
     ),
     (
         "deflatecompressionlevel",
@@ -1764,17 +1915,17 @@ const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
     (
         "deflatefilternote",
         OverrideCategory::FileInfo,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Reject,
     ),
     (
         "deflatememlevel",
         OverrideCategory::FileInfo,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Reject,
     ),
     (
         "deflatewindowssize",
         OverrideCategory::FileInfo,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Reject,
     ),
     (
         "deny",
@@ -1834,7 +1985,7 @@ const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
     (
         "headername",
         OverrideCategory::Indexes,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Reject,
     ),
     (
         "indexignore",
@@ -1844,7 +1995,7 @@ const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
     (
         "indexoptions",
         OverrideCategory::Indexes,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Reject,
     ),
     (
         "options",
@@ -1864,7 +2015,7 @@ const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
     (
         "readmefile",
         OverrideCategory::Indexes,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Reject,
     ),
     (
         "redirect",
@@ -1889,12 +2040,12 @@ const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
     (
         "removecharset",
         OverrideCategory::FileInfo,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Reject,
     ),
     (
         "removeencoding",
         OverrideCategory::FileInfo,
-        DirectiveDisposition::Inert,
+        DirectiveDisposition::Reject,
     ),
     (
         "removehandler",
@@ -2073,6 +2224,76 @@ fn directive_allowed_list(
     }
 }
 
+/// Apache validates directive arity while reading an access file. Keep that
+/// validation ahead of every policy mutation so a missing operand cannot be
+/// normalized into an empty string or an accepted no-op.
+fn validate_directive_arity(name: &str, count: usize) -> Result<(), String> {
+    let (min, max) = match name {
+        "authtype"
+        | "authname"
+        | "authuserfile"
+        | "authgroupfile"
+        | "sethandler"
+        | "forcetype"
+        | "adddefaultcharset"
+        | "rewriteengine"
+        | "rewritebase"
+        | "order"
+        | "satisfy"
+        | "authmerging"
+        | "enablesendfile"
+        | "directoryslash"
+        | "expiresactive"
+        | "deflatecompressionlevel"
+        | "brotlicompressionquality"
+        | "deflatealteretag"
+        | "brotlialteretag"
+        | "brotlicompressionalteretag"
+        | "deflatebuffersize"
+        | "deflatememlevel"
+        | "deflatewindowssize"
+        | "headername"
+        | "readmefile" => (1, Some(1)),
+        "errordocument" | "redirectpermanent" | "redirecttemp" => (2, Some(2)),
+        "redirect" | "redirectmatch" | "rewritecond" | "rewriterule" => (2, Some(3)),
+        "setenv" => (1, Some(2)),
+        "addtype"
+        | "addhandler"
+        | "addinputfilter"
+        | "addoutputfilter"
+        | "addoutputfilterbytype"
+        | "allow"
+        | "deny"
+        | "addcharset"
+        | "addencoding"
+        | "addlanguage"
+        | "adddescription" => (2, None),
+        "setenvif" | "setenvifnocase" => (3, None),
+        "browsermatch" | "browsermatchnocase" => (2, None),
+        "require" | "authbasicprovider" | "options" | "directoryindex" | "removetype"
+        | "removehandler" | "removecharset" | "removeencoding" | "setoutputfilter"
+        | "setinputfilter" | "unsetenv" | "passenv" | "indexignore" | "indexoptions"
+        | "rewriteoptions" | "expiresdefault" | "fileetag" | "deflatefilternote" => (1, None),
+        // Header has action-specific arity and ExpiresByType has a duration
+        // expression spanning the remainder of the line.
+        "header" | "expiresbytype" => (2, None),
+        // Rejected directives still pass through this default; they fail
+        // below rather than acquiring invented syntax here.
+        _ => (0, None),
+    };
+    if vapache_verified::config_argument_arity_admit(count, min, max) {
+        return Ok(());
+    }
+    let requirement = match max {
+        Some(max) if max == min => format!("exactly {min}"),
+        Some(max) => format!("between {min} and {max}"),
+        None => format!("at least {min}"),
+    };
+    Err(format!(
+        "directive '{name}' requires {requirement} argument(s), got {count}"
+    ))
+}
+
 fn apply_directive(
     cfg: &Config,
     scope: &mut Scope,
@@ -2084,6 +2305,7 @@ fn apply_directive(
     let Some(spec) = directive_spec(name) else {
         return Err(format!("unsupported .htaccess directive '{name}'"));
     };
+    validate_directive_arity(name, args.len())?;
     if spec.2 == DirectiveDisposition::Reject {
         return Err(match name {
             "allowmethods" => {
@@ -2110,12 +2332,19 @@ fn apply_directive(
             }
             scope.add_require(RequireNode::Provider(provider), limit);
         }
-        "authtype" => scope.authorization.auth_type = Some(first.to_ascii_lowercase()),
+        "authtype" => {
+            if !first.eq_ignore_ascii_case("basic") {
+                return Err(format!(
+                    "AuthType '{first}' is not implemented; only Basic is supported"
+                ));
+            }
+            scope.authorization.auth_type = Some("basic".into());
+        }
         "authname" => scope.authorization.auth_name = Some(first.to_string()),
         "authuserfile" => scope.authorization.auth_user_file = Some(server_path(cfg, first)),
         "authgroupfile" => scope.authorization.auth_group_file = Some(server_path(cfg, first)),
         "authbasicprovider" => {
-            if !first.eq_ignore_ascii_case("file") {
+            if args.len() != 1 || !first.eq_ignore_ascii_case("file") {
                 return Err("only the `file` AuthBasicProvider is supported".into());
             }
         }
@@ -2138,13 +2367,10 @@ fn apply_directive(
         }
         "directoryindex" => scope.content_policy.directory_index = Some(args.to_vec()),
         "errordocument" => {
-            if args.len() < 2 {
-                return Ok(());
-            }
-            let Ok(code) = args[0].parse::<u16>() else {
-                return Err("ErrorDocument requires a numeric status".into());
+            let Ok(code @ 400..=599) = args[0].parse::<u16>() else {
+                return Err("ErrorDocument requires a status from 400 through 599".into());
             };
-            let target = args[1..].join(" ");
+            let target = args[1].clone();
             let doc = if target.starts_with("http://") || target.starts_with("https://") {
                 ErrorDoc::External(target)
             } else if target.starts_with('/') {
@@ -2155,21 +2381,16 @@ fn apply_directive(
             scope.error_policy.documents.push((code, doc));
         }
         "addtype" => {
-            if args.len() >= 2 {
-                scope
-                    .content_policy
-                    .add_types
-                    .push((args[0].clone(), args[1..].join(" ")));
-            }
+            scope
+                .content_policy
+                .add_types
+                .push((args[0].clone(), args[1..].join(" ")));
         }
         "removetype" => scope
             .content_policy
             .remove_types
             .extend(args.iter().cloned()),
         "addhandler" => {
-            if args.len() < 2 {
-                return Ok(());
-            }
             require_handler_capability(cfg, &args[0], "AddHandler")?;
             for ext in &args[1..] {
                 scope
@@ -2202,9 +2423,6 @@ fn apply_directive(
             }
         }
         "addoutputfilterbytype" => {
-            if args.len() < 2 {
-                return Ok(());
-            }
             let (kinds, unsupported) = crate::config::parse_filter_names(&args[..1]);
             for kind in kinds {
                 scope
@@ -2225,9 +2443,6 @@ fn apply_directive(
             }
         }
         "addoutputfilter" => {
-            if args.len() < 2 {
-                return Ok(());
-            }
             let (kinds, unsupported) = crate::config::parse_filter_names(&args[..1]);
             for kind in kinds {
                 scope
@@ -2276,26 +2491,33 @@ fn apply_directive(
             }
         }
         "deflatecompressionlevel" => {
-            if let Some(n) = first.parse::<u32>().ok().filter(|n| *n <= 9) {
-                scope.compression_policy.deflate_level = Some(n);
-            }
+            let n = first
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n <= 9)
+                .ok_or_else(|| "DeflateCompressionLevel must be from 0 through 9".to_string())?;
+            scope.compression_policy.deflate_level = Some(n);
         }
         "brotlicompressionquality" => {
-            if let Some(n) = first.parse::<u32>().ok().filter(|n| *n <= 11) {
-                scope.compression_policy.brotli_quality = Some(n);
-            }
+            let n = first
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n <= 11)
+                .ok_or_else(|| "BrotliCompressionQuality must be from 0 through 11".to_string())?;
+            scope.compression_policy.brotli_quality = Some(n);
         }
         "deflatealteretag" => {
-            if let Some(v) = AlterEtag::parse(first) {
-                scope.compression_policy.deflate_alter_etag = Some(v);
-            }
+            let value = AlterEtag::parse(first).ok_or_else(|| {
+                "DeflateAlterETag requires AddSuffix, NoChange, or Remove".to_string()
+            })?;
+            scope.compression_policy.deflate_alter_etag = Some(value);
         }
         "brotlialteretag" | "brotlicompressionalteretag" => {
-            if let Some(v) = AlterEtag::parse(first) {
-                scope.compression_policy.brotli_alter_etag = Some(v);
-            }
+            let value = AlterEtag::parse(first).ok_or_else(|| {
+                "BrotliCompressionAlterETag requires AddSuffix, NoChange, or Remove".to_string()
+            })?;
+            scope.compression_policy.brotli_alter_etag = Some(value);
         }
-        "deflatefilternote" | "deflatebuffersize" | "deflatememlevel" | "deflatewindowssize" => {}
         "header" => apply_header(scope, args)?,
         "order" => {
             require_capability(cfg, Capability::LegacyAuthz, "Order")?;
@@ -2382,17 +2604,22 @@ fn apply_directive(
             scope.rewrite_policy.rewrite_rules.push(rule);
         }
         "rewriteoptions" => {
-            scope.rewrite_policy.rewrite_inherit =
-                Some(args.iter().any(|a| a.eq_ignore_ascii_case("Inherit")));
+            for arg in args {
+                if !arg.eq_ignore_ascii_case("Inherit") {
+                    return Err(format!("unsupported RewriteOptions flag '{arg}'"));
+                }
+            }
+            scope.rewrite_policy.rewrite_inherit = Some(true);
         }
         "redirect" | "redirectpermanent" | "redirecttemp" => {
-            let mut args = args.to_vec();
-            if name == "redirectpermanent" {
-                args.insert(0, "301".into());
+            let forced = if name == "redirectpermanent" {
+                Some(301)
             } else if name == "redirecttemp" {
-                args.insert(0, "302".into());
-            }
-            apply_redirect(scope, &args)?
+                Some(302)
+            } else {
+                None
+            };
+            apply_redirect(scope, args, forced)?
         }
         "redirectmatch" => apply_redirect_match(scope, args)?,
         "fileetag" => {
@@ -2404,28 +2631,36 @@ fn apply_directive(
                     "inode" => v |= crate::config::ETAG_INODE,
                     "mtime" => v |= crate::config::ETAG_MTIME,
                     "size" => v |= crate::config::ETAG_SIZE,
-                    _ => {}
+                    _ => return Err(format!("FileETag contains unsupported keyword '{a}'")),
                 }
             }
             scope.content_policy.file_etag = Some(v);
         }
         "enablesendfile" => {
-            scope.content_policy.enable_sendfile = Some(first.eq_ignore_ascii_case("on"))
+            scope.content_policy.enable_sendfile = Some(parse_on_off("EnableSendfile", first)?)
         }
         "directoryslash" => {
-            scope.content_policy.directory_slash = Some(first.eq_ignore_ascii_case("on"))
+            scope.content_policy.directory_slash = Some(parse_on_off("DirectorySlash", first)?)
         }
         "expiresactive" => {
-            scope.header_policy.expires_active = Some(first.eq_ignore_ascii_case("on"))
+            scope.header_policy.expires_active = Some(parse_on_off("ExpiresActive", first)?)
         }
-        "expiresdefault" => scope.header_policy.expires_default = Some(args.join(" ")),
-        "expiresbytype" => {
-            if args.len() >= 2 {
-                scope
-                    .header_policy
-                    .expires_by_type
-                    .push((args[0].to_ascii_lowercase(), args[1..].join(" ")));
+        "expiresdefault" => {
+            let spec = args.join(" ");
+            if !crate::expires::valid_spec(&spec) {
+                return Err("ExpiresDefault has invalid expiry syntax".into());
             }
+            scope.header_policy.expires_default = Some(spec);
+        }
+        "expiresbytype" => {
+            let spec = args[1..].join(" ");
+            if !crate::expires::valid_spec(&spec) {
+                return Err("ExpiresByType has invalid expiry syntax".into());
+            }
+            scope
+                .header_policy
+                .expires_by_type
+                .push((args[0].to_ascii_lowercase(), spec));
         }
         "setenv" => {
             let Some(name) = args.first() else {
@@ -2463,15 +2698,19 @@ fn apply_directive(
                 .index_ignore
                 .extend(args.iter().cloned());
         }
-        // These are explicitly reviewed as inert in `DIRECTIVE_SPECS`.  They
-        // do not affect access decisions, request mutation, handler selection
-        // or response framing; accepting them keeps common .htaccess files
-        // usable until the corresponding presentation filters are implemented.
-        "addcharset" | "addlanguage" | "addencoding" | "removecharset" | "removeencoding"
-        | "adddescription" | "indexoptions" | "readmefile" | "headername" => {}
         _ => return Err(format!("unsupported .htaccess directive '{name}'")),
     }
     Ok(())
+}
+
+fn parse_on_off(name: &str, value: &str) -> Result<bool, String> {
+    if value.eq_ignore_ascii_case("on") {
+        Ok(true)
+    } else if value.eq_ignore_ascii_case("off") {
+        Ok(false)
+    } else {
+        Err(format!("{name} requires On or Off"))
+    }
 }
 
 fn require_capability(cfg: &Config, capability: Capability, feature: &str) -> Result<(), String> {
@@ -2504,8 +2743,7 @@ fn require_handler_capability(cfg: &Config, handler: &str, directive: &str) -> R
 
 fn apply_options(scope: &mut Scope, args: &[String]) -> Result<(), String> {
     if args.is_empty() {
-        scope.options.push_set(Options::empty().0);
-        return Ok(());
+        return Err("Options requires at least one option".into());
     }
     // Apache resets the effective set to exactly the listed words when a
     // directive carries signless options, discarding anything inherited
@@ -2597,6 +2835,22 @@ fn apply_header(scope: &mut Scope, args: &[String]) -> Result<(), String> {
     }
     let action = args[idx].to_ascii_lowercase();
     let name = args[idx + 1].trim_end_matches(':').to_string();
+    let minimum = match action.as_str() {
+        "set" | "add" => idx + 3,
+        "unset" => idx + 2,
+        _ => return Err(format!("unsupported Header action '{action}'")),
+    };
+    let conditional = args[idx + 2..].iter().any(|arg| {
+        arg.eq_ignore_ascii_case("early")
+            || arg.to_ascii_lowercase().starts_with("env=")
+            || arg.to_ascii_lowercase().starts_with("expr=")
+    });
+    if args.len() < minimum || (action == "unset" && args.len() != minimum) || conditional {
+        return Err(
+            "conditional or extended Header forms are not implemented; refusing to broaden the header policy"
+                .into(),
+        );
+    }
     match (action.as_str(), always) {
         ("set", true) => {
             let value = args[idx + 2..].join(" ");
@@ -2616,26 +2870,23 @@ fn apply_header(scope: &mut Scope, args: &[String]) -> Result<(), String> {
         }
         ("unset", true) => scope.header_policy.always_unset_headers.push(name),
         ("unset", false) => scope.header_policy.unset_headers.push(name),
-        _ => return Err(format!("unsupported Header action '{action}'")),
+        _ => unreachable!("Header action was validated above"),
     }
     Ok(())
 }
 
-fn apply_redirect(scope: &mut Scope, args: &[String]) -> Result<(), String> {
-    if args.len() < 2 {
-        return Err("Redirect requires a source and target".into());
-    }
-    let (status, rest) = match args[0].parse::<u16>() {
-        Ok(s) => (s, &args[1..]),
-        _ => (302, args),
-    };
-    debug_assert!(!rest.is_empty());
+fn apply_redirect(
+    scope: &mut Scope,
+    args: &[String],
+    forced_status: Option<u16>,
+) -> Result<(), String> {
+    let (status, from, to) = crate::config::parse_redirect_arguments(args, forced_status)?;
     scope
         .mapping_policy
         .redirects
         .push(crate::config::Redirect {
-            from: rest[0].clone(),
-            to: rest[1..].join(" "),
+            from,
+            to,
             status,
             regex: None,
         });
@@ -2643,22 +2894,15 @@ fn apply_redirect(scope: &mut Scope, args: &[String]) -> Result<(), String> {
 }
 
 fn apply_redirect_match(scope: &mut Scope, args: &[String]) -> Result<(), String> {
-    if args.len() < 2 {
-        return Err("RedirectMatch requires a pattern".into());
-    }
-    let (status, rest) = match args[0].parse::<u16>() {
-        Ok(s) => (s, &args[1..]),
-        _ => (302, args),
-    };
-    debug_assert!(!rest.is_empty());
-    let regex = crate::config::compile_regex(&rest[0])
+    let (status, pattern, target) = crate::config::parse_redirect_arguments(args, None)?;
+    let regex = crate::config::compile_regex(&pattern)
         .map_err(|e| format!("bad RedirectMatch regex: {e}"))?;
     scope
         .mapping_policy
         .redirects
         .push(crate::config::Redirect {
             from: String::new(),
-            to: rest[1..].join(" "),
+            to: target,
             status,
             regex: Some(std::sync::Arc::new(regex)),
         });
@@ -3000,6 +3244,7 @@ mod tests {
             "<Limit POST>\n<Limit POST>\nRequire all granted\n</Limit>\n</Limit>\n",
             "<Else>\nRequire all granted\n</Else>\n",
             "AllowMethods POST\n",
+            "<If true>\n<Files secret.txt>\nRequire all granted\n</Files>\n</If>\n",
         ] {
             fs::write(&file, text).unwrap();
             assert!(
@@ -3072,16 +3317,14 @@ mod tests {
         let parsed = parse("<IfFile maintenance.flag>\nHeader set X-IfFile yes\n</IfFile>\n");
         assert!(parsed.scope.header_policy.set_headers.is_empty());
 
-        // The first argument remains the operand; the compatibility count
-        // word is ignored.
+        // Apache rejects extra operands instead of selecting only the first.
         fs::write(dir.join("first.flag"), "x").unwrap();
-        let parsed = parse("<IfFile first.flag ignored>\nHeader set X-IfFile yes\n</IfFile>\n");
-        assert!(parsed
-            .scope
-            .header_policy
-            .set_headers
-            .iter()
-            .any(|(name, _)| name == "X-IfFile"));
+        fs::write(
+            &file,
+            "<IfFile first.flag ignored>\nHeader set X-IfFile yes\n</IfFile>\n",
+        )
+        .unwrap();
+        assert!(parse_file(&cfg, &file, OverrideMode::All, "/sub").is_err());
 
         let parsed = parse("<IfFile !missing.flag>\nHeader set X-Negated yes\n</IfFile>\n");
         assert!(parsed
@@ -3170,7 +3413,7 @@ mod tests {
         DirectiveCase {
             name: "addcharset",
             args: &["utf-8", ".txt"],
-            effect: ExpectedEffect::Inert,
+            effect: ExpectedEffect::Error,
         },
         DirectiveCase {
             name: "adddefaultcharset",
@@ -3180,12 +3423,12 @@ mod tests {
         DirectiveCase {
             name: "adddescription",
             args: &["x", ".txt"],
-            effect: ExpectedEffect::Inert,
+            effect: ExpectedEffect::Error,
         },
         DirectiveCase {
             name: "addencoding",
             args: &["gzip", ".gz"],
-            effect: ExpectedEffect::Inert,
+            effect: ExpectedEffect::Error,
         },
         DirectiveCase {
             name: "addhandler",
@@ -3194,13 +3437,13 @@ mod tests {
         },
         DirectiveCase {
             name: "addinputfilter",
-            args: &["INCLUDES"],
+            args: &["INCLUDES", ".shtml"],
             effect: ExpectedEffect::Changed,
         },
         DirectiveCase {
             name: "addlanguage",
             args: &["en", ".txt"],
-            effect: ExpectedEffect::Inert,
+            effect: ExpectedEffect::Error,
         },
         DirectiveCase {
             name: "addoutputfilter",
@@ -3290,7 +3533,7 @@ mod tests {
         DirectiveCase {
             name: "deflatebuffersize",
             args: &["4096"],
-            effect: ExpectedEffect::Inert,
+            effect: ExpectedEffect::Error,
         },
         DirectiveCase {
             name: "deflatecompressionlevel",
@@ -3300,17 +3543,17 @@ mod tests {
         DirectiveCase {
             name: "deflatefilternote",
             args: &["foo"],
-            effect: ExpectedEffect::Inert,
+            effect: ExpectedEffect::Error,
         },
         DirectiveCase {
             name: "deflatememlevel",
             args: &["8"],
-            effect: ExpectedEffect::Inert,
+            effect: ExpectedEffect::Error,
         },
         DirectiveCase {
             name: "deflatewindowssize",
             args: &["15"],
-            effect: ExpectedEffect::Inert,
+            effect: ExpectedEffect::Error,
         },
         DirectiveCase {
             name: "deny",
@@ -3370,7 +3613,7 @@ mod tests {
         DirectiveCase {
             name: "headername",
             args: &["HEADER"],
-            effect: ExpectedEffect::Inert,
+            effect: ExpectedEffect::Error,
         },
         DirectiveCase {
             name: "indexignore",
@@ -3380,7 +3623,7 @@ mod tests {
         DirectiveCase {
             name: "indexoptions",
             args: &["FancyIndexing"],
-            effect: ExpectedEffect::Inert,
+            effect: ExpectedEffect::Error,
         },
         DirectiveCase {
             name: "options",
@@ -3400,7 +3643,7 @@ mod tests {
         DirectiveCase {
             name: "readmefile",
             args: &["README"],
-            effect: ExpectedEffect::Inert,
+            effect: ExpectedEffect::Error,
         },
         DirectiveCase {
             name: "redirect",
@@ -3425,12 +3668,12 @@ mod tests {
         DirectiveCase {
             name: "removecharset",
             args: &[".txt"],
-            effect: ExpectedEffect::Inert,
+            effect: ExpectedEffect::Error,
         },
         DirectiveCase {
             name: "removeencoding",
             args: &[".gz"],
-            effect: ExpectedEffect::Inert,
+            effect: ExpectedEffect::Error,
         },
         DirectiveCase {
             name: "removehandler",
@@ -3949,6 +4192,32 @@ mod tests {
         assert_eq!(lines, vec!["Require all  denied", "Options -Indexes"]);
     }
 
+    #[test]
+    fn access_program_seals_nested_sections_before_skipping() {
+        let lines = crate::config_frontend::logical_lines(
+            "<Unknown>\n<Files secret>\nRequire all denied\n</Files>\n</Unknown>\nRequire all granted\n",
+        );
+        let program = AccessProgram::seal(&lines).unwrap();
+        assert!(matches!(
+            &program.instructions[0],
+            AccessInstruction::SectionStart { end: 4, .. }
+        ));
+        assert!(matches!(
+            &program.instructions[1],
+            AccessInstruction::SectionStart { end: 3, .. }
+        ));
+        let mut cursor = 1;
+        skip_section(&program, &mut cursor, "unknown").unwrap();
+        assert_eq!(cursor, 5);
+        assert!(matches!(
+            &program.instructions[cursor],
+            AccessInstruction::Directive { name, .. } if name == "require"
+        ));
+
+        let mismatched = crate::config_frontend::logical_lines("<Files x>\n</If>\n");
+        assert!(AccessProgram::seal(&mismatched).is_err());
+    }
+
     fn request_with_header(name: &str, value: &str) -> crate::http::Request {
         let mut req = crate::http::Request {
             method: "GET".into(),
@@ -4394,7 +4663,7 @@ mod tests {
             ),
             (
                 "<IfFile ignored path>\nHeader set X-IfFile yes\n</IfFile>\n",
-                true,
+                false,
             ),
             ("<If \"true\">\n</If>\n<Else extra more>\n</Else>\n", false),
             (
@@ -4433,7 +4702,7 @@ mod tests {
             ),
             ("<RequireAll>\nHeader set X y\n</RequireAll>\n", false),
             ("SetEnv\n", false),
-            ("Options\n", true),
+            ("Options\n", false),
             ("Options All\n", true),
             ("Options Indexes\n", true),
             (
@@ -4452,14 +4721,14 @@ mod tests {
             ("AuthBasicProvider ldap\n", false),
             ("ErrorDocument x /x\n", false),
             ("ErrorDocument 404 http://example.test/x\n", true),
-            ("ErrorDocument 404 plain text\n", true),
+            ("ErrorDocument 404 plain text\n", false),
             ("Order bogus\n", false),
             ("Allow all\n", false),
             ("Allow from bogus\n", false),
             ("Satisfy bogus\n", false),
             ("AuthMerging bogus\n", false),
             ("RewriteEngine bogus\n", false),
-            ("ReadmeFile README\n", true),
+            ("ReadmeFile README\n", false),
         ];
         for (text, ok) in cases {
             let result = parse(text, all, NonfatalMode::None, &[]);
@@ -4482,18 +4751,14 @@ mod tests {
             &[],
         );
         assert!(unknown.is_ok(), "{:?}", unknown.err());
-        let skipped = vec![
-            String::new(),
-            "\"unterminated".to_string(),
-            "<Nested>".to_string(),
-            "</Unknown>".to_string(),
-            "</Unknown>".to_string(),
-        ];
-        let mut at = 0usize;
+        let skipped = AccessProgram::seal(&crate::config_frontend::logical_lines(
+            "<Unknown>\n<Nested>\n</Nested>\n</Unknown>\n",
+        ))
+        .unwrap();
+        let mut at = 1usize;
         assert!(skip_section(&skipped, &mut at, "unknown").is_ok());
-        assert_eq!(at, skipped.len());
-        let mut at = 0usize;
-        assert!(skip_section(&["<Unknown>".to_string()], &mut at, "unknown").is_err());
+        assert_eq!(at, skipped.instructions.len());
+        assert!(AccessProgram::seal(&["<Unknown>".to_string()]).is_err());
         assert!(parse(
             "Frobnicate x\n",
             OverrideMode::None,
@@ -4508,13 +4773,15 @@ mod tests {
             &[],
         )
         .is_err());
+        // Nonfatal controls policy disposition, not lexical validity: the
+        // complete access program must seal before any wrapper can be skipped.
         assert!(parse(
             "<RequireAll>\n\"unterminated\n</RequireAll>\n",
             OverrideMode::None,
             NonfatalMode::Override,
             &[],
         )
-        .is_ok());
+        .is_err());
         assert!(parse(
             "<RequireAll>\nRequire all denied\n</RequireAll>\n",
             OverrideMode::None,
@@ -4710,6 +4977,18 @@ mod tests {
         assert!(parse_file(&cfg, &big, OverrideMode::All, "/").is_err());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_tilde_regex_arity_matches_main_config() {
+        let args = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(
+            validate_section_arity(AccessSectionKind::Files, &args(&["~", "^secret\\.txt$"]))
+                .is_ok()
+        );
+        assert!(validate_section_arity(AccessSectionKind::Files, &args(&["~"])).is_err());
+        assert!(validate_section_arity(AccessSectionKind::Files, &args(&["x", "y"])).is_err());
+        assert!(validate_section_arity(AccessSectionKind::FilesMatch, &args(&["x", "y"])).is_err());
     }
 
     #[test]
@@ -4993,14 +5272,14 @@ mod tests {
             ("Require dbm ignored\n", true),
             ("RedirectMatch\n", false),
             ("RedirectMatch 301\n", false),
-            ("FileETag made-up\n", true),
+            ("FileETag made-up\n", false),
             ("AddHandler cgi-script .cgi\n", true),
-            ("AddHandler cgi-script\n", true),
-            ("ErrorDocument 404\n", true),
+            ("AddHandler cgi-script\n", false),
+            ("ErrorDocument 404\n", false),
             ("AddOutputFilterByType DEFLATE text/plain\n", true),
-            ("AddOutputFilterByType DEFLATE\n", true),
+            ("AddOutputFilterByType DEFLATE\n", false),
             ("AddOutputFilter DEFLATE .html\n", true),
-            ("AddOutputFilter DEFLATE\n", true),
+            ("AddOutputFilter DEFLATE\n", false),
             ("coverage-reject anything\n", false),
             ("coverage-unhandled anything\n", false),
         ] {
@@ -5046,7 +5325,6 @@ mod compression_tests {
                 "BrotliCompressionQuality 11\n",
                 "DeflateAlterETag Remove\n",
                 "BrotliAlterETag NoChange\n",
-                "DeflateFilterNote ratio\n",
             ),
         )
         .unwrap();

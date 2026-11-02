@@ -5,11 +5,10 @@
 //! `IncludeOptional` globs, `Define`, `<IfDefine>`, `<IfModule>`, nested
 //! containers, virtual hosts, and per-directory scopes.
 //!
-//! Directives are compiled into an immutable typed configuration.  Unknown
-//! directives are reported as warnings (so that a stock distribution config
-//! referencing modules we do not implement still starts); directives that
-//! carry access-control semantics are *fail closed*: an access directive we
-//! cannot evaluate denies access rather than silently allowing it.
+//! Directives are compiled into an immutable typed configuration. Unknown,
+//! malformed and recognized-but-unimplemented directives are configuration
+//! errors in every mode; no policy-bearing syntax is accepted as an inert
+//! compatibility placeholder.
 
 use crate::scope_policy::{
     AuthorizationPolicy, CompressionPolicy, ContentPolicy, EnvironmentPolicy, ErrorDocumentPolicy,
@@ -35,8 +34,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-
-pub(crate) use crate::config_frontend::tokenize_config;
 
 const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CONFIG_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
@@ -2162,29 +2159,24 @@ pub struct VHost {
 
 impl VHost {
     pub fn matches_name(&self, host: &str) -> bool {
+        fn without_port(name: &str) -> &str {
+            name.split(':').next().unwrap_or(name)
+        }
+
         let host = host.trim_end_matches('.');
-        let matches_one = |raw_pat: &str| -> bool {
-            let pat = raw_pat.trim_end_matches('.');
-            if let Some(re) = pat.strip_prefix('~') {
-                let lower = host.to_ascii_lowercase();
-                // Invalid patterns are rejected at config load; this is a
-                // defensive fallback and must never grant a match.
-                return compile_regex(re)
-                    .map(|r| r.is_match(lower.as_bytes()))
-                    .unwrap_or(false);
-            }
-            crate::verified::host_pattern_matches(host.as_bytes(), pat.as_bytes())
-        };
         if self
             .server_name
             .as_ref()
-            .is_some_and(|n| matches_one(n.split(':').next().unwrap_or(n)))
+            .is_some_and(|name| host.eq_ignore_ascii_case(without_port(name).trim_end_matches('.')))
         {
             return true;
         }
-        self.aliases
-            .iter()
-            .any(|a| matches_one(a.split(':').next().unwrap_or(a)))
+        self.aliases.iter().any(|alias| {
+            crate::verified::host_pattern_matches(
+                host.as_bytes(),
+                without_port(alias).trim_end_matches('.').as_bytes(),
+            )
+        })
     }
 
     pub fn has_wildcard_default(&self) -> bool {
@@ -2981,6 +2973,7 @@ impl Config {
             depth: 0,
             warnings: Vec::new(),
             errors: Vec::new(),
+            initial_server_root: server_root.to_path_buf(),
             server_root: server_root.to_path_buf(),
             include_count: 0,
             config_bytes: 0,
@@ -3001,7 +2994,17 @@ impl Config {
         if !p.errors.is_empty() {
             return Err(p.errors);
         }
-        match Compile::new(p, strict, capability_audit).compile() {
+        let program = match ConfigProgram::seal(std::mem::take(&mut p.events)) {
+            Ok(program) => program,
+            Err(msg) => {
+                return Err(vec![ConfigError {
+                    file: path.display().to_string(),
+                    line: 0,
+                    msg,
+                }]);
+            }
+        };
+        match Compile::new(p, program, strict, capability_audit).compile() {
             Ok(mut c) => {
                 c.override_enabled = c.override_scan();
                 let (prefixes, anywhere) = c.override_paths();
@@ -3039,6 +3042,489 @@ pub enum Event {
     },
 }
 
+/// Canonical directive identity established once when the expanded
+/// configuration stream is sealed.  The compiler consumes these facts rather
+/// than reclassifying an unhandled string at every policy mutation site.
+#[derive(Debug, Clone)]
+struct DirectiveIdentity {
+    canonical: String,
+    security_sensitive: bool,
+    apache_known: bool,
+    arity: DirectiveArity,
+    reject_empty: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirectiveArity {
+    min: usize,
+    max: Option<usize>,
+}
+
+impl DirectiveArity {
+    const ANY: Self = Self { min: 0, max: None };
+    const ONE: Self = Self {
+        min: 1,
+        max: Some(1),
+    };
+    const TWO: Self = Self {
+        min: 2,
+        max: Some(2),
+    };
+
+    const fn at_least(min: usize) -> Self {
+        Self { min, max: None }
+    }
+
+    const fn between(min: usize, max: usize) -> Self {
+        Self {
+            min,
+            max: Some(max),
+        }
+    }
+
+    fn admits(self, count: usize) -> bool {
+        vapache_verified::config_argument_arity_admit(count, self.min, self.max)
+    }
+
+    fn requirement(self) -> String {
+        match self.max {
+            Some(max) if max == self.min => format!("exactly {}", self.min),
+            Some(max) => format!("between {} and {max}", self.min),
+            None => format!("at least {}", self.min),
+        }
+    }
+}
+
+/// Minimum structural payload schema. Complex values (regular expressions,
+/// routes, Require providers, TLS policy) are parsed by their dedicated typed
+/// parsers later in compilation; this table prevents a missing token from
+/// being normalized into an empty path, user, handler, or security policy.
+fn directive_arity(name: &str) -> DirectiveArity {
+    match name {
+        "vapachecapability" => DirectiveArity {
+            min: 2,
+            max: Some(2),
+        },
+        "require"
+        | "allowoverride"
+        | "allowoverridelist"
+        | "protocols"
+        | "serveralias"
+        | "directoryindex"
+        | "indexignore"
+        | "fileetag"
+        | "accessfilename"
+        | "options"
+        | "expiresdefault"
+        | "deflatefilternote"
+        | "requestreadtimeout"
+        | "rewriteoptions"
+        | "sslprotocol"
+        | "ssloptions"
+        | "allowmethods"
+        | "unsetenv"
+        | "passenv"
+        | "sslciphersuite"
+        | "sslciphersuitetls13"
+        | "removetype"
+        | "removehandler"
+        | "cachedisable"
+        | "setoutputfilter"
+        | "setinputfilter" => DirectiveArity::at_least(1),
+        "order"
+        | "rewriteengine"
+        | "rewritebase"
+        | "sethandler"
+        | "forcetype"
+        | "adddefaultcharset"
+        | "enablesendfile"
+        | "directoryslash"
+        | "typesconfig"
+        | "cacheroot"
+        | "cachedefaultexpire"
+        | "cachemaxexpire"
+        | "cacheminexpire"
+        | "cachemaxfilesize"
+        | "cachemaxdisksize"
+        | "cachemaxmemorysize"
+        | "cacheminsize"
+        | "cacheignorenolastmod"
+        | "cacheignorecachecontrol"
+        | "cachestorenostore"
+        | "cachestoreprivate"
+        | "cacheignorequerystring"
+        | "cacheheader"
+        | "cachedetailheader"
+        | "cachelastmodifiedfactor"
+        | "deflatecompressionlevel"
+        | "brotlicompressionquality"
+        | "deflatealteretag"
+        | "brotlialteretag"
+        | "brotlicompressionalteretag"
+        | "expiresactive"
+        | "deflatebuffersize"
+        | "deflatememlevel"
+        | "deflatewindowssize"
+        | "user"
+        | "group"
+        | "pidfile"
+        | "errorlog"
+        | "remoteipheader"
+        | "timeout"
+        | "keepalive"
+        | "keepalivetimeout"
+        | "maxkeepaliverequests"
+        | "hostnamelookups"
+        | "usecanonicalname"
+        | "servertokens"
+        | "serversignature"
+        | "traceenable"
+        | "limitrequestline"
+        | "limitrequestfields"
+        | "limitrequestfieldsize"
+        | "maxrequestworkers"
+        | "serverlimit"
+        | "listenbacklog"
+        | "gracefulshutdowntimeout"
+        | "limitrequestbody"
+        | "allowencodedslashes"
+        | "satisfy"
+        | "authmerging"
+        | "secruleengine"
+        | "sslsessioncachetimeout"
+        | "sslsessiontickets"
+        | "sslhonorcipherorder"
+        | "sslengine"
+        | "sslcertificatefile"
+        | "sslcertificatekeyfile"
+        | "sslcertificatechainfile"
+        | "sslusestapling"
+        | "sslstaplingforceurl"
+        | "sslstaplingrespondertimeout"
+        | "sslstaplingstandardcachetimeout"
+        | "sslstaplingreturnrespondererrors"
+        | "sslstaplingcache"
+        | "sslproxycacertificatefile"
+        | "sslverifyclient"
+        | "sslcacertificatefile"
+        | "authtype"
+        | "authname"
+        | "authuserfile"
+        | "authgroupfile"
+        | "authbasicprovider"
+        | "serverroot"
+        | "servername"
+        | "serveradmin"
+        | "documentroot"
+        | "defaultruntime"
+        | "defaultruntimedir"
+        | "defaulttype"
+        | "include"
+        | "includeoptional"
+        | "undefine"
+        | "vapachemaxspoolbytes"
+        | "vapachemaxspoolfiles"
+        | "vapachemaxdynamicrequests"
+        | "vapachemaxfastcgioutput"
+        | "loglevel" => DirectiveArity::ONE,
+        "loadmodule" => DirectiveArity::TWO,
+        "define" => DirectiveArity::between(1, 2),
+        "setenv" => DirectiveArity::between(1, 2),
+        "listen" => DirectiveArity::between(1, 2),
+        "allow" | "deny" | "rewritecond" | "rewriterule" | "addtype" | "addhandler"
+        | "addinputfilter" | "header" | "expiresbytype" | "browsermatch" | "browsermatchnocase" => {
+            DirectiveArity::at_least(2)
+        }
+        "setenvif" | "setenvifnocase" => DirectiveArity::at_least(3),
+        "addcharset"
+        | "addencoding"
+        | "addlanguage"
+        | "remoteipinternalproxy"
+        | "remoteiptrustedproxy"
+        | "balancermember"
+        | "proxyset"
+        | "proxyhctemplate"
+        | "vapachefastcgistablepath"
+        | "sslrandomseed"
+        | "sslpassphrasedialog"
+        | "sslsessioncache" => DirectiveArity::at_least(1),
+        "alias" | "scriptalias" | "aliasmatch" | "scriptaliasmatch" | "rewritemap"
+        | "errordocument" => DirectiveArity::TWO,
+        "redirect" | "redirectmatch" => DirectiveArity::between(2, 3),
+        "redirectpermanent" | "redirecttemp" => DirectiveArity::TWO,
+        "proxypass"
+        | "proxypassreverse"
+        | "proxypassmatch"
+        | "addoutputfilter"
+        | "addoutputfilterbytype" => DirectiveArity::at_least(2),
+        "cacheenable" => DirectiveArity::between(1, 2),
+        // Vapache currently supports named LogFormat definitions and
+        // unconditional CustomLog sinks. Refuse the otherwise-valid Apache
+        // variants until their effects are implemented; accepting them as
+        // no-ops or unconditional logs changes the audit policy.
+        "logformat" | "customlog" => DirectiveArity::TWO,
+        // SSLRequireSSL is intentionally a zero-argument directive. Unknown
+        // and compatibility-only directives retain their existing parser or
+        // disposition behavior.
+        _ => DirectiveArity::ANY,
+    }
+}
+
+fn directive_rejects_empty(name: &str) -> bool {
+    matches!(
+        name,
+        "serverroot"
+            | "servername"
+            | "documentroot"
+            | "user"
+            | "group"
+            | "pidfile"
+            | "errorlog"
+            | "sethandler"
+            | "forcetype"
+            | "typesconfig"
+            | "cacheroot"
+            | "remoteipheader"
+            | "sslcertificatefile"
+            | "sslcertificatekeyfile"
+            | "sslcertificatechainfile"
+            | "sslproxycacertificatefile"
+            | "sslcacertificatefile"
+            | "sslprotocol"
+            | "sslciphersuite"
+            | "sslciphersuitetls13"
+            | "authtype"
+            | "authuserfile"
+            | "authgroupfile"
+            | "authbasicprovider"
+    )
+}
+
+impl DirectiveIdentity {
+    fn new(
+        canonical: String,
+        known: &HashSet<&'static str>,
+        fail_closed: &HashSet<&'static str>,
+    ) -> Self {
+        let security_sensitive = is_security_directive_with(&canonical, fail_closed);
+        DirectiveIdentity {
+            security_sensitive,
+            apache_known: known.contains(canonical.as_str()),
+            arity: directive_arity(&canonical),
+            reject_empty: directive_rejects_empty(&canonical),
+            canonical,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.canonical
+    }
+}
+
+/// Closed section vocabulary. Unknown names remain explicit data so the
+/// compiler can reject them; they can never acquire transparent semantics by
+/// falling through a string comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgramSectionClass {
+    VirtualHost,
+    Directory,
+    DirectoryMatch,
+    Location,
+    LocationMatch,
+    Files,
+    FilesMatch,
+    Proxy,
+    ProxyMatch,
+    Limit,
+    LimitExcept,
+    If,
+    IfFile,
+    ElseIf,
+    Else,
+    RequireAll,
+    RequireAny,
+    RequireNone,
+    AuthzProviderAlias,
+    ExecuteOnRead,
+    Unknown,
+}
+
+impl ProgramSectionClass {
+    fn from_name(name: &str) -> Self {
+        match name {
+            "virtualhost" => Self::VirtualHost,
+            "directory" => Self::Directory,
+            "directorymatch" => Self::DirectoryMatch,
+            "location" => Self::Location,
+            "locationmatch" => Self::LocationMatch,
+            "files" => Self::Files,
+            "filesmatch" => Self::FilesMatch,
+            "proxy" => Self::Proxy,
+            "proxymatch" => Self::ProxyMatch,
+            "limit" => Self::Limit,
+            "limitexcept" => Self::LimitExcept,
+            "if" => Self::If,
+            "iffile" => Self::IfFile,
+            "elseif" => Self::ElseIf,
+            "else" => Self::Else,
+            "requireall" => Self::RequireAll,
+            "requireany" => Self::RequireAny,
+            "requirenone" => Self::RequireNone,
+            "authzprovideralias" => Self::AuthzProviderAlias,
+            "ifmodule" | "ifdefine" | "ifdirective" | "ifsection" | "ifversion" => {
+                Self::ExecuteOnRead
+            }
+            _ => Self::Unknown,
+        }
+    }
+}
+
+fn validate_config_section_arity(name: &str, args: &[String]) -> Result<(), String> {
+    let (min, max) = match name {
+        "else" | "requireall" | "requireany" | "requirenone" => (0, Some(0)),
+        "ifmodule" | "ifdefine" | "iffile" | "ifdirective" | "ifsection" => (1, Some(1)),
+        "ifversion" => (1, Some(2)),
+        "authzprovideralias" => (2, Some(2)),
+        "directory" | "location" | "files" => (1, Some(2)),
+        "directorymatch" | "locationmatch" | "filesmatch" | "proxy" | "proxymatch" => (1, Some(1)),
+        "virtualhost" | "limit" | "limitexcept" | "if" | "elseif" => (1, None),
+        _ => return Ok(()),
+    };
+    if !vapache_verified::config_argument_arity_admit(args.len(), min, max) {
+        let requirement = match max {
+            Some(max) if max == min => format!("exactly {min}"),
+            Some(max) => format!("between {min} and {max}"),
+            None => format!("at least {min}"),
+        };
+        return Err(format!(
+            "<{name}> requires {requirement} argument(s), got {}",
+            args.len()
+        ));
+    }
+    if matches!(name, "directory" | "location" | "files")
+        && args.first().is_some_and(|arg| arg == "~")
+        && args.len() < 2
+    {
+        return Err(format!("<{name} ~> requires a regular expression"));
+    }
+    if matches!(name, "directory" | "location" | "files") && args.len() == 2 && args[0] != "~" {
+        return Err(format!(
+            "<{name}> accepts two arguments only in the '<{name} ~ regex>' form"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum ProgramEvent {
+    Directive {
+        identity: DirectiveIdentity,
+        args: Vec<String>,
+        loc: SourceLoc,
+    },
+    SectionStart {
+        name: String,
+        class: ProgramSectionClass,
+        args: Vec<String>,
+        loc: SourceLoc,
+        active: bool,
+        transparent: bool,
+        /// Exact matching `SectionEnd` instruction, established while sealing.
+        end: usize,
+    },
+    SectionEnd {
+        /// Exact matching `SectionStart` instruction.
+        start: usize,
+    },
+}
+
+/// Immutable, include-expanded configuration program.  It is constructed
+/// only after syntax/conditional processing succeeds. Every section has an
+/// exact mate and the verified depth transition proves that sealing cannot
+/// accept stack underflow or arithmetic wrap.
+#[derive(Debug)]
+struct ConfigProgram {
+    instructions: Box<[ProgramEvent]>,
+}
+
+impl ConfigProgram {
+    fn seal(events: Vec<Event>) -> Result<Self, String> {
+        let mut instructions = Vec::with_capacity(events.len());
+        let mut stack: Vec<usize> = Vec::new();
+        let mut depth = 0usize;
+        // These registries are immutable for one compilation. Constructing
+        // them once keeps sealing linear in the number of input events.
+        let known = known_directives();
+        let fail_closed = fail_closed_directives();
+        for event in events {
+            match event {
+                Event::Directive { name, args, loc } => {
+                    depth = vapache_verified::config_program_depth_step(
+                        depth,
+                        vapache_verified::ConfigLineKind::Directive,
+                    )
+                    .ok_or("configuration program depth overflow")?;
+                    instructions.push(ProgramEvent::Directive {
+                        identity: DirectiveIdentity::new(name, &known, &fail_closed),
+                        args,
+                        loc,
+                    });
+                }
+                Event::SectionStart {
+                    name,
+                    args,
+                    loc,
+                    active,
+                    transparent,
+                } => {
+                    depth = vapache_verified::config_program_depth_step(
+                        depth,
+                        vapache_verified::ConfigLineKind::SectionStart,
+                    )
+                    .ok_or("configuration program depth overflow")?;
+                    let start = instructions.len();
+                    let class = ProgramSectionClass::from_name(&name);
+                    instructions.push(ProgramEvent::SectionStart {
+                        name,
+                        class,
+                        args,
+                        loc,
+                        active,
+                        transparent,
+                        end: usize::MAX,
+                    });
+                    stack.push(start);
+                }
+                Event::SectionEnd { loc: _ } => {
+                    depth = vapache_verified::config_program_depth_step(
+                        depth,
+                        vapache_verified::ConfigLineKind::SectionEnd,
+                    )
+                    .ok_or("configuration program contains an unmatched closing section")?;
+                    let start = stack
+                        .pop()
+                        .ok_or("configuration program contains an unmatched closing section")?;
+                    let end = instructions.len();
+                    let ProgramEvent::SectionStart {
+                        end: matching_end, ..
+                    } = &mut instructions[start]
+                    else {
+                        return Err("configuration program section index is corrupt".into());
+                    };
+                    *matching_end = end;
+                    instructions.push(ProgramEvent::SectionEnd { start });
+                }
+            }
+        }
+        if depth != 0 || !stack.is_empty() {
+            return Err("configuration program contains an unclosed section".into());
+        }
+        Ok(ConfigProgram {
+            instructions: instructions.into_boxed_slice(),
+        })
+    }
+}
+
 struct ParserState {
     events: Vec<Event>,
     section_stack: Vec<(String, bool, bool)>,
@@ -3049,6 +3535,10 @@ struct ParserState {
     depth: usize,
     warnings: Vec<String>,
     errors: Vec<ConfigError>,
+    /// CLI/default root at the start of the configuration stream. Compilation
+    /// replays ServerRoot events from this value; `server_root` below tracks
+    /// the execute-on-read value used while expanding includes.
+    initial_server_root: PathBuf,
     server_root: PathBuf,
     include_count: usize,
     config_bytes: u64,
@@ -3454,10 +3944,12 @@ impl ParserState {
                             }
                         }
                     }
-                    if name == "virtualhost" && args.is_empty() {
-                        self.error(&loc, "<VirtualHost> requires an address");
-                    }
                     let parent_active = self.active();
+                    if parent_active {
+                        if let Err(error) = validate_config_section_arity(&name, &args) {
+                            self.error(&loc, error);
+                        }
+                    }
                     let active = if parent_active {
                         self.eval_condition(&name, &args, &loc)
                     } else {
@@ -3494,6 +3986,21 @@ impl ParserState {
                         continue;
                     }
                     match cmd.as_str() {
+                        "serverroot" => match args.as_slice() {
+                            [root] if !root.is_empty() => {
+                                let root = PathBuf::from(root);
+                                if root.is_absolute() {
+                                    // Apache's ServerRoot is EXEC_ON_READ: it
+                                    // changes resolution of subsequent Include
+                                    // directives even when written inside a
+                                    // syntactic section.
+                                    self.server_root = root;
+                                } else {
+                                    self.error(&loc, "ServerRoot must be an absolute path");
+                                }
+                            }
+                            _ => self.error(&loc, "ServerRoot requires exactly one path"),
+                        },
                         "define" => {
                             let name = args.first().cloned().unwrap_or_default();
                             if name.is_empty() {
@@ -3758,14 +4265,14 @@ enum SectionKind {
     Conditional,
 }
 
-fn section_kind(name: &str) -> Option<SectionKind> {
-    Some(match name {
-        "virtualhost" => SectionKind::VirtualHost,
-        "directory" => SectionKind::Directory,
-        "directorymatch" => SectionKind::DirectoryMatch,
-        "location" | "locationmatch" => SectionKind::Location,
-        "files" | "filesmatch" => SectionKind::Files,
-        "proxy" | "proxymatch" => SectionKind::Proxy,
+fn section_kind(class: ProgramSectionClass) -> Option<SectionKind> {
+    Some(match class {
+        ProgramSectionClass::VirtualHost => SectionKind::VirtualHost,
+        ProgramSectionClass::Directory => SectionKind::Directory,
+        ProgramSectionClass::DirectoryMatch => SectionKind::DirectoryMatch,
+        ProgramSectionClass::Location | ProgramSectionClass::LocationMatch => SectionKind::Location,
+        ProgramSectionClass::Files | ProgramSectionClass::FilesMatch => SectionKind::Files,
+        ProgramSectionClass::Proxy | ProgramSectionClass::ProxyMatch => SectionKind::Proxy,
         _ => return None,
     })
 }
@@ -3872,7 +4379,7 @@ fn parse_fastcgi_policy_endpoint(raw: &str) -> Result<FastCgiEndpoint, String> {
 }
 
 struct Compile {
-    events: Vec<Event>,
+    program: ConfigProgram,
     pos: usize,
     cfg: Config,
     warnings: Vec<String>,
@@ -3882,16 +4389,17 @@ struct Compile {
     current_vhost: Option<usize>,
     order: usize,
     current_balancer: Option<usize>,
-    known: HashSet<&'static str>,
     next_condition_chain: usize,
     next_route: usize,
     required_capabilities: Vec<(Capability, SourceLoc, String)>,
     capability_audit: bool,
+    server_limit: Option<usize>,
+    max_request_workers_set: bool,
 }
 
 impl Compile {
-    fn new(p: ParserState, strict: bool, capability_audit: bool) -> Self {
-        let server_root = p.server_root.clone();
+    fn new(p: ParserState, program: ConfigProgram, strict: bool, capability_audit: bool) -> Self {
+        let server_root = p.initial_server_root.clone();
         let admin_file_trust = p.admin_file_trust;
         let admin_input_targets = p.admin_input_targets.clone();
         let config_defines: HashSet<String> = p.defines.keys().cloned().collect();
@@ -3972,9 +4480,8 @@ impl Compile {
             policy_cache: Arc::new(RwLock::new(BoundedPolicyCache::default())),
             dir_scope_cache: Arc::new(RwLock::new(BoundedPolicyCache::default())),
         };
-        let known = known_directives();
         Compile {
-            events: p.events,
+            program,
             pos: 0,
             cfg,
             warnings: p.warnings,
@@ -3984,11 +4491,12 @@ impl Compile {
             current_vhost: None,
             order: 0,
             current_balancer: None,
-            known,
             next_condition_chain: 0,
             next_route: 0,
             required_capabilities: Vec::new(),
             capability_audit,
+            server_limit: None,
+            max_request_workers_set: false,
         }
     }
 
@@ -4098,20 +4606,58 @@ impl Compile {
         }
     }
 
-    /// Report a compatibility drop: an error under strict mode, a warning
-    /// otherwise.  The affected directive (or entry) is skipped either way,
-    /// but strict mode refuses to start when under-argument or unparsable
-    /// material would otherwise be silently dropped.
-    fn strict_failure(&mut self, loc: &SourceLoc, msg: impl Into<String>) {
-        let m = msg.into();
-        if self.strict {
-            self.errors.push(ConfigError {
-                file: loc.file.clone(),
-                line: loc.line,
-                msg: m,
-            });
-        } else {
-            self.warn(format!("{}:{}: {m} (ignored)", loc.file, loc.line));
+    /// A recognized directive with malformed or unsupported effectful
+    /// payload is always a configuration error. Apache rejects these during
+    /// `-t`; accepting and dropping them can remove an intended route, ACL,
+    /// handler, header, filter or audit control.
+    fn directive_error(&mut self, loc: &SourceLoc, msg: impl Into<String>) {
+        self.errors.push(ConfigError {
+            file: loc.file.clone(),
+            line: loc.line,
+            msg: msg.into(),
+        });
+    }
+
+    fn on_off_arg(&mut self, loc: &SourceLoc, name: &str, args: &[String]) -> Option<bool> {
+        match args {
+            [value] if value.eq_ignore_ascii_case("on") => Some(true),
+            [value] if value.eq_ignore_ascii_case("off") => Some(false),
+            _ => {
+                self.directive_error(loc, format!("{name} requires exactly On or Off"));
+                None
+            }
+        }
+    }
+
+    fn u32_arg(&mut self, loc: &SourceLoc, name: &str, args: &[String]) -> Option<u32> {
+        match args {
+            [value] => match value.parse::<u32>() {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    self.directive_error(loc, format!("{name} requires an unsigned integer"));
+                    None
+                }
+            },
+            _ => {
+                self.directive_error(loc, format!("{name} requires exactly one argument"));
+                None
+            }
+        }
+    }
+
+    fn u64_arg(&mut self, loc: &SourceLoc, name: &str, args: &[String]) -> Option<u64> {
+        match args {
+            [value] => match crate::util::parse_u64(value.as_bytes()) {
+                Some(value) => Some(value),
+                None => {
+                    self.directive_error(loc, format!("{name} requires an unsigned integer"));
+                    None
+                }
+            },
+            _ => {
+                self.directive_error(loc, format!("{name} requires exactly one argument"));
+                None
+            }
         }
     }
 
@@ -4229,14 +4775,40 @@ impl Compile {
         // Tracks the most recent <If>/<IfFile> chain in this configuration
         // scope so a following <ElseIf>/<Else> can attach to it.
         let mut current_chain: Option<usize> = None;
-        while self.pos < self.events.len() {
-            let ev = self.events[self.pos].clone();
+        while self.pos < self.program.instructions.len() {
+            let ev = self.program.instructions[self.pos].clone();
             self.pos += 1;
             match ev {
-                Event::SectionEnd { .. } => return,
-                Event::Directive { name, args, loc } => {
+                ProgramEvent::SectionEnd { .. } => return,
+                ProgramEvent::Directive {
+                    identity,
+                    args,
+                    loc,
+                } => {
+                    let name = identity.as_str();
+                    if !identity.arity.admits(args.len()) {
+                        let msg = format!(
+                            "directive '{name}' requires {} argument(s), got {}",
+                            identity.arity.requirement(),
+                            args.len()
+                        );
+                        self.directive_error(&loc, msg);
+                        continue;
+                    }
+                    let has_empty = args.iter().any(String::is_empty);
+                    if !vapache_verified::config_argument_nonempty_admit(
+                        identity.reject_empty,
+                        has_empty,
+                    ) {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!("directive '{name}' does not permit an empty argument"),
+                        });
+                        continue;
+                    }
                     if matches!(
-                        name.as_str(),
+                        name,
                         "include" | "includeoptional" | "loadmodule" | "define" | "undefine"
                     ) {
                         continue;
@@ -4252,7 +4824,7 @@ impl Compile {
                         continue;
                     }
                     self.apply_directive(
-                        &name,
+                        &identity,
                         &args,
                         &loc,
                         scope,
@@ -4262,12 +4834,14 @@ impl Compile {
                         section,
                     );
                 }
-                Event::SectionStart {
+                ProgramEvent::SectionStart {
                     name,
+                    class,
                     args,
                     loc,
                     active,
                     transparent,
+                    end: _,
                 } => {
                     if !active {
                         self.skip_section();
@@ -4279,7 +4853,7 @@ impl Compile {
                         self.walk(scope, rules, inside_vhost, in_directory, limit, section);
                         continue;
                     }
-                    if let Some(child) = section_kind(&name) {
+                    if let Some(child) = section_kind(class) {
                         if !structural_section_allowed(section, child) {
                             self.errors.push(ConfigError {
                                 file: loc.file.clone(),
@@ -4395,13 +4969,16 @@ impl Compile {
                                 None,
                                 SectionKind::Conditional,
                             );
-                            let before = inner_rules.len();
-                            inner_rules.retain(|rule| matches!(rule.kind, MatchKind::Always));
-                            if inner_rules.len() != before {
-                                self.warn(format!(
-                                    "{}:{}: nested Directory/Files/Location sections inside <{name}> are ignored",
-                                    loc.file, loc.line
-                                ));
+                            if inner_rules
+                                .iter()
+                                .any(|rule| !matches!(rule.kind, MatchKind::Always))
+                            {
+                                self.directive_error(
+                                    &loc,
+                                    format!(
+                                        "nested Directory/Files/Location sections inside <{name}> are not supported; refusing policy nesting Apache accepts but does not execute on ordinary requests"
+                                    ),
+                                );
                             }
                             self.order += 1;
                             rules.push(ScopeRule {
@@ -4582,10 +5159,12 @@ impl Compile {
                                 SectionKind::Require,
                             );
                             if !inner_rules.is_empty() {
-                                self.warn(format!(
-                                    "{}:{}: nested sections inside <{name}> are not supported and were ignored",
-                                    loc.file, loc.line
-                                ));
+                                self.directive_error(
+                                    &loc,
+                                    format!(
+                                        "nested sections inside <{name}> are not supported; refusing to ignore their authorization policy"
+                                    ),
+                                );
                             }
                             let mut items = Vec::new();
                             let inner_entries = match inner.authorization.requires.take() {
@@ -4709,6 +5288,16 @@ impl Compile {
                                 self.skip_section();
                                 continue;
                             };
+                            if inside_vhost && name == "proxy" && pattern.starts_with("balancer://")
+                            {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: "virtual-host balancer definitions are not implemented; refusing to expose a vhost-local balancer globally".into(),
+                                });
+                                self.skip_section();
+                                continue;
+                            }
                             let kind = if name == "proxymatch" {
                                 match compile_regex(&pattern) {
                                     Ok(re) => ProxyMatchKind::Regex(re),
@@ -4799,15 +5388,35 @@ impl Compile {
     }
 
     fn skip_section(&mut self) {
-        let mut depth = 1;
-        while self.pos < self.events.len() && depth > 0 {
-            match &self.events[self.pos] {
-                Event::SectionStart { .. } => depth += 1,
-                Event::SectionEnd { .. } => depth -= 1,
-                _ => {}
-            }
-            self.pos += 1;
-        }
+        let Some(ProgramEvent::SectionStart { end, .. }) = self
+            .pos
+            .checked_sub(1)
+            .and_then(|start| self.program.instructions.get(start))
+        else {
+            debug_assert!(
+                false,
+                "skip_section must immediately follow a section start"
+            );
+            return;
+        };
+        let Some(ProgramEvent::SectionEnd { start, .. }) = self.program.instructions.get(*end)
+        else {
+            debug_assert!(false, "sealed section end must exist");
+            return;
+        };
+        debug_assert_eq!(*start, self.pos - 1);
+        self.pos = *end + 1;
+    }
+
+    fn directive_disposition(
+        &self,
+        identity: &DirectiveIdentity,
+    ) -> vapache_verified::DirectiveDisposition {
+        vapache_verified::directive_disposition(
+            identity.security_sensitive,
+            identity.apache_known,
+            self.strict,
+        )
     }
 
     fn parse_method_set(
@@ -4832,7 +5441,7 @@ impl Compile {
 
     fn apply_directive(
         &mut self,
-        name: &str,
+        identity: &DirectiveIdentity,
         args: &[String],
         loc: &SourceLoc,
         scope: &mut Scope,
@@ -4841,6 +5450,113 @@ impl Compile {
         limit: Option<&MethodSet>,
         section: SectionKind,
     ) {
+        let name = identity.as_str();
+        // Some Apache directives are scoped per-vhost or per-directory, but
+        // Vapache currently stores their value in the process-wide Config.
+        // Accepting those forms would let the last unrelated scope overwrite
+        // every other scope. Until the storage is scoped, admit only the
+        // global form rather than silently broadening its effect.
+        if matches!(
+            name,
+            "listen"
+                | "user"
+                | "group"
+                | "pidfile"
+                | "loglevel"
+                | "logformat"
+                | "remoteipheader"
+                | "remoteipinternalproxy"
+                | "remoteiptrustedproxy"
+                | "timeout"
+                | "keepalive"
+                | "keepalivetimeout"
+                | "maxkeepaliverequests"
+                | "hostnamelookups"
+                | "usecanonicalname"
+                | "servertokens"
+                | "serversignature"
+                | "traceenable"
+                | "limitrequestline"
+                | "limitrequestfields"
+                | "limitrequestfieldsize"
+                | "maxrequestworkers"
+                | "serverlimit"
+                | "listenbacklog"
+                | "gracefulshutdowntimeout"
+                | "requestreadtimeout"
+                | "limitrequestbody"
+                | "allowencodedslashes"
+                | "typesconfig"
+                | "addencoding"
+                | "cacheroot"
+                | "cachedefaultexpire"
+                | "cachemaxexpire"
+                | "cacheminexpire"
+                | "cachemaxfilesize"
+                | "cachemaxdisksize"
+                | "cachemaxmemorysize"
+                | "cacheminsize"
+                | "cacheignorenolastmod"
+                | "cacheignorecachecontrol"
+                | "cachestorenostore"
+                | "cachestoreprivate"
+                | "cacheignorequerystring"
+                | "cacheheader"
+                | "cachedetailheader"
+                | "cachelastmodifiedfactor"
+                | "proxyhctemplate"
+        ) && (section != SectionKind::Server || inside_vhost)
+        {
+            self.directive_error(
+                loc,
+                format!(
+                    "directive '{name}' is not supported outside global server context; refusing to globalize a scoped Apache value"
+                ),
+            );
+            return;
+        }
+        if matches!(
+            name,
+            "servername"
+                | "serveradmin"
+                | "documentroot"
+                | "errorlog"
+                | "accessfilename"
+                | "alias"
+                | "scriptalias"
+                | "aliasmatch"
+                | "scriptaliasmatch"
+                | "rewritemap"
+                | "proxypass"
+                | "proxypassreverse"
+                | "proxypassmatch"
+                | "cacheenable"
+                | "cachedisable"
+                | "customlog"
+                | "sslengine"
+                | "sslcertificatefile"
+                | "sslcertificatekeyfile"
+                | "sslcertificatechainfile"
+                | "sslusestapling"
+                | "sslstaplingforceurl"
+                | "sslstaplingrespondertimeout"
+                | "sslstaplingstandardcachetimeout"
+                | "sslstaplingreturnrespondererrors"
+                | "sslsessiontickets"
+                | "sslhonorcipherorder"
+                | "sslverifyclient"
+                | "sslcacertificatefile"
+                | "sslprotocol"
+                | "sslciphersuite"
+                | "sslciphersuitetls13"
+        ) && !matches!(section, SectionKind::Server | SectionKind::VirtualHost)
+        {
+            self.directive_error(
+                loc,
+                format!("directive '{name}' is only supported in server or virtual-host context"),
+            );
+            return;
+        }
         // Directives accepted inside <Limit> must not be warned-and-ignored:
         // Apache applies Options/Header/AddHandler/SetHandler there, and a
         // discarded `Options -ExecCGI` is a remote-execution bypass (F40).
@@ -5108,20 +5824,28 @@ impl Compile {
             }
             "serveralias" => {
                 let Some(i) = self.current_vhost else {
+                    self.directive_error(
+                        loc,
+                        "ServerAlias is only valid inside <VirtualHost>",
+                    );
                     return;
                 };
                 for alias in args {
-                    if let Some(re) = alias.strip_prefix('~') {
-                        if let Err(e) = compile_regex(re) {
-                            self.errors.push(ConfigError {
-                                file: loc.file.clone(),
-                                line: loc.line,
-                                msg: format!("bad ServerAlias regex '{re}': {e}"),
-                            });
-                            continue;
-                        }
+                    let wildcard = alias.contains('*') || alias.contains('?');
+                    let supported_wildcard = alias == "*"
+                        || alias.strip_prefix("*.").is_some_and(|suffix| {
+                            !suffix.is_empty() && !suffix.contains('*') && !suffix.contains('?')
+                        });
+                    if wildcard && !supported_wildcard {
+                        self.directive_error(
+                            loc,
+                            format!(
+                                "ServerAlias wildcard '{alias}' is not implemented; only '*' or a leading '*.suffix' wildcard is supported"
+                            ),
+                        );
+                    } else {
+                        self.vhosts_raw[i].aliases.push(alias.clone());
                     }
-                    self.vhosts_raw[i].aliases.push(alias.clone());
                 }
             }
             "serveradmin" => {
@@ -5213,7 +5937,7 @@ impl Compile {
                             resets = true;
                         }
                         // None/All keep their explicit push_set in the loop
-                        // below; unknown tokens stay warn-only (H8 promotes).
+                        // below; unknown tokens are rejected in that loop.
                         _ => continue,
                     }
                 }
@@ -5238,7 +5962,7 @@ impl Compile {
                         "includesnoexec" => Some(Options(Options::INCLUDES_NOEXEC)),
                         "multiviews" => Some(Options(Options::MULTIVIEWS)),
                         _ => {
-                            self.strict_failure(loc, format!("unsupported Options flag '{a}'"));
+                            self.directive_error(loc, format!("unsupported Options flag '{a}'"));
                             None
                         }
                     };
@@ -5374,19 +6098,10 @@ impl Compile {
                     });
                 } else {
                     for u in unknown {
-                        let msg = format!(
-                            "{}:{}: unsupported AllowOverride category '{u}' (ignored)",
-                            loc.file, loc.line
+                        self.directive_error(
+                            loc,
+                            format!("unsupported AllowOverride category '{u}'"),
                         );
-                        if self.strict {
-                            self.errors.push(ConfigError {
-                                file: loc.file.clone(),
-                                line: loc.line,
-                                msg,
-                            });
-                        } else {
-                            self.warn(msg);
-                        }
                     }
                 }
             }
@@ -5521,11 +6236,14 @@ impl Compile {
                 if args.len() < 2 {
                     return;
                 }
-                let Ok(code) = args[0].parse::<u16>() else {
+                let Ok(code @ 400..=599) = args[0].parse::<u16>() else {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
-                        msg: format!("unsupported HTTP response code {}", args[0]),
+                        msg: format!(
+                            "ErrorDocument requires an HTTP error status from 400 through 599, got {}",
+                            args[0]
+                        ),
                     });
                     return;
                 };
@@ -5584,15 +6302,11 @@ impl Compile {
                 }
             }
             "redirectmatch" => {
-                if args.len() >= 2 {
-                    let (status, rest) = match args[0].parse::<u16>() {
-                        Ok(s) => (s, &args[1..]),
-                        _ => (302, &args[..]),
-                    };
-                    match compile_regex(&rest[0]) {
+                match parse_redirect_arguments(args, None) {
+                    Ok((status, pattern, target)) => match compile_regex(&pattern) {
                         Ok(regex) => scope.mapping_policy.redirects.push(Redirect {
                             from: String::new(),
-                            to: rest[1..].join(" "),
+                            to: target,
                             status,
                             regex: Some(Arc::new(regex)),
                         }),
@@ -5601,43 +6315,24 @@ impl Compile {
                             line: loc.line,
                             msg: format!("bad RedirectMatch regex: {e}"),
                         }),
-                    }
-                } else {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "RedirectMatch requires a pattern".into(),
-                    });
+                    },
+                    Err(error) => self.directive_error(loc, error),
                 }
             }
             "redirect" | "redirectpermanent" | "redirecttemp" => {
-                if args.len() >= 2 {
-                    let force = if name == "redirectpermanent" {
-                        Some(301)
-                    } else if name == "redirecttemp" {
-                        Some(302)
-                    } else {
-                        None
-                    };
-                    let (status, rest) = match force {
-                        Some(s) => (s, &args[..]),
-                        None => match args[0].parse::<u16>() {
-                            Ok(s) => (s, &args[1..]),
-                            _ => (302, &args[..]),
-                        },
-                    };
-                    scope.mapping_policy.redirects.push(Redirect {
-                        from: rest[0].clone(),
-                        to: rest[1..].join(" "),
+                let forced = match name {
+                    "redirectpermanent" => Some(301),
+                    "redirecttemp" => Some(302),
+                    _ => None,
+                };
+                match parse_redirect_arguments(args, forced) {
+                    Ok((status, from, to)) => scope.mapping_policy.redirects.push(Redirect {
+                        from,
+                        to,
                         status,
                         regex: None,
-                    });
-                } else {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!("{name} requires a source path"),
-                    });
+                    }),
+                    Err(error) => self.directive_error(loc, error),
                 }
             }
             "rewritemap" => {
@@ -5867,7 +6562,7 @@ impl Compile {
                 // option silently degraded Inherit to Off (Some(false)).
                 for a in args {
                     if !a.eq_ignore_ascii_case("Inherit") {
-                        self.strict_failure(loc, format!("unsupported RewriteOptions flag '{a}'"));
+                        self.directive_error(loc, format!("unsupported RewriteOptions flag '{a}'"));
                     }
                 }
                 scope.rewrite_policy.rewrite_inherit =
@@ -5875,7 +6570,7 @@ impl Compile {
             }
             "addtype" => {
                 if args.len() < 2 {
-                    self.strict_failure(
+                    self.directive_error(
                         loc,
                         "AddType requires a MIME-type and one or more extensions",
                     );
@@ -5894,7 +6589,7 @@ impl Compile {
             }
             "addhandler" => {
                 if args.len() < 2 {
-                    self.strict_failure(
+                    self.directive_error(
                         loc,
                         "AddHandler requires a handler-name and one or more extensions",
                     );
@@ -5955,7 +6650,10 @@ impl Compile {
                     scope.content_policy.default_charset = Some(a);
                 }
             }
-            "defaultruntime" => {}
+            "defaultruntime" => self.warn(format!(
+                "{}:{}: DefaultRuntime is accepted for compatibility and has no Vapache effect",
+                loc.file, loc.line
+            )),
             "fileetag" => {
                 let mut v = 0u32;
                 for a in args {
@@ -5965,16 +6663,23 @@ impl Compile {
                         "inode" => v |= ETAG_INODE,
                         "mtime" => v |= ETAG_MTIME,
                         "size" => v |= ETAG_SIZE,
-                        _ => {}
+                        _ => self.directive_error(
+                            loc,
+                            format!("FileETag contains unsupported keyword '{a}'"),
+                        ),
                     }
                 }
                 scope.content_policy.file_etag = Some(v);
             }
             "enablesendfile" => {
-                scope.content_policy.enable_sendfile = Some(first().eq_ignore_ascii_case("on"));
+                if let Some(enabled) = self.on_off_arg(loc, "EnableSendfile", args) {
+                    scope.content_policy.enable_sendfile = Some(enabled);
+                }
             }
             "directoryslash" => {
-                scope.content_policy.directory_slash = Some(first().eq_ignore_ascii_case("on"));
+                if let Some(enabled) = self.on_off_arg(loc, "DirectorySlash", args) {
+                    scope.content_policy.directory_slash = Some(enabled);
+                }
             }
             "accessfilename" => {
                 scope.content_policy.access_file_names = Some(args.to_vec());
@@ -5994,11 +6699,40 @@ impl Compile {
                     idx = 1;
                 }
                 if args.len() < idx + 2 {
-                    self.strict_failure(loc, "Header requires an action and a header name");
+                    self.directive_error(loc, "Header requires an action and a header name");
                     return;
                 }
                 let action = args[idx].to_ascii_lowercase();
                 let name = args[idx + 1].trim_end_matches(':').to_string();
+                let minimum = match action.as_str() {
+                    "set" | "add" => idx + 3,
+                    "unset" => idx + 2,
+                    _ => {
+                        self.directive_error(
+                            loc,
+                            format!(
+                                "Header action '{}' is not implemented; refusing to ignore a response-header policy",
+                                action
+                            ),
+                        );
+                        return;
+                    }
+                };
+                let conditional = args[idx + 2..].iter().any(|arg| {
+                    arg.eq_ignore_ascii_case("early")
+                        || arg.to_ascii_lowercase().starts_with("env=")
+                        || arg.to_ascii_lowercase().starts_with("expr=")
+                });
+                if args.len() < minimum
+                    || (action == "unset" && args.len() != minimum)
+                    || conditional
+                {
+                    self.directive_error(
+                        loc,
+                        "conditional or extended Header forms are not implemented; refusing to broaden the header policy",
+                    );
+                    return;
+                }
                 let value = args[idx + 2..].join(" ");
                 match (action.as_str(), always) {
                     ("set", true) => scope.header_policy.always_set_headers.push((name, value)),
@@ -6007,34 +6741,39 @@ impl Compile {
                     ("add", false) => scope.header_policy.add_headers.push((name, value)),
                     ("unset", true) => scope.header_policy.always_unset_headers.push(name),
                     ("unset", false) => scope.header_policy.unset_headers.push(name),
-                    _ => self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!(
-                            "Header action '{}' is not implemented; refusing to ignore a response-header policy",
-                            action
-                        ),
-                    }),
+                    _ => unreachable!("Header action was validated above"),
                 }
             }
             "expiresactive" => {
-                scope.header_policy.expires_active = Some(first().eq_ignore_ascii_case("on"));
+                if let Some(enabled) = self.on_off_arg(loc, "ExpiresActive", args) {
+                    scope.header_policy.expires_active = Some(enabled);
+                }
             }
             "expiresdefault" => {
-                scope.header_policy.expires_default = Some(joined());
+                let spec = joined();
+                if crate::expires::valid_spec(&spec) {
+                    scope.header_policy.expires_default = Some(spec);
+                } else {
+                    self.directive_error(loc, "ExpiresDefault has invalid expiry syntax");
+                }
             }
             "expiresbytype" => {
                 if args.len() < 2 {
-                    self.strict_failure(
+                    self.directive_error(
                         loc,
                         "ExpiresByType requires a MIME-type and an expiry time",
                     );
                     return;
                 }
-                scope
-                    .header_policy
-                    .expires_by_type
-                    .push((args[0].to_ascii_lowercase(), args[1..].join(" ")));
+                let spec = args[1..].join(" ");
+                if crate::expires::valid_spec(&spec) {
+                    scope
+                        .header_policy
+                        .expires_by_type
+                        .push((args[0].to_ascii_lowercase(), spec));
+                } else {
+                    self.directive_error(loc, "ExpiresByType has invalid expiry syntax");
+                }
             }
             "typesconfig" => {
                 let p = PathBuf::from(first());
@@ -6064,12 +6803,10 @@ impl Compile {
                 }
             }
             "cacheenable" => {
-                if args.len() >= 2 {
-                    scope
-                        .rewrite_policy
-                        .cache_enable
-                        .push((args[0].to_ascii_lowercase(), args[1].clone()));
-                }
+                scope.rewrite_policy.cache_enable.push((
+                    args[0].to_ascii_lowercase(),
+                    args.get(1).cloned().unwrap_or_else(|| "/".into()),
+                ));
             }
             "cachedisable" => {
                 if let Some(prefix) = args.first() {
@@ -6085,69 +6822,92 @@ impl Compile {
                 });
             }
             "cachedefaultexpire" => {
-                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                if let Some(n) = self.u64_arg(loc, "CacheDefaultExpire", args) {
                     self.cfg.cache.default_expire = n;
                 }
             }
             "cachemaxexpire" => {
-                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                if let Some(n) = self.u64_arg(loc, "CacheMaxExpire", args) {
                     self.cfg.cache.max_expire = n;
                 }
             }
             "cacheminexpire" => {
-                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                if let Some(n) = self.u64_arg(loc, "CacheMinExpire", args) {
                     self.cfg.cache.min_expire = n;
                 }
             }
             "cachemaxfilesize" => {
-                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                if let Some(n) = self.u64_arg(loc, "CacheMaxFileSize", args) {
                     self.cfg.cache.max_file_size = n;
                 }
             }
             "cachemaxdisksize" => {
-                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                if let Some(n) = self.u64_arg(loc, "CacheMaxDiskSize", args) {
                     self.cfg.cache.max_disk_size = n;
                 }
             }
             "cachemaxmemorysize" => {
-                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                if let Some(n) = self.u64_arg(loc, "CacheMaxMemorySize", args) {
                     self.cfg.cache.max_memory_size = n;
                 }
             }
             "cacheminsize" => {
-                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                if let Some(n) = self.u64_arg(loc, "CacheMinSize", args) {
                     self.cfg.cache.min_file_size = n;
                 }
             }
             "cacheignorenolastmod" => {
-                self.cfg.cache.ignore_no_last_mod = first().eq_ignore_ascii_case("on");
+                if let Some(enabled) = self.on_off_arg(loc, "CacheIgnoreNoLastMod", args) {
+                    self.cfg.cache.ignore_no_last_mod = enabled;
+                }
             }
             "cacheignorecachecontrol" => {
-                self.cfg.cache.ignore_cache_control = first().eq_ignore_ascii_case("on");
+                if let Some(enabled) = self.on_off_arg(loc, "CacheIgnoreCacheControl", args) {
+                    self.cfg.cache.ignore_cache_control = enabled;
+                }
             }
             "cachestorenostore" => {
-                self.cfg.cache.store_no_store = first().eq_ignore_ascii_case("on");
+                if let Some(enabled) = self.on_off_arg(loc, "CacheStoreNoStore", args) {
+                    self.cfg.cache.store_no_store = enabled;
+                }
             }
             "cachestoreprivate" => {
-                self.cfg.cache.store_private = first().eq_ignore_ascii_case("on");
+                if let Some(enabled) = self.on_off_arg(loc, "CacheStorePrivate", args) {
+                    self.cfg.cache.store_private = enabled;
+                }
             }
             "cacheignorequerystring" => {
-                self.cfg.cache.ignore_query_string = first().eq_ignore_ascii_case("on");
+                if let Some(enabled) = self.on_off_arg(loc, "CacheIgnoreQueryString", args) {
+                    self.cfg.cache.ignore_query_string = enabled;
+                }
             }
             "cacheheader" => {
-                self.cfg.cache.header = first().eq_ignore_ascii_case("on");
+                if let Some(enabled) = self.on_off_arg(loc, "CacheHeader", args) {
+                    self.cfg.cache.header = enabled;
+                }
             }
             "cachedetailheader" => {
-                self.cfg.cache.detail_header = first().eq_ignore_ascii_case("on");
+                if let Some(enabled) = self.on_off_arg(loc, "CacheDetailHeader", args) {
+                    self.cfg.cache.detail_header = enabled;
+                }
             }
             "cachelastmodifiedfactor" => {
-                if let Ok(v) = first().parse::<f64>() {
-                    self.cfg.cache.last_modified_factor = v.clamp(0.0, 1.0);
+                let parsed = match args {
+                    [value] => value.parse::<f64>().ok().filter(|v| v.is_finite()),
+                    _ => None,
+                };
+                if let Some(v) = parsed.filter(|v| (0.0..=1.0).contains(v)) {
+                    self.cfg.cache.last_modified_factor = v;
+                } else {
+                    self.directive_error(
+                        loc,
+                        "CacheLastModifiedFactor requires a finite number from 0 through 1",
+                    );
                 }
             }
             "proxypass" => {
                 if args.len() < 2 {
-                    self.strict_failure(loc, "ProxyPass requires a path and a backend URL");
+                    self.directive_error(loc, "ProxyPass requires a path and a backend URL");
                     return;
                 }
                 if args[1] == "!" || args[1].starts_with('!') {
@@ -6170,6 +6930,10 @@ impl Compile {
                     self.require_capability(Capability::FastCgi, loc, "ProxyPass FastCGI");
                 }
                 if args[0].starts_with('!') {
+                    self.directive_error(
+                        loc,
+                        "ProxyPass path cannot start with '!'; exclusions use '!' as the backend argument",
+                    );
                     return;
                 }
                 let mut rule = ProxyPassRule {
@@ -6182,6 +6946,10 @@ impl Compile {
                 self.next_route += 1;
                 for item in &args[2..] {
                     let Some((key, value)) = item.split_once('=') else {
+                        self.directive_error(
+                            loc,
+                            format!("ProxyPass parameter '{item}' must use name=value syntax"),
+                        );
                         continue;
                     };
                     match key.to_ascii_lowercase().as_str() {
@@ -6189,7 +6957,7 @@ impl Compile {
                         "failonstatus" => {
                             let (statuses, unparsable) = parse_status_list(value);
                             if !unparsable.is_empty() {
-                                self.strict_failure(
+                                self.directive_error(
                                     loc,
                                     format!(
                                         "ProxyPass failonstatus contains non-numeric entries {unparsable:?}"
@@ -6198,13 +6966,23 @@ impl Compile {
                             }
                             rule.fail_on_status = statuses;
                         }
-                        _ => {}
+                        _ => self.directive_error(
+                            loc,
+                            format!("unsupported ProxyPass parameter '{key}'"),
+                        ),
                     }
                 }
                 scope.proxy_policy.proxy_passes.push(rule);
             }
             "proxypassreverse" => {
                 if args.len() < 2 {
+                    return;
+                }
+                if args.len() > 2 {
+                    self.directive_error(
+                        loc,
+                        "ProxyPassReverse options are not implemented; refusing to ignore them",
+                    );
                     return;
                 }
                 if !supported_proxy_backend(&args[1], false) {
@@ -6222,6 +7000,13 @@ impl Compile {
             }
             "proxypassmatch" => {
                 if args.len() < 2 {
+                    return;
+                }
+                if args.len() > 2 {
+                    self.directive_error(
+                        loc,
+                        "ProxyPassMatch parameters are not implemented; refusing to ignore them",
+                    );
                     return;
                 }
                 if args[1] == "!" || args[1].starts_with('!') {
@@ -6345,51 +7130,85 @@ impl Compile {
                 }
             }
             "deflatefilternote" | "deflatebuffersize" | "deflatememlevel"
-            | "deflatewindowssize" => {}
+            | "deflatewindowssize" => self.directive_error(
+                loc,
+                format!(
+                    "directive '{name}' is not implemented by the Rust compression backend; refusing to ignore its resource policy"
+                ),
+            ),
             "deflatecompressionlevel" => {
-                let Some(n) = parse_u32_arg(args) else { return };
+                let Some(n) = self.u32_arg(loc, "DeflateCompressionLevel", args) else {
+                    return;
+                };
                 if n <= 9 {
                     scope.compression_policy.deflate_level = Some(n);
+                } else {
+                    self.directive_error(loc, "DeflateCompressionLevel must be from 0 through 9");
                 }
             }
             "brotlicompressionquality" => {
-                let Some(n) = parse_u32_arg(args) else { return };
+                let Some(n) = self.u32_arg(loc, "BrotliCompressionQuality", args) else {
+                    return;
+                };
                 if n <= 11 {
                     scope.compression_policy.brotli_quality = Some(n);
+                } else {
+                    self.directive_error(loc, "BrotliCompressionQuality must be from 0 through 11");
                 }
             }
             "deflatealteretag" => {
                 if let Some(v) = args.first().and_then(|s| AlterEtag::parse(s)) {
                     scope.compression_policy.deflate_alter_etag = Some(v);
+                } else {
+                    self.directive_error(
+                        loc,
+                        "DeflateAlterETag requires AddSuffix, NoChange, or Remove",
+                    );
                 }
             }
             "brotlialteretag" | "brotlicompressionalteretag" => {
                 if let Some(v) = args.first().and_then(|s| AlterEtag::parse(s)) {
                     scope.compression_policy.brotli_alter_etag = Some(v);
+                } else {
+                    self.directive_error(
+                        loc,
+                        "BrotliAlterETag requires AddSuffix, NoChange, or Remove",
+                    );
                 }
             }
-            "addcharset" | "addencoding" | "addlanguage" => {
-                if name == "addencoding" && args.len() >= 2 {
-                    for e in &args[1..] {
-                        self.cfg.mime.encodings.insert(
-                            e.trim_start_matches('.').to_ascii_lowercase(),
-                            args[0].clone(),
-                        );
-                    }
+            "addencoding" => {
+                for e in &args[1..] {
+                    self.cfg.mime.encodings.insert(
+                        e.trim_start_matches('.').to_ascii_lowercase(),
+                        args[0].clone(),
+                    );
                 }
             }
+            "addcharset" | "addlanguage" => self.directive_error(
+                loc,
+                format!(
+                    "{name} is not implemented; refusing to ignore a content metadata directive"
+                ),
+            ),
             "listen" => {
                 // Apache allows a protocol hint after the address, e.g.
                 // `Listen 443 https`; the hint does not enable TLS by itself.
-                for a in args.iter().take(1) {
-                    match parse_listen(a) {
-                        Ok(l) => self.cfg.listeners.push(l),
-                        Err(e) => self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: e,
-                        }),
+                if let Some(protocol) = args.get(1) {
+                    if !matches!(protocol.to_ascii_lowercase().as_str(), "http" | "https") {
+                        self.directive_error(
+                            loc,
+                            format!("unsupported Listen protocol hint '{protocol}'"),
+                        );
+                        return;
                     }
+                }
+                match parse_listen(&args[0]) {
+                    Ok(listener) => self.cfg.listeners.push(listener),
+                    Err(error) => self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: error,
+                    }),
                 }
             }
             "user" => self.cfg.user = first(),
@@ -6410,7 +7229,40 @@ impl Compile {
                     self.cfg.error_log = p;
                 }
             }
-            "loglevel" => self.cfg.log_level = first(),
+            "loglevel" => {
+                let valid_level = |value: &str| {
+                    let level = value.rsplit_once(':').map_or(value, |(_, level)| level);
+                    matches!(
+                        level.to_ascii_lowercase().as_str(),
+                        "emerg"
+                            | "alert"
+                            | "crit"
+                            | "error"
+                            | "warn"
+                            | "notice"
+                            | "info"
+                            | "debug"
+                            | "trace1"
+                            | "trace2"
+                            | "trace3"
+                            | "trace4"
+                            | "trace5"
+                            | "trace6"
+                            | "trace7"
+                            | "trace8"
+                    )
+                };
+                if args.len() > 1 || first().contains(':') {
+                    self.directive_error(
+                        loc,
+                        "module-specific LogLevel is not implemented; refusing to replace the configured audit policy with a global level",
+                    );
+                } else if args.iter().all(|value| valid_level(value)) {
+                    self.cfg.log_level = first();
+                } else {
+                    self.directive_error(loc, "LogLevel contains an invalid level");
+                }
+            }
             "logformat" => {
                 if args.len() >= 2 {
                     let fmt = args[0].clone();
@@ -6419,13 +7271,10 @@ impl Compile {
                 }
             }
             "customlog" => {
-                if args.len() < 2 {
-                    return;
-                }
                 let cl = CustomLog {
                     path: args[0].clone(),
                     format: args[1].clone(),
-                    condition: args.get(2).cloned(),
+                    condition: None,
                 };
                 if let Some(i) = self.current_vhost {
                     self.vhosts_raw[i].custom_logs.push(cl);
@@ -6497,25 +7346,37 @@ impl Compile {
                 }
             }
             "timeout" => {
-                if let Some(n) = parse_u32_arg(args) {
+                if let Some(n) = self.u32_arg(loc, "Timeout", args) {
                     let d = Duration::from_secs(n as u64);
                     self.cfg.timeout = d;
                     self.cfg.request_header_timeout = d;
                     self.cfg.request_body_timeout = d;
                 }
             }
-            "keepalive" => self.cfg.keep_alive = !first().eq_ignore_ascii_case("off"),
+            "keepalive" => {
+                if let Some(enabled) = self.on_off_arg(loc, "KeepAlive", args) {
+                    self.cfg.keep_alive = enabled;
+                }
+            }
             "keepalivetimeout" => {
-                if let Some(n) = parse_u32_arg(args) {
+                if let Some(n) = self.u32_arg(loc, "KeepAliveTimeout", args) {
                     self.cfg.keep_alive_timeout = Duration::from_secs(n as u64);
                 }
             }
             "maxkeepaliverequests" => {
-                if let Some(n) = parse_u32_arg(args) {
+                if let Some(n) = self.u32_arg(loc, "MaxKeepAliveRequests", args) {
                     self.cfg.max_keep_alive_requests = n as usize;
                 }
             }
-            "hostnamelookups" => self.cfg.hostname_lookups = first().eq_ignore_ascii_case("on"),
+            "hostnamelookups" => match first().to_ascii_lowercase().as_str() {
+                "on" => self.cfg.hostname_lookups = true,
+                "off" => self.cfg.hostname_lookups = false,
+                "double" => self.directive_error(
+                    loc,
+                    "HostnameLookups Double is not implemented; refusing to omit forward-confirmation",
+                ),
+                _ => self.directive_error(loc, "HostnameLookups requires On, Off, or Double"),
+            },
             "usecanonicalname" => match first().to_ascii_lowercase().as_str() {
                 "on" => self.cfg.use_canonical_name = true,
                 "off" => self.cfg.use_canonical_name = false,
@@ -6531,23 +7392,29 @@ impl Compile {
                 }),
             },
             "servertokens" => {
-                self.cfg.server_tokens = match first().to_ascii_lowercase().as_str() {
-                    "full" => ServerTokens::Full,
-                    "os" => ServerTokens::Os,
-                    "minimal" => ServerTokens::Minimal,
-                    "minor" => ServerTokens::Minor,
-                    "major" => ServerTokens::Major,
-                    "prod" => ServerTokens::Prod,
-                    _ => ServerTokens::Full,
+                let tokens = match first().to_ascii_lowercase().as_str() {
+                    "full" => Some(ServerTokens::Full),
+                    "os" => Some(ServerTokens::Os),
+                    "minimal" => Some(ServerTokens::Minimal),
+                    "minor" => Some(ServerTokens::Minor),
+                    "major" => Some(ServerTokens::Major),
+                    "prod" => Some(ServerTokens::Prod),
+                    _ => None,
                 };
-                self.cfg.server_software = server_software_for_tokens(self.cfg.server_tokens);
+                if let Some(tokens) = tokens {
+                    self.cfg.server_tokens = tokens;
+                    self.cfg.server_software = server_software_for_tokens(tokens);
+                } else {
+                    self.directive_error(loc, "ServerTokens has an invalid value");
+                }
             }
             "serversignature" => {
-                self.cfg.server_signature = match first().to_ascii_lowercase().as_str() {
-                    "off" => ServerSignature::Off,
-                    "email" => ServerSignature::Email,
-                    _ => ServerSignature::On,
-                };
+                match first().to_ascii_lowercase().as_str() {
+                    "on" => self.cfg.server_signature = ServerSignature::On,
+                    "off" => self.cfg.server_signature = ServerSignature::Off,
+                    "email" => self.cfg.server_signature = ServerSignature::Email,
+                    _ => self.directive_error(loc, "ServerSignature requires On, Off, or Email"),
+                }
             }
             "traceenable" => {
                 if args.len() != 1 {
@@ -6575,32 +7442,61 @@ impl Compile {
                 }
             }
             "limitrequestline" => {
-                if let Some(n) = parse_u32_arg(args) {
+                if let Some(n) = self.u32_arg(loc, "LimitRequestLine", args) {
                     self.cfg.limit_request_line = n as usize;
                 }
             }
             "limitrequestfields" => {
-                if let Some(n) = parse_u32_arg(args) {
+                if let Some(n) = self.u32_arg(loc, "LimitRequestFields", args) {
                     self.cfg.limit_request_fields = n as usize;
                 }
             }
             "limitrequestfieldsize" => {
-                if let Some(n) = parse_u32_arg(args) {
+                if let Some(n) = self.u32_arg(loc, "LimitRequestFieldSize", args) {
                     self.cfg.limit_request_field_size = n as usize;
                 }
             }
-            "maxrequestworkers" | "serverlimit" => {
-                if let Some(n) = parse_u32_arg(args) {
-                    self.cfg.max_request_workers = n.max(1) as usize;
+            "maxrequestworkers" => {
+                if let Some(n) = self.u32_arg(loc, name, args) {
+                    if n == 0 {
+                        self.directive_error(loc, "MaxRequestWorkers must be greater than zero");
+                    } else if self.server_limit.is_some_and(|limit| n as usize > limit) {
+                        self.directive_error(loc, "MaxRequestWorkers exceeds ServerLimit");
+                    } else {
+                        self.cfg.max_request_workers = n as usize;
+                        self.max_request_workers_set = true;
+                    }
+                }
+            }
+            "serverlimit" => {
+                if let Some(n) = self.u32_arg(loc, name, args) {
+                    if n == 0 {
+                        self.directive_error(loc, "ServerLimit must be greater than zero");
+                    } else {
+                        let limit = n as usize;
+                        if self.max_request_workers_set && self.cfg.max_request_workers > limit {
+                            self.directive_error(loc, "MaxRequestWorkers exceeds ServerLimit");
+                        } else {
+                            self.server_limit = Some(limit);
+                            self.cfg.max_request_workers =
+                                self.cfg.max_request_workers.min(limit);
+                        }
+                    }
                 }
             }
             "listenbacklog" => {
-                if let Some(n) = parse_u32_arg(args) {
-                    self.cfg.listen_backlog = n.max(1) as i32;
+                if let Some(n) = self.u32_arg(loc, "ListenBacklog", args) {
+                    match i32::try_from(n) {
+                        Ok(n) if n > 0 => self.cfg.listen_backlog = n,
+                        _ => self.directive_error(
+                            loc,
+                            format!("ListenBacklog must be from 1 through {}", i32::MAX),
+                        ),
+                    }
                 }
             }
             "gracefulshutdowntimeout" => {
-                if let Some(n) = parse_u32_arg(args) {
+                if let Some(n) = self.u32_arg(loc, "GracefulShutdownTimeout", args) {
                     self.cfg.graceful_shutdown_timeout = Duration::from_secs(n as u64);
                 }
             }
@@ -6608,6 +7504,7 @@ impl Compile {
                 let raw = args.join(" ");
                 let Some((header, body, header_rate, body_rate)) = parse_request_read_timeout(&raw)
                 else {
+                    self.directive_error(loc, "RequestReadTimeout has invalid syntax");
                     return;
                 };
                 if let Some(header) = header {
@@ -6624,16 +7521,20 @@ impl Compile {
                 }
             }
             "limitrequestbody" => {
-                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                if let Some(n) = self.u64_arg(loc, "LimitRequestBody", args) {
                     self.cfg.limit_request_body = n;
                 }
             }
             "allowencodedslashes" => {
-                self.cfg.encoded_slashes = match first().to_ascii_lowercase().as_str() {
-                    "on" => EncodedSlashes::On,
-                    "nodecode" => EncodedSlashes::NoDecode,
-                    _ => EncodedSlashes::Off,
-                };
+                match first().to_ascii_lowercase().as_str() {
+                    "on" => self.cfg.encoded_slashes = EncodedSlashes::On,
+                    "off" => self.cfg.encoded_slashes = EncodedSlashes::Off,
+                    "nodecode" => self.cfg.encoded_slashes = EncodedSlashes::NoDecode,
+                    _ => self.directive_error(
+                        loc,
+                        "AllowEncodedSlashes requires On, Off, or NoDecode",
+                    ),
+                }
             }
             "satisfy" => {
                 self.require_capability(Capability::LegacyAuthz, loc, "Satisfy");
@@ -6712,7 +7613,10 @@ impl Compile {
                     });
                 }
             }
-            "defaultruntimedir" => {}
+            "defaultruntimedir" => self.warn(format!(
+                "{}:{}: DefaultRuntimeDir is accepted for Apache layout compatibility; Vapache runtime paths are compiled separately",
+                loc.file, loc.line
+            )),
             "sslrandomseed" => {
                 let valid_context = args.first().is_some_and(|value| {
                     matches!(value.to_ascii_lowercase().as_str(), "startup" | "connect")
@@ -6740,11 +7644,17 @@ impl Compile {
                 // or executed by this process.
             }
             "sslpassphrasedialog" => {
-                if args.len() != 1 {
+                let value = first();
+                let supported = value.eq_ignore_ascii_case("builtin")
+                    || value
+                        .strip_prefix("exec:")
+                        .is_some_and(|program| Path::new(program).is_absolute());
+                if args.len() != 1 || !supported {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
-                        msg: "SSLPassPhraseDialog requires exactly one argument".into(),
+                        msg: "SSLPassPhraseDialog requires builtin or exec:/absolute/program"
+                            .into(),
                     });
                 } else {
                     self.warn(format!(
@@ -7018,7 +7928,23 @@ impl Compile {
                     ));
                 }
             }
-            "sslstaplingcache" => {}
+            "sslstaplingcache" => {
+                let value = first();
+                let valid = value
+                    .split_once(':')
+                    .is_some_and(|(provider, target)| !provider.is_empty() && !target.is_empty());
+                if !valid {
+                    self.directive_error(
+                        loc,
+                        "SSLStaplingCache requires a provider:target value",
+                    );
+                } else {
+                    self.warn(format!(
+                        "{}:{}: SSLStaplingCache uses Vapache's bounded in-process OCSP cache; the Apache provider path is ignored",
+                        loc.file, loc.line
+                    ));
+                }
+            }
             "sslproxycacertificatefile" => {
                 let p = PathBuf::from(first());
                 scope.proxy_policy.proxy_ca_file = Some(if p.is_absolute() {
@@ -7031,6 +7957,10 @@ impl Compile {
             }
             "balancermember" => {
                 let Some(i) = self.current_balancer else {
+                    self.directive_error(
+                        loc,
+                        "BalancerMember outside <Proxy balancer://...> is not implemented",
+                    );
                     return;
                 };
                 let Some(url) = args.first() else {
@@ -7042,37 +7972,86 @@ impl Compile {
                 };
                 for item in &args[1..] {
                     let Some((key, value)) = item.split_once('=') else {
+                        self.directive_error(
+                            loc,
+                            format!("BalancerMember parameter '{item}' must use name=value syntax"),
+                        );
                         continue;
                     };
                     match key.to_ascii_lowercase().as_str() {
                         "hcmethod" => member.hcmethod = Some(value.to_string()),
                         "hcuri" => member.hcuri = Some(value.to_string()),
-                        "hcinterval" => member.hcinterval = parse_duration(value),
-                        "hcpasses" => member.hcpasses = value.parse().ok(),
-                        "hcfails" => member.hcfails = value.parse().ok(),
+                        "hcinterval" => match parse_duration(value) {
+                            Some(duration) => member.hcinterval = Some(duration),
+                            None => self.directive_error(
+                                loc,
+                                format!("invalid BalancerMember hcinterval '{value}'"),
+                            ),
+                        },
+                        "hcpasses" => match value.parse() {
+                            Ok(passes) => member.hcpasses = Some(passes),
+                            Err(_) => self.directive_error(
+                                loc,
+                                format!("invalid BalancerMember hcpasses '{value}'"),
+                            ),
+                        },
+                        "hcfails" => match value.parse() {
+                            Ok(fails) => member.hcfails = Some(fails),
+                            Err(_) => self.directive_error(
+                                loc,
+                                format!("invalid BalancerMember hcfails '{value}'"),
+                            ),
+                        },
                         "template" => member.template = Some(value.to_string()),
                         "route" => member.route = Some(value.to_string()),
-                        _ => {}
+                        _ => self.directive_error(
+                            loc,
+                            format!("unsupported BalancerMember parameter '{key}'"),
+                        ),
                     }
                 }
                 self.cfg.balancers[i].members.push(member);
             }
             "proxyset" => {
                 let Some(i) = self.current_balancer else {
+                    self.directive_error(
+                        loc,
+                        "ProxySet outside <Proxy balancer://...> is not implemented",
+                    );
                     return;
                 };
                 for item in args {
                     let Some((key, value)) = item.split_once('=') else {
+                        self.directive_error(
+                            loc,
+                            format!("ProxySet parameter '{item}' must use name=value syntax"),
+                        );
                         continue;
                     };
                     match key.to_ascii_lowercase().as_str() {
                         "hcmethod" => self.cfg.balancers[i].health.method = Some(value.to_string()),
                         "hcuri" => self.cfg.balancers[i].health.uri = Some(value.to_string()),
-                        "hcinterval" => {
-                            self.cfg.balancers[i].health.interval = parse_duration(value)
-                        }
-                        "hcpasses" => self.cfg.balancers[i].health.passes = value.parse().ok(),
-                        "hcfails" => self.cfg.balancers[i].health.fails = value.parse().ok(),
+                        "hcinterval" => match parse_duration(value) {
+                            Some(duration) => self.cfg.balancers[i].health.interval = Some(duration),
+                            None => self.directive_error(
+                                loc,
+                                format!("invalid ProxySet hcinterval '{value}'"),
+                            ),
+                        },
+                        "hcpasses" => match value.parse() {
+                            Ok(passes) => self.cfg.balancers[i].health.passes = Some(passes),
+                            Err(_) => self.directive_error(
+                                loc,
+                                format!("invalid ProxySet hcpasses '{value}'"),
+                            ),
+                        },
+                        "hcfails" => match value.parse() {
+                            Ok(fails) => self.cfg.balancers[i].health.fails = Some(fails),
+                            Err(_) => self.directive_error(
+                                loc,
+                                format!("invalid ProxySet hcfails '{value}'"),
+                            ),
+                        },
                         "stickysession" => {
                             self.cfg.balancers[i].sticky_cookie = Some(value.to_string())
                         }
@@ -7082,7 +8061,7 @@ impl Compile {
                         "failonstatus" => {
                             let (statuses, unparsable) = parse_status_list(value);
                             if !unparsable.is_empty() {
-                                self.strict_failure(
+                                self.directive_error(
                                     loc,
                                     format!(
                                         "ProxySet failonstatus contains non-numeric entries {unparsable:?}"
@@ -7091,7 +8070,10 @@ impl Compile {
                             }
                             self.cfg.balancers[i].fail_on_status = statuses;
                         }
-                        _ => {}
+                        _ => self.directive_error(
+                            loc,
+                            format!("unsupported ProxySet parameter '{key}'"),
+                        ),
                     }
                 }
             }
@@ -7102,15 +8084,40 @@ impl Compile {
                 let mut template = HealthTemplate::default();
                 for item in &args[1..] {
                     let Some((key, value)) = item.split_once('=') else {
+                        self.directive_error(
+                            loc,
+                            format!("ProxyHCTemplate parameter '{item}' must use name=value syntax"),
+                        );
                         continue;
                     };
                     match key.to_ascii_lowercase().as_str() {
                         "hcmethod" => template.method = Some(value.to_string()),
                         "hcuri" => template.uri = Some(value.to_string()),
-                        "hcinterval" => template.interval = parse_duration(value),
-                        "hcpasses" => template.passes = value.parse().ok(),
-                        "hcfails" => template.fails = value.parse().ok(),
-                        _ => {}
+                        "hcinterval" => match parse_duration(value) {
+                            Some(duration) => template.interval = Some(duration),
+                            None => self.directive_error(
+                                loc,
+                                format!("invalid ProxyHCTemplate hcinterval '{value}'"),
+                            ),
+                        },
+                        "hcpasses" => match value.parse() {
+                            Ok(passes) => template.passes = Some(passes),
+                            Err(_) => self.directive_error(
+                                loc,
+                                format!("invalid ProxyHCTemplate hcpasses '{value}'"),
+                            ),
+                        },
+                        "hcfails" => match value.parse() {
+                            Ok(fails) => template.fails = Some(fails),
+                            Err(_) => self.directive_error(
+                                loc,
+                                format!("invalid ProxyHCTemplate hcfails '{value}'"),
+                            ),
+                        },
+                        _ => self.directive_error(
+                            loc,
+                            format!("unsupported ProxyHCTemplate parameter '{key}'"),
+                        ),
                     }
                 }
                 self.cfg.health_templates.insert(name.clone(), template);
@@ -7185,26 +8192,39 @@ impl Compile {
                     });
                     return;
                 }
+                let policy = joined();
+                if let Err(error) = crate::tls::protocol_policy(Some(&policy)) {
+                    self.directive_error(loc, error);
+                    return;
+                }
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
                     &mut self.cfg.ssl
                 };
-                target.protocols = Some(joined());
+                target.protocols = Some(policy);
             }
             "sslciphersuite" | "sslciphersuitetls13" => {
-                let target = if let Some(i) = self.current_vhost {
-                    &mut self.vhosts_raw[i].ssl
-                } else {
-                    &mut self.cfg.ssl
-                };
-                target.cipher_suite = Some(joined());
-                self.warn(format!(
-                    "{}:{}: {name} is not supported by the Rustls backend; secure default cipher suites are used",
-                    loc.file, loc.line
-                ));
+                self.directive_error(
+                    loc,
+                    format!(
+                        "{name} is not implemented by the Rustls backend; refusing to replace an explicit cipher policy with defaults"
+                    ),
+                );
             }
-            "authtype" => scope.authorization.auth_type = Some(first().to_ascii_lowercase()),
+            "authtype" => {
+                let auth_type = first();
+                if !auth_type.eq_ignore_ascii_case("basic") {
+                    self.directive_error(
+                        loc,
+                        format!(
+                            "AuthType '{auth_type}' is not implemented; only Basic is supported"
+                        ),
+                    );
+                } else {
+                    scope.authorization.auth_type = Some("basic".into());
+                }
+            }
             "authname" => scope.authorization.auth_name = Some(first()),
             "authuserfile" => {
                 let p = PathBuf::from(first());
@@ -7243,11 +8263,7 @@ impl Compile {
                 }
             }
             "defaulttype" => { /* removed in 2.4; accepted for compat */ }
-            _ => match vapache_verified::directive_disposition(
-                is_security_directive(name),
-                self.known.contains(name),
-                self.strict,
-            ) {
+            _ => match self.directive_disposition(identity) {
                 vapache_verified::DirectiveDisposition::FailClosedSecurity => {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
@@ -7257,30 +8273,72 @@ impl Compile {
                         ),
                     });
                 }
-                vapache_verified::DirectiveDisposition::WarnKnown => {
-                    // Recognised Apache directive from a module we do not
-                    // implement yet: harmless for static hosting, warn once.
-                    self.warn(format!(
-                        "{}:{}: directive '{name}' is recognised but not implemented (ignored)",
-                        loc.file, loc.line
-                    ));
+                vapache_verified::DirectiveDisposition::FailClosedKnown => {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!(
+                            "directive '{name}' is recognised but not implemented; refusing to ignore its effect"
+                        ),
+                    });
                 }
-                vapache_verified::DirectiveDisposition::FailClosedStrict => {
+                vapache_verified::DirectiveDisposition::FailClosedUnknown => {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
                         msg: format!("Invalid command '{name}', perhaps misspelled or defined by a module not included in the server configuration"),
                     });
                 }
-                vapache_verified::DirectiveDisposition::WarnUnknown => {
-                    self.warn(format!(
-                        "{}:{}: unknown directive '{name}' ignored (compat mode)",
-                        loc.file, loc.line
-                    ));
-                }
             },
         }
         let _ = joined;
+    }
+}
+
+/// Parse mod_alias redirect operands without treating an unknown status word
+/// as a URL path. Redirect statuses require a target; terminal error statuses
+/// (notably `gone`/410 and numeric 4xx/5xx) deliberately do not.
+pub(crate) fn parse_redirect_arguments(
+    args: &[String],
+    forced_status: Option<u16>,
+) -> Result<(u16, String, String), String> {
+    if let Some(status) = forced_status {
+        return match args {
+            [from, to] => Ok((status, from.clone(), to.clone())),
+            _ => Err("Redirect requires a source and target".into()),
+        };
+    }
+    let Some(first) = args.first() else {
+        return Err("Redirect requires a source path".into());
+    };
+    let keyword = first.to_ascii_lowercase();
+    let explicit = match keyword.as_str() {
+        "permanent" => Some(301),
+        "temp" => Some(302),
+        "seeother" => Some(303),
+        "gone" => Some(410),
+        _ => first.parse::<u16>().ok(),
+    };
+    match explicit {
+        Some(status) if !(300..=599).contains(&status) => {
+            Err(format!("unsupported Redirect status '{status}'"))
+        }
+        Some(status @ 300..=399) => match args {
+            [_, from, to] => Ok((status, from.clone(), to.clone())),
+            _ => Err(format!(
+                "Redirect status {status} requires a source and target"
+            )),
+        },
+        Some(status) => match args {
+            [_, from] => Ok((status, from.clone(), String::new())),
+            _ => Err(format!(
+                "Redirect status {status} requires a source and no target"
+            )),
+        },
+        None => match args {
+            [from, to] => Ok((302, from.clone(), to.clone())),
+            _ => Err("Redirect requires a source and target".into()),
+        },
     }
 }
 
@@ -8047,6 +9105,9 @@ pub(crate) fn compile_files_pattern(args: &[String]) -> Result<MatchKind, String
         return Err("<Files> requires a filename pattern".into());
     }
     if args[0] == "~" {
+        if args.len() < 2 {
+            return Err("<Files ~> requires a regular expression".into());
+        }
         let pattern = args[1..].join(" ");
         return compile_regex(&pattern)
             .map(MatchKind::FilesMatch)
@@ -8351,7 +9412,12 @@ pub(crate) fn parse_rewrite_flags(args: &[String]) -> Result<RewriteFlags, Strin
                 out.escape_controls = true;
             }
             "UNSAFEPREFIXSTAT" => out.unsafe_prefix_stat = true,
-            "DPI" => {}
+            "DPI" => {
+                return Err(
+                    "RewriteRule flag '[DPI]' is not implemented; refusing to ignore path-info discarding"
+                        .into(),
+                )
+            }
             "F" => out.forbidden = true,
             "G" => out.gone = true,
             "R" => out.redirect = Some(302),
@@ -8405,10 +9471,12 @@ pub(crate) fn parse_rewrite_flags(args: &[String]) -> Result<RewriteFlags, Strin
                         .map_err(|_| format!("invalid RewriteRule skip value '{flag}'"))?,
                 );
             }
-            // These flags affect environment/filter bookkeeping or subrequests,
-            // not URL resolution or access decisions.  They are accepted for
-            // compatibility and intentionally have no effect.
-            "NS" => {}
+            "NS" => {
+                return Err(
+                    "RewriteRule flag '[NS]' is not implemented; refusing to apply the rule to internal subrequests"
+                        .into(),
+                )
+            }
             _ => return Err(format!("unsupported RewriteRule flag '[{flag}]'")),
         }
     }
@@ -8621,8 +9689,13 @@ fn parse_listen(s: &str) -> Result<ListenSpec, String> {
 /// policy.  Handled directives never reach the fallback; this classifier is
 /// deliberately broader than the explicit list so an unknown member of an
 /// auth/TLS/proxy/filter/DAV/LDAP/cache family fails closed too.
+#[cfg(test)]
 fn is_security_directive(name: &str) -> bool {
-    if fail_closed_directives().contains(name) {
+    is_security_directive_with(name, &fail_closed_directives())
+}
+
+fn is_security_directive_with(name: &str, fail_closed: &HashSet<&'static str>) -> bool {
+    if fail_closed.contains(name) {
         return true;
     }
     [
@@ -9429,6 +10502,79 @@ mod tests {
     }
 
     #[test]
+    fn serverroot_is_execute_on_read_for_relative_includes() {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-serverroot-exec-on-read-{}",
+            std::process::id()
+        ));
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("included.conf"), "ServerName included.test\n").unwrap();
+        let main = dir.join("main.conf");
+        std::fs::write(
+            &main,
+            format!(
+                "ServerRoot \"{}\"\nInclude included.conf\nListen 127.0.0.1:0\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(&main, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        assert_eq!(cfg.server_root, root);
+        assert_eq!(cfg.server_name.as_deref(), Some("included.test"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typed_config_program_seals_sections_and_payload_schema() {
+        let loc = SourceLoc {
+            file: "test.conf".into(),
+            line: 1,
+        };
+        let program = ConfigProgram::seal(vec![
+            Event::SectionStart {
+                name: "directory".into(),
+                args: vec!["/srv".into()],
+                loc: loc.clone(),
+                active: true,
+                transparent: false,
+            },
+            Event::Directive {
+                name: "require".into(),
+                args: vec!["all".into(), "granted".into()],
+                loc: loc.clone(),
+            },
+            Event::SectionEnd { loc },
+        ])
+        .unwrap();
+        assert_eq!(program.instructions.len(), 3);
+        assert!(matches!(
+            &program.instructions[0],
+            ProgramEvent::SectionStart {
+                class: ProgramSectionClass::Directory,
+                end: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &program.instructions[2],
+            ProgramEvent::SectionEnd { start: 0, .. }
+        ));
+
+        let errors = load_text("Alias /missing-target\n", false).unwrap_err();
+        assert!(
+            errors.iter().any(|error| error.msg.contains("exactly 2")),
+            "{errors:?}"
+        );
+
+        let errors =
+            load_text("<Directory /srv>\nAuthUserFile \"\"\n</Directory>\n", false).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.msg.contains("does not permit an empty argument")));
+    }
+
+    #[test]
     fn relative_pid_file_is_resolved_below_server_root() {
         let config = load_text("Listen 127.0.0.1:0\nPidFile run/vapached.pid\n", false).unwrap();
         assert_eq!(
@@ -9664,8 +10810,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_refuses_silently_dropped_directives() {
-        // Compat mode keeps loading these with a warning only.
+    fn malformed_directives_fail_in_every_mode() {
         let promoted = [
             "RewriteOptions bogus",
             "Options +NoSuchOption",
@@ -9678,38 +10823,27 @@ mod tests {
         ];
         for text in &promoted {
             assert!(
-                load_text(&format!("Listen 127.0.0.1:0\n{text}\n"), false).is_ok(),
-                "{text} must stay a compat warning in non-strict mode"
+                load_text(&format!("Listen 127.0.0.1:0\n{text}\n"), false).is_err(),
+                "{text} must be refused in normal mode"
             );
             assert!(
                 load_text(&format!("Listen 127.0.0.1:0\n{text}\n"), true).is_err(),
                 "{text} must be refused in strict mode"
             );
         }
-        // failonstatus: unparsable entries shorten the list in compat mode
-        // with a warning, and refuse to start in strict mode; clean lists
-        // pass strict validation.
+        // A partially valid list must not be shortened into a different
+        // retry policy.
         let config = |entries: &str| {
             format!("Listen 127.0.0.1:0\nProxyPass /p http://127.0.0.1:9000 {entries}\n")
         };
-        assert!(load_text(&config("failonstatus=500,lop"), false).is_ok());
+        assert!(load_text(&config("failonstatus=500,lop"), false).is_err());
         assert!(load_text(&config("failonstatus=500,502"), true).is_ok());
         assert!(load_text(&config("failonstatus=500,lop"), true).is_err());
-        assert_eq!(
-            load_text(&config("failonstatus=200,no"), false)
-                .unwrap()
-                .effective_scope(None, Path::new("/p"), "/p")
-                .proxy_policy
-                .proxy_passes
-                .first()
-                .map(|rule| rule.fail_on_status.clone())
-                .unwrap(),
-            vec![200]
-        );
+        assert!(load_text(&config("failonstatus=200,no"), false).is_err());
         let balancer = |entries: &str| {
             format!("Listen 127.0.0.1:0\n<Proxy balancer://pool>\nProxySet {entries}\n</Proxy>\n")
         };
-        assert!(load_text(&balancer("failonstatus=500,lop"), false).is_ok());
+        assert!(load_text(&balancer("failonstatus=500,lop"), false).is_err());
         assert!(load_text(&balancer("failonstatus=500,lop"), true).is_err());
     }
 
@@ -9861,6 +10995,7 @@ SSLRandomSeed connect builtin\n\
 SSLRandomSeed connect file:/dev/urandom 512\n\
 SSLPassPhraseDialog exec:/usr/share/apache2/ask-for-passphrase\n\
 SSLSessionCache shmcb:/run/apache2/ssl_scache(512000)\n\
+SSLStaplingCache shmcb:/run/apache2/ssl_stapling(32768)\n\
 SSLSessionCacheTimeout 300\n\
 SSLSessionTickets Off\n\
 SSLHonorCipherOrder Off\n\
@@ -9883,6 +11018,10 @@ SSLOptions +StrictRequire\n";
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("bounded in-process cache")));
+            assert!(parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("bounded in-process OCSP cache")));
         }
     }
 
@@ -9894,12 +11033,16 @@ SSLOptions +StrictRequire\n";
             "SSLRandomSeed startup file:",
             "SSLRandomSeed startup file:/dev/urandom many",
             "SSLPassPhraseDialog builtin extra",
+            "SSLPassPhraseDialog nonsense",
             "SSLSessionCache shmcb:",
+            "SSLStaplingCache nonsense",
             "SSLSessionCacheTimeout forever",
             "SSLSessionTickets Maybe",
             "SSLHonorCipherOrder Prefer",
             "SSLOptions -StrictRequire",
             "SSLOptions +StrictRequire +StdEnvVars",
+            "SSLProtocol nonsense",
+            "SSLProtocol TLSv1",
         ];
         for directive in invalid {
             for strict in [false, true] {
@@ -9982,11 +11125,7 @@ SSLOptions +StrictRequire\n";
         assert!(load_text(cfg, true).is_err());
 
         let cfg = "Listen 127.0.0.1:0\n<Directory /srv>\nAllowOverride AuthConfig NotACategory\n</Directory>\n";
-        let c = load_text(cfg, false).unwrap();
-        assert!(c
-            .warnings
-            .iter()
-            .any(|w| w.contains("unsupported AllowOverride")));
+        assert!(load_text(cfg, false).is_err());
         assert!(load_text(cfg, true).is_err());
     }
 
@@ -10566,11 +11705,15 @@ SSLOptions +StrictRequire\n";
     #[test]
     fn vhost_name_patterns_use_verified_boundary_matching() {
         assert!(crate::verified::host_pattern_matches(
-            b"example.com",
-            b"*.example.com"
+            b"anything.test",
+            b"*"
         ));
         assert!(crate::verified::host_pattern_matches(
             b"a.example.com",
+            b"*.example.com"
+        ));
+        assert!(!crate::verified::host_pattern_matches(
+            b"example.com",
             b"*.example.com"
         ));
         assert!(!crate::verified::host_pattern_matches(
@@ -10581,7 +11724,7 @@ SSLOptions +StrictRequire\n";
             b"EXAMPLE.COM",
             b"example.com"
         ));
-        assert!(crate::verified::host_pattern_matches(
+        assert!(!crate::verified::host_pattern_matches(
             b"a.example.com",
             b".example.com"
         ));
@@ -10589,7 +11732,7 @@ SSLOptions +StrictRequire\n";
             "Listen 127.0.0.1:0\n<VirtualHost *:0>\nServerAlias ~[bad\n</VirtualHost>\n",
             false
         )
-        .is_err());
+        .is_ok());
     }
 
     #[test]
@@ -10647,14 +11790,7 @@ SSLOptions +StrictRequire\n";
                 "security family must fail closed: {directive}"
             );
         }
-        // Non-security unimplemented module directives remain warnings.
-        let ok = load_text("Listen 127.0.0.1:0\nAddDescription \"x\" .txt\n", false);
-        assert!(ok.is_ok());
-        assert!(ok
-            .unwrap()
-            .warnings
-            .iter()
-            .any(|w| w.contains("recognised but not implemented")));
+        assert!(load_text("Listen 127.0.0.1:0\nAddDescription \"x\" .txt\n", false).is_err());
     }
 
     #[test]
@@ -10666,19 +11802,11 @@ SSLOptions +StrictRequire\n";
     #[test]
     fn unknown_and_unimplemented_directives() {
         let unknown = "Listen 127.0.0.1:0\nDefinitelyNotADirective on\n";
-        let c = load_text(unknown, false).unwrap();
-        assert!(c.warnings.iter().any(|w| w.contains("unknown directive")));
+        assert!(load_text(unknown, false).is_err());
         assert!(load_text(unknown, true).is_err());
 
         let known = "Listen 127.0.0.1:0\nAddDescription \"x\" .txt\n";
-        let c = load_text(known, false).unwrap();
-        assert!(c
-            .warnings
-            .iter()
-            .any(|w| w.contains("recognised but not implemented")));
-        // Strict mode rejects every unhandled directive, not only unknown
-        // names; otherwise a known-but-unimplemented security control would
-        // be accepted and silently ignored.
+        assert!(load_text(known, false).is_err());
         assert!(load_text(known, true).is_err());
     }
 
@@ -10699,8 +11827,8 @@ SSLOptions +StrictRequire\n";
             );
         }
 
-        // A deliberately small presentation/module surface remains a warning
-        // in compatibility mode, but strict mode still rejects it.
+        // Presentation and module directives are effectful too. Refuse to
+        // claim they were applied when Vapache has no implementation.
         for directive in [
             "AddDescription \"x\" .txt",
             "UserDir public_html",
@@ -10709,13 +11837,9 @@ SSLOptions +StrictRequire\n";
             "CharsetDefault utf-8",
         ] {
             let text = format!("Listen 127.0.0.1:0\n{directive}\n");
-            let cfg = load_text(&text, false)
-                .unwrap_or_else(|e| panic!("compat directive '{directive}' failed: {e:?}"));
             assert!(
-                cfg.warnings
-                    .iter()
-                    .any(|w| w.contains("recognised but not implemented")),
-                "compat directive '{directive}' must be explicitly warned"
+                load_text(&text, false).is_err(),
+                "normal mode must reject '{directive}'"
             );
             assert!(
                 load_text(&text, true).is_err(),
@@ -11743,14 +12867,16 @@ ServerName localhost\n\
             "Listen 127.0.0.1:0\n",
             "<VirtualHost *:80>\n",
             "ServerName Example.Test:80\n",
-            "ServerAlias ~^foo[0-9]+\\.test$ bar.test\n",
+            "ServerAlias ~^rx[0-9]+\\.test$ *.foo.test bar.test\n",
             "ServerAdmin admin@example.test\n",
             "</VirtualHost>\n",
         );
         let c = load_text(cfg, false).unwrap();
         let vh = &c.vhosts[0];
         assert!(vh.matches_name("example.test."));
-        assert!(vh.matches_name("foo12.test"));
+        assert!(vh.matches_name("one.foo.test"));
+        assert!(!vh.matches_name("foo.test"));
+        assert!(!vh.matches_name("rx12.test"));
         assert!(vh.matches_name("BAR.TEST"));
         assert!(!vh.matches_name("other.test"));
         assert!(vh.has_wildcard_default());
@@ -12115,6 +13241,7 @@ ServerName localhost\n\
             depth: 0,
             warnings: Vec::new(),
             errors: Vec::new(),
+            initial_server_root: root.to_path_buf(),
             server_root: root.to_path_buf(),
             include_count: 0,
             config_bytes: 0,
@@ -12597,12 +13724,12 @@ ServerName localhost\n\
             "BNP".into(),
             "BCTLS".into(),
             "UNSAFEPREFIXSTAT".into(),
-            "DPI".into(),
             "F".into(),
-            "G".into(),
-            "NS".into()
+            "G".into()
         ])
         .is_ok());
+        assert!(parse_rewrite_flags(&["DPI".into()]).is_err());
+        assert!(parse_rewrite_flags(&["NS".into()]).is_err());
         assert_eq!(
             parse_rewrite_flags(&["R".into()]).unwrap().redirect,
             Some(302)
@@ -12774,7 +13901,7 @@ AllowEncodedSlashes NoDecode\n\
 LogLevel debug\n\
 LogFormat \"%h\" combined\n\
 CustomLog logs/access.log combined\n\
-SetEnv FOO bar baz\n\
+SetEnv FOO \"bar baz\"\n\
 UnsetEnv OLD\n\
 PassEnv PATH\n\
 RemoteIPHeader X-Forwarded-For\n\
@@ -12811,12 +13938,12 @@ SetOutputFilter DEFLATE BROTLI_COMPRESS\n\
 AddOutputFilter DEFLATE .html .css\n\
 AddOutputFilterByType DEFLATE text/html\n\
 SetInputFilter INCLUDES\n\
-AddInputFilter INCLUDES\n\
+AddInputFilter INCLUDES .shtml\n\
 DeflateCompressionLevel 9\n\
 BrotliCompressionQuality 11\n\
 DeflateAlterETag AddSuffix\n\
 BrotliAlterETag Remove\n\
-BrotliCompressAlterETag NoChange\n\
+BrotliCompressionAlterETag NoChange\n\
 ProxyHCTemplate health hcmethod=GET hcuri=/health hcinterval=5s hcpasses=2 hcfails=3\n\
 ProxyPass /p http://127.0.0.1:9000 stickysession=JSESSIONID failonstatus=500,502\n\
 ProxyPassReverse /p http://127.0.0.1:9000\n\
@@ -12826,7 +13953,6 @@ SSLCertificateFile {cert}\n\
 SSLCertificateKeyFile {key}\n\
 SSLCertificateChainFile {chain}\n\
 SSLProtocol all -SSLv3\n\
-SSLCipherSuite HIGH\n\
 SSLUseStapling On\n\
 SSLStaplingForceURL http://example.test/ocsp\n\
 SSLStaplingResponderTimeout 5\n\
@@ -12856,7 +13982,7 @@ RewriteOptions Inherit\n"
         assert_eq!(c.limit_request_fields, 20);
         assert_eq!(c.limit_request_field_size, 500);
         assert_eq!(c.limit_request_body, 1234);
-        assert_eq!(c.max_request_workers, 9);
+        assert_eq!(c.max_request_workers, 8);
         assert_eq!(c.listen_backlog, 5);
         assert_eq!(c.graceful_shutdown_timeout, Duration::from_secs(2));
         assert_eq!(c.request_header_min_rate, 5);
@@ -12897,7 +14023,7 @@ RewriteOptions Inherit\n"
         );
         assert_eq!(
             s.compression_policy.brotli_alter_etag,
-            Some(AlterEtag::Remove)
+            Some(AlterEtag::NoChange)
         );
         assert!(s
             .mapping_policy
@@ -12946,10 +14072,6 @@ RemoveHandler .php\n\
 SetHandler handler\n\
 AddType text/plain .txt\n\
 RemoveType .html\n\
-Alias /alias /srv/alias\n\
-ScriptAlias /cgi /srv/cgi\n\
-AliasMatch ^/am/(.*)$ /srv/$1\n\
-ScriptAliasMatch ^/sam/(.*)$ /srv/cgi/$1\n\
 Redirect 301 /old /new\n\
 RedirectPermanent /old2 /new2\n\
 RedirectTemp /old3 /new3\n\
@@ -12967,7 +14089,14 @@ ExpiresByType text/html \"access plus 1 hour\"\n\
 SetEnv DIR yes\n\
 </Directory>\n"
         );
-        let cfg = format!("Listen 127.0.0.1:0\n{directory}");
+        let cfg = format!(
+            "Listen 127.0.0.1:0\n\
+Alias /alias /srv/alias\n\
+ScriptAlias /cgi /srv/cgi\n\
+AliasMatch ^/am/(.*)$ /srv/$1\n\
+ScriptAliasMatch ^/sam/(.*)$ /srv/cgi/$1\n\
+{directory}"
+        );
         let c = load_text(&cfg, false).unwrap();
         let s = c.effective_scope(None, Path::new("/srv/www/file"), "/file");
         assert_eq!(s.options.effective_bits(0), 0);
@@ -13039,7 +14168,6 @@ SSLStaplingReturnResponderErrors On\n\
 SSLVerifyClient require\n\
 SSLCACertificateFile {cert}\n\
 SSLProtocol all\n\
-SSLCipherSuite HIGH\n\
 </VirtualHost>\n\
 <VirtualHost *:80>\n\
 ServerName plain.test\n\
@@ -13097,10 +14225,8 @@ ServerName plain.test\n\
 Define TEMP 1\n\
 Undefine TEMP\n\
 DocumentRoot rel/www\n\
-Options\n\
-Options +NoSuchOption\n\
 Options All\n\
-FileETag Unknown\n\
+FileETag MTime\n\
 TypesConfig {relative}/mime.types\n\
 CacheRoot rel/cache\n\
 SSLProxyCACertificateFile rel/ca.pem\n\
@@ -13110,8 +14236,6 @@ RedirectMatch ^/rm/(.*)$ /new/$1\n\
 RewriteMap reltxt txt:{relative}/types.txt\n\
 RewriteMap relrnd rnd:{relative}/rnd.txt\n\
 <Directory /srv/edge>\n\
-Options\n\
-Options +NoSuchOption\n\
 Options All\n\
 AllowOverride All Nonfatal=Override\n\
 AllowOverride AuthConfig Nonfatal=Unknown\n\
@@ -13131,36 +14255,17 @@ Require dbm\n\
 Options None\n\
 </LocationMatch>\n\
 <Proxy balancer://pool>\n\
-BalancerMember http://127.0.0.1:9000 hcmethod=GET hcuri=/health hcinterval=1s hcpasses=1 hcfails=2 template=health route=r1 nonsense unknown=1\n\
-ProxySet hcmethod=POST hcuri=/health hcinterval=2s hcpasses=2 hcfails=3 stickysession=S stickysessionsep=. failonstatus=500,502 nonsense unknown=1\n\
+BalancerMember http://127.0.0.1:9000 hcmethod=GET hcuri=/health hcinterval=1s hcpasses=1 hcfails=2 template=health route=r1\n\
+ProxySet hcmethod=POST hcuri=/health hcinterval=2s hcpasses=2 hcfails=3 stickysession=S stickysessionsep=. failonstatus=500,502\n\
 </Proxy>\n\
-ProxyPass /extra http://127.0.0.1:9000 unknown=1 stickysession=S nonsense\n\
-ProxyHCTemplate edge hcmethod=GET hcuri=/health hcinterval=3s hcpasses=4 hcfails=5 nonsense unknown=1\n\
+ProxyPass /extra http://127.0.0.1:9000 stickysession=S\n\
+ProxyHCTemplate edge hcmethod=GET hcuri=/health hcinterval=3s hcpasses=4 hcfails=5\n\
 DefaultType text/plain\n\
 DefaultRuntimeDir /tmp\n\
 AllowEncodedSlashes On\n\
 AllowEncodedSlashes Off\n\
 RemoteIPInternalProxy 192.0.2.5\n\
-ServerAlias at.example\n\
-ErrorDocument 404\n\
-Alias /onlyone\n\
-AddType text/plain\n\
-AddHandler handler\n\
-Header set X\n\
-Header set\n\
-ProxyPass /shortun\n\
-ProxyPass ! http://127.0.0.1:9000\n\
-ProxyPassReverse /shortun\n\
-ProxyPassMatch ^/short$\n\
-AddOutputFilterByType DEFLATE\n\
-AddOutputFilter DEFLATE\n\
-CustomLog logs/short.log\n\
-RequestReadTimeout nonsense\n\
-BalancerMember\n\
-ProxySet foo=bar\n\
-ProxyHCTemplate\n\
 <Proxy balancer://empty>\n\
-BalancerMember\n\
 </Proxy>\n\
 <VirtualHost *:443>\n\
 SSLEngine On\n\
@@ -13230,9 +14335,7 @@ Require all granted\n\
         }
         for value in ["Unknown"] {
             let cfg = format!("Listen 127.0.0.1:0\nServerTokens {value}\n");
-            let c = load_text(&cfg, false).unwrap();
-            assert_eq!(c.server_tokens, ServerTokens::Full);
-            assert_eq!(c.server_software, full);
+            assert!(load_text(&cfg, false).is_err());
         }
         let c = load_text(
             "Listen 127.0.0.1:0\nUseCanonicalName On\nServerSignature Off\n",
@@ -13273,11 +14376,17 @@ Require all granted\n\
         err("<Directory /x>\n<RequireAll>\n</RequireAll>\n</Directory>\n");
         err("<Directory /x>\n<Limit GET>\n<Limit POST>\n</Limit>\n</Limit>\n</Directory>\n");
         err("<Directory /x>\n<RequireAll>\n<Limit GET>\nRequire all granted\n</Limit>\n</RequireAll>\n</Directory>\n");
+        err("<Directory /x>\nDocumentRoot /tmp\n</Directory>\n");
+        err("<Directory /x>\nAlias /a /tmp\n</Directory>\n");
+        err("<Directory /x>\nProxyPass /p http://127.0.0.1:1/\n</Directory>\n");
+        err("<Directory /x>\nCacheEnable disk /\n</Directory>\n");
+        err("<Directory /x>\nLimitRequestBody 1\n</Directory>\n");
+        err("<VirtualHost *:80>\nLogLevel debug\n</VirtualHost>\n");
+        err("<VirtualHost *:80>\nRemoteIPHeader X-Real-IP\n</VirtualHost>\n");
         err("<Proxy>\n</Proxy>\n");
         err("<ProxyMatch (>\n</ProxyMatch>\n");
         err("<Directory /x>\n<Limit GET>\n<Unknown>\n</Unknown>\n</Limit>\n</Directory>\n");
         err("<Directory /x>\n<Limit GET>\n<If true>\n</If>\n</Limit>\n</Directory>\n");
-        err("<VirtualHost *:80>\nServerAlias ~(\n</VirtualHost>\n");
         err("AllowOverride All\n");
         err("<Directory /x>\nAllowOverride\n</Directory>\n");
         err("<Directory /x>\nAllowOverride Nonfatal=bad\n</Directory>\n");
@@ -13339,15 +14448,37 @@ Require all granted\n\
         err("SSLVerifyClient none extra\n");
         err("SSLCACertificateFile\n");
         err("SSLProtocol\n");
+        err("SSLCipherSuite HIGH\n");
+        err("LogLevel ssl:info\n");
+        err("DeflateBufferSize 4096\n");
         err("AuthBasicProvider ldap\n");
         err("<Directory /x>\nAuthBasicProvider ldap\n</Directory>\n");
+        err("Options\n");
+        err("Options +NoSuchOption\n");
+        err("FileETag Unknown\n");
+        err("ServerAlias at.example\n");
+        err("ErrorDocument 404\n");
+        err("AddType text/plain\n");
+        err("AddHandler handler\n");
+        err("Header set X\n");
+        err("Header set\n");
+        err("Header set X value env=FLAG\n");
+        err("ProxyPass /shortun\n");
+        err("ProxyPassReverse /shortun\n");
+        err("ProxyPassMatch ^/short$\n");
+        err("AddOutputFilterByType DEFLATE\n");
+        err("AddOutputFilter DEFLATE\n");
+        err("CustomLog logs/short.log\n");
+        err("CustomLog logs/access.log combined env=FLAG\n");
+        err("RequestReadTimeout nonsense\n");
+        err("BalancerMember\n");
+        err("ProxySet foo=bar\n");
+        err("ProxyHCTemplate\n");
 
-        let ok = "<Directory /x>\n<RequireAny>\nRequire all granted\n<If true>\nOptions Indexes\n</If>\n</RequireAny>\n</Directory>\n";
-        let c = load_text(ok, false).unwrap();
-        assert!(c.warnings.iter().any(|w| w.contains("nested sections")));
+        err("<Directory /x>\n<RequireAny>\nRequire all granted\n<If true>\nOptions Indexes\n</If>\n</RequireAny>\n</Directory>\n");
         let invalid = "<UnknownSection>\nServerName unknown.test\n</UnknownSection>\n";
         assert!(load_text(invalid, false).is_err());
-        let ok = concat!(
+        let invalid = concat!(
             "Listen 127.0.0.1:0\n",
             "<If true>\n",
             "<Files x>\n",
@@ -13355,21 +14486,14 @@ Require all granted\n\
             "</Files>\n",
             "</If>\n",
         );
-        let c = load_text(ok, false).unwrap();
-        assert!(c
-            .warnings
-            .iter()
-            .any(|w| w.contains("nested Directory/Files/Location")));
-        let ok = concat!(
+        assert!(load_text(invalid, false).is_err());
+        let warning_cfg = concat!(
             "Listen 127.0.0.1:0\n",
             "<Location />\nAllowOverride All\n</Location>\n",
             "<Location /list>\nAllowOverrideList None\n</Location>\n",
-            "AllowEncodedSlashes maybe\n",
             "SecRuleEngine Off\n",
-            "DeflateCompressionLevel 10\n",
-            "BrotliCompressionQuality 12\n",
         );
-        let c = load_text(ok, false).unwrap();
+        let c = load_text(warning_cfg, false).unwrap();
         assert!(c
             .warnings
             .iter()
@@ -13378,7 +14502,9 @@ Require all granted\n\
             .warnings
             .iter()
             .any(|w| w.contains("useless use of AllowOverrideList")));
-        assert_eq!(c.encoded_slashes, EncodedSlashes::Off);
+        err("AllowEncodedSlashes maybe\n");
+        err("DeflateCompressionLevel 10\n");
+        err("BrotliCompressionQuality 12\n");
     }
 
     #[test]
@@ -15022,6 +16148,20 @@ mod pass11_kernel_tests {
         assert!(location_kind(&[]).is_err());
         // A malformed regex is a configuration error too.
         assert!(location_kind(&["~", "(?=x"]).is_err());
+    }
+
+    #[test]
+    fn legacy_tilde_section_forms_have_narrow_arity() {
+        for name in ["directory", "location", "files"] {
+            assert!(validate_config_section_arity(name, &["~".into(), "^x$".into()]).is_ok());
+            assert!(validate_config_section_arity(name, &["x".into(), "y".into()]).is_err());
+            assert!(validate_config_section_arity(name, &["~".into()]).is_err());
+        }
+        assert!(matches!(
+            compile_files_pattern(&["~".into(), "^secret\\.".into()]).unwrap(),
+            MatchKind::FilesMatch(_)
+        ));
+        assert!(compile_files_pattern(&["~".into()]).is_err());
     }
 
     // F62/F62b: `<Files>` class negation honors BOTH markers; `?` covers

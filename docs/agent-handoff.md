@@ -1,4 +1,9 @@
-# Agent handoff — remaining hardening items
+# Agent handoff — historical hardening items
+
+> This is the original implementation handoff, retained for provenance. The
+> listed H1–H8 changes have since landed; current behavior and acceptance
+> commands are documented in `config-semantics.md` and
+> `verification-status.json`.
 
 This document hands the **remaining** review findings to an implementing
 agent. The Verus proof generalization and the containment/encoding refactors
@@ -211,8 +216,8 @@ the parent bits.
 `Options` directive into a fresh mask; if any signless word is present,
 `push_set(mask_of_all_signless_words)` once **before** applying the `+`/`-`
 words (in argument order); if none, behavior is unchanged. Keep `None`/`All`
-handling exactly as now. Unsupported tokens stay warn-only in main config
-(strict-mode promotion is H8).
+handling exactly as now. Unsupported tokens are configuration errors in every
+mode.
 
 **Acceptance:** add a generated case to `tests/config_semantics.py`
 (parent `Options +ExecCGI`, child signless `Options Indexes`, request a
@@ -323,9 +328,10 @@ resolves to the document root — always true — and silently forces the
 section's rules on. Main config reads `args.first()`
 (`config.rs:2677` area).
 
-**Required change:** `args.first().cloned().unwrap_or_default()`.
-Also decide and test `<IfFile a b>` (two words) behavior: with `first()`
-it tests `a`; keep that and document it.
+**Required change:** read `args[0]` only after enforcing exactly one operand.
+Vapache deliberately rejects `<IfFile a b>` rather than discarding `b`; local
+Apache 2.4.69 accepts the extra word, so the stricter behavior is recorded in
+`config_validity.py` `HARDENED_CASES`.
 
 **Acceptance:** unit tests in `htaccess.rs` tests for both arities
 (single-arg tests the named file; two-arg tests the first word).
@@ -338,16 +344,13 @@ Move ledger obligation `iffile_htaccess_argument` to partial (or fold into
 `:3642` (RewriteMap — covered by H4), `:3763` AddType, `:3778` AddHandler,
 `:3846` Header, `:3875` ExpiresByType, `:3976` ProxyPass,
 `:4769 parse_status_list` (`filter_map(…ok())` drops unparsable
-`failonstatus` entries), `:3261` (unsupported `Options` tokens — warn-only
-even in strict mode), `:3758` (`RewriteOptions` unknown tokens silently
+`failonstatus` entries), `:3261` (unsupported `Options` tokens), `:3758`
+(`RewriteOptions` unknown tokens silently
 become `Some(false)`); `.htaccess` already hard-errors where noted.
 
-**Required change:** follow the existing strict-mode pattern
-(`directive_disposition`'s `FailClosedStrict` at `config.rs:4728-4763`):
-each under-argument/unparsable drop becomes `self.errors.push(ConfigError …)`
-when strict mode is enabled (and stays a warning otherwise, except where the
-directive is malformed in any mode — H4 items). Unsupported `Options`
-tokens and `RewriteOptions` unknown tokens: strict error, compat warn.
+**Required change:** each under-argument, unsupported or unparsable drop is a
+`ConfigError` in every mode. `--strict-config` remains a compatibility CLI
+switch, not permission to accept a no-op in normal mode.
 
 **Acceptance:** `python3 tests/config_validity.py` strict cases (add one
 per promoted site); `cargo test`; move ledger obligation

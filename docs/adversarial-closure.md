@@ -580,11 +580,18 @@ The closure is exercised by:
   sticky per-round filesystem override is replaced by a later URL-only
   `[L]` rewrite (F68), and `[UnsafePrefixStat]` logs its inertness warning
   at load time);
-- `tests/config_validity.py` STRICT_CASES rows (H8: the promoted silent
-  drops — `AddType`/`AddHandler`/`Header`/`ExpiresByType`/`ProxyPass`
-  arities, unknown `Options` and `RewriteOptions` tokens, and unparsable
-  `ProxyPass`/`ProxySet` `failonstatus` lists — are refused under
-  `--strict-config` while Apache rejects them at `-t`);
+- `tests/config_validity.py` `MALFORMED_CASES` rows (H8: malformed
+  `AddType`/`AddHandler`/`Header`/`ExpiresByType`/`ProxyPass` arities,
+  unknown `Options` and `RewriteOptions` tokens, and unparsable
+  `ProxyPass`/`ProxySet` `failonstatus` lists are refused in every mode when
+  Apache rejects them at `-t`);
+- `tests/config_validity.py` `HARDENED_CASES` rows record ambiguous legacy
+  coercions that Apache 2.4 accepts (`Options` with no operand, nonnumeric
+  numeric directives, non-error `ErrorDocument`, malformed expiry text and
+  extra `<IfFile>` words, plus `<Files>` nested inside request-time `<If>`
+  whose child policy Apache does not evaluate on ordinary direct requests) but both Vapache modes
+  deliberately reject; the latter Apache parser/runtime mismatch is documented
+  in `adversarial/apache-if-files-nesting.md`;
 - operator replay harnesses that reproduce the Apache-versus-vapached
   differentials in `adversarial/findings.md`.
 

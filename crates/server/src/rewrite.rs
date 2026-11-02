@@ -5,10 +5,11 @@
 //! `RewriteCond expr`, `RewriteMap` (`txt`, `rnd`, `prg`, `int`), and the
 //! common rule flags including `[L]`, `[END]`, `[R]`, `[P]`, `[F]`, `[G]`,
 //! `[C]`, `[S]`, `[N]`, `[QSA]`, `[QSD]`, `[QSL]`, `[B]`, `[BNE]`, `[BCTLS]`,
-//! `[BNP]`, `[CO]`, `[E]`, `[H]`, `[T]`, `[NE]`, `[PT]`, `[NS]`,
+//! `[BNP]`, `[CO]`, `[E]`, `[H]`, `[T]`, `[NE]`, `[PT]`,
 //! `[UnsafeAllow3F]`, and `[UnsafePrefixStat]`.  Unsupported syntax is
 //! rejected while parsing the configuration rather than silently skipped;
-//! `[DPI]` is accepted but path-info is resolved later by the request mapper.
+//! `[DPI]` and `[NS]` are rejected until their path-info and internal-
+//! subrequest semantics are implemented.
 //!
 //! Round semantics (F67/F68): a `[PT]` substitution stays in URL space and is
 //! re-resolved by the dispatcher on the next round instead of being promoted

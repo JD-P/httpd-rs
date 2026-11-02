@@ -3,10 +3,11 @@
 //! This module is deliberately free of filesystem access, include expansion,
 //! section-context semantics and directive dispatch.  It is the target for
 //! the parser-refinement proof: bytes in, a small token/line IR out.  The
-//! production compiler and `.htaccess` parser currently consume the shared
-//! tokenizer and logical-line helpers from here; later stages can migrate the
-//! recursive section parser and directive refinement onto this IR without
-//! changing the eventual proof boundary.
+//! tokenizer and section-tag scanner consume verified executable state
+//! machines.  Main configuration and `.htaccess` then seal the resulting
+//! lines into immutable programs with exact section mates before applying any
+//! policy effect.  Directive payload parsers remain the next refinement
+//! boundary.
 
 /// One logical configuration line after backslash continuation handling, with
 /// the source line number where the logical line started.
@@ -82,51 +83,63 @@ pub fn logical_lines(text: &str) -> Vec<String> {
 pub(crate) fn tokenize(s: &str) -> Result<Vec<String>, String> {
     let b = s.as_bytes();
     let mut out = Vec::new();
+    let mut current: Option<Vec<u8>> = None;
+    let mut state = vapache_verified::ConfigLexState::Between;
     let mut i = 0;
     while i < b.len() {
-        while i < b.len() && b[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= b.len() {
-            break;
-        }
-        let mut cur = Vec::new();
-        if b[i] == b'"' || b[i] == b'\'' {
-            let quote = b[i];
-            i += 1;
-            while i < b.len() && b[i] != quote {
-                if b[i] == b'\\' && i + 1 < b.len() && b[i + 1] == quote {
-                    i += 1;
-                    cur.push(b[i]);
-                } else {
-                    cur.push(b[i]);
-                }
-                i += 1;
+        let next = b.get(i + 1).copied();
+        let step = vapache_verified::config_lex_step(state, b[i], next);
+        state = step.state;
+        match step.action {
+            vapache_verified::ConfigLexAction::Skip => {}
+            vapache_verified::ConfigLexAction::Begin => {
+                debug_assert!(current.is_none());
+                current = Some(Vec::new());
             }
-            if i >= b.len() {
-                return Err("unterminated quoted string".into());
+            vapache_verified::ConfigLexAction::Push => {
+                current
+                    .as_mut()
+                    .expect("verified lexer pushes only inside a token")
+                    .push(b[i]);
             }
-            i += 1;
-            if i < b.len() && !b[i].is_ascii_whitespace() {
+            vapache_verified::ConfigLexAction::PushNext => {
+                current
+                    .as_mut()
+                    .expect("verified lexer escapes only inside a token")
+                    .push(next.expect("verified two-byte transition requires a next byte"));
+            }
+            vapache_verified::ConfigLexAction::Finish => {
+                finish_token(&mut out, &mut current)?;
+            }
+            vapache_verified::ConfigLexAction::CloseQuote => {}
+            vapache_verified::ConfigLexAction::RejectAfterQuote => {
                 return Err("characters after closing quote".into());
             }
-        } else {
-            while i < b.len() && !b[i].is_ascii_whitespace() {
-                if b[i] == b'\\' && i + 1 < b.len() && b[i + 1].is_ascii_whitespace() {
-                    i += 1;
-                    cur.push(b[i]);
-                } else {
-                    cur.push(b[i]);
-                }
-                i += 1;
-            }
         }
-        out.push(String::from_utf8_lossy(&cur).to_string());
-        if out.len() > 256 {
-            return Err("too many arguments".into());
+        i += usize::from(step.advance);
+    }
+    match vapache_verified::config_lex_eof(state) {
+        vapache_verified::ConfigLexEof::Complete => {}
+        vapache_verified::ConfigLexEof::Finish => finish_token(&mut out, &mut current)?,
+        vapache_verified::ConfigLexEof::UnterminatedQuote => {
+            return Err("unterminated quoted string".into());
         }
     }
     Ok(out)
+}
+
+fn finish_token(out: &mut Vec<String>, current: &mut Option<Vec<u8>>) -> Result<(), String> {
+    let Some(next_count) = vapache_verified::config_argument_count_step(out.len()) else {
+        return Err("too many arguments".into());
+    };
+    let bytes = current
+        .take()
+        .expect("verified lexer finishes only after beginning a token");
+    let token = String::from_utf8(bytes)
+        .map_err(|_| "configuration token is not valid UTF-8".to_string())?;
+    out.push(token);
+    debug_assert_eq!(out.len(), next_count);
+    Ok(())
 }
 
 /// Tokenize one logical line, treating section tags as a single leading
@@ -142,21 +155,19 @@ pub(crate) fn tokenize_config(s: &str) -> Result<Vec<String>, String> {
     }
     if t.starts_with('<') {
         let b = t.as_bytes();
-        let mut quote = 0u8;
+        let mut quote = vapache_verified::ConfigTagQuote::Unquoted;
         let mut end = None;
-        for i in 1..b.len() {
-            if quote != 0 {
-                if b[i] == quote {
-                    quote = 0;
-                }
-            } else if b[i] == b'"' || b[i] == b'\'' {
-                quote = b[i];
-            } else if b[i] == b'>' {
+        let mut i = 1;
+        while i < b.len() {
+            let step = vapache_verified::config_tag_step(quote, b[i], b.get(i + 1).copied());
+            quote = step.quote;
+            if step.delimiter {
                 // Apache permits an unquoted comparison operator in
                 // `<IfVersion >= 2.4>`. The closing delimiter is therefore
                 // the last unquoted `>`, not necessarily the first one.
                 end = Some(i);
             }
+            i += usize::from(step.advance);
         }
         let end = end.ok_or("unterminated section tag")?;
         if !t[end + 1..].trim().is_empty() {
@@ -251,6 +262,12 @@ mod tests {
             tokenize_config("<IfVersion >= 2.4>").unwrap(),
             vec!["<IfVersion", ">=", "2.4"]
         );
+        assert_eq!(tokenize("'' \"\"").unwrap(), vec!["", ""]);
+        assert_eq!(tokenize("café 'δ value'").unwrap(), vec!["café", "δ value"]);
+        assert_eq!(
+            tokenize_config(r#"<Directory "a \"> b">"#).unwrap(),
+            vec!["<Directory", "a \"> b"]
+        );
     }
 
     #[test]
@@ -263,6 +280,8 @@ mod tests {
         assert!(tokenize("\"closed\"suffix").is_err());
         let too_many = std::iter::repeat_n("x", 257).collect::<Vec<_>>().join(" ");
         assert!(tokenize(&too_many).is_err());
+        let maximum = std::iter::repeat_n("x", 256).collect::<Vec<_>>().join(" ");
+        assert_eq!(tokenize(&maximum).unwrap().len(), 256);
         assert!(tokenize_config("</Directory> trailing").is_err());
         assert!(tokenize_config("<Directory> trailing").is_err());
         assert!(tokenize_config("<>").is_err());
