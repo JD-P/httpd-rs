@@ -99,7 +99,10 @@ def make_fixture():
     write(DOCROOT / "index.html", "root index\n")
     write(DOCROOT / "loc_file_grant", "not a directory\n")
     (BASE / "logs").mkdir(exist_ok=True)
-    os.chmod(BASE / "logs", 0o777)
+    # A privileged launch opens logs before dropping to www-data and must keep
+    # the administrative parent non-writable by that service identity.  An
+    # unprivileged developer run still needs a writable fixture directory.
+    os.chmod(BASE / "logs", 0o755 if os.geteuid() == 0 else 0o777)
     (BASE / "apache").mkdir(exist_ok=True)
     (BASE / "apache" / "logs").mkdir(exist_ok=True)
     # The <IfFile> flag file must be visible from both resolution roots:

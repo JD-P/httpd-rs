@@ -504,13 +504,14 @@ pub fn request_scope_with_plan(
                 fs_path = root.join(&st.rel_script);
                 cache_url_path = script_url.clone();
                 let target = crate::request_plan::CanonicalTarget::from_url_path(&script_url)?;
-                let script_plan = crate::request_plan::RequestPlan::from_fs_target(
+                let script_plan = crate::request_plan::RequestPlan::from_fs_target_for_request(
                     cfg,
                     vhost,
                     target,
                     root.clone(),
                     fs_path.clone(),
                     script_alias,
+                    req,
                 )
                 .ok()?;
                 let mut script_scope = script_plan.effective_scope(cfg, vhost, req, peer);
@@ -520,7 +521,8 @@ pub fn request_scope_with_plan(
                 // PATH_INFO spelling.
                 let lexical = crate::request_plan::CanonicalTarget::from_url_path(&script_url)?;
                 let lexical_plan =
-                    crate::request_plan::RequestPlan::resolve(cfg, vhost, lexical).ok()?;
+                    crate::request_plan::RequestPlan::resolve_for_request(cfg, vhost, lexical, req)
+                        .ok()?;
                 let lexical_scope = lexical_plan.effective_scope(cfg, vhost, req, peer);
                 script_scope.restrict_with(&lexical_scope);
                 script_scope.restrict_policy_with(&scope);
@@ -549,13 +551,14 @@ pub fn request_scope_with_plan(
             let index_url = format!("{}/{}", url_path.trim_end_matches('/'), index_name);
             let index_fs = crate::files::fd_path(&index.file)?;
             let target = crate::request_plan::CanonicalTarget::from_url_path(&index_url)?;
-            let index_plan = crate::request_plan::RequestPlan::from_fs_target(
+            let index_plan = crate::request_plan::RequestPlan::from_fs_target_for_request(
                 cfg,
                 vhost,
                 target,
                 root.clone(),
                 index_fs.clone(),
                 script_alias,
+                req,
             )
             .ok()?;
             let mut index_scope = index_plan.effective_scope(cfg, vhost, req, peer);
@@ -563,7 +566,8 @@ pub fn request_scope_with_plan(
             // lexical scope and the directory URL's non-handler policy.
             let lexical = crate::request_plan::CanonicalTarget::from_url_path(&index_url)?;
             let lexical_plan =
-                crate::request_plan::RequestPlan::resolve(cfg, vhost, lexical).ok()?;
+                crate::request_plan::RequestPlan::resolve_for_request(cfg, vhost, lexical, req)
+                    .ok()?;
             let lexical_scope = lexical_plan.effective_scope(cfg, vhost, req, peer);
             index_scope.restrict_with(&lexical_scope);
             index_scope.restrict_policy_with(&scope);
@@ -580,13 +584,14 @@ pub fn request_scope_with_plan(
     if let Ok(actual) = std::fs::canonicalize(&fs_path) {
         if actual != fs_path {
             let target = crate::request_plan::CanonicalTarget::from_url_path(&cache_url_path)?;
-            let target_plan = crate::request_plan::RequestPlan::from_fs_target(
+            let target_plan = crate::request_plan::RequestPlan::from_fs_target_for_request(
                 cfg,
                 vhost,
                 target,
                 root.clone(),
                 actual.clone(),
                 script_alias,
+                req,
             )
             .ok()?;
             let mut target_scope = target_plan.effective_scope(cfg, vhost, req, peer);
@@ -1263,7 +1268,7 @@ fn cache_stem(cfg: &Config, key: &str) -> Option<std::path::PathBuf> {
 
 fn encode_meta(key: &str, entry: &Entry) -> Vec<u8> {
     let mut out = format!(
-        "V4\nK {}\nS {}\nT {}\nE {}\nP {}\nG {}\n",
+        "V5\nK {}\nS {}\nT {}\nE {}\nP {}\nG {}\n",
         STANDARD.encode(key.as_bytes()),
         entry.status,
         entry.stored,
@@ -1292,7 +1297,7 @@ fn decode_meta(data: &[u8]) -> Option<Entry> {
     let text = std::str::from_utf8(data).ok()?;
     let mut lines = text.lines();
     let version = lines.next()?;
-    if version != "V1" && version != "V2" && version != "V3" && version != "V4" {
+    if version != "V1" && version != "V2" && version != "V3" && version != "V4" && version != "V5" {
         return None;
     }
     let mut status = None;
@@ -1348,7 +1353,9 @@ fn decode_meta(data: &[u8]) -> Option<Entry> {
 fn decode_meta_key(data: &[u8]) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(data).ok()?;
     let mut lines = text.lines();
-    if lines.next()? != "V4" {
+    // V5 deliberately invalidates representations created before the
+    // trailing-slash static-target admission moved ahead of lookup (P26-A).
+    if lines.next()? != "V5" {
         return None;
     }
     for line in lines {
@@ -3445,7 +3452,7 @@ CacheIgnoreQueryString On\n\
         let corrupt_stem = cache_stem(&cfg, corrupt).unwrap();
         fs::write(
             corrupt_stem.with_extension("meta"),
-            format!("V4\nK {}\n", STANDARD.encode(corrupt.as_bytes())),
+            format!("V5\nK {}\n", STANDARD.encode(corrupt.as_bytes())),
         )
         .unwrap();
         assert!(disk_load(&cfg, corrupt).is_none());
@@ -3984,7 +3991,28 @@ CacheIgnoreQueryString On\n\
         )
         .is_some());
         assert!(decode_meta(b"not-a-metadata-version\n").is_none());
-        assert!(decode_meta_key(b"V4\nS 200\n").is_none());
+        // V4 carried the pre-P26 cache semantics. It remains decodable for
+        // diagnostics but can never supply the exact current-format key used
+        // by disk_load, so an upgrade cannot serve a stale trailing-slash 200.
+        let legacy_v4 = format!(
+            "V4\nS 200\nT 1\nE 2\nP {}\nG 1\n",
+            STANDARD.encode([0u8; 32])
+        );
+        assert!(decode_meta(legacy_v4.as_bytes()).is_some());
+        assert!(decode_meta_key(b"V4\nK YQ==\n").is_none());
+        assert!(decode_meta_key(b"V5\nS 200\n").is_none());
+
+        let legacy_key = "pre-p26-trailing-slash";
+        let legacy_entry = disk_entry(b"SECRET-CONTENT", unix_now() + 60);
+        let legacy_stem = cache_stem(&cfg, legacy_key).unwrap();
+        fs::create_dir_all(legacy_stem.parent().unwrap()).unwrap();
+        let mut legacy_meta = encode_meta(legacy_key, &legacy_entry);
+        legacy_meta[..2].copy_from_slice(b"V4");
+        fs::write(legacy_stem.with_extension("meta"), legacy_meta).unwrap();
+        fs::write(legacy_stem.with_extension("body"), &legacy_entry.body).unwrap();
+        assert!(disk_load(&cfg, legacy_key).is_none());
+        assert!(!legacy_stem.with_extension("body").exists());
+        assert!(!legacy_stem.with_extension("meta").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -2196,6 +2196,37 @@ pub fn cache_invalidation_status_admit(unsafe_method: bool, status: u16) -> (ok:
     unsafe_method && status >= 200 && status < 400
 }
 
+/// A trailing slash denotes a directory-like request target.  A cache entry
+/// whose representation path is unchanged and whose mapped target is a
+/// regular file must never be considered: dispatch rejects that spelling
+/// after dynamic PATH_INFO handlers have had their opportunity to consume it.
+pub open spec fn cache_trailing_slash_target_spec(
+    trailing_slash: bool,
+    same_representation_path: bool,
+    regular_file: bool,
+) -> bool {
+    !(trailing_slash && same_representation_path && regular_file)
+}
+
+pub fn cache_trailing_slash_target_admit(
+    trailing_slash: bool,
+    same_representation_path: bool,
+    regular_file: bool,
+) -> (ok: bool)
+    ensures ok == cache_trailing_slash_target_spec(
+        trailing_slash,
+        same_representation_path,
+        regular_file,
+    ),
+{
+    !(trailing_slash && same_representation_path && regular_file)
+}
+
+pub proof fn trailing_slash_regular_file_cache_is_rejected()
+    ensures !cache_trailing_slash_target_spec(true, true, true),
+{
+}
+
 pub proof fn failed_or_safe_request_never_invalidates(unsafe_method: bool, status: u16)
     requires !unsafe_method || status < 200 || status >= 400,
     ensures !cache_invalidation_status_spec(unsafe_method, status),
@@ -2324,6 +2355,157 @@ pub proof fn regex_match_work_is_bounded(
         subject <= subject_limit,
         complexity > 0,
         subject <= work_limit / complexity,
+{
+}
+
+/// Bottom-up glob evaluation visits at most one DP cell for each pattern byte
+/// and each subject suffix.  The executable check uses division so the
+/// pattern-by-(subject+1) product cannot overflow before it is admitted.
+pub open spec fn glob_match_resource_spec(
+    pattern: u64,
+    subject: u64,
+    pattern_limit: u64,
+    work_limit: u64,
+) -> bool {
+    pattern <= pattern_limit
+        && pattern < work_limit
+        && subject < u64::MAX
+        && (subject as int) + 1 <= (work_limit as int) / ((pattern as int) + 1)
+}
+
+pub fn glob_match_resource_admit(
+    pattern: u64,
+    subject: u64,
+    pattern_limit: u64,
+    work_limit: u64,
+) -> (ok: bool)
+    ensures ok == glob_match_resource_spec(pattern, subject, pattern_limit, work_limit),
+{
+    pattern <= pattern_limit
+        && pattern < work_limit
+        && subject < u64::MAX
+        && subject + 1u64 <= work_limit / (pattern + 1u64)
+}
+
+pub proof fn admitted_glob_work_is_bounded(
+    pattern: u64,
+    subject: u64,
+    pattern_limit: u64,
+    work_limit: u64,
+)
+    requires glob_match_resource_spec(pattern, subject, pattern_limit, work_limit),
+    ensures
+        pattern <= pattern_limit,
+        (pattern as int) + 1 > 0,
+        (subject as int) + 1 <= (work_limit as int) / ((pattern as int) + 1),
+{
+}
+
+/// Admission for response-header count and serialized bytes.  Both dimensions
+/// are checked before policy values are cloned into a response or an HTTP
+/// adapter materializes the wire head.
+pub open spec fn response_header_budget_spec(
+    count: u64,
+    bytes: u64,
+    count_limit: u64,
+    byte_limit: u64,
+) -> bool {
+    count <= count_limit && bytes <= byte_limit
+}
+
+pub fn response_header_budget_admit(
+    count: u64,
+    bytes: u64,
+    count_limit: u64,
+    byte_limit: u64,
+) -> (ok: bool)
+    ensures ok == response_header_budget_spec(count, bytes, count_limit, byte_limit),
+{
+    count <= count_limit && bytes <= byte_limit
+}
+
+pub proof fn admitted_response_headers_are_bounded(
+    count: u64,
+    bytes: u64,
+    count_limit: u64,
+    byte_limit: u64,
+)
+    requires response_header_budget_spec(count, bytes, count_limit, byte_limit),
+    ensures count <= count_limit, bytes <= byte_limit,
+{
+}
+
+/// Admission for the breadth of the access-file program participating in one
+/// request.  `next_instructions` is checked by subtraction so the concrete
+/// accumulator cannot overflow while walking ancestor layers.
+pub open spec fn access_program_budget_spec(
+    layers: u64,
+    instructions: u64,
+    next_instructions: u64,
+    layer_limit: u64,
+    instruction_limit: u64,
+) -> bool {
+    layers < layer_limit
+        && instructions <= instruction_limit
+        && next_instructions <= instruction_limit - instructions
+}
+
+pub fn access_program_budget_admit(
+    layers: u64,
+    instructions: u64,
+    next_instructions: u64,
+    layer_limit: u64,
+    instruction_limit: u64,
+) -> (ok: bool)
+    ensures ok == access_program_budget_spec(
+        layers,
+        instructions,
+        next_instructions,
+        layer_limit,
+        instruction_limit,
+    ),
+{
+    layers < layer_limit
+        && instructions <= instruction_limit
+        && next_instructions <= instruction_limit - instructions
+}
+
+pub proof fn admitted_access_program_is_bounded(
+    layers: u64,
+    instructions: u64,
+    next_instructions: u64,
+    layer_limit: u64,
+    instruction_limit: u64,
+)
+    requires access_program_budget_spec(
+        layers,
+        instructions,
+        next_instructions,
+        layer_limit,
+        instruction_limit,
+    ),
+    ensures
+        layers + 1 <= layer_limit,
+        instructions + next_instructions <= instruction_limit,
+{
+}
+
+/// Append admission shared by rewrite and expression expansion.  Checking
+/// subtraction before allocation proves the resulting concrete byte vector
+/// remains within its declared ceiling without overflowing `current + input`.
+pub open spec fn bounded_expansion_append_spec(current: u64, input: u64, limit: u64) -> bool {
+    current <= limit && input <= limit - current
+}
+
+pub fn bounded_expansion_append_admit(current: u64, input: u64, limit: u64) -> (ok: bool)
+    ensures ok == bounded_expansion_append_spec(current, input, limit),
+{
+    current <= limit && input <= limit - current
+}
+
+pub proof fn bounded_expansion_append_stays_bounded(current: u64, input: u64, limit: u64)
+    requires bounded_expansion_append_spec(current, input, limit),
+    ensures current + input <= limit,
 {
 }
 
@@ -9488,6 +9670,25 @@ pub fn config_program_depth_step(
     }
 }
 
+/// Access-file sections are evaluated by a recursive policy compiler.  Its
+/// input program is sealed iteratively and must establish this bound before
+/// any recursive descent begins.
+pub open spec fn access_section_depth_spec(depth: usize, limit: usize) -> bool {
+    depth <= limit
+}
+
+pub fn access_section_depth_admit(depth: usize, limit: usize) -> (ok: bool)
+    ensures ok == access_section_depth_spec(depth, limit),
+{
+    depth <= limit
+}
+
+pub proof fn access_section_depth_overflow_rejected(depth: usize, limit: usize)
+    requires depth > limit,
+    ensures !access_section_depth_spec(depth, limit),
+{
+}
+
 // ---------------------------------------------------------------------------
 // Container-field merge model
 // ---------------------------------------------------------------------------
@@ -11240,7 +11441,12 @@ pub open spec fn fnmatch_spec(pattern: Seq<u8>, value: Seq<u8>, path_mode: bool)
             } else {
                 end + 1
             };
-            let hit = fnmatch_class_body_spec(pattern, body_start, value[0], path_mode);
+            let hit = fnmatch_class_body_spec(
+                pattern.subrange(body_start, end),
+                0,
+                value[0],
+                path_mode,
+            );
             (!path_mode || value[0] != b'/')
                 && hit != fnmatch_class_negated_spec(pattern, 0)
                 && fnmatch_spec(
@@ -11287,7 +11493,7 @@ pub fn fnmatch_match(pattern: &[u8], value: &[u8], path_mode: bool) -> (out: boo
         let body_start = fnmatch_class_body_start(pattern, 0);
         let end = fnmatch_class_end(pattern, body_start);
         if let Some(end) = end {
-            let hit = fnmatch_class_body(pattern, body_start, value[0], path_mode);
+            let hit = fnmatch_class_body(&pattern[body_start..end], 0, value[0], path_mode);
             let negated = fnmatch_class_negated(pattern, 0);
             return (!path_mode || value[0] != b'/')
                 && hit != negated

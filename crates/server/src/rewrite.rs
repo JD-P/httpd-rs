@@ -37,6 +37,19 @@ use std::time::Duration;
 
 const PRG_MAP_TIMEOUT: Duration = Duration::from_secs(2);
 const PRG_MAP_MAX_OUTPUT: usize = 8 * 1024;
+const MAX_REWRITE_OUTPUT_BYTES: usize = 64 * 1024;
+
+fn append_rewrite_output(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
+    if !vapache_verified::bounded_expansion_append_admit(
+        out.len() as u64,
+        value.len() as u64,
+        MAX_REWRITE_OUTPUT_BYTES as u64,
+    ) {
+        return Err("rewrite expansion exceeds 64 KiB".into());
+    }
+    out.extend_from_slice(value);
+    Ok(())
+}
 
 pub struct Context<'a> {
     pub url_path: &'a str,
@@ -428,6 +441,9 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
     let mut effects = Effects::default();
     let mut filesystem_override: Option<PathBuf> = None;
     let mut env: RequestEnvironment = scope.authorization_env(req, ctx.url_path, ctx.peer);
+    if req.policy_budget_failed() {
+        return Outcome::Error("request policy expansion limit exceeded".into());
+    }
     let mut vary: Vec<String> = Vec::new();
     let mut idx = 0usize;
     let chain_flags: Vec<bool> = scope
@@ -457,6 +473,17 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             idx = rewrite_no_match_index(&chain_flags, idx, rule);
             continue;
         };
+        if req
+            .charge_policy_work(
+                (rule.pattern.as_str().len() as u64)
+                    .saturating_add(subject.len() as u64)
+                    .saturating_add(rule.conditions.len() as u64)
+                    .saturating_add(1),
+            )
+            .is_err()
+        {
+            return Outcome::Error("request policy work limit exceeded".into());
+        }
         let conds = match conditions_match(
             rule,
             req,
@@ -634,6 +661,9 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         } else {
             format!("/{new_path}")
         };
+        if joined.len() > MAX_REWRITE_OUTPUT_BYTES {
+            return Outcome::Error("rewritten target exceeds 64 KiB".into());
+        }
         match vapache_verified::rewrite_query_action(
             has_target_query,
             rule.flags.qsa,
@@ -642,13 +672,26 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         ) {
             vapache_verified::RewriteQueryAction::Append => {
                 if !new_query.is_empty() {
+                    if new_query.len() >= MAX_REWRITE_OUTPUT_BYTES {
+                        return Outcome::Error("rewritten query exceeds 64 KiB".into());
+                    }
                     new_query.push(b'&');
+                }
+                if !vapache_verified::bounded_expansion_append_admit(
+                    new_query.len() as u64,
+                    query.len() as u64,
+                    MAX_REWRITE_OUTPUT_BYTES as u64,
+                ) {
+                    return Outcome::Error("rewritten query exceeds 64 KiB".into());
                 }
                 new_query.extend_from_slice(&query);
             }
             vapache_verified::RewriteQueryAction::Preserve => {
                 // Apache copies the original query string when the
                 // substitution does not contain a replacement query string.
+                if query.len() > MAX_REWRITE_OUTPUT_BYTES {
+                    return Outcome::Error("rewritten query exceeds 64 KiB".into());
+                }
                 new_query = query.clone();
             }
             vapache_verified::RewriteQueryAction::Replace
@@ -659,6 +702,9 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                 .is_ok_and(|query| query.chars().any(char::is_control))
         {
             return Outcome::Error("control character in rewrite query".into());
+        }
+        if new_query.len() > MAX_REWRITE_OUTPUT_BYTES {
+            return Outcome::Error("rewritten query exceeds 64 KiB".into());
         }
 
         // A [PT] substitution maps back through URL space (it is re-resolved
@@ -857,6 +903,12 @@ fn conditions_match(
             continue;
         }
         let value = expand_vars_bytes(&cond.test, req, ctx, path, query, cond_caps, maps, env)?;
+        req.charge_policy_work(
+            (cond.pattern.len() as u64)
+                .saturating_add(value.len() as u64)
+                .saturating_add(1),
+        )
+        .map_err(str::to_string)?;
         let r = eval_cond(cond, &value, ctx, cond_caps)?;
         if r {
             if let Some(name) = condition_header(&cond.test) {
@@ -1070,18 +1122,19 @@ fn expand_vars_bytes(
                         &test[i + 2..i + 2 + end],
                         &[],
                         cond_caps,
-                    ))
+                    )?)
                     .map_err(|_| "RewriteCond variable name is not valid UTF-8".to_string())?;
-                    out.extend_from_slice(&variable_value_bytes(
-                        &name, req, ctx, path, query, maps, env,
-                    )?);
+                    append_rewrite_output(
+                        &mut out,
+                        &variable_value_bytes(&name, req, ctx, path, query, maps, env)?,
+                    )?;
                     i += 2 + end + 1;
                     continue;
                 }
             }
             vapache_verified::RewriteExpandToken::ConditionCapture { index } => {
                 if let Some(v) = cond_caps.get(index as usize) {
-                    out.extend_from_slice(v);
+                    append_rewrite_output(&mut out, v)?;
                 }
                 i += 2;
                 continue;
@@ -1089,7 +1142,7 @@ fn expand_vars_bytes(
             vapache_verified::RewriteExpandToken::Literal
             | vapache_verified::RewriteExpandToken::RuleCapture { .. } => {}
         }
-        out.push(bytes[i]);
+        append_rewrite_output(&mut out, &bytes[i..i + 1])?;
         i += 1;
     }
     Ok(out)
@@ -1424,7 +1477,11 @@ fn read_prg_line(mut input: impl Read) -> (Vec<u8>, bool) {
     (line, complete)
 }
 
-fn expand_caps_bytes(name: &str, caps: &[Vec<u8>], cond_caps: &[Vec<u8>]) -> Vec<u8> {
+fn expand_caps_bytes(
+    name: &str,
+    caps: &[Vec<u8>],
+    cond_caps: &[Vec<u8>],
+) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let b = name.as_bytes();
     let mut i = 0;
@@ -1442,15 +1499,15 @@ fn expand_caps_bytes(name: &str, caps: &[Vec<u8>], cond_caps: &[Vec<u8>]) -> Vec
                 caps
             };
             if let Some(v) = pool.get(index as usize) {
-                out.extend_from_slice(v);
+                append_rewrite_output(&mut out, v)?;
             }
             i += 2;
         } else {
-            out.push(b[i]);
+            append_rewrite_output(&mut out, &b[i..i + 1])?;
             i += 1;
         }
     }
-    out
+    Ok(out)
 }
 
 fn expand_backrefs_bytes(
@@ -1477,15 +1534,18 @@ fn expand_backrefs_bytes(
                         &s[i + 2..i + 2 + end],
                         caps,
                         cond_caps,
-                    ))
+                    )?)
                     .map_err(|_| "rewrite variable name is not valid UTF-8".to_string())?;
                     let value = variable_value_bytes(&name, req, ctx, path, query, maps, env)?;
                     if let Some(spec) = escape {
-                        out.extend_from_slice(&escape_backref_value(&value, spec));
+                        append_rewrite_output(&mut out, &escape_backref_value(&value, spec))?;
                     } else if allow_3f {
-                        out.extend_from_slice(&value);
+                        append_rewrite_output(&mut out, &value)?;
                     } else {
-                        out.extend_from_slice(&vapache_verified::rewrite_backref_no_qmark(&value));
+                        append_rewrite_output(
+                            &mut out,
+                            &vapache_verified::rewrite_backref_no_qmark(&value),
+                        )?;
                     }
                     i += 2 + end + 1;
                     continue;
@@ -1502,11 +1562,14 @@ fn expand_backrefs_bytes(
                 };
                 if let Some(v) = pool.get(index as usize) {
                     if let Some(spec) = escape {
-                        out.extend_from_slice(&escape_backref_value(v, spec));
+                        append_rewrite_output(&mut out, &escape_backref_value(v, spec))?;
                     } else if !allow_3f {
-                        out.extend_from_slice(&vapache_verified::rewrite_backref_no_qmark(v));
+                        append_rewrite_output(
+                            &mut out,
+                            &vapache_verified::rewrite_backref_no_qmark(v),
+                        )?;
                     } else {
-                        out.extend_from_slice(v);
+                        append_rewrite_output(&mut out, v)?;
                     }
                 }
                 i += 2;
@@ -1514,7 +1577,7 @@ fn expand_backrefs_bytes(
             }
             vapache_verified::RewriteExpandToken::Literal => {}
         }
-        out.push(bytes[i]);
+        append_rewrite_output(&mut out, &bytes[i..i + 1])?;
         i += 1;
     }
     Ok(out)
@@ -3504,7 +3567,7 @@ mod tests {
         let caps = vec![b"zero".to_vec(), b"one".to_vec()];
         let cond = vec![b"condzero".to_vec(), b"cond".to_vec()];
         assert_eq!(
-            expand_caps_bytes("$0/$1/%0/\\1/$9", &caps, &cond),
+            expand_caps_bytes("$0/$1/%0/\\1/$9", &caps, &cond).unwrap(),
             b"zero/one/condzero/one/"
         );
         assert_eq!(
@@ -3665,6 +3728,35 @@ mod tests {
         assert_eq!(run_prg_map(&invalid_program, "value"), "");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewrite_expansion_is_capped_before_round_amplification() {
+        let r = req();
+        let root = Path::new("/tmp");
+        let old_path = root.join("old");
+        let c = ctx("/old", &old_path, root);
+        let caps = vec![Vec::new(), vec![b'a'; MAX_REWRITE_OUTPUT_BYTES + 1]];
+        assert!(
+            expand_backrefs("$1", &caps, &[], &r, &c, "/old", b"", &[], &[], true, None,).is_err()
+        );
+
+        let repeated = "$1".repeat(100);
+        let small_capture = vec![Vec::new(), vec![b'a'; 1024]];
+        assert!(expand_backrefs(
+            &repeated,
+            &small_capture,
+            &[],
+            &r,
+            &c,
+            "/old",
+            b"",
+            &[],
+            &[],
+            true,
+            None,
+        )
+        .is_err());
     }
 
     struct ErrorWriter;

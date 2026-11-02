@@ -109,6 +109,10 @@ pub struct Headers {
     // the charge alive through dispatch without adding a lease field to every
     // synthetic Request initializer in tests and modules.
     resident_lease: Option<std::sync::Arc<ResidentLease>>,
+    // Every clone of a request must consume the same policy budget.  Keeping
+    // it beside the already-shared header reservation avoids a reset when an
+    // internal rewrite or adapter clones `Request`.
+    policy_budget: std::sync::Arc<crate::resource::RequestPolicyBudget>,
 }
 
 impl Headers {
@@ -165,6 +169,10 @@ impl Headers {
 
     pub(crate) fn hold_resident(&mut self, lease: ResidentLease) {
         self.resident_lease = Some(std::sync::Arc::new(lease));
+    }
+
+    pub(crate) fn policy_budget(&self) -> &crate::resource::RequestPolicyBudget {
+        &self.policy_budget
     }
 }
 
@@ -399,6 +407,22 @@ impl Request {
 
     pub fn body_reader(&self) -> Option<io::Result<File>> {
         self.body_spool.as_ref().map(|b| b.reader())
+    }
+
+    pub(crate) fn charge_policy_work(&self, amount: u64) -> Result<(), &'static str> {
+        self.headers.policy_budget().charge_work(amount)
+    }
+
+    pub(crate) fn charge_policy_expansion(&self, amount: u64) -> Result<(), &'static str> {
+        self.headers.policy_budget().charge_expansion(amount)
+    }
+
+    pub(crate) fn policy_budget_failed(&self) -> bool {
+        self.headers.policy_budget().failed()
+    }
+
+    pub(crate) fn policy_budget(&self) -> &crate::resource::RequestPolicyBudget {
+        self.headers.policy_budget()
     }
 }
 
@@ -1078,6 +1102,7 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
         headers: Headers {
             entries,
             resident_lease: None,
+            policy_budget: std::sync::Arc::new(crate::resource::RequestPolicyBudget::default()),
         },
         body: Vec::new(),
         body_spool: None,
@@ -1159,6 +1184,25 @@ pub struct Response {
     resident_lease: Option<ResidentLease>,
 }
 
+pub const MAX_RESPONSE_HEADERS: usize = 256;
+pub const MAX_RESPONSE_HEADER_BYTES: usize = 128 * 1024;
+
+pub(crate) fn response_headers_admitted(resp: &Response) -> bool {
+    let count = resp.headers.len().saturating_add(3);
+    let bytes = resp.headers.iter().fold(0usize, |total, (name, value)| {
+        total
+            .saturating_add(name.len())
+            .saturating_add(value.len())
+            .saturating_add(4)
+    });
+    vapache_verified::response_header_budget_admit(
+        count as u64,
+        bytes.saturating_add(256) as u64,
+        MAX_RESPONSE_HEADERS as u64,
+        MAX_RESPONSE_HEADER_BYTES as u64,
+    )
+}
+
 impl Response {
     pub fn new(status: u16) -> Self {
         Response {
@@ -1178,6 +1222,22 @@ impl Response {
         ));
         r.body = Body::Bytes(body);
         r
+    }
+
+    pub(crate) fn policy_error() -> Self {
+        Response::bytes(
+            500,
+            "text/plain; charset=UTF-8",
+            b"Response policy exceeds configured resource limits\n".to_vec(),
+        )
+    }
+
+    pub(crate) fn memory_overload() -> Self {
+        Response::bytes(
+            503,
+            "text/plain; charset=UTF-8",
+            b"Response memory capacity is temporarily exhausted\n".to_vec(),
+        )
     }
 
     pub fn header(mut self, name: &str, value: impl Into<Vec<u8>>) -> Self {
@@ -1206,15 +1266,24 @@ impl Response {
         &mut self,
         budget: &std::sync::Arc<ResourceBudget>,
     ) -> io::Result<()> {
-        if self.resident_lease.is_some() {
-            return Ok(());
-        }
-        let Body::Bytes(bytes) = &self.body else {
-            return Ok(());
+        let header_bytes = self.headers.iter().fold(256u64, |total, (name, value)| {
+            total
+                .saturating_add(name.len() as u64)
+                .saturating_add(value.len() as u64)
+                .saturating_add(4)
+        });
+        let body_bytes = match &self.body {
+            Body::Bytes(bytes) => bytes.len() as u64,
+            Body::Empty | Body::File { .. } | Body::Stream { .. } => 0,
         };
-        let mut lease = budget.try_response_bytes();
-        lease.reserve(bytes.len() as u64)?;
-        self.resident_lease = Some(lease);
+        let amount = header_bytes.saturating_add(body_bytes);
+        if let Some(lease) = &mut self.resident_lease {
+            lease.reserve(header_bytes)?;
+        } else {
+            let mut lease = budget.try_response_bytes();
+            lease.reserve(amount)?;
+            self.resident_lease = Some(lease);
+        }
         Ok(())
     }
 
@@ -1304,8 +1373,9 @@ pub trait ResponseWrite: Write {
         ))
     }
 
-    /// Inform encrypted/adapted writers of the absolute response deadline.
-    /// Plain sockets are bounded directly with non-blocking I/O below.
+    /// Inform encrypted/adapted writers of the current stall deadline. It is
+    /// renewed whenever bytes are written; plain sockets are bounded directly
+    /// with non-blocking I/O below.
     fn set_write_deadline(&mut self, _deadline: Option<Instant>) {}
 }
 
@@ -1329,7 +1399,7 @@ pub struct ResponseOptions<'a> {
     pub head_only: bool,
     pub protocol: Version,
     pub request_keep_alive: bool,
-    /// Absolute budget for serializing and writing this response.
+    /// Maximum interval in which a response write may make no byte progress.
     pub write_timeout: Duration,
 }
 
@@ -1377,7 +1447,14 @@ fn poll_writable(fd: BorrowedFd<'_>, deadline: Instant) -> io::Result<()> {
     }
 }
 
-fn write_socket_all(fd: BorrowedFd<'_>, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+fn stall_deadline(timeout: Duration) -> io::Result<Instant> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(write_timeout_error)
+}
+
+fn write_socket_all(fd: BorrowedFd<'_>, mut bytes: &[u8], timeout: Duration) -> io::Result<()> {
+    let mut deadline = stall_deadline(timeout)?;
     while !bytes.is_empty() {
         if Instant::now() >= deadline {
             return Err(write_timeout_error());
@@ -1395,7 +1472,10 @@ fn write_socket_all(fd: BorrowedFd<'_>, mut bytes: &[u8], deadline: Instant) -> 
                     "response socket wrote zero bytes",
                 ));
             }
-            Ok(written) => bytes = &bytes[written..],
+            Ok(written) => {
+                bytes = &bytes[written..];
+                deadline = stall_deadline(timeout)?;
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => poll_writable(fd, deadline)?,
             Err(error) => return Err(error),
@@ -1407,11 +1487,13 @@ fn write_socket_all(fd: BorrowedFd<'_>, mut bytes: &[u8], deadline: Instant) -> 
 fn write_all_until<W: ResponseWrite>(
     stream: &mut W,
     mut bytes: &[u8],
-    deadline: Instant,
+    timeout: Duration,
 ) -> io::Result<()> {
     if let Some(fd) = stream.deadline_fd() {
-        return write_socket_all(fd, bytes, deadline);
+        return write_socket_all(fd, bytes, timeout);
     }
+    let mut deadline = stall_deadline(timeout)?;
+    stream.set_write_deadline(Some(deadline));
     while !bytes.is_empty() {
         if Instant::now() >= deadline {
             return Err(write_timeout_error());
@@ -1423,7 +1505,11 @@ fn write_all_until<W: ResponseWrite>(
                     "failed to write response",
                 ));
             }
-            Ok(written) => bytes = &bytes[written..],
+            Ok(written) => {
+                bytes = &bytes[written..];
+                deadline = stall_deadline(timeout)?;
+                stream.set_write_deadline(Some(deadline));
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(1));
@@ -1439,8 +1525,9 @@ fn sendfile_until(
     file: BorrowedFd<'_>,
     offset: &mut u64,
     remaining: &mut u64,
-    deadline: Instant,
+    timeout: Duration,
 ) -> io::Result<()> {
+    let mut deadline = stall_deadline(timeout)?;
     while *remaining > 0 {
         if Instant::now() >= deadline {
             return Err(write_timeout_error());
@@ -1450,6 +1537,7 @@ fn sendfile_until(
             Ok(0) => break,
             Ok(written) => {
                 *remaining -= written as u64;
+                deadline = stall_deadline(timeout)?;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1468,10 +1556,12 @@ pub fn write_response<W: ResponseWrite>(
     resp: &mut Response,
     opts: &ResponseOptions,
 ) -> io::Result<u64> {
-    let deadline = Instant::now()
-        .checked_add(opts.write_timeout)
-        .ok_or_else(write_timeout_error)?;
-    stream.set_write_deadline(Some(deadline));
+    if !response_headers_admitted(resp) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response headers exceed configured count/byte limits",
+        ));
+    }
     let body_len = resp.body_len();
     let status = resp.status;
     let mut have_date = false;
@@ -1579,15 +1669,13 @@ pub fn write_response<W: ResponseWrite>(
             file.read_exact(&mut head[start..])?;
             sent = *len;
         }
-        write_all_until(stream, &head, deadline)?;
-        if Instant::now() >= deadline {
-            return Err(write_timeout_error());
-        }
+        write_all_until(stream, &head, opts.write_timeout)?;
+        stream.set_write_deadline(Some(stall_deadline(opts.write_timeout)?));
         stream.flush()?;
         return Ok(sent);
     }
 
-    write_all_until(stream, &head, deadline)?;
+    write_all_until(stream, &head, opts.write_timeout)?;
     let mut sent = 0u64;
     if opts.head_only || no_body_status {
         return Ok(0);
@@ -1595,7 +1683,7 @@ pub fn write_response<W: ResponseWrite>(
     match &mut resp.body {
         Body::Empty => {}
         Body::Bytes(b) => {
-            write_all_until(stream, b, deadline)?;
+            write_all_until(stream, b, opts.write_timeout)?;
             sent = b.len() as u64;
         }
         Body::Stream { reader, len } => {
@@ -1610,7 +1698,7 @@ pub fn write_response<W: ResponseWrite>(
                         "short streamed response body",
                     ));
                 }
-                write_all_until(stream, &tmp[..got], deadline)?;
+                write_all_until(stream, &tmp[..got], opts.write_timeout)?;
                 sent += got as u64;
                 remaining -= got as u64;
             }
@@ -1627,11 +1715,16 @@ pub fn write_response<W: ResponseWrite>(
             if let Some(fd) = stream.deadline_fd() {
                 // A blocking sendfile can outlive SO_SNDTIMEO by several
                 // multiples. Temporarily make the destination non-blocking,
-                // then poll it against the response-wide deadline.
+                // then poll it against a deadline renewed on byte progress.
                 if stream.set_nonblocking(true).is_ok() {
                     let before_sendfile = remaining;
-                    let result =
-                        sendfile_until(fd, file.as_fd(), &mut off, &mut remaining, deadline);
+                    let result = sendfile_until(
+                        fd,
+                        file.as_fd(),
+                        &mut off,
+                        &mut remaining,
+                        opts.write_timeout,
+                    );
                     // sendfile can make progress before reporting an error.
                     // Preserve that progress for access-log byte accounting
                     // and let the fallback resume at the updated offset.
@@ -1664,16 +1757,14 @@ pub fn write_response<W: ResponseWrite>(
                             "short file response body",
                         ));
                     }
-                    write_all_until(stream, &tmp[..got], deadline)?;
+                    write_all_until(stream, &tmp[..got], opts.write_timeout)?;
                     sent += got as u64;
                     remaining -= got as u64;
                 }
             }
         }
     }
-    if Instant::now() >= deadline {
-        return Err(write_timeout_error());
-    }
+    stream.set_write_deadline(Some(stall_deadline(opts.write_timeout)?));
     stream.flush()?;
     Ok(sent)
 }
@@ -1695,6 +1786,17 @@ mod tests {
         assert_eq!(req.query, b"x=1");
         assert_eq!(req.version, Version::Http11);
         assert!(req.keep_alive);
+    }
+
+    #[test]
+    fn request_clones_share_one_policy_budget() {
+        let req = parse_head(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", &limits()).unwrap();
+        let clone = req.clone();
+        req.charge_policy_work(crate::resource::MAX_POLICY_WORK_UNITS - 1)
+            .unwrap();
+        assert!(clone.charge_policy_work(2).is_err());
+        assert!(req.policy_budget_failed());
+        assert!(clone.policy_budget_failed());
     }
 
     #[test]
@@ -2305,6 +2407,39 @@ mod tests {
     #[test]
     fn response_builders_and_body_lengths() {
         header_and_empty_body_helpers();
+    }
+
+    #[test]
+    fn response_header_limits_fail_before_any_wire_bytes_are_written() {
+        let mut response = Response::new(200);
+        for index in 0..MAX_RESPONSE_HEADERS {
+            response
+                .headers
+                .push((Cow::Owned(format!("X-{index}")), b"v".to_vec()));
+        }
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let error = write_response(&mut writer, &mut response, &response_options()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(writer.data.is_empty());
+
+        let mut response =
+            Response::new(200).header("X-Large", vec![b'x'; MAX_RESPONSE_HEADER_BYTES]);
+        let error = write_response(&mut writer, &mut response, &response_options()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(writer.data.is_empty());
+    }
+
+    #[test]
+    fn resident_response_admission_includes_serialized_headers() {
+        let budget = std::sync::Arc::new(ResourceBudget::default());
+        let mut response = Response::bytes(200, "text/plain", vec![b'x'; 100]);
+        response.admit_resident(&budget).unwrap();
+        assert!(budget.extended_usage().2 >= 100 + 256 + "Content-Type".len() as u64);
+        drop(response);
+        assert_eq!(budget.extended_usage().2, 0);
     }
 
     struct TestWriter {
@@ -3038,7 +3173,7 @@ mod tests {
     }
 
     #[test]
-    fn stalled_socket_file_write_obeys_absolute_deadline() {
+    fn stalled_socket_file_write_obeys_stall_deadline() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut server, _) = listener.accept().unwrap();
@@ -3070,6 +3205,44 @@ mod tests {
         let (elapsed, result) = outcome.expect("stalled writer exceeded its deadline");
         assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    struct ProgressWriter {
+        bytes: usize,
+        delay: Duration,
+    }
+
+    impl Write for ProgressWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(self.delay);
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            self.bytes += 1;
+            Ok(1)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ResponseWrite for ProgressWriter {}
+
+    #[test]
+    fn progressing_write_may_outlive_one_timeout_interval() {
+        let mut writer = ProgressWriter {
+            bytes: 0,
+            delay: Duration::from_millis(3),
+        };
+        let mut response = Response::bytes(200, "text/plain", vec![b'x'; 64]);
+        let mut opts = response_options();
+        opts.write_timeout = Duration::from_millis(20);
+        let started = Instant::now();
+        let sent = write_response(&mut writer, &mut response, &opts).unwrap();
+        assert_eq!(sent, 64);
+        assert!(started.elapsed() > opts.write_timeout);
+        assert!(writer.bytes > sent as usize); // response head plus body
     }
 
     #[test]

@@ -1303,7 +1303,11 @@ mod tests {
 
     #[test]
     fn pathname_only_fastcgi_handoff_requires_explicit_capability() {
-        let root = std::env::temp_dir();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("vapache-fcgi-capability-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
         let mut cfg = config(&root);
         let backend = parse_backend("fcgi://127.0.0.1:9000").unwrap();
 
@@ -1315,6 +1319,7 @@ mod tests {
         cfg.capabilities
             .set(crate::config::Capability::UnstableFastCgiPaths, true);
         assert!(stable_policy_for(&cfg, &backend).unwrap().is_none());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(target_os = "linux")]

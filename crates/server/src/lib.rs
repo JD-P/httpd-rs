@@ -32,6 +32,7 @@ pub mod expr;
 pub mod fastcgi;
 pub mod fault;
 pub mod files;
+pub mod glob;
 pub mod h2;
 pub mod htaccess;
 pub mod http;

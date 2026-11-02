@@ -444,10 +444,16 @@ fn check_requires(
     url_path: &str,
     fs_path: Option<&Path>,
 ) -> Access {
+    if req.policy_budget_failed() {
+        return Access::Denied;
+    }
     let Some(policy) = &scope.authorization.requires else {
         return Access::Allowed;
     };
     let env = scope.authorization_env(req, url_path, peer);
+    if req.policy_budget_failed() {
+        return Access::Denied;
+    }
     match eval_policy(
         policy, req, peer, identity, &env, true, docroot, url_path, fs_path,
     ) {
@@ -574,6 +580,13 @@ fn eval_node(
     url_path: &str,
     fs_path: Option<&Path>,
 ) -> PolicyResult {
+    // Every authorization node is an instruction in the request's compiled
+    // policy program.  This also bounds wide lists of constant providers,
+    // which do not otherwise perform a matcher or an expansion to debit the
+    // shared request meter.
+    if req.charge_policy_work(1).is_err() {
+        return PolicyResult::Denied;
+    }
     match node {
         RequireNode::Provider(r) => {
             eval_require(r, req, peer, identity, env, docroot, url_path, fs_path)
@@ -651,10 +664,28 @@ fn eval_require(
         peer: IpAddr,
         url_path: &str,
     ) -> Result<Vec<u8>, ()> {
+        fn append(out: &mut Vec<u8>, value: &[u8], req: &Request) -> Result<(), ()> {
+            if !vapache_verified::bounded_expansion_append_admit(
+                out.len() as u64,
+                value.len() as u64,
+                crate::resource::MAX_POLICY_VALUE_BYTES,
+            ) || req.charge_policy_expansion(value.len() as u64).is_err()
+            {
+                // Ensure an individual-value failure also poisons the shared
+                // request budget when the aggregate counter still had room.
+                let _ = req.charge_policy_expansion(
+                    crate::resource::MAX_POLICY_VALUE_BYTES.saturating_add(1),
+                );
+                return Err(());
+            }
+            out.extend_from_slice(value);
+            Ok(())
+        }
+
         let mut out = Vec::new();
         let mut rest = operand;
         while let Some(start) = rest.find("%{") {
-            out.extend_from_slice(rest[..start].as_bytes());
+            append(&mut out, rest[..start].as_bytes(), req)?;
             let after = &rest[start + 2..];
             let end = after.find('}').ok_or(())?;
             let variable = &after[..end];
@@ -679,10 +710,10 @@ fn eval_require(
                     .unwrap_or_default(),
                 _ => return Err(()),
             };
-            out.extend_from_slice(&value);
+            append(&mut out, &value, req)?;
             rest = &after[end + 1..];
         }
-        out.extend_from_slice(rest.as_bytes());
+        append(&mut out, rest.as_bytes(), req)?;
         Ok(out)
     }
 
@@ -1162,6 +1193,34 @@ mod tests {
             ),
             Access::Allowed
         );
+    }
+
+    #[test]
+    fn dynamic_require_operands_share_the_request_expansion_budget() {
+        let mut request = req("GET");
+        request.headers.insert("x-expand", vec![b'a'; 8_000]);
+        let operand = "%{HTTP:X-Expand}".repeat(256);
+        let mut scope = Scope::default();
+        scope.authorization.requires = reqs(vec![Require::User {
+            negate: false,
+            names: vec![operand],
+        }]);
+        let identity = Identity {
+            user: "alice".into(),
+            groups: Vec::new(),
+        };
+        assert_eq!(
+            check(
+                &scope,
+                &request,
+                "127.0.0.1".parse().unwrap(),
+                Some(&identity),
+                "/x",
+                None,
+            ),
+            Access::Denied
+        );
+        assert!(request.policy_budget_failed());
     }
 
     #[test]

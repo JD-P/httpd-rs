@@ -61,6 +61,7 @@ OVERRIDES: dict[str, tuple[str, str, str, str]] = {
     "CVE-2009-1891": ("prevented", "dos-compression", "compression is capped at 8 MiB and completed before response I/O; no worker continues after disconnect", "medium"),
     "CVE-2009-1956": ("not_applicable", "apr-big-endian", "APR-util big-endian off-by-one is not used by Vapache", "medium"),
     "CVE-2011-1928": ("not_applicable", "apr-fnmatch", "APR fnmatch is not used; path/autoindex matching is Rust regex/string logic", "medium"),
+    "CVE-2011-4415": ("prevented", "setenvif-expansion", "SetEnvIf capture replacement is admitted before allocation against a 1 MiB value and 4 MiB request-wide expansion budget; over-limit evaluation poisons authorization and fails closed", "high"),
     "CVE-2014-0118": ("fail_closed", "request-decompression", "request-body decompression filters are unsupported and fail closed", "medium"),
     "CVE-2018-1301": ("prevented", "dos-headers", "verified head size limit and strict parser reject the out-of-bounds boundary", "high"),
     "CVE-2022-22719": ("prevented", "dos-body", "Rust body/framing handling is memory-safe and bounded", "high"),
@@ -463,7 +464,12 @@ def main() -> int:
     OUT.write_text(json.dumps(rows, indent=2) + "\n")
     with CSV_OUT.open("w", newline="") as f:
         fields = ["id", "year", "severity", "status", "spec_prevents", "surface", "confidence", "rationale", "description"]
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fields,
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(rows)
     REPORT.write_text(report(rows) + "\n")

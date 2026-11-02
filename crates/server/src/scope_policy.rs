@@ -444,6 +444,56 @@ pub struct HeaderPolicy {
     pub vary: Vec<String>,
 }
 
+pub const MAX_CONFIGURED_RESPONSE_HEADERS: usize = 256;
+pub const MAX_CONFIGURED_RESPONSE_HEADER_BYTES: usize = 128 * 1024;
+
+fn header_bytes(name: &str, value: &str) -> usize {
+    name.len().saturating_add(value.len()).saturating_add(4)
+}
+
+impl HeaderPolicy {
+    fn configured_usage(&self) -> (usize, usize) {
+        let pairs = self
+            .add_headers
+            .iter()
+            .chain(self.set_headers.iter())
+            .chain(self.always_add_headers.iter())
+            .chain(self.always_set_headers.iter());
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        for (name, value) in pairs {
+            count = count.saturating_add(1);
+            bytes = bytes.saturating_add(header_bytes(name, value));
+        }
+        for name in self
+            .unset_headers
+            .iter()
+            .chain(self.always_unset_headers.iter())
+        {
+            count = count.saturating_add(1);
+            bytes = bytes.saturating_add(name.len());
+        }
+        for cookie in &self.cookies {
+            count = count.saturating_add(1);
+            bytes = bytes.saturating_add(header_bytes("Set-Cookie", cookie));
+        }
+        for vary in &self.vary {
+            bytes = bytes.saturating_add(vary.len()).saturating_add(2);
+        }
+        (count, bytes)
+    }
+
+    pub(crate) fn within_limits(&self) -> bool {
+        let (count, bytes) = self.configured_usage();
+        vapache_verified::response_header_budget_admit(
+            count as u64,
+            bytes as u64,
+            MAX_CONFIGURED_RESPONSE_HEADERS as u64,
+            MAX_CONFIGURED_RESPONSE_HEADER_BYTES as u64,
+        )
+    }
+}
+
 fn merge_set_headers(parent: &mut Vec<(String, String)>, child: &[(String, String)]) {
     for (name, value) in child {
         // A child `Header set` replaces an inherited value with the same name
@@ -454,7 +504,17 @@ fn merge_set_headers(parent: &mut Vec<(String, String)>, child: &[(String, Strin
 }
 
 impl HeaderPolicy {
-    pub fn merge_child(&mut self, child: &HeaderPolicy) {
+    pub fn merge_child(&mut self, child: &HeaderPolicy) -> bool {
+        let (parent_count, parent_bytes) = self.configured_usage();
+        let (child_count, child_bytes) = child.configured_usage();
+        if !vapache_verified::response_header_budget_admit(
+            parent_count.saturating_add(child_count) as u64,
+            parent_bytes.saturating_add(child_bytes) as u64,
+            MAX_CONFIGURED_RESPONSE_HEADERS as u64,
+            MAX_CONFIGURED_RESPONSE_HEADER_BYTES as u64,
+        ) {
+            return false;
+        }
         crate::verified::append_vec(&mut self.add_headers, &child.add_headers);
         merge_set_headers(&mut self.set_headers, &child.set_headers);
         crate::verified::append_vec(&mut self.unset_headers, &child.unset_headers);
@@ -470,6 +530,7 @@ impl HeaderPolicy {
         crate::verified::append_vec(&mut self.expires_by_type, &child.expires_by_type);
         crate::verified::append_vec(&mut self.cookies, &child.cookies);
         crate::verified::append_vec(&mut self.vary, &child.vary);
+        true
     }
 
     /// Apply configured response headers in Apache order: set/add first, then
@@ -479,7 +540,7 @@ impl HeaderPolicy {
         &self,
         headers: &mut Vec<(std::borrow::Cow<'static, str>, Vec<u8>)>,
         include_onsuccess: bool,
-    ) {
+    ) -> Result<(), &'static str> {
         let mut unset: Vec<&str> = self
             .always_unset_headers
             .iter()
@@ -491,6 +552,25 @@ impl HeaderPolicy {
             unset.extend(self.unset_headers.iter().map(String::as_str));
             set.extend(self.set_headers.iter());
             add.extend(self.add_headers.iter());
+        }
+        let mut count = headers.len();
+        let mut bytes = headers.iter().fold(0usize, |total, (name, value)| {
+            total
+                .saturating_add(name.len())
+                .saturating_add(value.len())
+                .saturating_add(4)
+        });
+        for (name, value) in set.iter().chain(add.iter()) {
+            count = count.saturating_add(1);
+            bytes = bytes.saturating_add(header_bytes(name, value));
+        }
+        if !vapache_verified::response_header_budget_admit(
+            count as u64,
+            bytes as u64,
+            MAX_CONFIGURED_RESPONSE_HEADERS as u64,
+            MAX_CONFIGURED_RESPONSE_HEADER_BYTES as u64,
+        ) {
+            return Err("configured response headers exceed the response-header budget");
         }
         for (name, value) in set {
             headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
@@ -508,6 +588,7 @@ impl HeaderPolicy {
         for name in unset {
             headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
         }
+        Ok(())
     }
 }
 
@@ -528,7 +609,7 @@ mod header_tests {
             (std::borrow::Cow::Borrowed("X-Old"), b"leak".to_vec()),
             (std::borrow::Cow::Borrowed("X-Set"), b"one".to_vec()),
         ];
-        parent.apply(&mut headers, true);
+        parent.apply(&mut headers, true).unwrap();
         assert!(!headers.iter().any(|(n, _)| n == "X-Old"));
         assert_eq!(
             headers
@@ -559,6 +640,27 @@ mod header_tests {
         assert_eq!(parent.add_headers, vec![("X-B".into(), "2".into())]);
         assert_eq!(parent.expires_active, Some(true));
         assert_eq!(parent.expires_by_type.len(), 2);
+    }
+
+    #[test]
+    fn response_header_policy_rejects_wide_merges_and_application() {
+        let mut parent = HeaderPolicy::default();
+        parent.add_headers = (0..MAX_CONFIGURED_RESPONSE_HEADERS)
+            .map(|index| (format!("X-{index}"), "v".into()))
+            .collect();
+        assert!(parent.within_limits());
+
+        let mut child = HeaderPolicy::default();
+        child.add_headers.push(("X-Overflow".into(), "v".into()));
+        let snapshot = parent.clone();
+        assert!(!parent.merge_child(&child));
+        assert_eq!(parent, snapshot, "a rejected merge must be atomic");
+
+        let mut headers = vec![(
+            std::borrow::Cow::Borrowed("X-Large"),
+            vec![b'x'; MAX_CONFIGURED_RESPONSE_HEADER_BYTES],
+        )];
+        assert!(child.apply(&mut headers, true).is_err());
     }
 }
 

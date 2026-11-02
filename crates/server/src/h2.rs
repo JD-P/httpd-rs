@@ -463,6 +463,13 @@ async fn send_response(
     mut resp: Response,
     head_only: bool,
 ) -> io::Result<u64> {
+    if !crate::http::response_headers_admitted(&resp) {
+        resp = Response::policy_error();
+    }
+    if resp.admit_resident(&cfg.resource_budget).is_err() {
+        resp = Response::memory_overload();
+        resp.admit_resident(&cfg.resource_budget)?;
+    }
     let status = StatusCode::from_u16(resp.status)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid response status"))?;
     let no_body = status.is_informational()
@@ -1769,6 +1776,18 @@ mod tests {
             7
         );
 
+        let mut excessive_headers = Response::new(200);
+        for index in 0..crate::http::MAX_RESPONSE_HEADERS {
+            excessive_headers
+                .headers
+                .push((Cow::Owned(format!("X-{index}")), b"value".to_vec()));
+        }
+        let (result, status, body) =
+            response_round_trip(cfg.clone(), excessive_headers, false).await;
+        assert_eq!(status, 500);
+        assert_eq!(result.unwrap(), body.len() as u64);
+        assert!(body.starts_with(b"Response policy exceeds"));
+
         let medium_path = dir.join("medium.bin");
         let medium = vec![b'm'; 300 * 1024 + 1];
         fs::write(&medium_path, &medium).unwrap();
@@ -1831,7 +1850,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn zero_window_stream_waits_before_reading_or_taking_a_global_lease() {
+    async fn zero_window_stream_waits_before_reading_body() {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         struct CountingReader(Arc<AtomicU64>);
@@ -1884,7 +1903,10 @@ mod tests {
 
         assert_eq!(reads.load(Ordering::Acquire), 0);
         let usage = cfg.resource_budget.extended_usage();
-        assert_eq!(usage.2, 0, "zero-window stream allocated response bytes");
+        assert_eq!(
+            usage.2, 256,
+            "only the bounded serialized-header reservation may be held"
+        );
         assert_eq!(usage.3, 0, "zero-window stream pinned a blocking read");
 
         drop(response);
@@ -1941,7 +1963,7 @@ mod tests {
 
         assert!(!server.is_finished(), "file was read before send capacity");
         let usage = cfg.resource_budget.extended_usage();
-        assert_eq!((usage.2, usage.3), (0, 0));
+        assert_eq!((usage.2, usage.3), (256, 0));
 
         drop(response);
         drop(client);

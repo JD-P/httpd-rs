@@ -134,9 +134,10 @@ For a request `(url, fs_path, fname)`:
   - a prefix ending in `/` matches only strings that begin with that exact
     prefix.  Thus `/admin/` does not match `/admin`.
 - `LocationGlob(pattern)` is a `<Location>` argument containing shell
-  wildcards (`*`, `?`, `[...]`): the verified fnmatch kernel evaluates it in
-  path mode — component-bounded, anchored, and `*` never crosses `/`
-  (F61-A/A2/B).  A `~` first argument compiles the rest as a regex
+  wildcards (`*`, `?`, `[...]`): the stack-safe iterative fnmatch evaluator
+  runs in path mode — component-bounded, anchored, and `*` never crosses `/`.
+  Exhaustive small-input refinement tests compare it with the Verus fnmatch
+  specification (F61-A/A2/B). A `~` first argument compiles the rest as a regex
   (`LocationMatch`); `<Location ~>` with no expression is a configuration
   error (fail closed).
 - `LocationMatch(regex)` matches the canonical URL path.
@@ -577,7 +578,7 @@ proxy response head/body/chunk/trailer: decoded-byte, chunk-count, framing-byte 
 proxy chunk arithmetic          : checked_add and MAX_PROXY_BODY
 proxy DNS / TLS CA              : bounded queue/deadline; CA parsed once per generation
 accepted connections            : MaxRequestWorkers plus per-source half-budget/32 cap
-HTTP/1 response writes          : absolute Timeout deadline; non-blocking send/poll
+HTTP/1 response writes          : progress-renewed Timeout stall deadline; non-blocking send/poll
 HTTP/2 streams/control frames   : stream quotas plus refillable per-connection control-frame work budget
 WebSocket tunnels               : 64 process slots, 8 per effective client, plus idle/write deadline
 handlers/descriptors            : only stdio + script fd cross exec
@@ -587,10 +588,18 @@ Exceeding a bound is an error response or connection close, never an
 unbounded allocation or an indefinitely pinned worker.
 
 Plain HTTP/1 socket writes use non-blocking `send`/`sendfile` plus `poll`
-against one response-wide deadline. TLS writes receive the same absolute
-deadline through the async adapter. Kernel `SO_SNDTIMEO` is defense in depth,
-not the resource boundary: a stalled receiver is closed at `Timeout` and its
-connection-worker reservation is released.
+against a stall deadline renewed after each successful byte write. TLS writes
+receive the same progress-renewed deadline through the async adapter. Kernel
+`SO_SNDTIMEO` is defense in depth, not the resource boundary: a stalled
+receiver is closed at `Timeout` and its connection-worker reservation is
+released, while a slow receiver that keeps making progress may finish.
+
+Shell-pattern evaluation is iterative and uses `O(subject)` memory. Access-file
+logical lines and all configuration-originated glob patterns are capped at
+8190 bytes; request-controlled expression globbing additionally consumes the
+verified pattern-times-subject work admission. Rewrite outputs are capped at
+64 KiB, expression values at 1 MiB with a shared 4 MiB evaluation budget, and
+access-file section nesting at 64 before recursive policy compilation begins.
 
 Resident-byte and compression reservations are made before extending request,
 proxy, autoindex or encoded-response buffers. HTTP/1 retains the reservation
@@ -1645,9 +1654,10 @@ expiry uses the verified saturating `cache_expiry`, so a positive TTL can never
 wrap into the past.  Disk accounting consumes `cache_disk_projected` and
 `cache_disk_evict`; eviction steps are proven not to increase projected usage.
 Policy binding uses `cache_fingerprint_field`, whose length framing is proven
-injective. V4 disk metadata stores the complete framed base key; lookup admits
+injective. V5 disk metadata stores the complete framed base key; lookup admits
 an entry only when that metadata key exactly matches the requested key, while
-the SHA-1 filename is treated only as an index. Unsafe-method invalidation uses
+the SHA-1 filename is treated only as an index. V4 and older metadata are
+deliberately ineligible after the P26 cache-admission change. Unsafe-method invalidation uses
 the same canonical request/selected-representation identity and removes only
 entries admitted by the verified key-prefix predicate.
 
@@ -1737,7 +1747,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **590 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **602 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1788,10 +1798,14 @@ construction: there is no second production interleaver.
 - `options_apply`.  `Scope::effective_options` uses the verified
   Set/Add/Remove operation instead of an open-coded match.
 - `expr_value_truthy`, `expr_compare_ints`, `expr_compare_strs`,
-  `expr_glob_match` and `cond_chain_eval`.  Expression values map to booleans
-  through the verified truthiness table; integer and UTF-8 byte-string
-  comparisons, `-strmatch`/`-fnmatch` globbing and rewrite `[OR]` condition
-  groups all consume verified kernels.  Leaf evaluators that consult regex,
+  `expr_glob_spec`, `glob_match_resource_admit` and `cond_chain_eval`.
+  Expression values map to booleans through the verified truthiness table;
+  integer and UTF-8 byte-string comparisons and rewrite `[OR]` condition
+  groups consume verified kernels. `-strmatch`/`-fnmatch` uses a stack-safe
+  iterative DP evaluator differentially checked against `expr_glob_spec`, with
+  a verified work gate before allocation. `bounded_expansion_append_admit`
+  also guards expression and rewrite output growth before vector extension.
+  Leaf evaluators that consult regex,
   filesystem, IP or request state remain explicit assumptions.
 - `path_under_base`, `rewrite_filesystem_admit`,
   `proxy_representation_witness`, `proxy_request_line_admit`,
@@ -1921,7 +1935,8 @@ construction: there is no second production interleaver.
   `AccessProgram`. Both programs establish exact start/end section mates and
   preclassify directive/section identity before compilation. Skipping a false,
   inactive or disallowed section jumps to its exact mate instead of rescanning
-  nested text.
+  nested text. `access_section_depth_admit` establishes the recursive access
+  policy compiler's depth ceiling during this iterative seal pass.
 - `config_section_nesting_allowed`.  The recursive configuration compiler
   checks section transitions through the verified context table. Complex
   directive and pattern payload refinements remain the explicit
@@ -1967,7 +1982,9 @@ construction: there is no second production interleaver.
   component.
 - `cache_invalidation_status_admit` proves that only a successful unsafe
   request can invalidate cache entries; safe methods and every 1xx/4xx/5xx
-  response are inert. `autoindex_append_admit` is consumed before both scan
+  response are inert. `cache_trailing_slash_target_admit` prevents an
+  unchanged regular-file representation ending in `/` from reaching lookup.
+  `autoindex_append_admit` is consumed before both scan
   count and rendered-byte growth, so checked subtraction establishes the
   configured ceiling before allocation.
 - `bcrypt_cost_admit` rejects bcrypt costs outside 4..=17 before invoking the

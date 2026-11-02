@@ -176,6 +176,7 @@ pub fn effective_scope_with_layers_and_file_name(
                 cfg.apply_directory_own_path_rules(
                     vhost,
                     &mut scope,
+                    Some(req),
                     fs_path,
                     url_path,
                     &mut directory_match_files,
@@ -187,6 +188,7 @@ pub fn effective_scope_with_layers_and_file_name(
                 cfg.apply_directory_match_rules(
                     vhost,
                     &mut scope,
+                    Some(req),
                     fs_path,
                     url_path,
                     &mut directory_match_files,

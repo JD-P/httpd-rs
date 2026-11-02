@@ -2234,9 +2234,13 @@ fn proxy_once_budgeted(
                 reader: Box::new(body),
                 len: n as u64,
             };
-            scope
+            if scope
                 .header_policy
-                .apply(&mut response.headers, response.status < 400);
+                .apply(&mut response.headers, response.status < 400)
+                .is_err()
+            {
+                return Ok((Response::policy_error(), None));
+            }
             crate::compression::finalize_budgeted(
                 scope,
                 req,
@@ -2307,9 +2311,13 @@ fn proxy_once_budgeted(
     if let Some(lease) = response_resident {
         response.hold_resident(lease);
     }
-    scope
+    if scope
         .header_policy
-        .apply(&mut response.headers, response.status < 400);
+        .apply(&mut response.headers, response.status < 400)
+        .is_err()
+    {
+        return Ok((Response::policy_error(), None));
+    }
     crate::compression::finalize_budgeted(
         scope,
         req,

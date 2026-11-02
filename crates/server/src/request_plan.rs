@@ -194,6 +194,7 @@ pub struct RequestPlan {
     fs_path: PathBuf,
     script_alias: bool,
     layers: Vec<AccessLayer>,
+    access_may_apply: bool,
 }
 
 impl RequestPlan {
@@ -208,7 +209,7 @@ impl RequestPlan {
     ) -> Result<Self, CanonicalErrorOrPlan> {
         let target = CanonicalTarget::from_request(req, allow_encoded)
             .map_err(CanonicalErrorOrPlan::Canonical)?;
-        Self::resolve(cfg, vhost, target).map_err(CanonicalErrorOrPlan::Plan)
+        Self::resolve_for_request(cfg, vhost, target, req).map_err(CanonicalErrorOrPlan::Plan)
     }
 
     pub fn resolve(
@@ -218,7 +219,18 @@ impl RequestPlan {
     ) -> Result<Self, PlanError> {
         let (root, rel, script_alias) =
             crate::server::map_path(cfg, vhost, &target.norm).ok_or(PlanError::Unmapped)?;
-        Self::build(cfg, vhost, target, root, rel, script_alias)
+        Self::build(cfg, vhost, target, root, rel, script_alias, None)
+    }
+
+    pub fn resolve_for_request(
+        cfg: &Config,
+        vhost: Option<&VHost>,
+        target: CanonicalTarget,
+        req: &Request,
+    ) -> Result<Self, PlanError> {
+        let (root, rel, script_alias) =
+            crate::server::map_path(cfg, vhost, &target.norm).ok_or(PlanError::Unmapped)?;
+        Self::build(cfg, vhost, target, root, rel, script_alias, Some(req))
     }
 
     /// Build a plan for an explicit filesystem target that may differ from
@@ -230,6 +242,31 @@ impl RequestPlan {
         root: PathBuf,
         fs_path: PathBuf,
         script_alias: bool,
+    ) -> Result<Self, PlanError> {
+        Self::from_fs_target_inner(cfg, vhost, target, root, fs_path, script_alias, None)
+    }
+
+    pub fn from_fs_target_for_request(
+        cfg: &Config,
+        vhost: Option<&VHost>,
+        target: CanonicalTarget,
+        root: PathBuf,
+        fs_path: PathBuf,
+        script_alias: bool,
+        req: &Request,
+    ) -> Result<Self, PlanError> {
+        Self::from_fs_target_inner(cfg, vhost, target, root, fs_path, script_alias, Some(req))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_fs_target_inner(
+        cfg: &Config,
+        vhost: Option<&VHost>,
+        target: CanonicalTarget,
+        root: PathBuf,
+        fs_path: PathBuf,
+        script_alias: bool,
+        req: Option<&Request>,
     ) -> Result<Self, PlanError> {
         let rel = fs_path
             .strip_prefix(&root)
@@ -253,7 +290,7 @@ impl RequestPlan {
                         .unwrap_or_default(),
                 )
             });
-        Self::build_with_fs_path(cfg, vhost, target, root, rel, fs_path, script_alias)
+        Self::build_with_fs_path(cfg, vhost, target, root, rel, fs_path, script_alias, req)
     }
 
     fn build(
@@ -263,9 +300,10 @@ impl RequestPlan {
         root: PathBuf,
         rel: PathBuf,
         script_alias: bool,
+        req: Option<&Request>,
     ) -> Result<Self, PlanError> {
         let fs_path = root.join(&rel);
-        Self::build_with_fs_path(cfg, vhost, target, root, rel, fs_path, script_alias)
+        Self::build_with_fs_path(cfg, vhost, target, root, rel, fs_path, script_alias, req)
     }
 
     /// Build a plan around one explicit filesystem target.  The target path,
@@ -280,6 +318,7 @@ impl RequestPlan {
         rel: PathBuf,
         fs_path: PathBuf,
         script_alias: bool,
+        req: Option<&Request>,
     ) -> Result<Self, PlanError> {
         // Paths participate in routing, access-file selection, rewrite
         // subjects and CGI identity.  Reject a filesystem identity that
@@ -293,14 +332,30 @@ impl RequestPlan {
                 fs_path.display()
             )));
         }
-        let layers = crate::htaccess::collect_layers_with_root(
-            cfg,
-            vhost,
-            &fs_path,
-            &target.url_path,
-            Some(&root),
-        )
+        let layers = match req {
+            Some(req) => crate::htaccess::collect_layers_with_root_req(
+                cfg,
+                vhost,
+                &fs_path,
+                &target.url_path,
+                Some(&root),
+                req,
+            ),
+            None => crate::htaccess::collect_layers_with_root(
+                cfg,
+                vhost,
+                &fs_path,
+                &target.url_path,
+                Some(&root),
+            ),
+        }
         .map_err(PlanError::AccessFiles)?;
+        let access_may_apply = match req {
+            Some(req) => cfg
+                .htaccess_may_apply_req(&fs_path, req)
+                .map_err(|error| PlanError::AccessFiles(error.to_string()))?,
+            None => cfg.htaccess_may_apply(&fs_path),
+        };
         let layers_match_target = layers
             .iter()
             .all(|layer| fs_path.starts_with(&layer.identity.dir));
@@ -319,6 +374,7 @@ impl RequestPlan {
             fs_path,
             script_alias,
             layers,
+            access_may_apply,
         })
     }
 
@@ -364,7 +420,7 @@ impl RequestPlan {
         // fall back to the configuration-only path merely because the target
         // path is outside the lexical `AllowOverride` prefix (F59/I60).
         let use_layers = vapache_verified::target_layer_consume_admit(
-            cfg.htaccess_may_apply(&self.fs_path),
+            self.access_may_apply,
             !self.layers.is_empty(),
         );
         if use_layers {
@@ -616,6 +672,7 @@ mod tests {
             PathBuf::from("file.txt"),
             root.join("file.txt"),
             false,
+            None,
         )
         .unwrap_err();
         assert!(matches!(error, PlanError::AccessFiles(message) if message.contains("non-UTF-8")));

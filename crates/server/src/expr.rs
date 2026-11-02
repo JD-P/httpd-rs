@@ -15,6 +15,9 @@ use std::path::{Component, Path, PathBuf};
 /// document tree.
 const MAX_EXPR_FILE_BYTES: u64 = 64 * 1024;
 const MAX_EXPR_REGEX_BYTES: u64 = 64 * 1024;
+const MAX_EXPR_SOURCE_BYTES: usize = 64 * 1024;
+const MAX_EXPR_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_EXPR_EVAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// A PCRE2-compatible expression compiled while the configuration is parsed.
 /// The in-tree engine accepts the regular PCRE2 subset used by Apache guards
@@ -158,6 +161,32 @@ impl Value {
             Value::Bytes(bytes) => bytes.clone(),
             _ => self.string().into_bytes(),
         }
+    }
+
+    fn resident_len(&self) -> usize {
+        match self {
+            Value::Bool(_) | Value::Int(_) => std::mem::size_of::<Self>(),
+            Value::Str(value) => value.len(),
+            Value::Bytes(value) => value.len(),
+            Value::List(values) => values.iter().fold(0usize, |total, value| {
+                total.saturating_add(value.resident_len())
+            }),
+        }
+    }
+}
+
+struct EvalBudget {
+    remaining: usize,
+}
+
+impl EvalBudget {
+    fn charge(&mut self, value: &Value) -> Result<(), String> {
+        let bytes = value.resident_len();
+        if bytes > MAX_EXPR_VALUE_BYTES || bytes > self.remaining {
+            return Err("expression value budget exceeded".into());
+        }
+        self.remaining -= bytes;
+        Ok(())
     }
 }
 
@@ -547,6 +576,18 @@ pub fn validate_vars(expr: &Expr) -> Result<(), String> {
     walk(expr)
 }
 
+fn append_expansion(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
+    if !vapache_verified::bounded_expansion_append_admit(
+        out.len() as u64,
+        value.len() as u64,
+        MAX_EXPR_VALUE_BYTES as u64,
+    ) {
+        return Err("expression value exceeds 1 MiB".into());
+    }
+    out.extend_from_slice(value);
+    Ok(())
+}
+
 fn expand_bytes(text: &str, ctx: &Context<'_>) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let b = text.as_bytes();
@@ -574,22 +615,20 @@ fn expand_bytes(text: &str, ctx: &Context<'_>) -> Result<Vec<u8>, String> {
                 )
             }) {
                 let value = Value::Str(function_arg(ctx, arg)?);
-                out.extend_from_slice(
-                    match func.to_ascii_lowercase().as_str() {
-                        "toupper" => value.string().to_ascii_uppercase(),
-                        "tolower" => value.string().to_ascii_lowercase(),
-                        "escape" => percent_encode(&value.string()),
-                        "unescape" => percent_decode(&value.string()),
-                        _ => return Err(format!("unknown expression function '{func}'")),
-                    }
-                    .as_bytes(),
-                );
+                let expanded = match func.to_ascii_lowercase().as_str() {
+                    "toupper" => value.string().to_ascii_uppercase(),
+                    "tolower" => value.string().to_ascii_lowercase(),
+                    "escape" => percent_encode(&value.string()),
+                    "unescape" => percent_decode(&value.string()),
+                    _ => return Err(format!("unknown expression function '{func}'")),
+                };
+                append_expansion(&mut out, expanded.as_bytes())?;
             } else {
-                out.extend_from_slice(&var(ctx, inner)?.bytes());
+                append_expansion(&mut out, &var(ctx, inner)?.bytes())?;
             }
             i = j;
         } else {
-            out.push(b[i]);
+            append_expansion(&mut out, &b[i..i + 1])?;
             i += 1;
         }
     }
@@ -640,8 +679,8 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
-fn glob(pattern: &str, value: &str, path_mode: bool) -> bool {
-    vapache_verified::expr_glob_match(pattern.as_bytes(), value.as_bytes(), path_mode)
+fn glob(pattern: &str, value: &str, path_mode: bool) -> Result<bool, String> {
+    crate::glob::expr_match(pattern.as_bytes(), value.as_bytes(), path_mode).map_err(str::to_string)
 }
 
 fn compare_op(op: &str) -> Option<vapache_verified::ExprCompareOp> {
@@ -741,7 +780,18 @@ fn read_expr_file(path: &Path) -> Result<String, String> {
 
 impl Expr {
     pub fn eval(&self, ctx: &mut Context<'_>) -> Result<Value, String> {
-        Ok(match self {
+        let mut budget = EvalBudget {
+            remaining: MAX_EXPR_EVAL_BYTES,
+        };
+        self.eval_budgeted(ctx, &mut budget)
+    }
+
+    fn eval_budgeted(
+        &self,
+        ctx: &mut Context<'_>,
+        budget: &mut EvalBudget,
+    ) -> Result<Value, String> {
+        let value = match self {
             Expr::Bool(b) => Value::Bool(*b),
             Expr::Str(s) => Value::Bytes(expand_bytes(s, ctx)?),
             Expr::Int(i) => Value::Int(*i),
@@ -750,15 +800,20 @@ impl Expr {
             Expr::Concat(parts) => {
                 let mut out = Vec::new();
                 for part in parts {
-                    out.extend_from_slice(&part.eval(ctx)?.bytes());
+                    let bytes = part.eval_budgeted(ctx, budget)?.bytes();
+                    append_expansion(&mut out, &bytes)?;
                 }
                 Value::Bytes(out)
             }
-            Expr::Not(e) => Value::Bool(!e.eval(ctx)?.truthy()),
-            Expr::Neg(e) => Value::Int(-e.eval(ctx)?.int().ok_or("unary - needs a number")?),
+            Expr::Not(e) => Value::Bool(!e.eval_budgeted(ctx, budget)?.truthy()),
+            Expr::Neg(e) => Value::Int(
+                -e.eval_budgeted(ctx, budget)?
+                    .int()
+                    .ok_or("unary - needs a number")?,
+            ),
             Expr::And(es) => {
                 for e in es {
-                    if !e.eval(ctx)?.truthy() {
+                    if !e.eval_budgeted(ctx, budget)?.truthy() {
                         return Ok(Value::Bool(false));
                     }
                 }
@@ -766,15 +821,19 @@ impl Expr {
             }
             Expr::Or(es) => {
                 for e in es {
-                    if e.eval(ctx)?.truthy() {
+                    if e.eval_budgeted(ctx, budget)?.truthy() {
                         return Ok(Value::Bool(true));
                     }
                 }
                 Value::Bool(false)
             }
-            Expr::Compare(l, op, r) => Value::Bool(cmp(&l.eval(ctx)?, op, &r.eval(ctx)?)),
+            Expr::Compare(l, op, r) => Value::Bool(cmp(
+                &l.eval_budgeted(ctx, budget)?,
+                op,
+                &r.eval_budgeted(ctx, budget)?,
+            )),
             Expr::Regex(l, regex, negate) => {
-                let text = l.eval(ctx)?.bytes();
+                let text = l.eval_budgeted(ctx, budget)?.bytes();
                 if !vapache_verified::expr_regex_size_admit(
                     regex.pattern.len() as u64,
                     text.len() as u64,
@@ -782,6 +841,12 @@ impl Expr {
                 ) {
                     return Err("expression regex input is too large".into());
                 }
+                let regex_work = (regex.pattern.len() as u64 + 1)
+                    .checked_mul(text.len() as u64 + 1)
+                    .ok_or("expression regex work overflow")?;
+                ctx.req
+                    .charge_policy_work(regex_work)
+                    .map_err(str::to_string)?;
                 let _expensive = crate::resource::try_expensive()
                     .ok_or("expression regex capacity exhausted")?;
                 let (caps, eval_error) = match regex.compiled.captures(&text) {
@@ -807,14 +872,18 @@ impl Expr {
                 Value::Bool(result)
             }
             Expr::In(l, list) => {
-                let needle = l.eval(ctx)?.bytes();
-                Value::Bool(
-                    list.iter()
-                        .any(|e| e.eval(ctx).map(|v| v.bytes() == needle).unwrap_or(false)),
-                )
+                let needle = l.eval_budgeted(ctx, budget)?.bytes();
+                let mut found = false;
+                for expression in list {
+                    if expression.eval_budgeted(ctx, budget)?.bytes() == needle {
+                        found = true;
+                        break;
+                    }
+                }
+                Value::Bool(found)
             }
             Expr::StrTest(e, nonempty) => {
-                let s = e.eval(ctx)?.bytes();
+                let s = e.eval_budgeted(ctx, budget)?.bytes();
                 Value::Bool(if *nonempty {
                     !s.is_empty()
                 } else {
@@ -825,7 +894,7 @@ impl Expr {
                 crate::files::symlink_metadata_cached(std::path::Path::new(path)).is_ok(),
             ),
             Expr::FileTest(op, e) => {
-                let raw = e.eval(ctx)?.string();
+                let raw = e.eval_budgeted(ctx, budget)?.string();
                 // File tests are a metadata oracle too.  Use the same
                 // canonical document-root confinement as file()/filesize();
                 // an absolute path or a symlink leaving the root must not be
@@ -850,7 +919,7 @@ impl Expr {
                         .map(|m| m.len() > 0)
                         .unwrap_or(false),
                     "-R" => {
-                        let spec = e.eval(ctx)?.string();
+                        let spec = e.eval_budgeted(ctx, budget)?.string();
                         crate::config::parse_ip_net(&spec)
                             .map(|(net, bits)| crate::access::ip_in_net(ctx.peer, net, bits))
                             .unwrap_or(false)
@@ -860,28 +929,36 @@ impl Expr {
             }
             Expr::IpMatch(l, r, negate) => {
                 let ip: IpAddr = l
-                    .eval(ctx)?
+                    .eval_budgeted(ctx, budget)?
                     .string()
                     .parse()
                     .map_err(|_| "bad IP expression")?;
-                let spec = r.eval(ctx)?.string();
+                let spec = r.eval_budgeted(ctx, budget)?.string();
                 let matched = crate::config::parse_ip_net(&spec)
                     .map(|(net, bits)| crate::access::ip_in_net(ip, net, bits))
                     .unwrap_or(false);
                 Value::Bool(matched != *negate)
             }
             Expr::StrMatch(l, r, nocase, path_mode) => {
-                let mut a = l.eval(ctx)?.string();
-                let mut b = r.eval(ctx)?.string();
+                let mut a = l.eval_budgeted(ctx, budget)?.string();
+                let mut b = r.eval_budgeted(ctx, budget)?.string();
                 if *nocase {
                     a = a.to_ascii_lowercase();
                     b = b.to_ascii_lowercase();
                 }
-                Value::Bool(glob(&b, &a, *path_mode))
+                let glob_work = (a.len() as u64 + 1)
+                    .checked_mul(b.len() as u64 + 1)
+                    .ok_or("expression glob work overflow")?;
+                ctx.req
+                    .charge_policy_work(glob_work)
+                    .map_err(str::to_string)?;
+                Value::Bool(glob(&b, &a, *path_mode)?)
             }
             Expr::Func(name, args) => {
-                let vals: Vec<Value> =
-                    args.iter().map(|a| a.eval(ctx)).collect::<Result<_, _>>()?;
+                let mut vals = Vec::with_capacity(args.len());
+                for arg in args {
+                    vals.push(arg.eval_budgeted(ctx, budget)?);
+                }
                 let arg = |i: usize| vals.get(i).map(Value::string).unwrap_or_default();
                 match name.to_ascii_lowercase().as_str() {
                     "req" | "http" => Value::Bytes(
@@ -923,7 +1000,18 @@ impl Expr {
                     other => return Err(format!("unknown expression function '{other}'")),
                 }
             }
-        })
+        };
+        let resident = value.resident_len() as u64;
+        ctx.req
+            .charge_policy_work(resident.saturating_add(1))
+            .map_err(str::to_string)?;
+        if matches!(&value, Value::Str(_) | Value::Bytes(_) | Value::List(_)) {
+            ctx.req
+                .charge_policy_expansion(resident)
+                .map_err(str::to_string)?;
+        }
+        budget.charge(&value)?;
+        Ok(value)
     }
 }
 
@@ -1389,6 +1477,11 @@ impl<'a> Parser<'a> {
 }
 
 pub fn parse(input: &str) -> Result<Expr, String> {
+    if input.len() > MAX_EXPR_SOURCE_BYTES {
+        return Err(format!(
+            "expression source exceeds {MAX_EXPR_SOURCE_BYTES} bytes"
+        ));
+    }
     let mut p = Parser::new(input);
     let e = p.or()?;
     p.skip();
@@ -1425,6 +1518,43 @@ mod tests {
         let docroot = Path::new("/tmp");
         let mut c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), docroot, "/x");
         e.eval(&mut c).unwrap().truthy()
+    }
+
+    #[test]
+    fn expression_expansion_and_glob_work_are_bounded() {
+        let mut r = req();
+        r.headers.insert("x", vec![b'a'; 8_000]);
+        r.headers.insert("x-p", vec![b'a'; 8_000]);
+        let mut pattern = b"*a".repeat(4_000);
+        pattern.push(b'b');
+        r.headers.insert("x-v", pattern);
+        let docroot = Path::new("/tmp");
+        let mut c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), docroot, "/x");
+
+        let repeated = format!("'{}'", "%{HTTP:X}".repeat(200));
+        assert!(parse(&repeated).unwrap().eval(&mut c).is_err());
+        assert!(parse("%{HTTP:X-P} -strmatch %{HTTP:X-V}")
+            .unwrap()
+            .eval(&mut c)
+            .is_err());
+        assert!(parse(&"x".repeat(MAX_EXPR_SOURCE_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn repeated_file_values_share_one_evaluation_budget() {
+        let dir = std::env::temp_dir().join(format!("vapache-expr-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big"), vec![b'x'; MAX_EXPR_FILE_BYTES as usize]).unwrap();
+        let expression = Expr::Concat(
+            (0..100)
+                .map(|_| Expr::Func("file".into(), vec![Expr::Str("big".into())]))
+                .collect(),
+        );
+        let r = req();
+        let mut c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), &dir, "/x");
+        assert!(expression.eval(&mut c).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

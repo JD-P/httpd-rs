@@ -21,6 +21,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 const MAX_HTACCESS: u64 = 1024 * 1024;
+const MAX_HTACCESS_LINE: usize = 8190;
+const MAX_ACCESS_SECTION_DEPTH: usize = 64;
+const MAX_ACCESS_INSTRUCTIONS_PER_FILE: usize = 8192;
+const MAX_ACCESS_INSTRUCTIONS_PER_REQUEST: usize = 16_384;
+const MAX_ACCESS_LAYERS: usize = 64;
 
 pub fn apply(
     cfg: &Config,
@@ -156,6 +161,8 @@ pub fn apply_req_deferred_with_root(
         .unwrap_or_else(|| access_root_for(cfg, vhost, fs_path));
     let start = walk_start(fs_path);
     let dirs = ancestor_dirs(start);
+    let mut access_layers = 0usize;
+    let mut access_instructions = 0usize;
     let can_read_access = cfg.override_enabled && cfg.override_applicable(fs_path);
     let mut ignored_locations = Vec::new();
     for dir in dirs {
@@ -222,6 +229,17 @@ pub fn apply_req_deferred_with_root(
                     parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, opened)?
                 }
             };
+            if !vapache_verified::access_program_budget_admit(
+                access_layers as u64,
+                access_instructions as u64,
+                delta.instruction_count as u64,
+                MAX_ACCESS_LAYERS as u64,
+                MAX_ACCESS_INSTRUCTIONS_PER_REQUEST as u64,
+            ) {
+                return Err("access-file request policy is too wide".into());
+            }
+            access_layers += 1;
+            access_instructions += delta.instruction_count;
             scope.merge(&delta.scope);
             let fname = fs_path
                 .file_name()
@@ -250,6 +268,7 @@ pub fn apply_req_deferred_with_root(
         cfg.apply_directory_own_path_rules(
             vhost,
             scope,
+            req,
             fs_path,
             url_path,
             config_files,
@@ -259,6 +278,7 @@ pub fn apply_req_deferred_with_root(
         cfg.apply_directory_match_rules(
             vhost,
             scope,
+            req,
             fs_path,
             url_path,
             config_files,
@@ -377,6 +397,28 @@ pub fn collect_layers_with_root(
     url_path: &str,
     mapping_root: Option<&Path>,
 ) -> Result<Vec<crate::policy_ref::AccessLayer>, String> {
+    collect_layers_with_root_inner(cfg, vhost, fs_path, url_path, mapping_root, None)
+}
+
+pub fn collect_layers_with_root_req(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    fs_path: &Path,
+    url_path: &str,
+    mapping_root: Option<&Path>,
+    req: &crate::http::Request,
+) -> Result<Vec<crate::policy_ref::AccessLayer>, String> {
+    collect_layers_with_root_inner(cfg, vhost, fs_path, url_path, mapping_root, Some(req))
+}
+
+fn collect_layers_with_root_inner(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    fs_path: &Path,
+    url_path: &str,
+    mapping_root: Option<&Path>,
+    req: Option<&crate::http::Request>,
+) -> Result<Vec<crate::policy_ref::AccessLayer>, String> {
     let root = match mapping_root {
         Some(root) => {
             // Callers pass the root returned by `map_path()` for the URL that
@@ -391,23 +433,44 @@ pub fn collect_layers_with_root(
     } else {
         fs::canonicalize(&root).ok()
     };
-    if !cfg.htaccess_may_apply(fs_path)
-        && !mapped_policy_dir(&root, canonical_root.as_deref(), fs_path)
-            .is_some_and(|mapped| cfg.htaccess_may_apply(&mapped))
-    {
+    let may_apply = |path: &Path| match req {
+        Some(req) => cfg
+            .htaccess_may_apply_req(path, req)
+            .map_err(str::to_string),
+        None => Ok(cfg.htaccess_may_apply(path)),
+    };
+    let direct_policy = may_apply(fs_path)?;
+    let mapped_policy = match mapped_policy_dir(&root, canonical_root.as_deref(), fs_path) {
+        Some(mapped) if mapped != fs_path => may_apply(&mapped)?,
+        _ => false,
+    };
+    if !direct_policy && !mapped_policy {
         return Ok(Vec::new());
     }
     let start = walk_start(fs_path);
     let dirs = ancestor_dirs(start);
     let mut layers = Vec::new();
+    let mut access_instructions = 0usize;
     for dir in dirs {
         // Ancestors above every override-enabled directory cannot contribute
         // an accessible layer (F50 still covers an enabled ancestor itself).
         let mapped_dir = mapped_policy_dir(&root, canonical_root.as_deref(), &dir);
-        let policy_applicable = cfg.access_file_dir_applicable(&dir)
-            || mapped_dir
-                .as_deref()
-                .is_some_and(|mapped| mapped != dir && cfg.access_file_dir_applicable(mapped));
+        let dir_policy_applicable = match req {
+            Some(req) => cfg
+                .access_file_dir_applicable_req(&dir, req)
+                .map_err(str::to_string)?,
+            None => cfg.access_file_dir_applicable(&dir),
+        };
+        let mapped_policy_applicable = match mapped_dir.as_deref().filter(|mapped| *mapped != dir) {
+            Some(mapped) => match req {
+                Some(req) => cfg
+                    .access_file_dir_applicable_req(mapped, req)
+                    .map_err(str::to_string)?,
+                None => cfg.access_file_dir_applicable(mapped),
+            },
+            None => false,
+        };
+        let policy_applicable = dir_policy_applicable || mapped_policy_applicable;
         if !policy_applicable {
             continue;
         }
@@ -415,7 +478,12 @@ pub fn collect_layers_with_root(
         if !is_dir {
             continue;
         }
-        let dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
+        let dir_scope = match req {
+            Some(req) => cfg
+                .effective_scope_cached_req(vhost, &dir, url_path, req)
+                .map_err(str::to_string)?,
+            None => cfg.effective_scope_cached(vhost, &dir, url_path),
+        };
         // A canonical target directory and its lexical URL-mapped counterpart
         // are two policy identities.  An explicit `AllowOverride None` on
         // either one denies the access file; when only one identity is
@@ -424,7 +492,12 @@ pub fn collect_layers_with_root(
         // scope was disabled was a fail-open branch.
         let mut override_policy = dir_scope.override_policy.clone();
         if let Some(mapped) = mapped_dir.as_deref().filter(|mapped| *mapped != dir) {
-            let mapped_scope = cfg.effective_scope_cached(vhost, mapped, url_path);
+            let mapped_scope = match req {
+                Some(req) => cfg
+                    .effective_scope_cached_req(vhost, mapped, url_path, req)
+                    .map_err(str::to_string)?,
+                None => cfg.effective_scope_cached(vhost, mapped, url_path),
+            };
             override_policy = override_policy.conjoined_with(&mapped_scope.override_policy);
         }
         let mode = override_policy.mode();
@@ -463,6 +536,16 @@ pub fn collect_layers_with_root(
                 Ok(Some(opened)) => opened,
             };
             let parsed = parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, opened)?;
+            if !vapache_verified::access_program_budget_admit(
+                layers.len() as u64,
+                access_instructions as u64,
+                parsed.instruction_count as u64,
+                MAX_ACCESS_LAYERS as u64,
+                MAX_ACCESS_INSTRUCTIONS_PER_REQUEST as u64,
+            ) {
+                return Err("access-file request policy is too wide".into());
+            }
+            access_instructions += parsed.instruction_count;
             // Preserve AuthMerging on the selected access file; later
             // AccessFileName candidates are not merged.
             layer.scope = Arc::clone(&parsed.scope);
@@ -602,7 +685,7 @@ fn rule_matches(kind: &MatchKind, fname: &str, url_path: &str) -> bool {
         MatchKind::Always => true,
         MatchKind::Files(re) | MatchKind::FilesMatch(re) => re.is_match(fname.as_bytes()),
         MatchKind::FilesGlob(pattern) => {
-            vapache_verified::fnmatch_match(pattern.as_bytes(), fname.as_bytes(), false)
+            crate::glob::fnmatch(pattern.as_bytes(), fname.as_bytes(), false)
         }
         MatchKind::Location(prefix) => {
             let base = prefix.trim_end_matches('/');
@@ -612,7 +695,7 @@ fn rule_matches(kind: &MatchKind, fname: &str, url_path: &str) -> bool {
                     && url_path.as_bytes().get(base.len()) == Some(&b'/'))
         }
         MatchKind::LocationGlob(pattern) => {
-            vapache_verified::fnmatch_match(pattern.as_bytes(), url_path.as_bytes(), true)
+            crate::glob::fnmatch(pattern.as_bytes(), url_path.as_bytes(), true)
         }
         MatchKind::LocationMatch(re) => re.is_match(url_path.as_bytes()),
         MatchKind::Directory(p) => Path::new(url_path).starts_with(p),
@@ -623,6 +706,7 @@ fn rule_matches(kind: &MatchKind, fname: &str, url_path: &str) -> bool {
 struct Parsed {
     scope: Arc<Scope>,
     rules: Vec<ScopeRule>,
+    instruction_count: usize,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -891,7 +975,20 @@ fn parse_access_bytes(
     let text = std::str::from_utf8(data)
         .map_err(|_| format!("{}: access file is not valid UTF-8", path.display()))?;
     let lines = logical_lines(text);
+    if let Some((index, _)) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.len() > MAX_HTACCESS_LINE)
+    {
+        return Err(format!(
+            "{}: line {} exceeds the {}-byte access-file line limit",
+            path.display(),
+            index + 1,
+            MAX_HTACCESS_LINE
+        ));
+    }
     let program = AccessProgram::seal(&lines)?;
+    let instruction_count = program.instructions.len();
     let mut scope = Scope::default();
     let mut rules = Vec::new();
     scope.rewrite_policy.rewrite_base = Some(identity.url_mount.clone());
@@ -913,12 +1010,19 @@ fn parse_access_bytes(
         None,
     )
     .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !scope.header_policy.within_limits() {
+        return Err(format!(
+            "{}: configured response headers exceed the count/byte limit",
+            path.display()
+        ));
+    }
     for rule in &mut scope.rewrite_policy.rewrite_rules {
         rule.subject_dir = Some(identity.dir.clone());
     }
     Ok(Parsed {
         scope: Arc::new(scope),
         rules,
+        instruction_count,
     })
 }
 
@@ -1059,6 +1163,11 @@ struct AccessProgram {
 
 impl AccessProgram {
     fn seal(lines: &[String]) -> Result<Self, String> {
+        if lines.len() > MAX_ACCESS_INSTRUCTIONS_PER_FILE {
+            return Err(format!(
+                "access program exceeds {MAX_ACCESS_INSTRUCTIONS_PER_FILE} instructions"
+            ));
+        }
         let mut instructions = Vec::with_capacity(lines.len());
         let mut stack: Vec<(String, usize)> = Vec::new();
         let mut depth = 0usize;
@@ -1087,6 +1196,14 @@ impl AccessProgram {
                         vapache_verified::ConfigLineKind::SectionStart,
                     )
                     .ok_or_else(|| format!("line {line_number}: access program depth overflow"))?;
+                    if !vapache_verified::access_section_depth_admit(
+                        depth,
+                        MAX_ACCESS_SECTION_DEPTH,
+                    ) {
+                        return Err(format!(
+                            "line {line_number}: access section nesting exceeds {MAX_ACCESS_SECTION_DEPTH}"
+                        ));
+                    }
                     let start = instructions.len();
                     let section = AccessSectionKind::parse(&name);
                     instructions.push(AccessInstruction::SectionStart {
@@ -2693,6 +2810,9 @@ fn apply_directive(
                 ));
         }
         "indexignore" => {
+            for pattern in args {
+                crate::config::validate_glob_pattern(pattern)?;
+            }
             scope
                 .content_policy
                 .index_ignore
@@ -4216,6 +4336,60 @@ mod tests {
 
         let mismatched = crate::config_frontend::logical_lines("<Files x>\n</If>\n");
         assert!(AccessProgram::seal(&mismatched).is_err());
+    }
+
+    #[test]
+    fn access_file_line_and_section_depth_are_bounded_before_descent() {
+        let mut nested = Vec::new();
+        for _ in 0..=MAX_ACCESS_SECTION_DEPTH {
+            nested.push("<RequireAll>".to_string());
+        }
+        nested.push("Require all granted".to_string());
+        for _ in 0..=MAX_ACCESS_SECTION_DEPTH {
+            nested.push("</RequireAll>".to_string());
+        }
+        let error = match AccessProgram::seal(&nested) {
+            Err(error) => error,
+            Ok(_) => panic!("oversize access section nesting was accepted"),
+        };
+        assert!(error.contains("nesting exceeds"), "{error}");
+
+        let wide = vec!["Require all granted".to_string(); MAX_ACCESS_INSTRUCTIONS_PER_FILE + 1];
+        let error = match AccessProgram::seal(&wide) {
+            Err(error) => error,
+            Ok(_) => panic!("wide access program was accepted"),
+        };
+        assert!(error.contains("exceeds"), "{error}");
+
+        assert!(vapache_verified::access_program_budget_admit(
+            MAX_ACCESS_LAYERS as u64 - 1,
+            MAX_ACCESS_INSTRUCTIONS_PER_REQUEST as u64 - 1,
+            1,
+            MAX_ACCESS_LAYERS as u64,
+            MAX_ACCESS_INSTRUCTIONS_PER_REQUEST as u64,
+        ));
+        assert!(!vapache_verified::access_program_budget_admit(
+            MAX_ACCESS_LAYERS as u64,
+            0,
+            0,
+            MAX_ACCESS_LAYERS as u64,
+            MAX_ACCESS_INSTRUCTIONS_PER_REQUEST as u64,
+        ));
+
+        let dir = tempdir("access-resource-bounds");
+        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let file = dir.join(".htaccess");
+        fs::write(
+            &file,
+            format!("IndexIgnore {}\n", "*".repeat(MAX_HTACCESS_LINE)),
+        )
+        .unwrap();
+        let error = match parse_file(&cfg, &file, OverrideMode::All, "/") {
+            Err(error) => error,
+            Ok(_) => panic!("oversize access-file line was accepted"),
+        };
+        assert!(error.contains("line limit"), "{error}");
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn request_with_header(name: &str, value: &str) -> crate::http::Request {

@@ -910,6 +910,13 @@ fn handle_connection<C: Conn + ResponseWrite>(
 
         let (mut resp, remote_user) =
             dispatch_with_scheme_and_identity(&cfg, &req, peer, &local_ip, local_port, tls);
+        if !crate::http::response_headers_admitted(&resp) {
+            resp = Response::policy_error();
+        }
+        if resp.admit_resident(&cfg.resource_budget).is_err() {
+            resp = Response::memory_overload();
+            let _ = resp.admit_resident(&cfg.resource_budget);
+        }
         let keep_alive = cfg.keep_alive
             && req.keep_alive
             && (cfg.max_keep_alive_requests == 0 || served + 1 < cfg.max_keep_alive_requests);
@@ -1207,7 +1214,9 @@ fn options_response(cfg: &Config, scope: &Scope, mime: Option<String>) -> Respon
     if let Some(mime) = mime {
         r.headers.push(("Content-Type".into(), mime.into_bytes()));
     }
-    scope.header_policy.apply(&mut r.headers, true);
+    if scope.header_policy.apply(&mut r.headers, true).is_err() {
+        return Response::policy_error();
+    }
     crate::compression::finalize_metadata(scope, &mut r);
     r
 }
@@ -1467,21 +1476,10 @@ pub(crate) fn dispatch_with_scheme_and_identity(
     tls: bool,
 ) -> (Response, Option<String>) {
     crate::auth::reset_request_identity();
-    let mut response = crate::expr::with_connection(tls, local_port, || {
+    let response = crate::expr::with_connection(tls, local_port, || {
         dispatch_inner_request(cfg, req, peer, local_ip, local_port)
     });
     let remote_user = crate::auth::take_request_identity();
-    if response.admit_resident(&cfg.resource_budget).is_err() {
-        response = Response::bytes(
-            503,
-            "text/html; charset=iso-8859-1",
-            b"Response memory capacity is temporarily exhausted\n".to_vec(),
-        );
-        // The small overload response should always fit once the rejected
-        // representation has been dropped. If it does not, sending it
-        // uncharged is preferable to retaining the original large body.
-        let _ = response.admit_resident(&cfg.resource_budget);
-    }
     (response, remote_user)
 }
 
@@ -1531,7 +1529,7 @@ fn dispatch_inner_request(
     let invalidation_path = initial_plan
         .as_ref()
         .map(|plan| plan.url_path().to_string());
-    let cache_scope = initial_plan.as_ref().and_then(|plan| {
+    let mut cache_scope = initial_plan.as_ref().and_then(|plan| {
         crate::cache::request_scope_with_plan(
             cfg,
             vhost,
@@ -1546,6 +1544,22 @@ fn dispatch_inner_request(
             local_ip,
         )
     });
+    if let (Some(plan), Some(cache_ctx)) = (&initial_plan, &cache_scope) {
+        let trailing_slash = plan.url_path().len() > 1 && plan.url_path().ends_with('/');
+        let same_representation_path = cache_ctx.path == plan.url_path();
+        let regular_file = cache_ctx.target.is_file();
+        if !vapache_verified::cache_trailing_slash_target_admit(
+            trailing_slash,
+            same_representation_path,
+            regular_file,
+        ) {
+            // P26-A: lookup used to run before dispatch's trailing-slash
+            // static-file rejection, so a persisted pre-fix 200 bypassed the
+            // new 404. Dynamic PATH_INFO and DirectoryIndex targets have a
+            // different representation path and remain eligible.
+            cache_scope = None;
+        }
+    }
     if let Some(cache_ctx) = &cache_scope {
         if let Some(resp) = crate::cache::lookup(
             cfg,
@@ -1699,13 +1713,14 @@ fn evaluate_scope_identities_for_path(
 ) -> Result<PathScopeIdentities, String> {
     let target = CanonicalTarget::from_url_path(url_path)
         .ok_or_else(|| format!("invalid canonical URL path '{url_path}'"))?;
-    let plan = RequestPlan::from_fs_target(
+    let plan = RequestPlan::from_fs_target_for_request(
         cfg,
         vhost,
         target,
         mapping_root.to_path_buf(),
         fs_path.to_path_buf(),
         false,
+        req,
     )
     .map_err(|error| match error {
         // from_fs_target() never performs URL mapping, so only AccessFiles
@@ -1911,7 +1926,7 @@ fn authorize_resolved_target(
     let lexical_target_plan = match CanonicalTarget::from_url_path(target_url)
         .ok_or_else(|| format!("invalid canonical target URL '{target_url}'"))
         .and_then(|target| {
-            RequestPlan::resolve(cfg, vhost, target)
+            RequestPlan::resolve_for_request(cfg, vhost, target, req)
                 .map_err(|error| format!("target URL has no mapping: {error:?}"))
         }) {
         Ok(plan) => plan,
@@ -2267,7 +2282,7 @@ fn dispatch_inner(
                     )
                 }
             };
-            match RequestPlan::resolve(cfg, vhost, target) {
+            match RequestPlan::resolve_for_request(cfg, vhost, target, req) {
                 Ok(plan) => plan,
                 Err(crate::request_plan::PlanError::Unmapped) => {
                     return error_response(
@@ -2609,7 +2624,13 @@ fn dispatch_inner(
                 if current_req.method == "HEAD" {
                     r.body = Body::Empty;
                 }
-                scope.header_policy.apply(&mut r.headers, r.status < 400);
+                if scope
+                    .header_policy
+                    .apply(&mut r.headers, r.status < 400)
+                    .is_err()
+                {
+                    return Response::policy_error();
+                }
                 crate::compression::finalize_budgeted(
                     &scope,
                     current_req,
@@ -2689,7 +2710,12 @@ fn dispatch_inner(
                 // loop iteration must use the same mapping/layer identities
                 // that dispatch will authorize and serve.
                 let target = CanonicalTarget::from_normalized(norm.clone(), url_path.clone());
-                plan = match RequestPlan::resolve(cfg, vhost, target) {
+                plan = match RequestPlan::resolve_for_request(
+                    cfg,
+                    vhost,
+                    target,
+                    owned_req.as_ref().unwrap_or(req),
+                ) {
                     Ok(plan) => plan,
                     Err(crate::request_plan::PlanError::Unmapped) => {
                         return error_response(
@@ -2861,7 +2887,13 @@ fn dispatch_inner(
         if req.method == "HEAD" {
             r.body = Body::Empty;
         }
-        scope.header_policy.apply(&mut r.headers, r.status < 400);
+        if scope
+            .header_policy
+            .apply(&mut r.headers, r.status < 400)
+            .is_err()
+        {
+            return Response::policy_error();
+        }
         crate::compression::finalize_budgeted(
             &scope,
             req,
@@ -3985,7 +4017,13 @@ fn run_fastcgi(
         script_file: None,
     };
     let mut r = fastcgi::execute_bound(&ctx, scope, &target, &script_binding);
-    scope.header_policy.apply(&mut r.headers, r.status < 400);
+    if scope
+        .header_policy
+        .apply(&mut r.headers, r.status < 400)
+        .is_err()
+    {
+        return Response::policy_error();
+    }
     r
 }
 
@@ -4110,7 +4148,13 @@ fn run_cgi(
         script_file: Some(script_file),
     };
     let mut r = cgi::execute(&ctx);
-    scope.header_policy.apply(&mut r.headers, r.status < 400);
+    if scope
+        .header_policy
+        .apply(&mut r.headers, r.status < 400)
+        .is_err()
+    {
+        return Response::policy_error();
+    }
     crate::compression::finalize_budgeted(
         scope,
         req,

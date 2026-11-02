@@ -36,17 +36,28 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 
 fn openat2_file(dir: &File, path: &CStr, how: &OpenHow) -> io::Result<File> {
-    let file = unsafe {
-        let fd = libc::syscall(
-            libc::SYS_openat2,
-            dir.as_raw_fd(),
-            path.as_ptr(),
-            how as *const OpenHow,
-            std::mem::size_of::<OpenHow>(),
-        );
-        (fd >= 0).then(|| File::from_raw_fd(fd as i32))
-    };
-    file.ok_or_else(io::Error::last_os_error)
+    const MAX_TRANSIENT_RETRIES: usize = 8;
+    for attempt in 0..=MAX_TRANSIENT_RETRIES {
+        let file = unsafe {
+            let fd = libc::syscall(
+                libc::SYS_openat2,
+                dir.as_raw_fd(),
+                path.as_ptr(),
+                how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            );
+            (fd >= 0).then(|| File::from_raw_fd(fd as i32))
+        };
+        if let Some(file) = file {
+            return Ok(file);
+        }
+        let error = io::Error::last_os_error();
+        let transient = matches!(error.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EINTR));
+        if !transient || attempt == MAX_TRANSIENT_RETRIES {
+            return Err(error);
+        }
+    }
+    unreachable!("bounded secure path retry loop always returns") // coverage:ignore-line
 }
 
 pub fn make_admin_dir_root_owned(dir: &File, mode: libc::mode_t) -> io::Result<()> {
@@ -1074,7 +1085,13 @@ fn not_modified_response(
             .headers
             .push(("ETag".into(), tag.as_bytes().to_vec()));
     }
-    scope.header_policy.apply(&mut response.headers, true);
+    if scope
+        .header_policy
+        .apply(&mut response.headers, true)
+        .is_err()
+    {
+        return Response::policy_error();
+    }
     response
 }
 
@@ -1116,7 +1133,13 @@ fn serve_file_inner(
     let headers = representation_headers(mime.as_deref(), &last_mod, tag.as_deref());
     let mut representation = Response::new(200);
     representation.headers = headers.clone();
-    scope.header_policy.apply(&mut representation.headers, true);
+    if scope
+        .header_policy
+        .apply(&mut representation.headers, true)
+        .is_err()
+    {
+        return Response::policy_error();
+    }
     let validator_tag =
         crate::compression::conditional_static_etag(scope, req, &representation, mime_name, size);
 
@@ -1204,7 +1227,9 @@ fn serve_file_inner(
     if let Some(cr) = content_range {
         r.headers.push(("Content-Range".into(), cr.into_bytes()));
     }
-    scope.header_policy.apply(&mut r.headers, true);
+    if scope.header_policy.apply(&mut r.headers, true).is_err() {
+        return Response::policy_error();
+    }
     if req.is_head() {
         r.headers
             .push(("Content-Length".into(), len.to_string().into_bytes()));
@@ -1274,6 +1299,12 @@ fn directory_action(
         return DirAction::Redirect(loc);
     }
     for name in cfg.directory_index_for(scope) {
+        if req
+            .charge_policy_work((name.len() as u64).saturating_add(1))
+            .is_err()
+        {
+            return DirAction::Overloaded;
+        }
         if name.contains('/') || name == ".." || name == "." || name.is_empty() {
             continue;
         }
@@ -1320,12 +1351,23 @@ fn directory_action(
                 if name.starts_with(b".") {
                     continue;
                 }
-                if scope
-                    .content_policy
-                    .index_ignore
-                    .iter()
-                    .any(|pattern| crate::config::glob_match(pattern.as_bytes(), &name))
-                {
+                let mut ignored = false;
+                for pattern in &scope.content_policy.index_ignore {
+                    match crate::glob::fnmatch_budgeted(
+                        pattern.as_bytes(),
+                        &name,
+                        false,
+                        req.policy_budget(),
+                    ) {
+                        Ok(true) => {
+                            ignored = true;
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(_) => return DirAction::Overloaded,
+                    }
+                }
+                if ignored {
                     continue;
                 }
                 if name.ends_with(b"~") || name.starts_with(b"#") {
@@ -1520,7 +1562,13 @@ pub fn serve_directory(
     let mut r = serve_directory_inner(
         cfg, vhost, scope, req, dir, url_path, raw_path, host, port, peer, local_ip,
     );
-    scope.header_policy.apply(&mut r.headers, r.status < 400);
+    if scope
+        .header_policy
+        .apply(&mut r.headers, r.status < 400)
+        .is_err()
+    {
+        return Response::policy_error();
+    }
     crate::compression::finalize_budgeted(
         scope,
         req,
@@ -1726,7 +1774,9 @@ pub fn error_response(
         cfg, vhost, scope, status, req, url_path, port, host, peer, local_ip,
     );
     // Only `Header always` applies to error responses.
-    scope.header_policy.apply(&mut r.headers, false);
+    if scope.header_policy.apply(&mut r.headers, false).is_err() {
+        return Response::policy_error();
+    }
     crate::compression::finalize_budgeted(
         scope,
         req,

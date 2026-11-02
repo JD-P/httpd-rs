@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Default)]
@@ -36,6 +36,69 @@ pub const MAX_REQUEST_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_RESPONSE_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_WEBSOCKET_TUNNELS: u64 = 64;
 pub const MAX_WEBSOCKETS_PER_CLIENT: u64 = 8;
+/// Per-request ceiling for configuration-policy work.  One unit represents
+/// one byte/cell inspected by a matcher or one constant-cost policy
+/// instruction.  The budget is shared by every clone and every internal
+/// rewrite of the same request, so splitting work across sections or phases
+/// cannot reset it.
+pub const MAX_POLICY_WORK_UNITS: u64 = 16 * 1024 * 1024;
+/// Aggregate bytes materialized by request-controlled configuration
+/// expansion (`SetEnvIf`, dynamic `Require` operands, and related policy
+/// values).  This is deliberately aligned with the expression evaluator's
+/// existing four-MiB aggregate limit.
+pub const MAX_POLICY_EXPANSION_BYTES: u64 = 4 * 1024 * 1024;
+/// No single configuration expansion may monopolize the aggregate budget.
+pub const MAX_POLICY_VALUE_BYTES: u64 = 1024 * 1024;
+
+/// Monotonic request-local accounting for attacker-influenced policy work.
+/// `Request` clones share this object through `Headers`, including internal
+/// rewrites and the HTTP/2 adapter.
+#[derive(Debug, Default)]
+pub struct RequestPolicyBudget {
+    work: AtomicU64,
+    expansion_bytes: AtomicU64,
+    failed: AtomicBool,
+}
+
+impl RequestPolicyBudget {
+    pub fn charge_work(&self, amount: u64) -> Result<(), &'static str> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err("request policy work limit exceeded");
+        }
+        if !try_add(&self.work, amount, MAX_POLICY_WORK_UNITS) {
+            self.failed.store(true, Ordering::Release);
+            return Err("request policy work limit exceeded");
+        }
+        Ok(())
+    }
+
+    pub fn charge_expansion(&self, amount: u64) -> Result<(), &'static str> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err("request policy expansion limit exceeded");
+        }
+        if amount > MAX_POLICY_VALUE_BYTES
+            || !try_add(&self.expansion_bytes, amount, MAX_POLICY_EXPANSION_BYTES)
+        {
+            self.failed.store(true, Ordering::Release);
+            return Err("request policy expansion limit exceeded");
+        }
+        Ok(())
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn charged_work(&self) -> u64 {
+        self.work.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn charged_expansion(&self) -> u64 {
+        self.expansion_bytes.load(Ordering::Acquire)
+    }
+}
 
 /// Collapse IPv6 interface identifiers into their /64 allocation while
 /// retaining exact IPv4 identities. IPv4-mapped IPv6 is canonicalized first.
@@ -495,6 +558,28 @@ impl Drop for DynamicLease {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn request_policy_budget_is_monotonic_and_poisoned_on_exhaustion() {
+        let budget = RequestPolicyBudget::default();
+        budget.charge_work(MAX_POLICY_WORK_UNITS - 1).unwrap();
+        assert_eq!(budget.charged_work(), MAX_POLICY_WORK_UNITS - 1);
+        assert!(budget.charge_work(2).is_err());
+        assert!(budget.failed());
+        assert_eq!(budget.charged_work(), MAX_POLICY_WORK_UNITS - 1);
+        assert!(budget.charge_work(1).is_err());
+        assert_eq!(budget.charged_work(), MAX_POLICY_WORK_UNITS - 1);
+
+        let expansion = RequestPolicyBudget::default();
+        expansion.charge_expansion(MAX_POLICY_VALUE_BYTES).unwrap();
+        assert_eq!(expansion.charged_expansion(), MAX_POLICY_VALUE_BYTES);
+        assert!(expansion
+            .charge_expansion(MAX_POLICY_VALUE_BYTES + 1)
+            .is_err());
+        assert!(expansion.failed());
+        assert!(expansion.charge_expansion(1).is_err());
+        assert_eq!(expansion.charged_expansion(), MAX_POLICY_VALUE_BYTES);
+    }
 
     #[test]
     fn aggregate_spool_and_dynamic_limits_release_on_drop() {

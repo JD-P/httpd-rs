@@ -212,9 +212,11 @@ Implemented today:
   quotas use the validated `RemoteIPHeader` identity, while an explicitly
   trusted transport proxy remains bounded by the process-wide worker ceiling
   instead of being mistaken for a single end user. HTTP/1 response writes,
-  including zero-copy static-file sends, use a non-blocking absolute deadline
-  derived from `Timeout`; a client that stops reading cannot pin a connection
-  worker beyond that budget. HTTP/2 additionally rate-bounds SETTINGS, PING,
+  including zero-copy static-file sends, use a non-blocking stall deadline
+  derived from `Timeout` and renew it only after byte progress; a client that
+  stops reading cannot pin a connection worker, while a progressing download
+  is not truncated merely because its total duration exceeds `Timeout`.
+  HTTP/2 additionally rate-bounds SETTINGS, PING,
   PRIORITY and tiny WINDOW_UPDATE processing with a refillable per-connection
   control-frame budget.
 - Privileged startup refuses uid/gid 0 and fails when an unprivileged launch
@@ -344,7 +346,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **590 verified functions, 0 errors** (percent-decoding,
+Current result: **602 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -520,7 +522,7 @@ Current ledger: **53.7% weighted obligations**, **5/6 proof debt**,
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **108 adversarial replay cases** covering the findings classes,
-and **590 Verus functions with 0 errors** (including the I3 fast-path
+and **602 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -530,7 +532,7 @@ access-file rewrite-subject kernels, the pass-9 I60 explicit-target
 access-layer binding kernels, the pass-10 I61 resolved-target/rewrite
 scope-conjunction kernels (`options_conjoin`, `handler_conjoin_admit`,
 `override_categories_conjoin`, `rewrite_scope_retained_admit`), the pass-11
-F61–F69 kernels (the class-capable `fnmatch_match` glob kernel,
+F61–F69 kernels (the class-capable `fnmatch_match` glob specification,
 `expr_var_known`, `set_handler_precedence_admit`/`set_handler_conjoin_admit`,
 `cgi_exec_admit`, `handler_identity_lexical_admit`), the pass-12 configuration,
 rewrite, HTTP/2, CGI, access-file, ETag and targeted-invalidation admission
@@ -714,9 +716,9 @@ failure races and privileged-kernel failures are excluded from that metric.
 
 Latest snapshot: **20,020/20,548 executable server production lines (97.43%)**;
 the new aggregate-resource module is **62/62 (100%)**. The current suite is
-545 Rust library tests, 8 CLI unit tests, 26 Rust integration/property tests,
+563 Rust library tests, 8 CLI unit tests, 26 Rust integration/property tests,
 165 conformance tests and 333 fixed configuration cases.
-The separate Verus gate proves 590 functions with 0 errors; proof-only code is
+The separate Verus gate proves 602 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

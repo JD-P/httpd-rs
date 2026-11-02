@@ -1629,7 +1629,7 @@ impl Scope {
             }
             let rule = &entry.value;
             let attr = rule.attribute.to_ascii_lowercase();
-            let value: Vec<u8> = match attr.as_str() {
+            let subject: Vec<u8> = match attr.as_str() {
                 "request_method" | "request-method" => req.method.as_bytes().to_vec(),
                 "request_uri" | "request-uri" => url_path.as_bytes().to_vec(),
                 "remote_addr" | "remote-addr" => peer.to_string().into_bytes(),
@@ -1665,19 +1665,61 @@ impl Scope {
                     })
                     .unwrap_or_default(),
             };
-            let captures = rule.pattern.captures(&value);
+            let work = rule
+                .pattern
+                .as_str()
+                .len()
+                .checked_add(subject.len())
+                .and_then(|n| n.checked_add(1))
+                .and_then(|n| u64::try_from(n).ok());
+            let Some(work) = work else {
+                let _ = req.charge_policy_work(u64::MAX);
+                return;
+            };
+            if req.charge_policy_work(work).is_err() {
+                return;
+            }
+            let captures = rule.pattern.captures(&subject);
             if captures.is_some() == rule.negate {
                 continue;
             }
             for (name, value) in &rule.actions {
                 match value {
                     Some(v) => {
+                        // `regex::Captures::expand` writes directly to a Vec.
+                        // Admit a conservative upper bound before calling it:
+                        // every '$' can contribute at most the complete
+                        // matched subject, while every literal byte contributes
+                        // at most itself.  This prevents the CVE-2011-4415
+                        // `$1$1...` allocation shape before memory is reserved.
+                        let expansion_bound = if captures.is_some() {
+                            v.len().checked_add(
+                                v.as_bytes()
+                                    .iter()
+                                    .filter(|byte| **byte == b'$')
+                                    .count()
+                                    .checked_mul(subject.len())
+                                    .unwrap_or(usize::MAX),
+                            )
+                        } else {
+                            Some(v.len())
+                        };
+                        let Some(expansion_bound) =
+                            expansion_bound.and_then(|bytes| u64::try_from(bytes).ok())
+                        else {
+                            let _ = req.charge_policy_expansion(u64::MAX);
+                            return;
+                        };
+                        if req.charge_policy_expansion(expansion_bound).is_err() {
+                            return;
+                        }
                         let mut expanded = Vec::new();
                         if let Some(captures) = &captures {
                             captures.expand(v.as_bytes(), &mut expanded);
                         } else {
                             expanded.extend_from_slice(v.as_bytes());
                         }
+                        debug_assert!(expanded.len() as u64 <= expansion_bound);
                         env.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
                         env.push((name.clone(), expanded));
                     }
@@ -1871,7 +1913,9 @@ impl Scope {
         self.authorization.merge_child(&child.authorization);
         self.mapping_policy.merge_child(&child.mapping_policy);
         self.error_policy.merge_child(&child.error_policy);
-        self.header_policy.merge_child(&child.header_policy);
+        if !self.header_policy.merge_child(&child.header_policy) {
+            self.conditional_error = true;
+        }
         self.environment_policy
             .merge_child(&child.environment_policy);
         self.rewrite_policy
@@ -1976,7 +2020,9 @@ impl Scope {
         // retained; target sets override lexical values only when the lexical
         // scope did not explicitly unset the header.
         let mut headers = base.header_policy.clone();
-        headers.merge_child(&self.header_policy);
+        if !headers.merge_child(&self.header_policy) {
+            self.conditional_error = true;
+        }
         self.header_policy = headers;
 
         for filter in &base.mapping_policy.unsupported_filters {
@@ -2023,7 +2069,7 @@ pub enum MatchKind {
     /// trailing `/` boundary.
     Location(String),
     /// `<Location shell-pattern>` containing a wildcard: compiled to the
-    /// verified fnmatch kernel in path mode at parse time (F61-A/A2/B).
+    /// stack-safe fnmatch evaluator in path mode at parse time (F61-A/A2/B).
     LocationGlob(String),
     LocationMatch(Regex),
 }
@@ -4241,11 +4287,7 @@ impl ParserState {
 }
 
 pub(crate) fn glob_match(pat: &[u8], name: &[u8]) -> bool {
-    // Delegated to the verified fnmatch kernel: shell glob semantics with
-    // `?`/`*` (unbounded, crosses `/` for the `<Proxy>` wildcard form),
-    // `[…]/[…]` bracket classes negated by BOTH `!` and `^` (F62/F62b — the
-    // previous hand-rolled matcher ignored `^`), and `\x` escapes.
-    vapache_verified::fnmatch_match(pat, name, false)
+    crate::glob::fnmatch(pat, name, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -5051,6 +5093,15 @@ impl Compile {
                                     } else {
                                         self.cfg.server_root.join(&p)
                                     };
+                                    if let Err(error) = validate_glob_pattern(&p) {
+                                        self.errors.push(ConfigError {
+                                            file: loc.file.clone(),
+                                            line: loc.line,
+                                            msg: format!("bad Directory pattern: {error}"),
+                                        });
+                                        self.skip_section();
+                                        continue;
+                                    }
                                     MatchKind::Directory(clean_path(&pb))
                                 }
                             } else if name == "files" {
@@ -5312,6 +5363,15 @@ impl Compile {
                                     }
                                 }
                             } else {
+                                if let Err(error) = validate_glob_pattern(&pattern) {
+                                    self.errors.push(ConfigError {
+                                        file: loc.file.clone(),
+                                        line: loc.line,
+                                        msg: format!("bad <Proxy> pattern: {error}"),
+                                    });
+                                    self.skip_section();
+                                    continue;
+                                }
                                 ProxyMatchKind::Wildcard(pattern.clone())
                             };
                             let mut balancer_prev = None;
@@ -5868,10 +5928,17 @@ impl Compile {
                 scope.content_policy.directory_index = Some(args.to_vec());
             }
             "indexignore" => {
-                scope
-                    .content_policy
-                    .index_ignore
-                    .extend(args.iter().cloned());
+                if args
+                    .iter()
+                    .any(|pattern| validate_glob_pattern(pattern).is_err())
+                {
+                    self.directive_error(loc, "IndexIgnore shell pattern exceeds 8190 bytes");
+                } else {
+                    scope
+                        .content_policy
+                        .index_ignore
+                        .extend(args.iter().cloned());
+                }
             }
             "options" => {
                 for arg in args {
@@ -6734,6 +6801,7 @@ impl Compile {
                     return;
                 }
                 let value = args[idx + 2..].join(" ");
+                let previous = scope.header_policy.clone();
                 match (action.as_str(), always) {
                     ("set", true) => scope.header_policy.always_set_headers.push((name, value)),
                     ("set", false) => scope.header_policy.set_headers.push((name, value)),
@@ -6742,6 +6810,13 @@ impl Compile {
                     ("unset", true) => scope.header_policy.always_unset_headers.push(name),
                     ("unset", false) => scope.header_policy.unset_headers.push(name),
                     _ => unreachable!("Header action was validated above"),
+                }
+                if !scope.header_policy.within_limits() {
+                    scope.header_policy = previous;
+                    self.directive_error(
+                        loc,
+                        "configured response headers exceed the count/byte limit",
+                    );
                 }
             }
             "expiresactive" => {
@@ -8548,6 +8623,32 @@ fn wildcard_path_matches(pattern: &Path, path: &Path) -> bool {
         .all(|(pat, name)| glob_match(pat, name))
 }
 
+fn wildcard_path_matches_req(
+    pattern: &Path,
+    path: &Path,
+    req: &crate::http::Request,
+) -> Result<bool, &'static str> {
+    use std::os::unix::ffi::OsStrExt;
+    let p = pattern.as_os_str().as_bytes();
+    let n = path.as_os_str().as_bytes();
+    if !p.iter().any(|b| matches!(b, b'*' | b'?' | b'[')) {
+        req.charge_policy_work(1)?;
+        return Ok(path_has_prefix(path, pattern));
+    }
+    let pc: Vec<&[u8]> = p.split(|b| *b == b'/').filter(|c| !c.is_empty()).collect();
+    let nc: Vec<&[u8]> = n.split(|b| *b == b'/').filter(|c| !c.is_empty()).collect();
+    if pc.len() != nc.len() {
+        req.charge_policy_work(pc.len().min(nc.len()) as u64 + 1)?;
+        return Ok(false);
+    }
+    for (pat, name) in pc.iter().zip(nc.iter()) {
+        if !crate::glob::fnmatch_budgeted(pat, name, false, req.policy_budget())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(crate) fn directory_wildcard_matches(pattern: &Path, fs_path: &Path) -> bool {
     // A <Directory> pattern walks the filesystem ancestors of the mapped
     // path.  Apache includes the mapped path itself, even when it names a
@@ -8561,6 +8662,20 @@ pub(crate) fn directory_wildcard_matches(pattern: &Path, fs_path: &Path) -> bool
         }
     }
     false
+}
+
+fn directory_wildcard_matches_req(
+    pattern: &Path,
+    fs_path: &Path,
+    req: &crate::http::Request,
+) -> Result<bool, &'static str> {
+    for ancestor in fs_path.ancestors() {
+        req.charge_policy_work(1)?;
+        if wildcard_path_matches_req(pattern, ancestor, req)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn directory_pattern_matches_exact(pattern: &Path, dir: &Path) -> bool {
@@ -8582,6 +8697,30 @@ fn directory_pattern_matches_exact(pattern: &Path, dir: &Path) -> bool {
     }
 }
 
+fn directory_pattern_matches_exact_req(
+    pattern: &Path,
+    dir: &Path,
+    req: &crate::http::Request,
+) -> Result<bool, &'static str> {
+    use std::os::unix::ffi::OsStrExt;
+    let pattern_bytes = pattern.as_os_str().as_bytes();
+    if pattern_bytes
+        .iter()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+    {
+        wildcard_path_matches_req(pattern, dir, req)
+    } else {
+        req.charge_policy_work(
+            (pattern_bytes.len() as u64)
+                .saturating_add(dir.as_os_str().as_bytes().len() as u64)
+                .saturating_add(1),
+        )?;
+        let dir_bytes = dir.as_os_str().as_bytes();
+        Ok(dir_bytes.strip_suffix(b"/").unwrap_or(dir_bytes)
+            == pattern_bytes.strip_suffix(b"/").unwrap_or(pattern_bytes))
+    }
+}
+
 fn rule_kind_matches(kind: &MatchKind, fs_path: &Path, url_path: &str, fname: &str) -> bool {
     match kind {
         MatchKind::Always => true,
@@ -8600,7 +8739,7 @@ fn rule_kind_matches(kind: &MatchKind, fs_path: &Path, url_path: &str, fname: &s
         MatchKind::DirectoryMatch(re) => re.is_match(fs_path.as_os_str().as_encoded_bytes()),
         MatchKind::Files(re) | MatchKind::FilesMatch(re) => re.is_match(fname.as_bytes()),
         MatchKind::FilesGlob(pattern) => {
-            vapache_verified::fnmatch_match(pattern.as_bytes(), fname.as_bytes(), false)
+            crate::glob::fnmatch(pattern.as_bytes(), fname.as_bytes(), false)
         }
         MatchKind::Location(prefix) => {
             if prefix.is_empty() || prefix == "/" {
@@ -8618,9 +8757,89 @@ fn rule_kind_matches(kind: &MatchKind, fs_path: &Path, url_path: &str, fname: &s
             }
         }
         MatchKind::LocationGlob(pattern) => {
-            vapache_verified::fnmatch_match(pattern.as_bytes(), url_path.as_bytes(), true)
+            crate::glob::fnmatch(pattern.as_bytes(), url_path.as_bytes(), true)
         }
         MatchKind::LocationMatch(re) => re.is_match(url_path.as_bytes()),
+    }
+}
+
+fn rule_kind_matches_req(
+    kind: &MatchKind,
+    fs_path: &Path,
+    url_path: &str,
+    fname: &str,
+    req: &crate::http::Request,
+) -> Result<bool, &'static str> {
+    req.charge_policy_work(1)?;
+    match kind {
+        MatchKind::Always => Ok(true),
+        MatchKind::Directory(pattern) => {
+            use std::os::unix::ffi::OsStrExt;
+            if pattern
+                .as_os_str()
+                .as_bytes()
+                .iter()
+                .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+            {
+                directory_wildcard_matches_req(pattern, fs_path, req)
+            } else {
+                req.charge_policy_work(fs_path.as_os_str().as_encoded_bytes().len() as u64)?;
+                Ok(path_has_prefix(fs_path, pattern))
+            }
+        }
+        MatchKind::DirectoryMatch(regex) => {
+            let subject = fs_path.as_os_str().as_encoded_bytes();
+            req.charge_policy_work(
+                (regex.as_str().len() as u64)
+                    .saturating_add(subject.len() as u64)
+                    .saturating_add(1),
+            )?;
+            Ok(regex.is_match(subject))
+        }
+        MatchKind::Files(regex) | MatchKind::FilesMatch(regex) => {
+            req.charge_policy_work(
+                (regex.as_str().len() as u64)
+                    .saturating_add(fname.len() as u64)
+                    .saturating_add(1),
+            )?;
+            Ok(regex.is_match(fname.as_bytes()))
+        }
+        MatchKind::FilesGlob(pattern) => crate::glob::fnmatch_budgeted(
+            pattern.as_bytes(),
+            fname.as_bytes(),
+            false,
+            req.policy_budget(),
+        ),
+        MatchKind::Location(prefix) => {
+            req.charge_policy_work(
+                (prefix.len() as u64)
+                    .saturating_add(url_path.len() as u64)
+                    .saturating_add(1),
+            )?;
+            if prefix.is_empty() || prefix == "/" {
+                Ok(true)
+            } else if prefix.ends_with('/') {
+                Ok(url_path.starts_with(prefix))
+            } else {
+                Ok(url_path == prefix
+                    || (url_path.starts_with(prefix)
+                        && url_path.as_bytes().get(prefix.len()) == Some(&b'/')))
+            }
+        }
+        MatchKind::LocationGlob(pattern) => crate::glob::fnmatch_budgeted(
+            pattern.as_bytes(),
+            url_path.as_bytes(),
+            true,
+            req.policy_budget(),
+        ),
+        MatchKind::LocationMatch(regex) => {
+            req.charge_policy_work(
+                (regex.as_str().len() as u64)
+                    .saturating_add(url_path.len() as u64)
+                    .saturating_add(1),
+            )?;
+            Ok(regex.is_match(url_path.as_bytes()))
+        }
     }
 }
 
@@ -8688,6 +8907,27 @@ pub(crate) fn apply_rules_config(
     }
 }
 
+fn apply_rules_config_budgeted(
+    rules: &[ScopeRule],
+    s: &mut Scope,
+    fs_path: &Path,
+    url_path: &str,
+    fname: &str,
+    req: &crate::http::Request,
+) -> Result<(), &'static str> {
+    for rule in rules {
+        if rule.phase() == RulePhase::Condition {
+            continue;
+        }
+        if !rule_kind_matches_req(&rule.kind, fs_path, url_path, fname, req)? {
+            continue;
+        }
+        merge_rule_delta(s, rule, fs_path, url_path);
+        apply_rules_config_budgeted(&rule.nested, s, fs_path, url_path, fname, req)?;
+    }
+    Ok(())
+}
+
 /// Apply normal directory/file/location rules first, then all `<If>`-style
 /// conditionals.  Apache documents that `<If>`, `<ElseIf>` and `<Else>` are
 /// applied last; applying them in section order can let a later
@@ -8747,7 +8987,14 @@ pub(crate) fn collect_rules_req(
     deferred: &mut Vec<ScopeRule>,
 ) {
     for rule in rules {
-        if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
+        let matched = match rule_kind_matches_req(&rule.kind, fs_path, url_path, fname, req) {
+            Ok(matched) => matched,
+            Err(_) => {
+                s.conditional_error = true;
+                return;
+            }
+        };
+        if !matched {
             continue;
         }
         if rule.phase() == RulePhase::Condition {
@@ -8787,7 +9034,14 @@ pub(crate) fn collect_directory_phase(
     conditionals: &mut Vec<ScopeRule>,
 ) {
     for rule in rules {
-        if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
+        let matched = match rule_kind_matches_req(&rule.kind, fs_path, url_path, fname, req) {
+            Ok(matched) => matched,
+            Err(_) => {
+                s.conditional_error = true;
+                return;
+            }
+        };
+        if !matched {
             continue;
         }
         match rule.phase() {
@@ -8819,7 +9073,14 @@ pub fn apply_normal_rule_list(
     conditionals: &mut Vec<ScopeRule>,
 ) {
     for rule in rules {
-        if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
+        let matched = match rule_kind_matches_req(&rule.kind, fs_path, url_path, fname, req) {
+            Ok(matched) => matched,
+            Err(_) => {
+                s.conditional_error = true;
+                return;
+            }
+        };
+        if !matched {
             continue;
         }
         if rule.phase() == RulePhase::Condition {
@@ -9063,13 +9324,23 @@ pub(crate) fn has_glob_wildcard(pattern: &str) -> bool {
     pattern.bytes().any(|b| matches!(b, b'*' | b'?' | b'['))
 }
 
+pub(crate) fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.len() > crate::glob::MAX_PATTERN_BYTES {
+        return Err(format!(
+            "shell pattern exceeds {} bytes",
+            crate::glob::MAX_PATTERN_BYTES
+        ));
+    }
+    Ok(())
+}
+
 /// Compile a `<Location>` argument (F61-A/A2/B).
 ///
 /// Apache distinguishes two forms: with `~` as the first argument the rest is
 /// a regular expression (and `<Location ~>` with no expression is a
 /// configuration error); otherwise the argument is a URL-path pattern in
 /// which the shell wildcards `*`, `?` and `[…]` are honored.  A wildcard
-/// form must be compiled to the verified fnmatch kernel at parse time —
+/// form must be compiled to the stack-safe fnmatch evaluator at parse time —
 /// leaving it a literal string silently disables every guard inside the
 /// section.  In path mode the kernel keeps `*` and `?` inside their URL
 /// component and anchors the match over the whole path.
@@ -9087,8 +9358,9 @@ pub(crate) fn compile_location_pattern(args: &[String]) -> Result<MatchKind, Str
             .map_err(|e| format!("bad Location regex: {e}"));
     }
     let pattern = args.join(" ");
+    validate_glob_pattern(&pattern)?;
     if has_glob_wildcard(&pattern) {
-        // F61: the wildcard form is compiled to the kernel match
+        // F61: the wildcard form is compiled to the iterative matcher
         // (`LocationGlob`).  Falling back to a literal `MatchKind::Location`
         // would silently disable every guard inside the section; the kernel
         // records the admission invariant.
@@ -9114,10 +9386,11 @@ pub(crate) fn compile_files_pattern(args: &[String]) -> Result<MatchKind, String
             .map_err(|e| format!("bad Files regex: {e}"));
     }
     let pattern = args.join(" ");
+    validate_glob_pattern(&pattern)?;
     // Shell-style <Files> patterns are matched against the basename with the
-    // verified fnmatch kernel (F62/F62b: both `!` and `^` negate a class;
-    // the old hand-rolled regex translation escaped `^` as a literal and
-    // only recognized `!`).
+    // stack-safe fnmatch implementation (F62/F62b: both `!` and `^` negate
+    // a class; the old hand-rolled regex translation escaped `^` as a literal
+    // and only recognized `!`).
     Ok(MatchKind::FilesGlob(pattern))
 }
 
@@ -12733,6 +13006,58 @@ ServerName localhost\n\
     }
 
     #[test]
+    fn set_env_if_capture_amplification_is_rejected_before_expansion() {
+        let mut scope = Scope::default();
+        let replacement = "$1".repeat(256);
+        scope.environment_policy.set_env_if.push(Originated::main(
+            parse_env_rule(
+                "setenvif",
+                &[
+                    "X-Capture".into(),
+                    "^(.*)$".into(),
+                    format!("EXPANDED={replacement}"),
+                ],
+            )
+            .unwrap(),
+        ));
+        let mut req = test_request("GET");
+        req.headers.insert("x-capture", vec![b'a'; 8_000]);
+        let env = scope.authorization_env(&req, "/", "127.0.0.1".parse().unwrap());
+        assert!(!env.iter().any(|(name, _)| name == "EXPANDED"));
+        assert!(req.policy_budget_failed());
+
+        let mut safe = Scope::default();
+        safe.environment_policy.set_env_if.push(Originated::main(
+            parse_env_rule(
+                "setenvif",
+                &[
+                    "X-Capture".into(),
+                    "^([a-z]+)$".into(),
+                    "EXPANDED=$1-$1".into(),
+                ],
+            )
+            .unwrap(),
+        ));
+        let mut req = test_request("GET");
+        req.headers.insert("x-capture", b"safe".to_vec());
+        let env = safe.authorization_env(&req, "/", "127.0.0.1".parse().unwrap());
+        assert!(env.contains(&("EXPANDED".into(), b"safe-safe".to_vec())));
+        assert!(!req.policy_budget_failed());
+    }
+
+    #[test]
+    fn access_file_prefilter_consumes_the_request_policy_budget() {
+        let mut cfg = load_text("Listen 127.0.0.1:0\n", false).unwrap();
+        cfg.override_enabled = true;
+        cfg.override_anywhere = false;
+        cfg.override_prefixes = vec![PathBuf::from(format!("/{}", "*".repeat(8_188)))];
+        let path = PathBuf::from(format!("/{}", "a".repeat(3_000)));
+        let req = test_request("GET");
+        assert!(cfg.override_applicable_req(&path, &req).is_err());
+        assert!(req.policy_budget_failed());
+    }
+
+    #[test]
     fn p16_regex_header_bytes_and_fastcgi_environment_provenance() {
         // Apache's directive PCRE mode is byte-oriented and ASCII by default.
         // Pin both the deny-guard and positive-gate directions at the shared
@@ -15468,6 +15793,43 @@ impl Config {
         })
     }
 
+    /// Request-metered form of [`Self::override_applicable`].  This prefilter
+    /// runs while a request plan is being built, before the ordinary policy
+    /// phases; it must therefore consume the same aggregate work budget as
+    /// the matchers it decides whether to invoke.
+    pub fn override_applicable_req(
+        &self,
+        fs_path: &Path,
+        req: &crate::http::Request,
+    ) -> Result<bool, &'static str> {
+        if !self.override_enabled || self.override_anywhere {
+            req.charge_policy_work(1)?;
+            return Ok(true);
+        }
+        for prefix in &self.override_prefixes {
+            use std::os::unix::ffi::OsStrExt;
+            let pattern = prefix.as_os_str().as_bytes();
+            if pattern
+                .iter()
+                .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+            {
+                if directory_wildcard_matches_req(prefix, fs_path, req)? {
+                    return Ok(true);
+                }
+            } else {
+                req.charge_policy_work(
+                    (pattern.len() as u64)
+                        .saturating_add(fs_path.as_os_str().as_bytes().len() as u64)
+                        .saturating_add(1),
+                )?;
+                if fs_path.starts_with(prefix) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// True when an access file could affect this request.  When false the
     /// dispatcher can use the one-pass Directory merge and skip the per-
     /// directory walk entirely.
@@ -15475,6 +15837,18 @@ impl Config {
         self.capability_enabled(Capability::AccessFiles)
             && self.override_enabled
             && self.override_applicable(fs_path)
+    }
+
+    pub fn htaccess_may_apply_req(
+        &self,
+        fs_path: &Path,
+        req: &crate::http::Request,
+    ) -> Result<bool, &'static str> {
+        if !self.capability_enabled(Capability::AccessFiles) || !self.override_enabled {
+            req.charge_policy_work(1)?;
+            return Ok(false);
+        }
+        self.override_applicable_req(fs_path, req)
     }
 
     /// Per-directory prefilter for the ancestor walk.  An access file in
@@ -15503,6 +15877,41 @@ impl Config {
             }
             dir.starts_with(prefix)
         })
+    }
+
+    pub(crate) fn access_file_dir_applicable_req(
+        &self,
+        dir: &Path,
+        req: &crate::http::Request,
+    ) -> Result<bool, &'static str> {
+        if !self.capability_enabled(Capability::AccessFiles) || !self.override_enabled {
+            req.charge_policy_work(1)?;
+            return Ok(false);
+        }
+        if self.override_anywhere {
+            req.charge_policy_work(1)?;
+            return Ok(true);
+        }
+        for prefix in &self.override_prefixes {
+            use std::os::unix::ffi::OsStrExt;
+            let pattern = prefix.as_os_str().as_bytes();
+            if pattern
+                .iter()
+                .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+            {
+                req.charge_policy_work(1)?;
+                return Ok(true);
+            }
+            req.charge_policy_work(
+                (pattern.len() as u64)
+                    .saturating_add(dir.as_os_str().as_bytes().len() as u64)
+                    .saturating_add(1),
+            )?;
+            if dir.starts_with(prefix) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The effective server header value for this configuration.
@@ -15551,6 +15960,48 @@ impl Config {
         scope
     }
 
+    /// Metered cache-miss path used while building a live request plan. Cache
+    /// hits pay only for their key; misses charge every rule matcher before
+    /// constructing and retaining the request-independent scope.
+    pub fn effective_scope_cached_req(
+        &self,
+        vhost: Option<&VHost>,
+        dir: &Path,
+        url_path: &str,
+        req: &crate::http::Request,
+    ) -> Result<Arc<Scope>, &'static str> {
+        req.charge_policy_work(
+            (dir.as_os_str().as_encoded_bytes().len() as u64)
+                .saturating_add(url_path.len() as u64)
+                .saturating_add(1),
+        )?;
+        let key = (
+            vhost.map(|v| v as *const VHost as usize).unwrap_or(0),
+            dir.to_path_buf(),
+            url_path.to_string(),
+        );
+        if let Ok(guard) = self.dir_scope_cache.read() {
+            if let Some(scope) = guard.get(&key) {
+                return Ok(scope);
+            }
+        }
+        let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
+        let mut scope = base.clone();
+        let rules: &[ScopeRule] = vhost
+            .map(|v| v.rules.as_slice())
+            .unwrap_or(self.global_rules.as_slice());
+        let fname = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        apply_rules_config_budgeted(rules, &mut scope, dir, url_path, &fname, req)?;
+        let scope = Arc::new(scope);
+        if let Ok(mut guard) = self.dir_scope_cache.write() {
+            guard.insert(key, Arc::clone(&scope));
+        }
+        Ok(scope)
+    }
+
     /// Apply matching `<Proxy>` / `<ProxyMatch>` container configuration to a
     /// request that is about to be proxied.  `proxy_url` is the backend URL
     /// (for example `http://backend/app/x`), matching Apache's proxy-section
@@ -15585,20 +16036,50 @@ impl Config {
             .unwrap_or(self.proxy_containers.as_slice());
         let docroot = self.documentation_root_for(vhost);
         for container in containers {
-            let matched = proxy_urls.iter().any(|proxy_url| match &container.kind {
-                ProxyMatchKind::Wildcard(pattern) => {
-                    if pattern
-                        .as_bytes()
-                        .iter()
-                        .any(|b| matches!(b, b'*' | b'?' | b'['))
-                    {
-                        glob_match(pattern.as_bytes(), proxy_url.as_bytes())
-                    } else {
-                        proxy_url.starts_with(pattern.as_str())
+            let mut matched = false;
+            for proxy_url in proxy_urls {
+                let result = match &container.kind {
+                    ProxyMatchKind::Wildcard(pattern) => {
+                        if pattern
+                            .as_bytes()
+                            .iter()
+                            .any(|b| matches!(b, b'*' | b'?' | b'['))
+                        {
+                            crate::glob::fnmatch_budgeted(
+                                pattern.as_bytes(),
+                                proxy_url.as_bytes(),
+                                false,
+                                req.policy_budget(),
+                            )
+                        } else {
+                            req.charge_policy_work(
+                                (pattern.len() as u64)
+                                    .saturating_add(proxy_url.len() as u64)
+                                    .saturating_add(1),
+                            )
+                            .map(|()| proxy_url.starts_with(pattern.as_str()))
+                        }
+                    }
+                    ProxyMatchKind::Regex(re) => req
+                        .charge_policy_work(
+                            (re.as_str().len() as u64)
+                                .saturating_add(proxy_url.len() as u64)
+                                .saturating_add(1),
+                        )
+                        .map(|()| re.is_match(proxy_url.as_bytes())),
+                };
+                match result {
+                    Ok(true) => {
+                        matched = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        scope.conditional_error = true;
+                        return;
                     }
                 }
-                ProxyMatchKind::Regex(re) => re.is_match(proxy_url.as_bytes()),
-            });
+            }
             if !matched {
                 continue;
             }
@@ -15701,12 +16182,19 @@ impl Config {
         conditionals: &mut Vec<ScopeRule>,
     ) -> Scope {
         let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
-        let s = base.clone();
+        let mut s = base.clone();
         let rules: &[ScopeRule] = vhost
             .map(|v| v.rules.as_slice())
             .unwrap_or(self.global_rules.as_slice());
         for rule in rules {
-            if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
+            let matched = match rule_kind_matches_req(&rule.kind, fs_path, url_path, fname, req) {
+                Ok(matched) => matched,
+                Err(_) => {
+                    s.conditional_error = true;
+                    break;
+                }
+            };
+            if !matched {
                 continue;
             }
             defer_rule_by_verified_phase(rule, files, locations, conditionals);
@@ -15736,7 +16224,6 @@ impl Config {
         let index = vhost
             .map(|v| &v.directory_index)
             .unwrap_or(&self.global_directory_index);
-        let _ = req;
         let _ = peer;
         let mut apply_rule = |rule: &ScopeRule| {
             merge_rule_delta(scope, rule, fs_path, url_path);
@@ -15747,6 +16234,10 @@ impl Config {
         if index.wildcard.is_empty() {
             if let Some(indices) = index.exact.get(dir) {
                 for &i in indices {
+                    if req.charge_policy_work(1).is_err() {
+                        scope.conditional_error = true;
+                        return;
+                    }
                     apply_rule(&rules[i]);
                 }
             }
@@ -15759,7 +16250,14 @@ impl Config {
             let MatchKind::Directory(pattern) = &rule.kind else {
                 continue;
             };
-            if !directory_pattern_matches_exact(pattern, dir) {
+            let matched = match directory_pattern_matches_exact_req(pattern, dir, req) {
+                Ok(matched) => matched,
+                Err(_) => {
+                    scope.conditional_error = true;
+                    return;
+                }
+            };
+            if !matched {
                 continue;
             }
             apply_rule(rule);
@@ -15771,6 +16269,7 @@ impl Config {
         &self,
         vhost: Option<&VHost>,
         scope: &mut Scope,
+        req: Option<&crate::http::Request>,
         fs_path: &Path,
         url_path: &str,
         files: &mut Vec<ScopeRule>,
@@ -15787,6 +16286,17 @@ impl Config {
             let MatchKind::DirectoryMatch(re) = &rule.kind else {
                 continue;
             };
+            if req.is_some_and(|req| {
+                req.charge_policy_work(
+                    (re.as_str().len() as u64)
+                        .saturating_add(fs_path.as_os_str().as_encoded_bytes().len() as u64)
+                        .saturating_add(1),
+                )
+                .is_err()
+            }) {
+                scope.conditional_error = true;
+                return;
+            }
             if !re.is_match(fs_path.as_os_str().as_encoded_bytes()) {
                 continue;
             }
@@ -15815,6 +16325,7 @@ impl Config {
         &self,
         vhost: Option<&VHost>,
         scope: &mut Scope,
+        req: Option<&crate::http::Request>,
         fs_path: &Path,
         url_path: &str,
         files: &mut Vec<ScopeRule>,
@@ -15837,7 +16348,17 @@ impl Config {
             let MatchKind::Directory(pattern) = &rule.kind else {
                 continue;
             };
-            if !directory_pattern_matches_exact(pattern, fs_path) {
+            let matched = match req {
+                Some(req) => match directory_pattern_matches_exact_req(pattern, fs_path, req) {
+                    Ok(matched) => matched,
+                    Err(_) => {
+                        scope.conditional_error = true;
+                        return;
+                    }
+                },
+                None => directory_pattern_matches_exact(pattern, fs_path),
+            };
+            if !matched {
                 continue;
             }
             merge_rule_delta(scope, rule, fs_path, url_path);
