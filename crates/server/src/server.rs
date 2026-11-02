@@ -19,7 +19,6 @@ use crate::proxy;
 use crate::request_plan::{CanonicalTarget, RequestPlan};
 use crate::util::is_canonical_path;
 use crate::verified::{normalize_uri_path, percent_decode_path};
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -29,7 +28,9 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -267,17 +268,6 @@ fn sockaddr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_
 }
 
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
-static ACTIVE_WORKER_CLIENTS: OnceLock<Mutex<HashMap<IpAddr, usize>>> = OnceLock::new();
-static ACTIVE_BODY_WORKERS: AtomicUsize = AtomicUsize::new(0);
-static ACTIVE_BODY_WORKER_CLIENTS: OnceLock<Mutex<HashMap<IpAddr, usize>>> = OnceLock::new();
-static PENDING_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-static PENDING_CONNECTION_CLIENTS: OnceLock<Mutex<HashMap<IpAddr, usize>>> = OnceLock::new();
-static H2_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-static H2_CONNECTION_CLIENTS: OnceLock<Mutex<HashMap<IpAddr, usize>>> = OnceLock::new();
-static TLS_HANDSHAKES: AtomicUsize = AtomicUsize::new(0);
-static TLS_HANDSHAKE_CLIENTS: OnceLock<Mutex<HashMap<IpAddr, usize>>> = OnceLock::new();
-static TLS_HANDSHAKE_RATE: OnceLock<Mutex<TlsHandshakeRate>> = OnceLock::new();
 static ADMISSION_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 const MAX_CONNECTIONS_PER_CLIENT: usize = 32;
 const MAX_PENDING_CONNECTIONS: usize = 2_048;
@@ -396,8 +386,9 @@ impl Server {
                             let cfg = self.cfg.clone();
                             let logger = self.logger.clone();
                             let trusted_proxy = cfg.transport_peer_is_trusted_proxy(peer.ip());
+                            let transport_context = cfg.resource_budget.context(peer.ip());
                             let Some(pending_guard) = try_reserve_pending_connection(
-                                peer.ip(),
+                                &transport_context,
                                 pending_connection_limit(cfg.max_request_workers),
                                 if trusted_proxy {
                                     MAX_PENDING_PER_TRUSTED_PROXY
@@ -463,36 +454,12 @@ impl Drop for ConnectionLifetimeGuard {
     }
 }
 
-struct QuotaGuard {
-    total: &'static AtomicUsize,
-    clients: &'static OnceLock<Mutex<HashMap<IpAddr, usize>>>,
-    client: IpAddr,
-}
-
-impl Drop for QuotaGuard {
-    fn drop(&mut self) {
-        let mut clients = self
-            .clients
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(count) = clients.get_mut(&self.client) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                clients.remove(&self.client);
-            }
-        }
-        drop(clients);
-        self.total.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 struct WorkerGuard {
-    _quota: QuotaGuard,
+    _quota: crate::resource::SlotLease,
 }
 
 struct BodyWorkerGuard {
-    _quota: QuotaGuard,
+    _quota: crate::resource::SlotLease,
 }
 
 fn per_client_connection_limit(limit: usize) -> usize {
@@ -511,128 +478,73 @@ fn body_worker_limit(worker_limit: usize) -> usize {
 }
 
 fn try_reserve_quota(
-    total: &'static AtomicUsize,
-    clients: &'static OnceLock<Mutex<HashMap<IpAddr, usize>>>,
-    client: IpAddr,
+    context: &crate::resource::ResourceContext,
+    kind: crate::resource::SlotKind,
     global_limit: usize,
     client_limit: usize,
-) -> Option<QuotaGuard> {
-    let client = crate::resource::client_quota_key(client);
-    let global_limit = global_limit.max(1);
-    let client_limit = client_limit.max(1);
-    let mut current = total.load(Ordering::Acquire);
-    loop {
-        if !vapache_verified::connection_admit(current as u64, global_limit as u64) {
-            return None;
-        }
-        match total.compare_exchange_weak(
-            current,
-            current.saturating_add(1),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
-    let mut client_counts = clients
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let count = client_counts.entry(client).or_default();
-    if !vapache_verified::connection_admit(*count as u64, client_limit as u64) {
-        total.fetch_sub(1, Ordering::AcqRel);
-        return None;
-    }
-    *count += 1;
-    drop(client_counts);
-    Some(QuotaGuard {
-        total,
-        clients,
-        client,
-    })
+) -> Option<crate::resource::SlotLease> {
+    context
+        .slot(
+            kind,
+            global_limit.max(1) as u64,
+            Some(client_limit.max(1) as u64),
+            Some(1),
+            "connection admission limit reached",
+        )
+        .ok()
 }
 
 fn try_reserve_pending_connection(
-    client: IpAddr,
+    context: &crate::resource::ResourceContext,
     global_limit: usize,
     client_limit: usize,
-) -> Option<QuotaGuard> {
+) -> Option<crate::resource::SlotLease> {
     try_reserve_quota(
-        &PENDING_CONNECTIONS,
-        &PENDING_CONNECTION_CLIENTS,
-        client,
+        context,
+        crate::resource::SlotKind::PendingConnection,
         global_limit,
         client_limit,
     )
 }
 
-fn try_reserve_body_worker(client: IpAddr, limit: usize) -> Option<BodyWorkerGuard> {
+fn try_reserve_body_worker(
+    context: &crate::resource::ResourceContext,
+    limit: usize,
+) -> Option<BodyWorkerGuard> {
     let body_limit = body_worker_limit(limit);
     let client_limit = (body_limit.saturating_add(3) / 4).max(1);
     try_reserve_quota(
-        &ACTIVE_BODY_WORKERS,
-        &ACTIVE_BODY_WORKER_CLIENTS,
-        client,
+        context,
+        crate::resource::SlotKind::RequestBodyWorker,
         body_limit,
         client_limit,
     )
     .map(|quota| BodyWorkerGuard { _quota: quota })
 }
 
-fn try_reserve_worker(client: IpAddr, limit: usize) -> Option<WorkerGuard> {
+fn try_reserve_worker(
+    context: &crate::resource::ResourceContext,
+    limit: usize,
+) -> Option<WorkerGuard> {
     try_reserve_quota(
-        &ACTIVE_WORKERS,
-        &ACTIVE_WORKER_CLIENTS,
-        client,
+        context,
+        crate::resource::SlotKind::RequestWorker,
         limit,
         per_client_connection_limit(limit),
     )
     .map(|quota| WorkerGuard { _quota: quota })
 }
 
-fn try_reserve_h2_connection(client: IpAddr, limit: usize) -> Option<QuotaGuard> {
+fn try_reserve_h2_connection(
+    context: &crate::resource::ResourceContext,
+    limit: usize,
+) -> Option<crate::resource::SlotLease> {
     try_reserve_quota(
-        &H2_CONNECTIONS,
-        &H2_CONNECTION_CLIENTS,
-        client,
+        context,
+        crate::resource::SlotKind::H2Connection,
         limit,
         per_client_connection_limit(limit),
     )
-}
-
-#[derive(Default)]
-struct TlsHandshakeRate {
-    window_started: Option<Instant>,
-    total: usize,
-    clients: HashMap<IpAddr, usize>,
-}
-
-impl TlsHandshakeRate {
-    fn admit_at(&mut self, client: IpAddr, now: Instant) -> bool {
-        let expired = self
-            .window_started
-            .is_none_or(|started| now.saturating_duration_since(started) >= Duration::from_secs(1));
-        if expired {
-            self.window_started = Some(now);
-            self.total = 0;
-            self.clients.clear();
-        }
-        let client = crate::resource::client_quota_key(client);
-        let client_total = self.clients.get(&client).copied().unwrap_or(0);
-        if !vapache_verified::connection_admit(
-            self.total as u64,
-            MAX_TLS_HANDSHAKES_PER_SECOND as u64,
-        ) || !vapache_verified::connection_admit(
-            client_total as u64,
-            MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND as u64,
-        ) {
-            return false;
-        }
-        self.total += 1;
-        self.clients.insert(client, client_total + 1);
-        true
-    }
 }
 
 fn tls_handshake_limit() -> usize {
@@ -643,21 +555,25 @@ fn tls_handshake_limit() -> usize {
     MAX_CONCURRENT_TLS_HANDSHAKES
 }
 
-fn try_reserve_tls_handshake(client: IpAddr) -> Option<QuotaGuard> {
-    let limit = tls_handshake_limit();
-    let guard = try_reserve_quota(&TLS_HANDSHAKES, &TLS_HANDSHAKE_CLIENTS, client, limit, 4)?;
-    let admitted = TLS_HANDSHAKE_RATE
-        .get_or_init(|| Mutex::new(TlsHandshakeRate::default()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .admit_at(client, Instant::now());
-    admitted.then_some(guard)
+fn try_reserve_tls_handshake(
+    context: &crate::resource::ResourceContext,
+) -> Option<crate::resource::SlotLease> {
+    context
+        .budget()
+        .try_tls_handshake(
+            context,
+            tls_handshake_limit() as u64,
+            MAX_TLS_HANDSHAKES_PER_SECOND as u64,
+            MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND as u64,
+        )
+        .ok()
 }
 
-fn keep_alive_capacity_available(limit: usize) -> bool {
+fn keep_alive_capacity_available(budget: &crate::resource::ResourceBudget, limit: usize) -> bool {
     let limit = limit.max(1);
     let reserve = (limit / 4).max(1);
-    ACTIVE_WORKERS.load(Ordering::Acquire) < limit.saturating_sub(reserve)
+    budget.slot_usage(crate::resource::SlotKind::RequestWorker)
+        < limit.saturating_sub(reserve) as u64
 }
 
 fn spawn_connection_worker<F>(work: F) -> io::Result<tokio::task::JoinHandle<()>>
@@ -820,6 +736,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
     mut buf: Vec<u8>,
     mut initial_reservation: Option<crate::resource::ResidentLease>,
     mut initial_body_guard: Option<BodyWorkerGuard>,
+    mut initial_resource_context: Option<crate::resource::ResourceContext>,
 ) -> io::Result<()> {
     let limits = request_limits(cfg, tls);
     // Configure the transport once rather than paying a setsockopt on every
@@ -867,18 +784,26 @@ fn handle_connection<C: Conn + ResponseWrite>(
                     ));
                 }
                 stream.set_read_timeout(Some(cfg.request_body_timeout.max(Duration::from_secs(1))));
+                let context = if served == 0 {
+                    initial_resource_context
+                        .take()
+                        .unwrap_or_else(|| cfg.resource_budget.context(effective.ip()))
+                } else {
+                    cfg.resource_budget.context(effective.ip())
+                };
                 if request_has_body(request) && body_guard.is_none() {
                     body_guard = Some(
-                        try_reserve_body_worker(effective.ip(), cfg.max_request_workers)
-                            .ok_or_else(|| {
+                        try_reserve_body_worker(&context, cfg.max_request_workers).ok_or_else(
+                            || {
                                 io::Error::new(
                                     io::ErrorKind::WouldBlock,
                                     "slow request-body capacity exhausted",
                                 )
-                            })?,
+                            },
+                        )?,
                     );
                 }
-                Ok(Some(effective.ip()))
+                Ok(Some(context))
             },
             reservation,
         ) {
@@ -952,6 +877,16 @@ fn handle_connection<C: Conn + ResponseWrite>(
         // WebSocket upgrades need the raw connection after the 101 response;
         // the normal Response pipeline only supports buffered bodies.
         if proxy::is_websocket(&req) {
+            // Upgrade routing performs scope evaluation, access-file parsing,
+            // rewrite processing and proxy authorization before ordinary
+            // dispatch. Bind those helpers to the same validated request
+            // hierarchy instead of letting them fail closed or create a
+            // second, protocol-specific resource scope.
+            let resource_context = req
+                .resource_context()
+                .cloned()
+                .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
+            let _resource_context_guard = crate::resource::enter_resource_context(resource_context);
             let host = host_header(&req).unwrap_or("");
             let vhost = cfg.select_vhost(
                 local_ip.parse().ok(),
@@ -1201,7 +1136,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
             // pressure. Existing keep-alive clients finish normally, but new
             // responses close instead of allowing idle sockets to consume the
             // final workers.
-            && keep_alive_capacity_available(cfg.max_request_workers)
+            && keep_alive_capacity_available(&cfg.resource_budget, cfg.max_request_workers)
             && (cfg.max_keep_alive_requests == 0 || served + 1 < cfg.max_keep_alive_requests);
         let mut opts = ResponseOptions {
             server_header: &cfg.server_header(),
@@ -1503,7 +1438,7 @@ async fn admit_plain_connection(
     peer: SocketAddr,
     local_ip: String,
     local_port: u16,
-    pending_guard: QuotaGuard,
+    pending_guard: crate::resource::SlotLease,
     lifetime_guard: ConnectionLifetimeGuard,
 ) -> io::Result<()> {
     stream.set_nonblocking(true)?;
@@ -1535,10 +1470,11 @@ async fn admit_plain_connection(
         }
     };
     let effective = cfg.client_addr(peer, &request);
+    let resource_context = cfg.resource_budget.context(effective.ip());
     let has_body = request_has_body(&request);
     drop(request);
     let body_guard = if has_body {
-        match try_reserve_body_worker(effective.ip(), cfg.max_request_workers) {
+        match try_reserve_body_worker(&resource_context, cfg.max_request_workers) {
             Some(guard) => Some(guard),
             None => {
                 reject_h1_async(&mut stream, &cfg, 503).await;
@@ -1548,7 +1484,7 @@ async fn admit_plain_connection(
     } else {
         None
     };
-    let Some(worker_guard) = try_reserve_worker(effective.ip(), cfg.max_request_workers.max(1))
+    let Some(worker_guard) = try_reserve_worker(&resource_context, cfg.max_request_workers.max(1))
     else {
         reject_h1_async(&mut stream, &cfg, 503).await;
         return Ok(());
@@ -1576,6 +1512,7 @@ async fn admit_plain_connection(
             initial,
             Some(resident),
             body_guard,
+            Some(resource_context),
         );
     })?;
     Ok(())
@@ -1589,10 +1526,11 @@ async fn admit_tls_connection(
     local_ip: String,
     local_port: u16,
     tls_config: Arc<rustls::ServerConfig>,
-    pending_guard: QuotaGuard,
+    pending_guard: crate::resource::SlotLease,
     lifetime_guard: ConnectionLifetimeGuard,
 ) -> io::Result<()> {
-    let handshake_guard = try_reserve_tls_handshake(peer.ip()).ok_or_else(|| {
+    let transport_context = cfg.resource_budget.context(peer.ip());
+    let handshake_guard = try_reserve_tls_handshake(&transport_context).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::WouldBlock,
             "TLS handshake capacity exhausted",
@@ -1618,8 +1556,9 @@ async fn admit_tls_connection(
     match admitted_tls_http_protocol(allows_h2, allows_http11, alpn)? {
         TlsHttpProtocol::Http2 => {
             let connection_limit = cfg.max_request_workers.max(1);
+            let h2_context = transport_context.clone();
             return crate::h2::serve(cfg, logger, tls, peer, local_ip, local_port, move || {
-                let established = try_reserve_h2_connection(peer.ip(), connection_limit)
+                let established = try_reserve_h2_connection(&h2_context, connection_limit)
                     .ok_or_else(|| {
                         io::Error::new(io::ErrorKind::WouldBlock, "HTTP/2 connection limit reached")
                     })?;
@@ -1658,10 +1597,11 @@ async fn admit_tls_connection(
         }
     };
     let effective = cfg.client_addr(peer, &request);
+    let resource_context = cfg.resource_budget.context(effective.ip());
     let has_body = request_has_body(&request);
     drop(request);
     let body_guard = if has_body {
-        match try_reserve_body_worker(effective.ip(), cfg.max_request_workers) {
+        match try_reserve_body_worker(&resource_context, cfg.max_request_workers) {
             Some(guard) => Some(guard),
             None => {
                 reject_h1_async(&mut tls, &cfg, 503).await;
@@ -1671,7 +1611,7 @@ async fn admit_tls_connection(
     } else {
         None
     };
-    let Some(worker_guard) = try_reserve_worker(effective.ip(), cfg.max_request_workers.max(1))
+    let Some(worker_guard) = try_reserve_worker(&resource_context, cfg.max_request_workers.max(1))
     else {
         reject_h1_async(&mut tls, &cfg, 503).await;
         return Ok(());
@@ -1693,6 +1633,7 @@ async fn admit_tls_connection(
             initial,
             Some(resident),
             body_guard,
+            Some(resource_context),
         );
     })?;
     Ok(())
@@ -1707,7 +1648,7 @@ async fn admit_connection(
     local_ip: String,
     local_port: u16,
     tls_config: Option<Arc<rustls::ServerConfig>>,
-    pending_guard: QuotaGuard,
+    pending_guard: crate::resource::SlotLease,
     lifetime_guard: ConnectionLifetimeGuard,
 ) -> io::Result<()> {
     if let Some(tls_config) = tls_config {
@@ -2041,7 +1982,11 @@ pub(crate) fn dispatch_with_scheme_and_identity(
     tls: bool,
 ) -> (Response, Option<String>) {
     crate::auth::reset_request_identity();
-    let response = crate::resource::with_expensive_client(peer.ip(), || {
+    let context = req
+        .resource_context()
+        .cloned()
+        .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
+    let response = crate::resource::with_resource_context(context, || {
         crate::expr::with_connection(tls, local_port, || {
             dispatch_inner_request(cfg, req, peer, local_ip, local_port)
         })
@@ -5663,15 +5608,20 @@ mod tests {
     fn connection_spawn_failure_releases_reserved_slot() {
         let _test_guard = ADMISSION_TEST_LOCK.lock().unwrap();
         let _fault_guard = crate::fault::test_guard();
-        let before = ACTIVE_WORKERS.load(Ordering::Acquire);
-        let guard = try_reserve_worker(IpAddr::from([192, 0, 2, 1]), usize::MAX).unwrap();
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let context = budget.context(IpAddr::from([192, 0, 2, 1]));
+        let before = budget.slot_usage(crate::resource::SlotKind::RequestWorker);
+        let guard = try_reserve_worker(&context, usize::MAX).unwrap();
         crate::fault::configure(
             "server.connection.spawn",
             0,
             std::io::ErrorKind::OutOfMemory,
         );
         assert!(spawn_connection_worker(move || drop(guard)).is_err());
-        assert_eq!(ACTIVE_WORKERS.load(Ordering::Acquire), before);
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::RequestWorker),
+            before
+        );
         crate::fault::clear();
     }
 
@@ -5687,33 +5637,34 @@ mod tests {
         let client = IpAddr::from([192, 0, 2, 99]);
         let other = IpAddr::from([192, 0, 2, 100]);
         let limit = usize::MAX;
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
         let leases: Vec<_> = (0..per_client_connection_limit(limit))
-            .map(|_| try_reserve_worker(client, limit).unwrap())
+            .map(|_| try_reserve_worker(&budget.context(client), limit).unwrap())
             .collect();
-        assert!(try_reserve_worker(client, limit).is_none());
-        assert!(try_reserve_worker(other, limit).is_some());
+        assert!(try_reserve_worker(&budget.context(client), limit).is_none());
+        assert!(try_reserve_worker(&budget.context(other), limit).is_some());
         drop(leases);
-        assert!(try_reserve_worker(client, limit).is_some());
+        assert!(try_reserve_worker(&budget.context(client), limit).is_some());
 
         let ipv6: IpAddr = "2001:db8:10:20::1".parse().unwrap();
         let rotated: IpAddr = "2001:db8:10:20:ffff::1".parse().unwrap();
         let other_prefix: IpAddr = "2001:db8:10:21::1".parse().unwrap();
         let leases: Vec<_> = (0..per_client_connection_limit(limit))
-            .map(|_| try_reserve_worker(ipv6, limit).unwrap())
+            .map(|_| try_reserve_worker(&budget.context(ipv6), limit).unwrap())
             .collect();
-        assert!(try_reserve_worker(rotated, limit).is_none());
-        assert!(try_reserve_worker(other_prefix, limit).is_some());
+        assert!(try_reserve_worker(&budget.context(rotated), limit).is_none());
+        assert!(try_reserve_worker(&budget.context(other_prefix), limit).is_some());
         drop(leases);
 
         let body_limit = 64;
         let body_share = body_worker_limit(body_limit).div_ceil(4);
         let bodies: Vec<_> = (0..body_share)
-            .map(|_| try_reserve_body_worker(client, body_limit).unwrap())
+            .map(|_| try_reserve_body_worker(&budget.context(client), body_limit).unwrap())
             .collect();
-        assert!(try_reserve_body_worker(client, body_limit).is_none());
-        assert!(try_reserve_body_worker(other, body_limit).is_some());
+        assert!(try_reserve_body_worker(&budget.context(client), body_limit).is_none());
+        assert!(try_reserve_body_worker(&budget.context(other), body_limit).is_some());
         drop(bodies);
-        assert!(try_reserve_body_worker(client, body_limit).is_some());
+        assert!(try_reserve_body_worker(&budget.context(client), body_limit).is_some());
     }
 
     #[test]
@@ -5733,20 +5684,32 @@ mod tests {
         let now = Instant::now();
         let client = IpAddr::from([192, 0, 2, 1]);
         let other = IpAddr::from([192, 0, 2, 2]);
-        let mut rate = TlsHandshakeRate::default();
+        let budget = crate::resource::ResourceBudget::default();
         for _ in 0..MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND {
-            assert!(rate.admit_at(client, now));
+            assert!(budget.test_rate_admit(
+                false,
+                Some(client),
+                now,
+                MAX_TLS_HANDSHAKES_PER_SECOND as u64,
+                MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND as u64,
+            ));
         }
-        assert!(!rate.admit_at(client, now));
-        assert!(rate.admit_at(other, now));
-        assert!(rate.admit_at(client, now + Duration::from_secs(1)));
+        assert!(!budget.test_rate_admit(false, Some(client), now, 128, 64));
+        assert!(budget.test_rate_admit(false, Some(other), now, 128, 64));
+        assert!(budget.test_rate_admit(false, Some(client), now + Duration::from_secs(1), 128, 64,));
 
-        let mut global_rate = TlsHandshakeRate::default();
+        let global_rate = crate::resource::ResourceBudget::default();
         for n in 0..MAX_TLS_HANDSHAKES_PER_SECOND {
             let ip = IpAddr::from([198, 51, (n / 256) as u8, (n % 256) as u8]);
-            assert!(global_rate.admit_at(ip, now));
+            assert!(global_rate.test_rate_admit(false, Some(ip), now, 128, 64));
         }
-        assert!(!global_rate.admit_at(IpAddr::from([203, 0, 113, 1]), now));
+        assert!(!global_rate.test_rate_admit(
+            false,
+            Some(IpAddr::from([203, 0, 113, 1])),
+            now,
+            128,
+            64,
+        ));
 
         assert_eq!(listener_index(0, 0, 3), 0);
         assert_eq!(listener_index(0, 1, 3), 1);
@@ -5824,6 +5787,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            None,
         );
         (String::from_utf8_lossy(&conn.output).into_owned(), result)
     }
@@ -5843,7 +5807,9 @@ mod tests {
         let mut cfg = cov_config(&dir, "");
         cfg.body_handlers_possible = true;
         cfg.max_request_workers = 4;
-        let saturated = try_reserve_body_worker(cov_peer().ip(), cfg.max_request_workers).unwrap();
+        let saturated_context = cfg.resource_budget.context(cov_peer().ip());
+        let saturated =
+            try_reserve_body_worker(&saturated_context, cfg.max_request_workers).unwrap();
         let request = "GET /file.txt HTTP/1.1\r\nHost: localhost\r\n\r\n\
                        POST /file.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody";
         let (response, result) = cov_run_conn(&cfg, request, 80);
@@ -5900,6 +5866,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            None,
         )
         .unwrap();
         let (head, response_body) = conn.output.split_at(
@@ -5940,6 +5907,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(cov_status(&String::from_utf8_lossy(&normal.output)), 200);
@@ -5957,6 +5925,7 @@ mod tests {
             80,
             false,
             Vec::new(),
+            None,
             None,
             None,
         )
@@ -5984,6 +5953,7 @@ mod tests {
             80,
             false,
             Vec::new(),
+            None,
             None,
             None,
         )
@@ -6082,6 +6052,7 @@ mod tests {
             80,
             false,
             Vec::new(),
+            None,
             None,
             None,
         )
@@ -6702,7 +6673,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EFAULT));
 
-        let workers_before = ACTIVE_WORKERS.swap(1, Ordering::SeqCst);
+        let saturated_context = cfg.resource_budget.context(cov_peer().ip());
+        let saturated = try_reserve_worker(&saturated_context, 1).unwrap();
         let stop = server.stop_flag();
         let handle = std::thread::spawn(move || {
             server.run_with_poll(&bound, |pollfds| {
@@ -6727,7 +6699,7 @@ mod tests {
         assert!(text.contains("503"), "{text}");
         stop.store(true, Ordering::SeqCst);
         handle.join().unwrap().unwrap();
-        ACTIVE_WORKERS.store(workers_before, Ordering::SeqCst);
+        drop(saturated);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

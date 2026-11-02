@@ -1451,12 +1451,11 @@ fn execute_inner(
     target: &Target,
     binding: Option<&ScriptBinding>,
 ) -> Response {
-    let _dynamic_lease = match base.cfg.resource_budget.try_dynamic_for(
-        base.cfg.max_dynamic_requests,
-        base.remote_ip
-            .parse()
-            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-    ) {
+    let _dynamic_lease = match base
+        .cfg
+        .resource_budget
+        .try_dynamic(base.cfg.max_dynamic_requests)
+    {
         Ok(lease) => lease,
         Err(e) => {
             eprintln!("vapache FastCGI admission error: {e}");

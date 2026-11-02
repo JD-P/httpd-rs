@@ -90,6 +90,7 @@ step "coverage-guided parser fuzz targets"
 tests/fuzz_smoke.sh
 
 step "Verus proof and verification-ledger gate"
+python3 tests/resource_inventory.py
 python3 tests/verification_status.py --run-verus
 
 step "configuration grammar and validity differentials"

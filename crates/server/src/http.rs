@@ -113,6 +113,9 @@ pub struct Headers {
     // it beside the already-shared header reservation avoids a reset when an
     // internal rewrite or adapter clones `Request`.
     policy_budget: std::sync::Arc<crate::resource::RequestPolicyBudget>,
+    // The validated source identity and request-local resource ledger travel
+    // with every clone/internal rewrite of this request.
+    resource_context: Option<crate::resource::ResourceContext>,
 }
 
 impl Headers {
@@ -173,6 +176,14 @@ impl Headers {
 
     pub(crate) fn policy_budget(&self) -> &crate::resource::RequestPolicyBudget {
         &self.policy_budget
+    }
+
+    pub(crate) fn bind_resource_context(&mut self, context: crate::resource::ResourceContext) {
+        self.resource_context = Some(context);
+    }
+
+    pub(crate) fn resource_context(&self) -> Option<&crate::resource::ResourceContext> {
+        self.resource_context.as_ref()
     }
 }
 
@@ -236,7 +247,7 @@ pub(crate) struct BodyAccumulator {
     resource_budget: std::sync::Arc<ResourceBudget>,
     max_spool_bytes: u64,
     max_spool_files: u64,
-    client: Option<std::net::IpAddr>,
+    resource_context: Option<crate::resource::ResourceContext>,
 }
 
 impl BodyAccumulator {
@@ -262,6 +273,23 @@ impl BodyAccumulator {
         max_spool_files: u64,
         client: Option<std::net::IpAddr>,
     ) -> Self {
+        let context = client.map(|client| resource_budget.context(client));
+        Self::new_in(
+            memory_limit,
+            resource_budget,
+            max_spool_bytes,
+            max_spool_files,
+            context,
+        )
+    }
+
+    pub(crate) fn new_in(
+        memory_limit: u64,
+        resource_budget: std::sync::Arc<ResourceBudget>,
+        max_spool_bytes: u64,
+        max_spool_files: u64,
+        resource_context: Option<crate::resource::ResourceContext>,
+    ) -> Self {
         Self {
             body: Vec::new(),
             file: None,
@@ -271,7 +299,7 @@ impl BodyAccumulator {
             resource_budget,
             max_spool_bytes,
             max_spool_files,
-            client,
+            resource_context,
         }
     }
 
@@ -309,11 +337,11 @@ impl BodyAccumulator {
             return Ok(());
         }
         if self.file.is_none() {
-            let mut lease = match self.client {
-                Some(client) => self.resource_budget.try_spool_for(
+            let mut lease = match self.resource_context.as_ref() {
+                Some(context) => self.resource_budget.try_spool_in(
                     self.max_spool_bytes,
                     self.max_spool_files,
-                    client,
+                    context,
                 )?,
                 None => self
                     .resource_budget
@@ -448,6 +476,10 @@ impl Request {
 
     pub(crate) fn policy_budget(&self) -> &crate::resource::RequestPolicyBudget {
         self.headers.policy_budget()
+    }
+
+    pub(crate) fn resource_context(&self) -> Option<&crate::resource::ResourceContext> {
+        self.headers.resource_context()
     }
 }
 
@@ -655,7 +687,10 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
     stream: &mut R,
     buf: &mut Vec<u8>,
     limits: &Limits,
-    on_headers: impl FnOnce(&mut R, &Request) -> Result<Option<std::net::IpAddr>, ReadError>,
+    on_headers: impl FnOnce(
+        &mut R,
+        &Request,
+    ) -> Result<Option<crate::resource::ResourceContext>, ReadError>,
     reservation: Option<ResidentLease>,
 ) -> Result<Option<Request>, ReadError> {
     let prefix_precharged = reservation.is_some();
@@ -731,7 +766,12 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
     // Admission that depends on parsed framing (for example the process-wide
     // slow-body reserve) must happen after the complete head is validated but
     // before a 100 response or any body byte is consumed.
-    let spool_client = on_headers(stream, &req)?;
+    let resource_context = on_headers(stream, &req)?;
+    let spool_context = resource_context.clone();
+    if let Some(context) = resource_context {
+        request_resident.attribute_context(context.clone())?;
+        req.headers.bind_resource_context(context);
+    }
 
     if req.expect_continue && framing != BodyFraming::None {
         // The client is waiting for this before sending the body.
@@ -754,12 +794,12 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
                 // A known-large body spills after a small actual-byte prefix.
                 // A declaration plus a token byte therefore holds neither a
                 // spool slot nor a declared-length byte reservation.
-                let mut body = BodyAccumulator::new_for(
+                let mut body = BodyAccumulator::new_in(
                     REQUEST_BODY_SPOOL_PREFIX,
                     limits.resource_budget.clone(),
                     limits.max_spool_bytes,
                     limits.max_spool_files,
-                    spool_client,
+                    spool_context.clone(),
                 );
                 let take = (n as usize).min(buf.len());
                 body.push_with_resident(&buf[..take], &mut request_resident)?;
@@ -811,12 +851,12 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
             }
         }
         BodyFraming::Chunked => {
-            let mut body = BodyAccumulator::new_for(
+            let mut body = BodyAccumulator::new_in(
                 REQUEST_BODY_SPOOL_PREFIX,
                 limits.resource_budget.clone(),
                 limits.max_spool_bytes,
                 limits.max_spool_files,
-                spool_client,
+                spool_context,
             );
             let chunk_deadline = Instant::now() + limits.body_timeout;
             let mut writer = ResidentBodyWriter {
@@ -1209,6 +1249,7 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
             entries,
             resident_lease: None,
             policy_budget: std::sync::Arc::new(crate::resource::RequestPolicyBudget::default()),
+            resource_context: None,
         },
         body: Vec::new(),
         body_spool: None,

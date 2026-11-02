@@ -46,6 +46,8 @@ jobs:
           python3 tests/native_dependency_policy.py --binary target/debug/vapached
       - name: Unsafe boundary budget
         run: python3 tests/unsafe_inventory.py
+      - name: Resource ownership inventory
+        run: python3 tests/resource_inventory.py
       - name: Verification ledger and CVE matrix
         run: |
           python3 tests/verification_status.py

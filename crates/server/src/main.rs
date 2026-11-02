@@ -821,84 +821,89 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
         framing: BodyFraming::None,
     };
     let peer = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-    let target =
-        vapached::request_plan::CanonicalTarget::from_raw_path(raw_path.as_bytes(), allow_encoded)
-            .map_err(|e| format!("invalid request path '{raw_path}': {e:?}"))?;
-    let plan = vapached::request_plan::RequestPlan::resolve(cfg, vhost, target)
-        .map_err(|e| format!("mapping failed for '{path}': {e:?}"))?;
-    let root = plan.root();
-    let fs_path = plan.fs_path();
-    let url_path = plan.url_path();
-    let mut evaluated = plan.evaluate_scope(cfg, vhost, &req, peer);
-    evaluated.apply_conditionals(cfg, vhost, fs_path, url_path, &req, peer);
-    let scope = evaluated.scope;
-    let override_enabled = cfg.override_enabled;
-    let override_prefilter = cfg.override_applicable(fs_path);
-    let access_files = cfg.access_file_names_for(&scope);
+    let resource_context = cfg.resource_budget.context(peer);
+    vapached::resource::with_resource_context(resource_context, || {
+        let target = vapached::request_plan::CanonicalTarget::from_raw_path(
+            raw_path.as_bytes(),
+            allow_encoded,
+        )
+        .map_err(|e| format!("invalid request path '{raw_path}': {e:?}"))?;
+        let plan = vapached::request_plan::RequestPlan::resolve(cfg, vhost, target)
+            .map_err(|e| format!("mapping failed for '{path}': {e:?}"))?;
+        let root = plan.root();
+        let fs_path = plan.fs_path();
+        let url_path = plan.url_path();
+        let mut evaluated = plan.evaluate_scope(cfg, vhost, &req, peer);
+        evaluated.apply_conditionals(cfg, vhost, fs_path, url_path, &req, peer);
+        let scope = evaluated.scope;
+        let override_enabled = cfg.override_enabled;
+        let override_prefilter = cfg.override_applicable(fs_path);
+        let access_files = cfg.access_file_names_for(&scope);
 
-    println!("explain: {method} {path}");
-    println!("  canonical_url_path: {url_path}");
-    println!(
-        "  vhost: {}",
-        vhost
-            .and_then(|v| v.server_name.as_deref())
-            .unwrap_or("<global>")
-    );
-    println!("  document_root: {}", root.display());
-    println!("  fs_path: {}", fs_path.display());
-    println!("  access_layers:");
-    for layer in plan.layers() {
+        println!("explain: {method} {path}");
+        println!("  canonical_url_path: {url_path}");
         println!(
-            "    dir={} url_mount={} subject={:?}",
-            layer.identity.dir.display(),
-            layer.identity.url_mount,
-            layer.identity.subject(fs_path, url_path)
+            "  vhost: {}",
+            vhost
+                .and_then(|v| v.server_name.as_deref())
+                .unwrap_or("<global>")
         );
-    }
-    println!("  override_policy: {:?}", scope.override_policy);
-    println!("  override_enabled: {override_enabled}");
-    println!("  override_prefilter: {override_prefilter}");
-    println!("  access_file_names: {access_files:?}");
-    println!("  matching_rules:");
-    for rule in cfg.rule_inventory(vhost, &fs_path, &url_path, &req, peer) {
-        println!("    {rule}");
-    }
-    println!("  access_file_trace:");
-    for file in vapached::htaccess::trace_access_files_with_root(
-        cfg,
-        vhost,
-        &fs_path,
-        &url_path,
-        Some(&root),
-    ) {
-        println!("    {file}");
-    }
-    println!("  options: {:?}", scope.effective_options());
-    println!("  allow_methods: {:?}", scope.authorization.allow_methods);
-    println!("  requires: {:?}", scope.authorization.requires);
-    println!("  legacy: {:?}", scope.authorization.legacy);
-    println!(
-        "  auth: type={:?} name={:?} userfile={:?} groupfile={:?}",
-        scope.authorization.auth_type,
-        scope.authorization.auth_name,
-        scope.authorization.auth_user_file,
-        scope.authorization.auth_group_file
-    );
-    println!(
-        "  rewrite_engine: {:?}, rules: {}",
-        scope.rewrite_policy.rewrite_engine,
-        scope.rewrite_policy.rewrite_rules.len()
-    );
-    println!("  cache_enable: {:?}", scope.rewrite_policy.cache_enable);
-    println!("  cache_disable: {:?}", scope.rewrite_policy.cache_disable);
-    if !override_prefilter {
-        println!("  htaccess: skipped (no override-enabled directory in path)");
-    } else if plan.layers().is_empty() {
-        println!("  htaccess: no access files present");
-    } else {
-        println!("  htaccess: {} layer(s) applied", plan.layers().len());
-    }
-    Ok(())
+        println!("  document_root: {}", root.display());
+        println!("  fs_path: {}", fs_path.display());
+        println!("  access_layers:");
+        for layer in plan.layers() {
+            println!(
+                "    dir={} url_mount={} subject={:?}",
+                layer.identity.dir.display(),
+                layer.identity.url_mount,
+                layer.identity.subject(fs_path, url_path)
+            );
+        }
+        println!("  override_policy: {:?}", scope.override_policy);
+        println!("  override_enabled: {override_enabled}");
+        println!("  override_prefilter: {override_prefilter}");
+        println!("  access_file_names: {access_files:?}");
+        println!("  matching_rules:");
+        for rule in cfg.rule_inventory(vhost, &fs_path, &url_path, &req, peer) {
+            println!("    {rule}");
+        }
+        println!("  access_file_trace:");
+        for file in vapached::htaccess::trace_access_files_with_root(
+            cfg,
+            vhost,
+            &fs_path,
+            &url_path,
+            Some(&root),
+        ) {
+            println!("    {file}");
+        }
+        println!("  options: {:?}", scope.effective_options());
+        println!("  allow_methods: {:?}", scope.authorization.allow_methods);
+        println!("  requires: {:?}", scope.authorization.requires);
+        println!("  legacy: {:?}", scope.authorization.legacy);
+        println!(
+            "  auth: type={:?} name={:?} userfile={:?} groupfile={:?}",
+            scope.authorization.auth_type,
+            scope.authorization.auth_name,
+            scope.authorization.auth_user_file,
+            scope.authorization.auth_group_file
+        );
+        println!(
+            "  rewrite_engine: {:?}, rules: {}",
+            scope.rewrite_policy.rewrite_engine,
+            scope.rewrite_policy.rewrite_rules.len()
+        );
+        println!("  cache_enable: {:?}", scope.rewrite_policy.cache_enable);
+        println!("  cache_disable: {:?}", scope.rewrite_policy.cache_disable);
+        if !override_prefilter {
+            println!("  htaccess: skipped (no override-enabled directory in path)");
+        } else if plan.layers().is_empty() {
+            println!("  htaccess: no access files present");
+        } else {
+            println!("  htaccess: {} layer(s) applied", plan.layers().len());
+        }
+        Ok(())
+    })
 }
 
 fn main() {

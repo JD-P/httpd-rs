@@ -25,7 +25,6 @@ use crate::config::{
 };
 use crate::http::Request;
 use crate::scope_policy::Originated;
-use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::IpAddr;
@@ -33,9 +32,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::time::Duration;
 
 const PRG_MAP_TIMEOUT: Duration = Duration::from_secs(2);
 const PRG_MAP_MAX_OUTPUT: usize = 8 * 1024;
@@ -45,109 +43,23 @@ const PRG_MAP_MAX_OUTPUT: usize = 8 * 1024;
 const PRG_MAP_WORK_COST: u64 = 2 * 1024 * 1024;
 const MAX_CONCURRENT_PRG_MAPS: usize = 8;
 const MAX_PRG_MAPS_PER_SECOND: usize = 64;
-static ACTIVE_PRG_MAPS: AtomicUsize = AtomicUsize::new(0);
-static ACTIVE_PRG_MAP_CLIENTS: OnceLock<Mutex<HashMap<std::net::IpAddr, usize>>> = OnceLock::new();
-static PRG_MAP_RATE: OnceLock<Mutex<PrgMapRate>> = OnceLock::new();
 const MAX_REWRITE_OUTPUT_BYTES: usize = 64 * 1024;
 
-#[derive(Default)]
-struct PrgMapRate {
-    window_started: Option<Instant>,
-    used: usize,
-    clients: HashMap<std::net::IpAddr, usize>,
-}
-
-impl PrgMapRate {
-    fn admit_at(&mut self, client: Option<std::net::IpAddr>, now: Instant) -> bool {
-        if self
-            .window_started
-            .is_none_or(|start| now.saturating_duration_since(start) >= Duration::from_secs(1))
-        {
-            self.window_started = Some(now);
-            self.used = 0;
-            self.clients.clear();
-        }
-        let client_used = client
-            .and_then(|client| self.clients.get(&client).copied())
-            .unwrap_or(0);
-        if !vapache_verified::connection_admit(self.used as u64, MAX_PRG_MAPS_PER_SECOND as u64) {
-            return false;
-        }
-        if client.is_some()
-            && !vapache_verified::connection_admit(
-                client_used as u64,
-                (MAX_PRG_MAPS_PER_SECOND / 4) as u64,
-            )
-        {
-            return false;
-        }
-        self.used += 1;
-        if let Some(client) = client {
-            self.clients.insert(client, client_used + 1);
-        }
-        true
-    }
-}
-
-struct PrgMapLease {
-    client: Option<std::net::IpAddr>,
-}
-
-impl Drop for PrgMapLease {
-    fn drop(&mut self) {
-        ACTIVE_PRG_MAPS.fetch_sub(1, Ordering::AcqRel);
-        if let Some(client) = self.client {
-            let mut clients = ACTIVE_PRG_MAP_CLIENTS
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(count) = clients.get_mut(&client) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    clients.remove(&client);
-                }
-            }
-        }
-    }
-}
-
-fn try_prg_map() -> Option<PrgMapLease> {
-    let client = crate::resource::current_expensive_client();
-    let mut active = ACTIVE_PRG_MAPS.load(Ordering::Acquire);
-    loop {
-        if !vapache_verified::connection_admit(active as u64, MAX_CONCURRENT_PRG_MAPS as u64) {
-            return None;
-        }
-        match ACTIVE_PRG_MAPS.compare_exchange_weak(
-            active,
-            active.saturating_add(1),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => break,
-            Err(observed) => active = observed,
-        }
-    }
-    if let Some(client) = client {
-        let mut clients = ACTIVE_PRG_MAP_CLIENTS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let count = clients.entry(client).or_default();
-        if !vapache_verified::connection_admit(*count as u64, (MAX_CONCURRENT_PRG_MAPS / 4) as u64)
-        {
-            ACTIVE_PRG_MAPS.fetch_sub(1, Ordering::AcqRel);
-            return None;
-        }
-        *count += 1;
-    }
-    let lease = PrgMapLease { client };
-    let admitted = PRG_MAP_RATE
-        .get_or_init(|| Mutex::new(PrgMapRate::default()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .admit_at(client, Instant::now());
-    admitted.then_some(lease)
+fn try_prg_map() -> Option<crate::resource::SlotLease> {
+    #[cfg(test)]
+    let context = crate::resource::current_or_test_context();
+    #[cfg(not(test))]
+    let context = crate::resource::current_context()?;
+    context
+        .budget()
+        .try_rewrite_program(
+            &context,
+            MAX_CONCURRENT_PRG_MAPS as u64,
+            (MAX_CONCURRENT_PRG_MAPS / 4) as u64,
+            MAX_PRG_MAPS_PER_SECOND as u64,
+            (MAX_PRG_MAPS_PER_SECOND / 4) as u64,
+        )
+        .ok()
 }
 
 fn append_rewrite_output(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
@@ -3816,26 +3728,62 @@ mod tests {
 
     #[test]
     fn program_rewrite_map_rate_is_finite_and_refills() {
-        let now = Instant::now();
-        let mut rate = PrgMapRate::default();
+        let now = std::time::Instant::now();
+        let budget = crate::resource::ResourceBudget::default();
         for _ in 0..MAX_PRG_MAPS_PER_SECOND {
-            assert!(rate.admit_at(None, now));
+            assert!(budget.test_rate_admit(
+                true,
+                None,
+                now,
+                MAX_PRG_MAPS_PER_SECOND as u64,
+                (MAX_PRG_MAPS_PER_SECOND / 4) as u64,
+            ));
         }
-        assert!(!rate.admit_at(None, now));
-        assert!(rate.admit_at(None, now + Duration::from_secs(1)));
+        assert!(!budget.test_rate_admit(
+            true,
+            None,
+            now,
+            MAX_PRG_MAPS_PER_SECOND as u64,
+            (MAX_PRG_MAPS_PER_SECOND / 4) as u64,
+        ));
+        assert!(budget.test_rate_admit(
+            true,
+            None,
+            now + Duration::from_secs(1),
+            MAX_PRG_MAPS_PER_SECOND as u64,
+            (MAX_PRG_MAPS_PER_SECOND / 4) as u64,
+        ));
     }
 
     #[test]
     fn program_rewrite_map_rate_reserves_capacity_for_other_clients() {
-        let now = Instant::now();
+        let now = std::time::Instant::now();
         let first = Some(std::net::IpAddr::from([192, 0, 2, 1]));
         let second = Some(std::net::IpAddr::from([198, 51, 100, 1]));
-        let mut rate = PrgMapRate::default();
+        let budget = crate::resource::ResourceBudget::default();
         for _ in 0..MAX_PRG_MAPS_PER_SECOND / 4 {
-            assert!(rate.admit_at(first, now));
+            assert!(budget.test_rate_admit(
+                true,
+                first,
+                now,
+                MAX_PRG_MAPS_PER_SECOND as u64,
+                (MAX_PRG_MAPS_PER_SECOND / 4) as u64,
+            ));
         }
-        assert!(!rate.admit_at(first, now));
-        assert!(rate.admit_at(second, now));
+        assert!(!budget.test_rate_admit(
+            true,
+            first,
+            now,
+            MAX_PRG_MAPS_PER_SECOND as u64,
+            (MAX_PRG_MAPS_PER_SECOND / 4) as u64,
+        ));
+        assert!(budget.test_rate_admit(
+            true,
+            second,
+            now,
+            MAX_PRG_MAPS_PER_SECOND as u64,
+            (MAX_PRG_MAPS_PER_SECOND / 4) as u64,
+        ));
     }
 
     #[test]

@@ -9,24 +9,103 @@ use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+
+/// Every attacker-reachable concurrency slot is represented in this one
+/// ledger. Byte reservations use the same `ResourceContext` below, but retain
+/// their specialized adjustable leases because their charge changes while a
+/// body is read or transformed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub(crate) enum SlotKind {
+    DynamicBackend,
+    H2Stream,
+    ResponseBodyRead,
+    Websocket,
+    ExpensiveCpu,
+    PendingConnection,
+    RequestWorker,
+    RequestBodyWorker,
+    H2Connection,
+    TlsHandshake,
+    RewriteProgram,
+    SpoolFile,
+}
+
+impl SlotKind {
+    const COUNT: usize = 12;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum ByteKind {
+    Spool,
+    RequestResident,
+    ResponseResident,
+    PolicyExpansion,
+}
+
+impl ByteKind {
+    const COUNT: usize = 4;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Debug)]
+struct ScopeUsage {
+    slots: [AtomicU64; SlotKind::COUNT],
+    bytes: [AtomicU64; ByteKind::COUNT],
+}
+
+impl Default for ScopeUsage {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| AtomicU64::new(0)),
+            bytes: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
+struct RateWindow {
+    started: Option<std::time::Instant>,
+    total: u64,
+    clients: HashMap<IpAddr, u64>,
+}
+
+#[derive(Debug, Default)]
+struct RateLedger {
+    tls: RateWindow,
+    rewrite_program: RateWindow,
+}
+
+#[derive(Debug)]
 pub struct ResourceBudget {
-    spool_bytes: AtomicU64,
-    spool_files: AtomicU64,
-    spool_clients: Mutex<HashMap<IpAddr, (u64, u64)>>,
-    dynamic_requests: AtomicU64,
-    dynamic_clients: Mutex<HashMap<IpAddr, u64>>,
-    h2_streams: AtomicU64,
-    h2_clients: Mutex<HashMap<IpAddr, u64>>,
-    request_bytes: AtomicU64,
-    response_bytes: AtomicU64,
-    response_clients: Mutex<HashMap<IpAddr, u64>>,
-    response_body_reads: AtomicU64,
-    response_body_read_clients: Mutex<HashMap<IpAddr, u64>>,
-    websocket_tunnels: AtomicU64,
-    websocket_clients: Mutex<HashMap<IpAddr, u64>>,
+    slot_process: [AtomicU64; SlotKind::COUNT],
+    slot_clients: Mutex<HashMap<IpAddr, [u64; SlotKind::COUNT]>>,
+    byte_process: [AtomicU64; ByteKind::COUNT],
+    byte_clients: Mutex<HashMap<IpAddr, [u64; ByteKind::COUNT]>>,
+    rates: Mutex<RateLedger>,
+    next_scope: AtomicU64,
+}
+
+impl Default for ResourceBudget {
+    fn default() -> Self {
+        Self {
+            slot_process: std::array::from_fn(|_| AtomicU64::new(0)),
+            slot_clients: Mutex::new(HashMap::new()),
+            byte_process: std::array::from_fn(|_| AtomicU64::new(0)),
+            byte_clients: Mutex::new(HashMap::new()),
+            rates: Mutex::new(RateLedger::default()),
+            next_scope: AtomicU64::new(1),
+        }
+    }
 }
 
 /// Process-wide ceilings for work whose callers do not carry a `Config`
@@ -42,11 +121,14 @@ pub const MAX_H2_STREAMS: u64 = 256;
 pub const MAX_H2_STREAMS_PER_CLIENT: u64 = 64;
 pub const MAX_REQUEST_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_RESPONSE_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_REQUEST_RESIDENT_BYTES_PER_CLIENT: u64 = 32 * 1024 * 1024;
+pub const MAX_REQUEST_RESIDENT_BYTES_PER_REQUEST: u64 = 8 * 1024 * 1024;
 /// One network identity may retain at most one quarter of the response heap
 /// while downstream clients consume it. This prevents a handful of slow
 /// responses from turning the process-wide memory safety bound into a global
 /// availability oracle.
 pub const MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT: u64 = 32 * 1024 * 1024;
+pub const MAX_RESPONSE_RESIDENT_BYTES_PER_REQUEST: u64 = 32 * 1024 * 1024;
 pub const MAX_WEBSOCKET_TUNNELS: u64 = 64;
 pub const MAX_WEBSOCKETS_PER_CLIENT: u64 = 8;
 /// Per-request ceiling for configuration-policy work.  One unit represents
@@ -74,16 +156,16 @@ pub const MAX_POLICY_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub struct RequestPolicyBudget {
     work: AtomicU64,
     expansion_bytes: AtomicU64,
+    expansion_lease: Mutex<Option<ByteLease>>,
     failed: AtomicBool,
 }
-
-static POLICY_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 impl Default for RequestPolicyBudget {
     fn default() -> Self {
         Self {
             work: AtomicU64::new(0),
             expansion_bytes: AtomicU64::new(0),
+            expansion_lease: Mutex::new(None),
             failed: AtomicBool::new(false),
         }
     }
@@ -109,14 +191,40 @@ impl RequestPolicyBudget {
             self.failed.store(true, Ordering::Release);
             return Err("request policy expansion limit exceeded");
         }
-        if !try_add(&POLICY_RESIDENT_BYTES, amount, MAX_POLICY_RESIDENT_BYTES) {
-            self.failed.store(true, Ordering::Release);
-            return Err("process policy expansion limit exceeded");
-        }
         if !try_add(&self.expansion_bytes, amount, MAX_POLICY_EXPANSION_BYTES) {
-            POLICY_RESIDENT_BYTES.fetch_sub(amount, Ordering::AcqRel);
             self.failed.store(true, Ordering::Release);
             return Err("request policy expansion limit exceeded");
+        }
+        #[cfg(test)]
+        let context = current_or_test_context();
+        #[cfg(not(test))]
+        let Some(context) = current_context() else {
+            self.expansion_bytes.fetch_sub(amount, Ordering::AcqRel);
+            self.failed.store(true, Ordering::Release);
+            return Err("policy expansion has no resource context");
+        };
+        let mut lease = self
+            .expansion_lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if lease.is_none() {
+            *lease = Some(ByteLease::new(
+                context,
+                ByteKind::PolicyExpansion,
+                MAX_POLICY_RESIDENT_BYTES,
+                Some(MAX_POLICY_RESIDENT_BYTES / 4),
+                Some(MAX_POLICY_EXPANSION_BYTES),
+            ));
+        }
+        if lease
+            .as_mut()
+            .expect("policy expansion lease initialized")
+            .reserve(amount, "hierarchical policy-expansion byte limit reached")
+            .is_err()
+        {
+            self.expansion_bytes.fetch_sub(amount, Ordering::AcqRel);
+            self.failed.store(true, Ordering::Release);
+            return Err("process policy expansion limit exceeded");
         }
         Ok(())
     }
@@ -136,15 +244,6 @@ impl RequestPolicyBudget {
     }
 }
 
-impl Drop for RequestPolicyBudget {
-    fn drop(&mut self) {
-        let reserved = self.expansion_bytes.load(Ordering::Acquire);
-        if reserved != 0 {
-            POLICY_RESIDENT_BYTES.fetch_sub(reserved, Ordering::AcqRel);
-        }
-    }
-}
-
 /// Collapse IPv6 interface identifiers into their /64 allocation while
 /// retaining exact IPv4 identities. IPv4-mapped IPv6 is canonicalized first.
 pub fn client_quota_key(client: IpAddr) -> IpAddr {
@@ -156,36 +255,141 @@ pub fn client_quota_key(client: IpAddr) -> IpAddr {
     }
 }
 
-static EXPENSIVE_OPS: AtomicU64 = AtomicU64::new(0);
-static EXPENSIVE_CLIENTS: OnceLock<Mutex<HashMap<IpAddr, u64>>> = OnceLock::new();
-
-thread_local! {
-    static EXPENSIVE_CLIENT: RefCell<Option<IpAddr>> = const { RefCell::new(None) };
+/// Validated resource identity for one request or pre-request connection
+/// phase. Clones share the request-local ledger, so internal rewrites and
+/// helper calls cannot reset request ceilings.
+#[derive(Clone, Debug)]
+pub struct ResourceContext {
+    budget: Arc<ResourceBudget>,
+    client: Option<IpAddr>,
+    scope_id: u64,
+    local: Arc<ScopeUsage>,
 }
 
+impl ResourceContext {
+    pub fn for_client(budget: &Arc<ResourceBudget>, client: IpAddr) -> Self {
+        let scope_id = budget.next_scope.fetch_add(1, Ordering::Relaxed);
+        Self {
+            budget: budget.clone(),
+            client: Some(client_quota_key(client)),
+            scope_id,
+            local: Arc::new(ScopeUsage::default()),
+        }
+    }
+
+    fn process_only(budget: &Arc<ResourceBudget>) -> Self {
+        let scope_id = budget.next_scope.fetch_add(1, Ordering::Relaxed);
+        Self {
+            budget: budget.clone(),
+            client: None,
+            scope_id,
+            local: Arc::new(ScopeUsage::default()),
+        }
+    }
+
+    pub fn client(&self) -> Option<IpAddr> {
+        self.client
+    }
+
+    pub fn scope_id(&self) -> u64 {
+        self.scope_id
+    }
+
+    pub fn budget(&self) -> &Arc<ResourceBudget> {
+        &self.budget
+    }
+
+    pub(crate) fn slot(
+        &self,
+        kind: SlotKind,
+        process_limit: u64,
+        client_limit: Option<u64>,
+        request_limit: Option<u64>,
+        message: &'static str,
+    ) -> io::Result<SlotLease> {
+        self.budget.try_slot(
+            self,
+            kind,
+            process_limit,
+            client_limit,
+            request_limit,
+            message,
+        )
+    }
+}
+
+thread_local! {
+    static CURRENT_CONTEXT: RefCell<Option<ResourceContext>> = const { RefCell::new(None) };
+}
+
+/// Thread-bound scope guard for synchronous protocol paths that need to make
+/// several helper calls before they enter ordinary request dispatch.
+pub(crate) struct ResourceContextGuard {
+    previous: Option<ResourceContext>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for ResourceContextGuard {
+    fn drop(&mut self) {
+        CURRENT_CONTEXT.with(|current| {
+            current.replace(self.previous.take());
+        });
+    }
+}
+
+pub(crate) fn enter_resource_context(context: ResourceContext) -> ResourceContextGuard {
+    let previous = CURRENT_CONTEXT.with(|current| current.replace(Some(context)));
+    ResourceContextGuard {
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+pub fn with_resource_context<T>(context: ResourceContext, operation: impl FnOnce() -> T) -> T {
+    let _guard = enter_resource_context(context);
+    operation()
+}
+
+pub(crate) fn current_context() -> Option<ResourceContext> {
+    CURRENT_CONTEXT.with(|current| current.borrow().clone())
+}
+
+#[cfg(test)]
+fn test_context(client: IpAddr) -> ResourceContext {
+    static BUDGET: std::sync::OnceLock<Arc<ResourceBudget>> = std::sync::OnceLock::new();
+    ResourceContext::for_client(
+        BUDGET.get_or_init(|| Arc::new(ResourceBudget::default())),
+        client,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn current_or_test_context() -> ResourceContext {
+    current_context().unwrap_or_else(|| test_context(IpAddr::from([127, 0, 0, 1])))
+}
+
+/// Compatibility wrapper for request dispatch call sites while they migrate
+/// to carrying the complete context. Unlike the old implementation, the
+/// thread-local value is the sealed hierarchical context, not merely an IP
+/// hint that each resource pool may interpret differently.
 pub fn with_expensive_client<T>(client: IpAddr, operation: impl FnOnce() -> T) -> T {
-    let client = client_quota_key(client);
-    EXPENSIVE_CLIENT.with(|current| {
-        let previous = current.replace(Some(client));
-        struct Restore<'a> {
-            slot: &'a RefCell<Option<IpAddr>>,
-            previous: Option<IpAddr>,
+    if let Some(current) = current_context() {
+        if current.client == Some(client_quota_key(client)) {
+            return operation();
         }
-        impl Drop for Restore<'_> {
-            fn drop(&mut self) {
-                self.slot.replace(self.previous);
-            }
-        }
-        let _restore = Restore {
-            slot: current,
-            previous,
-        };
-        operation()
-    })
+        let context = ResourceContext::for_client(&current.budget, client);
+        return with_resource_context(context, operation);
+    }
+    #[cfg(test)]
+    {
+        return with_resource_context(test_context(client), operation);
+    }
+    #[cfg(not(test))]
+    operation()
 }
 
 pub(crate) fn current_expensive_client() -> Option<IpAddr> {
-    EXPENSIVE_CLIENT.with(|current| *current.borrow())
+    current_context().and_then(|context| context.client)
 }
 
 fn try_add(counter: &AtomicU64, amount: u64, limit: u64) -> bool {
@@ -242,7 +446,7 @@ impl BudgetCounter for loom::sync::atomic::AtomicU64 {
 fn try_add_counter<C: BudgetCounter>(counter: &C, amount: u64, limit: u64) -> bool {
     let mut current = counter.load_value(Ordering::Acquire);
     loop {
-        if !vapache_verified::resource_budget_admit(current, amount, limit) {
+        if !vapache_verified::hierarchical_resource_admit(current, amount, limit) {
             return false;
         }
         let Some(next) = current.checked_add(amount) else {
@@ -255,13 +459,447 @@ fn try_add_counter<C: BudgetCounter>(counter: &C, amount: u64, limit: u64) -> bo
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct SlotLease {
+    context: ResourceContext,
+    kind: SlotKind,
+    amount: u64,
+    charged_client: bool,
+    charged_request: bool,
+    client_limit: Option<u64>,
+    request_limit: Option<u64>,
+    active: bool,
+}
+
+impl SlotLease {
+    fn attribute_context(&mut self, context: ResourceContext) -> io::Result<()> {
+        if !Arc::ptr_eq(&self.context.budget, &context.budget) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resource context belongs to another process ledger",
+            ));
+        }
+        if self.context.scope_id == context.scope_id {
+            return Ok(());
+        }
+        let index = self.kind.index();
+        let target_request = if let Some(limit) = self.request_limit {
+            if !try_add(&context.local.slots[index], self.amount, limit) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "request-local slot limit reached",
+                ));
+            }
+            true
+        } else {
+            false
+        };
+        let mut clients = self
+            .context
+            .budget
+            .slot_clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let unchanged_client = self.charged_client
+            && self.context.client.is_some()
+            && self.context.client == context.client;
+        let target_client = if unchanged_client {
+            true
+        } else if let (Some(client), Some(limit)) = (context.client, self.client_limit) {
+            let usage = clients.entry(client).or_insert([0; SlotKind::COUNT]);
+            if !vapache_verified::hierarchical_resource_admit(usage[index], self.amount, limit) {
+                if usage.iter().all(|value| *value == 0) {
+                    clients.remove(&client);
+                }
+                if target_request {
+                    context.local.slots[index].fetch_sub(self.amount, Ordering::AcqRel);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "per-client slot limit reached",
+                ));
+            }
+            usage[index] += self.amount;
+            true
+        } else {
+            false
+        };
+        if self.charged_client && !unchanged_client {
+            if let Some(old) = self.context.client {
+                if let Some(usage) = clients.get_mut(&old) {
+                    usage[index] = usage[index].saturating_sub(self.amount);
+                    if usage.iter().all(|value| *value == 0) {
+                        clients.remove(&old);
+                    }
+                }
+            }
+        }
+        drop(clients);
+        if self.charged_request {
+            self.context.local.slots[index].fetch_sub(self.amount, Ordering::AcqRel);
+        }
+        self.context = context;
+        self.charged_client = target_client;
+        self.charged_request = target_request;
+        Ok(())
+    }
+}
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let index = self.kind.index();
+        self.context.budget.slot_process[index].fetch_sub(self.amount, Ordering::AcqRel);
+        if self.charged_client {
+            if let Some(client) = self.context.client {
+                let mut clients = self
+                    .context
+                    .budget
+                    .slot_clients
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(usage) = clients.get_mut(&client) {
+                    usage[index] = usage[index].saturating_sub(self.amount);
+                    if usage.iter().all(|value| *value == 0) {
+                        clients.remove(&client);
+                    }
+                }
+            }
+        }
+        if self.charged_request {
+            self.context.local.slots[index].fetch_sub(self.amount, Ordering::AcqRel);
+        }
+        self.active = false;
+    }
+}
+
+#[derive(Debug)]
+struct ByteLease {
+    context: ResourceContext,
+    kind: ByteKind,
+    bytes: u64,
+    process_limit: u64,
+    client_limit: Option<u64>,
+    request_limit: Option<u64>,
+}
+
+impl ByteLease {
+    fn new(
+        context: ResourceContext,
+        kind: ByteKind,
+        process_limit: u64,
+        client_limit: Option<u64>,
+        request_limit: Option<u64>,
+    ) -> Self {
+        Self {
+            context,
+            kind,
+            bytes: 0,
+            process_limit,
+            client_limit,
+            request_limit,
+        }
+    }
+
+    fn reserve(&mut self, amount: u64, message: &'static str) -> io::Result<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let index = self.kind.index();
+        let charged_request = if let Some(limit) = self.request_limit {
+            if !try_add(&self.context.local.bytes[index], amount, limit) {
+                return Err(io::Error::new(io::ErrorKind::OutOfMemory, message));
+            }
+            true
+        } else {
+            false
+        };
+
+        let mut clients = self
+            .context
+            .budget
+            .byte_clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let charged_client =
+            if let (Some(client), Some(limit)) = (self.context.client, self.client_limit) {
+                let usage = clients.entry(client).or_insert([0; ByteKind::COUNT]);
+                if !vapache_verified::hierarchical_resource_admit(usage[index], amount, limit) {
+                    if usage.iter().all(|value| *value == 0) {
+                        clients.remove(&client);
+                    }
+                    if charged_request {
+                        self.context.local.bytes[index].fetch_sub(amount, Ordering::AcqRel);
+                    }
+                    return Err(io::Error::new(io::ErrorKind::OutOfMemory, message));
+                }
+                usage[index] += amount;
+                true
+            } else {
+                false
+            };
+
+        if !try_add(
+            &self.context.budget.byte_process[index],
+            amount,
+            self.process_limit,
+        ) {
+            if charged_client {
+                if let Some(client) = self.context.client {
+                    if let Some(usage) = clients.get_mut(&client) {
+                        usage[index] = usage[index].saturating_sub(amount);
+                        if usage.iter().all(|value| *value == 0) {
+                            clients.remove(&client);
+                        }
+                    }
+                }
+            }
+            drop(clients);
+            if charged_request {
+                self.context.local.bytes[index].fetch_sub(amount, Ordering::AcqRel);
+            }
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory, message));
+        }
+        drop(clients);
+        self.bytes += amount;
+        Ok(())
+    }
+
+    fn release(&mut self, amount: u64) {
+        let amount = amount.min(self.bytes);
+        if amount == 0 {
+            return;
+        }
+        let index = self.kind.index();
+        self.context.budget.byte_process[index].fetch_sub(amount, Ordering::AcqRel);
+        if let (Some(client), Some(_)) = (self.context.client, self.client_limit) {
+            let mut clients = self
+                .context
+                .budget
+                .byte_clients
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(usage) = clients.get_mut(&client) {
+                usage[index] = usage[index].saturating_sub(amount);
+                if usage.iter().all(|value| *value == 0) {
+                    clients.remove(&client);
+                }
+            }
+        }
+        if self.request_limit.is_some() {
+            self.context.local.bytes[index].fetch_sub(amount, Ordering::AcqRel);
+        }
+        self.bytes -= amount;
+    }
+
+    fn attribute_context(&mut self, context: ResourceContext) -> io::Result<()> {
+        if !Arc::ptr_eq(&self.context.budget, &context.budget) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resource context belongs to another process ledger",
+            ));
+        }
+        if self.context.scope_id == context.scope_id {
+            return Ok(());
+        }
+        if self.bytes == 0 {
+            self.context = context;
+            return Ok(());
+        }
+        let index = self.kind.index();
+        if let Some(limit) = self.request_limit {
+            if !try_add(&context.local.bytes[index], self.bytes, limit) {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "request-local byte limit reached",
+                ));
+            }
+        }
+        let mut clients = self
+            .context
+            .budget
+            .byte_clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let unchanged_client = self.client_limit.is_some()
+            && self.context.client.is_some()
+            && self.context.client == context.client;
+        if !unchanged_client {
+            if let (Some(client), Some(limit)) = (context.client, self.client_limit) {
+                let usage = clients.entry(client).or_insert([0; ByteKind::COUNT]);
+                if !vapache_verified::hierarchical_resource_admit(usage[index], self.bytes, limit) {
+                    if usage.iter().all(|value| *value == 0) {
+                        clients.remove(&client);
+                    }
+                    if self.request_limit.is_some() {
+                        context.local.bytes[index].fetch_sub(self.bytes, Ordering::AcqRel);
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "per-client byte limit reached",
+                    ));
+                }
+                usage[index] += self.bytes;
+            }
+            if let (Some(old), Some(_)) = (self.context.client, self.client_limit) {
+                if let Some(usage) = clients.get_mut(&old) {
+                    usage[index] = usage[index].saturating_sub(self.bytes);
+                    if usage.iter().all(|value| *value == 0) {
+                        clients.remove(&old);
+                    }
+                }
+            }
+        }
+        drop(clients);
+        if self.request_limit.is_some() {
+            self.context.local.bytes[index].fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+        self.context = context;
+        Ok(())
+    }
+}
+
+impl Drop for ByteLease {
+    fn drop(&mut self) {
+        self.release(self.bytes);
+    }
+}
+
 impl ResourceBudget {
+    pub fn context(self: &Arc<Self>, client: IpAddr) -> ResourceContext {
+        ResourceContext::for_client(self, client)
+    }
+
+    fn context_or_process(self: &Arc<Self>) -> ResourceContext {
+        current_context()
+            .filter(|context| Arc::ptr_eq(&context.budget, self))
+            .unwrap_or_else(|| ResourceContext::process_only(self))
+    }
+
+    fn try_slot(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+        kind: SlotKind,
+        process_limit: u64,
+        client_limit: Option<u64>,
+        request_limit: Option<u64>,
+        message: &'static str,
+    ) -> io::Result<SlotLease> {
+        if !Arc::ptr_eq(self, &context.budget) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resource context belongs to another process ledger",
+            ));
+        }
+        let index = kind.index();
+        let charged_request = if let Some(limit) = request_limit {
+            if !try_add(&context.local.slots[index], 1, limit) {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
+            }
+            true
+        } else {
+            false
+        };
+
+        let mut clients = self
+            .slot_clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let charged_client = if let (Some(client), Some(limit)) = (context.client, client_limit) {
+            let usage = clients.entry(client).or_insert([0; SlotKind::COUNT]);
+            if !vapache_verified::hierarchical_resource_admit(usage[index], 1, limit) {
+                if usage.iter().all(|value| *value == 0) {
+                    clients.remove(&client);
+                }
+                if charged_request {
+                    context.local.slots[index].fetch_sub(1, Ordering::AcqRel);
+                }
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
+            }
+            usage[index] += 1;
+            true
+        } else {
+            false
+        };
+
+        // Request and client scopes are admitted before process scope. A
+        // rejection can therefore never retain scarce global capacity while
+        // it reports a lower-level quota failure.
+        if !vapache_verified::hierarchical_acquisition_order_admit(
+            !charged_request || request_limit.is_some(),
+            !charged_client || client_limit.is_some(),
+        ) || !try_add(&self.slot_process[index], 1, process_limit)
+        {
+            if charged_client {
+                if let Some(client) = context.client {
+                    if let Some(usage) = clients.get_mut(&client) {
+                        usage[index] = usage[index].saturating_sub(1);
+                        if usage.iter().all(|value| *value == 0) {
+                            clients.remove(&client);
+                        }
+                    }
+                }
+            }
+            drop(clients);
+            if charged_request {
+                context.local.slots[index].fetch_sub(1, Ordering::AcqRel);
+            }
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
+        }
+        drop(clients);
+        Ok(SlotLease {
+            context: context.clone(),
+            kind,
+            amount: 1,
+            charged_client,
+            charged_request,
+            client_limit,
+            request_limit,
+            active: true,
+        })
+    }
+
+    fn admit_rate(
+        window: &mut RateWindow,
+        client: Option<IpAddr>,
+        now: std::time::Instant,
+        process_limit: u64,
+        client_limit: u64,
+    ) -> bool {
+        if window.started.is_none_or(|start| {
+            now.saturating_duration_since(start) >= std::time::Duration::from_secs(1)
+        }) {
+            window.started = Some(now);
+            window.total = 0;
+            window.clients.clear();
+        }
+        let client_used = client
+            .and_then(|client| window.clients.get(&client).copied())
+            .unwrap_or(0);
+        if !vapache_verified::hierarchical_rate_admit(
+            window.total,
+            client_used,
+            process_limit,
+            client_limit,
+            client.is_some(),
+        ) {
+            return false;
+        }
+        window.total += 1;
+        if let Some(client) = client {
+            window.clients.insert(client, client_used + 1);
+        }
+        true
+    }
+
     pub fn try_spool(self: &Arc<Self>, max_bytes: u64, max_files: u64) -> io::Result<SpoolLease> {
-        // Dynamic handlers run inside `with_expensive_client`. Attribute
-        // their temporary proxy/FastCGI/CGI spools at creation time so one
-        // request cannot consume the global pool before the completed
-        // response is attributed by the transport.
-        self.try_spool_inner(max_bytes, max_files, current_expensive_client())
+        let context = current_context()
+            .filter(|context| Arc::ptr_eq(context.budget(), self))
+            .or_else(|| current_expensive_client().map(|client| self.context(client)))
+            .unwrap_or_else(|| ResourceContext::process_only(self));
+        self.try_spool_inner(max_bytes, max_files, &context)
     }
 
     pub fn try_spool_for(
@@ -270,52 +908,49 @@ impl ResourceBudget {
         max_files: u64,
         client: IpAddr,
     ) -> io::Result<SpoolLease> {
-        self.try_spool_inner(max_bytes, max_files, Some(client_quota_key(client)))
+        let context = self.context(client);
+        self.try_spool_inner(max_bytes, max_files, &context)
+    }
+
+    pub(crate) fn try_spool_in(
+        self: &Arc<Self>,
+        max_bytes: u64,
+        max_files: u64,
+        context: &ResourceContext,
+    ) -> io::Result<SpoolLease> {
+        self.try_spool_inner(max_bytes, max_files, context)
     }
 
     fn try_spool_inner(
         self: &Arc<Self>,
         max_bytes: u64,
         max_files: u64,
-        client: Option<IpAddr>,
+        context: &ResourceContext,
     ) -> io::Result<SpoolLease> {
-        if !try_add(&self.spool_files, 1, max_files) {
-            return Err(io::Error::new(
-                io::ErrorKind::StorageFull,
-                "aggregate spool-file limit reached",
-            ));
-        }
-        if let Some(client) = client {
-            let mut clients = self
-                .spool_clients
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let usage = clients.entry(client).or_default();
-            let client_files = max_files.saturating_add(3) / 4;
-            if !vapache_verified::resource_budget_admit(usage.1, 1, client_files.max(1)) {
-                if usage.0 == 0 && usage.1 == 0 {
-                    clients.remove(&client);
-                }
-                self.spool_files.fetch_sub(1, Ordering::AcqRel);
-                return Err(io::Error::new(
-                    io::ErrorKind::StorageFull,
-                    "per-client spool-file limit reached",
-                ));
-            }
-            usage.1 += 1;
-        }
-        Ok(SpoolLease {
-            budget: self.clone(),
-            bytes: 0,
-            max_bytes,
+        let share_files = max_files.saturating_add(3) / 4;
+        let file_slot = context.slot(
+            SlotKind::SpoolFile,
             max_files,
-            client,
-            active: true,
+            Some(share_files.max(1)),
+            Some(share_files.max(1)),
+            "spool-file limit reached",
+        )?;
+        let share_bytes = max_bytes.saturating_add(3) / 4;
+        Ok(SpoolLease {
+            bytes: ByteLease::new(
+                context.clone(),
+                ByteKind::Spool,
+                max_bytes,
+                Some(share_bytes.max(1)),
+                Some(max_bytes.max(1)),
+            ),
+            _file_slot: file_slot,
         })
     }
 
     pub fn try_dynamic(self: &Arc<Self>, limit: u64) -> io::Result<DynamicLease> {
-        self.try_dynamic_inner(limit, None)
+        let context = self.context_or_process();
+        self.try_dynamic_in(&context, limit)
     }
 
     pub fn try_dynamic_for(
@@ -323,75 +958,23 @@ impl ResourceBudget {
         limit: u64,
         client: IpAddr,
     ) -> io::Result<DynamicLease> {
-        self.try_dynamic_inner(limit, Some(client_quota_key(client)))
+        let context = self.context(client);
+        self.try_dynamic_in(&context, limit)
     }
 
-    fn try_dynamic_inner(
+    pub fn try_dynamic_in(
         self: &Arc<Self>,
+        context: &ResourceContext,
         limit: u64,
-        client: Option<IpAddr>,
     ) -> io::Result<DynamicLease> {
-        if !try_add(&self.dynamic_requests, 1, limit) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "dynamic backend concurrency limit reached",
-            ));
-        }
-        if let Some(client) = client {
-            let mut clients = self
-                .dynamic_clients
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let count = clients.entry(client).or_insert(0);
-            if *count >= limit.min(MAX_DYNAMIC_REQUESTS_PER_CLIENT) {
-                drop(clients);
-                self.dynamic_requests.fetch_sub(1, Ordering::AcqRel);
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "per-client dynamic backend limit reached",
-                ));
-            }
-            *count += 1;
-        }
         Ok(DynamicLease {
-            budget: self.clone(),
-            client,
-            active: true,
-        })
-    }
-
-    fn try_h2_stream(self: &Arc<Self>) -> io::Result<H2StreamLease> {
-        if !try_add(&self.h2_streams, 1, MAX_H2_STREAMS) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "process-wide HTTP/2 stream limit reached",
-            ));
-        }
-        Ok(H2StreamLease {
-            budget: self.clone(),
-            active: true,
-        })
-    }
-
-    fn try_h2_client_for(self: &Arc<Self>, client: IpAddr) -> io::Result<H2ClientLease> {
-        let client = client_quota_key(client);
-        let mut clients = self
-            .h2_clients
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let count = clients.entry(client).or_default();
-        if !vapache_verified::resource_budget_admit(*count, 1, MAX_H2_STREAMS_PER_CLIENT) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "per-client HTTP/2 stream limit reached",
-            ));
-        }
-        *count += 1;
-        drop(clients);
-        Ok(H2ClientLease {
-            budget: self.clone(),
-            client,
-            active: true,
+            _slot: context.slot(
+                SlotKind::DynamicBackend,
+                limit,
+                Some(limit.min(MAX_DYNAMIC_REQUESTS_PER_CLIENT)),
+                Some(1),
+                "dynamic backend concurrency limit reached",
+            )?,
         })
     }
 
@@ -403,40 +986,58 @@ impl ResourceBudget {
         self: &Arc<Self>,
         client: IpAddr,
     ) -> io::Result<CombinedH2Lease> {
-        let client = self.try_h2_client_for(client)?;
-        debug_assert!(vapache_verified::h2_process_slot_admit(client.active));
-        let stream = self.try_h2_stream()?;
+        let context = self.context(client);
+        self.try_h2_stream_in(&context)
+    }
+
+    pub(crate) fn try_h2_stream_in(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+    ) -> io::Result<CombinedH2Lease> {
         Ok(CombinedH2Lease {
-            _stream: stream,
-            _client: client,
+            _slot: context.slot(
+                SlotKind::H2Stream,
+                MAX_H2_STREAMS,
+                Some(MAX_H2_STREAMS_PER_CLIENT),
+                Some(1),
+                "HTTP/2 stream limit reached",
+            )?,
         })
     }
 
     pub fn try_request_bytes(self: &Arc<Self>) -> ResidentLease {
+        let context = self.context_or_process();
         ResidentLease::new(
-            self.clone(),
+            context,
             ResidentKind::Request,
             MAX_REQUEST_RESIDENT_BYTES,
+            MAX_REQUEST_RESIDENT_BYTES_PER_CLIENT,
+            MAX_REQUEST_RESIDENT_BYTES_PER_REQUEST,
         )
     }
 
     pub fn try_response_bytes(self: &Arc<Self>) -> ResidentLease {
-        let mut lease = ResidentLease::new(
-            self.clone(),
+        let context = current_context()
+            .filter(|context| Arc::ptr_eq(context.budget(), self))
+            .or_else(|| current_expensive_client().map(|client| self.context(client)))
+            .unwrap_or_else(|| ResourceContext::process_only(self));
+        ResidentLease::new(
+            context,
             ResidentKind::Response,
             MAX_RESPONSE_RESIDENT_BYTES,
-        );
-        // Cover transient allocation as well as the retained response. The
-        // dispatch wrapper supplies the effective (RemoteIP-aware) identity
-        // while response generators build their result.
-        lease.client = current_expensive_client();
-        lease
+            MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT,
+            MAX_RESPONSE_RESIDENT_BYTES_PER_REQUEST,
+        )
     }
 
     pub fn try_response_bytes_for(self: &Arc<Self>, client: IpAddr) -> ResidentLease {
-        let mut lease = self.try_response_bytes();
-        lease.client = Some(client_quota_key(client));
-        lease
+        ResidentLease::new(
+            self.context(client),
+            ResidentKind::Response,
+            MAX_RESPONSE_RESIDENT_BYTES,
+            MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT,
+            MAX_RESPONSE_RESIDENT_BYTES_PER_REQUEST,
+        )
     }
 
     /// Reserve one short blocking read of a response-body descriptor.
@@ -445,109 +1046,162 @@ impl ResourceBudget {
     /// socket waits. Holding it across either boundary lets a client exhaust
     /// the read capacity without causing any read work (P30-A/A').
     pub fn try_response_body_read(self: &Arc<Self>) -> io::Result<ResponseBodyReadLease> {
-        self.try_response_body_read_inner(None)
+        let context = self.context_or_process();
+        self.try_response_body_read_in(&context)
     }
 
     pub fn try_response_body_read_for(
         self: &Arc<Self>,
         client: IpAddr,
     ) -> io::Result<ResponseBodyReadLease> {
-        self.try_response_body_read_inner(Some(client_quota_key(client)))
+        let context = self.context(client);
+        self.try_response_body_read_in(&context)
     }
 
-    fn try_response_body_read_inner(
+    pub fn try_response_body_read_in(
         self: &Arc<Self>,
-        client: Option<IpAddr>,
+        context: &ResourceContext,
     ) -> io::Result<ResponseBodyReadLease> {
         debug_assert!(vapache_verified::response_body_read_lease_admit(
             vapache_verified::ResponseWorkPhase::DescriptorRead,
         ));
-        if !try_add(&self.response_body_reads, 1, MAX_RESPONSE_BODY_READS) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "process-wide response-body read limit reached",
-            ));
-        }
-        if let Some(client) = client {
-            let mut clients = self
-                .response_body_read_clients
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let count = clients.entry(client).or_default();
-            if !vapache_verified::resource_budget_admit(
-                *count,
-                1,
-                MAX_RESPONSE_BODY_READS_PER_CLIENT,
-            ) {
-                if *count == 0 {
-                    clients.remove(&client);
-                }
-                self.response_body_reads.fetch_sub(1, Ordering::AcqRel);
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "per-client response-body read limit reached",
-                ));
-            }
-            *count += 1;
-        }
         Ok(ResponseBodyReadLease {
-            budget: self.clone(),
-            client,
-            active: true,
+            _slot: context.slot(
+                SlotKind::ResponseBodyRead,
+                MAX_RESPONSE_BODY_READS,
+                Some(MAX_RESPONSE_BODY_READS_PER_CLIENT),
+                Some(1),
+                "response-body read limit reached",
+            )?,
         })
     }
 
     pub fn try_websocket_for(self: &Arc<Self>, client: IpAddr) -> io::Result<WebsocketLease> {
-        let client = client_quota_key(client);
-        if !try_add(&self.websocket_tunnels, 1, MAX_WEBSOCKET_TUNNELS) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "process-wide WebSocket tunnel limit reached",
-            ));
-        }
-        let mut clients = self
-            .websocket_clients
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let count = clients.entry(client).or_default();
-        if !vapache_verified::resource_budget_admit(*count, 1, MAX_WEBSOCKETS_PER_CLIENT) {
-            self.websocket_tunnels.fetch_sub(1, Ordering::AcqRel);
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "per-client WebSocket tunnel limit reached",
-            ));
-        }
-        *count += 1;
-        drop(clients);
+        let context = self.context(client);
         Ok(WebsocketLease {
-            budget: self.clone(),
-            client,
-            active: true,
+            _slot: context.slot(
+                SlotKind::Websocket,
+                MAX_WEBSOCKET_TUNNELS,
+                Some(MAX_WEBSOCKETS_PER_CLIENT),
+                Some(1),
+                "WebSocket tunnel limit reached",
+            )?,
         })
+    }
+
+    pub(crate) fn try_tls_handshake(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+        concurrency_limit: u64,
+        process_rate_limit: u64,
+        client_rate_limit: u64,
+    ) -> io::Result<SlotLease> {
+        let slot = context.slot(
+            SlotKind::TlsHandshake,
+            concurrency_limit,
+            Some(concurrency_limit),
+            Some(1),
+            "TLS handshake concurrency limit reached",
+        )?;
+        let mut rates = self.rates.lock().unwrap_or_else(|error| error.into_inner());
+        if !Self::admit_rate(
+            &mut rates.tls,
+            context.client,
+            std::time::Instant::now(),
+            process_rate_limit,
+            client_rate_limit,
+        ) {
+            drop(slot);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "TLS handshake rate limit reached",
+            ));
+        }
+        Ok(slot)
+    }
+
+    pub(crate) fn try_rewrite_program(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+        concurrency_limit: u64,
+        client_concurrency_limit: u64,
+        process_rate_limit: u64,
+        client_rate_limit: u64,
+    ) -> io::Result<SlotLease> {
+        let slot = context.slot(
+            SlotKind::RewriteProgram,
+            concurrency_limit,
+            Some(client_concurrency_limit),
+            Some(1),
+            "rewrite program concurrency limit reached",
+        )?;
+        let mut rates = self.rates.lock().unwrap_or_else(|error| error.into_inner());
+        if !Self::admit_rate(
+            &mut rates.rewrite_program,
+            context.client,
+            std::time::Instant::now(),
+            process_rate_limit,
+            client_rate_limit,
+        ) {
+            drop(slot);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "rewrite program rate limit reached",
+            ));
+        }
+        Ok(slot)
+    }
+
+    pub(crate) fn slot_usage(&self, kind: SlotKind) -> u64 {
+        self.slot_process[kind.index()].load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_rate_admit(
+        &self,
+        rewrite_program: bool,
+        client: Option<IpAddr>,
+        now: std::time::Instant,
+        process_limit: u64,
+        client_limit: u64,
+    ) -> bool {
+        let mut rates = self.rates.lock().unwrap_or_else(|error| error.into_inner());
+        let window = if rewrite_program {
+            &mut rates.rewrite_program
+        } else {
+            &mut rates.tls
+        };
+        Self::admit_rate(
+            window,
+            client.map(client_quota_key),
+            now,
+            process_limit,
+            client_limit,
+        )
     }
 
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn usage(&self) -> (u64, u64, u64) {
         (
-            self.spool_bytes.load(Ordering::Acquire),
-            self.spool_files.load(Ordering::Acquire),
-            self.dynamic_requests.load(Ordering::Acquire),
+            self.byte_process[ByteKind::Spool.index()].load(Ordering::Acquire),
+            self.slot_usage(SlotKind::SpoolFile),
+            self.slot_usage(SlotKind::DynamicBackend),
         )
     }
 
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn extended_usage(&self) -> (u64, u64, u64, u64) {
         (
-            self.h2_streams.load(Ordering::Acquire),
-            self.request_bytes.load(Ordering::Acquire),
-            self.response_bytes.load(Ordering::Acquire),
-            self.response_body_reads.load(Ordering::Acquire),
+            self.slot_usage(SlotKind::H2Stream),
+            self.byte_process[ByteKind::RequestResident.index()].load(Ordering::Acquire),
+            self.byte_process[ByteKind::ResponseResident.index()].load(Ordering::Acquire),
+            self.slot_usage(SlotKind::ResponseBodyRead),
         )
     }
 
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn websocket_usage(&self) -> u64 {
-        self.websocket_tunnels.load(Ordering::Acquire)
+        self.slot_usage(SlotKind::Websocket)
     }
 }
 
@@ -559,71 +1213,37 @@ enum ResidentKind {
 
 #[derive(Debug)]
 pub struct ResidentLease {
-    budget: Arc<ResourceBudget>,
     kind: ResidentKind,
-    bytes: u64,
-    limit: u64,
-    client: Option<IpAddr>,
+    bytes: ByteLease,
 }
 
 impl ResidentLease {
-    fn new(budget: Arc<ResourceBudget>, kind: ResidentKind, limit: u64) -> Self {
+    fn new(
+        context: ResourceContext,
+        kind: ResidentKind,
+        process_limit: u64,
+        client_limit: u64,
+        request_limit: u64,
+    ) -> Self {
+        let byte_kind = match kind {
+            ResidentKind::Request => ByteKind::RequestResident,
+            ResidentKind::Response => ByteKind::ResponseResident,
+        };
         Self {
-            budget,
             kind,
-            bytes: 0,
-            limit,
-            client: None,
-        }
-    }
-
-    fn counter(&self) -> &AtomicU64 {
-        match self.kind {
-            ResidentKind::Request => &self.budget.request_bytes,
-            ResidentKind::Response => &self.budget.response_bytes,
+            bytes: ByteLease::new(
+                context,
+                byte_kind,
+                process_limit,
+                Some(client_limit),
+                Some(request_limit),
+            ),
         }
     }
 
     pub fn reserve(&mut self, amount: u64) -> io::Result<()> {
-        if amount == 0 {
-            return Ok(());
-        }
-        let mut client_counts = if matches!(self.kind, ResidentKind::Response) {
-            self.client.map(|client| {
-                let counts = self
-                    .budget
-                    .response_clients
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                (client, counts)
-            })
-        } else {
-            None
-        };
-        if let Some((client, counts)) = client_counts.as_mut() {
-            let current = counts.get(client).copied().unwrap_or(0);
-            if !vapache_verified::resource_budget_admit(
-                current,
-                amount,
-                MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT,
-            ) {
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "per-client response resident-byte limit reached",
-                ));
-            }
-        }
-        if !try_add(self.counter(), amount, self.limit) {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "process-wide resident-byte limit reached",
-            ));
-        }
-        if let Some((client, counts)) = client_counts.as_mut() {
-            *counts.entry(*client).or_default() += amount;
-        }
-        self.bytes = self.bytes.saturating_add(amount);
-        Ok(())
+        self.bytes
+            .reserve(amount, "hierarchical resident-byte limit reached")
     }
 
     /// Attribute an already-reserved transient response allocation to the
@@ -635,368 +1255,93 @@ impl ResidentLease {
                 "request memory cannot be attributed as a response",
             ));
         }
-        let client = client_quota_key(client);
-        if self.client == Some(client) {
-            return Ok(());
-        }
-        if self.client.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "response memory already belongs to another client",
-            ));
-        }
-        let mut counts = self
-            .budget
-            .response_clients
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let current = counts.get(&client).copied().unwrap_or(0);
-        if !vapache_verified::resource_budget_admit(
-            current,
-            self.bytes,
-            MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT,
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "per-client response resident-byte limit reached",
-            ));
-        }
-        if self.bytes != 0 {
-            *counts.entry(client).or_default() += self.bytes;
-        }
-        self.client = Some(client);
-        Ok(())
+        let context = self.bytes.context.budget.context(client);
+        self.bytes.attribute_context(context)
+    }
+
+    pub(crate) fn attribute_context(&mut self, context: ResourceContext) -> io::Result<()> {
+        self.bytes.attribute_context(context)
     }
 
     /// Release transient working-set bytes that are no longer retained by the
     /// response representation.
     pub fn release(&mut self, amount: u64) {
-        let amount = amount.min(self.bytes);
-        if amount == 0 {
-            return;
-        }
-        self.counter().fetch_sub(amount, Ordering::AcqRel);
-        if let Some(client) = self.client {
-            let mut counts = self
-                .budget
-                .response_clients
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(current) = counts.get_mut(&client) {
-                *current = current.saturating_sub(amount);
-                if *current == 0 {
-                    counts.remove(&client);
-                }
-            }
-        }
-        self.bytes -= amount;
+        self.bytes.release(amount);
     }
 
     pub fn bytes(&self) -> u64 {
-        self.bytes
-    }
-}
-
-impl Drop for ResidentLease {
-    fn drop(&mut self) {
-        self.release(self.bytes);
-    }
-}
-
-#[derive(Debug)]
-pub struct H2StreamLease {
-    budget: Arc<ResourceBudget>,
-    active: bool,
-}
-
-impl Drop for H2StreamLease {
-    fn drop(&mut self) {
-        if self.active {
-            self.budget.h2_streams.fetch_sub(1, Ordering::AcqRel);
-            self.active = false;
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct H2ClientLease {
-    budget: Arc<ResourceBudget>,
-    client: IpAddr,
-    active: bool,
-}
-
-impl Drop for H2ClientLease {
-    fn drop(&mut self) {
-        if self.active {
-            let mut clients = self
-                .budget
-                .h2_clients
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(count) = clients.get_mut(&self.client) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    clients.remove(&self.client);
-                }
-            }
-            self.active = false;
-        }
+        self.bytes.bytes
     }
 }
 
 #[derive(Debug)]
 pub struct CombinedH2Lease {
-    _stream: H2StreamLease,
-    _client: H2ClientLease,
+    _slot: SlotLease,
 }
 
 #[derive(Debug)]
 pub struct ResponseBodyReadLease {
-    budget: Arc<ResourceBudget>,
-    client: Option<IpAddr>,
-    active: bool,
+    _slot: SlotLease,
 }
 
 #[derive(Debug)]
 pub struct WebsocketLease {
-    budget: Arc<ResourceBudget>,
-    client: IpAddr,
-    active: bool,
-}
-
-impl Drop for WebsocketLease {
-    fn drop(&mut self) {
-        if self.active {
-            let mut clients = self
-                .budget
-                .websocket_clients
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(count) = clients.get_mut(&self.client) {
-                *count -= 1;
-                if *count == 0 {
-                    clients.remove(&self.client);
-                }
-            }
-            drop(clients);
-            self.budget.websocket_tunnels.fetch_sub(1, Ordering::AcqRel);
-            self.active = false;
-        }
-    }
-}
-
-impl Drop for ResponseBodyReadLease {
-    fn drop(&mut self) {
-        if self.active {
-            self.budget
-                .response_body_reads
-                .fetch_sub(1, Ordering::AcqRel);
-            if let Some(client) = self.client {
-                let mut clients = self
-                    .budget
-                    .response_body_read_clients
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if let Some(count) = clients.get_mut(&client) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        clients.remove(&client);
-                    }
-                }
-            }
-            self.active = false;
-        }
-    }
+    _slot: SlotLease,
 }
 
 #[derive(Debug)]
 pub struct ExpensiveLease {
-    client: Option<IpAddr>,
-    active: bool,
+    _slot: SlotLease,
 }
 
 pub fn try_expensive() -> Option<ExpensiveLease> {
-    if !try_add(&EXPENSIVE_OPS, 1, MAX_EXPENSIVE_OPS) {
-        return None;
-    }
-    let client = EXPENSIVE_CLIENT.with(|current| *current.borrow());
-    if let Some(client) = client {
-        let mut clients = EXPENSIVE_CLIENTS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let count = clients.entry(client).or_insert(0);
-        if *count >= MAX_EXPENSIVE_OPS_PER_CLIENT {
-            if *count == 0 {
-                clients.remove(&client);
-            }
-            drop(clients);
-            EXPENSIVE_OPS.fetch_sub(1, Ordering::AcqRel);
-            return None;
-        }
-        *count += 1;
-    }
+    #[cfg(test)]
+    let context = current_or_test_context();
+    #[cfg(not(test))]
+    let context = current_context()?;
     Some(ExpensiveLease {
-        client,
-        active: true,
+        _slot: context
+            .slot(
+                SlotKind::ExpensiveCpu,
+                MAX_EXPENSIVE_OPS,
+                Some(MAX_EXPENSIVE_OPS_PER_CLIENT),
+                Some(MAX_EXPENSIVE_OPS_PER_CLIENT),
+                "expensive operation limit reached",
+            )
+            .ok()?,
     })
-}
-
-impl Drop for ExpensiveLease {
-    fn drop(&mut self) {
-        if self.active {
-            if let Some(client) = self.client {
-                let mut clients = EXPENSIVE_CLIENTS
-                    .get_or_init(|| Mutex::new(HashMap::new()))
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if let Some(count) = clients.get_mut(&client) {
-                    *count -= 1;
-                    if *count == 0 {
-                        clients.remove(&client);
-                    }
-                }
-            }
-            EXPENSIVE_OPS.fetch_sub(1, Ordering::AcqRel);
-            self.active = false;
-        }
-    }
 }
 
 #[derive(Debug)]
 pub struct SpoolLease {
-    budget: Arc<ResourceBudget>,
-    bytes: u64,
-    max_bytes: u64,
-    max_files: u64,
-    client: Option<IpAddr>,
-    active: bool,
+    bytes: ByteLease,
+    _file_slot: SlotLease,
 }
 
 impl SpoolLease {
     pub fn reserve(&mut self, amount: u64) -> io::Result<()> {
-        if amount == 0 {
-            return Ok(());
-        }
-        let mut clients = self.client.map(|client| {
-            let counts = self
-                .budget
-                .spool_clients
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            (client, counts)
-        });
-        if let Some((client, counts)) = clients.as_mut() {
-            let current = counts.get(client).copied().unwrap_or_default().0;
-            let client_bytes = self.max_bytes.saturating_add(3) / 4;
-            if !vapache_verified::resource_budget_admit(current, amount, client_bytes.max(1)) {
-                return Err(io::Error::new(
-                    io::ErrorKind::StorageFull,
-                    "per-client spool-byte limit reached",
-                ));
-            }
-        }
-        if !try_add(&self.budget.spool_bytes, amount, self.max_bytes) {
-            return Err(io::Error::new(
-                io::ErrorKind::StorageFull,
-                "aggregate spool-byte limit reached",
-            ));
-        }
-        if let Some((client, counts)) = clients.as_mut() {
-            counts.entry(*client).or_default().0 += amount;
-        }
-        self.bytes += amount;
-        Ok(())
+        self.bytes
+            .reserve(amount, "hierarchical spool-byte limit reached")
+            .map_err(|error| io::Error::new(io::ErrorKind::StorageFull, error))
     }
 
     pub fn attribute_client(&mut self, client: IpAddr) -> io::Result<()> {
-        let client = client_quota_key(client);
-        if self.client == Some(client) {
-            return Ok(());
+        let context = self.bytes.context.budget.context(client);
+        self._file_slot.attribute_context(context.clone())?;
+        if let Err(error) = self.bytes.attribute_context(context) {
+            // A failed byte attribution must not leave the file slot owned by
+            // a different scope. Move it back before reporting failure.
+            let old = self.bytes.context.clone();
+            let _ = self._file_slot.attribute_context(old);
+            return Err(error);
         }
-        if self.client.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "spool already belongs to another client",
-            ));
-        }
-        let mut clients = self
-            .budget
-            .spool_clients
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let usage = clients.get(&client).copied().unwrap_or_default();
-        let client_bytes = self.max_bytes.saturating_add(3) / 4;
-        let client_files = self.max_files.saturating_add(3) / 4;
-        if !vapache_verified::resource_budget_admit(usage.0, self.bytes, client_bytes.max(1))
-            || !vapache_verified::resource_budget_admit(usage.1, 1, client_files.max(1))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::StorageFull,
-                "per-client spool limit reached",
-            ));
-        }
-        let entry = clients.entry(client).or_default();
-        entry.0 += self.bytes;
-        entry.1 += 1;
-        self.client = Some(client);
         Ok(())
-    }
-}
-
-impl Drop for SpoolLease {
-    fn drop(&mut self) {
-        if self.active {
-            self.budget
-                .spool_bytes
-                .fetch_sub(self.bytes, Ordering::AcqRel);
-            self.budget.spool_files.fetch_sub(1, Ordering::AcqRel);
-            if let Some(client) = self.client {
-                let mut clients = self
-                    .budget
-                    .spool_clients
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if let Some(usage) = clients.get_mut(&client) {
-                    usage.0 = usage.0.saturating_sub(self.bytes);
-                    usage.1 = usage.1.saturating_sub(1);
-                    if usage.0 == 0 && usage.1 == 0 {
-                        clients.remove(&client);
-                    }
-                }
-            }
-            self.active = false;
-        }
     }
 }
 
 #[derive(Debug)]
 pub struct DynamicLease {
-    budget: Arc<ResourceBudget>,
-    client: Option<IpAddr>,
-    active: bool,
-}
-
-impl Drop for DynamicLease {
-    fn drop(&mut self) {
-        if self.active {
-            if let Some(client) = self.client {
-                let mut clients = self
-                    .budget
-                    .dynamic_clients
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if let Some(count) = clients.get_mut(&client) {
-                    *count -= 1;
-                    if *count == 0 {
-                        clients.remove(&client);
-                    }
-                }
-            }
-            self.budget.dynamic_requests.fetch_sub(1, Ordering::AcqRel);
-            self.active = false;
-        }
-    }
+    _slot: SlotLease,
 }
 
 #[cfg(test)]
@@ -1057,6 +1402,91 @@ mod tests {
         let other = budget.try_dynamic_for(64, second).unwrap();
         drop((leases, other));
         assert!(budget.try_dynamic_for(64, first).is_ok());
+    }
+
+    #[test]
+    fn one_request_context_cannot_multiply_dynamic_backend_slots() {
+        let budget = Arc::new(ResourceBudget::default());
+        let context = budget.context(IpAddr::from([192, 0, 2, 2]));
+        let lease = budget.try_dynamic_in(&context, 64).unwrap();
+        assert!(budget.try_dynamic_in(&context, 64).is_err());
+        assert_eq!(budget.slot_usage(SlotKind::DynamicBackend), 1);
+        drop(lease);
+        assert!(budget.try_dynamic_in(&context, 64).is_ok());
+    }
+
+    #[test]
+    fn failed_process_admission_rolls_back_request_and_client_scopes() {
+        let budget = Arc::new(ResourceBudget::default());
+        let first = budget.context(IpAddr::from([192, 0, 2, 3]));
+        let second = budget.context(IpAddr::from([192, 0, 2, 3]));
+        let occupied = first
+            .slot(SlotKind::DynamicBackend, 1, Some(2), Some(1), "full")
+            .unwrap();
+        assert!(second
+            .slot(SlotKind::DynamicBackend, 1, Some(2), Some(1), "full")
+            .is_err());
+        drop(occupied);
+        assert!(second
+            .slot(SlotKind::DynamicBackend, 1, Some(2), Some(1), "full")
+            .is_ok());
+    }
+
+    #[test]
+    fn resident_bytes_transfer_to_the_validated_request_identity() {
+        let budget = Arc::new(ResourceBudget::default());
+        let mut request = budget.try_request_bytes();
+        request.reserve(1024).unwrap();
+        let context = budget.context(IpAddr::from([192, 0, 2, 4]));
+        request.attribute_context(context.clone()).unwrap();
+        assert_eq!(request.bytes.context.scope_id(), context.scope_id());
+        assert_eq!(budget.extended_usage().1, 1024);
+        drop(request);
+        assert_eq!(budget.extended_usage().1, 0);
+    }
+
+    #[test]
+    fn context_transfer_does_not_double_charge_an_unchanged_client() {
+        let budget = Arc::new(ResourceBudget::default());
+        let client = IpAddr::from([192, 0, 2, 5]);
+        let first = budget.context(client);
+        let second = budget.context(client);
+
+        let mut bytes = ByteLease::new(
+            first.clone(),
+            ByteKind::RequestResident,
+            8,
+            Some(8),
+            Some(8),
+        );
+        bytes.reserve(8, "full").unwrap();
+        bytes.attribute_context(second.clone()).unwrap();
+        assert_eq!(bytes.context.scope_id(), second.scope_id());
+
+        let mut slot = first
+            .slot(SlotKind::DynamicBackend, 1, Some(1), Some(1), "full")
+            .unwrap();
+        slot.attribute_context(second).unwrap();
+        assert_eq!(slot.context.client(), Some(client));
+        drop((bytes, slot));
+        assert!(budget.slot_clients.lock().unwrap().is_empty());
+        assert!(budget.byte_clients.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn zero_byte_context_transfer_does_not_retain_a_client_entry() {
+        let budget = Arc::new(ResourceBudget::default());
+        let mut bytes = ByteLease::new(
+            ResourceContext::process_only(&budget),
+            ByteKind::RequestResident,
+            8,
+            Some(8),
+            Some(8),
+        );
+        bytes
+            .attribute_context(budget.context(IpAddr::from([192, 0, 2, 6])))
+            .unwrap();
+        assert!(budget.byte_clients.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1149,10 +1579,10 @@ mod tests {
         let budget = Arc::new(ResourceBudget::default());
         let client = IpAddr::from([192, 0, 2, 40]);
         let clients: Vec<_> = (0..MAX_H2_STREAMS_PER_CLIENT)
-            .map(|_| budget.try_h2_client_for(client).unwrap())
+            .map(|_| budget.try_h2_stream_for(client).unwrap())
             .collect();
         assert!(budget.try_h2_stream_for(client).is_err());
-        assert_eq!(budget.extended_usage().0, 0);
+        assert_eq!(budget.extended_usage().0, MAX_H2_STREAMS_PER_CLIENT);
         drop(clients);
         assert!(budget.try_h2_stream_for(client).is_ok());
     }
@@ -1256,7 +1686,13 @@ mod tests {
     #[test]
     fn resident_lease_rejects_overflow_and_global_expensive_work_releases() {
         let budget = Arc::new(ResourceBudget::default());
-        let mut resident = ResidentLease::new(budget, ResidentKind::Request, 8);
+        let mut resident = ResidentLease::new(
+            budget.context(IpAddr::from([192, 0, 2, 1])),
+            ResidentKind::Request,
+            8,
+            8,
+            8,
+        );
         resident.reserve(8).unwrap();
         assert!(resident.reserve(1).is_err());
         let lease = try_expensive().expect("expensive slot");

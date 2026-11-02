@@ -2751,10 +2751,7 @@ pub fn execute(
             local_ip,
         );
     }
-    let Ok(_dynamic_lease) = cfg
-        .resource_budget
-        .try_dynamic_for(cfg.max_dynamic_requests, peer.ip())
-    else {
+    let Ok(_dynamic_lease) = cfg.resource_budget.try_dynamic(cfg.max_dynamic_requests) else {
         return crate::files::error_response(
             cfg,
             vhost,

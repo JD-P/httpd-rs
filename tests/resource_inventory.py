@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Keep mutable process state and hierarchical request resources explicit."""
+
+from pathlib import Path
+import re
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "crates" / "server" / "src"
+
+EXPECTED_SLOTS = {
+    "DynamicBackend", "H2Stream", "ResponseBodyRead", "Websocket",
+    "ExpensiveCpu", "PendingConnection", "RequestWorker",
+    "RequestBodyWorker", "H2Connection", "TlsHandshake",
+    "RewriteProgram", "SpoolFile",
+}
+EXPECTED_BYTES = {
+    "Spool", "RequestResident", "ResponseResident", "PolicyExpansion",
+}
+
+# These are generation/process infrastructure, bounded caches, telemetry,
+# thread-local request state, temporary-name counters, or test-only state.
+# Adding one is a security-review action and requires updating
+# docs/resource-inventory.md.
+ALLOWED_MUTABLE_STATICS = {
+    ("access.rs", "SENDER"),
+    ("auth.rs", "REQUEST_IDENTITY"), ("auth.rs", "CACHE"),
+    ("auth.rs", "NEXT_TEMP"),
+    ("cache.rs", "CACHE_EPOCH"), ("cache.rs", "CACHE"),
+    ("cache.rs", "USAGE"), ("cache.rs", "SCAN"), ("cache.rs", "LOCKS"),
+    ("cgi.rs", "POOL"),
+    ("config.rs", "NEXT"), ("config.rs", "NEXT_FIXTURE"),
+    ("expr.rs", "REQUEST_HTTPS"), ("expr.rs", "REQUEST_PORT"),
+    ("expr.rs", "REQUEST_SERVER_NAME"),
+    ("fastcgi.rs", "COUNTER"),
+    ("fault.rs", "PLAN"),
+    ("files.rs", "DIR"), ("files.rs", "REQUEST_ROOT_FDS"),
+    ("files.rs", "REQUEST_METADATA"),
+    ("files.rs", "REQUEST_SYMLINK_METADATA"),
+    ("files.rs", "IN_ERROR_DOCUMENT"),
+    ("files.rs", "LOCAL_ERROR_DOCUMENT_RESPONSE"),
+    ("h2.rs", "POOL"), ("htaccess.rs", "CACHE"),
+    ("htaccess.rs", "TEST_REJECT_SPEC"),
+    ("htaccess.rs", "TEST_UNHANDLED_SPEC"),
+    ("http.rs", "COUNTER"),
+    ("log.rs", "STDERR_WRITER_BUSY"), ("log.rs", "LOG_WRITER_BUSY"),
+    ("log.rs", "LOG_TIME_CACHE"), ("log.rs", "ACCESS_LINE"),
+    ("log.rs", "TEST_GATE"),
+    ("main.rs", "STOP"), ("main.rs", "RELOAD"), ("main.rs", "REOPEN"),
+    ("main.rs", "GLOBAL_ALLOCATOR"),
+    ("ocsp.rs", "CACHE"), ("ocsp.rs", "NEXT_TEMP"),
+    ("proxy.rs", "DEAD"), ("proxy.rs", "HEALTH"),
+    ("proxy.rs", "GENERATION"), ("proxy.rs", "COUNTERS"),
+    ("proxy.rs", "DNS"), ("proxy.rs", "CACHE"),
+    ("proxy.rs", "TEST_BUDGET"),
+    ("resource.rs", "CURRENT_CONTEXT"), ("resource.rs", "BUDGET"),
+    ("server.rs", "ACTIVE_CONNECTIONS"),
+    ("server.rs", "ADMISSION_RUNTIME"),
+    ("server.rs", "ADMISSION_TEST_LOCK"),
+    ("status.rs", "START"), ("status.rs", "REQUESTS"),
+    ("status.rs", "BYTES"),
+    ("tls.rs", "PRIVILEGED_FILE_BROKER"),
+    ("util.rs", "HTTP_DATE_CACHE"),
+}
+
+FORBIDDEN_SPLIT_LEDGERS = {
+    "ACTIVE_WORKERS", "ACTIVE_BODY_WORKERS", "PENDING_CONNECTIONS",
+    "H2_CONNECTIONS", "TLS_HANDSHAKES", "ACTIVE_PRG_MAPS",
+    "EXPENSIVE_OPS", "POLICY_RESIDENT_BYTES",
+}
+
+
+def enum_variants(text: str, name: str) -> set[str]:
+    match = re.search(rf"enum\s+{name}\s*\{{(?P<body>.*?)\n\}}", text, re.S)
+    if not match:
+        raise AssertionError(f"missing {name}")
+    return set(re.findall(r"^\s*([A-Z][A-Za-z0-9_]*)\s*,", match["body"], re.M))
+
+
+def main() -> int:
+    resource = (SRC / "resource.rs").read_text()
+    errors: list[str] = []
+    if enum_variants(resource, "SlotKind") != EXPECTED_SLOTS:
+        errors.append("SlotKind changed without updating the resource inventory")
+    if enum_variants(resource, "ByteKind") != EXPECTED_BYTES:
+        errors.append("ByteKind changed without updating the resource inventory")
+
+    observed: set[tuple[str, str]] = set()
+    static_pattern = re.compile(r"\bstatic\s+([A-Z][A-Z0-9_]*)\s*:")
+    all_source = ""
+    for path in sorted(SRC.glob("*.rs")):
+        text = path.read_text()
+        all_source += text
+        observed.update((path.name, name) for name in static_pattern.findall(text))
+    unknown = observed - ALLOWED_MUTABLE_STATICS
+    missing = ALLOWED_MUTABLE_STATICS - observed
+    if unknown:
+        errors.append(f"unreviewed mutable static state: {sorted(unknown)}")
+    if missing:
+        errors.append(f"stale resource-inventory allowlist: {sorted(missing)}")
+    leaked = sorted(
+        name
+        for name in FORBIDDEN_SPLIT_LEDGERS
+        if re.search(rf"\b{re.escape(name)}\b", all_source)
+    )
+    if leaked:
+        errors.append(f"standalone attacker resource ledgers returned: {leaked}")
+
+    for required in (
+        "with_resource_context(context", "try_dynamic_in", "try_h2_stream_in",
+        "try_tls_handshake", "try_rewrite_program",
+        "attribute_context(resource_context", "enter_resource_context(resource_context",
+    ):
+        if required not in all_source:
+            errors.append(f"hierarchical integration marker disappeared: {required}")
+
+    if errors:
+        for error in errors:
+            print(f"resource inventory: {error}", file=sys.stderr)
+        return 1
+    print(
+        f"resource inventory: {len(EXPECTED_SLOTS)} slot classes, "
+        f"{len(EXPECTED_BYTES)} byte classes, {len(observed)} reviewed statics"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

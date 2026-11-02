@@ -333,18 +333,18 @@ async fn read_body(
     resource_budget: Arc<crate::resource::ResourceBudget>,
     max_spool_bytes: u64,
     max_spool_files: u64,
-    client: std::net::IpAddr,
+    resource_context: crate::resource::ResourceContext,
     resident: &mut crate::resource::ResidentLease,
 ) -> Result<H2RequestBody, H2ReadFailure> {
     // HTTP/2 can run many request bodies concurrently on one connection.  A
     // small per-stream prefix keeps ordinary forms cheap while the process-
     // wide spool budget bounds larger concurrent bodies.
-    let mut body = BodyAccumulator::new_for(
+    let mut body = BodyAccumulator::new_in(
         REQUEST_BODY_SPOOL_PREFIX,
         resource_budget,
         max_spool_bytes,
         max_spool_files,
-        Some(client),
+        Some(resource_context),
     );
     let mut budget = vapache_verified::h2_body_init(limit);
     let mut framing = vapache_verified::ChunkFramingState {
@@ -784,7 +784,8 @@ async fn handle_stream(
         }
     }
     let quota_peer = cfg.client_addr_from_headers(peer, &quota_headers);
-    let _stream_quota = match cfg.resource_budget.try_h2_stream_for(quota_peer.ip()) {
+    let resource_context = cfg.resource_budget.context(quota_peer.ip());
+    let _stream_quota = match cfg.resource_budget.try_h2_stream_in(&resource_context) {
         Ok(lease) => lease,
         Err(_) => {
             respond.send_reset(h2::Reason::REFUSED_STREAM);
@@ -843,6 +844,20 @@ async fn handle_stream(
     // request. Charge it before cloning and retain the lease through dispatch
     // and response sending.
     let mut request_resident = cfg.resource_budget.try_request_bytes();
+    if request_resident
+        .attribute_context(resource_context.clone())
+        .is_err()
+    {
+        return send_response(
+            respond,
+            &cfg,
+            quota_peer.ip(),
+            bad(503, "request memory capacity exhausted"),
+            false,
+        )
+        .await
+        .is_err();
+    }
     let header_bytes = parts
         .headers
         .iter()
@@ -1007,7 +1022,7 @@ async fn handle_stream(
             cfg.resource_budget.clone(),
             cfg.max_spool_bytes,
             cfg.max_spool_files,
-            quota_peer.ip(),
+            resource_context.clone(),
             &mut request_resident,
         );
         tokio::pin!(body_future);
@@ -1052,6 +1067,7 @@ async fn handle_stream(
         }
     }
 
+    headers.bind_resource_context(resource_context);
     headers.hold_resident(request_resident);
     let req = Request {
         method,

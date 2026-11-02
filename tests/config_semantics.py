@@ -2960,7 +2960,9 @@ def stateful_access_cases(count: int, seed: int):
     stack and mutate it: balanced nesting, a close of the wrong stack entry,
     and EOF with live entries.  The remaining states cover duplicate
     AllowOverride ordering and every Nonfatal behavior (the default None plus
-    Override, Unknown and All).  Apache remains the result oracle.
+    Override, Unknown and All).  Apache remains the result oracle except for
+    the documented <If><Files> policy-discard case that Vapache deliberately
+    rejects rather than accepting authorization text it would not execute.
     """
     rng = random.Random(seed)
     out = []
@@ -3072,18 +3074,22 @@ def stateful_access_cases(count: int, seed: int):
                 "</Directory>",
             ]
 
-        out.append(
-            {
-                "name": name,
-                "dir": directory,
-                "files": {".htaccess": access},
-                "config": config,
-                "requests": [
-                    ("GET", f"/{directory}/file.txt", headers, {}),
-                    ("HEAD", f"/{directory}/file.txt", headers, {}),
-                ],
-            }
-        )
+        case = {
+            "name": name,
+            "dir": directory,
+            "files": {".htaccess": access},
+            "config": config,
+            "requests": [
+                ("GET", f"/{directory}/file.txt", headers, {}),
+                ("HEAD", f"/{directory}/file.txt", headers, {}),
+            ],
+        }
+        if state == 0:
+            case["known_divergence"] = (
+                "Vapache rejects nested Files/FilesMatch inside If because "
+                "Apache accepts but silently discards the nested policy"
+            )
+        out.append(case)
     return out
 
 

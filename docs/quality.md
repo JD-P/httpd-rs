@@ -16,6 +16,7 @@ cargo clippy -p vapached --lib --bins --no-deps -- \
   -D unused_must_use -A unsafe_code
 cargo test --workspace --all-targets --all-features -- --test-threads=1
 python3 tests/unsafe_inventory.py
+python3 tests/resource_inventory.py
 python3 tests/verification_status.py
 ```
 
@@ -30,6 +31,11 @@ normalization, cache-key injectivity, monotone scope/capability restriction,
 overflow-safe resource admission and HTTP read fragmentation. The resource
 budget's production compare/exchange algorithm also runs under Loom to explore
 admission/release interleavings deterministically.
+
+`tests/resource_inventory.py` locks attacker-facing slots and adjustable byte
+reservations to the request/client/process hierarchy. It also inventories
+bounded process-owned caches, queues, telemetry, and lifecycle state, so a new
+mutable static cannot silently become a second resource ledger.
 
 Thirteen libFuzzer targets cover:
 

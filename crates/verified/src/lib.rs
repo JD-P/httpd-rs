@@ -3016,6 +3016,165 @@ pub proof fn resource_budget_rejects_exhausted(used: u64, incoming: u64)
 {
 }
 
+/// One tier of the unified request -> client -> process admission hierarchy.
+/// Every runtime slot acquisition uses this predicate at each applicable
+/// scope, rather than maintaining feature-specific overflow and boundary
+/// logic.
+pub open spec fn hierarchical_resource_spec(
+    used: u64,
+    incoming: u64,
+    limit: u64,
+) -> bool {
+    used <= limit && incoming <= limit - used
+}
+
+pub fn hierarchical_resource_admit(
+    used: u64,
+    incoming: u64,
+    limit: u64,
+) -> (ok: bool)
+    ensures ok == hierarchical_resource_spec(used, incoming, limit),
+{
+    used <= limit && incoming <= limit - used
+}
+
+pub proof fn hierarchical_resource_admission_is_bounded(
+    used: u64,
+    incoming: u64,
+    limit: u64,
+)
+    requires hierarchical_resource_spec(used, incoming, limit),
+    ensures used + incoming <= limit,
+{
+}
+
+/// The complete three-level decision used by a typed resource lease. A
+/// pre-identity phase may omit the client tier, but request and process tiers
+/// remain mandatory.
+pub open spec fn hierarchical_three_scope_spec(
+    request_used: u64,
+    client_used: u64,
+    process_used: u64,
+    incoming: u64,
+    request_limit: u64,
+    client_limit: u64,
+    process_limit: u64,
+    has_client: bool,
+) -> bool {
+    hierarchical_resource_spec(request_used, incoming, request_limit)
+        && (!has_client
+            || hierarchical_resource_spec(client_used, incoming, client_limit))
+        && hierarchical_resource_spec(process_used, incoming, process_limit)
+}
+
+pub fn hierarchical_three_scope_admit(
+    request_used: u64,
+    client_used: u64,
+    process_used: u64,
+    incoming: u64,
+    request_limit: u64,
+    client_limit: u64,
+    process_limit: u64,
+    has_client: bool,
+) -> (ok: bool)
+    ensures ok == hierarchical_three_scope_spec(
+        request_used,
+        client_used,
+        process_used,
+        incoming,
+        request_limit,
+        client_limit,
+        process_limit,
+        has_client,
+    ),
+{
+    hierarchical_resource_admit(request_used, incoming, request_limit)
+        && (!has_client
+            || hierarchical_resource_admit(client_used, incoming, client_limit))
+        && hierarchical_resource_admit(process_used, incoming, process_limit)
+}
+
+pub proof fn hierarchical_three_scope_success_is_bounded(
+    request_used: u64,
+    client_used: u64,
+    process_used: u64,
+    incoming: u64,
+    request_limit: u64,
+    client_limit: u64,
+    process_limit: u64,
+    has_client: bool,
+)
+    requires hierarchical_three_scope_spec(
+        request_used,
+        client_used,
+        process_used,
+        incoming,
+        request_limit,
+        client_limit,
+        process_limit,
+        has_client,
+    ),
+    ensures
+        request_used + incoming <= request_limit,
+        has_client ==> client_used + incoming <= client_limit,
+        process_used + incoming <= process_limit,
+{
+}
+
+/// Lower scopes must be acquired before the process slot.  This prevents a
+/// request/client rejection from retaining global capacity while its error is
+/// handled. The runtime ledger rolls the lower scopes back if process
+/// admission then fails.
+pub open spec fn hierarchical_acquisition_order_spec(
+    request_scope_complete: bool,
+    client_scope_complete: bool,
+) -> bool {
+    request_scope_complete && client_scope_complete
+}
+
+pub fn hierarchical_acquisition_order_admit(
+    request_scope_complete: bool,
+    client_scope_complete: bool,
+) -> (ok: bool)
+    ensures ok == hierarchical_acquisition_order_spec(
+        request_scope_complete,
+        client_scope_complete,
+    ),
+{
+    request_scope_complete && client_scope_complete
+}
+
+/// Fixed-window rate admission is hierarchical too: process capacity is
+/// always required and, when an authenticated client identity exists, its
+/// source-keyed capacity is required in the same decision.
+pub open spec fn hierarchical_rate_spec(
+    process_used: u64,
+    client_used: u64,
+    process_limit: u64,
+    client_limit: u64,
+    has_client: bool,
+) -> bool {
+    process_used < process_limit && (!has_client || client_used < client_limit)
+}
+
+pub fn hierarchical_rate_admit(
+    process_used: u64,
+    client_used: u64,
+    process_limit: u64,
+    client_limit: u64,
+    has_client: bool,
+) -> (ok: bool)
+    ensures ok == hierarchical_rate_spec(
+        process_used,
+        client_used,
+        process_limit,
+        client_limit,
+        has_client,
+    ),
+{
+    process_used < process_limit && (!has_client || client_used < client_limit)
+}
+
 /// A process-wide HTTP/2 stream slot may be acquired only after the
 /// source-keyed slot. This ordering ensures that rejecting a client cannot
 /// retain global capacity while its error response waits on that client's
