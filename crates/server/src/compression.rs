@@ -466,7 +466,7 @@ fn finalize_inner(
         return;
     };
     let mut compression_lease = budget.map(|budget| {
-        let mut lease = budget.try_response_bytes();
+        let mut lease = budget.try_response_bytes()?;
         let peak = resp.body_len().saturating_mul(2).saturating_add(64 * 1024);
         lease.reserve(peak).map(|()| lease)
     });

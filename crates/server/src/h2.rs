@@ -717,37 +717,24 @@ async fn send_response(
     Ok(sent)
 }
 
-async fn handle_stream(
-    cfg: Arc<Config>,
-    logger: Arc<Logger>,
+struct H2StreamAdmission {
+    quota_peer: SocketAddr,
+    resource_context: crate::resource::ResourceContext,
+    quota_identity_valid: bool,
+    _stream_quota: crate::resource::CombinedH2Lease,
+}
+
+fn admit_stream_before_spawn(
+    cfg: &Arc<Config>,
     peer: SocketAddr,
-    local_ip: String,
-    local_port: u16,
-    request: http::Request<h2::RecvStream>,
-    mut respond: h2::server::SendResponse<Bytes>,
-) -> bool {
-    // The return value is true when the stream was reset (including a
-    // timeout that drops the response future).  `serve` projects that event
-    // into the verified connection budget.
-    let started = Instant::now();
-    let (parts, recv) = request.into_parts();
-    let method = parts.method.as_str().to_string();
-    let uri = parts.uri.clone();
-    // Establish both halves of stream admission before any error response can
-    // wait on client-controlled flow control. The old split acquired the
-    // process slot in `serve` and the client slot much later here, allowing a
-    // client-limit rejection to retain every process slot (P30 follow-up).
+    request: &http::Request<h2::RecvStream>,
+) -> io::Result<H2StreamAdmission> {
     let mut quota_headers = crate::http::Headers::default();
     let mut quota_identity_valid = true;
     if let Some(remoteip_header) = &cfg.remoteip_header {
         let remoteip_header = remoteip_header.to_ascii_lowercase();
         if remoteip_header == "host" {
-            // The adapter's canonical request view discards a legacy H2 Host
-            // field and exposes :authority as Host. Quota admission must use
-            // that same value or an unusual `RemoteIPHeader Host`
-            // configuration could admit and dispatch under different source
-            // identities.
-            if let Some(authority) = uri.authority() {
+            if let Some(authority) = request.uri().authority() {
                 let value = authority.as_str().as_bytes();
                 quota_identity_valid = vapache_verified::h2_field_size_admit(
                     b"host".len() as u64,
@@ -759,7 +746,7 @@ async fn handle_stream(
                 }
             }
         } else {
-            for (name, value) in &parts.headers {
+            for (name, value) in request.headers() {
                 if name.as_str() != remoteip_header {
                     continue;
                 }
@@ -785,13 +772,42 @@ async fn handle_stream(
     }
     let quota_peer = cfg.client_addr_from_headers(peer, &quota_headers);
     let resource_context = cfg.resource_budget.context(quota_peer.ip());
-    let _stream_quota = match cfg.resource_budget.try_h2_stream_in(&resource_context) {
-        Ok(lease) => lease,
-        Err(_) => {
-            respond.send_reset(h2::Reason::REFUSED_STREAM);
-            return true;
-        }
-    };
+    let stream_quota = cfg.resource_budget.try_h2_stream_in(&resource_context)?;
+    if let Err(error) = cfg.resource_budget.try_request_rate(&resource_context) {
+        drop(stream_quota);
+        return Err(error);
+    }
+    Ok(H2StreamAdmission {
+        quota_peer,
+        resource_context,
+        quota_identity_valid,
+        _stream_quota: stream_quota,
+    })
+}
+
+async fn handle_stream(
+    cfg: Arc<Config>,
+    logger: Arc<Logger>,
+    peer: SocketAddr,
+    local_ip: String,
+    local_port: u16,
+    request: http::Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    admission: H2StreamAdmission,
+) -> bool {
+    // The return value is true when the stream was reset (including a
+    // timeout that drops the response future).  `serve` projects that event
+    // into the verified connection budget.
+    let started = Instant::now();
+    let (parts, recv) = request.into_parts();
+    let method = parts.method.as_str().to_string();
+    let uri = parts.uri.clone();
+    let H2StreamAdmission {
+        quota_peer,
+        resource_context,
+        quota_identity_valid,
+        _stream_quota,
+    } = admission;
     if !quota_identity_valid {
         return send_response(
             respond,
@@ -843,7 +859,20 @@ async fn handle_stream(
     // The adapter creates a second owned representation of the decoded h2
     // request. Charge it before cloning and retain the lease through dispatch
     // and response sending.
-    let mut request_resident = cfg.resource_budget.try_request_bytes();
+    let mut request_resident = match cfg.resource_budget.try_request_bytes_in(&resource_context) {
+        Ok(lease) => lease,
+        Err(_) => {
+            return send_response(
+                respond,
+                &cfg,
+                quota_peer.ip(),
+                bad(503, "request memory capacity exhausted"),
+                false,
+            )
+            .await
+            .is_err();
+        }
+    };
     if request_resident
         .attribute_context(resource_context.clone())
         .is_err()
@@ -1385,6 +1414,13 @@ where
                     established_guard = Some(callback()?);
                 }
                 let stream_id = respond.stream_id().as_u32() as u64;
+                let admission = match admit_stream_before_spawn(&cfg, peer, &request) {
+                    Ok(admission) => admission,
+                    Err(_) => {
+                        respond.send_reset(h2::Reason::REFUSED_STREAM);
+                        continue;
+                    }
+                };
                 let Some(next) = vapache_verified::h2_budget_step(
                     budget,
                     vapache_verified::H2BudgetEvent::Begin,
@@ -1425,7 +1461,7 @@ where
                     // timeout would truncate a transfer that keeps making
                     // progress merely because its total duration is long.
                     done.reset = handle_stream(
-                        cfg, logger, peer, local_ip, local_port, request, respond,
+                        cfg, logger, peer, local_ip, local_port, request, respond, admission,
                     )
                     .await;
                 });
@@ -1495,6 +1531,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut connection = h2::server::handshake(server_io).await.unwrap();
             let (request, respond) = connection.accept().await.unwrap().unwrap();
+            let admission =
+                admit_stream_before_spawn(&cfg, "127.0.0.1:12345".parse().unwrap(), &request)
+                    .unwrap();
             let handler = handle_stream(
                 cfg,
                 logger,
@@ -1503,6 +1542,7 @@ mod tests {
                 443,
                 request,
                 respond,
+                admission,
             );
             tokio::pin!(handler);
             let reset = loop {
@@ -2142,6 +2182,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut connection = h2::server::handshake(server_io).await.unwrap();
             let (request, respond) = connection.accept().await.unwrap().unwrap();
+            let admission =
+                admit_stream_before_spawn(&cfg, "127.0.0.1:12345".parse().unwrap(), &request)
+                    .unwrap();
             let handler = handle_stream(
                 cfg,
                 logger,
@@ -2150,6 +2193,7 @@ mod tests {
                 443,
                 request,
                 respond,
+                admission,
             );
             tokio::pin!(handler);
             let reset = loop {

@@ -1,6 +1,18 @@
 use std::io::{self, Read, Write};
 use vapached::http::{read_request, Limits, ReadError};
 
+fn read_accounted<R: Read + Write>(
+    stream: &mut R,
+) -> Result<Option<vapached::http::Request>, ReadError> {
+    let limits = Limits::default();
+    let context = limits
+        .resource_budget
+        .context(std::net::IpAddr::from([192, 0, 2, 1]));
+    vapached::resource::with_resource_context(context, || {
+        read_request(stream, &mut Vec::new(), &limits, |_| {})
+    })
+}
+
 struct FaultyIo<'a> {
     input: &'a [u8],
     offset: usize,
@@ -55,7 +67,7 @@ fn every_header_read_failure_fails_closed() {
                 kind,
                 max_chunk: 7,
             };
-            let result = read_request(&mut stream, &mut Vec::new(), &Limits::default(), |_| {});
+            let result = read_accounted(&mut stream);
             if fail_at < stream.calls && kind != io::ErrorKind::Interrupted {
                 assert!(
                     matches!(result, Err(ReadError::Io(_))),
@@ -78,7 +90,7 @@ fn short_reads_at_every_boundary_preserve_the_request() {
             kind: io::ErrorKind::Other,
             max_chunk: chunk,
         };
-        let request = read_request(&mut stream, &mut Vec::new(), &Limits::default(), |_| {})
+        let request = read_accounted(&mut stream)
             .expect("short reads must not fail")
             .expect("complete request");
         assert_eq!(request.target, b"/upload");

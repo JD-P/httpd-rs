@@ -50,17 +50,17 @@ impl ProxyBodyCollector {
         budget: Arc<crate::resource::ResourceBudget>,
         max_spool_bytes: u64,
         max_spool_files: u64,
-    ) -> Self {
-        Self {
+    ) -> std::io::Result<Self> {
+        Ok(Self {
             memory: Vec::new(),
             file: None,
             lease: None,
-            resident: Some(budget.try_response_bytes()),
+            resident: Some(budget.try_response_bytes()?),
             len: 0,
             budget,
             max_spool_bytes,
             max_spool_files,
-        }
+        })
     }
 
     fn push(&mut self, bytes: &[u8]) -> std::io::Result<()> {
@@ -2468,14 +2468,14 @@ fn proxy_once_budgeted(
                 Arc::clone(resource_budget),
                 max_spool_bytes,
                 max_spool_files,
-            );
+            )?;
             read_chunked(&mut reader, &mut collector)?;
             let (collected, lease, resident) = collector.finish()?;
             collected_body = Some(collected);
             spool_lease = lease;
             response_resident = resident;
         } else if let Some(n) = content_length {
-            let mut resident = resource_budget.try_response_bytes();
+            let mut resident = resource_budget.try_response_bytes()?;
             resident.reserve(n as u64)?;
             body.resize(n, 0);
             reader.read_exact(&mut body)?;
@@ -2485,7 +2485,7 @@ fn proxy_once_budgeted(
                 Arc::clone(resource_budget),
                 max_spool_bytes,
                 max_spool_files,
-            );
+            )?;
             let mut chunk = [0u8; 64 * 1024];
             loop {
                 let read = reader.read(&mut chunk)?;

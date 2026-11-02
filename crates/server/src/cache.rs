@@ -83,6 +83,9 @@ struct Entry {
     policy: PolicyFingerprint,
     epoch: u64,
     vary: Vec<(String, Vec<u8>)>,
+    // Keeps the process-wide resident-memory reservation alive for exactly as
+    // long as this representation remains reachable from the memory cache.
+    _resident: Option<Arc<crate::resource::CacheResidentLease>>,
 }
 
 #[derive(Default)]
@@ -201,6 +204,13 @@ fn insert_memory(cfg: &Config, key: &str, entry: Arc<Entry>) {
 
 fn insert_memory_into(cfg: &Config, cache: &mut MemoryCache, key: &str, entry: Arc<Entry>) {
     if cfg.cache.max_memory_size == 0 || entry.body_len > MAX_MEMORY_BODY as u64 {
+        return;
+    }
+    // Production callers must reserve the shared physical-memory parent
+    // before publishing an entry. Tests may construct synthetic entries to
+    // exercise eviction independently of the process ledger.
+    #[cfg(not(test))]
+    if entry._resident.is_none() {
         return;
     }
     let incoming = memory_entry_size(key, &entry);
@@ -362,6 +372,19 @@ fn open_cache_regular(path: &Path, limit: u64) -> Option<(File, fs::Metadata)> {
 
 fn read_disk_metadata(path: &Path) -> Option<Vec<u8>> {
     let (mut file, meta) = open_cache_regular(path, MAX_DISK_META_BYTES)?;
+    let mut data = vec![0u8; meta.len() as usize];
+    file.read_exact(&mut data).ok()?;
+    Some(data)
+}
+
+fn read_disk_metadata_accounted(
+    path: &Path,
+    resident: &mut crate::resource::ResidentLease,
+) -> Option<Vec<u8>> {
+    let (mut file, meta) = open_cache_regular(path, MAX_DISK_META_BYTES)?;
+    // Decoding retains the raw record while allocating decoded names and
+    // values. Charging twice its encoded size conservatively covers both.
+    resident.reserve(meta.len().saturating_mul(2)).ok()?;
     let mut data = vec![0u8; meta.len() as usize];
     file.read_exact(&mut data).ok()?;
     Some(data)
@@ -1165,7 +1188,12 @@ pub fn lookup(
     }
     let key = cache_key.to_string();
     let now = unix_now();
+    let cache_context = req
+        .resource_context()
+        .cloned()
+        .unwrap_or_else(|| cfg.resource_budget.context(peer));
     let mut found: Option<Arc<Entry>> = None;
+    let mut response_resident = None;
     {
         let mut cache = entries().lock().unwrap_or_else(|e| e.into_inner());
         let mut list = cache.entries.remove(&key).unwrap_or_default();
@@ -1197,7 +1225,11 @@ pub fn lookup(
         }
     }
     if found.is_none() {
-        if let Some(loaded) = disk_load(cfg, &key) {
+        let mut load_resident = cfg
+            .resource_budget
+            .try_response_bytes_in(&cache_context)
+            .ok()?;
+        if let Some(mut loaded) = disk_load_accounted(cfg, &key, &mut load_resident) {
             if !vapache_verified::cache_lookup_admit(
                 true,
                 loaded.policy == fingerprint,
@@ -1208,9 +1240,25 @@ pub fn lookup(
             ) {
                 return None;
             }
+            // Cover the response-body clone while the decoded disk entry is
+            // still live. The lease is transferred into the Response below.
+            load_resident.reserve(loaded.body.len() as u64).ok()?;
+            if loaded.body_len <= MAX_MEMORY_BODY as u64 && cfg.cache.max_memory_size > 0 {
+                let incoming = memory_entry_size(&key, &loaded);
+                if incoming <= cfg.cache.max_memory_size {
+                    loaded._resident = cfg
+                        .resource_budget
+                        .try_cache_resident(&cache_context, cfg.cache.max_memory_size, incoming)
+                        .ok()
+                        .map(Arc::new);
+                }
+            }
             let loaded = Arc::new(loaded);
-            insert_memory(cfg, &key, Arc::clone(&loaded));
+            if loaded._resident.is_some() {
+                insert_memory(cfg, &key, Arc::clone(&loaded));
+            }
             found = Some(loaded);
+            response_resident = Some(load_resident);
         }
     }
     let entry = found?;
@@ -1267,8 +1315,19 @@ pub fn lookup(
             }
         }
         if !served_file {
+            if response_resident.is_none() {
+                let mut resident = cfg
+                    .resource_budget
+                    .try_response_bytes_in(&cache_context)
+                    .ok()?;
+                resident.reserve(entry.body.len() as u64).ok()?;
+                response_resident = Some(resident);
+            }
             response.body = Body::Bytes(entry.body.clone());
         }
+    }
+    if let Some(resident) = response_resident {
+        response.hold_resident(resident);
     }
     Some(response)
 }
@@ -1488,6 +1547,7 @@ fn decode_meta(data: &[u8]) -> Option<Entry> {
         policy: policy?,
         epoch: epoch?,
         vary,
+        _resident: None,
     })
 }
 
@@ -1679,12 +1739,16 @@ fn release_disk_reservation(root: &Path, stem: &Path, generation: u64) {
     }
 }
 
-fn disk_load(cfg: &Config, key: &str) -> Option<Entry> {
+fn disk_load_accounted(
+    cfg: &Config,
+    key: &str,
+    resident: &mut crate::resource::ResidentLease,
+) -> Option<Entry> {
     let stem = cache_stem(cfg, key)?;
     let _io_guard = disk_io_lock(&stem)
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let meta = match read_disk_metadata(&stem.with_extension("meta")) {
+    let meta = match read_disk_metadata_accounted(&stem.with_extension("meta"), resident) {
         Some(meta) => meta,
         None => {
             remove_disk_stem(cfg, &stem);
@@ -1721,6 +1785,7 @@ fn disk_load(cfg: &Config, key: &str) -> Option<Entry> {
         };
     entry.body_len = body_meta.len();
     if entry.body_len <= MAX_MEMORY_BODY as u64 {
+        resident.reserve(entry.body_len).ok()?;
         entry.body.resize(entry.body_len as usize, 0);
         if body.read_exact(&mut entry.body).is_err() {
             remove_disk_stem(cfg, &stem);
@@ -1728,6 +1793,13 @@ fn disk_load(cfg: &Config, key: &str) -> Option<Entry> {
         }
     }
     Some(entry)
+}
+
+#[cfg(test)]
+fn disk_load(cfg: &Config, key: &str) -> Option<Entry> {
+    let client = "127.0.0.1".parse().expect("loopback address");
+    let mut resident = cfg.resource_budget.try_response_bytes_for(client);
+    disk_load_accounted(cfg, key, &mut resident)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1801,7 +1873,9 @@ pub fn store(
     let vary_star = combined_header(&response_headers_for_vary, "vary")
         .map(|v| v.split(',').any(|part| part.trim() == "*"))
         .unwrap_or(false);
-    let mut cache_resident = cfg.resource_budget.try_response_bytes();
+    let Ok(mut cache_resident) = cfg.resource_budget.try_response_bytes() else {
+        return;
+    };
     let Some(body) = response_body_bytes(&mut resp.body, &mut cache_resident) else {
         return;
     };
@@ -1830,7 +1904,7 @@ pub fn store(
     let vary = vary_values(req, &headers);
     let key = cache_key.to_string();
     let body_len = body.len() as u64;
-    let entry = Entry {
+    let mut entry = Entry {
         status: resp.status,
         headers,
         body,
@@ -1840,7 +1914,35 @@ pub fn store(
         policy: fingerprint,
         epoch: current_epoch(),
         vary,
+        _resident: None,
     };
+    let cache_context = req
+        .resource_context()
+        .cloned()
+        .unwrap_or_else(|| cfg.resource_budget.context(peer));
+    let cache_write_bytes =
+        body_len.saturating_add(entry.headers.iter().fold(256u64, |total, (name, value)| {
+            total
+                .saturating_add(name.len() as u64)
+                .saturating_add(value.len() as u64)
+        }));
+    if cfg
+        .resource_budget
+        .try_cache_write(&cache_context, cache_write_bytes)
+        .is_err()
+    {
+        return;
+    }
+    if entry.body_len <= MAX_MEMORY_BODY as u64 {
+        let incoming = memory_entry_size(&key, &entry);
+        if incoming <= cfg.cache.max_memory_size {
+            entry._resident = cfg
+                .resource_budget
+                .try_cache_resident(&cache_context, cfg.cache.max_memory_size, incoming)
+                .ok()
+                .map(Arc::new);
+        }
+    }
     disk_store(cfg, &key, &entry);
     insert_memory(cfg, &key, Arc::new(entry));
     if cfg.cache.header {
@@ -2035,6 +2137,7 @@ mod tests {
             policy: [7u8; 32],
             epoch: current_epoch(),
             vary: vec![("accept".into(), b"text/plain".to_vec())],
+            _resident: None,
         };
         disk_store(&cfg, "host\n/path\n", &entry);
         let loaded = disk_load(&cfg, "host\n/path\n").expect("warm entry");
@@ -2081,6 +2184,9 @@ mod tests {
             fingerprint,
         );
         disk_store(&cfg, &key, &entry);
+        // A disk-only configuration must still serve small warm entries; it
+        // simply declines to retain the decoded body in the memory cache.
+        cfg.cache.max_memory_size = 0;
         let hit = lookup(
             &cfg,
             None,
@@ -2158,6 +2264,7 @@ mod tests {
             policy: [7u8; 32],
             epoch: current_epoch().saturating_sub(1),
             vary: Vec::new(),
+            _resident: None,
         };
         disk_store(&cfg, "old\n/path\n", &entry);
         assert!(disk_load(&cfg, "old\n/path\n").is_none());
@@ -3602,6 +3709,7 @@ CacheIgnoreQueryString On\n\
             policy: [7u8; 32],
             epoch: current_epoch(),
             vary: Vec::new(),
+            _resident: None,
         }
     }
 
@@ -3957,6 +4065,7 @@ CacheIgnoreQueryString On\n\
                     policy,
                     epoch: current_epoch(),
                     vary: Vec::new(),
+                    _resident: None,
                 }),
                 Arc::new(Entry {
                     status: 200,
@@ -3971,6 +4080,7 @@ CacheIgnoreQueryString On\n\
                     policy,
                     epoch: current_epoch(),
                     vary: Vec::new(),
+                    _resident: None,
                 }),
             ],
         );
@@ -4011,6 +4121,25 @@ CacheIgnoreQueryString On\n\
             .headers
             .iter()
             .any(|(n, _)| n.eq_ignore_ascii_case("x-cache-detail")));
+
+        let mut memory = entries().lock().unwrap();
+        Arc::make_mut(&mut memory.entries.get_mut(&key).unwrap()[0]).policy = policy;
+        drop(memory);
+        let mut body_hit = lookup(
+            &cfg,
+            None,
+            &req,
+            "host",
+            "/x",
+            &Scope::default(),
+            "127.0.0.1".parse().unwrap(),
+            &crate::access::test_grant(),
+            &key,
+            Path::new("/tmp/target"),
+        )
+        .unwrap();
+        assert_eq!(body_hit.body_len(), 5);
+        assert!(body_hit.take_resident().unwrap().bytes() >= 5);
 
         let wrong_resource =
             crate::access::ResourceKey::cache(None, &req, "different-host", "/different-path");
@@ -4112,7 +4241,7 @@ CacheIgnoreQueryString On\n\
         assert!(freshness(&no_last, &[], now).is_some());
 
         let budget = Arc::new(crate::resource::ResourceBudget::default());
-        let mut resident = budget.try_response_bytes();
+        let mut resident = budget.try_response_bytes().unwrap();
         let mut empty = Body::Empty;
         assert_eq!(
             response_body_bytes(&mut empty, &mut resident),
@@ -4532,6 +4661,7 @@ CacheIgnoreQueryString On\n\
                         policy,
                         epoch: current_epoch(),
                         vary: vec![("x-variant".into(), vec![i as u8])],
+                        _resident: None,
                     })
                 })
                 .collect(),
@@ -4546,6 +4676,7 @@ CacheIgnoreQueryString On\n\
             policy,
             epoch: current_epoch(),
             vary: vec![("x-variant".into(), b"new".to_vec())],
+            _resident: None,
         });
         insert_memory_into(&cfg, &mut variants, "variants", variant_entry);
         let mut variant_req = base_req.clone();

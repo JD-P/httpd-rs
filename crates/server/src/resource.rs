@@ -47,10 +47,31 @@ enum ByteKind {
     RequestResident,
     ResponseResident,
     PolicyExpansion,
+    CacheResident,
+}
+
+/// Typed leases ultimately consume a smaller set of operating-system
+/// resources.  These parent counters prevent individually-safe pools from
+/// collectively exhausting the process file-descriptor, task, or resident
+/// memory ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum PhysicalKind {
+    FileDescriptor,
+    Task,
+    ResidentMemory,
+}
+
+impl PhysicalKind {
+    const COUNT: usize = 3;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 impl ByteKind {
-    const COUNT: usize = 4;
+    const COUNT: usize = 5;
 
     const fn index(self) -> usize {
         self as usize
@@ -61,6 +82,7 @@ impl ByteKind {
 struct ScopeUsage {
     slots: [AtomicU64; SlotKind::COUNT],
     bytes: [AtomicU64; ByteKind::COUNT],
+    request_rate_admitted: AtomicBool,
 }
 
 impl Default for ScopeUsage {
@@ -68,6 +90,7 @@ impl Default for ScopeUsage {
         Self {
             slots: std::array::from_fn(|_| AtomicU64::new(0)),
             bytes: std::array::from_fn(|_| AtomicU64::new(0)),
+            request_rate_admitted: AtomicBool::new(false),
         }
     }
 }
@@ -83,6 +106,11 @@ struct RateWindow {
 struct RateLedger {
     tls: RateWindow,
     rewrite_program: RateWindow,
+    request_parse: RateWindow,
+    request: RateWindow,
+    expensive: RateWindow,
+    cache_write: RateWindow,
+    log_bytes: RateWindow,
 }
 
 #[derive(Debug)]
@@ -91,17 +119,22 @@ pub struct ResourceBudget {
     slot_clients: Mutex<HashMap<IpAddr, [u64; SlotKind::COUNT]>>,
     byte_process: [AtomicU64; ByteKind::COUNT],
     byte_clients: Mutex<HashMap<IpAddr, [u64; ByteKind::COUNT]>>,
+    physical_process: [AtomicU64; PhysicalKind::COUNT],
+    physical_limits: [u64; PhysicalKind::COUNT],
     rates: Mutex<RateLedger>,
     next_scope: AtomicU64,
 }
 
 impl Default for ResourceBudget {
     fn default() -> Self {
+        let physical_limits = detected_physical_limits();
         Self {
             slot_process: std::array::from_fn(|_| AtomicU64::new(0)),
             slot_clients: Mutex::new(HashMap::new()),
             byte_process: std::array::from_fn(|_| AtomicU64::new(0)),
             byte_clients: Mutex::new(HashMap::new()),
+            physical_process: std::array::from_fn(|_| AtomicU64::new(0)),
+            physical_limits,
             rates: Mutex::new(RateLedger::default()),
             next_scope: AtomicU64::new(1),
         }
@@ -131,6 +164,100 @@ pub const MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT: u64 = 32 * 1024 * 1024;
 pub const MAX_RESPONSE_RESIDENT_BYTES_PER_REQUEST: u64 = 32 * 1024 * 1024;
 pub const MAX_WEBSOCKET_TUNNELS: u64 = 64;
 pub const MAX_WEBSOCKETS_PER_CLIENT: u64 = 8;
+// These are runaway-work ceilings, not ordinary traffic shaping. Keep them
+// above measured same-host static throughput so the security boundary does
+// not impose a benchmark or CDN/NAT bottleneck.
+pub const MAX_REQUESTS_PER_SECOND: u64 = 2_000_000;
+pub const MAX_REQUESTS_PER_CLIENT_PER_SECOND: u64 = 500_000;
+pub const MAX_REQUEST_HEADS_PER_SECOND: u64 = 2_000_000;
+pub const MAX_REQUEST_HEADS_PER_CLIENT_PER_SECOND: u64 = 500_000;
+pub const MAX_EXPENSIVE_OPS_PER_SECOND: u64 = 256;
+pub const MAX_EXPENSIVE_OPS_PER_CLIENT_PER_SECOND: u64 = 64;
+pub const MAX_CACHE_WRITE_UNITS_PER_SECOND: u64 = 64 * 1024 * 1024;
+pub const MAX_CACHE_WRITE_UNITS_PER_CLIENT_PER_SECOND: u64 = 16 * 1024 * 1024;
+pub const MAX_LOG_BYTES_PER_SECOND: u64 = 16 * 1024 * 1024;
+pub const MAX_LOG_BYTES_PER_CLIENT_PER_SECOND: u64 = 2 * 1024 * 1024;
+const CACHE_WRITE_MIN_CHARGE: u64 = 64 * 1024;
+const DEFAULT_TASK_BUDGET: u64 = 1_024;
+const DEFAULT_RESIDENT_BUDGET: u64 = 256 * 1024 * 1024;
+
+fn bounded_system_limit(path: &str, fallback: u64) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
+}
+
+fn process_open_file_limit() -> u64 {
+    std::fs::read_to_string("/proc/self/limits")
+        .ok()
+        .and_then(|limits| {
+            limits.lines().find_map(|line| {
+                line.strip_prefix("Max open files")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+        })
+        .unwrap_or(1_024)
+}
+
+fn detected_physical_limits() -> [u64; PhysicalKind::COUNT] {
+    let nofile = process_open_file_limit();
+    // Retain at least one quarter for listeners, logs, libraries, reloads and
+    // administrator access. Never raise a deliberately tiny kernel limit.
+    let fd = nofile.saturating_mul(3).saturating_div(4).max(1);
+
+    let pids = bounded_system_limit("/sys/fs/cgroup/pids.max", DEFAULT_TASK_BUDGET);
+    let tasks = pids
+        .saturating_mul(3)
+        .saturating_div(4)
+        .min(DEFAULT_TASK_BUDGET)
+        .max(1);
+
+    let cgroup_memory = bounded_system_limit("/sys/fs/cgroup/memory.max", u64::MAX);
+    let memory = cgroup_memory
+        .saturating_div(4)
+        .min(DEFAULT_RESIDENT_BUDGET)
+        .max(1);
+    [fd, tasks, memory]
+}
+
+const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
+    use SlotKind::*;
+    match kind {
+        // Pending, H1 and H2 connection leases are alternate ownership phases
+        // of one accepted socket. A short overlap during transfer is covered by
+        // the reserved descriptor/task headroom. Resident charges cover
+        // protocol state and conservative stack/allocator overhead that is not
+        // represented by an explicit byte lease.
+        PendingConnection => [1, 1, 32 * 1024],
+        RequestWorker => [1, 1, 512 * 1024],
+        H2Connection => [1, 1, 256 * 1024],
+        H2Stream => [0, 1, 128 * 1024],
+        ResponseBodyRead => [0, 1, 64 * 1024],
+        // A dynamic request may own an upstream socket or the CGI stdin/stdout/
+        // stderr pipes, plus bounded helper work.
+        DynamicBackend => [4, 2, 256 * 1024],
+        Websocket => [1, 0, 64 * 1024],
+        RewriteProgram => [3, 1, 128 * 1024],
+        SpoolFile => [1, 0, 0],
+        TlsHandshake => [0, 0, 128 * 1024],
+        RequestBodyWorker | ExpensiveCpu => [0, 0, 0],
+    }
+}
+
+const fn byte_physical_kind(kind: ByteKind) -> Option<PhysicalKind> {
+    match kind {
+        ByteKind::RequestResident
+        | ByteKind::ResponseResident
+        | ByteKind::PolicyExpansion
+        | ByteKind::CacheResident => Some(PhysicalKind::ResidentMemory),
+        ByteKind::Spool => None,
+    }
+}
 /// Per-request ceiling for configuration-policy work.  One unit represents
 /// one byte/cell inspected by a matcher or one constant-cost policy
 /// instruction.  The budget is shared by every clone and every internal
@@ -468,6 +595,7 @@ pub(crate) struct SlotLease {
     charged_request: bool,
     client_limit: Option<u64>,
     request_limit: Option<u64>,
+    physical: [u64; PhysicalKind::COUNT],
     active: bool,
 }
 
@@ -552,6 +680,7 @@ impl Drop for SlotLease {
         }
         let index = self.kind.index();
         self.context.budget.slot_process[index].fetch_sub(self.amount, Ordering::AcqRel);
+        self.context.budget.release_physical(self.physical);
         if self.charged_client {
             if let Some(client) = self.context.client {
                 let mut clients = self
@@ -662,6 +791,29 @@ impl ByteLease {
             }
             return Err(io::Error::new(io::ErrorKind::OutOfMemory, message));
         }
+        if let Some(kind) = byte_physical_kind(self.kind) {
+            if !self.context.budget.try_physical_one(kind, amount) {
+                self.context.budget.byte_process[index].fetch_sub(amount, Ordering::AcqRel);
+                if charged_client {
+                    if let Some(client) = self.context.client {
+                        if let Some(usage) = clients.get_mut(&client) {
+                            usage[index] = usage[index].saturating_sub(amount);
+                            if usage.iter().all(|value| *value == 0) {
+                                clients.remove(&client);
+                            }
+                        }
+                    }
+                }
+                drop(clients);
+                if charged_request {
+                    self.context.local.bytes[index].fetch_sub(amount, Ordering::AcqRel);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "aggregate resident-memory limit reached",
+                ));
+            }
+        }
         drop(clients);
         self.bytes += amount;
         Ok(())
@@ -674,6 +826,9 @@ impl ByteLease {
         }
         let index = self.kind.index();
         self.context.budget.byte_process[index].fetch_sub(amount, Ordering::AcqRel);
+        if let Some(kind) = byte_physical_kind(self.kind) {
+            self.context.budget.release_physical_one(kind, amount);
+        }
         if let (Some(client), Some(_)) = (self.context.client, self.client_limit) {
             let mut clients = self
                 .context
@@ -772,10 +927,67 @@ impl ResourceBudget {
         ResourceContext::for_client(self, client)
     }
 
-    fn context_or_process(self: &Arc<Self>) -> ResourceContext {
-        current_context()
-            .filter(|context| Arc::ptr_eq(&context.budget, self))
-            .unwrap_or_else(|| ResourceContext::process_only(self))
+    fn current_context_for(self: &Arc<Self>) -> io::Result<ResourceContext> {
+        if let Some(context) =
+            current_context().filter(|context| Arc::ptr_eq(&context.budget, self))
+        {
+            return Ok(context);
+        }
+        #[cfg(test)]
+        {
+            return Ok(ResourceContext::process_only(self));
+        }
+        #[cfg(not(test))]
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "request resource operation has no matching resource context",
+        ))
+    }
+
+    fn try_physical_one(&self, kind: PhysicalKind, amount: u64) -> bool {
+        try_add(
+            &self.physical_process[kind.index()],
+            amount,
+            self.physical_limits[kind.index()],
+        )
+    }
+
+    fn release_physical_one(&self, kind: PhysicalKind, amount: u64) {
+        if amount > 0 {
+            self.physical_process[kind.index()].fetch_sub(amount, Ordering::AcqRel);
+        }
+    }
+
+    fn try_physical(&self, charge: [u64; PhysicalKind::COUNT]) -> bool {
+        let mut admitted = 0usize;
+        while admitted < PhysicalKind::COUNT {
+            let amount = charge[admitted];
+            if amount > 0
+                && !try_add(
+                    &self.physical_process[admitted],
+                    amount,
+                    self.physical_limits[admitted],
+                )
+            {
+                for rollback in 0..admitted {
+                    if charge[rollback] > 0 {
+                        self.physical_process[rollback]
+                            .fetch_sub(charge[rollback], Ordering::AcqRel);
+                    }
+                }
+                return false;
+            }
+            admitted += 1;
+        }
+        true
+    }
+
+    fn release_physical(&self, charge: [u64; PhysicalKind::COUNT]) {
+        for (index, amount) in charge.into_iter().enumerate() {
+            if amount > 0 {
+                self.physical_process[index].fetch_sub(amount, Ordering::AcqRel);
+            }
+        }
     }
 
     fn try_slot(
@@ -848,6 +1060,28 @@ impl ResourceBudget {
             }
             return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
         }
+        let physical = slot_physical_charge(kind);
+        if !self.try_physical(physical) {
+            self.slot_process[index].fetch_sub(1, Ordering::AcqRel);
+            if charged_client {
+                if let Some(client) = context.client {
+                    if let Some(usage) = clients.get_mut(&client) {
+                        usage[index] = usage[index].saturating_sub(1);
+                        if usage.iter().all(|value| *value == 0) {
+                            clients.remove(&client);
+                        }
+                    }
+                }
+            }
+            drop(clients);
+            if charged_request {
+                context.local.slots[index].fetch_sub(1, Ordering::AcqRel);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "aggregate physical resource limit reached",
+            ));
+        }
         drop(clients);
         Ok(SlotLease {
             context: context.clone(),
@@ -857,14 +1091,16 @@ impl ResourceBudget {
             charged_request,
             client_limit,
             request_limit,
+            physical,
             active: true,
         })
     }
 
-    fn admit_rate(
+    fn admit_rate_amount(
         window: &mut RateWindow,
         client: Option<IpAddr>,
         now: std::time::Instant,
+        amount: u64,
         process_limit: u64,
         client_limit: u64,
     ) -> bool {
@@ -878,27 +1114,157 @@ impl ResourceBudget {
         let client_used = client
             .and_then(|client| window.clients.get(&client).copied())
             .unwrap_or(0);
-        if !vapache_verified::hierarchical_rate_admit(
+        if !vapache_verified::hierarchical_weighted_rate_admit(
             window.total,
             client_used,
+            amount,
             process_limit,
             client_limit,
             client.is_some(),
         ) {
             return false;
         }
-        window.total += 1;
+        window.total += amount;
         if let Some(client) = client {
-            window.clients.insert(client, client_used + 1);
+            window.clients.insert(client, client_used + amount);
         }
         true
     }
 
+    fn admit_rate(
+        window: &mut RateWindow,
+        client: Option<IpAddr>,
+        now: std::time::Instant,
+        process_limit: u64,
+        client_limit: u64,
+    ) -> bool {
+        Self::admit_rate_amount(window, client, now, 1, process_limit, client_limit)
+    }
+
+    /// Charge one parsed request exactly once for its shared request scope.
+    /// Internal rewrites and helper calls clone the same `ScopeUsage`, so they
+    /// cannot multiply or reset the process/client rate gate.
+    pub(crate) fn try_request_rate(&self, context: &ResourceContext) -> io::Result<()> {
+        if !std::ptr::eq(self, Arc::as_ptr(&context.budget)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resource context belongs to another process ledger",
+            ));
+        }
+        if context
+            .local
+            .request_rate_admitted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let mut rates = self.rates.lock().unwrap_or_else(|error| error.into_inner());
+        if !Self::admit_rate(
+            &mut rates.request,
+            context.client,
+            std::time::Instant::now(),
+            MAX_REQUESTS_PER_SECOND,
+            MAX_REQUESTS_PER_CLIENT_PER_SECOND,
+        ) {
+            context
+                .local
+                .request_rate_admitted
+                .store(false, Ordering::Release);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "request rate limit reached",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bound work spent parsing HTTP/1 request heads, including malformed
+    /// heads that never reach request admission. The transport peer is used
+    /// because trusted forwarding headers are not available until parsing has
+    /// completed.
+    pub(crate) fn try_request_parse_rate(&self, client: IpAddr) -> io::Result<()> {
+        let mut rates = self.rates.lock().unwrap_or_else(|error| error.into_inner());
+        Self::admit_rate(
+            &mut rates.request_parse,
+            Some(client_quota_key(client)),
+            std::time::Instant::now(),
+            MAX_REQUEST_HEADS_PER_SECOND,
+            MAX_REQUEST_HEADS_PER_CLIENT_PER_SECOND,
+        )
+        .then_some(())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "request-head parse rate limit reached",
+            )
+        })
+    }
+
+    pub(crate) fn try_cache_write(&self, context: &ResourceContext, bytes: u64) -> io::Result<()> {
+        if !std::ptr::eq(self, Arc::as_ptr(&context.budget)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resource context belongs to another process ledger",
+            ));
+        }
+        let charge = bytes.max(CACHE_WRITE_MIN_CHARGE);
+        let mut rates = self.rates.lock().unwrap_or_else(|error| error.into_inner());
+        Self::admit_rate_amount(
+            &mut rates.cache_write,
+            context.client,
+            std::time::Instant::now(),
+            charge,
+            MAX_CACHE_WRITE_UNITS_PER_SECOND,
+            MAX_CACHE_WRITE_UNITS_PER_CLIENT_PER_SECOND,
+        )
+        .then_some(())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "cache write rate limit reached"))
+    }
+
+    pub(crate) fn try_cache_resident(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+        limit: u64,
+        bytes: u64,
+    ) -> io::Result<CacheResidentLease> {
+        if !Arc::ptr_eq(self, &context.budget) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resource context belongs to another process ledger",
+            ));
+        }
+        if limit == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "memory cache is disabled",
+            ));
+        }
+        let mut lease = ByteLease::new(
+            context.clone(),
+            ByteKind::CacheResident,
+            limit,
+            Some(limit.saturating_add(3).saturating_div(4).max(1)),
+            Some(limit),
+        );
+        lease.reserve(bytes, "hierarchical memory-cache limit reached")?;
+        Ok(CacheResidentLease { bytes: lease })
+    }
+
+    pub(crate) fn try_log_bytes(&self, client: Option<IpAddr>, bytes: u64) -> bool {
+        let mut rates = self.rates.lock().unwrap_or_else(|error| error.into_inner());
+        Self::admit_rate_amount(
+            &mut rates.log_bytes,
+            client.map(client_quota_key),
+            std::time::Instant::now(),
+            bytes.max(1),
+            MAX_LOG_BYTES_PER_SECOND,
+            MAX_LOG_BYTES_PER_CLIENT_PER_SECOND,
+        )
+    }
+
     pub fn try_spool(self: &Arc<Self>, max_bytes: u64, max_files: u64) -> io::Result<SpoolLease> {
-        let context = current_context()
-            .filter(|context| Arc::ptr_eq(context.budget(), self))
-            .or_else(|| current_expensive_client().map(|client| self.context(client)))
-            .unwrap_or_else(|| ResourceContext::process_only(self));
+        let context = self.current_context_for()?;
         self.try_spool_inner(max_bytes, max_files, &context)
     }
 
@@ -949,7 +1315,7 @@ impl ResourceBudget {
     }
 
     pub fn try_dynamic(self: &Arc<Self>, limit: u64) -> io::Result<DynamicLease> {
-        let context = self.context_or_process();
+        let context = self.current_context_for()?;
         self.try_dynamic_in(&context, limit)
     }
 
@@ -1005,10 +1371,20 @@ impl ResourceBudget {
         })
     }
 
-    pub fn try_request_bytes(self: &Arc<Self>) -> ResidentLease {
-        let context = self.context_or_process();
-        ResidentLease::new(
+    pub fn try_request_bytes(self: &Arc<Self>) -> io::Result<ResidentLease> {
+        let context = self.current_context_for()?;
+        Ok(ResidentLease::new(
             context,
+            ResidentKind::Request,
+            MAX_REQUEST_RESIDENT_BYTES,
+            MAX_REQUEST_RESIDENT_BYTES_PER_CLIENT,
+            MAX_REQUEST_RESIDENT_BYTES_PER_REQUEST,
+        ))
+    }
+
+    pub fn try_request_bytes_for(self: &Arc<Self>, client: IpAddr) -> ResidentLease {
+        ResidentLease::new(
+            self.context(client),
             ResidentKind::Request,
             MAX_REQUEST_RESIDENT_BYTES,
             MAX_REQUEST_RESIDENT_BYTES_PER_CLIENT,
@@ -1016,18 +1392,34 @@ impl ResourceBudget {
         )
     }
 
-    pub fn try_response_bytes(self: &Arc<Self>) -> ResidentLease {
-        let context = current_context()
-            .filter(|context| Arc::ptr_eq(context.budget(), self))
-            .or_else(|| current_expensive_client().map(|client| self.context(client)))
-            .unwrap_or_else(|| ResourceContext::process_only(self));
-        ResidentLease::new(
+    pub(crate) fn try_request_bytes_in(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+    ) -> io::Result<ResidentLease> {
+        if !Arc::ptr_eq(self, &context.budget) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resource context belongs to another process ledger",
+            ));
+        }
+        Ok(ResidentLease::new(
+            context.clone(),
+            ResidentKind::Request,
+            MAX_REQUEST_RESIDENT_BYTES,
+            MAX_REQUEST_RESIDENT_BYTES_PER_CLIENT,
+            MAX_REQUEST_RESIDENT_BYTES_PER_REQUEST,
+        ))
+    }
+
+    pub fn try_response_bytes(self: &Arc<Self>) -> io::Result<ResidentLease> {
+        let context = self.current_context_for()?;
+        Ok(ResidentLease::new(
             context,
             ResidentKind::Response,
             MAX_RESPONSE_RESIDENT_BYTES,
             MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT,
             MAX_RESPONSE_RESIDENT_BYTES_PER_REQUEST,
-        )
+        ))
     }
 
     pub fn try_response_bytes_for(self: &Arc<Self>, client: IpAddr) -> ResidentLease {
@@ -1040,13 +1432,32 @@ impl ResourceBudget {
         )
     }
 
+    pub(crate) fn try_response_bytes_in(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+    ) -> io::Result<ResidentLease> {
+        if !Arc::ptr_eq(self, &context.budget) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resource context belongs to another process ledger",
+            ));
+        }
+        Ok(ResidentLease::new(
+            context.clone(),
+            ResidentKind::Response,
+            MAX_RESPONSE_RESIDENT_BYTES,
+            MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT,
+            MAX_RESPONSE_RESIDENT_BYTES_PER_REQUEST,
+        ))
+    }
+
     /// Reserve one short blocking read of a response-body descriptor.
     ///
     /// This permit deliberately excludes request dispatch and downstream
     /// socket waits. Holding it across either boundary lets a client exhaust
     /// the read capacity without causing any read work (P30-A/A').
     pub fn try_response_body_read(self: &Arc<Self>) -> io::Result<ResponseBodyReadLease> {
-        let context = self.context_or_process();
+        let context = self.current_context_for()?;
         self.try_response_body_read_in(&context)
     }
 
@@ -1217,6 +1628,18 @@ pub struct ResidentLease {
     bytes: ByteLease,
 }
 
+#[derive(Debug)]
+pub(crate) struct CacheResidentLease {
+    bytes: ByteLease,
+}
+
+impl CacheResidentLease {
+    #[cfg(test)]
+    fn bytes(&self) -> u64 {
+        self.bytes.bytes
+    }
+}
+
 impl ResidentLease {
     fn new(
         context: ResourceContext,
@@ -1299,17 +1722,33 @@ pub fn try_expensive() -> Option<ExpensiveLease> {
     let context = current_or_test_context();
     #[cfg(not(test))]
     let context = current_context()?;
-    Some(ExpensiveLease {
-        _slot: context
-            .slot(
-                SlotKind::ExpensiveCpu,
-                MAX_EXPENSIVE_OPS,
-                Some(MAX_EXPENSIVE_OPS_PER_CLIENT),
-                Some(MAX_EXPENSIVE_OPS_PER_CLIENT),
-                "expensive operation limit reached",
-            )
-            .ok()?,
-    })
+    let slot = context
+        .slot(
+            SlotKind::ExpensiveCpu,
+            MAX_EXPENSIVE_OPS,
+            Some(MAX_EXPENSIVE_OPS_PER_CLIENT),
+            Some(MAX_EXPENSIVE_OPS_PER_CLIENT),
+            "expensive operation limit reached",
+        )
+        .ok()?;
+    let mut rates = context
+        .budget
+        .rates
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !ResourceBudget::admit_rate(
+        &mut rates.expensive,
+        context.client,
+        std::time::Instant::now(),
+        MAX_EXPENSIVE_OPS_PER_SECOND,
+        MAX_EXPENSIVE_OPS_PER_CLIENT_PER_SECOND,
+    ) {
+        drop(rates);
+        drop(slot);
+        return None;
+    }
+    drop(rates);
+    Some(ExpensiveLease { _slot: slot })
 }
 
 #[derive(Debug)]
@@ -1435,7 +1874,7 @@ mod tests {
     #[test]
     fn resident_bytes_transfer_to_the_validated_request_identity() {
         let budget = Arc::new(ResourceBudget::default());
-        let mut request = budget.try_request_bytes();
+        let mut request = budget.try_request_bytes().unwrap();
         request.reserve(1024).unwrap();
         let context = budget.context(IpAddr::from([192, 0, 2, 4]));
         request.attribute_context(context.clone()).unwrap();
@@ -1495,8 +1934,8 @@ mod tests {
         let stream = budget
             .try_h2_stream_for(IpAddr::from([192, 0, 2, 1]))
             .unwrap();
-        let mut request = budget.try_request_bytes();
-        let mut response = budget.try_response_bytes();
+        let mut request = budget.try_request_bytes().unwrap();
+        let mut response = budget.try_response_bytes().unwrap();
         let blocking = budget.try_response_body_read().unwrap();
         request.reserve(7).unwrap();
         response.reserve(11).unwrap();
@@ -1522,13 +1961,10 @@ mod tests {
         let budget = Arc::new(ResourceBudget::default());
         let first = IpAddr::from([192, 0, 2, 10]);
         let second = IpAddr::from([198, 51, 100, 10]);
-        let mut retained = with_expensive_client(first, || {
-            let mut lease = budget.try_response_bytes();
-            lease
-                .reserve(MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT)
-                .unwrap();
-            lease
-        });
+        let mut retained = budget.try_response_bytes_for(first);
+        retained
+            .reserve(MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT)
+            .unwrap();
         assert!(budget.try_response_bytes_for(first).reserve(1).is_err());
         let mut other = budget.try_response_bytes_for(second);
         other.reserve(1).unwrap();
@@ -1545,7 +1981,7 @@ mod tests {
         let budget = Arc::new(ResourceBudget::default());
         let first = IpAddr::from([192, 0, 2, 20]);
         let second = IpAddr::from([198, 51, 100, 20]);
-        let mut one = with_expensive_client(first, || budget.try_spool(100, 8).unwrap());
+        let mut one = budget.try_spool_for(100, 8, first).unwrap();
         one.reserve(25).unwrap();
         assert!(one.reserve(1).is_err());
         let two = budget.try_spool_for(100, 8, first).unwrap();
@@ -1553,7 +1989,8 @@ mod tests {
         let mut other = budget.try_spool_for(100, 8, second).unwrap();
         other.reserve(25).unwrap();
 
-        let mut unattributed = budget.try_spool(100, 8).unwrap();
+        let process_context = ResourceContext::process_only(&budget);
+        let mut unattributed = budget.try_spool_in(100, 8, &process_context).unwrap();
         unattributed.reserve(1).unwrap();
         assert!(unattributed.attribute_client(first).is_err());
         drop((one, two, other, unattributed));
@@ -1713,6 +2150,95 @@ mod tests {
             drop(leases);
             assert!(try_expensive().is_some());
         });
+    }
+
+    #[test]
+    fn physical_parent_composes_typed_fd_and_task_leases() {
+        let mut raw = ResourceBudget::default();
+        raw.physical_limits[PhysicalKind::FileDescriptor.index()] = 4;
+        raw.physical_limits[PhysicalKind::Task.index()] = 8;
+        let budget = Arc::new(raw);
+        let context = budget.context(IpAddr::from([192, 0, 2, 90]));
+        let dynamic = budget.try_dynamic_in(&context, 8).unwrap();
+        assert!(budget.try_spool_in(1024, 8, &context).is_err());
+        drop(dynamic);
+        assert!(budget.try_spool_in(1024, 8, &context).is_ok());
+
+        let mut task_limited = ResourceBudget::default();
+        task_limited.physical_limits[PhysicalKind::Task.index()] = 1;
+        let task_limited = Arc::new(task_limited);
+        let context = task_limited.context(IpAddr::from([192, 0, 2, 91]));
+        let pending = context
+            .slot(SlotKind::PendingConnection, 8, Some(8), Some(1), "full")
+            .unwrap();
+        assert!(task_limited.try_h2_stream_in(&context).is_err());
+        drop(pending);
+        assert!(task_limited.try_h2_stream_in(&context).is_ok());
+    }
+
+    #[test]
+    fn physical_memory_parent_composes_typed_resident_categories() {
+        let mut raw = ResourceBudget::default();
+        raw.physical_limits[PhysicalKind::ResidentMemory.index()] = 10;
+        let budget = Arc::new(raw);
+        let context = budget.context(IpAddr::from([192, 0, 2, 92]));
+        let mut request = ResidentLease::new(context.clone(), ResidentKind::Request, 100, 100, 100);
+        let mut response =
+            ResidentLease::new(context.clone(), ResidentKind::Response, 100, 100, 100);
+        request.reserve(6).unwrap();
+        assert!(budget.try_cache_resident(&context, 100, 5).is_err());
+        let cache = budget.try_cache_resident(&context, 100, 4).unwrap();
+        assert_eq!(cache.bytes(), 4);
+        assert!(response.reserve(1).is_err());
+        drop(cache);
+        response.reserve(4).unwrap();
+    }
+
+    #[test]
+    fn request_rate_is_once_per_scope_and_weighted_rates_are_exact() {
+        let budget = Arc::new(ResourceBudget::default());
+        let context = budget.context(IpAddr::from([192, 0, 2, 93]));
+        budget.try_request_rate(&context).unwrap();
+        budget.try_request_rate(&context).unwrap();
+        let rates = budget.rates.lock().unwrap();
+        assert_eq!(rates.request.total, 1);
+        drop(rates);
+
+        let mut window = RateWindow::default();
+        let now = std::time::Instant::now();
+        let client = Some(IpAddr::from([192, 0, 2, 94]));
+        assert!(ResourceBudget::admit_rate_amount(
+            &mut window,
+            client,
+            now,
+            7,
+            10,
+            8,
+        ));
+        assert!(!ResourceBudget::admit_rate_amount(
+            &mut window,
+            client,
+            now,
+            2,
+            10,
+            8,
+        ));
+        assert!(ResourceBudget::admit_rate_amount(
+            &mut window,
+            None,
+            now,
+            3,
+            10,
+            8,
+        ));
+        assert!(!ResourceBudget::admit_rate_amount(
+            &mut window,
+            None,
+            now,
+            1,
+            10,
+            8,
+        ));
     }
 
     #[test]

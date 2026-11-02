@@ -750,6 +750,32 @@ fn handle_connection<C: Conn + ResponseWrite>(
     loop {
         if served == 0 {
             stream.set_read_timeout(Some(cfg.request_header_timeout.max(Duration::from_secs(1))));
+        } else if cfg
+            .resource_budget
+            .try_request_parse_rate(peer.ip())
+            .is_err()
+        {
+            let mut response = Response::bytes(
+                503,
+                "text/html; charset=iso-8859-1",
+                b"Request rate capacity is temporarily exhausted\n".to_vec(),
+            );
+            response
+                .headers
+                .push(("Connection".into(), b"close".to_vec()));
+            let _ = write_response(
+                stream,
+                &mut response,
+                &ResponseOptions {
+                    server_header: &cfg.server_header(),
+                    keep_alive: false,
+                    head_only: false,
+                    protocol: Version::Http11,
+                    request_keep_alive: false,
+                    write_timeout: cfg.timeout,
+                },
+            );
+            return Ok(());
         }
         let started = Instant::now();
         let reservation = if served == 0 {
@@ -762,6 +788,8 @@ fn handle_connection<C: Conn + ResponseWrite>(
         } else {
             None
         };
+        let pre_identity_context = cfg.resource_budget.context(peer.ip());
+        let _pre_identity_guard = crate::resource::enter_resource_context(pre_identity_context);
         let req = match read_request_with_reservation(
             stream,
             &mut buf,
@@ -791,6 +819,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 } else {
                     cfg.resource_budget.context(effective.ip())
                 };
+                cfg.resource_budget.try_request_rate(&context)?;
                 if request_has_body(request) && body_guard.is_none() {
                     body_guard = Some(
                         try_reserve_body_worker(&context, cfg.max_request_workers).ok_or_else(
@@ -867,6 +896,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 return Ok(());
             }
         };
+        drop(_pre_identity_guard);
         // This lease protects only the slow body-read phase. The parsed body
         // has independent resident/spool accounting while dispatch runs.
         drop(body_guard);
@@ -1384,13 +1414,14 @@ async fn read_first_request_head<S>(
     stream: &mut S,
     timeout: Duration,
     resource_budget: Arc<crate::resource::ResourceBudget>,
+    client: IpAddr,
 ) -> io::Result<(Vec<u8>, usize, crate::resource::ResidentLease)>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     tokio::time::timeout(timeout.max(Duration::from_secs(1)), async {
         let mut bytes = Vec::with_capacity(8 * 1024);
-        let mut resident = resource_budget.try_request_bytes();
+        let mut resident = resource_budget.try_request_bytes_for(client);
         loop {
             if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
                 let head_end = position + 4;
@@ -1443,10 +1474,19 @@ async fn admit_plain_connection(
 ) -> io::Result<()> {
     stream.set_nonblocking(true)?;
     let mut stream = tokio::net::TcpStream::from_std(stream)?;
+    if cfg
+        .resource_budget
+        .try_request_parse_rate(peer.ip())
+        .is_err()
+    {
+        reject_h1_async(&mut stream, &cfg, 503).await;
+        return Ok(());
+    }
     let (initial, head_end, resident) = match read_first_request_head(
         &mut stream,
         cfg.request_header_timeout,
         cfg.resource_budget.clone(),
+        peer.ip(),
     )
     .await
     {
@@ -1471,6 +1511,14 @@ async fn admit_plain_connection(
     };
     let effective = cfg.client_addr(peer, &request);
     let resource_context = cfg.resource_budget.context(effective.ip());
+    if cfg
+        .resource_budget
+        .try_request_rate(&resource_context)
+        .is_err()
+    {
+        reject_h1_async(&mut stream, &cfg, 503).await;
+        return Ok(());
+    }
     let has_body = request_has_body(&request);
     drop(request);
     let body_guard = if has_body {
@@ -1570,10 +1618,20 @@ async fn admit_tls_connection(
         TlsHttpProtocol::Http11 => {}
     }
 
+    if cfg
+        .resource_budget
+        .try_request_parse_rate(peer.ip())
+        .is_err()
+    {
+        reject_h1_async(&mut tls, &cfg, 503).await;
+        return Ok(());
+    }
+
     let (initial, head_end, resident) = match read_first_request_head(
         &mut tls,
         cfg.request_header_timeout,
         cfg.resource_budget.clone(),
+        peer.ip(),
     )
     .await
     {
@@ -1598,6 +1656,14 @@ async fn admit_tls_connection(
     };
     let effective = cfg.client_addr(peer, &request);
     let resource_context = cfg.resource_budget.context(effective.ip());
+    if cfg
+        .resource_budget
+        .try_request_rate(&resource_context)
+        .is_err()
+    {
+        reject_h1_async(&mut tls, &cfg, 503).await;
+        return Ok(());
+    }
     let has_body = request_has_body(&request);
     drop(request);
     let body_guard = if has_body {
@@ -5723,10 +5789,14 @@ mod tests {
         let input = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody";
         let mut reader = &input[..];
         let budget = Arc::new(crate::resource::ResourceBudget::default());
-        let (bytes, head_end, resident) =
-            read_first_request_head(&mut reader, Duration::from_secs(1), budget.clone())
-                .await
-                .unwrap();
+        let (bytes, head_end, resident) = read_first_request_head(
+            &mut reader,
+            Duration::from_secs(1),
+            budget.clone(),
+            IpAddr::from([127, 0, 0, 1]),
+        )
+        .await
+        .unwrap();
         assert_eq!(&bytes[..head_end], &input[..head_end]);
         assert_eq!(&bytes[head_end..], b"body");
         assert_eq!(resident.bytes(), input.len() as u64 + head_end as u64);
@@ -5756,6 +5826,7 @@ mod tests {
             &mut reader,
             Duration::from_secs(1),
             Arc::new(crate::resource::ResourceBudget::default()),
+            IpAddr::from([127, 0, 0, 1]),
         )
         .await
         .unwrap_err();

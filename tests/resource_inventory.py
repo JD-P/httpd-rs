@@ -16,7 +16,9 @@ EXPECTED_SLOTS = {
 }
 EXPECTED_BYTES = {
     "Spool", "RequestResident", "ResponseResident", "PolicyExpansion",
+    "CacheResident",
 }
+EXPECTED_PHYSICAL = {"FileDescriptor", "Task", "ResidentMemory"}
 
 # These are generation/process infrastructure, bounded caches, telemetry,
 # thread-local request state, temporary-name counters, or test-only state.
@@ -84,6 +86,8 @@ def main() -> int:
         errors.append("SlotKind changed without updating the resource inventory")
     if enum_variants(resource, "ByteKind") != EXPECTED_BYTES:
         errors.append("ByteKind changed without updating the resource inventory")
+    if enum_variants(resource, "PhysicalKind") != EXPECTED_PHYSICAL:
+        errors.append("PhysicalKind changed without updating the resource inventory")
 
     observed: set[tuple[str, str]] = set()
     static_pattern = re.compile(r"\bstatic\s+([A-Z][A-Z0-9_]*)\s*:")
@@ -120,7 +124,8 @@ def main() -> int:
         return 1
     print(
         f"resource inventory: {len(EXPECTED_SLOTS)} slot classes, "
-        f"{len(EXPECTED_BYTES)} byte classes, {len(observed)} reviewed statics"
+        f"{len(EXPECTED_BYTES)} byte classes, {len(EXPECTED_PHYSICAL)} physical classes, "
+        f"{len(observed)} reviewed statics"
     )
     return 0
 

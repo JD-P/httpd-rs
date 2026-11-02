@@ -694,8 +694,10 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
     reservation: Option<ResidentLease>,
 ) -> Result<Option<Request>, ReadError> {
     let prefix_precharged = reservation.is_some();
-    let mut request_resident =
-        reservation.unwrap_or_else(|| limits.resource_budget.try_request_bytes());
+    let mut request_resident = match reservation {
+        Some(reservation) => reservation,
+        None => limits.resource_budget.try_request_bytes()?,
+    };
     // Pipelined bytes left by the previous request remain resident while this
     // request is dispatched, so they enter the new request's reservation.
     if !prefix_precharged {
@@ -1466,7 +1468,7 @@ impl Response {
         } else {
             let mut lease = match client {
                 Some(client) => budget.try_response_bytes_for(client),
-                None => budget.try_response_bytes(),
+                None => budget.try_response_bytes()?,
             };
             lease.reserve(amount)?;
             self.resident_lease = Some(lease);

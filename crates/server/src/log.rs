@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 /// disk write large enough to become its own denial-of-service primitive.
 const MAX_LOG_LINE_BYTES: usize = 128 * 1024;
 const MAX_STDERR_MESSAGE_BYTES: usize = MAX_LOG_LINE_BYTES / 4;
+/// Preserve service availability even when external rotation is missing or
+/// broken. A reopen after rotation starts with the replacement file's size.
+const MAX_LOG_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 static STDERR_WRITER_BUSY: AtomicBool = AtomicBool::new(false);
 static LOG_WRITER_BUSY: AtomicBool = AtomicBool::new(false);
 
@@ -37,6 +40,35 @@ fn try_writer(gate: &'static AtomicBool) -> Option<WriterGuard> {
 }
 
 struct BoundedMessage(String);
+
+struct CappedLogFile {
+    file: std::fs::File,
+    bytes: u64,
+}
+
+impl Write for CappedLogFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.bytes >= MAX_LOG_FILE_BYTES {
+            return Ok(buf.len());
+        }
+        let allowed = usize::try_from(MAX_LOG_FILE_BYTES - self.bytes)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        let written = self.file.write(&buf[..allowed])?;
+        self.bytes = self.bytes.saturating_add(written as u64);
+        if written == allowed && allowed < buf.len() {
+            // Report the remainder as consumed so callers do not spin while the
+            // overflow is intentionally discarded.
+            Ok(buf.len())
+        } else {
+            Ok(written)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
 
 impl fmt::Write for BoundedMessage {
     fn write_str(&mut self, value: &str) -> fmt::Result {
@@ -121,6 +153,7 @@ pub struct Logger {
     service_uid: Option<u32>,
     level: Level,
     access: Vec<AccessLog>,
+    resource_budget: std::sync::Arc<crate::resource::ResourceBudget>,
     pub errors: Mutex<Vec<String>>,
 }
 
@@ -243,7 +276,11 @@ fn open_log(
             "log target is not a regular file",
         ));
     }
-    Ok(Box::new(std::io::BufWriter::new(f)))
+    let bytes = metadata.len().min(MAX_LOG_FILE_BYTES);
+    Ok(Box::new(std::io::BufWriter::new(CappedLogFile {
+        file: f,
+        bytes,
+    })))
 }
 
 impl Logger {
@@ -287,6 +324,7 @@ impl Logger {
             service_uid,
             level: Level::parse(&cfg.log_level),
             access,
+            resource_budget: cfg.resource_budget.clone(),
             errors: Mutex::new(Vec::new()),
         })
     }
@@ -415,6 +453,12 @@ impl Logger {
             std::process::id(),
             msg
         );
+        if !self.resource_budget.try_log_bytes(
+            crate::resource::current_expensive_client(),
+            line.len() as u64,
+        ) {
+            return;
+        }
         // Never queue request workers behind a filesystem-stalled logger. One
         // process-wide configured-log writer may block in the kernel;
         // concurrent messages are dropped under that overload instead of
@@ -458,6 +502,13 @@ impl Logger {
                 }
                 line.clear();
                 format_access_into(&mut line, &log.format, e);
+                let client = e.remote_ip.parse().ok();
+                if !self
+                    .resource_budget
+                    .try_log_bytes(client, line.len().saturating_add(1) as u64)
+                {
+                    continue;
+                }
                 let Some(_writer_guard) = try_writer(&LOG_WRITER_BUSY) else {
                     continue;
                 };
@@ -778,6 +829,21 @@ mod tests {
         assert!(try_writer(&TEST_GATE).is_none());
         drop(first);
         assert!(try_writer(&TEST_GATE).is_some());
+
+        let path = std::env::temp_dir().join(format!(
+            "vapache-capped-log-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut capped = CappedLogFile {
+            file,
+            bytes: MAX_LOG_FILE_BYTES - 2,
+        };
+        capped.write_all(b"abcd").unwrap();
+        capped.flush().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 2);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

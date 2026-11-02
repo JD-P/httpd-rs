@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct Identity {
@@ -859,8 +859,65 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
 
     struct DnsJob {
         ip: IpAddr,
-        names: Vec<String>,
-        reply: mpsc::SyncSender<bool>,
+        deadline: Instant,
+        reply: mpsc::SyncSender<Option<String>>,
+    }
+
+    fn isolated_lookup(job: &DnsJob, unreaped: &mut Vec<std::process::Child>) -> Option<String> {
+        unreaped.retain_mut(|child| match child.try_wait() {
+            Ok(Some(_)) => false,
+            Ok(None) | Err(_) => true,
+        });
+        if unreaped.len() >= 2 || Instant::now() >= job.deadline {
+            return None;
+        }
+        let current = std::env::current_exe().ok()?;
+        let executable = current
+            .parent()
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "deps"))
+            .and_then(Path::parent)
+            .map(|parent| parent.join("vapached"))
+            .filter(|candidate| candidate.is_file())
+            .unwrap_or(current);
+        let mut child = std::process::Command::new(executable)
+            .arg("--vapache-reverse-resolver-worker")
+            .arg(job.ip.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        return None;
+                    }
+                    let output = child.wait_with_output().ok()?;
+                    if output.stdout.len() > 254 {
+                        return None;
+                    }
+                    let host = std::str::from_utf8(&output.stdout).ok()?.trim();
+                    if host.is_empty()
+                        || host.len() > 253
+                        || host.bytes().any(|byte| byte <= b' ' || byte == 0x7f)
+                    {
+                        return None;
+                    }
+                    return Some(host.to_string());
+                }
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+            if Instant::now() >= job.deadline {
+                let _ = child.kill();
+                if !child.try_wait().is_ok_and(|status| status.is_some()) {
+                    unreaped.push(child);
+                }
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn sender() -> &'static mpsc::SyncSender<DnsJob> {
@@ -873,17 +930,20 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
             for index in 0..DNS_WORKERS {
                 let rx = Arc::clone(&rx);
                 let _ = std::thread::Builder::new()
-                    .name(format!("dns-{index}"))
-                    .spawn(move || loop {
-                        let job = {
-                            let receiver = rx.lock().unwrap_or_else(|error| error.into_inner());
-                            receiver.recv()
-                        };
-                        let Ok(job) = job else {
-                            break;
-                        };
-                        let result = reverse_dns_matches_blocking(job.ip, &job.names);
-                        let _ = job.reply.try_send(result);
+                    .name(format!("reverse-dns-{index}"))
+                    .spawn(move || {
+                        let mut unreaped = Vec::new();
+                        loop {
+                            let job = {
+                                let receiver = rx.lock().unwrap_or_else(|error| error.into_inner());
+                                receiver.recv()
+                            };
+                            let Ok(job) = job else {
+                                break;
+                            };
+                            let result = isolated_lookup(&job, &mut unreaped);
+                            let _ = job.reply.try_send(result);
+                        }
                     });
             }
             tx
@@ -898,31 +958,40 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
     {
         return false;
     }
+    let Some(_expensive) = crate::resource::try_expensive() else {
+        return false;
+    };
 
     let (reply, result) = mpsc::sync_channel(1);
     let job = DnsJob {
-        ip,
-        names: names.to_vec(),
+        ip: canonical_ip(ip),
+        deadline: Instant::now() + Duration::from_secs(2),
         reply,
     };
     if sender().try_send(job).is_err() {
         return false;
     }
-    result.recv_timeout(Duration::from_secs(2)).unwrap_or(false)
+    result
+        .recv_timeout(Duration::from_secs(2))
+        .ok()
+        .flatten()
+        .is_some_and(|host| names.iter().any(|domain| hostname_in_domain(domain, &host)))
 }
 
-fn reverse_dns_matches_blocking(ip: IpAddr, names: &[String]) -> bool {
+/// Hidden disposable-process entrypoint for `Require host`. Both PTR and
+/// forward confirmation occur in this process, so a wedged libc/NSS resolver
+/// can be killed without consuming one of the daemon's fixed workers forever.
+pub fn reverse_resolver_worker_main(ip: IpAddr) -> std::io::Result<()> {
     let ip = canonical_ip(ip);
-    // Forward-confirmed reverse DNS (FCrDNS), matching Apache's behavior:
-    // a PTR result is only accepted if it resolves back to the peer address.
-    let Ok(host) = reverse_dns(ip) else {
-        return false;
-    };
-    let name_ok = names.iter().any(|domain| hostname_in_domain(domain, &host));
-    if !name_ok {
-        return false;
+    let host = reverse_dns(ip)?;
+    if !forward_dns_confirms(&host, ip) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "reverse DNS result was not forward-confirmed",
+        ));
     }
-    forward_dns_confirms(&host, ip)
+    println!("{host}");
+    Ok(())
 }
 
 /// Exact port of mod_authz_host's `in_domain()`: operands are

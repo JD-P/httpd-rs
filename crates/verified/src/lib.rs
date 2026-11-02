@@ -3175,6 +3175,68 @@ pub fn hierarchical_rate_admit(
     process_used < process_limit && (!has_client || client_used < client_limit)
 }
 
+/// Weighted fixed-window admission is used for byte and cost budgets.  It is
+/// the rate analogue of hierarchical resource admission: both the process and
+/// source-keyed projection must fit without overflow.
+pub open spec fn hierarchical_weighted_rate_spec(
+    process_used: u64,
+    client_used: u64,
+    incoming: u64,
+    process_limit: u64,
+    client_limit: u64,
+    has_client: bool,
+) -> bool {
+    process_used <= process_limit
+        && incoming <= process_limit - process_used
+        && (!has_client
+            || (client_used <= client_limit && incoming <= client_limit - client_used))
+}
+
+pub fn hierarchical_weighted_rate_admit(
+    process_used: u64,
+    client_used: u64,
+    incoming: u64,
+    process_limit: u64,
+    client_limit: u64,
+    has_client: bool,
+) -> (ok: bool)
+    ensures ok == hierarchical_weighted_rate_spec(
+        process_used,
+        client_used,
+        incoming,
+        process_limit,
+        client_limit,
+        has_client,
+    ),
+{
+    process_used <= process_limit
+        && incoming <= process_limit - process_used
+        && (!has_client
+            || (client_used <= client_limit && incoming <= client_limit - client_used))
+}
+
+pub proof fn hierarchical_weighted_rate_success_is_bounded(
+    process_used: u64,
+    client_used: u64,
+    incoming: u64,
+    process_limit: u64,
+    client_limit: u64,
+    has_client: bool,
+)
+    requires hierarchical_weighted_rate_spec(
+        process_used,
+        client_used,
+        incoming,
+        process_limit,
+        client_limit,
+        has_client,
+    ),
+    ensures
+        process_used + incoming <= process_limit,
+        has_client ==> client_used + incoming <= client_limit,
+{
+}
+
 /// A process-wide HTTP/2 stream slot may be acquired only after the
 /// source-keyed slot. This ordering ensures that rejecting a client cannot
 /// retain global capacity while its error response waits on that client's

@@ -908,6 +908,24 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
 
 fn main() {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
+    if raw_args.get(1).map(OsString::as_os_str)
+        == Some(OsStr::new("--vapache-reverse-resolver-worker"))
+    {
+        let result = raw_args
+            .get(2)
+            .and_then(|ip| ip.to_str())
+            .and_then(|ip| ip.parse().ok())
+            .filter(|_| raw_args.len() == 3)
+            .ok_or_else(|| "invalid reverse resolver worker arguments".to_string())
+            .and_then(|ip| {
+                vapached::access::reverse_resolver_worker_main(ip)
+                    .map_err(|error| error.to_string())
+            });
+        if result.is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
     if raw_args.get(1).map(OsString::as_os_str) == Some(OsStr::new("--vapache-resolver-worker")) {
         let result = raw_args
             .get(2)

@@ -192,7 +192,14 @@ fn parse_once(wire: &[u8], chunk: usize) -> String {
         chunk,
     };
     let mut buffered = Vec::new();
-    match read_request(&mut stream, &mut buffered, &Limits::default(), |_| {}) {
+    let limits = Limits::default();
+    let context = limits
+        .resource_budget
+        .context(std::net::IpAddr::from([192, 0, 2, 1]));
+    let result = vapached::resource::with_resource_context(context, || {
+        read_request(&mut stream, &mut buffered, &limits, |_| {})
+    });
+    match result {
         Ok(Some(request)) => format!(
             "ok:{}:{:?}:{}:{}:{:?}",
             request.method,

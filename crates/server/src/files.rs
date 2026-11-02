@@ -1611,7 +1611,13 @@ fn autoindex(
             b"Directory listing capacity is temporarily exhausted\n".to_vec(),
         );
     };
-    let mut resident = cfg.resource_budget.try_response_bytes();
+    let Ok(mut resident) = cfg.resource_budget.try_response_bytes() else {
+        return Response::bytes(
+            503,
+            "text/html; charset=UTF-8",
+            b"Directory listing capacity is temporarily exhausted\n".to_vec(),
+        );
+    };
     if resident.reserve(estimated as u64).is_err() {
         return Response::bytes(
             503,

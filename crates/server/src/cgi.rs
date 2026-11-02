@@ -14,6 +14,7 @@ use crate::verified::valid_token;
 use std::ffi::OsString;
 use std::fs::{File, Metadata};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -383,7 +384,10 @@ pub fn execute(ctx: &CgiContext) -> Response {
         }
     }
 
-    let mut response_lease = ctx.cfg.resource_budget.try_response_bytes();
+    let mut response_lease = match ctx.cfg.resource_budget.try_response_bytes() {
+        Ok(lease) => lease,
+        Err(_) => return cgi_status_error(ctx, 503),
+    };
     match run_local(
         &path,
         &cwd,
@@ -453,7 +457,10 @@ fn execute_via_pool(
         BodySource::Bytes(_) => None,
     };
     let mut worker = pool.take()?;
-    let mut response_lease = ctx.cfg.resource_budget.try_response_bytes();
+    let mut response_lease = match ctx.cfg.resource_budget.try_response_bytes() {
+        Ok(lease) => lease,
+        Err(_) => return Some(cgi_status_error(ctx, 503)),
+    };
     match exchange(
         &mut worker.stream,
         path,
@@ -1036,15 +1043,10 @@ fn feed_stdin(
     stdin: std::process::ChildStdin,
     body: &BodySource,
     body_len: u64,
+    deadline: Instant,
 ) -> Option<std::thread::JoinHandle<()>> {
     let mut stdin = stdin;
     if body_len == 0 {
-        drop(stdin);
-        None
-    } else if body_len <= 16 * 1024 {
-        if let Ok(mut reader) = body.reader() {
-            let _ = std::io::copy(&mut reader, &mut stdin);
-        }
         drop(stdin);
         None
     } else {
@@ -1053,7 +1055,65 @@ fn feed_stdin(
             return None;
         };
         Some(std::thread::spawn(move || {
-            let _ = std::io::copy(&mut reader, &mut stdin);
+            let Ok(flags) = rustix::fs::fcntl_getfl(&stdin) else {
+                return;
+            };
+            if rustix::fs::fcntl_setfl(&stdin, flags | rustix::fs::OFlags::NONBLOCK).is_err() {
+                return;
+            }
+            let mut chunk = [0u8; 64 * 1024];
+            let mut start = 0usize;
+            let mut end = 0usize;
+            loop {
+                if Instant::now() >= deadline {
+                    return;
+                }
+                if start == end {
+                    match reader.read(&mut chunk) {
+                        Ok(0) => return,
+                        Ok(read) => {
+                            start = 0;
+                            end = read;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => return,
+                    }
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let timeout =
+                    rustix::event::Timespec::try_from(remaining.min(Duration::from_millis(100)))
+                        .unwrap_or(rustix::event::Timespec {
+                            tv_sec: 0,
+                            tv_nsec: 100_000_000,
+                        });
+                let mut poll = rustix::event::PollFd::from_borrowed_fd(
+                    stdin.as_fd(),
+                    rustix::event::PollFlags::OUT,
+                );
+                let result =
+                    match rustix::event::poll(std::slice::from_mut(&mut poll), Some(&timeout))
+                        .map_err(std::io::Error::from)
+                    {
+                        Ok(result) => result,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                            continue;
+                        }
+                        Err(_) => return,
+                    };
+                if result == 0 {
+                    continue;
+                }
+                match stdin.write(&chunk[start..end]) {
+                    Ok(0) => return,
+                    Ok(written) => start += written,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                        ) => {}
+                    Err(_) => return,
+                }
+            }
         }))
     }
 }
@@ -1133,11 +1193,11 @@ fn run_local(
     let stdin_thread = child
         .stdin
         .take()
-        .and_then(|stdin| feed_stdin(stdin, body, body_len));
+        .and_then(|stdin| feed_stdin(stdin, body, body_len, deadline));
     let stderr_thread = child.stderr.take().map(|e| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = e.take(MAX_STDERR as u64).read_to_end(&mut buf);
+            let _ = read_limited_with_deadline(e, deadline, &mut buf, MAX_STDERR, true, None);
             buf
         })
     });
@@ -1201,9 +1261,20 @@ fn poll_result(rc: i32, error: std::io::Error) -> Result<bool, String> {
 }
 
 fn read_with_deadline(
+    reader: impl Read + AsRawFd,
+    deadline: Instant,
+    out: &mut Vec<u8>,
+    resident: Option<&mut crate::resource::ResidentLease>,
+) -> Result<(), String> {
+    read_limited_with_deadline(reader, deadline, out, MAX_OUTPUT, false, resident)
+}
+
+fn read_limited_with_deadline(
     mut reader: impl Read + AsRawFd,
     deadline: Instant,
     out: &mut Vec<u8>,
+    limit: usize,
+    truncate_at_limit: bool,
     mut resident: Option<&mut crate::resource::ResidentLease>,
 ) -> Result<(), String> {
     let fd = reader.as_raw_fd();
@@ -1227,14 +1298,17 @@ fn read_with_deadline(
         match reader.read(&mut chunk) {
             Ok(0) => return Ok(()),
             Ok(n) => {
+                if out.len().saturating_add(n) > limit {
+                    return Err("CGI output too large".into());
+                }
                 if let Some(lease) = resident.as_mut() {
                     lease
                         .reserve(n as u64)
                         .map_err(|_| "CGI response memory capacity exhausted".to_string())?;
                 }
                 out.extend_from_slice(&chunk[..n]);
-                if out.len() > MAX_OUTPUT {
-                    return Err("CGI output too large".into());
+                if truncate_at_limit && out.len() == limit {
+                    return Ok(());
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -2248,7 +2322,13 @@ mod tests {
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
-        assert!(feed_stdin(stdin, &bad, 64 * 1024).is_none());
+        assert!(feed_stdin(
+            stdin,
+            &bad,
+            64 * 1024,
+            Instant::now() + Duration::from_millis(100),
+        )
+        .is_none());
         let _ = child.wait();
         drop(stream);
         let _ = fs::remove_dir_all(&dir);
@@ -2411,6 +2491,30 @@ mod tests {
             None,
         )
         .is_err());
+
+        // A CGI descendant can create a new session and retain all three pipe
+        // descriptors after the authorized script exits. The daemon must still
+        // return at its deadline instead of joining a permanently blocked pipe
+        // helper. The orphan is deliberately short-lived so the test cleans up
+        // without relying on the process-group kill it is testing around.
+        let escaped = script(
+            &dir,
+            "escaped-pipes.sh",
+            "#!/bin/sh\nsetsid sh -c 'sleep 1' &\nprintf 'Content-Type: text/plain\\r\\n\\r\\nescaped\\n'\n",
+        );
+        let escaped_started = Instant::now();
+        assert!(run_local(
+            &escaped,
+            &dir,
+            &[],
+            &BodySource::Bytes(vec![b'x'; 32 * 1024]),
+            Duration::from_millis(75),
+            false,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(escaped_started.elapsed() < Duration::from_millis(750));
 
         let mut out = Vec::new();
         assert!(read_with_deadline(
