@@ -94,6 +94,26 @@ pub fn effective_scope_with_layers_and_file_name(
     layers: &[AccessLayer],
     fname: &str,
 ) -> (Scope, Vec<ScopeRule>, Vec<ScopeRule>) {
+    // This evaluator is also called directly by a few internal policy paths,
+    // so retain the limit here even though RequestPlan normally rejects the
+    // target first.  Fail closed instead of allocating an attacker-sized
+    // ancestor vector.
+    let start = if crate::files::is_dir_cached(fs_path) {
+        fs_path
+    } else {
+        fs_path.parent().unwrap_or(fs_path)
+    };
+    let dirs = match crate::util::bounded_policy_ancestor_dirs(start) {
+        Ok(dirs) => dirs,
+        Err(_) => {
+            let mut scope = vhost
+                .map(|vhost| vhost.scope.clone())
+                .unwrap_or_else(|| cfg.global.clone());
+            scope.conditional_error = true;
+            let _ = req.charge_policy_work(u64::MAX);
+            return (scope, Vec::new(), Vec::new());
+        }
+    };
     let mut base_config_files = Vec::new();
     let mut config_locations = Vec::new();
     let mut config_conditionals = Vec::new();
@@ -108,25 +128,6 @@ pub fn effective_scope_with_layers_and_file_name(
         &mut config_locations,
         &mut config_conditionals,
     );
-    let start = if crate::files::is_dir_cached(fs_path) {
-        fs_path
-    } else {
-        fs_path.parent().unwrap_or(fs_path)
-    };
-    let mut dirs = Vec::new();
-    let mut cur = Some(start);
-    while let Some(d) = cur {
-        dirs.push(d.to_path_buf());
-        let Some(parent) = d.parent() else {
-            break;
-        };
-        cur = Some(parent);
-    }
-    // The parent walk already produces leaf-to-root order; reversing is
-    // equivalent to sorting by component count for normal absolute paths and
-    // avoids repeated `Path::components` parsing on every request.
-    dirs.reverse();
-    dirs.dedup();
     let docroot = cfg.documentation_root_for(vhost);
     // Build the verified stage plan.  One `Walk` step consumes exactly one
     // directory in root-to-leaf order; `access` records whether that
@@ -492,6 +493,39 @@ mod tests {
                 crate::verified::AccessStep::AccessConditions,
             ]
         );
+    }
+
+    #[test]
+    fn verified_plan_execution_is_stack_constant_for_deep_inputs() {
+        // P29-A used roughly 18,000 ancestors to overflow a Tokio blocking
+        // thread's stack.  Keep this above that reproducer and exercise both
+        // verified iterative phase builders through the combined plan.
+        let present = vec![false; 20_000];
+        let plan = crate::verified::access_plan_exec(&present);
+        assert_eq!(plan.len(), present.len() * 2 + 7);
+        assert_eq!(
+            plan.first(),
+            Some(&crate::verified::AccessStep::DirectoryConfig { depth: 0 })
+        );
+        assert_eq!(
+            plan.last(),
+            Some(&crate::verified::AccessStep::AccessConditions)
+        );
+    }
+
+    #[test]
+    fn direct_policy_evaluation_rejects_deep_paths_fail_closed() {
+        let cfg = load("p29-policy-path-bound", "Listen 127.0.0.1:0\n");
+        let req = request();
+        let mut path = PathBuf::from("/");
+        for _ in 0..=crate::util::MAX_POLICY_PATH_COMPONENTS {
+            path.push("x");
+        }
+        let (scope, conditionals) =
+            effective_scope_req(&cfg, None, &path, "/x", &req, "127.0.0.1".parse().unwrap());
+        assert!(scope.conditional_error);
+        assert!(conditionals.is_empty());
+        assert!(req.policy_budget_failed());
     }
 
     #[test]

@@ -8159,20 +8159,23 @@ pub fn access_walk_plan_exec_from(
 ) -> (out: Vec<AccessStep>)
     requires start <= present.len(),
     ensures out@ == access_walk_plan_from(present@, start as int),
-    decreases present.len() - start,
 {
-    if start >= present.len() {
-        Vec::new()
-    } else {
-        let mut out: Vec<AccessStep> = Vec::new();
-        out.push(AccessStep::DirectoryConfig { depth: start });
-        if present[start] {
-            out.push(AccessStep::DirectoryAccess { depth: start });
+    let mut out: Vec<AccessStep> = Vec::new();
+    let mut cursor = start;
+    while cursor < present.len()
+        invariant
+            start <= cursor <= present.len(),
+            out@ + access_walk_plan_from(present@, cursor as int)
+                == access_walk_plan_from(present@, start as int),
+        decreases present.len() - cursor,
+    {
+        out.push(AccessStep::DirectoryConfig { depth: cursor });
+        if present[cursor] {
+            out.push(AccessStep::DirectoryAccess { depth: cursor });
         }
-        let mut rest = access_walk_plan_exec_from(present, start + 1);
-        out.append(&mut rest);
-        out
+        cursor = cursor + 1;
     }
+    out
 }
 
 pub fn access_walk_plan_exec(present: &[bool]) -> (out: Vec<AccessStep>)
@@ -8187,20 +8190,23 @@ pub fn access_files_plan_exec_from(
 ) -> (out: Vec<AccessStep>)
     requires start <= present.len(),
     ensures out@ == access_files_plan_from(present@, start as int),
-    decreases present.len() - start,
 {
-    if start >= present.len() {
-        Vec::new()
-    } else {
-        let mut out: Vec<AccessStep> = Vec::new();
-        out.push(AccessStep::FilesConfig { depth: start });
-        if present[start] {
-            out.push(AccessStep::FilesAccess { depth: start });
+    let mut out: Vec<AccessStep> = Vec::new();
+    let mut cursor = start;
+    while cursor < present.len()
+        invariant
+            start <= cursor <= present.len(),
+            out@ + access_files_plan_from(present@, cursor as int)
+                == access_files_plan_from(present@, start as int),
+        decreases present.len() - cursor,
+    {
+        out.push(AccessStep::FilesConfig { depth: cursor });
+        if present[cursor] {
+            out.push(AccessStep::FilesAccess { depth: cursor });
         }
-        let mut rest = access_files_plan_exec_from(present, start + 1);
-        out.append(&mut rest);
-        out
+        cursor = cursor + 1;
     }
+    out
 }
 
 pub fn access_files_plan_exec(present: &[bool]) -> (out: Vec<AccessStep>)
@@ -8241,6 +8247,34 @@ pub proof fn access_plan_interleaves(present: Seq<bool>)
         access_tail().len() == 4,
 {
     assert(access_tail().len() == 4);
+}
+
+/// Admit a filesystem-policy walk only while both dimensions of its work are
+/// bounded.  `ancestor_bytes` is the sum of the ancestor path lengths that a
+/// caller would copy, not merely the length of the final path.
+pub open spec fn policy_path_work_spec(
+    components: u64,
+    ancestor_bytes: u64,
+    max_components: u64,
+    max_ancestor_bytes: u64,
+) -> bool {
+    components <= max_components && ancestor_bytes <= max_ancestor_bytes
+}
+
+pub fn policy_path_work_admit(
+    components: u64,
+    ancestor_bytes: u64,
+    max_components: u64,
+    max_ancestor_bytes: u64,
+) -> (ok: bool)
+    ensures ok == policy_path_work_spec(
+        components,
+        ancestor_bytes,
+        max_components,
+        max_ancestor_bytes,
+    ),
+{
+    components <= max_components && ancestor_bytes <= max_ancestor_bytes
 }
 
 

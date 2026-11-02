@@ -2818,6 +2818,9 @@ pub struct Config {
     /// Conservative startup-compiled proof bit used before body ingestion.
     /// False means no configured route can consume request body bytes.
     pub(crate) body_handlers_possible: bool,
+    /// Conservative startup-compiled bit for CGI/PATH_INFO dispatch.  False
+    /// means a missing static path must not trigger any script-prefix probes.
+    pub(crate) cgi_path_info_possible: bool,
     pub document_root: PathBuf,
     pub default_charset: Option<String>,
     pub use_canonical_name: bool,
@@ -2882,6 +2885,54 @@ impl Config {
                     || scope_may_consume(&vhost.delta)
                     || rules_may_consume(&vhost.rules)
             })
+    }
+
+    fn compute_cgi_path_info_possible(&self) -> bool {
+        if !self.capability_enabled(Capability::Cgi) {
+            return false;
+        }
+        fn scope_may_dispatch_cgi(scope: &Scope) -> bool {
+            scope
+                .mapping_policy
+                .aliases
+                .iter()
+                .any(|alias| alias.script)
+                || scope.effective_options().contains(Options::EXEC_CGI)
+                || scope.mapping_policy.handlers.iter().any(|handler| {
+                    !handler.remove && handler.handler.eq_ignore_ascii_case("cgi-script")
+                })
+                || scope
+                    .mapping_policy
+                    .set_handler
+                    .as_ref()
+                    .and_then(SetHandler::name)
+                    .is_some_and(|handler| handler.eq_ignore_ascii_case("cgi-script"))
+                || scope.rewrite_policy.rewrite_rules.iter().any(|rule| {
+                    rule.flags
+                        .handler
+                        .as_deref()
+                        .is_some_and(|handler| handler.eq_ignore_ascii_case("cgi-script"))
+                })
+        }
+        fn rules_may_dispatch_cgi(rules: &[ScopeRule]) -> bool {
+            rules.iter().any(|rule| {
+                scope_may_dispatch_cgi(&rule.delta) || rules_may_dispatch_cgi(&rule.nested)
+            })
+        }
+        // An access file can introduce Options/AddHandler/SetHandler at
+        // request time, so any enabled override remains conservatively true.
+        self.override_enabled
+            || scope_may_dispatch_cgi(&self.global)
+            || rules_may_dispatch_cgi(&self.global_rules)
+            || self.vhosts.iter().any(|vhost| {
+                scope_may_dispatch_cgi(&vhost.scope)
+                    || scope_may_dispatch_cgi(&vhost.delta)
+                    || rules_may_dispatch_cgi(&vhost.rules)
+            })
+    }
+
+    pub(crate) fn cgi_path_info_possible(&self) -> bool {
+        self.cgi_path_info_possible
     }
 
     /// Reject directives whose startup effects cannot be changed by swapping
@@ -3112,6 +3163,7 @@ impl Config {
                 c.override_prefixes = prefixes;
                 c.override_anywhere = anywhere;
                 c.body_handlers_possible = c.compute_body_handlers_possible();
+                c.cgi_path_info_possible = c.compute_cgi_path_info_possible();
                 Ok(c)
             }
             Err(e) => Err(vec![e]),
@@ -4566,6 +4618,7 @@ impl Compile {
             override_prefixes: Vec::new(),
             override_anywhere: false,
             body_handlers_possible: false,
+            cgi_path_info_possible: false,
             document_root: server_root.join("htdocs"),
             default_charset: None,
             use_canonical_name: false,
@@ -12553,6 +12606,22 @@ ServerName localhost\n\
         )
         .unwrap();
         assert!(c.has_cgi());
+
+        let c = load_text(
+            "Listen 127.0.0.1:0\n<Directory /srv>\n<Files *.run>\nSetHandler cgi-script\n</Files>\n</Directory>\n",
+            false,
+        )
+        .unwrap();
+        assert!(c.has_cgi());
+
+        // Access files are request-time configuration and can introduce CGI
+        // handlers, so the startup gate must stay conservatively enabled.
+        let c = load_text(
+            "Listen 127.0.0.1:0\n<Directory /srv>\nAllowOverride FileInfo\n</Directory>\n",
+            false,
+        )
+        .unwrap();
+        assert!(c.has_cgi());
     }
 
     #[test]
@@ -15736,23 +15805,7 @@ impl Config {
     /// True when the compiled configuration can dispatch a CGI request.
     /// Used to avoid starting CGI worker processes for static-only servers.
     pub fn has_cgi(&self) -> bool {
-        if !self.capability_enabled(Capability::Cgi) {
-            return false;
-        }
-        fn scope_has_cgi(s: &Scope) -> bool {
-            s.mapping_policy.aliases.iter().any(|a| a.script)
-                || s.effective_options().contains(Options::EXEC_CGI)
-                || s.mapping_policy
-                    .handlers
-                    .iter()
-                    .any(|h| h.handler.eq_ignore_ascii_case("cgi-script"))
-        }
-        scope_has_cgi(&self.global)
-            || self.global_rules.iter().any(|r| scope_has_cgi(&r.delta))
-            || self
-                .vhosts
-                .iter()
-                .any(|v| scope_has_cgi(&v.scope) || v.rules.iter().any(|r| scope_has_cgi(&r.delta)))
+        self.cgi_path_info_possible
     }
 
     fn override_scan(&self) -> bool {

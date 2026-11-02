@@ -68,7 +68,7 @@ pub struct ScriptTarget {
 /// Find the executable prefix of a mapped path, splitting `PATH_INFO` the way
 /// Apache's mod_cgi does when the trailing path does not exist.
 pub fn find_script(root: &Path, rel: &Path, follow: bool) -> Option<ScriptTarget> {
-    find_script_checked(root, rel, follow, false)
+    find_script_checked_inner(root, rel, follow, false, None)
 }
 
 pub fn find_script_checked(
@@ -77,11 +77,47 @@ pub fn find_script_checked(
     follow: bool,
     owner_match_only: bool,
 ) -> Option<ScriptTarget> {
+    find_script_checked_inner(root, rel, follow, owner_match_only, None)
+}
+
+pub(crate) fn find_script_checked_for_request(
+    root: &Path,
+    rel: &Path,
+    follow: bool,
+    owner_match_only: bool,
+    req: &Request,
+) -> Option<ScriptTarget> {
+    find_script_checked_inner(root, rel, follow, owner_match_only, Some(req))
+}
+
+fn find_script_checked_inner(
+    root: &Path,
+    rel: &Path,
+    follow: bool,
+    owner_match_only: bool,
+    req: Option<&Request>,
+) -> Option<ScriptTarget> {
     let comps: Vec<&std::ffi::OsStr> = rel.iter().collect();
-    for n in (1..=comps.len()).rev() {
-        let mut prefix = PathBuf::new();
-        for c in &comps[..n] {
-            prefix.push(c);
+    if comps.len() > crate::util::MAX_POLICY_PATH_COMPONENTS {
+        if let Some(req) = req {
+            let _ = req.charge_policy_work(u64::MAX);
+        }
+        return None;
+    }
+    // Mutate one buffer while shortening it instead of rebuilding every
+    // prefix.  Kernel probes are additionally charged by prefix length, so
+    // CGI-enabled configurations retain a request-local bound even when most
+    // of the candidate prefixes do not exist.
+    let mut prefix = rel.to_path_buf();
+    let mut n = comps.len();
+    while n > 0 {
+        if req.is_some_and(|req| {
+            req.charge_policy_work(
+                (prefix.as_os_str().as_encoded_bytes().len() as u64).saturating_add(1),
+            )
+            .is_err()
+        }) {
+            return None;
         }
         if let crate::files::Target::File { file, meta, .. } =
             crate::files::resolve_target_checked(root, &prefix, follow, owner_match_only)
@@ -102,6 +138,8 @@ pub fn find_script_checked(
                 },
             });
         }
+        prefix.pop();
+        n -= 1;
     }
     None
 }
@@ -1933,6 +1971,30 @@ mod tests {
                 .any(|(name, value)| name == "CONTENT_TYPE"
                     && value.to_string_lossy() == "text/plain")
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn script_prefix_search_is_component_and_request_work_bounded() {
+        let dir = tempdir("prefix-budget");
+        let mut deep = PathBuf::new();
+        for _ in 0..=crate::util::MAX_POLICY_PATH_COMPONENTS {
+            deep.push("x");
+        }
+        assert!(find_script_checked(&dir, &deep, false, false).is_none());
+
+        let req = request("/missing/path", Vec::new());
+        req.charge_policy_work(crate::resource::MAX_POLICY_WORK_UNITS)
+            .unwrap();
+        assert!(find_script_checked_for_request(
+            &dir,
+            Path::new("missing/path"),
+            false,
+            false,
+            &req,
+        )
+        .is_none());
+        assert!(req.policy_budget_failed());
         let _ = fs::remove_dir_all(&dir);
     }
 

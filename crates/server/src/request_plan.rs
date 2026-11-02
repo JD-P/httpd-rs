@@ -99,6 +99,9 @@ pub enum PlanError {
     Unmapped,
     /// An access file exists but could not be read or parsed.
     AccessFiles(String),
+    /// The mapped filesystem path would make request-time policy evaluation
+    /// exceed its fixed component or ancestor-copy budget.
+    PolicyLimit(String),
 }
 
 /// Identity of one access-file layer.
@@ -320,6 +323,15 @@ impl RequestPlan {
         script_alias: bool,
         req: Option<&Request>,
     ) -> Result<Self, PlanError> {
+        // Enforce this before checking whether `.htaccess` happens to apply.
+        // Main-config Directory/Files evaluation walks the same ancestors and
+        // rewrites may expand a short client target into a much deeper path.
+        let policy_walk_start = if crate::files::is_dir_cached(&fs_path) {
+            fs_path.as_path()
+        } else {
+            fs_path.parent().unwrap_or(fs_path.as_path())
+        };
+        crate::util::validate_policy_path(policy_walk_start).map_err(PlanError::PolicyLimit)?;
         // Paths participate in routing, access-file selection, rewrite
         // subjects and CGI identity.  Reject a filesystem identity that
         // cannot be represented exactly instead of projecting it through
@@ -676,6 +688,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, PlanError::AccessFiles(message) if message.contains("non-UTF-8")));
+    }
+
+    #[test]
+    fn filesystem_policy_paths_have_a_universal_component_bound() {
+        let cfg = load_config("Listen 127.0.0.1:0\n");
+        let root = PathBuf::from("/srv/www");
+        let mut rel = PathBuf::new();
+        for _ in 0..crate::util::MAX_POLICY_PATH_COMPONENTS {
+            rel.push("x");
+        }
+        let error = RequestPlan::build_with_fs_path(
+            &cfg,
+            None,
+            CanonicalTarget::from_url_path("/file.txt").unwrap(),
+            root.clone(),
+            rel.clone(),
+            root.join(rel),
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PlanError::PolicyLimit(message) if message.contains("too many")));
     }
 
     #[test]

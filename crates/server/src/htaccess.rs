@@ -26,8 +26,6 @@ const MAX_ACCESS_SECTION_DEPTH: usize = 64;
 const MAX_ACCESS_INSTRUCTIONS_PER_FILE: usize = 8192;
 const MAX_ACCESS_INSTRUCTIONS_PER_REQUEST: usize = 16_384;
 const MAX_ACCESS_LAYERS: usize = 64;
-const MAX_ACCESS_PATH_COMPONENTS: usize = 256;
-const MAX_ACCESS_ANCESTOR_BYTES: usize = 512 * 1024;
 
 pub fn apply(
     cfg: &Config,
@@ -303,31 +301,7 @@ fn walk_start(fs_path: &Path) -> &Path {
 /// Access-file authorization is directory-based, so this list is independent
 /// of `DocumentRoot` and of any alias root (F50).
 fn ancestor_dirs(start: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut cur = Some(start);
-    let mut copied = 0usize;
-    while let Some(d) = cur {
-        if dirs.len() >= MAX_ACCESS_PATH_COMPONENTS {
-            return Err("access-file path has too many ancestor components".into());
-        }
-        copied = copied
-            .checked_add(d.as_os_str().as_encoded_bytes().len())
-            .ok_or_else(|| "access-file ancestor work overflow".to_string())?;
-        if copied > MAX_ACCESS_ANCESTOR_BYTES {
-            return Err("access-file ancestor work limit exceeded".into());
-        }
-        dirs.push(d.to_path_buf());
-        let Some(parent) = d.parent() else {
-            break;
-        };
-        cur = Some(parent);
-    }
-    // The parent walk already produces leaf-to-root order; reversing is
-    // equivalent to sorting by component count for normal absolute paths and
-    // avoids repeated `Path::components` parsing on every request.
-    dirs.reverse();
-    dirs.dedup();
-    Ok(dirs)
+    crate::util::bounded_policy_ancestor_dirs(start)
 }
 
 /// Fallback mapping root used only for URL/`RewriteBase` derivation when a
@@ -3131,7 +3105,7 @@ mod tests {
     #[test]
     fn ancestor_walk_rejects_path_copy_amplification() {
         let mut path = PathBuf::from("/");
-        for _ in 0..MAX_ACCESS_PATH_COMPONENTS {
+        for _ in 0..crate::util::MAX_POLICY_PATH_COMPONENTS {
             path.push("x");
         }
         assert!(ancestor_dirs(&path).is_err());

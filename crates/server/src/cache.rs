@@ -624,7 +624,12 @@ pub fn request_scope_with_plan(
             .effective_options()
             .contains(crate::config::Options::SYMLINKS_IF_OWNER_MATCH);
     let follow = follow_symlinks || owner_match_only;
-    if let Some(st) = crate::cgi::find_script_checked(&root, &rel, follow, owner_match_only) {
+    let script_target = if cfg.cgi_path_info_possible() {
+        crate::cgi::find_script_checked_for_request(&root, &rel, follow, owner_match_only, req)
+    } else {
+        None
+    };
+    if let Some(st) = script_target {
         if !st.path_info.is_empty() {
             let script_base = st
                 .rel_script

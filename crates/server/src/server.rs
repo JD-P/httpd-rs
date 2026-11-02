@@ -2299,7 +2299,8 @@ fn evaluate_scope_identities_for_path(
         // from_fs_target() never performs URL mapping, so only AccessFiles
         // can occur here.
         crate::request_plan::PlanError::Unmapped => "target has no URL mapping".to_string(), // coverage:ignore-line
-        crate::request_plan::PlanError::AccessFiles(e) => e,
+        crate::request_plan::PlanError::AccessFiles(e)
+        | crate::request_plan::PlanError::PolicyLimit(e) => e,
     })?;
     let evaluated = plan.evaluate_scope(cfg, vhost, req, peer);
     let handler_scope = lexical_handler_path.map(|lexical_path| {
@@ -2886,6 +2887,21 @@ fn dispatch_inner(
                         local_ip,
                     );
                 }
+                Err(crate::request_plan::PlanError::PolicyLimit(e)) => {
+                    eprintln!("vapached: request policy path limit: {e}");
+                    return error_response(
+                        cfg,
+                        vhost,
+                        base_scope,
+                        414,
+                        req,
+                        &String::from_utf8_lossy(&req.raw_path),
+                        local_port,
+                        &server_name,
+                        peer.ip(),
+                        local_ip,
+                    );
+                }
             }
         }
     };
@@ -3311,6 +3327,21 @@ fn dispatch_inner(
                             vhost,
                             base_scope,
                             500,
+                            owned_req.as_ref().unwrap_or(req),
+                            &url_path,
+                            local_port,
+                            &server_name,
+                            peer.ip(),
+                            local_ip,
+                        );
+                    }
+                    Err(crate::request_plan::PlanError::PolicyLimit(e)) => {
+                        eprintln!("vapached: rewritten policy path limit: {e}");
+                        return error_response(
+                            cfg,
+                            vhost,
+                            base_scope,
+                            414,
                             owned_req.as_ref().unwrap_or(req),
                             &url_path,
                             local_port,
@@ -4099,7 +4130,12 @@ fn dispatch_inner(
             // is only executable when `protected.sh` itself is configured as a
             // CGI script.  Policy is then re-evaluated for the actual script
             // path before the script inode is executed.
-            if let Some(st) = cgi::find_script_checked(&root, &rel, follow, owner_match_only) {
+            let script_target = if cfg.cgi_path_info_possible() {
+                cgi::find_script_checked_for_request(&root, &rel, follow, owner_match_only, req)
+            } else {
+                None
+            };
+            if let Some(st) = script_target {
                 let lexical_script = root.join(&st.rel_script);
                 let Some(actual_path) = crate::files::fd_path_cow(&st.file, &lexical_script) else {
                     return error_response(
@@ -6006,6 +6042,44 @@ mod tests {
     fn cov_dispatch(cfg: &Config, method: &str, path: &str) -> Response {
         let req = cov_req(method, path);
         dispatch(cfg, &req, cov_peer(), "127.0.0.1", 80)
+    }
+
+    #[test]
+    fn deep_static_policy_paths_return_414_without_harming_dispatch() {
+        let dir = cov_dir("p29-deep-static-path");
+        std::fs::write(dir.join("www/ok.txt"), "ok\n").unwrap();
+        let cfg = cov_config(&dir, "");
+        assert!(!cfg.cgi_path_info_possible());
+        let deep = format!("/{}missing", "x/".repeat(300));
+        assert_eq!(cov_dispatch(&cfg, "GET", &deep).status, 414);
+        assert_eq!(cov_dispatch(&cfg, "GET", "/ok.txt").status, 200);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn access_file_rewrite_cannot_expand_into_an_unbounded_policy_walk() {
+        let dir = cov_dir("p29-rewrite-path");
+        std::fs::create_dir(dir.join("www/rw")).unwrap();
+        std::fs::write(dir.join("www/ok.txt"), "ok\n").unwrap();
+        std::fs::write(
+            dir.join("www/rw/.htaccess"),
+            format!(
+                "RewriteEngine On\nRewriteRule ^(.*)$ /x/{} [L]\n",
+                "$1".repeat(80)
+            ),
+        )
+        .unwrap();
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "<Directory \"{}/www/rw\">\nAllowOverride FileInfo\nRequire all granted\n</Directory>\n",
+                dir.display()
+            ),
+        );
+        let attack = format!("/rw/{}a", "a/".repeat(250));
+        assert_eq!(cov_dispatch(&cfg, "GET", &attack).status, 414);
+        assert_eq!(cov_dispatch(&cfg, "GET", "/ok.txt").status, 200);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

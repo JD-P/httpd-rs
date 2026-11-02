@@ -5,6 +5,7 @@
 //! written.
 
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Maximum pathname/URI-like value produced by a regex-backed configuration
@@ -12,6 +13,73 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// multiplying a bounded request target into an unbounded allocation.
 pub const MAX_CAPTURE_EXPANSION_BYTES: usize = 64 * 1024;
 const MAX_CAPTURE_GROUPS: usize = 128;
+
+/// Shared bound for every filesystem path that enters the configuration
+/// policy evaluator.  This applies even when `.htaccess` is disabled: config
+/// `<Directory>`/`<Files>` processing still constructs one entry per ancestor.
+pub(crate) const MAX_POLICY_PATH_COMPONENTS: usize = 256;
+/// Bound the sum of copied ancestor-prefix lengths, rather than only the final
+/// pathname.  A many-component path otherwise turns a small request target
+/// into quadratic allocation/copy work.
+pub(crate) const MAX_POLICY_ANCESTOR_BYTES: usize = 512 * 1024;
+
+fn next_policy_ancestor_work(
+    path: &Path,
+    components: usize,
+    copied: usize,
+) -> Result<(usize, usize), String> {
+    let components = components
+        .checked_add(1)
+        .ok_or_else(|| "filesystem policy path component count overflow".to_string())?;
+    let copied = copied
+        .checked_add(path.as_os_str().as_encoded_bytes().len())
+        .ok_or_else(|| "filesystem policy ancestor work overflow".to_string())?;
+    if !vapache_verified::policy_path_work_admit(
+        components as u64,
+        copied as u64,
+        MAX_POLICY_PATH_COMPONENTS as u64,
+        MAX_POLICY_ANCESTOR_BYTES as u64,
+    ) {
+        return Err(if components > MAX_POLICY_PATH_COMPONENTS {
+            "filesystem policy path has too many ancestor components".into()
+        } else {
+            "filesystem policy ancestor work limit exceeded".into()
+        });
+    }
+    Ok((components, copied))
+}
+
+/// Validate the amount of ancestor work before any policy evaluator allocates
+/// its directory vectors.  Rewrites and explicit filesystem targets pass this
+/// boundary just like ordinary URL mappings.
+pub(crate) fn validate_policy_path(path: &Path) -> Result<(), String> {
+    let mut components = 0usize;
+    let mut copied = 0usize;
+    let mut current = Some(path);
+    while let Some(ancestor) = current {
+        (components, copied) = next_policy_ancestor_work(ancestor, components, copied)?;
+        current = ancestor.parent();
+    }
+    Ok(())
+}
+
+/// Return every ancestor root-to-leaf after enforcing the shared policy-work
+/// bound.  This is the only ancestor-vector constructor used by request-time
+/// configuration and access-file evaluation.
+pub(crate) fn bounded_policy_ancestor_dirs(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut dirs = Vec::new();
+    let mut components = 0usize;
+    let mut copied = 0usize;
+    let mut current = Some(path);
+    while let Some(ancestor) = current {
+        (components, copied) = next_policy_ancestor_work(ancestor, components, copied)?;
+        dirs.push(ancestor.to_path_buf());
+        current = ancestor.parent();
+    }
+    dirs.reverse();
+    dirs.dedup();
+    Ok(dirs)
+}
 
 pub fn expand_regex_captures(
     template: &str,
