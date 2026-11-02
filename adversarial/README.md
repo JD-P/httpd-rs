@@ -54,7 +54,10 @@ prevents re-deriving them from scratch.
 | `p28/exploit_p28.py` | Pass-28 upload-access evaluator battery (8 verdicts): A1–A3 `RewriteRule $1`-repetition growth to 1.07 GB RSS in 6 s and `memory allocation of N bytes failed` under `RLIMIT_AS` (Apache `403`, 1.9 MB); B1–B3 `Require expr` header/`file()` expansion to >500 MB with allocator abort (Apache `500`, flat); C1–C2 27 KB/90 KB `.htaccess` section nesting stack-overflow aborts (Apache `200`, alive). Loopback only; fixtures under `/tmp/opencode/p28-harness` |
 | `findings_p28.md` | Pass-28 write-ups (P28-A/B/C): unbounded rewrite substitution growth, expression value expansion and access-file section nesting |
 | `p29/exploit_p29.py` | Pass-29 availability battery (5 verdicts): a 518-byte request plus an attacker-written `.htaccess` rewrite expands to a ~20,000-component internal target and aborts the process in the recursive verified ancestor-plan kernel (Apache `500`, alive); the same kernel is reachable from a static config with `LimitRequestLine ≥ ~38 KiB`; and `find_script_checked` burns ~39 ms of CPU per maximum-length 404 (~260× Apache, saturating 7.7/8 cores from one address). Loopback only; fixtures under `/tmp/opencode/p29-harness` |
+| `p30/exploit_p30.py` | Pass-30 availability battery (8 verdicts): 32 stalled >64 KiB responses from a single source address hold all 32 process-wide blocking-read leases for the full `Timeout` (default 60 s) so every >64 KiB response is `503 Response memory capacity is temporarily exhausted` (48/48 victim probes at default `Timeout`), the denial survives a holder refresh cycle at t≈62 s, small responses and recovery controls pass, and Apache `mpm_event` serves the identical victims `200`. Loopback only; fixtures under `/tmp/opencode/p30-harness` when `--keep` is given |
+| `p30/exploit_p30_h2.py` | Pass-30 cross-protocol battery (4 verdicts): 32 stalled HTTP/1 responses on the cleartext listener hold the shared blocking-lease counter, so every HTTP/2 request on the TLS listener (even a 3-byte file) returns `:status: 503` before dispatch and recovers after release. Needs `nghttp`; fixtures under `/tmp/opencode/p30-h2-harness` |
 | `findings_p29.md` | Pass-29 write-ups (P29-A/A′/B): recursive ancestor-plan stack overflow (whole-process abort) and the quadratic 404 PATH_INFO prefix walk (CPU exhaustion at default configuration) |
+| `findings_p30.md` | Pass-30 write-up (P30-A/A′): one HTTP/1 client exhausts the 32 process-wide blocking-I/O leases with stalled >64 KiB requests, denying every >64 KiB response process-wide and all HTTP/2 requests through the shared dispatch lease |
 | `dos-resource-budget-followup.md` | Post-P28 DoS review: CVE-2011-4415-style `SetEnvIf` amplification, request-wide matcher/policy work and expansion budgets, access-program breadth limits, and generated-response-header admission |
 | `dos-connection-admission-followup.md` | Post-P28 connection DoS follow-up: asynchronous first-head admission, H2 preface deadline, worker/source reserves, fair listener batches, and complete control-frame charging |
 
@@ -466,3 +469,35 @@ spends ~39 ms of CPU per request (Apache ~0.15 ms) and 16 connections from
 the identical traffic at ~10,000 rps using 1.3 cores.  Loopback only;
 fixtures and per-server logs are kept under `/tmp/opencode/p29-harness`
 when `--keep` is given.
+
+## Running the pass-30 battery
+
+```sh
+cargo build --release -p vapached
+python3 adversarial/p30/exploit_p30.py            # both groups (8 verdicts)
+python3 adversarial/p30/exploit_p30.py A          # vapache stall attack
+python3 adversarial/p30/exploit_p30.py B          # Apache mpm_event oracle
+python3 adversarial/p30/exploit_p30.py --keep     # retain fixtures and logs
+python3 adversarial/p30/exploit_p30_h2.py         # cross-protocol HTTP/1 -> HTTP/2
+```
+
+**P30-A** runs both servers on the static `bench/bench.py` shape with the
+default `Timeout 60`.  Thirty-two connections from a single source address
+(`127.0.0.2`) request `/big.bin` (4 MiB), read only the response head and
+never read the body.  All 32 process-wide blocking-read leases stay occupied
+for the full `Timeout`, and every victim probe for a >64 KiB object
+(`/big.bin`, `/medium.bin` 100 KiB) returns
+`503 Response memory capacity is temporarily exhausted`, while `/small.txt`
+(3 bytes) still returns `200`.  The holders reissue after ~50 s and the
+denial survives the refresh cycle (t≈62 s probe); closing them restores
+`200` immediately.  Apache `mpm_event` serves every identical victim probe
+`200` with the full body.  `--keep` retains the tree under
+`/tmp/opencode/p30-harness`.
+
+**P30-A′** (`exploit_p30_h2.py`) runs a cleartext listener and a TLS/h2
+listener in one process.  While the 32 HTTP/1 stalls are held, every HTTP/2
+request -- even `small.txt` -- returns `:status: 503`
+("request execution capacity exhausted") because `h2::handle_stream` takes
+the same lease for request dispatch; HTTP/2 service recovers when the stalls
+close.  Needs `nghttp` (`nghttp2-client`); fixtures under
+`/tmp/opencode/p30-h2-harness`.
