@@ -41,6 +41,7 @@ struct ProxyBodyCollector {
     resident: Option<crate::resource::ResidentLease>,
     len: usize,
     budget: Arc<crate::resource::ResourceBudget>,
+    context: crate::resource::ResourceContext,
     max_spool_bytes: u64,
     max_spool_files: u64,
 }
@@ -48,6 +49,7 @@ struct ProxyBodyCollector {
 impl ProxyBodyCollector {
     fn new(
         budget: Arc<crate::resource::ResourceBudget>,
+        context: crate::resource::ResourceContext,
         max_spool_bytes: u64,
         max_spool_files: u64,
     ) -> std::io::Result<Self> {
@@ -55,9 +57,10 @@ impl ProxyBodyCollector {
             memory: Vec::new(),
             file: None,
             lease: None,
-            resident: Some(budget.try_response_bytes()?),
+            resident: Some(budget.try_response_bytes_in(&context)?),
             len: 0,
             budget,
+            context,
             max_spool_bytes,
             max_spool_files,
         })
@@ -81,9 +84,11 @@ impl ProxyBodyCollector {
             return Ok(());
         }
         if self.file.is_none() {
-            let mut lease = self
-                .budget
-                .try_spool(self.max_spool_bytes, self.max_spool_files)?;
+            let mut lease = self.budget.try_spool_in(
+                self.max_spool_bytes,
+                self.max_spool_files,
+                &self.context,
+            )?;
             lease.reserve(next as u64)?;
             let mut file = crate::http::spool_file()?;
             file.write_all(&self.memory)?;
@@ -2190,7 +2195,7 @@ fn proxy_once(
     proxy_once_budgeted(
         stream,
         budget,
-        crate::resource::MAX_RESPONSE_RESIDENT_BYTES,
+        (MAX_PROXY_BODY as u64 + 1).saturating_mul(4),
         32,
         target,
         req,
@@ -2216,6 +2221,25 @@ fn proxy_once_budgeted(
     https: bool,
     host: &str,
 ) -> std::io::Result<(Response, Option<Box<dyn ReadWrite>>)> {
+    #[cfg(any(test, feature = "fuzzing"))]
+    let fallback_context;
+    let resource_context = match req.resource_context() {
+        Some(context) => context,
+        None => {
+            #[cfg(any(test, feature = "fuzzing"))]
+            {
+                fallback_context = resource_budget.context(peer.ip());
+                &fallback_context
+            }
+            #[cfg(not(any(test, feature = "fuzzing")))]
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "proxy request has no resource scope",
+                ));
+            }
+        }
+    };
     if !proxy_path_identity_safe(&target.path, &target.path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -2466,6 +2490,7 @@ fn proxy_once_budgeted(
         if chunked {
             let mut collector = ProxyBodyCollector::new(
                 Arc::clone(resource_budget),
+                resource_context.clone(),
                 max_spool_bytes,
                 max_spool_files,
             )?;
@@ -2475,7 +2500,7 @@ fn proxy_once_budgeted(
             spool_lease = lease;
             response_resident = resident;
         } else if let Some(n) = content_length {
-            let mut resident = resource_budget.try_response_bytes()?;
+            let mut resident = resource_budget.try_response_bytes_in(resource_context)?;
             resident.reserve(n as u64)?;
             body.resize(n, 0);
             reader.read_exact(&mut body)?;
@@ -2483,6 +2508,7 @@ fn proxy_once_budgeted(
         } else {
             let mut collector = ProxyBodyCollector::new(
                 Arc::clone(resource_budget),
+                resource_context.clone(),
                 max_spool_bytes,
                 max_spool_files,
             )?;
@@ -2751,7 +2777,36 @@ pub fn execute(
             local_ip,
         );
     }
-    let Ok(_dynamic_lease) = cfg.resource_budget.try_dynamic(cfg.max_dynamic_requests) else {
+    #[cfg(test)]
+    let fallback_context;
+    let resource_context = match req.resource_context() {
+        Some(context) => context,
+        #[cfg(test)]
+        None => {
+            fallback_context = cfg.resource_budget.context(peer.ip());
+            &fallback_context
+        }
+        #[cfg(not(test))]
+        None => {
+            return crate::files::error_response(
+                cfg,
+                vhost,
+                scope,
+                503,
+                req,
+                url_path,
+                local_port,
+                host,
+                peer.ip(),
+                local_ip,
+            );
+        }
+    };
+    let Ok(_dynamic_lease) = cfg.resource_budget.try_dynamic_descriptors_in(
+        resource_context,
+        cfg.max_dynamic_requests,
+        1,
+    ) else {
         return crate::files::error_response(
             cfg,
             vhost,

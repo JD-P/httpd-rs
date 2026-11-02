@@ -1523,7 +1523,7 @@ fn serve_directory_inner(
                 port,
             )
         }
-        DirAction::List(entries) => autoindex(cfg, scope, url_path, &entries, host, port),
+        DirAction::List(entries) => autoindex(cfg, scope, req, url_path, &entries, host, port),
         DirAction::Overloaded => Response::bytes(
             503,
             "text/html; charset=UTF-8",
@@ -1582,6 +1582,7 @@ pub fn serve_directory(
 fn autoindex(
     cfg: &Config,
     scope: &Scope,
+    req: &Request,
     url_path: &str,
     entries: &[(Vec<u8>, bool, u64)],
     host: &str,
@@ -1611,7 +1612,27 @@ fn autoindex(
             b"Directory listing capacity is temporarily exhausted\n".to_vec(),
         );
     };
-    let Ok(mut resident) = cfg.resource_budget.try_response_bytes() else {
+    #[cfg(test)]
+    let fallback_context;
+    let resource_context = match req.resource_context() {
+        Some(context) => context,
+        #[cfg(test)]
+        None => {
+            fallback_context = cfg
+                .resource_budget
+                .context(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            &fallback_context
+        }
+        #[cfg(not(test))]
+        None => {
+            return Response::bytes(
+                503,
+                "text/html; charset=UTF-8",
+                b"Directory listing capacity is temporarily exhausted\n".to_vec(),
+            );
+        }
+    };
+    let Ok(mut resident) = cfg.resource_budget.try_response_bytes_in(resource_context) else {
         return Response::bytes(
             503,
             "text/html; charset=UTF-8",
@@ -2579,6 +2600,7 @@ mod tests {
         let listed = autoindex(
             &cfg,
             &scope,
+            &request("GET", b"/dir/"),
             "/dir/",
             &[(b"child".to_vec(), true, 0), (b"file".to_vec(), false, 7)],
             "example.test",
@@ -2587,7 +2609,16 @@ mod tests {
         assert_eq!(listed.status, 200);
         let too_many = vec![(b"entry".to_vec(), false, 1); MAX_AUTOINDEX_ENTRIES + 1];
         assert_eq!(
-            autoindex(&cfg, &scope, "/dir/", &too_many, "example.test", 8080,).status,
+            autoindex(
+                &cfg,
+                &scope,
+                &request("GET", b"/dir/"),
+                "/dir/",
+                &too_many,
+                "example.test",
+                8080,
+            )
+            .status,
             503
         );
 

@@ -322,11 +322,30 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
 }
 
 pub fn execute(ctx: &CgiContext) -> Response {
-    let _dynamic_lease = match ctx
-        .cfg
-        .resource_budget
-        .try_dynamic(ctx.cfg.max_dynamic_requests)
-    {
+    #[cfg(test)]
+    let fallback_context;
+    let resource_context = match ctx.req.resource_context() {
+        Some(context) => context,
+        #[cfg(test)]
+        None => {
+            fallback_context = ctx.cfg.resource_budget.context(
+                ctx.remote_ip
+                    .parse()
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            );
+            &fallback_context
+        }
+        #[cfg(not(test))]
+        None => {
+            eprintln!("vapached: CGI request has no resource scope");
+            return cgi_status_error(ctx, 503);
+        }
+    };
+    let _dynamic_lease = match ctx.cfg.resource_budget.try_dynamic_descriptors_in(
+        resource_context,
+        ctx.cfg.max_dynamic_requests,
+        4,
+    ) {
         Ok(lease) => lease,
         Err(e) => {
             eprintln!("vapached: CGI admission failed: {e}");
@@ -377,14 +396,25 @@ pub fn execute(ctx: &CgiContext) -> Response {
         path.as_path()
     };
     if let Some(pool) = POOL.get() {
-        if let Some(resp) =
-            execute_via_pool(pool, ctx, worker_path, &cwd, &env, &body, worker_identity)
-        {
+        if let Some(resp) = execute_via_pool(
+            pool,
+            ctx,
+            worker_path,
+            &cwd,
+            &env,
+            &body,
+            worker_identity,
+            resource_context,
+        ) {
             return resp;
         }
     }
 
-    let mut response_lease = match ctx.cfg.resource_budget.try_response_bytes() {
+    let mut response_lease = match ctx
+        .cfg
+        .resource_budget
+        .try_response_bytes_in(resource_context)
+    {
         Ok(lease) => lease,
         Err(_) => return cgi_status_error(ctx, 503),
     };
@@ -434,14 +464,15 @@ fn execute_via_pool(
     env: &[(OsString, OsString)],
     body: &BodySource,
     expected: Option<(u64, u64)>,
+    resource_context: &crate::resource::ResourceContext,
 ) -> Option<Response> {
     let _worker_spool_lease = match body {
         BodySource::File(_) => {
-            let mut lease = match ctx
-                .cfg
-                .resource_budget
-                .try_spool(ctx.cfg.max_spool_bytes, ctx.cfg.max_spool_files)
-            {
+            let mut lease = match ctx.cfg.resource_budget.try_spool_in(
+                ctx.cfg.max_spool_bytes,
+                ctx.cfg.max_spool_files,
+                resource_context,
+            ) {
                 Ok(lease) => lease,
                 Err(e) => {
                     eprintln!("vapached: CGI worker spool admission failed: {e}");
@@ -457,7 +488,11 @@ fn execute_via_pool(
         BodySource::Bytes(_) => None,
     };
     let mut worker = pool.take()?;
-    let mut response_lease = match ctx.cfg.resource_budget.try_response_bytes() {
+    let mut response_lease = match ctx
+        .cfg
+        .resource_budget
+        .try_response_bytes_in(resource_context)
+    {
         Ok(lease) => lease,
         Err(_) => return Some(cgi_status_error(ctx, 503)),
     };
@@ -2275,6 +2310,7 @@ mod tests {
             ready: Condvar::new(),
             closed: AtomicBool::new(false),
         };
+        let resource_context = cfg.resource_budget.context("127.0.0.1".parse().unwrap());
         let resp = execute_via_pool(
             &pool,
             &ctx,
@@ -2283,6 +2319,7 @@ mod tests {
             &[],
             &BodySource::Bytes(Vec::new()),
             None,
+            &resource_context,
         )
         .unwrap();
         assert_eq!(resp.status, 200);
@@ -2294,6 +2331,7 @@ mod tests {
             &[],
             &BodySource::Bytes(Vec::new()),
             None,
+            &resource_context,
         )
         .unwrap();
         assert_eq!(resp.status, 500);

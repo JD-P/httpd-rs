@@ -1873,7 +1873,19 @@ pub fn store(
     let vary_star = combined_header(&response_headers_for_vary, "vary")
         .map(|v| v.split(',').any(|part| part.trim() == "*"))
         .unwrap_or(false);
-    let Ok(mut cache_resident) = cfg.resource_budget.try_response_bytes() else {
+    #[cfg(test)]
+    let fallback_context;
+    let resource_context = match req.resource_context() {
+        Some(context) => context,
+        #[cfg(test)]
+        None => {
+            fallback_context = cfg.resource_budget.context(peer);
+            &fallback_context
+        }
+        #[cfg(not(test))]
+        None => return,
+    };
+    let Ok(mut cache_resident) = cfg.resource_budget.try_response_bytes_in(resource_context) else {
         return;
     };
     let Some(body) = response_body_bytes(&mut resp.body, &mut cache_resident) else {

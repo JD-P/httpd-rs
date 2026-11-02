@@ -24,6 +24,7 @@ pub(crate) enum SlotKind {
     Websocket,
     ExpensiveCpu,
     PendingConnection,
+    H1Connection,
     RequestWorker,
     RequestBodyWorker,
     H2Connection,
@@ -33,7 +34,7 @@ pub(crate) enum SlotKind {
 }
 
 impl SlotKind {
-    const COUNT: usize = 12;
+    const COUNT: usize = 13;
 
     const fn index(self) -> usize {
         self as usize
@@ -233,17 +234,18 @@ const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
         // the reserved descriptor/task headroom. Resident charges cover
         // protocol state and conservative stack/allocator overhead that is not
         // represented by an explicit byte lease.
-        PendingConnection => [1, 1, 32 * 1024],
-        RequestWorker => [1, 1, 512 * 1024],
-        H2Connection => [1, 1, 256 * 1024],
+        PendingConnection => [0, 1, 32 * 1024],
+        H1Connection => [0, 1, 64 * 1024],
+        RequestWorker => [0, 1, 512 * 1024],
+        H2Connection => [0, 1, 256 * 1024],
         H2Stream => [0, 1, 128 * 1024],
         ResponseBodyRead => [0, 1, 64 * 1024],
         // A dynamic request may own an upstream socket or the CGI stdin/stdout/
         // stderr pipes, plus bounded helper work.
-        DynamicBackend => [4, 2, 256 * 1024],
+        DynamicBackend => [0, 2, 256 * 1024],
         Websocket => [1, 0, 64 * 1024],
         RewriteProgram => [3, 1, 128 * 1024],
-        SpoolFile => [1, 0, 0],
+        SpoolFile => [0, 0, 0],
         TlsHandshake => [0, 0, 128 * 1024],
         RequestBodyWorker | ExpensiveCpu => [0, 0, 0],
     }
@@ -284,6 +286,7 @@ pub struct RequestPolicyBudget {
     work: AtomicU64,
     expansion_bytes: AtomicU64,
     expansion_lease: Mutex<Option<ByteLease>>,
+    context: Mutex<Option<ResourceContext>>,
     failed: AtomicBool,
 }
 
@@ -293,12 +296,23 @@ impl Default for RequestPolicyBudget {
             work: AtomicU64::new(0),
             expansion_bytes: AtomicU64::new(0),
             expansion_lease: Mutex::new(None),
+            context: Mutex::new(None),
             failed: AtomicBool::new(false),
         }
     }
 }
 
 impl RequestPolicyBudget {
+    pub(crate) fn bind_context(&self, context: ResourceContext) {
+        let mut bound = self
+            .context
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if bound.is_none() {
+            *bound = Some(context);
+        }
+    }
+
     pub fn charge_work(&self, amount: u64) -> Result<(), &'static str> {
         if self.failed.load(Ordering::Acquire) {
             return Err("request policy work limit exceeded");
@@ -322,10 +336,17 @@ impl RequestPolicyBudget {
             self.failed.store(true, Ordering::Release);
             return Err("request policy expansion limit exceeded");
         }
+        let context = self
+            .context
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .or_else(current_context);
         #[cfg(test)]
-        let context = current_or_test_context();
+        let context = context.unwrap_or_else(|| current_or_test_context());
         #[cfg(not(test))]
-        let Some(context) = current_context() else {
+        let Some(context) = context
+        else {
             self.expansion_bytes.fetch_sub(amount, Ordering::AcqRel);
             self.failed.store(true, Ordering::Release);
             return Err("policy expansion has no resource context");
@@ -442,6 +463,61 @@ impl ResourceContext {
             request_limit,
             message,
         )
+    }
+}
+
+#[derive(Debug)]
+struct RequestScopeState {
+    cancelled: AtomicBool,
+}
+
+/// Explicit lifetime and cancellation authority for one externally admitted
+/// request.  Clones carried by internal rewrites share both the hierarchical
+/// resource ledger and cancellation state.
+#[derive(Clone, Debug)]
+pub struct RequestScope {
+    context: ResourceContext,
+    state: Arc<RequestScopeState>,
+}
+
+impl RequestScope {
+    pub fn new(context: ResourceContext) -> Self {
+        Self {
+            context,
+            state: Arc::new(RequestScopeState {
+                cancelled: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    pub fn context(&self) -> &ResourceContext {
+        &self.context
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn cancel(&self) {
+        self.state.cancelled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn guard(&self) -> RequestScopeGuard {
+        RequestScopeGuard {
+            scope: self.clone(),
+        }
+    }
+}
+
+/// Cancels child work on every request exit, including parse/dispatch/write
+/// errors. Resource leases remain ordinary RAII values owned by the request.
+pub(crate) struct RequestScopeGuard {
+    scope: RequestScope,
+}
+
+impl Drop for RequestScopeGuard {
+    fn drop(&mut self) {
+        self.scope.cancel();
     }
 }
 
@@ -583,6 +659,23 @@ fn try_add_counter<C: BudgetCounter>(counter: &C, amount: u64, limit: u64) -> bo
             Ok(_) => return true,
             Err(observed) => current = observed,
         }
+    }
+}
+
+/// Exact ownership permit for one open descriptor.  Slot weights describe
+/// scheduler and memory pressure; descriptors are charged at the point the
+/// kernel object is actually acquired so ownership transfers cannot double
+/// count (or silently omit) the same socket/file.
+#[derive(Debug)]
+pub(crate) struct DescriptorLease {
+    budget: Arc<ResourceBudget>,
+    amount: u64,
+}
+
+impl Drop for DescriptorLease {
+    fn drop(&mut self) {
+        self.budget
+            .release_physical_one(PhysicalKind::FileDescriptor, self.amount);
     }
 }
 
@@ -952,6 +1045,48 @@ impl ResourceBudget {
         )
     }
 
+    pub(crate) fn try_descriptor(self: &Arc<Self>) -> io::Result<DescriptorLease> {
+        self.try_descriptors(1)
+    }
+
+    pub(crate) fn try_descriptors(self: &Arc<Self>, amount: u64) -> io::Result<DescriptorLease> {
+        if !self.try_physical_one(PhysicalKind::FileDescriptor, amount) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "aggregate file-descriptor limit reached",
+            ));
+        }
+        Ok(DescriptorLease {
+            budget: self.clone(),
+            amount,
+        })
+    }
+
+    /// Hysteresis signals used by the listener loop.  Pausing before the hard
+    /// ceiling leaves enough capacity for logs, reloads and accepted sockets
+    /// already racing through admission; resumption at the lower watermark
+    /// prevents poll/accept oscillation.
+    pub(crate) fn listener_pressure_high(&self, pending_limit: u64) -> bool {
+        let fd_index = PhysicalKind::FileDescriptor.index();
+        let descriptors = self.physical_process[fd_index].load(Ordering::Acquire);
+        let descriptor_high = self.physical_limits[fd_index]
+            .saturating_mul(9)
+            .saturating_add(9)
+            / 10;
+        let pending = self.slot_usage(SlotKind::PendingConnection);
+        let pending_high = pending_limit.saturating_mul(9).saturating_add(9) / 10;
+        descriptors >= descriptor_high.max(1) || pending >= pending_high.max(1)
+    }
+
+    pub(crate) fn listener_pressure_below_low(&self, pending_limit: u64) -> bool {
+        let fd_index = PhysicalKind::FileDescriptor.index();
+        let descriptors = self.physical_process[fd_index].load(Ordering::Acquire);
+        let descriptor_low = self.physical_limits[fd_index].saturating_mul(3) / 4;
+        let pending = self.slot_usage(SlotKind::PendingConnection);
+        let pending_low = pending_limit.saturating_mul(3) / 4;
+        descriptors <= descriptor_low && pending <= pending_low
+    }
+
     fn release_physical_one(&self, kind: PhysicalKind, amount: u64) {
         if amount > 0 {
             self.physical_process[kind.index()].fetch_sub(amount, Ordering::AcqRel);
@@ -1293,6 +1428,7 @@ impl ResourceBudget {
         max_files: u64,
         context: &ResourceContext,
     ) -> io::Result<SpoolLease> {
+        let descriptor = self.try_descriptor()?;
         let share_files = max_files.saturating_add(3) / 4;
         let file_slot = context.slot(
             SlotKind::SpoolFile,
@@ -1311,6 +1447,7 @@ impl ResourceBudget {
                 Some(max_bytes.max(1)),
             ),
             _file_slot: file_slot,
+            _descriptor: descriptor,
         })
     }
 
@@ -1333,14 +1470,26 @@ impl ResourceBudget {
         context: &ResourceContext,
         limit: u64,
     ) -> io::Result<DynamicLease> {
+        self.try_dynamic_descriptors_in(context, limit, 4)
+    }
+
+    pub(crate) fn try_dynamic_descriptors_in(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+        limit: u64,
+        descriptors: u64,
+    ) -> io::Result<DynamicLease> {
+        let slot = context.slot(
+            SlotKind::DynamicBackend,
+            limit,
+            Some(limit.min(MAX_DYNAMIC_REQUESTS_PER_CLIENT)),
+            Some(1),
+            "dynamic backend concurrency limit reached",
+        )?;
+        let descriptor_lease = self.try_descriptors(descriptors)?;
         Ok(DynamicLease {
-            _slot: context.slot(
-                SlotKind::DynamicBackend,
-                limit,
-                Some(limit.min(MAX_DYNAMIC_REQUESTS_PER_CLIENT)),
-                Some(1),
-                "dynamic backend concurrency limit reached",
-            )?,
+            _slot: slot,
+            _descriptors: descriptor_lease,
         })
     }
 
@@ -1722,6 +1871,10 @@ pub fn try_expensive() -> Option<ExpensiveLease> {
     let context = current_or_test_context();
     #[cfg(not(test))]
     let context = current_context()?;
+    try_expensive_in(&context)
+}
+
+pub(crate) fn try_expensive_in(context: &ResourceContext) -> Option<ExpensiveLease> {
     let slot = context
         .slot(
             SlotKind::ExpensiveCpu,
@@ -1755,6 +1908,7 @@ pub fn try_expensive() -> Option<ExpensiveLease> {
 pub struct SpoolLease {
     bytes: ByteLease,
     _file_slot: SlotLease,
+    _descriptor: DescriptorLease,
 }
 
 impl SpoolLease {
@@ -1781,12 +1935,58 @@ impl SpoolLease {
 #[derive(Debug)]
 pub struct DynamicLease {
     _slot: SlotLease,
+    _descriptors: DescriptorLease,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn request_scope_cancellation_is_shared_by_internal_clones() {
+        let budget = Arc::new(ResourceBudget::default());
+        let scope = RequestScope::new(budget.context(IpAddr::from([192, 0, 2, 9])));
+        let child = scope.clone();
+        assert!(!child.is_cancelled());
+        {
+            let _guard = scope.guard();
+        }
+        assert!(scope.is_cancelled());
+        assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn bound_policy_budget_does_not_depend_on_thread_local_context() {
+        let budget = Arc::new(ResourceBudget::default());
+        let policy = RequestPolicyBudget::default();
+        policy.bind_context(budget.context(IpAddr::from([192, 0, 2, 10])));
+        policy.charge_expansion(64).unwrap();
+        assert_eq!(policy.charged_expansion(), 64);
+    }
+
+    #[test]
+    fn exact_descriptor_permits_drive_listener_hysteresis_and_recover() {
+        let budget = Arc::new(ResourceBudget {
+            physical_limits: [4, DEFAULT_TASK_BUDGET, DEFAULT_RESIDENT_BUDGET],
+            ..ResourceBudget::default()
+        });
+        let first = budget.try_descriptor().unwrap();
+        let second = budget.try_descriptor().unwrap();
+        let third = budget.try_descriptor().unwrap();
+        assert!(!budget.listener_pressure_high(64));
+        let fourth = budget.try_descriptor().unwrap();
+        assert!(budget.listener_pressure_high(64));
+        assert!(!budget.listener_pressure_below_low(64));
+        assert!(budget.try_descriptor().is_err());
+        drop(fourth);
+        assert!(budget.listener_pressure_below_low(64));
+        drop((first, second, third));
+        assert_eq!(
+            budget.physical_process[PhysicalKind::FileDescriptor.index()].load(Ordering::Acquire),
+            0
+        );
+    }
 
     #[test]
     fn request_policy_budget_is_monotonic_and_poisoned_on_exhaustion() {

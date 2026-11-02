@@ -1056,13 +1056,18 @@ impl Spool {
     fn push_budgeted(
         &mut self,
         data: &[u8],
-        budget: Option<(&std::sync::Arc<crate::resource::ResourceBudget>, u64, u64)>,
+        budget: Option<(
+            &std::sync::Arc<crate::resource::ResourceBudget>,
+            &crate::resource::ResourceContext,
+            u64,
+            u64,
+        )>,
     ) -> io::Result<()> {
         match self {
             Spool::Memory(v) => {
                 if v.len().saturating_add(data.len()) > FASTCGI_SPOOL_THRESHOLD {
-                    let mut lease = if let Some((budget, max_bytes, max_files)) = budget {
-                        let mut lease = budget.try_spool(max_bytes, max_files)?;
+                    let mut lease = if let Some((budget, context, max_bytes, max_files)) = budget {
+                        let mut lease = budget.try_spool_in(max_bytes, max_files, context)?;
                         lease.reserve(v.len() as u64 + data.len() as u64)?;
                         Some(lease)
                     } else {
@@ -1198,7 +1203,12 @@ fn read_response_with_limit(
 fn read_response_with_budget(
     stream: &mut dyn ReadWrite,
     max_output: u64,
-    budget: Option<(&std::sync::Arc<crate::resource::ResourceBudget>, u64, u64)>,
+    budget: Option<(
+        &std::sync::Arc<crate::resource::ResourceBudget>,
+        &crate::resource::ResourceContext,
+        u64,
+        u64,
+    )>,
 ) -> io::Result<(Spool, Vec<u8>)> {
     let mut spool = Spool::Memory(Vec::new());
     let mut stderr = Vec::new();
@@ -1451,11 +1461,27 @@ fn execute_inner(
     target: &Target,
     binding: Option<&ScriptBinding>,
 ) -> Response {
-    let _dynamic_lease = match base
-        .cfg
-        .resource_budget
-        .try_dynamic(base.cfg.max_dynamic_requests)
-    {
+    #[cfg(test)]
+    let fallback_context;
+    let resource_context = match base.req.resource_context() {
+        Some(context) => context,
+        #[cfg(test)]
+        None => {
+            fallback_context = base.cfg.resource_budget.context(
+                base.remote_ip
+                    .parse()
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            );
+            &fallback_context
+        }
+        #[cfg(not(test))]
+        None => return fastcgi_error_response(base, scope, target, 503),
+    };
+    let _dynamic_lease = match base.cfg.resource_budget.try_dynamic_descriptors_in(
+        resource_context,
+        base.cfg.max_dynamic_requests,
+        1,
+    ) {
         Ok(lease) => lease,
         Err(e) => {
             eprintln!("vapache FastCGI admission error: {e}");
@@ -1530,6 +1556,7 @@ fn execute_inner(
             base.cfg.max_fastcgi_output,
             Some((
                 &base.cfg.resource_budget,
+                resource_context,
                 base.cfg.max_spool_bytes,
                 base.cfg.max_spool_files,
             )),
@@ -2677,11 +2704,12 @@ mod tests {
         }
         record(&mut input, FCGI_END_REQUEST, 1, &[0u8; 8]);
         let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let context = budget.context("192.0.2.1".parse().unwrap());
         let mut cursor = Cursor::new(input);
         let (spool, _) = read_response_with_budget(
             &mut cursor,
             2 * 1024 * 1024,
-            Some((&budget, 2 * 1024 * 1024, 1)),
+            Some((&budget, &context, 8 * 1024 * 1024, 1)),
         )
         .unwrap();
         assert_eq!(budget.usage().1, 1);

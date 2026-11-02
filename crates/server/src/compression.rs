@@ -460,13 +460,25 @@ fn finalize_inner(
         return;
     }
 
-    let Some(_expensive) = crate::resource::try_expensive() else {
+    #[cfg(test)]
+    let fallback_context;
+    let resource_context = match req.resource_context() {
+        Some(context) => context,
+        #[cfg(test)]
+        None => {
+            fallback_context = crate::resource::current_or_test_context();
+            &fallback_context
+        }
+        #[cfg(not(test))]
+        None => return,
+    };
+    let Some(_expensive) = crate::resource::try_expensive_in(resource_context) else {
         // Compression is optional. Under CPU pressure preserve and send the
         // identity representation instead of queueing more expensive work.
         return;
     };
     let mut compression_lease = budget.map(|budget| {
-        let mut lease = budget.try_response_bytes()?;
+        let mut lease = budget.try_response_bytes_in(resource_context)?;
         let peak = resp.body_len().saturating_mul(2).saturating_add(64 * 1024);
         lease.reserve(peak).map(|()| lease)
     });

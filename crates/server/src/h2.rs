@@ -1096,7 +1096,7 @@ async fn handle_stream(
         }
     }
 
-    headers.bind_resource_context(resource_context);
+    headers.bind_request_scope(crate::resource::RequestScope::new(resource_context));
     headers.hold_resident(request_resident);
     let req = Request {
         method,
@@ -1113,6 +1113,7 @@ async fn handle_stream(
         framing: crate::verified::BodyFraming::None,
     };
     let peer = cfg.client_addr(peer, &req);
+    let _request_scope_guard = req.request_scope().map(|scope| scope.guard());
     if peer != quota_peer {
         // Admission and dispatch must never disagree about the effective
         // source. Fail the stream closed if a future header-canonicalization

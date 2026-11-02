@@ -370,8 +370,32 @@ impl Server {
             })
             .collect();
         let mut first_listener = 0usize;
+        let pending_limit = pending_connection_limit(self.cfg.max_request_workers) as u64;
+        let mut listeners_paused = false;
         while !self.stop.load(Ordering::Relaxed) {
+            if listeners_paused {
+                if self
+                    .cfg
+                    .resource_budget
+                    .listener_pressure_below_low(pending_limit)
+                {
+                    listeners_paused = false;
+                }
+            } else if self
+                .cfg
+                .resource_budget
+                .listener_pressure_high(pending_limit)
+            {
+                listeners_paused = true;
+            }
+            for pollfd in &mut pollfds {
+                pollfd.events = if listeners_paused { 0 } else { libc::POLLIN };
+                pollfd.revents = 0;
+            }
             poll_fn(&mut pollfds)?;
+            if listeners_paused {
+                continue;
+            }
             for offset in 0..bound.len() {
                 let i = listener_index(first_listener, offset, bound.len());
                 let b = &bound[i];
@@ -379,12 +403,28 @@ impl Server {
                     continue;
                 }
                 for _ in 0..ACCEPT_BATCH {
+                    if self
+                        .cfg
+                        .resource_budget
+                        .listener_pressure_high(pending_limit)
+                    {
+                        listeners_paused = true;
+                        break;
+                    }
                     match b.listener.accept() {
                         Ok((stream, peer)) => {
                             let local = stream.local_addr().ok().map(access::canonical_socket_addr);
                             let peer = access::canonical_socket_addr(peer);
                             let cfg = self.cfg.clone();
                             let logger = self.logger.clone();
+                            let descriptor_guard = match cfg.resource_budget.try_descriptor() {
+                                Ok(guard) => guard,
+                                Err(_) => {
+                                    reject_busy_connection(stream, b.tls.is_some(), &self.cfg);
+                                    listeners_paused = true;
+                                    break;
+                                }
+                            };
                             let trusted_proxy = cfg.transport_peer_is_trusted_proxy(peer.ip());
                             let transport_context = cfg.resource_budget.context(peer.ip());
                             let Some(pending_guard) = try_reserve_pending_connection(
@@ -416,6 +456,7 @@ impl Server {
                                     tls,
                                     pending_guard,
                                     lifetime_guard,
+                                    descriptor_guard,
                                 )
                                 .await;
                             });
@@ -547,6 +588,18 @@ fn try_reserve_h2_connection(
     )
 }
 
+fn try_reserve_h1_connection(
+    context: &crate::resource::ResourceContext,
+    limit: usize,
+) -> Option<crate::resource::SlotLease> {
+    try_reserve_quota(
+        context,
+        crate::resource::SlotKind::H1Connection,
+        pending_connection_limit(limit),
+        MAX_CONNECTIONS_PER_CLIENT,
+    )
+}
+
 fn tls_handshake_limit() -> usize {
     // Waiting handshakes are asynchronous, so this ceiling primarily bounds
     // their state. CPU work is independently bounded by the rate gate below.
@@ -576,9 +629,10 @@ fn keep_alive_capacity_available(budget: &crate::resource::ResourceBudget, limit
         < limit.saturating_sub(reserve) as u64
 }
 
-fn spawn_connection_worker<F>(work: F) -> io::Result<tokio::task::JoinHandle<()>>
+fn spawn_connection_worker<F, T>(work: F) -> io::Result<tokio::task::JoinHandle<T>>
 where
-    F: FnOnce() + Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
 {
     crate::fault::hit("server.connection.spawn")?;
     let handle = tokio::runtime::Handle::try_current().map_err(|error| {
@@ -725,7 +779,7 @@ fn request_limits(cfg: &Config, tls: bool) -> Limits {
     }
 }
 
-fn handle_connection<C: Conn + ResponseWrite>(
+fn handle_connection_inner<C: Conn + ResponseWrite>(
     cfg: &Config,
     logger: &Logger,
     stream: &mut C,
@@ -733,11 +787,13 @@ fn handle_connection<C: Conn + ResponseWrite>(
     local_ip: &str,
     local_port: u16,
     tls: bool,
-    mut buf: Vec<u8>,
+    buf: &mut Vec<u8>,
     mut initial_reservation: Option<crate::resource::ResidentLease>,
     mut initial_body_guard: Option<BodyWorkerGuard>,
     mut initial_resource_context: Option<crate::resource::ResourceContext>,
-) -> io::Result<()> {
+    served: &mut usize,
+    single_request: bool,
+) -> io::Result<bool> {
     let limits = request_limits(cfg, tls);
     // Configure the transport once rather than paying a setsockopt on every
     // keep-alive response. The explicit write deadline remains the fallback
@@ -746,14 +802,14 @@ fn handle_connection<C: Conn + ResponseWrite>(
     // `Timeout` applies to the first request; idle keep-alive connections use
     // `KeepAliveTimeout`.
     stream.set_read_timeout(Some(cfg.request_header_timeout.max(Duration::from_secs(1))));
-    let mut served = 0usize;
     loop {
-        if served == 0 {
+        if *served == 0 {
             stream.set_read_timeout(Some(cfg.request_header_timeout.max(Duration::from_secs(1))));
-        } else if cfg
-            .resource_budget
-            .try_request_parse_rate(peer.ip())
-            .is_err()
+        } else if !single_request
+            && cfg
+                .resource_budget
+                .try_request_parse_rate(peer.ip())
+                .is_err()
         {
             let mut response = Response::bytes(
                 503,
@@ -775,15 +831,15 @@ fn handle_connection<C: Conn + ResponseWrite>(
                     write_timeout: cfg.timeout,
                 },
             );
-            return Ok(());
+            return Ok(false);
         }
         let started = Instant::now();
-        let reservation = if served == 0 {
+        let reservation = if *served == 0 || single_request {
             initial_reservation.take()
         } else {
             None
         };
-        let mut body_guard = if served == 0 {
+        let mut body_guard = if *served == 0 || single_request {
             initial_body_guard.take()
         } else {
             None
@@ -792,7 +848,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
         let _pre_identity_guard = crate::resource::enter_resource_context(pre_identity_context);
         let req = match read_request_with_reservation(
             stream,
-            &mut buf,
+            buf,
             &limits,
             |stream, request| {
                 let effective = cfg.client_addr(peer, request);
@@ -812,14 +868,21 @@ fn handle_connection<C: Conn + ResponseWrite>(
                     ));
                 }
                 stream.set_read_timeout(Some(cfg.request_body_timeout.max(Duration::from_secs(1))));
-                let context = if served == 0 {
-                    initial_resource_context
-                        .take()
-                        .unwrap_or_else(|| cfg.resource_budget.context(effective.ip()))
+                let (context, rate_pre_admitted) = if *served == 0 || single_request {
+                    match initial_resource_context.take() {
+                        // The asynchronous admission path parsed this exact
+                        // head and consumed its request-rate token before it
+                        // acquired a blocking worker. Do not charge it again
+                        // when ownership crosses into the worker.
+                        Some(context) => (context, true),
+                        None => (cfg.resource_budget.context(effective.ip()), false),
+                    }
                 } else {
-                    cfg.resource_budget.context(effective.ip())
+                    (cfg.resource_budget.context(effective.ip()), false)
                 };
-                cfg.resource_budget.try_request_rate(&context)?;
+                if !rate_pre_admitted {
+                    cfg.resource_budget.try_request_rate(&context)?;
+                }
                 if request_has_body(request) && body_guard.is_none() {
                     body_guard = Some(
                         try_reserve_body_worker(&context, cfg.max_request_workers).ok_or_else(
@@ -837,7 +900,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
             reservation,
         ) {
             Ok(Some(r)) => r,
-            Ok(None) => return Ok(()),
+            Ok(None) => return Ok(false),
             Err(ReadError::Io(e))
                 if matches!(
                     e.kind(),
@@ -868,7 +931,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                         write_timeout: cfg.timeout,
                     },
                 );
-                return Ok(());
+                return Ok(false);
             }
             Err(ReadError::Io(e)) => return Err(e),
             Err(ReadError::Parse(e)) => {
@@ -893,10 +956,11 @@ fn handle_connection<C: Conn + ResponseWrite>(
                         write_timeout: cfg.timeout,
                     },
                 );
-                return Ok(());
+                return Ok(false);
             }
         };
         drop(_pre_identity_guard);
+        let _request_scope_guard = req.request_scope().map(|scope| scope.guard());
         // This lease protects only the slow body-read phase. The parsed body
         // has independent resident/spool accounting while dispatch runs.
         drop(body_guard);
@@ -934,7 +998,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 Some(d) => d,
                 None => {
                     let _ = write_ws_error(stream, &cfg, 400, b"bad request path");
-                    return Ok(());
+                    return Ok(false);
                 }
             };
             let norm = match normalize_uri_path(&decoded) {
@@ -948,7 +1012,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 }
                 _ => {
                     let _ = write_ws_error(stream, &cfg, 400, b"bad request path");
-                    return Ok(());
+                    return Ok(false);
                 }
             };
             let trailing_slash = decoded.len() > 1 && decoded.ends_with(b"/");
@@ -956,7 +1020,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 Ok(path) => path,
                 Err(_) => {
                     let _ = write_ws_error(stream, &cfg, 400, b"request path is not UTF-8");
-                    return Ok(());
+                    return Ok(false);
                 }
             };
             if trailing_slash && url_path != "/" {
@@ -964,7 +1028,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
             }
             let Some((root, rel, _script_alias)) = map_path(&cfg, vhost, &norm) else {
                 let _ = write_ws_error(stream, &cfg, 404, b"no mapping");
-                return Ok(());
+                return Ok(false);
             };
             let fs_path = root.join(&rel);
             let (mut scope, config_conditionals, htaccess_conditionals) =
@@ -981,7 +1045,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                     Err(e) => {
                         eprintln!("vapached: .htaccess error: {e}");
                         let _ = write_ws_error(stream, &cfg, 500, b"access-file error");
-                        return Ok(());
+                        return Ok(false);
                     }
                 };
             apply_scope_conditionals(
@@ -1016,24 +1080,24 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 crate::rewrite::Outcome::None => {}
                 crate::rewrite::Outcome::Forbidden => {
                     let _ = write_ws_error(stream, &cfg, 403, b"forbidden");
-                    return Ok(());
+                    return Ok(false);
                 }
                 crate::rewrite::Outcome::Gone => {
                     let _ = write_ws_error(stream, &cfg, 410, b"gone");
-                    return Ok(());
+                    return Ok(false);
                 }
                 crate::rewrite::Outcome::Error(e) => {
                     eprintln!("vapached: websocket rewrite error: {e}");
                     let _ = write_ws_error(stream, &cfg, 500, b"rewrite error");
-                    return Ok(());
+                    return Ok(false);
                 }
                 crate::rewrite::Outcome::Redirect { .. } => {
                     let _ = write_ws_error(stream, &cfg, 403, b"upgrade redirect unsupported");
-                    return Ok(());
+                    return Ok(false);
                 }
                 crate::rewrite::Outcome::Internal { .. } => {
                     let _ = write_ws_error(stream, &cfg, 403, b"upgrade rewrite unsupported");
-                    return Ok(());
+                    return Ok(false);
                 }
                 crate::rewrite::Outcome::Proxy { url, effects } => {
                     apply_rewrite_effects(&mut scope, &effects);
@@ -1041,7 +1105,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                         Some(target) => rewritten_target = Some(target),
                         None => {
                             let _ = write_ws_error(stream, &cfg, 502, b"bad proxy target");
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
                 }
@@ -1074,7 +1138,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                     &local_ip,
                 ) {
                     let _ = write_ws_response(stream, &cfg, &mut resp);
-                    return Ok(());
+                    return Ok(false);
                 }
                 let mut resource = access::ResourceKey::request(
                     vhost,
@@ -1099,7 +1163,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                     Ok(grant) => grant,
                     Err(mut resp) => {
                         let _ = write_ws_response(stream, &cfg, &mut resp);
-                        return Ok(());
+                        return Ok(false);
                     }
                 };
                 if let Some((tls, handle)) = stream.take_tls_stream() {
@@ -1109,7 +1173,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                         &cfg, &scope, &req, &target, &_grant, &resource, tls, peer, true, host,
                         &buf,
                     ));
-                    return Ok(());
+                    return Ok(false);
                 }
                 if let Some(mut client) = stream.try_clone_tcp() {
                     client.set_nonblocking(true)?;
@@ -1138,10 +1202,10 @@ fn handle_connection<C: Conn + ResponseWrite>(
                         };
                         let _ = write_ws_error(stream, &cfg, status, b"WebSocket upstream failed");
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
                 let _ = write_ws_error(stream, &cfg, 501, b"WebSocket transport is not supported");
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -1162,12 +1226,14 @@ fn handle_connection<C: Conn + ResponseWrite>(
         }
         let keep_alive = cfg.keep_alive
             && req.keep_alive
-            // Keep one quarter of the blocking worker pool available under
-            // pressure. Existing keep-alive clients finish normally, but new
-            // responses close instead of allowing idle sockets to consume the
-            // final workers.
-            && keep_alive_capacity_available(&cfg.resource_budget, cfg.max_request_workers)
-            && (cfg.max_keep_alive_requests == 0 || served + 1 < cfg.max_keep_alive_requests);
+            // The asynchronous production path returns after one response and
+            // parks the socket without its worker. The capacity check remains
+            // for the synchronous test/compatibility loop, where keeping the
+            // connection alive also retains the current blocking worker.
+            && (single_request
+                || keep_alive_capacity_available(&cfg.resource_budget, cfg.max_request_workers))
+            && (cfg.max_keep_alive_requests == 0
+                || *served + 1 < cfg.max_keep_alive_requests);
         let mut opts = ResponseOptions {
             server_header: &cfg.server_header(),
             keep_alive,
@@ -1184,7 +1250,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
             // The head or body was partially written, or the response failed
             // its own framing checks.  Reusing this connection would let the
             // next response be read as a continuation of this body.
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(false),
         };
         crate::status::hit(body_sent);
         if logger.wants_access_log() {
@@ -1217,14 +1283,51 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 started,
             });
         }
-        served += 1;
+        *served += 1;
         if !keep_alive {
-            return Ok(());
+            return Ok(false);
         }
-        if served == 1 {
+        if single_request {
+            return Ok(true);
+        }
+        if *served == 1 {
             stream.set_read_timeout(Some(cfg.keep_alive_timeout));
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn handle_connection<C: Conn + ResponseWrite>(
+    cfg: &Config,
+    logger: &Logger,
+    stream: &mut C,
+    peer: SocketAddr,
+    local_ip: &str,
+    local_port: u16,
+    tls: bool,
+    mut buf: Vec<u8>,
+    initial_reservation: Option<crate::resource::ResidentLease>,
+    initial_body_guard: Option<BodyWorkerGuard>,
+    initial_resource_context: Option<crate::resource::ResourceContext>,
+) -> io::Result<()> {
+    let mut served = 0;
+    handle_connection_inner(
+        cfg,
+        logger,
+        stream,
+        peer,
+        local_ip,
+        local_port,
+        tls,
+        &mut buf,
+        initial_reservation,
+        initial_body_guard,
+        initial_resource_context,
+        &mut served,
+        false,
+    )
+    .map(|_| ())
 }
 
 /// Blocking adapter for an async TLS stream.  Every read/write is bounded by
@@ -1269,6 +1372,10 @@ impl TlsH1 {
                     "TLS response write deadline exceeded",
                 )
             })
+    }
+
+    fn into_inner(self) -> Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+        self.stream
     }
 }
 
@@ -1410,18 +1517,22 @@ where
     .await;
 }
 
-async fn read_first_request_head<S>(
+async fn read_request_head<S>(
     stream: &mut S,
     timeout: Duration,
     resource_budget: Arc<crate::resource::ResourceBudget>,
     client: IpAddr,
+    mut bytes: Vec<u8>,
 ) -> io::Result<(Vec<u8>, usize, crate::resource::ResidentLease)>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     tokio::time::timeout(timeout.max(Duration::from_secs(1)), async {
-        let mut bytes = Vec::with_capacity(8 * 1024);
         let mut resident = resource_budget.try_request_bytes_for(client);
+        // A pipelined prefix was retained from the preceding request. Charge
+        // it to this admission before doing more I/O or parsing; failure closes
+        // the connection without processing unaccounted input.
+        resident.reserve(bytes.len() as u64)?;
         loop {
             if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
                 let head_end = position + 4;
@@ -1458,8 +1569,71 @@ where
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request header timed out"))?
 }
 
+async fn read_first_request_head<S>(
+    stream: &mut S,
+    timeout: Duration,
+    resource_budget: Arc<crate::resource::ResourceBudget>,
+    client: IpAddr,
+) -> io::Result<(Vec<u8>, usize, crate::resource::ResidentLease)>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    read_request_head(
+        stream,
+        timeout,
+        resource_budget,
+        client,
+        Vec::with_capacity(8 * 1024),
+    )
+    .await
+}
+
+async fn read_keepalive_request_head<S>(
+    stream: &mut S,
+    idle_timeout: Duration,
+    header_timeout: Duration,
+    resource_budget: Arc<crate::resource::ResourceBudget>,
+    client: IpAddr,
+    mut buffered: Vec<u8>,
+) -> io::Result<(Vec<u8>, usize, crate::resource::ResidentLease)>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    if buffered.is_empty() {
+        let mut chunk = [0u8; 8 * 1024];
+        let read = tokio::time::timeout(idle_timeout, stream.read(&mut chunk))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "keep-alive idle timeout"))??;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "keep-alive connection closed",
+            ));
+        }
+        buffered.extend_from_slice(&chunk[..read]);
+    }
+    read_request_head(stream, header_timeout, resource_budget, client, buffered).await
+}
+
 fn request_has_body(request: &Request) -> bool {
     !matches!(request.framing, crate::verified::BodyFraming::None)
+}
+
+fn preflight_h1_admission(
+    cfg: &Config,
+    peer: SocketAddr,
+    bytes: &[u8],
+    head_end: usize,
+    tls: bool,
+) -> Result<(crate::resource::ResourceContext, bool), u16> {
+    let limits = request_limits(cfg, tls);
+    let request = preflight_request_head(&bytes[..head_end], &limits).map_err(|e| e.status())?;
+    let effective = cfg.client_addr(peer, &request);
+    let context = cfg.resource_budget.context(effective.ip());
+    cfg.resource_budget
+        .try_request_rate(&context)
+        .map_err(|_| 503u16)?;
+    Ok((context, request_has_body(&request)))
 }
 
 async fn admit_plain_connection(
@@ -1471,7 +1645,10 @@ async fn admit_plain_connection(
     local_port: u16,
     pending_guard: crate::resource::SlotLease,
     lifetime_guard: ConnectionLifetimeGuard,
+    descriptor_guard: crate::resource::DescriptorLease,
 ) -> io::Result<()> {
+    let _lifetime_guard = lifetime_guard;
+    let _descriptor_guard = descriptor_guard;
     stream.set_nonblocking(true)?;
     let mut stream = tokio::net::TcpStream::from_std(stream)?;
     if cfg
@@ -1482,7 +1659,7 @@ async fn admit_plain_connection(
         reject_h1_async(&mut stream, &cfg, 503).await;
         return Ok(());
     }
-    let (initial, head_end, resident) = match read_first_request_head(
+    let (mut initial, mut head_end, mut resident) = match read_first_request_head(
         &mut stream,
         cfg.request_header_timeout,
         cfg.resource_budget.clone(),
@@ -1501,69 +1678,124 @@ async fn admit_plain_connection(
         }
         Err(error) => return Err(error),
     };
-    let limits = request_limits(&cfg, false);
-    let request = match preflight_request_head(&initial[..head_end], &limits) {
-        Ok(request) => request,
-        Err(error) => {
-            reject_h1_async(&mut stream, &cfg, error.status()).await;
+    let first_admission = match preflight_h1_admission(&cfg, peer, &initial, head_end, false) {
+        Ok(admission) => admission,
+        Err(status) => {
+            reject_h1_async(&mut stream, &cfg, status).await;
             return Ok(());
         }
     };
-    let effective = cfg.client_addr(peer, &request);
-    let resource_context = cfg.resource_budget.context(effective.ip());
-    if cfg
-        .resource_budget
-        .try_request_rate(&resource_context)
-        .is_err()
-    {
-        reject_h1_async(&mut stream, &cfg, 503).await;
-        return Ok(());
-    }
-    let has_body = request_has_body(&request);
-    drop(request);
-    let body_guard = if has_body {
-        match try_reserve_body_worker(&resource_context, cfg.max_request_workers) {
-            Some(guard) => Some(guard),
-            None => {
-                reject_h1_async(&mut stream, &cfg, 503).await;
-                return Ok(());
-            }
-        }
-    } else {
-        None
-    };
-    let Some(worker_guard) = try_reserve_worker(&resource_context, cfg.max_request_workers.max(1))
+    let Some(_established_guard) =
+        try_reserve_h1_connection(&first_admission.0, cfg.max_request_workers)
     else {
         reject_h1_async(&mut stream, &cfg, 503).await;
         return Ok(());
     };
     drop(pending_guard);
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    stream.set_nodelay(true).ok();
-    stream
-        .set_read_timeout(Some(cfg.request_header_timeout.max(Duration::from_secs(1))))
-        .ok();
-    stream.set_write_timeout(Some(cfg.timeout)).ok();
-    spawn_connection_worker(move || {
-        let _lifetime_guard = lifetime_guard;
-        let _worker_guard = worker_guard;
-        let mut stream = stream;
-        let _ = handle_connection(
-            &cfg,
-            &logger,
+    let mut served = 0usize;
+    let mut next_admission = Some(first_admission);
+    loop {
+        let (resource_context, has_body) = match next_admission.take() {
+            Some(admission) => admission,
+            None => match preflight_h1_admission(&cfg, peer, &initial, head_end, false) {
+                Ok(admission) => admission,
+                Err(status) => {
+                    reject_h1_async(&mut stream, &cfg, status).await;
+                    return Ok(());
+                }
+            },
+        };
+        let body_guard = if has_body {
+            match try_reserve_body_worker(&resource_context, cfg.max_request_workers) {
+                Some(guard) => Some(guard),
+                None => {
+                    reject_h1_async(&mut stream, &cfg, 503).await;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+        let Some(worker_guard) =
+            try_reserve_worker(&resource_context, cfg.max_request_workers.max(1))
+        else {
+            reject_h1_async(&mut stream, &cfg, 503).await;
+            return Ok(());
+        };
+        let blocking = stream.into_std()?;
+        blocking.set_nonblocking(false)?;
+        blocking.set_nodelay(true).ok();
+        let cfg_worker = cfg.clone();
+        let logger_worker = logger.clone();
+        let local_ip_worker = local_ip.clone();
+        let mut request_buf = initial;
+        let result = spawn_connection_worker(move || {
+            let _worker_guard = worker_guard;
+            let mut blocking = blocking;
+            let result = handle_connection_inner(
+                &cfg_worker,
+                &logger_worker,
+                &mut blocking,
+                peer,
+                &local_ip_worker,
+                local_port,
+                false,
+                &mut request_buf,
+                Some(resident),
+                body_guard,
+                Some(resource_context),
+                &mut served,
+                true,
+            );
+            (blocking, request_buf, served, result)
+        })?
+        .await
+        .map_err(|error| io::Error::other(format!("HTTP/1 worker failed: {error}")))?;
+        let (blocking, buffered, next_served, reusable) = result;
+        served = next_served;
+        if !reusable? {
+            return Ok(());
+        }
+        blocking.set_nonblocking(true)?;
+        stream = tokio::net::TcpStream::from_std(blocking)?;
+        if cfg
+            .resource_budget
+            .try_request_parse_rate(peer.ip())
+            .is_err()
+        {
+            reject_h1_async(&mut stream, &cfg, 503).await;
+            return Ok(());
+        }
+        (initial, head_end, resident) = match read_keepalive_request_head(
             &mut stream,
-            peer,
-            &local_ip,
-            local_port,
-            false,
-            initial,
-            Some(resident),
-            body_guard,
-            Some(resource_context),
-        );
-    })?;
-    Ok(())
+            cfg.keep_alive_timeout,
+            cfg.request_header_timeout,
+            cfg.resource_budget.clone(),
+            peer.ip(),
+            buffered,
+        )
+        .await
+        {
+            Ok(head) => head,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                reject_h1_async(&mut stream, &cfg, 431).await;
+                return Ok(());
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
+                reject_h1_async(&mut stream, &cfg, 503).await;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+    }
 }
 
 async fn admit_tls_connection(
@@ -1576,7 +1808,9 @@ async fn admit_tls_connection(
     tls_config: Arc<rustls::ServerConfig>,
     pending_guard: crate::resource::SlotLease,
     lifetime_guard: ConnectionLifetimeGuard,
+    descriptor_guard: crate::resource::DescriptorLease,
 ) -> io::Result<()> {
+    let _descriptor_guard = descriptor_guard;
     let transport_context = cfg.resource_budget.context(peer.ip());
     let handshake_guard = try_reserve_tls_handshake(&transport_context).ok_or_else(|| {
         io::Error::new(
@@ -1627,7 +1861,7 @@ async fn admit_tls_connection(
         return Ok(());
     }
 
-    let (initial, head_end, resident) = match read_first_request_head(
+    let (mut initial, mut head_end, mut resident) = match read_first_request_head(
         &mut tls,
         cfg.request_header_timeout,
         cfg.resource_budget.clone(),
@@ -1646,63 +1880,126 @@ async fn admit_tls_connection(
         }
         Err(error) => return Err(error),
     };
-    let limits = request_limits(&cfg, true);
-    let request = match preflight_request_head(&initial[..head_end], &limits) {
-        Ok(request) => request,
-        Err(error) => {
-            reject_h1_async(&mut tls, &cfg, error.status()).await;
+    let first_admission = match preflight_h1_admission(&cfg, peer, &initial, head_end, true) {
+        Ok(admission) => admission,
+        Err(status) => {
+            reject_h1_async(&mut tls, &cfg, status).await;
             return Ok(());
         }
     };
-    let effective = cfg.client_addr(peer, &request);
-    let resource_context = cfg.resource_budget.context(effective.ip());
-    if cfg
-        .resource_budget
-        .try_request_rate(&resource_context)
-        .is_err()
-    {
-        reject_h1_async(&mut tls, &cfg, 503).await;
-        return Ok(());
-    }
-    let has_body = request_has_body(&request);
-    drop(request);
-    let body_guard = if has_body {
-        match try_reserve_body_worker(&resource_context, cfg.max_request_workers) {
-            Some(guard) => Some(guard),
-            None => {
-                reject_h1_async(&mut tls, &cfg, 503).await;
-                return Ok(());
-            }
-        }
-    } else {
-        None
-    };
-    let Some(worker_guard) = try_reserve_worker(&resource_context, cfg.max_request_workers.max(1))
+    let Some(_established_guard) =
+        try_reserve_h1_connection(&first_admission.0, cfg.max_request_workers)
     else {
         reject_h1_async(&mut tls, &cfg, 503).await;
         return Ok(());
     };
     drop(pending_guard);
-    let bridge = TlsH1::new(tls, tokio::runtime::Handle::current());
-    spawn_connection_worker(move || {
-        let _lifetime_guard = lifetime_guard;
-        let _worker_guard = worker_guard;
-        let mut bridge = bridge;
-        let _ = handle_connection(
-            &cfg,
-            &logger,
-            &mut bridge,
-            peer,
-            &local_ip,
-            local_port,
-            true,
-            initial,
-            Some(resident),
-            body_guard,
-            Some(resource_context),
-        );
-    })?;
-    Ok(())
+    let _lifetime_guard = lifetime_guard;
+    let runtime_handle = tokio::runtime::Handle::current();
+    let mut served = 0usize;
+    let mut next_admission = Some(first_admission);
+    loop {
+        let (resource_context, has_body) = match next_admission.take() {
+            Some(admission) => admission,
+            None => match preflight_h1_admission(&cfg, peer, &initial, head_end, true) {
+                Ok(admission) => admission,
+                Err(status) => {
+                    reject_h1_async(&mut tls, &cfg, status).await;
+                    return Ok(());
+                }
+            },
+        };
+        let body_guard = if has_body {
+            match try_reserve_body_worker(&resource_context, cfg.max_request_workers) {
+                Some(guard) => Some(guard),
+                None => {
+                    reject_h1_async(&mut tls, &cfg, 503).await;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+        let Some(worker_guard) =
+            try_reserve_worker(&resource_context, cfg.max_request_workers.max(1))
+        else {
+            reject_h1_async(&mut tls, &cfg, 503).await;
+            return Ok(());
+        };
+        let bridge = TlsH1::new(tls, runtime_handle.clone());
+        let cfg_worker = cfg.clone();
+        let logger_worker = logger.clone();
+        let local_ip_worker = local_ip.clone();
+        let mut request_buf = initial;
+        let result = spawn_connection_worker(move || {
+            let _worker_guard = worker_guard;
+            let mut bridge = bridge;
+            let result = handle_connection_inner(
+                &cfg_worker,
+                &logger_worker,
+                &mut bridge,
+                peer,
+                &local_ip_worker,
+                local_port,
+                true,
+                &mut request_buf,
+                Some(resident),
+                body_guard,
+                Some(resource_context),
+                &mut served,
+                true,
+            );
+            (bridge, request_buf, served, result)
+        })?
+        .await
+        .map_err(|error| io::Error::other(format!("TLS HTTP/1 worker failed: {error}")))?;
+        let (bridge, buffered, next_served, reusable) = result;
+        served = next_served;
+        if !reusable? {
+            return Ok(());
+        }
+        let Some(next_tls) = bridge.into_inner() else {
+            return Ok(());
+        };
+        tls = next_tls;
+        if cfg
+            .resource_budget
+            .try_request_parse_rate(peer.ip())
+            .is_err()
+        {
+            reject_h1_async(&mut tls, &cfg, 503).await;
+            return Ok(());
+        }
+        (initial, head_end, resident) = match read_keepalive_request_head(
+            &mut tls,
+            cfg.keep_alive_timeout,
+            cfg.request_header_timeout,
+            cfg.resource_budget.clone(),
+            peer.ip(),
+            buffered,
+        )
+        .await
+        {
+            Ok(head) => head,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                reject_h1_async(&mut tls, &cfg, 431).await;
+                return Ok(());
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
+                reject_h1_async(&mut tls, &cfg, 503).await;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1716,6 +2013,7 @@ async fn admit_connection(
     tls_config: Option<Arc<rustls::ServerConfig>>,
     pending_guard: crate::resource::SlotLease,
     lifetime_guard: ConnectionLifetimeGuard,
+    descriptor_guard: crate::resource::DescriptorLease,
 ) -> io::Result<()> {
     if let Some(tls_config) = tls_config {
         admit_tls_connection(
@@ -1728,6 +2026,7 @@ async fn admit_connection(
             tls_config,
             pending_guard,
             lifetime_guard,
+            descriptor_guard,
         )
         .await
     } else {
@@ -1740,6 +2039,7 @@ async fn admit_connection(
             local_port,
             pending_guard,
             lifetime_guard,
+            descriptor_guard,
         )
         .await
     }
@@ -6771,6 +7071,72 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         handle.join().unwrap().unwrap();
         drop(saturated);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idle_http1_keepalive_releases_request_worker() {
+        let _test_guard = ADMISSION_TEST_LOCK.lock().unwrap();
+        let dir = cov_dir("event-keepalive");
+        std::fs::write(dir.join("www/index.html"), "ok\n").unwrap();
+        let mut cfg = cov_config(&dir, "KeepAlive On\nKeepAliveTimeout 5\n");
+        cfg.max_request_workers = 1;
+        let budget = cfg.resource_budget.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bound = vec![Bound {
+            listener,
+            port: addr.port(),
+            addr: "127.0.0.1".into(),
+            tls: None,
+            pending_tls: None,
+        }];
+        let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
+        let stop = server.stop_flag();
+        let handle = std::thread::spawn(move || server.run(&bound));
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        fn read_head(stream: &mut TcpStream) -> Vec<u8> {
+            let mut response = Vec::new();
+            let mut byte = [0u8; 1];
+            while !response.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                response.push(byte[0]);
+            }
+            response
+        }
+
+        client
+            .write_all(b"HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let first = read_head(&mut client);
+        assert!(String::from_utf8_lossy(&first).starts_with("HTTP/1.1 200"));
+        for _ in 0..100 {
+            if budget.slot_usage(crate::resource::SlotKind::RequestWorker) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::RequestWorker),
+            0,
+            "an idle keep-alive socket retained its request worker"
+        );
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::H1Connection),
+            1
+        );
+
+        client
+            .write_all(b"HEAD / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let second = read_head(&mut client);
+        assert!(String::from_utf8_lossy(&second).starts_with("HTTP/1.1 200"));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

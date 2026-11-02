@@ -115,7 +115,7 @@ pub struct Headers {
     policy_budget: std::sync::Arc<crate::resource::RequestPolicyBudget>,
     // The validated source identity and request-local resource ledger travel
     // with every clone/internal rewrite of this request.
-    resource_context: Option<crate::resource::ResourceContext>,
+    request_scope: Option<crate::resource::RequestScope>,
 }
 
 impl Headers {
@@ -178,12 +178,19 @@ impl Headers {
         &self.policy_budget
     }
 
-    pub(crate) fn bind_resource_context(&mut self, context: crate::resource::ResourceContext) {
-        self.resource_context = Some(context);
+    pub(crate) fn bind_request_scope(&mut self, scope: crate::resource::RequestScope) {
+        self.policy_budget.bind_context(scope.context().clone());
+        self.request_scope = Some(scope);
     }
 
     pub(crate) fn resource_context(&self) -> Option<&crate::resource::ResourceContext> {
-        self.resource_context.as_ref()
+        self.request_scope
+            .as_ref()
+            .map(crate::resource::RequestScope::context)
+    }
+
+    pub(crate) fn request_scope(&self) -> Option<&crate::resource::RequestScope> {
+        self.request_scope.as_ref()
     }
 }
 
@@ -481,6 +488,10 @@ impl Request {
     pub(crate) fn resource_context(&self) -> Option<&crate::resource::ResourceContext> {
         self.headers.resource_context()
     }
+
+    pub(crate) fn request_scope(&self) -> Option<&crate::resource::RequestScope> {
+        self.headers.request_scope()
+    }
 }
 
 #[derive(Debug)]
@@ -772,7 +783,8 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
     let spool_context = resource_context.clone();
     if let Some(context) = resource_context {
         request_resident.attribute_context(context.clone())?;
-        req.headers.bind_resource_context(context);
+        req.headers
+            .bind_request_scope(crate::resource::RequestScope::new(context));
     }
 
     if req.expect_continue && framing != BodyFraming::None {
@@ -1251,7 +1263,7 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
             entries,
             resident_lease: None,
             policy_budget: std::sync::Arc::new(crate::resource::RequestPolicyBudget::default()),
-            resource_context: None,
+            request_scope: None,
         },
         body: Vec::new(),
         body_spool: None,
