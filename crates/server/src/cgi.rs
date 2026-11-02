@@ -402,8 +402,14 @@ pub fn execute(ctx: &CgiContext) -> Response {
             if response_lease.reserve(out.len() as u64).is_err() {
                 return cgi_status_error(ctx, 503);
             }
-            match parse_cgi_response(&out, ctx.req.version) {
+            let parsed = parse_cgi_response(&out, ctx.req.version);
+            // The second reservation covers the parser's body copy while the
+            // complete CGI wire buffer is still live. Drop that source before
+            // shrinking the lease to the retained representation.
+            drop(out);
+            match parsed {
                 Ok(mut r) => {
+                    response_lease.release(response_lease.bytes().saturating_sub(r.body_len()));
                     r.hold_resident(response_lease);
                     r
                 }
@@ -467,8 +473,11 @@ fn execute_via_pool(
             if response_lease.reserve(out.len() as u64).is_err() {
                 return Some(cgi_status_error(ctx, 503));
             }
-            Some(match parse_cgi_response(&out, ctx.req.version) {
+            let parsed = parse_cgi_response(&out, ctx.req.version);
+            drop(out);
+            Some(match parsed {
                 Ok(mut r) => {
+                    response_lease.release(response_lease.bytes().saturating_sub(r.body_len()));
                     r.hold_resident(response_lease);
                     r
                 }

@@ -503,6 +503,10 @@ fn finalize_inner(
                 .unwrap_or(DEFAULT_BROTLI_QUALITY),
         ),
     };
+    // Compression admission covers the identity and encoded buffers at their
+    // simultaneous peak. Retire the identity allocation before converting
+    // that peak lease into the retained encoded-response lease below.
+    drop(raw);
     let len = encoded.len();
     resp.body = Body::Bytes(encoded);
     set_header(
@@ -513,7 +517,11 @@ fn finalize_inner(
     set_header(resp, "Content-Length", len.to_string().into_bytes());
     set_header(resp, "Accept-Ranges", b"none".to_vec());
     alter_etag(resp, kind, scope);
-    if let Some(Ok(lease)) = compression_lease.take() {
+    if let Some(Ok(mut lease)) = compression_lease.take() {
+        // The 2x reservation covers the simultaneous identity and encoded
+        // working set only. Retain accounting for the encoded representation,
+        // not the transient peak, while a downstream client consumes it.
+        lease.release(lease.bytes().saturating_sub(len as u64));
         resp.hold_resident(lease);
     }
 }

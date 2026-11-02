@@ -270,6 +270,7 @@ static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_WORKER_CLIENTS: OnceLock<Mutex<HashMap<IpAddr, usize>>> = OnceLock::new();
 static ACTIVE_BODY_WORKERS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_BODY_WORKER_CLIENTS: OnceLock<Mutex<HashMap<IpAddr, usize>>> = OnceLock::new();
 static PENDING_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_CONNECTION_CLIENTS: OnceLock<Mutex<HashMap<IpAddr, usize>>> = OnceLock::new();
 static H2_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -490,12 +491,8 @@ struct WorkerGuard {
     _quota: QuotaGuard,
 }
 
-struct BodyWorkerGuard;
-
-impl Drop for BodyWorkerGuard {
-    fn drop(&mut self) {
-        ACTIVE_BODY_WORKERS.fetch_sub(1, Ordering::AcqRel);
-    }
+struct BodyWorkerGuard {
+    _quota: QuotaGuard,
 }
 
 fn per_client_connection_limit(limit: usize) -> usize {
@@ -570,23 +567,17 @@ fn try_reserve_pending_connection(
     )
 }
 
-fn try_reserve_body_worker(limit: usize) -> Option<BodyWorkerGuard> {
+fn try_reserve_body_worker(client: IpAddr, limit: usize) -> Option<BodyWorkerGuard> {
     let body_limit = body_worker_limit(limit);
-    let mut current = ACTIVE_BODY_WORKERS.load(Ordering::Acquire);
-    loop {
-        if !vapache_verified::connection_admit(current as u64, body_limit as u64) {
-            return None;
-        }
-        match ACTIVE_BODY_WORKERS.compare_exchange_weak(
-            current,
-            current.saturating_add(1),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return Some(BodyWorkerGuard),
-            Err(observed) => current = observed,
-        }
-    }
+    let client_limit = (body_limit.saturating_add(3) / 4).max(1);
+    try_reserve_quota(
+        &ACTIVE_BODY_WORKERS,
+        &ACTIVE_BODY_WORKER_CLIENTS,
+        client,
+        body_limit,
+        client_limit,
+    )
+    .map(|quota| BodyWorkerGuard { _quota: quota })
 }
 
 fn try_reserve_worker(client: IpAddr, limit: usize) -> Option<WorkerGuard> {
@@ -859,6 +850,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
             &mut buf,
             &limits,
             |stream, request| {
+                let effective = cfg.client_addr(peer, request);
                 if request_has_body(request) && !cfg.body_handlers_possible() {
                     // A startup-compiled policy bit proves this generation has
                     // no CGI/FastCGI/proxy/body-consuming handler. Reject any
@@ -877,15 +869,16 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 stream.set_read_timeout(Some(cfg.request_body_timeout.max(Duration::from_secs(1))));
                 if request_has_body(request) && body_guard.is_none() {
                     body_guard = Some(
-                        try_reserve_body_worker(cfg.max_request_workers).ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::WouldBlock,
-                                "slow request-body capacity exhausted",
-                            )
-                        })?,
+                        try_reserve_body_worker(effective.ip(), cfg.max_request_workers)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::WouldBlock,
+                                    "slow request-body capacity exhausted",
+                                )
+                            })?,
                     );
                 }
-                Ok(())
+                Ok(Some(effective.ip()))
             },
             reservation,
         ) {
@@ -1192,9 +1185,15 @@ fn handle_connection<C: Conn + ResponseWrite>(
         if !crate::http::response_headers_admitted(&resp) {
             resp = Response::policy_error();
         }
-        if resp.admit_resident(&cfg.resource_budget).is_err() {
+        if resp.attribute_spool_client(peer.ip()).is_err() {
             resp = Response::memory_overload();
-            let _ = resp.admit_resident(&cfg.resource_budget);
+        }
+        if resp
+            .admit_resident_for(&cfg.resource_budget, peer.ip())
+            .is_err()
+        {
+            resp = Response::memory_overload();
+            let _ = resp.admit_resident_for(&cfg.resource_budget, peer.ip());
         }
         let keep_alive = cfg.keep_alive
             && req.keep_alive
@@ -1539,7 +1538,7 @@ async fn admit_plain_connection(
     let has_body = request_has_body(&request);
     drop(request);
     let body_guard = if has_body {
-        match try_reserve_body_worker(cfg.max_request_workers) {
+        match try_reserve_body_worker(effective.ip(), cfg.max_request_workers) {
             Some(guard) => Some(guard),
             None => {
                 reject_h1_async(&mut stream, &cfg, 503).await;
@@ -1662,7 +1661,7 @@ async fn admit_tls_connection(
     let has_body = request_has_body(&request);
     drop(request);
     let body_guard = if has_body {
-        match try_reserve_body_worker(cfg.max_request_workers) {
+        match try_reserve_body_worker(effective.ip(), cfg.max_request_workers) {
             Some(guard) => Some(guard),
             None => {
                 reject_h1_async(&mut tls, &cfg, 503).await;
@@ -5705,6 +5704,16 @@ mod tests {
         assert!(try_reserve_worker(rotated, limit).is_none());
         assert!(try_reserve_worker(other_prefix, limit).is_some());
         drop(leases);
+
+        let body_limit = 64;
+        let body_share = body_worker_limit(body_limit).div_ceil(4);
+        let bodies: Vec<_> = (0..body_share)
+            .map(|_| try_reserve_body_worker(client, body_limit).unwrap())
+            .collect();
+        assert!(try_reserve_body_worker(client, body_limit).is_none());
+        assert!(try_reserve_body_worker(other, body_limit).is_some());
+        drop(bodies);
+        assert!(try_reserve_body_worker(client, body_limit).is_some());
     }
 
     #[test]
@@ -5767,7 +5776,7 @@ mod tests {
             &mut cursor,
             &mut buf,
             &limits,
-            |_, _| Ok(()),
+            |_, _| Ok(None),
             Some(resident),
         )
         .unwrap()
@@ -5834,7 +5843,7 @@ mod tests {
         let mut cfg = cov_config(&dir, "");
         cfg.body_handlers_possible = true;
         cfg.max_request_workers = 4;
-        let saturated = try_reserve_body_worker(cfg.max_request_workers).unwrap();
+        let saturated = try_reserve_body_worker(cov_peer().ip(), cfg.max_request_workers).unwrap();
         let request = "GET /file.txt HTTP/1.1\r\nHost: localhost\r\n\r\n\
                        POST /file.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody";
         let (response, result) = cov_run_conn(&cfg, request, 80);

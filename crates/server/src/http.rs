@@ -236,6 +236,7 @@ pub(crate) struct BodyAccumulator {
     resource_budget: std::sync::Arc<ResourceBudget>,
     max_spool_bytes: u64,
     max_spool_files: u64,
+    client: Option<std::net::IpAddr>,
 }
 
 impl BodyAccumulator {
@@ -244,6 +245,22 @@ impl BodyAccumulator {
         resource_budget: std::sync::Arc<ResourceBudget>,
         max_spool_bytes: u64,
         max_spool_files: u64,
+    ) -> Self {
+        Self::new_for(
+            memory_limit,
+            resource_budget,
+            max_spool_bytes,
+            max_spool_files,
+            None,
+        )
+    }
+
+    pub(crate) fn new_for(
+        memory_limit: u64,
+        resource_budget: std::sync::Arc<ResourceBudget>,
+        max_spool_bytes: u64,
+        max_spool_files: u64,
+        client: Option<std::net::IpAddr>,
     ) -> Self {
         Self {
             body: Vec::new(),
@@ -254,6 +271,7 @@ impl BodyAccumulator {
             resource_budget,
             max_spool_bytes,
             max_spool_files,
+            client,
         }
     }
 
@@ -291,9 +309,16 @@ impl BodyAccumulator {
             return Ok(());
         }
         if self.file.is_none() {
-            let mut lease = self
-                .resource_budget
-                .try_spool(self.max_spool_bytes, self.max_spool_files)?;
+            let mut lease = match self.client {
+                Some(client) => self.resource_budget.try_spool_for(
+                    self.max_spool_bytes,
+                    self.max_spool_files,
+                    client,
+                )?,
+                None => self
+                    .resource_budget
+                    .try_spool(self.max_spool_bytes, self.max_spool_files)?,
+            };
             // Once the in-memory prefix moves to disk it becomes part of the
             // spool budget too.  Reserve before writing so failure is atomic.
             lease.reserve(next)?;
@@ -595,6 +620,11 @@ fn validate_request_authority(req: &mut Request, limits: &Limits) -> Result<(), 
     Ok(())
 }
 
+pub(crate) fn minimum_read_rate_ok(started: Instant, bytes: u64, min_rate: u64) -> bool {
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    vapache_verified::minimum_progress_rate_admit(bytes, elapsed_ms, min_rate, 1_000)
+}
+
 /// Read one complete request from a keep-alive connection.
 ///
 /// `buf` is a per-connection buffer; any bytes belonging to the next pipelined
@@ -611,7 +641,7 @@ pub fn read_request<R: Read + Write>(
         limits,
         |stream, _request| {
             on_headers(stream);
-            Ok(())
+            Ok(None)
         },
         None,
     )
@@ -625,7 +655,7 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
     stream: &mut R,
     buf: &mut Vec<u8>,
     limits: &Limits,
-    on_headers: impl FnOnce(&mut R, &Request) -> Result<(), ReadError>,
+    on_headers: impl FnOnce(&mut R, &Request) -> Result<Option<std::net::IpAddr>, ReadError>,
     reservation: Option<ResidentLease>,
 ) -> Result<Option<Request>, ReadError> {
     let prefix_precharged = reservation.is_some();
@@ -646,8 +676,8 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
         }
         let elapsed = header_started.elapsed();
         // `header_timeout` is the configured range maximum.  Never derive an
-        // absolute connection lifetime from attacker-controlled byte counts;
-        // MinRate remains a compatibility hint inside that hard ceiling.
+        // absolute connection lifetime from attacker-controlled byte counts.
+        // MinRate is enforced independently inside that hard ceiling.
         let allowed = limits.header_timeout;
         if elapsed > allowed {
             return Err(ReadError::Io(io::Error::new(
@@ -669,6 +699,12 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
             Ok(n) => {
                 request_resident.reserve(n as u64)?;
                 buf.extend_from_slice(&chunk[..n]);
+                if !minimum_read_rate_ok(header_started, buf.len() as u64, limits.header_min_rate) {
+                    return Err(ReadError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "request header minimum rate not met",
+                    )));
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(ReadError::Io(e)),
@@ -695,7 +731,7 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
     // Admission that depends on parsed framing (for example the process-wide
     // slow-body reserve) must happen after the complete head is validated but
     // before a 100 response or any body byte is consumed.
-    on_headers(stream, &req)?;
+    let spool_client = on_headers(stream, &req)?;
 
     if req.expect_continue && framing != BodyFraming::None {
         // The client is waiting for this before sending the body.
@@ -713,15 +749,17 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
             // Content-Length let a huge declaration extend a worker lease for
             // hours even when the peer sent no body bytes.
             let body_deadline = Instant::now() + limits.body_timeout;
+            let body_started = Instant::now();
             if n > MAX_REQUEST_BODY_IN_MEMORY {
                 // A known-large body spills after a small actual-byte prefix.
                 // A declaration plus a token byte therefore holds neither a
                 // spool slot nor a declared-length byte reservation.
-                let mut body = BodyAccumulator::new(
+                let mut body = BodyAccumulator::new_for(
                     REQUEST_BODY_SPOOL_PREFIX,
                     limits.resource_budget.clone(),
                     limits.max_spool_bytes,
                     limits.max_spool_files,
+                    spool_client,
                 );
                 let take = (n as usize).min(buf.len());
                 body.push_with_resident(&buf[..take], &mut request_resident)?;
@@ -746,6 +784,16 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
                     }
                     body.push_with_resident(&chunk[..got], &mut request_resident)?;
                     remaining -= got as u64;
+                    if !minimum_read_rate_ok(
+                        body_started,
+                        n.saturating_sub(remaining),
+                        limits.body_min_rate,
+                    ) {
+                        return Err(ReadError::Io(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "request body minimum rate not met",
+                        )));
+                    }
                 }
                 let (bytes, spool) = body.finish();
                 req.body = bytes;
@@ -763,11 +811,12 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
             }
         }
         BodyFraming::Chunked => {
-            let mut body = BodyAccumulator::new(
+            let mut body = BodyAccumulator::new_for(
                 REQUEST_BODY_SPOOL_PREFIX,
                 limits.resource_budget.clone(),
                 limits.max_spool_bytes,
                 limits.max_spool_files,
+                spool_client,
             );
             let chunk_deadline = Instant::now() + limits.body_timeout;
             let mut writer = ResidentBodyWriter {
@@ -782,6 +831,7 @@ pub(crate) fn read_request_with_reservation<R: Read + Write>(
                 chunk_deadline,
                 None,
                 limits.allow_request_trailers,
+                limits.body_min_rate,
             )
             .map_err(|error| {
                 if error.kind() == io::ErrorKind::PermissionDenied {
@@ -853,9 +903,10 @@ fn read_exact_into<R: Read>(
     out: &mut Vec<u8>,
     n: u64,
     deadline: Instant,
-    _min_rate: u64,
+    min_rate: u64,
     resident: &mut ResidentLease,
 ) -> io::Result<()> {
+    let started = Instant::now();
     let n = n as usize;
     let take = n.min(buf.len());
     resident.reserve(take as u64)?;
@@ -886,6 +937,12 @@ fn read_exact_into<R: Read>(
         resident.reserve(got as u64)?;
         out.extend_from_slice(&chunk[..got]);
         remaining -= got;
+        if !minimum_read_rate_ok(started, (n - remaining) as u64, min_rate) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "request body minimum rate not met",
+            ));
+        }
     }
     Ok(())
 }
@@ -911,7 +968,7 @@ fn read_chunked_to_file_budgeted<R: Read>(
     lease: Option<&mut SpoolLease>,
     allow_trailers: bool,
 ) -> io::Result<u64> {
-    read_chunked_to_writer_budgeted(stream, buf, file, max, deadline, lease, allow_trailers)
+    read_chunked_to_writer_budgeted(stream, buf, file, max, deadline, lease, allow_trailers, 0)
 }
 
 /// Parse one RFC 9112 chunk-size line, including the complete chunk-extension
@@ -939,7 +996,9 @@ fn read_chunked_to_writer_budgeted<R: Read, W: Write>(
     deadline: Instant,
     mut lease: Option<&mut SpoolLease>,
     allow_trailers: bool,
+    min_rate: u64,
 ) -> io::Result<u64> {
+    let started = Instant::now();
     let mut total = 0u64;
     let mut framing_budget = ChunkFramingBudget::default();
     loop {
@@ -1018,6 +1077,12 @@ fn read_chunked_to_writer_budgeted<R: Read, W: Write>(
                 buf.drain(..take);
                 remaining -= take;
                 total += take as u64;
+                if !minimum_read_rate_ok(started, total, min_rate) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "request body minimum rate not met",
+                    ));
+                }
             } else {
                 let mut chunk = [0u8; 8192];
                 let want = remaining.min(chunk.len());
@@ -1035,6 +1100,12 @@ fn read_chunked_to_writer_budgeted<R: Read, W: Write>(
                 writer.write_all(&chunk[..got])?;
                 remaining -= got;
                 total += got as u64;
+                if !minimum_read_rate_ok(started, total, min_rate) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "request body minimum rate not met",
+                    ));
+                }
             }
         }
         let mut crlf = [0u8; 2];
@@ -1305,12 +1376,35 @@ impl Response {
         self.spool_lease = Some(lease);
     }
 
+    pub(crate) fn attribute_spool_client(&mut self, client: std::net::IpAddr) -> io::Result<()> {
+        if let Some(lease) = &mut self.spool_lease {
+            lease.attribute_client(client)?;
+        }
+        Ok(())
+    }
+
     /// Charge retained byte bodies until the response has actually been sent
     /// or discarded. File and streaming bodies already have bounded backing
     /// storage and do not consume this resident-byte budget.
     pub(crate) fn admit_resident(
         &mut self,
         budget: &std::sync::Arc<ResourceBudget>,
+    ) -> io::Result<()> {
+        self.admit_resident_inner(budget, None)
+    }
+
+    pub(crate) fn admit_resident_for(
+        &mut self,
+        budget: &std::sync::Arc<ResourceBudget>,
+        client: std::net::IpAddr,
+    ) -> io::Result<()> {
+        self.admit_resident_inner(budget, Some(client))
+    }
+
+    fn admit_resident_inner(
+        &mut self,
+        budget: &std::sync::Arc<ResourceBudget>,
+        client: Option<std::net::IpAddr>,
     ) -> io::Result<()> {
         let header_bytes = self.headers.iter().fold(256u64, |total, (name, value)| {
             total
@@ -1324,9 +1418,15 @@ impl Response {
         };
         let amount = header_bytes.saturating_add(body_bytes);
         if let Some(lease) = &mut self.resident_lease {
+            if let Some(client) = client {
+                lease.attribute_response_client(client)?;
+            }
             lease.reserve(header_bytes)?;
         } else {
-            let mut lease = budget.try_response_bytes();
+            let mut lease = match client {
+                Some(client) => budget.try_response_bytes_for(client),
+                None => budget.try_response_bytes(),
+            };
             lease.reserve(amount)?;
             self.resident_lease = Some(lease);
         }
@@ -1335,6 +1435,10 @@ impl Response {
 
     pub(crate) fn hold_resident(&mut self, lease: ResidentLease) {
         self.resident_lease = Some(lease);
+    }
+
+    pub(crate) fn take_resident(&mut self) -> Option<ResidentLease> {
+        self.resident_lease.take()
     }
 }
 
@@ -2290,6 +2394,7 @@ mod tests {
                 Instant::now() + Duration::from_secs(1),
                 None,
                 false,
+                0,
             )
             .unwrap(),
             4
@@ -2316,6 +2421,40 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn minimum_read_rate_has_a_grace_period_and_overflow_safe_boundary() {
+        assert!(vapache_verified::minimum_progress_rate_admit(
+            0,
+            999,
+            u64::MAX,
+            1_000
+        ));
+        assert!(!vapache_verified::minimum_progress_rate_admit(
+            1, 2_000, 100, 1_000
+        ));
+        assert!(vapache_verified::minimum_progress_rate_admit(
+            200, 2_000, 100, 1_000
+        ));
+        assert!(vapache_verified::minimum_progress_rate_admit(
+            u64::MAX,
+            u64::MAX,
+            1,
+            1_000,
+        ));
+        assert!(!vapache_verified::minimum_progress_rate_admit(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            1_000,
+        ));
+        assert!(vapache_verified::minimum_progress_rate_admit(
+            0,
+            u64::MAX,
+            0,
+            1_000,
+        ));
     }
 
     #[test]

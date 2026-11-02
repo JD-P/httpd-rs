@@ -684,6 +684,8 @@ fn validate_unix_endpoint(
 
 fn connect_unix_timeout(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
     let bytes = path.as_os_str().as_bytes();
+    // SAFETY: every bit pattern is valid for sockaddr_un; this temporary is
+    // used only to obtain the platform sun_path capacity.
     let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
         .sun_path
         .len();
@@ -693,6 +695,8 @@ fn connect_unix_timeout(path: &Path, deadline: Instant) -> io::Result<UnixStream
             "invalid FastCGI Unix socket path",
         ));
     }
+    // SAFETY: socket has no pointer operands. A successful descriptor is
+    // immediately placed under the guard below.
     let fd = unsafe {
         libc::socket(
             libc::AF_UNIX,
@@ -706,14 +710,19 @@ fn connect_unix_timeout(path: &Path, deadline: Instant) -> io::Result<UnixStream
     struct FdGuard(RawFd);
     impl Drop for FdGuard {
         fn drop(&mut self) {
+            // SAFETY: FdGuard exclusively owns this successfully-created fd.
             unsafe {
                 libc::close(self.0);
             }
         }
     }
     let guard = FdGuard(fd);
+    // SAFETY: zero is a valid initial representation for sockaddr_un and its
+    // family/path fields are initialized before the kernel observes it.
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    // SAFETY: bytes was checked strictly shorter than sun_path above, and the
+    // source and destination are distinct live allocations.
     unsafe {
         std::ptr::copy_nonoverlapping(
             bytes.as_ptr(),
@@ -724,6 +733,8 @@ fn connect_unix_timeout(path: &Path, deadline: Instant) -> io::Result<UnixStream
     let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path)
         .saturating_add(bytes.len())
         .saturating_add(1) as libc::socklen_t;
+    // SAFETY: address remains live for the call and address_len covers only
+    // the initialized family, pathname bytes and trailing zero byte.
     let connected = unsafe {
         libc::connect(
             fd,
@@ -753,6 +764,7 @@ fn connect_unix_timeout(path: &Path, deadline: Instant) -> io::Result<UnixStream
                 events: libc::POLLOUT,
                 revents: 0,
             };
+            // SAFETY: poll points to one live pollfd, matching nfds=1.
             let result = unsafe { libc::poll(&mut poll, 1, wait) };
             if result == 0 {
                 return Err(io::Error::new(
@@ -769,6 +781,8 @@ fn connect_unix_timeout(path: &Path, deadline: Instant) -> io::Result<UnixStream
             }
             let mut socket_error: libc::c_int = 0;
             let mut length = std::mem::size_of_val(&socket_error) as libc::socklen_t;
+            // SAFETY: both output pointers are live and length describes the
+            // exact c_int buffer supplied to getsockopt.
             if unsafe {
                 libc::getsockopt(
                     fd,
@@ -787,11 +801,15 @@ fn connect_unix_timeout(path: &Path, deadline: Instant) -> io::Result<UnixStream
             break;
         }
     }
+    // SAFETY: fd remains exclusively owned by guard and both fcntl commands
+    // use the argument shape required by F_GETFL/F_SETFL.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } != 0 {
         return Err(io::Error::last_os_error());
     }
     std::mem::forget(guard);
+    // SAFETY: guard ownership was deliberately transferred after every
+    // fallible setup step; UnixStream is now the descriptor's sole owner.
     Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
@@ -1313,6 +1331,8 @@ fn path_has_posix_acl(path: &Path) -> io::Result<bool> {
     })?;
     for name in ["system.posix_acl_access", "system.posix_acl_default"] {
         let name = std::ffi::CString::new(name).expect("static xattr name");
+        // SAFETY: path/name are live NUL-terminated strings. Linux permits a
+        // null value pointer with size zero for this length-only query.
         let len = unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
         if len > 0 {
             return Ok(true);

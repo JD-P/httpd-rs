@@ -212,6 +212,17 @@ struct PooledBuffer {
     _resident: ResidentLease,
 }
 
+struct AccountedResponseBytes {
+    data: Vec<u8>,
+    _resident: ResidentLease,
+}
+
+impl AsRef<[u8]> for AccountedResponseBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
 impl AsRef<[u8]> for PooledBuffer {
     fn as_ref(&self) -> &[u8] {
         self.buf.as_deref().unwrap_or(&[])
@@ -237,8 +248,12 @@ impl Drop for PooledBuffer {
     }
 }
 
-fn response_chunk_lease(budget: &Arc<ResourceBudget>, len: usize) -> io::Result<ResidentLease> {
-    let mut resident = budget.try_response_bytes();
+fn response_chunk_lease(
+    budget: &Arc<ResourceBudget>,
+    client: std::net::IpAddr,
+    len: usize,
+) -> io::Result<ResidentLease> {
+    let mut resident = budget.try_response_bytes_for(client);
     resident.reserve(len as u64)?;
     Ok(resident)
 }
@@ -314,19 +329,22 @@ async fn read_body(
     mut recv: h2::RecvStream,
     limit: u64,
     timeout: std::time::Duration,
+    min_rate: u64,
     resource_budget: Arc<crate::resource::ResourceBudget>,
     max_spool_bytes: u64,
     max_spool_files: u64,
+    client: std::net::IpAddr,
     resident: &mut crate::resource::ResidentLease,
 ) -> Result<H2RequestBody, H2ReadFailure> {
     // HTTP/2 can run many request bodies concurrently on one connection.  A
     // small per-stream prefix keeps ordinary forms cheap while the process-
     // wide spool budget bounds larger concurrent bodies.
-    let mut body = BodyAccumulator::new(
+    let mut body = BodyAccumulator::new_for(
         REQUEST_BODY_SPOOL_PREFIX,
         resource_budget,
         max_spool_bytes,
         max_spool_files,
+        Some(client),
     );
     let mut budget = vapache_verified::h2_body_init(limit);
     let mut framing = vapache_verified::ChunkFramingState {
@@ -386,6 +404,12 @@ async fn read_body(
                 bad(500, "cannot spool request body")
             };
             return Err(H2ReadFailure::Response(response));
+        }
+        if !crate::http::minimum_read_rate_ok(started, body.len(), min_rate) {
+            return Err(H2ReadFailure::Response(bad(
+                408,
+                "request body minimum rate not met",
+            )));
         }
         // Return consumed receive-window capacity to h2.  Without this, any
         // body larger than the initial connection window stalls permanently.
@@ -462,7 +486,7 @@ async fn send_data_bounded(
     if data.is_empty() {
         return send.send_data(data, end).map_err(send_io_error);
     }
-    let deadline = Instant::now() + timeout;
+    let mut deadline = Instant::now() + timeout;
     let mut offset = 0usize;
     while offset < data.len() {
         let remaining = data.len() - offset;
@@ -472,6 +496,10 @@ async fn send_data_bounded(
         send.send_data(data.slice(offset..offset + n), last)
             .map_err(send_io_error)?;
         offset += n;
+        // This is a stall deadline, not a total-response lifetime. Receiving
+        // additional flow-control capacity is downstream progress and renews
+        // the deadline just as a successful HTTP/1 socket write does.
+        deadline = Instant::now() + timeout;
     }
     Ok(())
 }
@@ -479,15 +507,22 @@ async fn send_data_bounded(
 async fn send_response(
     mut respond: h2::server::SendResponse<Bytes>,
     cfg: &Config,
+    client: std::net::IpAddr,
     mut resp: Response,
     head_only: bool,
 ) -> io::Result<u64> {
     if !crate::http::response_headers_admitted(&resp) {
         resp = Response::policy_error();
     }
-    if resp.admit_resident(&cfg.resource_budget).is_err() {
+    if resp.attribute_spool_client(client).is_err() {
         resp = Response::memory_overload();
-        resp.admit_resident(&cfg.resource_budget)?;
+    }
+    if resp
+        .admit_resident_for(&cfg.resource_budget, client)
+        .is_err()
+    {
+        resp = Response::memory_overload();
+        resp.admit_resident_for(&cfg.resource_budget, client)?;
     }
     let status = StatusCode::from_u16(resp.status)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid response status"))?;
@@ -568,7 +603,11 @@ async fn send_response(
     if end {
         return Ok(0);
     }
-    let send_timeout = cfg.timeout.max(std::time::Duration::from_secs(5));
+    let send_timeout = cfg.timeout.max(H2_STREAM_FLOOR);
+    // The h2 crate retains queued `Bytes` after this function returns. Move
+    // the body reservation into the byte owner so accounting lasts until the
+    // transport releases the final queued slice, not merely until enqueue.
+    let mut response_resident = resp.take_resident();
 
     let mut sent = 0u64;
     match resp.body {
@@ -580,7 +619,17 @@ async fn send_response(
         }
         Body::Bytes(data) => {
             sent = data.len() as u64;
-            send_data_bounded(&mut send, Bytes::from(data), true, send_timeout).await?;
+            let resident = response_resident.take().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "response body lost its resident-byte reservation",
+                )
+            })?;
+            let data = Bytes::from_owner(AccountedResponseBytes {
+                data,
+                _resident: resident,
+            });
+            send_data_bounded(&mut send, data, true, send_timeout).await?;
         }
         Body::Stream { mut reader, len } => {
             let mut left = len;
@@ -592,8 +641,8 @@ async fn send_response(
                 let capacity = send_capacity(&mut send, want, Instant::now() + send_timeout)
                     .await?
                     .min(want);
-                let resident = response_chunk_lease(&cfg.resource_budget, capacity)?;
-                let blocking_read = cfg.resource_budget.try_response_body_read()?;
+                let resident = response_chunk_lease(&cfg.resource_budget, client, capacity)?;
+                let blocking_read = cfg.resource_budget.try_response_body_read_for(client)?;
                 let (next_reader, mut buf, resident, result) =
                     tokio::task::spawn_blocking(move || {
                         let _blocking_read = blocking_read;
@@ -638,9 +687,9 @@ async fn send_response(
                 let capacity = send_capacity(&mut send, want, Instant::now() + send_timeout)
                     .await?
                     .min(want);
-                let resident = response_chunk_lease(&cfg.resource_budget, capacity)?;
+                let resident = response_chunk_lease(&cfg.resource_budget, client, capacity)?;
                 let data = if offload {
-                    let blocking_read = cfg.resource_budget.try_response_body_read()?;
+                    let blocking_read = cfg.resource_budget.try_response_body_read_for(client)?;
                     let (next_file, data) = tokio::task::spawn_blocking(move || {
                         let _blocking_read = blocking_read;
                         let data = read_range(&file, pos, capacity, resident);
@@ -684,6 +733,75 @@ async fn handle_stream(
     let (parts, recv) = request.into_parts();
     let method = parts.method.as_str().to_string();
     let uri = parts.uri.clone();
+    // Establish both halves of stream admission before any error response can
+    // wait on client-controlled flow control. The old split acquired the
+    // process slot in `serve` and the client slot much later here, allowing a
+    // client-limit rejection to retain every process slot (P30 follow-up).
+    let mut quota_headers = crate::http::Headers::default();
+    let mut quota_identity_valid = true;
+    if let Some(remoteip_header) = &cfg.remoteip_header {
+        let remoteip_header = remoteip_header.to_ascii_lowercase();
+        if remoteip_header == "host" {
+            // The adapter's canonical request view discards a legacy H2 Host
+            // field and exposes :authority as Host. Quota admission must use
+            // that same value or an unusual `RemoteIPHeader Host`
+            // configuration could admit and dispatch under different source
+            // identities.
+            if let Some(authority) = uri.authority() {
+                let value = authority.as_str().as_bytes();
+                quota_identity_valid = vapache_verified::h2_field_size_admit(
+                    b"host".len() as u64,
+                    value.len() as u64,
+                    cfg.limit_request_field_size as u64,
+                );
+                if quota_identity_valid {
+                    quota_headers.push("host", value.to_vec());
+                }
+            }
+        } else {
+            for (name, value) in &parts.headers {
+                if name.as_str() != remoteip_header {
+                    continue;
+                }
+                let merged_len = quota_headers
+                    .get(&remoteip_header)
+                    .map(|existing| existing.len().saturating_add(2))
+                    .unwrap_or(0)
+                    .saturating_add(value.as_bytes().len());
+                if !vapache_verified::h2_field_size_admit(
+                    name.as_str().len() as u64,
+                    merged_len as u64,
+                    cfg.limit_request_field_size as u64,
+                ) {
+                    quota_identity_valid = false;
+                    break;
+                }
+                quota_headers.push_merged(name.as_str(), value.as_bytes());
+            }
+        }
+        if !quota_identity_valid {
+            quota_headers = crate::http::Headers::default();
+        }
+    }
+    let quota_peer = cfg.client_addr_from_headers(peer, &quota_headers);
+    let _stream_quota = match cfg.resource_budget.try_h2_stream_for(quota_peer.ip()) {
+        Ok(lease) => lease,
+        Err(_) => {
+            respond.send_reset(h2::Reason::REFUSED_STREAM);
+            return true;
+        }
+    };
+    if !quota_identity_valid {
+        return send_response(
+            respond,
+            &cfg,
+            quota_peer.ip(),
+            bad(431, "request header field too large"),
+            false,
+        )
+        .await
+        .is_err();
+    }
     // Bound the request-controlled authority before parsing it. The complete
     // head admission below still determines final error precedence for all
     // fields, but no field parser should receive more than the configured
@@ -698,6 +816,7 @@ async fn handle_stream(
         return send_response(
             respond,
             &cfg,
+            quota_peer.ip(),
             bad(431, "request header field too large"),
             false,
         )
@@ -708,6 +827,7 @@ async fn handle_stream(
         return send_response(
             respond,
             &cfg,
+            quota_peer.ip(),
             bad(400, "invalid HTTP/2 request target"),
             false,
         )
@@ -742,6 +862,7 @@ async fn handle_stream(
         return send_response(
             respond,
             &cfg,
+            quota_peer.ip(),
             bad(503, "request memory capacity exhausted"),
             false,
         )
@@ -760,6 +881,7 @@ async fn handle_stream(
             let _ = send_response(
                 respond,
                 &cfg,
+                quota_peer.ip(),
                 bad(431, "request header list too large"),
                 false,
             )
@@ -778,6 +900,7 @@ async fn handle_stream(
             let _ = send_response(
                 respond,
                 &cfg,
+                quota_peer.ip(),
                 bad(400, "connection-specific HTTP/2 header"),
                 false,
             )
@@ -803,6 +926,7 @@ async fn handle_stream(
             let _ = send_response(
                 respond,
                 &cfg,
+                quota_peer.ip(),
                 bad(431, "request header list too large"),
                 false,
             )
@@ -829,32 +953,25 @@ async fn handle_stream(
         cfg.limit_request_field_size as u64,
     ));
     if let Some(resp) = head_error {
-        return send_response(respond, &cfg, resp, false).await.is_err();
-    }
-    let quota_peer = cfg.client_addr_from_headers(peer, &headers);
-    let _client_stream = match cfg.resource_budget.try_h2_client_for(quota_peer.ip()) {
-        Ok(lease) => lease,
-        Err(_) => {
-            return send_response(
-                respond,
-                &cfg,
-                bad(503, "per-client HTTP/2 stream limit reached"),
-                false,
-            )
+        return send_response(respond, &cfg, quota_peer.ip(), resp, false)
             .await
             .is_err();
-        }
-    };
-
+    }
     let declared = match declared_content_length(&headers) {
         Ok(declared) => declared,
         Err(()) => {
             // h2 validates Content-Length syntax and duplicates before
             // yielding an accepted request.
             // coverage:ignore-start - upstream h2 framing invariant
-            return send_response(respond, &cfg, bad(400, "invalid Content-Length"), false)
-                .await
-                .is_err();
+            return send_response(
+                respond,
+                &cfg,
+                quota_peer.ip(),
+                bad(400, "invalid Content-Length"),
+                false,
+            )
+            .await
+            .is_err();
             // coverage:ignore-stop
         }
     };
@@ -873,7 +990,9 @@ async fn handle_stream(
                 .headers
                 .push(("Allow".into(), b"GET, HEAD, OPTIONS".to_vec()));
         }
-        return send_response(respond, &cfg, response, false).await.is_err();
+        return send_response(respond, &cfg, quota_peer.ip(), response, false)
+            .await
+            .is_err();
     }
     let max_body = cfg.limit_request_body.min(crate::http::MAX_BODY_BUFFERED);
     let body_timeout = cfg
@@ -884,9 +1003,11 @@ async fn handle_stream(
             recv,
             max_body,
             body_timeout,
+            cfg.request_body_min_rate,
             cfg.resource_budget.clone(),
             cfg.max_spool_bytes,
             cfg.max_spool_files,
+            quota_peer.ip(),
             &mut request_resident,
         );
         tokio::pin!(body_future);
@@ -918,9 +1039,15 @@ async fn handle_stream(
         if declared != body.len && early.is_none() {
             // h2 enforces the declared DATA length before clean end-of-stream.
             // coverage:ignore-start - upstream h2 framing invariant
-            return send_response(respond, &cfg, bad(400, "Content-Length mismatch"), false)
-                .await
-                .is_err();
+            return send_response(
+                respond,
+                &cfg,
+                quota_peer.ip(),
+                bad(400, "Content-Length mismatch"),
+                false,
+            )
+            .await
+            .is_err();
             // coverage:ignore-stop
         }
     }
@@ -941,6 +1068,14 @@ async fn handle_stream(
         framing: crate::verified::BodyFraming::None,
     };
     let peer = cfg.client_addr(peer, &req);
+    if peer != quota_peer {
+        // Admission and dispatch must never disagree about the effective
+        // source. Fail the stream closed if a future header-canonicalization
+        // change escapes the pre-admission projection above.
+        logger.error("HTTP/2 quota and dispatch client identities diverged");
+        respond.send_reset(h2::Reason::PROTOCOL_ERROR);
+        return true;
+    }
     let (req, resp, remote_user) = match early {
         Some(resp) => (req, resp, None),
         None => {
@@ -972,7 +1107,7 @@ async fn handle_stream(
     let head_only = req.is_head();
     let status = resp.status;
     let bytes_in = req.target.len() as u64 + req.body_len();
-    let body_sent = match send_response(respond, &cfg, resp, head_only).await {
+    let body_sent = match send_response(respond, &cfg, quota_peer.ip(), resp, head_only).await {
         Ok(n) => n,
         Err(e) => {
             // Peer-close/send failures are already exercised directly by the
@@ -1219,7 +1354,7 @@ where
                     }
                 }
             }
-            _ = tokio::time::sleep(idle_timeout) => {
+            _ = tokio::time::sleep(idle_timeout), if budget.active == 0 => {
                 logger.error("HTTP/2 connection idle timeout");
                 conn.abrupt_shutdown(h2::Reason::NO_ERROR);
                 break;
@@ -1234,13 +1369,6 @@ where
                     established_guard = Some(callback()?);
                 }
                 let stream_id = respond.stream_id().as_u32() as u64;
-                let process_stream = match cfg.resource_budget.try_h2_stream() {
-                    Ok(lease) => lease,
-                    Err(_) => {
-                        respond.send_reset(h2::Reason::REFUSED_STREAM);
-                        continue;
-                    }
-                };
                 let Some(next) = vapache_verified::h2_budget_step(
                     budget,
                     vapache_verified::H2BudgetEvent::Begin,
@@ -1269,27 +1397,21 @@ where
                 let cfg = cfg.clone();
                 let logger = logger.clone();
                 let local_ip = local_ip.clone();
-                let stream_timeout = cfg.timeout.max(H2_STREAM_FLOOR);
                 let tx = events_tx.clone();
                 tokio::spawn(async move {
-                    let _process_stream = process_stream;
                     let mut done = H2TaskEventGuard {
                         tx,
                         stream_id,
                         reset: true,
                     };
-                    done.reset = match tokio::time::timeout(
-                        stream_timeout,
-                        handle_stream(cfg, logger, peer, local_ip, local_port, request, respond),
+                    // Request-body, backend, and response-capacity operations
+                    // each own a phase-specific deadline. A whole-stream
+                    // timeout would truncate a transfer that keeps making
+                    // progress merely because its total duration is long.
+                    done.reset = handle_stream(
+                        cfg, logger, peer, local_ip, local_port, request, respond,
                     )
-                    .await
-                    {
-                        Ok(reset) => reset,
-                        // Dropping the response future resets the h2 stream.
-                        // All adapter awaits have stricter local deadlines;
-                        // this remains a final containment guard for scheduler stalls.
-                        Err(_) => true, // coverage:ignore-line - outer timeout fallback
-                    };
+                    .await;
                 });
             }
         }
@@ -1453,7 +1575,13 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut connection = h2::server::handshake(server_io).await.unwrap();
             let (_, respond) = connection.accept().await.unwrap().unwrap();
-            let sender = send_response(respond, &cfg, response, head_only);
+            let sender = send_response(
+                respond,
+                &cfg,
+                std::net::IpAddr::from([127, 0, 0, 1]),
+                response,
+                head_only,
+            );
             tokio::pin!(sender);
             let result = loop {
                 tokio::select! {
@@ -1742,6 +1870,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn h2_remoteip_identity_is_bounded_before_stream_admission() {
+        let (cfg, logger, dir) = test_config_with_extra(
+            "remoteip-admission",
+            "RemoteIPHeader X-Forwarded-For\n\
+             RemoteIPTrustedProxy 127.0.0.1\n\
+             LimitRequestFieldSize 32",
+        );
+        let mut request = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/file.txt")
+            .body(())
+            .unwrap();
+        // Each wire field fits independently, but the value used by
+        // mod_remoteip semantics is the comma-merged field. Reject before
+        // quota admission if that effective identity operand exceeds the
+        // configured field bound.
+        request.headers_mut().append(
+            "x-forwarded-for",
+            http::HeaderValue::from_static("198.51.100.1"),
+        );
+        request.headers_mut().append(
+            "x-forwarded-for",
+            http::HeaderValue::from_static("203.0.113.1"),
+        );
+        assert_eq!(round_trip(cfg, logger, request, &[]).await.0, 431);
+        fs::remove_dir_all(dir).unwrap();
+
+        let (cfg, logger, dir) = test_config_with_extra(
+            "remoteip-host-admission",
+            "RemoteIPHeader Host\nRemoteIPTrustedProxy 127.0.0.1",
+        );
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://198.51.100.1/file.txt")
+            // HTTP/2 canonicalization intentionally ignores this legacy
+            // field in favor of :authority. Admission must do likewise.
+            .header("host", "203.0.113.1")
+            .body(())
+            .unwrap();
+        assert_eq!(round_trip(cfg, logger, request, &[]).await.0, 200);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn h2_connection_loop_handles_completion_reset_and_reclaim() {
         async fn run(reset: bool) {
             let (cfg, logger, dir) = test_config(if reset { "serve-reset" } else { "serve-ok" });
@@ -1888,6 +2060,56 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), server)
             .await
             .expect("timed-out stream connection did not close")
+            .unwrap()
+            .unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn progressing_h2_response_outlives_the_idle_and_send_intervals() {
+        let (cfg, logger, dir) = test_config("progressing-response");
+        let mut short = (*cfg).clone();
+        short.timeout = std::time::Duration::ZERO;
+        short.keep_alive_timeout = std::time::Duration::ZERO;
+        let cfg = Arc::new(short);
+        let expected = vec![b'p'; 64 * 1024];
+        fs::write(dir.join("www/progress.bin"), &expected).unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server = tokio::spawn(serve_io(
+            cfg,
+            logger,
+            server_io,
+            "127.0.0.1:12345".parse().unwrap(),
+            "127.0.0.1".into(),
+            443,
+            || Ok(()),
+        ));
+        let mut builder = h2::client::Builder::new();
+        builder.initial_window_size(4 * 1024);
+        let (mut client, connection) = builder.handshake::<_, Bytes>(client_io).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+        let request = http::Request::builder()
+            .uri("https://localhost/progress.bin")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        let mut body = response.await.unwrap().into_body();
+        let mut received = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            received.extend_from_slice(&chunk);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+        }
+        assert_eq!(received, expected);
+
+        drop((body, client));
+        driver.abort();
+        let _ = driver.await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("progressing response server did not close")
             .unwrap()
             .unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -2089,7 +2311,13 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut connection = h2::server::handshake(server_io).await.unwrap();
             let (_, respond) = connection.accept().await.unwrap().unwrap();
-            let sender = send_response(respond, &server_cfg, body, false);
+            let sender = send_response(
+                respond,
+                &server_cfg,
+                std::net::IpAddr::from([127, 0, 0, 1]),
+                body,
+                false,
+            );
             tokio::pin!(sender);
             loop {
                 tokio::select! {
@@ -2149,7 +2377,13 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut connection = h2::server::handshake(server_io).await.unwrap();
             let (_, respond) = connection.accept().await.unwrap().unwrap();
-            let sender = send_response(respond, &server_cfg, body, false);
+            let sender = send_response(
+                respond,
+                &server_cfg,
+                std::net::IpAddr::from([127, 0, 0, 1]),
+                body,
+                false,
+            );
             tokio::pin!(sender);
             loop {
                 tokio::select! {
@@ -2520,13 +2754,49 @@ mod tests {
         let file = File::open(&path).unwrap();
         let budget = Arc::new(ResourceBudget::default());
 
-        let middle = read_range(&file, 3, 5, response_chunk_lease(&budget, 5).unwrap()).unwrap();
+        let client = std::net::IpAddr::from([127, 0, 0, 1]);
+        let middle = read_range(
+            &file,
+            3,
+            5,
+            response_chunk_lease(&budget, client, 5).unwrap(),
+        )
+        .unwrap();
         assert_eq!(&middle[..], b"34567");
-        let whole = read_range(&file, 0, 10, response_chunk_lease(&budget, 10).unwrap()).unwrap();
+        let whole = read_range(
+            &file,
+            0,
+            10,
+            response_chunk_lease(&budget, client, 10).unwrap(),
+        )
+        .unwrap();
         assert_eq!(&whole[..], b"0123456789");
-        let short = read_range(&file, 8, 5, response_chunk_lease(&budget, 5).unwrap()).unwrap();
+        let short = read_range(
+            &file,
+            8,
+            5,
+            response_chunk_lease(&budget, client, 5).unwrap(),
+        )
+        .unwrap();
         assert_eq!(&short[..], b"89");
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn queued_byte_slices_retain_their_resident_accounting() {
+        let budget = Arc::new(ResourceBudget::default());
+        let client = std::net::IpAddr::from([192, 0, 2, 50]);
+        let mut resident = budget.try_response_bytes_for(client);
+        resident.reserve(16).unwrap();
+        let bytes = Bytes::from_owner(AccountedResponseBytes {
+            data: vec![b'x'; 16],
+            _resident: resident,
+        });
+        let tail = bytes.slice(8..);
+        drop(bytes);
+        assert_eq!(budget.extended_usage().2, 16);
+        drop(tail);
+        assert_eq!(budget.extended_usage().2, 0);
     }
 }

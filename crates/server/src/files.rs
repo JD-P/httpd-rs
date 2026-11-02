@@ -1668,6 +1668,7 @@ fn autoindex(
     add_signature(&mut body, cfg, host, port);
     body.push_str(" </body>\n</html>\n");
     let mut response = Response::bytes(200, "text/html; charset=UTF-8", body.into_bytes());
+    resident.release(resident.bytes().saturating_sub(response.body_len()));
     response.hold_resident(resident);
     response
 }

@@ -3016,6 +3016,68 @@ pub proof fn resource_budget_rejects_exhausted(used: u64, incoming: u64)
 {
 }
 
+/// A process-wide HTTP/2 stream slot may be acquired only after the
+/// source-keyed slot. This ordering ensures that rejecting a client cannot
+/// retain global capacity while its error response waits on that client's
+/// flow-control window.
+pub open spec fn h2_process_slot_spec(client_slot_acquired: bool) -> bool {
+    client_slot_acquired
+}
+
+pub fn h2_process_slot_admit(client_slot_acquired: bool) -> (ok: bool)
+    ensures ok == h2_process_slot_spec(client_slot_acquired),
+{
+    client_slot_acquired
+}
+
+pub proof fn h2_process_slot_requires_client_slot()
+    ensures !h2_process_slot_spec(false),
+{
+}
+
+/// Enforce a minimum average byte rate after a fixed grace interval without
+/// using unchecked arithmetic. This is independent of the caller's absolute
+/// lifetime ceiling: progress can reject a slow peer but never extends that
+/// ceiling.
+pub open spec fn minimum_progress_rate_spec(
+    bytes: u64,
+    elapsed_ms: u64,
+    min_rate: u64,
+    grace_ms: u64,
+) -> bool {
+    min_rate == 0
+        || elapsed_ms < grace_ms
+        || (bytes as nat) >= (min_rate as nat) * ((elapsed_ms / 1000) as nat)
+}
+
+pub fn minimum_progress_rate_admit(
+    bytes: u64,
+    elapsed_ms: u64,
+    min_rate: u64,
+    grace_ms: u64,
+) -> (ok: bool)
+    ensures ok == minimum_progress_rate_spec(bytes, elapsed_ms, min_rate, grace_ms),
+{
+    if min_rate == 0 || elapsed_ms < grace_ms {
+        true
+    } else {
+        let elapsed_seconds = elapsed_ms / 1000;
+        match min_rate.checked_mul(elapsed_seconds) {
+            Some(required) => bytes >= required,
+            None => false,
+        }
+    }
+}
+
+pub proof fn zero_minimum_progress_rate_is_unconditional(
+    bytes: u64,
+    elapsed_ms: u64,
+    grace_ms: u64,
+)
+    ensures minimum_progress_rate_spec(bytes, elapsed_ms, 0, grace_ms),
+{
+}
+
 /// The process-wide response-body read counter protects blocking descriptor
 /// reads only. Request dispatch and downstream socket waits have independent
 /// concurrency/deadline bounds and must never retain this scarce permit.
