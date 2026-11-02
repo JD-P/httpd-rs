@@ -53,6 +53,8 @@ prevents re-deriving them from scratch.
 | `findings_p27.md` | Pass-27 write-ups (P27-A/P27-B): one-request stack-overflow abort and permanent worker starvation in the verified `fnmatch`/`expr_glob` backtracking kernels |
 | `p28/exploit_p28.py` | Pass-28 upload-access evaluator battery (8 verdicts): A1–A3 `RewriteRule $1`-repetition growth to 1.07 GB RSS in 6 s and `memory allocation of N bytes failed` under `RLIMIT_AS` (Apache `403`, 1.9 MB); B1–B3 `Require expr` header/`file()` expansion to >500 MB with allocator abort (Apache `500`, flat); C1–C2 27 KB/90 KB `.htaccess` section nesting stack-overflow aborts (Apache `200`, alive). Loopback only; fixtures under `/tmp/opencode/p28-harness` |
 | `findings_p28.md` | Pass-28 write-ups (P28-A/B/C): unbounded rewrite substitution growth, expression value expansion and access-file section nesting |
+| `p29/exploit_p29.py` | Pass-29 availability battery (5 verdicts): a 518-byte request plus an attacker-written `.htaccess` rewrite expands to a ~20,000-component internal target and aborts the process in the recursive verified ancestor-plan kernel (Apache `500`, alive); the same kernel is reachable from a static config with `LimitRequestLine ≥ ~38 KiB`; and `find_script_checked` burns ~39 ms of CPU per maximum-length 404 (~260× Apache, saturating 7.7/8 cores from one address). Loopback only; fixtures under `/tmp/opencode/p29-harness` |
+| `findings_p29.md` | Pass-29 write-ups (P29-A/A′/B): recursive ancestor-plan stack overflow (whole-process abort) and the quadratic 404 PATH_INFO prefix walk (CPU exhaustion at default configuration) |
 | `dos-resource-budget-followup.md` | Post-P28 DoS review: CVE-2011-4415-style `SetEnvIf` amplification, request-wide matcher/policy work and expansion budgets, access-program breadth limits, and generated-response-header admission |
 | `dos-connection-admission-followup.md` | Post-P28 connection DoS follow-up: asynchronous first-head admission, H2 preface deadline, worker/source reserves, fair listener batches, and complete control-frame charging |
 
@@ -430,3 +432,37 @@ must be aborted by remediated vapache's response-wide deadline, release their
 connection workers, and leave a fresh client at `200`; the Apache `mpm_event`
 oracle must likewise keep serving the fresh client. Loopback only; fixtures
 are removed unless `--keep` is given.
+
+## Running the pass-29 availability battery
+
+```sh
+cargo build --release -p vapached
+python3 adversarial/p29/exploit_p29.py            # both groups (5 verdicts)
+python3 adversarial/p29/exploit_p29.py A          # P29-A stack-overflow abort + Apache oracle
+python3 adversarial/p29/exploit_p29.py B          # P29-B 404 prefix-walk CPU burn + Apache oracle
+python3 adversarial/p29/exploit_p29.py --keep     # retain fixtures and logs
+```
+
+**P29-A** writes the project's conformance/feature access-file shape
+(`VapacheCapability AccessFiles On` + `AllowOverride FileInfo`) and an
+attacker-written `.htaccess` whose `RewriteRule` repeats `$1` 80 times.  A
+518-byte request expands to a ~40 KiB internal target with ~20,000 path
+components; the target is outside the override directory, so the
+access-file component caps are skipped and
+`policy_ref::effective_scope_with_layers_and_file_name` feeds the whole
+ancestor vector to the recursive verified kernel
+`access_walk_plan_exec_from`.  vapache aborts with
+`thread 'vapache-io' has overflowed its stack` / `fatal runtime error:
+stack overflow, aborting` (`SIGABRT`); Apache answers `500` in ~1 ms and
+stays alive, and the rewrite-removal control is `404` with vapache alive.
+The same kernel is reachable from the static `bench.py` shape with
+`LimitRequestLine ≥ ~38 KiB`; the bisection and gdb backtraces are recorded
+in `findings_p29.md`.
+
+**P29-B** runs both servers on the static `bench.py` shape and sends the
+maximum-length 404 (8,175-byte request line, 4,080 components).  vapache
+spends ~39 ms of CPU per request (Apache ~0.15 ms) and 16 connections from
+127.0.0.1 consume 7.7 of 8 cores at ~190 rps while the Apache oracle serves
+the identical traffic at ~10,000 rps using 1.3 cores.  Loopback only;
+fixtures and per-server logs are kept under `/tmp/opencode/p29-harness`
+when `--keep` is given.
