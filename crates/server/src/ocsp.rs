@@ -1099,7 +1099,8 @@ pub(crate) fn account_cached(
     if leases.contains_key(path) {
         return true;
     }
-    let Ok(lease) = budget.try_disk(bytes, 1) else {
+    let target = path.parent().unwrap_or(path);
+    let Ok(lease) = budget.try_disk_at(target, bytes, 1) else {
         return false;
     };
     leases.insert(path.to_path_buf(), lease);
@@ -1192,10 +1193,12 @@ fn save_cached_inner(
     // the peak reservation until rename has committed, then retain the final
     // file's charge for the lifetime of this process generation.
     let mut disk = match budget {
-        Some(budget) => match budget.try_disk((response.len() as u64).saturating_mul(2), 2) {
-            Ok(lease) => Some(lease),
-            Err(_) => return,
-        },
+        Some(budget) => {
+            match budget.try_disk_at(parent, (response.len() as u64).saturating_mul(2), 2) {
+                Ok(lease) => Some(lease),
+                Err(_) => return,
+            }
+        }
         None => None,
     };
     for _ in 0..16 {

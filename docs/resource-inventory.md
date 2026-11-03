@@ -40,9 +40,13 @@ rate checkpoint or the absolute sixteen-interval lifetime.
 Every typed lease also charges a physical parent for file descriptors, tasks,
 and resident memory. A second exact parent combines writable disk bytes and
 directory entries across spools, disk cache records, log files, and OCSP
-staples; it retains one quarter of observed free capacity and never exceeds a
-4 GiB/16,384-entry generation ceiling. Cache replacement holds its old-plus-
-temporary peak until rename commits. The parent ceilings retain
+staples, with a 4 GiB/16,384-entry generation ceiling. Each reservation also
+charges a child ledger keyed by the target filesystem's kernel `st_dev`; every
+child retains one quarter of that filesystem's observed free byte/inode
+capacity and is independently capped at 4 GiB/16,384 entries. A small log or
+cache mount therefore cannot borrow capacity measured on `ServerRoot` or a
+different mount. Cache replacement holds its old-plus-temporary peak until
+rename commits. The parent and filesystem ceilings retain
 kernel/cgroup/filesystem headroom, so
 individually safe pools cannot collectively exhaust the process. Connection
 and backend slots include conservative protocol/stack overhead; request,
@@ -53,8 +57,9 @@ Accepted TCP transports and TCP proxy/FastCGI backends request 128 KiB send
 and receive buffers and hold a conservative 512 KiB kernel/dependency-buffer
 lease under one 256 MiB parent (CGI is conservatively charged through the same
 dynamic-backend lease). HTTP/2 additionally limits each h2 send buffer to 256
-KiB. Writable-disk and transport usage/limits are exported by
-`server-status?auto`.
+KiB. Writable-disk and transport usage/limits, the number of discovered
+writable filesystems, and the most constrained filesystem's remaining byte
+and inode headroom are exported by `server-status?auto`.
 
 Fixed-window process/source gates bound valid requests, malformed HTTP/1 head
 parsing, expensive operations, cache writes, and log bytes. HTTP/2 acquires

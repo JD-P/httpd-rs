@@ -590,7 +590,7 @@ ready listeners                  : rotating order plus 64-accept batch cap
 HTTP/1 response writes          : progress-renewed Timeout stall deadline; non-blocking send/poll; plain/TLS 64 KiB TCP unsent low-water wakeup; effective-client worker quota (no body-read permit while waiting)
 HTTP/2 streams/control frames   : preface/initial-head deadline, client-before-process stream quotas, 128-process/32-source slow-output reserve with anchored rate/lifetime, and every control frame charged; useful WINDOW_UPDATE is 4096 burst/2048 per second
 WebSocket tunnels               : 64 process slots, 8 per effective client, plus idle/write deadline
-logs / RewriteMap prg / cache   : 128 KiB lines and non-queuing writers; 8-request/8-concurrent/64-per-second helpers plus 2-concurrent/16-per-second per-client shares; iterative depth/record-bounded cache walks; one 4 GiB/16,384-entry disk parent shared with spools and OCSP
+logs / RewriteMap prg / cache   : 128 KiB lines and non-queuing writers; 8-request/8-concurrent/64-per-second helpers plus 2-concurrent/16-per-second per-client shares; iterative depth/record-bounded cache walks; one 4 GiB/16,384-entry disk parent shared with spools and OCSP, plus a 75%-of-observed-free child (capped at the same maxima) for each target `st_dev`
 handlers/descriptors            : only stdio + script fd cross exec
 ```
 

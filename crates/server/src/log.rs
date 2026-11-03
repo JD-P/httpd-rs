@@ -298,7 +298,7 @@ fn open_log(
     let disk = if explicit_null {
         None
     } else {
-        Some(resource_budget.try_disk(bytes, 1)?)
+        Some(resource_budget.try_disk_at(&full, bytes, 1)?)
     };
     Ok(Box::new(std::io::BufWriter::new(CappedLogFile {
         file: f,

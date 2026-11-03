@@ -4802,9 +4802,7 @@ impl Compile {
             max_spool_files: 128,
             max_dynamic_requests: 64,
             max_fastcgi_output: 64 * 1024 * 1024,
-            resource_budget: Arc::new(crate::resource::ResourceBudget::for_filesystem(
-                &server_root,
-            )),
+            resource_budget: Arc::new(crate::resource::ResourceBudget::default()),
             access_file_names: vec![".htaccess".into()],
             directory_index: vec!["index.html".into()],
             override_enabled: false,

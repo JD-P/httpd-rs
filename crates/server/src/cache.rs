@@ -311,7 +311,7 @@ fn ensure_disk_usage(
     };
     for (stem, (bytes, _, _)) in &scanned.stems {
         let files = scanned.file_counts.get(stem).copied().unwrap_or(1);
-        let Ok(lease) = budget.try_disk(*bytes, files) else {
+        let Ok(lease) = budget.try_disk_at(root, *bytes, files) else {
             return false;
         };
         scanned.leases.insert(stem.clone(), lease);
@@ -1657,7 +1657,7 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
         let peak_files = old_files.saturating_add(2);
         let lease = usage.leases.entry(stem.clone()).or_insert_with(|| {
             cfg.resource_budget
-                .try_disk(0, 0)
+                .try_disk_at(root, 0, 0)
                 .expect("zero-sized disk lease must be admissible")
         });
         if lease.resize(peak_bytes, peak_files).is_err() {

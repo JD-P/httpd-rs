@@ -25,12 +25,17 @@ pub fn response(auto: bool, resources: &crate::resource::ResourceBudget) -> Resp
             "Total Accesses: {requests}\nTotal kBytes: {}\nUptime: {uptime}\n\
              VapacheDiskBytes: {}\nVapacheDiskByteLimit: {}\n\
              VapacheDiskFiles: {}\nVapacheDiskFileLimit: {}\n\
+             VapacheDiskFilesystems: {}\nVapacheDiskMinByteHeadroom: {}\n\
+             VapacheDiskMinFileHeadroom: {}\n\
              VapacheTransportBytes: {}\nVapacheTransportByteLimit: {}\n",
             bytes / 1024,
             resource.disk_bytes,
             resource.disk_byte_limit,
             resource.disk_files,
             resource.disk_file_limit,
+            resource.disk_filesystems,
+            resource.disk_min_byte_headroom,
+            resource.disk_min_file_headroom,
             resource.transport_bytes,
             resource.transport_byte_limit,
         );
@@ -40,13 +45,17 @@ pub fn response(auto: bool, resources: &crate::resource::ResourceBudget) -> Resp
         "<!DOCTYPE html><html><head><title>Server Status</title></head><body>\
          <h1>Server Status</h1><p>Server uptime: {uptime} seconds</p>\
          <p>Total accesses: {requests}</p><p>Total kBytes: {}</p>\
-         <p>Writable disk: {} / {} bytes, {} / {} files</p>\
+         <p>Writable disk: {} / {} bytes, {} / {} files across {} filesystems; \
+         most constrained filesystem has {} bytes and {} files available</p>\
          <p>Transport buffers: {} / {} bytes</p></body></html>\n",
         bytes / 1024,
         resource.disk_bytes,
         resource.disk_byte_limit,
         resource.disk_files,
         resource.disk_file_limit,
+        resource.disk_filesystems,
+        resource.disk_min_byte_headroom,
+        resource.disk_min_file_headroom,
         resource.transport_bytes,
         resource.transport_byte_limit,
     );

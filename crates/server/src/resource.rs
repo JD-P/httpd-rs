@@ -8,9 +8,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::RawFd;
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -123,6 +123,40 @@ struct RateLedger {
     log_bytes: RateWindow,
 }
 
+/// One writable filesystem's exact byte and directory-entry allowance.  The
+/// device number is the kernel identity returned by `stat(2)`, so configured
+/// cache, log and OCSP paths on different mounts cannot consume one another's
+/// reserved recovery headroom.
+#[derive(Debug)]
+struct DiskLedger {
+    device: u64,
+    bytes: AtomicU64,
+    files: AtomicU64,
+    byte_limit: u64,
+    file_limit: u64,
+}
+
+impl DiskLedger {
+    fn new(device: u64, byte_limit: u64, file_limit: u64) -> Self {
+        Self {
+            device,
+            bytes: AtomicU64::new(0),
+            files: AtomicU64::new(0),
+            byte_limit,
+            file_limit,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DiskLedgers {
+    devices: HashMap<u64, Arc<DiskLedger>>,
+    /// Callers use a small, configuration-owned set of roots (temp, cache,
+    /// log and OCSP). Caching those paths avoids a `statvfs(2)` on every
+    /// request-body or response-cache spool admission.
+    paths: HashMap<PathBuf, Arc<DiskLedger>>,
+}
+
 #[derive(Debug)]
 pub struct ResourceBudget {
     slot_process: [AtomicU64; SlotKind::COUNT],
@@ -135,6 +169,7 @@ pub struct ResourceBudget {
     disk_files: AtomicU64,
     disk_byte_limit: u64,
     disk_file_limit: u64,
+    disk_ledgers: Mutex<DiskLedgers>,
     transport_bytes: AtomicU64,
     transport_byte_limit: u64,
     rates: Mutex<RateLedger>,
@@ -144,7 +179,6 @@ pub struct ResourceBudget {
 impl Default for ResourceBudget {
     fn default() -> Self {
         let physical_limits = detected_physical_limits();
-        let (disk_byte_limit, disk_file_limit) = detected_disk_limits(Path::new("."));
         Self {
             slot_process: std::array::from_fn(|_| AtomicU64::new(0)),
             slot_clients: Mutex::new(HashMap::new()),
@@ -154,8 +188,9 @@ impl Default for ResourceBudget {
             physical_limits,
             disk_bytes: AtomicU64::new(0),
             disk_files: AtomicU64::new(0),
-            disk_byte_limit,
-            disk_file_limit,
+            disk_byte_limit: DEFAULT_DISK_BYTE_BUDGET,
+            disk_file_limit: DEFAULT_DISK_FILE_BUDGET,
+            disk_ledgers: Mutex::new(DiskLedgers::default()),
             transport_bytes: AtomicU64::new(0),
             transport_byte_limit: DEFAULT_TRANSPORT_BUFFER_BUDGET,
             rates: Mutex::new(RateLedger::default()),
@@ -287,13 +322,38 @@ fn detected_physical_limits() -> [u64; PhysicalKind::COUNT] {
     [fd, tasks, memory]
 }
 
-fn detected_disk_limits(root: &Path) -> (u64, u64) {
-    let Ok(path) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
-        return (DEFAULT_DISK_BYTE_BUDGET, DEFAULT_DISK_FILE_BUDGET);
+fn existing_filesystem_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute;
+    let mut candidate = if path.is_absolute() {
+        path
+    } else {
+        absolute = std::env::current_dir()?.join(path);
+        &absolute
     };
+    loop {
+        match std::fs::metadata(candidate) {
+            Ok(_) => return Ok(candidate.to_path_buf()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                candidate = candidate.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn detected_disk_target(path: &Path) -> io::Result<(u64, u64, u64)> {
+    let existing = existing_filesystem_path(path)?;
+    // Bind identity and capacity to one opened object. A concurrent rename or
+    // mount change cannot pair one filesystem's `st_dev` with another one's
+    // free-space limits.
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(existing)?;
+    let device = opened.metadata()?.dev();
     let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
-        return (DEFAULT_DISK_BYTE_BUDGET, DEFAULT_DISK_FILE_BUDGET);
+    if unsafe { libc::fstatvfs(opened.as_raw_fd(), &mut stats) } != 0 {
+        return Err(io::Error::last_os_error());
     }
     let available_bytes = (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64);
     let available_files = stats.f_favail as u64;
@@ -301,7 +361,8 @@ fn detected_disk_limits(root: &Path) -> (u64, u64) {
     // system, administrator recovery, and unrelated services. The hard caps
     // also keep a very large filesystem from turning configured log/spool
     // ceilings into an unexpectedly large aggregate allowance.
-    (
+    Ok((
+        device,
         available_bytes
             .saturating_mul(3)
             .saturating_div(4)
@@ -312,7 +373,7 @@ fn detected_disk_limits(root: &Path) -> (u64, u64) {
             .saturating_div(4)
             .min(DEFAULT_DISK_FILE_BUDGET)
             .max(1),
-    )
+    ))
 }
 
 const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
@@ -763,11 +824,12 @@ pub(crate) struct DescriptorLease {
 }
 
 /// Exact ownership of attacker-influenced persistent/spooled filesystem
-/// capacity. Bytes and directory entries share one process-generation parent
-/// across spools, cache records, logs and certificate-status cache files.
+/// capacity. Bytes and directory entries charge both the process-generation
+/// parent and the child ledger for the filesystem that owns the target.
 #[derive(Debug)]
 pub(crate) struct DiskLease {
     budget: Arc<ResourceBudget>,
+    ledger: Arc<DiskLedger>,
     bytes: u64,
     files: u64,
 }
@@ -784,41 +846,78 @@ impl DiskLease {
     pub(crate) fn resize(&mut self, bytes: u64, files: u64) -> io::Result<()> {
         let add_bytes = bytes.saturating_sub(self.bytes);
         let add_files = files.saturating_sub(self.files);
-        if add_bytes > 0
-            && !try_add(
+        if add_bytes > 0 {
+            if !try_add(
                 &self.budget.disk_bytes,
                 add_bytes,
                 self.budget.disk_byte_limit,
-            )
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::StorageFull,
-                "aggregate writable-disk byte limit reached",
-            ));
-        }
-        if add_files > 0
-            && !try_add(
-                &self.budget.disk_files,
-                add_files,
-                self.budget.disk_file_limit,
-            )
-        {
-            if add_bytes > 0 {
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "aggregate writable-disk byte limit reached",
+                ));
+            }
+            if !try_add(&self.ledger.bytes, add_bytes, self.ledger.byte_limit) {
                 self.budget
                     .disk_bytes
                     .fetch_sub(add_bytes, Ordering::AcqRel);
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    format!(
+                        "writable-disk byte limit reached for filesystem {}",
+                        self.ledger.device
+                    ),
+                ));
             }
-            return Err(io::Error::new(
-                io::ErrorKind::StorageFull,
-                "aggregate writable-disk inode limit reached",
-            ));
+        }
+        if add_files > 0 {
+            if !try_add(
+                &self.budget.disk_files,
+                add_files,
+                self.budget.disk_file_limit,
+            ) {
+                if add_bytes > 0 {
+                    self.ledger.bytes.fetch_sub(add_bytes, Ordering::AcqRel);
+                    self.budget
+                        .disk_bytes
+                        .fetch_sub(add_bytes, Ordering::AcqRel);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "aggregate writable-disk inode limit reached",
+                ));
+            }
+            if !try_add(&self.ledger.files, add_files, self.ledger.file_limit) {
+                self.budget
+                    .disk_files
+                    .fetch_sub(add_files, Ordering::AcqRel);
+                if add_bytes > 0 {
+                    self.ledger.bytes.fetch_sub(add_bytes, Ordering::AcqRel);
+                    self.budget
+                        .disk_bytes
+                        .fetch_sub(add_bytes, Ordering::AcqRel);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    format!(
+                        "writable-disk inode limit reached for filesystem {}",
+                        self.ledger.device
+                    ),
+                ));
+            }
         }
         if bytes < self.bytes {
+            self.ledger
+                .bytes
+                .fetch_sub(self.bytes - bytes, Ordering::AcqRel);
             self.budget
                 .disk_bytes
                 .fetch_sub(self.bytes - bytes, Ordering::AcqRel);
         }
         if files < self.files {
+            self.ledger
+                .files
+                .fetch_sub(self.files - files, Ordering::AcqRel);
             self.budget
                 .disk_files
                 .fetch_sub(self.files - files, Ordering::AcqRel);
@@ -831,6 +930,8 @@ impl DiskLease {
 
 impl Drop for DiskLease {
     fn drop(&mut self) {
+        self.ledger.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.ledger.files.fetch_sub(self.files, Ordering::AcqRel);
         self.budget
             .disk_bytes
             .fetch_sub(self.bytes, Ordering::AcqRel);
@@ -860,6 +961,9 @@ pub(crate) struct ResourceTelemetry {
     pub disk_byte_limit: u64,
     pub disk_files: u64,
     pub disk_file_limit: u64,
+    pub disk_filesystems: u64,
+    pub disk_min_byte_headroom: u64,
+    pub disk_min_file_headroom: u64,
     pub transport_bytes: u64,
     pub transport_byte_limit: u64,
 }
@@ -1304,10 +1408,44 @@ impl Drop for ByteLease {
 }
 
 impl ResourceBudget {
-    pub(crate) fn for_filesystem(root: &Path) -> Self {
-        let mut budget = Self::default();
-        (budget.disk_byte_limit, budget.disk_file_limit) = detected_disk_limits(root);
-        budget
+    fn disk_ledger_for_path(&self, path: &Path) -> io::Result<Arc<DiskLedger>> {
+        {
+            let ledgers = self
+                .disk_ledgers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(ledger) = ledgers.paths.get(path) {
+                return Ok(ledger.clone());
+            }
+        }
+        let (device, byte_limit, file_limit) = detected_disk_target(path)?;
+        let mut ledgers = self
+            .disk_ledgers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let ledger = ledgers
+            .devices
+            .entry(device)
+            .or_insert_with(|| Arc::new(DiskLedger::new(device, byte_limit, file_limit)))
+            .clone();
+        ledgers.paths.insert(path.to_path_buf(), ledger.clone());
+        Ok(ledger)
+    }
+
+    fn try_disk_on_ledger(
+        self: &Arc<Self>,
+        ledger: Arc<DiskLedger>,
+        bytes: u64,
+        files: u64,
+    ) -> io::Result<DiskLease> {
+        let mut lease = DiskLease {
+            budget: self.clone(),
+            ledger,
+            bytes: 0,
+            files: 0,
+        };
+        lease.resize(bytes, files)?;
+        Ok(lease)
     }
 
     pub fn context(self: &Arc<Self>, client: IpAddr) -> ResourceContext {
@@ -1356,14 +1494,19 @@ impl ResourceBudget {
         })
     }
 
-    pub(crate) fn try_disk(self: &Arc<Self>, bytes: u64, files: u64) -> io::Result<DiskLease> {
-        let mut lease = DiskLease {
-            budget: self.clone(),
-            bytes: 0,
-            files: 0,
-        };
-        lease.resize(bytes, files)?;
-        Ok(lease)
+    #[cfg(test)]
+    fn try_disk(self: &Arc<Self>, bytes: u64, files: u64) -> io::Result<DiskLease> {
+        self.try_disk_at(Path::new("."), bytes, files)
+    }
+
+    pub(crate) fn try_disk_at(
+        self: &Arc<Self>,
+        path: &Path,
+        bytes: u64,
+        files: u64,
+    ) -> io::Result<DiskLease> {
+        let ledger = self.disk_ledger_for_path(path)?;
+        self.try_disk_on_ledger(ledger, bytes, files)
     }
 
     pub(crate) fn try_transport_buffers(self: &Arc<Self>) -> io::Result<TransportBufferLease> {
@@ -1384,11 +1527,38 @@ impl ResourceBudget {
     }
 
     pub(crate) fn telemetry(&self) -> ResourceTelemetry {
+        let ledgers = self
+            .disk_ledgers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let disk_min_byte_headroom = ledgers
+            .devices
+            .values()
+            .map(|ledger| {
+                ledger
+                    .byte_limit
+                    .saturating_sub(ledger.bytes.load(Ordering::Acquire))
+            })
+            .min()
+            .unwrap_or(self.disk_byte_limit);
+        let disk_min_file_headroom = ledgers
+            .devices
+            .values()
+            .map(|ledger| {
+                ledger
+                    .file_limit
+                    .saturating_sub(ledger.files.load(Ordering::Acquire))
+            })
+            .min()
+            .unwrap_or(self.disk_file_limit);
         ResourceTelemetry {
             disk_bytes: self.disk_bytes.load(Ordering::Acquire),
             disk_byte_limit: self.disk_byte_limit,
             disk_files: self.disk_files.load(Ordering::Acquire),
             disk_file_limit: self.disk_file_limit,
+            disk_filesystems: ledgers.devices.len() as u64,
+            disk_min_byte_headroom,
+            disk_min_file_headroom,
             transport_bytes: self.transport_bytes.load(Ordering::Acquire),
             transport_byte_limit: self.transport_byte_limit,
         }
@@ -1809,7 +1979,7 @@ impl ResourceBudget {
             ),
             file_slot: Some(file_slot),
             _descriptor: descriptor,
-            disk: self.try_disk(0, 1)?,
+            disk: self.try_disk_at(&std::env::temp_dir(), 0, 1)?,
             slow: false,
         })
     }
@@ -2710,6 +2880,80 @@ mod tests {
         assert_eq!(telemetry.disk_bytes, 0);
         assert_eq!(telemetry.disk_files, 0);
         assert_eq!(telemetry.transport_bytes, 0);
+    }
+
+    #[test]
+    fn disk_children_isolate_filesystems_beneath_the_shared_parent() {
+        let budget = Arc::new(ResourceBudget {
+            disk_byte_limit: 100,
+            disk_file_limit: 10,
+            ..ResourceBudget::default()
+        });
+        let first = Arc::new(DiskLedger::new(11, 5, 1));
+        let second = Arc::new(DiskLedger::new(22, 7, 2));
+        let no_inodes = Arc::new(DiskLedger::new(33, 10, 0));
+        {
+            let mut ledgers = budget
+                .disk_ledgers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            ledgers.devices.insert(first.device, first.clone());
+            ledgers.devices.insert(second.device, second.clone());
+            ledgers.devices.insert(no_inodes.device, no_inodes.clone());
+        }
+
+        let first_lease = budget.try_disk_on_ledger(first.clone(), 5, 1).unwrap();
+        assert!(budget.try_disk_on_ledger(first.clone(), 1, 0).is_err());
+        let second_lease = budget.try_disk_on_ledger(second.clone(), 7, 2).unwrap();
+        assert_eq!(first.bytes.load(Ordering::Acquire), 5);
+        assert_eq!(second.bytes.load(Ordering::Acquire), 7);
+        assert!(budget.try_disk_on_ledger(no_inodes.clone(), 3, 1).is_err());
+        assert_eq!(no_inodes.bytes.load(Ordering::Acquire), 0);
+        assert_eq!(no_inodes.files.load(Ordering::Acquire), 0);
+        let telemetry = budget.telemetry();
+        assert_eq!(telemetry.disk_bytes, 12);
+        assert_eq!(telemetry.disk_filesystems, 3);
+        assert_eq!(telemetry.disk_min_byte_headroom, 0);
+        assert_eq!(telemetry.disk_min_file_headroom, 0);
+
+        drop(first_lease);
+        assert_eq!(first.bytes.load(Ordering::Acquire), 0);
+        assert_eq!(second.bytes.load(Ordering::Acquire), 7);
+        drop(second_lease);
+        assert_eq!(budget.telemetry().disk_bytes, 0);
+        assert_eq!(budget.telemetry().disk_files, 0);
+
+        let inode_capped = Arc::new(ResourceBudget {
+            disk_byte_limit: 10,
+            disk_file_limit: 0,
+            ..ResourceBudget::default()
+        });
+        let ample_child = Arc::new(DiskLedger::new(44, 10, 10));
+        assert!(inode_capped
+            .try_disk_on_ledger(ample_child.clone(), 3, 1)
+            .is_err());
+        assert_eq!(ample_child.bytes.load(Ordering::Acquire), 0);
+        assert_eq!(inode_capped.disk_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(inode_capped.disk_files.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn disk_paths_reuse_their_kernel_device_ledger() {
+        let budget = ResourceBudget::default();
+        let first = budget.disk_ledger_for_path(Path::new(".")).unwrap();
+        let second = budget
+            .disk_ledger_for_path(&std::env::current_dir().unwrap().join("missing/child"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.device, std::fs::metadata(".").unwrap().dev());
+        if let Ok(other_metadata) = std::fs::metadata("/dev/shm") {
+            if other_metadata.dev() != first.device {
+                let other = budget.disk_ledger_for_path(Path::new("/dev/shm")).unwrap();
+                assert!(!Arc::ptr_eq(&first, &other));
+                assert_eq!(other.device, other_metadata.dev());
+                assert_eq!(budget.telemetry().disk_filesystems, 2);
+            }
+        }
     }
 
     #[test]
