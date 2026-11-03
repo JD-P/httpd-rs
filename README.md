@@ -140,9 +140,12 @@ Implemented today:
   absolute connect deadline, and custom CA bundles are parsed once per policy
   generation.
 - TLS client-certificate authentication (`SSLVerifyClient`,
-  `SSLCACertificateFile`), and OCSP stapling with AIA or
+  `SSLCACertificateFile`) with bounded PEM CRL enforcement through
+  `SSLCARevocationFile` and `SSLCARevocationCheck leaf|chain`, and OCSP stapling with AIA or
   `SSLStaplingForceURL` responders, startup warm-start persistence and
-  periodic refresh, plus required or optional client certificates. Full and
+  validity-driven refresh. An expiring staple is refreshed before its
+  `nextUpdate` boundary and is removed from the live certificate generation
+  if no fresh authenticated response is available. Full and
   resumed handshakes retain the same verified peer identity; the bounded
   session store expires after `SSLSessionCacheTimeout` (300 seconds by
   default). Unverified `optional_no_ca` semantics are rejected.
@@ -283,7 +286,8 @@ Implemented today:
   be re-evaluated against an opened symlink's resolved target; there is no
   canonicalize-then-open or lexical-path fallback.
 
-Not yet implemented: OCSP responder error-cache timeout tuning, rare
+Not yet implemented: online OCSP checking for client certificates (CRLs are
+supported), OCSP responder error-cache timeout tuning, rare
 expression forms such as `LogMessage` interpolation, `RewriteMap dbm`, exact
 `[DPI]` path-info discarding in per-directory contexts, some `[NE]`/`[PT]`
 corner cases, `mod_cache_socache`/`mod_file_cache`, Digest/LDAP
@@ -385,7 +389,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **658 verified functions, 0 errors** (percent-decoding,
+Current result: **659 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
@@ -564,7 +568,7 @@ Current ledger: **53.7% weighted obligations**, **5/6 proof debt**,
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **108 adversarial replay cases** covering the findings classes,
-and **658 Verus functions with 0 errors** (including the I3 fast-path
+and **659 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -777,7 +781,7 @@ current instrumented suite is 682 Rust library tests, 8 CLI unit tests, 31 Rust
 integration/property tests, 168 conformance tests and 333 fixed configuration
 cases. The module-by-module reason for the remaining debt and the intended test
 mechanism for each major module are tracked in `docs/coverage-debt.md`.
-The separate Verus gate proves 658 functions with 0 errors; proof-only code is
+The separate Verus gate proves 659 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

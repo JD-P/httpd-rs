@@ -125,6 +125,39 @@ expects the unbracketed IP literal as its certificate identity. Both synchronous
 and asynchronous proxy TLS paths now remove only those brackets before creating
 the `ServerName`; hostname/IP certificate verification remains mandatory.
 
+### 9. OCSP cache intervals could outlive an authenticated staple
+
+An OCSP response was checked for freshness when fetched or loaded, but the
+live `CertifiedKey` retained the response until the configured cache-refresh
+interval. A response with an earlier `nextUpdate` could therefore remain
+stapled after Vapache's own validator would reject it.
+
+Validation now returns the authenticated response deadline as well as a
+boolean verdict. Each TLS generation records that deadline, schedules refresh
+before it (including a bounded near-expiry retry schedule), and atomically
+removes the staple when the deadline is reached without a valid replacement.
+A response is never installed unless both its semantic deadline and a
+monotonic in-process deadline can be represented. The cached-startup and live
+refresh tests exercise deadline derivation, early scheduling and removal from
+the shared certificate key.
+
+### 10. Client-certificate revocation had no usable supported path
+
+Vapache correctly rejected unsupported `SSLOCSP*` directives, but it also
+treated Apache's CRL configuration as unsupported. Operators could enforce a
+trust anchor and certificate lifetime but could not deploy revocation without
+placing a different TLS terminator in front of Vapache.
+
+`SSLCARevocationFile` and `SSLCARevocationCheck none|leaf|chain` are now typed
+configuration fields and part of the listener's immutable handshake policy.
+The CRL is a bounded privileged administrative input, is parsed before the TLS
+generation commits, and is passed to Rustls/WebPKI with expired CRLs and
+unknown revocation status rejected. A revocation mode without a CRL, a CRL
+without active checking, revocation configuration without client
+authentication, and vhosts with different effective CRL policy all fail
+startup. Online client-certificate OCSP remains explicitly unsupported and
+fails configuration loading.
+
 ## Deliberately closed protocol surface
 
 - Only TLS 1.2 and 1.3 are enabled.
@@ -132,8 +165,9 @@ the `ServerName`; hostname/IP certificate verification remains mandatory.
   disabled, rather than relying on dependency defaults.
 - All vhosts on a listener must agree on effective client-auth, protocol,
   cipher preference, session-resumption and ALPN policy.
-- Unsupported cipher, client-revocation, peer-verification and TLS access
-  directives fail configuration loading instead of becoming no-ops.
+- Unsupported cipher, online client-OCSP, peer-verification and TLS access
+  directives fail configuration loading instead of becoming no-ops. Client
+  revocation through a bounded PEM CRL supports leaf or complete-chain checks.
 - HTTPS proxy connections use WebPKI roots or one bounded, trusted custom CA
   bundle and always verify the configured DNS/IP identity.
 - Certificate/key pairs are validated before a generation commits; graceful
@@ -149,12 +183,23 @@ destination-address certificate selection, different/equivalent certificate
 policies, H1 421 admission, H2 coalescing,
 required/optional mTLS, full and resumed mTLS handshakes, default session expiry,
 malformed security directives, OCSP URL injection shapes and IPv6 proxy TLS
-identity construction.
+identity construction. A real negative-handshake matrix rejects wrong server
+names, unknown server and client CAs, not-yet-valid and expired server
+certificates, a server-only EKU presented for client authentication, a cached
+session after the listener's client trust changes, and a revoked client leaf.
+An HTTPS health-check integration test proves that a trusted certificate for
+the wrong configured IP/DNS identity is still rejected. OCSP tests cover
+deadline extraction, early refresh and removal of an expired live staple.
+
+The verified crate additionally owns exact equality of the effective
+leaf/chain revocation mode and active CRL identity. The Verus gate reports 659
+verified functions and 0 errors.
 
 ## Remaining assumptions
 
-Rustls/WebPKI cryptography, X.509 parsing/path validation, handshake transcript
-binding and persisted-session decoding remain external trusted dependencies.
+Rustls/WebPKI cryptography, X.509 and CRL parsing/path/revocation validation,
+handshake transcript binding and persisted-session decoding remain external
+trusted dependencies.
 The operating system's randomness and time sources are also assumptions.
 Vapache's formal layer proves the policy joins around those results; it does
 not reimplement or claim to prove the cryptographic protocol.

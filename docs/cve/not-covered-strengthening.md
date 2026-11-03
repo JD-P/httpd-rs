@@ -229,11 +229,18 @@ not a Verus refinement; the rows are closed only at these boundaries.
 `CVE-2019-0215` / `CVE-2025-23048` prompted a listener-level policy
 invariant.  Rustls has one client-certificate verifier per `ServerConfig`, so
 Vapache now rejects a TLS listener whose virtual hosts disagree on
-`SSLVerifyClient` or `SSLCACertificateFile`.  A single uniform policy means
+`SSLVerifyClient`, `SSLCACertificateFile`, `SSLCARevocationFile` or
+`SSLCARevocationCheck`.  A single uniform policy means
 session resumption cannot cross a vhost with a different client-auth policy.
-Per-location `SSLVerifyClient`/`SSLCACertificateFile` is rejected at
+Per-location client-authentication and revocation policy is rejected at
 configuration load because Rustls authenticates the connection, not an
 individual request.
+
+PEM certificate-revocation lists are supported with Apache's
+`SSLCARevocationFile` and `SSLCARevocationCheck leaf|chain` directives. Rustls
+checks the configured leaf or complete presented chain, rejects unknown
+revocation status, and rejects expired CRLs. Online client-certificate OCSP is
+not claimed: `SSLOCSP*` remains a security-sensitive startup error.
 
 The completed handshake now retains immutable SNI, selected TLS-policy and
 verified client-certificate identity for both full and resumed sessions.
@@ -248,6 +255,10 @@ uses Apache's 300-second default expiry.
 line, header and body limits are enforced, and the DER TLV parser checks
 bounds in safe Rust.  The C buffer over-read primitive is absent; the
 external Rustls certificate parser remains the separate dependency row.
+Staple lifetime is derived from the authenticated `nextUpdate` value (or the
+bounded no-`nextUpdate` lifetime), refresh is scheduled before that deadline,
+and an expired response is removed from the live certificate generation
+rather than being served until the configured cache interval elapses.
 
 ### External certificate parser — the remaining not-covered row
 

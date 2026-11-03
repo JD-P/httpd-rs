@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-03",
   "verus": {
-    "verified_functions": 658,
+    "verified_functions": 659,
     "errors": 0
   },
   "obligations": [
@@ -555,7 +555,7 @@
     "Proxy target identity key",
     "CGI configured-environment admission",
     "HTTP/2 adapter stream-ID admission and local lifecycle state",
-    "TLS listener client-certificate policy identity",
+    "TLS listener client-certificate trust and CRL-revocation policy identity",
     "Scope append-only container/list merge and reverse child-wins map lookup",
     "Rewrite target external/internal classification, internal joining and same-host authority identity",
     "Component-aware filesystem containment for alias, rewrite and FastCGI targets (path_under_base)",

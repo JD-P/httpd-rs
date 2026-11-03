@@ -10082,6 +10082,26 @@ pub fn tls_client_policy_equal(
     }
 }
 
+/// CRL enforcement is part of the immutable client-authentication policy.
+/// Two vhosts may share a handshake only when they use the same effective
+/// leaf/chain check and the same configured CRL identity.
+pub fn tls_client_revocation_policy_equal(
+    check_a: u8,
+    has_crl_a: bool,
+    crl_a: &[u8],
+    check_b: u8,
+    has_crl_b: bool,
+    crl_b: &[u8],
+) -> (equal: bool)
+    ensures equal == (check_a == check_b && has_crl_a == has_crl_b && crl_a@ == crl_b@),
+{
+    if check_a != check_b || has_crl_a != has_crl_b || crl_a.len() != crl_b.len() {
+        false
+    } else {
+        bytes_eq(crl_a, crl_b)
+    }
+}
+
 /// A TLS connection authenticated one virtual-host policy during the
 /// handshake.  A later HTTP Host/:authority may select another vhost only
 /// when its handshake-relevant policy is identical.  This is the executable

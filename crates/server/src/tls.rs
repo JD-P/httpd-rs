@@ -5,10 +5,10 @@
 //! usable certificate/key pair is a startup error, and only TLS 1.2/1.3 are
 //! offered even if an old configuration mentions SSLv3/TLSv1.0.
 
-use crate::config::{vhost_port, Config, HttpProtocol, SslConfig, VHost};
+use crate::config::{vhost_port, ClientRevocationCheck, Config, HttpProtocol, SslConfig, VHost};
 use rustls::crypto::{ring, CryptoProvider};
 use rustls::pki_types::pem::{Error as PemError, PemObject};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{RootCertStore, ServerConfig, SupportedProtocolVersion};
@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 type SharedKey = Arc<RwLock<Arc<CertifiedKey>>>;
 const MAX_TLS_CERTIFICATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_TLS_PRIVATE_KEY_BYTES: u64 = 1024 * 1024;
+const MAX_TLS_CRL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_BROKER_ERROR_BYTES: u64 = 1024;
 const BROKER_SHUTDOWN: u32 = u32::MAX;
 const DEFAULT_SESSION_CACHE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -149,6 +150,7 @@ fn tls_file_specs(cfg: &Config) -> Vec<(PathBuf, u64)> {
         add(specs, &ssl.key_file, MAX_TLS_PRIVATE_KEY_BYTES);
         add(specs, &ssl.chain_file, MAX_TLS_CERTIFICATE_BYTES);
         add(specs, &ssl.ca_file, MAX_TLS_CERTIFICATE_BYTES);
+        add(specs, &ssl.ca_revocation_file, MAX_TLS_CRL_BYTES);
     }
 
     let mut specs = HashMap::new();
@@ -561,6 +563,7 @@ struct OcspRefresh {
     interval: Duration,
     cache_path: PathBuf,
     resource_budget: Option<Arc<crate::resource::ResourceBudget>>,
+    staple_expires: Mutex<Option<Instant>>,
     // A refresher must not keep a retired TLS generation alive forever.
     key: Weak<RwLock<Arc<CertifiedKey>>>,
 }
@@ -701,6 +704,18 @@ fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
     })
 }
 
+fn read_crls(path: &Path) -> Result<Vec<CertificateRevocationListDer<'static>>, String> {
+    let data = read_tls_admin_file(path, MAX_TLS_CRL_BYTES)
+        .map_err(|e| format!("cannot open client CRL {}: {e}", path.display()))?;
+    let crls = CertificateRevocationListDer::pem_slice_iter(&data)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("cannot parse client CRL {}: {e}", path.display()))?;
+    if crls.is_empty() {
+        return Err(format!("no PEM CRLs found in {}", path.display()));
+    }
+    Ok(crls)
+}
+
 fn load_key(
     ssl: &SslConfig,
     provider: &CryptoProvider,
@@ -767,6 +782,17 @@ fn load_key_with_ocsp_accounted(
         } else {
             cached
         };
+        let (response, staple_expires) = match response {
+            Some(response) => {
+                let expires = crate::ocsp::valid_response_ttl(&chain, &response)
+                    .and_then(|ttl| Instant::now().checked_add(ttl));
+                match expires {
+                    Some(expires) => (Some(response), Some(expires)),
+                    None => (None, None),
+                }
+            }
+            None => (None, None),
+        };
         if response.is_none() {
             eprintln!(
                 "vapache: OCSP stapling requested but no response could be fetched for {}",
@@ -778,7 +804,7 @@ fn load_key_with_ocsp_accounted(
         } else {
             ssl.stapling_standard_cache_timeout
         };
-        refresh = Some((chain.clone(), cache_path, interval, timeout));
+        refresh = Some((chain.clone(), cache_path, interval, timeout, staple_expires));
         response
     } else {
         None
@@ -787,22 +813,28 @@ fn load_key_with_ocsp_accounted(
         .map_err(|e| format!("invalid TLS certificate/key pair: {e}"))?;
     certified.ocsp = ocsp;
     let certified = Arc::new(certified);
-    let refresh = refresh.map(|(chain, cache_path, interval, timeout)| OcspRefresh {
-        chain,
-        force_url: ssl.stapling_force_url.clone(),
-        timeout,
-        interval,
-        cache_path,
-        resource_budget: resource_budget.cloned(),
-        key: Weak::new(),
-    });
+    let refresh =
+        refresh.map(
+            |(chain, cache_path, interval, timeout, staple_expires)| OcspRefresh {
+                chain,
+                force_url: ssl.stapling_force_url.clone(),
+                timeout,
+                interval,
+                cache_path,
+                resource_budget: resource_budget.cloned(),
+                staple_expires: Mutex::new(staple_expires),
+                key: Weak::new(),
+            },
+        );
     Ok((certified, refresh))
 }
 
 fn apply_ocsp_response(refresh: &OcspRefresh, response: Vec<u8>) -> bool {
-    if !crate::ocsp::valid_response(&refresh.chain, &response) {
+    let Some(expires) = crate::ocsp::valid_response_ttl(&refresh.chain, &response)
+        .and_then(|ttl| Instant::now().checked_add(ttl))
+    else {
         return true;
-    }
+    };
     let Some(shared) = refresh.key.upgrade() else {
         return false;
     };
@@ -815,16 +847,81 @@ fn apply_ocsp_response(refresh: &OcspRefresh, response: Vec<u8>) -> bool {
     let mut key = (**guard).clone();
     key.ocsp = Some(response);
     *guard = Arc::new(key);
+    *refresh
+        .staple_expires
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(expires);
     true
 }
 
+fn clear_expired_ocsp(refresh: &OcspRefresh, now: Instant) -> bool {
+    let expired = refresh
+        .staple_expires
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .is_some_and(|expires| expires <= now);
+    if !expired {
+        return true;
+    }
+    let Some(shared) = refresh.key.upgrade() else {
+        return false;
+    };
+    let mut guard = shared.write().unwrap_or_else(|error| error.into_inner());
+    if guard.ocsp.is_some() {
+        let mut key = (**guard).clone();
+        key.ocsp = None;
+        *guard = Arc::new(key);
+    }
+    *refresh
+        .staple_expires
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+    true
+}
+
+fn ocsp_refresh_deadline(
+    now: Instant,
+    interval_deadline: Instant,
+    staple_expires: Option<Instant>,
+) -> Instant {
+    let staple_deadline = staple_expires.map(|expires| {
+        let remaining = expires.saturating_duration_since(now);
+        if remaining > Duration::from_secs(30) {
+            let lead = (remaining / 5).min(Duration::from_secs(300));
+            now.checked_add(remaining.saturating_sub(lead))
+                .unwrap_or(expires)
+        } else if remaining > Duration::from_secs(2) {
+            now.checked_add((remaining / 2).min(Duration::from_secs(5)))
+                .unwrap_or(expires)
+        } else {
+            expires
+        }
+    });
+    staple_deadline
+        .map(|deadline| deadline.min(interval_deadline))
+        .unwrap_or(interval_deadline)
+}
+
 fn wait_for_refresh(refresh: &OcspRefresh) -> bool {
-    let deadline = Instant::now() + refresh.interval;
+    let started = Instant::now();
+    let interval_deadline = started.checked_add(refresh.interval).unwrap_or(started);
     loop {
         if refresh.key.upgrade().is_none() {
             return false;
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        let expires = *refresh
+            .staple_expires
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if expires.is_some_and(|expires| expires <= now) {
+            return clear_expired_ocsp(refresh, now);
+        }
+        // Never wait past nextUpdate. Refresh before it when the response has
+        // enough lifetime left, but avoid a retry storm when a responder keeps
+        // returning the same nearly expired response.
+        let deadline = ocsp_refresh_deadline(now, interval_deadline, expires);
+        let remaining = deadline.saturating_duration_since(now);
         if remaining.is_zero() {
             return true;
         }
@@ -950,8 +1047,21 @@ fn client_policy_mode(ssl: &SslConfig) -> u8 {
     }
 }
 
-fn client_policy_key(ssl: &SslConfig) -> (u8, Option<Vec<u8>>) {
+type ClientPolicyKey = (u8, Option<Vec<u8>>, u8, Option<Vec<u8>>);
+
+fn client_revocation_mode(ssl: &SslConfig) -> u8 {
+    match ssl.ca_revocation_check {
+        None | Some(ClientRevocationCheck::None) => 0,
+        Some(ClientRevocationCheck::Leaf) => 1,
+        Some(ClientRevocationCheck::Chain) => 2,
+    }
+}
+
+fn client_policy_key(ssl: &SslConfig) -> ClientPolicyKey {
     let mode = client_policy_mode(ssl);
+    let revocation = (mode != 0)
+        .then(|| client_revocation_mode(ssl))
+        .unwrap_or(0);
     (
         mode,
         (mode != 0)
@@ -961,12 +1071,20 @@ fn client_policy_key(ssl: &SslConfig) -> (u8, Option<Vec<u8>>) {
                     .map(|path| path.as_os_str().as_bytes().to_vec())
             })
             .flatten(),
+        revocation,
+        (revocation != 0)
+            .then(|| {
+                ssl.ca_revocation_file
+                    .as_ref()
+                    .map(|path| path.as_os_str().as_bytes().to_vec())
+            })
+            .flatten(),
     )
 }
 
-fn client_policy_equal(a: &(u8, Option<Vec<u8>>), b: &(u8, Option<Vec<u8>>)) -> bool {
-    let (a_mode, a_ca) = a;
-    let (b_mode, b_ca) = b;
+fn client_policy_equal(a: &ClientPolicyKey, b: &ClientPolicyKey) -> bool {
+    let (a_mode, a_ca, a_revocation, a_crl) = a;
+    let (b_mode, b_ca, b_revocation, b_crl) = b;
     vapache_verified::tls_client_policy_equal(
         *a_mode,
         a_ca.is_some(),
@@ -974,6 +1092,13 @@ fn client_policy_equal(a: &(u8, Option<Vec<u8>>), b: &(u8, Option<Vec<u8>>)) -> 
         *b_mode,
         b_ca.is_some(),
         b_ca.as_deref().unwrap_or(&[]),
+    ) && vapache_verified::tls_client_revocation_policy_equal(
+        *a_revocation,
+        a_crl.is_some(),
+        a_crl.as_deref().unwrap_or(&[]),
+        *b_revocation,
+        b_crl.is_some(),
+        b_crl.as_deref().unwrap_or(&[]),
     )
 }
 
@@ -985,7 +1110,7 @@ fn ensure_uniform_client_policy(policies: &[&SslConfig], port: u16) -> Result<()
     for ssl in policies.iter().skip(1) {
         if !client_policy_equal(&expected, &client_policy_key(ssl)) {
             return Err(format!(
-                "TLS port {port} has virtual hosts with different client-certificate policies;                  use separate Listen directives so SSLVerifyClient/SSLCACertificateFile cannot                  be applied across vhosts"
+                "TLS port {port} has virtual hosts with different client-certificate policies; use separate Listen directives so client trust/revocation policy cannot be applied across vhosts"
             ));
         }
     }
@@ -1375,6 +1500,18 @@ pub(crate) fn prepare_server_config(
     }
 
     let versions = protocol_versions(default_ssl.protocols.as_deref())?;
+    let revocation_check = default_ssl
+        .ca_revocation_check
+        .unwrap_or(ClientRevocationCheck::None);
+    if client_policy_mode(default_ssl) == 0
+        && (revocation_check != ClientRevocationCheck::None
+            || default_ssl.ca_revocation_file.is_some())
+    {
+        return Err(
+            "client-certificate revocation policy requires SSLVerifyClient optional or require"
+                .into(),
+        );
+    }
     let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> = match default_ssl
         .verify_client
         .unwrap_or(crate::config::ClientVerify::None)
@@ -1391,7 +1528,25 @@ pub(crate) fn prepare_server_config(
                     .add(cert)
                     .map_err(|e| format!("invalid client CA certificate: {e}"))?;
             }
-            let builder = WebPkiClientVerifier::builder(Arc::new(roots));
+            let mut builder = WebPkiClientVerifier::builder(Arc::new(roots));
+            match revocation_check {
+                ClientRevocationCheck::None => {
+                    if default_ssl.ca_revocation_file.is_some() {
+                        return Err("SSLCARevocationFile requires SSLCARevocationCheck leaf or chain; refusing to load an unused security policy".into());
+                    }
+                }
+                check => {
+                    let crl = default_ssl.ca_revocation_file.as_ref().ok_or_else(|| {
+                        "SSLCARevocationCheck requires SSLCARevocationFile".to_string()
+                    })?;
+                    builder = builder
+                        .with_crls(read_crls(crl)?)
+                        .enforce_revocation_expiration();
+                    if check == ClientRevocationCheck::Leaf {
+                        builder = builder.only_check_end_entity_revocation();
+                    }
+                }
+            }
             let builder = if mode == crate::config::ClientVerify::Optional {
                 builder.allow_unauthenticated()
             } else {
@@ -1696,6 +1851,26 @@ mod tests {
             ..SslConfig::default()
         };
         assert!(ensure_uniform_client_policy(&[&require, &require3], 443).is_err());
+        let revoked_leaf = SslConfig {
+            verify_client: Some(crate::config::ClientVerify::Require),
+            ca_file: Some("/etc/client-ca.pem".into()),
+            ca_revocation_file: Some("/etc/client.crl".into()),
+            ca_revocation_check: Some(ClientRevocationCheck::Leaf),
+            ..SslConfig::default()
+        };
+        let revoked_leaf_same = revoked_leaf.clone();
+        assert!(ensure_uniform_client_policy(&[&revoked_leaf, &revoked_leaf_same], 443).is_ok());
+        assert!(ensure_uniform_client_policy(&[&require, &revoked_leaf], 443).is_err());
+        let revoked_chain = SslConfig {
+            ca_revocation_check: Some(ClientRevocationCheck::Chain),
+            ..revoked_leaf.clone()
+        };
+        assert!(ensure_uniform_client_policy(&[&revoked_leaf, &revoked_chain], 443).is_err());
+        let other_crl = SslConfig {
+            ca_revocation_file: Some("/etc/other.crl".into()),
+            ..revoked_leaf.clone()
+        };
+        assert!(ensure_uniform_client_policy(&[&revoked_leaf, &other_crl], 443).is_err());
     }
 
     #[test]
@@ -1946,31 +2121,145 @@ mod tests {
         (ca, server, server_key, client, client_key)
     }
 
-    fn drive_handshake(client: &mut ClientConnection, server: &mut ServerConnection) {
+    fn make_crl(dir: &Path, ca: &Path, ca_key: &Path, revoked: &Path) -> PathBuf {
+        let database = dir.join("index.txt");
+        let serial = dir.join("crl-serial");
+        let number = dir.join("crlnumber");
+        let new_certs = dir.join("newcerts");
+        let config = dir.join("crl-openssl.cnf");
+        let crl = dir.join("client.crl.pem");
+        std::fs::create_dir_all(&new_certs).unwrap();
+        std::fs::write(&database, "").unwrap();
+        std::fs::write(&serial, "1000\n").unwrap();
+        std::fs::write(&number, "1000\n").unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "[ ca ]\n\
+                 default_ca = local\n\
+                 [ local ]\n\
+                 database = {}\n\
+                 new_certs_dir = {}\n\
+                 certificate = {}\n\
+                 private_key = {}\n\
+                 serial = {}\n\
+                 crlnumber = {}\n\
+                 default_md = sha256\n\
+                 default_days = 1\n\
+                 default_crl_days = 1\n\
+                 policy = policy_any\n\
+                 [ policy_any ]\n\
+                 commonName = optional\n",
+                database.display(),
+                new_certs.display(),
+                ca.display(),
+                ca_key.display(),
+                serial.display(),
+                number.display()
+            ),
+        )
+        .unwrap();
+        run_openssl(&[
+            "ca",
+            "-batch",
+            "-config",
+            config.to_str().unwrap(),
+            "-revoke",
+            revoked.to_str().unwrap(),
+        ]);
+        run_openssl(&[
+            "ca",
+            "-batch",
+            "-config",
+            config.to_str().unwrap(),
+            "-gencrl",
+            "-out",
+            crl.to_str().unwrap(),
+        ]);
+        crl
+    }
+
+    fn drive_handshake_result(
+        client: &mut ClientConnection,
+        server: &mut ServerConnection,
+    ) -> Result<(), String> {
         for _ in 0..32 {
             let mut progressed = false;
             if client.wants_write() {
                 let mut message = Vec::new();
-                progressed |= client.write_tls(&mut message).unwrap() != 0;
+                progressed |= client.write_tls(&mut message).map_err(|e| e.to_string())? != 0;
                 if !message.is_empty() {
-                    server.read_tls(&mut message.as_slice()).unwrap();
-                    server.process_new_packets().unwrap();
+                    server
+                        .read_tls(&mut message.as_slice())
+                        .map_err(|e| e.to_string())?;
+                    server.process_new_packets().map_err(|e| e.to_string())?;
                 }
             }
             if server.wants_write() {
                 let mut message = Vec::new();
-                progressed |= server.write_tls(&mut message).unwrap() != 0;
+                progressed |= server.write_tls(&mut message).map_err(|e| e.to_string())? != 0;
                 if !message.is_empty() {
-                    client.read_tls(&mut message.as_slice()).unwrap();
-                    client.process_new_packets().unwrap();
+                    client
+                        .read_tls(&mut message.as_slice())
+                        .map_err(|e| e.to_string())?;
+                    client.process_new_packets().map_err(|e| e.to_string())?;
                 }
             }
             if !client.is_handshaking() && !server.is_handshaking() && !server.wants_write() {
-                return;
+                return Ok(());
             }
-            assert!(progressed, "TLS handshake made no progress");
+            if !progressed {
+                return Err("TLS handshake made no progress".into());
+            }
         }
-        panic!("TLS handshake did not complete");
+        Err("TLS handshake did not complete".into())
+    }
+
+    fn drive_handshake(client: &mut ClientConnection, server: &mut ServerConnection) {
+        drive_handshake_result(client, server).unwrap();
+    }
+
+    #[derive(Debug)]
+    struct FixedTime(rustls::pki_types::UnixTime);
+
+    impl rustls::time_provider::TimeProvider for FixedTime {
+        fn current_time(&self) -> Option<rustls::pki_types::UnixTime> {
+            Some(self.0)
+        }
+    }
+
+    fn test_client_config(
+        server_ca: &Path,
+        client_identity: Option<(&Path, &Path)>,
+    ) -> ClientConfig {
+        let mut roots = RootCertStore::empty();
+        for cert in read_certs(server_ca).unwrap() {
+            roots.add(cert).unwrap();
+        }
+        let builder = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots);
+        match client_identity {
+            Some((cert, key)) => builder
+                .with_client_auth_cert(read_certs(cert).unwrap(), read_key(key).unwrap())
+                .unwrap(),
+            None => builder.with_no_client_auth(),
+        }
+    }
+
+    fn handshake_with_name(
+        client_config: Arc<ClientConfig>,
+        server_config: Arc<ServerConfig>,
+        name: &str,
+    ) -> Result<(), String> {
+        let mut client = ClientConnection::new(
+            client_config,
+            ServerName::try_from(name).unwrap().to_owned(),
+        )
+        .unwrap();
+        let mut server = ServerConnection::new(server_config).unwrap();
+        drive_handshake_result(&mut client, &mut server)
     }
 
     fn test_config(dir: &Path, text: &str) -> Config {
@@ -1984,17 +2273,19 @@ mod tests {
         let dir = tempdir("broker-allowlist");
         let cert = dir.join("cert.pem");
         let key = dir.join("key.pem");
+        let crl = dir.join("client.crl");
         let cfg = test_config(
             &dir,
             &format!(
-                "Listen 127.0.0.1:443\nSSLEngine On\nSSLCertificateFile {}\nSSLCertificateKeyFile {}\nSSLCertificateChainFile {}\n",
+                "Listen 127.0.0.1:443\nSSLEngine On\nSSLCertificateFile {}\nSSLCertificateKeyFile {}\nSSLCertificateChainFile {}\nSSLCARevocationFile {}\nSSLCARevocationCheck leaf\n",
                 cert.display(),
                 key.display(),
-                cert.display()
+                cert.display(),
+                crl.display()
             ),
         );
         let specs = tls_file_specs(&cfg);
-        assert_eq!(specs.len(), 2);
+        assert_eq!(specs.len(), 3);
         assert_eq!(
             specs.iter().find(|(path, _)| path == &cert).unwrap().1,
             MAX_TLS_CERTIFICATE_BYTES
@@ -2002,6 +2293,10 @@ mod tests {
         assert_eq!(
             specs.iter().find(|(path, _)| path == &key).unwrap().1,
             MAX_TLS_PRIVATE_KEY_BYTES
+        );
+        assert_eq!(
+            specs.iter().find(|(path, _)| path == &crl).unwrap().1,
+            MAX_TLS_CRL_BYTES
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2015,11 +2310,13 @@ mod tests {
             .unwrap_err()
             .contains("no PEM certificates"));
         assert!(read_key(&empty).unwrap_err().contains("no PEM private key"));
+        assert!(read_crls(&empty).unwrap_err().contains("no PEM CRLs"));
 
         let garbage = dir.join("garbage.pem");
         std::fs::write(&garbage, "not a pem file\n").unwrap();
         assert!(read_certs(&garbage).is_err());
         assert!(read_key(&garbage).is_err());
+        assert!(read_crls(&garbage).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2052,7 +2349,39 @@ mod tests {
         let provider = ring::default_provider();
         let (certified, refresh) = load_key(&ssl, &provider, Some(&cache_dir)).unwrap();
         assert!(certified.ocsp.is_some());
-        assert!(refresh.is_some());
+        let mut refresh = refresh.expect("refresh handle");
+        let expires = refresh
+            .staple_expires
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("cached response deadline");
+        let now = Instant::now();
+        let interval_deadline = now + Duration::from_secs(3600);
+        let deadline = ocsp_refresh_deadline(now, interval_deadline, Some(expires));
+        assert!(deadline <= expires);
+        assert!(deadline <= interval_deadline);
+        let near_expiry = now + Duration::from_secs(20);
+        let near_deadline = ocsp_refresh_deadline(now, interval_deadline, Some(near_expiry));
+        assert!(near_deadline > now);
+        assert!(near_deadline < near_expiry);
+
+        let shared = Arc::new(RwLock::new(certified));
+        refresh.key = Arc::downgrade(&shared);
+        *refresh
+            .staple_expires
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Instant::now());
+        assert!(clear_expired_ocsp(&refresh, Instant::now()));
+        assert!(shared
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .ocsp
+            .is_none());
+        assert!(refresh
+            .staple_expires
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_none());
 
         // Non-zero responder timeout with no cached response exercises the
         // warning path and returns a refresh handle with no initial staple.
@@ -2387,6 +2716,134 @@ mod tests {
                 expected_leaf.as_ref()
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn negative_handshake_matrix_rejects_invalid_server_and_client_identity() {
+        let dir = tempdir("negative-handshake-matrix");
+        let first_dir = dir.join("first");
+        let second_dir = dir.join("second");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let (ca, server_cert, server_key, client_cert, client_key) =
+            make_mtls_certificates(&first_dir);
+        let (other_ca, _, _, other_client_cert, other_client_key) =
+            make_mtls_certificates(&second_dir);
+
+        let plain = test_config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:443\n\
+                 SSLEngine on\n\
+                 SSLProtocol TLSv1.3\n\
+                 SSLCertificateFile {}\n\
+                 SSLCertificateKeyFile {}\n",
+                server_cert.display(),
+                server_key.display()
+            ),
+        );
+        let plain_server = server_config(&plain, 443, None).unwrap().unwrap();
+        assert!(handshake_with_name(
+            Arc::new(test_client_config(&ca, None)),
+            plain_server.clone(),
+            "localhost"
+        )
+        .is_ok());
+
+        // The certificate is otherwise trusted, so this isolates name
+        // validation rather than merely testing an unknown issuer.
+        assert!(handshake_with_name(
+            Arc::new(test_client_config(&ca, None)),
+            plain_server.clone(),
+            "wrong.example"
+        )
+        .is_err());
+        assert!(handshake_with_name(
+            Arc::new(test_client_config(&other_ca, None)),
+            plain_server.clone(),
+            "localhost"
+        )
+        .is_err());
+
+        // Exercise both sides of the X.509 validity interval with actual TLS
+        // handshakes, using Rustls's injectable wall clock instead of flaky
+        // sub-second certificates.
+        let mut not_yet_valid = test_client_config(&ca, None);
+        not_yet_valid.time_provider = Arc::new(FixedTime(
+            rustls::pki_types::UnixTime::since_unix_epoch(Duration::ZERO),
+        ));
+        assert!(
+            handshake_with_name(Arc::new(not_yet_valid), plain_server.clone(), "localhost")
+                .is_err()
+        );
+        let mut expired = test_client_config(&ca, None);
+        expired.time_provider = Arc::new(FixedTime(rustls::pki_types::UnixTime::since_unix_epoch(
+            Duration::from_secs(rustls::pki_types::UnixTime::now().as_secs() + 10 * 86_400),
+        )));
+        assert!(handshake_with_name(Arc::new(expired), plain_server, "localhost").is_err());
+
+        let mtls_text = |client_ca: &Path, revocation: Option<&Path>| {
+            format!(
+                "Listen 127.0.0.1:443\n\
+                 SSLEngine on\n\
+                 SSLProtocol TLSv1.3\n\
+                 SSLCertificateFile {}\n\
+                 SSLCertificateKeyFile {}\n\
+                 SSLVerifyClient require\n\
+                 SSLCACertificateFile {}\n{}",
+                server_cert.display(),
+                server_key.display(),
+                client_ca.display(),
+                revocation.map_or_else(String::new, |crl| format!(
+                    "SSLCARevocationFile {}\nSSLCARevocationCheck leaf\n",
+                    crl.display()
+                ))
+            )
+        };
+        let mtls = test_config(&dir, &mtls_text(&ca, None));
+        let mtls_server = server_config(&mtls, 443, None).unwrap().unwrap();
+        let valid_client = Arc::new(test_client_config(&ca, Some((&client_cert, &client_key))));
+        assert!(
+            handshake_with_name(valid_client.clone(), mtls_server.clone(), "localhost").is_ok()
+        );
+
+        // A certificate with only serverAuth is not a client identity, even
+        // when it chains to the configured client CA.
+        assert!(handshake_with_name(
+            Arc::new(test_client_config(&ca, Some((&server_cert, &server_key)))),
+            mtls_server.clone(),
+            "localhost"
+        )
+        .is_err());
+        assert!(handshake_with_name(
+            Arc::new(test_client_config(
+                &ca,
+                Some((&other_client_cert, &other_client_key))
+            )),
+            mtls_server,
+            "localhost"
+        )
+        .is_err());
+
+        // The client has a cached session from the successful CA-1
+        // handshake. Rebuilding the listener with CA-2 must still reject that
+        // identity rather than carrying authentication across the boundary.
+        let changed_trust = test_config(&dir, &mtls_text(&other_ca, None));
+        let changed_server = server_config(&changed_trust, 443, None).unwrap().unwrap();
+        assert!(handshake_with_name(valid_client.clone(), changed_server, "localhost").is_err());
+
+        let crl = make_crl(&first_dir, &ca, &first_dir.join("ca.key"), &client_cert);
+        assert!(!read_crls(&crl).unwrap().is_empty());
+        let revoked = test_config(&dir, &mtls_text(&ca, Some(&crl)));
+        let revoked_server = server_config(&revoked, 443, None).unwrap().unwrap();
+        assert!(handshake_with_name(valid_client, revoked_server, "localhost").is_err());
+
+        let missing_crl_policy = test_config(
+            &dir,
+            &format!("{}SSLCARevocationCheck leaf\n", mtls_text(&ca, None)),
+        );
+        assert!(server_config(&missing_crl_policy, 443, None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

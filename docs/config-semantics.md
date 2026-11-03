@@ -2112,12 +2112,15 @@ construction: there is no second production interleaver.
   identity variables such as `REQUEST_METHOD`, `SCRIPT_FILENAME`,
   `CONTENT_LENGTH`, `REMOTE_ADDR` and `HTTP_*`; custom variables still pass
   through.  CGI stdout/stderr, timeouts, and FastCGI headers are bounded.
-- `tls_client_policy_equal` / `ensure_uniform_client_policy`.  Every TLS
+- `tls_client_policy_equal`, `tls_client_revocation_policy_equal` /
+  `ensure_uniform_client_policy`.  Every TLS
   listener requires one client-certificate policy across its virtual hosts;
-  mixed `SSLVerifyClient`/`SSLCACertificateFile` configurations fail startup.
+  mixed `SSLVerifyClient`/`SSLCACertificateFile` or
+  `SSLCARevocationFile`/`SSLCARevocationCheck` configurations fail startup.
   The runtime compares a verified exact identity of the effective verification
-  mode and active CA path bytes; omitted and explicit `none` are equivalent,
-  while active CA identities must match. Per-location client authentication is
+  mode, active CA path bytes, leaf/chain revocation mode and active CRL path;
+  omitted and explicit `none` are equivalent, while active CA/CRL identities
+  must match. Per-location client authentication is
   rejected because Rustls verifies the connection, not an individual request;
   Rustls chain validation itself remains an external TLS assumption.
 - `tls_vhost_transition_admit`, `tls_sni_authority_admit` and

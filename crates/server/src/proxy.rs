@@ -4996,6 +4996,76 @@ mod coverage_tests {
     }
 
     #[test]
+    fn https_health_check_rejects_a_trusted_certificate_for_the_wrong_name() {
+        let dir =
+            std::env::temp_dir().join(format!("vapache-proxy-health-tls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let status = std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+                "-keyout",
+                key.to_str().unwrap(),
+                "-out",
+                cert.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("openssl");
+        assert!(status.success());
+
+        let chain = CertificateDer::pem_file_iter(&cert)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key_der = rustls::pki_types::PrivateKeyDer::from_pem_file(&key).unwrap();
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(chain, key_der)
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let connection = rustls::ServerConnection::new(server_config).unwrap();
+            let mut stream = rustls::StreamOwned::new(connection, tcp);
+            let mut request = [0u8; 256];
+            let _ = stream.read(&mut request);
+        });
+        let spec = HealthSpec {
+            key: "tls-name".into(),
+            url: format!("https://127.0.0.1:{port}/health"),
+            method: "GET".into(),
+            uri: "/health".into(),
+            interval: Duration::from_secs(1),
+            passes: 1,
+            fails: 1,
+            ca_file: Some(cert),
+            ca_trust: crate::files::AdminFileTrust::ProcessOwned,
+        };
+        assert!(!check_health(&spec));
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn proxy_response_error_paths() {
         invalid("HTTP/1.1\r\n\r\n", "missing status");
         invalid("garbage 200 OK\r\n\r\n", "invalid version");

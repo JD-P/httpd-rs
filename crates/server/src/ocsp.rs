@@ -704,24 +704,31 @@ fn cert_id_matches(data: &[u8], cert_id: Tlv, leaf: &CertInfo, issuer: &CertInfo
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SingleResponseValidity {
+    OtherCertificate,
+    Invalid,
+    GoodUntil(i64),
+}
+
 fn valid_single_response(
     data: &[u8],
     single: Tlv,
     leaf: &CertInfo,
     issuer: &CertInfo,
     now: i64,
-) -> Option<Option<bool>> {
+) -> Option<SingleResponseValidity> {
     if single.tag != 0x30 {
         return None;
     }
     let cert_id = parse_tlv(data, single.content_start)?;
     let matches = cert_id_matches(data, cert_id, leaf, issuer)?;
     if !matches {
-        return Some(None);
+        return Some(SingleResponseValidity::OtherCertificate);
     }
     let status = parse_tlv(data, cert_id.end)?;
     if status.tag != 0x80 || status.content_start != status.content_end {
-        return Some(Some(false));
+        return Some(SingleResponseValidity::Invalid);
     }
     let this_update = parse_tlv(data, status.end)?;
     if this_update.tag != 0x18 {
@@ -730,7 +737,7 @@ fn valid_single_response(
     let this_update_time =
         generalized_time(&data[this_update.content_start..this_update.content_end])?;
     if this_update_time > now + OCSP_CLOCK_SKEW_SECS {
-        return Some(Some(false));
+        return Some(SingleResponseValidity::Invalid);
     }
     let mut p = this_update.end;
     let mut next_update_time = None;
@@ -757,10 +764,15 @@ fn valid_single_response(
     if p != single.content_end {
         return None;
     }
-    let fresh = next_update_time
-        .map(|next| next >= now - OCSP_CLOCK_SKEW_SECS)
-        .unwrap_or_else(|| now - this_update_time <= MAX_OCSP_AGE_WITHOUT_NEXT_UPDATE_SECS);
-    Some(Some(fresh))
+    let valid_until = match next_update_time {
+        Some(next) => next.checked_add(OCSP_CLOCK_SKEW_SECS)?,
+        None => this_update_time.checked_add(MAX_OCSP_AGE_WITHOUT_NEXT_UPDATE_SECS)?,
+    };
+    Some(if valid_until > now {
+        SingleResponseValidity::GoodUntil(valid_until)
+    } else {
+        SingleResponseValidity::Invalid
+    })
 }
 
 fn responder_matches(data: &[u8], responder: Tlv, signer: &CertInfo) -> bool {
@@ -849,79 +861,86 @@ fn signature_valid(
     false
 }
 
-pub(crate) fn valid_response(chain: &[CertificateDer<'static>], response: &[u8]) -> bool {
+fn valid_response_until(
+    chain: &[CertificateDer<'static>],
+    response: &[u8],
+    now: i64,
+) -> Option<i64> {
     if chain.len() < 2 {
-        return false;
+        return None;
     }
     let Some(leaf) = parse_cert(chain[0].as_ref()) else {
-        return false;
+        return None;
     };
     let Some(issuer) = parse_cert(chain[1].as_ref()) else {
-        return false;
+        return None;
     };
     let Some(basic) = basic_response(response) else {
-        return false;
+        return None;
     };
     if basic.signature.content_start >= basic.signature.content_end
         || basic.bytes[basic.signature.content_start] != 0
     {
-        return false;
+        return None;
     }
     let mut p = basic.tbs.content_start;
     let Some(mut responder) = parse_tlv(basic.bytes, p) else {
-        return false;
+        return None;
     };
     if responder.tag == 0xa0 {
         let Some(version) = parse_tlv(basic.bytes, responder.content_start) else {
-            return false;
+            return None;
         };
         if version.tag != 0x02
             || version.end != responder.content_end
             || &basic.bytes[version.content_start..version.content_end] != [0]
         {
-            return false;
+            return None;
         }
         p = responder.end;
         let Some(next) = parse_tlv(basic.bytes, p) else {
-            return false;
+            return None;
         };
         responder = next;
     }
     if !matches!(responder.tag, 0xa1 | 0xa2 | 0x82) {
-        return false;
+        return None;
     }
     let Some(produced_at) = parse_tlv(basic.bytes, responder.end) else {
-        return false;
+        return None;
     };
     if produced_at.tag != 0x18 {
-        return false;
+        return None;
     }
-    let now = UnixTime::now().as_secs() as i64;
     let Some(produced) =
         generalized_time(&basic.bytes[produced_at.content_start..produced_at.content_end])
     else {
-        return false;
+        return None;
     };
     if produced > now + OCSP_CLOCK_SKEW_SECS {
-        return false;
+        return None;
     }
     let Some(responses) = parse_tlv(basic.bytes, produced_at.end) else {
-        return false;
+        return None;
     };
     if responses.tag != 0x30 {
-        return false;
+        return None;
     }
-    let mut matched = false;
+    let mut matched = None;
     let mut q = responses.content_start;
     while q < responses.content_end {
         let Some(single) = parse_tlv(basic.bytes, q) else {
-            return false;
+            return None;
         };
         q = single.end;
         match valid_single_response(basic.bytes, single, &leaf, &issuer, now) {
-            Some(None) => {}
-            Some(Some(true)) if !matched => matched = true,
-            Some(Some(_)) | None => return false,
+            Some(SingleResponseValidity::OtherCertificate) => {}
+            Some(SingleResponseValidity::GoodUntil(until)) if matched.is_none() => {
+                matched = Some(until)
+            }
+            Some(SingleResponseValidity::GoodUntil(_) | SingleResponseValidity::Invalid) | None => {
+                return None
+            }
         }
     }
     if produced_at.end > responses.start
@@ -931,9 +950,23 @@ pub(crate) fn valid_response(chain: &[CertificateDer<'static>], response: &[u8])
                 extensions.tag != 0xa1 || extensions.end != basic.tbs.content_end
             }))
     {
-        return false;
+        return None;
     }
-    matched && signature_valid(&basic, responder, chain)
+    signature_valid(&basic, responder, chain).then_some(matched?)
+}
+
+pub(crate) fn valid_response(chain: &[CertificateDer<'static>], response: &[u8]) -> bool {
+    valid_response_until(chain, response, UnixTime::now().as_secs() as i64).is_some()
+}
+
+pub(crate) fn valid_response_ttl(
+    chain: &[CertificateDer<'static>],
+    response: &[u8],
+) -> Option<Duration> {
+    let now = UnixTime::now().as_secs() as i64;
+    let valid_until = valid_response_until(chain, response, now)?;
+    let seconds = valid_until.checked_sub(now)?;
+    (seconds > 0).then(|| Duration::from_secs(seconds as u64))
 }
 
 #[cfg(test)]
@@ -1580,12 +1613,14 @@ mod tests {
                 &issuer,
                 now
             ),
-            Some(Some(true))
+            Some(SingleResponseValidity::GoodUntil(
+                now + 3600 + OCSP_CLOCK_SKEW_SECS
+            ))
         );
         let stale = single(0x80, now - 2 * 86_400, None);
         assert_eq!(
             valid_single_response(&stale, parse_tlv(&stale, 0).unwrap(), &leaf, &issuer, now),
-            Some(Some(false))
+            Some(SingleResponseValidity::Invalid)
         );
         let unknown = single(0x82, now - 60, Some(now + 3600));
         assert_eq!(
@@ -1596,7 +1631,7 @@ mod tests {
                 &issuer,
                 now
             ),
-            Some(Some(false))
+            Some(SingleResponseValidity::Invalid)
         );
     }
 

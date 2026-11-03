@@ -2556,6 +2556,13 @@ pub enum ClientVerify {
     Require,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientRevocationCheck {
+    None,
+    Leaf,
+    Chain,
+}
+
 /// Application protocols offered by a TLS listener through ALPN. Keep this
 /// separate from `SslConfig::protocols`, which models `SSLProtocol` and thus
 /// selects TLS versions rather than HTTP versions.
@@ -2625,6 +2632,8 @@ pub struct SslConfig {
     pub session_tickets: Option<bool>,
     pub verify_client: Option<ClientVerify>,
     pub ca_file: Option<PathBuf>,
+    pub ca_revocation_file: Option<PathBuf>,
+    pub ca_revocation_check: Option<ClientRevocationCheck>,
     pub stapling: bool,
     pub stapling_set: bool,
     pub stapling_force_url: Option<String>,
@@ -2671,6 +2680,12 @@ impl SslConfig {
         }
         if self.ca_file.is_none() {
             self.ca_file = parent.ca_file.clone();
+        }
+        if self.ca_revocation_file.is_none() {
+            self.ca_revocation_file = parent.ca_revocation_file.clone();
+        }
+        if self.ca_revocation_check.is_none() {
+            self.ca_revocation_check = parent.ca_revocation_check;
         }
         if !self.stapling_set {
             self.stapling = parent.stapling;
@@ -3531,6 +3546,8 @@ fn directive_arity(name: &str) -> PayloadArity {
         | "sslproxycacertificatefile"
         | "sslverifyclient"
         | "sslcacertificatefile"
+        | "sslcarevocationfile"
+        | "sslcarevocationcheck"
         | "authtype"
         | "authname"
         | "authuserfile"
@@ -3611,6 +3628,7 @@ fn directive_rejects_empty(name: &str) -> bool {
             | "sslcertificatechainfile"
             | "sslproxycacertificatefile"
             | "sslcacertificatefile"
+            | "sslcarevocationfile"
             | "sslprotocol"
             | "sslciphersuite"
             | "sslciphersuitetls13"
@@ -3648,6 +3666,7 @@ const SATISFY_KEYWORDS: &[&str] = &["all", "any"];
 const AUTH_MERGING_KEYWORDS: &[&str] = &["off", "and", "or"];
 const BASIC_AUTH_KEYWORDS: &[&str] = &["basic"];
 const FILE_PROVIDER_KEYWORDS: &[&str] = &["file"];
+const SSL_CA_REVOCATION_CHECK_KEYWORDS: &[&str] = &["none", "leaf", "chain"];
 
 /// Directive payloads are compiled while the immutable program is sealed.
 /// Remaining token payloads are exact strings or lists whose application is
@@ -3767,6 +3786,7 @@ fn directive_payload_schema(name: &str) -> PayloadSchema {
         "sslverifyclient" => {
             PayloadValueSchema::Keyword(&["none", "optional", "require", "optional_no_ca"])
         }
+        "sslcarevocationcheck" => PayloadValueSchema::Keyword(SSL_CA_REVOCATION_CHECK_KEYWORDS),
         "cachelastmodifiedfactor" => PayloadValueSchema::UnitFloat,
         "sslstaplingforceurl" => PayloadValueSchema::OcspResponderUrl,
         "aliasmatch" | "scriptaliasmatch" => PayloadValueSchema::AliasRegex,
@@ -4285,6 +4305,8 @@ fn directive_owner(name: &str) -> Option<&'static str> {
         | "sslcertificatefile"
         | "sslcertificatekeyfile"
         | "sslcacertificatefile"
+        | "sslcarevocationfile"
+        | "sslcarevocationcheck"
         | "ssloptions"
         | "sslrequiressl" => "ssl",
         "listen" => "mpm_event",
@@ -5312,6 +5334,7 @@ impl Compile {
                     ssl.key_file.as_ref(),
                     ssl.chain_file.as_ref(),
                     ssl.ca_file.as_ref(),
+                    ssl.ca_revocation_file.as_ref(),
                 ]
                 .into_iter()
                 .flatten()
@@ -5970,6 +5993,8 @@ impl Compile {
                 | "sslhonorcipherorder"
                 | "sslverifyclient"
                 | "sslcacertificatefile"
+                | "sslcarevocationfile"
+                | "sslcarevocationcheck"
                 | "sslprotocol"
                 | "sslciphersuite"
                 | "sslciphersuitetls13"
@@ -8063,6 +8088,37 @@ impl Compile {
                     &mut self.cfg.ssl
                 };
                 target.ca_file = Some(full);
+            }
+            "sslcarevocationfile" => {
+                let p = PathBuf::from(first());
+                let full = if p.is_absolute() {
+                    p
+                } else {
+                    self.cfg.server_root.join(p)
+                };
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
+                } else {
+                    &mut self.cfg.ssl
+                };
+                target.ca_revocation_file = Some(full);
+            }
+            "sslcarevocationcheck" => {
+                let check = match payload
+                    .keyword()
+                    .expect("SSLCARevocationCheck is compiled while sealing")
+                {
+                    0 => ClientRevocationCheck::None,
+                    1 => ClientRevocationCheck::Leaf,
+                    2 => ClientRevocationCheck::Chain,
+                    _ => unreachable!("sealed SSLCARevocationCheck keyword index"),
+                };
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
+                } else {
+                    &mut self.cfg.ssl
+                };
+                target.ca_revocation_check = Some(check);
             }
             "sslprotocol" => {
                 let target = if let Some(i) = self.current_vhost {
@@ -10264,6 +10320,7 @@ fn known_directives() -> HashSet<&'static str> {
         "singlelisten",
         "sslcacertificatefile",
         "sslcacertificatepath",
+        "sslcarevocationcheck",
         "sslcarevocationfile",
         "sslcarevocationpath",
         "sslciphersuite",
@@ -10715,6 +10772,7 @@ mod tests {
             ("remoteiptrustedproxy", vec!["not-an-address"]),
             ("sslprotocol", vec!["TLSv9"]),
             ("sslverifyclient", vec!["sometimes"]),
+            ("sslcarevocationcheck", vec!["sometimes"]),
             ("aliasmatch", vec!["(?=lookahead)", "/srv"]),
             ("proxypass", vec!["/", "gopher://backend"]),
             ("proxyset", vec!["unknown=value"]),
@@ -11307,6 +11365,14 @@ mod tests {
             (
                 "SSLCACertificateFile one two\n".to_string(),
                 "client CA path arity",
+            ),
+            (
+                "SSLCARevocationFile one two\n".to_string(),
+                "client CRL path arity",
+            ),
+            (
+                "SSLCARevocationCheck sometimes\n".to_string(),
+                "client revocation mode",
             ),
             ("SSLProtocol\n".to_string(), "empty TLS protocol policy"),
             (
@@ -12243,6 +12309,8 @@ SSLOptions +StrictRequire\n";
             "SSLRandomSeed startup builtin",
             "SSLPassPhraseDialog builtin",
             "SSLStaplingCache shmcb:/run/apache2/stapling(32768)",
+            "SSLCARevocationFile /etc/apache2/client.crl",
+            "SSLCARevocationCheck leaf",
         ] {
             let config = format!(
                 "Listen 127.0.0.1:443\n<Directory /srv/private>\n{directive}\n</Directory>\n"
@@ -14525,6 +14593,8 @@ SSLStaplingStandardCacheTimeout 10\n\
 SSLStaplingReturnResponderErrors On\n\
 SSLVerifyClient optional\n\
 SSLCACertificateFile {cert}\n\
+SSLCARevocationFile {chain}\n\
+SSLCARevocationCheck leaf\n\
 SSLProxyCACertificateFile {cert}\n\
 RewriteEngine On\n\
 RewriteBase /base\n\
@@ -14605,6 +14675,8 @@ RewriteOptions Inherit\n"
             2
         );
         assert_eq!(c.ssl.verify_client, Some(ClientVerify::Optional));
+        assert_eq!(c.ssl.ca_revocation_file.as_deref(), Some(Path::new(&chain)));
+        assert_eq!(c.ssl.ca_revocation_check, Some(ClientRevocationCheck::Leaf));
         assert!(c.ssl.engine);
         assert!(c.ssl.stapling);
         assert_eq!(c.ssl.stapling_responder_timeout, Duration::from_secs(5));
@@ -14732,6 +14804,8 @@ SSLStaplingStandardCacheTimeout 8\n\
 SSLStaplingReturnResponderErrors On\n\
 SSLVerifyClient require\n\
 SSLCACertificateFile {cert}\n\
+SSLCARevocationFile {chain}\n\
+SSLCARevocationCheck chain\n\
 SSLProtocol all\n\
 </VirtualHost>\n\
 <VirtualHost *:80>\n\
@@ -14748,6 +14822,10 @@ ServerName plain.test\n\
         assert_eq!(v.server_admin.as_deref(), Some("vhost@example.test"));
         assert!(v.ssl.engine);
         assert_eq!(v.ssl.verify_client, Some(ClientVerify::Require));
+        assert_eq!(
+            v.ssl.ca_revocation_check,
+            Some(ClientRevocationCheck::Chain)
+        );
         assert_eq!(v.ssl.stapling_responder_timeout, Duration::from_secs(4));
         assert_eq!(
             v.ssl.stapling_standard_cache_timeout,
@@ -14837,6 +14915,8 @@ SSLEngine On\n\
 SSLCertificateFile rel/cert.pem\n\
 SSLCertificateKeyFile rel/key.pem\n\
 SSLCACertificateFile rel/ca.pem\n\
+SSLCARevocationFile rel/client.crl\n\
+SSLCARevocationCheck leaf\n\
 <Proxy *>\n\
 Require all granted\n\
 </Proxy>\n\
@@ -14880,6 +14960,14 @@ Require all granted\n\
         assert_eq!(
             c.vhosts[0].ssl.cert_file.as_deref(),
             Some(Path::new("/tmp/rel/cert.pem"))
+        );
+        assert_eq!(
+            c.vhosts[0].ssl.ca_revocation_file.as_deref(),
+            Some(Path::new("/tmp/rel/client.crl"))
+        );
+        assert_eq!(
+            c.vhosts[0].ssl.ca_revocation_check,
+            Some(ClientRevocationCheck::Leaf)
         );
 
         let full = format!("vapache/{} (Linux)", crate::VERSION);
@@ -15016,6 +15104,8 @@ Require all granted\n\
         err("SSLVerifyClient optional_no_ca\n");
         err("SSLVerifyClient none extra\n");
         err("SSLCACertificateFile\n");
+        err("SSLCARevocationFile\n");
+        err("SSLCARevocationCheck maybe\n");
         err("SSLProtocol\n");
         err("SSLCipherSuite HIGH\n");
         err("LogLevel ssl:info\n");
