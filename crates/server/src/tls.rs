@@ -27,6 +27,7 @@ const MAX_TLS_CERTIFICATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_TLS_PRIVATE_KEY_BYTES: u64 = 1024 * 1024;
 const MAX_BROKER_ERROR_BYTES: u64 = 1024;
 const BROKER_SHUTDOWN: u32 = u32::MAX;
+const DEFAULT_SESSION_CACHE_TIMEOUT: Duration = Duration::from_secs(300);
 
 struct PrivilegedFileBroker {
     stream: UnixStream,
@@ -533,8 +534,20 @@ pub fn shutdown_privileged_file_broker() {
 #[derive(Debug)]
 struct SniResolver {
     default: SharedKey,
-    names: HashMap<String, SharedKey>,
-    wildcards: Vec<(String, SharedKey)>,
+    names: HashMap<String, (usize, SharedKey)>,
+    wildcards: Vec<(usize, String, SharedKey)>,
+}
+
+/// Security identity fixed by a completed TLS handshake.  It is immutable
+/// for the lifetime of the connection and is copied into both protocol
+/// adapters before any request can select a virtual host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TlsConnectionIdentity {
+    sni: Option<String>,
+    local_ip: Option<IpAddr>,
+    port: u16,
+    handshake_vhost: Option<usize>,
+    client_certificate_sha256: Option<[u8; 32]>,
 }
 
 fn current_key(key: &SharedKey) -> Arc<CertifiedKey> {
@@ -561,6 +574,15 @@ pub(crate) struct PreparedServerConfig {
     refreshes: Vec<OcspRefresh>,
 }
 
+/// TLS generations for one bound listener. A concrete listener needs one
+/// generation; a wildcard listener needs a fallback plus one generation for
+/// each address-specific virtual-host bucket because Rustls certificate
+/// resolution does not receive the accepted socket's destination address.
+pub(crate) struct PreparedListenerConfigs {
+    default: PreparedServerConfig,
+    exact: HashMap<IpAddr, PreparedServerConfig>,
+}
+
 impl PreparedServerConfig {
     pub(crate) fn config(&self) -> Option<Arc<ServerConfig>> {
         self.config.clone()
@@ -569,6 +591,29 @@ impl PreparedServerConfig {
     pub(crate) fn activate(&mut self) {
         for refresh in self.refreshes.drain(..) {
             let _ = spawn_ocsp_refresh(refresh);
+        }
+    }
+}
+
+impl PreparedListenerConfigs {
+    pub(crate) fn configs(
+        &self,
+    ) -> (
+        Option<Arc<ServerConfig>>,
+        HashMap<IpAddr, Option<Arc<ServerConfig>>>,
+    ) {
+        let exact = self
+            .exact
+            .iter()
+            .map(|(address, prepared)| (*address, prepared.config()))
+            .collect();
+        (self.default.config(), exact)
+    }
+
+    pub(crate) fn activate(&mut self) {
+        self.default.activate();
+        for prepared in self.exact.values_mut() {
+            prepared.activate();
         }
     }
 }
@@ -585,30 +630,23 @@ fn normalize_name(name: &str) -> String {
     name.trim_end_matches('.').to_ascii_lowercase()
 }
 
-fn wildcard_name_matches(name: &str, suffix: &str) -> bool {
-    name.strip_suffix(&format!(".{suffix}"))
-        .is_some_and(|prefix| !prefix.is_empty() && !prefix.contains('.'))
+fn wildcard_name_matches(name: &str, pattern: &str) -> bool {
+    vapache_verified::host_pattern_matches(name.as_bytes(), pattern.as_bytes())
 }
 
 impl SniResolver {
-    fn add_name(&mut self, raw: &str, key: SharedKey) {
+    fn add_name(&mut self, raw: &str, order: usize, key: SharedKey, pattern: bool) {
         let name = normalize_name(raw);
-        if name.is_empty() || name == "*" || name.starts_with('_') {
+        if name.is_empty() {
             return;
         }
-        if let Some(suffix) = name.strip_prefix("*.") {
-            if !suffix.is_empty() {
-                self.wildcards.push((suffix.to_string(), key));
-            }
-        } else if let Some(suffix) = name.strip_prefix('.') {
-            if !suffix.is_empty() {
-                self.wildcards.push((suffix.to_string(), key));
-            }
+        if pattern && name.bytes().any(|byte| matches!(byte, b'*' | b'?')) {
+            self.wildcards.push((order, name, key));
         } else {
             // Apache selects the first virtual host for a duplicate name.
             // Keeping the first certificate makes the TLS and HTTP routing
             // decisions agree instead of presenting a later vhost's key.
-            self.names.entry(name).or_insert(key);
+            self.names.entry(name).or_insert((order, key));
         }
     }
 
@@ -617,15 +655,18 @@ impl SniResolver {
             return current_key(&self.default);
         };
         let name = normalize_name(name);
-        if let Some(key) = self.names.get(&name) {
-            return current_key(key);
-        }
-        for (suffix, key) in &self.wildcards {
-            if wildcard_name_matches(&name, suffix) {
-                return current_key(key);
+        let mut selected = self.names.get(&name).map(|(order, key)| (*order, key));
+        for (order, pattern, key) in &self.wildcards {
+            if selected.is_some_and(|(selected_order, _)| selected_order <= *order) {
+                continue;
+            }
+            if wildcard_name_matches(&name, pattern) {
+                selected = Some((*order, key));
             }
         }
-        current_key(&self.default)
+        selected
+            .map(|(_, key)| current_key(key))
+            .unwrap_or_else(|| current_key(&self.default))
     }
 }
 
@@ -903,19 +944,23 @@ fn vhost_applies(v: &VHost, port: u16, local_ip: Option<IpAddr>) -> bool {
 /// from a public vhost or accept one on a vhost that requires it.
 fn client_policy_mode(ssl: &SslConfig) -> u8 {
     match ssl.verify_client {
-        None => 0,
-        Some(crate::config::ClientVerify::None) => 1,
-        Some(crate::config::ClientVerify::Optional) => 2,
-        Some(crate::config::ClientVerify::Require) => 3,
+        None | Some(crate::config::ClientVerify::None) => 0,
+        Some(crate::config::ClientVerify::Optional) => 1,
+        Some(crate::config::ClientVerify::Require) => 2,
     }
 }
 
 fn client_policy_key(ssl: &SslConfig) -> (u8, Option<Vec<u8>>) {
+    let mode = client_policy_mode(ssl);
     (
-        client_policy_mode(ssl),
-        ssl.ca_file
-            .as_ref()
-            .map(|path| path.as_os_str().as_bytes().to_vec()),
+        mode,
+        (mode != 0)
+            .then(|| {
+                ssl.ca_file
+                    .as_ref()
+                    .map(|path| path.as_os_str().as_bytes().to_vec())
+            })
+            .flatten(),
     )
 }
 
@@ -945,6 +990,146 @@ fn ensure_uniform_client_policy(policies: &[&SslConfig], port: u16) -> Result<()
         }
     }
     Ok(())
+}
+
+fn path_identity(path: Option<&Path>) -> Option<&[u8]> {
+    path.map(|path| path.as_os_str().as_bytes())
+}
+
+/// Apache's default secure SNI policy permits a Host-selected vhost transition
+/// only when the handshake-relevant authentication and public-key policy is
+/// identical.  Listener-wide settings are already required to be uniform;
+/// retaining them here makes this comparison complete even for directly
+/// constructed embedding configurations.
+fn tls_vhost_policy_equal(a: &SslConfig, b: &SslConfig) -> bool {
+    let a_key = a.key_file.as_deref().or(a.cert_file.as_deref());
+    let b_key = b.key_file.as_deref().or(b.cert_file.as_deref());
+    let protocols_equal = matches!(
+        (
+            protocol_policy(a.protocols.as_deref()),
+            protocol_policy(b.protocols.as_deref())
+        ),
+        (Ok(a), Ok(b)) if a == b
+    );
+    client_policy_equal(&client_policy_key(a), &client_policy_key(b))
+        && protocols_equal
+        && a.engine == b.engine
+        && path_identity(a.cert_file.as_deref()) == path_identity(b.cert_file.as_deref())
+        && path_identity(a_key) == path_identity(b_key)
+        && path_identity(a.chain_file.as_deref()) == path_identity(b.chain_file.as_deref())
+        && a.cipher_suite == b.cipher_suite
+        && a.honor_cipher_order.unwrap_or(false) == b.honor_cipher_order.unwrap_or(false)
+        && a.session_cache.unwrap_or(true) == b.session_cache.unwrap_or(true)
+        && a.session_cache_timeout
+            .unwrap_or(DEFAULT_SESSION_CACHE_TIMEOUT)
+            == b.session_cache_timeout
+                .unwrap_or(DEFAULT_SESSION_CACHE_TIMEOUT)
+        && a.session_tickets.unwrap_or(true) == b.session_tickets.unwrap_or(true)
+}
+
+impl TlsConnectionIdentity {
+    fn from_parts(
+        cfg: &Config,
+        local_ip: Option<IpAddr>,
+        port: u16,
+        sni: Option<&str>,
+        client_certificate: Option<&[u8]>,
+    ) -> Result<Self, String> {
+        let sni = sni.map(normalize_name).filter(|name| !name.is_empty());
+        let handshake_vhost = cfg
+            .select_vhost(local_ip, port, sni.as_deref())
+            .map(|vhost| {
+                cfg.vhost_position(vhost).ok_or_else(|| {
+                    "TLS handshake selected a virtual host outside the compiled configuration"
+                        .to_string()
+                })
+            })
+            .transpose()?;
+        let ssl = handshake_vhost
+            .and_then(|index| cfg.vhosts.get(index))
+            .map(|vhost| &vhost.ssl)
+            .unwrap_or(&cfg.ssl);
+        let certificate_present = client_certificate.is_some();
+        if !vapache_verified::tls_client_identity_admit(
+            matches!(
+                ssl.verify_client,
+                Some(crate::config::ClientVerify::Require)
+            ),
+            certificate_present,
+        ) {
+            return Err(
+                "required TLS client identity was absent after the completed handshake".into(),
+            );
+        }
+        let client_certificate_sha256 = client_certificate.map(|certificate| {
+            let digest = ::ring::digest::digest(&::ring::digest::SHA256, certificate);
+            let mut identity = [0u8; 32];
+            identity.copy_from_slice(digest.as_ref());
+            identity
+        });
+        Ok(Self {
+            sni,
+            local_ip,
+            port,
+            handshake_vhost,
+            client_certificate_sha256,
+        })
+    }
+
+    pub(crate) fn capture(
+        cfg: &Config,
+        local_ip: Option<IpAddr>,
+        port: u16,
+        connection: &rustls::ServerConnection,
+    ) -> Result<Self, String> {
+        Self::from_parts(
+            cfg,
+            local_ip,
+            port,
+            connection.server_name(),
+            connection
+                .peer_certificates()
+                .and_then(|chain| chain.first())
+                .map(|certificate| certificate.as_ref()),
+        )
+    }
+
+    /// Return an HTTP status when an authority cannot safely use this TLS
+    /// connection.  400 preserves Apache's SNI-without-Host behavior; 421 is
+    /// the RFC-defined signal that a coalesced connection selected an
+    /// incompatible vhost.
+    pub(crate) fn request_status(&self, cfg: &Config, authority: Option<&str>) -> Option<u16> {
+        if !vapache_verified::tls_sni_authority_admit(self.sni.is_some(), authority.is_some()) {
+            return Some(400);
+        }
+        let request_vhost = cfg
+            .select_vhost(self.local_ip, self.port, authority)
+            .and_then(|vhost| cfg.vhost_position(vhost));
+        let handshake_ssl = self
+            .handshake_vhost
+            .and_then(|index| cfg.vhosts.get(index))
+            .map(|vhost| &vhost.ssl)
+            .unwrap_or(&cfg.ssl);
+        let request_ssl = request_vhost
+            .and_then(|index| cfg.vhosts.get(index))
+            .map(|vhost| &vhost.ssl)
+            .unwrap_or(&cfg.ssl);
+        (!vapache_verified::tls_vhost_transition_admit(tls_vhost_policy_equal(
+            handshake_ssl,
+            request_ssl,
+        )))
+        .then_some(421)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        cfg: &Config,
+        local_ip: Option<IpAddr>,
+        port: u16,
+        sni: Option<&str>,
+    ) -> Self {
+        Self::from_parts(cfg, local_ip, port, sni, None).expect("test TLS connection identity")
+    }
 }
 
 /// Rustls selects protocol versions before SNI-based certificate resolution,
@@ -989,13 +1174,16 @@ fn ensure_uniform_resumption_policy(policies: &[&SslConfig], port: u16) -> Resul
     };
     let expected = (
         first.session_cache.unwrap_or(true),
-        first.session_cache_timeout,
+        first
+            .session_cache_timeout
+            .unwrap_or(DEFAULT_SESSION_CACHE_TIMEOUT),
         first.session_tickets.unwrap_or(true),
     );
     for ssl in policies.iter().skip(1) {
         if (
             ssl.session_cache.unwrap_or(true),
-            ssl.session_cache_timeout,
+            ssl.session_cache_timeout
+                .unwrap_or(DEFAULT_SESSION_CACHE_TIMEOUT),
             ssl.session_tickets.unwrap_or(true),
         ) != expected
         {
@@ -1030,13 +1218,51 @@ fn ensure_uniform_application_protocols(
 /// Build the TLS configuration for a listening port, if any virtual host on
 /// that port has `SSLEngine on` (or a global SSLEngine is configured).
 /// `local_ip` filters address-bound vhosts when the listener itself is bound
-/// to a specific destination address.
+/// to a specific destination address. `None` returns the safe wildcard
+/// fallback; use `validate_listener_configs` when every exact destination
+/// generation must be checked.
 pub fn server_config(
     cfg: &Config,
     port: u16,
     local_ip: Option<IpAddr>,
 ) -> Result<Option<Arc<ServerConfig>>, String> {
+    let local_ip = local_ip.or(Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)));
     Ok(prepare_server_config(cfg, port, local_ip)?.config())
+}
+
+/// Prepare every destination-specific TLS generation needed by one listener.
+/// `listener_ip == None` denotes a wildcard bind. The fallback is built with
+/// an unspecified destination so address-specific vhosts cannot leak into its
+/// resolver; accepted sockets select an exact generation before handshaking.
+pub(crate) fn prepare_listener_configs(
+    cfg: &Config,
+    port: u16,
+    listener_ip: Option<IpAddr>,
+) -> Result<PreparedListenerConfigs, String> {
+    if let Some(listener_ip) = listener_ip {
+        return Ok(PreparedListenerConfigs {
+            default: prepare_server_config(cfg, port, Some(listener_ip))?,
+            exact: HashMap::new(),
+        });
+    }
+
+    let default =
+        prepare_server_config(cfg, port, Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)))?;
+    let mut exact = HashMap::new();
+    for address in cfg.vhost_specific_addresses(port) {
+        exact.insert(address, prepare_server_config(cfg, port, Some(address))?);
+    }
+    Ok(PreparedListenerConfigs { default, exact })
+}
+
+/// Syntax-test entry point that validates every certificate/policy generation
+/// a wildcard listener may choose without exposing the prepared key material.
+pub fn validate_listener_configs(
+    cfg: &Config,
+    port: u16,
+    listener_ip: Option<IpAddr>,
+) -> Result<(), String> {
+    prepare_listener_configs(cfg, port, listener_ip).map(|_| ())
 }
 
 /// Fully validate and construct a TLS generation without starting any
@@ -1119,7 +1345,7 @@ pub(crate) fn prepare_server_config(
         // No SNI names are known; the global certificate is the only key.
     } else {
         // The default vhost may be repeated; insert names for every TLS vhost.
-        for v in vhosts.drain(..) {
+        for (order, v) in vhosts.drain(..).enumerate() {
             let key = if std::ptr::eq(&v.ssl, default_ssl) {
                 default_key.clone()
             } else {
@@ -1137,13 +1363,13 @@ pub(crate) fn prepare_server_config(
                 }
                 shared
             };
-            let mut names = Vec::new();
             if let Some(n) = &v.server_name {
-                names.push(n.clone());
+                // Apache treats ServerName literally even when it contains a
+                // wildcard metacharacter. Only ServerAlias is pattern-aware.
+                resolver.add_name(n, order, key.clone(), false);
             }
-            names.extend(v.aliases.iter().cloned());
-            for raw in names {
-                resolver.add_name(&raw, key.clone());
+            for alias in &v.aliases {
+                resolver.add_name(alias, order, key.clone(), true);
             }
         }
     }
@@ -1181,10 +1407,22 @@ pub(crate) fn prepare_server_config(
         .map_err(|e| format!("invalid TLS protocol configuration: {e}"))?
         .with_client_cert_verifier(verifier)
         .with_cert_resolver(Arc::new(resolver));
+    // Keep replayable 0-RTT and pre-client-Finished application data outside
+    // the supported protocol, even if a future Rustls release changes a
+    // builder default. Request admission assumes every byte follows a fully
+    // authenticated handshake and an immutable mTLS identity.
+    config.max_early_data_size = 0;
+    config.send_half_rtt_data = false;
+    config.enable_secret_extraction = false;
     if default_ssl.session_cache == Some(false) {
         config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
-    } else if let Some(timeout) = default_ssl.session_cache_timeout {
-        config.session_storage = Arc::new(ExpiringSessionCache::new(256, timeout));
+    } else {
+        config.session_storage = Arc::new(ExpiringSessionCache::new(
+            256,
+            default_ssl
+                .session_cache_timeout
+                .unwrap_or(DEFAULT_SESSION_CACHE_TIMEOUT),
+        ));
     }
     if default_ssl.session_tickets == Some(false) {
         // Rustls already disables stateless TLS 1.2 tickets. This also turns
@@ -1206,7 +1444,9 @@ pub(crate) fn prepare_server_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::pki_types::ServerName;
     use rustls::server::StoresServerSessions as _;
+    use rustls::{ClientConfig, ClientConnection, HandshakeKind, ServerConnection};
     use std::os::fd::IntoRawFd;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
@@ -1477,6 +1717,10 @@ mod tests {
         assert!(ensure_uniform_protocol_policy(&[&both, &equivalent], 443).is_ok());
         assert!(ensure_uniform_protocol_policy(&[&both, &tls12], 443).is_err());
         assert!(ensure_uniform_protocol_policy(&[&both, &invalid], 443).is_err());
+        // Two malformed policies are not equal merely because both fail to
+        // parse. Startup rejects them, and the request-time transition guard
+        // independently remains closed for directly constructed configs.
+        assert!(!tls_vhost_policy_equal(&invalid, &invalid));
     }
 
     #[test]
@@ -1588,6 +1832,145 @@ mod tests {
             .expect("openssl");
         assert!(status.success());
         (cert, key)
+    }
+
+    fn run_openssl(args: &[&str]) {
+        let status = std::process::Command::new("openssl")
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("openssl");
+        assert!(status.success(), "openssl failed: {args:?}");
+    }
+
+    fn make_mtls_certificates(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let ca = dir.join("ca.pem");
+        let ca_key = dir.join("ca.key");
+        let server = dir.join("server.pem");
+        let server_key = dir.join("server.key");
+        let server_csr = dir.join("server.csr");
+        let server_ext = dir.join("server.ext");
+        let client = dir.join("client.pem");
+        let client_key = dir.join("client.key");
+        let client_csr = dir.join("client.csr");
+        let client_ext = dir.join("client.ext");
+
+        run_openssl(&[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=vapache-test-ca",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+            "-keyout",
+            ca_key.to_str().unwrap(),
+            "-out",
+            ca.to_str().unwrap(),
+        ]);
+        run_openssl(&[
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+            "-keyout",
+            server_key.to_str().unwrap(),
+            "-out",
+            server_csr.to_str().unwrap(),
+        ]);
+        std::fs::write(
+            &server_ext,
+            "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n",
+        )
+        .unwrap();
+        run_openssl(&[
+            "x509",
+            "-req",
+            "-days",
+            "1",
+            "-in",
+            server_csr.to_str().unwrap(),
+            "-CA",
+            ca.to_str().unwrap(),
+            "-CAkey",
+            ca_key.to_str().unwrap(),
+            "-CAcreateserial",
+            "-extfile",
+            server_ext.to_str().unwrap(),
+            "-out",
+            server.to_str().unwrap(),
+        ]);
+        run_openssl(&[
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-subj",
+            "/CN=vapache-test-client",
+            "-keyout",
+            client_key.to_str().unwrap(),
+            "-out",
+            client_csr.to_str().unwrap(),
+        ]);
+        std::fs::write(
+            &client_ext,
+            "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n",
+        )
+        .unwrap();
+        run_openssl(&[
+            "x509",
+            "-req",
+            "-days",
+            "1",
+            "-in",
+            client_csr.to_str().unwrap(),
+            "-CA",
+            ca.to_str().unwrap(),
+            "-CAkey",
+            ca_key.to_str().unwrap(),
+            "-CAcreateserial",
+            "-extfile",
+            client_ext.to_str().unwrap(),
+            "-out",
+            client.to_str().unwrap(),
+        ]);
+        (ca, server, server_key, client, client_key)
+    }
+
+    fn drive_handshake(client: &mut ClientConnection, server: &mut ServerConnection) {
+        for _ in 0..32 {
+            let mut progressed = false;
+            if client.wants_write() {
+                let mut message = Vec::new();
+                progressed |= client.write_tls(&mut message).unwrap() != 0;
+                if !message.is_empty() {
+                    server.read_tls(&mut message.as_slice()).unwrap();
+                    server.process_new_packets().unwrap();
+                }
+            }
+            if server.wants_write() {
+                let mut message = Vec::new();
+                progressed |= server.write_tls(&mut message).unwrap() != 0;
+                if !message.is_empty() {
+                    client.read_tls(&mut message.as_slice()).unwrap();
+                    client.process_new_packets().unwrap();
+                }
+            }
+            if !client.is_handshaking() && !server.is_handshaking() && !server.wants_write() {
+                return;
+            }
+            assert!(progressed, "TLS handshake made no progress");
+        }
+        panic!("TLS handshake did not complete");
     }
 
     fn test_config(dir: &Path, text: &str) -> Config {
@@ -1763,8 +2146,8 @@ mod tests {
         let second = Arc::new(RwLock::new(second));
         let resolver = SniResolver {
             default: first.clone(),
-            names: HashMap::from([("exact.test".to_string(), second.clone())]),
-            wildcards: vec![("example.test".to_string(), second.clone())],
+            names: HashMap::from([("exact.test".to_string(), (1, second.clone()))]),
+            wildcards: vec![(1, "*.example.test".to_string(), second.clone())],
         };
         let default_key = current_key(&first);
         let second_key = current_key(&second);
@@ -1779,7 +2162,7 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(
             &resolver.select_key(Some("multi.label.example.test")),
-            &default_key
+            &second_key
         ));
         assert!(Arc::ptr_eq(
             &resolver.select_key(Some("unknown.test")),
@@ -1791,11 +2174,43 @@ mod tests {
             names: HashMap::new(),
             wildcards: Vec::new(),
         };
-        duplicates.add_name("duplicate.test", first.clone());
-        duplicates.add_name("DUPLICATE.TEST.", second.clone());
+        duplicates.add_name("duplicate.test", 0, first.clone(), false);
+        duplicates.add_name("DUPLICATE.TEST.", 1, second.clone(), false);
+        duplicates.add_name("*.test", 0, first.clone(), true);
+        duplicates.add_name("*", 1, second.clone(), true);
         assert!(Arc::ptr_eq(
             &duplicates.select_key(Some("duplicate.test")),
             &default_key
+        ));
+        // First configured vhost wins across exact and wildcard aliases, just
+        // as it does in the HTTP vhost index.
+        assert!(Arc::ptr_eq(
+            &duplicates.select_key(Some("later.test")),
+            &default_key
+        ));
+        assert!(Arc::ptr_eq(
+            &duplicates.select_key(Some("anything.invalid")),
+            &second_key
+        ));
+
+        let mut patterns = SniResolver {
+            default: first.clone(),
+            names: HashMap::new(),
+            wildcards: Vec::new(),
+        };
+        patterns.add_name("api-?.example", 1, second.clone(), true);
+        patterns.add_name("literal-?.example", 1, second.clone(), false);
+        assert!(Arc::ptr_eq(
+            &patterns.select_key(Some("api-a.example")),
+            &default_key
+        ));
+        assert!(Arc::ptr_eq(
+            &patterns.select_key(Some("literal-a.example")),
+            &default_key
+        ));
+        assert!(Arc::ptr_eq(
+            &patterns.select_key(Some("literal-?.example")),
+            &second_key
         ));
 
         assert_eq!(client_policy_mode(&SslConfig::default()), 0);
@@ -1804,23 +2219,255 @@ mod tests {
                 verify_client: Some(crate::config::ClientVerify::None),
                 ..SslConfig::default()
             }),
-            1
+            0
         );
         assert_eq!(
             client_policy_mode(&SslConfig {
                 verify_client: Some(crate::config::ClientVerify::Optional),
                 ..SslConfig::default()
             }),
-            2
+            1
         );
         assert_eq!(
             client_policy_mode(&SslConfig {
                 verify_client: Some(crate::config::ClientVerify::Require),
                 ..SslConfig::default()
             }),
-            3
+            2
         );
         assert!(ensure_uniform_client_policy(&[], 443).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tls_connection_identity_binds_sni_host_and_verified_client() {
+        let dir = tempdir("connection-identity");
+        let cfg = test_config(
+            &dir,
+            "Listen 127.0.0.1:443\n\
+             <VirtualHost *:443>\n\
+               ServerName a.test\n\
+               SSLEngine On\n\
+               SSLCertificateFile /tls/a.pem\n\
+               SSLCertificateKeyFile /tls/a.key\n\
+             </VirtualHost>\n\
+             <VirtualHost *:443>\n\
+               ServerName b.test\n\
+               SSLEngine On\n\
+               SSLCertificateFile /tls/b.pem\n\
+               SSLCertificateKeyFile /tls/b.key\n\
+             </VirtualHost>\n\
+             <VirtualHost *:443>\n\
+               ServerName alias.test\n\
+               SSLEngine On\n\
+               SSLCertificateFile /tls/a.pem\n\
+               SSLCertificateKeyFile /tls/a.key\n\
+             </VirtualHost>\n",
+        );
+        let ip = Some("127.0.0.1".parse().unwrap());
+        let identity = TlsConnectionIdentity::from_parts(
+            &cfg,
+            ip,
+            443,
+            Some("A.TEST."),
+            Some(b"verified-client-leaf"),
+        )
+        .unwrap();
+        assert_eq!(identity.sni.as_deref(), Some("a.test"));
+        assert!(identity.client_certificate_sha256.is_some());
+        assert_eq!(identity.request_status(&cfg, Some("a.test")), None);
+        assert_eq!(identity.request_status(&cfg, Some("alias.test")), None);
+        assert_eq!(identity.request_status(&cfg, Some("b.test")), Some(421));
+        assert_eq!(identity.request_status(&cfg, None), Some(400));
+
+        let no_sni = TlsConnectionIdentity::from_parts(&cfg, ip, 443, None, None).unwrap();
+        assert_eq!(no_sni.request_status(&cfg, Some("a.test")), None);
+        assert_eq!(no_sni.request_status(&cfg, Some("b.test")), Some(421));
+
+        let required = test_config(
+            &dir,
+            "Listen 127.0.0.1:443\n\
+             SSLEngine On\n\
+             SSLCertificateFile /tls/server.pem\n\
+             SSLCertificateKeyFile /tls/server.key\n\
+             SSLVerifyClient require\n\
+             SSLCACertificateFile /tls/client-ca.pem\n",
+        );
+        assert!(TlsConnectionIdentity::from_parts(&required, ip, 443, None, None).is_err());
+        assert!(TlsConnectionIdentity::from_parts(
+            &required,
+            ip,
+            443,
+            None,
+            Some(b"verified-client-leaf")
+        )
+        .is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completed_and_resumed_mtls_handshakes_preserve_connection_identity() {
+        let dir = tempdir("mtls-resumption-identity");
+        let (ca, server_cert, server_key, client_cert, client_key) = make_mtls_certificates(&dir);
+        let expected_leaf = read_certs(&client_cert).unwrap().remove(0);
+        for (policy, version) in [
+            ("TLSv1.2", &rustls::version::TLS12),
+            ("TLSv1.3", &rustls::version::TLS13),
+        ] {
+            let cfg = test_config(
+                &dir,
+                &format!(
+                    "Listen 127.0.0.1:443\n\
+                     SSLEngine on\n\
+                     SSLProtocol {policy}\n\
+                     SSLCertificateFile {}\n\
+                     SSLCertificateKeyFile {}\n\
+                     SSLVerifyClient require\n\
+                     SSLCACertificateFile {}\n",
+                    server_cert.display(),
+                    server_key.display(),
+                    ca.display()
+                ),
+            );
+            let server_config = server_config(&cfg, 443, None).unwrap().unwrap();
+            let mut roots = RootCertStore::empty();
+            for cert in read_certs(&ca).unwrap() {
+                roots.add(cert).unwrap();
+            }
+            let client_config = Arc::new(
+                ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+                    .with_protocol_versions(&[version])
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_client_auth_cert(
+                        read_certs(&client_cert).unwrap(),
+                        read_key(&client_key).unwrap(),
+                    )
+                    .unwrap(),
+            );
+
+            let mut first_client = ClientConnection::new(
+                client_config.clone(),
+                ServerName::try_from("localhost").unwrap().to_owned(),
+            )
+            .unwrap();
+            let mut first_server = ServerConnection::new(server_config.clone()).unwrap();
+            drive_handshake(&mut first_client, &mut first_server);
+            assert_eq!(
+                first_server.handshake_kind(),
+                Some(HandshakeKind::Full),
+                "{policy}"
+            );
+            let first_identity =
+                TlsConnectionIdentity::capture(&cfg, None, 443, &first_server).unwrap();
+            assert_eq!(first_identity.sni.as_deref(), Some("localhost"));
+            assert!(first_identity.client_certificate_sha256.is_some());
+            assert_eq!(
+                first_server.peer_certificates().unwrap()[0].as_ref(),
+                expected_leaf.as_ref()
+            );
+
+            let mut resumed_client = ClientConnection::new(
+                client_config,
+                ServerName::try_from("localhost").unwrap().to_owned(),
+            )
+            .unwrap();
+            let mut resumed_server = ServerConnection::new(server_config).unwrap();
+            drive_handshake(&mut resumed_client, &mut resumed_server);
+            assert_eq!(
+                resumed_server.handshake_kind(),
+                Some(HandshakeKind::Resumed),
+                "{policy}"
+            );
+            let resumed_identity =
+                TlsConnectionIdentity::capture(&cfg, None, 443, &resumed_server).unwrap();
+            assert_eq!(resumed_identity, first_identity, "{policy}");
+            assert_eq!(
+                resumed_server.peer_certificates().unwrap()[0].as_ref(),
+                expected_leaf.as_ref()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wildcard_listener_selects_tls_generation_by_destination_address() {
+        let dir = tempdir("destination-identity");
+        let first_dir = dir.join("first");
+        let second_dir = dir.join("second");
+        std::fs::create_dir(&first_dir).unwrap();
+        std::fs::create_dir(&second_dir).unwrap();
+        let (first_ca, first_cert, first_key, _, _) = make_mtls_certificates(&first_dir);
+        let (second_ca, second_cert, second_key, _, _) = make_mtls_certificates(&second_dir);
+        let cfg = test_config(
+            &dir,
+            &format!(
+                "Listen 0.0.0.0:443\n\
+                 <VirtualHost 127.0.0.1:443>\n\
+                   ServerName localhost\n\
+                   SSLEngine on\n\
+                   SSLProtocol TLSv1.2\n\
+                   SSLCertificateFile {}\n\
+                   SSLCertificateKeyFile {}\n\
+                 </VirtualHost>\n\
+                 <VirtualHost 127.0.0.2:443>\n\
+                   ServerName localhost\n\
+                   SSLEngine on\n\
+                   SSLProtocol TLSv1.2\n\
+                   SSLCertificateFile {}\n\
+                   SSLCertificateKeyFile {}\n\
+                 </VirtualHost>\n",
+                first_cert.display(),
+                first_key.display(),
+                second_cert.display(),
+                second_key.display()
+            ),
+        );
+        let prepared = prepare_listener_configs(&cfg, 443, None).unwrap();
+        let (default, exact) = prepared.configs();
+        assert!(default.is_none());
+        let first_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let second_ip: IpAddr = "127.0.0.2".parse().unwrap();
+        let first_server_config = exact.get(&first_ip).unwrap().clone().unwrap();
+        let second_server_config = exact.get(&second_ip).unwrap().clone().unwrap();
+        assert!(!Arc::ptr_eq(&first_server_config, &second_server_config));
+
+        let mut roots = RootCertStore::empty();
+        for cert in read_certs(&first_ca)
+            .unwrap()
+            .into_iter()
+            .chain(read_certs(&second_ca).unwrap())
+        {
+            roots.add(cert).unwrap();
+        }
+        let client_config = Arc::new(
+            ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS12])
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        for (ip, server_config, expected_cert) in [
+            (first_ip, first_server_config, first_cert),
+            (second_ip, second_server_config, second_cert),
+        ] {
+            let mut client = ClientConnection::new(
+                client_config.clone(),
+                ServerName::try_from("localhost").unwrap().to_owned(),
+            )
+            .unwrap();
+            let mut server = ServerConnection::new(server_config).unwrap();
+            drive_handshake(&mut client, &mut server);
+            let expected = read_certs(&expected_cert).unwrap().remove(0);
+            assert_eq!(
+                client.peer_certificates().unwrap()[0].as_ref(),
+                expected.as_ref(),
+                "wrong certificate for destination {ip}"
+            );
+            let identity = TlsConnectionIdentity::capture(&cfg, Some(ip), 443, &server).unwrap();
+            assert_eq!(identity.request_status(&cfg, Some("localhost")), None);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1845,6 +2492,12 @@ mod tests {
             global_tls.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
+        assert_eq!(global_tls.max_early_data_size, 0);
+        assert!(!global_tls.send_half_rtt_data);
+        assert!(!global_tls.enable_secret_extraction);
+        let default_cache = format!("{:?}", global_tls.session_storage);
+        assert!(default_cache.contains("ExpiringSessionCache"));
+        assert!(default_cache.contains("300s"));
 
         let resumption = test_config(
             &dir,
@@ -2003,8 +2656,13 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(server_config(&address_disabled, 443, None)
-            .unwrap_err()
-            .contains("different SSLEngine policies"));
+            .unwrap()
+            .is_some());
+        let prepared = prepare_listener_configs(&address_disabled, 443, None).unwrap();
+        let (fallback, exact) = prepared.configs();
+        assert!(fallback.is_some());
+        assert!(exact.get(&loopback).is_some_and(Option::is_none));
+        assert!(!exact.contains_key(&other));
 
         for mode in ["optional", "require"] {
             let cfg = test_config(

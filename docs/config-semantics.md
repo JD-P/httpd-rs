@@ -852,11 +852,12 @@ dimension and asserts that the fingerprint or key changes.  A future policy
 field is therefore either automatically bound through its policy object or
 fails the matrix when someone replaces that object with a manual list.
 
-The current authenticators are request-header based (`Authorization`), and
-credentialed requests are excluded from cache lookup and storage.  If a future
-authenticator derives identity from the connection rather than a header (for
-example a TLS client certificate), that identity must be added to the
-fingerprint before it can authorize a cacheable request.
+The current request authorizers are header based (`Authorization`), and
+credentialed requests are excluded from cache lookup and storage. TLS client
+certificates can gate the whole connection, but are not currently exposed as a
+request principal or CGI identity. If that changes, the immutable connection
+certificate identity must be added to the fingerprint before it can authorize
+a cacheable request.
 
 ### I27 — Authenticated identity reaches every script sink
 
@@ -2114,18 +2115,30 @@ construction: there is no second production interleaver.
 - `tls_client_policy_equal` / `ensure_uniform_client_policy`.  Every TLS
   listener requires one client-certificate policy across its virtual hosts;
   mixed `SSLVerifyClient`/`SSLCACertificateFile` configurations fail startup.
-  The runtime compares a verified exact identity of verification mode and CA
-  path bytes, with absent and present CA distinguished.  Per-location client
-  authentication is rejected because Rustls verifies the connection, not an
-  individual request; Rustls chain validation itself remains an external
-  TLS assumption.
+  The runtime compares a verified exact identity of the effective verification
+  mode and active CA path bytes; omitted and explicit `none` are equivalent,
+  while active CA identities must match. Per-location client authentication is
+  rejected because Rustls verifies the connection, not an individual request;
+  Rustls chain validation itself remains an external TLS assumption.
+- `tls_vhost_transition_admit`, `tls_sni_authority_admit` and
+  `tls_client_identity_admit`. A completed TLS handshake records immutable SNI,
+  destination, selected TLS-vhost policy and verified client-leaf identity.
+  Every HTTP/1 request and HTTP/2 stream must retain that policy (or receive
+  421), named SNI cannot lose its HTTP authority, and required mTLS cannot
+  reach request dispatch without a peer certificate. Rustls's resumed-session
+  peer chain is covered by a full/resumed handshake integration test.
+- A wildcard `Listen` prebuilds a TLS generation for every concrete
+  destination-address vhost plus a wildcard fallback. The accepted socket's
+  canonical local address selects the generation before the handshake, so SNI
+  certificate selection and the address-aware HTTP vhost bucket cannot diverge.
 - `host_pattern_matches` / `host_suffix_matches`.  `VHost::matches_name`
-  uses exact `ServerName` matching and verified exact, `*`, or leading
-  `*.suffix` `ServerAlias` matching with ASCII case folding and DNS-label boundaries. A
-  wildcard requires a preceding label and therefore does not match its bare
-  suffix. Values beginning with `~` remain ordinary Apache names; Vapache does
-  not invent regex virtual-host matching. Other Apache wildcard placements
-  fail at startup until their semantics are implemented.
+  and the TLS resolver use exact `ServerName` matching and the same verified
+  exact, `*`, or leading `*.suffix` `ServerAlias` matching with ASCII case
+  folding. A suffix wildcard requires a preceding label and therefore does not
+  match its bare suffix. Values beginning with `~` remain ordinary Apache
+  names; Vapache does not invent regex virtual-host matching. Other wildcard
+  placements fail at startup until their semantics are implemented. First
+  configured match wins at both certificate and HTTP routing boundaries.
 - `first_true_index`.  Virtual-host candidate selection uses the verified
   first-match policy.
 - `parse_http_authority_endpoint`/`parse_http_ipv6_literal`, `ipv4_in_net` /

@@ -1196,7 +1196,8 @@ fn main() {
                 .ok()
                 .filter(|ip| !ip.is_unspecified())
                 .map(vapached::access::canonical_ip);
-            if let Err(e) = vapached::tls::server_config(&cfg, listener.port, local_ip) {
+            if let Err(e) = vapached::tls::validate_listener_configs(&cfg, listener.port, local_ip)
+            {
                 eprintln!("vapached: SSL configuration error: {e}");
                 eprintln!("vapached: configuration test failed");
                 std::process::exit(1);

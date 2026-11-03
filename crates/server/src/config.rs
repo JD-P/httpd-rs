@@ -5961,6 +5961,11 @@ impl Compile {
                 | "sslstaplingrespondertimeout"
                 | "sslstaplingstandardcachetimeout"
                 | "sslstaplingreturnrespondererrors"
+                | "sslstaplingcache"
+                | "sslrandomseed"
+                | "sslpassphrasedialog"
+                | "sslsessioncache"
+                | "sslsessioncachetimeout"
                 | "sslsessiontickets"
                 | "sslhonorcipherorder"
                 | "sslverifyclient"
@@ -8017,18 +8022,19 @@ impl Compile {
                 let verify_index = payload
                     .keyword()
                     .expect("SSLVerifyClient is compiled while sealing");
+                if verify_index == 3 {
+                    self.directive_error(
+                        loc,
+                        "SSLVerifyClient optional_no_ca is not implemented by Rustls; refusing to replace unverified client-certificate semantics with verified optional authentication",
+                    );
+                    return;
+                }
                 let verify = match verify_index {
                     0 => ClientVerify::None,
-                    1 | 3 => ClientVerify::Optional,
+                    1 => ClientVerify::Optional,
                     2 => ClientVerify::Require,
                     _ => unreachable!("sealed SSLVerifyClient keyword index"),
                 };
-                if verify_index == 3 {
-                    self.warn(format!(
-                        "{}:{}: SSLVerifyClient optional_no_ca is treated as optional",
-                        loc.file, loc.line
-                    ));
-                }
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
@@ -12230,6 +12236,28 @@ SSLOptions +StrictRequire\n";
     }
 
     #[test]
+    fn connection_wide_tls_directives_cannot_be_globalized_from_a_location() {
+        for directive in [
+            "SSLSessionCache none",
+            "SSLSessionCacheTimeout 999999",
+            "SSLRandomSeed startup builtin",
+            "SSLPassPhraseDialog builtin",
+            "SSLStaplingCache shmcb:/run/apache2/stapling(32768)",
+        ] {
+            let config = format!(
+                "Listen 127.0.0.1:443\n<Directory /srv/private>\n{directive}\n</Directory>\n"
+            );
+            let errors = load_text(&config, false).unwrap_err();
+            assert!(
+                errors.iter().any(|error| error
+                    .msg
+                    .contains("only supported in server or virtual-host context")),
+                "scoped TLS directive was globalized: {directive}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
     fn security_sensitive_unimplemented_directives_fail_closed() {
         for directive in [
             "ProxyBlock 169.254.169.254",
@@ -14495,7 +14523,7 @@ SSLStaplingForceURL http://example.test/ocsp\n\
 SSLStaplingResponderTimeout 5\n\
 SSLStaplingStandardCacheTimeout 10\n\
 SSLStaplingReturnResponderErrors On\n\
-SSLVerifyClient optional_no_ca\n\
+SSLVerifyClient optional\n\
 SSLCACertificateFile {cert}\n\
 SSLProxyCACertificateFile {cert}\n\
 RewriteEngine On\n\
@@ -14985,6 +15013,7 @@ Require all granted\n\
         err("SSLStaplingStandardCacheTimeout 1 2\n");
         err("SSLStaplingReturnResponderErrors maybe\n");
         err("SSLVerifyClient maybe\n");
+        err("SSLVerifyClient optional_no_ca\n");
         err("SSLVerifyClient none extra\n");
         err("SSLCACertificateFile\n");
         err("SSLProtocol\n");
@@ -15791,6 +15820,28 @@ impl Config {
                     .map(crate::access::canonical_ip)
                     .is_ok_and(|bound| bound == crate::access::canonical_ip(local_ip))
         })
+    }
+
+    /// Concrete destination identities that need distinct TLS configurations
+    /// when one wildcard listener accepts connections for several local IPs.
+    pub(crate) fn vhost_specific_addresses(&self, port: u16) -> Vec<IpAddr> {
+        let mut addresses = HashSet::new();
+        for vhost in &self.vhosts {
+            for address in &vhost.addrs {
+                if vhost_port(address) != 0 && vhost_port(address) != port {
+                    continue;
+                }
+                if Self::vhost_address_is_wildcard(address) {
+                    continue;
+                }
+                if let Ok(ip) = Self::vhost_address_text(address).parse::<IpAddr>() {
+                    addresses.insert(crate::access::canonical_ip(ip));
+                }
+            }
+        }
+        let mut addresses: Vec<_> = addresses.into_iter().collect();
+        addresses.sort_unstable();
+        addresses
     }
 
     pub(crate) fn vhost_address_applies(v: &VHost, local_ip: IpAddr, port: u16) -> bool {

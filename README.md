@@ -87,6 +87,12 @@ Implemented today:
   negotiated before the HTTP host is known. Unsupported values, including
   the unimplemented cleartext `h2c`, fail configuration loading. An `h2`-only
   listener closes clients that omit ALPN instead of falling back to HTTP/1.1.
+  The completed handshake's SNI-selected certificate policy and verified
+  client identity are immutable connection state: HTTP/1 keep-alive and HTTP/2
+  coalescing receive 421 if a later authority selects an incompatible TLS
+  vhost. TLS and HTTP use the same first-match `ServerAlias` pattern semantics,
+  and wildcard listeners choose a prevalidated TLS generation from the
+  accepted socket's destination address before starting the handshake.
   A root-started daemon retains a minimal pre-thread TLS file broker whose
   numeric allowlist is fixed by the startup configuration, so SIGHUP can
   rotate root-only keys without restoring arbitrary root pathname access.
@@ -136,7 +142,10 @@ Implemented today:
 - TLS client-certificate authentication (`SSLVerifyClient`,
   `SSLCACertificateFile`), and OCSP stapling with AIA or
   `SSLStaplingForceURL` responders, startup warm-start persistence and
-  periodic refresh, plus required or optional client certificates.
+  periodic refresh, plus required or optional client certificates. Full and
+  resumed handshakes retain the same verified peer identity; the bounded
+  session store expires after `SSLSessionCacheTimeout` (300 seconds by
+  default). Unverified `optional_no_ca` semantics are rejected.
 - `mod_remoteip` client-address rewriting for trusted proxy headers.
 - `mod_expires` (`ExpiresActive`, `ExpiresDefault`, `ExpiresByType`),
   `SetEnv`/`SetEnvIf`/`PassEnv`/`UnsetEnv`, `Require env`, and a basic
@@ -376,14 +385,16 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **655 verified functions, 0 errors** (percent-decoding,
+Current result: **658 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
 lifecycle, HTTP/2 method/head/body admission,
 the stream/reset budget model, the stream-ID admission/lifecycle model and the
 idempotent early-reset purge model, and the TLS listener client-certificate
-policy identity, the append-only container/list merge model, the rewrite target
+policy identity, vhost-transition, SNI/authority and required-client-identity
+admission decisions, the append-only container/list merge model, the rewrite
+target
 classification/internal-join/same-host authority model, component-aware
 filesystem containment for alias/rewrite/FastCGI targets, the expression
 truthiness/comparison/glob/condition-chain model, the regex dialect admission
@@ -553,7 +564,7 @@ Current ledger: **53.7% weighted obligations**, **5/6 proof debt**,
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **108 adversarial replay cases** covering the findings classes,
-and **655 Verus functions with 0 errors** (including the I3 fast-path
+and **658 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -762,11 +773,11 @@ configuration compilation, protocol and resource-accounting work and was not
 being enforced by CI. The reviewed per-module debt is recorded in
 `tests/security_coverage_baseline.json`; reducing it tightens the ratchet, while
 new debt beyond that scheduling envelope fails the quality workflow. The
-current instrumented suite is 658 Rust library tests, 8 CLI unit tests, 24 Rust
+current instrumented suite is 682 Rust library tests, 8 CLI unit tests, 31 Rust
 integration/property tests, 168 conformance tests and 333 fixed configuration
 cases. The module-by-module reason for the remaining debt and the intended test
 mechanism for each major module are tracked in `docs/coverage-debt.md`.
-The separate Verus gate proves 655 functions with 0 errors; proof-only code is
+The separate Verus gate proves 658 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

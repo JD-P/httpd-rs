@@ -1975,9 +1975,9 @@ OVERRIDES: dict[str, tuple[str, str, str, str, str, str]] = {
         "high", "Traffic Server CNA title and cache extension inventory",
     ),
     "CVE-2026-41920": (
-        "partial", "tls",
+        "prevented", "tls",
         "a configured SNI-to-Host matching policy was not enforced",
-        "Vapache prevents Host/SNI from selecting different client-certificate or TLS policies on one listener, but it does not implement a general strict SNI-equals-Host policy",
+        "Vapache binds every HTTP/1 request and HTTP/2 stream to the SNI-selected certificate/client-auth policy and returns 421 on an incompatible transition; aliases with an identical TLS policy remain intentionally valid rather than requiring textual SNI/Host equality",
         "high", "Traffic Server CNA title and Vapache TLS/vhost policy review",
     ),
     "CVE-2026-58151": (

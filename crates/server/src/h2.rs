@@ -955,6 +955,7 @@ async fn handle_stream(
     peer: SocketAddr,
     local_ip: String,
     local_port: u16,
+    tls_identity: crate::tls::TlsConnectionIdentity,
     request: http::Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
     admission: H2StreamAdmission,
@@ -1201,6 +1202,26 @@ async fn handle_stream(
         // HTTP/2 framing is handled by the h2 crate before a `Request` exists.
         framing: crate::verified::BodyFraming::None,
     };
+    if let Some(status) =
+        tls_identity.request_status(&cfg, req.header_str("host").filter(|host| !host.is_empty()))
+    {
+        return send_response_with_admission(
+            respond,
+            &cfg,
+            bad(
+                status,
+                if status == 421 {
+                    "misdirected TLS virtual host"
+                } else {
+                    "TLS SNI requires an HTTP authority"
+                },
+            ),
+            req.is_head(),
+            &mut output_admission,
+        )
+        .await
+        .is_err();
+    }
     let peer = cfg.client_addr(peer, &req);
     let _request_scope_guard = req.request_scope().map(|scope| scope.guard());
     if peer != quota_peer {
@@ -1766,19 +1787,30 @@ pub fn fuzz_h2_frames(data: &[u8]) {
     });
 }
 
-pub async fn serve<G, F>(
+pub(crate) async fn serve<G, F>(
     cfg: Arc<Config>,
     logger: Arc<Logger>,
     tls: TlsStream<TcpStream>,
     peer: SocketAddr,
     local_ip: String,
     local_port: u16,
+    tls_identity: crate::tls::TlsConnectionIdentity,
     on_ready: F,
 ) -> io::Result<()>
 where
     F: FnOnce() -> io::Result<G>,
 {
-    serve_io(cfg, logger, tls, peer, local_ip, local_port, on_ready).await
+    serve_io(
+        cfg,
+        logger,
+        tls,
+        peer,
+        local_ip,
+        local_port,
+        tls_identity,
+        on_ready,
+    )
+    .await
 }
 
 async fn serve_io<T, G, F>(
@@ -1788,6 +1820,7 @@ async fn serve_io<T, G, F>(
     peer: SocketAddr,
     local_ip: String,
     local_port: u16,
+    tls_identity: crate::tls::TlsConnectionIdentity,
     on_ready: F,
 ) -> io::Result<()>
 where
@@ -1967,6 +2000,7 @@ where
                 let cfg = cfg.clone();
                 let logger = logger.clone();
                 let local_ip = local_ip.clone();
+                let tls_identity = tls_identity.clone();
                 let tx = events_tx.clone();
                 tokio::spawn(async move {
                     let mut done = H2TaskEventGuard {
@@ -1979,7 +2013,15 @@ where
                     // timeout would truncate a transfer that keeps making
                     // progress merely because its total duration is long.
                     done.reset = handle_stream(
-                        cfg, logger, peer, local_ip, local_port, request, respond, admission,
+                        cfg,
+                        logger,
+                        peer,
+                        local_ip,
+                        local_port,
+                        tls_identity,
+                        request,
+                        respond,
+                        admission,
                     )
                     .await;
                 });
@@ -2035,14 +2077,39 @@ mod tests {
         test_config_with_extra(name, "")
     }
 
+    fn test_tls_identity(cfg: &Config) -> crate::tls::TlsConnectionIdentity {
+        crate::tls::TlsConnectionIdentity::for_test(
+            cfg,
+            Some("127.0.0.1".parse().unwrap()),
+            443,
+            None,
+        )
+    }
+
     async fn round_trip(
         cfg: Arc<Config>,
         logger: Arc<Logger>,
         request: http::Request<()>,
         body: &[u8],
     ) -> (u16, Vec<u8>, bool) {
+        round_trip_with_sni(cfg, logger, request, body, None).await
+    }
+
+    async fn round_trip_with_sni(
+        cfg: Arc<Config>,
+        logger: Arc<Logger>,
+        request: http::Request<()>,
+        body: &[u8],
+        sni: Option<&str>,
+    ) -> (u16, Vec<u8>, bool) {
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
         let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let tls_identity = crate::tls::TlsConnectionIdentity::for_test(
+            &cfg,
+            Some("127.0.0.1".parse().unwrap()),
+            443,
+            sni,
+        );
         let server = tokio::spawn(async move {
             let mut connection = h2::server::handshake(server_io).await.unwrap();
             let (request, respond) = connection.accept().await.unwrap().unwrap();
@@ -2055,6 +2122,7 @@ mod tests {
                 "127.0.0.1:12345".parse().unwrap(),
                 "127.0.0.1".into(),
                 443,
+                tls_identity,
                 request,
                 respond,
                 admission,
@@ -2223,12 +2291,14 @@ mod tests {
             let admission =
                 admit_stream_before_spawn(&cfg, "127.0.0.1:12345".parse().unwrap(), &request)
                     .unwrap();
+            let tls_identity = test_tls_identity(&cfg);
             let handler = handle_stream(
                 cfg,
                 logger,
                 "127.0.0.1:12345".parse().unwrap(),
                 "127.0.0.1".into(),
                 443,
+                tls_identity,
                 request,
                 respond,
                 admission,
@@ -2667,10 +2737,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn h2_coalescing_cannot_cross_a_tls_vhost_policy() {
+        let (cfg, logger, dir) = test_config_with_extra(
+            "tls-vhost-coalescing",
+            "<VirtualHost *:443>\n\
+               ServerName a.test\n\
+               SSLEngine On\n\
+               SSLCertificateFile /tls/a.pem\n\
+               SSLCertificateKeyFile /tls/a.key\n\
+             </VirtualHost>\n\
+             <VirtualHost *:443>\n\
+               ServerName b.test\n\
+               SSLEngine On\n\
+               SSLCertificateFile /tls/b.pem\n\
+               SSLCertificateKeyFile /tls/b.key\n\
+             </VirtualHost>\n\
+             <VirtualHost *:443>\n\
+               ServerName alias.test\n\
+               SSLEngine On\n\
+               SSLCertificateFile /tls/a.pem\n\
+               SSLCertificateKeyFile /tls/a.key\n\
+             </VirtualHost>",
+        );
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://b.test/file.txt")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            round_trip_with_sni(cfg.clone(), logger.clone(), request, &[], Some("a.test"))
+                .await
+                .0,
+            421
+        );
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://alias.test/file.txt")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            round_trip_with_sni(cfg, logger, request, &[], Some("a.test"))
+                .await
+                .0,
+            200
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn h2_connection_loop_handles_completion_reset_and_reclaim() {
         async fn run(reset: bool) {
             let (cfg, logger, dir) = test_config(if reset { "serve-reset" } else { "serve-ok" });
             let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+            let tls_identity = test_tls_identity(&cfg);
             let server = tokio::spawn(serve_io(
                 cfg,
                 logger,
@@ -2678,6 +2797,7 @@ mod tests {
                 "127.0.0.1:12345".parse().unwrap(),
                 "127.0.0.1".into(),
                 443,
+                tls_identity,
                 || Ok(()),
             ));
             let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
@@ -2730,6 +2850,7 @@ mod tests {
             }
             let admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let admitted_by_callback = admitted.clone();
+            let tls_identity = test_tls_identity(&cfg);
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 serve_io(
@@ -2739,6 +2860,7 @@ mod tests {
                     "127.0.0.1:12345".parse().unwrap(),
                     "127.0.0.1".into(),
                     443,
+                    tls_identity,
                     move || {
                         admitted_by_callback.store(true, std::sync::atomic::Ordering::Release);
                         Ok(())
@@ -2763,6 +2885,7 @@ mod tests {
         let cfg = Arc::new(short);
 
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let tls_identity = test_tls_identity(&cfg);
         let server = tokio::spawn(serve_io(
             cfg.clone(),
             logger.clone(),
@@ -2770,6 +2893,7 @@ mod tests {
             "127.0.0.1:12345".parse().unwrap(),
             "127.0.0.1".into(),
             443,
+            tls_identity,
             || Ok(()),
         ));
         let (_client, connection) = h2::client::handshake(client_io).await.unwrap();
@@ -2785,6 +2909,7 @@ mod tests {
         let large = vec![b'x'; 2 * 1024 * 1024];
         fs::write(dir.join("www/large.bin"), large).unwrap();
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let tls_identity = test_tls_identity(&cfg);
         let server = tokio::spawn(serve_io(
             cfg,
             logger,
@@ -2792,6 +2917,7 @@ mod tests {
             "127.0.0.1:12345".parse().unwrap(),
             "127.0.0.1".into(),
             443,
+            tls_identity,
             || Ok(()),
         ));
         let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
@@ -2829,6 +2955,7 @@ mod tests {
         fs::write(dir.join("www/progress.bin"), &expected).unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let tls_identity = test_tls_identity(&cfg);
         let server = tokio::spawn(serve_io(
             cfg,
             logger,
@@ -2836,6 +2963,7 @@ mod tests {
             "127.0.0.1:12345".parse().unwrap(),
             "127.0.0.1".into(),
             443,
+            tls_identity,
             || Ok(()),
         ));
         let mut builder = h2::client::Builder::new();
@@ -3021,12 +3149,14 @@ mod tests {
             let admission =
                 admit_stream_before_spawn(&cfg, "127.0.0.1:12345".parse().unwrap(), &request)
                     .unwrap();
+            let tls_identity = test_tls_identity(&cfg);
             let handler = handle_stream(
                 cfg,
                 logger,
                 "127.0.0.1:12345".parse().unwrap(),
                 "127.0.0.1".into(),
                 443,
+                tls_identity,
                 request,
                 respond,
                 admission,

@@ -10060,9 +10060,10 @@ pub fn option_child_presence<T: Clone>(
 /// Decide whether two virtual hosts may share one TLS listener.  Rustls has
 /// one client-certificate verifier per `ServerConfig`, so a listener may only
 /// be shared by vhosts with identical verification mode and CA-file identity.
-/// The mode is encoded by the caller (including the absent/present
-/// distinction); the CA is compared by exact bytes.  Chain validation itself
-/// remains the external TLS/Rustls contract.
+/// The caller encodes the effective mode (an omitted directive and explicit
+/// `none` are equivalent); active client-auth CA identities are compared by
+/// exact bytes. Chain validation itself remains the external TLS/Rustls
+/// contract.
 pub fn tls_client_policy_equal(
     mode_a: u8,
     has_ca_a: bool,
@@ -10079,6 +10080,37 @@ pub fn tls_client_policy_equal(
     } else {
         bytes_eq(ca_a, ca_b)
     }
+}
+
+/// A TLS connection authenticated one virtual-host policy during the
+/// handshake.  A later HTTP Host/:authority may select another vhost only
+/// when its handshake-relevant policy is identical.  This is the executable
+/// core of the RFC 9110 421 boundary; the runtime computes the complete policy
+/// identity and this predicate makes the final transition non-bypassable.
+pub fn tls_vhost_transition_admit(policy_equal: bool) -> (admit: bool)
+    ensures admit == policy_equal,
+{
+    policy_equal
+}
+
+/// Once SNI selected a named TLS identity, an HTTP request without an
+/// authority cannot safely be associated with that identity.  Protocol
+/// parsers normally require Host/:authority independently; retaining this
+/// predicate at the TLS join prevents a future HTTP/1.0 compatibility change
+/// from silently weakening the binding.
+pub fn tls_sni_authority_admit(sni_present: bool, authority_present: bool) -> (admit: bool)
+    ensures admit == (!sni_present || authority_present),
+{
+    !sni_present || authority_present
+}
+
+/// Rustls supplies the verified peer chain for both full and resumed
+/// handshakes.  Required mTLS must never advance to HTTP without that
+/// connection-bound identity; optional/disabled modes may do so.
+pub fn tls_client_identity_admit(require_client: bool, certificate_present: bool) -> (admit: bool)
+    ensures admit == (!require_client || certificate_present),
+{
+    !require_client || certificate_present
 }
 
 // ---------------------------------------------------------------------------

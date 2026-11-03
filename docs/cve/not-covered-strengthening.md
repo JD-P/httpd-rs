@@ -235,6 +235,13 @@ Per-location `SSLVerifyClient`/`SSLCACertificateFile` is rejected at
 configuration load because Rustls authenticates the connection, not an
 individual request.
 
+The completed handshake now retains immutable SNI, selected TLS-policy and
+verified client-certificate identity for both full and resumed sessions.
+HTTP/1 keep-alive and HTTP/2 coalescing return 421 when a request authority
+would select a different certificate/client-auth policy. TLS and HTTP vhost
+selection share first-match wildcard semantics, and the bounded session store
+uses Apache's 300-second default expiry.
+
 ### OCSP response path — prevented
 
 `CVE-2026-44185` prompted bounded HTTP response parsing for the OCSP fetch:
@@ -259,6 +266,7 @@ formal models are extended, add a strict security profile that rejects:
 
 - forward proxy and unmodeled proxy transports,
 - expression conditions outside the verified AST,
-- client-certificate/session policy unless the vhost mapping is verified.
+- any future request-level use of client-certificate identity unless cache and
+  authorization keys bind the immutable connection identity.
 
 Then build a replay corpus for the **0 high/critical** rows, starting with the external Rustls parser assumption.

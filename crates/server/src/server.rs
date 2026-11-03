@@ -21,6 +21,7 @@ use crate::proxy;
 use crate::request_plan::{CanonicalTarget, RequestPlan};
 use crate::util::is_canonical_path;
 use crate::verified::{normalize_uri_path, percent_decode_path};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -40,7 +41,18 @@ pub struct Bound {
     pub port: u16,
     pub addr: String,
     pub tls: Option<Arc<rustls::ServerConfig>>,
-    pending_tls: Option<crate::tls::PreparedServerConfig>,
+    tls_by_local_ip: HashMap<IpAddr, Option<Arc<rustls::ServerConfig>>>,
+    pending_tls: Option<crate::tls::PreparedListenerConfigs>,
+}
+
+impl Bound {
+    fn tls_for(&self, local_ip: Option<IpAddr>) -> Option<Arc<rustls::ServerConfig>> {
+        local_ip
+            .map(access::canonical_ip)
+            .and_then(|address| self.tls_by_local_ip.get(&address))
+            .cloned()
+            .unwrap_or_else(|| self.tls.clone())
+    }
 }
 
 fn listener_local_ip(l: &crate::config::ListenSpec) -> Option<IpAddr> {
@@ -74,15 +86,16 @@ pub fn bind(cfg: &Config) -> io::Result<Vec<Bound>> {
             let addrs = (addr_str, l.port).to_socket_addrs()?;
             first_resolved_addr(addrs)?
         };
-        let pending_tls = crate::tls::prepare_server_config(cfg, l.port, listener_local_ip(l))
+        let pending_tls = crate::tls::prepare_listener_configs(cfg, l.port, listener_local_ip(l))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let tls = pending_tls.config();
+        let (tls, tls_by_local_ip) = pending_tls.configs();
         let listener = bind_reuse(sock_addr, cfg.listen_backlog)?;
         out.push(Bound {
             listener,
             port: l.port,
             addr: l.addr.clone(),
             tls,
+            tls_by_local_ip,
             pending_tls: Some(pending_tls),
         });
     }
@@ -143,14 +156,15 @@ pub fn rebind(cfg: &Config, previous: &[Bound]) -> io::Result<Vec<Bound>> {
             ));
         }
         let listener = old.listener.try_clone()?;
-        let pending_tls = crate::tls::prepare_server_config(cfg, l.port, listener_local_ip(l))
+        let pending_tls = crate::tls::prepare_listener_configs(cfg, l.port, listener_local_ip(l))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let tls = pending_tls.config();
+        let (tls, tls_by_local_ip) = pending_tls.configs();
         out.push(Bound {
             listener,
             port: l.port,
             addr: l.addr.clone(),
             tls,
+            tls_by_local_ip,
             pending_tls: Some(pending_tls),
         });
     }
@@ -413,13 +427,14 @@ impl Server {
                     match b.listener.accept() {
                         Ok((stream, peer)) => {
                             let local = stream.local_addr().ok().map(access::canonical_socket_addr);
+                            let tls = b.tls_for(local.map(|address| address.ip()));
                             let peer = access::canonical_socket_addr(peer);
                             let cfg = self.cfg.clone();
                             let logger = self.logger.clone();
                             let descriptor_guard = match cfg.resource_budget.try_descriptor() {
                                 Ok(guard) => guard,
                                 Err(_) => {
-                                    reject_busy_connection(stream, b.tls.is_some(), &self.cfg);
+                                    reject_busy_connection(stream, tls.is_some(), &self.cfg);
                                     listeners_paused = true;
                                     break;
                                 }
@@ -431,7 +446,7 @@ impl Server {
                             {
                                 Ok(guard) => guard,
                                 Err(_) => {
-                                    reject_busy_connection(stream, b.tls.is_some(), &self.cfg);
+                                    reject_busy_connection(stream, tls.is_some(), &self.cfg);
                                     listeners_paused = true;
                                     break;
                                 }
@@ -447,7 +462,7 @@ impl Server {
                                     MAX_PENDING_PER_CLIENT
                                 },
                             ) else {
-                                reject_busy_connection(stream, b.tls.is_some(), &self.cfg);
+                                reject_busy_connection(stream, tls.is_some(), &self.cfg);
                                 continue;
                             };
                             let lifetime_guard = ConnectionLifetimeGuard::new(transport_guard);
@@ -455,7 +470,6 @@ impl Server {
                             let local_ip = local
                                 .map(|l| l.ip().to_string())
                                 .unwrap_or_else(|| "127.0.0.1".into());
-                            let tls = b.tls.clone();
                             runtime.spawn(async move {
                                 let _ = admit_connection(
                                     cfg,
@@ -1540,6 +1554,7 @@ fn admission_reason(status: u16) -> &'static str {
         411 => "Length Required",
         413 => "Payload Too Large",
         414 => "URI Too Long",
+        421 => "Misdirected Request",
         431 => "Request Header Fields Too Large",
         501 => "Not Implemented",
         503 => "Service Unavailable",
@@ -1691,9 +1706,15 @@ fn preflight_h1_admission(
     bytes: &[u8],
     head_end: usize,
     tls: bool,
+    tls_identity: Option<&crate::tls::TlsConnectionIdentity>,
 ) -> Result<H1Admission, u16> {
     let limits = request_limits(cfg, tls);
     let request = preflight_request_head(&bytes[..head_end], &limits).map_err(|e| e.status())?;
+    if let Some(status) = tls_identity.and_then(|identity| {
+        identity.request_status(cfg, host_header(&request).filter(|host| !host.is_empty()))
+    }) {
+        return Err(status);
+    }
     let effective = cfg.client_addr(peer, &request);
     let context = cfg.resource_budget.context(effective.ip());
     cfg.resource_budget
@@ -2436,7 +2457,8 @@ async fn admit_plain_connection(
         }
         Err(error) => return Err(error),
     };
-    let first_admission = match preflight_h1_admission(&cfg, peer, &initial, head_end, false) {
+    let first_admission = match preflight_h1_admission(&cfg, peer, &initial, head_end, false, None)
+    {
         Ok(admission) => admission,
         Err(status) => {
             reject_h1_async(&mut stream, &cfg, status).await;
@@ -2456,7 +2478,7 @@ async fn admit_plain_connection(
     loop {
         let admission = match next_admission.take() {
             Some(admission) => admission,
-            None => match preflight_h1_admission(&cfg, peer, &initial, head_end, false) {
+            None => match preflight_h1_admission(&cfg, peer, &initial, head_end, false, None) {
                 Ok(admission) => admission,
                 Err(status) => {
                     reject_h1_async(&mut stream, &cfg, status).await;
@@ -2799,19 +2821,38 @@ async fn admit_tls_connection(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
     drop(handshake_guard);
+    let tls_identity = crate::tls::TlsConnectionIdentity::capture(
+        &cfg,
+        local_ip.parse().ok(),
+        local_port,
+        tls.get_ref().1,
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let alpn = tls.get_ref().1.alpn_protocol();
     match admitted_tls_http_protocol(allows_h2, allows_http11, alpn)? {
         TlsHttpProtocol::Http2 => {
             let connection_limit = cfg.max_request_workers.max(1);
             let h2_context = transport_context.clone();
-            return crate::h2::serve(cfg, logger, tls, peer, local_ip, local_port, move || {
-                let established = try_reserve_h2_connection(&h2_context, connection_limit)
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::WouldBlock, "HTTP/2 connection limit reached")
-                    })?;
-                drop(pending_guard);
-                Ok((lifetime_guard, established))
-            })
+            return crate::h2::serve(
+                cfg,
+                logger,
+                tls,
+                peer,
+                local_ip,
+                local_port,
+                tls_identity,
+                move || {
+                    let established = try_reserve_h2_connection(&h2_context, connection_limit)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "HTTP/2 connection limit reached",
+                            )
+                        })?;
+                    drop(pending_guard);
+                    Ok((lifetime_guard, established))
+                },
+            )
             .await;
         }
         TlsHttpProtocol::Http11 => {}
@@ -2845,13 +2886,14 @@ async fn admit_tls_connection(
         }
         Err(error) => return Err(error),
     };
-    let first_admission = match preflight_h1_admission(&cfg, peer, &initial, head_end, true) {
-        Ok(admission) => admission,
-        Err(status) => {
-            reject_h1_async(&mut tls, &cfg, status).await;
-            return Ok(());
-        }
-    };
+    let first_admission =
+        match preflight_h1_admission(&cfg, peer, &initial, head_end, true, Some(&tls_identity)) {
+            Ok(admission) => admission,
+            Err(status) => {
+                reject_h1_async(&mut tls, &cfg, status).await;
+                return Ok(());
+            }
+        };
     let Some(established_guard) =
         try_reserve_h1_connection(&first_admission.context, cfg.max_request_workers)
     else {
@@ -2867,7 +2909,14 @@ async fn admit_tls_connection(
     loop {
         let admission = match next_admission.take() {
             Some(admission) => admission,
-            None => match preflight_h1_admission(&cfg, peer, &initial, head_end, true) {
+            None => match preflight_h1_admission(
+                &cfg,
+                peer,
+                &initial,
+                head_end,
+                true,
+                Some(&tls_identity),
+            ) {
                 Ok(admission) => admission,
                 Err(status) => {
                     reject_h1_async(&mut tls, &cfg, status).await;
@@ -7090,6 +7139,56 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn h1_preflight_rejects_an_incompatible_tls_vhost_transition() {
+        let dir = cov_dir("tls-vhost-preflight");
+        let cfg = cov_config(
+            &dir,
+            "<VirtualHost *:443>\n\
+               ServerName a.test\n\
+               SSLEngine On\n\
+               SSLCertificateFile /tls/a.pem\n\
+               SSLCertificateKeyFile /tls/a.key\n\
+             </VirtualHost>\n\
+             <VirtualHost *:443>\n\
+               ServerName b.test\n\
+               SSLEngine On\n\
+               SSLCertificateFile /tls/b.pem\n\
+               SSLCertificateKeyFile /tls/b.key\n\
+             </VirtualHost>\n",
+        );
+        let identity = crate::tls::TlsConnectionIdentity::for_test(
+            &cfg,
+            Some("127.0.0.1".parse().unwrap()),
+            443,
+            Some("a.test"),
+        );
+        let allowed = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        assert!(preflight_h1_admission(
+            &cfg,
+            cov_peer(),
+            allowed,
+            allowed.len(),
+            true,
+            Some(&identity)
+        )
+        .is_ok());
+        let misdirected = b"GET / HTTP/1.1\r\nHost: b.test\r\n\r\n";
+        assert_eq!(
+            preflight_h1_admission(
+                &cfg,
+                cov_peer(),
+                misdirected,
+                misdirected.len(),
+                true,
+                Some(&identity)
+            )
+            .err(),
+            Some(421)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn cov_req(method: &str, path: &str) -> Request {
         Request {
             method: method.into(),
@@ -8724,6 +8823,7 @@ mod tests {
             port: addr.port(),
             addr: "127.0.0.1".into(),
             tls: None,
+            tls_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -8771,6 +8871,7 @@ mod tests {
             port: addr.port(),
             addr: "127.0.0.1".into(),
             tls: None,
+            tls_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -8836,6 +8937,7 @@ mod tests {
             port: addr.port(),
             addr: "127.0.0.1".into(),
             tls: None,
+            tls_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -8912,6 +9014,7 @@ mod tests {
             port: addr.port(),
             addr: "127.0.0.1".into(),
             tls: None,
+            tls_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -8955,6 +9058,7 @@ mod tests {
             port: addr.port(),
             addr: "127.0.0.1".into(),
             tls: None,
+            tls_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -9034,6 +9138,7 @@ mod tests {
             port: addr.port(),
             addr: "127.0.0.1".into(),
             tls: None,
+            tls_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -9124,6 +9229,7 @@ mod tests {
             port: addr.port(),
             addr: "127.0.0.1".into(),
             tls: None,
+            tls_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -9192,6 +9298,7 @@ mod tests {
             port: addr.port(),
             addr: "127.0.0.1".into(),
             tls: None,
+            tls_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));

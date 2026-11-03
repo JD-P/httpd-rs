@@ -10,6 +10,7 @@ prevents re-deriving them from scratch.
 | Path | Contents |
 |---|---|
 | `http-desynchronization-review.md` | Cross-hop HTTP/1 framing and protocol-transition review: strict verified request metadata, exact fragmented pipeline properties, canonical single-use proxying, and reconstructed WebSocket 101 responses |
+| `tls-mtls-state-review.md` | TLS/mTLS state campaign: immutable negotiated identity, SNI/Host policy binding, resolver parity, resumed client identity, expiring sessions, strict OCSP URLs and HTTPS proxy verification |
 | `apache-if-files-nesting.md` | Apache 2.4.69 configuration-validation bug: unsupported `<Files>`/request-time `<If>` nesting passes configtest but its policy is not evaluated on ordinary requests; source analysis, impact, reproduction, and Vapache disposition |
 | `findings.md` | Pass 3 write-ups (F31–F36, F38) |
 | `findings_p4.md` … `findings_p9.md` | Pass 4–9 write-ups |

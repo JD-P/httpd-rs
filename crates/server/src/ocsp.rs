@@ -289,18 +289,26 @@ fn build_request(leaf: &CertInfo, issuer: &CertInfo) -> Option<Vec<u8>> {
 
 fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
     let rest = url.trim().strip_prefix("http://")?;
-    let (authority, path) = match rest.split_once('/') {
-        Some((a, p)) => (a, format!("/{p}")),
-        None => (rest, "/".to_string()),
+    let split = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..split];
+    let path = if split == rest.len() {
+        "/"
+    } else {
+        &rest[split..]
     };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().ok()?),
-        None => (authority.to_string(), 80),
-    };
-    if host.is_empty() {
+    // The URL is copied into an HTTP request line and Host field. Reuse the
+    // verified authority parser and admit only visible ASCII origin-form path
+    // bytes, so a certificate AIA value cannot inject a second field/request.
+    let (host, port) = crate::util::parse_http_authority(authority.as_bytes(), 80)?;
+    if path.is_empty()
+        || !path.starts_with('/')
+        || path
+            .bytes()
+            .any(|byte| !(0x21..=0x7e).contains(&byte) || byte == b'#')
+    {
         return None;
     }
-    Some((host, port, path))
+    Some((host, port, path.to_string()))
 }
 
 pub(crate) fn supported_responder_url(url: &str) -> bool {
@@ -363,8 +371,13 @@ fn fetch_response(url: &str, request: &[u8], timeout: Duration) -> Option<Vec<u8
     stream.set_read_timeout(Some(quantum)).ok()?;
     stream.set_write_timeout(Some(quantum)).ok()?;
     let mut stream = OcspDeadlineStream { stream, deadline };
+    let host_field = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     let head = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/ocsp-request\r\nAccept: application/ocsp-response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {host_field}\r\nContent-Type: application/ocsp-request\r\nAccept: application/ocsp-response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         request.len()
     );
     stream.write_all(head.as_bytes()).ok()?;
@@ -1505,6 +1518,13 @@ mod tests {
         assert!(parse_http_url("https://example.test/").is_none());
         assert!(parse_http_url("http:///path").is_none());
         assert!(parse_http_url("http://host:bad/").is_none());
+        assert!(parse_http_url("http://user@host/").is_none());
+        assert!(parse_http_url("http://host/path\r\nX-Injected: yes").is_none());
+        assert!(parse_http_url("http://host/path#fragment").is_none());
+        assert_eq!(
+            parse_http_url("http://[::1]:8080/status"),
+            Some(("::1".into(), 8080, "/status".into()))
+        );
 
         assert!(!successful_response(&[]));
         assert!(!successful_response(&der(0x04, b"bad")));

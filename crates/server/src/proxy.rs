@@ -358,6 +358,19 @@ fn valid_forwarded_host(host: &str) -> bool {
         && crate::verified::sanitize_header_value(host.as_bytes()).is_some()
 }
 
+fn tls_server_name(
+    host: &str,
+) -> Result<ServerName<'static>, rustls::pki_types::InvalidDnsNameError> {
+    // URL authorities retain IPv6 brackets for Host/request serialization;
+    // Rustls expects the underlying IP literal when constructing the
+    // certificate-verification identity.
+    let identity = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    ServerName::try_from(identity.to_string())
+}
+
 fn dead_map() -> &'static Mutex<HashMap<String, std::time::Instant>> {
     static DEAD: OnceLock<Mutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
     DEAD.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1910,7 +1923,7 @@ async fn connect_async(
     if !backend.tls {
         return Ok(Box::new(stream));
     }
-    let name = ServerName::try_from(backend.host.clone())
+    let name = tls_server_name(&backend.host)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad TLS host"))?;
     let connector = tokio_rustls::TlsConnector::from(client_config(scope)?);
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2224,6 +2237,8 @@ fn build_client_config(scope: &Scope) -> Result<Arc<rustls::ClientConfig>, Strin
         .with_root_certificates(roots)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.enable_early_data = false;
+    config.enable_secret_extraction = false;
     Ok(Arc::new(config))
 }
 
@@ -2280,7 +2295,7 @@ fn connect(
     let inner: Box<dyn ReadWrite> = if !backend.tls {
         Box::new(tcp)
     } else {
-        let name = ServerName::try_from(backend.host.clone())
+        let name = tls_server_name(&backend.host)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad TLS host"))?;
         let conn = ClientConnection::new(client_config(scope)?, name)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -6267,6 +6282,21 @@ mod coverage_tests {
         let first = client_config(&scope).unwrap();
         let second = client_config(&scope).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
+        assert!(!first.enable_early_data);
+        assert!(!first.enable_secret_extraction);
+    }
+
+    #[test]
+    fn proxy_tls_identity_removes_only_ipv6_authority_brackets() {
+        assert!(matches!(
+            tls_server_name("[::1]").unwrap(),
+            ServerName::IpAddress(_)
+        ));
+        assert!(matches!(
+            tls_server_name("example.test").unwrap(),
+            ServerName::DnsName(_)
+        ));
+        assert!(tls_server_name("bad host").is_err());
     }
 
     #[test]
