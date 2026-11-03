@@ -2115,14 +2115,74 @@ pub(crate) fn response_headers_admitted(resp: &Response) -> bool {
     )
 }
 
+/// Parse response `Connection` options before serialization. The transport
+/// writer removes the field itself and every nominated field, so handler,
+/// proxy, CGI, or configuration output cannot contradict the connection
+/// lifetime selected by the server.
+pub(crate) fn response_connection_nominations(resp: &Response) -> io::Result<Vec<String>> {
+    let mut nominations = Vec::new();
+    for (_, value) in resp
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+    {
+        for raw in value.split(|byte| *byte == b',') {
+            let token = crate::util::trim_ascii(raw);
+            if token.is_empty() || !crate::verified::valid_token(token) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid response Connection option",
+                ));
+            }
+            // `valid_token` admits only ASCII HTTP token bytes. Build the
+            // normalized spelling directly instead of retaining an
+            // unreachable UTF-8 error path after that validation.
+            let token = token
+                .iter()
+                .map(|byte| char::from(byte.to_ascii_lowercase()))
+                .collect::<String>();
+            if nominations.iter().any(|existing| existing == &token) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate response Connection option",
+                ));
+            }
+            nominations.push(token);
+        }
+    }
+    Ok(nominations)
+}
+
+pub(crate) fn response_header_is_hop_by_hop(name: &str, nominations: &[String]) -> bool {
+    const FIXED: [&str; 9] = [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ];
+    FIXED.iter().any(|fixed| name.eq_ignore_ascii_case(fixed))
+        || nominations
+            .iter()
+            .any(|token| name.eq_ignore_ascii_case(token))
+}
+
 /// Return the single canonical representation length that may be emitted on
-/// a bodyless HEAD/304 response. Informational and 204 responses can never
-/// carry Content-Length. Other body-bearing responses ignore caller framing
-/// and are serialized from `Response::body_len` by the transport writer.
+/// a bodyless HEAD/304 response, or the transport-owned zero length for 205.
+/// Informational and 204 responses can never carry Content-Length. Other
+/// body-bearing responses ignore caller framing and are serialized from
+/// `Response::body_len` by the transport writer.
 pub(crate) fn preserved_response_content_length(
     resp: &Response,
     head_only: bool,
 ) -> io::Result<Option<u64>> {
+    if resp.status == 205 {
+        return Ok(Some(0));
+    }
     let status_forbids_length = (100..200).contains(&resp.status) || resp.status == 204;
     let may_preserve = !status_forbids_length && (head_only || resp.status == 304);
     if !may_preserve {
@@ -2638,18 +2698,23 @@ fn serialize_response_head(
             "response headers exceed configured count/byte limits",
         ));
     }
+    let connection_nominations = response_connection_nominations(resp)?;
     let body_len = resp.body_len();
     let status = resp.status;
     let mut have_date = false;
     let mut have_server = false;
     for (n, _) in &resp.headers {
+        if response_header_is_hop_by_hop(n, &connection_nominations) {
+            continue;
+        }
         if n.eq_ignore_ascii_case("date") {
             have_date = true;
         } else if n.eq_ignore_ascii_case("server") {
             have_server = true;
         }
     }
-    let no_body_status = status == 204 || status == 304 || (100..200).contains(&status);
+    let no_body_status =
+        status == 204 || status == 205 || status == 304 || (100..200).contains(&status);
     // HEAD and 304 may advertise a selected representation length. The
     // shared helper validates and canonicalizes exactly one such field; 1xx
     // and 204 always strip it as RFC 9110 requires.
@@ -2678,7 +2743,7 @@ fn serialize_response_head(
         // smuggling for the next request on the socket).
         if name.eq_ignore_ascii_case("content-length") {
             continue;
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+        } else if response_header_is_hop_by_hop(name, &connection_nominations) {
             continue;
         }
         // Never let an upstream/CGI/filename-derived header split the response.
@@ -5287,6 +5352,93 @@ mod tests {
             let head = String::from_utf8_lossy(&writer.data);
             assert!(!head.contains("Content-Length"), "{head}");
         }
+
+        // A 205 is bodyless but, unlike 204, needs an explicit zero length on
+        // a persistent HTTP/1 connection. Discard both a supplied length and
+        // any selected body.
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response::bytes(205, "text/plain", b"must not escape".to_vec());
+        response
+            .headers
+            .push((Cow::Borrowed("Content-Length"), b"15".to_vec()));
+        assert_eq!(
+            write_response(&mut writer, &mut response, &response_options()).unwrap(),
+            0
+        );
+        let head = String::from_utf8_lossy(&writer.data);
+        assert!(head.contains("Content-Length: 0\r\n"), "{head}");
+        assert!(!head.contains("must not escape"), "{head}");
+
+        // The writer is the sole owner of hop-by-hop metadata. It removes
+        // both the fixed set and fields nominated by Connection before
+        // emitting exactly its own persistence decision.
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response::bytes(200, "text/plain", b"ok".to_vec());
+        for (name, value) in [
+            ("Connection", b"keep-alive, X-Hop".as_slice()),
+            ("X-Hop", b"secret".as_slice()),
+            ("Keep-Alive", b"timeout=99".as_slice()),
+            ("Proxy-Connection", b"keep-alive".as_slice()),
+            ("Upgrade", b"websocket".as_slice()),
+            ("TE", b"trailers".as_slice()),
+            ("Trailer", b"X-Later".as_slice()),
+            ("Proxy-Authenticate", b"Basic".as_slice()),
+            ("Proxy-Authorization", b"secret".as_slice()),
+        ] {
+            response.headers.push((Cow::Borrowed(name), value.to_vec()));
+        }
+        let mut opts = response_options();
+        opts.keep_alive = false;
+        write_response(&mut writer, &mut response, &opts).unwrap();
+        let head = String::from_utf8_lossy(&writer.data[..writer.data.len() - 2]);
+        assert_eq!(head.matches("Connection:").count(), 1, "{head}");
+        assert!(head.contains("Connection: close\r\n"), "{head}");
+        for removed in [
+            "X-Hop:",
+            "Keep-Alive:",
+            "Proxy-Connection:",
+            "Upgrade:",
+            "TE:",
+            "Trailer:",
+            "Proxy-Authenticate:",
+            "Proxy-Authorization:",
+        ] {
+            assert!(!head.contains(removed), "{removed}: {head}");
+        }
+
+        let mut invalid = Response::new(200);
+        invalid
+            .headers
+            .push((Cow::Borrowed("Connection"), b"x,,y".to_vec()));
+        assert!(write_response(
+            &mut TestWriter {
+                data: Vec::new(),
+                fd: None,
+            },
+            &mut invalid,
+            &response_options(),
+        )
+        .is_err());
+
+        let mut duplicate = Response::new(200);
+        duplicate
+            .headers
+            .push((Cow::Borrowed("Connection"), b"x, X".to_vec()));
+        assert!(write_response(
+            &mut TestWriter {
+                data: Vec::new(),
+                fd: None,
+            },
+            &mut duplicate,
+            &response_options(),
+        )
+        .is_err());
 
         // 304 may advertise one selected-representation length, but it is
         // parsed and emitted canonically rather than copied byte-for-byte.

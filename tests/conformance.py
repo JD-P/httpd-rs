@@ -371,12 +371,20 @@ def tree():
         "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
     )
     script5.chmod(0o755)
+    script6 = www / "cgi-bin" / "reset-content.sh"
+    script6.write_text(
+        "#!/bin/sh\n"
+        "printf 'Status: 205 Reset Content\\r\\n'\n"
+        "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+        "printf 'body must not escape\\n'\n"
+    )
+    script6.chmod(0o755)
     for p in www.rglob("*"):
         if p.is_file() and not p.is_symlink():
             os.chmod(p, 0o644)
     for p in [www, www / "dir", www / "noidx", www / "list", www / "cgi-bin", www / "vhost"]:
         os.chmod(p, 0o755)
-    for p in [www / "cgi-bin" / "env.sh", www / "cgi-bin" / "status.sh", www / "cgi-bin" / "redirect.sh", www / "cgi-bin" / "mixed-boundary.sh", www / "cgi-bin" / "no-content.sh", www / "dir-cgi" / "index.cgi", www / "errorcgi" / "err.cgi"]:
+    for p in [www / "cgi-bin" / "env.sh", www / "cgi-bin" / "status.sh", www / "cgi-bin" / "redirect.sh", www / "cgi-bin" / "mixed-boundary.sh", www / "cgi-bin" / "no-content.sh", www / "cgi-bin" / "reset-content.sh", www / "dir-cgi" / "index.cgi", www / "errorcgi" / "err.cgi"]:
         p.chmod(0o755)
     cert = BASE / "cert.pem"
     key = BASE / "key.pem"
@@ -841,6 +849,16 @@ def common(port, root, apache, tls_port):
         "</Location>",
         '<Location "/cgi-bin/no-content.sh">',
         "    Header set Content-Length 12",
+        "</Location>",
+        '<Location "/cgi-bin/reset-content.sh">',
+        "    Header set Content-Length 12",
+        '    Header set Connection "keep-alive, X-Hop"',
+        "    Header set X-Hop secret",
+        "    Header set Keep-Alive timeout=99",
+        "    Header set Proxy-Connection keep-alive",
+        "    Header set Upgrade websocket",
+        "    Header set TE trailers",
+        "    Header set Trailer X-Later",
         "</Location>",
         '<Location "/access/expr.txt">',
         '    Require expr "%{REQUEST_METHOD} == \'GET\'"',
@@ -2474,6 +2492,22 @@ class CgiTests(Base):
         st, h, body = self.get("/cgi-bin/no-content.sh")
         self.assertEqual(st, 204)
         self.assertNotIn("content-length", h)
+        self.assertEqual(body, b"")
+
+    def test_205_is_bodyless_and_writer_owns_hop_headers(self):
+        st, h, body = self.get("/cgi-bin/reset-content.sh")
+        self.assertEqual(st, 205)
+        self.assertEqual(h.get("content-length"), ["0"])
+        self.assertEqual(h.get("connection"), ["close"])
+        for removed in (
+            "x-hop",
+            "keep-alive",
+            "proxy-connection",
+            "upgrade",
+            "te",
+            "trailer",
+        ):
+            self.assertNotIn(removed, h)
         self.assertEqual(body, b"")
 
     def test_cgi_path_info(self):

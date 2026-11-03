@@ -8,8 +8,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
+use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -258,23 +258,13 @@ const DEFAULT_TRANSPORT_BUFFER_BUDGET: u64 = 256 * 1024 * 1024;
 /// Conservative ownership charge for the kernel send/receive queues and the
 /// protocol/TLS buffers associated with one accepted transport.
 pub(crate) const TRANSPORT_BUFFER_CHARGE: u64 = 512 * 1024;
-pub(crate) const SOCKET_BUFFER_BYTES: libc::c_int = 128 * 1024;
+pub(crate) const SOCKET_BUFFER_BYTES: usize = 128 * 1024;
 
-pub(crate) fn configure_transport_fd(fd: RawFd) -> io::Result<()> {
-    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-        let result = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                option,
-                (&SOCKET_BUFFER_BYTES as *const libc::c_int).cast(),
-                std::mem::size_of_val(&SOCKET_BUFFER_BYTES) as libc::socklen_t,
-            )
-        };
-        if result != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
+pub(crate) fn configure_transport_fd(fd: impl AsFd) -> io::Result<()> {
+    rustix::net::sockopt::set_socket_send_buffer_size(&fd, SOCKET_BUFFER_BYTES)
+        .map_err(io::Error::from)?;
+    rustix::net::sockopt::set_socket_recv_buffer_size(&fd, SOCKET_BUFFER_BYTES)
+        .map_err(io::Error::from)?;
     Ok(())
 }
 
@@ -351,12 +341,9 @@ fn detected_disk_target(path: &Path) -> io::Result<(u64, u64, u64)> {
         .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
         .open(existing)?;
     let device = opened.metadata()?.dev();
-    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstatvfs(opened.as_raw_fd(), &mut stats) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let available_bytes = (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64);
-    let available_files = stats.f_favail as u64;
+    let stats = rustix::fs::fstatvfs(&opened).map_err(io::Error::from)?;
+    let available_bytes = stats.f_bavail.saturating_mul(stats.f_frsize);
+    let available_files = stats.f_favail;
     // Retain one quarter of the observed free filesystem for the operating
     // system, administrator recovery, and unrelated services. The hard caps
     // also keep a very large filesystem from turning configured log/spool

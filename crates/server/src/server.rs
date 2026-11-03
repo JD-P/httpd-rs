@@ -27,7 +27,6 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(test)]
@@ -280,7 +279,7 @@ const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 64;
 const MAX_TLS_HANDSHAKES_PER_SECOND: usize = 128;
 const MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND: usize = 64;
 fn configure_accepted_transport(stream: &TcpStream) -> io::Result<()> {
-    crate::resource::configure_transport_fd(stream.as_raw_fd())
+    crate::resource::configure_transport_fd(stream)
 }
 
 fn listener_index(first: usize, offset: usize, count: usize) -> usize {
@@ -342,19 +341,13 @@ impl Server {
 
     pub fn run(&self, bound: &[Bound]) -> io::Result<()> {
         self.run_with_poll(bound, |pollfds| {
-            let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, 100) };
-            poll_result(
-                rc,
-                io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EINVAL),
-            )
+            poll_listener_fds(pollfds, Duration::from_millis(100))
         })
     }
 
     fn run_with_poll<F>(&self, bound: &[Bound], mut poll_fn: F) -> io::Result<()>
     where
-        F: FnMut(&mut [libc::pollfd]) -> io::Result<()>,
+        F: FnMut(&mut [rustix::event::PollFd<'_>]) -> io::Result<()>,
     {
         if self.cfg.capability_audit_only {
             return Err(io::Error::new(
@@ -366,13 +359,9 @@ impl Server {
             b.listener.set_nonblocking(true)?;
         }
         let runtime = admission_runtime()?;
-        let mut pollfds: Vec<libc::pollfd> = bound
+        let mut pollfds: Vec<_> = bound
             .iter()
-            .map(|b| libc::pollfd {
-                fd: b.listener.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            })
+            .map(|bound| rustix::event::PollFd::new(&bound.listener, rustix::event::PollFlags::IN))
             .collect();
         let mut first_listener = 0usize;
         let pending_limit = pending_connection_limit(self.cfg.max_request_workers) as u64;
@@ -394,9 +383,13 @@ impl Server {
             {
                 listeners_paused = true;
             }
-            for pollfd in &mut pollfds {
-                pollfd.events = if listeners_paused { 0 } else { libc::POLLIN };
-                pollfd.revents = 0;
+            let events = if listeners_paused {
+                rustix::event::PollFlags::empty()
+            } else {
+                rustix::event::PollFlags::IN
+            };
+            for (pollfd, bound) in pollfds.iter_mut().zip(bound) {
+                *pollfd = rustix::event::PollFd::new(&bound.listener, events);
             }
             poll_fn(&mut pollfds)?;
             if listeners_paused {
@@ -405,7 +398,7 @@ impl Server {
             for offset in 0..bound.len() {
                 let i = listener_index(first_listener, offset, bound.len());
                 let b = &bound[i];
-                if pollfds[i].revents & libc::POLLIN == 0 {
+                if !pollfds[i].revents().contains(rustix::event::PollFlags::IN) {
                     continue;
                 }
                 for _ in 0..ACCEPT_BATCH {
@@ -666,15 +659,18 @@ where
     Ok(handle.spawn_blocking(work))
 }
 
-fn poll_result(rc: libc::c_int, errno: i32) -> io::Result<()> {
-    if rc >= 0 {
-        return Ok(());
-    }
-    let e = io::Error::from_raw_os_error(errno);
-    if e.kind() == io::ErrorKind::Interrupted {
-        Ok(())
-    } else {
-        Err(e)
+fn poll_listener_fds(
+    pollfds: &mut [rustix::event::PollFd<'_>],
+    timeout: Duration,
+) -> io::Result<()> {
+    let timeout = rustix::event::Timespec::try_from(timeout).unwrap_or(rustix::event::Timespec {
+        tv_sec: i64::MAX,
+        tv_nsec: 0,
+    });
+    match rustix::event::poll(pollfds, Some(&timeout)).map_err(io::Error::from) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(()),
+        Err(error) => Err(error), // coverage:ignore-line - kernel poll failure
     }
 }
 
@@ -6848,6 +6844,7 @@ fn apply_rewrite_effects(scope: &mut crate::config::Scope, effects: &crate::rewr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd as _;
 
     // Admission counters are intentionally process-wide.  Serialize the few
     // tests that fill or overwrite them so the normal parallel test runner
@@ -7254,12 +7251,6 @@ mod tests {
             80
         );
         assert!(create_tcp_socket(-1).is_err());
-        assert!(poll_result(0, 0).is_ok());
-        assert!(poll_result(-1, libc::EINTR).is_ok());
-        assert_eq!(
-            poll_result(-1, libc::EFAULT).unwrap_err().raw_os_error(),
-            Some(libc::EFAULT)
-        );
         assert_eq!(
             accept_error_action(&io::Error::from(io::ErrorKind::WouldBlock)),
             AcceptAction::Break
@@ -7773,21 +7764,10 @@ mod tests {
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
         configure_accepted_transport(&server).unwrap();
-        for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-            let mut value: libc::c_int = 0;
-            let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
-            assert_eq!(
-                unsafe {
-                    libc::getsockopt(
-                        server.as_raw_fd(),
-                        libc::SOL_SOCKET,
-                        option,
-                        (&mut value as *mut libc::c_int).cast(),
-                        &mut length,
-                    )
-                },
-                0
-            );
+        for value in [
+            rustix::net::sockopt::socket_send_buffer_size(&server).unwrap(),
+            rustix::net::sockopt::socket_recv_buffer_size(&server).unwrap(),
+        ] {
             assert!(value > 0);
             // Linux reports twice the requested value for bookkeeping;
             // other supported kernels report the effective/requested value.
@@ -8761,13 +8741,7 @@ mod tests {
         let stop = server.stop_flag();
         let handle = std::thread::spawn(move || {
             server.run_with_poll(&bound, |pollfds| {
-                let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, 20) };
-                poll_result(
-                    rc,
-                    io::Error::last_os_error()
-                        .raw_os_error()
-                        .unwrap_or(libc::EINVAL),
-                )
+                poll_listener_fds(pollfds, Duration::from_millis(20))
             })
         });
         let mut client = TcpStream::connect(addr).unwrap();

@@ -21,7 +21,7 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{FromRawFd, RawFd};
 #[cfg(test)]
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
@@ -872,7 +872,7 @@ fn connect(
                 }
                 match TcpStream::connect_timeout(&addr, remaining) {
                     Ok(s) => {
-                        crate::resource::configure_transport_fd(s.as_raw_fd())?;
+                        crate::resource::configure_transport_fd(&s)?;
                         let quantum = deadline
                             .saturating_duration_since(Instant::now())
                             .min(Duration::from_secs(1));
@@ -1173,7 +1173,11 @@ fn response_from_spool(spool: Spool, version: crate::http::Version) -> io::Resul
                 io::Error::new(io::ErrorKind::InvalidData, "invalid FastCGI response")
             })?;
             let body_len = len.saturating_sub(head_end as u64);
-            if response.status == 204 || response.status == 304 || body_len == 0 {
+            if response.status == 204
+                || response.status == 205
+                || response.status == 304
+                || body_len == 0
+            {
                 response.body = Body::Empty;
             } else {
                 response.body = Body::File {
@@ -2709,6 +2713,14 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(empty.body, Body::Empty));
+
+        let reset = response_from_spool(
+            spool_from_bytes(b"Status: 205 Reset Content\r\n\r\nbody"),
+            crate::http::Version::Http11,
+        )
+        .unwrap();
+        assert_eq!(reset.status, 205);
+        assert!(matches!(reset.body, Body::Empty));
 
         let mixed_wire =
             b"Content-Type: text/plain\n\nStatus: 302 Found\r\nLocation: /injected\r\n\r\nbody";

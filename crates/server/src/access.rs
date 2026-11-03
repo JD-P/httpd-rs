@@ -1358,7 +1358,7 @@ mod tests {
         assert!(grant.bind_file(&other, &meta).is_none());
         assert!(grant.bind_backend(&other, "backend".into()).is_none());
         assert!(grant
-            .bind_proxy(&allowed, "example.test", 80, false, "/unsafe;path")
+            .bind_proxy(&allowed, "example.test", 80, false, "/ambiguous;path")
             .is_none());
     }
 

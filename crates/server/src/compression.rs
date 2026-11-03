@@ -412,7 +412,7 @@ fn finalize_inner(
     budget: Option<&Arc<crate::resource::ResourceBudget>>,
 ) {
     finalize_metadata(scope, resp);
-    if resp.status == 204 || (100..200).contains(&resp.status) {
+    if resp.status == 204 || resp.status == 205 || (100..200).contains(&resp.status) {
         return;
     }
     let media = media_type(resp);
@@ -635,6 +635,13 @@ mod tests {
         finalize(&scope, &request("gzip;q=0"), &mut r, b"/x.html");
         assert!(header(&r, "content-encoding").is_none());
         assert_eq!(header_str(&r, "vary").as_deref(), Some("Accept-Encoding"));
+
+        for status in [101, 204, 205] {
+            let mut r = response(b"must not compress", "text/html");
+            r.status = status;
+            finalize(&scope, &request("gzip"), &mut r, b"/x.html");
+            assert!(header(&r, "content-encoding").is_none());
+        }
     }
 
     #[test]

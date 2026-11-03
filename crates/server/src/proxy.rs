@@ -18,7 +18,6 @@ use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -1909,7 +1908,7 @@ async fn connect_async(
     let stream = stream.ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "cannot connect upstream")
     })?;
-    crate::resource::configure_transport_fd(stream.as_raw_fd())?;
+    crate::resource::configure_transport_fd(&stream)?;
     stream.set_nodelay(true)?;
     if !backend.tls {
         return Ok(Box::new(stream));
@@ -2274,7 +2273,7 @@ fn connect_tcp(backend: &HttpBackend, timeout: Duration) -> std::io::Result<TcpS
     let tcp = tcp.ok_or_else(|| {
         last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address"))
     })?;
-    crate::resource::configure_transport_fd(tcp.as_raw_fd())?;
+    crate::resource::configure_transport_fd(&tcp)?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(std::io::Error::new(
@@ -5106,6 +5105,24 @@ mod coverage_tests {
             vapache_verified::proxy_response_framing(false, 204, &length),
             None
         );
+        assert_eq!(
+            vapache_verified::proxy_response_framing(false, 205, &[]),
+            Some(ProxyResponseFraming::NoBody)
+        );
+        let zero = vec![(b"content-length".to_vec(), b"0".to_vec())];
+        assert_eq!(
+            vapache_verified::proxy_response_framing(false, 205, &zero),
+            Some(ProxyResponseFraming::NoBody)
+        );
+        assert_eq!(
+            vapache_verified::proxy_response_framing(false, 205, &length),
+            None
+        );
+        let chunked = vec![(b"transfer-encoding".to_vec(), b"chunked".to_vec())];
+        assert_eq!(
+            vapache_verified::proxy_response_framing(false, 205, &chunked),
+            None
+        );
     }
 
     #[test]
@@ -5123,6 +5140,11 @@ mod coverage_tests {
         let (resp, _) = run("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
         assert_eq!(resp.status, 204);
         assert!(matches!(resp.body, Body::Empty));
+
+        let (resp, _) = run("HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n\r\n").unwrap();
+        assert_eq!(resp.status, 205);
+        assert!(matches!(resp.body, Body::Empty));
+        assert!(run("HTTP/1.1 205 Reset Content\r\nContent-Length: 1\r\n\r\nx").is_err());
 
         let (resp, _) = run("HTTP/1.1 200 OK\r\nContent-Length: 300000\r\n\r\n").unwrap();
         match resp.body {

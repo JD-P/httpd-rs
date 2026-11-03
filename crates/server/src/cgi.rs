@@ -1495,10 +1495,10 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
         }
         headers.insert("location", loc);
     }
-    if !headers.contains("content-type") && status != 204 && status != 304 {
+    if !headers.contains("content-type") && status != 204 && status != 205 && status != 304 {
         headers.insert("content-type", b"text/html".to_vec());
     }
-    let body = if status == 204 || status == 304 {
+    let body = if status == 204 || status == 205 || status == 304 {
         Vec::new()
     } else {
         body.to_vec()
@@ -2276,6 +2276,14 @@ mod tests {
             response_header(&no_type, "content-type"),
             Some(&b"text/html"[..])
         );
+
+        let reset = parse_cgi_response(
+            b"Status: 205 Reset Content\r\nContent-Type: text/plain\r\n\r\nbody",
+            Version::Http11,
+        )
+        .unwrap();
+        assert_eq!(reset.status, 205);
+        assert!(matches!(reset.body, Body::Bytes(ref body) if body.is_empty()));
 
         let empty_part = parse_cgi_response(
             b"X--Y: v\r\nContent-Type: text/plain\r\n\r\n",

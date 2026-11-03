@@ -117,6 +117,27 @@ HTTP/1.0 backend 101 could enter the tunnel path. Vapache now requires HTTP/1.1
 on the client request and the backend switching response in addition to the
 existing exact handshake checks.
 
+### D8: response connection state was still caller-controlled
+
+The response writers owned `Content-Length` and `Transfer-Encoding`, but the
+HTTP/1 path could still forward a handler or `Header` directive's `Connection`,
+`Keep-Alive`, `Upgrade`, `TE`, or `Trailer` fields before appending its own
+connection decision. That could produce contradictory persistence metadata,
+and a `Connection` nomination could leave another hop-specific field in the
+outbound message. HTTP/2 removed only part of the same set.
+
+Both writers now parse the complete caller-supplied `Connection` list, reject
+malformed or duplicate options, remove every nominated field, and remove the
+complete fixed hop-by-hop set before serializing transport-owned metadata.
+HTTP/1 emits at most its single `Connection` decision; HTTP/2 emits none.
+
+The bodyless status matrix now also includes 205 across CGI, file-backed
+FastCGI, ordinary proxy framing, HTTP/1, HTTP/2, compression and expiration.
+An upstream 205 is accepted only without transfer coding and with no declared
+length or an exact zero length. Outbound 205 responses discard any body and
+emit the transport-owned `Content-Length: 0` needed to delimit a persistent
+HTTP/1 response.
+
 ## Preserved invariants
 
 - HTTP/1 body readers consume exactly the selected fixed length or the complete
@@ -133,6 +154,8 @@ existing exact handshake checks.
   HTTP/1.1 101 has passed complete handshake validation.
 - HTTP/1 and HTTP/2 response writers own framing and share the same
   status-aware `Content-Length` preservation rule.
+- The writers also own connection state: fixed and nominated hop-by-hop fields
+  cannot cross from an application response into either protocol.
 
 ## Regression and proof coverage
 

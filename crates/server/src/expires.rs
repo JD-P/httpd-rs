@@ -69,7 +69,7 @@ pub fn apply(scope: &Scope, resp: &mut Response) {
     if scope.header_policy.expires_active != Some(true) {
         return;
     }
-    if resp.status == 204 || (100..200).contains(&resp.status) {
+    if resp.status == 204 || resp.status == 205 || (100..200).contains(&resp.status) {
         return;
     }
     let media = header(resp, "content-type").map(|v| {
@@ -201,7 +201,7 @@ mod tests {
         apply(&Scope::default(), &mut response);
         assert!(header(&response, "Expires").is_none());
 
-        for status in [101, 204] {
+        for status in [101, 204, 205] {
             let mut response = Response::new(status);
             apply(&active_scope(Some("A60")), &mut response);
             assert!(header(&response, "Expires").is_none());

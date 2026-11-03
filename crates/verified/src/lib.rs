@@ -5953,7 +5953,8 @@ pub enum ProxyResponseFraming {
 }
 
 pub open spec fn proxy_response_has_no_body(head_request: bool, status: u16) -> bool {
-    head_request || status == 204 || status == 304 || (100 <= status && status < 200)
+    head_request || status == 204 || status == 205 || status == 304
+        || (100 <= status && status < 200)
 }
 
 /// Decide upstream response framing from the complete admitted field list.
@@ -6007,14 +6008,34 @@ pub fn proxy_response_framing(
         return None;
     }
     // RFC 9110 forbids both framing fields on informational and 204
-    // responses. HEAD and 304 may carry metadata describing the selected
-    // representation, but it never selects a body reader for this message.
+    // responses. A 205 has no content; accept only an explicit zero length,
+    // never a coding or nonzero length. HEAD and 304 may carry metadata
+    // describing the selected representation, but it never selects a body
+    // reader for this message.
     if (status == 204 || (status >= 100 && status < 200))
         && (content_length.is_some() || transfer_encoding)
     {
         return None;
     }
-    if head_request || status == 204 || status == 304 || (status >= 100 && status < 200) {
+    if status == 205 {
+        if transfer_encoding {
+            return None;
+        }
+        match content_length {
+            Some(length) => {
+                if length != 0 {
+                    return None;
+                }
+            }
+            None => {}
+        }
+    }
+    if head_request
+        || status == 204
+        || status == 205
+        || status == 304
+        || (status >= 100 && status < 200)
+    {
         return Some(ProxyResponseFraming::NoBody);
     }
     if transfer_encoding {

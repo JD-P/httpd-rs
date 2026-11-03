@@ -621,11 +621,13 @@ async fn send_response_with_admission(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid response status"))?;
     let no_body = status.is_informational()
         || status == StatusCode::NO_CONTENT
+        || status == StatusCode::RESET_CONTENT
         || status == StatusCode::NOT_MODIFIED
         || head_only;
     let body_len = resp.body_len();
     let preserved_content_length =
         crate::http::preserved_response_content_length(&resp, head_only)?;
+    let connection_nominations = crate::http::response_connection_nominations(&resp)?;
 
     let mut out = http::Response::builder().status(status);
     {
@@ -634,15 +636,19 @@ async fn send_response_with_admission(
         let mut have_server = false;
         for (name, value) in resp.headers.drain(..) {
             let lname = name.to_ascii_lowercase();
-            match lname.as_str() {
-                "date" => have_date = true,
-                "server" => have_server = true,
-                "content-length" => continue,
-                // Connection-specific header fields are forbidden in HTTP/2.
-                "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding"
-                | "upgrade" => continue,
-                "te" if !value.eq_ignore_ascii_case(b"trailers") => continue,
-                _ => {}
+            if lname == "content-length" {
+                continue;
+            }
+            // Connection-specific fields are forbidden in HTTP/2. Apply the
+            // same complete ownership rule as the HTTP/1 writer, including
+            // fields nominated by a caller-supplied Connection field.
+            if crate::http::response_header_is_hop_by_hop(&lname, &connection_nominations) {
+                continue;
+            }
+            if lname == "date" {
+                have_date = true;
+            } else if lname == "server" {
+                have_server = true;
             }
             let Ok(name) = HeaderName::from_bytes(lname.as_bytes()) else {
                 continue;
@@ -674,6 +680,7 @@ async fn send_response_with_admission(
             );
         } else if !status.is_informational()
             && status != StatusCode::NO_CONTENT
+            && status != StatusCode::RESET_CONTENT
             && status != StatusCode::NOT_MODIFIED
         {
             // Body-bearing responses and HEAD responses without an explicit
@@ -2133,7 +2140,7 @@ mod tests {
         cfg: Arc<Config>,
         response: Response,
         head_only: bool,
-    ) -> (io::Result<u64>, u16, Vec<u8>) {
+    ) -> (io::Result<u64>, u16, http::HeaderMap, Vec<u8>) {
         let (client_io, server_io) = tokio::io::duplex(32 * 1024 * 1024);
         let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
@@ -2179,6 +2186,7 @@ mod tests {
         let (response, _) = client.send_request(request, true).unwrap();
         let response = response.await.unwrap();
         let status = response.status().as_u16();
+        let headers = response.headers().clone();
         let mut body = Vec::new();
         if !head_only {
             let mut recv = response.into_body();
@@ -2198,7 +2206,7 @@ mod tests {
         drop(client);
         driver.abort();
         let _ = driver.await;
-        (result, status, body)
+        (result, status, headers, body)
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3072,17 +3080,56 @@ mod tests {
             reader: Box::new(&b"stream body"[..]),
             len: 11,
         };
-        let (result, status, body) = response_round_trip(cfg.clone(), stream, false).await;
+        let (result, status, _, body) = response_round_trip(cfg.clone(), stream, false).await;
         assert_eq!(result.unwrap(), 11);
         assert_eq!(status, 200);
         assert_eq!(body, b"stream body");
+
+        let mut reset = Response::bytes(205, "text/plain", b"must not escape".to_vec());
+        reset
+            .headers
+            .push((Cow::Borrowed("Content-Length"), b"15".to_vec()));
+        reset
+            .headers
+            .push((Cow::Borrowed("Connection"), b"keep-alive, X-Hop".to_vec()));
+        reset
+            .headers
+            .push((Cow::Borrowed("X-Hop"), b"secret".to_vec()));
+        reset
+            .headers
+            .push((Cow::Borrowed("TE"), b"trailers".to_vec()));
+        reset
+            .headers
+            .push((Cow::Borrowed("Trailer"), b"X-Later".to_vec()));
+        reset.headers.push((
+            Cow::Borrowed("Date"),
+            b"Tue, 15 Nov 1994 08:12:31 GMT".to_vec(),
+        ));
+        reset
+            .headers
+            .push((Cow::Borrowed("Server"), b"explicit-server".to_vec()));
+        let (result, status, headers, body) = response_round_trip(cfg.clone(), reset, false).await;
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(status, 205);
+        assert!(body.is_empty());
+        assert_eq!(headers.get("content-length").unwrap(), "0");
+        assert_eq!(headers.get_all("date").iter().count(), 1);
+        assert_eq!(
+            headers.get("date").unwrap(),
+            "Tue, 15 Nov 1994 08:12:31 GMT"
+        );
+        assert_eq!(headers.get_all("server").iter().count(), 1);
+        assert_eq!(headers.get("server").unwrap(), "explicit-server");
+        for removed in ["connection", "keep-alive", "x-hop", "te", "trailer"] {
+            assert!(!headers.contains_key(removed), "{removed}: {headers:?}");
+        }
 
         let mut short_stream = Response::new(200);
         short_stream.body = Body::Stream {
             reader: Box::new(&b""[..]),
             len: 1,
         };
-        let (result, _, _) = response_round_trip(cfg.clone(), short_stream, false).await;
+        let (result, _, _, _) = response_round_trip(cfg.clone(), short_stream, false).await;
         assert_eq!(result.unwrap(), 0);
 
         let mut invalid_headers = Response::bytes(200, "text/plain", b"headers".to_vec());
@@ -3106,7 +3153,7 @@ mod tests {
                 .headers
                 .push((Cow::Owned(format!("X-{index}")), b"value".to_vec()));
         }
-        let (result, status, body) =
+        let (result, status, _, body) =
             response_round_trip(cfg.clone(), excessive_headers, false).await;
         assert_eq!(status, 500);
         assert_eq!(result.unwrap(), body.len() as u64);
@@ -3121,7 +3168,7 @@ mod tests {
             offset: 0,
             len: 300 * 1024,
         };
-        let (result, _, body) = response_round_trip(cfg.clone(), mapped, false).await;
+        let (result, _, _, body) = response_round_trip(cfg.clone(), mapped, false).await;
         assert_eq!(result.unwrap(), 300 * 1024);
         assert_eq!(body.len(), 300 * 1024);
 
@@ -3131,7 +3178,7 @@ mod tests {
             offset: 1,
             len: 300 * 1024,
         };
-        let (result, status, body) = response_round_trip(cfg.clone(), ranged, false).await;
+        let (result, status, _, body) = response_round_trip(cfg.clone(), ranged, false).await;
         assert_eq!(result.unwrap(), 300 * 1024);
         assert_eq!(status, 206);
         assert_eq!(body, medium[1..].to_vec());
@@ -3145,7 +3192,7 @@ mod tests {
             offset: 0,
             len: large.len() as u64,
         };
-        let (result, _, body) = response_round_trip(cfg.clone(), batched, false).await;
+        let (result, _, _, body) = response_round_trip(cfg.clone(), batched, false).await;
         assert_eq!(result.unwrap(), large.len() as u64);
         assert_eq!(body.len(), large.len());
 
@@ -3159,7 +3206,7 @@ mod tests {
             offset: 0,
             len: 8 * 1024 * 1024 + 1,
         };
-        let (result, _, _) = response_round_trip(cfg.clone(), empty_large, false).await;
+        let (result, _, _, _) = response_round_trip(cfg.clone(), empty_large, false).await;
         assert_eq!(result.unwrap(), 0);
 
         let mut read_error = Response::new(200);
