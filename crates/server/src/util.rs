@@ -516,17 +516,7 @@ pub fn parse_hex_u64(s: &[u8]) -> Option<u64> {
 
 /// Parse a decimal `u64`, rejecting signs and overflow.
 pub fn parse_u64(s: &[u8]) -> Option<u64> {
-    if s.is_empty() {
-        return None;
-    }
-    let mut v: u64 = 0;
-    for &b in s {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        v = v.checked_mul(10)?.checked_add((b - b'0') as u64)?;
-    }
-    Some(v)
+    vapache_verified::parse_decimal_u64(s)
 }
 
 /// Parse an HTTP authority into one unambiguous routing identity.

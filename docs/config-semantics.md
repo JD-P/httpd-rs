@@ -17,8 +17,10 @@ directive disposition and `.htaccess` layer-slot translation use verified
 helpers. Configuration quote/escape tokenization, section-tag delimiters,
 argument bounds and section-depth transitions now consume executable verified
 kernels. Main and access-file configuration are sealed into immutable programs
-with exact section mates before directive effects are applied. Directive and
-pattern payload translation remains the explicit parser-refinement assumption.
+with exact section mates and semantic directive/section values before effects
+are applied. Fallible regex, expression, route, authorization, TLS, listener,
+method, expiry, environment and compatibility payload parsing therefore cannot
+be hidden in a skipped branch or partially mutate policy before failing.
 
 ## Process capability boundary
 
@@ -1985,9 +1987,9 @@ construction: there is no second production interleaver.
   `access_section_depth_admit` establish the main/access recursive compiler
   depth ceilings during these iterative seal passes.
 - `config_section_nesting_allowed`.  The recursive configuration compiler
-  checks section transitions through the verified context table. Complex
-  directive and pattern payload refinements remain the explicit
-  parser-refinement assumption.
+  checks section transitions through the verified context table. Section
+  operands are semantic-sealed too: expressions and variables, regex/glob
+  patterns and method sets are compiled before the mutation walk.
 - `classify_access_rule`.  `htaccess::collect_layers` uses this verified
   partition: condition/non-normal rules go to the deferred conditional bucket,
   `<Files>` rules to the Files bucket, and everything else to the top-level
@@ -2138,9 +2140,10 @@ inode comparison before emitting parameters. The required stable-path policy
 additionally projects `fastcgi_stable_component_admit` over every lexical and
 canonical component using the configured backend and trusted-owner UIDs.
 Proxy and WebSocket grants are
-backend-bound; cache grants are policy-key-bound. Parser payload semantics,
-the regex engine, expression leaf evaluators and the standard library's
-concrete sorting implementation remain outside Verus. The external backend
+backend-bound; cache grants are policy-key-bound. Apache-equivalence of the
+sealed semantic constructors, the regex engine, expression leaf evaluators
+and the standard library's concrete sorting implementation remain outside
+Verus. The external backend
 must still open `SCRIPT_FILENAME` itself. With `VapacheFastCGIStablePath On`,
 the verified component predicate is enforced immediately before that handoff;
 without it, FastCGI is rejected unless `UnstableFastCgiPaths` explicitly
@@ -2206,14 +2209,22 @@ a closed section vocabulary, canonical directive identities, typed payload
 schemas, directive/section arity checks, context checks, and exact section
 mates. Each stable access-file snapshot is likewise sealed into an
 `AccessProgram` before it mutates a `Scope`; malformed syntax inside a skipped
-wrapper therefore cannot evade validation.
+wrapper therefore cannot evade validation. The seal owns precompiled Require,
+Options, ACL, redirect, rewrite, header, expiry, environment, listener,
+RemoteIP, proxy and TLS values. Section expressions, method sets and match
+patterns are precompiled as well. Raw tokens remain only for exact string/list
+assignments, context-dependent filesystem effects, and directives that are
+unconditionally rejected.
 
 The main program is compiled only during startup/reload. An access program is
 compiled only for a new descriptor/version snapshot and the resulting parsed
 layer is cached; the sealed program is not retained on the request hot path.
-The remaining proof work is the full directive/pattern payload-to-policy
-projection and the complete IR-to-`Scope` equivalence theorem. AccessLayer slot
-and directive disposition boundaries are already verified.
+The token-to-semantic-IR boundary is now closed in production: no fallible
+payload parser is first invoked after `Scope` mutation begins. Apache
+compatibility of the safe-Rust semantic constructors is still a differential
+oracle obligation, while regex matching semantics remain the separate engine
+assumption. AccessLayer slot and directive disposition boundaries are already
+verified.
 
 ### Remaining refinement boundary
 
@@ -2221,18 +2232,18 @@ The verified source/depth plan is consumed by the evaluator. Rule-kind phase
 classification, deferred-slot selection and the recursive ordering comparator
 are executable verified decisions. Configuration/access-file lexical
 transitions, argument bounds and sealed section structure are executable
-verified decisions too. Directive and pattern payload construction and
-standard-library sort correctness remain outside mechanical proof;
-container/list field merging and the security disposition/layer-slot
-translation use verified helpers. The remaining parser assumption is limited
-to payload parsers refining their typed runtime policy values and the eventual
-whole-program projection theorem.
+verified decisions too. Semantic payload construction is encapsulated by the
+sealed Rust IR, uses verified schema and decimal kernels, and completes before
+effects. Exact equivalence of those constructors to Apache and standard-library
+sort correctness remain outside mechanical proof; container/list field merging
+and the security disposition/layer-slot translation use verified helpers.
 
 The authorization decision, access-phase interleaving, Options algebra,
 scalar overrides, `.htaccess` rule classification, expression truthiness,
 comparison and glob semantics, and rewrite condition-chain folding are
-verified kernels. Parser payload translation, standard-library sorting and
-regex semantics are explicit assumptions, not hidden axioms. Filesystem
+verified kernels. Apache-equivalence of semantic IR construction,
+standard-library sorting and regex semantics are explicit assumptions, not
+hidden axioms. Filesystem
 objects used by protected sinks and access-file parsing are descriptor/inode
 bound. Secure path opening requires Linux `openat2` with
 `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`; configuration testing and startup
@@ -2254,7 +2265,7 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus
 ```
 
-The current ledger (2026-11-01) is:
+The current ledger (2026-11-03) is:
 
 - weighted obligations: **36.0 / 67.0 (53.7%)** if partial obligations receive
   half credit;
@@ -2265,7 +2276,7 @@ The current ledger (2026-11-01) is:
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **576 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **648 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops
@@ -2354,8 +2365,9 @@ profile with its exact executable build ID before export; this avoids the Rust
   phase classification, deferred-slot selection and the recursive ordering
   comparator also consume executable Verus decisions. Lexical transitions,
   argument bounds and immutable section structure are verified and connected;
-  directive/pattern payloads and concrete library sorting remain covered by
-  the explicit refinement assumption. Container/list field merging, directive
+  semantic payloads are sealed before effects, while their exact Apache
+  equivalence and concrete library sorting remain covered by the explicit
+  oracle/refinement assumption. Container/list field merging, directive
   disposition and `.htaccess` layer-slot translation use verified helpers.
 - Some module-specific merge rules are not modelled.  `AllowOverrideList`,
   `Nonfatal=...`, `Include`/`IncludeOptional` and the covered contexts are now

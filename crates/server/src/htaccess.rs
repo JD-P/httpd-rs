@@ -6,13 +6,13 @@
 //! instead of silently ignoring a possible access-control rule.
 
 use crate::config::{
-    normalize_rewrite_base, parse_filter_tokens, parse_ip_net, parse_require, parse_rewrite_cond,
-    parse_rewrite_rule, require_is_negated, require_node_is_negative, AlterEtag, AuthMerging,
-    Capability, CompressionRule, ConditionBranch, Config, ErrorDoc, HostSpec, MatchKind, MethodSet,
-    NonfatalMode, Options, Order, OverrideCategories, OverrideCategory, OverrideMode, Require,
+    normalize_rewrite_base, parse_filter_tokens, require_is_negated, require_node_is_negative,
+    AlterEtag, AuthMerging, Capability, CompressionRule, ConditionBranch, Config, MatchKind,
+    MethodSet, NonfatalMode, Order, OverrideCategories, OverrideCategory, OverrideMode,
     RequireNode, Satisfy, Scope, ScopeRule, VHost,
 };
 use crate::config_frontend::logical_lines;
+use crate::config_payload::{PayloadArity, PayloadSchema, PayloadValueSchema, SealedPayload};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
@@ -1128,13 +1128,13 @@ impl AccessSectionKind {
 enum AccessInstruction {
     Directive {
         name: String,
-        args: Vec<String>,
+        payload: SealedPayload,
         line: usize,
         known: bool,
     },
     SectionStart {
         name: String,
-        args: Vec<String>,
+        payload: AccessSectionPayload,
         line: usize,
         section: Option<AccessSectionKind>,
         end: usize,
@@ -1144,6 +1144,81 @@ enum AccessInstruction {
         line: usize,
         start: usize,
     },
+}
+
+/// Closed semantic value for an access-file section command. Every fallible
+/// parse is completed during `AccessProgram::seal`, before AllowOverride or a
+/// false execute-on-read condition can skip the section.
+#[derive(Debug)]
+enum AccessSectionPayload {
+    Unknown,
+    Empty,
+    Expression(crate::expr::Expr),
+    IfFile { negated: bool, path: String },
+    NamedCondition { negated: bool, name: String },
+    StaticCondition(bool),
+    Methods(MethodSet),
+    Files(MatchKind),
+}
+
+fn seal_access_section(
+    section: AccessSectionKind,
+    args: Vec<String>,
+) -> Result<AccessSectionPayload, String> {
+    validate_section_arity(section, &args)?;
+    Ok(match section {
+        AccessSectionKind::Else
+        | AccessSectionKind::RequireAll
+        | AccessSectionKind::RequireAny
+        | AccessSectionKind::RequireNone => AccessSectionPayload::Empty,
+        AccessSectionKind::If | AccessSectionKind::ElseIf => {
+            let expression = crate::expr::parse(&args.join(" "))?;
+            crate::expr::validate_vars(&expression)?;
+            AccessSectionPayload::Expression(expression)
+        }
+        AccessSectionKind::IfFile => {
+            let raw = &args[0];
+            let (negated, path) = raw
+                .strip_prefix('!')
+                .map_or((false, raw.as_str()), |path| (true, path));
+            if path.is_empty() {
+                return Err("<IfFile> requires a non-empty path".into());
+            }
+            AccessSectionPayload::IfFile {
+                negated,
+                path: path.to_string(),
+            }
+        }
+        AccessSectionKind::IfModule
+        | AccessSectionKind::IfDefine
+        | AccessSectionKind::IfDirective
+        | AccessSectionKind::IfSection => {
+            let raw = &args[0];
+            let (negated, name) = raw
+                .strip_prefix('!')
+                .map_or((false, raw.as_str()), |name| (true, name));
+            if name.is_empty() {
+                return Err(format!("<{}> requires a non-empty name", section.name()));
+            }
+            AccessSectionPayload::NamedCondition {
+                negated,
+                name: name.to_string(),
+            }
+        }
+        AccessSectionKind::IfVersion => {
+            AccessSectionPayload::StaticCondition(crate::config::ifversion_matches(&args)?)
+        }
+        AccessSectionKind::Limit | AccessSectionKind::LimitExcept => AccessSectionPayload::Methods(
+            crate::config::parse_method_set_args(section.name(), &args, true)?,
+        ),
+        AccessSectionKind::Files => {
+            AccessSectionPayload::Files(crate::config::compile_files_pattern(&args)?)
+        }
+        AccessSectionKind::FilesMatch => AccessSectionPayload::Files(MatchKind::FilesMatch(
+            crate::config::compile_regex(&args[0])
+                .map_err(|error| format!("bad FilesMatch regex: {error}"))?,
+        )),
+    })
 }
 
 /// Immutable access-file program. Parsing and structural validation complete
@@ -1175,9 +1250,23 @@ impl AccessProgram {
                     )
                     .ok_or_else(|| format!("line {line_number}: access program depth overflow"))?;
                     let known = directive_category(&name).is_some();
+                    let payload = if known {
+                        SealedPayload::seal(&name, args, access_directive_schema(&name))
+                            .map_err(|error| format!("line {line_number}: {error}"))?
+                    } else {
+                        // Unknown directives are retained so Nonfatal=Unknown
+                        // can make the verified access gate skip them. They
+                        // have no schema and can never reach apply_directive.
+                        SealedPayload::seal(
+                            &name,
+                            args,
+                            PayloadSchema::new(PayloadArity::ANY, false),
+                        )
+                        .expect("unconstrained unknown-directive payload seals")
+                    };
                     instructions.push(AccessInstruction::Directive {
                         name,
-                        args,
+                        payload,
                         line: line_number,
                         known,
                     });
@@ -1198,9 +1287,14 @@ impl AccessProgram {
                     }
                     let start = instructions.len();
                     let section = AccessSectionKind::parse(&name);
+                    let payload = match section {
+                        Some(section) => seal_access_section(section, args)
+                            .map_err(|error| format!("line {line_number}: {error}"))?,
+                        None => AccessSectionPayload::Unknown,
+                    };
                     instructions.push(AccessInstruction::SectionStart {
                         name: name.clone(),
-                        args,
+                        payload,
                         line: line_number,
                         section,
                         end: usize::MAX,
@@ -1301,7 +1395,7 @@ fn parse_block(
             }
             AccessInstruction::SectionStart {
                 name,
-                args,
+                payload,
                 line,
                 section,
                 end: _,
@@ -1362,8 +1456,6 @@ fn parse_block(
                     _ => {}
                 }
                 let section = section.expect("known section passed the admission gate");
-                validate_section_arity(section, &args)
-                    .map_err(|error| format!("line {line}: {error}"))?;
                 if limit.is_some() && !section.allowed_in_limit() {
                     return Err(format!(
                         "line {}: <{name}> is not allowed inside a method-limited section",
@@ -1375,12 +1467,10 @@ fn parse_block(
                         if require_only {
                             return Err(format!("line {line}: <{name}> is not allowed here"));
                         }
-                        let Some(raw_path) = args.first() else {
-                            return Err(format!("line {line}: <IfFile> requires an argument"));
+                        let AccessSectionPayload::IfFile { negated, path } = payload else {
+                            unreachable!("sealed IfFile section payload")
                         };
-                        let (negated, raw_path) = raw_path
-                            .strip_prefix('!')
-                            .map_or((false, raw_path.as_str()), |path| (true, path));
+                        let raw_path = path.as_str();
                         let candidate = Path::new(raw_path);
                         let candidate = if candidate.is_absolute() {
                             candidate.to_path_buf()
@@ -1388,7 +1478,7 @@ fn parse_block(
                             cfg.server_root.join(candidate)
                         };
                         let exists = crate::files::metadata_cached(&candidate).is_ok();
-                        let selected = exists != negated;
+                        let selected = exists != *negated;
                         debug_assert!(vapache_verified::iffile_exec_on_read_admit(
                             candidate.is_absolute(),
                             true,
@@ -1431,26 +1521,30 @@ fn parse_block(
                             return Err(format!("line {line}: <{name}> is not allowed here"));
                         }
                         let (branch, chain, condition) = if section == AccessSectionKind::If {
-                            let expression = crate::expr::parse(&args.join(" "))
-                                .map_err(|e| format!("line {line}: {e}"))?;
-                            // F63/I63: unknown variables fail closed.
-                            crate::expr::validate_vars(&expression)
-                                .map_err(|e| format!("line {line}: {e}"))?;
+                            let AccessSectionPayload::Expression(expression) = payload else {
+                                unreachable!("sealed If expression")
+                            };
                             let chain = *next_chain;
                             *next_chain += 1;
                             current_chain = Some(chain);
-                            (ConditionBranch::Normal, Some(chain), Some(expression))
+                            (
+                                ConditionBranch::Normal,
+                                Some(chain),
+                                Some(expression.clone()),
+                            )
                         } else {
                             let Some(chain) = current_chain else {
                                 return Err(format!("line {line}: <{name}> has no preceding <If>"));
                             };
                             if section == AccessSectionKind::ElseIf {
-                                let expression = crate::expr::parse(&args.join(" "))
-                                    .map_err(|e| format!("line {line}: {e}"))?;
-                                // F63/I63: unknown variables fail closed.
-                                crate::expr::validate_vars(&expression)
-                                    .map_err(|e| format!("line {line}: {e}"))?;
-                                (ConditionBranch::ElseIf, Some(chain), Some(expression))
+                                let AccessSectionPayload::Expression(expression) = payload else {
+                                    unreachable!("sealed ElseIf expression")
+                                };
+                                (
+                                    ConditionBranch::ElseIf,
+                                    Some(chain),
+                                    Some(expression.clone()),
+                                )
                             } else {
                                 current_chain = None;
                                 (ConditionBranch::Else, Some(chain), None)
@@ -1557,11 +1651,12 @@ fn parse_block(
                         if require_only {
                             return Err(format!("line {line}: <{name}> is not allowed here"));
                         }
-                        let methods = crate::config::parse_method_set_args(&name, &args, true)
-                            .map_err(|e| format!("line {line}: {e}"))?;
+                        let AccessSectionPayload::Methods(methods) = payload else {
+                            unreachable!("sealed method section")
+                        };
                         let combined = match limit {
                             Some(outer) => outer.intersect(&methods),
-                            None => methods,
+                            None => methods.clone(),
                         };
                         if combined.is_empty() {
                             return Err(format!(
@@ -1592,16 +1687,9 @@ fn parse_block(
                         if require_only {
                             return Err(format!("line {line}: <{name}> is not allowed here"));
                         }
-                        let pat = args.join(" ");
-                        let kind =
-                            if section == AccessSectionKind::Files {
-                                crate::config::compile_files_pattern(&args)
-                                    .map_err(|e| format!("line {line}: {e}"))?
-                            } else {
-                                MatchKind::FilesMatch(crate::config::compile_regex(&pat).map_err(
-                                    |e| format!("line {line}: bad FilesMatch regex: {e}"),
-                                )?)
-                            };
+                        let AccessSectionPayload::Files(kind) = payload else {
+                            unreachable!("sealed Files section")
+                        };
                         let mut inner = Scope::default();
                         let mut inner_rules = Vec::new();
                         parse_block(
@@ -1619,7 +1707,7 @@ fn parse_block(
                             None,
                         )?;
                         rules.push(ScopeRule {
-                            kind,
+                            kind: kind.clone(),
                             delta: inner,
                             order: rules.len(),
                             condition: None,
@@ -1629,7 +1717,14 @@ fn parse_block(
                         });
                     }
                     AccessSectionKind::IfModule => {
-                        let active = ifmodule_active(cfg, &args)?;
+                        let AccessSectionPayload::NamedCondition {
+                            negated,
+                            name: candidate,
+                        } = payload
+                        else {
+                            unreachable!("sealed IfModule condition")
+                        };
+                        let active = cfg.module_loaded(candidate) != *negated;
                         if active {
                             parse_block(
                                 cfg,
@@ -1650,9 +1745,14 @@ fn parse_block(
                         }
                     }
                     AccessSectionKind::IfDefine => {
-                        let active =
-                            named_condition_active(&args, |name| cfg.config_defines.contains(name))
-                                .map_err(|e| format!("line {line}: {e}"))?;
+                        let AccessSectionPayload::NamedCondition {
+                            negated,
+                            name: candidate,
+                        } = payload
+                        else {
+                            unreachable!("sealed IfDefine condition")
+                        };
+                        let active = cfg.config_defines.contains(candidate) != *negated;
                         if active {
                             parse_block(
                                 cfg,
@@ -1673,19 +1773,21 @@ fn parse_block(
                         }
                     }
                     AccessSectionKind::IfDirective | AccessSectionKind::IfSection => {
-                        let active = named_condition_active(&args, |candidate| {
-                            if section == AccessSectionKind::IfDirective {
-                                cfg.directive_exists(candidate).unwrap_or(false)
-                            } else {
-                                cfg.section_exists(candidate)
-                            }
-                        })
-                        .map_err(|e| format!("line {line}: {e}"))?;
+                        let AccessSectionPayload::NamedCondition {
+                            negated,
+                            name: candidate,
+                        } = payload
+                        else {
+                            unreachable!("sealed named condition")
+                        };
+                        let found = if section == AccessSectionKind::IfDirective {
+                            cfg.directive_exists(candidate)
+                                .map_err(|e| format!("line {line}: {e}"))?
+                        } else {
+                            cfg.section_exists(candidate)
+                        };
+                        let active = found != *negated;
                         if section == AccessSectionKind::IfDirective {
-                            let candidate = args
-                                .first()
-                                .map(|arg| arg.trim_start_matches('!'))
-                                .unwrap_or("");
                             cfg.directive_exists(candidate)
                                 .map_err(|e| format!("line {line}: {e}"))?;
                         }
@@ -1709,8 +1811,10 @@ fn parse_block(
                         }
                     }
                     AccessSectionKind::IfVersion => {
-                        let active = crate::config::ifversion_matches(&args)
-                            .map_err(|e| format!("line {line}: {e}"))?;
+                        let AccessSectionPayload::StaticCondition(active) = payload else {
+                            unreachable!("sealed IfVersion condition")
+                        };
+                        let active = *active;
                         if active {
                             parse_block(
                                 cfg,
@@ -1734,10 +1838,11 @@ fn parse_block(
             }
             AccessInstruction::Directive {
                 name,
-                args,
+                payload,
                 line,
                 known,
             } => {
+                let args = payload.as_slice();
                 if require_only && name != "require" {
                     return Err(format!(
                         "line {line}: only Require directives are allowed in a Require section"
@@ -1753,7 +1858,7 @@ fn parse_block(
                     "line {line}: directive '{name}' is not allowed inside a method-limited section"
                 ));
                 }
-                let policy_allowed = directive_allowed_list(mode, allow_list, &name, &args);
+                let policy_allowed = directive_allowed_list(mode, allow_list, name, args);
                 match vapache_verified::htaccess_gate_admit(
                     policy_allowed,
                     *known,
@@ -1773,7 +1878,7 @@ fn parse_block(
                     }
                     _ => {}
                 }
-                apply_directive(cfg, scope, &name, &args, limit, require_only)
+                apply_directive(cfg, scope, name, payload, limit, require_only)
                     .map_err(|e| format!("line {line}: {e}"))?;
             }
         }
@@ -1851,31 +1956,6 @@ fn skip_section(program: &AccessProgram, i: &mut usize, name: &str) -> Result<()
     }
     *i = *end + 1;
     Ok(())
-}
-
-fn named_condition_active(
-    args: &[String],
-    exists: impl FnOnce(&str) -> bool,
-) -> Result<bool, String> {
-    let Some(raw) = args.first() else {
-        return Err("conditional section requires an argument".into());
-    };
-    if raw.is_empty() {
-        return Err("conditional section requires an argument".into());
-    }
-    let (negated, name) = match raw.strip_prefix('!') {
-        Some(name) => (true, name),
-        None => (false, raw.as_str()),
-    };
-    let found = exists(name);
-    Ok(if negated { !found } else { found })
-}
-
-/// Access files are parsed with the compiled main configuration available, so
-/// use its exact linked/LoadModule set. Activating every positive condition
-/// made `<IfModule missing> Require all granted` an unconditional grant.
-fn ifmodule_active(cfg: &Config, args: &[String]) -> Result<bool, String> {
-    named_condition_active(args, |name| cfg.module_loaded(name))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2333,10 +2413,10 @@ fn directive_allowed_list(
     }
 }
 
-/// Apache validates directive arity while reading an access file. Keep that
-/// validation ahead of every policy mutation so a missing operand cannot be
-/// normalized into an empty string or an accepted no-op.
-fn validate_directive_arity(name: &str, count: usize) -> Result<(), String> {
+/// Schema used while sealing an access program, before section admission or
+/// execute-on-read skipping. A malformed child therefore cannot hide in an
+/// inactive wrapper and later acquire meaning after a configuration change.
+fn access_directive_schema(name: &str) -> PayloadSchema {
     let (min, max) = match name {
         "authtype"
         | "authname"
@@ -2390,31 +2470,82 @@ fn validate_directive_arity(name: &str, count: usize) -> Result<(), String> {
         // below rather than acquiring invented syntax here.
         _ => (0, None),
     };
-    if vapache_verified::config_argument_arity_admit(count, min, max) {
-        return Ok(());
-    }
-    let requirement = match max {
-        Some(max) if max == min => format!("exactly {min}"),
-        Some(max) => format!("between {min} and {max}"),
-        None => format!("at least {min}"),
+    let reject_empty = matches!(
+        name,
+        "authtype"
+            | "authuserfile"
+            | "authgroupfile"
+            | "authbasicprovider"
+            | "sethandler"
+            | "forcetype"
+            | "rewriteengine"
+            | "rewritebase"
+            | "order"
+            | "satisfy"
+            | "authmerging"
+    );
+    let value = match name {
+        "options" => PayloadValueSchema::Options,
+        "require" => PayloadValueSchema::Require,
+        "allow" | "deny" => PayloadValueSchema::LegacyHosts,
+        "fileetag" => PayloadValueSchema::FileEtag,
+        "errordocument" => PayloadValueSchema::ErrorDocument,
+        "header" => PayloadValueSchema::Header,
+        "redirect" => PayloadValueSchema::Redirect {
+            forced_status: None,
+            regex: false,
+        },
+        "redirectpermanent" => PayloadValueSchema::Redirect {
+            forced_status: Some(301),
+            regex: false,
+        },
+        "redirecttemp" => PayloadValueSchema::Redirect {
+            forced_status: Some(302),
+            regex: false,
+        },
+        "redirectmatch" => PayloadValueSchema::Redirect {
+            forced_status: None,
+            regex: true,
+        },
+        "rewritecond" => PayloadValueSchema::RewriteCond,
+        "rewriterule" => PayloadValueSchema::RewriteRule,
+        "rewriteoptions" => PayloadValueSchema::RepeatedKeyword("Inherit"),
+        "expiresdefault" => PayloadValueSchema::ExpiresDefault,
+        "expiresbytype" => PayloadValueSchema::ExpiresByType,
+        "setenvif" | "setenvifnocase" | "browsermatch" | "browsermatchnocase" => {
+            PayloadValueSchema::EnvironmentRule
+        }
+        "indexignore" => PayloadValueSchema::GlobPatterns,
+        "rewriteengine" | "enablesendfile" | "directoryslash" | "expiresactive" => {
+            PayloadValueSchema::OnOff
+        }
+        "deflatecompressionlevel" => PayloadValueSchema::Unsigned { min: 0, max: 9 },
+        "brotlicompressionquality" => PayloadValueSchema::Unsigned { min: 0, max: 11 },
+        "deflatealteretag" | "brotlialteretag" | "brotlicompressionalteretag" => {
+            PayloadValueSchema::Keyword(&["AddSuffix", "NoChange", "Remove"])
+        }
+        "order" => PayloadValueSchema::Keyword(&["allow,deny", "mutual-failure", "deny,allow"]),
+        "satisfy" => PayloadValueSchema::Keyword(&["all", "any"]),
+        "authmerging" => PayloadValueSchema::Keyword(&["off", "and", "or"]),
+        "authtype" => PayloadValueSchema::Keyword(&["basic"]),
+        "authbasicprovider" => PayloadValueSchema::Keyword(&["file"]),
+        _ => PayloadValueSchema::Tokens,
     };
-    Err(format!(
-        "directive '{name}' requires {requirement} argument(s), got {count}"
-    ))
+    PayloadSchema::typed(PayloadArity { min, max }, reject_empty, value)
 }
 
 fn apply_directive(
     cfg: &Config,
     scope: &mut Scope,
     name: &str,
-    args: &[String],
+    payload: &SealedPayload,
     limit: Option<&MethodSet>,
     require_only: bool,
 ) -> Result<(), String> {
+    let args = payload.as_slice();
     let Some(spec) = directive_spec(name) else {
         return Err(format!("unsupported .htaccess directive '{name}'"));
     };
-    validate_directive_arity(name, args.len())?;
     if spec.2 == DirectiveDisposition::Reject {
         return Err(match name {
             "allowmethods" => {
@@ -2430,64 +2561,43 @@ fn apply_directive(
     let first = args.first().map(String::as_str).unwrap_or("");
     match name {
         "require" => {
-            let provider = parse_require(args);
-            if let Require::Unsupported(msg) = &provider {
-                if crate::config::require_syntax_error(msg) {
-                    return Err(msg.clone());
-                }
-            }
+            let provider = payload
+                .require()
+                .expect("Require is compiled while sealing")
+                .clone();
             if !require_only && require_is_negated(&provider) {
                 return Err("negative Require directive has no effect in <RequireAny>".into());
             }
             scope.add_require(RequireNode::Provider(provider), limit);
         }
         "authtype" => {
-            if !first.eq_ignore_ascii_case("basic") {
-                return Err(format!(
-                    "AuthType '{first}' is not implemented; only Basic is supported"
-                ));
-            }
+            debug_assert_eq!(payload.keyword(), Some(0));
             scope.authorization.auth_type = Some("basic".into());
         }
         "authname" => scope.authorization.auth_name = Some(first.to_string()),
         "authuserfile" => scope.authorization.auth_user_file = Some(server_path(cfg, first)),
         "authgroupfile" => scope.authorization.auth_group_file = Some(server_path(cfg, first)),
         "authbasicprovider" => {
-            if args.len() != 1 || !first.eq_ignore_ascii_case("file") {
-                return Err("only the `file` AuthBasicProvider is supported".into());
-            }
+            debug_assert_eq!(payload.keyword(), Some(0));
         }
         "options" => {
-            for arg in args {
-                if arg.starts_with('-') {
-                    continue;
-                }
-                match arg.trim_start_matches('+').to_ascii_lowercase().as_str() {
-                    "all" => {
-                        require_capability(cfg, Capability::AutoIndex, "Options All")?;
-                        require_capability(cfg, Capability::Cgi, "Options All")?;
-                    }
-                    "indexes" => require_capability(cfg, Capability::AutoIndex, "Options Indexes")?,
-                    "execcgi" => require_capability(cfg, Capability::Cgi, "Options ExecCGI")?,
-                    _ => {}
-                }
+            let options = payload
+                .options()
+                .expect("Options is compiled while sealing");
+            if options.requires_autoindex {
+                require_capability(cfg, Capability::AutoIndex, "Options Indexes/All")?;
             }
-            apply_options(scope, args)?
+            if options.requires_cgi {
+                require_capability(cfg, Capability::Cgi, "Options ExecCGI/All")?;
+            }
+            scope.options.merge_child(&options.policy);
         }
         "directoryindex" => scope.content_policy.directory_index = Some(args.to_vec()),
         "errordocument" => {
-            let Ok(code @ 400..=599) = args[0].parse::<u16>() else {
-                return Err("ErrorDocument requires a status from 400 through 599".into());
-            };
-            let target = args[1].clone();
-            let doc = if target.starts_with("http://") || target.starts_with("https://") {
-                ErrorDoc::External(target)
-            } else if target.starts_with('/') {
-                ErrorDoc::Local(target)
-            } else {
-                ErrorDoc::Text(target)
-            };
-            scope.error_policy.documents.push((code, doc));
+            let (code, document) = payload
+                .error_document()
+                .expect("ErrorDocument is compiled while sealing");
+            scope.error_policy.documents.push((code, document.clone()));
         }
         "addtype" => {
             scope
@@ -2600,60 +2710,73 @@ fn apply_directive(
             }
         }
         "deflatecompressionlevel" => {
-            let n = first
-                .parse::<u32>()
-                .ok()
-                .filter(|n| *n <= 9)
-                .ok_or_else(|| "DeflateCompressionLevel must be from 0 through 9".to_string())?;
-            scope.compression_policy.deflate_level = Some(n);
+            scope.compression_policy.deflate_level = Some(
+                payload
+                    .unsigned()
+                    .expect("DeflateCompressionLevel is typed while sealing")
+                    as u32,
+            );
         }
         "brotlicompressionquality" => {
-            let n = first
-                .parse::<u32>()
-                .ok()
-                .filter(|n| *n <= 11)
-                .ok_or_else(|| "BrotliCompressionQuality must be from 0 through 11".to_string())?;
-            scope.compression_policy.brotli_quality = Some(n);
+            scope.compression_policy.brotli_quality = Some(
+                payload
+                    .unsigned()
+                    .expect("BrotliCompressionQuality is typed while sealing")
+                    as u32,
+            );
         }
         "deflatealteretag" => {
-            let value = AlterEtag::parse(first).ok_or_else(|| {
-                "DeflateAlterETag requires AddSuffix, NoChange, or Remove".to_string()
-            })?;
+            let value = match payload
+                .keyword()
+                .expect("DeflateAlterETag is typed while sealing")
+            {
+                0 => AlterEtag::AddSuffix,
+                1 => AlterEtag::NoChange,
+                2 => AlterEtag::Remove,
+                _ => unreachable!("sealed AlterETag keyword index"),
+            };
             scope.compression_policy.deflate_alter_etag = Some(value);
         }
         "brotlialteretag" | "brotlicompressionalteretag" => {
-            let value = AlterEtag::parse(first).ok_or_else(|| {
-                "BrotliCompressionAlterETag requires AddSuffix, NoChange, or Remove".to_string()
-            })?;
+            let value = match payload
+                .keyword()
+                .expect("BrotliCompressionAlterETag is typed while sealing")
+            {
+                0 => AlterEtag::AddSuffix,
+                1 => AlterEtag::NoChange,
+                2 => AlterEtag::Remove,
+                _ => unreachable!("sealed AlterETag keyword index"),
+            };
             scope.compression_policy.brotli_alter_etag = Some(value);
         }
-        "header" => apply_header(scope, args)?,
+        "header" => {
+            let previous = scope.header_policy.clone();
+            payload
+                .header()
+                .expect("Header is compiled while sealing")
+                .apply(&mut scope.header_policy);
+            if !scope.header_policy.within_limits() {
+                scope.header_policy = previous;
+                return Err("configured response headers exceed the count/byte limit".into());
+            }
+        }
         "order" => {
             require_capability(cfg, Capability::LegacyAuthz, "Order")?;
-            let order = match first.to_ascii_lowercase().as_str() {
-                "allow,deny" | "mutual-failure" => Order::AllowDeny,
-                "deny,allow" => Order::DenyAllow,
-                other => return Err(format!("unknown Order '{other}'")),
+            let order = match payload.keyword().expect("Order is typed while sealing") {
+                0 | 1 => Order::AllowDeny,
+                2 => Order::DenyAllow,
+                _ => unreachable!("sealed Order keyword index"),
             };
             scope.add_order(order, limit);
         }
         "allow" | "deny" => {
             require_capability(cfg, Capability::LegacyAuthz, name)?;
-            if !args
-                .first()
-                .map(|s| s.eq_ignore_ascii_case("from"))
-                .unwrap_or(false)
+            for host in payload
+                .legacy_hosts()
+                .expect("legacy host ACL is compiled while sealing")
+                .iter()
+                .cloned()
             {
-                return Err(format!("{name} must be followed by 'from'"));
-            }
-            for a in &args[1..] {
-                let host = if a.eq_ignore_ascii_case("all") {
-                    HostSpec::All
-                } else if let Some((net, bits)) = parse_ip_net(a) {
-                    HostSpec::Net(net, bits)
-                } else {
-                    return Err(format!("unsupported {name} host '{a}'"));
-                };
                 if name == "allow" {
                     scope.add_allow(host, limit);
                 } else {
@@ -2663,35 +2786,40 @@ fn apply_directive(
         }
         "satisfy" => {
             require_capability(cfg, Capability::LegacyAuthz, "Satisfy")?;
-            let satisfy = match first.to_ascii_lowercase().as_str() {
-                "all" => Satisfy::All,
-                "any" => Satisfy::Any,
-                _ => return Err("Satisfy requires 'all' or 'any'".into()),
+            let satisfy = match payload.keyword().expect("Satisfy is typed while sealing") {
+                0 => Satisfy::All,
+                1 => Satisfy::Any,
+                _ => unreachable!("sealed Satisfy keyword index"),
             };
             scope.add_satisfy(satisfy, limit);
         }
         "authmerging" => {
-            scope.authorization.auth_merging = Some(match first.to_ascii_lowercase().as_str() {
-                "off" => AuthMerging::Off,
-                "and" => AuthMerging::And,
-                "or" => AuthMerging::Or,
-                _ => return Err("AuthMerging requires Off, And or Or".into()),
-            });
+            scope.authorization.auth_merging = Some(
+                match payload
+                    .keyword()
+                    .expect("AuthMerging is typed while sealing")
+                {
+                    0 => AuthMerging::Off,
+                    1 => AuthMerging::And,
+                    2 => AuthMerging::Or,
+                    _ => unreachable!("sealed AuthMerging keyword index"),
+                },
+            );
         }
         "rewriteengine" => {
-            let on = first.eq_ignore_ascii_case("on");
-            let off = first.eq_ignore_ascii_case("off");
-            if on || off {
-                scope.rewrite_policy.rewrite_engine = Some(on);
-            } else {
-                return Err("RewriteEngine requires On or Off".into());
-            }
+            scope.rewrite_policy.rewrite_engine = Some(
+                payload
+                    .on_off()
+                    .expect("RewriteEngine is typed while sealing"),
+            );
         }
         "rewritebase" => scope.rewrite_policy.rewrite_base = Some(normalize_rewrite_base(first)),
-        "rewritecond" => scope
-            .rewrite_policy
-            .pending_rewrite_conds
-            .push(parse_rewrite_cond(args)?),
+        "rewritecond" => scope.rewrite_policy.pending_rewrite_conds.push(
+            payload
+                .rewrite_cond()
+                .expect("RewriteCond is compiled while sealing")
+                .clone(),
+        ),
         "rewriterule" => {
             let match_base = scope
                 .rewrite_policy
@@ -2703,7 +2831,12 @@ fn apply_directive(
                 .rewrite_base
                 .as_deref()
                 .unwrap_or(match_base);
-            let mut rule = parse_rewrite_rule(args, match_base, true)?;
+            let mut rule = payload
+                .rewrite_rule()
+                .expect("RewriteRule is compiled while sealing")
+                .clone();
+            rule.match_base = normalize_rewrite_base(match_base);
+            rule.per_dir = true;
             if let Some(handler) = rule.flags.handler.as_deref() {
                 require_handler_capability(cfg, handler, "RewriteRule")?;
             }
@@ -2713,63 +2846,66 @@ fn apply_directive(
             scope.rewrite_policy.rewrite_rules.push(rule);
         }
         "rewriteoptions" => {
-            for arg in args {
-                if !arg.eq_ignore_ascii_case("Inherit") {
-                    return Err(format!("unsupported RewriteOptions flag '{arg}'"));
-                }
-            }
             scope.rewrite_policy.rewrite_inherit = Some(true);
         }
         "redirect" | "redirectpermanent" | "redirecttemp" => {
-            let forced = if name == "redirectpermanent" {
-                Some(301)
-            } else if name == "redirecttemp" {
-                Some(302)
-            } else {
-                None
-            };
-            apply_redirect(scope, args, forced)?
+            scope.mapping_policy.redirects.push(
+                payload
+                    .redirect()
+                    .expect("Redirect is compiled while sealing")
+                    .clone(),
+            );
         }
-        "redirectmatch" => apply_redirect_match(scope, args)?,
+        "redirectmatch" => scope.mapping_policy.redirects.push(
+            payload
+                .redirect()
+                .expect("RedirectMatch is compiled while sealing")
+                .clone(),
+        ),
         "fileetag" => {
-            let mut v = 0u32;
-            for a in args {
-                match a.to_ascii_lowercase().as_str() {
-                    "none" => v = 0,
-                    "all" => v = crate::config::ETAG_ALL,
-                    "inode" => v |= crate::config::ETAG_INODE,
-                    "mtime" => v |= crate::config::ETAG_MTIME,
-                    "size" => v |= crate::config::ETAG_SIZE,
-                    _ => return Err(format!("FileETag contains unsupported keyword '{a}'")),
-                }
-            }
-            scope.content_policy.file_etag = Some(v);
+            scope.content_policy.file_etag = Some(
+                payload
+                    .file_etag()
+                    .expect("FileETag is compiled while sealing"),
+            );
         }
         "enablesendfile" => {
-            scope.content_policy.enable_sendfile = Some(parse_on_off("EnableSendfile", first)?)
+            scope.content_policy.enable_sendfile = Some(
+                payload
+                    .on_off()
+                    .expect("EnableSendfile is typed while sealing"),
+            )
         }
         "directoryslash" => {
-            scope.content_policy.directory_slash = Some(parse_on_off("DirectorySlash", first)?)
+            scope.content_policy.directory_slash = Some(
+                payload
+                    .on_off()
+                    .expect("DirectorySlash is typed while sealing"),
+            )
         }
         "expiresactive" => {
-            scope.header_policy.expires_active = Some(parse_on_off("ExpiresActive", first)?)
+            scope.header_policy.expires_active = Some(
+                payload
+                    .on_off()
+                    .expect("ExpiresActive is typed while sealing"),
+            )
         }
         "expiresdefault" => {
-            let spec = args.join(" ");
-            if !crate::expires::valid_spec(&spec) {
-                return Err("ExpiresDefault has invalid expiry syntax".into());
-            }
-            scope.header_policy.expires_default = Some(spec);
+            scope.header_policy.expires_default = Some(
+                payload
+                    .expires_default()
+                    .expect("ExpiresDefault is compiled while sealing")
+                    .to_string(),
+            );
         }
         "expiresbytype" => {
-            let spec = args[1..].join(" ");
-            if !crate::expires::valid_spec(&spec) {
-                return Err("ExpiresByType has invalid expiry syntax".into());
-            }
+            let (content_type, spec) = payload
+                .expires_by_type()
+                .expect("ExpiresByType is compiled while sealing");
             scope
                 .header_policy
                 .expires_by_type
-                .push((args[0].to_ascii_lowercase(), spec));
+                .push((content_type.to_string(), spec.to_string()));
         }
         "setenv" => {
             let Some(name) = args.first() else {
@@ -2798,31 +2934,24 @@ fn apply_directive(
                 .environment_policy
                 .set_env_if
                 .push(crate::scope_policy::Originated::access(
-                    crate::config::parse_env_rule(name, args)?,
+                    payload
+                        .environment_rule()
+                        .expect("environment rule is compiled while sealing")
+                        .clone(),
                 ));
         }
         "indexignore" => {
-            for pattern in args {
-                crate::config::validate_glob_pattern(pattern)?;
-            }
-            scope
-                .content_policy
-                .index_ignore
-                .extend(args.iter().cloned());
+            scope.content_policy.index_ignore.extend(
+                payload
+                    .glob_patterns()
+                    .expect("IndexIgnore patterns are validated while sealing")
+                    .iter()
+                    .cloned(),
+            );
         }
         _ => return Err(format!("unsupported .htaccess directive '{name}'")),
     }
     Ok(())
-}
-
-fn parse_on_off(name: &str, value: &str) -> Result<bool, String> {
-    if value.eq_ignore_ascii_case("on") {
-        Ok(true)
-    } else if value.eq_ignore_ascii_case("off") {
-        Ok(false)
-    } else {
-        Err(format!("{name} requires On or Off"))
-    }
 }
 
 fn require_capability(cfg: &Config, capability: Capability, feature: &str) -> Result<(), String> {
@@ -2853,174 +2982,6 @@ fn require_handler_capability(cfg: &Config, handler: &str, directive: &str) -> R
     Ok(())
 }
 
-fn apply_options(scope: &mut Scope, args: &[String]) -> Result<(), String> {
-    if args.is_empty() {
-        return Err("Options requires at least one option".into());
-    }
-    // Apache resets the effective set to exactly the listed words when a
-    // directive carries signless options, discarding anything inherited
-    // (including the compiled FollowSymLinks default). Collect them first so
-    // the reset lands before the +/- words of the same directive.
-    let mut reset_mask = Options::empty().0;
-    let mut resets = false;
-    for a in args {
-        if a.starts_with('+') || a.starts_with('-') {
-            continue;
-        }
-        match a.to_ascii_lowercase().as_str() {
-            "indexes" => {
-                reset_mask |= Options::INDEXES;
-                resets = true;
-            }
-            "followsymlinks" => {
-                reset_mask |= Options::FOLLOW_SYMLINKS;
-                resets = true;
-            }
-            "symlinksifownermatch" => {
-                reset_mask |= Options::SYMLINKS_IF_OWNER_MATCH;
-                resets = true;
-            }
-            "execcgi" => {
-                reset_mask |= Options::EXEC_CGI;
-                resets = true;
-            }
-            "includes" => {
-                reset_mask |= Options::INCLUDES;
-                resets = true;
-            }
-            "includesnoexec" => {
-                reset_mask |= Options::INCLUDES_NOEXEC;
-                resets = true;
-            }
-            "multiviews" => {
-                reset_mask |= Options::MULTIVIEWS;
-                resets = true;
-            }
-            // None/All keep their explicit push_set in the loop below.
-            _ => continue,
-        }
-    }
-    if resets {
-        scope.options.push_set(Options::empty().0);
-        scope.options.push_add(reset_mask);
-    }
-    for a in args {
-        let (sign, flag) = match a.as_bytes().first() {
-            Some(b'+') => (1, &a[1..]),
-            Some(b'-') => (-1, &a[1..]),
-            _ => (0, a.as_str()),
-        };
-        let opt = match flag.to_ascii_lowercase().as_str() {
-            "none" => Options::empty(),
-            "all" => Options::all(),
-            "indexes" => Options(Options::INDEXES),
-            "followsymlinks" => Options(Options::FOLLOW_SYMLINKS),
-            "symlinksifownermatch" => Options(Options::SYMLINKS_IF_OWNER_MATCH),
-            "execcgi" => Options(Options::EXEC_CGI),
-            "includes" => Options(Options::INCLUDES),
-            "includesnoexec" => Options(Options::INCLUDES_NOEXEC),
-            "multiviews" => Options(Options::MULTIVIEWS),
-            _ => return Err(format!("unsupported Options flag '{a}'")),
-        };
-        match sign {
-            1 => scope.options.push_add(opt.0),
-            -1 => scope.options.push_remove(opt.0),
-            _ if flag.eq_ignore_ascii_case("none") => scope.options.push_set(Options::empty().0),
-            _ if flag.eq_ignore_ascii_case("all") => scope.options.push_set(Options::all().0),
-            _ => scope.options.push_add(opt.0),
-        }
-    }
-    Ok(())
-}
-
-fn apply_header(scope: &mut Scope, args: &[String]) -> Result<(), String> {
-    if args.len() < 2 {
-        return Err("Header requires an action and name".into());
-    }
-    let mut idx = 0;
-    let always = args[0].eq_ignore_ascii_case("always");
-    if always || args[0].eq_ignore_ascii_case("onsuccess") {
-        idx = 1;
-    }
-    if args.len() < idx + 2 {
-        return Err("Header requires an action and name".into());
-    }
-    let action = args[idx].to_ascii_lowercase();
-    let name = args[idx + 1].trim_end_matches(':').to_string();
-    let minimum = match action.as_str() {
-        "set" | "add" => idx + 3,
-        "unset" => idx + 2,
-        _ => return Err(format!("unsupported Header action '{action}'")),
-    };
-    let conditional = args[idx + 2..].iter().any(|arg| {
-        arg.eq_ignore_ascii_case("early")
-            || arg.to_ascii_lowercase().starts_with("env=")
-            || arg.to_ascii_lowercase().starts_with("expr=")
-    });
-    if args.len() < minimum || (action == "unset" && args.len() != minimum) || conditional {
-        return Err(
-            "conditional or extended Header forms are not implemented; refusing to broaden the header policy"
-                .into(),
-        );
-    }
-    match (action.as_str(), always) {
-        ("set", true) => {
-            let value = args[idx + 2..].join(" ");
-            scope.header_policy.always_set_headers.push((name, value));
-        }
-        ("set", false) => {
-            let value = args[idx + 2..].join(" ");
-            scope.header_policy.set_headers.push((name, value));
-        }
-        ("add", true) => {
-            let value = args[idx + 2..].join(" ");
-            scope.header_policy.always_add_headers.push((name, value));
-        }
-        ("add", false) => {
-            let value = args[idx + 2..].join(" ");
-            scope.header_policy.add_headers.push((name, value));
-        }
-        ("unset", true) => scope.header_policy.always_unset_headers.push(name),
-        ("unset", false) => scope.header_policy.unset_headers.push(name),
-        _ => unreachable!("Header action was validated above"),
-    }
-    Ok(())
-}
-
-fn apply_redirect(
-    scope: &mut Scope,
-    args: &[String],
-    forced_status: Option<u16>,
-) -> Result<(), String> {
-    let (status, from, to) = crate::config::parse_redirect_arguments(args, forced_status)?;
-    scope
-        .mapping_policy
-        .redirects
-        .push(crate::config::Redirect {
-            from,
-            to,
-            status,
-            regex: None,
-        });
-    Ok(())
-}
-
-fn apply_redirect_match(scope: &mut Scope, args: &[String]) -> Result<(), String> {
-    let (status, pattern, target) = crate::config::parse_redirect_arguments(args, None)?;
-    let regex = crate::config::compile_regex(&pattern)
-        .map_err(|e| format!("bad RedirectMatch regex: {e}"))?;
-    scope
-        .mapping_policy
-        .redirects
-        .push(crate::config::Redirect {
-            from: String::new(),
-            to: target,
-            status,
-            regex: Some(std::sync::Arc::new(regex)),
-        });
-    Ok(())
-}
-
 fn server_path(cfg: &Config, value: &str) -> PathBuf {
     let p = PathBuf::from(value);
     if p.is_absolute() {
@@ -3033,7 +2994,7 @@ fn server_path(cfg: &Config, value: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AuthPolicy, OverrideCategories, RequireEntry};
+    use crate::config::{AuthPolicy, Options, OverrideCategories, RequireEntry};
     use std::collections::HashMap;
     use std::fs;
 
@@ -4338,6 +4299,23 @@ mod tests {
 
         let mismatched = crate::config_frontend::logical_lines("<Files x>\n</If>\n");
         assert!(AccessProgram::seal(&mismatched).is_err());
+
+        let hidden_bad_match = crate::config_frontend::logical_lines(
+            "<Unknown>\n<FilesMatch (?=unsupported-lookahead)>\n</FilesMatch>\n</Unknown>\n",
+        );
+        let error = match AccessProgram::seal(&hidden_bad_match) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed nested section payload was accepted"),
+        };
+        assert!(error.contains("FilesMatch regex"), "{error}");
+
+        let malformed_denied_directive =
+            crate::config_frontend::logical_lines("<Files x>\nExpiresDefault nonsense\n</Files>\n");
+        let error = match AccessProgram::seal(&malformed_denied_directive) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed semantic payload was accepted"),
+        };
+        assert!(error.contains("invalid expiry syntax"), "{error}");
     }
 
     #[test]
@@ -5429,11 +5407,17 @@ mod tests {
     fn direct_directive_errors_and_unknown_specs() {
         let dir = tempdir("coverage-directive-errors");
         let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let unknown = SealedPayload::seal(
+            "definitely-unknown",
+            Vec::new(),
+            PayloadSchema::new(PayloadArity::ANY, false),
+        )
+        .unwrap();
         assert!(apply_directive(
             &cfg,
             &mut Scope::default(),
             "definitely-unknown",
-            &[],
+            &unknown,
             None,
             false,
         )

@@ -257,6 +257,11 @@ Implemented today:
   compatibility mode rather than silently weakening access or TLS policy.
   Unsupported handlers (`mod_php`, `mod_perl`, `mod_wsgi`, ...) and output
   filters (SSI, unknown filters) return `500` instead of serving source.
+- Main and access-file configuration are compiled through a sealed semantic
+  IR. Section expressions/matchers/method sets and fallible directive values
+  (authorization, rewrites, routes, listeners, expiry, environment and TLS)
+  are validated or precompiled before any policy object is mutated; an
+  inactive or disallowed wrapper cannot hide malformed policy syntax.
 - Access/error logging with Apache `LogFormat`, daemonization, pid files,
   privilege dropping, graceful reload/shutdown and log reopening.
 - Defence in depth: URI percent-decoding, path canonicalization, and the
@@ -371,7 +376,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **644 verified functions, 0 errors** (percent-decoding,
+Current result: **648 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
@@ -548,7 +553,7 @@ Current ledger: **53.7% weighted obligations**, **5/6 proof debt**,
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **108 adversarial replay cases** covering the findings classes,
-and **644 Verus functions with 0 errors** (including the I3 fast-path
+and **648 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -757,11 +762,11 @@ configuration compilation, protocol and resource-accounting work and was not
 being enforced by CI. The reviewed per-module debt is recorded in
 `tests/security_coverage_baseline.json`; reducing it tightens the ratchet, while
 new debt beyond that scheduling envelope fails the quality workflow. The
-current instrumented suite is 632 Rust library tests, 8 CLI unit tests, 24 Rust
+current instrumented suite is 658 Rust library tests, 8 CLI unit tests, 24 Rust
 integration/property tests, 168 conformance tests and 333 fixed configuration
 cases. The module-by-module reason for the remaining debt and the intended test
 mechanism for each major module are tracked in `docs/coverage-debt.md`.
-The separate Verus gate proves 644 functions with 0 errors; proof-only code is
+The separate Verus gate proves 648 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

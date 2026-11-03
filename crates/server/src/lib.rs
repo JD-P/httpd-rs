@@ -36,6 +36,7 @@ pub mod cgi;
 pub mod compression;
 pub mod config;
 pub mod config_frontend;
+mod config_payload;
 pub mod expires;
 pub mod expr;
 pub mod fastcgi;

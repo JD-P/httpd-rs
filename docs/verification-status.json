@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated": "2026-11-02",
+  "updated": "2026-11-03",
   "verus": {
     "verified_functions": 648,
     "errors": 0
@@ -18,14 +18,14 @@
       "title": "Directory < Files < Location < Condition",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "config_rule_phase, config_deferred_slot and config_rule_precedes are executable specifications consumed through an exhaustive MatchKind projection by phase collection and the recursive nested-rule sorter; config_rule_order_is_asymmetric proves the comparator cannot order a pair both ways. access_plan_interleaves proves the exact source/depth plan consumed by the runtime: DirectoryConfig then optional DirectoryAccess at each root-to-leaf depth, Directory own-path and DirectoryMatch, BaseFiles, FilesConfig then optional FilesAccess at each depth, DirectoryMatch Files, Location, config conditions and access conditions. P29 makes both executable plan builders iterative; their loop invariants prove equality to the same recursive specifications without an input-dependent call stack. condition_source_plan_exec is consumed by request_plan when it applies config conditions before access-file conditions, and its proof ties that order to the access-plan tail. Access-file IfFile is evaluated while parsing against an absolute ServerRoot path and its children retain their native Directory/Files phases; iffile_exec_on_read_admit is consumed at that splice. Main and access-file inputs consume verified lexical/tag/argument/depth kernels and are sealed into immutable programs with exact section mates before effects. Standard-library sort correctness and directive/pattern payload semantics remain outside Verus."
+      "evidence": "config_rule_phase, config_deferred_slot and config_rule_precedes are executable specifications consumed through an exhaustive MatchKind projection by phase collection and the recursive nested-rule sorter; config_rule_order_is_asymmetric proves the comparator cannot order a pair both ways. access_plan_interleaves proves the exact source/depth plan consumed by the runtime: DirectoryConfig then optional DirectoryAccess at each root-to-leaf depth, Directory own-path and DirectoryMatch, BaseFiles, FilesConfig then optional FilesAccess at each depth, DirectoryMatch Files, Location, config conditions and access conditions. P29 makes both executable plan builders iterative; their loop invariants prove equality to the same recursive specifications without an input-dependent call stack. condition_source_plan_exec is consumed by request_plan when it applies config conditions before access-file conditions, and its proof ties that order to the access-plan tail. Access-file IfFile is evaluated while parsing against an absolute ServerRoot path and its children retain their native Directory/Files phases; iffile_exec_on_read_admit is consumed at that splice. Main and access-file inputs consume verified lexical/tag/argument/depth kernels and are sealed into immutable programs with exact section mates plus semantic directive/section values before effects. Standard-library sort correctness and exact Apache-equivalence of those safe-Rust constructors remain outside Verus."
     },
     {
       "id": "htaccess_interleave",
       "title": "per-directory Directory; access-file interleaving",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "AccessStep names config versus access-file provenance and exact depth for both Directory and Files phases; access_plan_exec is the only production iteration plan, and access_plan_interleaves proves its structural equality and suffix. P29's executable walk and Files builders are constant-stack loops proved equal to their recursive specifications. The access walk covers every ancestor whose effective AllowOverride permits a layer and is not bounded by DocumentRoot or an alias target (access_walk_dir_admit, I47), while policy_path_work_admit bounds every request-time ancestor vector independently of whether AllowOverride applies. Every stable descriptor snapshot is lexed through the verified transition kernel and sealed into an AccessProgram with exact section mates before Scope mutation; the resulting layer is cached by file version. Directive payload parsing and filesystem discovery remain refinement assumptions."
+      "evidence": "AccessStep names config versus access-file provenance and exact depth for both Directory and Files phases; access_plan_exec is the only production iteration plan, and access_plan_interleaves proves its structural equality and suffix. P29's executable walk and Files builders are constant-stack loops proved equal to their recursive specifications. The access walk covers every ancestor whose effective AllowOverride permits a layer and is not bounded by DocumentRoot or an alias target (access_walk_dir_admit, I47), while policy_path_work_admit bounds every request-time ancestor vector independently of whether AllowOverride applies. Every stable descriptor snapshot is lexed through the verified transition kernel and sealed into an AccessProgram with exact section mates and semantic payloads before Scope mutation; the resulting layer is cached by file version. Apache-equivalence of semantic constructors and filesystem discovery remain refinement assumptions."
     },
     {
       "id": "require_eval_sound",
@@ -485,7 +485,7 @@
       "the safe-Rust regex automata backend implements its documented regular-language/capture semantics; the PCRE2 compatibility frontend is differentially checked against the test-only 10.46 C oracle",
       "when VapacheCapability UnstableFastCgiPaths is explicitly enabled, an external FastCGI backend opens SCRIPT_FILENAME after vapache's final descriptor/inode check and the deployment must provide the read-only script-tree invariant that VapacheFastCGIStablePath otherwise machine-enforces",
       "h2 wire framing, TLS client-certificate chain validation, and CGI/proxy protocol details are outside the model",
-      "directive and pattern payload parsers refine their typed runtime policy values; configuration lexical quote/escape transitions, tag delimiters, argument bounds/schema gates, and sealed section structure are executable verified kernels consumed by main and access-file compilers",
+      "safe-Rust semantic payload constructors match Apache semantics; construction is sealed before effects and consumes verified lexical quote/escape, tag, argument/schema, decimal and section-structure kernels, with differential Apache oracles covering the remaining refinement",
       "authorization backends implement their stated contracts"
     ],
     "unmodeled_security_directive_classes": [],

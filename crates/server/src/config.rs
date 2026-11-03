@@ -10,6 +10,9 @@
 //! errors in every mode; no policy-bearing syntax is accepted as an inert
 //! compatibility placeholder.
 
+use crate::config_payload::{
+    PayloadArity, PayloadSchema, PayloadValidation, PayloadValueSchema, SealedPayload,
+};
 use crate::scope_policy::{
     AuthorizationPolicy, CompressionPolicy, ContentPolicy, EnvironmentPolicy, ErrorDocumentPolicy,
     HeaderPolicy, MappingPolicy, OptionsPolicy, Originated, OverridePolicy, ProxyPolicy,
@@ -2544,7 +2547,7 @@ impl HttpProtocol {
     }
 }
 
-fn parse_http_protocols(args: &[String]) -> Result<Vec<HttpProtocol>, String> {
+pub(crate) fn parse_http_protocols(args: &[String]) -> Result<Vec<HttpProtocol>, String> {
     if args.is_empty() {
         return Err("Protocols requires at least one protocol".into());
     }
@@ -2857,7 +2860,7 @@ impl Capability {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|capability| capability.name().eq_ignore_ascii_case(value))
@@ -3386,58 +3389,16 @@ struct DirectiveIdentity {
     canonical: String,
     security_sensitive: bool,
     apache_known: bool,
-    arity: DirectiveArity,
-    reject_empty: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DirectiveArity {
-    min: usize,
-    max: Option<usize>,
-}
-
-impl DirectiveArity {
-    const ANY: Self = Self { min: 0, max: None };
-    const ONE: Self = Self {
-        min: 1,
-        max: Some(1),
-    };
-    const TWO: Self = Self {
-        min: 2,
-        max: Some(2),
-    };
-
-    const fn at_least(min: usize) -> Self {
-        Self { min, max: None }
-    }
-
-    const fn between(min: usize, max: usize) -> Self {
-        Self {
-            min,
-            max: Some(max),
-        }
-    }
-
-    fn admits(self, count: usize) -> bool {
-        vapache_verified::config_argument_arity_admit(count, self.min, self.max)
-    }
-
-    fn requirement(self) -> String {
-        match self.max {
-            Some(max) if max == self.min => format!("exactly {}", self.min),
-            Some(max) => format!("between {} and {max}", self.min),
-            None => format!("at least {}", self.min),
-        }
-    }
+    schema: PayloadSchema,
 }
 
 /// Minimum structural payload schema. Complex values (regular expressions,
 /// routes, Require providers, TLS policy) are parsed by their dedicated typed
 /// parsers later in compilation; this table prevents a missing token from
 /// being normalized into an empty path, user, handler, or security policy.
-fn directive_arity(name: &str) -> DirectiveArity {
+fn directive_arity(name: &str) -> PayloadArity {
     match name {
-        "vapachecapability" => DirectiveArity {
+        "vapachecapability" => PayloadArity {
             min: 2,
             max: Some(2),
         },
@@ -3466,7 +3427,7 @@ fn directive_arity(name: &str) -> DirectiveArity {
         | "removehandler"
         | "cachedisable"
         | "setoutputfilter"
-        | "setinputfilter" => DirectiveArity::at_least(1),
+        | "setinputfilter" => PayloadArity::at_least(1),
         "order"
         | "rewriteengine"
         | "rewritebase"
@@ -3562,16 +3523,16 @@ fn directive_arity(name: &str) -> DirectiveArity {
         | "vapachemaxspoolfiles"
         | "vapachemaxdynamicrequests"
         | "vapachemaxfastcgioutput"
-        | "loglevel" => DirectiveArity::ONE,
-        "loadmodule" => DirectiveArity::TWO,
-        "define" => DirectiveArity::between(1, 2),
-        "setenv" => DirectiveArity::between(1, 2),
-        "listen" => DirectiveArity::between(1, 2),
+        | "loglevel" => PayloadArity::ONE,
+        "loadmodule" => PayloadArity::TWO,
+        "define" => PayloadArity::between(1, 2),
+        "setenv" => PayloadArity::between(1, 2),
+        "listen" => PayloadArity::between(1, 2),
         "allow" | "deny" | "rewritecond" | "rewriterule" | "addtype" | "addhandler"
         | "addinputfilter" | "header" | "expiresbytype" | "browsermatch" | "browsermatchnocase" => {
-            DirectiveArity::at_least(2)
+            PayloadArity::at_least(2)
         }
-        "setenvif" | "setenvifnocase" => DirectiveArity::at_least(3),
+        "setenvif" | "setenvifnocase" => PayloadArity::at_least(3),
         "addcharset"
         | "addencoding"
         | "addlanguage"
@@ -3583,26 +3544,23 @@ fn directive_arity(name: &str) -> DirectiveArity {
         | "vapachefastcgistablepath"
         | "sslrandomseed"
         | "sslpassphrasedialog"
-        | "sslsessioncache" => DirectiveArity::at_least(1),
+        | "sslsessioncache" => PayloadArity::at_least(1),
         "alias" | "scriptalias" | "aliasmatch" | "scriptaliasmatch" | "rewritemap"
-        | "errordocument" => DirectiveArity::TWO,
-        "redirect" | "redirectmatch" => DirectiveArity::between(2, 3),
-        "redirectpermanent" | "redirecttemp" => DirectiveArity::TWO,
-        "proxypass"
-        | "proxypassreverse"
-        | "proxypassmatch"
-        | "addoutputfilter"
-        | "addoutputfilterbytype" => DirectiveArity::at_least(2),
-        "cacheenable" => DirectiveArity::between(1, 2),
+        | "errordocument" => PayloadArity::TWO,
+        "redirect" | "redirectmatch" => PayloadArity::between(2, 3),
+        "redirectpermanent" | "redirecttemp" => PayloadArity::TWO,
+        "proxypass" | "addoutputfilter" | "addoutputfilterbytype" => PayloadArity::at_least(2),
+        "proxypassreverse" | "proxypassmatch" => PayloadArity::TWO,
+        "cacheenable" => PayloadArity::between(1, 2),
         // Vapache currently supports named LogFormat definitions and
         // unconditional CustomLog sinks. Refuse the otherwise-valid Apache
         // variants until their effects are implemented; accepting them as
         // no-ops or unconditional logs changes the audit policy.
-        "logformat" | "customlog" => DirectiveArity::TWO,
+        "logformat" | "customlog" => PayloadArity::TWO,
         // SSLRequireSSL is intentionally a zero-argument directive. Unknown
         // and compatibility-only directives retain their existing parser or
         // disposition behavior.
-        _ => DirectiveArity::ANY,
+        _ => PayloadArity::ANY,
     }
 }
 
@@ -3633,7 +3591,183 @@ fn directive_rejects_empty(name: &str) -> bool {
             | "authuserfile"
             | "authgroupfile"
             | "authbasicprovider"
+            | "vapachecapability"
+            | "vapachefastcgistablepath"
+            | "serveralias"
+            | "allowoverride"
+            | "allowoverridelist"
+            | "rewritemap"
+            | "loglevel"
+            | "sslrandomseed"
+            | "sslpassphrasedialog"
+            | "sslsessioncache"
+            | "sslstaplingcache"
+            | "ssloptions"
+            | "balancermember"
+            | "proxyset"
+            | "proxyhctemplate"
     )
+}
+
+const ALTER_ETAG_KEYWORDS: &[&str] = &["AddSuffix", "NoChange", "Remove"];
+const HOSTNAME_LOOKUPS_KEYWORDS: &[&str] = &["On", "Off", "Double"];
+const CANONICAL_NAME_KEYWORDS: &[&str] = &["On", "Off", "DNS"];
+const SERVER_TOKENS_KEYWORDS: &[&str] = &["Full", "OS", "Minimal", "Minor", "Major", "Prod"];
+const SERVER_SIGNATURE_KEYWORDS: &[&str] = &["On", "Off", "Email"];
+const TRACE_ENABLE_KEYWORDS: &[&str] = &["Off", "On", "Extended"];
+const ENCODED_SLASH_KEYWORDS: &[&str] = &["On", "Off", "NoDecode"];
+const ORDER_KEYWORDS: &[&str] = &["allow,deny", "mutual-failure", "deny,allow"];
+const SATISFY_KEYWORDS: &[&str] = &["all", "any"];
+const AUTH_MERGING_KEYWORDS: &[&str] = &["off", "and", "or"];
+const BASIC_AUTH_KEYWORDS: &[&str] = &["basic"];
+const FILE_PROVIDER_KEYWORDS: &[&str] = &["file"];
+
+/// Directive payloads are compiled while the immutable program is sealed.
+/// Remaining token payloads are exact strings or lists whose application is
+/// infallible; fallible semantic parsers have a closed value variant.
+fn directive_payload_schema(name: &str) -> PayloadSchema {
+    let arity = directive_arity(name);
+    let reject_empty = directive_rejects_empty(name);
+    let value = match name {
+        "options" => PayloadValueSchema::Options,
+        "require" => PayloadValueSchema::Require,
+        "allow" | "deny" => PayloadValueSchema::LegacyHosts,
+        "fileetag" => PayloadValueSchema::FileEtag,
+        "errordocument" => PayloadValueSchema::ErrorDocument,
+        "header" => PayloadValueSchema::Header,
+        "redirect" => PayloadValueSchema::Redirect {
+            forced_status: None,
+            regex: false,
+        },
+        "redirectpermanent" => PayloadValueSchema::Redirect {
+            forced_status: Some(301),
+            regex: false,
+        },
+        "redirecttemp" => PayloadValueSchema::Redirect {
+            forced_status: Some(302),
+            regex: false,
+        },
+        "redirectmatch" => PayloadValueSchema::Redirect {
+            forced_status: None,
+            regex: true,
+        },
+        "rewritecond" => PayloadValueSchema::RewriteCond,
+        "rewriterule" => PayloadValueSchema::RewriteRule,
+        "rewriteoptions" => PayloadValueSchema::RepeatedKeyword("Inherit"),
+        "protocols" => PayloadValueSchema::HttpProtocols,
+        "expiresdefault" => PayloadValueSchema::ExpiresDefault,
+        "expiresbytype" => PayloadValueSchema::ExpiresByType,
+        "setenvif" | "setenvifnocase" | "browsermatch" | "browsermatchnocase" => {
+            PayloadValueSchema::EnvironmentRule
+        }
+        "indexignore" => PayloadValueSchema::GlobPatterns,
+        "allowmethods" => PayloadValueSchema::AllowMethods,
+        "requestreadtimeout" => PayloadValueSchema::RequestReadTimeout,
+        "listen" => PayloadValueSchema::Listen,
+        "remoteipinternalproxy" | "remoteiptrustedproxy" => PayloadValueSchema::RemoteIpNetworks,
+        "sslprotocol" => PayloadValueSchema::SslProtocol,
+        "rewriteengine"
+        | "enablesendfile"
+        | "directoryslash"
+        | "expiresactive"
+        | "cacheignorenolastmod"
+        | "cacheignorecachecontrol"
+        | "cachestorenostore"
+        | "cachestoreprivate"
+        | "cacheignorequerystring"
+        | "cacheheader"
+        | "cachedetailheader"
+        | "keepalive"
+        | "sslengine"
+        | "sslusestapling"
+        | "sslstaplingreturnrespondererrors"
+        | "sslsessiontickets"
+        | "sslhonorcipherorder" => PayloadValueSchema::OnOff,
+        "vapachemaxspoolbytes"
+        | "vapachemaxspoolfiles"
+        | "vapachemaxdynamicrequests"
+        | "vapachemaxfastcgioutput" => PayloadValueSchema::Unsigned {
+            min: 1,
+            max: u64::MAX,
+        },
+        "cachedefaultexpire" | "cachemaxexpire" | "cacheminexpire" | "cachemaxfilesize"
+        | "cachemaxdisksize" | "cachemaxmemorysize" | "cacheminsize" | "limitrequestbody" => {
+            PayloadValueSchema::Unsigned {
+                min: 0,
+                max: u64::MAX,
+            }
+        }
+        "deflatecompressionlevel" => PayloadValueSchema::Unsigned { min: 0, max: 9 },
+        "brotlicompressionquality" => PayloadValueSchema::Unsigned { min: 0, max: 11 },
+        "timeout"
+        | "keepalivetimeout"
+        | "maxkeepaliverequests"
+        | "limitrequestline"
+        | "limitrequestfields"
+        | "limitrequestfieldsize"
+        | "gracefulshutdowntimeout" => PayloadValueSchema::Unsigned {
+            min: 0,
+            max: u32::MAX as u64,
+        },
+        "maxrequestworkers" | "serverlimit" => PayloadValueSchema::Unsigned {
+            min: 1,
+            max: MAX_IMPLEMENTED_REQUEST_WORKERS as u64,
+        },
+        "listenbacklog" => PayloadValueSchema::Unsigned {
+            min: 1,
+            max: i32::MAX as u64,
+        },
+        "sslstaplingrespondertimeout"
+        | "sslstaplingstandardcachetimeout"
+        | "sslsessioncachetimeout" => PayloadValueSchema::Unsigned {
+            min: 0,
+            max: u64::MAX,
+        },
+        "deflatealteretag" | "brotlialteretag" | "brotlicompressionalteretag" => {
+            PayloadValueSchema::Keyword(ALTER_ETAG_KEYWORDS)
+        }
+        "hostnamelookups" => PayloadValueSchema::Keyword(HOSTNAME_LOOKUPS_KEYWORDS),
+        "usecanonicalname" => PayloadValueSchema::Keyword(CANONICAL_NAME_KEYWORDS),
+        "servertokens" => PayloadValueSchema::Keyword(SERVER_TOKENS_KEYWORDS),
+        "serversignature" => PayloadValueSchema::Keyword(SERVER_SIGNATURE_KEYWORDS),
+        "traceenable" => PayloadValueSchema::Keyword(TRACE_ENABLE_KEYWORDS),
+        "allowencodedslashes" => PayloadValueSchema::Keyword(ENCODED_SLASH_KEYWORDS),
+        "order" => PayloadValueSchema::Keyword(ORDER_KEYWORDS),
+        "satisfy" => PayloadValueSchema::Keyword(SATISFY_KEYWORDS),
+        "authmerging" => PayloadValueSchema::Keyword(AUTH_MERGING_KEYWORDS),
+        "authtype" => PayloadValueSchema::Keyword(BASIC_AUTH_KEYWORDS),
+        "authbasicprovider" => PayloadValueSchema::Keyword(FILE_PROVIDER_KEYWORDS),
+        "sslverifyclient" => {
+            PayloadValueSchema::Keyword(&["none", "optional", "require", "optional_no_ca"])
+        }
+        "cachelastmodifiedfactor" => PayloadValueSchema::UnitFloat,
+        "sslstaplingforceurl" => PayloadValueSchema::OcspResponderUrl,
+        "aliasmatch" | "scriptaliasmatch" => PayloadValueSchema::AliasRegex,
+        "proxypass" => PayloadValueSchema::ProxyPass,
+        "proxypassreverse" => PayloadValueSchema::ProxyPassReverse,
+        "proxypassmatch" => PayloadValueSchema::ProxyPassMatch,
+        "vapachecapability" => PayloadValueSchema::Validated(PayloadValidation::Capability),
+        "vapachefastcgistablepath" => {
+            PayloadValueSchema::Validated(PayloadValidation::FastCgiStablePath)
+        }
+        "serveralias" => PayloadValueSchema::Validated(PayloadValidation::ServerAliases),
+        "allowoverride" => PayloadValueSchema::Validated(PayloadValidation::AllowOverride),
+        "allowoverridelist" => PayloadValueSchema::Validated(PayloadValidation::AllowOverrideList),
+        "rewritemap" => PayloadValueSchema::Validated(PayloadValidation::RewriteMap),
+        "loglevel" => PayloadValueSchema::Validated(PayloadValidation::LogLevel),
+        "sslrandomseed" => PayloadValueSchema::Validated(PayloadValidation::SslRandomSeed),
+        "sslpassphrasedialog" => {
+            PayloadValueSchema::Validated(PayloadValidation::SslPassphraseDialog)
+        }
+        "sslsessioncache" => PayloadValueSchema::Validated(PayloadValidation::SslSessionCache),
+        "sslstaplingcache" => PayloadValueSchema::Validated(PayloadValidation::SslStaplingCache),
+        "ssloptions" => PayloadValueSchema::Validated(PayloadValidation::SslOptions),
+        "balancermember" => PayloadValueSchema::Validated(PayloadValidation::BalancerMember),
+        "proxyset" => PayloadValueSchema::Validated(PayloadValidation::ProxySet),
+        "proxyhctemplate" => PayloadValueSchema::Validated(PayloadValidation::ProxyHealthTemplate),
+        _ => PayloadValueSchema::Tokens,
+    };
+    PayloadSchema::typed(arity, reject_empty, value)
 }
 
 impl DirectiveIdentity {
@@ -3646,8 +3780,7 @@ impl DirectiveIdentity {
         DirectiveIdentity {
             security_sensitive,
             apache_known: known.contains(canonical.as_str()),
-            arity: directive_arity(&canonical),
-            reject_empty: directive_rejects_empty(&canonical),
+            schema: directive_payload_schema(&canonical),
             canonical,
         }
     }
@@ -3755,13 +3888,13 @@ fn validate_config_section_arity(name: &str, args: &[String]) -> Result<(), Stri
 enum ProgramEvent {
     Directive {
         identity: DirectiveIdentity,
-        args: Vec<String>,
+        payload: SealedPayload,
         loc: SourceLoc,
     },
     SectionStart {
         name: String,
         class: ProgramSectionClass,
-        args: Vec<String>,
+        payload: ProgramSectionPayload,
         loc: SourceLoc,
         active: bool,
         transparent: bool,
@@ -3772,6 +3905,97 @@ enum ProgramEvent {
         /// Exact matching `SectionStart` instruction.
         start: usize,
     },
+}
+
+/// Closed semantic value for a main-configuration section command. The only
+/// path still resolved during the mutation walk is a relative literal
+/// `<Directory>` path because `ServerRoot` is order-sensitive; its glob syntax
+/// is nevertheless validated here.
+#[derive(Debug, Clone)]
+enum ProgramSectionPayload {
+    Unknown,
+    Empty,
+    Arguments(Box<[String]>),
+    Expression(crate::expr::Expr),
+    Methods(MethodSet),
+    Match(MatchKind),
+    DirectoryLiteral(String),
+    ProxyWildcard(String),
+    ProxyRegex(Regex),
+}
+
+fn seal_program_section(
+    name: &str,
+    class: ProgramSectionClass,
+    args: Vec<String>,
+) -> Result<ProgramSectionPayload, String> {
+    validate_config_section_arity(name, &args)?;
+    Ok(match class {
+        ProgramSectionClass::If | ProgramSectionClass::ElseIf => {
+            let expression = crate::expr::parse(&args.join(" "))
+                .map_err(|error| format!("bad <{name}> expression: {error}"))?;
+            crate::expr::validate_vars(&expression)
+                .map_err(|error| format!("bad <{name}> expression: {error}"))?;
+            ProgramSectionPayload::Expression(expression)
+        }
+        ProgramSectionClass::IfFile => {
+            let expression = crate::expr::Expr::IfFile(args[0].clone());
+            crate::expr::validate_vars(&expression)
+                .map_err(|error| format!("bad <IfFile> expression: {error}"))?;
+            ProgramSectionPayload::Expression(expression)
+        }
+        ProgramSectionClass::Else
+        | ProgramSectionClass::RequireAll
+        | ProgramSectionClass::RequireAny
+        | ProgramSectionClass::RequireNone => ProgramSectionPayload::Empty,
+        ProgramSectionClass::Limit | ProgramSectionClass::LimitExcept => {
+            ProgramSectionPayload::Methods(parse_method_set_args(name, &args, false)?)
+        }
+        ProgramSectionClass::Directory => {
+            if args[0] == "~" {
+                ProgramSectionPayload::Match(MatchKind::DirectoryMatch(
+                    compile_regex(&args[1..].join(" "))
+                        .map_err(|error| format!("bad Directory regex: {error}"))?,
+                ))
+            } else {
+                validate_glob_pattern(&args[0])
+                    .map_err(|error| format!("bad Directory pattern: {error}"))?;
+                ProgramSectionPayload::DirectoryLiteral(args[0].clone())
+            }
+        }
+        ProgramSectionClass::DirectoryMatch => {
+            ProgramSectionPayload::Match(MatchKind::DirectoryMatch(
+                compile_regex(&args[0]).map_err(|error| format!("bad Directory regex: {error}"))?,
+            ))
+        }
+        ProgramSectionClass::Files => ProgramSectionPayload::Match(compile_files_pattern(&args)?),
+        ProgramSectionClass::FilesMatch => ProgramSectionPayload::Match(MatchKind::FilesMatch(
+            compile_regex(&args[0]).map_err(|error| format!("bad FilesMatch regex: {error}"))?,
+        )),
+        ProgramSectionClass::Location => {
+            ProgramSectionPayload::Match(compile_location_pattern(&args)?)
+        }
+        ProgramSectionClass::LocationMatch => {
+            ProgramSectionPayload::Match(MatchKind::LocationMatch(
+                compile_regex(&args[0])
+                    .map_err(|error| format!("bad LocationMatch regex: {error}"))?,
+            ))
+        }
+        ProgramSectionClass::Proxy => {
+            validate_glob_pattern(&args[0])
+                .map_err(|error| format!("bad <Proxy> pattern: {error}"))?;
+            ProgramSectionPayload::ProxyWildcard(args[0].clone())
+        }
+        ProgramSectionClass::ProxyMatch => ProgramSectionPayload::ProxyRegex(
+            compile_regex(&args[0]).map_err(|error| format!("bad <ProxyMatch> regex: {error}"))?,
+        ),
+        ProgramSectionClass::VirtualHost
+        | ProgramSectionClass::AuthzProviderAlias
+        | ProgramSectionClass::ExecuteOnRead => {
+            ProgramSectionPayload::Arguments(args.into_boxed_slice())
+        }
+        ProgramSectionClass::Unknown => ProgramSectionPayload::Unknown,
+    })
 }
 
 /// Immutable, include-expanded configuration program.  It is constructed
@@ -3800,9 +4024,12 @@ impl ConfigProgram {
                         vapache_verified::ConfigLineKind::Directive,
                     )
                     .ok_or("configuration program depth overflow")?;
+                    let identity = DirectiveIdentity::new(name, &known, &fail_closed);
+                    let payload = SealedPayload::seal(identity.as_str(), args, identity.schema)
+                        .map_err(|message| format!("{}:{}: {message}", loc.file, loc.line))?;
                     instructions.push(ProgramEvent::Directive {
-                        identity: DirectiveIdentity::new(name, &known, &fail_closed),
-                        args,
+                        identity,
+                        payload,
                         loc,
                     });
                 }
@@ -3828,10 +4055,12 @@ impl ConfigProgram {
                     }
                     let start = instructions.len();
                     let class = ProgramSectionClass::from_name(&name);
+                    let payload = seal_program_section(&name, class, args)
+                        .map_err(|message| format!("{}:{}: {message}", loc.file, loc.line))?;
                     instructions.push(ProgramEvent::SectionStart {
                         name,
                         class,
-                        args,
+                        payload,
                         loc,
                         active,
                         transparent,
@@ -4655,7 +4884,7 @@ fn authz_section_allowed(section: SectionKind) -> bool {
     )
 }
 
-fn parse_fastcgi_policy_endpoint(raw: &str) -> Result<FastCgiEndpoint, String> {
+pub(crate) fn parse_fastcgi_policy_endpoint(raw: &str) -> Result<FastCgiEndpoint, String> {
     if let Some(path) = raw.strip_prefix("unix:") {
         let path = PathBuf::from(path);
         if path.as_os_str().is_empty() || !path.is_absolute() || raw.contains('|') {
@@ -4961,49 +5190,6 @@ impl Compile {
         });
     }
 
-    fn on_off_arg(&mut self, loc: &SourceLoc, name: &str, args: &[String]) -> Option<bool> {
-        match args {
-            [value] if value.eq_ignore_ascii_case("on") => Some(true),
-            [value] if value.eq_ignore_ascii_case("off") => Some(false),
-            _ => {
-                self.directive_error(loc, format!("{name} requires exactly On or Off"));
-                None
-            }
-        }
-    }
-
-    fn u32_arg(&mut self, loc: &SourceLoc, name: &str, args: &[String]) -> Option<u32> {
-        match args {
-            [value] => match value.parse::<u32>() {
-                Ok(value) => Some(value),
-                Err(_) => {
-                    self.directive_error(loc, format!("{name} requires an unsigned integer"));
-                    None
-                }
-            },
-            _ => {
-                self.directive_error(loc, format!("{name} requires exactly one argument"));
-                None
-            }
-        }
-    }
-
-    fn u64_arg(&mut self, loc: &SourceLoc, name: &str, args: &[String]) -> Option<u64> {
-        match args {
-            [value] => match crate::util::parse_u64(value.as_bytes()) {
-                Some(value) => Some(value),
-                None => {
-                    self.directive_error(loc, format!("{name} requires an unsigned integer"));
-                    None
-                }
-            },
-            _ => {
-                self.directive_error(loc, format!("{name} requires exactly one argument"));
-                None
-            }
-        }
-    }
-
     fn compile(mut self) -> Result<Config, ConfigError> {
         let mut scope = self.cfg.global.clone();
         let mut rules: Vec<ScopeRule> = Vec::new();
@@ -5142,31 +5328,10 @@ impl Compile {
                 ProgramEvent::SectionEnd { .. } => return,
                 ProgramEvent::Directive {
                     identity,
-                    args,
+                    payload,
                     loc,
                 } => {
                     let name = identity.as_str();
-                    if !identity.arity.admits(args.len()) {
-                        let msg = format!(
-                            "directive '{name}' requires {} argument(s), got {}",
-                            identity.arity.requirement(),
-                            args.len()
-                        );
-                        self.directive_error(&loc, msg);
-                        continue;
-                    }
-                    let has_empty = args.iter().any(String::is_empty);
-                    if !vapache_verified::config_argument_nonempty_admit(
-                        identity.reject_empty,
-                        has_empty,
-                    ) {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: format!("directive '{name}' does not permit an empty argument"),
-                        });
-                        continue;
-                    }
                     if matches!(
                         name,
                         "include" | "includeoptional" | "loadmodule" | "define" | "undefine"
@@ -5185,7 +5350,7 @@ impl Compile {
                     }
                     self.apply_directive(
                         &identity,
-                        &args,
+                        &payload,
                         &loc,
                         scope,
                         inside_vhost,
@@ -5197,7 +5362,7 @@ impl Compile {
                 ProgramEvent::SectionStart {
                     name,
                     class,
-                    args,
+                    payload,
                     loc,
                     active,
                     transparent,
@@ -5240,29 +5405,17 @@ impl Compile {
                                 continue;
                             }
                             let (branch, chain, condition) = if name == "if" || name == "iffile" {
-                                let expression = if name == "if" {
-                                    crate::expr::parse(&args.join(" "))
-                                        .map_err(|e| {
-                                            self.errors.push(ConfigError {
-                                                file: loc.file.clone(),
-                                                line: loc.line,
-                                                msg: format!("bad <If> expression: {e}"),
-                                            });
-                                        })
-                                        .ok()
-                                } else {
-                                    Some(crate::expr::Expr::IfFile(
-                                        args.first().cloned().unwrap_or_default(),
-                                    ))
-                                };
-                                let Some(condition) = expression else {
-                                    self.skip_section();
-                                    continue;
+                                let ProgramSectionPayload::Expression(condition) = &payload else {
+                                    unreachable!("sealed conditional section")
                                 };
                                 let chain = self.next_condition_chain;
                                 self.next_condition_chain += 1;
                                 current_chain = Some(chain);
-                                (ConditionBranch::Normal, Some(chain), Some(condition))
+                                (
+                                    ConditionBranch::Normal,
+                                    Some(chain),
+                                    Some(condition.clone()),
+                                )
                             } else {
                                 let Some(chain) = current_chain else {
                                     self.errors.push(ConfigError {
@@ -5276,49 +5429,20 @@ impl Compile {
                                     continue;
                                 };
                                 if name == "elseif" {
-                                    let Some(condition) = crate::expr::parse(&args.join(" "))
-                                        .map_err(|e| {
-                                            self.errors.push(ConfigError {
-                                                file: loc.file.clone(),
-                                                line: loc.line,
-                                                msg: format!("bad <ElseIf> expression: {e}"),
-                                            });
-                                        })
-                                        .ok()
+                                    let ProgramSectionPayload::Expression(condition) = &payload
                                     else {
-                                        self.skip_section();
-                                        continue;
+                                        unreachable!("sealed ElseIf expression")
                                     };
-                                    (ConditionBranch::ElseIf, Some(chain), Some(condition))
+                                    (
+                                        ConditionBranch::ElseIf,
+                                        Some(chain),
+                                        Some(condition.clone()),
+                                    )
                                 } else {
-                                    if !args.is_empty() {
-                                        self.errors.push(ConfigError {
-                                            file: loc.file.clone(),
-                                            line: loc.line,
-                                            msg: "<Else> does not take arguments".into(),
-                                        });
-                                        self.skip_section();
-                                        continue;
-                                    }
                                     current_chain = None;
                                     (ConditionBranch::Else, Some(chain), None)
                                 }
                             };
-                            // F63/I63: reject expressions containing variables
-                            // the evaluator does not implement.  An unknown
-                            // variable must be a configuration error at load
-                            // time, never an empty-string substitution.
-                            if let Some(cond) = &condition {
-                                if let Err(e) = crate::expr::validate_vars(cond) {
-                                    self.errors.push(ConfigError {
-                                        file: loc.file.clone(),
-                                        line: loc.line,
-                                        msg: format!("bad <{name}> expression: {e}"),
-                                    });
-                                    self.skip_section();
-                                    continue;
-                                }
-                            }
                             let mut inner = Scope::default();
                             let mut inner_rules = Vec::new();
                             self.walk(
@@ -5352,8 +5476,11 @@ impl Compile {
                             });
                         }
                         "virtualhost" => {
+                            let ProgramSectionPayload::Arguments(args) = payload else {
+                                unreachable!("sealed VirtualHost arguments")
+                            };
                             let vh = VHost {
-                                addrs: args,
+                                addrs: args.into_vec(),
                                 ports: Vec::new(),
                                 server_name: None,
                                 aliases: Vec::new(),
@@ -5387,95 +5514,18 @@ impl Compile {
                         }
                         "directory" | "files" | "filesmatch" | "location" | "locationmatch"
                         | "directorymatch" => {
-                            let kind = if name == "directory" || name == "directorymatch" {
-                                let p = args.first().cloned().unwrap_or_default();
-                                let tilde_regex =
-                                    name == "directory" && p == "~" && args.len() >= 2;
-                                if name == "directorymatch" || tilde_regex {
-                                    let pattern = if tilde_regex { args[1..].join(" ") } else { p };
-                                    match compile_regex(&pattern) {
-                                        Ok(r) => MatchKind::DirectoryMatch(r),
-                                        Err(e) => {
-                                            self.errors.push(ConfigError {
-                                                file: loc.file.clone(),
-                                                line: loc.line,
-                                                msg: format!("bad Directory regex: {e}"),
-                                            });
-                                            self.skip_section();
-                                            continue;
-                                        }
-                                    }
-                                } else {
-                                    let pb = if Path::new(&p).is_absolute() {
-                                        PathBuf::from(&p)
+                            let kind = match &payload {
+                                ProgramSectionPayload::Match(kind) => kind.clone(),
+                                ProgramSectionPayload::DirectoryLiteral(path) => {
+                                    let path = Path::new(path);
+                                    let resolved = if path.is_absolute() {
+                                        path.to_path_buf()
                                     } else {
-                                        self.cfg.server_root.join(&p)
+                                        self.cfg.server_root.join(path)
                                     };
-                                    if let Err(error) = validate_glob_pattern(&p) {
-                                        self.errors.push(ConfigError {
-                                            file: loc.file.clone(),
-                                            line: loc.line,
-                                            msg: format!("bad Directory pattern: {error}"),
-                                        });
-                                        self.skip_section();
-                                        continue;
-                                    }
-                                    MatchKind::Directory(clean_path(&pb))
+                                    MatchKind::Directory(clean_path(&resolved))
                                 }
-                            } else if name == "files" {
-                                match compile_files_pattern(&args) {
-                                    Ok(kind) => kind,
-                                    Err(e) => {
-                                        self.errors.push(ConfigError {
-                                            file: loc.file.clone(),
-                                            line: loc.line,
-                                            msg: e,
-                                        });
-                                        self.skip_section();
-                                        continue;
-                                    }
-                                }
-                            } else if name == "filesmatch" {
-                                let pat = args.join(" ");
-                                match compile_regex(&pat) {
-                                    Ok(r) => MatchKind::FilesMatch(r),
-                                    Err(e) => {
-                                        self.errors.push(ConfigError {
-                                            file: loc.file.clone(),
-                                            line: loc.line,
-                                            msg: format!("bad FilesMatch regex: {e}"),
-                                        });
-                                        self.skip_section();
-                                        continue;
-                                    }
-                                }
-                            } else if name == "location" {
-                                match compile_location_pattern(&args) {
-                                    Ok(kind) => kind,
-                                    Err(e) => {
-                                        self.errors.push(ConfigError {
-                                            file: loc.file.clone(),
-                                            line: loc.line,
-                                            msg: e,
-                                        });
-                                        self.skip_section();
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                let pat = args.join(" ");
-                                match compile_regex(&pat) {
-                                    Ok(r) => MatchKind::LocationMatch(r),
-                                    Err(e) => {
-                                        self.errors.push(ConfigError {
-                                            file: loc.file.clone(),
-                                            line: loc.line,
-                                            msg: format!("bad LocationMatch regex: {e}"),
-                                        });
-                                        self.skip_section();
-                                        continue;
-                                    }
-                                }
+                                _ => unreachable!("sealed match section"),
                             };
                             let mut delta = Scope::default();
                             let mut nested = Vec::new();
@@ -5609,14 +5659,12 @@ impl Compile {
                                 self.skip_section();
                                 continue;
                             }
-                            let Some(methods) = self.parse_method_set(&name, &args, &loc, false)
-                            else {
-                                self.skip_section();
-                                continue;
+                            let ProgramSectionPayload::Methods(methods) = &payload else {
+                                unreachable!("sealed method section")
                             };
                             let combined = match limit {
                                 Some(outer) => outer.intersect(&methods),
-                                None => methods,
+                                None => methods.clone(),
                             };
                             if combined.is_empty() {
                                 self.errors.push(ConfigError {
@@ -5648,14 +5696,14 @@ impl Compile {
                             );
                         }
                         "proxy" | "proxymatch" => {
-                            let Some(pattern) = args.first().cloned() else {
-                                self.errors.push(ConfigError {
-                                    file: loc.file.clone(),
-                                    line: loc.line,
-                                    msg: format!("<{name}> requires a URL or pattern"),
-                                });
-                                self.skip_section();
-                                continue;
+                            let (pattern, kind) = match &payload {
+                                ProgramSectionPayload::ProxyWildcard(pattern) => {
+                                    (pattern.clone(), ProxyMatchKind::Wildcard(pattern.clone()))
+                                }
+                                ProgramSectionPayload::ProxyRegex(regex) => {
+                                    (String::new(), ProxyMatchKind::Regex(regex.clone()))
+                                }
+                                _ => unreachable!("sealed Proxy section"),
                             };
                             if inside_vhost && name == "proxy" && pattern.starts_with("balancer://")
                             {
@@ -5667,31 +5715,6 @@ impl Compile {
                                 self.skip_section();
                                 continue;
                             }
-                            let kind = if name == "proxymatch" {
-                                match compile_regex(&pattern) {
-                                    Ok(re) => ProxyMatchKind::Regex(re),
-                                    Err(e) => {
-                                        self.errors.push(ConfigError {
-                                            file: loc.file.clone(),
-                                            line: loc.line,
-                                            msg: format!("bad <ProxyMatch> regex: {e}"),
-                                        });
-                                        self.skip_section();
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                if let Err(error) = validate_glob_pattern(&pattern) {
-                                    self.errors.push(ConfigError {
-                                        file: loc.file.clone(),
-                                        line: loc.line,
-                                        msg: format!("bad <Proxy> pattern: {error}"),
-                                    });
-                                    self.skip_section();
-                                    continue;
-                                }
-                                ProxyMatchKind::Wildcard(pattern.clone())
-                            };
                             let mut balancer_prev = None;
                             let mut balancer_created = false;
                             if name == "proxy" {
@@ -5797,30 +5820,10 @@ impl Compile {
         )
     }
 
-    fn parse_method_set(
-        &mut self,
-        section: &str,
-        args: &[String],
-        loc: &SourceLoc,
-        htaccess: bool,
-    ) -> Option<MethodSet> {
-        match parse_method_set_args(section, args, htaccess) {
-            Ok(set) => Some(set),
-            Err(msg) => {
-                self.errors.push(ConfigError {
-                    file: loc.file.clone(),
-                    line: loc.line,
-                    msg,
-                });
-                None
-            }
-        }
-    }
-
     fn apply_directive(
         &mut self,
         identity: &DirectiveIdentity,
-        args: &[String],
+        payload: &SealedPayload,
         loc: &SourceLoc,
         scope: &mut Scope,
         inside_vhost: bool,
@@ -5828,6 +5831,7 @@ impl Compile {
         limit: Option<&MethodSet>,
         section: SectionKind,
     ) {
+        let args = payload.as_slice();
         let name = identity.as_str();
         // Some Apache directives are scoped per-vhost or per-directory, but
         // Vapache currently stores their value in the process-wide Config.
@@ -6142,30 +6146,9 @@ impl Compile {
                     });
                     return;
                 }
-                if args.len() != 1 {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!("{name} requires exactly one positive integer"),
-                    });
-                    return;
-                }
-                let Some(value) = crate::util::parse_u64(args[0].as_bytes()) else {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!("invalid resource limit '{}'", args[0]),
-                    });
-                    return;
-                };
-                if value == 0 {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!("{name} must be greater than zero"),
-                    });
-                    return;
-                }
+                let value = payload
+                    .unsigned()
+                    .expect("resource limits are typed while sealing");
                 match name {
                     "vapachemaxspoolbytes" => self.cfg.max_spool_bytes = value,
                     "vapachemaxspoolfiles" => self.cfg.max_spool_files = value,
@@ -6183,17 +6166,10 @@ impl Compile {
                     });
                     return;
                 }
-                let protocols = match parse_http_protocols(args) {
-                    Ok(protocols) => protocols,
-                    Err(msg) => {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg,
-                        });
-                        return;
-                    }
-                };
+                let protocols = payload
+                    .http_protocols()
+                    .expect("Protocols is compiled while sealing")
+                    .to_vec();
                 if let Some(i) = self.current_vhost {
                     self.vhosts_raw[i].protocols = protocols;
                 } else {
@@ -6256,125 +6232,25 @@ impl Compile {
                 scope.content_policy.directory_index = Some(args.to_vec());
             }
             "indexignore" => {
-                if args
-                    .iter()
-                    .any(|pattern| validate_glob_pattern(pattern).is_err())
-                {
-                    self.directive_error(loc, "IndexIgnore shell pattern exceeds 8190 bytes");
-                } else {
-                    scope
-                        .content_policy
-                        .index_ignore
-                        .extend(args.iter().cloned());
-                }
+                scope.content_policy.index_ignore.extend(
+                    payload
+                        .glob_patterns()
+                        .expect("IndexIgnore patterns are validated while sealing")
+                        .iter()
+                        .cloned(),
+                );
             }
             "options" => {
-                for arg in args {
-                    if arg.starts_with('-') {
-                        continue;
-                    }
-                    match arg.trim_start_matches('+').to_ascii_lowercase().as_str() {
-                        "all" => {
-                            self.require_capability(Capability::AutoIndex, loc, "Options All");
-                            self.require_capability(Capability::Cgi, loc, "Options All");
-                        }
-                        "indexes" => {
-                            self.require_capability(Capability::AutoIndex, loc, "Options Indexes")
-                        }
-                        "execcgi" => {
-                            self.require_capability(Capability::Cgi, loc, "Options ExecCGI")
-                        }
-                        _ => {}
-                    }
+                let options = payload
+                    .options()
+                    .expect("Options is compiled while sealing");
+                if options.requires_autoindex {
+                    self.require_capability(Capability::AutoIndex, loc, "Options Indexes/All");
                 }
-                if args.is_empty() {
-                    scope.options.push_set(Options::empty().0);
+                if options.requires_cgi {
+                    self.require_capability(Capability::Cgi, loc, "Options ExecCGI/All");
                 }
-                // Apache resets the effective set to exactly the listed words
-                // when a directive carries signless options (verified against
-                // the local oracle: a child `Options Indexes` drops both an
-                // inherited +ExecCGI and the compiled FollowSymLinks default).
-                // Collect them first so the reset lands before the +/- words
-                // of the same directive apply in argument order.
-                let mut reset_mask = Options::empty().0;
-                let mut resets = false;
-                for a in args {
-                    if a.starts_with('+') || a.starts_with('-') {
-                        continue;
-                    }
-                    match a.to_ascii_lowercase().as_str() {
-                        "indexes" => {
-                            reset_mask |= Options::INDEXES;
-                            resets = true;
-                        }
-                        "followsymlinks" => {
-                            reset_mask |= Options::FOLLOW_SYMLINKS;
-                            resets = true;
-                        }
-                        "symlinksifownermatch" => {
-                            reset_mask |= Options::SYMLINKS_IF_OWNER_MATCH;
-                            resets = true;
-                        }
-                        "execcgi" => {
-                            reset_mask |= Options::EXEC_CGI;
-                            resets = true;
-                        }
-                        "includes" => {
-                            reset_mask |= Options::INCLUDES;
-                            resets = true;
-                        }
-                        "includesnoexec" => {
-                            reset_mask |= Options::INCLUDES_NOEXEC;
-                            resets = true;
-                        }
-                        "multiviews" => {
-                            reset_mask |= Options::MULTIVIEWS;
-                            resets = true;
-                        }
-                        // None/All keep their explicit push_set in the loop
-                        // below; unknown tokens are rejected in that loop.
-                        _ => continue,
-                    }
-                }
-                if resets {
-                    scope.options.push_set(Options::empty().0);
-                    scope.options.push_add(reset_mask);
-                }
-                for a in args {
-                    let (sign, flag) = match a.as_bytes().first() {
-                        Some(b'+') => (1, &a[1..]),
-                        Some(b'-') => (-1, &a[1..]),
-                        _ => (0, a.as_str()),
-                    };
-                    let opt = match flag.to_ascii_lowercase().as_str() {
-                        "none" => Some(Options::empty()),
-                        "all" => Some(Options::all()),
-                        "indexes" => Some(Options(Options::INDEXES)),
-                        "followsymlinks" => Some(Options(Options::FOLLOW_SYMLINKS)),
-                        "symlinksifownermatch" => Some(Options(Options::SYMLINKS_IF_OWNER_MATCH)),
-                        "execcgi" => Some(Options(Options::EXEC_CGI)),
-                        "includes" => Some(Options(Options::INCLUDES)),
-                        "includesnoexec" => Some(Options(Options::INCLUDES_NOEXEC)),
-                        "multiviews" => Some(Options(Options::MULTIVIEWS)),
-                        _ => {
-                            self.directive_error(loc, format!("unsupported Options flag '{a}'"));
-                            None
-                        }
-                    };
-                    if let Some(o) = opt {
-                        match sign {
-                            1 => scope.options.push_add(o.0),
-                            -1 => scope.options.push_remove(o.0),
-                            _ if flag.eq_ignore_ascii_case("none") => {
-                                scope.options.push_set(Options::empty().0)
-                            }
-                            _ if flag.eq_ignore_ascii_case("all") => {
-                                scope.options.push_set(Options::all().0)
-                            }
-                            _ => scope.options.push_add(o.0),
-                        }
-                    }
-                }
+                scope.options.merge_child(&options.policy);
             }
             "allowoverride" => {
                 if section != SectionKind::Directory {
@@ -6554,17 +6430,10 @@ impl Compile {
                 }
             }
             "require" => {
-                let provider = parse_require(args);
-                if let Require::Unsupported(msg) = &provider {
-                    if require_syntax_error(msg) {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: msg.clone(),
-                        });
-                        return;
-                    }
-                }
+                let provider = payload
+                    .require()
+                    .expect("Require is compiled while sealing")
+                    .clone();
                 if section != SectionKind::Require && require_is_negated(&provider) {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
@@ -6577,49 +6446,21 @@ impl Compile {
             }
             "order" => {
                 self.require_capability(Capability::LegacyAuthz, loc, "Order");
-                let order = match first().to_ascii_lowercase().as_str() {
-                    "allow,deny" | "mutual-failure" => Order::AllowDeny,
-                    "deny,allow" => Order::DenyAllow,
-                    other => {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: format!("unknown Order '{other}'"),
-                        });
-                        return;
-                    }
+                let order = match payload.keyword().expect("Order is typed while sealing") {
+                    0 | 1 => Order::AllowDeny,
+                    2 => Order::DenyAllow,
+                    _ => unreachable!("sealed Order keyword index"),
                 };
                 scope.add_order(order, limit);
             }
             "allow" | "deny" => {
                 self.require_capability(Capability::LegacyAuthz, loc, name);
-                if !args
-                    .first()
-                    .map(|s| s.eq_ignore_ascii_case("from"))
-                    .unwrap_or(false)
+                for host in payload
+                    .legacy_hosts()
+                    .expect("legacy host ACL is compiled while sealing")
+                    .iter()
+                    .cloned()
                 {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!("{name} must be followed by 'from'"),
-                    });
-                    return;
-                }
-                for a in &args[1..] {
-                    let host = if a == "all" {
-                        HostSpec::All
-                    } else if let Some((net, bits)) = parse_ip_net(a) {
-                        HostSpec::Net(net, bits)
-                    } else {
-                        // Host-name access requires a reverse DNS lookup; keep
-                        // failing closed rather than silently widening access.
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: format!("unsupported {name} host '{a}'"),
-                        });
-                        return;
-                    };
                     if name == "allow" {
                         scope.add_allow(host, limit);
                     } else {
@@ -6628,29 +6469,10 @@ impl Compile {
                 }
             }
             "errordocument" => {
-                if args.len() < 2 {
-                    return;
-                }
-                let Ok(code @ 400..=599) = args[0].parse::<u16>() else {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!(
-                            "ErrorDocument requires an HTTP error status from 400 through 599, got {}",
-                            args[0]
-                        ),
-                    });
-                    return;
-                };
-                let target = args[1..].join(" ");
-                let doc = if target.starts_with("http://") || target.starts_with("https://") {
-                    ErrorDoc::External(target)
-                } else if target.starts_with('/') {
-                    ErrorDoc::Local(target)
-                } else {
-                    ErrorDoc::Text(target)
-                };
-                scope.error_policy.documents.push((code, doc));
+                let (code, document) = payload
+                    .error_document()
+                    .expect("ErrorDocument is compiled while sealing");
+                scope.error_policy.documents.push((code, document.clone()));
             }
             "alias" | "scriptalias" => {
                 if args.len() < 2 {
@@ -6671,64 +6493,34 @@ impl Compile {
                 ));
             }
             "aliasmatch" | "scriptaliasmatch" => {
-                if args.len() >= 2 {
-                    if name == "scriptaliasmatch" {
-                        self.require_capability(Capability::Cgi, loc, "ScriptAliasMatch");
-                    }
-                    match compile_regex(&args[0]) {
-                        Ok(regex) => scope.mapping_policy.aliases.push(Alias::regex(
-                            Arc::new(regex),
-                            args[1].clone(),
-                            name == "scriptaliasmatch",
-                            &self.cfg.server_root,
-                        )),
-                        Err(e) => self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: format!("bad {name} regex: {e}"),
-                        }),
-                    }
-                } else {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!("{name} requires a pattern and a target"),
-                    });
+                if name == "scriptaliasmatch" {
+                    self.require_capability(Capability::Cgi, loc, "ScriptAliasMatch");
                 }
+                let alias = payload
+                    .alias_regex()
+                    .expect("regex alias is compiled while sealing");
+                scope.mapping_policy.aliases.push(Alias::regex(
+                    alias.pattern.clone(),
+                    alias.target.clone(),
+                    name == "scriptaliasmatch",
+                    &self.cfg.server_root,
+                ));
             }
             "redirectmatch" => {
-                match parse_redirect_arguments(args, None) {
-                    Ok((status, pattern, target)) => match compile_regex(&pattern) {
-                        Ok(regex) => scope.mapping_policy.redirects.push(Redirect {
-                            from: String::new(),
-                            to: target,
-                            status,
-                            regex: Some(Arc::new(regex)),
-                        }),
-                        Err(e) => self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: format!("bad RedirectMatch regex: {e}"),
-                        }),
-                    },
-                    Err(error) => self.directive_error(loc, error),
-                }
+                scope.mapping_policy.redirects.push(
+                    payload
+                        .redirect()
+                        .expect("RedirectMatch is compiled while sealing")
+                        .clone(),
+                );
             }
             "redirect" | "redirectpermanent" | "redirecttemp" => {
-                let forced = match name {
-                    "redirectpermanent" => Some(301),
-                    "redirecttemp" => Some(302),
-                    _ => None,
-                };
-                match parse_redirect_arguments(args, forced) {
-                    Ok((status, from, to)) => scope.mapping_policy.redirects.push(Redirect {
-                        from,
-                        to,
-                        status,
-                        regex: None,
-                    }),
-                    Err(error) => self.directive_error(loc, error),
-                }
+                scope.mapping_policy.redirects.push(
+                    payload
+                        .redirect()
+                        .expect("Redirect is compiled while sealing")
+                        .clone(),
+                );
             }
             "rewritemap" => {
                 if args.len() < 2 {
@@ -6861,107 +6653,82 @@ impl Compile {
                 }
             }
             "rewriteengine" => {
-                let on = first().eq_ignore_ascii_case("on");
-                let off = first().eq_ignore_ascii_case("off");
-                if on || off {
-                    scope.rewrite_policy.rewrite_engine = Some(on);
-                } else {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "RewriteEngine requires On or Off".into(),
-                    });
-                }
+                scope.rewrite_policy.rewrite_engine = Some(
+                    payload
+                        .on_off()
+                        .expect("RewriteEngine is typed while sealing"),
+                );
             }
             "rewritebase" => {
                 scope.rewrite_policy.rewrite_base = Some(normalize_rewrite_base(&first()));
             }
-            "rewritecond" => match parse_rewrite_cond(args) {
-                Ok(c) => scope.rewrite_policy.pending_rewrite_conds.push(c),
-                Err(e) => self.errors.push(ConfigError {
-                    file: loc.file.clone(),
-                    line: loc.line,
-                    msg: e,
-                }),
-            },
+            "rewritecond" => scope
+                .rewrite_policy
+                .pending_rewrite_conds
+                .push(
+                    payload
+                        .rewrite_cond()
+                        .expect("RewriteCond is compiled while sealing")
+                        .clone(),
+                ),
             "rewriterule" => {
                 let base = scope.rewrite_policy.rewrite_base.as_deref().unwrap_or("/");
-                match parse_rewrite_rule(args, base, false) {
-                    Ok(mut rule) => {
-                        // Certbot's Apache HTTP-01 performer writes this exact
-                        // trusted server-context rule. Apache classifies its
-                        // absolute substitution as a filesystem path, while
-                        // Vapache deliberately permits such rewrites only
-                        // inside the current mapping root. Add an equivalent
-                        // regex Alias so the established alias confinement and
-                        // target <Directory>/<Location> authorization remain
-                        // the boundary; do not relax arbitrary absolute
-                        // rewrite targets (CVE-2024-38475).
-                        let certbot_http01_alias = args.len() == 3
-                            && args[0] == r"^/\.well-known/acme-challenge/([A-Za-z0-9-_=]+)$"
-                            && args[2].eq_ignore_ascii_case("[END]")
-                            && rule.substitution == "/var/lib/letsencrypt/http_challenges/$1"
-                            && scope.rewrite_policy.pending_rewrite_conds.is_empty();
-                        if let Some(handler) = rule.flags.handler.as_deref() {
-                            if handler.eq_ignore_ascii_case("cgi-script") {
-                                self.require_capability(
-                                    Capability::Cgi,
-                                    loc,
-                                    "RewriteRule cgi-script handler",
-                                );
-                            }
-                            if handler.eq_ignore_ascii_case("server-status") {
-                                self.require_capability(
-                                    Capability::ServerStatus,
-                                    loc,
-                                    "RewriteRule server-status handler",
-                                );
-                            }
-                            if handler.to_ascii_lowercase().contains("fcgi://") {
-                                self.require_capability(
-                                    Capability::FastCgi,
-                                    loc,
-                                    "RewriteRule FastCGI handler",
-                                );
-                            }
-                        }
-                        // Deliberately inert since the F32 remediation; accepted
-                        // for Apache compatibility but must not be silent.
-                        if rule.flags.unsafe_prefix_stat {
-                            self.warn(format!(
-                                "{}:{}: [UnsafePrefixStat] is accepted for compatibility and has no effect",
-                                loc.file, loc.line
-                            ));
-                        }
-                        rule.conditions =
-                            std::mem::take(&mut scope.rewrite_policy.pending_rewrite_conds);
-                        if certbot_http01_alias {
-                            scope.mapping_policy.aliases.push(Alias::regex(
-                                rule.pattern.clone(),
-                                rule.substitution.clone(),
-                                false,
-                                &self.cfg.server_root,
-                            ));
-                        }
-                        scope.rewrite_policy.rewrite_rules.push(rule);
+                let mut rule = payload
+                    .rewrite_rule()
+                    .expect("RewriteRule is compiled while sealing")
+                    .clone();
+                rule.base = normalize_rewrite_base(base);
+                rule.match_base = rule.base.clone();
+                // Certbot's Apache HTTP-01 performer writes this exact trusted
+                // server-context rule. Add an equivalent regex Alias without
+                // relaxing arbitrary absolute rewrite targets (CVE-2024-38475).
+                let certbot_http01_alias = args.len() == 3
+                    && args[0] == r"^/\.well-known/acme-challenge/([A-Za-z0-9-_=]+)$"
+                    && args[2].eq_ignore_ascii_case("[END]")
+                    && rule.substitution == "/var/lib/letsencrypt/http_challenges/$1"
+                    && scope.rewrite_policy.pending_rewrite_conds.is_empty();
+                if let Some(handler) = rule.flags.handler.as_deref() {
+                    if handler.eq_ignore_ascii_case("cgi-script") {
+                        self.require_capability(
+                            Capability::Cgi,
+                            loc,
+                            "RewriteRule cgi-script handler",
+                        );
                     }
-                    Err(e) => self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: e,
-                    }),
+                    if handler.eq_ignore_ascii_case("server-status") {
+                        self.require_capability(
+                            Capability::ServerStatus,
+                            loc,
+                            "RewriteRule server-status handler",
+                        );
+                    }
+                    if handler.to_ascii_lowercase().contains("fcgi://") {
+                        self.require_capability(
+                            Capability::FastCgi,
+                            loc,
+                            "RewriteRule FastCGI handler",
+                        );
+                    }
                 }
+                if rule.flags.unsafe_prefix_stat {
+                    self.warn(format!(
+                        "{}:{}: [UnsafePrefixStat] is accepted for compatibility and has no effect",
+                        loc.file, loc.line
+                    ));
+                }
+                rule.conditions = std::mem::take(&mut scope.rewrite_policy.pending_rewrite_conds);
+                if certbot_http01_alias {
+                    scope.mapping_policy.aliases.push(Alias::regex(
+                        rule.pattern.clone(),
+                        rule.substitution.clone(),
+                        false,
+                        &self.cfg.server_root,
+                    ));
+                }
+                scope.rewrite_policy.rewrite_rules.push(rule);
             }
             "rewriteoptions" => {
-                // Only RewriteOptions Inherit is implemented; every other
-                // option silently degraded Inherit to Off (Some(false)).
-                for a in args {
-                    if !a.eq_ignore_ascii_case("Inherit") {
-                        self.directive_error(loc, format!("unsupported RewriteOptions flag '{a}'"));
-                    }
-                }
-                scope.rewrite_policy.rewrite_inherit =
-                    Some(args.iter().any(|a| a.eq_ignore_ascii_case("Inherit")));
+                scope.rewrite_policy.rewrite_inherit = Some(true);
             }
             "addtype" => {
                 if args.len() < 2 {
@@ -7050,95 +6817,35 @@ impl Compile {
                 loc.file, loc.line
             )),
             "fileetag" => {
-                let mut v = 0u32;
-                for a in args {
-                    match a.to_ascii_lowercase().as_str() {
-                        "none" => v = 0,
-                        "all" => v = ETAG_ALL,
-                        "inode" => v |= ETAG_INODE,
-                        "mtime" => v |= ETAG_MTIME,
-                        "size" => v |= ETAG_SIZE,
-                        _ => self.directive_error(
-                            loc,
-                            format!("FileETag contains unsupported keyword '{a}'"),
-                        ),
-                    }
-                }
-                scope.content_policy.file_etag = Some(v);
+                scope.content_policy.file_etag = Some(
+                    payload
+                        .file_etag()
+                        .expect("FileETag is compiled while sealing"),
+                );
             }
             "enablesendfile" => {
-                if let Some(enabled) = self.on_off_arg(loc, "EnableSendfile", args) {
-                    scope.content_policy.enable_sendfile = Some(enabled);
-                }
+                scope.content_policy.enable_sendfile = Some(
+                    payload
+                        .on_off()
+                        .expect("EnableSendfile is typed while sealing"),
+                );
             }
             "directoryslash" => {
-                if let Some(enabled) = self.on_off_arg(loc, "DirectorySlash", args) {
-                    scope.content_policy.directory_slash = Some(enabled);
-                }
+                scope.content_policy.directory_slash = Some(
+                    payload
+                        .on_off()
+                        .expect("DirectorySlash is typed while sealing"),
+                );
             }
             "accessfilename" => {
                 scope.content_policy.access_file_names = Some(args.to_vec());
             }
             "header" => {
-                let mut idx = 0;
-                let always = args
-                    .first()
-                    .map(|a| a.eq_ignore_ascii_case("always"))
-                    .unwrap_or(false);
-                if always
-                    || args
-                        .first()
-                        .map(|a| a.eq_ignore_ascii_case("onsuccess"))
-                        .unwrap_or(false)
-                {
-                    idx = 1;
-                }
-                if args.len() < idx + 2 {
-                    self.directive_error(loc, "Header requires an action and a header name");
-                    return;
-                }
-                let action = args[idx].to_ascii_lowercase();
-                let name = args[idx + 1].trim_end_matches(':').to_string();
-                let minimum = match action.as_str() {
-                    "set" | "add" => idx + 3,
-                    "unset" => idx + 2,
-                    _ => {
-                        self.directive_error(
-                            loc,
-                            format!(
-                                "Header action '{}' is not implemented; refusing to ignore a response-header policy",
-                                action
-                            ),
-                        );
-                        return;
-                    }
-                };
-                let conditional = args[idx + 2..].iter().any(|arg| {
-                    arg.eq_ignore_ascii_case("early")
-                        || arg.to_ascii_lowercase().starts_with("env=")
-                        || arg.to_ascii_lowercase().starts_with("expr=")
-                });
-                if args.len() < minimum
-                    || (action == "unset" && args.len() != minimum)
-                    || conditional
-                {
-                    self.directive_error(
-                        loc,
-                        "conditional or extended Header forms are not implemented; refusing to broaden the header policy",
-                    );
-                    return;
-                }
-                let value = args[idx + 2..].join(" ");
                 let previous = scope.header_policy.clone();
-                match (action.as_str(), always) {
-                    ("set", true) => scope.header_policy.always_set_headers.push((name, value)),
-                    ("set", false) => scope.header_policy.set_headers.push((name, value)),
-                    ("add", true) => scope.header_policy.always_add_headers.push((name, value)),
-                    ("add", false) => scope.header_policy.add_headers.push((name, value)),
-                    ("unset", true) => scope.header_policy.always_unset_headers.push(name),
-                    ("unset", false) => scope.header_policy.unset_headers.push(name),
-                    _ => unreachable!("Header action was validated above"),
-                }
+                payload
+                    .header()
+                    .expect("Header is compiled while sealing")
+                    .apply(&mut scope.header_policy);
                 if !scope.header_policy.within_limits() {
                     scope.header_policy = previous;
                     self.directive_error(
@@ -7148,35 +6855,28 @@ impl Compile {
                 }
             }
             "expiresactive" => {
-                if let Some(enabled) = self.on_off_arg(loc, "ExpiresActive", args) {
-                    scope.header_policy.expires_active = Some(enabled);
-                }
+                scope.header_policy.expires_active = Some(
+                    payload
+                        .on_off()
+                        .expect("ExpiresActive is typed while sealing"),
+                );
             }
             "expiresdefault" => {
-                let spec = joined();
-                if crate::expires::valid_spec(&spec) {
-                    scope.header_policy.expires_default = Some(spec);
-                } else {
-                    self.directive_error(loc, "ExpiresDefault has invalid expiry syntax");
-                }
+                scope.header_policy.expires_default = Some(
+                    payload
+                        .expires_default()
+                        .expect("ExpiresDefault is compiled while sealing")
+                        .to_string(),
+                );
             }
             "expiresbytype" => {
-                if args.len() < 2 {
-                    self.directive_error(
-                        loc,
-                        "ExpiresByType requires a MIME-type and an expiry time",
-                    );
-                    return;
-                }
-                let spec = args[1..].join(" ");
-                if crate::expires::valid_spec(&spec) {
-                    scope
-                        .header_policy
-                        .expires_by_type
-                        .push((args[0].to_ascii_lowercase(), spec));
-                } else {
-                    self.directive_error(loc, "ExpiresByType has invalid expiry syntax");
-                }
+                let (content_type, spec) = payload
+                    .expires_by_type()
+                    .expect("ExpiresByType is compiled while sealing");
+                scope
+                    .header_policy
+                    .expires_by_type
+                    .push((content_type.to_string(), spec.to_string()));
             }
             "typesconfig" => {
                 let p = PathBuf::from(first());
@@ -7225,238 +6925,119 @@ impl Compile {
                 });
             }
             "cachedefaultexpire" => {
-                if let Some(n) = self.u64_arg(loc, "CacheDefaultExpire", args) {
-                    self.cfg.cache.default_expire = n;
-                }
+                self.cfg.cache.default_expire = payload
+                    .unsigned()
+                    .expect("CacheDefaultExpire is typed while sealing");
             }
             "cachemaxexpire" => {
-                if let Some(n) = self.u64_arg(loc, "CacheMaxExpire", args) {
-                    self.cfg.cache.max_expire = n;
-                }
+                self.cfg.cache.max_expire = payload
+                    .unsigned()
+                    .expect("CacheMaxExpire is typed while sealing");
             }
             "cacheminexpire" => {
-                if let Some(n) = self.u64_arg(loc, "CacheMinExpire", args) {
-                    self.cfg.cache.min_expire = n;
-                }
+                self.cfg.cache.min_expire = payload
+                    .unsigned()
+                    .expect("CacheMinExpire is typed while sealing");
             }
             "cachemaxfilesize" => {
-                if let Some(n) = self.u64_arg(loc, "CacheMaxFileSize", args) {
-                    self.cfg.cache.max_file_size = n;
-                }
+                self.cfg.cache.max_file_size = payload
+                    .unsigned()
+                    .expect("CacheMaxFileSize is typed while sealing");
             }
             "cachemaxdisksize" => {
-                if let Some(n) = self.u64_arg(loc, "CacheMaxDiskSize", args) {
-                    self.cfg.cache.max_disk_size = n;
-                }
+                self.cfg.cache.max_disk_size = payload
+                    .unsigned()
+                    .expect("CacheMaxDiskSize is typed while sealing");
             }
             "cachemaxmemorysize" => {
-                if let Some(n) = self.u64_arg(loc, "CacheMaxMemorySize", args) {
-                    self.cfg.cache.max_memory_size = n;
-                }
+                self.cfg.cache.max_memory_size = payload
+                    .unsigned()
+                    .expect("CacheMaxMemorySize is typed while sealing");
             }
             "cacheminsize" => {
-                if let Some(n) = self.u64_arg(loc, "CacheMinSize", args) {
-                    self.cfg.cache.min_file_size = n;
-                }
+                self.cfg.cache.min_file_size = payload
+                    .unsigned()
+                    .expect("CacheMinSize is typed while sealing");
             }
             "cacheignorenolastmod" => {
-                if let Some(enabled) = self.on_off_arg(loc, "CacheIgnoreNoLastMod", args) {
-                    self.cfg.cache.ignore_no_last_mod = enabled;
-                }
+                self.cfg.cache.ignore_no_last_mod = payload
+                    .on_off()
+                    .expect("CacheIgnoreNoLastMod is typed while sealing");
             }
             "cacheignorecachecontrol" => {
-                if let Some(enabled) = self.on_off_arg(loc, "CacheIgnoreCacheControl", args) {
-                    self.cfg.cache.ignore_cache_control = enabled;
-                }
+                self.cfg.cache.ignore_cache_control = payload
+                    .on_off()
+                    .expect("CacheIgnoreCacheControl is typed while sealing");
             }
             "cachestorenostore" => {
-                if let Some(enabled) = self.on_off_arg(loc, "CacheStoreNoStore", args) {
-                    self.cfg.cache.store_no_store = enabled;
-                }
+                self.cfg.cache.store_no_store = payload
+                    .on_off()
+                    .expect("CacheStoreNoStore is typed while sealing");
             }
             "cachestoreprivate" => {
-                if let Some(enabled) = self.on_off_arg(loc, "CacheStorePrivate", args) {
-                    self.cfg.cache.store_private = enabled;
-                }
+                self.cfg.cache.store_private = payload
+                    .on_off()
+                    .expect("CacheStorePrivate is typed while sealing");
             }
             "cacheignorequerystring" => {
-                if let Some(enabled) = self.on_off_arg(loc, "CacheIgnoreQueryString", args) {
-                    self.cfg.cache.ignore_query_string = enabled;
-                }
+                self.cfg.cache.ignore_query_string = payload
+                    .on_off()
+                    .expect("CacheIgnoreQueryString is typed while sealing");
             }
             "cacheheader" => {
-                if let Some(enabled) = self.on_off_arg(loc, "CacheHeader", args) {
-                    self.cfg.cache.header = enabled;
-                }
+                self.cfg.cache.header = payload
+                    .on_off()
+                    .expect("CacheHeader is typed while sealing");
             }
             "cachedetailheader" => {
-                if let Some(enabled) = self.on_off_arg(loc, "CacheDetailHeader", args) {
-                    self.cfg.cache.detail_header = enabled;
-                }
+                self.cfg.cache.detail_header = payload
+                    .on_off()
+                    .expect("CacheDetailHeader is typed while sealing");
             }
             "cachelastmodifiedfactor" => {
-                let parsed = match args {
-                    [value] => value.parse::<f64>().ok().filter(|v| v.is_finite()),
-                    _ => None,
-                };
-                if let Some(v) = parsed.filter(|v| (0.0..=1.0).contains(v)) {
-                    self.cfg.cache.last_modified_factor = v;
-                } else {
-                    self.directive_error(
-                        loc,
-                        "CacheLastModifiedFactor requires a finite number from 0 through 1",
-                    );
-                }
+                self.cfg.cache.last_modified_factor = payload
+                    .unit_float()
+                    .expect("CacheLastModifiedFactor is compiled while sealing");
             }
             "proxypass" => {
-                if args.len() < 2 {
-                    self.directive_error(loc, "ProxyPass requires a path and a backend URL");
-                    return;
-                }
-                if args[1] == "!" || args[1].starts_with('!') {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "ProxyPass exclusions (!) are not implemented; refusing to ignore a route exclusion".into(),
-                    });
-                    return;
-                }
-                if !supported_proxy_backend(&args[1], false) {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!("unsupported ProxyPass backend '{}'", args[1]),
-                    });
-                    return;
-                }
-                if args[1].to_ascii_lowercase().contains("fcgi://") {
+                let sealed = payload
+                    .proxy_pass()
+                    .expect("ProxyPass is compiled while sealing");
+                if sealed.fastcgi {
                     self.require_capability(Capability::FastCgi, loc, "ProxyPass FastCGI");
                 }
-                if args[0].starts_with('!') {
-                    self.directive_error(
-                        loc,
-                        "ProxyPass path cannot start with '!'; exclusions use '!' as the backend argument",
-                    );
-                    return;
-                }
-                let mut rule = ProxyPassRule {
-                    prefix: args[0].clone(),
-                    backend: args[1].clone(),
-                    sticky_cookie: None,
-                    fail_on_status: Vec::new(),
+                let rule = ProxyPassRule {
+                    prefix: sealed.prefix.clone(),
+                    backend: sealed.backend.clone(),
+                    sticky_cookie: sealed.sticky_cookie.clone(),
+                    fail_on_status: sealed.fail_on_status.clone(),
                     route_order: self.next_route,
                 };
                 self.next_route += 1;
-                for item in &args[2..] {
-                    let Some((key, value)) = item.split_once('=') else {
-                        self.directive_error(
-                            loc,
-                            format!("ProxyPass parameter '{item}' must use name=value syntax"),
-                        );
-                        continue;
-                    };
-                    match key.to_ascii_lowercase().as_str() {
-                        "stickysession" => rule.sticky_cookie = Some(value.to_string()),
-                        "failonstatus" => {
-                            let (statuses, unparsable) = parse_status_list(value);
-                            if !unparsable.is_empty() {
-                                self.directive_error(
-                                    loc,
-                                    format!(
-                                        "ProxyPass failonstatus contains non-numeric entries {unparsable:?}"
-                                    ),
-                                );
-                            }
-                            rule.fail_on_status = statuses;
-                        }
-                        _ => self.directive_error(
-                            loc,
-                            format!("unsupported ProxyPass parameter '{key}'"),
-                        ),
-                    }
-                }
                 scope.proxy_policy.proxy_passes.push(rule);
             }
             "proxypassreverse" => {
-                if args.len() < 2 {
-                    return;
-                }
-                if args.len() > 2 {
-                    self.directive_error(
-                        loc,
-                        "ProxyPassReverse options are not implemented; refusing to ignore them",
-                    );
-                    return;
-                }
-                if !supported_proxy_backend(&args[1], false) {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!("unsupported ProxyPassReverse backend '{}'", args[1]),
-                    });
-                    return;
-                }
+                let sealed = payload
+                    .proxy_pass_reverse()
+                    .expect("ProxyPassReverse is compiled while sealing");
                 scope.proxy_policy.proxy_reverses.push(ProxyReverseRule {
-                    front: args[0].clone(),
-                    backend: args[1].clone(),
+                    front: sealed.front.clone(),
+                    backend: sealed.backend.clone(),
                 });
             }
             "proxypassmatch" => {
-                if args.len() < 2 {
-                    return;
-                }
-                if args.len() > 2 {
-                    self.directive_error(
-                        loc,
-                        "ProxyPassMatch parameters are not implemented; refusing to ignore them",
-                    );
-                    return;
-                }
-                if args[1] == "!" || args[1].starts_with('!') {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "ProxyPassMatch exclusions (!) are not implemented; refusing to ignore a route exclusion".into(),
-                    });
-                    return;
-                }
-                if !supported_proxy_backend(&args[1], true) {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!("unsupported ProxyPassMatch backend '{}'", args[1]),
-                    });
-                    return;
-                }
-                if args[1].to_ascii_lowercase().contains("fcgi://") {
+                let sealed = payload
+                    .proxy_pass_match()
+                    .expect("ProxyPassMatch is compiled while sealing");
+                if sealed.fastcgi {
                     self.require_capability(Capability::FastCgi, loc, "ProxyPassMatch FastCGI");
                 }
-                if !proxy_template_authority_safe(&args[1]) {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!(
-                            "ProxyPassMatch backend authority may not be derived from a capture: '{}'",
-                            args[1]
-                        ),
-                    });
-                    return;
-                }
-                match compile_regex(&args[0]) {
-                    Ok(pattern) => {
-                        scope.proxy_policy.proxy_rules.push(ProxyRule {
-                            pattern: Arc::new(pattern),
-                            backend: args[1].clone(),
-                            route_order: self.next_route,
-                        });
-                        self.next_route += 1;
-                    }
-                    Err(e) => self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!("bad ProxyPassMatch regex: {e}"),
-                    }),
-                }
+                scope.proxy_policy.proxy_rules.push(ProxyRule {
+                    pattern: sealed.pattern.clone(),
+                    backend: sealed.backend.clone(),
+                    route_order: self.next_route,
+                });
+                self.next_route += 1;
             }
             "addoutputfilterbytype" => {
                 if args.len() < 2 {
@@ -7540,44 +7121,42 @@ impl Compile {
                 ),
             ),
             "deflatecompressionlevel" => {
-                let Some(n) = self.u32_arg(loc, "DeflateCompressionLevel", args) else {
-                    return;
-                };
-                if n <= 9 {
-                    scope.compression_policy.deflate_level = Some(n);
-                } else {
-                    self.directive_error(loc, "DeflateCompressionLevel must be from 0 through 9");
-                }
+                scope.compression_policy.deflate_level = Some(
+                    payload
+                        .unsigned()
+                        .expect("DeflateCompressionLevel is typed while sealing")
+                        as u32,
+                );
             }
             "brotlicompressionquality" => {
-                let Some(n) = self.u32_arg(loc, "BrotliCompressionQuality", args) else {
-                    return;
-                };
-                if n <= 11 {
-                    scope.compression_policy.brotli_quality = Some(n);
-                } else {
-                    self.directive_error(loc, "BrotliCompressionQuality must be from 0 through 11");
-                }
+                scope.compression_policy.brotli_quality = Some(
+                    payload
+                        .unsigned()
+                        .expect("BrotliCompressionQuality is typed while sealing")
+                        as u32,
+                );
             }
             "deflatealteretag" => {
-                if let Some(v) = args.first().and_then(|s| AlterEtag::parse(s)) {
-                    scope.compression_policy.deflate_alter_etag = Some(v);
-                } else {
-                    self.directive_error(
-                        loc,
-                        "DeflateAlterETag requires AddSuffix, NoChange, or Remove",
-                    );
-                }
+                scope.compression_policy.deflate_alter_etag = Some(match payload
+                    .keyword()
+                    .expect("DeflateAlterETag is typed while sealing")
+                {
+                    0 => AlterEtag::AddSuffix,
+                    1 => AlterEtag::NoChange,
+                    2 => AlterEtag::Remove,
+                    _ => unreachable!("sealed AlterETag keyword index"),
+                });
             }
             "brotlialteretag" | "brotlicompressionalteretag" => {
-                if let Some(v) = args.first().and_then(|s| AlterEtag::parse(s)) {
-                    scope.compression_policy.brotli_alter_etag = Some(v);
-                } else {
-                    self.directive_error(
-                        loc,
-                        "BrotliAlterETag requires AddSuffix, NoChange, or Remove",
-                    );
-                }
+                scope.compression_policy.brotli_alter_etag = Some(match payload
+                    .keyword()
+                    .expect("BrotliAlterETag is typed while sealing")
+                {
+                    0 => AlterEtag::AddSuffix,
+                    1 => AlterEtag::NoChange,
+                    2 => AlterEtag::Remove,
+                    _ => unreachable!("sealed AlterETag keyword index"),
+                });
             }
             "addencoding" => {
                 for e in &args[1..] {
@@ -7594,25 +7173,12 @@ impl Compile {
                 ),
             ),
             "listen" => {
-                // Apache allows a protocol hint after the address, e.g.
-                // `Listen 443 https`; the hint does not enable TLS by itself.
-                if let Some(protocol) = args.get(1) {
-                    if !matches!(protocol.to_ascii_lowercase().as_str(), "http" | "https") {
-                        self.directive_error(
-                            loc,
-                            format!("unsupported Listen protocol hint '{protocol}'"),
-                        );
-                        return;
-                    }
-                }
-                match parse_listen(&args[0]) {
-                    Ok(listener) => self.cfg.listeners.push(listener),
-                    Err(error) => self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: error,
-                    }),
-                }
+                self.cfg.listeners.push(
+                    payload
+                        .listen()
+                        .expect("Listen is compiled while sealing")
+                        .clone(),
+                );
             }
             "user" => self.cfg.user = first(),
             "group" => self.cfg.group = first(),
@@ -7702,228 +7268,175 @@ impl Compile {
                 .pass_env
                 .extend(args.iter().cloned().map(Originated::main)),
             "setenvif" | "setenvifnocase" | "browsermatch" | "browsermatchnocase" => {
-                match parse_env_rule(name, args) {
-                    Ok(rule) => scope
-                        .environment_policy
-                        .set_env_if
-                        .push(Originated::main(rule)),
-                    Err(e) => self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: e,
-                    }),
-                }
+                scope.environment_policy.set_env_if.push(Originated::main(
+                    payload
+                        .environment_rule()
+                        .expect("environment rule is compiled while sealing")
+                        .clone(),
+                ));
             }
             "remoteipheader" => {
                 self.cfg.remoteip_header = Some(first());
             }
             "remoteipinternalproxy" | "remoteiptrustedproxy" => {
                 let internal = name == "remoteipinternalproxy";
-                for a in args {
-                    let network = if a.eq_ignore_ascii_case("all") {
-                        Some(("0.0.0.0".parse().unwrap(), 0))
-                    } else if let Some(net) = parse_ip_net(a) {
-                        Some(net)
-                    } else {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: format!(
-                                "bad {} address '{a}'",
-                                if internal {
-                                    "RemoteIPInternalProxy"
-                                } else {
-                                    "RemoteIPTrustedProxy"
-                                }
-                            ),
-                        });
-                        None
-                    };
-                    if let Some((network, bits)) = network {
-                        self.cfg.remoteip_proxies.push(RemoteIpProxy {
-                            network,
-                            bits,
-                            internal,
-                        });
-                    }
+                for (network, bits) in payload
+                    .remote_ip_networks()
+                    .expect("RemoteIP networks are compiled while sealing")
+                {
+                    self.cfg.remoteip_proxies.push(RemoteIpProxy {
+                        network: *network,
+                        bits: *bits,
+                        internal,
+                    });
                 }
             }
             "timeout" => {
-                if let Some(n) = self.u32_arg(loc, "Timeout", args) {
-                    let d = Duration::from_secs(n as u64);
-                    self.cfg.timeout = d;
-                    self.cfg.request_header_timeout = d;
-                    self.cfg.request_body_timeout = d;
-                }
+                let d = Duration::from_secs(
+                    payload
+                        .unsigned()
+                        .expect("Timeout is typed while sealing"),
+                );
+                self.cfg.timeout = d;
+                self.cfg.request_header_timeout = d;
+                self.cfg.request_body_timeout = d;
             }
             "keepalive" => {
-                if let Some(enabled) = self.on_off_arg(loc, "KeepAlive", args) {
-                    self.cfg.keep_alive = enabled;
-                }
+                self.cfg.keep_alive = payload
+                    .on_off()
+                    .expect("KeepAlive is typed while sealing");
             }
             "keepalivetimeout" => {
-                if let Some(n) = self.u32_arg(loc, "KeepAliveTimeout", args) {
-                    self.cfg.keep_alive_timeout = Duration::from_secs(n as u64);
-                }
+                self.cfg.keep_alive_timeout = Duration::from_secs(
+                    payload
+                        .unsigned()
+                        .expect("KeepAliveTimeout is typed while sealing"),
+                );
             }
             "maxkeepaliverequests" => {
-                if let Some(n) = self.u32_arg(loc, "MaxKeepAliveRequests", args) {
-                    self.cfg.max_keep_alive_requests = n as usize;
-                }
+                self.cfg.max_keep_alive_requests = payload
+                    .unsigned()
+                    .expect("MaxKeepAliveRequests is typed while sealing")
+                    as usize;
             }
-            "hostnamelookups" => match first().to_ascii_lowercase().as_str() {
-                "on" => self.cfg.hostname_lookups = true,
-                "off" => self.cfg.hostname_lookups = false,
-                "double" => self.directive_error(
+            "hostnamelookups" => match payload
+                .keyword()
+                .expect("HostnameLookups is typed while sealing")
+            {
+                0 => self.cfg.hostname_lookups = true,
+                1 => self.cfg.hostname_lookups = false,
+                2 => self.directive_error(
                     loc,
                     "HostnameLookups Double is not implemented; refusing to omit forward-confirmation",
                 ),
-                _ => self.directive_error(loc, "HostnameLookups requires On, Off, or Double"),
+                _ => unreachable!("sealed HostnameLookups keyword index"),
             },
-            "usecanonicalname" => match first().to_ascii_lowercase().as_str() {
-                "on" => self.cfg.use_canonical_name = true,
-                "off" => self.cfg.use_canonical_name = false,
+            "usecanonicalname" => match payload
+                .keyword()
+                .expect("UseCanonicalName is typed while sealing")
+            {
+                0 => self.cfg.use_canonical_name = true,
+                1 => self.cfg.use_canonical_name = false,
                 // Apache resolves the local address for `DNS`.  Until that
                 // reverse-DNS path is modeled, use ServerName, which is the
                 // conservative choice for redirects and expression variables:
                 // the client Host header never becomes the canonical name.
-                "dns" => self.cfg.use_canonical_name = true,
-                other => self.errors.push(ConfigError {
-                    file: loc.file.clone(),
-                    line: loc.line,
-                    msg: format!("UseCanonicalName must be On, Off or DNS, not '{other}'"),
-                }),
+                2 => self.cfg.use_canonical_name = true,
+                _ => unreachable!("sealed UseCanonicalName keyword index"),
             },
             "servertokens" => {
-                let tokens = match first().to_ascii_lowercase().as_str() {
-                    "full" => Some(ServerTokens::Full),
-                    "os" => Some(ServerTokens::Os),
-                    "minimal" => Some(ServerTokens::Minimal),
-                    "minor" => Some(ServerTokens::Minor),
-                    "major" => Some(ServerTokens::Major),
-                    "prod" => Some(ServerTokens::Prod),
-                    _ => None,
+                let tokens = match payload
+                    .keyword()
+                    .expect("ServerTokens is typed while sealing")
+                {
+                    0 => ServerTokens::Full,
+                    1 => ServerTokens::Os,
+                    2 => ServerTokens::Minimal,
+                    3 => ServerTokens::Minor,
+                    4 => ServerTokens::Major,
+                    5 => ServerTokens::Prod,
+                    _ => unreachable!("sealed ServerTokens keyword index"),
                 };
-                if let Some(tokens) = tokens {
-                    self.cfg.server_tokens = tokens;
-                    self.cfg.server_software = server_software_for_tokens(tokens);
-                } else {
-                    self.directive_error(loc, "ServerTokens has an invalid value");
-                }
+                self.cfg.server_tokens = tokens;
+                self.cfg.server_software = server_software_for_tokens(tokens);
             }
-            "serversignature" => {
-                match first().to_ascii_lowercase().as_str() {
-                    "on" => self.cfg.server_signature = ServerSignature::On,
-                    "off" => self.cfg.server_signature = ServerSignature::Off,
-                    "email" => self.cfg.server_signature = ServerSignature::Email,
-                    _ => self.directive_error(loc, "ServerSignature requires On, Off, or Email"),
-                }
-            }
+            "serversignature" => match payload
+                .keyword()
+                .expect("ServerSignature is typed while sealing")
+            {
+                0 => self.cfg.server_signature = ServerSignature::On,
+                1 => self.cfg.server_signature = ServerSignature::Off,
+                2 => self.cfg.server_signature = ServerSignature::Email,
+                _ => unreachable!("sealed ServerSignature keyword index"),
+            },
             "traceenable" => {
-                if args.len() != 1 {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "TraceEnable requires exactly one of Off, On, or Extended".into(),
-                    });
-                    return;
-                }
-                self.cfg.trace_enable = match first().to_ascii_lowercase().as_str() {
-                    "off" => false,
-                    "on" | "extended" => true,
-                    _ => {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: "TraceEnable requires Off, On, or Extended".into(),
-                        });
-                        return;
-                    }
-                };
+                self.cfg.trace_enable = payload
+                    .keyword()
+                    .map(|value| value != 0)
+                    .expect("TraceEnable is typed while sealing");
                 if self.cfg.trace_enable {
                     self.require_capability(Capability::Trace, loc, "enabled TraceEnable");
                 }
             }
             "limitrequestline" => {
-                if let Some(n) = self.u32_arg(loc, "LimitRequestLine", args) {
-                    self.cfg.limit_request_line = n as usize;
-                }
+                self.cfg.limit_request_line = payload
+                    .unsigned()
+                    .expect("LimitRequestLine is typed while sealing")
+                    as usize;
             }
             "limitrequestfields" => {
-                if let Some(n) = self.u32_arg(loc, "LimitRequestFields", args) {
-                    self.cfg.limit_request_fields = n as usize;
-                }
+                self.cfg.limit_request_fields = payload
+                    .unsigned()
+                    .expect("LimitRequestFields is typed while sealing")
+                    as usize;
             }
             "limitrequestfieldsize" => {
-                if let Some(n) = self.u32_arg(loc, "LimitRequestFieldSize", args) {
-                    self.cfg.limit_request_field_size = n as usize;
-                }
+                self.cfg.limit_request_field_size = payload
+                    .unsigned()
+                    .expect("LimitRequestFieldSize is typed while sealing")
+                    as usize;
             }
             "maxrequestworkers" => {
-                if let Some(n) = self.u32_arg(loc, name, args) {
-                    if n == 0 {
-                        self.directive_error(loc, "MaxRequestWorkers must be greater than zero");
-                    } else if n as usize > MAX_IMPLEMENTED_REQUEST_WORKERS {
-                        self.directive_error(
-                            loc,
-                            format!(
-                                "MaxRequestWorkers exceeds Vapache's implementation limit of {MAX_IMPLEMENTED_REQUEST_WORKERS}"
-                            ),
-                        );
-                    } else if self.server_limit.is_some_and(|limit| n as usize > limit) {
-                        self.directive_error(loc, "MaxRequestWorkers exceeds ServerLimit");
-                    } else {
-                        self.cfg.max_request_workers = n as usize;
-                        self.max_request_workers_set = true;
-                    }
+                let n = payload
+                    .unsigned()
+                    .expect("MaxRequestWorkers is typed while sealing")
+                    as usize;
+                if self.server_limit.is_some_and(|limit| n > limit) {
+                    self.directive_error(loc, "MaxRequestWorkers exceeds ServerLimit");
+                } else {
+                    self.cfg.max_request_workers = n;
+                    self.max_request_workers_set = true;
                 }
             }
             "serverlimit" => {
-                if let Some(n) = self.u32_arg(loc, name, args) {
-                    if n == 0 {
-                        self.directive_error(loc, "ServerLimit must be greater than zero");
-                    } else if n as usize > MAX_IMPLEMENTED_REQUEST_WORKERS {
-                        self.directive_error(
-                            loc,
-                            format!(
-                                "ServerLimit exceeds Vapache's implementation limit of {MAX_IMPLEMENTED_REQUEST_WORKERS}"
-                            ),
-                        );
-                    } else {
-                        let limit = n as usize;
-                        if self.max_request_workers_set && self.cfg.max_request_workers > limit {
-                            self.directive_error(loc, "MaxRequestWorkers exceeds ServerLimit");
-                        } else {
-                            self.server_limit = Some(limit);
-                            self.cfg.max_request_workers =
-                                self.cfg.max_request_workers.min(limit);
-                        }
-                    }
+                let limit = payload
+                    .unsigned()
+                    .expect("ServerLimit is typed while sealing")
+                    as usize;
+                if self.max_request_workers_set && self.cfg.max_request_workers > limit {
+                    self.directive_error(loc, "MaxRequestWorkers exceeds ServerLimit");
+                } else {
+                    self.server_limit = Some(limit);
+                    self.cfg.max_request_workers = self.cfg.max_request_workers.min(limit);
                 }
             }
             "listenbacklog" => {
-                if let Some(n) = self.u32_arg(loc, "ListenBacklog", args) {
-                    match i32::try_from(n) {
-                        Ok(n) if n > 0 => self.cfg.listen_backlog = n,
-                        _ => self.directive_error(
-                            loc,
-                            format!("ListenBacklog must be from 1 through {}", i32::MAX),
-                        ),
-                    }
-                }
+                self.cfg.listen_backlog = payload
+                    .unsigned()
+                    .expect("ListenBacklog is typed while sealing")
+                    as i32;
             }
             "gracefulshutdowntimeout" => {
-                if let Some(n) = self.u32_arg(loc, "GracefulShutdownTimeout", args) {
-                    self.cfg.graceful_shutdown_timeout = Duration::from_secs(n as u64);
-                }
+                self.cfg.graceful_shutdown_timeout = Duration::from_secs(
+                    payload
+                        .unsigned()
+                        .expect("GracefulShutdownTimeout is typed while sealing"),
+                );
             }
             "requestreadtimeout" => {
-                let raw = args.join(" ");
-                let Some((header, body, header_rate, body_rate)) = parse_request_read_timeout(&raw)
-                else {
-                    self.directive_error(loc, "RequestReadTimeout has invalid syntax");
-                    return;
-                };
+                let (header, body, header_rate, body_rate) = payload
+                    .request_read_timeout()
+                    .expect("RequestReadTimeout is compiled while sealing");
                 if let Some(header) = header {
                     self.cfg.request_header_timeout = header;
                 }
@@ -7938,34 +7451,30 @@ impl Compile {
                 }
             }
             "limitrequestbody" => {
-                if let Some(n) = self.u64_arg(loc, "LimitRequestBody", args) {
-                    self.cfg.limit_request_body = n;
-                }
+                self.cfg.limit_request_body = payload
+                    .unsigned()
+                    .expect("LimitRequestBody is typed while sealing");
             }
             "allowencodedslashes" => {
-                match first().to_ascii_lowercase().as_str() {
-                    "on" => self.cfg.encoded_slashes = EncodedSlashes::On,
-                    "off" => self.cfg.encoded_slashes = EncodedSlashes::Off,
-                    "nodecode" => self.cfg.encoded_slashes = EncodedSlashes::NoDecode,
-                    _ => self.directive_error(
-                        loc,
-                        "AllowEncodedSlashes requires On, Off, or NoDecode",
-                    ),
+                self.cfg.encoded_slashes = match payload
+                    .keyword()
+                    .expect("AllowEncodedSlashes is typed while sealing")
+                {
+                    0 => EncodedSlashes::On,
+                    1 => EncodedSlashes::Off,
+                    2 => EncodedSlashes::NoDecode,
+                    _ => unreachable!("sealed AllowEncodedSlashes keyword index"),
                 }
             }
             "satisfy" => {
                 self.require_capability(Capability::LegacyAuthz, loc, "Satisfy");
-                let satisfy = match first().to_ascii_lowercase().as_str() {
-                    "all" => Satisfy::All,
-                    "any" => Satisfy::Any,
-                    _ => {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: "Satisfy requires 'all' or 'any'".into(),
-                        });
-                        return;
-                    }
+                let satisfy = match payload
+                    .keyword()
+                    .expect("Satisfy is typed while sealing")
+                {
+                    0 => Satisfy::All,
+                    1 => Satisfy::Any,
+                    _ => unreachable!("sealed Satisfy keyword index"),
                 };
                 scope.add_satisfy(satisfy, limit);
             }
@@ -7978,30 +7487,22 @@ impl Compile {
                     });
                     return;
                 }
-                match parse_allow_methods(args) {
-                    Ok(allowed) => scope.authorization.allow_methods = Some(allowed),
-                    Err(msg) => {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg,
-                        });
-                    }
-                }
+                scope.authorization.allow_methods = Some(
+                    payload
+                        .allow_methods()
+                        .expect("AllowMethods is compiled while sealing")
+                        .clone(),
+                );
             }
             "authmerging" => {
-                let merging = match first().to_ascii_lowercase().as_str() {
-                    "off" => AuthMerging::Off,
-                    "and" => AuthMerging::And,
-                    "or" => AuthMerging::Or,
-                    _ => {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: "AuthMerging requires Off, And or Or".into(),
-                        });
-                        return;
-                    }
+                let merging = match payload
+                    .keyword()
+                    .expect("AuthMerging is typed while sealing")
+                {
+                    0 => AuthMerging::Off,
+                    1 => AuthMerging::And,
+                    2 => AuthMerging::Or,
+                    _ => unreachable!("sealed AuthMerging keyword index"),
                 };
                 scope.authorization.auth_merging = Some(merging);
             }
@@ -8116,65 +7617,37 @@ impl Compile {
                 }
             }
             "sslsessioncachetimeout" => {
-                let timeout = (args.len() == 1)
-                    .then(|| crate::util::parse_u64(first().as_bytes()))
-                    .flatten();
-                if let Some(seconds) = timeout {
-                    let target = if let Some(i) = self.current_vhost {
-                        &mut self.vhosts_raw[i].ssl
-                    } else {
-                        &mut self.cfg.ssl
-                    };
-                    target.session_cache_timeout = Some(Duration::from_secs(seconds));
+                let seconds = payload
+                    .unsigned()
+                    .expect("SSLSessionCacheTimeout is compiled while sealing");
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
                 } else {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "SSLSessionCacheTimeout requires one non-negative integer".into(),
-                    });
-                }
+                    &mut self.cfg.ssl
+                };
+                target.session_cache_timeout = Some(Duration::from_secs(seconds));
             }
             "sslsessiontickets" => {
-                let enabled = match first().to_ascii_lowercase().as_str() {
-                    "on" => Some(true),
-                    "off" => Some(false),
-                    _ => None,
-                };
-                if args.len() != 1 || enabled.is_none() {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "SSLSessionTickets requires On or Off".into(),
-                    });
+                let enabled = payload
+                    .on_off()
+                    .expect("SSLSessionTickets is compiled while sealing");
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
                 } else {
-                    let target = if let Some(i) = self.current_vhost {
-                        &mut self.vhosts_raw[i].ssl
-                    } else {
-                        &mut self.cfg.ssl
-                    };
-                    target.session_tickets = enabled;
-                }
+                    &mut self.cfg.ssl
+                };
+                target.session_tickets = Some(enabled);
             }
             "sslhonorcipherorder" => {
-                let enabled = match (args.len(), first().to_ascii_lowercase()) {
-                    (1, value) if value == "on" => Some(true),
-                    (1, value) if value == "off" => Some(false),
-                    _ => None,
-                };
-                if let Some(enabled) = enabled {
-                    let target = if let Some(i) = self.current_vhost {
-                        &mut self.vhosts_raw[i].ssl
-                    } else {
-                        &mut self.cfg.ssl
-                    };
-                    target.honor_cipher_order = Some(enabled);
+                let enabled = payload
+                    .on_off()
+                    .expect("SSLHonorCipherOrder is compiled while sealing");
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
                 } else {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "SSLHonorCipherOrder requires exactly On or Off".into(),
-                    });
-                }
+                    &mut self.cfg.ssl
+                };
+                target.honor_cipher_order = Some(enabled);
             }
             "ssloptions" => {
                 if args.is_empty()
@@ -8194,19 +7667,9 @@ impl Compile {
                 // strengthening flag itself cannot weaken request policy.
             }
             "sslengine" => {
-                let on = match (args.len(), first().to_ascii_lowercase()) {
-                    (1, value) if value == "on" => true,
-                    (1, value) if value == "off" => false,
-                    _ => {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: "SSLEngine requires exactly On or Off; optional TLS upgrade is unsupported"
-                                .into(),
-                        });
-                        return;
-                    }
-                };
+                let on = payload
+                    .on_off()
+                    .expect("SSLEngine is compiled while sealing");
                 if let Some(i) = self.current_vhost {
                     self.vhosts_raw[i].ssl.engine = on;
                     self.vhosts_raw[i].ssl.engine_set = true;
@@ -8242,18 +7705,9 @@ impl Compile {
                 }
             }
             "sslusestapling" => {
-                let on = match (args.len(), first().to_ascii_lowercase()) {
-                    (1, value) if value == "on" => true,
-                    (1, value) if value == "off" => false,
-                    _ => {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: "SSLUseStapling requires exactly On or Off".into(),
-                        });
-                        return;
-                    }
-                };
+                let on = payload
+                    .on_off()
+                    .expect("SSLUseStapling is compiled while sealing");
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
@@ -8263,34 +7717,22 @@ impl Compile {
                 target.stapling_set = true;
             }
             "sslstaplingforceurl" => {
-                if args.len() != 1 || !crate::ocsp::supported_responder_url(&first()) {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "SSLStaplingForceURL requires one supported http:// responder URL"
-                            .into(),
-                    });
-                    return;
-                }
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
                     &mut self.cfg.ssl
                 };
-                target.stapling_force_url = Some(first());
+                target.stapling_force_url = Some(
+                    payload
+                        .ocsp_responder_url()
+                        .expect("SSLStaplingForceURL is compiled while sealing")
+                        .to_string(),
+                );
             }
             "sslstaplingrespondertimeout" => {
-                let Some(n) = (args.len() == 1)
-                    .then(|| crate::util::parse_u64(first().as_bytes()))
-                    .flatten()
-                else {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "SSLStaplingResponderTimeout requires one non-negative integer".into(),
-                    });
-                    return;
-                };
+                let n = payload
+                    .unsigned()
+                    .expect("SSLStaplingResponderTimeout is compiled while sealing");
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
@@ -8299,18 +7741,9 @@ impl Compile {
                 target.stapling_responder_timeout = Duration::from_secs(n.max(1));
             }
             "sslstaplingstandardcachetimeout" => {
-                let Some(n) = (args.len() == 1)
-                    .then(|| crate::util::parse_u64(first().as_bytes()))
-                    .flatten()
-                else {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "SSLStaplingStandardCacheTimeout requires one non-negative integer"
-                            .into(),
-                    });
-                    return;
-                };
+                let n = payload
+                    .unsigned()
+                    .expect("SSLStaplingStandardCacheTimeout is compiled while sealing");
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
@@ -8319,19 +7752,9 @@ impl Compile {
                 target.stapling_standard_cache_timeout = Duration::from_secs(n.max(1));
             }
             "sslstaplingreturnrespondererrors" => {
-                let enabled = match (args.len(), first().to_ascii_lowercase()) {
-                    (1, value) if value == "on" => true,
-                    (1, value) if value == "off" => false,
-                    _ => {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: "SSLStaplingReturnResponderErrors requires exactly On or Off"
-                                .into(),
-                        });
-                        return;
-                    }
-                };
+                let enabled = payload
+                    .on_off()
+                    .expect("SSLStaplingReturnResponderErrors is compiled while sealing");
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
@@ -8540,32 +7963,16 @@ impl Compile {
                 self.cfg.health_templates.insert(name.clone(), template);
             }
             "sslverifyclient" => {
-                if args.len() != 1 {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "SSLVerifyClient requires exactly one argument".into(),
-                    });
-                    return;
-                }
-                let raw = first().to_ascii_lowercase();
-                let verify = match raw.as_str() {
-                    "none" => ClientVerify::None,
-                    "optional" => ClientVerify::Optional,
-                    "require" => ClientVerify::Require,
-                    "optional_no_ca" => ClientVerify::Optional,
-                    _ => {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg:
-                                "SSLVerifyClient must be none, optional, require or optional_no_ca"
-                                    .into(),
-                        });
-                        ClientVerify::None
-                    }
+                let verify_index = payload
+                    .keyword()
+                    .expect("SSLVerifyClient is compiled while sealing");
+                let verify = match verify_index {
+                    0 => ClientVerify::None,
+                    1 | 3 => ClientVerify::Optional,
+                    2 => ClientVerify::Require,
+                    _ => unreachable!("sealed SSLVerifyClient keyword index"),
                 };
-                if raw == "optional_no_ca" {
+                if verify_index == 3 {
                     self.warn(format!(
                         "{}:{}: SSLVerifyClient optional_no_ca is treated as optional",
                         loc.file, loc.line
@@ -8601,25 +8008,17 @@ impl Compile {
                 target.ca_file = Some(full);
             }
             "sslprotocol" => {
-                if args.is_empty() {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "SSLProtocol requires at least one protocol token".into(),
-                    });
-                    return;
-                }
-                let policy = joined();
-                if let Err(error) = crate::tls::protocol_policy(Some(&policy)) {
-                    self.directive_error(loc, error);
-                    return;
-                }
                 let target = if let Some(i) = self.current_vhost {
                     &mut self.vhosts_raw[i].ssl
                 } else {
                     &mut self.cfg.ssl
                 };
-                target.protocols = Some(policy);
+                target.protocols = Some(
+                    payload
+                        .ssl_protocol()
+                        .expect("SSLProtocol is compiled while sealing")
+                        .to_string(),
+                );
             }
             "sslciphersuite" | "sslciphersuitetls13" => {
                 self.directive_error(
@@ -8630,17 +8029,8 @@ impl Compile {
                 );
             }
             "authtype" => {
-                let auth_type = first();
-                if !auth_type.eq_ignore_ascii_case("basic") {
-                    self.directive_error(
-                        loc,
-                        format!(
-                            "AuthType '{auth_type}' is not implemented; only Basic is supported"
-                        ),
-                    );
-                } else {
-                    scope.authorization.auth_type = Some("basic".into());
-                }
+                debug_assert_eq!(payload.keyword(), Some(0));
+                scope.authorization.auth_type = Some("basic".into());
             }
             "authname" => scope.authorization.auth_name = Some(first()),
             "authuserfile" => {
@@ -8668,16 +8058,7 @@ impl Compile {
                 scope.authorization.auth_group_file = Some(full);
             }
             "authbasicprovider" => {
-                if !first().eq_ignore_ascii_case("file") {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: format!(
-                            "AuthBasicProvider '{}' is not implemented; refusing to fall back to the file provider",
-                            first()
-                        ),
-                    });
-                }
+                debug_assert_eq!(payload.keyword(), Some(0));
             }
             "defaulttype" => { /* removed in 2.4; accepted for compat */ }
             _ => match self.directive_disposition(identity) {
@@ -8764,7 +8145,7 @@ pub(crate) fn parse_redirect_arguments(
 /// callers can refuse them under strict mode instead of silently loading a
 /// shorter list (an entry like `failonstatus=500,lop` used to load as
 /// `[500]`).
-fn parse_status_list(value: &str) -> (Vec<u16>, Vec<String>) {
+pub(crate) fn parse_status_list(value: &str) -> (Vec<u16>, Vec<String>) {
     let mut statuses = Vec::new();
     let mut unparsable = Vec::new();
     for v in value.split(',') {
@@ -8780,7 +8161,7 @@ fn parse_status_list(value: &str) -> (Vec<u16>, Vec<String>) {
     (statuses, unparsable)
 }
 
-fn parse_request_read_timeout(
+pub(crate) fn parse_request_read_timeout(
     raw: &str,
 ) -> Option<(Option<Duration>, Option<Duration>, Option<u64>, Option<u64>)> {
     let part = |prefix: &str| -> Option<(Duration, Option<u64>)> {
@@ -10275,7 +9656,7 @@ pub(crate) fn parse_ip_net(s: &str) -> Option<(IpAddr, u8)> {
     Some((addr, bits))
 }
 
-fn parse_listen(s: &str) -> Result<ListenSpec, String> {
+pub(crate) fn parse_listen(s: &str) -> Result<ListenSpec, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty Listen".into());
@@ -10384,7 +9765,7 @@ fn fail_closed_directives() -> HashSet<&'static str> {
     .collect()
 }
 
-fn proxy_template_authority_safe(value: &str) -> bool {
+pub(crate) fn proxy_template_authority_safe(value: &str) -> bool {
     let value = value.trim();
     let Some((_, rest)) = value.split_once("://") else {
         // Non-URL backends (notably Unix FastCGI sockets) must not be
@@ -10400,7 +9781,7 @@ fn proxy_template_authority_safe(value: &str) -> bool {
         && !authority.contains('@')
 }
 
-fn supported_proxy_backend(value: &str, allow_fastcgi: bool) -> bool {
+pub(crate) fn supported_proxy_backend(value: &str, allow_fastcgi: bool) -> bool {
     let value = value.trim();
     value.starts_with("http://")
         || value.starts_with("https://")
@@ -11235,6 +10616,62 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.msg.contains("does not permit an empty argument")));
+
+        let invalid_inactive_match = ConfigProgram::seal(vec![
+            Event::SectionStart {
+                name: "filesmatch".into(),
+                args: vec!["(?=unsupported-lookahead)".into()],
+                loc: SourceLoc {
+                    file: "inactive.conf".into(),
+                    line: 7,
+                },
+                active: false,
+                transparent: false,
+            },
+            Event::SectionEnd {
+                loc: SourceLoc {
+                    file: "inactive.conf".into(),
+                    line: 8,
+                },
+            },
+        ])
+        .unwrap_err();
+        assert!(invalid_inactive_match.contains("FilesMatch regex"));
+
+        let invalid_condition = load_text(
+            "<If \"%{NOSUCHVAR} == 'x'\">\nRequire all granted\n</If>\n",
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            invalid_condition
+                .iter()
+                .any(|error| error.msg.contains("bad <if> expression")),
+            "{invalid_condition:?}"
+        );
+
+        for (name, args) in [
+            ("protocols", vec!["h2c"]),
+            ("expiresdefault", vec!["nonsense"]),
+            ("setenvif", vec!["Remote_Addr", "(?=lookahead)", "X=1"]),
+            ("listen", vec!["not-a-port"]),
+            ("remoteiptrustedproxy", vec!["not-an-address"]),
+            ("sslprotocol", vec!["TLSv9"]),
+            ("sslverifyclient", vec!["sometimes"]),
+            ("aliasmatch", vec!["(?=lookahead)", "/srv"]),
+            ("proxypass", vec!["/", "gopher://backend"]),
+            ("proxyset", vec!["unknown=value"]),
+        ] {
+            let result = ConfigProgram::seal(vec![Event::Directive {
+                name: name.into(),
+                args: args.into_iter().map(str::to_string).collect(),
+                loc: SourceLoc {
+                    file: "semantic.conf".into(),
+                    line: 1,
+                },
+            }]);
+            assert!(result.is_err(), "{name} reached the mutation walk unsealed");
+        }
 
         let nested_program = |depth: usize| {
             let loc = SourceLoc {

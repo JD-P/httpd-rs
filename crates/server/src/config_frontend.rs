@@ -5,9 +5,8 @@
 //! the parser-refinement proof: bytes in, a small token/line IR out.  The
 //! tokenizer and section-tag scanner consume verified executable state
 //! machines.  Main configuration and `.htaccess` then seal the resulting
-//! lines into immutable programs with exact section mates before applying any
-//! policy effect.  Directive payload parsers remain the next refinement
-//! boundary.
+//! lines into immutable programs with exact section mates and semantic
+//! directive/section payloads before applying any policy effect.
 
 /// One logical configuration line after backslash continuation handling, with
 /// the source line number where the logical line started.

@@ -6709,7 +6709,10 @@ fn lower_ascii(input: &[u8]) -> (out: Vec<u8>)
     out
 }
 
-fn parse_decimal_u64(input: &[u8]) -> (out: Option<u64>)
+/// Decimal parser shared by HTTP framing and configuration payload sealing.
+/// A successful result is non-empty, digit-only, and every multiplication and
+/// addition is proved to remain within `u64`.
+pub fn parse_decimal_u64(input: &[u8]) -> (out: Option<u64>)
     ensures
         match out {
             Some(_) => input@.len() > 0
@@ -10367,10 +10370,53 @@ pub fn config_argument_nonempty_admit(reject_empty: bool, has_empty: bool) -> (o
     !reject_empty || !has_empty
 }
 
-/// The three pure line kinds produced by the configuration tokenizer.  This
-/// is the Verus-side anchor for the parser IR; argument payloads and concrete
-/// directive parsing remain in the server front-end until the recursive
-/// section parser is migrated.
+/// Complete structural schema gate carried by every sealed directive payload.
+/// Keeping the conjunction in one executable kernel prevents the main and
+/// access-file compilers from validating arity while accidentally omitting
+/// the empty-token half (or vice versa).
+pub open spec fn config_payload_schema_spec(
+    count: usize,
+    min: usize,
+    max: Option<usize>,
+    reject_empty: bool,
+    has_empty: bool,
+) -> bool {
+    count >= min
+        && match max { Some(bound) => count <= bound, None => true }
+        && (!reject_empty || !has_empty)
+}
+
+pub fn config_payload_schema_admit(
+    count: usize,
+    min: usize,
+    max: Option<usize>,
+    reject_empty: bool,
+    has_empty: bool,
+) -> (ok: bool)
+    ensures ok == config_payload_schema_spec(count, min, max, reject_empty, has_empty),
+{
+    config_argument_arity_admit(count, min, max)
+        && config_argument_nonempty_admit(reject_empty, has_empty)
+}
+
+pub proof fn config_payload_schema_implies_arity_and_nonempty(
+    count: usize,
+    min: usize,
+    max: Option<usize>,
+    reject_empty: bool,
+    has_empty: bool,
+)
+    requires config_payload_schema_spec(count, min, max, reject_empty, has_empty),
+    ensures
+        count >= min,
+        match max { Some(bound) => count <= bound, None => true },
+        reject_empty ==> !has_empty,
+{
+}
+
+/// The three pure line kinds produced by the configuration tokenizer. This is
+/// the Verus-side anchor for the lexical IR; the server front-end consumes it
+/// while constructing the sealed semantic directive and section program.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConfigLineKind {
     Directive,
