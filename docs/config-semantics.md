@@ -1681,10 +1681,11 @@ expiry uses the verified saturating `cache_expiry`, so a positive TTL can never
 wrap into the past.  Disk accounting consumes `cache_disk_projected` and
 `cache_disk_evict`; eviction steps are proven not to increase projected usage.
 Policy binding uses `cache_fingerprint_field`, whose length framing is proven
-injective. V5 disk metadata stores the complete framed base key; lookup admits
+injective. V6 disk metadata stores the complete framed base key; lookup admits
 an entry only when that metadata key exactly matches the requested key, while
-the SHA-1 filename is treated only as an index. V4 and older metadata are
-deliberately ineligible after the P26 cache-admission change. Unsafe-method invalidation uses
+the SHA-1 filename is treated only as an index. V5 and older metadata are
+deliberately ineligible after response-header cache sanitization changed.
+Unsafe-method invalidation uses
 the same canonical request/selected-representation identity and removes only
 entries admitted by the verified key-prefix predicate.
 
@@ -2276,7 +2277,7 @@ The current ledger (2026-11-03) is:
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **648 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **651 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

@@ -627,7 +627,7 @@ async fn send_response_with_admission(
     let body_len = resp.body_len();
     let preserved_content_length =
         crate::http::preserved_response_content_length(&resp, head_only)?;
-    let connection_nominations = crate::http::response_connection_nominations(&resp)?;
+    let header_sanitizer = crate::http::ResponseHeaderSanitizer::from_response(&resp)?;
 
     let mut out = http::Response::builder().status(status);
     {
@@ -642,7 +642,7 @@ async fn send_response_with_admission(
             // Connection-specific fields are forbidden in HTTP/2. Apply the
             // same complete ownership rule as the HTTP/1 writer, including
             // fields nominated by a caller-supplied Connection field.
-            if crate::http::response_header_is_hop_by_hop(&lname, &connection_nominations) {
+            if header_sanitizer.is_hop_by_hop(&lname) {
                 continue;
             }
             if lname == "date" {

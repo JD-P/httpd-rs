@@ -60,17 +60,10 @@ fn current_epoch() -> u64 {
 fn bump_epoch() -> u64 {
     CACHE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1
 }
-const HOP_HEADERS: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-];
+// Authorization is not hop-by-hop, but it is identity-bearing metadata and
+// must never be persisted in the shared response cache. Transport-owned and
+// Connection-nominated fields are classified by ResponseHeaderSanitizer.
+const CACHE_PRIVATE_HEADERS: &[&str] = &["authorization"];
 
 #[derive(Clone)]
 struct Entry {
@@ -511,6 +504,7 @@ fn header_str(headers: &[(String, Vec<u8>)], name: &str) -> Option<String> {
     header(headers, name).map(|v| String::from_utf8_lossy(v).into_owned())
 }
 
+#[cfg(test)]
 fn response_header<'a>(resp: &'a Response, name: &str) -> Option<&'a [u8]> {
     resp.headers
         .iter()
@@ -518,6 +512,7 @@ fn response_header<'a>(resp: &'a Response, name: &str) -> Option<&'a [u8]> {
         .map(|(_, v)| v.as_slice())
 }
 
+#[cfg(test)]
 fn response_header_str(resp: &Response, name: &str) -> Option<String> {
     response_header(resp, name).map(|v| String::from_utf8_lossy(v).into_owned())
 }
@@ -1496,7 +1491,7 @@ fn cache_stem(cfg: &Config, key: &str) -> Option<std::path::PathBuf> {
 
 fn encode_meta(key: &str, entry: &Entry) -> Vec<u8> {
     let mut out = format!(
-        "V5\nK {}\nS {}\nT {}\nE {}\nP {}\nG {}\n",
+        "V6\nK {}\nS {}\nT {}\nE {}\nP {}\nG {}\n",
         STANDARD.encode(key.as_bytes()),
         entry.status,
         entry.stored,
@@ -1525,7 +1520,13 @@ fn decode_meta(data: &[u8]) -> Option<Entry> {
     let text = std::str::from_utf8(data).ok()?;
     let mut lines = text.lines();
     let version = lines.next()?;
-    if version != "V1" && version != "V2" && version != "V3" && version != "V4" && version != "V5" {
+    if version != "V1"
+        && version != "V2"
+        && version != "V3"
+        && version != "V4"
+        && version != "V5"
+        && version != "V6"
+    {
         return None;
     }
     let mut status = None;
@@ -1582,9 +1583,10 @@ fn decode_meta(data: &[u8]) -> Option<Entry> {
 fn decode_meta_key(data: &[u8]) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(data).ok()?;
     let mut lines = text.lines();
-    // V5 deliberately invalidates representations created before the
-    // trailing-slash static-target admission moved ahead of lookup (P26-A).
-    if lines.next()? != "V5" {
+    // V6 deliberately invalidates representations written before cache
+    // storage consumed the canonical Connection-nomination sanitizer. V5 and
+    // older entries can otherwise replay a field whose nomination was lost.
+    if lines.next()? != "V6" {
         return None;
     }
     for line in lines {
@@ -1941,9 +1943,13 @@ pub fn store(
     if !vapache_verified::cache_store_status_admit(resp.status) {
         return;
     }
+    let Ok(header_sanitizer) = crate::http::ResponseHeaderSanitizer::from_response(resp) else {
+        return;
+    };
     let response_headers: Vec<(String, Vec<u8>)> = resp
         .headers
         .iter()
+        .filter(|(name, _)| !header_sanitizer.is_hop_by_hop(name))
         .map(|(n, v)| (n.to_string(), v.clone()))
         .collect();
     let directives = cache_control_directives(&response_headers);
@@ -1960,13 +1966,8 @@ pub fn store(
     ) {
         return;
     }
-    let set_cookie = response_header(resp, "set-cookie").is_some();
-    let response_headers_for_vary: Vec<(String, Vec<u8>)> = resp
-        .headers
-        .iter()
-        .map(|(n, v)| (n.to_string(), v.clone()))
-        .collect();
-    let vary_star = combined_header(&response_headers_for_vary, "vary")
+    let set_cookie = header(&response_headers, "set-cookie").is_some();
+    let vary_star = combined_header(&response_headers, "vary")
         .map(|v| v.split(',').any(|part| part.trim() == "*"))
         .unwrap_or(false);
     #[cfg(test)]
@@ -2000,14 +2001,17 @@ pub fn store(
         return;
     }
     let mut headers = Vec::new();
-    for (name, value) in &resp.headers {
-        if HOP_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+    for (name, value) in &response_headers {
+        if CACHE_PRIVATE_HEADERS
+            .iter()
+            .any(|private| name.eq_ignore_ascii_case(private))
+            || name.eq_ignore_ascii_case("content-length")
             || name.eq_ignore_ascii_case("age")
             || name.eq_ignore_ascii_case("x-cache")
         {
             continue;
         }
-        headers.push((name.to_string(), value.clone()));
+        headers.push((name.clone(), value.clone()));
     }
     let vary = vary_values(req, &headers);
     let key = cache_key.to_string();
@@ -3204,8 +3208,8 @@ AddHandler cgi-script .cgi\n\
         let b = format!("{}\nhost\n/path\n\n{}", "/srv", key_component(&[1u8; 32]));
         assert_ne!(a, b);
         // Credentials must never be persisted as cache metadata.
-        assert!(HOP_HEADERS.contains(&"authorization"));
-        assert!(HOP_HEADERS.contains(&"proxy-authorization"));
+        assert!(CACHE_PRIVATE_HEADERS.contains(&"authorization"));
+        assert!(crate::http::ResponseHeaderSanitizer::new().is_hop_by_hop("proxy-authorization"));
     }
 
     #[test]
@@ -3978,7 +3982,7 @@ CacheIgnoreQueryString On\n\
         let corrupt_stem = cache_stem(&cfg, corrupt).unwrap();
         fs::write(
             corrupt_stem.with_extension("meta"),
-            format!("V5\nK {}\n", STANDARD.encode(corrupt.as_bytes())),
+            format!("V6\nK {}\n", STANDARD.encode(corrupt.as_bytes())),
         )
         .unwrap();
         assert!(disk_load(&cfg, corrupt).is_none());
@@ -4584,16 +4588,18 @@ CacheIgnoreQueryString On\n\
         )
         .is_some());
         assert!(decode_meta(b"not-a-metadata-version\n").is_none());
-        // V4 carried the pre-P26 cache semantics. It remains decodable for
-        // diagnostics but can never supply the exact current-format key used
-        // by disk_load, so an upgrade cannot serve a stale trailing-slash 200.
+        // Historical metadata remains decodable for diagnostics but can
+        // never supply the exact current-format key used by disk_load. V6
+        // also invalidates V5 entries that may have lost Connection
+        // nominations while persisting their nominated fields.
         let legacy_v4 = format!(
             "V4\nS 200\nT 1\nE 2\nP {}\nG 1\n",
             STANDARD.encode([0u8; 32])
         );
         assert!(decode_meta(legacy_v4.as_bytes()).is_some());
         assert!(decode_meta_key(b"V4\nK YQ==\n").is_none());
-        assert!(decode_meta_key(b"V5\nS 200\n").is_none());
+        assert!(decode_meta_key(b"V5\nK YQ==\n").is_none());
+        assert!(decode_meta_key(b"V6\nS 200\n").is_none());
 
         let mut invalid_conditional = test_request();
         invalid_conditional
@@ -4606,12 +4612,12 @@ CacheIgnoreQueryString On\n\
             &mut conditional_response,
         ));
 
-        let legacy_key = "pre-p26-trailing-slash";
+        let legacy_key = "pre-sanitizer-connection-nomination";
         let legacy_entry = disk_entry(b"SECRET-CONTENT", unix_now() + 60);
         let legacy_stem = cache_stem(&cfg, legacy_key).unwrap();
         fs::create_dir_all(legacy_stem.parent().unwrap()).unwrap();
         let mut legacy_meta = encode_meta(legacy_key, &legacy_entry);
-        legacy_meta[..2].copy_from_slice(b"V4");
+        legacy_meta[..2].copy_from_slice(b"V5");
         fs::write(legacy_stem.with_extension("meta"), legacy_meta).unwrap();
         fs::write(legacy_stem.with_extension("body"), &legacy_entry.body).unwrap();
         assert!(disk_load(&cfg, legacy_key).is_none());
@@ -5049,7 +5055,10 @@ CacheIgnoreQueryString On\n\
 
         let mut stored = Response::bytes(200, "text/plain", b"ok".to_vec());
         stored.headers.extend([
-            (Cow::Borrowed("Connection"), b"close".to_vec()),
+            (Cow::Borrowed("Connection"), b"close, X-Hop".to_vec()),
+            (Cow::Borrowed("X-Hop"), b"must-not-be-replayed".to_vec()),
+            (Cow::Borrowed("Proxy-Connection"), b"keep-alive".to_vec()),
+            (Cow::Borrowed("Content-Length"), b"999".to_vec()),
             (Cow::Borrowed("Age"), b"1".to_vec()),
             (Cow::Borrowed("X-Cache"), b"old".to_vec()),
         ]);
@@ -5073,6 +5082,27 @@ CacheIgnoreQueryString On\n\
             .headers
             .iter()
             .any(|(n, v)| n.eq_ignore_ascii_case("x-cache") && v == b"MISS"));
+        {
+            let cache = entries().lock().unwrap();
+            let cached = cache.entries["new-key"].last().unwrap();
+            for removed in [
+                "connection",
+                "x-hop",
+                "proxy-connection",
+                "content-length",
+                "age",
+                "x-cache",
+            ] {
+                assert!(
+                    !cached
+                        .headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case(removed)),
+                    "cached hop-by-hop/transport field {removed}"
+                );
+            }
+        }
+        entries().lock().unwrap().entries.remove("new-key");
 
         let policy = cache_policy_fingerprint(&scope, &base_req, peer, target);
         let mut variants = MemoryCache::default();

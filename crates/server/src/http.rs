@@ -9,6 +9,7 @@
 use crate::resource::{ResidentLease, ResourceBudget, SpoolLease};
 use crate::util::with_http_date_now;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
@@ -2098,6 +2099,8 @@ impl Drop for ResponseOwnership {
 
 pub const MAX_RESPONSE_HEADERS: usize = 256;
 pub const MAX_RESPONSE_HEADER_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_RESPONSE_CONNECTION_OPTIONS: usize = 64;
+pub(crate) const MAX_RESPONSE_CONNECTION_OPTION_BYTES: usize = 4 * 1024;
 
 pub(crate) fn response_headers_admitted(resp: &Response) -> bool {
     let count = resp.headers.len().saturating_add(3);
@@ -2115,17 +2118,40 @@ pub(crate) fn response_headers_admitted(resp: &Response) -> bool {
     )
 }
 
-/// Parse response `Connection` options before serialization. The transport
-/// writer removes the field itself and every nominated field, so handler,
-/// proxy, CGI, or configuration output cannot contradict the connection
-/// lifetime selected by the server.
-pub(crate) fn response_connection_nominations(resp: &Response) -> io::Result<Vec<String>> {
-    let mut nominations = Vec::new();
-    for (_, value) in resp
-        .headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
-    {
+/// The single parser and classifier for response hop-by-hop metadata.
+///
+/// A `Connection` field can nominate arbitrary other fields for removal. The
+/// options are normalized once into a hash set so duplicate detection is
+/// linear, while explicit count and byte ceilings prevent a small response
+/// head from expanding into thousands of heap allocations. The same object is
+/// used by proxy ingestion, cache storage, and both transport writers so none
+/// of those boundaries can lose a nomination while copying headers.
+pub(crate) struct ResponseHeaderSanitizer {
+    nominations: HashSet<String>,
+    nomination_bytes: usize,
+}
+
+impl ResponseHeaderSanitizer {
+    pub(crate) fn new() -> Self {
+        Self {
+            nominations: HashSet::new(),
+            nomination_bytes: 0,
+        }
+    }
+
+    pub(crate) fn from_response(resp: &Response) -> io::Result<Self> {
+        let mut sanitizer = Self::new();
+        for (_, value) in resp
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        {
+            sanitizer.add_connection_value(value)?;
+        }
+        Ok(sanitizer)
+    }
+
+    pub(crate) fn add_connection_value(&mut self, value: &[u8]) -> io::Result<()> {
         for raw in value.split(|byte| *byte == b',') {
             let token = crate::util::trim_ascii(raw);
             if token.is_empty() || !crate::verified::valid_token(token) {
@@ -2134,41 +2160,62 @@ pub(crate) fn response_connection_nominations(resp: &Response) -> io::Result<Vec
                     "invalid response Connection option",
                 ));
             }
-            // `valid_token` admits only ASCII HTTP token bytes. Build the
-            // normalized spelling directly instead of retaining an
-            // unreachable UTF-8 error path after that validation.
+            let next_count = self.nominations.len().saturating_add(1);
+            let next_bytes = self.nomination_bytes.saturating_add(token.len());
+            if !crate::verified::response_header_budget_admit(
+                next_count as u64,
+                next_bytes as u64,
+                MAX_RESPONSE_CONNECTION_OPTIONS as u64,
+                MAX_RESPONSE_CONNECTION_OPTION_BYTES as u64,
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "response Connection options exceed configured limits",
+                ));
+            }
+            // `valid_token` admits only ASCII HTTP token bytes. Check the
+            // aggregate limits against the borrowed slice before allocating
+            // its normalized spelling.
             let token = token
                 .iter()
                 .map(|byte| char::from(byte.to_ascii_lowercase()))
                 .collect::<String>();
-            if nominations.iter().any(|existing| existing == &token) {
+            if !self.nominations.insert(token) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "duplicate response Connection option",
                 ));
             }
-            nominations.push(token);
+            self.nomination_bytes = next_bytes;
         }
+        Ok(())
     }
-    Ok(nominations)
-}
 
-pub(crate) fn response_header_is_hop_by_hop(name: &str, nominations: &[String]) -> bool {
-    const FIXED: [&str; 9] = [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-    ];
-    FIXED.iter().any(|fixed| name.eq_ignore_ascii_case(fixed))
-        || nominations
+    pub(crate) fn connection_option_count(&self) -> usize {
+        self.nominations.len()
+    }
+
+    pub(crate) fn has_connection_option(&self, name: &str) -> bool {
+        self.nominations
             .iter()
             .any(|token| name.eq_ignore_ascii_case(token))
+    }
+
+    pub(crate) fn is_hop_by_hop(&self, name: &str) -> bool {
+        const FIXED: [&str; 9] = [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ];
+        FIXED.iter().any(|fixed| name.eq_ignore_ascii_case(fixed))
+            || self.has_connection_option(name)
+    }
 }
 
 /// Return the single canonical representation length that may be emitted on
@@ -2698,13 +2745,13 @@ fn serialize_response_head(
             "response headers exceed configured count/byte limits",
         ));
     }
-    let connection_nominations = response_connection_nominations(resp)?;
+    let header_sanitizer = ResponseHeaderSanitizer::from_response(resp)?;
     let body_len = resp.body_len();
     let status = resp.status;
     let mut have_date = false;
     let mut have_server = false;
     for (n, _) in &resp.headers {
-        if response_header_is_hop_by_hop(n, &connection_nominations) {
+        if header_sanitizer.is_hop_by_hop(n) {
             continue;
         }
         if n.eq_ignore_ascii_case("date") {
@@ -2743,7 +2790,7 @@ fn serialize_response_head(
         // smuggling for the next request on the socket).
         if name.eq_ignore_ascii_case("content-length") {
             continue;
-        } else if response_header_is_hop_by_hop(name, &connection_nominations) {
+        } else if header_sanitizer.is_hop_by_hop(name) {
             continue;
         }
         // Never let an upstream/CGI/filename-derived header split the response.
@@ -5436,6 +5483,39 @@ mod tests {
                 fd: None,
             },
             &mut duplicate,
+            &response_options(),
+        )
+        .is_err());
+
+        let too_many_options = (0..=MAX_RESPONSE_CONNECTION_OPTIONS)
+            .map(|index| format!("x{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut excessive = Response::new(200);
+        excessive
+            .headers
+            .push((Cow::Borrowed("Connection"), too_many_options.into_bytes()));
+        assert!(write_response(
+            &mut TestWriter {
+                data: Vec::new(),
+                fd: None,
+            },
+            &mut excessive,
+            &response_options(),
+        )
+        .is_err());
+
+        let mut oversized = Response::new(200);
+        oversized.headers.push((
+            Cow::Borrowed("Connection"),
+            vec![b'x'; MAX_RESPONSE_CONNECTION_OPTION_BYTES + 1],
+        ));
+        assert!(write_response(
+            &mut TestWriter {
+                data: Vec::new(),
+                fd: None,
+            },
+            &mut oversized,
             &response_options(),
         )
         .is_err());

@@ -138,6 +138,23 @@ length or an exact zero length. Outbound 205 responses discard any body and
 emit the transport-owned `Content-Length: 0` needed to delimit a persistent
 HTTP/1 response.
 
+### D9: cache storage lost Connection nominations
+
+The live response writers removed both `Connection` and every field it
+nominated, but cache storage removed only the fixed hop-by-hop names. A
+configured response containing `Connection: X-Hop` and `X-Hop: secret` was
+safe on its first response, then persisted `X-Hop` without the nomination. A
+cache hit could consequently replay it as an end-to-end field.
+
+Proxy ingestion, cache storage, HTTP/1 and HTTP/2 now share one strict response
+header sanitizer. It rejects malformed and duplicate options, uses hash-set
+duplicate detection, and caps nominations at 64 options and 4 KiB before
+allocation can amplify a response head. Ordinary proxy responses no longer
+ignore malformed `Connection` list members, and WebSocket token validation uses
+the same bounded parser. Cache storage consumes the sanitized end-to-end field
+set, strips transport-owned length metadata, and writes V6 metadata; V5 and
+older disk entries are deliberately ineligible after upgrade.
+
 ## Preserved invariants
 
 - HTTP/1 body readers consume exactly the selected fixed length or the complete
@@ -154,8 +171,9 @@ HTTP/1 response.
   HTTP/1.1 101 has passed complete handshake validation.
 - HTTP/1 and HTTP/2 response writers own framing and share the same
   status-aware `Content-Length` preservation rule.
-- The writers also own connection state: fixed and nominated hop-by-hop fields
-  cannot cross from an application response into either protocol.
+- Proxy ingestion, cache storage and both writers share one bounded connection
+  state parser; fixed or nominated hop-by-hop fields cannot be resurrected by
+  an intermediate representation.
 
 ## Regression and proof coverage
 

@@ -1438,20 +1438,10 @@ async fn read_async_head<S: AsyncRead + Unpin>(
     }
 }
 
-fn strict_connection_tokens(value: &[u8]) -> Option<Vec<String>> {
-    let mut out = Vec::new();
-    for raw in value.split(|byte| *byte == b',') {
-        let token = trim_ascii_bytes(raw);
-        if token.is_empty() || !crate::verified::valid_token(token) {
-            return None;
-        }
-        let token = String::from_utf8(token.to_ascii_lowercase()).ok()?;
-        if out.iter().any(|existing| existing == &token) {
-            return None;
-        }
-        out.push(token);
-    }
-    Some(out)
+fn strict_connection_options(value: &[u8]) -> Option<crate::http::ResponseHeaderSanitizer> {
+    let mut options = crate::http::ResponseHeaderSanitizer::new();
+    options.add_connection_value(value).ok()?;
+    Some(options)
 }
 
 fn websocket_response_status(head: &[u8]) -> std::io::Result<u16> {
@@ -1516,8 +1506,10 @@ fn canonical_websocket_switching_head(
         let lower = name.to_ascii_lowercase();
         match lower.as_slice() {
             b"upgrade" => {
-                let canonical = strict_connection_tokens(value)
-                    .is_some_and(|tokens| tokens.as_slice() == ["websocket"]);
+                let canonical = strict_connection_options(value).is_some_and(|options| {
+                    options.connection_option_count() == 1
+                        && options.has_connection_option("websocket")
+                });
                 if saw_upgrade || !canonical {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -1527,8 +1519,10 @@ fn canonical_websocket_switching_head(
                 saw_upgrade = true;
             }
             b"connection" => {
-                let canonical = strict_connection_tokens(value)
-                    .is_some_and(|tokens| tokens.as_slice() == ["upgrade"]);
+                let canonical = strict_connection_options(value).is_some_and(|options| {
+                    options.connection_option_count() == 1
+                        && options.has_connection_option("upgrade")
+                });
                 if saw_connection || !canonical {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -2520,7 +2514,7 @@ fn proxy_once_budgeted(
     }
     let mut headers: Vec<(String, Vec<u8>)> = Vec::new();
     let mut framing_headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut connection_header_tokens: Vec<String> = Vec::new();
+    let mut header_sanitizer = crate::http::ResponseHeaderSanitizer::new();
     let mut header_count = 0usize;
     let mut head_bytes = status_line.len();
     loop {
@@ -2573,10 +2567,10 @@ fn proxy_once_budgeted(
             continue;
         }
         if name == "connection" {
-            connection_header_tokens.extend(connection_tokens(value));
+            header_sanitizer.add_connection_value(value)?;
             continue;
         }
-        if hop_by_hop(&name) {
+        if header_sanitizer.is_hop_by_hop(&name) || name == "host" {
             continue;
         }
         if name == "location" {
@@ -2598,11 +2592,7 @@ fn proxy_once_budgeted(
         };
         headers.push((name, clean));
     }
-    headers.retain(|(name, _)| {
-        !connection_header_tokens
-            .iter()
-            .any(|token| token.eq_ignore_ascii_case(name))
-    });
+    headers.retain(|(name, _)| !header_sanitizer.is_hop_by_hop(name));
     let framing =
         crate::verified::proxy_response_framing(req.method == "HEAD", status, &framing_headers)
             .ok_or_else(|| {
@@ -5136,6 +5126,23 @@ mod coverage_tests {
             Body::Bytes(body) => assert_eq!(body, b"ok"),
             _ => panic!("expected bytes"),
         }
+
+        let (resp, _) = run(
+            "HTTP/1.1 200 OK\r\nX-Hop: secret\r\nConnection: X-Hop\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert!(!resp
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-hop")));
+        assert!(
+            run("HTTP/1.1 200 OK\r\nConnection: X-Hop,,close\r\nContent-Length: 0\r\n\r\n")
+                .is_err()
+        );
+        assert!(
+            run("HTTP/1.1 200 OK\r\nConnection: X-Hop, x-hop\r\nContent-Length: 0\r\n\r\n")
+                .is_err()
+        );
 
         let (resp, _) = run("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
         assert_eq!(resp.status, 204);
