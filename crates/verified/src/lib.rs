@@ -2466,6 +2466,38 @@ pub proof fn admitted_response_headers_are_bounded(
 {
 }
 
+/// A backend may select a WebSocket negotiation item only when its syntax was
+/// accepted, the client offered it, and the switching response did not make
+/// the selection ambiguous by repeating it.
+pub open spec fn websocket_negotiation_selection_spec(
+    syntax_valid: bool,
+    offered: bool,
+    duplicate: bool,
+) -> bool {
+    syntax_valid && offered && !duplicate
+}
+
+pub fn websocket_negotiation_selection_admit(
+    syntax_valid: bool,
+    offered: bool,
+    duplicate: bool,
+) -> (ok: bool)
+    ensures
+        ok == websocket_negotiation_selection_spec(syntax_valid, offered, duplicate),
+{
+    syntax_valid && offered && !duplicate
+}
+
+pub proof fn rejected_websocket_negotiation_is_not_admitted(
+    syntax_valid: bool,
+    offered: bool,
+    duplicate: bool,
+)
+    requires !syntax_valid || !offered || duplicate,
+    ensures !websocket_negotiation_selection_spec(syntax_valid, offered, duplicate),
+{
+}
+
 /// Admission for the breadth of the access-file program participating in one
 /// request.  `next_instructions` is checked by subtraction so the concrete
 /// accumulator cannot overflow while walking ancestor layers.

@@ -101,6 +101,30 @@ only disk metadata generation eligible for lookup; older entries remain
 decodable for bounded cleanup and diagnostics but cannot provide a live cache
 key.
 
+### R7: WebSocket negotiation selections were not bound to the client offer
+
+The WebSocket switching path strictly validated `Upgrade`, `Connection` and
+`Sec-WebSocket-Accept`, but treated `Sec-WebSocket-Protocol` and
+`Sec-WebSocket-Extensions` as ordinary response fields. A malicious backend
+could therefore select an unoffered subprotocol or extension, repeat a
+selection, return malformed extension parameters, or use duplicate parameter
+names. The raw 101 parser also had a byte ceiling but no independent header
+count ceiling.
+
+Client offers now compile into a bounded typed negotiation model before
+routing or upstream connection. Subprotocol tokens must be unique and
+extension lists must satisfy the RFC 6455 token/quoted-token grammar, with
+unique parameter names and explicit item/parameter ceilings. A backend may
+select exactly one offered subprotocol and only offered, non-duplicated
+extension names. Request-only WebSocket fields are rejected in a 101,
+response header count and bytes are jointly bounded, and admitted selections
+are serialized into one canonical field per negotiation dimension. Extension-
+specific parameter semantics remain correctly owned by the WebSocket client
+and application endpoint; the proxy enforces the generic wire grammar and
+offer/selection relationship without pretending to implement each extension.
+The selection gate is an executable Verus predicate proving that malformed,
+unoffered or duplicate selections cannot be admitted.
+
 ## Boundaries reviewed without a new finding
 
 - HTTP proxy response lines require strict CRLF, a valid HTTP/1 status and no
@@ -116,9 +140,6 @@ key.
 - Proxy and FastCGI bodies have explicit output ceilings and aggregate spool
   accounting. Large fixed-length proxy bodies stream with an exact remaining
   length.
-- WebSocket is the sole raw response transition. Its 101 response is parsed,
-  validates unique handshake fields and framing exclusions, and is rebuilt
-  canonically before tunneling begins.
 
 ## Retained evidence
 
@@ -131,10 +152,16 @@ The primary deterministic regressions are:
 - `expires::tests::apply_covers_inactive_status_invalid_and_cache_control_edges`
 - `cgi::tests::parse_cgi_response_edge_cases`
 - `proxy::tests::proxy_response_success_and_streaming`
+- `proxy::coverage_tests::websocket_negotiation_is_typed_bounded_and_offer_bound`
+- `proxy::coverage_tests::websocket_async_binds_backend_negotiation_to_client_offer`
+- `proxy::coverage_tests::websocket_async_rejects_unoffered_backend_selection`
 - `fastcgi::tests::response_reader_unknown_records_and_output_limit`
 - `h2::tests::response_sender_covers_stream_and_every_file_strategy`
 
 The CGI, proxy and FastCGI fuzz targets now continue through the semantic
-response/cache-policy boundary after successful wire parsing. Verus proves
-the three-way `BackendConnectionDisposition` decision, including that framing
-nominations reject and stripped end-to-end metadata never becomes cacheable.
+response/cache-policy boundary after successful wire parsing. A dedicated
+WebSocket negotiation target exercises client protocol/extension offers, raw
+101 parsing and structured selection responses. Verus proves the three-way
+`BackendConnectionDisposition` decision, including that framing nominations
+reject and stripped end-to-end metadata never becomes cacheable, plus the
+WebSocket selection admission rule.

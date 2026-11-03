@@ -70,6 +70,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "websocket_negotiation"
+path = "fuzz_targets/websocket_negotiation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rewrite_expr"
 path = "fuzz_targets/rewrite_expr.rs"
 test = false

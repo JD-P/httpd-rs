@@ -28,6 +28,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 const MAX_PROXY_HEAD: usize = 64 * 1024;
 const MAX_PROXY_BODY: usize = 64 * 1024 * 1024;
 const MAX_PROXY_BODY_IN_MEMORY: usize = 256 * 1024;
+const MAX_WEBSOCKET_NEGOTIATION_ITEMS: usize = 64;
+const MAX_WEBSOCKET_EXTENSION_PARAMS: usize = 32;
 const MAX_PROXY_CA_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PROXY_ADDRESSES: usize = 32;
 const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1460,6 +1462,218 @@ fn strict_connection_options(value: &[u8]) -> Option<crate::http::ResponseHeader
     Some(options)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WebSocketExtension {
+    name: Vec<u8>,
+    params: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WebSocketOffer {
+    protocols: Vec<Vec<u8>>,
+    extensions: Vec<WebSocketExtension>,
+}
+
+fn invalid_websocket_negotiation(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+fn skip_websocket_ows(value: &[u8], cursor: &mut usize) {
+    while value
+        .get(*cursor)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        *cursor += 1;
+    }
+}
+
+fn parse_websocket_token<'a>(value: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    let start = *cursor;
+    while value
+        .get(*cursor)
+        .is_some_and(|byte| crate::verified::valid_token(std::slice::from_ref(byte)))
+    {
+        *cursor += 1;
+    }
+    (*cursor > start).then_some(&value[start..*cursor])
+}
+
+fn parse_websocket_quoted(value: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
+    if value.get(*cursor) != Some(&b'"') {
+        return None;
+    }
+    *cursor += 1;
+    let mut decoded = Vec::new();
+    while let Some(byte) = value.get(*cursor).copied() {
+        *cursor += 1;
+        match byte {
+            b'"' => return Some(decoded),
+            b'\\' => {
+                let escaped = value.get(*cursor).copied()?;
+                if !(escaped == b'\t' || (b' '..=b'~').contains(&escaped) || escaped >= 0x80) {
+                    return None;
+                }
+                *cursor += 1;
+                decoded.push(escaped);
+            }
+            b'\t' | b' ' | b'!' | b'#'..=b'[' | b']'..=b'~' => decoded.push(byte),
+            0x80..=0xff => decoded.push(byte),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn parse_websocket_protocol_values<'a>(
+    values: impl IntoIterator<Item = &'a [u8]>,
+) -> std::io::Result<Vec<Vec<u8>>> {
+    let mut protocols: Vec<Vec<u8>> = Vec::new();
+    for value in values {
+        for raw in value.split(|byte| *byte == b',') {
+            let protocol = trim_ascii_bytes(raw);
+            if !crate::verified::valid_token(protocol)
+                || protocols.iter().any(|seen| seen.as_slice() == protocol)
+                || protocols.len() >= MAX_WEBSOCKET_NEGOTIATION_ITEMS
+            {
+                return Err(invalid_websocket_negotiation(
+                    "invalid or duplicate WebSocket subprotocol",
+                ));
+            }
+            protocols.push(protocol.to_vec());
+        }
+    }
+    Ok(protocols)
+}
+
+fn parse_websocket_extension_values<'a>(
+    values: impl IntoIterator<Item = &'a [u8]>,
+) -> std::io::Result<Vec<WebSocketExtension>> {
+    let mut extensions = Vec::new();
+    for value in values {
+        let mut cursor = 0usize;
+        skip_websocket_ows(value, &mut cursor);
+        if cursor == value.len() {
+            return Err(invalid_websocket_negotiation(
+                "empty WebSocket extension offer",
+            ));
+        }
+        loop {
+            if extensions.len() >= MAX_WEBSOCKET_NEGOTIATION_ITEMS {
+                return Err(invalid_websocket_negotiation(
+                    "too many WebSocket extension offers",
+                ));
+            }
+            let name = parse_websocket_token(value, &mut cursor)
+                .ok_or_else(|| invalid_websocket_negotiation("invalid WebSocket extension"))?
+                .to_vec();
+            let mut params: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+            skip_websocket_ows(value, &mut cursor);
+            while value.get(cursor) == Some(&b';') {
+                cursor += 1;
+                skip_websocket_ows(value, &mut cursor);
+                let param_name = parse_websocket_token(value, &mut cursor)
+                    .ok_or_else(|| {
+                        invalid_websocket_negotiation("invalid WebSocket extension parameter")
+                    })?
+                    .to_vec();
+                if params.len() >= MAX_WEBSOCKET_EXTENSION_PARAMS
+                    || params.iter().any(|(seen, _)| {
+                        seen.as_slice().eq_ignore_ascii_case(param_name.as_slice())
+                    })
+                {
+                    return Err(invalid_websocket_negotiation(
+                        "duplicate or excessive WebSocket extension parameter",
+                    ));
+                }
+                skip_websocket_ows(value, &mut cursor);
+                let param_value = if value.get(cursor) == Some(&b'=') {
+                    cursor += 1;
+                    skip_websocket_ows(value, &mut cursor);
+                    let parsed = if value.get(cursor) == Some(&b'"') {
+                        parse_websocket_quoted(value, &mut cursor)
+                            .filter(|decoded| crate::verified::valid_token(decoded))
+                    } else {
+                        parse_websocket_token(value, &mut cursor).map(<[u8]>::to_vec)
+                    }
+                    .ok_or_else(|| {
+                        invalid_websocket_negotiation("invalid WebSocket extension parameter value")
+                    })?;
+                    Some(parsed)
+                } else {
+                    None
+                };
+                params.push((param_name, param_value));
+                skip_websocket_ows(value, &mut cursor);
+            }
+            extensions.push(WebSocketExtension { name, params });
+            match value.get(cursor) {
+                None => break,
+                Some(b',') => {
+                    cursor += 1;
+                    skip_websocket_ows(value, &mut cursor);
+                    if cursor == value.len() {
+                        return Err(invalid_websocket_negotiation(
+                            "trailing comma in WebSocket extensions",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(invalid_websocket_negotiation(
+                        "invalid WebSocket extension separator",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(extensions)
+}
+
+fn websocket_offer(req: &Request) -> std::io::Result<WebSocketOffer> {
+    Ok(WebSocketOffer {
+        protocols: parse_websocket_protocol_values(req.headers.get_all("sec-websocket-protocol"))?,
+        extensions: parse_websocket_extension_values(
+            req.headers.get_all("sec-websocket-extensions"),
+        )?,
+    })
+}
+
+/// Validate optional negotiation fields before routing or opening an upstream
+/// connection. The core Upgrade fields are checked by [`is_websocket`].
+pub fn websocket_negotiation_offer_valid(req: &Request) -> bool {
+    websocket_offer(req).is_ok()
+}
+
+fn append_websocket_extensions(out: &mut Vec<u8>, extensions: &[WebSocketExtension]) {
+    let mut value = Vec::new();
+    for (extension_index, extension) in extensions.iter().enumerate() {
+        if extension_index != 0 {
+            value.extend_from_slice(b", ");
+        }
+        value.extend_from_slice(&extension.name);
+        for (name, parameter) in &extension.params {
+            value.extend_from_slice(b"; ");
+            value.extend_from_slice(name);
+            let Some(parameter) = parameter else {
+                continue;
+            };
+            value.push(b'=');
+            if crate::verified::valid_token(parameter) {
+                value.extend_from_slice(parameter);
+            } else {
+                value.push(b'"');
+                for byte in parameter {
+                    if matches!(byte, b'"' | b'\\') {
+                        value.push(b'\\');
+                    }
+                    value.push(*byte);
+                }
+                value.push(b'"');
+            }
+        }
+    }
+    append_proxy_header(out, b"Sec-WebSocket-Extensions", &value);
+}
+
 fn websocket_response_status(head: &[u8]) -> std::io::Result<u16> {
     let mut reader = BufReader::new(std::io::Cursor::new(head));
     let status_line = read_line(&mut reader)?;
@@ -1485,6 +1699,7 @@ fn websocket_response_status(head: &[u8]) -> std::io::Result<u16> {
 fn canonical_websocket_switching_head(
     head: &[u8],
     expected_accept: &str,
+    offer: &WebSocketOffer,
 ) -> std::io::Result<Vec<u8>> {
     let mut reader = BufReader::new(std::io::Cursor::new(head));
     let status_line = read_line(&mut reader)?;
@@ -1499,11 +1714,25 @@ fn canonical_websocket_switching_head(
     let mut saw_upgrade = false;
     let mut saw_connection = false;
     let mut saw_accept = false;
+    let mut selected_protocol = None;
+    let mut extension_fields = Vec::new();
     let mut forwarded = Vec::new();
+    let mut header_count = 0usize;
     loop {
         let line = read_line(&mut reader)?;
         if line.is_empty() {
             break;
+        }
+        header_count = header_count.saturating_add(1);
+        if !crate::verified::response_header_budget_admit(
+            header_count as u64,
+            head.len() as u64,
+            MAX_PROXY_HEADERS as u64,
+            MAX_PROXY_HEAD as u64,
+        ) {
+            return Err(invalid_websocket_negotiation(
+                "WebSocket response headers exceed budget",
+            ));
         }
         let colon = line.iter().position(|byte| *byte == b':').ok_or_else(|| {
             std::io::Error::new(
@@ -1556,6 +1785,32 @@ fn canonical_websocket_switching_head(
                 }
                 saw_accept = true;
             }
+            b"sec-websocket-protocol" => {
+                let protocols = parse_websocket_protocol_values([value])?;
+                let protocol = protocols.first();
+                let offered = protocol.is_some_and(|protocol| {
+                    offer
+                        .protocols
+                        .iter()
+                        .any(|candidate| candidate == protocol)
+                });
+                if !crate::verified::websocket_negotiation_selection_admit(
+                    protocols.len() == 1,
+                    offered,
+                    selected_protocol.is_some(),
+                ) {
+                    return Err(invalid_websocket_negotiation(
+                        "unoffered or ambiguous WebSocket subprotocol",
+                    ));
+                }
+                selected_protocol = protocol.cloned();
+            }
+            b"sec-websocket-extensions" => extension_fields.push(value.to_vec()),
+            b"sec-websocket-key" | b"sec-websocket-version" => {
+                return Err(invalid_websocket_negotiation(
+                    "request-only field in WebSocket switching response",
+                ));
+            }
             b"content-length"
             | b"transfer-encoding"
             | b"proxy-connection"
@@ -1579,6 +1834,30 @@ fn canonical_websocket_switching_head(
         ));
     }
 
+    let selected_extensions =
+        parse_websocket_extension_values(extension_fields.iter().map(Vec::as_slice))?;
+    let mut admitted_extensions: Vec<WebSocketExtension> = Vec::new();
+    for extension in selected_extensions {
+        let offered = offer.extensions.iter().any(|candidate| {
+            candidate
+                .name
+                .as_slice()
+                .eq_ignore_ascii_case(extension.name.as_slice())
+        });
+        let duplicate = admitted_extensions.iter().any(|candidate| {
+            candidate
+                .name
+                .as_slice()
+                .eq_ignore_ascii_case(extension.name.as_slice())
+        });
+        if !crate::verified::websocket_negotiation_selection_admit(true, offered, duplicate) {
+            return Err(invalid_websocket_negotiation(
+                "unoffered or duplicate WebSocket extension selection",
+            ));
+        }
+        admitted_extensions.push(extension);
+    }
+
     let mut canonical =
         b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
             .to_vec();
@@ -1587,10 +1866,26 @@ fn canonical_websocket_switching_head(
         b"Sec-WebSocket-Accept",
         expected_accept.as_bytes(),
     );
+    if let Some(protocol) = selected_protocol {
+        append_proxy_header(&mut canonical, b"Sec-WebSocket-Protocol", &protocol);
+    }
+    if !admitted_extensions.is_empty() {
+        append_websocket_extensions(&mut canonical, &admitted_extensions);
+    }
     for (name, value) in forwarded {
         append_proxy_header(&mut canonical, &name, &value);
     }
     canonical.extend_from_slice(b"\r\n");
+    if !crate::verified::response_header_budget_admit(
+        header_count as u64,
+        canonical.len() as u64,
+        MAX_PROXY_HEADERS as u64,
+        MAX_PROXY_HEAD as u64,
+    ) {
+        return Err(invalid_websocket_negotiation(
+            "canonical WebSocket response exceeds budget",
+        ));
+    }
     Ok(canonical)
 }
 
@@ -2038,6 +2333,10 @@ pub(crate) async fn websocket_async_with_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Parse the client's complete optional negotiation surface before any
+    // routing side effect or upstream connection. The resulting typed offer
+    // is the authority used to validate the backend's 101 selection.
+    let websocket_offer = websocket_offer(req)?;
     if !proxy_path_identity_safe(&resource.url_path, &target.path)
         || target.path.bytes().any(|byte| byte < b' ' || byte == 0x7f)
     {
@@ -2151,7 +2450,8 @@ where
                 "invalid WebSocket client key",
             )
         })?;
-        let canonical = canonical_websocket_switching_head(&response.head, &expected)?;
+        let canonical =
+            canonical_websocket_switching_head(&response.head, &expected, &websocket_offer)?;
         tokio::time::timeout(timeout, client.write_all(&canonical))
             .await
             .map_err(|_| {
@@ -2829,6 +3129,31 @@ pub fn fuzz_parse_proxy_response(data: &[u8]) {
     ) {
         let _ = crate::http::response_cache_control(&response);
     }
+}
+
+/// Exercise all three untrusted WebSocket negotiation grammars: client
+/// subprotocol offers, extension offers/selections, and the backend's raw 101
+/// response. The fixed offer deliberately contains multiple alternatives so
+/// the fuzzer can reach admitted as well as rejected selection paths.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_websocket_negotiation(data: &[u8]) {
+    let _ = parse_websocket_protocol_values([data]);
+    let _ = parse_websocket_extension_values([data]);
+    let offer = WebSocketOffer {
+        protocols: vec![b"chat".to_vec(), b"superchat".to_vec()],
+        extensions: parse_websocket_extension_values([
+            b"permessage-deflate; client_max_window_bits, x-test; mode=safe".as_slice(),
+        ])
+        .expect("static WebSocket offer is valid"),
+    };
+    let _ = canonical_websocket_switching_head(data, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &offer);
+    let mut structured = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n".to_vec();
+    if !data.is_empty() {
+        structured.extend_from_slice(data);
+        structured.extend_from_slice(b"\r\n");
+    }
+    structured.extend_from_slice(b"\r\n");
+    let _ = canonical_websocket_switching_head(&structured, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &offer);
 }
 
 fn alternate_target(
@@ -4785,7 +5110,9 @@ mod coverage_tests {
         let good = format!(
             "HTTP/1.1 101 Anything\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\nX-Raw: abc\r\n\r\n"
         );
-        let canonical = canonical_websocket_switching_head(good.as_bytes(), &accept).unwrap();
+        let offer = WebSocketOffer::default();
+        let canonical =
+            canonical_websocket_switching_head(good.as_bytes(), &accept, &offer).unwrap();
         assert!(canonical.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
         assert!(canonical
             .windows(b"X-Raw: abc\r\n".len())
@@ -4798,7 +5125,9 @@ mod coverage_tests {
             format!("HTTP/1.1 101 OK\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"),
             format!("HTTP/1.1 101 OK\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"),
         ] {
-            assert!(canonical_websocket_switching_head(bad.as_bytes(), &accept).is_err());
+            assert!(
+                canonical_websocket_switching_head(bad.as_bytes(), &accept, &offer).is_err()
+            );
         }
 
         assert_eq!(encode_proxy_path("/a b%\u{7f}?#"), "/a%20b%25%7F%3F%23");
@@ -4820,6 +5149,103 @@ mod coverage_tests {
         assert!(!valid_forwarded_host("bad host"));
         assert!(!valid_forwarded_host(""));
         assert!(client_config(&Scope::default()).is_ok());
+    }
+
+    #[test]
+    fn websocket_negotiation_is_typed_bounded_and_offer_bound() {
+        let mut request = req("/ws");
+        request
+            .headers
+            .push("Sec-WebSocket-Protocol", "chat, superchat");
+        request.headers.push(
+            "Sec-WebSocket-Extensions",
+            "permessage-deflate; client_max_window_bits, x-test; mode=\"safe\"",
+        );
+        let offer = websocket_offer(&request).unwrap();
+        assert!(websocket_negotiation_offer_valid(&request));
+        let mut malformed_request = request.clone();
+        malformed_request
+            .headers
+            .insert("Sec-WebSocket-Protocol", b"chat, chat".to_vec());
+        assert!(!websocket_negotiation_offer_valid(&malformed_request));
+        assert_eq!(offer.protocols, [b"chat".to_vec(), b"superchat".to_vec()]);
+        assert_eq!(offer.extensions.len(), 2);
+
+        let accept = websocket_accept("dGhlIHNhbXBsZSBub25jZQ==").unwrap();
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: chat\r\nSec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=12\r\n\r\n"
+        );
+        let canonical =
+            canonical_websocket_switching_head(response.as_bytes(), &accept, &offer).unwrap();
+        assert!(canonical
+            .windows(b"Sec-WebSocket-Protocol: chat\r\n".len())
+            .any(|window| window == b"Sec-WebSocket-Protocol: chat\r\n"));
+        assert!(canonical
+            .windows(
+                b"Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=12\r\n"
+                    .len()
+            )
+            .any(|window| window
+                == b"Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=12\r\n"));
+
+        for invalid in ["chat, chat", "chat,", "chat bad", ",chat"] {
+            assert!(parse_websocket_protocol_values([invalid.as_bytes()]).is_err());
+        }
+        for invalid in [
+            "permessage-deflate; mode=",
+            "permessage-deflate; mode=a; MODE=b",
+            "permessage-deflate,",
+            ",permessage-deflate",
+            "permessage-deflate; mode=\"unterminated",
+            "permessage-deflate; mode=\"safe mode\"",
+            "permessage-deflate; mode=\"bad\rvalue\"",
+        ] {
+            assert!(parse_websocket_extension_values([invalid.as_bytes()]).is_err());
+        }
+        let too_many_protocols = (0..=MAX_WEBSOCKET_NEGOTIATION_ITEMS)
+            .map(|index| format!("p{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_websocket_protocol_values([too_many_protocols.as_bytes()]).is_err());
+        let too_many_extensions = (0..=MAX_WEBSOCKET_NEGOTIATION_ITEMS)
+            .map(|index| format!("x{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_websocket_extension_values([too_many_extensions.as_bytes()]).is_err());
+        let too_many_parameters = (0..=MAX_WEBSOCKET_EXTENSION_PARAMS)
+            .map(|index| format!("; p{index}=v"))
+            .collect::<String>();
+        assert!(
+            parse_websocket_extension_values([format!("x{too_many_parameters}").as_bytes()])
+                .is_err()
+        );
+
+        for selected in [
+            "Sec-WebSocket-Protocol: unoffered\r\n",
+            "Sec-WebSocket-Protocol: chat, superchat\r\n",
+            "Sec-WebSocket-Protocol: chat\r\nSec-WebSocket-Protocol: chat\r\n",
+            "Sec-WebSocket-Extensions: unknown\r\n",
+            "Sec-WebSocket-Extensions: permessage-deflate, PERMESSAGE-DEFLATE\r\n",
+            "Sec-WebSocket-Extensions: permessage-deflate; a=1; A=2\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+        ] {
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n{selected}\r\n"
+            );
+            assert!(
+                canonical_websocket_switching_head(response.as_bytes(), &accept, &offer).is_err()
+            );
+        }
+
+        let mut excessive = String::from(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n",
+        );
+        for _ in 0..MAX_PROXY_HEADERS {
+            excessive.push_str("X-Fill: x\r\n");
+        }
+        excessive.push_str(&format!("Sec-WebSocket-Accept: {accept}\r\n\r\n"));
+        assert!(canonical_websocket_switching_head(excessive.as_bytes(), &accept, &offer).is_err());
     }
 
     #[test]
@@ -5805,6 +6231,105 @@ mod coverage_tests {
             .windows(b"x-raw: a\xffb\r\n".len())
             .any(|window| window == b"x-raw: a\xffb\r\n"));
         assert!(request.ends_with(b"hello"));
+    }
+
+    #[tokio::test]
+    async fn websocket_async_binds_backend_negotiation_to_client_offer() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let accept = websocket_accept(key).unwrap();
+        let switching_response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: chat\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n\r\nfirst-frame"
+        )
+        .into_bytes();
+        let (port, upstream) = spawn_upstream(switching_response, false).await;
+        let mut r = ws_request(key);
+        r.headers.push("Sec-WebSocket-Protocol", "chat, superchat");
+        r.headers.push(
+            "Sec-WebSocket-Extensions",
+            "permessage-deflate; client_max_window_bits",
+        );
+        let (cfg, scope, r, target, grant, resource) = ws_context(port, &r);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move {
+            websocket_async(
+                &cfg,
+                &scope,
+                &r,
+                &target,
+                &grant,
+                &resource,
+                server,
+                "127.0.0.1:1".parse().unwrap(),
+                false,
+                "client.example",
+                &[],
+            )
+            .await
+        });
+        let mut response = Vec::new();
+        while !response.ends_with(b"first-frame") {
+            let mut chunk = [0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut chunk))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(n, 0);
+            response.extend_from_slice(&chunk[..n]);
+        }
+        assert!(response
+            .windows(b"Sec-WebSocket-Protocol: chat\r\n".len())
+            .any(|window| window == b"Sec-WebSocket-Protocol: chat\r\n"));
+        assert!(response
+            .windows(
+                b"Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n"
+                    .len()
+            )
+            .any(|window| {
+                window
+                    == b"Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n"
+            }));
+        drop(client);
+        assert!(tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+        let request = upstream.await.unwrap();
+        assert!(request
+            .windows(b"sec-websocket-protocol: chat, superchat\r\n".len())
+            .any(|window| window == b"sec-websocket-protocol: chat, superchat\r\n"));
+    }
+
+    #[tokio::test]
+    async fn websocket_async_rejects_unoffered_backend_selection() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let accept = websocket_accept(key).unwrap();
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: admin\r\n\r\n"
+        )
+        .into_bytes();
+        let (port, upstream) = spawn_upstream(response, false).await;
+        let mut r = ws_request(key);
+        r.headers.push("Sec-WebSocket-Protocol", "chat");
+        let (cfg, scope, r, target, grant, resource) = ws_context(port, &r);
+        let (_client, server) = tokio::io::duplex(1024);
+        let error = websocket_async(
+            &cfg,
+            &scope,
+            &r,
+            &target,
+            &grant,
+            &resource,
+            server,
+            "127.0.0.1:1".parse().unwrap(),
+            false,
+            "client.example",
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let _ = upstream.await;
     }
 
     #[tokio::test]

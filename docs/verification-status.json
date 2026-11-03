@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-03",
   "verus": {
-    "verified_functions": 665,
+    "verified_functions": 667,
     "errors": 0
   },
   "obligations": [
@@ -630,6 +630,7 @@
     "Configuration/filesystem text identity admission: invalid UTF-8 is rejected before policy parsing or request planning",
     "FastCGI environment provenance admission and tagged merge: main configuration allowed, access-file origin rejected without origin upgrades",
     "Process-global compatibility capability admission and disabled-surface rejection",
-    "Privilege-drop service identity and pidfd process-control admission"
+    "Privilege-drop service identity and pidfd process-control admission",
+    "WebSocket negotiation selection syntax, offered-set and uniqueness admission"
   ]
 }

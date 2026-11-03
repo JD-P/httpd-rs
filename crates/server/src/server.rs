@@ -1005,6 +1005,10 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
         // WebSocket upgrades need the raw connection after the 101 response;
         // the normal Response pipeline only supports buffered bodies.
         if proxy::is_websocket(&req) {
+            if !proxy::websocket_negotiation_offer_valid(&req) {
+                let _ = write_ws_error(stream, &cfg, 400, b"bad WebSocket negotiation offer");
+                return Ok(false);
+            }
             // Upgrade routing performs scope evaluation, access-file parsing,
             // rewrite processing and proxy authorization before ordinary
             // dispatch. Bind those helpers to the same validated request
@@ -8094,6 +8098,11 @@ mod tests {
             result.unwrap();
             assert_eq!(cov_status(&text), 400, "{path}: {text}");
         }
+        let malformed_negotiation = cov_ws_request("/file.txt")
+            .replace("\r\n\r\n", "\r\nSec-WebSocket-Protocol: chat, chat\r\n\r\n");
+        let (text, result) = cov_run_conn(&cfg, &malformed_negotiation, 80);
+        result.unwrap();
+        assert_eq!(cov_status(&text), 400, "{text}");
         let mut raw_ws = b"GET /".to_vec();
         raw_ws.push(0xff);
         raw_ws.extend_from_slice(
