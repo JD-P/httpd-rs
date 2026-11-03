@@ -1,0 +1,23 @@
+baseline: status=b'200' reset=None terminated=None body=10
+before trickle: status=None reset=7 terminated=None body=0
+t=40s grants_ok=512 failed=0 victim=status=None reset=7 terminated=None body=0
+t=80s grants_ok=1024 failed=0 victim=status=None reset=7 terminated=None body=0
+t=120s grants_ok=1536 failed=0 victim=status=None reset=7 terminated=None body=0
+t=160s grants_ok=2048 failed=0 victim=status=None reset=7 terminated=None body=0
+t=200s grants_ok=2560 failed=0 victim=status=None reset=7 terminated=None body=0
+t=240s grants_ok=3072 failed=0 victim=status=None reset=7 terminated=None body=0
+final during: status=None reset=7 terminated=None body=0
+after release: status=b'200' reset=None terminated=None body=10
+--- apache oracle ---
+baseline: status=b'200' reset=None terminated=None body=10
+before trickle: status=b'200' reset=None terminated=None body=10
+t=40s victim=status=b'200' reset=None terminated=None body=10
+t=80s victim=status=b'200' reset=None terminated=None body=10
+t=120s victim=status=b'200' reset=None terminated=None body=10
+final during: status=b'200' reset=None terminated=None body=10
+--- threshold control (4 sources x 32 streams = 128) ---
+baseline: status=b'200' reset=None terminated=None body=10
+before trickle: status=b'200' reset=None terminated=None body=10
+t=40s grants_ok=256 failed=0 victim=status=b'200' reset=None terminated=None body=10
+final during: status=b'200' reset=None terminated=None body=10
+after release: status=b'200' reset=None terminated=None body=10
