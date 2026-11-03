@@ -192,7 +192,7 @@ the wrong configured IP/DNS identity is still rejected. OCSP tests cover
 deadline extraction, early refresh and removal of an expired live staple.
 
 The verified crate additionally owns exact equality of the effective
-leaf/chain revocation mode and active CRL identity. The Verus gate reports 659
+leaf/chain revocation mode and active CRL identity. The Verus gate reports 665
 verified functions and 0 errors.
 
 ## Remaining assumptions

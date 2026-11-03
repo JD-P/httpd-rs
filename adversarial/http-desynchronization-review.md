@@ -152,8 +152,8 @@ duplicate detection, and caps nominations at 64 options and 4 KiB before
 allocation can amplify a response head. Ordinary proxy responses no longer
 ignore malformed `Connection` list members, and WebSocket token validation uses
 the same bounded parser. Cache storage consumes the sanitized end-to-end field
-set, strips transport-owned length metadata, and writes V6 metadata; V5 and
-older disk entries are deliberately ineligible after upgrade.
+set, strips transport-owned length metadata, and writes current V7 metadata;
+V6 and older disk entries are deliberately ineligible after upgrade.
 
 ## Preserved invariants
 

@@ -5034,6 +5034,30 @@ pub fn cache_ttl_clamp(value: i64, min: i64, max: i64) -> (ttl: i64)
     }
 }
 
+pub open spec fn cache_remaining_freshness_spec(lifetime: u64, current_age: u64) -> u64 {
+    if current_age >= lifetime {
+        0
+    } else {
+        (lifetime - current_age) as u64
+    }
+}
+
+/// A response's Age/apparent age consumes its origin freshness lifetime
+/// before local cache limits are applied.  In particular, an already-stale
+/// response can never be revived by CacheMinExpire.
+pub fn cache_remaining_freshness(lifetime: u64, current_age: u64) -> (remaining: u64)
+    ensures
+        remaining == cache_remaining_freshness_spec(lifetime, current_age),
+        remaining <= lifetime,
+        current_age >= lifetime ==> remaining == 0,
+{
+    if current_age >= lifetime {
+        0
+    } else {
+        lifetime - current_age
+    }
+}
+
 /// Freshness expiry uses saturating arithmetic so a hostile or malformed
 /// freshness value can never wrap `expires` into the past.  The runtime only
 /// stores entries with `ttl > 0`.
@@ -7834,6 +7858,88 @@ pub proof fn cgi_response_header_rejects_connection_state(
     ensures
         framing || hop_by_hop || connection_nominated
             ==> !cgi_response_header_spec(framing, hop_by_hop, connection_nominated),
+{
+}
+
+/// A backend may use standard hop-by-hop options without changing the
+/// representation metadata visible to a shared cache.  Nominating framing is
+/// always fatal; nominating any other end-to-end field permits forwarding
+/// only after the field is stripped and permanently disables shared caching.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BackendConnectionDisposition {
+    Reject,
+    ForwardOnly,
+    Cacheable,
+}
+
+pub open spec fn backend_connection_disposition_spec(
+    framing_nominated: bool,
+    end_to_end_nominated: bool,
+) -> BackendConnectionDisposition {
+    if framing_nominated {
+        BackendConnectionDisposition::Reject
+    } else if end_to_end_nominated {
+        BackendConnectionDisposition::ForwardOnly
+    } else {
+        BackendConnectionDisposition::Cacheable
+    }
+}
+
+pub fn backend_connection_disposition(
+    framing_nominated: bool,
+    end_to_end_nominated: bool,
+) -> (disposition: BackendConnectionDisposition)
+    ensures disposition == backend_connection_disposition_spec(
+        framing_nominated,
+        end_to_end_nominated,
+    ),
+{
+    if framing_nominated {
+        BackendConnectionDisposition::Reject
+    } else if end_to_end_nominated {
+        BackendConnectionDisposition::ForwardOnly
+    } else {
+        BackendConnectionDisposition::Cacheable
+    }
+}
+
+pub open spec fn backend_shared_cache_admit_spec(
+    disposition: BackendConnectionDisposition,
+) -> bool {
+    match disposition {
+        BackendConnectionDisposition::Cacheable => true,
+        BackendConnectionDisposition::Reject | BackendConnectionDisposition::ForwardOnly => false,
+    }
+}
+
+/// Exact projection used after backend response normalization.  ForwardOnly
+/// is intentionally distinct from Reject for client delivery, but both are
+/// ineligible at the shared-cache sink.
+pub fn backend_shared_cache_admit(
+    disposition: BackendConnectionDisposition,
+) -> (admit: bool)
+    ensures admit == backend_shared_cache_admit_spec(disposition),
+{
+    match disposition {
+        BackendConnectionDisposition::Cacheable => true,
+        BackendConnectionDisposition::Reject | BackendConnectionDisposition::ForwardOnly => false,
+    }
+}
+
+pub proof fn backend_framing_nomination_never_reaches_a_response(
+    end_to_end_nominated: bool,
+)
+    ensures
+        backend_connection_disposition_spec(true, end_to_end_nominated)
+            == BackendConnectionDisposition::Reject,
+{
+}
+
+pub proof fn stripped_end_to_end_metadata_never_reaches_shared_cache()
+    ensures
+        backend_connection_disposition_spec(false, true)
+            == BackendConnectionDisposition::ForwardOnly,
+        !backend_shared_cache_admit_spec(backend_connection_disposition_spec(false, true)),
 {
 }
 

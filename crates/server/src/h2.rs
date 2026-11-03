@@ -601,7 +601,10 @@ async fn send_response_with_admission(
     output: &mut crate::resource::SlowOutputAdmission,
 ) -> io::Result<u64> {
     let client = output.client();
-    if !crate::http::response_headers_admitted(&resp) {
+    if !crate::http::response_headers_valid(&resp) {
+        // Do not silently discard just the malformed fields and forward the
+        // backend-selected body.  HTTP/2 can still return a canonical local
+        // policy error because no response head has been committed yet.
         resp = Response::policy_error();
     }
     if resp.ensure_file_descriptor(&cfg.resource_budget).is_err() {
@@ -650,12 +653,12 @@ async fn send_response_with_admission(
             } else if lname == "server" {
                 have_server = true;
             }
-            let Ok(name) = HeaderName::from_bytes(lname.as_bytes()) else {
-                continue;
-            };
-            let Ok(value) = HeaderValue::from_bytes(&value) else {
-                continue;
-            };
+            let name = HeaderName::from_bytes(lname.as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid response header name")
+            })?;
+            let value = HeaderValue::from_bytes(&value).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid response header value")
+            })?;
             headers.append(name, value);
         }
         if !have_date {
@@ -3269,13 +3272,11 @@ mod tests {
         invalid_headers
             .headers
             .push((Cow::Borrowed("x-bad-value"), b"bad\nvalue".to_vec()));
-        assert_eq!(
-            response_round_trip(cfg.clone(), invalid_headers, false)
-                .await
-                .0
-                .unwrap(),
-            7
-        );
+        let (result, status, _, body) =
+            response_round_trip(cfg.clone(), invalid_headers, false).await;
+        assert_eq!(status, 500);
+        assert_eq!(result.unwrap(), body.len() as u64);
+        assert!(body.starts_with(b"Response policy exceeds"));
 
         let mut excessive_headers = Response::new(200);
         for index in 0..crate::http::MAX_RESPONSE_HEADERS {

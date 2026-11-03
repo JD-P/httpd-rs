@@ -1972,6 +1972,11 @@ pub struct Response {
     pub status: u16,
     pub headers: Vec<(Cow<'static, str>, Vec<u8>)>,
     pub body: Body,
+    /// False when transport metadata removed an end-to-end backend field.
+    /// Such a response can still be forwarded after normalization, but the
+    /// shared cache must not persist a representation selected from the
+    /// incomplete metadata view.
+    shared_cache_eligible: bool,
     spool_lease: Option<SpoolLease>,
     resident_lease: Option<ResidentLease>,
     flow: ResponseFlow,
@@ -2101,6 +2106,7 @@ pub const MAX_RESPONSE_HEADERS: usize = 256;
 pub const MAX_RESPONSE_HEADER_BYTES: usize = 128 * 1024;
 pub(crate) const MAX_RESPONSE_CONNECTION_OPTIONS: usize = 64;
 pub(crate) const MAX_RESPONSE_CONNECTION_OPTION_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_CACHE_CONTROL_DIRECTIVES: usize = 256;
 
 pub(crate) fn response_headers_admitted(resp: &Response) -> bool {
     let count = resp.headers.len().saturating_add(3);
@@ -2201,6 +2207,27 @@ impl ResponseHeaderSanitizer {
             .any(|token| name.eq_ignore_ascii_case(token))
     }
 
+    /// Framing fields cannot be made connection-specific.  Accepting such a
+    /// nomination would let the backend and this hop select the body boundary
+    /// from different header sets.
+    pub(crate) fn nominates_framing(&self) -> bool {
+        self.has_connection_option("content-length")
+            || self.has_connection_option("transfer-encoding")
+            || self.has_connection_option("connection")
+    }
+
+    /// A standard connection option does not remove representation metadata.
+    /// Every other nomination does, so a normalized response is safe to
+    /// forward but no longer has enough provenance for shared-cache storage.
+    pub(crate) fn nominates_end_to_end(&self) -> bool {
+        self.nominations.iter().any(|name| {
+            !matches!(
+                name.as_str(),
+                "close" | "keep-alive" | "proxy-connection" | "te" | "trailer" | "upgrade"
+            )
+        })
+    }
+
     pub(crate) fn is_hop_by_hop(&self, name: &str) -> bool {
         const FIXED: [&str; 9] = [
             "connection",
@@ -2216,6 +2243,177 @@ impl ResponseHeaderSanitizer {
         FIXED.iter().any(|fixed| name.eq_ignore_ascii_case(fixed))
             || self.has_connection_option(name)
     }
+}
+
+/// A parsed Cache-Control directive.  Cache policy and output filters share
+/// this parser so a backend cannot obtain different behavior by splitting
+/// directives across field lines or hiding commas inside quoted strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CacheControlDirective {
+    pub(crate) name: String,
+    pub(crate) value: Option<Vec<u8>>,
+}
+
+fn cache_control_ows(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+fn cache_control_value_byte(byte: u8) -> bool {
+    byte == b'\t' || (byte >= 0x20 && byte != 0x7f)
+}
+
+fn cache_control_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Parse every Cache-Control field as one RFC list.  Malformed metadata is a
+/// cache miss/no-transform decision, never permission to ignore the broken
+/// directive and use a permissive default.
+pub(crate) fn parse_cache_control_values<'a, I>(values: I) -> Result<Vec<CacheControlDirective>, ()>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut directives = Vec::new();
+    for value in values {
+        let mut pos = 0usize;
+        let mut field_directives = 0usize;
+        while pos < value.len() {
+            // A syntactically tiny directive still has substantial owned
+            // representation overhead. Bound that amplification separately
+            // from the response-head byte ceiling before allocating it.
+            if directives.len() >= MAX_CACHE_CONTROL_DIRECTIVES {
+                return Err(());
+            }
+            while pos < value.len() && cache_control_ows(value[pos]) {
+                pos += 1;
+            }
+            if pos == value.len() || value[pos] == b',' {
+                return Err(());
+            }
+            let name_start = pos;
+            while pos < value.len() && cache_control_token_byte(value[pos]) {
+                pos += 1;
+            }
+            if pos == name_start {
+                return Err(());
+            }
+            let name = std::str::from_utf8(&value[name_start..pos])
+                .map_err(|_| ())?
+                .to_ascii_lowercase();
+            while pos < value.len() && cache_control_ows(value[pos]) {
+                pos += 1;
+            }
+            let directive_value = if pos < value.len() && value[pos] == b'=' {
+                pos += 1;
+                while pos < value.len() && cache_control_ows(value[pos]) {
+                    pos += 1;
+                }
+                if pos == value.len() {
+                    return Err(());
+                }
+                if value[pos] == b'"' {
+                    pos += 1;
+                    let mut decoded = Vec::new();
+                    let mut closed = false;
+                    while pos < value.len() {
+                        let byte = value[pos];
+                        pos += 1;
+                        if byte == b'"' {
+                            closed = true;
+                            break;
+                        }
+                        if byte == b'\\' {
+                            if pos == value.len() || !cache_control_value_byte(value[pos]) {
+                                return Err(());
+                            }
+                            decoded.push(value[pos]);
+                            pos += 1;
+                        } else if cache_control_value_byte(byte) {
+                            decoded.push(byte);
+                        } else {
+                            return Err(());
+                        }
+                    }
+                    if !closed {
+                        return Err(());
+                    }
+                    Some(decoded)
+                } else {
+                    let start = pos;
+                    while pos < value.len() && cache_control_token_byte(value[pos]) {
+                        pos += 1;
+                    }
+                    if pos == start {
+                        return Err(());
+                    }
+                    Some(value[start..pos].to_vec())
+                }
+            } else {
+                None
+            };
+            while pos < value.len() && cache_control_ows(value[pos]) {
+                pos += 1;
+            }
+            if pos < value.len() {
+                if value[pos] != b',' {
+                    return Err(());
+                }
+                pos += 1;
+                if pos == value.len() {
+                    return Err(());
+                }
+            }
+            directives.push(CacheControlDirective {
+                name,
+                value: directive_value,
+            });
+            field_directives += 1;
+        }
+        if field_directives == 0 {
+            return Err(());
+        }
+    }
+    Ok(directives)
+}
+
+pub(crate) fn response_cache_control(resp: &Response) -> Result<Vec<CacheControlDirective>, ()> {
+    parse_cache_control_values(
+        resp.headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+            .map(|(_, value)| value.as_slice()),
+    )
+}
+
+/// Validate the representation metadata before it can enter a cache or a
+/// protocol adapter.  HTTP/2 used to silently drop a malformed field while
+/// HTTP/1 failed the response; a hostile backend could therefore create two
+/// different downstream representations from the same Response object.
+pub(crate) fn response_headers_valid(resp: &Response) -> bool {
+    (100..=599).contains(&resp.status)
+        && response_headers_admitted(resp)
+        && resp.headers.iter().all(|(name, value)| {
+            crate::verified::valid_token(name.as_bytes())
+                && crate::verified::sanitize_header_value(value).is_some()
+        })
+        && ResponseHeaderSanitizer::from_response(resp).is_ok()
 }
 
 /// Return the single canonical representation length that may be emitted on
@@ -2264,6 +2462,7 @@ impl Response {
             status,
             headers: Vec::new(),
             body: Body::Empty,
+            shared_cache_eligible: true,
             spool_lease: None,
             resident_lease: None,
             flow: ResponseFlow::Normal,
@@ -2362,6 +2561,14 @@ impl Response {
             Body::File { len, .. } => *len,
             Body::Stream { len, .. } => *len,
         }
+    }
+
+    pub(crate) fn forbid_shared_cache(&mut self) {
+        self.shared_cache_eligible = false;
+    }
+
+    pub(crate) fn shared_cache_eligible(&self) -> bool {
+        self.shared_cache_eligible
     }
 
     pub(crate) fn hold_spool(&mut self, lease: SpoolLease) {
@@ -2739,10 +2946,10 @@ fn serialize_response_head(
     resp: &mut Response,
     opts: &ResponseOptions,
 ) -> io::Result<(Vec<u8>, bool, u64)> {
-    if !response_headers_admitted(resp) {
+    if !response_headers_valid(resp) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "response headers exceed configured count/byte limits",
+            "invalid or oversized response headers",
         ));
     }
     let header_sanitizer = ResponseHeaderSanitizer::from_response(resp)?;
@@ -4013,6 +4220,49 @@ mod tests {
         ] {
             assert_ne!(reason_phrase(status), "Unknown", "status {status}");
         }
+    }
+
+    #[test]
+    fn cache_control_parser_owns_all_field_lines_and_quoted_commas() {
+        let fields: [&[u8]; 2] = [b"public, max-age=\"60\"", b"private=\"Set-Cookie, X-User\""];
+        let parsed = parse_cache_control_values(fields).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].name, "public");
+        assert_eq!(parsed[0].value, None);
+        assert_eq!(parsed[1].name, "max-age");
+        assert_eq!(parsed[1].value.as_deref(), Some(&b"60"[..]));
+        assert_eq!(parsed[2].name, "private");
+        assert_eq!(parsed[2].value.as_deref(), Some(&b"Set-Cookie, X-User"[..]));
+
+        for malformed in [
+            b"".as_slice(),
+            b",public".as_slice(),
+            b"public,".as_slice(),
+            b"max-age=".as_slice(),
+            b"max-age=\"unterminated".as_slice(),
+            b"bad name=value".as_slice(),
+            b"public\x01".as_slice(),
+        ] {
+            assert!(
+                parse_cache_control_values([malformed]).is_err(),
+                "{malformed:?}"
+            );
+        }
+        assert!(parse_cache_control_values(std::iter::empty::<&[u8]>())
+            .unwrap()
+            .is_empty());
+
+        let at_limit = std::iter::repeat_n("x", MAX_CACHE_CONTROL_DIRECTIVES)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_cache_control_values([at_limit.as_bytes()])
+                .unwrap()
+                .len(),
+            MAX_CACHE_CONTROL_DIRECTIVES
+        );
+        let over_limit = format!("{at_limit},x");
+        assert!(parse_cache_control_values([over_limit.as_bytes()]).is_err());
     }
 
     #[test]

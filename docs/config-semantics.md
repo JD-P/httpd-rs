@@ -1682,16 +1682,20 @@ A representation enters the shared cache only through these gates.  The
 runtime consumes `cache_store_request_admit`, `cache_store_status_admit`,
 `cache_store_control_admit`, `cache_store_shape_admit` and
 `cache_store_ttl_admit` instead of an unverified chain of early returns.
-Freshness values pass through `cache_ttl_clamp`, which returns zero for a
-reversed `CacheMinExpire`/`CacheMaxExpire` pair rather than panicking, and
-expiry uses the verified saturating `cache_expiry`, so a positive TTL can never
-wrap into the past.  Disk accounting consumes `cache_disk_projected` and
+Origin `Age` and apparent age from `Date` pass through the verified
+`cache_remaining_freshness` subtraction before storage. Explicit max-age and
+Expires lifetimes are capped but never raised by `CacheMinExpire`; that floor
+applies only to heuristic freshness and cannot revive a zero remainder.
+Heuristic values pass through `cache_ttl_clamp`, which returns zero for a
+reversed `CacheMinExpire`/`CacheMaxExpire` pair rather than panicking. Expiry
+uses the verified saturating `cache_expiry`, so a positive TTL can never wrap
+into the past. Disk accounting consumes `cache_disk_projected` and
 `cache_disk_evict`; eviction steps are proven not to increase projected usage.
 Policy binding uses `cache_fingerprint_field`, whose length framing is proven
-injective. V6 disk metadata stores the complete framed base key; lookup admits
+injective. V7 disk metadata stores the complete framed base key; lookup admits
 an entry only when that metadata key exactly matches the requested key, while
-the SHA-1 filename is treated only as an index. V5 and older metadata are
-deliberately ineligible after response-header cache sanitization changed.
+the SHA-1 filename is treated only as an index. V6 and older metadata are
+deliberately ineligible after complete response cache-policy admission changed.
 Unsafe-method invalidation uses
 the same canonical request/selected-representation identity and removes only
 entries admitted by the verified key-prefix predicate.

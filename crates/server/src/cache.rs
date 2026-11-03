@@ -500,10 +500,6 @@ fn header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> 
         .map(|(_, v)| v.as_slice())
 }
 
-fn header_str(headers: &[(String, Vec<u8>)], name: &str) -> Option<String> {
-    header(headers, name).map(|v| String::from_utf8_lossy(v).into_owned())
-}
-
 #[cfg(test)]
 fn response_header<'a>(resp: &'a Response, name: &str) -> Option<&'a [u8]> {
     resp.headers
@@ -1133,26 +1129,30 @@ fn combined_header(headers: &[(String, Vec<u8>)], name: &str) -> Option<String> 
     found.then_some(out)
 }
 
-fn vary_values(req: &Request, headers: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
+fn vary_values(req: &Request, headers: &[(String, Vec<u8>)]) -> Option<Vec<(String, Vec<u8>)>> {
+    const MAX_VARY_DIMENSIONS: usize = 256;
     // Multiple `Vary` field lines are legal and equivalent to one
     // comma-separated list.  Collapsing to the first line silently dropped
     // later dimensions such as Cookie on a response that also varied by
     // Accept-Encoding.
     let Some(vary) = combined_header(headers, "vary") else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     let mut out = Vec::new();
     for name in vary.split(',') {
         let name = name.trim().to_ascii_lowercase();
-        if name.is_empty() || name == "*" {
-            continue;
+        if name.is_empty() || name == "*" || !crate::verified::valid_token(name.as_bytes()) {
+            return None;
         }
         if out.iter().any(|(n, _)| n == &name) {
             continue;
         }
+        if out.len() >= MAX_VARY_DIMENSIONS {
+            return None;
+        }
         out.push((name.clone(), req.header(&name).unwrap_or(b"").to_vec()));
     }
-    out
+    Some(out)
 }
 
 fn vary_matches(entry: &Entry, req: &Request) -> bool {
@@ -1365,69 +1365,177 @@ pub fn lookup(
     Some(response)
 }
 
-fn cache_control_directives(headers: &[(String, Vec<u8>)]) -> Vec<String> {
-    header_str(headers, "cache-control")
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_ascii_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+fn cache_control_directives(
+    headers: &[(String, Vec<u8>)],
+) -> Result<Vec<crate::http::CacheControlDirective>, ()> {
+    crate::http::parse_cache_control_values(
+        headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+            .map(|(_, value)| value.as_slice()),
+    )
 }
 
-fn directive_seconds(directives: &[String], name: &str) -> Option<u64> {
-    directives.iter().find_map(|d| {
-        let (k, v) = d.split_once('=')?;
-        if k.trim() == name {
-            v.trim().trim_matches('"').parse().ok()
-        } else {
-            None
+fn directive_seconds(
+    directives: &[crate::http::CacheControlDirective],
+    name: &str,
+) -> Result<Option<u64>, ()> {
+    let mut found = None;
+    for directive in directives {
+        if directive.name != name {
+            continue;
         }
-    })
-}
-
-fn freshness(cfg: &CacheConfig, headers: &[(String, Vec<u8>)], now: i64) -> Option<i64> {
-    let directives = cache_control_directives(headers);
-    if let Some(n) = directive_seconds(&directives, "s-maxage")
-        .or_else(|| directive_seconds(&directives, "max-age"))
-    {
-        let n = vapache_verified::cache_ttl_clamp(
-            n as i64,
-            cfg.min_expire as i64,
-            cfg.max_expire as i64,
-        );
-        return Some(n);
+        if found.is_some() {
+            return Err(());
+        }
+        let value = directive.value.as_deref().ok_or(())?;
+        if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+            return Err(());
+        }
+        let value = std::str::from_utf8(value)
+            .map_err(|_| ())?
+            .parse::<u64>()
+            .map_err(|_| ())?;
+        found = Some(value);
     }
-    if let Some(expires) = header(headers, "expires").and_then(parse_http_date) {
-        let n = expires - now;
-        if n <= 0 {
-            return None;
-        }
-        return Some(vapache_verified::cache_ttl_clamp(
-            n,
-            cfg.min_expire as i64,
-            cfg.max_expire as i64,
+    Ok(found)
+}
+
+fn single_header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Result<Option<&'a [u8]>, ()> {
+    let mut values = headers
+        .iter()
+        .filter(|(field, _)| field.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_slice());
+    let first = values.next();
+    if values.next().is_some() {
+        Err(())
+    } else {
+        Ok(first)
+    }
+}
+
+fn cache_metadata_singletons_valid(headers: &[(String, Vec<u8>)]) -> bool {
+    const SINGLETONS: [&str; 11] = [
+        "age",
+        "content-disposition",
+        "content-location",
+        "content-range",
+        "content-type",
+        "date",
+        "etag",
+        "expires",
+        "last-modified",
+        "location",
+        "retry-after",
+    ];
+    SINGLETONS
+        .iter()
+        .all(|name| single_header(headers, name).is_ok())
+        // A reusable complete response cannot carry partial-representation
+        // metadata under one of the cacheable full-response statuses.
+        && header(headers, "content-range").is_none()
+}
+
+fn decimal_seconds(value: &[u8]) -> Option<u64> {
+    let value = crate::util::trim_ascii(value);
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(value).ok()?.parse().ok()
+}
+
+fn response_current_age(headers: &[(String, Vec<u8>)], now: i64) -> Option<(u64, Option<i64>)> {
+    let age_value = match single_header(headers, "age").ok()? {
+        Some(value) => decimal_seconds(value)?,
+        None => 0,
+    };
+    let date = match single_header(headers, "date").ok()? {
+        Some(value) => Some(parse_http_date(value)?),
+        None => None,
+    };
+    let apparent_age = date
+        .map(|date| u64::try_from(now.saturating_sub(date).max(0)).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    Some((age_value.max(apparent_age), date))
+}
+
+fn bounded_remaining_ttl(
+    cfg: &CacheConfig,
+    lifetime: u64,
+    current_age: u64,
+    heuristic: bool,
+) -> i64 {
+    if cfg.min_expire > cfg.max_expire {
+        return 0;
+    }
+    let remaining = vapache_verified::cache_remaining_freshness(lifetime, current_age);
+    if remaining == 0 {
+        return 0;
+    }
+    let remaining = i64::try_from(remaining).unwrap_or(i64::MAX);
+    let min = if heuristic {
+        i64::try_from(cfg.min_expire).unwrap_or(i64::MAX)
+    } else {
+        0
+    };
+    let max = i64::try_from(cfg.max_expire).unwrap_or(i64::MAX);
+    vapache_verified::cache_ttl_clamp(remaining, min, max)
+}
+
+fn freshness_and_age(
+    cfg: &CacheConfig,
+    headers: &[(String, Vec<u8>)],
+    now: i64,
+) -> Option<(i64, u64)> {
+    let directives = cache_control_directives(headers).ok()?;
+    let s_maxage = directive_seconds(&directives, "s-maxage").ok()?;
+    let max_age = directive_seconds(&directives, "max-age").ok()?;
+    let (current_age, date) = response_current_age(headers, now)?;
+    if let Some(n) = s_maxage.or(max_age) {
+        return Some((
+            bounded_remaining_ttl(cfg, n, current_age, false),
+            current_age,
         ));
     }
-    if let Some(last) = header(headers, "last-modified").and_then(parse_http_date) {
-        let age = (now - last).max(0) as f64;
-        let n = (age * cfg.last_modified_factor) as i64;
-        if n > 0 {
-            return Some(vapache_verified::cache_ttl_clamp(
-                n,
-                cfg.min_expire as i64,
-                cfg.max_expire as i64,
+    if let Some(expires) = single_header(headers, "expires").ok()? {
+        let expires = parse_http_date(expires)?;
+        let reference = date.unwrap_or(now);
+        let lifetime = u64::try_from(expires.saturating_sub(reference).max(0)).ok()?;
+        let ttl = bounded_remaining_ttl(cfg, lifetime, current_age, false);
+        if ttl <= 0 {
+            return None;
+        }
+        return Some((ttl, current_age));
+    }
+    if let Some(last) = single_header(headers, "last-modified").ok()? {
+        let last = parse_http_date(last)?;
+        let reference = date.unwrap_or(now);
+        let representation_age = reference.saturating_sub(last).max(0) as f64;
+        let lifetime = (representation_age * cfg.last_modified_factor) as u64;
+        if lifetime > 0 {
+            return Some((
+                bounded_remaining_ttl(cfg, lifetime, current_age, true),
+                current_age,
             ));
         }
         // A just-written file has no observable reuse window through the
         // Last-Modified heuristic; CacheDefaultExpire keeps it cacheable.
-        return Some(cfg.default_expire.min(cfg.max_expire) as i64);
+        return Some((
+            bounded_remaining_ttl(cfg, cfg.default_expire, current_age, true),
+            current_age,
+        ));
     }
     if cfg.ignore_no_last_mod {
-        return Some(cfg.default_expire.min(cfg.max_expire) as i64);
+        return Some((
+            bounded_remaining_ttl(cfg, cfg.default_expire, current_age, true),
+            current_age,
+        ));
     }
     None
+}
+
+fn freshness(cfg: &CacheConfig, headers: &[(String, Vec<u8>)], now: i64) -> Option<i64> {
+    freshness_and_age(cfg, headers, now).map(|(ttl, _)| ttl)
 }
 
 fn response_body_bytes(
@@ -1504,7 +1612,7 @@ fn cache_stem(cfg: &Config, key: &str) -> Option<std::path::PathBuf> {
 
 fn encode_meta(key: &str, entry: &Entry) -> Vec<u8> {
     let mut out = format!(
-        "V6\nK {}\nS {}\nT {}\nE {}\nP {}\nG {}\n",
+        "V7\nK {}\nS {}\nT {}\nE {}\nP {}\nG {}\n",
         STANDARD.encode(key.as_bytes()),
         entry.status,
         entry.stored,
@@ -1539,6 +1647,7 @@ fn decode_meta(data: &[u8]) -> Option<Entry> {
         && version != "V4"
         && version != "V5"
         && version != "V6"
+        && version != "V7"
     {
         return None;
     }
@@ -1596,10 +1705,12 @@ fn decode_meta(data: &[u8]) -> Option<Entry> {
 fn decode_meta_key(data: &[u8]) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(data).ok()?;
     let mut lines = text.lines();
-    // V6 deliberately invalidates representations written before cache
-    // storage consumed the canonical Connection-nomination sanitizer. V5 and
-    // older entries can otherwise replay a field whose nomination was lost.
-    if lines.next()? != "V6" {
+    // V7 deliberately invalidates representations admitted before every
+    // Cache-Control line, qualified private/no-cache directives, malformed
+    // Vary metadata and ambiguous singleton fields failed closed.  Older
+    // entries can otherwise replay a representation the current admission
+    // policy would refuse to store.
+    if lines.next()? != "V7" {
         return None;
     }
     for line in lines {
@@ -1935,6 +2046,9 @@ pub fn store(
     ) {
         return;
     }
+    if !resp.shared_cache_eligible() || !crate::http::response_headers_valid(resp) {
+        return;
+    }
     let fingerprint = cache_policy_fingerprint(scope, req, peer, target);
     if !grant.require_sink(
         &crate::access::ResourceKey::cache_policy(vhost, req, host, path, fingerprint),
@@ -1959,16 +2073,24 @@ pub fn store(
     let Ok(header_sanitizer) = crate::http::ResponseHeaderSanitizer::from_response(resp) else {
         return;
     };
+    if header_sanitizer.nominates_framing() || header_sanitizer.nominates_end_to_end() {
+        return;
+    }
     let response_headers: Vec<(String, Vec<u8>)> = resp
         .headers
         .iter()
         .filter(|(name, _)| !header_sanitizer.is_hop_by_hop(name))
         .map(|(n, v)| (n.to_string(), v.clone()))
         .collect();
-    let directives = cache_control_directives(&response_headers);
-    let no_store = directives.iter().any(|d| d == "no-store");
-    let no_cache = directives.iter().any(|d| d == "no-cache");
-    let private = directives.iter().any(|d| d == "private");
+    if !cache_metadata_singletons_valid(&response_headers) {
+        return;
+    }
+    let Ok(directives) = cache_control_directives(&response_headers) else {
+        return;
+    };
+    let no_store = directives.iter().any(|d| d.name == "no-store");
+    let no_cache = directives.iter().any(|d| d.name == "no-cache");
+    let private = directives.iter().any(|d| d.name == "private");
     if !vapache_verified::cache_store_control_admit(
         no_store,
         no_cache,
@@ -1980,9 +2102,9 @@ pub fn store(
         return;
     }
     let set_cookie = header(&response_headers, "set-cookie").is_some();
-    let vary_star = combined_header(&response_headers, "vary")
-        .map(|v| v.split(',').any(|part| part.trim() == "*"))
-        .unwrap_or(false);
+    let Some(vary) = vary_values(req, &response_headers) else {
+        return;
+    };
     #[cfg(test)]
     let fallback_context;
     let resource_context = match req.resource_context() {
@@ -2003,11 +2125,11 @@ pub fn store(
     };
     let size_ok = body.len() as u64 <= cfg.cache.max_file_size
         && (body.len() as u64) >= cfg.cache.min_file_size;
-    if !vapache_verified::cache_store_shape_admit(set_cookie, vary_star, size_ok) {
+    if !vapache_verified::cache_store_shape_admit(set_cookie, false, size_ok) {
         return;
     }
     let now = unix_now();
-    let Some(ttl) = freshness(&cfg.cache, &response_headers, now) else {
+    let Some((ttl, response_age)) = freshness_and_age(&cfg.cache, &response_headers, now) else {
         return;
     };
     if !vapache_verified::cache_store_ttl_admit(ttl) {
@@ -2026,7 +2148,6 @@ pub fn store(
         }
         headers.push((name.clone(), value.clone()));
     }
-    let vary = vary_values(req, &headers);
     let key = cache_key.to_string();
     let body_len = body.len() as u64;
     let mut entry = Entry {
@@ -2034,7 +2155,7 @@ pub fn store(
         headers,
         body,
         body_len,
-        stored: now,
+        stored: now.saturating_sub(i64::try_from(response_age).unwrap_or(i64::MAX)),
         expires: vapache_verified::cache_expiry(now, ttl),
         policy: fingerprint,
         epoch: current_epoch(),
@@ -3819,6 +3940,44 @@ CacheIgnoreQueryString On\n\
         let headers = vec![("Cache-Control".into(), b"max-age=999999".to_vec())];
         assert_eq!(freshness(&cfg, &headers, 100), Some(cfg.max_expire as i64));
 
+        let aged = vec![
+            ("Cache-Control".into(), b"max-age=100".to_vec()),
+            ("Age".into(), b"99".to_vec()),
+        ];
+        assert_eq!(freshness(&cfg, &aged, 100), Some(1));
+        let stale = vec![
+            ("Cache-Control".into(), b"max-age=100".to_vec()),
+            ("Age".into(), b"100".to_vec()),
+        ];
+        assert_eq!(freshness(&cfg, &stale, 100), Some(0));
+        let apparent = vec![
+            ("Cache-Control".into(), b"max-age=100".to_vec()),
+            ("Date".into(), crate::util::http_date(10).into_bytes()),
+        ];
+        assert_eq!(freshness(&cfg, &apparent, 100), Some(10));
+        assert!(freshness(
+            &cfg,
+            &[
+                ("Cache-Control".into(), b"max-age=100".to_vec()),
+                ("Age".into(), b"not-seconds".to_vec()),
+            ],
+            100,
+        )
+        .is_none());
+
+        // CacheMinExpire is a heuristic floor, not permission to revive an
+        // explicitly stale response or extend an origin max-age.
+        let mut minimum = cfg.clone();
+        minimum.min_expire = 60;
+        assert_eq!(
+            freshness(
+                &minimum,
+                &[("Cache-Control".into(), b"max-age=1".to_vec())],
+                100,
+            ),
+            Some(1)
+        );
+
         // A reversed configuration pair must disable reuse instead of
         // panicking in `i64::clamp` (verified `cache_ttl_clamp`).
         let mut reversed = crate::config::CacheConfig::default();
@@ -3904,6 +4063,16 @@ CacheIgnoreQueryString On\n\
         )
         .unwrap();
         cfg.cache.root = Some(dir.join("cache"));
+        // Most disk-cache unit tests exercise store/load behavior rather than
+        // the deliberately nonblocking cold-start scan. Give each unique
+        // fixture an empty index up front so unrelated parallel tests cannot
+        // make its first optional store skip on the process-wide scan lock.
+        let root = cfg.cache.root.as_ref().unwrap();
+        fs::create_dir_all(root).unwrap();
+        disk_usage()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(root.clone(), DiskUsageState::default());
         (dir, cfg)
     }
 
@@ -3934,6 +4103,10 @@ CacheIgnoreQueryString On\n\
         fs::write(root.join("orphan.body.tmp"), b"partial").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink("missing-target", root.join("unrelated-link")).unwrap();
+        disk_usage()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&root);
         let fingerprint = [7u8; 32];
         let target = Path::new("/srv/index.html");
         let selected_index = base_key(
@@ -4010,7 +4183,7 @@ CacheIgnoreQueryString On\n\
         let corrupt_stem = cache_stem(&cfg, corrupt).unwrap();
         fs::write(
             corrupt_stem.with_extension("meta"),
-            format!("V6\nK {}\n", STANDARD.encode(corrupt.as_bytes())),
+            format!("V7\nK {}\n", STANDARD.encode(corrupt.as_bytes())),
         )
         .unwrap();
         assert!(disk_load(&cfg, corrupt).is_none());
@@ -4230,8 +4403,18 @@ CacheIgnoreQueryString On\n\
         ];
         let mut req = test_request();
         req.headers.insert("accept-encoding", b"gzip".to_vec());
-        let vary = vary_values(&req, &headers);
+        assert!(vary_values(&req, &headers).is_none());
+        let valid = vec![
+            ("Vary".into(), b"Accept-Encoding".to_vec()),
+            ("vary".into(), b"Cookie".to_vec()),
+        ];
+        let vary = vary_values(&req, &valid).unwrap();
         assert_eq!(vary.len(), 2);
+        let excessive_vary = (0..=256)
+            .map(|index| format!("x-{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(vary_values(&req, &[("Vary".into(), excessive_vary.into_bytes())]).is_none());
         assert_eq!(
             combined_header(&headers, "vary")
                 .unwrap()
@@ -4239,7 +4422,7 @@ CacheIgnoreQueryString On\n\
                 .count(),
             4
         );
-        assert!(vary_values(&req, &[]).is_empty());
+        assert!(vary_values(&req, &[]).unwrap().is_empty());
         assert!(!cache_enabled(&Scope::default(), "/x"));
         let mut disabled = Scope::default();
         disabled
@@ -4617,9 +4800,9 @@ CacheIgnoreQueryString On\n\
         .is_some());
         assert!(decode_meta(b"not-a-metadata-version\n").is_none());
         // Historical metadata remains decodable for diagnostics but can
-        // never supply the exact current-format key used by disk_load. V6
-        // also invalidates V5 entries that may have lost Connection
-        // nominations while persisting their nominated fields.
+        // never supply the exact current-format key used by disk_load. V7
+        // also invalidates V6 entries admitted before response cache-policy
+        // metadata was parsed and validated as a complete field set.
         let legacy_v4 = format!(
             "V4\nS 200\nT 1\nE 2\nP {}\nG 1\n",
             STANDARD.encode([0u8; 32])
@@ -4627,7 +4810,8 @@ CacheIgnoreQueryString On\n\
         assert!(decode_meta(legacy_v4.as_bytes()).is_some());
         assert!(decode_meta_key(b"V4\nK YQ==\n").is_none());
         assert!(decode_meta_key(b"V5\nK YQ==\n").is_none());
-        assert!(decode_meta_key(b"V6\nS 200\n").is_none());
+        assert!(decode_meta_key(b"V6\nK YQ==\n").is_none());
+        assert!(decode_meta_key(b"V7\nS 200\n").is_none());
 
         let mut invalid_conditional = test_request();
         invalid_conditional
@@ -4640,12 +4824,12 @@ CacheIgnoreQueryString On\n\
             &mut conditional_response,
         ));
 
-        let legacy_key = "pre-sanitizer-connection-nomination";
+        let legacy_key = "pre-strict-response-cache-policy";
         let legacy_entry = disk_entry(b"SECRET-CONTENT", unix_now() + 60);
         let legacy_stem = cache_stem(&cfg, legacy_key).unwrap();
         fs::create_dir_all(legacy_stem.parent().unwrap()).unwrap();
         let mut legacy_meta = encode_meta(legacy_key, &legacy_entry);
-        legacy_meta[..2].copy_from_slice(b"V5");
+        legacy_meta[..2].copy_from_slice(b"V6");
         fs::write(legacy_stem.with_extension("meta"), legacy_meta).unwrap();
         fs::write(legacy_stem.with_extension("body"), &legacy_entry.body).unwrap();
         assert!(disk_load(&cfg, legacy_key).is_none());
@@ -4932,6 +5116,10 @@ CacheIgnoreQueryString On\n\
         cfg.cache.max_file_size = 1_000_000;
         prepare(&cfg);
         let root = cfg.cache.root.clone().unwrap();
+        disk_usage()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&root);
 
         crate::fault::configure("cache.scan", 0, io::ErrorKind::PermissionDenied);
         assert!(scan_disk_usage(&root).is_none());
@@ -5061,6 +5249,107 @@ CacheIgnoreQueryString On\n\
                 .push((Cow::Owned(name.into()), value.as_bytes().to_vec()));
             call(&cfg, &base_req, &mut response, &good, key);
         }
+        for (key, headers) in [
+            (
+                "cache-control-second-line-private",
+                vec![
+                    (
+                        Cow::Borrowed("Cache-Control"),
+                        b"public, max-age=60".to_vec(),
+                    ),
+                    (
+                        Cow::Borrowed("Cache-Control"),
+                        b"private=\"Set-Cookie\"".to_vec(),
+                    ),
+                ],
+            ),
+            (
+                "cache-control-second-line-no-store",
+                vec![
+                    (
+                        Cow::Borrowed("Cache-Control"),
+                        b"public, max-age=60".to_vec(),
+                    ),
+                    (Cow::Borrowed("Cache-Control"), b"no-store".to_vec()),
+                ],
+            ),
+            (
+                "cache-control-qualified-no-cache",
+                vec![(
+                    Cow::Borrowed("Cache-Control"),
+                    b"no-cache=\"Authorization, Set-Cookie\"".to_vec(),
+                )],
+            ),
+            (
+                "cache-control-malformed",
+                vec![(
+                    Cow::Borrowed("Cache-Control"),
+                    b"public, extension=\"unterminated".to_vec(),
+                )],
+            ),
+            (
+                "cache-control-duplicate-age",
+                vec![
+                    (Cow::Borrowed("Cache-Control"), b"max-age=60".to_vec()),
+                    (Cow::Borrowed("Cache-Control"), b"max-age=120".to_vec()),
+                ],
+            ),
+            (
+                "duplicate-etag",
+                vec![
+                    (Cow::Borrowed("ETag"), b"\"one\"".to_vec()),
+                    (Cow::Borrowed("ETag"), b"\"two\"".to_vec()),
+                ],
+            ),
+            (
+                "duplicate-age",
+                vec![
+                    (Cow::Borrowed("Age"), b"1".to_vec()),
+                    (Cow::Borrowed("Age"), b"2".to_vec()),
+                ],
+            ),
+            (
+                "malformed-age",
+                vec![(Cow::Borrowed("Age"), b"not-seconds".to_vec())],
+            ),
+            (
+                "content-range-on-complete",
+                vec![(Cow::Borrowed("Content-Range"), b"bytes 0-1/2".to_vec())],
+            ),
+            (
+                "invalid-vary",
+                vec![(Cow::Borrowed("Vary"), b"Accept-Encoding,,Cookie".to_vec())],
+            ),
+            (
+                "connection-nominated-metadata",
+                vec![
+                    (Cow::Borrowed("Connection"), b"X-Private".to_vec()),
+                    (Cow::Borrowed("X-Private"), b"secret selector".to_vec()),
+                ],
+            ),
+        ] {
+            let mut response = Response::bytes(200, "text/plain", b"sensitive".to_vec());
+            response.headers.extend(headers);
+            call(&cfg, &base_req, &mut response, &good, key);
+            assert!(
+                !entries().lock().unwrap().entries.contains_key(key),
+                "hostile backend metadata reached shared cache for {key}"
+            );
+        }
+        let mut provenance_lost = Response::bytes(200, "text/plain", b"sensitive".to_vec());
+        provenance_lost.forbid_shared_cache();
+        call(
+            &cfg,
+            &base_req,
+            &mut provenance_lost,
+            &good,
+            "backend-provenance-lost",
+        );
+        assert!(!entries()
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key("backend-provenance-lost"));
         let mut stream = Response::new(200);
         stream.body = Body::Stream {
             reader: Box::new(&b"x"[..]),
@@ -5083,8 +5372,7 @@ CacheIgnoreQueryString On\n\
 
         let mut stored = Response::bytes(200, "text/plain", b"ok".to_vec());
         stored.headers.extend([
-            (Cow::Borrowed("Connection"), b"close, X-Hop".to_vec()),
-            (Cow::Borrowed("X-Hop"), b"must-not-be-replayed".to_vec()),
+            (Cow::Borrowed("Connection"), b"close".to_vec()),
             (Cow::Borrowed("Proxy-Connection"), b"keep-alive".to_vec()),
             (Cow::Borrowed("Content-Length"), b"999".to_vec()),
             (Cow::Borrowed("Age"), b"1".to_vec()),

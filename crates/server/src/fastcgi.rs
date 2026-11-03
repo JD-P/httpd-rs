@@ -36,6 +36,8 @@ const FCGI_STDIN: u8 = 5;
 const FCGI_STDOUT: u8 = 6;
 const FCGI_STDERR: u8 = 7;
 const FCGI_RESPONDER: u16 = 1;
+const FCGI_REQUEST_ID: u16 = 1;
+const FCGI_REQUEST_COMPLETE: u8 = 0;
 const DEFAULT_MAX_FASTCGI_OUTPUT: u64 = 64 * 1024 * 1024;
 const FASTCGI_SPOOL_THRESHOLD: usize = 1024 * 1024;
 const MAX_FASTCGI_RECORDS: u64 = 8192;
@@ -1225,8 +1227,23 @@ fn read_response_with_budget(
             ));
         }
         let ty = header[1];
+        let request_id = u16::from_be_bytes([header[2], header[3]]);
         let len = u16::from_be_bytes([header[4], header[5]]) as usize;
         let pad = header[6] as usize;
+        if header[7] != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "nonzero FastCGI reserved byte",
+            ));
+        }
+        if matches!(ty, FCGI_STDOUT | FCGI_STDERR | FCGI_END_REQUEST)
+            && request_id != FCGI_REQUEST_ID
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FastCGI response request id mismatch",
+            ));
+        }
         records = records.checked_add(1).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "FastCGI record count overflow")
         })?;
@@ -1268,8 +1285,25 @@ fn read_response_with_budget(
                     .min((64 * 1024usize).saturating_sub(stderr.len()));
                 stderr.extend_from_slice(&content[..take]);
             }
-            FCGI_END_REQUEST => return Ok((spool, stderr)),
-            _ => {}
+            FCGI_END_REQUEST => {
+                if content.len() != 8
+                    || content[4] != FCGI_REQUEST_COMPLETE
+                    || content[5..].iter().any(|byte| *byte != 0)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid FastCGI END_REQUEST record",
+                    ));
+                }
+                return Ok((spool, stderr));
+            }
+            _ if request_id == 0 => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected FastCGI application record",
+                ));
+            }
         }
     }
 }
@@ -1281,7 +1315,9 @@ fn read_response(stream: &mut dyn ReadWrite) -> io::Result<(Spool, Vec<u8>)> {
 #[cfg(feature = "fuzzing")]
 pub fn fuzz_parse_fastcgi_records(data: &[u8]) {
     let mut cursor = Cursor::new(data.to_vec());
-    let _ = read_response_with_limit(&mut cursor, 1024 * 1024);
+    if let Ok((spool, _)) = read_response_with_limit(&mut cursor, 1024 * 1024) {
+        let _ = response_from_spool(spool, crate::http::Version::Http11);
+    }
 }
 
 /// Execute a FastCGI request.  `base` supplies the request and connection
@@ -2758,12 +2794,45 @@ mod tests {
     #[test]
     fn response_reader_unknown_records_and_output_limit() {
         let mut input = Vec::new();
-        record(&mut input, 99, 1, b"ignored");
+        record(&mut input, 99, 0, b"ignored management record");
         record(&mut input, FCGI_END_REQUEST, 1, &[0u8; 8]);
         let mut cursor = Cursor::new(input);
         let (spool, stderr) = read_response(&mut cursor).unwrap();
         assert_eq!(spool.len(), 0);
         assert!(stderr.is_empty());
+
+        for mut input in [
+            {
+                let mut wire = Vec::new();
+                record(&mut wire, 99, 1, b"foreign application record");
+                wire
+            },
+            {
+                let mut wire = Vec::new();
+                record(&mut wire, FCGI_STDOUT, 2, b"foreign response");
+                wire
+            },
+            {
+                let mut wire = Vec::new();
+                record(&mut wire, FCGI_END_REQUEST, 1, &[0u8; 7]);
+                wire
+            },
+            {
+                let mut wire = Vec::new();
+                let mut end = [0u8; 8];
+                end[4] = 1;
+                record(&mut wire, FCGI_END_REQUEST, 1, &end);
+                wire
+            },
+            {
+                let mut wire = Vec::new();
+                record(&mut wire, FCGI_END_REQUEST, 1, &[0u8; 8]);
+                wire[7] = 1;
+                wire
+            },
+        ] {
+            assert!(read_response(&mut Cursor::new(std::mem::take(&mut input))).is_err());
+        }
 
         let mut input = Vec::new();
         record(&mut input, FCGI_STDOUT, 1, b"12345678");

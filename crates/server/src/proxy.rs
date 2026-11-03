@@ -2596,6 +2596,16 @@ fn proxy_once_budgeted(
         };
         headers.push((name, clean));
     }
+    let connection_disposition = vapache_verified::backend_connection_disposition(
+        header_sanitizer.nominates_framing(),
+        header_sanitizer.nominates_end_to_end(),
+    );
+    if connection_disposition == vapache_verified::BackendConnectionDisposition::Reject {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "backend Connection field nominates response framing",
+        ));
+    }
     headers.retain(|(name, _)| !header_sanitizer.is_hop_by_hop(name));
     let framing =
         crate::verified::proxy_response_framing(req.method == "HEAD", status, &framing_headers)
@@ -2643,6 +2653,9 @@ fn proxy_once_budgeted(
                 .into_iter()
                 .map(|(n, v)| (std::borrow::Cow::Owned(n), v))
                 .collect();
+            if !vapache_verified::backend_shared_cache_admit(connection_disposition) {
+                response.forbid_shared_cache();
+            }
             response.body = Body::Stream {
                 reader: Box::new(body),
                 len: n as u64,
@@ -2713,6 +2726,9 @@ fn proxy_once_budgeted(
         .into_iter()
         .map(|(n, v)| (std::borrow::Cow::Owned(n), v))
         .collect();
+    if !vapache_verified::backend_shared_cache_admit(connection_disposition) {
+        response.forbid_shared_cache();
+    }
     response.body = collected_body.unwrap_or_else(|| {
         if body.is_empty() {
             Body::Empty
@@ -2801,7 +2817,7 @@ pub fn fuzz_parse_proxy_response(data: &[u8]) {
     let io = FuzzIo {
         input: std::io::Cursor::new(data.to_vec()),
     };
-    let _ = proxy_once(
+    if let Ok((response, _)) = proxy_once(
         Box::new(io),
         &target,
         &request,
@@ -2810,7 +2826,9 @@ pub fn fuzz_parse_proxy_response(data: &[u8]) {
         "127.0.0.1:1".parse().expect("static socket address"),
         false,
         "localhost",
-    );
+    ) {
+        let _ = crate::http::response_cache_control(&response);
+    }
 }
 
 fn alternate_target(
@@ -5218,6 +5236,22 @@ mod coverage_tests {
             run("HTTP/1.1 200 OK\r\nConnection: X-Hop, x-hop\r\nContent-Length: 0\r\n\r\n")
                 .is_err()
         );
+        assert!(
+            run("HTTP/1.1 200 OK\r\nConnection: Content-Length\r\nContent-Length: 0\r\n\r\n")
+                .is_err()
+        );
+        let (nominated, _) = run(
+            "HTTP/1.1 200 OK\r\nConnection: X-Private\r\nX-Private: selected\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert!(!nominated.shared_cache_eligible());
+        assert!(!nominated
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-private")));
+        let (ordinary_connection, _) =
+            run("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").unwrap();
+        assert!(ordinary_connection.shared_cache_eligible());
 
         let (resp, _) = run("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
         assert_eq!(resp.status, 204);

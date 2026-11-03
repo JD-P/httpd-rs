@@ -28,6 +28,19 @@ fn header_str(resp: &Response, name: &str) -> Option<String> {
     header(resp, name).map(|v| String::from_utf8_lossy(v).into_owned())
 }
 
+fn cache_control_allows_transform(resp: &Response) -> bool {
+    crate::http::response_cache_control(resp)
+        .map(|directives| {
+            !directives
+                .iter()
+                .any(|directive| directive.name == "no-transform")
+        })
+        // A malformed backend policy is not permission to transform the
+        // representation.  Forward it unchanged and let the output boundary
+        // apply its ordinary header validation.
+        .unwrap_or(false)
+}
+
 fn remove_header(resp: &mut Response, name: &str) {
     resp.headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
 }
@@ -286,11 +299,7 @@ pub(crate) fn conditional_static_etag(
         || req.header("range").is_some()
         || req.header("if-range").is_some()
         || header(response, "content-encoding").is_some()
-        || header_str(response, "cache-control").is_some_and(|value| {
-            value
-                .split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case("no-transform"))
-        })
+        || !cache_control_allows_transform(response)
     {
         return Some(current);
     }
@@ -430,13 +439,8 @@ fn finalize_inner(
     if header(resp, "content-encoding").is_some() {
         return;
     }
-    if let Some(cc) = header_str(resp, "cache-control") {
-        if cc
-            .split(',')
-            .any(|v| v.trim().eq_ignore_ascii_case("no-transform"))
-        {
-            return;
-        }
+    if !cache_control_allows_transform(resp) {
+        return;
     }
     let kind = [CompressionKind::Brotli, CompressionKind::Gzip]
         .into_iter()
@@ -691,6 +695,22 @@ mod tests {
             .push((Cow::Borrowed("Cache-Control"), b"no-transform".to_vec()));
         finalize(&scope, &request("gzip"), &mut r, b"/x.html");
         assert!(header(&r, "content-encoding").is_none());
+
+        let mut split = response(b"hello", "text/html");
+        split.headers.extend([
+            (Cow::Borrowed("Cache-Control"), b"public".to_vec()),
+            (Cow::Borrowed("Cache-Control"), b"no-transform".to_vec()),
+        ]);
+        finalize(&scope, &request("gzip"), &mut split, b"/x.html");
+        assert!(header(&split, "content-encoding").is_none());
+
+        let mut malformed = response(b"hello", "text/html");
+        malformed.headers.push((
+            Cow::Borrowed("Cache-Control"),
+            b"public, extension=\"unterminated".to_vec(),
+        ));
+        finalize(&scope, &request("gzip"), &mut malformed, b"/x.html");
+        assert!(header(&malformed, "content-encoding").is_none());
     }
 
     #[test]
@@ -707,6 +727,16 @@ mod tests {
         ));
         assert_eq!(
             conditional_static_etag(&scope, &request("gzip"), &r, b"/x.html", 5).as_deref(),
+            Some("\"abc\"")
+        );
+
+        let mut split = response(b"hello", "text/html");
+        split.headers.extend([
+            (Cow::Borrowed("Cache-Control"), b"public".to_vec()),
+            (Cow::Borrowed("Cache-Control"), b"No-Transform".to_vec()),
+        ]);
+        assert_eq!(
+            conditional_static_etag(&scope, &request("gzip"), &split, b"/x.html", 5).as_deref(),
             Some("\"abc\"")
         );
     }

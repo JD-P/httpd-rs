@@ -1,0 +1,7 @@
+Status: 200 OK
+Cache-Control: public
+Cache-Control: private="Set-Cookie, X-User"
+Vary: Accept-Encoding, Cookie
+Content-Type: text/plain
+
+body

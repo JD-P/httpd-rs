@@ -95,6 +95,17 @@ pub fn apply(scope: &Scope, resp: &mut Response) {
     let Some(mut secs) = duration(spec) else {
         return;
     };
+    let Ok(cache_control) = crate::http::response_cache_control(resp) else {
+        // A malformed backend cache policy is not permission for a filter to
+        // replace it with a locally cacheable one.
+        return;
+    };
+    if cache_control
+        .iter()
+        .any(|directive| directive.name == "no-store")
+    {
+        return;
+    }
     let modification = secs & (1 << 62) != 0;
     if modification {
         secs &= !(1 << 62);
@@ -113,27 +124,17 @@ pub fn apply(scope: &Scope, resp: &mut Response) {
         crate::util::http_date(expires).into_bytes(),
     );
     let max_age = secs.max(0);
-    if let Some(cc) = header(resp, "cache-control") {
-        let text = String::from_utf8_lossy(cc);
-        if text
-            .split(',')
-            .any(|v| v.trim().eq_ignore_ascii_case("no-store"))
-        {
-            return;
-        }
-        if !text.to_ascii_lowercase().contains("max-age=") {
-            set(
-                resp,
-                "Cache-Control",
-                format!("{text}, max-age={max_age}").into_bytes(),
-            );
-        }
-    } else {
-        set(
-            resp,
-            "Cache-Control",
+    if !cache_control
+        .iter()
+        .any(|directive| directive.name == "max-age")
+    {
+        // Multiple Cache-Control field lines are one list. Append our own
+        // directive instead of replacing the backend's other lines and
+        // potentially erasing private/no-cache/no-transform metadata.
+        resp.headers.push((
+            std::borrow::Cow::Borrowed("Cache-Control"),
             format!("max-age={max_age}").into_bytes(),
-        );
+        ));
     }
 }
 
@@ -226,10 +227,9 @@ mod tests {
             &active_scope(Some("modification plus 1 second")),
             &mut response,
         );
-        assert!(
-            String::from_utf8_lossy(header(&response, "Cache-Control").unwrap())
-                .contains("max-age=1")
-        );
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == b"max-age=1"
+        }));
 
         let mut response = Response::new(200);
         response.headers.push((
@@ -240,6 +240,48 @@ mod tests {
         assert_eq!(
             header(&response, "Cache-Control"),
             Some(&b"private, no-store"[..])
+        );
+        assert!(header(&response, "Expires").is_none());
+
+        let mut split = Response::new(200);
+        split.headers.extend([
+            (
+                std::borrow::Cow::Borrowed("Cache-Control"),
+                b"public".to_vec(),
+            ),
+            (
+                std::borrow::Cow::Borrowed("Cache-Control"),
+                b"private, no-transform".to_vec(),
+            ),
+        ]);
+        apply(&active_scope(Some("A60")), &mut split);
+        assert_eq!(
+            split
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+                .count(),
+            3
+        );
+        assert!(split
+            .headers
+            .iter()
+            .any(|(_, value)| value == b"private, no-transform"));
+
+        let mut malformed = Response::new(200);
+        malformed.headers.push((
+            std::borrow::Cow::Borrowed("Cache-Control"),
+            b"public, extension=\"unterminated".to_vec(),
+        ));
+        apply(&active_scope(Some("A60")), &mut malformed);
+        assert!(header(&malformed, "Expires").is_none());
+        assert_eq!(
+            malformed
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+                .count(),
+            1
         );
 
         let mut response = Response::new(200);

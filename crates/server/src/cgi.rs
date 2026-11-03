@@ -1408,7 +1408,7 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
             return Err(());
         }
         let value = trim_ascii(&line[colon + 1..]);
-        if value.iter().any(|&b| b == b'\r' || b == b'\n' || b == 0) {
+        if !vapache_verified::proxy_response_header_admit(name, value) {
             return Err(());
         }
         let lname = std::str::from_utf8(name)
@@ -1470,12 +1470,21 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
         }
         headers.push(&lname, value.to_vec());
     }
-    if connection_tokens.iter().any(|token| {
+    let framing_nominated = connection_tokens.iter().any(|token| {
         matches!(
             token.as_str(),
-            "status" | "content-length" | "transfer-encoding" | "connection" | "proxy-connection"
+            "status" | "content-length" | "transfer-encoding" | "connection"
         )
-    }) {
+    });
+    let end_to_end_nominated = connection_tokens.iter().any(|token| {
+        !matches!(
+            token.as_str(),
+            "close" | "keep-alive" | "proxy-connection" | "te" | "trailer" | "upgrade"
+        )
+    });
+    let connection_disposition =
+        vapache_verified::backend_connection_disposition(framing_nominated, end_to_end_nominated);
+    if connection_disposition == vapache_verified::BackendConnectionDisposition::Reject {
         return Err(());
     }
     for token in &connection_tokens {
@@ -1514,6 +1523,12 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
         })
         .collect();
     r.body = crate::http::Body::Bytes(body);
+    if !vapache_verified::backend_shared_cache_admit(connection_disposition) {
+        r.forbid_shared_cache();
+    }
+    if !crate::http::response_headers_valid(&r) {
+        return Err(());
+    }
     let _ = version;
     Ok(r)
 }
@@ -1534,7 +1549,9 @@ fn canonical_header_name(lname: &str) -> String {
 
 #[cfg(feature = "fuzzing")]
 pub fn fuzz_parse_cgi_response(data: &[u8]) {
-    let _ = parse_cgi_response(data, Version::Http11);
+    if let Ok(response) = parse_cgi_response(data, Version::Http11) {
+        let _ = crate::http::response_cache_control(&response);
+    }
 }
 
 /// Return the end of the first CGI header delimiter on the byte stream.
@@ -2223,6 +2240,7 @@ mod tests {
         for data in [
             &b"Bad_Name: x\r\n\r\n"[..],
             b"X: a\rb\r\n\r\n",
+            b"X: a\x01b\r\n\r\n",
             b"Status: 99 Nope\r\n\r\n",
             b"Status: 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
             b"Status: nope\r\n\r\n",
@@ -2259,6 +2277,7 @@ mod tests {
         ] {
             assert!(response_header(&hop, name).is_none(), "{name}");
         }
+        assert!(!hop.shared_cache_eligible());
         let nominated_location = parse_cgi_response(
             b"Connection: Location\r\nLocation: /hidden\r\n\r\nbody",
             Version::Http11,
@@ -2266,6 +2285,14 @@ mod tests {
         .unwrap();
         assert_eq!(nominated_location.status, 200);
         assert!(response_header(&nominated_location, "location").is_none());
+        assert!(!nominated_location.shared_cache_eligible());
+
+        let ordinary_connection = parse_cgi_response(
+            b"Connection: close\r\nContent-Type: text/plain\r\n\r\nbody",
+            Version::Http11,
+        )
+        .unwrap();
+        assert!(ordinary_connection.shared_cache_eligible());
 
         let location = parse_cgi_response(b"Location: /next\r\n\r\n", Version::Http11).unwrap();
         assert_eq!(location.status, 302);
