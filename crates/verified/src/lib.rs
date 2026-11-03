@@ -11533,67 +11533,69 @@ pub proof fn h2_stream_phase_preserves_no_reopen(
 {
 }
 
-/// Output ownership is transferred at most once from the general stream pool
-/// to the source-fair slow-response pool.  In particular, a WINDOW_UPDATE can
-/// never promote a classified slow output back into general capacity.
+/// Output ownership is transferred at most once from a protocol's general
+/// admission pool to the source-fair slow-output pool.  In particular,
+/// downstream progress can never promote a classified slow output back into
+/// general capacity.  HTTP/1 socket writability and HTTP/2 flow control use
+/// this same state machine.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum H2OutputPhase {
+pub enum SlowOutputPhase {
     General,
     Slow,
     Closed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum H2OutputEvent {
-    FlowControlStall,
+pub enum SlowOutputEvent {
+    DownstreamStall,
     Finish,
 }
 
-pub open spec fn h2_output_phase_step_spec(
-    phase: H2OutputPhase,
-    event: H2OutputEvent,
-) -> Option<H2OutputPhase> {
+pub open spec fn slow_output_phase_step_spec(
+    phase: SlowOutputPhase,
+    event: SlowOutputEvent,
+) -> Option<SlowOutputPhase> {
     match (phase, event) {
-        (H2OutputPhase::General, H2OutputEvent::FlowControlStall) => {
-            Some(H2OutputPhase::Slow)
+        (SlowOutputPhase::General, SlowOutputEvent::DownstreamStall) => {
+            Some(SlowOutputPhase::Slow)
         },
-        (H2OutputPhase::General, H2OutputEvent::Finish) => Some(H2OutputPhase::Closed),
-        (H2OutputPhase::Slow, H2OutputEvent::FlowControlStall) => Some(H2OutputPhase::Slow),
-        (H2OutputPhase::Slow, H2OutputEvent::Finish) => Some(H2OutputPhase::Closed),
+        (SlowOutputPhase::General, SlowOutputEvent::Finish) => Some(SlowOutputPhase::Closed),
+        (SlowOutputPhase::Slow, SlowOutputEvent::DownstreamStall) => Some(SlowOutputPhase::Slow),
+        (SlowOutputPhase::Slow, SlowOutputEvent::Finish) => Some(SlowOutputPhase::Closed),
         _ => None,
     }
 }
 
 /// Executable transition used by the server, proved identical to the output
 /// ownership model above.
-pub fn h2_output_phase_step(
-    phase: H2OutputPhase,
-    event: H2OutputEvent,
-) -> (next: Option<H2OutputPhase>)
-    ensures next == h2_output_phase_step_spec(phase, event),
+pub fn slow_output_phase_step(
+    phase: SlowOutputPhase,
+    event: SlowOutputEvent,
+) -> (next: Option<SlowOutputPhase>)
+    ensures next == slow_output_phase_step_spec(phase, event),
 {
     match (phase, event) {
-        (H2OutputPhase::General, H2OutputEvent::FlowControlStall) => {
-            Some(H2OutputPhase::Slow)
+        (SlowOutputPhase::General, SlowOutputEvent::DownstreamStall) => {
+            Some(SlowOutputPhase::Slow)
         },
-        (H2OutputPhase::General, H2OutputEvent::Finish) => Some(H2OutputPhase::Closed),
-        (H2OutputPhase::Slow, H2OutputEvent::FlowControlStall) => Some(H2OutputPhase::Slow),
-        (H2OutputPhase::Slow, H2OutputEvent::Finish) => Some(H2OutputPhase::Closed),
+        (SlowOutputPhase::General, SlowOutputEvent::Finish) => Some(SlowOutputPhase::Closed),
+        (SlowOutputPhase::Slow, SlowOutputEvent::DownstreamStall) => Some(SlowOutputPhase::Slow),
+        (SlowOutputPhase::Slow, SlowOutputEvent::Finish) => Some(SlowOutputPhase::Closed),
         _ => None,
     }
 }
 
-pub proof fn h2_slow_output_cannot_return_to_general(
-    event: H2OutputEvent,
+pub proof fn slow_output_cannot_return_to_general(
+    event: SlowOutputEvent,
 )
     ensures
-        h2_output_phase_step_spec(H2OutputPhase::Slow, event)
-            != Some(H2OutputPhase::General),
+        slow_output_phase_step_spec(SlowOutputPhase::Slow, event)
+            != Some(SlowOutputPhase::General),
 {
 }
 
-pub proof fn h2_closed_output_is_absorbing(event: H2OutputEvent)
-    ensures h2_output_phase_step_spec(H2OutputPhase::Closed, event).is_none(),
+pub proof fn closed_slow_output_is_absorbing(event: SlowOutputEvent)
+    ensures slow_output_phase_step_spec(SlowOutputPhase::Closed, event).is_none(),
 {
 }
 

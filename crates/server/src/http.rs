@@ -1968,9 +1968,13 @@ enum ResponseFlow {
     PreparedHandler(Option<Box<crate::server::PreparedHandler>>),
 }
 
-struct ResponseOwnership {
+pub(crate) struct ResponseOwnership {
     _descriptor_leases: Vec<crate::resource::DescriptorLease>,
     _dynamic_lease: Option<crate::resource::DynamicLease>,
+    spool_lease: Option<SpoolLease>,
+    resident_lease: Option<ResidentLease>,
+    queued_resident_leases: Vec<std::sync::Weak<std::sync::Mutex<ResidentLease>>>,
+    slow: bool,
     phase: vapache_verified::OutputOwnershipPhase,
 }
 
@@ -1980,17 +1984,78 @@ impl ResponseOwnership {
             .expect("illegal response ownership transition");
     }
 
-    fn begin_read(mut self) -> Self {
+    pub(crate) fn begin_read(mut self) -> Self {
         self.advance(vapache_verified::OutputOwnershipEvent::BeginRead);
         self
     }
 
-    fn complete_read(mut self) -> Self {
+    pub(crate) fn complete_read(mut self) -> Self {
         self.advance(vapache_verified::OutputOwnershipEvent::ReadComplete);
         self
     }
 
-    fn finish(mut self) {
+    pub(crate) fn enter_slow(&mut self) -> io::Result<()> {
+        if let Some(resident) = &mut self.resident_lease {
+            resident.enter_slow_output()?;
+        }
+        self.queued_resident_leases
+            .retain(|resident| resident.strong_count() != 0);
+        for resident in &self.queued_resident_leases {
+            if let Some(resident) = resident.upgrade() {
+                resident
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .enter_slow_output()?;
+            }
+        }
+        if let Some(spool) = &mut self.spool_lease {
+            spool.enter_slow()?;
+        }
+        if let Some(dynamic) = &mut self._dynamic_lease {
+            dynamic.release_general_slot();
+        }
+        self.slow = true;
+        Ok(())
+    }
+
+    /// Transfer the resident lease into a transport-owned byte buffer while
+    /// retaining a handle that can reclassify it if the output later stalls.
+    /// The lease itself remains alive until the transport releases its final
+    /// queued slice; the response task retains only a non-owning weak handle.
+    pub(crate) fn share_resident(
+        &mut self,
+    ) -> io::Result<std::sync::Arc<std::sync::Mutex<ResidentLease>>> {
+        let resident = self.resident_lease.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "response body lost its resident-byte reservation",
+            )
+        })?;
+        self.track_resident(resident)
+    }
+
+    /// Attach a transient transport buffer to this response's ownership
+    /// phase. Weak registration avoids prolonging buffers the transport has
+    /// already released, while every still-live slice remains reclassifiable.
+    pub(crate) fn track_resident(
+        &mut self,
+        mut resident: ResidentLease,
+    ) -> io::Result<std::sync::Arc<std::sync::Mutex<ResidentLease>>> {
+        if self.slow {
+            resident.enter_slow_output()?;
+        }
+        let resident = std::sync::Arc::new(std::sync::Mutex::new(resident));
+        // A long streaming response may create arbitrarily many chunks over
+        // time. Keep only slices the transport still owns so this registry is
+        // bounded by the live flow-control window, not total response size.
+        self.queued_resident_leases
+            .retain(|resident| resident.strong_count() != 0);
+        self.queued_resident_leases
+            .push(std::sync::Arc::downgrade(&resident));
+        Ok(resident)
+    }
+
+    pub(crate) fn finish(mut self) {
         self.advance(vapache_verified::OutputOwnershipEvent::Finish);
     }
 }
@@ -2074,10 +2139,14 @@ impl Response {
         self.dynamic_lease = Some(lease);
     }
 
-    fn take_output_ownership(&mut self) -> ResponseOwnership {
+    pub(crate) fn take_retained_output_ownership(&mut self) -> ResponseOwnership {
         ResponseOwnership {
             _descriptor_leases: std::mem::take(&mut self.descriptor_leases),
             _dynamic_lease: self.dynamic_lease.take(),
+            spool_lease: self.spool_lease.take(),
+            resident_lease: self.resident_lease.take(),
+            queued_resident_leases: Vec::new(),
+            slow: false,
             phase: vapache_verified::OutputOwnershipPhase::ResponseOwned,
         }
     }
@@ -2742,12 +2811,22 @@ pub fn write_response<W: ResponseWrite>(
 /// large download must not monopolize a Tokio worker or starve timeout/cancel
 /// processing for other connections.
 pub(crate) const ASYNC_OUTPUT_QUANTUM: usize = 256 * 1024;
+#[cfg(not(test))]
+const H1_SLOW_CLASSIFY_GRACE: Duration = Duration::from_millis(100);
+#[cfg(test)]
+const H1_SLOW_CLASSIFY_GRACE: Duration = Duration::from_millis(2);
+#[cfg(not(test))]
+const H1_OUTPUT_FLOOR: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const H1_OUTPUT_FLOOR: Duration = Duration::from_millis(20);
 
 async fn async_write_progress<W>(
     stream: &mut W,
     mut bytes: &[u8],
-    timeout: Duration,
     scope: Option<&crate::resource::RequestScope>,
+    output: &mut crate::resource::SlowOutputAdmission,
+    progress: &mut crate::resource::SlowOutputProgress,
+    ownership: &mut ResponseOwnership,
 ) -> io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -2760,22 +2839,90 @@ where
             ));
         }
         let quantum = bytes.len().min(ASYNC_OUTPUT_QUANTUM);
-        let written = tokio::time::timeout(
-            timeout,
-            tokio::io::AsyncWriteExt::write(stream, &bytes[..quantum]),
-        )
-        .await
-        .map_err(|_| write_timeout_error())??;
+        let written = if output.is_slow() {
+            loop {
+                let now = Instant::now();
+                progress.validate(now)?;
+                let deadline = tokio::time::Instant::from_std(progress.next_deadline());
+                match tokio::time::timeout_at(
+                    deadline,
+                    tokio::io::AsyncWriteExt::write(stream, &bytes[..quantum]),
+                )
+                .await
+                {
+                    Ok(result) => break result?,
+                    Err(_) => progress.validate(Instant::now())?,
+                }
+            }
+        } else {
+            let remaining = progress.remaining_classification_grace(H1_SLOW_CLASSIFY_GRACE);
+            if remaining.is_zero() {
+                output.enter_slow_with(|| ownership.enter_slow())?;
+                continue;
+            }
+            let wait_started = Instant::now();
+            match tokio::time::timeout(
+                remaining,
+                tokio::io::AsyncWriteExt::write(stream, &bytes[..quantum]),
+            )
+            .await
+            {
+                Ok(result) => {
+                    progress.record_blocked(wait_started.elapsed());
+                    result?
+                }
+                Err(_) => {
+                    progress.record_blocked(wait_started.elapsed());
+                    output.enter_slow_with(|| ownership.enter_slow())?;
+                    continue;
+                }
+            }
+        };
         if written == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
                 "response socket wrote zero bytes",
             ));
         }
+        progress.record(written);
         bytes = &bytes[written..];
         tokio::task::yield_now().await;
     }
     Ok(())
+}
+
+async fn async_flush_progress<W>(
+    stream: &mut W,
+    output: &mut crate::resource::SlowOutputAdmission,
+    progress: &mut crate::resource::SlowOutputProgress,
+    ownership: &mut ResponseOwnership,
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if !output.is_slow() {
+        let remaining = progress.remaining_classification_grace(H1_SLOW_CLASSIFY_GRACE);
+        if !remaining.is_zero() {
+            let wait_started = Instant::now();
+            match tokio::time::timeout(remaining, tokio::io::AsyncWriteExt::flush(stream)).await {
+                Ok(result) => {
+                    progress.record_blocked(wait_started.elapsed());
+                    return result;
+                }
+                Err(_) => progress.record_blocked(wait_started.elapsed()),
+            }
+        }
+        output.enter_slow_with(|| ownership.enter_slow())?;
+    }
+    loop {
+        let now = Instant::now();
+        progress.validate(now)?;
+        let deadline = tokio::time::Instant::from_std(progress.next_deadline());
+        match tokio::time::timeout_at(deadline, tokio::io::AsyncWriteExt::flush(stream)).await {
+            Ok(result) => return result,
+            Err(_) => progress.validate(Instant::now())?,
+        }
+    }
 }
 
 async fn async_read_stream_chunk(
@@ -2833,16 +2980,21 @@ pub(crate) async fn write_response_async<W>(
     resp: &mut Response,
     opts: &ResponseOptions<'_>,
     scope: Option<&crate::resource::RequestScope>,
+    output: &mut crate::resource::SlowOutputAdmission,
 ) -> io::Result<u64>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let (head, no_body_status, _) = serialize_response_head(resp, opts)?;
-    async_write_progress(stream, &head, opts.write_timeout, scope).await?;
+    let mut progress =
+        crate::resource::SlowOutputProgress::new(opts.write_timeout.max(H1_OUTPUT_FLOOR));
+    // Ownership is detached from the response before the first wire wait, so
+    // a slow header or flush transfers dynamic capacity just like a slow body.
+    let mut ownership = resp.take_retained_output_ownership();
+    async_write_progress(stream, &head, scope, output, &mut progress, &mut ownership).await?;
     if opts.head_only || no_body_status {
-        tokio::time::timeout(opts.write_timeout, tokio::io::AsyncWriteExt::flush(stream))
-            .await
-            .map_err(|_| write_timeout_error())??;
+        async_flush_progress(stream, output, &mut progress, &mut ownership).await?;
+        ownership.finish();
         return Ok(0);
     }
 
@@ -2851,12 +3003,12 @@ where
     // the async output future is cancelled while `spawn_blocking` is running,
     // the exact descriptor/backend permits therefore remain held until the
     // kernel object itself leaves that task.
-    let mut ownership = resp.take_output_ownership();
     let mut sent = 0u64;
     match body {
         Body::Empty => {}
         Body::Bytes(bytes) => {
-            async_write_progress(stream, &bytes, opts.write_timeout, scope).await?;
+            async_write_progress(stream, &bytes, scope, output, &mut progress, &mut ownership)
+                .await?;
             sent = bytes.len() as u64;
         }
         Body::File {
@@ -2884,7 +3036,8 @@ where
                         "short file response body",
                     ));
                 }
-                async_write_progress(stream, &chunk, opts.write_timeout, scope).await?;
+                async_write_progress(stream, &chunk, scope, output, &mut progress, &mut ownership)
+                    .await?;
                 sent += read as u64;
                 len -= read as u64;
                 offset = offset.saturating_add(read as u64);
@@ -2913,16 +3066,15 @@ where
                         "short streamed response body",
                     ));
                 }
-                async_write_progress(stream, &bytes, opts.write_timeout, scope).await?;
+                async_write_progress(stream, &bytes, scope, output, &mut progress, &mut ownership)
+                    .await?;
                 sent += read as u64;
                 len -= read as u64;
             }
         }
     }
+    async_flush_progress(stream, output, &mut progress, &mut ownership).await?;
     ownership.finish();
-    tokio::time::timeout(opts.write_timeout, tokio::io::AsyncWriteExt::flush(stream))
-        .await
-        .map_err(|_| write_timeout_error())??;
     Ok(sent)
 }
 
@@ -2935,17 +3087,20 @@ pub(crate) async fn write_response_async_plain(
     resp: &mut Response,
     opts: &ResponseOptions<'_>,
     scope: Option<&crate::resource::RequestScope>,
+    output: &mut crate::resource::SlowOutputAdmission,
 ) -> io::Result<u64> {
     if !matches!(&resp.body, Body::File { .. }) {
-        return write_response_async(stream, resp, opts, scope).await;
+        return write_response_async(stream, resp, opts, scope, output).await;
     }
 
     let (head, no_body_status, _) = serialize_response_head(resp, opts)?;
-    async_write_progress(stream, &head, opts.write_timeout, scope).await?;
+    let mut progress =
+        crate::resource::SlowOutputProgress::new(opts.write_timeout.max(H1_OUTPUT_FLOOR));
+    let mut ownership = resp.take_retained_output_ownership();
+    async_write_progress(stream, &head, scope, output, &mut progress, &mut ownership).await?;
     if opts.head_only || no_body_status {
-        tokio::time::timeout(opts.write_timeout, tokio::io::AsyncWriteExt::flush(stream))
-            .await
-            .map_err(|_| write_timeout_error())??;
+        async_flush_progress(stream, output, &mut progress, &mut ownership).await?;
+        ownership.finish();
         return Ok(0);
     }
 
@@ -2957,7 +3112,6 @@ pub(crate) async fn write_response_async_plain(
     else {
         unreachable!("plain file response changed after specialization check")
     };
-    let mut ownership = resp.take_output_ownership();
     let mut sent = 0u64;
     let mut fallback = false;
     while len > 0 && !fallback {
@@ -2968,30 +3122,57 @@ pub(crate) async fn write_response_async_plain(
             ));
         }
         let count = len.min(ASYNC_OUTPUT_QUANTUM as u64) as usize;
-        let transfer = tokio::time::timeout(opts.write_timeout, async {
-            loop {
-                stream.writable().await?;
-                let socket = stream.as_fd();
-                match stream.try_io(tokio::io::Interest::WRITABLE, || {
-                    rustix::fs::sendfile(socket, file.as_fd(), Some(&mut offset), count)
-                        .map_err(io::Error::from)
-                }) {
-                    Ok(written) => return Ok::<usize, io::Error>(written),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-                    Err(error) => return Err(error),
+        let transfer = loop {
+            let operation = async {
+                loop {
+                    stream.writable().await?;
+                    let socket = stream.as_fd();
+                    match stream.try_io(tokio::io::Interest::WRITABLE, || {
+                        rustix::fs::sendfile(socket, file.as_fd(), Some(&mut offset), count)
+                            .map_err(io::Error::from)
+                    }) {
+                        Ok(written) => return Ok::<usize, io::Error>(written),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
+            if output.is_slow() {
+                let now = Instant::now();
+                progress.validate(now)?;
+                let deadline = tokio::time::Instant::from_std(progress.next_deadline());
+                match tokio::time::timeout_at(deadline, operation).await {
+                    Ok(result) => break result,
+                    Err(_) => progress.validate(Instant::now())?,
+                }
+            } else {
+                let remaining = progress.remaining_classification_grace(H1_SLOW_CLASSIFY_GRACE);
+                if remaining.is_zero() {
+                    output.enter_slow_with(|| ownership.enter_slow())?;
+                    continue;
+                }
+                let wait_started = Instant::now();
+                match tokio::time::timeout(remaining, operation).await {
+                    Ok(result) => {
+                        progress.record_blocked(wait_started.elapsed());
+                        break result;
+                    }
+                    Err(_) => {
+                        progress.record_blocked(wait_started.elapsed());
+                        output.enter_slow_with(|| ownership.enter_slow())?;
+                    }
                 }
             }
-        })
-        .await;
+        };
         match transfer {
-            Err(_) => return Err(write_timeout_error()),
-            Ok(Ok(0)) => {
+            Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "short file response body",
                 ));
             }
-            Ok(Ok(written)) => {
+            Ok(written) => {
+                progress.record(written);
                 sent += written as u64;
                 len -= written as u64;
                 tokio::task::yield_now().await;
@@ -2999,7 +3180,7 @@ pub(crate) async fn write_response_async_plain(
             // Pipes, synthetic descriptors and some filesystems cannot be
             // sendfile sources. Resume at the explicit offset through the
             // same bounded reader used by TLS output.
-            Ok(Err(_)) => fallback = true,
+            Err(_) => fallback = true,
         }
     }
 
@@ -3018,16 +3199,15 @@ pub(crate) async fn write_response_async_plain(
                     "short file response body",
                 ));
             }
-            async_write_progress(stream, &chunk, opts.write_timeout, scope).await?;
+            async_write_progress(stream, &chunk, scope, output, &mut progress, &mut ownership)
+                .await?;
             sent += read as u64;
             len -= read as u64;
             offset = offset.saturating_add(read as u64);
         }
     }
+    async_flush_progress(stream, output, &mut progress, &mut ownership).await?;
     ownership.finish();
-    tokio::time::timeout(opts.write_timeout, tokio::io::AsyncWriteExt::flush(stream))
-        .await
-        .map_err(|_| write_timeout_error())??;
     Ok(sent)
 }
 
@@ -3810,9 +3990,19 @@ mod tests {
         let expected = body.len();
         let writer = tokio::spawn(async move {
             let mut response = Response::bytes(200, "application/octet-stream", body);
-            write_response_async(&mut server, &mut response, &response_options(), None)
-                .await
-                .unwrap()
+            let budget = std::sync::Arc::new(ResourceBudget::default());
+            let mut output = crate::resource::SlowOutputAdmission::detached(
+                budget.context("127.0.0.1".parse().unwrap()),
+            );
+            write_response_async(
+                &mut server,
+                &mut response,
+                &response_options(),
+                None,
+                &mut output,
+            )
+            .await
+            .unwrap()
         });
         let mut wire = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut client, &mut wire)
@@ -3826,6 +4016,155 @@ mod tests {
             .unwrap()
             + 4;
         assert_eq!(&wire[split..], vec![b'x'; expected]);
+    }
+
+    #[test]
+    fn slow_h1_ownership_releases_general_backend_memory_and_spool_pools() {
+        let budget = std::sync::Arc::new(ResourceBudget::default());
+        let client = "192.0.2.77".parse().unwrap();
+        let context = budget.context(client);
+        let mut response = Response::bytes(200, "application/octet-stream", vec![b'x'; 4096]);
+        response.admit_resident_for(&budget, client).unwrap();
+        let mut spool = budget.try_spool_in(8192, 2, &context).unwrap();
+        spool.reserve(1024).unwrap();
+        response.hold_spool(spool);
+        response.hold_dynamic(budget.try_dynamic_descriptors_in(&context, 1, 1).unwrap());
+        let general = context
+            .slot(
+                crate::resource::SlotKind::H1Connection,
+                1,
+                Some(1),
+                Some(1),
+                "full",
+            )
+            .unwrap();
+        let mut output = crate::resource::SlowOutputAdmission::tracked_h1(context, general);
+        let mut ownership = response.take_retained_output_ownership();
+
+        output.enter_slow().unwrap();
+        ownership.enter_slow().unwrap();
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::H1Connection),
+            0
+        );
+        assert_eq!(budget.usage().2, 0, "general backend slot was retained");
+        let (slow_outputs, slow_resident, slow_files, slow_spool) =
+            budget.slow_output_resource_usage();
+        assert_eq!(slow_outputs, 1);
+        assert!(slow_resident >= 4096);
+        assert_eq!(slow_files, 1);
+        assert_eq!(slow_spool, 1024);
+
+        ownership.finish();
+        assert!(output.finish_h1().is_none());
+        assert_eq!(budget.slow_output_resource_usage(), (0, 0, 0, 0));
+        assert_eq!(budget.usage(), (0, 0, 0));
+    }
+
+    #[test]
+    fn queued_resident_lease_can_be_reclassified_after_transport_handoff() {
+        let budget = std::sync::Arc::new(ResourceBudget::default());
+        let client = "192.0.2.79".parse().unwrap();
+        let mut response = Response::bytes(200, "application/octet-stream", vec![b'x'; 4096]);
+        response.admit_resident_for(&budget, client).unwrap();
+        let mut ownership = response.take_retained_output_ownership();
+        let queued = ownership.share_resident().unwrap();
+        let admitted = queued
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .bytes();
+        let mut transient = budget.try_response_bytes_for(client);
+        transient.reserve(1024).unwrap();
+        let transient = ownership.track_resident(transient).unwrap();
+
+        ownership.enter_slow().unwrap();
+        assert!(admitted >= 4096);
+        assert_eq!(
+            budget.slow_output_resource_usage(),
+            (0, admitted + 1024, 0, 0)
+        );
+
+        ownership.finish();
+        assert_eq!(
+            budget.slow_output_resource_usage(),
+            (0, admitted + 1024, 0, 0),
+            "all transport-owned byte slices must keep their accounting"
+        );
+        drop(queued);
+        assert_eq!(budget.slow_output_resource_usage(), (0, 1024, 0, 0));
+        drop(transient);
+        assert_eq!(budget.slow_output_resource_usage(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn transport_resident_registry_is_bounded_by_live_slices() {
+        let budget = std::sync::Arc::new(ResourceBudget::default());
+        let client = "192.0.2.80".parse().unwrap();
+        let mut response = Response::new(200);
+        let mut ownership = response.take_retained_output_ownership();
+
+        for _ in 0..256 {
+            let mut resident = budget.try_response_bytes_for(client);
+            resident.reserve(1).unwrap();
+            drop(ownership.track_resident(resident).unwrap());
+        }
+
+        assert_eq!(ownership.queued_resident_leases.len(), 1);
+        assert_eq!(budget.extended_usage().2, 0);
+        ownership.finish();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_h1_writer_enters_slow_pool_without_renewing_general_capacity() {
+        let budget = std::sync::Arc::new(ResourceBudget::default());
+        let client = "192.0.2.78".parse().unwrap();
+        let context = budget.context(client);
+        let general = context
+            .slot(
+                crate::resource::SlotKind::H1Connection,
+                1,
+                Some(1),
+                Some(1),
+                "full",
+            )
+            .unwrap();
+        let dynamic = budget.try_dynamic_descriptors_in(&context, 1, 1).unwrap();
+        let (mut server, _client) = tokio::io::duplex(64);
+        let task_budget = budget.clone();
+        let writer = tokio::spawn(async move {
+            let mut response =
+                Response::bytes(200, "application/octet-stream", vec![b'x'; 512 * 1024]);
+            response.admit_resident_for(&task_budget, client).unwrap();
+            response.hold_dynamic(dynamic);
+            let mut output = crate::resource::SlowOutputAdmission::tracked_h1(context, general);
+            write_response_async(
+                &mut server,
+                &mut response,
+                &response_options(),
+                None,
+                &mut output,
+            )
+            .await
+        });
+
+        for _ in 0..100 {
+            if budget.slow_output_resource_usage().0 == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(budget.slow_output_resource_usage().0, 1);
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::H1Connection),
+            0
+        );
+        assert_eq!(budget.usage().2, 0);
+        assert!(budget.slow_output_resource_usage().1 >= 512 * 1024);
+
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+        assert_eq!(budget.slow_output_resource_usage(), (0, 0, 0, 0));
+        assert_eq!(budget.extended_usage().2, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3879,9 +4218,19 @@ mod tests {
                 offset: 0,
                 len: body.len() as u64,
             };
-            write_response_async_plain(&mut socket, &mut response, &response_options(), None)
-                .await
-                .unwrap()
+            let budget = std::sync::Arc::new(ResourceBudget::default());
+            let mut output = crate::resource::SlowOutputAdmission::detached(
+                budget.context("127.0.0.1".parse().unwrap()),
+            );
+            write_response_async_plain(
+                &mut socket,
+                &mut response,
+                &response_options(),
+                None,
+                &mut output,
+            )
+            .await
+            .unwrap()
         });
         let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
         let mut wire = Vec::new();
@@ -3932,7 +4281,15 @@ mod tests {
                 len: 1,
             };
             response.hold_dynamic(dynamic);
-            write_response_async(&mut server, &mut response, &response_options(), None).await
+            let mut output = crate::resource::SlowOutputAdmission::detached(context);
+            write_response_async(
+                &mut server,
+                &mut response,
+                &response_options(),
+                None,
+                &mut output,
+            )
+            .await
         });
         tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
             .await

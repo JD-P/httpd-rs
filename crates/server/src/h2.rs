@@ -42,8 +42,6 @@ const H2_STREAM_FLOOR: std::time::Duration = std::time::Duration::from_millis(20
 const H2_SLOW_CLASSIFY_GRACE: Duration = Duration::from_millis(100);
 #[cfg(test)]
 const H2_SLOW_CLASSIFY_GRACE: Duration = Duration::from_millis(2);
-const H2_SLOW_RESPONSE_MIN_RATE: u64 = 1024;
-const H2_SLOW_RESPONSE_MAX_INTERVALS: u32 = 16;
 
 #[derive(Clone, Copy)]
 enum H2TaskEvent {
@@ -216,12 +214,12 @@ fn take_body_buffer(len: usize) -> Vec<u8> {
 
 struct PooledBuffer {
     buf: Option<Vec<u8>>,
-    _resident: ResidentLease,
+    _resident: Arc<Mutex<ResidentLease>>,
 }
 
 struct AccountedResponseBytes {
     data: Vec<u8>,
-    _resident: ResidentLease,
+    _resident: Arc<Mutex<ResidentLease>>,
 }
 
 impl AsRef<[u8]> for AccountedResponseBytes {
@@ -269,7 +267,7 @@ fn read_range(
     file: &std::fs::File,
     offset: u64,
     len: usize,
-    resident: ResidentLease,
+    resident: Arc<Mutex<ResidentLease>>,
 ) -> io::Result<Bytes> {
     let mut buf = take_body_buffer(len);
     let reader = FileAt { file, pos: offset };
@@ -529,185 +527,25 @@ async fn poll_send_capacity(send: &mut h2::SendStream<Bytes>) -> io::Result<usiz
     }
 }
 
-struct H2OutputAdmission {
-    context: crate::resource::ResourceContext,
-    general: Option<crate::resource::CombinedH2Lease>,
-    slow: Option<crate::resource::H2SlowResponseLease>,
-    phase: vapache_verified::H2OutputPhase,
-}
-
-impl H2OutputAdmission {
-    fn tracked(
-        context: crate::resource::ResourceContext,
-        general: crate::resource::CombinedH2Lease,
-    ) -> Self {
-        Self {
-            context,
-            general: Some(general),
-            slow: None,
-            phase: vapache_verified::H2OutputPhase::General,
-        }
-    }
-
-    fn detached(context: crate::resource::ResourceContext) -> Self {
-        Self {
-            context,
-            general: None,
-            slow: None,
-            phase: vapache_verified::H2OutputPhase::General,
-        }
-    }
-
-    fn is_slow(&self) -> bool {
-        self.phase == vapache_verified::H2OutputPhase::Slow
-    }
-
-    fn client(&self) -> std::net::IpAddr {
-        self.context
-            .client()
-            .expect("HTTP/2 output admission requires a client identity")
-    }
-
-    fn enter_slow(&mut self) -> io::Result<()> {
-        if self.is_slow() {
-            return Ok(());
-        }
-        let next = vapache_verified::h2_output_phase_step(
-            self.phase,
-            vapache_verified::H2OutputEvent::FlowControlStall,
-        )
-        .ok_or_else(|| io::Error::other("HTTP/2 output ownership is closed"))?;
-        let slow = self
-            .context
-            .budget()
-            .try_h2_slow_response_in(&self.context)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "HTTP/2 slow-response capacity exhausted",
-                )
-            })?;
-        self.phase = next;
-        self.slow = Some(slow);
-        // Acquire the smaller pool first, then release general capacity.  If
-        // acquisition fails the caller resets this stream and its ordinary
-        // lease is released by RAII; no unaccounted task is ever created.
-        drop(self.general.take());
-        Ok(())
-    }
-
-    fn finish(&mut self) {
-        if let Some(next) = vapache_verified::h2_output_phase_step(
-            self.phase,
-            vapache_verified::H2OutputEvent::Finish,
-        ) {
-            self.phase = next;
-        }
-        drop(self.general.take());
-        drop(self.slow.take());
-    }
-}
-
-impl Drop for H2OutputAdmission {
-    fn drop(&mut self) {
-        self.finish();
-    }
-}
-
-struct H2SendProgress {
-    started: Instant,
-    delivered: u64,
-    flow_blocked: Duration,
-    interval: Duration,
-    checkpoint: Instant,
-    absolute_deadline: Instant,
-}
-
-impl H2SendProgress {
-    fn new(interval: Duration) -> Self {
-        let started = Instant::now();
-        let checkpoint = started.checked_add(interval).unwrap_or(started);
-        let absolute_deadline = started
-            .checked_add(interval.saturating_mul(H2_SLOW_RESPONSE_MAX_INTERVALS))
-            .unwrap_or(checkpoint);
-        Self {
-            started,
-            delivered: 0,
-            flow_blocked: Duration::ZERO,
-            interval,
-            checkpoint,
-            absolute_deadline,
-        }
-    }
-
-    fn record(&mut self, bytes: usize) {
-        self.delivered = self.delivered.saturating_add(bytes as u64);
-    }
-
-    fn record_flow_blocked(&mut self, blocked: Duration) {
-        self.flow_blocked = self.flow_blocked.saturating_add(blocked);
-    }
-
-    fn validate(&mut self, now: Instant) -> io::Result<()> {
-        if now >= self.absolute_deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "HTTP/2 response lifetime exceeded",
-            ));
-        }
-        if now < self.checkpoint {
-            return Ok(());
-        }
-        let elapsed_ms =
-            u64::try_from(now.duration_since(self.started).as_millis()).unwrap_or(u64::MAX);
-        let grace_ms = u64::try_from(self.interval.as_millis()).unwrap_or(u64::MAX);
-        if !vapache_verified::minimum_progress_rate_admit(
-            self.delivered,
-            elapsed_ms,
-            H2_SLOW_RESPONSE_MIN_RATE,
-            grace_ms,
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "HTTP/2 response minimum rate not met",
-            ));
-        }
-        while self.checkpoint <= now {
-            self.checkpoint = self
-                .checkpoint
-                .checked_add(self.interval)
-                .unwrap_or(self.absolute_deadline);
-            if self.checkpoint >= self.absolute_deadline {
-                self.checkpoint = self.absolute_deadline;
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn next_deadline(&self) -> Instant {
-        self.checkpoint.min(self.absolute_deadline)
-    }
-}
-
 async fn send_capacity(
     send: &mut h2::SendStream<Bytes>,
     remaining: usize,
-    output: &mut H2OutputAdmission,
-    progress: &mut H2SendProgress,
+    output: &mut crate::resource::SlowOutputAdmission,
+    progress: &mut crate::resource::SlowOutputProgress,
+    ownership: &mut crate::http::ResponseOwnership,
 ) -> io::Result<usize> {
     send.reserve_capacity(remaining);
     if !output.is_slow() {
-        let remaining_grace = H2_SLOW_CLASSIFY_GRACE.saturating_sub(progress.flow_blocked);
+        let remaining_grace = progress.remaining_classification_grace(H2_SLOW_CLASSIFY_GRACE);
         let wait_started = Instant::now();
         match tokio::time::timeout(remaining_grace, poll_send_capacity(send)).await {
             Ok(result) => {
-                progress.record_flow_blocked(wait_started.elapsed());
+                progress.record_blocked(wait_started.elapsed());
                 return result;
             }
             Err(_) => {
-                progress.record_flow_blocked(wait_started.elapsed());
-                output.enter_slow()?;
+                progress.record_blocked(wait_started.elapsed());
+                output.enter_slow_with(|| ownership.enter_slow())?;
             }
         }
     }
@@ -734,8 +572,9 @@ async fn send_data_bounded(
     send: &mut h2::SendStream<Bytes>,
     data: Bytes,
     end: bool,
-    output: &mut H2OutputAdmission,
-    progress: &mut H2SendProgress,
+    output: &mut crate::resource::SlowOutputAdmission,
+    progress: &mut crate::resource::SlowOutputProgress,
+    ownership: &mut crate::http::ResponseOwnership,
 ) -> io::Result<()> {
     if data.is_empty() {
         return send.send_data(data, end).map_err(send_io_error);
@@ -743,7 +582,7 @@ async fn send_data_bounded(
     let mut offset = 0usize;
     while offset < data.len() {
         let remaining = data.len() - offset;
-        let capacity = send_capacity(send, remaining, output, progress).await?;
+        let capacity = send_capacity(send, remaining, output, progress, ownership).await?;
         let n = capacity.min(remaining);
         let last = end && offset + n == data.len();
         send.send_data(data.slice(offset..offset + n), last)
@@ -759,7 +598,7 @@ async fn send_response_with_admission(
     cfg: &Config,
     mut resp: Response,
     head_only: bool,
-    output: &mut H2OutputAdmission,
+    output: &mut crate::resource::SlowOutputAdmission,
 ) -> io::Result<u64> {
     let client = output.client();
     if !crate::http::response_headers_admitted(&resp) {
@@ -851,41 +690,62 @@ async fn send_response_with_admission(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid response headers"))?;
 
     let end = no_body || body_len == 0;
+    let mut ownership = resp.take_retained_output_ownership();
     let mut send = respond
         .send_response(response, end)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     if end {
-        output.finish();
+        ownership.finish();
+        output.finish_response();
         return Ok(0);
     }
     let send_timeout = cfg.timeout.max(H2_STREAM_FLOOR);
-    let mut progress = H2SendProgress::new(send_timeout);
+    let mut progress = crate::resource::SlowOutputProgress::new(send_timeout);
     // The h2 crate retains queued `Bytes` after this function returns. Move
     // the body reservation into the byte owner so accounting lasts until the
     // transport releases the final queued slice, not merely until enqueue.
-    let mut response_resident = resp.take_resident();
-
     let mut sent = 0u64;
     match resp.body {
         Body::Empty => {
             // `end` returned above because Body::Empty has length zero.
             // coverage:ignore-start - body-length invariant
-            send_data_bounded(&mut send, Bytes::new(), true, output, &mut progress).await?;
+            send_data_bounded(
+                &mut send,
+                Bytes::new(),
+                true,
+                output,
+                &mut progress,
+                &mut ownership,
+            )
+            .await?;
             // coverage:ignore-stop
         }
         Body::Bytes(data) => {
             sent = data.len() as u64;
-            let resident = response_resident.take().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "response body lost its resident-byte reservation",
-                )
-            })?;
+            let capacity =
+                send_capacity(&mut send, data.len(), output, &mut progress, &mut ownership)
+                    .await?
+                    .min(data.len());
+            let resident = ownership.share_resident()?;
             let data = Bytes::from_owner(AccountedResponseBytes {
                 data,
                 _resident: resident,
             });
-            send_data_bounded(&mut send, data, true, output, &mut progress).await?;
+            let first = capacity.min(data.len());
+            send.send_data(data.slice(..first), first == data.len())
+                .map_err(send_io_error)?;
+            progress.record(first);
+            if first < data.len() {
+                send_data_bounded(
+                    &mut send,
+                    data.slice(first..),
+                    true,
+                    output,
+                    &mut progress,
+                    &mut ownership,
+                )
+                .await?;
+            }
         }
         Body::Stream { mut reader, len } => {
             let mut left = len;
@@ -894,26 +754,37 @@ async fn send_response_with_admission(
                 // Wait for downstream capacity before reading from the
                 // upstream. A zero-window client therefore owns neither a
                 // response buffer nor a process-wide blocking-read lease.
-                let capacity = send_capacity(&mut send, want, output, &mut progress)
-                    .await?
-                    .min(want);
+                let capacity =
+                    send_capacity(&mut send, want, output, &mut progress, &mut ownership)
+                        .await?
+                        .min(want);
                 let resident = response_chunk_lease(&cfg.resource_budget, client, capacity)?;
+                let resident = ownership.track_resident(resident)?;
                 let blocking_read = cfg.resource_budget.try_response_body_read_for(client)?;
-                let (next_reader, mut buf, resident, result) =
+                let read_ownership = ownership.begin_read();
+                let (next_reader, mut buf, resident, result, next_ownership) =
                     tokio::task::spawn_blocking(move || {
                         let _blocking_read = blocking_read;
                         let mut buf = take_body_buffer(capacity);
                         buf.resize(capacity, 0);
                         let result = reader.read(&mut buf[..capacity]);
-                        (reader, buf, resident, result)
+                        (
+                            reader,
+                            buf,
+                            resident,
+                            result,
+                            read_ownership.complete_read(),
+                        )
                     })
                     .await
                     .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
                 reader = next_reader;
+                ownership = next_ownership;
                 let n = result.map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
                 if n == 0 {
                     send.send_data(Bytes::new(), true).map_err(send_io_error)?;
-                    output.finish();
+                    ownership.finish();
+                    output.finish_response();
                     return Ok(sent);
                 }
                 if output.is_slow() {
@@ -945,20 +816,25 @@ async fn send_response_with_admission(
             let mut pos = offset;
             while left > 0 {
                 let want = left.min(CHUNK) as usize;
-                let capacity = send_capacity(&mut send, want, output, &mut progress)
-                    .await?
-                    .min(want);
+                let capacity =
+                    send_capacity(&mut send, want, output, &mut progress, &mut ownership)
+                        .await?
+                        .min(want);
                 let resident = response_chunk_lease(&cfg.resource_budget, client, capacity)?;
+                let resident = ownership.track_resident(resident)?;
                 let data = if offload {
                     let blocking_read = cfg.resource_budget.try_response_body_read_for(client)?;
-                    let (next_file, data) = tokio::task::spawn_blocking(move || {
-                        let _blocking_read = blocking_read;
-                        let data = read_range(&file, pos, capacity, resident);
-                        (file, data)
-                    })
-                    .await
-                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+                    let read_ownership = ownership.begin_read();
+                    let (next_file, data, next_ownership) =
+                        tokio::task::spawn_blocking(move || {
+                            let _blocking_read = blocking_read;
+                            let data = read_range(&file, pos, capacity, resident);
+                            (file, data, read_ownership.complete_read())
+                        })
+                        .await
+                        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
                     file = next_file;
+                    ownership = next_ownership;
                     data?
                 } else {
                     read_range(&file, pos, capacity, resident)?
@@ -966,7 +842,8 @@ async fn send_response_with_admission(
                 let filled = data.len();
                 if filled == 0 {
                     send.send_data(Bytes::new(), true).map_err(send_io_error)?;
-                    output.finish();
+                    ownership.finish();
+                    output.finish_response();
                     return Ok(sent);
                 }
                 if output.is_slow() {
@@ -980,7 +857,8 @@ async fn send_response_with_admission(
             }
         }
     }
-    output.finish();
+    ownership.finish();
+    output.finish_response();
     Ok(sent)
 }
 
@@ -991,7 +869,8 @@ async fn send_response(
     resp: Response,
     head_only: bool,
 ) -> io::Result<u64> {
-    let mut output = H2OutputAdmission::detached(cfg.resource_budget.context(client));
+    let mut output =
+        crate::resource::SlowOutputAdmission::detached(cfg.resource_budget.context(client));
     send_response_with_admission(respond, cfg, resp, head_only, &mut output).await
 }
 
@@ -1086,7 +965,8 @@ async fn handle_stream(
         quota_identity_valid,
         stream_quota,
     } = admission;
-    let mut output_admission = H2OutputAdmission::tracked(resource_context.clone(), stream_quota);
+    let mut output_admission =
+        crate::resource::SlowOutputAdmission::tracked_h2(resource_context.clone(), stream_quota);
     if !quota_identity_valid {
         return send_response_with_admission(
             respond,
@@ -2988,7 +2868,9 @@ mod tests {
             for _ in 0..32 {
                 let context = budget.context(std::net::IpAddr::from([192, 0, 2, source]));
                 let general = budget.try_h2_stream_in(&context).unwrap();
-                outputs.push(H2OutputAdmission::tracked(context, general));
+                outputs.push(crate::resource::SlowOutputAdmission::tracked_h2(
+                    context, general,
+                ));
             }
         }
         assert_eq!(budget.h2_output_usage(), (256, 0));
@@ -3016,7 +2898,7 @@ mod tests {
 
     #[test]
     fn slow_output_progress_is_anchored_and_has_an_absolute_ceiling() {
-        let mut progress = H2SendProgress::new(Duration::from_secs(1));
+        let mut progress = crate::resource::SlowOutputProgress::new(Duration::from_secs(1));
         progress.record(1024);
         assert!(progress
             .validate(progress.started + Duration::from_secs(1))
@@ -3025,7 +2907,7 @@ mod tests {
             .validate(progress.started + Duration::from_secs(2))
             .is_err());
 
-        let mut trickle = H2SendProgress::new(Duration::from_millis(20));
+        let mut trickle = crate::resource::SlowOutputProgress::new(Duration::from_millis(20));
         trickle.record(1);
         assert!(
             trickle.validate(trickle.absolute_deadline).is_err(),
@@ -3035,7 +2917,7 @@ mod tests {
         // Exercise the defensive Instant overflow path deterministically.
         // The constructor cannot create this shape because the absolute
         // deadline is derived from the same smaller interval.
-        let mut rollover = H2SendProgress::new(Duration::from_secs(1));
+        let mut rollover = crate::resource::SlowOutputProgress::new(Duration::from_secs(1));
         rollover.interval = Duration::MAX;
         rollover.checkpoint = rollover.started;
         rollover.absolute_deadline = rollover.started + Duration::from_secs(1);
@@ -3066,8 +2948,9 @@ mod tests {
             let mut connection = h2::server::handshake(server_io).await.unwrap();
             let (_, respond) = connection.accept().await.unwrap().unwrap();
             let client = std::net::IpAddr::from([127, 0, 0, 1]);
-            let mut output =
-                H2OutputAdmission::detached(server_cfg.resource_budget.context(client));
+            let mut output = crate::resource::SlowOutputAdmission::detached(
+                server_cfg.resource_budget.context(client),
+            );
             output.enter_slow().unwrap();
             let sender =
                 send_response_with_admission(respond, &server_cfg, response, false, &mut output);
@@ -3764,7 +3647,9 @@ mod tests {
             &file,
             3,
             5,
-            response_chunk_lease(&budget, client, 5).unwrap(),
+            Arc::new(Mutex::new(
+                response_chunk_lease(&budget, client, 5).unwrap(),
+            )),
         )
         .unwrap();
         assert_eq!(&middle[..], b"34567");
@@ -3772,7 +3657,9 @@ mod tests {
             &file,
             0,
             10,
-            response_chunk_lease(&budget, client, 10).unwrap(),
+            Arc::new(Mutex::new(
+                response_chunk_lease(&budget, client, 10).unwrap(),
+            )),
         )
         .unwrap();
         assert_eq!(&whole[..], b"0123456789");
@@ -3780,7 +3667,9 @@ mod tests {
             &file,
             8,
             5,
-            response_chunk_lease(&budget, client, 5).unwrap(),
+            Arc::new(Mutex::new(
+                response_chunk_lease(&budget, client, 5).unwrap(),
+            )),
         )
         .unwrap();
         assert_eq!(&short[..], b"89");
@@ -3794,10 +3683,12 @@ mod tests {
         let client = std::net::IpAddr::from([192, 0, 2, 50]);
         let mut resident = budget.try_response_bytes_for(client);
         resident.reserve(16).unwrap();
+        let resident = Arc::new(Mutex::new(resident));
         let bytes = Bytes::from_owner(AccountedResponseBytes {
             data: vec![b'x'; 16],
-            _resident: resident,
+            _resident: Arc::clone(&resident),
         });
+        drop(resident);
         let tail = bytes.slice(8..);
         drop(bytes);
         assert_eq!(budget.extended_usage().2, 16);

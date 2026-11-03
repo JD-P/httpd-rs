@@ -795,6 +795,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
     mut initial_body_guard: Option<BodyWorkerGuard>,
     mut initial_resource_context: Option<crate::resource::ResourceContext>,
     mut request_worker: Option<WorkerGuard>,
+    mut general_connection: Option<crate::resource::SlotLease>,
     served: &mut usize,
     single_request: bool,
 ) -> io::Result<bool> {
@@ -1178,9 +1179,19 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                     // WebSocket lease protects the long-lived tunnel, so do
                     // not pin a scarce request worker for the tunnel lifetime.
                     drop(request_worker.take());
-                    let _ = handle.block_on(proxy::websocket_async(
-                        &cfg, &scope, &req, &target, &_grant, &resource, tls, peer, true, host,
+                    let _ = handle.block_on(proxy::websocket_async_with_connection(
+                        &cfg,
+                        &scope,
+                        &req,
+                        &target,
+                        &_grant,
+                        &resource,
+                        tls,
+                        peer,
+                        true,
+                        host,
                         &buf,
+                        general_connection.take(),
                     ));
                     return Ok(false);
                 }
@@ -1198,9 +1209,19 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                     let buf_ref = &buf;
                     let result = rt.block_on(async move {
                         let tcp = tokio::net::TcpStream::from_std(client)?;
-                        proxy::websocket_async(
-                            cfg_ref, scope_ref, req_ref, target_ref, &_grant, &resource, tcp, peer,
-                            false, host, buf_ref,
+                        proxy::websocket_async_with_connection(
+                            cfg_ref,
+                            scope_ref,
+                            req_ref,
+                            target_ref,
+                            &_grant,
+                            &resource,
+                            tcp,
+                            peer,
+                            false,
+                            host,
+                            buf_ref,
+                            general_connection.take(),
                         )
                         .await
                     });
@@ -1337,6 +1358,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
         initial_reservation,
         initial_body_guard,
         initial_resource_context,
+        None,
         None,
         &mut served,
         false,
@@ -2247,7 +2269,8 @@ async fn send_h1_response<S>(
     local_ip: &str,
     local_port: u16,
     deferred: &mut H1DeferredResponse,
-) -> io::Result<u64>
+    established_guard: &mut Option<crate::resource::SlotLease>,
+) -> io::Result<(u64, bool)>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
@@ -2261,15 +2284,31 @@ where
         write_timeout: cfg.timeout,
     };
     let scope = deferred.request.request_scope().cloned();
-    let result =
-        write_response_async(stream, &mut deferred.response, &options, scope.as_ref()).await;
+    let context = scope
+        .as_ref()
+        .map(|scope| scope.context().clone())
+        .ok_or_else(|| io::Error::other("HTTP/1 response lost its resource context"))?;
+    let general = established_guard
+        .take()
+        .ok_or_else(|| io::Error::other("HTTP/1 response lost its connection admission"))?;
+    let mut output = crate::resource::SlowOutputAdmission::tracked_h1(context, general);
+    let result = write_response_async(
+        stream,
+        &mut deferred.response,
+        &options,
+        scope.as_ref(),
+        &mut output,
+    )
+    .await;
+    let was_slow = output.is_slow();
+    *established_guard = output.finish_h1();
     match result {
         Ok(sent) => {
             deferred
                 .phase
                 .advance(vapache_verified::RequestPhaseEvent::OutputComplete);
             log_h1_response(cfg, logger, local_ip, local_port, deferred, sent);
-            Ok(sent)
+            Ok((sent, was_slow))
         }
         Err(error) => {
             deferred
@@ -2290,7 +2329,8 @@ async fn send_h1_response_plain(
     local_ip: &str,
     local_port: u16,
     deferred: &mut H1DeferredResponse,
-) -> io::Result<u64> {
+    established_guard: &mut Option<crate::resource::SlotLease>,
+) -> io::Result<(u64, bool)> {
     let server_header = cfg.server_header();
     let options = ResponseOptions {
         server_header: &server_header,
@@ -2301,15 +2341,31 @@ async fn send_h1_response_plain(
         write_timeout: cfg.timeout,
     };
     let scope = deferred.request.request_scope().cloned();
-    let result =
-        write_response_async_plain(stream, &mut deferred.response, &options, scope.as_ref()).await;
+    let context = scope
+        .as_ref()
+        .map(|scope| scope.context().clone())
+        .ok_or_else(|| io::Error::other("HTTP/1 response lost its resource context"))?;
+    let general = established_guard
+        .take()
+        .ok_or_else(|| io::Error::other("HTTP/1 response lost its connection admission"))?;
+    let mut output = crate::resource::SlowOutputAdmission::tracked_h1(context, general);
+    let result = write_response_async_plain(
+        stream,
+        &mut deferred.response,
+        &options,
+        scope.as_ref(),
+        &mut output,
+    )
+    .await;
+    let was_slow = output.is_slow();
+    *established_guard = output.finish_h1();
     match result {
         Ok(sent) => {
             deferred
                 .phase
                 .advance(vapache_verified::RequestPhaseEvent::OutputComplete);
             log_h1_response(cfg, logger, local_ip, local_port, deferred, sent);
-            Ok(sent)
+            Ok((sent, was_slow))
         }
         Err(error) => {
             deferred
@@ -2372,12 +2428,13 @@ async fn admit_plain_connection(
             return Ok(());
         }
     };
-    let Some(_established_guard) =
+    let Some(established_guard) =
         try_reserve_h1_connection(&first_admission.context, cfg.max_request_workers)
     else {
         reject_h1_async(&mut stream, &cfg, 503).await;
         return Ok(());
     };
+    let mut established_guard = Some(established_guard);
     drop(pending_guard);
     let mut served = 0usize;
     let mut next_admission = Some(first_admission);
@@ -2416,6 +2473,10 @@ async fn admit_plain_connection(
         let logger_worker = logger.clone();
         let local_ip_worker = local_ip.clone();
         let mut request_buf = initial;
+        let websocket_connection_guard = admission
+            .websocket
+            .then(|| established_guard.take())
+            .flatten();
         let result = if admission.websocket {
             spawn_connection_worker(move || {
                 let mut blocking = blocking;
@@ -2432,6 +2493,7 @@ async fn admit_plain_connection(
                     body_guard,
                     Some(admission.context),
                     Some(worker_guard),
+                    websocket_connection_guard,
                     &mut served,
                     true,
                 );
@@ -2622,24 +2684,25 @@ async fn admit_plain_connection(
             }
             Err(ReadError::Io(error)) => return Err(error),
         };
-        if send_h1_response_plain(
+        let was_slow = match send_h1_response_plain(
             &mut stream,
             &cfg,
             &logger,
             &local_ip,
             local_port,
             &mut deferred,
+            &mut established_guard,
         )
         .await
-        .is_err()
         {
-            return Ok(());
-        }
+            Ok((_, was_slow)) => was_slow,
+            Err(_) => return Ok(()),
+        };
         served += 1;
         let reusable = deferred.keep_alive;
         let linger_unread_body = deferred.linger_unread_body;
         drop(deferred);
-        if !reusable {
+        if was_slow || !reusable {
             if linger_unread_body {
                 bounded_lingering_close(&mut stream, &mut buffered).await;
             }
@@ -2774,12 +2837,13 @@ async fn admit_tls_connection(
             return Ok(());
         }
     };
-    let Some(_established_guard) =
+    let Some(established_guard) =
         try_reserve_h1_connection(&first_admission.context, cfg.max_request_workers)
     else {
         reject_h1_async(&mut tls, &cfg, 503).await;
         return Ok(());
     };
+    let mut established_guard = Some(established_guard);
     drop(pending_guard);
     let _lifetime_guard = lifetime_guard;
     let runtime_handle = tokio::runtime::Handle::current();
@@ -2818,6 +2882,10 @@ async fn admit_tls_connection(
         let logger_worker = logger.clone();
         let local_ip_worker = local_ip.clone();
         let mut request_buf = initial;
+        let websocket_connection_guard = admission
+            .websocket
+            .then(|| established_guard.take())
+            .flatten();
         let result = if admission.websocket {
             spawn_connection_worker(move || {
                 let mut bridge = bridge;
@@ -2834,6 +2902,7 @@ async fn admit_tls_connection(
                     body_guard,
                     Some(admission.context),
                     Some(worker_guard),
+                    websocket_connection_guard,
                     &mut served,
                     true,
                 );
@@ -3027,24 +3096,25 @@ async fn admit_tls_connection(
             }
             Err(ReadError::Io(error)) => return Err(error),
         };
-        if send_h1_response(
+        let was_slow = match send_h1_response(
             &mut tls,
             &cfg,
             &logger,
             &local_ip,
             local_port,
             &mut deferred,
+            &mut established_guard,
         )
         .await
-        .is_err()
         {
-            return Ok(());
-        }
+            Ok((_, was_slow)) => was_slow,
+            Err(_) => return Ok(()),
+        };
         served += 1;
         let reusable = deferred.keep_alive;
         let linger_unread_body = deferred.linger_unread_body;
         drop(deferred);
-        if !reusable {
+        if was_slow || !reusable {
             if linger_unread_body {
                 bounded_lingering_close(&mut tls, &mut buffered).await;
             }
@@ -9104,6 +9174,12 @@ mod tests {
             budget.slot_usage(crate::resource::SlotKind::RequestWorker),
             0,
             "a WebSocket tunnel retained the request worker"
+        );
+        assert_eq!(budget.websocket_usage(), 1);
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::H1Connection),
+            0,
+            "a WebSocket tunnel retained general HTTP/1 connection capacity"
         );
 
         let mut fast = TcpStream::connect(addr).unwrap();

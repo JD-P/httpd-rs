@@ -10,6 +10,7 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Every attacker-reachable concurrency slot is represented in this one
 /// ledger. Byte reservations use the same `ResourceContext` below, but retain
@@ -20,7 +21,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) enum SlotKind {
     DynamicBackend,
     H2Stream,
-    H2SlowResponse,
+    SlowOutput,
     ResponseBodyRead,
     Websocket,
     ExpensiveCpu,
@@ -32,10 +33,11 @@ pub(crate) enum SlotKind {
     TlsHandshake,
     RewriteProgram,
     SpoolFile,
+    SlowSpoolFile,
 }
 
 impl SlotKind {
-    const COUNT: usize = 14;
+    const COUNT: usize = 15;
 
     const fn index(self) -> usize {
         self as usize
@@ -46,8 +48,10 @@ impl SlotKind {
 #[repr(usize)]
 enum ByteKind {
     Spool,
+    SlowSpool,
     RequestResident,
     ResponseResident,
+    SlowResponseResident,
     PolicyExpansion,
     CacheResident,
 }
@@ -73,7 +77,7 @@ impl PhysicalKind {
 }
 
 impl ByteKind {
-    const COUNT: usize = 5;
+    const COUNT: usize = 7;
 
     const fn index(self) -> usize {
         self as usize
@@ -157,11 +161,17 @@ pub const MAX_H2_STREAMS_PER_CLIENT: u64 = 64;
 /// Flow-control-blocked outputs leave the general stream pool and enter this
 /// smaller source-fair pool. A handful of slow peers can therefore retain
 /// their responses without denying dispatch capacity to unrelated clients.
-pub const MAX_H2_SLOW_RESPONSES: u64 = 128;
+pub const MAX_SLOW_OUTPUTS: u64 = 128;
 /// Preserve a complete advertised 32-stream connection for a legitimate slow
 /// client while preventing one address from owning more than one quarter of
 /// the process reserve.
-pub const MAX_H2_SLOW_RESPONSES_PER_CLIENT: u64 = 32;
+pub const MAX_SLOW_OUTPUTS_PER_CLIENT: u64 = 32;
+/// Once output becomes downstream-bound, require useful aggregate progress
+/// from the original response start and impose a non-renewable lifetime.
+/// Protocol adapters choose the interval (normally max(Timeout, 5s)) but do
+/// not get to weaken these shared invariants.
+pub const SLOW_OUTPUT_MIN_RATE: u64 = 1024;
+pub const SLOW_OUTPUT_MAX_INTERVALS: u32 = 16;
 pub const MAX_REQUEST_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_RESPONSE_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_REQUEST_RESIDENT_BYTES_PER_CLIENT: u64 = 32 * 1024 * 1024;
@@ -247,14 +257,14 @@ const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
         H1Connection => [0, 1, 64 * 1024],
         RequestWorker => [0, 1, 512 * 1024],
         H2Connection => [0, 1, 256 * 1024],
-        H2Stream | H2SlowResponse => [0, 1, 128 * 1024],
+        H2Stream | SlowOutput => [0, 1, 128 * 1024],
         ResponseBodyRead => [0, 1, 64 * 1024],
         // A dynamic request may own an upstream socket or the CGI stdin/stdout/
         // stderr pipes, plus bounded helper work.
         DynamicBackend => [0, 2, 256 * 1024],
         Websocket => [1, 0, 64 * 1024],
         RewriteProgram => [3, 1, 128 * 1024],
-        SpoolFile => [0, 0, 0],
+        SpoolFile | SlowSpoolFile => [0, 0, 0],
         TlsHandshake => [0, 0, 128 * 1024],
         RequestBodyWorker | ExpensiveCpu => [0, 0, 0],
     }
@@ -264,9 +274,10 @@ const fn byte_physical_kind(kind: ByteKind) -> Option<PhysicalKind> {
     match kind {
         ByteKind::RequestResident
         | ByteKind::ResponseResident
+        | ByteKind::SlowResponseResident
         | ByteKind::PolicyExpansion
         | ByteKind::CacheResident => Some(PhysicalKind::ResidentMemory),
-        ByteKind::Spool => None,
+        ByteKind::Spool | ByteKind::SlowSpool => None,
     }
 }
 /// Per-request ceiling for configuration-policy work.  One unit represents
@@ -693,6 +704,7 @@ pub(crate) struct SlotLease {
     context: ResourceContext,
     kind: SlotKind,
     amount: u64,
+    process_limit: u64,
     charged_client: bool,
     charged_request: bool,
     client_limit: Option<u64>,
@@ -918,6 +930,101 @@ impl ByteLease {
         }
         drop(clients);
         self.bytes += amount;
+        Ok(())
+    }
+
+    /// Move an existing charge between sibling logical pools without
+    /// changing its physical-memory charge. The destination is admitted
+    /// first; only then are the source counters released.
+    fn transfer_kind(
+        &mut self,
+        kind: ByteKind,
+        process_limit: u64,
+        client_limit: Option<u64>,
+        request_limit: Option<u64>,
+        message: &'static str,
+    ) -> io::Result<()> {
+        if self.kind == kind {
+            return Ok(());
+        }
+        debug_assert_eq!(byte_physical_kind(self.kind), byte_physical_kind(kind));
+        let amount = self.bytes;
+        if amount == 0 {
+            self.kind = kind;
+            self.process_limit = process_limit;
+            self.client_limit = client_limit;
+            self.request_limit = request_limit;
+            return Ok(());
+        }
+        let old_index = self.kind.index();
+        let new_index = kind.index();
+        let charged_request = if let Some(limit) = request_limit {
+            if !try_add(&self.context.local.bytes[new_index], amount, limit) {
+                return Err(io::Error::new(io::ErrorKind::OutOfMemory, message));
+            }
+            true
+        } else {
+            false
+        };
+
+        let mut clients = self
+            .context
+            .budget
+            .byte_clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let charged_client =
+            if let (Some(client), Some(limit)) = (self.context.client, client_limit) {
+                let usage = clients.entry(client).or_insert([0; ByteKind::COUNT]);
+                if !vapache_verified::hierarchical_resource_admit(usage[new_index], amount, limit) {
+                    if usage.iter().all(|value| *value == 0) {
+                        clients.remove(&client);
+                    }
+                    if charged_request {
+                        self.context.local.bytes[new_index].fetch_sub(amount, Ordering::AcqRel);
+                    }
+                    return Err(io::Error::new(io::ErrorKind::OutOfMemory, message));
+                }
+                usage[new_index] += amount;
+                true
+            } else {
+                false
+            };
+        if !try_add(
+            &self.context.budget.byte_process[new_index],
+            amount,
+            process_limit,
+        ) {
+            if charged_client {
+                if let Some(client) = self.context.client {
+                    if let Some(usage) = clients.get_mut(&client) {
+                        usage[new_index] = usage[new_index].saturating_sub(amount);
+                        if usage.iter().all(|value| *value == 0) {
+                            clients.remove(&client);
+                        }
+                    }
+                }
+            }
+            if charged_request {
+                self.context.local.bytes[new_index].fetch_sub(amount, Ordering::AcqRel);
+            }
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory, message));
+        }
+
+        self.context.budget.byte_process[old_index].fetch_sub(amount, Ordering::AcqRel);
+        if let (Some(client), Some(_)) = (self.context.client, self.client_limit) {
+            if let Some(usage) = clients.get_mut(&client) {
+                usage[old_index] = usage[old_index].saturating_sub(amount);
+            }
+        }
+        drop(clients);
+        if self.request_limit.is_some() {
+            self.context.local.bytes[old_index].fetch_sub(amount, Ordering::AcqRel);
+        }
+        self.kind = kind;
+        self.process_limit = process_limit;
+        self.client_limit = client_limit;
+        self.request_limit = request_limit;
         Ok(())
     }
 
@@ -1246,6 +1353,7 @@ impl ResourceBudget {
             context: context.clone(),
             kind,
             amount: 1,
+            process_limit,
             charged_client,
             charged_request,
             client_limit,
@@ -1470,8 +1578,9 @@ impl ResourceBudget {
                 Some(share_bytes.max(1)),
                 Some(max_bytes.max(1)),
             ),
-            _file_slot: file_slot,
+            file_slot: Some(file_slot),
             _descriptor: descriptor,
+            slow: false,
         })
     }
 
@@ -1512,7 +1621,7 @@ impl ResourceBudget {
         )?;
         let descriptor_lease = self.try_descriptors(descriptors)?;
         Ok(DynamicLease {
-            _slot: slot,
+            _slot: Some(slot),
             _descriptors: descriptor_lease,
         })
     }
@@ -1544,17 +1653,17 @@ impl ResourceBudget {
         })
     }
 
-    pub(crate) fn try_h2_slow_response_in(
+    pub(crate) fn try_slow_output_in(
         self: &Arc<Self>,
         context: &ResourceContext,
-    ) -> io::Result<H2SlowResponseLease> {
-        Ok(H2SlowResponseLease {
+    ) -> io::Result<SlowOutputLease> {
+        Ok(SlowOutputLease {
             _slot: context.slot(
-                SlotKind::H2SlowResponse,
-                MAX_H2_SLOW_RESPONSES,
-                Some(MAX_H2_SLOW_RESPONSES_PER_CLIENT),
+                SlotKind::SlowOutput,
+                MAX_SLOW_OUTPUTS,
+                Some(MAX_SLOW_OUTPUTS_PER_CLIENT),
                 Some(1),
-                "HTTP/2 slow-response limit reached",
+                "slow-output limit reached",
             )?,
         })
     }
@@ -1782,8 +1891,13 @@ impl ResourceBudget {
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn usage(&self) -> (u64, u64, u64) {
         (
-            self.byte_process[ByteKind::Spool.index()].load(Ordering::Acquire),
-            self.slot_usage(SlotKind::SpoolFile),
+            self.byte_process[ByteKind::Spool.index()]
+                .load(Ordering::Acquire)
+                .saturating_add(
+                    self.byte_process[ByteKind::SlowSpool.index()].load(Ordering::Acquire),
+                ),
+            self.slot_usage(SlotKind::SpoolFile)
+                .saturating_add(self.slot_usage(SlotKind::SlowSpoolFile)),
             self.slot_usage(SlotKind::DynamicBackend),
         )
     }
@@ -1793,7 +1907,12 @@ impl ResourceBudget {
         (
             self.slot_usage(SlotKind::H2Stream),
             self.byte_process[ByteKind::RequestResident.index()].load(Ordering::Acquire),
-            self.byte_process[ByteKind::ResponseResident.index()].load(Ordering::Acquire),
+            self.byte_process[ByteKind::ResponseResident.index()]
+                .load(Ordering::Acquire)
+                .saturating_add(
+                    self.byte_process[ByteKind::SlowResponseResident.index()]
+                        .load(Ordering::Acquire),
+                ),
             self.slot_usage(SlotKind::ResponseBodyRead),
         )
     }
@@ -1802,7 +1921,17 @@ impl ResourceBudget {
     pub fn h2_output_usage(&self) -> (u64, u64) {
         (
             self.slot_usage(SlotKind::H2Stream),
-            self.slot_usage(SlotKind::H2SlowResponse),
+            self.slot_usage(SlotKind::SlowOutput),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn slow_output_resource_usage(&self) -> (u64, u64, u64, u64) {
+        (
+            self.slot_usage(SlotKind::SlowOutput),
+            self.byte_process[ByteKind::SlowResponseResident.index()].load(Ordering::Acquire),
+            self.slot_usage(SlotKind::SlowSpoolFile),
+            self.byte_process[ByteKind::SlowSpool.index()].load(Ordering::Acquire),
         )
     }
 
@@ -1891,6 +2020,22 @@ impl ResidentLease {
     pub fn bytes(&self) -> u64 {
         self.bytes.bytes
     }
+
+    pub(crate) fn enter_slow_output(&mut self) -> io::Result<()> {
+        if !matches!(self.kind, ResidentKind::Response) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request memory cannot enter the slow-output pool",
+            ));
+        }
+        self.bytes.transfer_kind(
+            ByteKind::SlowResponseResident,
+            MAX_RESPONSE_RESIDENT_BYTES,
+            Some(MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT),
+            Some(MAX_RESPONSE_RESIDENT_BYTES_PER_REQUEST),
+            "slow-output resident-byte limit reached",
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -1899,7 +2044,7 @@ pub struct CombinedH2Lease {
 }
 
 #[derive(Debug)]
-pub(crate) struct H2SlowResponseLease {
+pub(crate) struct SlowOutputLease {
     _slot: SlotLease,
 }
 
@@ -1959,8 +2104,9 @@ pub(crate) fn try_expensive_in(context: &ResourceContext) -> Option<ExpensiveLea
 #[derive(Debug)]
 pub struct SpoolLease {
     bytes: ByteLease,
-    _file_slot: SlotLease,
+    file_slot: Option<SlotLease>,
     _descriptor: DescriptorLease,
+    slow: bool,
 }
 
 impl SpoolLease {
@@ -1972,22 +2118,280 @@ impl SpoolLease {
 
     pub fn attribute_client(&mut self, client: IpAddr) -> io::Result<()> {
         let context = self.bytes.context.budget.context(client);
-        self._file_slot.attribute_context(context.clone())?;
+        self.file_slot
+            .as_mut()
+            .expect("spool lease lost its file slot")
+            .attribute_context(context.clone())?;
         if let Err(error) = self.bytes.attribute_context(context) {
             // A failed byte attribution must not leave the file slot owned by
             // a different scope. Move it back before reporting failure.
             let old = self.bytes.context.clone();
-            let _ = self._file_slot.attribute_context(old);
+            let _ = self
+                .file_slot
+                .as_mut()
+                .expect("spool lease lost its file slot")
+                .attribute_context(old);
             return Err(error);
         }
+        Ok(())
+    }
+
+    pub(crate) fn enter_slow(&mut self) -> io::Result<()> {
+        if self.slow {
+            return Ok(());
+        }
+        let general = self
+            .file_slot
+            .as_ref()
+            .expect("spool lease lost its file slot");
+        let slow_files = (general.process_limit.saturating_add(3) / 4).max(1);
+        let slow_slot = general.context.slot(
+            SlotKind::SlowSpoolFile,
+            slow_files,
+            Some(slow_files),
+            Some(slow_files),
+            "slow-output spool-file limit reached",
+        )?;
+        let slow_bytes = (self.bytes.process_limit.saturating_add(3) / 4).max(1);
+        if let Err(error) = self.bytes.transfer_kind(
+            ByteKind::SlowSpool,
+            slow_bytes,
+            Some(slow_bytes),
+            Some(slow_bytes),
+            "slow-output spool-byte limit reached",
+        ) {
+            drop(slow_slot);
+            return Err(io::Error::new(io::ErrorKind::StorageFull, error));
+        }
+        drop(self.file_slot.replace(slow_slot));
+        self.slow = true;
         Ok(())
     }
 }
 
 #[derive(Debug)]
 pub struct DynamicLease {
-    _slot: SlotLease,
+    _slot: Option<SlotLease>,
     _descriptors: DescriptorLease,
+}
+
+impl DynamicLease {
+    /// A downstream-bound dynamic response is protected by the slow-output
+    /// pool. Release only its general backend concurrency slot while retaining
+    /// the descriptor lease until the reader itself is finished.
+    pub(crate) fn release_general_slot(&mut self) {
+        drop(self._slot.take());
+    }
+}
+
+#[derive(Debug)]
+enum GeneralOutputLease {
+    H1(SlotLease),
+    H2 { _lease: CombinedH2Lease },
+}
+
+/// Protocol-neutral ownership transfer for downstream-bound responses.  The
+/// slow lease is acquired before the protocol's general lease is released,
+/// so cancellation or admission failure cannot create an unaccounted output.
+#[derive(Debug)]
+pub(crate) struct SlowOutputAdmission {
+    context: ResourceContext,
+    general: Option<GeneralOutputLease>,
+    slow: Option<SlowOutputLease>,
+    phase: vapache_verified::SlowOutputPhase,
+}
+
+impl SlowOutputAdmission {
+    pub(crate) fn tracked_h1(context: ResourceContext, general: SlotLease) -> Self {
+        Self {
+            context,
+            general: Some(GeneralOutputLease::H1(general)),
+            slow: None,
+            phase: vapache_verified::SlowOutputPhase::General,
+        }
+    }
+
+    pub(crate) fn tracked_h2(context: ResourceContext, general: CombinedH2Lease) -> Self {
+        Self {
+            context,
+            general: Some(GeneralOutputLease::H2 { _lease: general }),
+            slow: None,
+            phase: vapache_verified::SlowOutputPhase::General,
+        }
+    }
+
+    pub(crate) fn detached(context: ResourceContext) -> Self {
+        Self {
+            context,
+            general: None,
+            slow: None,
+            phase: vapache_verified::SlowOutputPhase::General,
+        }
+    }
+
+    pub(crate) fn is_slow(&self) -> bool {
+        self.phase == vapache_verified::SlowOutputPhase::Slow
+    }
+
+    pub(crate) fn client(&self) -> IpAddr {
+        self.context
+            .client()
+            .expect("slow output admission requires a client identity")
+    }
+
+    pub(crate) fn enter_slow(&mut self) -> io::Result<()> {
+        self.enter_slow_with(|| Ok(()))
+    }
+
+    /// Acquire slow-output ownership, run every coupled resource transfer,
+    /// and only then surrender general protocol capacity. If any transfer
+    /// fails, the temporary slow lease is rolled back and the general lease
+    /// remains owned by this admission value.
+    pub(crate) fn enter_slow_with(
+        &mut self,
+        transfer: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.is_slow() {
+            return Ok(());
+        }
+        let next = vapache_verified::slow_output_phase_step(
+            self.phase,
+            vapache_verified::SlowOutputEvent::DownstreamStall,
+        )
+        .ok_or_else(|| io::Error::other("output ownership is closed"))?;
+        let slow = self
+            .context
+            .budget()
+            .try_slow_output_in(&self.context)
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "slow-output capacity exhausted")
+            })?;
+        transfer()?;
+        self.phase = next;
+        self.slow = Some(slow);
+        drop(self.general.take());
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        if let Some(next) = vapache_verified::slow_output_phase_step(
+            self.phase,
+            vapache_verified::SlowOutputEvent::Finish,
+        ) {
+            self.phase = next;
+        }
+        drop(self.general.take());
+        drop(self.slow.take());
+    }
+
+    /// A fast HTTP/1 response may return its established-connection lease to
+    /// the keep-alive loop. A classified slow connection is deliberately not
+    /// promoted: its response completes under the slow pool and then closes.
+    pub(crate) fn finish_h1(mut self) -> Option<SlotLease> {
+        let reusable = if self.is_slow() {
+            None
+        } else {
+            match self.general.take() {
+                Some(GeneralOutputLease::H1(lease)) => Some(lease),
+                _ => None,
+            }
+        };
+        self.finish();
+        reusable
+    }
+
+    pub(crate) fn finish_response(&mut self) {
+        self.finish();
+    }
+}
+
+impl Drop for SlowOutputAdmission {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Anchored progress state shared by HTTP/1 socket output and HTTP/2 flow
+/// control. Neither successful partial writes nor capacity grants alter the
+/// response start or its absolute deadline.
+pub(crate) struct SlowOutputProgress {
+    pub(crate) started: Instant,
+    pub(crate) delivered: u64,
+    blocked: Duration,
+    pub(crate) interval: Duration,
+    pub(crate) checkpoint: Instant,
+    pub(crate) absolute_deadline: Instant,
+}
+
+impl SlowOutputProgress {
+    pub(crate) fn new(interval: Duration) -> Self {
+        let started = Instant::now();
+        let checkpoint = started.checked_add(interval).unwrap_or(started);
+        let absolute_deadline = started
+            .checked_add(interval.saturating_mul(SLOW_OUTPUT_MAX_INTERVALS))
+            .unwrap_or(checkpoint);
+        Self {
+            started,
+            delivered: 0,
+            blocked: Duration::ZERO,
+            interval,
+            checkpoint,
+            absolute_deadline,
+        }
+    }
+
+    pub(crate) fn record(&mut self, bytes: usize) {
+        self.delivered = self.delivered.saturating_add(bytes as u64);
+    }
+
+    pub(crate) fn record_blocked(&mut self, blocked: Duration) {
+        self.blocked = self.blocked.saturating_add(blocked);
+    }
+
+    pub(crate) fn remaining_classification_grace(&self, grace: Duration) -> Duration {
+        grace.saturating_sub(self.blocked)
+    }
+
+    pub(crate) fn validate(&mut self, now: Instant) -> io::Result<()> {
+        if now >= self.absolute_deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "response lifetime exceeded",
+            ));
+        }
+        if now < self.checkpoint {
+            return Ok(());
+        }
+        let elapsed_ms =
+            u64::try_from(now.duration_since(self.started).as_millis()).unwrap_or(u64::MAX);
+        let grace_ms = u64::try_from(self.interval.as_millis()).unwrap_or(u64::MAX);
+        if !vapache_verified::minimum_progress_rate_admit(
+            self.delivered,
+            elapsed_ms,
+            SLOW_OUTPUT_MIN_RATE,
+            grace_ms,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "response minimum rate not met",
+            ));
+        }
+        while self.checkpoint <= now {
+            self.checkpoint = self
+                .checkpoint
+                .checked_add(self.interval)
+                .unwrap_or(self.absolute_deadline);
+            if self.checkpoint >= self.absolute_deadline {
+                self.checkpoint = self.absolute_deadline;
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn next_deadline(&self) -> Instant {
+        self.checkpoint.min(self.absolute_deadline)
+    }
 }
 
 #[cfg(test)]
@@ -2093,6 +2497,40 @@ mod tests {
         let other = budget.try_dynamic_for(64, second).unwrap();
         drop((leases, other));
         assert!(budget.try_dynamic_for(64, first).is_ok());
+    }
+
+    #[test]
+    fn protocol_neutral_slow_output_handoff_is_irreversible() {
+        let budget = Arc::new(ResourceBudget::default());
+        let context = budget.context(IpAddr::from([192, 0, 2, 44]));
+        let general = context
+            .slot(SlotKind::H1Connection, 1, Some(1), Some(1), "full")
+            .unwrap();
+        let mut output = SlowOutputAdmission::tracked_h1(context.clone(), general);
+        assert_eq!(budget.slot_usage(SlotKind::H1Connection), 1);
+        assert!(output
+            .enter_slow_with(|| Err(io::Error::other("coupled transfer rejected")))
+            .is_err());
+        assert_eq!(budget.slot_usage(SlotKind::H1Connection), 1);
+        assert_eq!(budget.slot_usage(SlotKind::SlowOutput), 0);
+        assert!(!output.is_slow());
+        output.enter_slow().unwrap();
+        output.enter_slow().unwrap();
+        assert_eq!(budget.slot_usage(SlotKind::H1Connection), 0);
+        assert_eq!(budget.slot_usage(SlotKind::SlowOutput), 1);
+        assert!(output.finish_h1().is_none());
+        assert_eq!(budget.slot_usage(SlotKind::SlowOutput), 0);
+
+        let general = context
+            .slot(SlotKind::H1Connection, 1, Some(1), Some(1), "full")
+            .unwrap();
+        let output = SlowOutputAdmission::tracked_h1(context, general);
+        let reclaimed = output
+            .finish_h1()
+            .expect("fast HTTP/1 output did not return its general lease");
+        assert_eq!(budget.slot_usage(SlotKind::H1Connection), 1);
+        drop(reclaimed);
+        assert_eq!(budget.slot_usage(SlotKind::H1Connection), 0);
     }
 
     #[test]
@@ -2303,27 +2741,27 @@ mod tests {
     #[test]
     fn slow_h2_outputs_have_source_and_process_fairness() {
         let budget = Arc::new(ResourceBudget::default());
-        let first_leases: Vec<_> = (0..MAX_H2_SLOW_RESPONSES_PER_CLIENT)
+        let first_leases: Vec<_> = (0..MAX_SLOW_OUTPUTS_PER_CLIENT)
             .map(|_| {
                 let context = budget.context(IpAddr::from([192, 0, 2, 1]));
-                budget.try_h2_slow_response_in(&context).unwrap()
+                budget.try_slow_output_in(&context).unwrap()
             })
             .collect();
         let first_overflow = budget.context(IpAddr::from([192, 0, 2, 1]));
-        assert!(budget.try_h2_slow_response_in(&first_overflow).is_err());
+        assert!(budget.try_slow_output_in(&first_overflow).is_err());
 
         let mut all = first_leases;
         for source in 2..=4 {
-            all.extend((0..MAX_H2_SLOW_RESPONSES_PER_CLIENT).map(|_| {
+            all.extend((0..MAX_SLOW_OUTPUTS_PER_CLIENT).map(|_| {
                 let context = budget.context(IpAddr::from([192, 0, 2, source]));
-                budget.try_h2_slow_response_in(&context).unwrap()
+                budget.try_slow_output_in(&context).unwrap()
             }));
         }
-        assert_eq!(all.len() as u64, MAX_H2_SLOW_RESPONSES);
+        assert_eq!(all.len() as u64, MAX_SLOW_OUTPUTS);
         assert!(budget
-            .try_h2_slow_response_in(&budget.context(IpAddr::from([198, 51, 100, 1])))
+            .try_slow_output_in(&budget.context(IpAddr::from([198, 51, 100, 1])))
             .is_err());
-        assert_eq!(budget.h2_output_usage(), (0, MAX_H2_SLOW_RESPONSES));
+        assert_eq!(budget.h2_output_usage(), (0, MAX_SLOW_OUTPUTS));
         drop(all);
         assert_eq!(budget.h2_output_usage(), (0, 0));
     }

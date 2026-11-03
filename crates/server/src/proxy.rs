@@ -1833,11 +1833,39 @@ pub async fn websocket_async<S>(
     target: &Target,
     grant: &crate::access::AccessGrant,
     resource: &crate::access::ResourceKey,
+    client: S,
+    peer: SocketAddr,
+    https: bool,
+    host: &str,
+    initial: &[u8],
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    websocket_async_with_connection(
+        cfg, scope, req, target, grant, resource, client, peer, https, host, initial, None,
+    )
+    .await
+}
+
+/// Server-side upgrade entry point. The ordinary HTTP/1 connection lease is
+/// surrendered only after the dedicated WebSocket lease has been acquired,
+/// preserving continuous accounting without double-charging the long-lived
+/// tunnel against general request capacity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn websocket_async_with_connection<S>(
+    cfg: &Config,
+    scope: &Scope,
+    req: &Request,
+    target: &Target,
+    grant: &crate::access::AccessGrant,
+    resource: &crate::access::ResourceKey,
     mut client: S,
     peer: SocketAddr,
     https: bool,
     host: &str,
     initial: &[u8],
+    general_connection: Option<crate::resource::SlotLease>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1878,6 +1906,7 @@ where
     }
     let client_ip = crate::access::canonical_ip(peer.ip());
     let _websocket_lease = cfg.resource_budget.try_websocket_for(client_ip)?;
+    drop(general_connection);
     let timeout = cfg.timeout.max(Duration::from_secs(5));
     let mut upstream = connect_async(&target.backend, scope, timeout).await?;
     // `Target::path` is the decoded authorization identity. Re-encode bytes

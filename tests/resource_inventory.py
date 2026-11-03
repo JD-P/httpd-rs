@@ -9,14 +9,14 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "crates" / "server" / "src"
 
 EXPECTED_SLOTS = {
-    "DynamicBackend", "H2Stream", "H2SlowResponse", "ResponseBodyRead", "Websocket",
+    "DynamicBackend", "H2Stream", "SlowOutput", "ResponseBodyRead", "Websocket",
     "ExpensiveCpu", "PendingConnection", "H1Connection", "RequestWorker",
     "RequestBodyWorker", "H2Connection", "TlsHandshake",
-    "RewriteProgram", "SpoolFile",
+    "RewriteProgram", "SpoolFile", "SlowSpoolFile",
 }
 EXPECTED_BYTES = {
-    "Spool", "RequestResident", "ResponseResident", "PolicyExpansion",
-    "CacheResident",
+    "Spool", "SlowSpool", "RequestResident", "ResponseResident",
+    "SlowResponseResident", "PolicyExpansion", "CacheResident",
 }
 EXPECTED_PHYSICAL = {"FileDescriptor", "Task", "ResidentMemory"}
 
@@ -113,7 +113,7 @@ def main() -> int:
 
     for required in (
         "with_resource_context(context", "try_dynamic_in", "try_h2_stream_in",
-        "try_h2_slow_response_in",
+        "try_slow_output_in",
         "try_tls_handshake", "try_rewrite_program",
         "attribute_context(resource_context", "enter_resource_context(resource_context",
     ):

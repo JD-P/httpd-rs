@@ -9,13 +9,31 @@ scope. RAII leases release every charge on errors, resets, timeouts, and normal
 completion.
 
 The slot ledger covers pending connections, HTTP/1 workers, slow-body workers,
-TLS handshakes, HTTP/2 connections, ordinary streams and source-fair
-flow-control-blocked outputs, dynamic backend requests, blocking response
-reads, WebSocket tunnels, expensive CPU operations,
-`RewriteMap prg` helpers, and spool files. The adjustable byte ledger covers
-request memory, response memory, request/backend/proxy spools, and retained
-policy expansions and retained memory-cache entries. Fixed-window rates use
-the same canonical client identity and process ledger.
+TLS handshakes, HTTP/2 connections, ordinary streams and a shared source-fair
+slow-output class, dynamic backend requests, blocking response reads,
+WebSocket tunnels, expensive CPU operations, `RewriteMap prg` helpers, and
+general/slow spool files. The adjustable byte ledger covers request memory,
+general/slow response memory, general/slow request/backend/proxy spools, and
+retained policy expansions and retained memory-cache entries. Fixed-window
+rates use the same canonical client identity and process ledger.
+
+HTTP/1 socket backpressure and HTTP/2 flow-control backpressure use one
+irreversible `General -> Slow -> Closed` ownership transition. The slow lease
+is acquired and every coupled transfer succeeds before general
+connection/stream capacity is released. Dynamic backend slots, retained
+response bytes, still-live HTTP/2 transport slices, and spool bytes/files
+transfer with the response; their descriptors remain charged until the
+underlying reader finishes. A failed coupled transfer rolls back the tentative
+slow admission while retaining general protocol ownership. Slow spools have a
+separate reserve capped at one quarter of the configured general spool pool.
+An HTTP/1 connection that entered the slow class closes after its response
+instead of returning to keep-alive capacity. WebSocket upgrades similarly
+acquire their dedicated tunnel lease before releasing the general HTTP/1
+connection lease.
+
+All downstream-bound output is measured from the original response start.
+Partial writes and HTTP/2 capacity grants cannot renew the minimum average
+rate checkpoint or the absolute sixteen-interval lifetime.
 
 Every typed lease also charges a physical parent for file descriptors, tasks,
 and resident memory. The parent ceilings retain kernel/cgroup headroom, so
