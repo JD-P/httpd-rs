@@ -2240,6 +2240,176 @@ impl VHost {
     }
 }
 
+const MAX_VHOST_WILDCARD_PATTERNS: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum VHostAddressKey {
+    NoAddress,
+    Wildcard,
+    Exact(IpAddr),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct VHostBucketKey {
+    address: VHostAddressKey,
+    port: u16,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VHostBucket {
+    candidates: Vec<usize>,
+    exact_names: HashMap<String, usize>,
+    wildcard_names: Vec<(usize, String)>,
+}
+
+impl VHostBucket {
+    fn build(vhosts: &[VHost], candidates: Vec<usize>) -> Self {
+        let mut exact_names = HashMap::new();
+        let mut wildcard_names = Vec::new();
+        for index in &candidates {
+            let vhost = &vhosts[*index];
+            if let Some(name) = &vhost.server_name {
+                exact_names.entry(vhost_name_key(name)).or_insert(*index);
+            }
+            for alias in &vhost.aliases {
+                if alias.bytes().any(|byte| matches!(byte, b'*' | b'?')) {
+                    wildcard_names.push((*index, vhost_name_key(alias)));
+                } else {
+                    exact_names.entry(vhost_name_key(alias)).or_insert(*index);
+                }
+            }
+        }
+        Self {
+            candidates,
+            exact_names,
+            wildcard_names,
+        }
+    }
+
+    fn select(&self, vhosts: &[VHost], host: Option<&str>) -> Option<usize> {
+        let default = *self.candidates.first()?;
+        let Some(host) = host else {
+            return Some(default);
+        };
+        let bare = authority_host(host).trim_end_matches('.');
+        let key = bare.to_ascii_lowercase();
+        let mut selected = self.exact_names.get(&key).copied();
+        for (index, pattern) in &self.wildcard_names {
+            if !vapache_verified::vhost_name_candidate_precedes(selected, *index) {
+                continue;
+            }
+            if crate::verified::host_pattern_matches(bare.as_bytes(), pattern.as_bytes()) {
+                selected = Some(*index);
+            }
+        }
+        selected
+            .or(Some(default))
+            .filter(|index| *index < vhosts.len())
+    }
+}
+
+fn vhost_name_key(name: &str) -> String {
+    name.split(':')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+#[derive(Debug, Clone, Default)]
+struct VHostIndex {
+    buckets: HashMap<VHostBucketKey, VHostBucket>,
+}
+
+impl VHostIndex {
+    fn build(vhosts: &[VHost], listeners: &[ListenSpec]) -> Self {
+        let mut ports = HashSet::new();
+        let mut exact_addresses = HashSet::new();
+        for listener in listeners {
+            ports.insert(listener.port);
+            if let Ok(ip) = listener.addr.parse::<IpAddr>() {
+                let ip = crate::access::canonical_ip(ip);
+                if !ip.is_unspecified() {
+                    exact_addresses.insert(ip);
+                }
+            }
+        }
+        for vhost in vhosts {
+            for port in &vhost.ports {
+                if *port != 0 {
+                    ports.insert(*port);
+                }
+            }
+            for address in &vhost.addrs {
+                if !Config::vhost_address_is_wildcard(address) {
+                    if let Ok(ip) = Config::vhost_address_text(address).parse::<IpAddr>() {
+                        exact_addresses.insert(crate::access::canonical_ip(ip));
+                    }
+                }
+            }
+        }
+        let mut buckets = HashMap::new();
+        for port in ports {
+            let no_address: Vec<_> = vhosts
+                .iter()
+                .enumerate()
+                .filter(|(_, vhost)| {
+                    vhost.addrs.is_empty() || Config::vhost_port_matches(vhost, port)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if !no_address.is_empty() {
+                buckets.insert(
+                    VHostBucketKey {
+                        address: VHostAddressKey::NoAddress,
+                        port,
+                    },
+                    VHostBucket::build(vhosts, no_address),
+                );
+            }
+            let wildcard: Vec<_> = vhosts
+                .iter()
+                .enumerate()
+                .filter(|(_, vhost)| {
+                    vhost.addrs.is_empty()
+                        || vhost.addrs.iter().any(|address| {
+                            (vhost_port(address) == 0 || vhost_port(address) == port)
+                                && Config::vhost_address_is_wildcard(address)
+                        })
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if !wildcard.is_empty() {
+                buckets.insert(
+                    VHostBucketKey {
+                        address: VHostAddressKey::Wildcard,
+                        port,
+                    },
+                    VHostBucket::build(vhosts, wildcard),
+                );
+            }
+            for address in &exact_addresses {
+                let exact: Vec<_> = vhosts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, vhost)| Config::vhost_address_is_specific(vhost, *address, port))
+                    .map(|(index, _)| index)
+                    .collect();
+                if !exact.is_empty() {
+                    buckets.insert(
+                        VHostBucketKey {
+                            address: VHostAddressKey::Exact(*address),
+                            port,
+                        },
+                        VHostBucket::build(vhosts, exact),
+                    );
+                }
+            }
+        }
+        Self { buckets }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MimeMap {
     pub types: HashMap<String, String>,
@@ -2779,6 +2949,7 @@ pub struct Config {
     pub request_body_min_rate: u64,
     pub encoded_slashes: EncodedSlashes,
     pub vhosts: Vec<VHost>,
+    vhost_index: Arc<VHostIndex>,
     pub global: Scope,
     pub global_rules: Vec<ScopeRule>,
     pub global_directory_index: DirectoryRuleIndex,
@@ -4611,6 +4782,7 @@ impl Compile {
             request_body_min_rate: 0,
             encoded_slashes: EncodedSlashes::Off,
             vhosts: Vec::new(),
+            vhost_index: Arc::new(VHostIndex::default()),
             global: Scope::default(),
             global_rules: Vec::new(),
             global_directory_index: DirectoryRuleIndex::default(),
@@ -4630,7 +4802,9 @@ impl Compile {
             max_spool_files: 128,
             max_dynamic_requests: 64,
             max_fastcgi_output: 64 * 1024 * 1024,
-            resource_budget: Arc::new(crate::resource::ResourceBudget::default()),
+            resource_budget: Arc::new(crate::resource::ResourceBudget::for_filesystem(
+                &server_root,
+            )),
             access_file_names: vec![".htaccess".into()],
             directory_index: vec!["index.html".into()],
             override_enabled: false,
@@ -4902,6 +5076,23 @@ impl Compile {
             }
         }
         self.cfg.vhosts = self.vhosts_raw;
+        let wildcard_patterns = self
+            .cfg
+            .vhosts
+            .iter()
+            .flat_map(|vhost| &vhost.aliases)
+            .filter(|alias| alias.bytes().any(|byte| matches!(byte, b'*' | b'?')))
+            .count();
+        if wildcard_patterns > MAX_VHOST_WILDCARD_PATTERNS {
+            return Err(ConfigError {
+                file: String::new(),
+                line: 0,
+                msg: format!(
+                    "virtual-host wildcard alias count {wildcard_patterns} exceeds the request-time bound of {MAX_VHOST_WILDCARD_PATTERNS}"
+                ),
+            });
+        }
+        self.cfg.vhost_index = Arc::new(VHostIndex::build(&self.cfg.vhosts, &self.cfg.listeners));
         let mut tls_inputs = Vec::new();
         let mut collect_tls = |ssl: &SslConfig| {
             tls_inputs.extend(
@@ -10943,6 +11134,39 @@ mod tests {
     }
 
     #[test]
+    fn compiled_vhost_index_preserves_first_match_and_bounds_wildcards() {
+        let cfg = load_text(
+            "Listen 127.0.0.1:19215\n\
+             <VirtualHost *:19215>\nServerName first.test\nServerAlias *.example.test\n</VirtualHost>\n\
+             <VirtualHost *:19215>\nServerName exact.example.test\n</VirtualHost>\n",
+            false,
+        )
+        .unwrap();
+        let selected = cfg
+            .select_vhost(
+                Some("127.0.0.1".parse().unwrap()),
+                19215,
+                Some("exact.example.test"),
+            )
+            .unwrap();
+        assert_eq!(selected.server_name.as_deref(), Some("first.test"));
+
+        let aliases = (0..=MAX_VHOST_WILDCARD_PATTERNS)
+            .map(|index| format!("ServerAlias *.wildcard-{index}.test\n"))
+            .collect::<String>();
+        let error = load_text(
+            &format!("Listen 127.0.0.1:19216\n<VirtualHost *:19216>\n{aliases}</VirtualHost>\n"),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error[0].msg.contains("wildcard alias count"),
+            "unexpected error: {:?}",
+            error
+        );
+    }
+
+    #[test]
     fn serverroot_is_execute_on_read_for_relative_includes() {
         let dir = std::env::temp_dir().join(format!(
             "vapache-serverroot-exec-on-read-{}",
@@ -16112,6 +16336,38 @@ impl Config {
         port: u16,
         host: Option<&str>,
     ) -> Option<&VHost> {
+        let has_bucket = |address| {
+            self.vhost_index
+                .buckets
+                .contains_key(&VHostBucketKey { address, port })
+                || self
+                    .vhost_index
+                    .buckets
+                    .contains_key(&VHostBucketKey { address, port: 0 })
+        };
+        let address = match local_ip.map(crate::access::canonical_ip) {
+            None => VHostAddressKey::NoAddress,
+            Some(ip) if has_bucket(VHostAddressKey::Exact(ip)) => VHostAddressKey::Exact(ip),
+            Some(_) => VHostAddressKey::Wildcard,
+        };
+        if let Some(bucket) = self
+            .vhost_index
+            .buckets
+            .get(&VHostBucketKey { address, port })
+            .or_else(|| {
+                self.vhost_index
+                    .buckets
+                    .get(&VHostBucketKey { address, port: 0 })
+            })
+        {
+            return bucket
+                .select(&self.vhosts, host)
+                .and_then(|index| self.vhosts.get(index));
+        }
+        // Public Config fields are retained for source compatibility with
+        // embedders and tests that construct/mutate a Config manually. Normal
+        // loader output always has a bucket for every listener, so remote
+        // requests never take this compatibility path.
         let port_candidates: Vec<&VHost> = self
             .vhosts
             .iter()
@@ -16151,6 +16407,24 @@ impl Config {
         }
         // Apache uses the first configured vhost for the address as default.
         Some(candidates[0])
+    }
+
+    /// Rebuild the compiled virtual-host index after directly mutating `vhosts`
+    /// or `listeners` on an embedded configuration.
+    pub fn rebuild_vhost_index(&mut self) {
+        self.vhost_index = Arc::new(VHostIndex::build(&self.vhosts, &self.listeners));
+    }
+
+    pub(crate) fn vhost_position(&self, vhost: &VHost) -> Option<usize> {
+        let width = std::mem::size_of::<VHost>();
+        let start = self.vhosts.as_ptr() as usize;
+        let address = std::ptr::from_ref(vhost) as usize;
+        let offset = address.checked_sub(start)?;
+        if width == 0 || offset % width != 0 {
+            return None;
+        }
+        let index = offset / width;
+        (index < self.vhosts.len()).then_some(index)
     }
 
     pub fn resolve_log_format(&self, name: &str) -> String {

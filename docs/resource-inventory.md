@@ -12,7 +12,9 @@ The slot ledger covers pending connections, HTTP/1 workers, slow-body workers,
 TLS handshakes, HTTP/2 connections, ordinary streams and a shared source-fair
 slow-output class, dynamic backend requests, blocking response reads,
 WebSocket tunnels, expensive CPU operations, `RewriteMap prg` helpers, and
-general/slow spool files. The adjustable byte ledger covers request memory,
+general/slow spool files. Filesystem lookup/cache work has a separate
+64-process/8-source phase, so a stalled mount cannot occupy every request
+worker or any dynamic-backend slot. The adjustable byte ledger covers request memory,
 general/slow response memory, general/slow request/backend/proxy spools, and
 retained policy expansions and retained memory-cache entries. Fixed-window
 rates use the same canonical client identity and process ledger.
@@ -36,11 +38,23 @@ Partial writes and HTTP/2 capacity grants cannot renew the minimum average
 rate checkpoint or the absolute sixteen-interval lifetime.
 
 Every typed lease also charges a physical parent for file descriptors, tasks,
-and resident memory. The parent ceilings retain kernel/cgroup headroom, so
+and resident memory. A second exact parent combines writable disk bytes and
+directory entries across spools, disk cache records, log files, and OCSP
+staples; it retains one quarter of observed free capacity and never exceeds a
+4 GiB/16,384-entry generation ceiling. Cache replacement holds its old-plus-
+temporary peak until rename commits. The parent ceilings retain
+kernel/cgroup/filesystem headroom, so
 individually safe pools cannot collectively exhaust the process. Connection
 and backend slots include conservative protocol/stack overhead; request,
 response, policy-expansion, and memory-cache bytes share the resident parent.
 Cache entries retain their reservation until eviction.
+
+Accepted TCP transports and TCP proxy/FastCGI backends request 128 KiB send
+and receive buffers and hold a conservative 512 KiB kernel/dependency-buffer
+lease under one 256 MiB parent (CGI is conservatively charged through the same
+dynamic-backend lease). HTTP/2 additionally limits each h2 send buffer to 256
+KiB. Writable-disk and transport usage/limits are exported by
+`server-status?auto`.
 
 Fixed-window process/source gates bound valid requests, malformed HTTP/1 head
 parsing, expensive operations, cache writes, and log bytes. HTTP/2 acquires

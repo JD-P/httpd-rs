@@ -13,6 +13,7 @@ EXPECTED_SLOTS = {
     "ExpensiveCpu", "PendingConnection", "H1Connection", "RequestWorker",
     "RequestBodyWorker", "H2Connection", "TlsHandshake",
     "RewriteProgram", "SpoolFile", "SlowSpoolFile",
+    "FilesystemWork",
 }
 EXPECTED_BYTES = {
     "Spool", "SlowSpool", "RequestResident", "ResponseResident",
@@ -50,7 +51,7 @@ ALLOWED_MUTABLE_STATICS = {
     ("log.rs", "TEST_GATE"),
     ("main.rs", "STOP"), ("main.rs", "RELOAD"), ("main.rs", "REOPEN"),
     ("main.rs", "GLOBAL_ALLOCATOR"),
-    ("ocsp.rs", "CACHE"), ("ocsp.rs", "NEXT_TEMP"),
+    ("ocsp.rs", "CACHE"), ("ocsp.rs", "NEXT_TEMP"), ("ocsp.rs", "DISK"),
     ("proxy.rs", "DEAD"), ("proxy.rs", "HEALTH"),
     ("proxy.rs", "GENERATION"), ("proxy.rs", "COUNTERS"),
     ("proxy.rs", "DNS"), ("proxy.rs", "CACHE"),
@@ -114,6 +115,7 @@ def main() -> int:
     for required in (
         "with_resource_context(context", "try_dynamic_in", "try_h2_stream_in",
         "try_slow_output_in",
+        "try_filesystem_work_in", "try_disk", "try_transport_buffers",
         "try_tls_handshake", "try_rewrite_program",
         "attribute_context(resource_context", "enter_resource_context(resource_context",
     ):

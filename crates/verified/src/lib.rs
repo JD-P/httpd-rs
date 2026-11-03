@@ -2890,6 +2890,24 @@ pub fn vhost_address_precedence(exact_available: bool, candidate_exact: bool) ->
     !exact_available || candidate_exact
 }
 
+/// Startup-index refinement for name matching: exact-name hashing may find a
+/// later vhost before wildcard evaluation, but Apache's first configured match
+/// still wins regardless of which representation produced the candidate.
+pub fn vhost_name_candidate_precedes(
+    current: Option<usize>,
+    candidate: usize,
+) -> (prefer: bool)
+    ensures prefer == match current {
+        None => true,
+        Some(index) => candidate < index,
+    },
+{
+    match current {
+        None => true,
+        Some(index) => candidate < index,
+    }
+}
+
 /// F39/I35: a prefix `Alias`/`ScriptAlias` whose target is a regular file is
 /// resolved as `(parent, basename)`, never `(file, empty)`.  The nonempty
 /// basename is what carries the handler and MIME extension.
@@ -11259,7 +11277,7 @@ pub fn h2_settings() -> (s: H2Settings)
         initial_connection_window: 1024 * 1024,
         max_frame: 16 * 1024,
         max_reset_streams: 100,
-        max_send_buffer: 1024 * 1024,
+        max_send_buffer: 256 * 1024,
     }
 }
 

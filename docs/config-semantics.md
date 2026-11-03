@@ -581,29 +581,31 @@ proxy response head/body/chunk/trailer: decoded-byte, chunk-count, framing-byte 
 proxy chunk arithmetic          : checked_add and MAX_PROXY_BODY
 proxy DNS / TLS CA              : bounded queue/deadline; CA parsed once per generation
 pre-request sockets              : async bounded pool; header/TLS/H2-preface deadline and per-transport cap
+client/upstream transport buffers: 128 KiB requested send/receive queues; 512 KiB accounting lease under a shared 256 MiB process parent
 TLS handshakes                   : 64 concurrent, 4/source, 128/second and 64/source/second
 HTTP/1 blocking workers          : reusable pool; MaxRequestWorkers/effective-client caps; configuration ceiling 512
+filesystem/cache lookup phase    : 64 process slots, 8/source; cache stripe/cold-scan contention bypasses instead of queues
 slow request bodies              : every keep-alive request enters a one-quarter-worker reserve with a one-quarter per-effective-client share
 ready listeners                  : rotating order plus 64-accept batch cap
 HTTP/1 response writes          : progress-renewed Timeout stall deadline; non-blocking send/poll; plain/TLS 64 KiB TCP unsent low-water wakeup; effective-client worker quota (no body-read permit while waiting)
 HTTP/2 streams/control frames   : preface/initial-head deadline, client-before-process stream quotas, 128-process/32-source slow-output reserve with anchored rate/lifetime, and every control frame charged; useful WINDOW_UPDATE is 4096 burst/2048 per second
 WebSocket tunnels               : 64 process slots, 8 per effective client, plus idle/write deadline
-logs / RewriteMap prg / cache   : 128 KiB lines and non-queuing writers; 8-request/8-concurrent/64-per-second helpers plus 2-concurrent/16-per-second per-client shares; iterative depth/record-bounded cache walks
+logs / RewriteMap prg / cache   : 128 KiB lines and non-queuing writers; 8-request/8-concurrent/64-per-second helpers plus 2-concurrent/16-per-second per-client shares; iterative depth/record-bounded cache walks; one 4 GiB/16,384-entry disk parent shared with spools and OCSP
 handlers/descriptors            : only stdio + script fd cross exec
 ```
 
 Exceeding a bound is an error response or connection close, never an
 unbounded allocation or an indefinitely pinned worker.
 
-Plain HTTP/1 socket writes use non-blocking `send`/`sendfile` plus `poll`
-against a stall deadline renewed after each successful byte write. TLS writes
-receive the same progress-renewed deadline through the async adapter. Kernel
-`SO_SNDTIMEO` is defense in depth, not the resource boundary: a stalled
-receiver is closed at `Timeout` and its connection-worker reservation is
-released. On Linux, plain and TLS HTTP/1 transports set `TCP_NOTSENT_LOWAT` to
-cap the queued-unsent region at 64 KiB, so a slow receiver opening its TCP
-receive window wakes the writer, lets the server observe a successful write
-and renews the deadline.
+Plain HTTP/1 socket writes use non-blocking `send`/`sendfile` plus `poll`.
+Plain and TLS output share an irreversible general-to-slow ownership transfer,
+an average-rate checkpoint anchored at the original response start, and an
+absolute sixteen-interval lifetime; partial progress cannot renew either
+boundary. Kernel `SO_SNDTIMEO` is defense in depth, not the resource boundary.
+On Linux, plain and TLS HTTP/1 transports also set `TCP_NOTSENT_LOWAT` to cap
+the queued-unsent region at 64 KiB. Accepted sockets request bounded send and
+receive queues, while their conservative kernel/TLS/protocol memory charge is
+retained until connection teardown.
 
 Shell-pattern evaluation is iterative and uses `O(subject)` memory. Access-file
 logical lines and all configuration-originated glob patterns are capped at
@@ -1284,6 +1286,13 @@ vhost filter when a listener has a concrete destination address; HTTP/1.1,
 HTTP/2, WebSocket, cache and logging call sites all pass the connection's local
 address.
 
+The compiler materializes address/port buckets and exact-name maps at startup.
+Request selection is therefore constant-time for exact names and scans only a
+configuration-bounded wildcard list while preserving Apache's first-match
+precedence (an earlier wildcard still beats a later exact name). More than 256
+wildcard `ServerAlias` patterns is a configuration error, preventing remote
+Host traffic from multiplying an unbounded administrator-supplied rule set.
+
 ### I46 — Canonical peer identity
 
 ```text
@@ -1892,12 +1901,13 @@ construction: there is no second production interleaver.
   consumes `expr_file_test_admit`; the remaining predicates document and
   mechanize the runtime branches exercised by the F39–F45 replay suite.
 - `combine_or_all`, `require_none_multi`, `require_none_multi_result`,
-  `vhost_address_admit`, `vhost_address_precedence` and
+  `vhost_address_admit`, `vhost_address_precedence`,
+  `vhost_name_candidate_precedes` and
   `ipv4_mapped_to_v4`.  These are the pass-5 kernels for multi-provider
   `<RequireNone>` (I43), regex alias file targets (I44, sharing the pass-4
   split predicates), destination-address virtual-host eligibility (I45) and
   canonical IPv4-mapped peer identity (I46).  `access::eval_node`,
-  `Config::select_vhost`, the TLS vhost filter and `access::canonical_ip`
+  the compiled `Config::select_vhost` index, the TLS vhost filter and `access::canonical_ip`
   consume them directly.
 - `access_walk_dir_admit`, `alias_mapping_root_admit`,
   `cache_directory_index_bind_admit` and `cache_ignore_query_admit`.  These are

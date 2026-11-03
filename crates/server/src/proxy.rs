@@ -18,6 +18,7 @@ use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -1751,6 +1752,7 @@ async fn connect_async(
     let stream = stream.ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "cannot connect upstream")
     })?;
+    crate::resource::configure_transport_fd(stream.as_raw_fd())?;
     stream.set_nodelay(true)?;
     if !backend.tls {
         return Ok(Box::new(stream));
@@ -2115,6 +2117,7 @@ fn connect_tcp(backend: &HttpBackend, timeout: Duration) -> std::io::Result<TcpS
     let tcp = tcp.ok_or_else(|| {
         last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address"))
     })?;
+    crate::resource::configure_transport_fd(tcp.as_raw_fd())?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(std::io::Error::new(

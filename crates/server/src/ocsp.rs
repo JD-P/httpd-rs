@@ -1082,6 +1082,30 @@ fn cache() -> &'static Mutex<HashMap<Vec<u8>, Vec<u8>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn disk_leases() -> &'static Mutex<HashMap<std::path::PathBuf, crate::resource::DiskLease>> {
+    static DISK: OnceLock<Mutex<HashMap<std::path::PathBuf, crate::resource::DiskLease>>> =
+        OnceLock::new();
+    DISK.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn account_cached(
+    path: &std::path::Path,
+    bytes: u64,
+    budget: &std::sync::Arc<crate::resource::ResourceBudget>,
+) -> bool {
+    let mut leases = disk_leases()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if leases.contains_key(path) {
+        return true;
+    }
+    let Ok(lease) = budget.try_disk(bytes, 1) else {
+        return false;
+    };
+    leases.insert(path.to_path_buf(), lease);
+    true
+}
+
 fn response_key(chain: &[CertificateDer<'static>], force_url: Option<&str>) -> Vec<u8> {
     let mut key = chain
         .first()
@@ -1133,6 +1157,24 @@ pub fn load_cached(path: &std::path::Path, chain: &[CertificateDer<'static>]) ->
 }
 
 pub fn save_cached(path: &std::path::Path, chain: &[CertificateDer<'static>], response: &[u8]) {
+    save_cached_inner(path, chain, response, None);
+}
+
+pub(crate) fn save_cached_accounted(
+    path: &std::path::Path,
+    chain: &[CertificateDer<'static>],
+    response: &[u8],
+    budget: &std::sync::Arc<crate::resource::ResourceBudget>,
+) {
+    save_cached_inner(path, chain, response, Some(budget));
+}
+
+fn save_cached_inner(
+    path: &std::path::Path,
+    chain: &[CertificateDer<'static>],
+    response: &[u8],
+    budget: Option<&std::sync::Arc<crate::resource::ResourceBudget>>,
+) {
     if response.len() as u64 > MAX_OCSP_RESPONSE || !valid_response(chain, response) {
         return;
     }
@@ -1145,6 +1187,16 @@ pub fn save_cached(path: &std::path::Path, chain: &[CertificateDer<'static>], re
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return;
+    };
+    // During replacement the old staple and a temporary file coexist. Hold
+    // the peak reservation until rename has committed, then retain the final
+    // file's charge for the lifetime of this process generation.
+    let mut disk = match budget {
+        Some(budget) => match budget.try_disk((response.len() as u64).saturating_mul(2), 2) {
+            Ok(lease) => Some(lease),
+            Err(_) => return,
+        },
+        None => None,
     };
     for _ in 0..16 {
         let nonce = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -1171,6 +1223,16 @@ pub fn save_cached(path: &std::path::Path, chain: &[CertificateDer<'static>], re
                 })
             && std::fs::rename(&tmp, path).is_ok()
         {
+            if let Some(mut lease) = disk.take() {
+                if lease.resize(response.len() as u64, 1).is_err() {
+                    let _ = std::fs::remove_file(path);
+                    return;
+                }
+                disk_leases()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(path.to_path_buf(), lease);
+            }
             return;
         }
         let _ = std::fs::remove_file(&tmp);

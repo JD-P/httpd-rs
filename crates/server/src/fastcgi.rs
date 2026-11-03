@@ -21,7 +21,7 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 #[cfg(test)]
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
@@ -872,6 +872,7 @@ fn connect(
                 }
                 match TcpStream::connect_timeout(&addr, remaining) {
                     Ok(s) => {
+                        crate::resource::configure_transport_fd(s.as_raw_fd())?;
                         let quantum = deadline
                             .saturating_duration_since(Instant::now())
                             .min(Duration::from_secs(1));

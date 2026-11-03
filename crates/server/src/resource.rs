@@ -8,6 +8,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::RawFd;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -34,10 +37,11 @@ pub(crate) enum SlotKind {
     RewriteProgram,
     SpoolFile,
     SlowSpoolFile,
+    FilesystemWork,
 }
 
 impl SlotKind {
-    const COUNT: usize = 15;
+    const COUNT: usize = 16;
 
     const fn index(self) -> usize {
         self as usize
@@ -127,6 +131,12 @@ pub struct ResourceBudget {
     byte_clients: Mutex<HashMap<IpAddr, [u64; ByteKind::COUNT]>>,
     physical_process: [AtomicU64; PhysicalKind::COUNT],
     physical_limits: [u64; PhysicalKind::COUNT],
+    disk_bytes: AtomicU64,
+    disk_files: AtomicU64,
+    disk_byte_limit: u64,
+    disk_file_limit: u64,
+    transport_bytes: AtomicU64,
+    transport_byte_limit: u64,
     rates: Mutex<RateLedger>,
     next_scope: AtomicU64,
 }
@@ -134,6 +144,7 @@ pub struct ResourceBudget {
 impl Default for ResourceBudget {
     fn default() -> Self {
         let physical_limits = detected_physical_limits();
+        let (disk_byte_limit, disk_file_limit) = detected_disk_limits(Path::new("."));
         Self {
             slot_process: std::array::from_fn(|_| AtomicU64::new(0)),
             slot_clients: Mutex::new(HashMap::new()),
@@ -141,6 +152,12 @@ impl Default for ResourceBudget {
             byte_clients: Mutex::new(HashMap::new()),
             physical_process: std::array::from_fn(|_| AtomicU64::new(0)),
             physical_limits,
+            disk_bytes: AtomicU64::new(0),
+            disk_files: AtomicU64::new(0),
+            disk_byte_limit,
+            disk_file_limit,
+            transport_bytes: AtomicU64::new(0),
+            transport_byte_limit: DEFAULT_TRANSPORT_BUFFER_BUDGET,
             rates: Mutex::new(RateLedger::default()),
             next_scope: AtomicU64::new(1),
         }
@@ -200,6 +217,31 @@ pub const MAX_LOG_BYTES_PER_CLIENT_PER_SECOND: u64 = 2 * 1024 * 1024;
 const CACHE_WRITE_MIN_CHARGE: u64 = 64 * 1024;
 const DEFAULT_TASK_BUDGET: u64 = 1_024;
 const DEFAULT_RESIDENT_BUDGET: u64 = 256 * 1024 * 1024;
+const DEFAULT_DISK_BYTE_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
+const DEFAULT_DISK_FILE_BUDGET: u64 = 16 * 1024;
+const DEFAULT_TRANSPORT_BUFFER_BUDGET: u64 = 256 * 1024 * 1024;
+/// Conservative ownership charge for the kernel send/receive queues and the
+/// protocol/TLS buffers associated with one accepted transport.
+pub(crate) const TRANSPORT_BUFFER_CHARGE: u64 = 512 * 1024;
+pub(crate) const SOCKET_BUFFER_BYTES: libc::c_int = 128 * 1024;
+
+pub(crate) fn configure_transport_fd(fd: RawFd) -> io::Result<()> {
+    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&SOCKET_BUFFER_BYTES as *const libc::c_int).cast(),
+                std::mem::size_of_val(&SOCKET_BUFFER_BYTES) as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
 
 fn bounded_system_limit(path: &str, fallback: u64) -> u64 {
     std::fs::read_to_string(path)
@@ -245,6 +287,34 @@ fn detected_physical_limits() -> [u64; PhysicalKind::COUNT] {
     [fd, tasks, memory]
 }
 
+fn detected_disk_limits(root: &Path) -> (u64, u64) {
+    let Ok(path) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
+        return (DEFAULT_DISK_BYTE_BUDGET, DEFAULT_DISK_FILE_BUDGET);
+    };
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
+        return (DEFAULT_DISK_BYTE_BUDGET, DEFAULT_DISK_FILE_BUDGET);
+    }
+    let available_bytes = (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64);
+    let available_files = stats.f_favail as u64;
+    // Retain one quarter of the observed free filesystem for the operating
+    // system, administrator recovery, and unrelated services. The hard caps
+    // also keep a very large filesystem from turning configured log/spool
+    // ceilings into an unexpectedly large aggregate allowance.
+    (
+        available_bytes
+            .saturating_mul(3)
+            .saturating_div(4)
+            .min(DEFAULT_DISK_BYTE_BUDGET)
+            .max(1),
+        available_files
+            .saturating_mul(3)
+            .saturating_div(4)
+            .min(DEFAULT_DISK_FILE_BUDGET)
+            .max(1),
+    )
+}
+
 const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
     use SlotKind::*;
     match kind {
@@ -264,7 +334,7 @@ const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
         DynamicBackend => [0, 2, 256 * 1024],
         Websocket => [1, 0, 64 * 1024],
         RewriteProgram => [3, 1, 128 * 1024],
-        SpoolFile | SlowSpoolFile => [0, 0, 0],
+        SpoolFile | SlowSpoolFile | FilesystemWork => [0, 0, 0],
         TlsHandshake => [0, 0, 128 * 1024],
         RequestBodyWorker | ExpensiveCpu => [0, 0, 0],
     }
@@ -690,6 +760,108 @@ fn try_add_counter<C: BudgetCounter>(counter: &C, amount: u64, limit: u64) -> bo
 pub(crate) struct DescriptorLease {
     budget: Arc<ResourceBudget>,
     amount: u64,
+}
+
+/// Exact ownership of attacker-influenced persistent/spooled filesystem
+/// capacity. Bytes and directory entries share one process-generation parent
+/// across spools, cache records, logs and certificate-status cache files.
+#[derive(Debug)]
+pub(crate) struct DiskLease {
+    budget: Arc<ResourceBudget>,
+    bytes: u64,
+    files: u64,
+}
+
+impl DiskLease {
+    pub(crate) fn reserve(&mut self, amount: u64) -> io::Result<()> {
+        self.resize(self.bytes.saturating_add(amount), self.files)
+    }
+
+    pub(crate) fn release(&mut self, amount: u64) {
+        let _ = self.resize(self.bytes.saturating_sub(amount), self.files);
+    }
+
+    pub(crate) fn resize(&mut self, bytes: u64, files: u64) -> io::Result<()> {
+        let add_bytes = bytes.saturating_sub(self.bytes);
+        let add_files = files.saturating_sub(self.files);
+        if add_bytes > 0
+            && !try_add(
+                &self.budget.disk_bytes,
+                add_bytes,
+                self.budget.disk_byte_limit,
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "aggregate writable-disk byte limit reached",
+            ));
+        }
+        if add_files > 0
+            && !try_add(
+                &self.budget.disk_files,
+                add_files,
+                self.budget.disk_file_limit,
+            )
+        {
+            if add_bytes > 0 {
+                self.budget
+                    .disk_bytes
+                    .fetch_sub(add_bytes, Ordering::AcqRel);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "aggregate writable-disk inode limit reached",
+            ));
+        }
+        if bytes < self.bytes {
+            self.budget
+                .disk_bytes
+                .fetch_sub(self.bytes - bytes, Ordering::AcqRel);
+        }
+        if files < self.files {
+            self.budget
+                .disk_files
+                .fetch_sub(self.files - files, Ordering::AcqRel);
+        }
+        self.bytes = bytes;
+        self.files = files;
+        Ok(())
+    }
+}
+
+impl Drop for DiskLease {
+    fn drop(&mut self) {
+        self.budget
+            .disk_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+        self.budget
+            .disk_files
+            .fetch_sub(self.files, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct TransportBufferLease {
+    budget: Arc<ResourceBudget>,
+    bytes: u64,
+}
+
+impl Drop for TransportBufferLease {
+    fn drop(&mut self) {
+        self.budget
+            .transport_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResourceTelemetry {
+    pub disk_bytes: u64,
+    pub disk_byte_limit: u64,
+    pub disk_files: u64,
+    pub disk_file_limit: u64,
+    pub transport_bytes: u64,
+    pub transport_byte_limit: u64,
 }
 
 impl Drop for DescriptorLease {
@@ -1132,6 +1304,12 @@ impl Drop for ByteLease {
 }
 
 impl ResourceBudget {
+    pub(crate) fn for_filesystem(root: &Path) -> Self {
+        let mut budget = Self::default();
+        (budget.disk_byte_limit, budget.disk_file_limit) = detected_disk_limits(root);
+        budget
+    }
+
     pub fn context(self: &Arc<Self>, client: IpAddr) -> ResourceContext {
         ResourceContext::for_client(self, client)
     }
@@ -1176,6 +1354,44 @@ impl ResourceBudget {
             budget: self.clone(),
             amount,
         })
+    }
+
+    pub(crate) fn try_disk(self: &Arc<Self>, bytes: u64, files: u64) -> io::Result<DiskLease> {
+        let mut lease = DiskLease {
+            budget: self.clone(),
+            bytes: 0,
+            files: 0,
+        };
+        lease.resize(bytes, files)?;
+        Ok(lease)
+    }
+
+    pub(crate) fn try_transport_buffers(self: &Arc<Self>) -> io::Result<TransportBufferLease> {
+        if !try_add(
+            &self.transport_bytes,
+            TRANSPORT_BUFFER_CHARGE,
+            self.transport_byte_limit,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "aggregate transport-buffer limit reached",
+            ));
+        }
+        Ok(TransportBufferLease {
+            budget: self.clone(),
+            bytes: TRANSPORT_BUFFER_CHARGE,
+        })
+    }
+
+    pub(crate) fn telemetry(&self) -> ResourceTelemetry {
+        ResourceTelemetry {
+            disk_bytes: self.disk_bytes.load(Ordering::Acquire),
+            disk_byte_limit: self.disk_byte_limit,
+            disk_files: self.disk_files.load(Ordering::Acquire),
+            disk_file_limit: self.disk_file_limit,
+            transport_bytes: self.transport_bytes.load(Ordering::Acquire),
+            transport_byte_limit: self.transport_byte_limit,
+        }
     }
 
     /// Hysteresis signals used by the listener loop.  Pausing before the hard
@@ -1530,6 +1746,19 @@ impl ResourceBudget {
         )
     }
 
+    pub(crate) fn try_filesystem_work_in(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+    ) -> io::Result<SlotLease> {
+        context.slot(
+            SlotKind::FilesystemWork,
+            64,
+            Some(8),
+            Some(1),
+            "filesystem work limit reached",
+        )
+    }
+
     pub fn try_spool(self: &Arc<Self>, max_bytes: u64, max_files: u64) -> io::Result<SpoolLease> {
         let context = self.current_context_for()?;
         self.try_spool_inner(max_bytes, max_files, &context)
@@ -1580,6 +1809,7 @@ impl ResourceBudget {
             ),
             file_slot: Some(file_slot),
             _descriptor: descriptor,
+            disk: self.try_disk(0, 1)?,
             slow: false,
         })
     }
@@ -1620,9 +1850,11 @@ impl ResourceBudget {
             "dynamic backend concurrency limit reached",
         )?;
         let descriptor_lease = self.try_descriptors(descriptors)?;
+        let transport_lease = self.try_transport_buffers()?;
         Ok(DynamicLease {
             _slot: Some(slot),
             _descriptors: descriptor_lease,
+            _transport: transport_lease,
         })
     }
 
@@ -2106,14 +2338,23 @@ pub struct SpoolLease {
     bytes: ByteLease,
     file_slot: Option<SlotLease>,
     _descriptor: DescriptorLease,
+    disk: DiskLease,
     slow: bool,
 }
 
 impl SpoolLease {
     pub fn reserve(&mut self, amount: u64) -> io::Result<()> {
-        self.bytes
+        self.disk.reserve(amount)?;
+        if let Err(error) = self
+            .bytes
             .reserve(amount, "hierarchical spool-byte limit reached")
-            .map_err(|error| io::Error::new(io::ErrorKind::StorageFull, error))
+        {
+            let _ = self
+                .disk
+                .resize(self.disk.bytes.saturating_sub(amount), self.disk.files);
+            return Err(io::Error::new(io::ErrorKind::StorageFull, error));
+        }
+        Ok(())
     }
 
     pub fn attribute_client(&mut self, client: IpAddr) -> io::Result<()> {
@@ -2173,6 +2414,7 @@ impl SpoolLease {
 pub struct DynamicLease {
     _slot: Option<SlotLease>,
     _descriptors: DescriptorLease,
+    _transport: TransportBufferLease,
 }
 
 impl DynamicLease {
@@ -2442,6 +2684,50 @@ mod tests {
             budget.physical_process[PhysicalKind::FileDescriptor.index()].load(Ordering::Acquire),
             0
         );
+    }
+
+    #[test]
+    fn disk_and_transport_parents_are_shared_exact_and_recoverable() {
+        let budget = Arc::new(ResourceBudget {
+            disk_byte_limit: 8,
+            disk_file_limit: 2,
+            transport_byte_limit: TRANSPORT_BUFFER_CHARGE,
+            ..ResourceBudget::default()
+        });
+        let mut first = budget.try_disk(5, 1).unwrap();
+        let second = budget.try_disk(3, 1).unwrap();
+        assert!(budget.try_disk(1, 0).is_err());
+        assert!(budget.try_disk(0, 1).is_err());
+        first.resize(4, 1).unwrap();
+        let third = budget.try_disk(1, 0).unwrap();
+        assert_eq!(budget.telemetry().disk_bytes, 8);
+
+        let transport = budget.try_transport_buffers().unwrap();
+        assert!(budget.try_transport_buffers().is_err());
+        assert_eq!(budget.telemetry().transport_bytes, TRANSPORT_BUFFER_CHARGE);
+        drop((first, second, third, transport));
+        let telemetry = budget.telemetry();
+        assert_eq!(telemetry.disk_bytes, 0);
+        assert_eq!(telemetry.disk_files, 0);
+        assert_eq!(telemetry.transport_bytes, 0);
+    }
+
+    #[test]
+    fn filesystem_phase_is_source_fair_and_releases() {
+        let budget = Arc::new(ResourceBudget::default());
+        let client = IpAddr::from([192, 0, 2, 60]);
+        let leases: Vec<_> = (0..8)
+            .map(|_| {
+                let context = budget.context(client);
+                budget.try_filesystem_work_in(&context).unwrap()
+            })
+            .collect();
+        let denied = budget.context(client);
+        assert!(budget.try_filesystem_work_in(&denied).is_err());
+        let other = budget.context(IpAddr::from([198, 51, 100, 60]));
+        let other_lease = budget.try_filesystem_work_in(&other).unwrap();
+        drop((leases, other_lease));
+        assert_eq!(budget.slot_usage(SlotKind::FilesystemWork), 0);
     }
 
     #[test]

@@ -279,6 +279,9 @@ const ACCEPT_BATCH: usize = 64;
 const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 64;
 const MAX_TLS_HANDSHAKES_PER_SECOND: usize = 128;
 const MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND: usize = 64;
+fn configure_accepted_transport(stream: &TcpStream) -> io::Result<()> {
+    crate::resource::configure_transport_fd(stream.as_raw_fd())
+}
 
 fn listener_index(first: usize, offset: usize, count: usize) -> usize {
     debug_assert!(count > 0);
@@ -428,6 +431,18 @@ impl Server {
                                     break;
                                 }
                             };
+                            if configure_accepted_transport(&stream).is_err() {
+                                continue;
+                            }
+                            let transport_guard = match cfg.resource_budget.try_transport_buffers()
+                            {
+                                Ok(guard) => guard,
+                                Err(_) => {
+                                    reject_busy_connection(stream, b.tls.is_some(), &self.cfg);
+                                    listeners_paused = true;
+                                    break;
+                                }
+                            };
                             let trusted_proxy = cfg.transport_peer_is_trusted_proxy(peer.ip());
                             let transport_context = cfg.resource_budget.context(peer.ip());
                             let Some(pending_guard) = try_reserve_pending_connection(
@@ -442,7 +457,7 @@ impl Server {
                                 reject_busy_connection(stream, b.tls.is_some(), &self.cfg);
                                 continue;
                             };
-                            let lifetime_guard = ConnectionLifetimeGuard::new();
+                            let lifetime_guard = ConnectionLifetimeGuard::new(transport_guard);
                             let port = local.map(|l| l.port()).unwrap_or(b.port);
                             let local_ip = local
                                 .map(|l| l.ip().to_string())
@@ -483,12 +498,16 @@ impl Server {
     }
 }
 
-struct ConnectionLifetimeGuard;
+struct ConnectionLifetimeGuard {
+    _transport: crate::resource::TransportBufferLease,
+}
 
 impl ConnectionLifetimeGuard {
-    fn new() -> Self {
+    fn new(transport: crate::resource::TransportBufferLease) -> Self {
         ACTIVE_CONNECTIONS.fetch_add(1, Ordering::AcqRel);
-        Self
+        Self {
+            _transport: transport,
+        }
     }
 }
 
@@ -3632,26 +3651,40 @@ impl PreparedHandler {
             } => {
                 let mut response = handler.execute(cfg, req);
                 let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
-                if let Some(cache) = cache {
-                    crate::cache::store(
-                        cfg,
-                        vhost,
-                        req,
-                        &host,
-                        &cache.path,
-                        &cache.scope,
-                        peer,
-                        &mut response,
-                        &cache.grant,
-                        &cache.key,
-                        &cache.target,
-                    );
-                }
                 let unsafe_method =
                     !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
-                if vapache_verified::cache_invalidation_status_admit(unsafe_method, response.status)
-                {
-                    crate::cache::invalidate(cfg, &host, &invalidation_path);
+                let must_invalidate = vapache_verified::cache_invalidation_status_admit(
+                    unsafe_method,
+                    response.status,
+                );
+                let context = req
+                    .resource_context()
+                    .cloned()
+                    .unwrap_or_else(|| cfg.resource_budget.context(peer));
+                if let Ok(_filesystem_work) = cfg.resource_budget.try_filesystem_work_in(&context) {
+                    if let Some(cache) = cache {
+                        crate::cache::store(
+                            cfg,
+                            vhost,
+                            req,
+                            &host,
+                            &cache.path,
+                            &cache.scope,
+                            peer,
+                            &mut response,
+                            &cache.grant,
+                            &cache.key,
+                            &cache.target,
+                        );
+                    }
+                    if must_invalidate {
+                        crate::cache::invalidate(cfg, &host, &invalidation_path);
+                    }
+                } else if must_invalidate {
+                    // Correctness cannot wait for filesystem capacity: make
+                    // every persisted representation stale immediately and
+                    // let later bounded maintenance remove the files.
+                    crate::cache::invalidate_generation_only();
                 }
                 response
             }
@@ -3858,11 +3891,7 @@ pub(crate) fn execute_prepared_handler(
 }
 
 fn selected_vhost_index(cfg: &Config, vhost: Option<&VHost>) -> Option<usize> {
-    vhost.and_then(|selected| {
-        cfg.vhosts
-            .iter()
-            .position(|candidate| std::ptr::eq(candidate, selected))
-    })
+    vhost.and_then(|selected| cfg.vhost_position(selected))
 }
 
 fn dispatch_inner_request(
@@ -3875,6 +3904,24 @@ fn dispatch_inner_request(
     // Each outer request starts without error-document provenance; the
     // internal subrequest sets it before this request's cache store runs.
     crate::files::reset_local_error_document_response();
+    // Filesystem lookup is deliberately admitted as its own bounded phase.
+    // Dynamic backends execute after this function returns a prepared handler,
+    // so a stalled mount/cache/access-file lookup cannot consume the entire
+    // general request-worker population or hold backend capacity.
+    let filesystem_context = req
+        .resource_context()
+        .cloned()
+        .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
+    let Ok(_filesystem_work) = cfg
+        .resource_budget
+        .try_filesystem_work_in(&filesystem_context)
+    else {
+        return Response::bytes(
+            503,
+            "text/plain; charset=utf-8",
+            b"Service Unavailable\n".to_vec(),
+        );
+    };
     // Memoize repeated metadata probes for this request only.  The guard drops
     // on every return path, so the next request cannot observe stale state.
     let _metadata_guard = crate::files::request_metadata_scope();
@@ -5542,7 +5589,7 @@ fn dispatch_inner(
             );
         }
         let auto = req.query.eq_ignore_ascii_case(b"auto");
-        return crate::status::response(auto);
+        return crate::status::response(auto, &cfg.resource_budget);
     }
 
     if fastcgi_wins {
@@ -7289,6 +7336,7 @@ mod tests {
         };
         let mut cfg_name = cfg.clone();
         cfg_name.vhosts = vec![vhost_name.clone()];
+        cfg_name.rebuild_vhost_index();
         assert_eq!(
             server_name_for(&cfg_name, &no_host, "127.0.0.1", 80),
             "vhost.test"
@@ -7352,6 +7400,7 @@ mod tests {
             "https://vhost.test:80/x"
         );
         cfg_abs.vhosts.clear();
+        cfg_abs.rebuild_vhost_index();
         assert_eq!(
             absolute_url_scheme(&cfg_abs, None, &req_abs, "/x", "server.test", 8443, true),
             "https://cfg.test/x"
@@ -7370,6 +7419,7 @@ mod tests {
             server_name: Some(" ".into()),
             ..vhost_name.clone()
         }];
+        cfg_abs.rebuild_vhost_index();
         assert_eq!(
             absolute_url_scheme(
                 &cfg_abs,
@@ -7715,6 +7765,35 @@ mod tests {
         assert_eq!(listener_index(1, 0, 3), 1);
         assert_eq!(listener_index(1, 2, 3), 0);
         assert_eq!(listener_index(2, 0, 3), 2);
+    }
+
+    #[test]
+    fn accepted_socket_buffers_are_explicitly_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        configure_accepted_transport(&server).unwrap();
+        for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+            let mut value: libc::c_int = 0;
+            let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+            assert_eq!(
+                unsafe {
+                    libc::getsockopt(
+                        server.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        option,
+                        (&mut value as *mut libc::c_int).cast(),
+                        &mut length,
+                    )
+                },
+                0
+            );
+            assert!(value > 0);
+            // Linux reports twice the requested value for bookkeeping;
+            // other supported kernels report the effective/requested value.
+            assert!(value <= crate::resource::SOCKET_BUFFER_BYTES * 2);
+        }
+        drop(client);
     }
 
     #[tokio::test(flavor = "current_thread")]

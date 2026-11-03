@@ -257,6 +257,7 @@ struct DiskUsageState {
     total: u64,
     /// stem -> (accounted bytes, modification time, insertion generation)
     stems: HashMap<PathBuf, (u64, SystemTime, u64)>,
+    file_counts: HashMap<PathBuf, u64>,
     /// Insertion/scan order with timestamps used to discard stale records.
     /// This makes eviction O(1) amortized instead of sorting the entire cache
     /// on every unique request key.
@@ -265,6 +266,8 @@ struct DiskUsageState {
     /// Exact key decoded once from the metadata file. `None` denotes corrupt
     /// or legacy metadata and is removed conservatively on invalidation.
     keys: HashMap<PathBuf, Option<Vec<u8>>>,
+    /// Shared disk/inode parent permits for every persisted representation.
+    leases: HashMap<PathBuf, crate::resource::DiskLease>,
 }
 
 fn disk_usage() -> &'static Mutex<HashMap<PathBuf, DiskUsageState>> {
@@ -272,7 +275,10 @@ fn disk_usage() -> &'static Mutex<HashMap<PathBuf, DiskUsageState>> {
     USAGE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn ensure_disk_usage(root: &Path) -> bool {
+fn ensure_disk_usage(
+    root: &Path,
+    budget: &std::sync::Arc<crate::resource::ResourceBudget>,
+) -> bool {
     let mut roots = disk_usage()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -288,10 +294,11 @@ fn ensure_disk_usage(root: &Path) -> bool {
     // Serialize only index construction; steady-state accounting and file I/O
     // do not use this lock.
     static SCAN: OnceLock<Mutex<()>> = OnceLock::new();
-    let _scan = SCAN
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let Ok(_scan) = SCAN.get_or_init(|| Mutex::new(())).try_lock() else {
+        // A cold scan is already in flight. Bypass disk cache rather than
+        // parking another request worker behind filesystem latency.
+        return false;
+    };
     if disk_usage()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -299,9 +306,16 @@ fn ensure_disk_usage(root: &Path) -> bool {
     {
         return true;
     }
-    let Some(scanned) = scan_disk_usage(root) else {
+    let Some(mut scanned) = scan_disk_usage(root) else {
         return false;
     };
+    for (stem, (bytes, _, _)) in &scanned.stems {
+        let files = scanned.file_counts.get(stem).copied().unwrap_or(1);
+        let Ok(lease) = budget.try_disk(*bytes, files) else {
+            return false;
+        };
+        scanned.leases.insert(stem.clone(), lease);
+    }
     disk_usage()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -347,11 +361,12 @@ fn disk_stem_files(stem: &Path) -> [PathBuf; 4] {
 }
 
 fn record_disk_file(state: &mut DiskUsageState, stem: PathBuf, len: u64, modified: SystemTime) {
-    let slot = state.stems.entry(stem).or_insert((0, modified, 0));
+    let slot = state.stems.entry(stem.clone()).or_insert((0, modified, 0));
     slot.0 = slot.0.saturating_add(len);
     if modified < slot.1 {
         slot.1 = modified;
     }
+    *state.file_counts.entry(stem).or_insert(0) += 1;
 }
 
 fn remove_disk_stem_files(stem: &Path) {
@@ -479,6 +494,8 @@ fn remove_disk_stem(cfg: &Config, stem: &Path) {
         if let Some((size, _, _)) = usage.stems.remove(stem) {
             usage.total = usage.total.saturating_sub(size);
         }
+        usage.file_counts.remove(stem);
+        usage.leases.remove(stem);
         usage.keys.remove(stem);
     }
 }
@@ -1589,9 +1606,12 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
     let Some(stem) = cache_stem(cfg, key) else {
         return;
     };
-    let _io_guard = disk_io_lock(&stem)
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let Ok(_io_guard) = disk_io_lock(&stem).try_lock() else {
+        // Contention means another reader/writer is already making progress
+        // for this stripe. Cache population is optional, so never turn the
+        // stripe into a request-worker convoy.
+        return;
+    };
     // `cache_stem` succeeds exactly when the root exists.
     let root = cfg
         .cache
@@ -1612,7 +1632,7 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
     // Establish the initial index without holding the process-wide state lock
     // across the bounded filesystem walk. A racing store may install an
     // equivalent index first; `entry().or_insert` keeps that newer state.
-    if !ensure_disk_usage(root) {
+    if !ensure_disk_usage(root, &cfg.resource_budget) {
         return;
     }
     let (generation, victims) = {
@@ -1626,12 +1646,23 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
             .map(|(size, _, _)| *size)
             .unwrap_or(0);
         let old_count = usize::from(old_size > 0);
+        let old_files = usage.file_counts.get(&stem).copied().unwrap_or(0);
         let mut projected = vapache_verified::cache_disk_projected(usage.total, old_size, incoming);
         let mut entries = usage
             .stems
             .len()
             .saturating_sub(old_count)
             .saturating_add(1);
+        let peak_bytes = old_size.saturating_add(incoming);
+        let peak_files = old_files.saturating_add(2);
+        let lease = usage.leases.entry(stem.clone()).or_insert_with(|| {
+            cfg.resource_budget
+                .try_disk(0, 0)
+                .expect("zero-sized disk lease must be admissible")
+        });
+        if lease.resize(peak_bytes, peak_files).is_err() {
+            return;
+        }
         let mut victims = Vec::new();
         while projected > cfg.cache.max_disk_size || entries > MAX_DISK_ENTRIES {
             let Some((victim, queued_generation)) = usage.eviction.pop_front() else {
@@ -1650,41 +1681,54 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
                 usage.total = usage.total.saturating_sub(size);
                 projected = vapache_verified::cache_disk_evict(projected, size);
                 entries = entries.saturating_sub(1);
-                victims.push(victim.clone());
+                victims.push((victim.clone(), usage.leases.remove(&victim)));
             }
+            usage.file_counts.remove(&victim);
             usage.keys.remove(&victim);
         }
         if projected > cfg.cache.max_disk_size || entries > MAX_DISK_ENTRIES {
-            return;
+            if let Some(lease) = usage.leases.get_mut(&stem) {
+                let _ = lease.resize(old_size, old_files);
+            }
+            if old_size == 0 {
+                usage.leases.remove(&stem);
+            }
+            (None, victims)
+        } else {
+            usage.next_generation = usage.next_generation.wrapping_add(1).max(1);
+            let generation = usage.next_generation;
+            let stored = SystemTime::now();
+            usage.total = projected;
+            usage
+                .stems
+                .insert(stem.clone(), (incoming, stored, generation));
+            usage.file_counts.insert(stem.clone(), 2);
+            usage.eviction.push_back((stem.clone(), generation));
+            if usage.eviction.len() > MAX_DISK_ENTRIES * 8 {
+                let (stems, eviction) = (&usage.stems, &mut usage.eviction);
+                eviction.retain(|(candidate, queued_generation)| {
+                    stems
+                        .get(candidate)
+                        .is_some_and(|(_, _, current_generation)| {
+                            current_generation == queued_generation
+                        })
+                });
+            }
+            usage
+                .keys
+                .insert(stem.clone(), Some(key.as_bytes().to_vec()));
+            (Some(generation), victims)
         }
-        usage.next_generation = usage.next_generation.wrapping_add(1).max(1);
-        let generation = usage.next_generation;
-        let stored = SystemTime::now();
-        usage.total = projected;
-        usage
-            .stems
-            .insert(stem.clone(), (incoming, stored, generation));
-        usage.eviction.push_back((stem.clone(), generation));
-        if usage.eviction.len() > MAX_DISK_ENTRIES * 8 {
-            let (stems, eviction) = (&usage.stems, &mut usage.eviction);
-            eviction.retain(|(candidate, queued_generation)| {
-                stems
-                    .get(candidate)
-                    .is_some_and(|(_, _, current_generation)| {
-                        current_generation == queued_generation
-                    })
-            });
-        }
-        usage
-            .keys
-            .insert(stem.clone(), Some(key.as_bytes().to_vec()));
-        (generation, victims)
     };
     // Filesystem I/O happens after releasing the accounting lock. Concurrent
     // stores reserve their bytes first, so the disk quota remains closed.
-    for victim in victims {
+    for (victim, lease) in victims {
         remove_disk_stem_files(&victim);
+        drop(lease);
     }
+    let Some(generation) = generation else {
+        return;
+    };
     let body_path = stem.with_extension("body");
     let meta_path = stem.with_extension("meta");
     let body_tmp = stem.with_extension("body.tmp");
@@ -1728,7 +1772,12 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
         return;
     };
     if crate::fault::hit("cache.commit.reservation").is_err() {
-        usage.stems.remove(&stem);
+        if let Some((reserved, _, _)) = usage.stems.remove(&stem) {
+            usage.total = usage.total.saturating_sub(reserved);
+        }
+        usage.file_counts.remove(&stem);
+        usage.keys.remove(&stem);
+        usage.leases.remove(&stem);
     }
     let Some((reserved, _, current_generation)) = usage.stems.get_mut(&stem) else {
         drop(roots);
@@ -1739,12 +1788,31 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
         *current_generation = current_generation.wrapping_add(1);
     }
     if *current_generation != generation {
+        let reserved = *reserved;
+        usage.stems.remove(&stem);
+        usage.file_counts.remove(&stem);
+        usage.keys.remove(&stem);
+        usage.leases.remove(&stem);
+        usage.total = usage.total.saturating_sub(reserved);
         drop(roots);
         remove_disk_stem_files(&stem);
         return;
     }
     usage.total = usage.total.saturating_sub(*reserved).saturating_add(actual);
     *reserved = actual;
+    if usage
+        .leases
+        .get_mut(&stem)
+        .is_none_or(|lease| lease.resize(actual, 2).is_err())
+    {
+        usage.stems.remove(&stem);
+        usage.file_counts.remove(&stem);
+        usage.keys.remove(&stem);
+        usage.leases.remove(&stem);
+        usage.total = usage.total.saturating_sub(actual);
+        drop(roots);
+        remove_disk_stem_files(&stem);
+    }
 }
 
 fn release_disk_reservation(root: &Path, stem: &Path, generation: u64) {
@@ -1756,7 +1824,9 @@ fn release_disk_reservation(root: &Path, stem: &Path, generation: u64) {
     if let Some((size, _, current_generation)) = current {
         if current_generation == generation {
             usage.stems.remove(stem);
+            usage.file_counts.remove(stem);
             usage.keys.remove(stem);
+            usage.leases.remove(stem);
             usage.total = usage.total.saturating_sub(size);
         }
     }
@@ -1768,9 +1838,9 @@ fn disk_load_accounted(
     resident: &mut crate::resource::ResidentLease,
 ) -> Option<Entry> {
     let stem = cache_stem(cfg, key)?;
-    let _io_guard = disk_io_lock(&stem)
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let Ok(_io_guard) = disk_io_lock(&stem).try_lock() else {
+        return None;
+    };
     let meta = match read_disk_metadata_accounted(&stem.with_extension("meta"), resident) {
         Some(meta) => meta,
         None => {
@@ -2001,12 +2071,17 @@ pub fn clear(cfg: &Config) {
     invalidate_disk(cfg);
 }
 
+pub(crate) fn invalidate_generation_only() {
+    bump_epoch();
+    *entries().lock().unwrap_or_else(|e| e.into_inner()) = MemoryCache::default();
+}
+
 /// Remove every persisted cache file after a configuration-generation change.
 fn invalidate_disk(cfg: &Config) {
     let Some(root) = &cfg.cache.root else {
         return;
     };
-    disk_usage()
+    let retained_usage = disk_usage()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(root);
@@ -2042,6 +2117,7 @@ fn invalidate_disk(cfg: &Config) {
             }
         }
     }
+    drop(retained_usage);
 }
 
 /// Remove only disk entries whose embedded, complete key has the selected
@@ -2054,7 +2130,7 @@ fn invalidate_disk_prefix(cfg: &Config, prefix: &[u8]) {
     // Build the index at most once per cache generation. Subsequent unsafe
     // requests select matching stems in memory instead of recursively walking
     // and rereading every metadata file.
-    if !ensure_disk_usage(root) {
+    if !ensure_disk_usage(root, &cfg.resource_budget) {
         // A bounded scan could not establish which persisted entries are
         // affected. Advance the generation so none of them can be served,
         // and release the bounded in-memory cache as the fail-closed path.
@@ -2067,7 +2143,7 @@ fn invalidate_disk_prefix(cfg: &Config, prefix: &[u8]) {
         let usage = roots
             .get_mut(root)
             .expect("bounded disk scan inserted cache usage");
-        let victims: Vec<PathBuf> = usage
+        let victim_paths: Vec<PathBuf> = usage
             .stems
             .keys()
             .filter(|stem| {
@@ -2079,16 +2155,20 @@ fn invalidate_disk_prefix(cfg: &Config, prefix: &[u8]) {
             })
             .cloned()
             .collect();
-        for stem in &victims {
-            if let Some((size, _, _)) = usage.stems.remove(stem) {
+        let mut victims = Vec::with_capacity(victim_paths.len());
+        for stem in victim_paths {
+            if let Some((size, _, _)) = usage.stems.remove(&stem) {
                 usage.total = usage.total.saturating_sub(size);
             }
-            usage.keys.remove(stem);
+            usage.file_counts.remove(&stem);
+            usage.keys.remove(&stem);
+            victims.push((stem.clone(), usage.leases.remove(&stem)));
         }
         victims
     };
-    for stem in victims {
+    for (stem, lease) in victims {
         remove_disk_stem_files(&stem);
+        drop(lease);
     }
 }
 
@@ -4046,6 +4126,8 @@ CacheIgnoreQueryString On\n\
         let usage = scan_disk_usage(&cache_root).unwrap();
         assert!(usage.total >= 11);
         assert_eq!(usage.stems.len(), 2);
+        assert_eq!(usage.file_counts[&cache_root.join("alpha")], 2);
+        assert_eq!(usage.file_counts[&cache_root.join("nested/beta")], 1);
         let mut recorded = DiskUsageState::default();
         record_disk_file(
             &mut recorded,
@@ -4060,6 +4142,7 @@ CacheIgnoreQueryString On\n\
             SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
         );
         assert_eq!(recorded.stems[Path::new("manual")].0, 5);
+        assert_eq!(recorded.file_counts[Path::new("manual")], 2);
         assert_eq!(
             scan_disk_usage(&cache_root.join("missing")).unwrap().total,
             0
@@ -4549,8 +4632,28 @@ CacheIgnoreQueryString On\n\
         fs::write(nested.join("entry.body"), b"body").unwrap();
         assert!(scan_disk_usage(root).is_none());
         disk_usage().lock().unwrap().remove(root);
-        assert!(!ensure_disk_usage(root));
+        assert!(!ensure_disk_usage(root, &cfg.resource_budget));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contended_disk_cache_stripe_is_a_nonblocking_miss_and_store_skip() {
+        let (dir, cfg) = disk_test_config("disk-stripe-contention");
+        prepare(&cfg);
+        let key = "contended-key";
+        let original = disk_entry(b"original", unix_now() + 60);
+        disk_store(&cfg, key, &original);
+        let stem = cache_stem(&cfg, key).unwrap();
+        let guard = disk_io_lock(&stem).lock().unwrap();
+        assert!(disk_load(&cfg, key).is_none());
+        disk_store(&cfg, key, &disk_entry(b"replacement", unix_now() + 60));
+        drop(guard);
+        assert_eq!(disk_load(&cfg, key).unwrap().body, b"original");
+        disk_usage()
+            .lock()
+            .unwrap()
+            .remove(cfg.cache.root.as_ref().unwrap());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -4799,7 +4902,7 @@ CacheIgnoreQueryString On\n\
         crate::fault::configure("cache.scan", 0, io::ErrorKind::PermissionDenied);
         assert!(scan_disk_usage(&root).is_none());
         crate::fault::configure("cache.scan", 0, io::ErrorKind::PermissionDenied);
-        assert!(!ensure_disk_usage(&root));
+        assert!(!ensure_disk_usage(&root, &cfg.resource_budget));
         crate::fault::configure("cache.scan", 0, io::ErrorKind::PermissionDenied);
         disk_store(&cfg, "scan-failure", &disk_entry(b"body", unix_now() + 60));
         assert!(!cache_stem(&cfg, "scan-failure")
@@ -4808,7 +4911,7 @@ CacheIgnoreQueryString On\n\
             .exists());
 
         crate::fault::configure("cache.scan.concurrent", 0, io::ErrorKind::AlreadyExists);
-        assert!(ensure_disk_usage(&root));
+        assert!(ensure_disk_usage(&root, &cfg.resource_budget));
         disk_usage().lock().unwrap().remove(&root);
 
         fs::write(root.join("scan-limit-record"), b"x").unwrap();

@@ -44,6 +44,7 @@ struct BoundedMessage(String);
 struct CappedLogFile {
     file: std::fs::File,
     bytes: u64,
+    disk: Option<crate::resource::DiskLease>,
 }
 
 impl Write for CappedLogFile {
@@ -54,7 +55,23 @@ impl Write for CappedLogFile {
         let allowed = usize::try_from(MAX_LOG_FILE_BYTES - self.bytes)
             .unwrap_or(usize::MAX)
             .min(buf.len());
-        let written = self.file.write(&buf[..allowed])?;
+        if let Some(disk) = &mut self.disk {
+            disk.reserve(allowed as u64)?;
+        }
+        let written = match self.file.write(&buf[..allowed]) {
+            Ok(written) => written,
+            Err(error) => {
+                if let Some(disk) = &mut self.disk {
+                    disk.release(allowed as u64);
+                }
+                return Err(error);
+            }
+        };
+        if written < allowed {
+            if let Some(disk) = &mut self.disk {
+                disk.release((allowed - written) as u64);
+            }
+        }
         self.bytes = self.bytes.saturating_add(written as u64);
         if written == allowed && allowed < buf.len() {
             // Report the remainder as consumed so callers do not spin while the
@@ -212,6 +229,7 @@ fn open_log(
     path: &str,
     server_root: &Path,
     service_uid: Option<u32>,
+    resource_budget: &std::sync::Arc<crate::resource::ResourceBudget>,
 ) -> std::io::Result<Box<dyn Write + Send>> {
     if let Some(rest) = path.strip_prefix("syslog:") {
         let _ = rest;
@@ -277,9 +295,15 @@ fn open_log(
         ));
     }
     let bytes = metadata.len().min(MAX_LOG_FILE_BYTES);
+    let disk = if explicit_null {
+        None
+    } else {
+        Some(resource_budget.try_disk(bytes, 1)?)
+    };
     Ok(Box::new(std::io::BufWriter::new(CappedLogFile {
         file: f,
         bytes,
+        disk,
     })))
 }
 
@@ -288,10 +312,20 @@ impl Logger {
         let service_uid = running_privileged()
             .then(|| configured_user_id(&cfg.user))
             .transpose()?;
-        let error = open_log(&cfg.error_log, &cfg.server_root, service_uid)?;
+        let error = open_log(
+            &cfg.error_log,
+            &cfg.server_root,
+            service_uid,
+            &cfg.resource_budget,
+        )?;
         let mut access = Vec::new();
         let mut add = |cl: &CustomLog, vhost: Option<usize>| -> std::io::Result<()> {
-            let w = open_log(&cl.path, &cfg.server_root, service_uid)?;
+            let w = open_log(
+                &cl.path,
+                &cfg.server_root,
+                service_uid,
+                &cfg.resource_budget,
+            )?;
             let fmt = if cl.format.starts_with('"') && cl.format.ends_with('"') {
                 cl.format[1..cl.format.len() - 1].to_string()
             } else {
@@ -420,10 +454,20 @@ impl Logger {
 
     /// Reopen error/access logs after log rotation (`SIGUSR1`).
     pub fn reopen(&self) -> std::io::Result<()> {
-        let error = open_log(&self.error_path, &self.root, self.service_uid)?;
+        let error = open_log(
+            &self.error_path,
+            &self.root,
+            self.service_uid,
+            &self.resource_budget,
+        )?;
         let mut access_writers = Vec::new();
         for entry in &self.access {
-            access_writers.push(open_log(&entry.path, &self.root, self.service_uid)?);
+            access_writers.push(open_log(
+                &entry.path,
+                &self.root,
+                self.service_uid,
+                &self.resource_budget,
+            )?);
         }
         *self.error.lock().unwrap_or_else(|e| e.into_inner()) = error;
         for (entry, writer) in self.access.iter().zip(access_writers) {
@@ -851,6 +895,7 @@ mod tests {
         let mut capped = CappedLogFile {
             file,
             bytes: MAX_LOG_FILE_BYTES - 2,
+            disk: None,
         };
         capped.write_all(b"abcd").unwrap();
         capped.flush().unwrap();
@@ -863,6 +908,7 @@ mod tests {
 
     #[test]
     fn configured_log_identity_and_target_errors_are_explicit() {
+        let budget = std::sync::Arc::new(crate::resource::ResourceBudget::default());
         assert_eq!(configured_user_id("123").unwrap(), 123);
         assert_eq!(
             configured_user_id(&crate::files::effective_uid().to_string()).unwrap(),
@@ -870,7 +916,7 @@ mod tests {
         );
         assert!(configured_user_id("bad\0user").is_err());
         assert!(configured_user_id("vapache-user-that-does-not-exist").is_err());
-        assert!(open_log("/dev/zero", Path::new("/"), None).is_err());
+        assert!(open_log("/dev/zero", Path::new("/"), None, &budget).is_err());
 
         let dir = std::env::temp_dir().join(format!(
             "vapache-log-errors-{}-{:?}",
@@ -880,14 +926,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::os::unix::fs::symlink("loop", dir.join("loop")).unwrap();
-        assert!(open_log("loop/error.log", &dir, None).is_err());
+        assert!(open_log("loop/error.log", &dir, None, &budget).is_err());
 
         let target = dir.join("target.log");
         let linked = dir.join("linked.log");
         std::fs::write(&target, b"").unwrap();
         std::os::unix::fs::symlink(&target, &linked).unwrap();
-        assert!(open_log(linked.to_str().unwrap(), &dir, None).is_err());
-        assert!(open_log("", Path::new(""), None).is_err());
+        assert!(open_log(linked.to_str().unwrap(), &dir, None, &budget).is_err());
+        assert!(open_log("", Path::new(""), None, &budget).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1167,7 +1213,8 @@ mod tests {
             .unwrap()
             .contains("192.0.2.1 200 5"));
 
-        assert!(open_log("syslog:local0", &dir, None).is_ok());
+        let budget = std::sync::Arc::new(crate::resource::ResourceBudget::default());
+        assert!(open_log("syslog:local0", &dir, None, &budget).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1184,7 +1231,8 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         symlink(&target, dir.join("logs")).unwrap();
 
-        let mut log = open_log("logs/error.log", &dir, None).unwrap();
+        let budget = std::sync::Arc::new(crate::resource::ResourceBudget::default());
+        let mut log = open_log("logs/error.log", &dir, None, &budget).unwrap();
         writeln!(log, "through canonical parent").unwrap();
         drop(log);
         assert!(std::fs::read_to_string(target.join("error.log"))
@@ -1193,7 +1241,8 @@ mod tests {
         assert!(open_log(
             "logs/rejected.log",
             &dir,
-            Some(crate::files::effective_uid())
+            Some(crate::files::effective_uid()),
+            &budget,
         )
         .is_err());
 

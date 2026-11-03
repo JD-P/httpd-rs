@@ -547,6 +547,7 @@ struct OcspRefresh {
     timeout: Duration,
     interval: Duration,
     cache_path: PathBuf,
+    resource_budget: Option<Arc<crate::resource::ResourceBudget>>,
     // A refresher must not keep a retired TLS generation alive forever.
     key: Weak<RwLock<Arc<CertifiedKey>>>,
 }
@@ -673,6 +674,16 @@ fn load_key_with_ocsp(
     cache_dir: Option<&Path>,
     enable_ocsp: bool,
 ) -> Result<(Arc<CertifiedKey>, Option<OcspRefresh>), String> {
+    load_key_with_ocsp_accounted(ssl, provider, cache_dir, enable_ocsp, None)
+}
+
+fn load_key_with_ocsp_accounted(
+    ssl: &SslConfig,
+    provider: &CryptoProvider,
+    cache_dir: Option<&Path>,
+    enable_ocsp: bool,
+    resource_budget: Option<&Arc<crate::resource::ResourceBudget>>,
+) -> Result<(Arc<CertifiedKey>, Option<OcspRefresh>), String> {
     let cert_file = ssl
         .cert_file
         .as_ref()
@@ -696,11 +707,21 @@ fn load_key_with_ocsp(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| std::env::temp_dir().join("vapache-ocsp-cache"));
         let cache_path = crate::ocsp::cache_path(&dir, &chain, ssl.stapling_force_url.as_deref());
-        let cached = crate::ocsp::load_cached(&cache_path, &chain);
+        let mut cached = crate::ocsp::load_cached(&cache_path, &chain);
+        if let (Some(response), Some(budget)) = (&cached, resource_budget) {
+            if !crate::ocsp::account_cached(&cache_path, response.len() as u64, budget) {
+                let _ = std::fs::remove_file(&cache_path);
+                cached = None;
+            }
+        }
         let fetched =
             crate::ocsp::staple_response(&chain, ssl.stapling_force_url.as_deref(), timeout);
         let response = if let Some(fresh) = fetched {
-            crate::ocsp::save_cached(&cache_path, &chain, &fresh);
+            if let Some(budget) = resource_budget {
+                crate::ocsp::save_cached_accounted(&cache_path, &chain, &fresh, budget);
+            } else {
+                crate::ocsp::save_cached(&cache_path, &chain, &fresh);
+            }
             Some(fresh)
         } else {
             cached
@@ -731,6 +752,7 @@ fn load_key_with_ocsp(
         timeout,
         interval,
         cache_path,
+        resource_budget: resource_budget.cloned(),
         key: Weak::new(),
     });
     Ok((certified, refresh))
@@ -743,7 +765,11 @@ fn apply_ocsp_response(refresh: &OcspRefresh, response: Vec<u8>) -> bool {
     let Some(shared) = refresh.key.upgrade() else {
         return false;
     };
-    crate::ocsp::save_cached(&refresh.cache_path, &refresh.chain, &response);
+    if let Some(budget) = &refresh.resource_budget {
+        crate::ocsp::save_cached_accounted(&refresh.cache_path, &refresh.chain, &response, budget);
+    } else {
+        crate::ocsp::save_cached(&refresh.cache_path, &refresh.chain, &response);
+    }
     let mut guard = shared.write().unwrap_or_else(|e| e.into_inner());
     let mut key = (**guard).clone();
     key.ocsp = Some(response);
@@ -1071,8 +1097,13 @@ pub(crate) fn prepare_server_config(
     // not below a legacy logs directory that older releases handed to the
     // service account.
     let ocsp_cache_dir = cfg.server_root.join(".vapache-ocsp-cache");
-    let (default_cert, default_refresh) =
-        load_key_with_ocsp(default_ssl, &provider, Some(&ocsp_cache_dir), true)?;
+    let (default_cert, default_refresh) = load_key_with_ocsp_accounted(
+        default_ssl,
+        &provider,
+        Some(&ocsp_cache_dir),
+        true,
+        Some(&cfg.resource_budget),
+    )?;
     let default_key: SharedKey = Arc::new(RwLock::new(default_cert));
     let mut refreshes = Vec::new();
     if let Some(mut refresh) = default_refresh {
@@ -1092,8 +1123,13 @@ pub(crate) fn prepare_server_config(
             let key = if std::ptr::eq(&v.ssl, default_ssl) {
                 default_key.clone()
             } else {
-                let (cert, refresh) =
-                    load_key_with_ocsp(&v.ssl, &provider, Some(&ocsp_cache_dir), true)?;
+                let (cert, refresh) = load_key_with_ocsp_accounted(
+                    &v.ssl,
+                    &provider,
+                    Some(&ocsp_cache_dir),
+                    true,
+                    Some(&cfg.resource_budget),
+                )?;
                 let shared = Arc::new(RwLock::new(cert));
                 if let Some(mut refresh) = refresh {
                     refresh.key = Arc::downgrade(&shared);
