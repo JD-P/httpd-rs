@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) enum SlotKind {
     DynamicBackend,
     H2Stream,
+    H2SlowResponse,
     ResponseBodyRead,
     Websocket,
     ExpensiveCpu,
@@ -34,7 +35,7 @@ pub(crate) enum SlotKind {
 }
 
 impl SlotKind {
-    const COUNT: usize = 13;
+    const COUNT: usize = 14;
 
     const fn index(self) -> usize {
         self as usize
@@ -153,6 +154,14 @@ pub const MAX_RESPONSE_BODY_READS: u64 = 32;
 pub const MAX_RESPONSE_BODY_READS_PER_CLIENT: u64 = 8;
 pub const MAX_H2_STREAMS: u64 = 256;
 pub const MAX_H2_STREAMS_PER_CLIENT: u64 = 64;
+/// Flow-control-blocked outputs leave the general stream pool and enter this
+/// smaller source-fair pool. A handful of slow peers can therefore retain
+/// their responses without denying dispatch capacity to unrelated clients.
+pub const MAX_H2_SLOW_RESPONSES: u64 = 128;
+/// Preserve a complete advertised 32-stream connection for a legitimate slow
+/// client while preventing one address from owning more than one quarter of
+/// the process reserve.
+pub const MAX_H2_SLOW_RESPONSES_PER_CLIENT: u64 = 32;
 pub const MAX_REQUEST_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_RESPONSE_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_REQUEST_RESIDENT_BYTES_PER_CLIENT: u64 = 32 * 1024 * 1024;
@@ -238,7 +247,7 @@ const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
         H1Connection => [0, 1, 64 * 1024],
         RequestWorker => [0, 1, 512 * 1024],
         H2Connection => [0, 1, 256 * 1024],
-        H2Stream => [0, 1, 128 * 1024],
+        H2Stream | H2SlowResponse => [0, 1, 128 * 1024],
         ResponseBodyRead => [0, 1, 64 * 1024],
         // A dynamic request may own an upstream socket or the CGI stdin/stdout/
         // stderr pipes, plus bounded helper work.
@@ -1535,6 +1544,21 @@ impl ResourceBudget {
         })
     }
 
+    pub(crate) fn try_h2_slow_response_in(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+    ) -> io::Result<H2SlowResponseLease> {
+        Ok(H2SlowResponseLease {
+            _slot: context.slot(
+                SlotKind::H2SlowResponse,
+                MAX_H2_SLOW_RESPONSES,
+                Some(MAX_H2_SLOW_RESPONSES_PER_CLIENT),
+                Some(1),
+                "HTTP/2 slow-response limit reached",
+            )?,
+        })
+    }
+
     pub fn try_request_bytes(self: &Arc<Self>) -> io::Result<ResidentLease> {
         let context = self.current_context_for()?;
         Ok(ResidentLease::new(
@@ -1775,6 +1799,14 @@ impl ResourceBudget {
     }
 
     #[cfg(any(test, feature = "fuzzing"))]
+    pub fn h2_output_usage(&self) -> (u64, u64) {
+        (
+            self.slot_usage(SlotKind::H2Stream),
+            self.slot_usage(SlotKind::H2SlowResponse),
+        )
+    }
+
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn websocket_usage(&self) -> u64 {
         self.slot_usage(SlotKind::Websocket)
     }
@@ -1863,6 +1895,11 @@ impl ResidentLease {
 
 #[derive(Debug)]
 pub struct CombinedH2Lease {
+    _slot: SlotLease,
+}
+
+#[derive(Debug)]
+pub(crate) struct H2SlowResponseLease {
     _slot: SlotLease,
 }
 
@@ -2261,6 +2298,34 @@ mod tests {
         assert!(budget
             .try_h2_stream_for(IpAddr::from([198, 51, 100, 1]))
             .is_ok());
+    }
+
+    #[test]
+    fn slow_h2_outputs_have_source_and_process_fairness() {
+        let budget = Arc::new(ResourceBudget::default());
+        let first_leases: Vec<_> = (0..MAX_H2_SLOW_RESPONSES_PER_CLIENT)
+            .map(|_| {
+                let context = budget.context(IpAddr::from([192, 0, 2, 1]));
+                budget.try_h2_slow_response_in(&context).unwrap()
+            })
+            .collect();
+        let first_overflow = budget.context(IpAddr::from([192, 0, 2, 1]));
+        assert!(budget.try_h2_slow_response_in(&first_overflow).is_err());
+
+        let mut all = first_leases;
+        for source in 2..=4 {
+            all.extend((0..MAX_H2_SLOW_RESPONSES_PER_CLIENT).map(|_| {
+                let context = budget.context(IpAddr::from([192, 0, 2, source]));
+                budget.try_h2_slow_response_in(&context).unwrap()
+            }));
+        }
+        assert_eq!(all.len() as u64, MAX_H2_SLOW_RESPONSES);
+        assert!(budget
+            .try_h2_slow_response_in(&budget.context(IpAddr::from([198, 51, 100, 1])))
+            .is_err());
+        assert_eq!(budget.h2_output_usage(), (0, MAX_H2_SLOW_RESPONSES));
+        drop(all);
+        assert_eq!(budget.h2_output_usage(), (0, 0));
     }
 
     #[test]

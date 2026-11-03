@@ -11533,6 +11533,70 @@ pub proof fn h2_stream_phase_preserves_no_reopen(
 {
 }
 
+/// Output ownership is transferred at most once from the general stream pool
+/// to the source-fair slow-response pool.  In particular, a WINDOW_UPDATE can
+/// never promote a classified slow output back into general capacity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2OutputPhase {
+    General,
+    Slow,
+    Closed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2OutputEvent {
+    FlowControlStall,
+    Finish,
+}
+
+pub open spec fn h2_output_phase_step_spec(
+    phase: H2OutputPhase,
+    event: H2OutputEvent,
+) -> Option<H2OutputPhase> {
+    match (phase, event) {
+        (H2OutputPhase::General, H2OutputEvent::FlowControlStall) => {
+            Some(H2OutputPhase::Slow)
+        },
+        (H2OutputPhase::General, H2OutputEvent::Finish) => Some(H2OutputPhase::Closed),
+        (H2OutputPhase::Slow, H2OutputEvent::FlowControlStall) => Some(H2OutputPhase::Slow),
+        (H2OutputPhase::Slow, H2OutputEvent::Finish) => Some(H2OutputPhase::Closed),
+        _ => None,
+    }
+}
+
+/// Executable transition used by the server, proved identical to the output
+/// ownership model above.
+pub fn h2_output_phase_step(
+    phase: H2OutputPhase,
+    event: H2OutputEvent,
+) -> (next: Option<H2OutputPhase>)
+    ensures next == h2_output_phase_step_spec(phase, event),
+{
+    match (phase, event) {
+        (H2OutputPhase::General, H2OutputEvent::FlowControlStall) => {
+            Some(H2OutputPhase::Slow)
+        },
+        (H2OutputPhase::General, H2OutputEvent::Finish) => Some(H2OutputPhase::Closed),
+        (H2OutputPhase::Slow, H2OutputEvent::FlowControlStall) => Some(H2OutputPhase::Slow),
+        (H2OutputPhase::Slow, H2OutputEvent::Finish) => Some(H2OutputPhase::Closed),
+        _ => None,
+    }
+}
+
+pub proof fn h2_slow_output_cannot_return_to_general(
+    event: H2OutputEvent,
+)
+    ensures
+        h2_output_phase_step_spec(H2OutputPhase::Slow, event)
+            != Some(H2OutputPhase::General),
+{
+}
+
+pub proof fn h2_closed_output_is_absorbing(event: H2OutputEvent)
+    ensures h2_output_phase_step_spec(H2OutputPhase::Closed, event).is_none(),
+{
+}
+
 pub fn h2_budget_step(b: H2Budget, event: H2BudgetEvent) -> (out: Option<H2Budget>)
     requires h2_budget_inv(b),
     ensures

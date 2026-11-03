@@ -11,6 +11,9 @@ is refused.
 """
 
 import argparse
+import os
+import pwd
+import grp
 import socket
 import ssl
 import subprocess
@@ -49,13 +52,19 @@ def setup() -> None:
     )
     (RUN / "cert.pem").chmod(0o644)
     (RUN / "key.pem").chmod(0o600)
+    if os.geteuid() == 0:
+        service_user = "www-data"
+        service_group = "www-data"
+    else:
+        service_user = pwd.getpwuid(os.geteuid()).pw_name
+        service_group = grp.getgrgid(os.getegid()).gr_name
     conf = RUN / "httpd.conf"
     conf.write_text(
         f'''ServerRoot "{RUN}"
 Listen 127.0.0.1:{PLAIN_PORT}
 Listen 127.0.0.1:{TLS_PORT}
-User www-data
-Group www-data
+User {service_user}
+Group {service_group}
 PidFile "{RUN}/logs/pid"
 ErrorLog "{RUN}/logs/error.log"
 LogLevel warn

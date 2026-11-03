@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "crates" / "server" / "src"
 
 EXPECTED_SLOTS = {
-    "DynamicBackend", "H2Stream", "ResponseBodyRead", "Websocket",
-    "ExpensiveCpu", "PendingConnection", "RequestWorker",
+    "DynamicBackend", "H2Stream", "H2SlowResponse", "ResponseBodyRead", "Websocket",
+    "ExpensiveCpu", "PendingConnection", "H1Connection", "RequestWorker",
     "RequestBodyWorker", "H2Connection", "TlsHandshake",
     "RewriteProgram", "SpoolFile",
 }
@@ -55,6 +55,7 @@ ALLOWED_MUTABLE_STATICS = {
     ("proxy.rs", "GENERATION"), ("proxy.rs", "COUNTERS"),
     ("proxy.rs", "DNS"), ("proxy.rs", "CACHE"),
     ("proxy.rs", "TEST_BUDGET"),
+    ("request_plan.rs", "NEXT_FIXTURE"),
     ("resource.rs", "CURRENT_CONTEXT"), ("resource.rs", "BUDGET"),
     ("server.rs", "ACTIVE_CONNECTIONS"),
     ("server.rs", "ADMISSION_RUNTIME"),
@@ -112,6 +113,7 @@ def main() -> int:
 
     for required in (
         "with_resource_context(context", "try_dynamic_in", "try_h2_stream_in",
+        "try_h2_slow_response_in",
         "try_tls_handshake", "try_rewrite_program",
         "attribute_context(resource_context", "enter_resource_context(resource_context",
     ):

@@ -9,8 +9,9 @@ scope. RAII leases release every charge on errors, resets, timeouts, and normal
 completion.
 
 The slot ledger covers pending connections, HTTP/1 workers, slow-body workers,
-TLS handshakes, HTTP/2 connections and streams, dynamic backend requests,
-blocking response reads, WebSocket tunnels, expensive CPU operations,
+TLS handshakes, HTTP/2 connections, ordinary streams and source-fair
+flow-control-blocked outputs, dynamic backend requests, blocking response
+reads, WebSocket tunnels, expensive CPU operations,
 `RewriteMap prg` helpers, and spool files. The adjustable byte ledger covers
 request memory, response memory, request/backend/proxy spools, and retained
 policy expansions and retained memory-cache entries. Fixed-window rates use

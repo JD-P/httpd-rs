@@ -21,7 +21,7 @@ use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::server::TlsStream;
@@ -38,6 +38,12 @@ const H2_IDLE_FLOOR: std::time::Duration = std::time::Duration::from_millis(20);
 const H2_STREAM_FLOOR: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const H2_STREAM_FLOOR: std::time::Duration = std::time::Duration::from_millis(20);
+#[cfg(not(test))]
+const H2_SLOW_CLASSIFY_GRACE: Duration = Duration::from_millis(100);
+#[cfg(test)]
+const H2_SLOW_CLASSIFY_GRACE: Duration = Duration::from_millis(2);
+const H2_SLOW_RESPONSE_MIN_RATE: u64 = 1024;
+const H2_SLOW_RESPONSE_MAX_INTERVALS: u32 = 16;
 
 #[derive(Clone, Copy)]
 enum H2TaskEvent {
@@ -505,28 +511,13 @@ fn send_io_error(e: h2::Error) -> io::Error {
 }
 // coverage:ignore-stop
 
-async fn send_capacity(
-    send: &mut h2::SendStream<Bytes>,
-    remaining: usize,
-    deadline: Instant,
-) -> io::Result<usize> {
-    send.reserve_capacity(remaining);
+async fn poll_send_capacity(send: &mut h2::SendStream<Bytes>) -> io::Result<usize> {
     loop {
-        let now = Instant::now();
-        if now >= deadline {
-            // coverage:ignore-start - opaque upstream h2 capacity timing
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "HTTP/2 send window timeout",
-            ));
-            // coverage:ignore-stop
-        }
-        let wait = deadline.saturating_duration_since(now);
-        match tokio::time::timeout(wait, std::future::poll_fn(|cx| send.poll_capacity(cx))).await {
-            Ok(Some(Ok(n))) if n > 0 => return Ok(n),
-            Ok(Some(Ok(_))) => continue, // coverage:ignore-line - h2 never assigns zero
-            Ok(Some(Err(e))) => return Err(send_io_error(e)), // coverage:ignore-line - opaque h2 error
-            Ok(None) => {
+        match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+            Some(Ok(n)) if n > 0 => return Ok(n),
+            Some(Ok(_)) => continue, // coverage:ignore-line - h2 never assigns zero
+            Some(Err(e)) => return Err(send_io_error(e)), // coverage:ignore-line - opaque h2 error
+            None => {
                 // coverage:ignore-start - opaque upstream h2 closure state
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -534,14 +525,203 @@ async fn send_capacity(
                 ));
                 // coverage:ignore-stop
             }
-            Err(_) => {
-                // coverage:ignore-start - Tokio deadline terminal state
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "HTTP/2 send window timeout",
-                ));
-                // coverage:ignore-stop
+        }
+    }
+}
+
+struct H2OutputAdmission {
+    context: crate::resource::ResourceContext,
+    general: Option<crate::resource::CombinedH2Lease>,
+    slow: Option<crate::resource::H2SlowResponseLease>,
+    phase: vapache_verified::H2OutputPhase,
+}
+
+impl H2OutputAdmission {
+    fn tracked(
+        context: crate::resource::ResourceContext,
+        general: crate::resource::CombinedH2Lease,
+    ) -> Self {
+        Self {
+            context,
+            general: Some(general),
+            slow: None,
+            phase: vapache_verified::H2OutputPhase::General,
+        }
+    }
+
+    fn detached(context: crate::resource::ResourceContext) -> Self {
+        Self {
+            context,
+            general: None,
+            slow: None,
+            phase: vapache_verified::H2OutputPhase::General,
+        }
+    }
+
+    fn is_slow(&self) -> bool {
+        self.phase == vapache_verified::H2OutputPhase::Slow
+    }
+
+    fn client(&self) -> std::net::IpAddr {
+        self.context
+            .client()
+            .expect("HTTP/2 output admission requires a client identity")
+    }
+
+    fn enter_slow(&mut self) -> io::Result<()> {
+        if self.is_slow() {
+            return Ok(());
+        }
+        let next = vapache_verified::h2_output_phase_step(
+            self.phase,
+            vapache_verified::H2OutputEvent::FlowControlStall,
+        )
+        .ok_or_else(|| io::Error::other("HTTP/2 output ownership is closed"))?;
+        let slow = self
+            .context
+            .budget()
+            .try_h2_slow_response_in(&self.context)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "HTTP/2 slow-response capacity exhausted",
+                )
+            })?;
+        self.phase = next;
+        self.slow = Some(slow);
+        // Acquire the smaller pool first, then release general capacity.  If
+        // acquisition fails the caller resets this stream and its ordinary
+        // lease is released by RAII; no unaccounted task is ever created.
+        drop(self.general.take());
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        if let Some(next) = vapache_verified::h2_output_phase_step(
+            self.phase,
+            vapache_verified::H2OutputEvent::Finish,
+        ) {
+            self.phase = next;
+        }
+        drop(self.general.take());
+        drop(self.slow.take());
+    }
+}
+
+impl Drop for H2OutputAdmission {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+struct H2SendProgress {
+    started: Instant,
+    delivered: u64,
+    flow_blocked: Duration,
+    interval: Duration,
+    checkpoint: Instant,
+    absolute_deadline: Instant,
+}
+
+impl H2SendProgress {
+    fn new(interval: Duration) -> Self {
+        let started = Instant::now();
+        let checkpoint = started.checked_add(interval).unwrap_or(started);
+        let absolute_deadline = started
+            .checked_add(interval.saturating_mul(H2_SLOW_RESPONSE_MAX_INTERVALS))
+            .unwrap_or(checkpoint);
+        Self {
+            started,
+            delivered: 0,
+            flow_blocked: Duration::ZERO,
+            interval,
+            checkpoint,
+            absolute_deadline,
+        }
+    }
+
+    fn record(&mut self, bytes: usize) {
+        self.delivered = self.delivered.saturating_add(bytes as u64);
+    }
+
+    fn record_flow_blocked(&mut self, blocked: Duration) {
+        self.flow_blocked = self.flow_blocked.saturating_add(blocked);
+    }
+
+    fn validate(&mut self, now: Instant) -> io::Result<()> {
+        if now >= self.absolute_deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP/2 response lifetime exceeded",
+            ));
+        }
+        if now < self.checkpoint {
+            return Ok(());
+        }
+        let elapsed_ms =
+            u64::try_from(now.duration_since(self.started).as_millis()).unwrap_or(u64::MAX);
+        let grace_ms = u64::try_from(self.interval.as_millis()).unwrap_or(u64::MAX);
+        if !vapache_verified::minimum_progress_rate_admit(
+            self.delivered,
+            elapsed_ms,
+            H2_SLOW_RESPONSE_MIN_RATE,
+            grace_ms,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP/2 response minimum rate not met",
+            ));
+        }
+        while self.checkpoint <= now {
+            self.checkpoint = self
+                .checkpoint
+                .checked_add(self.interval)
+                .unwrap_or(self.absolute_deadline);
+            if self.checkpoint >= self.absolute_deadline {
+                self.checkpoint = self.absolute_deadline;
+                break;
             }
+        }
+        Ok(())
+    }
+
+    fn next_deadline(&self) -> Instant {
+        self.checkpoint.min(self.absolute_deadline)
+    }
+}
+
+async fn send_capacity(
+    send: &mut h2::SendStream<Bytes>,
+    remaining: usize,
+    output: &mut H2OutputAdmission,
+    progress: &mut H2SendProgress,
+) -> io::Result<usize> {
+    send.reserve_capacity(remaining);
+    if !output.is_slow() {
+        let remaining_grace = H2_SLOW_CLASSIFY_GRACE.saturating_sub(progress.flow_blocked);
+        let wait_started = Instant::now();
+        match tokio::time::timeout(remaining_grace, poll_send_capacity(send)).await {
+            Ok(result) => {
+                progress.record_flow_blocked(wait_started.elapsed());
+                return result;
+            }
+            Err(_) => {
+                progress.record_flow_blocked(wait_started.elapsed());
+                output.enter_slow()?;
+            }
+        }
+    }
+    loop {
+        let now = Instant::now();
+        progress.validate(now)?;
+        let deadline = tokio::time::Instant::from_std(progress.next_deadline());
+        match tokio::time::timeout_at(deadline, poll_send_capacity(send)).await {
+            Ok(result) => {
+                let capacity = result?;
+                progress.validate(Instant::now())?;
+                return Ok(capacity);
+            }
+            Err(_) => progress.validate(Instant::now())?,
         }
     }
 }
@@ -554,36 +734,34 @@ async fn send_data_bounded(
     send: &mut h2::SendStream<Bytes>,
     data: Bytes,
     end: bool,
-    timeout: std::time::Duration,
+    output: &mut H2OutputAdmission,
+    progress: &mut H2SendProgress,
 ) -> io::Result<()> {
     if data.is_empty() {
         return send.send_data(data, end).map_err(send_io_error);
     }
-    let mut deadline = Instant::now() + timeout;
     let mut offset = 0usize;
     while offset < data.len() {
         let remaining = data.len() - offset;
-        let capacity = send_capacity(send, remaining, deadline).await?;
+        let capacity = send_capacity(send, remaining, output, progress).await?;
         let n = capacity.min(remaining);
         let last = end && offset + n == data.len();
         send.send_data(data.slice(offset..offset + n), last)
             .map_err(send_io_error)?;
         offset += n;
-        // This is a stall deadline, not a total-response lifetime. Receiving
-        // additional flow-control capacity is downstream progress and renews
-        // the deadline just as a successful HTTP/1 socket write does.
-        deadline = Instant::now() + timeout;
+        progress.record(n);
     }
     Ok(())
 }
 
-async fn send_response(
+async fn send_response_with_admission(
     mut respond: h2::server::SendResponse<Bytes>,
     cfg: &Config,
-    client: std::net::IpAddr,
     mut resp: Response,
     head_only: bool,
+    output: &mut H2OutputAdmission,
 ) -> io::Result<u64> {
+    let client = output.client();
     if !crate::http::response_headers_admitted(&resp) {
         resp = Response::policy_error();
     }
@@ -677,9 +855,11 @@ async fn send_response(
         .send_response(response, end)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     if end {
+        output.finish();
         return Ok(0);
     }
     let send_timeout = cfg.timeout.max(H2_STREAM_FLOOR);
+    let mut progress = H2SendProgress::new(send_timeout);
     // The h2 crate retains queued `Bytes` after this function returns. Move
     // the body reservation into the byte owner so accounting lasts until the
     // transport releases the final queued slice, not merely until enqueue.
@@ -690,7 +870,7 @@ async fn send_response(
         Body::Empty => {
             // `end` returned above because Body::Empty has length zero.
             // coverage:ignore-start - body-length invariant
-            send_data_bounded(&mut send, Bytes::new(), true, send_timeout).await?;
+            send_data_bounded(&mut send, Bytes::new(), true, output, &mut progress).await?;
             // coverage:ignore-stop
         }
         Body::Bytes(data) => {
@@ -705,7 +885,7 @@ async fn send_response(
                 data,
                 _resident: resident,
             });
-            send_data_bounded(&mut send, data, true, send_timeout).await?;
+            send_data_bounded(&mut send, data, true, output, &mut progress).await?;
         }
         Body::Stream { mut reader, len } => {
             let mut left = len;
@@ -714,7 +894,7 @@ async fn send_response(
                 // Wait for downstream capacity before reading from the
                 // upstream. A zero-window client therefore owns neither a
                 // response buffer nor a process-wide blocking-read lease.
-                let capacity = send_capacity(&mut send, want, Instant::now() + send_timeout)
+                let capacity = send_capacity(&mut send, want, output, &mut progress)
                     .await?
                     .min(want);
                 let resident = response_chunk_lease(&cfg.resource_budget, client, capacity)?;
@@ -733,7 +913,11 @@ async fn send_response(
                 let n = result.map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
                 if n == 0 {
                     send.send_data(Bytes::new(), true).map_err(send_io_error)?;
+                    output.finish();
                     return Ok(sent);
+                }
+                if output.is_slow() {
+                    progress.validate(Instant::now())?;
                 }
                 buf.truncate(n);
                 left -= n as u64;
@@ -743,6 +927,7 @@ async fn send_response(
                     _resident: resident,
                 });
                 send.send_data(data, left == 0).map_err(send_io_error)?;
+                progress.record(n);
             }
         }
         Body::File {
@@ -760,7 +945,7 @@ async fn send_response(
             let mut pos = offset;
             while left > 0 {
                 let want = left.min(CHUNK) as usize;
-                let capacity = send_capacity(&mut send, want, Instant::now() + send_timeout)
+                let capacity = send_capacity(&mut send, want, output, &mut progress)
                     .await?
                     .min(want);
                 let resident = response_chunk_lease(&cfg.resource_budget, client, capacity)?;
@@ -781,23 +966,40 @@ async fn send_response(
                 let filled = data.len();
                 if filled == 0 {
                     send.send_data(Bytes::new(), true).map_err(send_io_error)?;
+                    output.finish();
                     return Ok(sent);
+                }
+                if output.is_slow() {
+                    progress.validate(Instant::now())?;
                 }
                 left -= filled as u64;
                 pos = pos.saturating_add(filled as u64);
                 sent += filled as u64;
                 send.send_data(data, left == 0).map_err(send_io_error)?;
+                progress.record(filled);
             }
         }
     }
+    output.finish();
     Ok(sent)
+}
+
+async fn send_response(
+    respond: h2::server::SendResponse<Bytes>,
+    cfg: &Config,
+    client: std::net::IpAddr,
+    resp: Response,
+    head_only: bool,
+) -> io::Result<u64> {
+    let mut output = H2OutputAdmission::detached(cfg.resource_budget.context(client));
+    send_response_with_admission(respond, cfg, resp, head_only, &mut output).await
 }
 
 struct H2StreamAdmission {
     quota_peer: SocketAddr,
     resource_context: crate::resource::ResourceContext,
     quota_identity_valid: bool,
-    _stream_quota: crate::resource::CombinedH2Lease,
+    stream_quota: crate::resource::CombinedH2Lease,
 }
 
 fn admit_stream_before_spawn(
@@ -857,7 +1059,7 @@ fn admit_stream_before_spawn(
         quota_peer,
         resource_context,
         quota_identity_valid,
-        _stream_quota: stream_quota,
+        stream_quota,
     })
 }
 
@@ -882,15 +1084,16 @@ async fn handle_stream(
         quota_peer,
         resource_context,
         quota_identity_valid,
-        _stream_quota,
+        stream_quota,
     } = admission;
+    let mut output_admission = H2OutputAdmission::tracked(resource_context.clone(), stream_quota);
     if !quota_identity_valid {
-        return send_response(
+        return send_response_with_admission(
             respond,
             &cfg,
-            quota_peer.ip(),
             bad(431, "request header field too large"),
             false,
+            &mut output_admission,
         )
         .await
         .is_err();
@@ -906,23 +1109,23 @@ async fn handle_stream(
             cfg.limit_request_field_size as u64,
         )
     }) {
-        return send_response(
+        return send_response_with_admission(
             respond,
             &cfg,
-            quota_peer.ip(),
             bad(431, "request header field too large"),
             false,
+            &mut output_admission,
         )
         .await
         .is_err();
     }
     let Some(target) = request_target(&method, &uri, true) else {
-        return send_response(
+        return send_response_with_admission(
             respond,
             &cfg,
-            quota_peer.ip(),
             bad(400, "invalid HTTP/2 request target"),
             false,
+            &mut output_admission,
         )
         .await
         .is_err();
@@ -938,12 +1141,12 @@ async fn handle_stream(
     let mut request_resident = match cfg.resource_budget.try_request_bytes_in(&resource_context) {
         Ok(lease) => lease,
         Err(_) => {
-            return send_response(
+            return send_response_with_admission(
                 respond,
                 &cfg,
-                quota_peer.ip(),
                 bad(503, "request memory capacity exhausted"),
                 false,
+                &mut output_admission,
             )
             .await
             .is_err();
@@ -953,12 +1156,12 @@ async fn handle_stream(
         .attribute_context(resource_context.clone())
         .is_err()
     {
-        return send_response(
+        return send_response_with_admission(
             respond,
             &cfg,
-            quota_peer.ip(),
             bad(503, "request memory capacity exhausted"),
             false,
+            &mut output_admission,
         )
         .await
         .is_err();
@@ -979,12 +1182,12 @@ async fn handle_stream(
                 .unwrap_or(0),
         );
     if request_resident.reserve(header_bytes).is_err() {
-        return send_response(
+        return send_response_with_admission(
             respond,
             &cfg,
-            quota_peer.ip(),
             bad(503, "request memory capacity exhausted"),
             false,
+            &mut output_admission,
         )
         .await
         .is_err();
@@ -999,12 +1202,12 @@ async fn handle_stream(
     for (name, value) in parts.headers.iter() {
         let field_len = name.as_str().len().saturating_add(value.as_bytes().len()) as u64;
         let Some(next) = vapache_verified::h2_header_add(header_budget, field_len) else {
-            let _ = send_response(
+            let _ = send_response_with_admission(
                 respond,
                 &cfg,
-                quota_peer.ip(),
                 bad(431, "request header list too large"),
                 false,
+                &mut output_admission,
             )
             .await;
             return true;
@@ -1018,12 +1221,12 @@ async fn handle_stream(
         // adapter so a dependency behavior change cannot reintroduce the
         // Transfer-Encoding smuggling primitive (CVE-2026-58150).
         if forbidden_h2_header(name.as_str(), value.as_bytes()) {
-            let _ = send_response(
+            let _ = send_response_with_admission(
                 respond,
                 &cfg,
-                quota_peer.ip(),
                 bad(400, "connection-specific HTTP/2 header"),
                 false,
+                &mut output_admission,
             )
             .await;
             return true;
@@ -1044,12 +1247,12 @@ async fn handle_stream(
         let value = authority.as_str().as_bytes();
         let field_len = b"host".len().saturating_add(value.len()) as u64;
         let Some(_next) = vapache_verified::h2_header_add(header_budget, field_len) else {
-            let _ = send_response(
+            let _ = send_response_with_admission(
                 respond,
                 &cfg,
-                quota_peer.ip(),
                 bad(431, "request header list too large"),
                 false,
+                &mut output_admission,
             )
             .await;
             return true;
@@ -1074,7 +1277,7 @@ async fn handle_stream(
         cfg.limit_request_field_size as u64,
     ));
     if let Some(resp) = head_error {
-        return send_response(respond, &cfg, quota_peer.ip(), resp, false)
+        return send_response_with_admission(respond, &cfg, resp, false, &mut output_admission)
             .await
             .is_err();
     }
@@ -1084,12 +1287,12 @@ async fn handle_stream(
             // h2 validates Content-Length syntax and duplicates before
             // yielding an accepted request.
             // coverage:ignore-start - upstream h2 framing invariant
-            return send_response(
+            return send_response_with_admission(
                 respond,
                 &cfg,
-                quota_peer.ip(),
                 bad(400, "invalid Content-Length"),
                 false,
+                &mut output_admission,
             )
             .await
             .is_err();
@@ -1124,12 +1327,12 @@ async fn handle_stream(
 
     let has_body = declared.unwrap_or(0) > 0 || !recv.is_end_stream();
     if declared.is_some_and(|length| length > cfg.limit_request_body) {
-        return send_response(
+        return send_response_with_admission(
             respond,
             &cfg,
-            quota_peer.ip(),
             bad(413, "request body too large"),
             req.is_head(),
+            &mut output_admission,
         )
         .await
         .is_err();
@@ -1140,15 +1343,15 @@ async fn handle_stream(
         } else {
             405
         };
-        return send_response(
+        return send_response_with_admission(
             respond,
             &cfg,
-            quota_peer.ip(),
             bad(
                 status,
                 "request body is not accepted by a static-only configuration",
             ),
             req.is_head(),
+            &mut output_admission,
         )
         .await
         .is_err();
@@ -1453,12 +1656,12 @@ async fn handle_stream(
                     // h2 enforces this before clean end-of-stream; retain the
                     // adapter check as a fail-closed dependency boundary.
                     // coverage:ignore-start - upstream h2 framing invariant
-                    return send_response(
+                    return send_response_with_admission(
                         respond,
                         &cfg,
-                        quota_peer.ip(),
                         bad(400, "Content-Length mismatch"),
                         false,
+                        &mut output_admission,
                     )
                     .await
                     .is_err();
@@ -1565,21 +1768,24 @@ async fn handle_stream(
     let head_only = req.is_head();
     let status = resp.status;
     let bytes_in = req.target.len() as u64 + req.body_len();
-    let body_sent = match send_response(respond, &cfg, quota_peer.ip(), resp, head_only).await {
-        Ok(n) => n,
-        Err(e) => {
-            let closed = vapache_verified::request_phase_step(
-                phase,
-                vapache_verified::RequestPhaseEvent::Cancel,
-            )
-            .expect("HTTP/2 cancellation phase transition");
-            debug_assert_eq!(closed, vapache_verified::RequestPhase::Closed);
-            // Peer-close/send failures are already exercised directly by the
-            // bounded response sender; this adapter arm only adds logging.
-            logger.error(&format!("HTTP/2 stream failed: {e}")); // coverage:ignore-line - peer timing race
-            return true; // coverage:ignore-line - peer timing race
-        }
-    };
+    let body_sent =
+        match send_response_with_admission(respond, &cfg, resp, head_only, &mut output_admission)
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                let closed = vapache_verified::request_phase_step(
+                    phase,
+                    vapache_verified::RequestPhaseEvent::Cancel,
+                )
+                .expect("HTTP/2 cancellation phase transition");
+                debug_assert_eq!(closed, vapache_verified::RequestPhase::Closed);
+                // Peer-close/send failures are already exercised directly by the
+                // bounded response sender; this adapter arm only adds logging.
+                logger.error(&format!("HTTP/2 stream failed: {e}")); // coverage:ignore-line - peer timing race
+                return true; // coverage:ignore-line - peer timing race
+            }
+        };
     phase = vapache_verified::request_phase_step(
         phase,
         vapache_verified::RequestPhaseEvent::OutputComplete,
@@ -2771,6 +2977,142 @@ mod tests {
             .expect("progressing response server did not close")
             .unwrap()
             .unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn slow_output_handoff_preserves_capacity_for_an_unrelated_client() {
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let mut outputs = Vec::new();
+        for source in 1..=8 {
+            for _ in 0..32 {
+                let context = budget.context(std::net::IpAddr::from([192, 0, 2, source]));
+                let general = budget.try_h2_stream_in(&context).unwrap();
+                outputs.push(H2OutputAdmission::tracked(context, general));
+            }
+        }
+        assert_eq!(budget.h2_output_usage(), (256, 0));
+
+        let mut retained = Vec::new();
+        for mut output in outputs {
+            if output.enter_slow().is_ok() {
+                output.enter_slow().unwrap();
+                retained.push(output);
+            }
+            // Rejected slow outputs are dropped here, exactly as an errored
+            // response task is unwound by the stream handler.
+        }
+        assert_eq!(budget.h2_output_usage(), (0, 128));
+
+        let victim = budget.context(std::net::IpAddr::from([198, 51, 100, 7]));
+        let victim_stream = budget
+            .try_h2_stream_in(&victim)
+            .expect("slow outputs consumed unrelated dispatch capacity");
+        assert_eq!(budget.h2_output_usage(), (1, 128));
+        drop(victim_stream);
+        drop(retained);
+        assert_eq!(budget.h2_output_usage(), (0, 0));
+    }
+
+    #[test]
+    fn slow_output_progress_is_anchored_and_has_an_absolute_ceiling() {
+        let mut progress = H2SendProgress::new(Duration::from_secs(1));
+        progress.record(1024);
+        assert!(progress
+            .validate(progress.started + Duration::from_secs(1))
+            .is_ok());
+        assert!(progress
+            .validate(progress.started + Duration::from_secs(2))
+            .is_err());
+
+        let mut trickle = H2SendProgress::new(Duration::from_millis(20));
+        trickle.record(1);
+        assert!(
+            trickle.validate(trickle.absolute_deadline).is_err(),
+            "partial progress renewed the absolute deadline"
+        );
+
+        // Exercise the defensive Instant overflow path deterministically.
+        // The constructor cannot create this shape because the absolute
+        // deadline is derived from the same smaller interval.
+        let mut rollover = H2SendProgress::new(Duration::from_secs(1));
+        rollover.interval = Duration::MAX;
+        rollover.checkpoint = rollover.started;
+        rollover.absolute_deadline = rollover.started + Duration::from_secs(1);
+        assert!(rollover.validate(rollover.started).is_ok());
+        assert_eq!(rollover.checkpoint, rollover.absolute_deadline);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn admitted_slow_stream_body_checks_deadlines_after_each_read() {
+        let (cfg, _logger, dir) = test_config("progressing-stream-response");
+        let mut short = (*cfg).clone();
+        short.timeout = Duration::ZERO;
+        let cfg = Arc::new(short);
+        // Keep the body small enough that this invariant-path test cannot
+        // approach the deliberately tiny test-only absolute deadline under a
+        // loaded CI scheduler.
+        let expected = vec![b's'; 8 * 1024];
+        let mut response = Response::new(200);
+        response.body = Body::Stream {
+            reader: Box::new(std::io::Cursor::new(expected.clone())),
+            len: expected.len() as u64,
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let server_cfg = cfg.clone();
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (_, respond) = connection.accept().await.unwrap().unwrap();
+            let client = std::net::IpAddr::from([127, 0, 0, 1]);
+            let mut output =
+                H2OutputAdmission::detached(server_cfg.resource_budget.context(client));
+            output.enter_slow().unwrap();
+            let sender =
+                send_response_with_admission(respond, &server_cfg, response, false, &mut output);
+            tokio::pin!(sender);
+            let result = loop {
+                tokio::select! {
+                    result = &mut sender => break result,
+                    accepted = connection.accept() => {
+                        if accepted.is_none() {
+                            break Err(io::Error::new(io::ErrorKind::BrokenPipe, "client closed"));
+                        }
+                    }
+                }
+            };
+            loop {
+                tokio::select! {
+                    _ = &mut done_rx => break,
+                    accepted = connection.accept() => {
+                        if accepted.is_none() { break; }
+                    }
+                }
+            }
+            result
+        });
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+        let request = http::Request::builder()
+            .uri("https://localhost/stream")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        let mut body = response.await.unwrap().into_body();
+        let mut received = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            received.extend_from_slice(&chunk);
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+        }
+        assert_eq!(received, expected);
+        let _ = done_tx.send(());
+        assert_eq!(server.await.unwrap().unwrap(), expected.len() as u64);
+
+        drop((body, client));
+        driver.abort();
+        let _ = driver.await;
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -14,6 +14,11 @@
   machine, then live Apache-versus-vapached differentials using the vendored
   `h2` framing through Python `h2` (`python3-h2`), with the project's own
   TLS/h2 benchmark shape.
+- **Remediation status:** closed after this report. Flow-control-blocked
+  outputs transfer out of general dispatch capacity into a 128-process,
+  32-per-source slow-response pool. Minimum-rate checkpoints and the absolute
+  response lifetime are anchored at response start and cannot be renewed by
+  a partial WINDOW_UPDATE grant.
 
 ---
 
