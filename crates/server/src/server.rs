@@ -11,10 +11,10 @@ use crate::files::{
     serve_file, simple_html, Target,
 };
 use crate::http::{
-    preflight_request_head, read_request_body_async, read_request_head_with_reservation,
-    read_request_with_reservation, write_response, write_response_async, Body, BodyContinuation,
-    Limits, ParseError, ParsedRequestHead, ReadError, Request, Response, ResponseOptions,
-    ResponseWrite, Version,
+    preflight_request_head, prepare_streaming_request_body, pump_streaming_request_body,
+    read_request_body_async, read_request_head_with_reservation, read_request_with_reservation,
+    write_response, write_response_async, write_response_async_plain, Body, Limits, ParseError,
+    ParsedRequestHead, ReadError, Request, Response, ResponseOptions, ResponseWrite, Version,
 };
 use crate::log::{AccessEntry, Logger};
 use crate::proxy;
@@ -794,6 +794,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
     mut initial_reservation: Option<crate::resource::ResidentLease>,
     mut initial_body_guard: Option<BodyWorkerGuard>,
     mut initial_resource_context: Option<crate::resource::ResourceContext>,
+    mut request_worker: Option<WorkerGuard>,
     served: &mut usize,
     single_request: bool,
 ) -> io::Result<bool> {
@@ -1172,6 +1173,11 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                 if let Some((tls, handle)) = stream.take_tls_stream() {
                     // The TLS stream has been consumed by the tunnel; there is
                     // no safe way to inject a response here.
+                    // Request-worker admission protects parsing, policy, and
+                    // the upgrade decision.  The independently bounded
+                    // WebSocket lease protects the long-lived tunnel, so do
+                    // not pin a scarce request worker for the tunnel lifetime.
+                    drop(request_worker.take());
                     let _ = handle.block_on(proxy::websocket_async(
                         &cfg, &scope, &req, &target, &_grant, &resource, tls, peer, true, host,
                         &buf,
@@ -1180,6 +1186,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                 }
                 if let Some(client) = stream.try_clone_tcp() {
                     client.set_nonblocking(true)?;
+                    drop(request_worker.take());
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_io()
                         .enable_time()
@@ -1330,6 +1337,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
         initial_reservation,
         initial_body_guard,
         initial_resource_context,
+        None,
         &mut served,
         false,
     )
@@ -1712,7 +1720,24 @@ enum H1WorkerPhase {
     NeedBody {
         head: ParsedRequestHead,
         body_guard: BodyWorkerGuard,
-        continuation: BodyContinuation,
+        handler: PreparedHandler,
+        remote_user: Option<String>,
+        scope_guard: Option<crate::resource::RequestScopeGuard>,
+        started: Instant,
+        phase: RequestPhaseToken,
+    },
+    DrainBody {
+        head: ParsedRequestHead,
+        body_guard: BodyWorkerGuard,
+        response: Response,
+        remote_user: Option<String>,
+        scope_guard: Option<crate::resource::RequestScopeGuard>,
+        started: Instant,
+        phase: RequestPhaseToken,
+    },
+    Backend {
+        request: Request,
+        handler: PreparedHandler,
         remote_user: Option<String>,
         scope_guard: Option<crate::resource::RequestScopeGuard>,
         started: Instant,
@@ -1805,11 +1830,19 @@ fn process_h1_request_phase<C: Conn + ResponseWrite>(
         )));
     };
     let scope_guard = head.request().request_scope().map(|scope| scope.guard());
+    let dispatch_peer = cfg.client_addr(peer, head.request());
     let mut phase = RequestPhaseToken::head();
     if request_has_body(head.request()) {
-        match probe_request_body(cfg, head.request_mut(), peer, local_ip, local_port, tls) {
+        match probe_request_body(
+            cfg,
+            head.request_mut(),
+            dispatch_peer,
+            local_ip,
+            local_port,
+            tls,
+        ) {
             BodyRouteDecision::Read {
-                continuation,
+                handler,
                 remote_user,
             } => {
                 let Some(body_guard) = body_guard else {
@@ -1822,7 +1855,25 @@ fn process_h1_request_phase<C: Conn + ResponseWrite>(
                 return Ok(H1WorkerPhase::NeedBody {
                     head,
                     body_guard,
-                    continuation,
+                    handler,
+                    remote_user,
+                    scope_guard,
+                    started,
+                    phase,
+                });
+            }
+            BodyRouteDecision::Drain(response, remote_user) => {
+                let Some(body_guard) = body_guard else {
+                    return Err(ReadError::Io(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "request body capacity unavailable",
+                    )));
+                };
+                phase.advance(vapache_verified::RequestPhaseEvent::RouteNeedsDrain);
+                return Ok(H1WorkerPhase::DrainBody {
+                    head,
+                    body_guard,
+                    response,
                     remote_user,
                     scope_guard,
                     started,
@@ -1849,27 +1900,43 @@ fn process_h1_request_phase<C: Conn + ResponseWrite>(
     }
 
     drop(body_guard);
-    phase.advance(vapache_verified::RequestPhaseEvent::RouteReady);
-    let request = head.finish_without_body();
-    let (response, remote_user) =
-        dispatch_with_scheme_and_identity(cfg, &request, peer, local_ip, local_port, tls);
-    phase.advance(vapache_verified::RequestPhaseEvent::DispatchComplete);
-    Ok(H1WorkerPhase::Response(finish_h1_response(
-        cfg,
-        request,
-        response,
-        remote_user,
-        peer,
-        started,
-        served,
-        false,
-        scope_guard,
-        phase,
-    )))
+    let mut request = head.finish_without_body();
+    match probe_prepared_handler(cfg, &mut request, dispatch_peer, local_ip, local_port, tls) {
+        PreparedRouteDecision::Prepared {
+            handler,
+            remote_user,
+        } => {
+            phase.advance(vapache_verified::RequestPhaseEvent::RoutePrepared);
+            Ok(H1WorkerPhase::Backend {
+                request,
+                handler,
+                remote_user,
+                scope_guard,
+                started,
+                phase,
+            })
+        }
+        PreparedRouteDecision::Respond(response, remote_user) => {
+            phase.advance(vapache_verified::RequestPhaseEvent::RouteReady);
+            phase.advance(vapache_verified::RequestPhaseEvent::DispatchComplete);
+            Ok(H1WorkerPhase::Response(finish_h1_response(
+                cfg,
+                request,
+                response,
+                remote_user,
+                peer,
+                started,
+                served,
+                false,
+                scope_guard,
+                phase,
+            )))
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_h1_body_phase(
+fn dispatch_h1_backend_phase(
     cfg: &Config,
     mut request: Request,
     peer: SocketAddr,
@@ -1878,15 +1945,16 @@ fn dispatch_h1_body_phase(
     tls: bool,
     started: Instant,
     served: usize,
-    continuation: BodyContinuation,
+    handler: PreparedHandler,
     remote_user: Option<String>,
     scope_guard: Option<crate::resource::RequestScopeGuard>,
     mut phase: RequestPhaseToken,
 ) -> H1DeferredResponse {
-    phase.advance(vapache_verified::RequestPhaseEvent::BodyComplete);
-    let response =
-        execute_body_continuation(cfg, &mut request, peer, local_port, tls, continuation);
-    phase.advance(vapache_verified::RequestPhaseEvent::DispatchComplete);
+    if phase.phase == vapache_verified::RequestPhase::Body {
+        phase.advance(vapache_verified::RequestPhaseEvent::BodyComplete);
+    }
+    let response = execute_prepared_handler(cfg, &mut request, peer, local_port, tls, handler);
+    phase.advance(vapache_verified::RequestPhaseEvent::BackendComplete);
     finish_h1_response(
         cfg,
         request,
@@ -1899,6 +1967,208 @@ fn dispatch_h1_body_phase(
         scope_guard,
         phase,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_h1_drained_body(
+    cfg: &Config,
+    mut request: Request,
+    response: Response,
+    remote_user: Option<String>,
+    peer: SocketAddr,
+    started: Instant,
+    served: usize,
+    scope_guard: Option<crate::resource::RequestScopeGuard>,
+    mut phase: RequestPhaseToken,
+) -> H1DeferredResponse {
+    request.discard_body();
+    phase.advance(vapache_verified::RequestPhaseEvent::BodyDiscarded);
+    finish_h1_response(
+        cfg,
+        request,
+        response,
+        remote_user,
+        peer,
+        started,
+        served,
+        false,
+        scope_guard,
+        phase,
+    )
+}
+
+async fn read_h1_body_phase<S>(
+    stream: &mut S,
+    buffered: &mut Vec<u8>,
+    cfg: &Config,
+    tls: bool,
+    head: ParsedRequestHead,
+    phase: &mut RequestPhaseToken,
+) -> io::Result<Option<Request>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match read_request_body_async(stream, buffered, &request_limits(cfg, tls), head).await {
+        Ok(request) => Ok(Some(request)),
+        Err(ReadError::Parse(error)) => {
+            reject_h1_body_phase(stream, cfg, error.status(), phase).await;
+            Ok(None)
+        }
+        Err(ReadError::Io(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::OutOfMemory | io::ErrorKind::StorageFull | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            reject_h1_body_phase(stream, cfg, 503, phase).await;
+            Ok(None)
+        }
+        Err(ReadError::Io(error)) if error.kind() == io::ErrorKind::TimedOut => {
+            reject_h1_body_phase(stream, cfg, 408, phase).await;
+            Ok(None)
+        }
+        Err(ReadError::Io(error)) => {
+            phase.advance(vapache_verified::RequestPhaseEvent::Cancel);
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_streaming_h1_body_phase<S>(
+    stream: &mut S,
+    buffered: &mut Vec<u8>,
+    cfg: &Config,
+    head: ParsedRequestHead,
+    body_guard: BodyWorkerGuard,
+    peer: SocketAddr,
+    local_port: u16,
+    tls: bool,
+    started: Instant,
+    served: usize,
+    handler: PreparedHandler,
+    remote_user: Option<String>,
+    scope_guard: Option<crate::resource::RequestScopeGuard>,
+    mut phase: RequestPhaseToken,
+) -> io::Result<H1DeferredResponse>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let limits = request_limits(cfg, tls);
+    let (request, pump) = match prepare_streaming_request_body(head, &limits) {
+        Ok(prepared) => prepared,
+        Err((request, error)) => {
+            let status = if matches!(
+                error.kind(),
+                io::ErrorKind::OutOfMemory | io::ErrorKind::StorageFull | io::ErrorKind::WouldBlock
+            ) {
+                503
+            } else {
+                400
+            };
+            phase.advance(vapache_verified::RequestPhaseEvent::BodyErrorResponse);
+            drop(body_guard);
+            return Ok(finish_h1_response(
+                cfg,
+                request,
+                Response::bytes(
+                    status,
+                    "text/plain; charset=UTF-8",
+                    b"Request body could not be admitted\n".to_vec(),
+                ),
+                remote_user,
+                peer,
+                started,
+                served,
+                true,
+                scope_guard,
+                phase,
+            ));
+        }
+    };
+    let mut rejected_request = request.clone();
+    phase.advance(vapache_verified::RequestPhaseEvent::BackendStarted);
+    let cfg_worker = cfg.clone();
+    let mut backend = spawn_connection_worker(move || {
+        let mut request = request;
+        let response =
+            execute_prepared_handler(&cfg_worker, &mut request, peer, local_port, tls, handler);
+        (request, response)
+    })?;
+    let mut body = Box::pin(pump_streaming_request_body(stream, buffered, &limits, pump));
+
+    let (request, response, body_complete) = tokio::select! {
+        biased;
+        result = &mut backend => {
+            let (request, response) = result
+                .map_err(|error| io::Error::other(format!("HTTP/1 backend failed: {error}")))?;
+            (request, response, false)
+        }
+        result = &mut body => {
+            match result {
+                Ok(()) => {
+                    let (request, response) = backend.await
+                        .map_err(|error| io::Error::other(format!("HTTP/1 backend failed: {error}")))?;
+                    (request, response, true)
+                }
+                // A backend is allowed to reject an upload without consuming
+                // it. Its response wins, but the connection cannot be reused
+                // because unread request bytes remain on the wire.
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    let (request, response) = backend.await
+                        .map_err(|join| io::Error::other(format!("HTTP/1 backend failed: {join}")))?;
+                    (request, response, false)
+                }
+                Err(error) => {
+                    if let Some(scope) = rejected_request.request_scope() {
+                        scope.cancel();
+                    }
+                    drop(backend);
+                    rejected_request.clear_streaming_body();
+                    let status = match error.kind() {
+                        io::ErrorKind::TimedOut => 408,
+                        io::ErrorKind::OutOfMemory
+                        | io::ErrorKind::StorageFull
+                        | io::ErrorKind::WouldBlock => 503,
+                        _ => 400,
+                    };
+                    let response = Response::bytes(
+                        status,
+                        "text/plain; charset=UTF-8",
+                        b"Request body could not be consumed\n".to_vec(),
+                    );
+                    phase.advance(vapache_verified::RequestPhaseEvent::BodyErrorResponse);
+                    drop(body_guard);
+                    return Ok(finish_h1_response(
+                        cfg,
+                        rejected_request,
+                        response,
+                        remote_user,
+                        peer,
+                        started,
+                        served,
+                        true,
+                        scope_guard,
+                        phase,
+                    ));
+                }
+            }
+        }
+    };
+    drop(body_guard);
+    phase.advance(vapache_verified::RequestPhaseEvent::BackendComplete);
+    Ok(finish_h1_response(
+        cfg,
+        request,
+        response,
+        remote_user,
+        peer,
+        started,
+        served,
+        !body_complete,
+        scope_guard,
+        phase,
+    ))
 }
 
 fn log_h1_response(
@@ -1993,6 +2263,46 @@ where
     let scope = deferred.request.request_scope().cloned();
     let result =
         write_response_async(stream, &mut deferred.response, &options, scope.as_ref()).await;
+    match result {
+        Ok(sent) => {
+            deferred
+                .phase
+                .advance(vapache_verified::RequestPhaseEvent::OutputComplete);
+            log_h1_response(cfg, logger, local_ip, local_port, deferred, sent);
+            Ok(sent)
+        }
+        Err(error) => {
+            deferred
+                .phase
+                .advance(vapache_verified::RequestPhaseEvent::Cancel);
+            if let Some(scope) = scope {
+                scope.cancel();
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn send_h1_response_plain(
+    stream: &mut tokio::net::TcpStream,
+    cfg: &Config,
+    logger: &Logger,
+    local_ip: &str,
+    local_port: u16,
+    deferred: &mut H1DeferredResponse,
+) -> io::Result<u64> {
+    let server_header = cfg.server_header();
+    let options = ResponseOptions {
+        server_header: &server_header,
+        keep_alive: deferred.keep_alive,
+        head_only: deferred.request.is_head(),
+        protocol: deferred.request.version,
+        request_keep_alive: deferred.request.keep_alive,
+        write_timeout: cfg.timeout,
+    };
+    let scope = deferred.request.request_scope().cloned();
+    let result =
+        write_response_async_plain(stream, &mut deferred.response, &options, scope.as_ref()).await;
     match result {
         Ok(sent) => {
             deferred
@@ -2108,7 +2418,6 @@ async fn admit_plain_connection(
         let mut request_buf = initial;
         let result = if admission.websocket {
             spawn_connection_worker(move || {
-                let _worker_guard = worker_guard;
                 let mut blocking = blocking;
                 let result = handle_connection_inner(
                     &cfg_worker,
@@ -2122,6 +2431,7 @@ async fn admit_plain_connection(
                     Some(resident),
                     body_guard,
                     Some(admission.context),
+                    Some(worker_guard),
                     &mut served,
                     true,
                 );
@@ -2160,64 +2470,18 @@ async fn admit_plain_connection(
         stream = tokio::net::TcpStream::from_std(blocking)?;
         let mut deferred = match phase.expect("non-WebSocket worker returned a phase") {
             Ok(H1WorkerPhase::Response(deferred)) => deferred,
-            Ok(H1WorkerPhase::NeedBody {
-                head,
-                body_guard,
-                continuation,
+            Ok(H1WorkerPhase::Backend {
+                request,
+                handler,
                 remote_user,
                 scope_guard,
                 started,
-                mut phase,
+                phase,
             }) => {
-                let request = match read_request_body_async(
-                    &mut stream,
-                    &mut buffered,
-                    &request_limits(&cfg, false),
-                    head,
-                )
-                .await
-                {
-                    Ok(request) => request,
-                    Err(ReadError::Parse(error)) => {
-                        reject_h1_body_phase(&mut stream, &cfg, error.status(), &mut phase).await;
-                        return Ok(());
-                    }
-                    Err(ReadError::Io(error))
-                        if matches!(
-                            error.kind(),
-                            io::ErrorKind::OutOfMemory
-                                | io::ErrorKind::StorageFull
-                                | io::ErrorKind::WouldBlock
-                        ) =>
-                    {
-                        reject_h1_body_phase(&mut stream, &cfg, 503, &mut phase).await;
-                        return Ok(());
-                    }
-                    Err(ReadError::Io(error)) if error.kind() == io::ErrorKind::TimedOut => {
-                        reject_h1_body_phase(&mut stream, &cfg, 408, &mut phase).await;
-                        return Ok(());
-                    }
-                    Err(ReadError::Io(error)) => {
-                        phase.advance(vapache_verified::RequestPhaseEvent::Cancel);
-                        return Err(error);
-                    }
-                };
-                drop(body_guard);
-                let context = request
-                    .resource_context()
-                    .cloned()
-                    .ok_or_else(|| io::Error::other("body request lost its resource scope"))?;
-                let Some(worker_guard) =
-                    try_reserve_worker(&context, cfg.max_request_workers.max(1))
-                else {
-                    reject_h1_async(&mut stream, &cfg, 503).await;
-                    return Ok(());
-                };
                 let cfg_worker = cfg.clone();
                 let local_ip_worker = local_ip.clone();
                 spawn_connection_worker(move || {
-                    let _worker_guard = worker_guard;
-                    dispatch_h1_body_phase(
+                    dispatch_h1_backend_phase(
                         &cfg_worker,
                         request,
                         peer,
@@ -2226,14 +2490,131 @@ async fn admit_plain_connection(
                         false,
                         started,
                         served,
-                        continuation,
+                        handler,
                         remote_user,
                         scope_guard,
                         phase,
                     )
                 })?
                 .await
-                .map_err(|error| io::Error::other(format!("HTTP/1 dispatch failed: {error}")))?
+                .map_err(|error| io::Error::other(format!("HTTP/1 backend failed: {error}")))?
+            }
+            Ok(H1WorkerPhase::DrainBody {
+                head,
+                body_guard,
+                response,
+                remote_user,
+                scope_guard,
+                started,
+                mut phase,
+            }) => {
+                let Some(request) =
+                    read_h1_body_phase(&mut stream, &mut buffered, &cfg, false, head, &mut phase)
+                        .await?
+                else {
+                    return Ok(());
+                };
+                drop(body_guard);
+                finish_h1_drained_body(
+                    &cfg,
+                    request,
+                    response,
+                    remote_user,
+                    peer,
+                    started,
+                    served,
+                    scope_guard,
+                    phase,
+                )
+            }
+            Ok(H1WorkerPhase::NeedBody {
+                head,
+                body_guard,
+                handler,
+                remote_user,
+                scope_guard,
+                started,
+                mut phase,
+            }) => {
+                if matches!(
+                    head.request().framing,
+                    crate::verified::BodyFraming::Length(length)
+                        if length > crate::http::MAX_REQUEST_BODY_IN_MEMORY
+                ) {
+                    dispatch_streaming_h1_body_phase(
+                        &mut stream,
+                        &mut buffered,
+                        &cfg,
+                        head,
+                        body_guard,
+                        peer,
+                        local_port,
+                        false,
+                        started,
+                        served,
+                        handler,
+                        remote_user,
+                        scope_guard,
+                        phase,
+                    )
+                    .await?
+                } else {
+                    let request = match read_request_body_async(
+                        &mut stream,
+                        &mut buffered,
+                        &request_limits(&cfg, false),
+                        head,
+                    )
+                    .await
+                    {
+                        Ok(request) => request,
+                        Err(ReadError::Parse(error)) => {
+                            reject_h1_body_phase(&mut stream, &cfg, error.status(), &mut phase)
+                                .await;
+                            return Ok(());
+                        }
+                        Err(ReadError::Io(error))
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::OutOfMemory
+                                    | io::ErrorKind::StorageFull
+                                    | io::ErrorKind::WouldBlock
+                            ) =>
+                        {
+                            reject_h1_body_phase(&mut stream, &cfg, 503, &mut phase).await;
+                            return Ok(());
+                        }
+                        Err(ReadError::Io(error)) if error.kind() == io::ErrorKind::TimedOut => {
+                            reject_h1_body_phase(&mut stream, &cfg, 408, &mut phase).await;
+                            return Ok(());
+                        }
+                        Err(ReadError::Io(error)) => {
+                            phase.advance(vapache_verified::RequestPhaseEvent::Cancel);
+                            return Err(error);
+                        }
+                    };
+                    drop(body_guard);
+                    let cfg_worker = cfg.clone();
+                    let local_ip_worker = local_ip.clone();
+                    spawn_connection_worker(move || {
+                        dispatch_h1_backend_phase(
+                            &cfg_worker,
+                            request,
+                            peer,
+                            &local_ip_worker,
+                            local_port,
+                            false,
+                            started,
+                            served,
+                            handler,
+                            remote_user,
+                            scope_guard,
+                            phase,
+                        )
+                    })?
+                    .await
+                    .map_err(|error| io::Error::other(format!("HTTP/1 dispatch failed: {error}")))?
+                }
             }
             Err(ReadError::Parse(error)) => {
                 reject_h1_async(&mut stream, &cfg, error.status()).await;
@@ -2241,7 +2622,7 @@ async fn admit_plain_connection(
             }
             Err(ReadError::Io(error)) => return Err(error),
         };
-        if send_h1_response(
+        if send_h1_response_plain(
             &mut stream,
             &cfg,
             &logger,
@@ -2439,7 +2820,6 @@ async fn admit_tls_connection(
         let mut request_buf = initial;
         let result = if admission.websocket {
             spawn_connection_worker(move || {
-                let _worker_guard = worker_guard;
                 let mut bridge = bridge;
                 let result = handle_connection_inner(
                     &cfg_worker,
@@ -2453,6 +2833,7 @@ async fn admit_tls_connection(
                     Some(resident),
                     body_guard,
                     Some(admission.context),
+                    Some(worker_guard),
                     &mut served,
                     true,
                 );
@@ -2493,64 +2874,18 @@ async fn admit_tls_connection(
         tls = next_tls;
         let mut deferred = match phase.expect("non-WebSocket worker returned a phase") {
             Ok(H1WorkerPhase::Response(deferred)) => deferred,
-            Ok(H1WorkerPhase::NeedBody {
-                head,
-                body_guard,
-                continuation,
+            Ok(H1WorkerPhase::Backend {
+                request,
+                handler,
                 remote_user,
                 scope_guard,
                 started,
-                mut phase,
+                phase,
             }) => {
-                let request = match read_request_body_async(
-                    &mut tls,
-                    &mut buffered,
-                    &request_limits(&cfg, true),
-                    head,
-                )
-                .await
-                {
-                    Ok(request) => request,
-                    Err(ReadError::Parse(error)) => {
-                        reject_h1_body_phase(&mut tls, &cfg, error.status(), &mut phase).await;
-                        return Ok(());
-                    }
-                    Err(ReadError::Io(error))
-                        if matches!(
-                            error.kind(),
-                            io::ErrorKind::OutOfMemory
-                                | io::ErrorKind::StorageFull
-                                | io::ErrorKind::WouldBlock
-                        ) =>
-                    {
-                        reject_h1_body_phase(&mut tls, &cfg, 503, &mut phase).await;
-                        return Ok(());
-                    }
-                    Err(ReadError::Io(error)) if error.kind() == io::ErrorKind::TimedOut => {
-                        reject_h1_body_phase(&mut tls, &cfg, 408, &mut phase).await;
-                        return Ok(());
-                    }
-                    Err(ReadError::Io(error)) => {
-                        phase.advance(vapache_verified::RequestPhaseEvent::Cancel);
-                        return Err(error);
-                    }
-                };
-                drop(body_guard);
-                let context = request
-                    .resource_context()
-                    .cloned()
-                    .ok_or_else(|| io::Error::other("body request lost its resource scope"))?;
-                let Some(worker_guard) =
-                    try_reserve_worker(&context, cfg.max_request_workers.max(1))
-                else {
-                    reject_h1_async(&mut tls, &cfg, 503).await;
-                    return Ok(());
-                };
                 let cfg_worker = cfg.clone();
                 let local_ip_worker = local_ip.clone();
                 spawn_connection_worker(move || {
-                    let _worker_guard = worker_guard;
-                    dispatch_h1_body_phase(
+                    dispatch_h1_backend_phase(
                         &cfg_worker,
                         request,
                         peer,
@@ -2559,14 +2894,132 @@ async fn admit_tls_connection(
                         true,
                         started,
                         served,
-                        continuation,
+                        handler,
                         remote_user,
                         scope_guard,
                         phase,
                     )
                 })?
                 .await
-                .map_err(|error| io::Error::other(format!("TLS HTTP/1 dispatch failed: {error}")))?
+                .map_err(|error| io::Error::other(format!("TLS HTTP/1 backend failed: {error}")))?
+            }
+            Ok(H1WorkerPhase::DrainBody {
+                head,
+                body_guard,
+                response,
+                remote_user,
+                scope_guard,
+                started,
+                mut phase,
+            }) => {
+                let Some(request) =
+                    read_h1_body_phase(&mut tls, &mut buffered, &cfg, true, head, &mut phase)
+                        .await?
+                else {
+                    return Ok(());
+                };
+                drop(body_guard);
+                finish_h1_drained_body(
+                    &cfg,
+                    request,
+                    response,
+                    remote_user,
+                    peer,
+                    started,
+                    served,
+                    scope_guard,
+                    phase,
+                )
+            }
+            Ok(H1WorkerPhase::NeedBody {
+                head,
+                body_guard,
+                handler,
+                remote_user,
+                scope_guard,
+                started,
+                mut phase,
+            }) => {
+                if matches!(
+                    head.request().framing,
+                    crate::verified::BodyFraming::Length(length)
+                        if length > crate::http::MAX_REQUEST_BODY_IN_MEMORY
+                ) {
+                    dispatch_streaming_h1_body_phase(
+                        &mut tls,
+                        &mut buffered,
+                        &cfg,
+                        head,
+                        body_guard,
+                        peer,
+                        local_port,
+                        true,
+                        started,
+                        served,
+                        handler,
+                        remote_user,
+                        scope_guard,
+                        phase,
+                    )
+                    .await?
+                } else {
+                    let request = match read_request_body_async(
+                        &mut tls,
+                        &mut buffered,
+                        &request_limits(&cfg, true),
+                        head,
+                    )
+                    .await
+                    {
+                        Ok(request) => request,
+                        Err(ReadError::Parse(error)) => {
+                            reject_h1_body_phase(&mut tls, &cfg, error.status(), &mut phase).await;
+                            return Ok(());
+                        }
+                        Err(ReadError::Io(error))
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::OutOfMemory
+                                    | io::ErrorKind::StorageFull
+                                    | io::ErrorKind::WouldBlock
+                            ) =>
+                        {
+                            reject_h1_body_phase(&mut tls, &cfg, 503, &mut phase).await;
+                            return Ok(());
+                        }
+                        Err(ReadError::Io(error)) if error.kind() == io::ErrorKind::TimedOut => {
+                            reject_h1_body_phase(&mut tls, &cfg, 408, &mut phase).await;
+                            return Ok(());
+                        }
+                        Err(ReadError::Io(error)) => {
+                            phase.advance(vapache_verified::RequestPhaseEvent::Cancel);
+                            return Err(error);
+                        }
+                    };
+                    drop(body_guard);
+                    let cfg_worker = cfg.clone();
+                    let local_ip_worker = local_ip.clone();
+                    spawn_connection_worker(move || {
+                        dispatch_h1_backend_phase(
+                            &cfg_worker,
+                            request,
+                            peer,
+                            &local_ip_worker,
+                            local_port,
+                            true,
+                            started,
+                            served,
+                            handler,
+                            remote_user,
+                            scope_guard,
+                            phase,
+                        )
+                    })?
+                    .await
+                    .map_err(|error| {
+                        io::Error::other(format!("TLS HTTP/1 dispatch failed: {error}"))
+                    })?
+                }
             }
             Err(ReadError::Parse(error)) => {
                 reject_h1_async(&mut tls, &cfg, error.status()).await;
@@ -2998,18 +3451,293 @@ pub(crate) fn dispatch_with_scheme_and_identity(
 
 pub(crate) enum BodyRouteDecision {
     Read {
-        continuation: BodyContinuation,
+        handler: PreparedHandler,
+        remote_user: Option<String>,
+    },
+    Drain(Response, Option<String>),
+    Respond(Response, Option<String>),
+}
+
+pub(crate) enum PreparedRouteDecision {
+    Prepared {
+        handler: PreparedHandler,
         remote_user: Option<String>,
     },
     Respond(Response, Option<String>),
 }
 
+/// Fully authorized, side-effect-free dynamic sink selected by the routing
+/// phase.  Keeping this as an explicit IR makes the route/body boundary
+/// inspectable and prevents a second rewrite/authentication pass after upload.
+pub(crate) enum PreparedHandler {
+    /// Complete the outer dispatch operations only after the dynamic sink has
+    /// produced its real status and headers. Cache stores and unsafe-method
+    /// invalidation must never be decided from the prepared marker response.
+    FinalizeDispatch {
+        handler: Box<PreparedHandler>,
+        vhost_index: Option<usize>,
+        cache: Option<Box<crate::cache::CacheContext>>,
+        host: String,
+        peer: std::net::IpAddr,
+        invalidation_path: String,
+    },
+    /// A local ErrorDocument is an explicit response transformation: execute
+    /// its handler, preserve the original error status, then apply the outer
+    /// error response's header and compression policy.
+    FinalizeErrorDocument {
+        handler: Box<PreparedHandler>,
+        scope: Scope,
+        status: u16,
+        url_path: String,
+        port: u16,
+        host: String,
+    },
+    Proxy {
+        vhost_index: Option<usize>,
+        scope: Scope,
+        target: proxy::Target,
+        peer: SocketAddr,
+        local_port: u16,
+        https: bool,
+        server_name: String,
+        local_ip: String,
+        grant: access::AccessGrant,
+        resource: access::ResourceKey,
+        url_path: String,
+        query_override: Option<Vec<u8>>,
+    },
+    FastCgi {
+        vhost_index: Option<usize>,
+        scope: Scope,
+        target: fastcgi::Target,
+        peer: SocketAddr,
+        local_port: u16,
+        server_name: String,
+        local_ip: String,
+        grant: access::AccessGrant,
+        resource: access::ResourceKey,
+        url_path: String,
+        mapping_root: PathBuf,
+    },
+    Cgi {
+        vhost_index: Option<usize>,
+        scope: Scope,
+        peer: SocketAddr,
+        local_port: u16,
+        server_name: String,
+        local_ip: String,
+        grant: access::AccessGrant,
+        resource: access::ResourceKey,
+        root: PathBuf,
+        script_rel: PathBuf,
+        url_path: String,
+        path_info: String,
+        script_name: String,
+        script_file: std::fs::File,
+        script_meta: std::fs::Metadata,
+        _descriptor_lease: crate::resource::DescriptorLease,
+    },
+}
+
+impl PreparedHandler {
+    fn kind(&self) -> vapache_verified::PreparedHandlerKind {
+        match self {
+            PreparedHandler::FinalizeDispatch { handler, .. }
+            | PreparedHandler::FinalizeErrorDocument { handler, .. } => handler.kind(),
+            PreparedHandler::Proxy { .. } => vapache_verified::PreparedHandlerKind::Proxy,
+            PreparedHandler::FastCgi { .. } => vapache_verified::PreparedHandlerKind::FastCgi,
+            PreparedHandler::Cgi { .. } => vapache_verified::PreparedHandlerKind::Cgi,
+        }
+    }
+
+    fn execute(self, cfg: &Config, req: &mut Request) -> Response {
+        match self {
+            PreparedHandler::FinalizeDispatch {
+                handler,
+                vhost_index,
+                cache,
+                host,
+                peer,
+                invalidation_path,
+            } => {
+                let mut response = handler.execute(cfg, req);
+                let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
+                if let Some(cache) = cache {
+                    crate::cache::store(
+                        cfg,
+                        vhost,
+                        req,
+                        &host,
+                        &cache.path,
+                        &cache.scope,
+                        peer,
+                        &mut response,
+                        &cache.grant,
+                        &cache.key,
+                        &cache.target,
+                    );
+                }
+                let unsafe_method =
+                    !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
+                if vapache_verified::cache_invalidation_status_admit(unsafe_method, response.status)
+                {
+                    crate::cache::invalidate(cfg, &host, &invalidation_path);
+                }
+                response
+            }
+            PreparedHandler::FinalizeErrorDocument {
+                handler,
+                scope,
+                status,
+                url_path,
+                port,
+                host,
+            } => {
+                let response = handler.execute(cfg, req);
+                crate::files::finalize_prepared_error_document(
+                    cfg, &scope, status, req, &url_path, port, &host, response,
+                )
+            }
+            PreparedHandler::Proxy {
+                vhost_index,
+                scope,
+                target,
+                peer,
+                local_port,
+                https,
+                server_name,
+                local_ip,
+                grant,
+                resource,
+                url_path,
+                query_override,
+            } => {
+                let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
+                let original_query =
+                    query_override.map(|query| std::mem::replace(&mut req.query, query));
+                let response = proxy::execute(
+                    cfg,
+                    vhost,
+                    &scope,
+                    req,
+                    &url_path,
+                    &target,
+                    peer,
+                    local_port,
+                    https,
+                    &server_name,
+                    &local_ip,
+                    &grant,
+                    &resource,
+                );
+                if let Some(original_query) = original_query {
+                    req.query = original_query;
+                }
+                response
+            }
+            PreparedHandler::FastCgi {
+                vhost_index,
+                scope,
+                target,
+                peer,
+                local_port,
+                server_name,
+                local_ip,
+                grant,
+                resource,
+                url_path,
+                mapping_root,
+            } => {
+                let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
+                run_fastcgi(
+                    cfg,
+                    vhost,
+                    req,
+                    &url_path,
+                    &server_name,
+                    peer,
+                    &local_ip,
+                    local_port,
+                    &scope,
+                    &target,
+                    &grant,
+                    &resource,
+                    &mapping_root,
+                )
+            }
+            PreparedHandler::Cgi {
+                vhost_index,
+                scope,
+                peer,
+                local_port,
+                server_name,
+                local_ip,
+                grant,
+                resource,
+                root,
+                script_rel,
+                url_path,
+                path_info,
+                script_name,
+                script_file,
+                script_meta,
+                _descriptor_lease,
+            } => {
+                let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
+                run_cgi(
+                    cfg,
+                    vhost,
+                    req,
+                    &root,
+                    &script_rel,
+                    &url_path,
+                    &path_info,
+                    &script_name,
+                    &server_name,
+                    peer,
+                    &local_ip,
+                    local_port,
+                    &scope,
+                    &grant,
+                    &resource,
+                    Some(&script_file),
+                    Some(&script_meta),
+                )
+            }
+        }
+    }
+}
+
 /// Execute the normal request policy pipeline without allowing a content
-/// handler to perform side effects. Dynamic handlers return a private marker
-/// only after their final route and authorization grants have been established.
-/// Any other result is safe to send without consuming the body; successful
-/// static responses become a route-specific rejection instead of silently
-/// accepting attacker-controlled bytes.
+/// handler to perform side effects. Dynamic handlers return typed IR only
+/// after their final route and authorization grants have been established.
+pub(crate) fn probe_prepared_handler(
+    cfg: &Config,
+    req: &mut Request,
+    peer: SocketAddr,
+    local_ip: &str,
+    local_port: u16,
+    tls: bool,
+) -> PreparedRouteDecision {
+    req.set_handler_probe(true);
+    let (mut response, remote_user) =
+        dispatch_with_scheme_and_identity(cfg, req, peer, local_ip, local_port, tls);
+    req.set_handler_probe(false);
+    if response.has_prepared_handler() {
+        let handler = response
+            .take_prepared_handler()
+            .expect("prepared route response retained its handler");
+        return PreparedRouteDecision::Prepared {
+            handler,
+            remote_user,
+        };
+    }
+    PreparedRouteDecision::Respond(response, remote_user)
+}
+
+/// Body acquisition is admitted only after routing. Dynamic sinks receive the
+/// body; successful static routes drain it under the same bounds so a safe
+/// HTTP/1 keep-alive connection can remain synchronized with Apache.
 pub(crate) fn probe_request_body(
     cfg: &Config,
     req: &mut Request,
@@ -3018,48 +3746,44 @@ pub(crate) fn probe_request_body(
     local_port: u16,
     tls: bool,
 ) -> BodyRouteDecision {
-    req.set_body_probe(true);
-    let (mut response, remote_user) =
-        dispatch_with_scheme_and_identity(cfg, req, peer, local_ip, local_port, tls);
-    req.set_body_probe(false);
-    if response.requires_body() {
-        let continuation = response
-            .take_body_continuation()
-            .expect("body route response retained its continuation");
-        return BodyRouteDecision::Read {
-            continuation,
-            remote_user,
+    let (response, remote_user) =
+        match probe_prepared_handler(cfg, req, peer, local_ip, local_port, tls) {
+            PreparedRouteDecision::Prepared {
+                handler,
+                remote_user,
+            } => {
+                return BodyRouteDecision::Read {
+                    handler,
+                    remote_user,
+                };
+            }
+            PreparedRouteDecision::Respond(response, remote_user) => (response, remote_user),
         };
-    }
     if (200..300).contains(&response.status) {
-        let mut rejected = Response::bytes(
-            400,
-            "text/plain; charset=UTF-8",
-            b"Request body is not accepted by the selected handler\n".to_vec(),
-        );
-        rejected
-            .headers
-            .push(("Connection".into(), b"close".to_vec()));
-        BodyRouteDecision::Respond(rejected, remote_user)
+        BodyRouteDecision::Drain(response, remote_user)
     } else {
         BodyRouteDecision::Respond(response, remote_user)
     }
 }
 
-pub(crate) fn execute_body_continuation(
+pub(crate) fn execute_prepared_handler(
     cfg: &Config,
     req: &mut Request,
     peer: SocketAddr,
     local_port: u16,
     tls: bool,
-    continuation: BodyContinuation,
+    handler: PreparedHandler,
 ) -> Response {
+    crate::files::reset_local_error_document_response();
+    debug_assert!(vapache_verified::prepared_handler_needs_dynamic_lease(
+        handler.kind()
+    ));
     let context = req
         .resource_context()
         .cloned()
         .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
     crate::resource::with_resource_context(context, || {
-        crate::expr::with_connection(tls, local_port, || continuation(cfg, req))
+        crate::expr::with_connection(tls, local_port, || handler.execute(cfg, req))
     })
 }
 
@@ -3117,7 +3841,9 @@ fn dispatch_inner_request(
     let invalidation_path = initial_plan
         .as_ref()
         .map(|plan| plan.url_path().to_string());
-    let mut cache_scope = (!req.body_probe())
+    let probing_body =
+        req.handler_probe() && !matches!(req.framing, crate::verified::BodyFraming::None);
+    let mut cache_scope = (!probing_body)
         .then_some(())
         .and_then(|()| initial_plan.as_ref())
         .and_then(|plan| {
@@ -3177,24 +3903,39 @@ fn dispatch_inner_request(
         &server_name_for_cache,
         initial_plan,
     );
-    if let Some(cache_ctx) = cache_scope {
-        crate::cache::store(
-            cfg,
-            vhost,
-            req,
-            host,
-            &cache_ctx.path,
-            &cache_ctx.scope,
-            peer.ip(),
-            &mut resp,
-            &cache_ctx.grant,
-            &cache_ctx.key,
-            &cache_ctx.target,
-        );
-    }
-    let unsafe_method = !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
-    if vapache_verified::cache_invalidation_status_admit(unsafe_method, resp.status) {
-        crate::cache::invalidate(cfg, host, invalidation_path.as_deref().unwrap_or(&path));
+    if resp.has_prepared_handler() {
+        let finalize = resp
+            .take_prepared_handler()
+            .expect("prepared dispatch response retained its handler");
+        let finalizer = PreparedHandler::FinalizeDispatch {
+            handler: Box::new(finalize),
+            vhost_index: selected_vhost_index(cfg, vhost),
+            cache: cache_scope.map(Box::new),
+            host: host.to_string(),
+            peer: peer.ip(),
+            invalidation_path: invalidation_path.as_deref().unwrap_or(&path).to_string(),
+        };
+        resp = Response::prepared_handler(finalizer);
+    } else {
+        if let Some(cache_ctx) = cache_scope {
+            crate::cache::store(
+                cfg,
+                vhost,
+                req,
+                host,
+                &cache_ctx.path,
+                &cache_ctx.scope,
+                peer.ip(),
+                &mut resp,
+                &cache_ctx.grant,
+                &cache_ctx.key,
+                &cache_ctx.target,
+            );
+        }
+        let unsafe_method = !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
+        if vapache_verified::cache_invalidation_status_admit(unsafe_method, resp.status) {
+            crate::cache::invalidate(cfg, host, invalidation_path.as_deref().unwrap_or(&path));
+        }
     }
     resp
 }
@@ -3218,8 +3959,7 @@ pub(crate) fn internal_dispatch(
     }
     internal.target = target;
     internal.raw_path = url.as_bytes().to_vec();
-    internal.body.clear();
-    internal.body_spool = None;
+    internal.clear_body_for_internal_subrequest();
     internal.framing = crate::verified::BodyFraming::None;
     internal.expect_continue = false;
     internal.headers.remove("content-length");
@@ -4136,33 +4876,21 @@ fn dispatch_inner(
                         return r; // coverage:ignore-line - filesystem race
                     }
                 }
-                if current_req.body_probe() {
-                    let vhost_index = selected_vhost_index(cfg, vhost);
-                    let upstream_path = url_path_part.to_string();
-                    let upstream_query = query.as_bytes().to_vec();
-                    let server_name = server_name.to_string();
-                    let local_ip = local_ip.to_string();
-                    return Response::body_required(Box::new(move |cfg, req| {
-                        let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
-                        let original_query = std::mem::replace(&mut req.query, upstream_query);
-                        let response = proxy::execute(
-                            cfg,
-                            vhost,
-                            &scope,
-                            req,
-                            &upstream_path,
-                            &target,
-                            peer,
-                            local_port,
-                            https,
-                            &server_name,
-                            &local_ip,
-                            &_grant,
-                            &resource,
-                        );
-                        req.query = original_query;
-                        response
-                    }));
+                if current_req.handler_probe() {
+                    return Response::prepared_handler(PreparedHandler::Proxy {
+                        vhost_index: selected_vhost_index(cfg, vhost),
+                        scope,
+                        target,
+                        peer,
+                        local_port,
+                        https,
+                        server_name: server_name.to_string(),
+                        local_ip: local_ip.to_string(),
+                        grant: _grant,
+                        resource,
+                        url_path: url_path_part.to_string(),
+                        query_override: Some(query.as_bytes().to_vec()),
+                    });
                 }
                 let mut proxy_req = current_req.clone();
                 proxy_req.query = query.as_bytes().to_vec();
@@ -4749,29 +5477,20 @@ fn dispatch_inner(
 
     if fastcgi_wins {
         if let Some(target) = fastcgi_target {
-            if req.body_probe() {
-                let vhost_index = selected_vhost_index(cfg, vhost);
-                let url_path = url_path.clone();
-                let server_name = server_name.to_string();
-                let local_ip = local_ip.to_string();
-                return Response::body_required(Box::new(move |cfg, req| {
-                    let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
-                    run_fastcgi(
-                        cfg,
-                        vhost,
-                        req,
-                        &url_path,
-                        &server_name,
-                        peer,
-                        &local_ip,
-                        local_port,
-                        &scope,
-                        &target,
-                        &grant,
-                        &resource,
-                        &root,
-                    )
-                }));
+            if req.handler_probe() {
+                return Response::prepared_handler(PreparedHandler::FastCgi {
+                    vhost_index: selected_vhost_index(cfg, vhost),
+                    scope,
+                    target,
+                    peer,
+                    local_port,
+                    server_name: server_name.to_string(),
+                    local_ip: local_ip.to_string(),
+                    grant,
+                    resource,
+                    url_path: url_path.clone(),
+                    mapping_root: root,
+                });
             }
             return run_fastcgi(
                 cfg,
@@ -4792,29 +5511,21 @@ fn dispatch_inner(
     }
 
     if let Some(target) = proxy_target {
-        if req.body_probe() {
-            let vhost_index = selected_vhost_index(cfg, vhost);
-            let url_path = url_path.clone();
-            let server_name = server_name.to_string();
-            let local_ip = local_ip.to_string();
-            return Response::body_required(Box::new(move |cfg, req| {
-                let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
-                proxy::execute(
-                    cfg,
-                    vhost,
-                    &scope,
-                    req,
-                    &url_path,
-                    &target,
-                    peer,
-                    local_port,
-                    https,
-                    &server_name,
-                    &local_ip,
-                    &grant,
-                    &resource,
-                )
-            }));
+        if req.handler_probe() {
+            return Response::prepared_handler(PreparedHandler::Proxy {
+                vhost_index: selected_vhost_index(cfg, vhost),
+                scope,
+                target,
+                peer,
+                local_port,
+                https,
+                server_name: server_name.to_string(),
+                local_ip: local_ip.to_string(),
+                grant,
+                resource,
+                url_path: url_path.clone(),
+                query_override: None,
+            });
         }
         return proxy::execute(
             cfg,
@@ -4966,29 +5677,20 @@ fn dispatch_inner(
                 actual_path.as_ref(),
                 name,
             ) {
-                if req.body_probe() {
-                    let vhost_index = selected_vhost_index(cfg, vhost);
-                    let url_path = url_path.clone();
-                    let server_name = server_name.to_string();
-                    let local_ip = local_ip.to_string();
-                    return Response::body_required(Box::new(move |cfg, req| {
-                        let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
-                        run_fastcgi(
-                            cfg,
-                            vhost,
-                            req,
-                            &url_path,
-                            &server_name,
-                            peer,
-                            &local_ip,
-                            local_port,
-                            &target_scope,
-                            &target,
-                            &target_grant,
-                            &target_resource,
-                            &root,
-                        )
-                    }));
+                if req.handler_probe() {
+                    return Response::prepared_handler(PreparedHandler::FastCgi {
+                        vhost_index: selected_vhost_index(cfg, vhost),
+                        scope: target_scope,
+                        target,
+                        peer,
+                        local_port,
+                        server_name: server_name.to_string(),
+                        local_ip: local_ip.to_string(),
+                        grant: target_grant,
+                        resource: target_resource,
+                        url_path: url_path.clone(),
+                        mapping_root: root,
+                    });
                 }
                 return run_fastcgi(
                     cfg,
@@ -5007,38 +5709,29 @@ fn dispatch_inner(
                 );
             }
             if cgi::is_cgi(cfg, scope, name, script_alias) {
-                if req.body_probe() {
+                if req.handler_probe() {
                     let descriptor_lease = match cfg.resource_budget.try_descriptor() {
                         Ok(lease) => lease,
                         Err(_) => return Response::memory_overload(),
                     };
-                    let vhost_index = selected_vhost_index(cfg, vhost);
-                    let url_path = url_path.clone();
-                    let server_name = server_name.to_string();
-                    let local_ip = local_ip.to_string();
-                    return Response::body_required(Box::new(move |cfg, req| {
-                        let _descriptor_lease = descriptor_lease;
-                        let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
-                        run_cgi(
-                            cfg,
-                            vhost,
-                            req,
-                            &script_root,
-                            &script_rel,
-                            &url_path,
-                            "",
-                            &url_path,
-                            &server_name,
-                            peer,
-                            &local_ip,
-                            local_port,
-                            &target_scope,
-                            &target_grant,
-                            &target_resource,
-                            Some(&file),
-                            Some(&meta),
-                        )
-                    }));
+                    return Response::prepared_handler(PreparedHandler::Cgi {
+                        vhost_index: selected_vhost_index(cfg, vhost),
+                        scope: target_scope,
+                        peer,
+                        local_port,
+                        server_name: server_name.to_string(),
+                        local_ip: local_ip.to_string(),
+                        grant: target_grant,
+                        resource: target_resource,
+                        root: script_root,
+                        script_rel,
+                        url_path: url_path.clone(),
+                        path_info: String::new(),
+                        script_name: url_path.clone(),
+                        script_file: file,
+                        script_meta: meta,
+                        _descriptor_lease: descriptor_lease,
+                    });
                 }
                 return run_cgi(
                     cfg,
@@ -5360,39 +6053,29 @@ fn dispatch_inner(
                         .map(PathBuf::from)
                         .unwrap_or_else(|| st.rel_script.clone());
                     if cgi::is_cgi(cfg, &target_scope, actual_name, script_alias) {
-                        if req.body_probe() {
+                        if req.handler_probe() {
                             let descriptor_lease = match cfg.resource_budget.try_descriptor() {
                                 Ok(lease) => lease,
                                 Err(_) => return Response::memory_overload(),
                             };
-                            let vhost_index = selected_vhost_index(cfg, vhost);
-                            let url_path = url_path.clone();
-                            let path_info = st.path_info.clone();
-                            let server_name = server_name.to_string();
-                            let local_ip = local_ip.to_string();
-                            return Response::body_required(Box::new(move |cfg, req| {
-                                let _descriptor_lease = descriptor_lease;
-                                let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
-                                run_cgi(
-                                    cfg,
-                                    vhost,
-                                    req,
-                                    &script_root,
-                                    &script_rel,
-                                    &url_path,
-                                    &path_info,
-                                    &script_name,
-                                    &server_name,
-                                    peer,
-                                    &local_ip,
-                                    local_port,
-                                    &target_scope,
-                                    &target_grant,
-                                    &target_resource,
-                                    Some(&st.file),
-                                    Some(&st.meta),
-                                )
-                            }));
+                            return Response::prepared_handler(PreparedHandler::Cgi {
+                                vhost_index: selected_vhost_index(cfg, vhost),
+                                scope: target_scope,
+                                peer,
+                                local_port,
+                                server_name: server_name.to_string(),
+                                local_ip: local_ip.to_string(),
+                                grant: target_grant,
+                                resource: target_resource,
+                                root: script_root,
+                                script_rel,
+                                url_path: url_path.clone(),
+                                path_info: st.path_info,
+                                script_name,
+                                script_file: st.file,
+                                script_meta: st.meta,
+                                _descriptor_lease: descriptor_lease,
+                            });
                         }
                         return run_cgi(
                             cfg,
@@ -8061,8 +8744,8 @@ mod tests {
     }
 
     #[test]
-    fn body_route_continuation_does_not_repeat_policy_compilation() {
-        let dir = cov_dir("body-route-continuation");
+    fn prepared_body_handler_does_not_repeat_policy_compilation() {
+        let dir = cov_dir("prepared-body-handler");
         let cfg = cov_config(&dir, "ProxyPass /upload http://127.0.0.1:9/\n");
         let peer = cov_peer();
         let mut request = cov_req("POST", "/upload");
@@ -8073,19 +8756,20 @@ mod tests {
                 cfg.resource_budget.context(peer.ip()),
             ));
 
-        let (continuation, remote_user) =
+        let (handler, remote_user) =
             match probe_request_body(&cfg, &mut request, peer, "127.0.0.1", 80, false) {
                 BodyRouteDecision::Read {
-                    continuation,
+                    handler,
                     remote_user,
-                } => (continuation, remote_user),
+                } => (handler, remote_user),
+                BodyRouteDecision::Drain(_, _) => panic!("proxy route selected static drain"),
                 BodyRouteDecision::Respond(response, _) => {
                     panic!("proxy body route returned {}", response.status)
                 }
             };
         let compiled_work = request.policy_budget().charged_work();
         request.body = b"body".to_vec();
-        let response = execute_body_continuation(&cfg, &mut request, peer, 80, false, continuation);
+        let response = execute_prepared_handler(&cfg, &mut request, peer, 80, false, handler);
         assert_eq!(response.status, 502);
         assert!(remote_user.is_none());
         assert_eq!(
@@ -8189,6 +8873,252 @@ mod tests {
         drop(slow);
         stop.store(true, Ordering::SeqCst);
         handle.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slow_proxy_backend_does_not_retain_the_only_request_worker() {
+        let _test_guard = ADMISSION_TEST_LOCK.lock().unwrap();
+        let dir = cov_dir("async-backend-worker");
+        std::fs::write(dir.join("www/index.html"), "ok\n").unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let upstream_thread = std::thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            accepted_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nslow\n",
+                )
+                .unwrap();
+        });
+
+        let mut cfg = cov_config(
+            &dir,
+            &format!("ProxyPass /slow http://127.0.0.1:{upstream_port}/\n"),
+        );
+        cfg.max_request_workers = 1;
+        let budget = cfg.resource_budget.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bound = vec![Bound {
+            listener,
+            port: addr.port(),
+            addr: "127.0.0.1".into(),
+            tls: None,
+            pending_tls: None,
+        }];
+        let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
+        let stop = server.stop_flag();
+        let server_thread = std::thread::spawn(move || server.run(&bound));
+        let slow_client = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            client
+                .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            response
+        });
+        accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        for _ in 0..100 {
+            if budget.slot_usage(crate::resource::SlotKind::RequestWorker) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::RequestWorker),
+            0,
+            "a stalled proxy backend retained the request worker"
+        );
+
+        let mut fast = TcpStream::connect(addr).unwrap();
+        fast.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        fast.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        fast.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("ok\n"), "{response}");
+
+        release_tx.send(()).unwrap();
+        assert!(slow_client.join().unwrap().starts_with("HTTP/1.1 200"));
+        upstream_thread.join().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        server_thread.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn large_proxy_upload_streams_through_the_bounded_body_channel() {
+        let _test_guard = ADMISSION_TEST_LOCK.lock().unwrap();
+        let dir = cov_dir("streaming-proxy-upload");
+        let body_len = crate::http::MAX_REQUEST_BODY_IN_MEMORY as usize + 64 * 1024;
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let upstream_thread = std::thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let mut request_head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request_head.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request_head.push(byte[0]);
+            }
+            assert!(String::from_utf8_lossy(&request_head)
+                .contains(&format!("Content-Length: {body_len}")));
+            let mut received = 0usize;
+            let mut chunk = [0u8; 64 * 1024];
+            while received < body_len {
+                let want = chunk.len().min(body_len - received);
+                let read = socket.read(&mut chunk[..want]).unwrap();
+                assert_ne!(read, 0);
+                assert!(chunk[..read].iter().all(|byte| *byte == b'u'));
+                received += read;
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n")
+                .unwrap();
+        });
+
+        let mut cfg = cov_config(
+            &dir,
+            &format!("ProxyPass /upload http://127.0.0.1:{upstream_port}/upload\n"),
+        );
+        cfg.max_request_workers = 1;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bound = vec![Bound {
+            listener,
+            port: addr.port(),
+            addr: "127.0.0.1".into(),
+            tls: None,
+            pending_tls: None,
+        }];
+        let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
+        let stop = server.stop_flag();
+        let server_thread = std::thread::spawn(move || server.run(&bound));
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        client
+            .write_all(
+                format!(
+                    "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        client.write_all(&vec![b'u'; body_len]).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("ok\n"), "{response}");
+
+        upstream_thread.join().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        server_thread.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn websocket_tunnel_does_not_retain_the_only_request_worker() {
+        let _test_guard = ADMISSION_TEST_LOCK.lock().unwrap();
+        let dir = cov_dir("websocket-worker-release");
+        std::fs::write(dir.join("www/index.html"), "ok\n").unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let (upgraded_tx, upgraded_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let upstream_thread = std::thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                )
+                .unwrap();
+            upgraded_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let mut cfg = cov_config(
+            &dir,
+            &format!("ProxyPass /ws http://127.0.0.1:{upstream_port}/ws\n"),
+        );
+        cfg.max_request_workers = 1;
+        let budget = cfg.resource_budget.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bound = vec![Bound {
+            listener,
+            port: addr.port(),
+            addr: "127.0.0.1".into(),
+            tls: None,
+            pending_tls: None,
+        }];
+        let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
+        let stop = server.stop_flag();
+        let server_thread = std::thread::spawn(move || server.run(&bound));
+
+        let mut websocket = TcpStream::connect(addr).unwrap();
+        websocket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        websocket
+            .write_all(cov_ws_request("/ws").as_bytes())
+            .unwrap();
+        let mut response_head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !response_head.ends_with(b"\r\n\r\n") {
+            websocket.read_exact(&mut byte).unwrap();
+            response_head.push(byte[0]);
+        }
+        assert!(response_head.starts_with(b"HTTP/1.1 101"));
+        upgraded_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        for _ in 0..100 {
+            if budget.slot_usage(crate::resource::SlotKind::RequestWorker) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::RequestWorker),
+            0,
+            "a WebSocket tunnel retained the request worker"
+        );
+
+        let mut fast = TcpStream::connect(addr).unwrap();
+        fast.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        fast.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        fast.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        release_tx.send(()).unwrap();
+        drop(websocket);
+        upstream_thread.join().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        server_thread.join().unwrap().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

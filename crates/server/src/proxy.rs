@@ -198,7 +198,7 @@ impl Read for DeadlineStream {
             if Instant::now() >= self.deadline {
                 return Err(self.timed_out());
             }
-            match self.inner.read(buf) {
+            match crate::fault::hit("proxy.read").and_then(|()| self.inner.read(buf)) {
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -216,7 +216,7 @@ impl Write for DeadlineStream {
             if Instant::now() >= self.deadline {
                 return Err(self.timed_out());
             }
-            match self.inner.write(buf) {
+            match crate::fault::hit("proxy.write").and_then(|()| self.inner.write(buf)) {
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -232,7 +232,7 @@ impl Write for DeadlineStream {
             if Instant::now() >= self.deadline {
                 return Err(self.timed_out());
             }
-            match self.inner.flush() {
+            match crate::fault::hit("proxy.flush").and_then(|()| self.inner.flush()) {
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -3163,6 +3163,52 @@ mod tests {
     use std::fs;
     use std::net::TcpListener;
 
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn injected_proxy_transport_failures_retry_or_propagate() {
+        let _fault_guard = crate::fault::test_guard();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut reader = DeadlineStream {
+            inner: Box::new(std::io::Cursor::new(b"reply".to_vec())),
+            deadline,
+        };
+        crate::fault::configure("proxy.read", 0, std::io::ErrorKind::WouldBlock);
+        let mut byte = [0u8; 1];
+        assert_eq!(reader.read(&mut byte).unwrap(), 1);
+        assert_eq!(byte, [b'r']);
+        crate::fault::configure("proxy.read", 0, std::io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            reader.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+
+        let mut writer = DeadlineStream {
+            inner: Box::new(std::io::Cursor::new(Vec::new())),
+            deadline,
+        };
+        crate::fault::configure("proxy.write", 0, std::io::ErrorKind::TimedOut);
+        assert_eq!(writer.write(b"request").unwrap(), 7);
+        crate::fault::configure("proxy.flush", 0, std::io::ErrorKind::WouldBlock);
+        writer.flush().unwrap();
+
+        let mut expired = DeadlineStream {
+            inner: Box::new(std::io::Cursor::new(Vec::new())),
+            deadline: Instant::now() - Duration::from_millis(1),
+        };
+        assert_eq!(
+            expired.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            expired.write(b"x").unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            expired.flush().unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
     fn config(root: &Path) -> Config {
         let path = root.join("httpd.conf");
         fs::write(&path, "Listen 127.0.0.1:0\n").unwrap();
@@ -6012,6 +6058,47 @@ mod coverage_tests {
                 .kind(),
             std::io::ErrorKind::TimedOut
         );
+        if !resolver_daemon_is_built() {
+            return;
+        }
+
+        // `ip6-localhost` bypasses the literal localhost fast path while still
+        // resolving entirely through the host's local resolver configuration.
+        let (reply, _rx) = mpsc::channel();
+        let local_dns = DnsJob {
+            host: "ip6-localhost".into(),
+            port: 8081,
+            deadline: Instant::now() + Duration::from_secs(2),
+            reply,
+        };
+        let resolved = isolated_dns_lookup(&local_dns, &mut Vec::new()).unwrap();
+        assert!(!resolved.is_empty());
+        assert!(resolved.iter().all(|address| address.port() == 8081));
+
+        let cached = resolve_backend_addrs("ip6-localhost", 8082, Duration::from_secs(2)).unwrap();
+        assert!(!cached.is_empty());
+        assert_eq!(
+            resolve_backend_addrs("IP6-LOCALHOST", 8082, Duration::from_secs(2)).unwrap(),
+            cached
+        );
+    }
+
+    #[tokio::test]
+    async fn async_dns_resolution_uses_the_isolated_worker_and_cache() {
+        if !resolver_daemon_is_built() {
+            return;
+        }
+        let first = resolve_backend_addrs_async("ip6-localhost", 8083, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(!first.is_empty());
+        assert!(first.iter().all(|address| address.port() == 8083));
+        assert_eq!(
+            resolve_backend_addrs_async("IP6-LOCALHOST", 8083, Duration::from_secs(2))
+                .await
+                .unwrap(),
+            first
+        );
     }
 
     #[tokio::test]
@@ -6027,4 +6114,13 @@ mod coverage_tests {
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
+}
+#[cfg(test)]
+fn resolver_daemon_is_built() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "deps"))
+        .and_then(|deps| deps.parent().map(|target| target.join("vapached")))
+        .is_some_and(|daemon| daemon.is_file())
 }

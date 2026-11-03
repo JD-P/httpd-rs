@@ -11350,6 +11350,263 @@ mod tests {
     }
 
     #[test]
+    fn coverable_parser_rejection_edges_are_explicit() {
+        let strings = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(parse_http_protocols(&[]).is_err());
+        assert!(parse_http_protocols(&strings(&["h2c"])).is_err());
+        assert!(parse_http_protocols(&strings(&["spdy/3"])).is_err());
+
+        assert!(ifversion_matches(&strings(&[])).is_err());
+        assert!(ifversion_matches(&strings(&["2..4"])).is_err());
+        assert!(ifversion_matches(&strings(&["~", "2.4"])).is_err());
+        assert!(ifversion_matches(&strings(&["=", "/2\\.4/"])).is_err());
+        assert!(!ifversion_matches(&strings(&["!<", "2.5"])).unwrap());
+        assert!(ifversion_matches(&strings(&["<", "3"])).unwrap());
+        assert!(ifversion_matches(&strings(&["<>", "2.4"])).is_err());
+
+        for invalid in [
+            "unix:relative.sock",
+            "unix:/run/../tmp/fcgi.sock",
+            "http://host:9000",
+            "fcgi://",
+            "fcgi://host/path",
+            "fcgi://[::1",
+            "fcgi://[::1]suffix",
+            "fcgi://[::1]:nope",
+            "fcgi://::1",
+            "fcgi://host:nope",
+            "fcgi://:9000",
+            "fcgi://host:0",
+        ] {
+            assert!(
+                parse_fastcgi_policy_endpoint(invalid).is_err(),
+                "{invalid} must fail"
+            );
+        }
+        assert!(matches!(
+            parse_fastcgi_policy_endpoint("fcgi://EXAMPLE.test").unwrap(),
+            FastCgiEndpoint::Tcp { ref host, port } if host == "example.test" && port == 9000
+        ));
+        assert!(matches!(
+            parse_fastcgi_policy_endpoint("fcgi://[::1]:9001").unwrap(),
+            FastCgiEndpoint::Tcp { ref host, port } if host == "::1" && port == 9001
+        ));
+
+        assert!(parse_redirect_arguments(&strings(&["/from"]), Some(301)).is_err());
+        assert!(parse_redirect_arguments(&[], None).is_err());
+        assert!(parse_redirect_arguments(&strings(&["299", "/from", "/to"]), None).is_err());
+        assert!(parse_redirect_arguments(&strings(&["301", "/from"]), None).is_err());
+        assert!(parse_redirect_arguments(&strings(&["410", "/from", "/to"]), None).is_err());
+        assert!(parse_redirect_arguments(&strings(&["mystery"]), None).is_err());
+
+        assert!(validate_glob_pattern(&"x".repeat(crate::glob::MAX_PATTERN_BYTES + 1)).is_err());
+        for (provider, operand) in [
+            ("host", "%{UNKNOWN}"),
+            ("host", "%{HTTP_HOST"),
+            ("user", "%{UNKNOWN}"),
+            ("group", "%{UNKNOWN}"),
+        ] {
+            assert!(matches!(
+                parse_require(&strings(&[provider, operand])),
+                Require::Unsupported(_)
+            ));
+        }
+        assert!(matches!(
+            parse_require(&strings(&["host", "%{HTTP:X-Test}", "%{ENV:ZONE}"])),
+            Require::Host { .. }
+        ));
+
+        assert!(parse_env_rule("setenvif", &strings(&["remote_host", "x", "MATCH"])).is_err());
+        assert!(parse_env_rule("setenvif", &strings(&["X-(.*)", "x", "MATCH"])).is_err());
+    }
+
+    #[test]
+    fn coverable_environment_protocol_and_fastcgi_origin_edges_are_explicit() {
+        let mut scope = Scope::default();
+        for (attribute, pattern, action) in [
+            ("Request_Protocol", "^HTTP/1\\.0$", "HTTP10=1"),
+            ("Request_Protocol", "^HTTP/2\\.0$", "HTTP2=1"),
+            ("Host", "^$", "NO_HOST=1"),
+            ("Referer", "^$", "NO_REFERER=1"),
+        ] {
+            scope.environment_policy.set_env_if.push(Originated::main(
+                parse_env_rule(
+                    "setenvif",
+                    &[attribute.into(), pattern.into(), action.into()],
+                )
+                .unwrap(),
+            ));
+        }
+        let peer = "127.0.0.1".parse().unwrap();
+        let mut http10 = test_request("GET");
+        http10.version = crate::http::Version::Http10;
+        let env10 = scope.authorization_env(&http10, "/", peer);
+        assert!(env10.contains(&("HTTP10".into(), b"1".to_vec())));
+        assert!(env10.contains(&("NO_HOST".into(), b"1".to_vec())));
+        assert!(env10.contains(&("NO_REFERER".into(), b"1".to_vec())));
+
+        let mut http2 = test_request("GET");
+        http2.version = crate::http::Version::Http2;
+        assert!(scope
+            .authorization_env(&http2, "/", peer)
+            .contains(&("HTTP2".into(), b"1".to_vec())));
+
+        scope
+            .environment_policy
+            .rewrite_env
+            .push(Originated::access(("ACCESS_EARLY".into(), b"1".to_vec())));
+        scope
+            .environment_policy
+            .rewrite_unset_env
+            .push(Originated::access("ACCESS_EARLY".into()));
+        scope
+            .environment_policy
+            .rewrite_late_unset_env
+            .push(Originated::access("ACCESS_LATE".into()));
+        scope
+            .environment_policy
+            .pass_env
+            .push(Originated::access("PATH".into()));
+        scope
+            .environment_policy
+            .pass_env
+            .push(Originated::main("VAPACHE_TEST_MISSING_ENV".into()));
+        scope
+            .environment_policy
+            .unset_env
+            .push(Originated::access("ACCESS_UNSET".into()));
+        let fastcgi = scope.fastcgi_env(&http2, "/", peer);
+        for forbidden in ["ACCESS_EARLY", "ACCESS_LATE", "ACCESS_UNSET"] {
+            assert!(!fastcgi.iter().any(|(name, _)| name == forbidden));
+        }
+    }
+
+    #[test]
+    fn coverable_directive_rejection_matrix_is_executed() {
+        let oversized_glob = "x".repeat(crate::glob::MAX_PATTERN_BYTES + 1);
+        let cases = [
+            ("VapacheCapability Cgi\n".to_string(), "capability arity"),
+            (
+                "VapacheMaxSpoolBytes 1 2\n".to_string(),
+                "resource-limit arity",
+            ),
+            (
+                "VapacheFastCGIStablePath On unix:/run/php/test.sock 33 0 nope\n".to_string(),
+                "trusted FastCGI owner uid",
+            ),
+            (
+                "<VirtualHost *:80>\nServerAlias foo*bar.example\n</VirtualHost>\n".to_string(),
+                "server-alias wildcard",
+            ),
+            (format!("IndexIgnore {oversized_glob}\n"), "oversized IndexIgnore"),
+            (
+                "<Directory /tmp>\nAllowOverride\n</Directory>\n".to_string(),
+                "empty AllowOverride",
+            ),
+            (
+                "<Directory /tmp>\nAllowOverrideList\n</Directory>\n".to_string(),
+                "empty AllowOverrideList",
+            ),
+            (
+                "<Directory /tmp>\nAllow 127.0.0.1\n</Directory>\n".to_string(),
+                "Allow without from",
+            ),
+            (
+                "RedirectMatch 302 [ /target\n".to_string(),
+                "invalid RedirectMatch regex",
+            ),
+            (
+                "RedirectMatch 302 ^/from$\n".to_string(),
+                "RedirectMatch missing target",
+            ),
+            ("RewriteMap\n".to_string(), "RewriteMap arity"),
+            (
+                "RewriteMap map dbm:/tmp/map\n".to_string(),
+                "unsupported RewriteMap type",
+            ),
+            ("Header\n".to_string(), "Header arity"),
+            (
+                "ExpiresByType text/plain nonsense\n".to_string(),
+                "invalid expiry syntax",
+            ),
+            (
+                "CacheLastModifiedFactor NaN\n".to_string(),
+                "invalid cache factor",
+            ),
+            (
+                "ProxyPass /app http://127.0.0.1:9000/ broken\n".to_string(),
+                "ProxyPass parameter shape",
+            ),
+            (
+                "AddOutputFilterByType DEFLATE\n".to_string(),
+                "output-filter arity",
+            ),
+            (
+                "BrotliAlterETag Invalid\n".to_string(),
+                "Brotli ETag mode",
+            ),
+            (
+                "Listen 127.0.0.1:0 spdy\n".to_string(),
+                "Listen protocol hint",
+            ),
+            ("LogLevel impossible\n".to_string(), "invalid LogLevel"),
+            ("TraceEnable impossible\n".to_string(), "invalid TraceEnable"),
+            (
+                "MaxRequestWorkers 0\n".to_string(),
+                "zero MaxRequestWorkers",
+            ),
+            (
+                "ServerLimit 1\nMaxRequestWorkers 2\n".to_string(),
+                "workers above prior limit",
+            ),
+            (
+                "MaxRequestWorkers 2\nServerLimit 1\n".to_string(),
+                "workers above later limit",
+            ),
+            ("ListenBacklog 0\n".to_string(), "invalid listen backlog"),
+            (
+                "SSLCertificateFile\n".to_string(),
+                "certificate path arity",
+            ),
+            (
+                "SSLStaplingStandardCacheTimeout nope\n".to_string(),
+                "stapling cache timeout",
+            ),
+            (
+                "<Proxy balancer://pool>\nBalancerMember http://127.0.0.1:9000 broken hcinterval=nope hcpasses=nope hcfails=nope unknown=x\nProxySet broken hcinterval=nope hcpasses=nope hcfails=nope unknown=x\n</Proxy>\n".to_string(),
+                "balancer parameter matrix",
+            ),
+            (
+                "ProxyHCTemplate t broken hcinterval=nope hcpasses=nope hcfails=nope unknown=x\n"
+                    .to_string(),
+                "health-template parameter matrix",
+            ),
+            ("SSLVerifyClient\n".to_string(), "client verify arity"),
+            (
+                "SSLCACertificateFile one two\n".to_string(),
+                "client CA path arity",
+            ),
+            ("SSLProtocol\n".to_string(), "empty TLS protocol policy"),
+            (
+                "<Directory /tmp>\nAuthType Digest\n</Directory>\n".to_string(),
+                "unsupported authentication type",
+            ),
+        ];
+        for (snippet, label) in cases {
+            assert!(
+                load_text(&format!("Listen 127.0.0.1:0\n{snippet}"), false).is_err(),
+                "{label} was unexpectedly accepted: {snippet}"
+            );
+        }
+    }
+
+    #[test]
     fn rewritemap_loading_fails_closed() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("vapache-rewritemap-{}", std::process::id()));

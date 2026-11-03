@@ -8,7 +8,7 @@
 //! responses, preventing response splitting.
 
 use crate::config::{Config, VHost};
-use crate::http::{Headers, Request, Response, Version};
+use crate::http::{Headers, Request, RequestBodyReader, Response, Version};
 use crate::util::trim_ascii;
 use crate::verified::valid_token;
 use std::ffi::OsString;
@@ -37,6 +37,10 @@ const CGI_BODY_IN_MEMORY: u64 = 1024 * 1024;
 enum BodySource {
     Bytes(Vec<u8>),
     File(File),
+    Stream {
+        reader: Mutex<Option<RequestBodyReader>>,
+        len: u64,
+    },
 }
 
 impl BodySource {
@@ -44,6 +48,7 @@ impl BodySource {
         match self {
             BodySource::Bytes(bytes) => bytes.len() as u64,
             BodySource::File(file) => file.metadata().map(|m| m.len()).unwrap_or(0),
+            BodySource::Stream { len, .. } => *len,
         }
     }
 
@@ -55,6 +60,12 @@ impl BodySource {
                 clone.seek(SeekFrom::Start(0))?;
                 Ok(Box::new(clone))
             }
+            BodySource::Stream { reader, .. } => reader
+                .lock()
+                .map_err(|_| std::io::Error::other("CGI body stream lock poisoned"))?
+                .take()
+                .map(|reader| Box::new(reader) as Box<dyn Read + Send>)
+                .ok_or_else(|| std::io::Error::other("CGI body stream already consumed")),
         }
     }
 }
@@ -375,7 +386,11 @@ pub fn execute(ctx: &CgiContext) -> Response {
     // in-memory case is copied, so concurrent CGI POSTs no longer multiply
     // LimitRequestBody-sized allocations.
     let body = match ctx.req.body_reader() {
-        Some(Ok(file)) => BodySource::File(file),
+        Some(Ok(RequestBodyReader::File(file))) => BodySource::File(file),
+        Some(Ok(reader)) => BodySource::Stream {
+            reader: Mutex::new(Some(reader)),
+            len: ctx.req.body_len(),
+        },
         _ => BodySource::Bytes(ctx.req.body.clone()),
     };
 
@@ -466,8 +481,9 @@ fn execute_via_pool(
     expected: Option<(u64, u64)>,
     resource_context: &crate::resource::ResourceContext,
 ) -> Option<Response> {
-    let _worker_spool_lease = match body {
-        BodySource::File(_) => {
+    let stream_body = matches!(body, BodySource::Stream { .. });
+    let mut worker_spool_lease = match body {
+        BodySource::File(_) | BodySource::Stream { .. } => {
             let mut lease = match ctx.cfg.resource_budget.try_spool_in(
                 ctx.cfg.max_spool_bytes,
                 ctx.cfg.max_spool_files,
@@ -479,9 +495,11 @@ fn execute_via_pool(
                     return Some(cgi_status_error(ctx, 503));
                 }
             };
-            if let Err(e) = lease.reserve(body.len()) {
-                eprintln!("vapached: CGI worker spool admission failed: {e}");
-                return Some(cgi_status_error(ctx, 503));
+            if !stream_body {
+                if let Err(e) = lease.reserve(body.len()) {
+                    eprintln!("vapached: CGI worker spool admission failed: {e}");
+                    return Some(cgi_status_error(ctx, 503));
+                }
             }
             Some(lease)
         }
@@ -496,6 +514,7 @@ fn execute_via_pool(
         Ok(lease) => lease,
         Err(_) => return Some(cgi_status_error(ctx, 503)),
     };
+    let incremental_spool = stream_body.then(|| worker_spool_lease.as_mut()).flatten();
     match exchange(
         &mut worker.stream,
         path,
@@ -505,6 +524,7 @@ fn execute_via_pool(
         ctx.cfg.timeout,
         expected,
         Some(&mut response_lease),
+        incremental_spool,
     ) {
         Ok((out, stderr)) => {
             pool.put(worker);
@@ -957,6 +977,7 @@ fn exchange(
     timeout: Duration,
     expected: Option<(u64, u64)>,
     response_lease: Option<&mut crate::resource::ResidentLease>,
+    mut request_spool_lease: Option<&mut crate::resource::SpoolLease>,
 ) -> Result<(Vec<u8>, String), String> {
     write_bytes(stream, path.as_os_str().as_bytes())?;
     match expected {
@@ -976,7 +997,21 @@ fn exchange(
     let body_len = body.len();
     write_u64(stream, body_len)?;
     let mut reader = body.reader().map_err(|e| e.to_string())?;
-    let copied = std::io::copy(&mut reader, stream).map_err(|e| e.to_string())?;
+    let mut copied = 0u64;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut chunk).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        if let Some(lease) = request_spool_lease.as_mut() {
+            lease.reserve(read as u64).map_err(|e| e.to_string())?;
+        }
+        stream
+            .write_all(&chunk[..read])
+            .map_err(|e| e.to_string())?;
+        copied += read as u64;
+    }
     if copied != body_len {
         return Err("short CGI body".into());
     }
@@ -1878,6 +1913,7 @@ mod tests {
             Duration::from_secs(1),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(out, b"out");
@@ -1900,6 +1936,7 @@ mod tests {
             &[],
             &BodySource::Bytes(Vec::new()),
             Duration::from_secs(1),
+            None,
             None,
             None,
         )
@@ -2400,6 +2437,7 @@ mod tests {
             Duration::from_secs(1),
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert_eq!(err, "CGI worker reported failure");
@@ -2427,6 +2465,7 @@ mod tests {
                 &[],
                 &BodySource::File(file),
                 Duration::from_secs(1),
+                None,
                 None,
                 None,
             )

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Concurrent valid/malformed connection soak with an RSS-growth ceiling."""
 
+import grp
 import os
+import pwd
 import random
 import socket
 import subprocess
@@ -14,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target/release/vapached"))
 DURATION = int(os.environ.get("SOAK_SECONDS", "30"))
 WORKERS = int(os.environ.get("SOAK_WORKERS", "24"))
+SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
+SERVICE_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
 
 
 def free_port():
@@ -29,11 +33,14 @@ def rss_kib(pid):
     return 0
 
 
-def health(port):
+def probe(port):
     with socket.create_connection(("127.0.0.1", port), timeout=2) as stream:
         stream.sendall(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        response = stream.recv(4096)
-    return b" 200 " in response
+        return stream.recv(4096)
+
+
+def health(port):
+    return b" 200 " in probe(port)
 
 
 def worker(port, stop, failures, seed):
@@ -71,6 +78,9 @@ def main():
         base = Path(temporary)
         (base / "logs").mkdir()
         (base / "www").mkdir()
+        base.chmod(0o755)
+        (base / "logs").chmod(0o755)
+        (base / "www").chmod(0o755)
         (base / "www/index.html").write_text("healthy\n")
         port = free_port()
         config = base / "httpd.conf"
@@ -78,6 +88,8 @@ def main():
 Listen 127.0.0.1:{port}
 PidFile "{base}/logs/vapached.pid"
 ErrorLog "{base}/logs/error.log"
+User {SERVICE_USER}
+Group {SERVICE_GROUP}
 ServerName localhost
 TraceEnable Off
 KeepAlive On
@@ -105,7 +117,18 @@ DocumentRoot "{base}/www"
                         pass
                     time.sleep(0.05)
                 else:
-                    raise AssertionError("vapached did not become healthy")
+                    output.flush()
+                    details = (base / "logs/process.log").read_text(errors="replace")
+                    error_log = base / "logs/error.log"
+                    if error_log.exists():
+                        details += error_log.read_text(errors="replace")
+                    try:
+                        details += f"\nlast probe: {probe(port)!r}"
+                    except OSError as error:
+                        details += f"\nlast probe failed: {error}"
+                    raise AssertionError(
+                        f"vapached did not become healthy (status={process.poll()}):\n{details}"
+                    )
                 baseline = rss_kib(process.pid)
                 stop = threading.Event()
                 failures = []

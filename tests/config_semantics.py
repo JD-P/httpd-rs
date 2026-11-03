@@ -3192,8 +3192,22 @@ def main():
                 case_file(case, rel, content)
 
         failures = 0
+        burst_requests = 0
         for case in CASES:
+            # The corpus intentionally creates a fresh .htaccess file for
+            # almost every case.  That is useful for parser coverage, but it
+            # is unlike ordinary traffic (where parsed access files are
+            # cached) and can otherwise trip Vapache's per-client expensive-
+            # operation rate limit before semantic comparison is complete.
+            # Pace actual requests rather than cases because one case may
+            # issue several methods, each with more than one policy matcher.
+            # Sixteen requests leaves headroom below the 64-operation window.
+            case_requests = max(1, len(case.get("requests", [])))
+            if burst_requests and burst_requests + case_requests > 16:
+                time.sleep(1.05)
+                burst_requests = 0
             problems = run_case(case, args.verbose)
+            burst_requests += case_requests
             if problems and case.get("known_divergence"):
                 print(f"KNOWN {case['name']}: {case['known_divergence']}")
                 for p in problems:

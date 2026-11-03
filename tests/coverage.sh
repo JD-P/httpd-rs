@@ -14,38 +14,51 @@ HOST="$(rustc -vV | awk '/^host:/ {print $2}')"
 LLVM_BIN="$SYSROOT/lib/rustlib/$HOST/bin"
 PROFILE_DIR="${PROFILE_DIR:-/tmp/vapcov}"
 
+if [ ! -x "$LLVM_BIN/llvm-profdata" ] || [ ! -x "$LLVM_BIN/llvm-cov" ]; then
+    echo "coverage: missing llvm-tools-preview for $(rustc --version)" >&2
+    echo "coverage: install it with: rustup component add llvm-tools-preview" >&2
+    exit 1
+fi
+if ! command -v apache2 >/dev/null 2>&1; then
+    echo "coverage: Apache is required for the configuration differential corpus" >&2
+    exit 1
+fi
+
 rm -rf target/cov "$PROFILE_DIR"
 mkdir -p "$PROFILE_DIR"
 chmod 777 "$PROFILE_DIR"
 
 COVERAGE_RUSTFLAGS="-C instrument-coverage -C llvm-args=-runtime-counter-relocation"
+# ThinLTO rewrites coverage-instrumented Rust functions after their profile
+# hashes and source mappings have been emitted. Rust 1.99 then reports those
+# functions as mismatched and may discard their counters. Production releases
+# retain ThinLTO; the semantically equivalent coverage build disables it so
+# the measurement itself is stable.
+export CARGO_PROFILE_RELEASE_LTO=false
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 
 CARGO_TARGET_DIR=target/cov RUSTFLAGS="$COVERAGE_RUSTFLAGS" \
     cargo build --release -p vapached
 
 CARGO_TARGET_DIR=target/cov RUSTFLAGS="$COVERAGE_RUSTFLAGS" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/unit-%p-%m%c.profraw" \
-    cargo test -p vapached -- --test-threads=1
+    cargo test -p vapached --features fault-injection -- --test-threads=1
 
-if command -v apache2 >/dev/null 2>&1; then
-    VAPACHED="$PWD/target/cov/release/vapached" \
-    LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
-    PYTHONDONTWRITEBYTECODE=1 \
-        python3 tests/config_grammar.py
+VAPACHED="$PWD/target/cov/release/vapached" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
+PYTHONDONTWRITEBYTECODE=1 \
+    python3 tests/config_grammar.py
 
-    VAPACHED="$PWD/target/cov/release/vapached" \
-    LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
-    PYTHONDONTWRITEBYTECODE=1 \
-        python3 tests/config_validity.py
+VAPACHED="$PWD/target/cov/release/vapached" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
+PYTHONDONTWRITEBYTECODE=1 \
+    python3 tests/config_validity.py
 
-    VAPACHED="$PWD/target/cov/release/vapached" \
-    LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
-    PYTHONDONTWRITEBYTECODE=1 \
-        python3 tests/config_semantics.py --random 128 --seed 2469 \
-            --stateful 128 --stateful-seed 1818
-else
-    echo "coverage: Apache not found; skipping differential config suites"
-fi
+VAPACHED="$PWD/target/cov/release/vapached" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
+PYTHONDONTWRITEBYTECODE=1 \
+    python3 tests/config_semantics.py --random 128 --seed 2469 \
+        --stateful 128 --stateful-seed 1818
 
 VAPACHED="$PWD/target/cov/release/vapached" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
@@ -57,20 +70,8 @@ LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/adversarial_regressions.py
 
-"$LLVM_BIN/llvm-profdata" merge -sparse -failure-mode=all "$PROFILE_DIR"/*.profraw \
-    -o "$PROFILE_DIR/all.profdata"
-
-# Pass the release binary plus every instrumented test executable so the
-# report covers both the daemon and the unit-test-only code paths.
-set -- target/cov/release/vapached
-if [ -x target/cov/debug/vapached ]; then
-    set -- "$@" -object target/cov/debug/vapached
-fi
-for bin in target/cov/debug/deps/vapache*; do
-    if [ -x "$bin" ] && [ ! -d "$bin" ]; then
-        set -- "$@" -object "$bin"
-    fi
-done
-"$LLVM_BIN/llvm-cov" report "$@" \
-    -instr-profile="$PROFILE_DIR/all.profdata" \
-    --ignore-filename-regex='(\.cargo|rustc|/root/\.rustup)'
+# The post-processor groups raw profiles by exact binary build id before
+# exporting LCOV. This avoids Rust symbol collisions between the release
+# daemon, unit harnesses, integration tests, build scripts and proc macros.
+SECURITY_COVERAGE_PROFILE="$PROFILE_DIR/all.profdata" \
+    python3 tests/security_coverage.py --check

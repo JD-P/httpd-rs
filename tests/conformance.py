@@ -2830,14 +2830,14 @@ DIFFERENTIAL = False
 
 
 class TlsTests(unittest.TestCase):
-    def curl(self, port, path, *extra):
+    def curl(self, port, path, *extra, input=None):
         proc = subprocess.run(
             [
                 "curl", "--silent", "--show-error", "--insecure", "--noproxy", "*",
                 "--output", "-", "--write-out", "\n%{http_version} %{http_code}",
                 *extra, f"https://127.0.0.1:{port}{path}",
             ],
-            capture_output=True, timeout=20,
+            input=input, capture_output=True, timeout=20,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr.decode("latin-1", "replace"))
         body, _, meta = proc.stdout.rpartition(b"\n")
@@ -2851,6 +2851,50 @@ class TlsTests(unittest.TestCase):
         r = conn.getresponse()
         self.assertEqual((r.status, r.read()), (200, b"hello world\n"))
         conn.close()
+
+    def test_tls_http11_backend_and_body_phases(self):
+        # Keep HTTP/1.1 covered independently from HTTP/2: the TLS adapter
+        # deliberately has separate lazy-body and backend dispatch phases.
+        version, status, body = self.curl(
+            VP_TLS_PORT, "/cgi-bin/env.sh", "--http1.1"
+        )
+        self.assertEqual((version, status), ("1.1", 200))
+        self.assertIn(b"METHOD=GET", body)
+
+        version, status, body = self.curl(
+            VP_TLS_PORT,
+            "/cgi-bin/env.sh",
+            "--http1.1",
+            "--data-binary",
+            "payload=small",
+        )
+        self.assertEqual((version, status), ("1.1", 200))
+        self.assertIn(b"BODY=payload=small", body)
+
+        # Cross the 1 MiB in-memory request-body boundary so the TLS socket
+        # task and CGI backend communicate through the bounded streaming pump.
+        large = "x" * (1024 * 1024 + 64 * 1024)
+        version, status, body = self.curl(
+            VP_TLS_PORT,
+            "/cgi-bin/env.sh",
+            "--http1.1",
+            "--data-binary",
+            "@-",
+            input=large.encode(),
+        )
+        self.assertEqual((version, status), ("1.1", 200))
+        self.assertIn(large[:64].encode(), body)
+
+        version, status, _ = self.curl(
+            VP_TLS_PORT,
+            "/auth/protected.txt",
+            "--http1.1",
+            "--data-binary",
+            "discard-me",
+            "-H",
+            "Expect: 100-continue",
+        )
+        self.assertEqual((version, status), ("1.1", 401))
 
     def test_tls_http2(self):
         version, status, body = self.curl(VP_TLS_PORT, "/hello.txt", "--http2")

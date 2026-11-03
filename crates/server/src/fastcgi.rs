@@ -695,6 +695,7 @@ fn connect_unix_timeout(path: &Path, deadline: Instant) -> io::Result<UnixStream
             "invalid FastCGI Unix socket path",
         ));
     }
+    crate::fault::hit("fastcgi.unix.socket")?;
     // SAFETY: socket has no pointer operands. A successful descriptor is
     // immediately placed under the guard below.
     let fd = unsafe {
@@ -918,7 +919,7 @@ impl Read for DeadlineStream {
             if Instant::now() >= self.deadline {
                 return Err(self.timeout_error());
             }
-            match self.inner.read(buf) {
+            match crate::fault::hit("fastcgi.read").and_then(|()| self.inner.read(buf)) {
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -936,7 +937,7 @@ impl Write for DeadlineStream {
             if Instant::now() >= self.deadline {
                 return Err(self.timeout_error());
             }
-            match self.inner.write(buf) {
+            match crate::fault::hit("fastcgi.write").and_then(|()| self.inner.write(buf)) {
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -952,7 +953,7 @@ impl Write for DeadlineStream {
             if Instant::now() >= self.deadline {
                 return Err(self.timeout_error());
             }
-            match self.inner.flush() {
+            match crate::fault::hit("fastcgi.flush").and_then(|()| self.inner.flush()) {
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -1603,6 +1604,58 @@ mod tests {
         )
         .unwrap();
         Config::load(&path, root, &HashMap::new(), &HashMap::new(), false).unwrap()
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn injected_fastcgi_transport_failures_retry_or_propagate() {
+        let _fault_guard = crate::fault::test_guard();
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let mut reader = DeadlineStream {
+            inner: Box::new(std::io::Cursor::new(b"reply".to_vec())),
+            deadline,
+        };
+        crate::fault::configure("fastcgi.read", 0, io::ErrorKind::WouldBlock);
+        let mut byte = [0u8; 1];
+        assert_eq!(reader.read(&mut byte).unwrap(), 1);
+        assert_eq!(byte, [b'r']);
+        crate::fault::configure("fastcgi.read", 0, io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            reader.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::ConnectionReset
+        );
+
+        let mut writer = DeadlineStream {
+            inner: Box::new(std::io::Cursor::new(Vec::new())),
+            deadline,
+        };
+        crate::fault::configure("fastcgi.write", 0, io::ErrorKind::TimedOut);
+        assert_eq!(writer.write(b"request").unwrap(), 7);
+        crate::fault::configure("fastcgi.flush", 0, io::ErrorKind::WouldBlock);
+        writer.flush().unwrap();
+
+        let mut expired = DeadlineStream {
+            inner: Box::new(std::io::Cursor::new(Vec::new())),
+            deadline: Instant::now() - Duration::from_millis(1),
+        };
+        assert_eq!(
+            expired.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            expired.write(b"x").unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(expired.flush().unwrap_err().kind(), io::ErrorKind::TimedOut);
+
+        crate::fault::configure("fastcgi.unix.socket", 0, io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            connect_unix_timeout(Path::new("/tmp/unreached.sock"), deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]

@@ -38,21 +38,29 @@ const RESOLVE_BENEATH: u64 = 0x08;
 fn openat2_file(dir: &File, path: &CStr, how: &OpenHow) -> io::Result<File> {
     const MAX_TRANSIENT_RETRIES: usize = 8;
     for attempt in 0..=MAX_TRANSIENT_RETRIES {
-        let file = unsafe {
-            let fd = libc::syscall(
-                libc::SYS_openat2,
-                dir.as_raw_fd(),
-                path.as_ptr(),
-                how as *const OpenHow,
-                std::mem::size_of::<OpenHow>(),
-            );
-            (fd >= 0).then(|| File::from_raw_fd(fd as i32))
+        let injected = crate::fault::hit("fs.openat2").err();
+        let file = if injected.is_none() {
+            unsafe {
+                let fd = libc::syscall(
+                    libc::SYS_openat2,
+                    dir.as_raw_fd(),
+                    path.as_ptr(),
+                    how as *const OpenHow,
+                    std::mem::size_of::<OpenHow>(),
+                );
+                (fd >= 0).then(|| File::from_raw_fd(fd as i32))
+            }
+        } else {
+            None
         };
         if let Some(file) = file {
             return Ok(file);
         }
-        let error = io::Error::last_os_error();
-        let transient = matches!(error.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EINTR));
+        let error = injected.unwrap_or_else(io::Error::last_os_error);
+        let transient = matches!(
+            error.kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+        ) || matches!(error.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EINTR));
         if !transient || attempt == MAX_TRANSIENT_RETRIES {
             return Err(error);
         }
@@ -174,7 +182,8 @@ pub fn read_admin_file_with_trust(
     let mut data = Vec::with_capacity(before.len().min(max_bytes) as usize);
     file.by_ref().take(max_bytes + 1).read_to_end(&mut data)?;
     let after = file.metadata()?;
-    if data.len() as u64 > max_bytes
+    if crate::fault::hit("fs.admin.post_read.identity").is_err()
+        || data.len() as u64 > max_bytes
         || before.dev() != after.dev()
         || before.ino() != after.ino()
         || before.len() != after.len()
@@ -1763,6 +1772,16 @@ fn error_response_inner(
             }
         }
     }
+    default_error_response(cfg, status, url_path, port, host)
+}
+
+fn default_error_response(
+    cfg: &Config,
+    status: u16,
+    url_path: &str,
+    port: u16,
+    host: &str,
+) -> Response {
     let reason = reason_phrase(status);
     let mut body = String::new();
     body.push_str("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n<html><head>\n<title>");
@@ -1801,6 +1820,19 @@ pub fn error_response(
     let mut r = error_response_inner(
         cfg, vhost, scope, status, req, url_path, port, host, peer, local_ip,
     );
+    if r.has_prepared_handler() {
+        let handler = r
+            .take_prepared_handler()
+            .expect("prepared ErrorDocument response retained its handler");
+        return Response::prepared_handler(crate::server::PreparedHandler::FinalizeErrorDocument {
+            handler: Box::new(handler),
+            scope: scope.clone(),
+            status,
+            url_path: url_path.to_string(),
+            port,
+            host: host.to_string(),
+        });
+    }
     // Only `Header always` applies to error responses.
     if scope.header_policy.apply(&mut r.headers, false).is_err() {
         return Response::policy_error();
@@ -1848,6 +1880,44 @@ thread_local! {
 
 pub(crate) fn reset_local_error_document_response() {
     LOCAL_ERROR_DOCUMENT_RESPONSE.with(|active| active.set(false));
+}
+
+pub(crate) fn mark_local_error_document_response() {
+    LOCAL_ERROR_DOCUMENT_RESPONSE.with(|active| active.set(true));
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_prepared_error_document(
+    cfg: &Config,
+    scope: &Scope,
+    status: u16,
+    req: &Request,
+    url_path: &str,
+    port: u16,
+    host: &str,
+    mut response: Response,
+) -> Response {
+    if response.status >= 300 {
+        response = default_error_response(cfg, status, url_path, port, host);
+    } else {
+        mark_local_error_document_response();
+        response.status = status;
+    }
+    if scope
+        .header_policy
+        .apply(&mut response.headers, false)
+        .is_err()
+    {
+        return Response::policy_error();
+    }
+    crate::compression::finalize_budgeted(
+        scope,
+        req,
+        &mut response,
+        url_path.as_bytes(),
+        &cfg.resource_budget,
+    );
+    response
 }
 
 pub(crate) fn local_error_document_response() -> bool {
@@ -2836,6 +2906,44 @@ mod tests {
         assert!(open_admin_path(&root.join("final-link"), libc::O_RDONLY, 0).is_err());
         assert_eq!(std::fs::read(real.join("state")).unwrap(), b"safe");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn injected_openat2_failures_retry_only_transient_errors() {
+        let _fault_guard = crate::fault::test_guard();
+        let (root, _cfg) = config("openat2-faults");
+        let path = root.join("input");
+        std::fs::write(&path, b"safe").unwrap();
+
+        crate::fault::configure("fs.openat2", 0, std::io::ErrorKind::Interrupted);
+        let mut opened = open_admin_path(&path, libc::O_RDONLY, 0).unwrap();
+        let mut contents = Vec::new();
+        opened.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"safe");
+
+        crate::fault::configure("fs.openat2", 0, std::io::ErrorKind::PermissionDenied);
+        let error = open_admin_path(&path, libc::O_RDONLY, 0).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn injected_administrative_file_identity_race_is_rejected() {
+        let _fault_guard = crate::fault::test_guard();
+        let (root, _cfg) = config("admin-read-race");
+        let path = root.join("input");
+        std::fs::write(&path, b"safe").unwrap();
+        crate::fault::configure(
+            "fs.admin.post_read.identity",
+            0,
+            std::io::ErrorKind::InvalidData,
+        );
+        let error =
+            read_admin_file_with_trust(&path, 64, AdminFileTrust::ProcessOwned).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

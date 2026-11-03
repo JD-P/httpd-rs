@@ -183,12 +183,13 @@ Implemented today:
   root-ownership/parent trust for every administrative input, and rejection
   of reload-only changes to process identity, listeners, pid file, server root
   or listen backlog. Hard absolute body deadlines and
-  request-body spooling for fixed HTTP/1 bodies declared above 1 MB after a
-  64 KiB actual-byte prefix (also 64 KiB for chunked HTTP/1 and HTTP/2).
+  resource-accounted streaming for known-length dynamic uploads above 1 MiB;
+  a bounded four-chunk channel propagates backend backpressure to HTTP/1 and
+  HTTP/2 clients. Unknown-length/chunked bodies retain the bounded spool path.
 - Bounded-memory proxy and FastCGI traffic: large fixed-length upstream
   bodies stream through `Body::Stream`, chunked/EOF proxy responses spill to
   an unlinked file above 256 KiB, large FastCGI stdout is spooled, and large
-  request bodies are spooled before forwarding. Proxy responses are capped at
+  known-length request bodies stream to Proxy/CGI/FastCGI sinks. Proxy responses are capped at
   64 MiB and local CGI output at 8 MiB. Request and proxy chunk sizes, trailer
   counts/bytes, proxy head sizes and CGI/FastCGI output are explicitly bounded.
   Chunk framing has an independent 65,536-chunk/1 MiB overhead budget, so a
@@ -207,11 +208,13 @@ Implemented today:
   implementation ceiling. Every keep-alive request body enters the slow-body
   reserve, which may occupy at most a quarter of the worker pool; keep-alive is shed before the last quarter is
   consumed. Request workers are released before lazy body socket waits and
-  before the asynchronous output pump. Routing and authorization produce a
-  one-shot prepared handler before an upload is accepted, so rewrites and
-  authentication are not repeated after the body arrives. File/upstream reads
-  use short 64 KiB permits and downstream writes use a 256 KiB fairness
-  quantum. Listener acceptance rotates, pauses once saturated workers have an
+  before the asynchronous output pump. Routing and authorization produce typed
+  Proxy/FastCGI/CGI handler IR before backend I/O; backend waits and WebSocket
+  tunnels then run under their own bounded leases without retaining request
+  workers. Large known-length uploads use a resource-accounted bounded channel.
+  Plain HTTP file output uses nonblocking `sendfile(2)` in 256 KiB fairness
+  quanta, while TLS and unsupported filesystems use short 64 KiB read permits.
+  Listener acceptance rotates, pauses once saturated workers have an
   admitted connection queued, and is capped per ready-listener batch,
   so a busy listener cannot starve another. These limits sit alongside 128 MiB
   each of retained request and response bytes, 32 blocking response reads,
@@ -368,7 +371,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **635 verified functions, 0 errors** (percent-decoding,
+Current result: **644 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
@@ -545,7 +548,7 @@ Current ledger: **53.7% weighted obligations**, **5/6 proof debt**,
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **108 adversarial replay cases** covering the findings classes,
-and **630 Verus functions with 0 errors** (including the I3 fast-path
+and **644 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -725,23 +728,40 @@ is in `docs/apache-access-parity.md`.
 Combined unit and end-to-end line coverage is measured against instrumented binaries:
 
 ```sh
-tests/coverage.sh
-python3 tests/security_coverage.py --check
+tests/coverage.sh                         # full corpus plus CI ratchet
+python3 tests/security_coverage.py --strict  # absolute 100% target
 ```
 
 `security_coverage.py` reports executable production-line coverage before each
-file's test module. Every listed server module has a 100% target, so `--check`
-fails while any module has uncovered production code. The list includes the
-CLI, cache, file serving, HTTP/2, logging, OCSP, proxying, rewrite execution
-and aggregate resource accounting.
+file's test module. Every listed server module retains a 100% target. The CI
+`--check` mode is a monotone ratchet: for each module, covered lines may not
+decrease and missed lines may not increase from the reviewed baseline.
+`--strict` fails while any production line remains uncovered. The list includes
+the CLI, cache, file serving, HTTP/2, logging, OCSP, proxying, rewrite execution
+and aggregate resource accounting. `tests/coverage.sh` requires Apache and runs
+the grammar, validity and fixed/random/stateful semantic differential corpora
+before applying the ratchet; it never silently substitutes a partial corpus.
 Delimiter-only lines and narrowly documented unreachable invariants, external
 failure races and privileged-kernel failures are excluded from that metric.
+The instrumented-only release build disables ThinLTO because Rust 1.99 emits
+stale coverage hashes after ThinLTO rewriting. Raw profiles are paired with the
+exact executable build ID before LCOV export, so release, unit, integration,
+property, build-script and proc-macro symbols cannot contaminate one another.
 
-Latest snapshot: **20,020/20,548 executable server production lines (97.43%)**;
-the new aggregate-resource module is **62/62 (100%)**. The current suite is
-616 Rust library tests, 8 CLI unit tests, 26 Rust integration/property tests,
-167 conformance tests and 333 fixed configuration cases.
-The separate Verus gate proves 635 functions with 0 errors; proof-only code is
+Latest fail-closed floor: **29,460/32,026 executable server production lines
+(91.99%)**. Asynchronous cancellation tests can cover an additional line or
+two depending on which side of a deliberately exercised race completes first;
+the per-module and aggregate baseline records the worst observed result.
+The prior 20,020/20,548 snapshot predated roughly 11,500 executable lines of
+configuration compilation, protocol and resource-accounting work and was not
+being enforced by CI. The reviewed per-module debt is recorded in
+`tests/security_coverage_baseline.json`; reducing it tightens the ratchet, while
+new debt beyond that scheduling envelope fails the quality workflow. The
+current instrumented suite is 632 Rust library tests, 8 CLI unit tests, 24 Rust
+integration/property tests, 168 conformance tests and 333 fixed configuration
+cases. The module-by-module reason for the remaining debt and the intended test
+mechanism for each major module are tracked in `docs/coverage-debt.md`.
+The separate Verus gate proves 644 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

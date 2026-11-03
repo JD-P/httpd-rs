@@ -785,5 +785,7 @@ mod tests {
         );
         let amplification = "$1".repeat(16);
         assert!(expand_regex_captures(&amplification, &captures).is_none());
+        let oversized_template = "x".repeat(MAX_CAPTURE_EXPANSION_BYTES + 1);
+        assert!(expand_regex_captures(&oversized_template, &captures).is_none());
     }
 }

@@ -56,6 +56,22 @@ jobs:
       - name: Certbot Apache control command routing
         run: tests/certbot_apache_shim.sh
 
+  production-coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install coverage and Apache reference tools
+        run: |
+          rustup show active-toolchain
+          rustup component add llvm-tools-preview
+          sudo apt-get update
+          sudo apt-get install -y apache2
+      - name: Production coverage ratchet
+        run: tests/coverage.sh
+
   verus:
     runs-on: ubuntu-24.04
     steps:

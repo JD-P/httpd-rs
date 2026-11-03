@@ -863,6 +863,18 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
         reply: mpsc::SyncSender<Option<String>>,
     }
 
+    #[cfg(test)]
+    fn isolated_lookup(job: &DnsJob, _unreaped: &mut Vec<std::process::Child>) -> Option<String> {
+        // Unit-test binaries do not expose the daemon's hidden resolver
+        // entrypoint, and Cargo does not guarantee that target/debug/vapached
+        // exists during `cargo test --lib`. Exercise the same FCrDNS decision
+        // directly here; non-test builds always use the disposable process
+        // implementation below.
+        let host = reverse_dns(canonical_ip(job.ip)).ok()?;
+        forward_dns_confirms(&host, canonical_ip(job.ip)).then_some(host)
+    }
+
+    #[cfg(not(test))]
     fn isolated_lookup(job: &DnsJob, unreaped: &mut Vec<std::process::Child>) -> Option<String> {
         unreaped.retain_mut(|child| match child.try_wait() {
             Ok(Some(_)) => false,
@@ -1339,11 +1351,119 @@ mod tests {
             None,
             "/x",
             None,
-            allowed,
+            allowed.clone(),
         )
         .expect("allowed");
         let meta = std::fs::metadata("/proc/self/exe").expect("self metadata");
         assert!(grant.bind_file(&other, &meta).is_none());
+        assert!(grant.bind_backend(&other, "backend".into()).is_none());
+        assert!(grant
+            .bind_proxy(&allowed, "example.test", 80, false, "/unsafe;path")
+            .is_none());
+    }
+
+    #[test]
+    fn coverable_authorization_budget_and_expansion_failures_deny() {
+        let peer = "127.0.0.1".parse().unwrap();
+        let root = Path::new("/tmp");
+
+        let prefailed = req("GET");
+        assert!(prefailed
+            .charge_policy_expansion(crate::resource::MAX_POLICY_EXPANSION_BYTES + 1)
+            .is_err());
+        let mut scope = Scope::default();
+        scope.authorization.requires = reqs(vec![Require::AllGranted]);
+        assert_eq!(
+            check_requires(&scope, &prefailed, peer, None, root, "/x", None),
+            Access::Denied
+        );
+
+        let work_exhausted = req("GET");
+        work_exhausted
+            .charge_policy_work(crate::resource::MAX_POLICY_WORK_UNITS)
+            .unwrap();
+        assert_eq!(
+            check_requires(&scope, &work_exhausted, peer, None, root, "/x", None),
+            Access::Denied
+        );
+
+        let mut env_exhausted = req("GET");
+        env_exhausted.headers.insert(
+            "x-large",
+            vec![b'x'; crate::resource::MAX_POLICY_WORK_UNITS as usize],
+        );
+        scope
+            .environment_policy
+            .set_env_if
+            .push(crate::scope_policy::Originated::main(
+                crate::config::EnvRule {
+                    attribute: "x-large".into(),
+                    pattern: Arc::new(crate::config::compile_regex("x").unwrap()),
+                    negate: false,
+                    nocase: false,
+                    actions: vec![("MATCH".into(), Some("1".into()))],
+                },
+            ));
+        assert_eq!(
+            check_requires(&scope, &env_exhausted, peer, None, root, "/x", None),
+            Access::Denied
+        );
+
+        let identity = Identity {
+            user: "alice".into(),
+            groups: vec!["admins".into()],
+        };
+        for provider in [
+            Require::Host {
+                negate: false,
+                names: vec!["%{ENV:BAD}".into()],
+            },
+            Require::Group {
+                negate: false,
+                names: vec!["%{ENV:BAD}".into()],
+            },
+        ] {
+            let mut invalid_env = Scope::default();
+            invalid_env.authorization.requires = reqs(vec![provider]);
+            invalid_env
+                .environment_policy
+                .rewrite_env
+                .push(crate::scope_policy::Originated::main((
+                    "BAD".into(),
+                    vec![0xff],
+                )));
+            assert_eq!(
+                check_requires(
+                    &invalid_env,
+                    &req("GET"),
+                    peer,
+                    Some(&identity),
+                    root,
+                    "/x",
+                    None
+                ),
+                Access::Denied
+            );
+        }
+
+        let mut unknown_variable = Scope::default();
+        unknown_variable.authorization.requires = reqs(vec![Require::Host {
+            negate: false,
+            names: vec!["%{UNKNOWN}".into()],
+        }]);
+        assert_eq!(
+            check_requires(&unknown_variable, &req("GET"), peer, None, root, "/x", None),
+            Access::Denied
+        );
+
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let context = budget.context(peer);
+        crate::resource::with_resource_context(context.clone(), || {
+            let _leases = (0..crate::resource::MAX_EXPENSIVE_OPS_PER_CLIENT)
+                .map(|_| crate::resource::try_expensive_in(&context).unwrap())
+                .collect::<Vec<_>>();
+            assert!(!reverse_dns_matches(peer, &["localhost".into()]));
+        });
     }
 
     #[test]

@@ -1386,6 +1386,13 @@ mod tests {
         assert!(parse_tlv(&[0x04, 0x82, 0x01], 0).is_none());
         assert!(parse_tlv(&[0x04, 3, 1], 0).is_none());
 
+        assert!(leap_year(2000));
+        assert!(!leap_year(1900));
+        assert!(generalized_time(b"20000229000000Z").is_some());
+        assert!(generalized_time(b"19000229000000Z").is_none());
+        assert!(generalized_time(b"20001301000000Z").is_none());
+        assert!(generalized_time(b"20000101240000Z").is_none());
+
         let empty_spki = der(0x30, &[]);
         assert!(parse_spki(&empty_spki, parse_tlv(&empty_spki, 0).unwrap()).is_none());
         for content in [&[][..], &[8, 1][..]] {

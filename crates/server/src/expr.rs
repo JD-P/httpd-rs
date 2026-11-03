@@ -768,8 +768,13 @@ fn read_expr_file(path: &Path) -> Result<String, String> {
     ) {
         return Err("expression file must be a regular file no larger than 64 KiB".into());
     }
-    let mut data = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_EXPR_FILE_BYTES + 1)
+    read_expr_file_contents(file, metadata.len() as usize)
+}
+
+fn read_expr_file_contents(reader: impl Read, initial_len: usize) -> Result<String, String> {
+    let mut data = Vec::with_capacity(initial_len.min(MAX_EXPR_FILE_BYTES as usize));
+    reader
+        .take(MAX_EXPR_FILE_BYTES + 1)
         .read_to_end(&mut data)
         .map_err(|error| error.to_string())?;
     if data.len() as u64 > MAX_EXPR_FILE_BYTES {
@@ -1555,6 +1560,51 @@ mod tests {
         let mut c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), &dir, "/x");
         assert!(expression.eval(&mut c).is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn value_and_file_growth_limits_fail_closed() {
+        let list = Value::List(vec![Value::Str("abc".into()), Value::Bytes(vec![1, 2])]);
+        assert_eq!(list.resident_len(), 5);
+        let mut budget = EvalBudget { remaining: 4 };
+        assert!(budget.charge(&list).is_err());
+
+        let grew = std::io::Cursor::new(vec![b'x'; MAX_EXPR_FILE_BYTES as usize + 1]);
+        assert!(read_expr_file_contents(grew, 8).is_err());
+    }
+
+    #[test]
+    fn regex_subject_and_if_file_edges_are_bounded() {
+        let r = req();
+        let mut c = Context::new(
+            &r,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            "/x",
+        );
+        let expression = Expr::Regex(
+            Box::new(Expr::Str("x".repeat(MAX_EXPR_REGEX_BYTES as usize + 1))),
+            ExprRegex::compile("x".into(), false).unwrap(),
+            false,
+        );
+        assert!(expression.eval(&mut c).is_err());
+
+        let path =
+            std::env::temp_dir().join(format!("vapache-expr-if-file-{}", std::process::id()));
+        std::fs::write(&path, b"present").unwrap();
+        let mut c = Context::new(
+            &r,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            "/x",
+        );
+        assert!(Expr::IfFile(path.to_string_lossy().into_owned())
+            .eval(&mut c)
+            .unwrap()
+            .truthy());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

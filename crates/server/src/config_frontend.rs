@@ -254,6 +254,7 @@ mod tests {
     #[test]
     fn tokenizes_quotes_and_escaped_whitespace() {
         assert_eq!(tokenize("a \"b c\" d").unwrap(), vec!["a", "b c", "d"]);
+        assert_eq!(tokenize(" \t a  b \r").unwrap(), vec!["a", "b"]);
         assert_eq!(tokenize("a\\ b").unwrap(), vec!["a b"]);
         assert_eq!(tokenize("\"^\\.ht\"").unwrap(), vec!["^\\.ht"]);
         assert_eq!(tokenize("\"a \\\"b\\\"\"").unwrap(), vec!["a \"b\""]);

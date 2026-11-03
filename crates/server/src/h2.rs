@@ -116,6 +116,7 @@ enum H2ReadFailure {
     /// The peer sent RST_STREAM.  Do not attempt a response; report the
     /// observed reset to the connection-level budget.
     Reset,
+    BackendClosed,
     Response(Response),
 }
 
@@ -421,6 +422,78 @@ async fn read_body(
     let len = body.len();
     let (bytes, spool) = body.finish();
     Ok(H2RequestBody { bytes, spool, len })
+}
+
+async fn stream_body(
+    mut recv: h2::RecvStream,
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    declared: u64,
+    limit: u64,
+    timeout: std::time::Duration,
+    min_rate: u64,
+) -> Result<(), H2ReadFailure> {
+    let mut budget = vapache_verified::h2_body_init(limit);
+    let mut framing = vapache_verified::ChunkFramingState {
+        chunks: 0,
+        bytes: 0,
+    };
+    let started = Instant::now();
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let next = match tokio::time::timeout(remaining, recv.data()).await {
+            Ok(next) => next,
+            Err(_) => return Err(H2ReadFailure::Response(bad(408, "request body timeout"))),
+        };
+        let Some(chunk) = next else {
+            break;
+        };
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) if error.is_reset() => return Err(H2ReadFailure::Reset),
+            Err(_) => {
+                return Err(H2ReadFailure::Response(bad(
+                    400,
+                    "malformed HTTP/2 request body",
+                )))
+            }
+        };
+        let Some(next_framing) =
+            vapache_verified::chunk_framing_budget_step(framing, 5, true, 65_536, 1024 * 1024)
+        else {
+            return Err(H2ReadFailure::Response(bad(
+                400,
+                "HTTP/2 DATA frame budget exceeded",
+            )));
+        };
+        framing = next_framing;
+        let Some(next_budget) = vapache_verified::h2_body_append(budget, chunk.len() as u64) else {
+            return Err(H2ReadFailure::Response(bad(413, "request body too large")));
+        };
+        if next_budget.len > declared {
+            return Err(H2ReadFailure::Response(bad(400, "Content-Length mismatch")));
+        }
+        budget = next_budget;
+        let chunk_len = chunk.len();
+        let remaining = timeout.saturating_sub(started.elapsed());
+        match tokio::time::timeout(remaining, sender.send(chunk.to_vec())).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(H2ReadFailure::BackendClosed),
+            Err(_) => return Err(H2ReadFailure::Response(bad(408, "request body timeout"))),
+        }
+        if !crate::http::minimum_read_rate_ok(started, budget.len, min_rate) {
+            return Err(H2ReadFailure::Response(bad(
+                408,
+                "request body minimum rate not met",
+            )));
+        }
+        if recv.flow_control().release_capacity(chunk_len).is_err() {
+            return Err(H2ReadFailure::Reset);
+        }
+    }
+    if budget.len != declared {
+        return Err(H2ReadFailure::Response(bad(400, "Content-Length mismatch")));
+    }
+    Ok(())
 }
 
 // The h2 crate owns these capacity terminal states.  The bounded sender is
@@ -916,6 +989,7 @@ async fn handle_stream(
         .await
         .is_err();
     }
+    let mut request_resident = Some(request_resident);
 
     let mut headers = crate::http::Headers::default();
     let mut header_budget =
@@ -1049,11 +1123,52 @@ async fn handle_stream(
     }
 
     let has_body = declared.unwrap_or(0) > 0 || !recv.is_end_stream();
+    if declared.is_some_and(|length| length > cfg.limit_request_body) {
+        return send_response(
+            respond,
+            &cfg,
+            quota_peer.ip(),
+            bad(413, "request body too large"),
+            req.is_head(),
+        )
+        .await
+        .is_err();
+    }
+    if has_body && !cfg.body_handlers_possible() {
+        let status = if matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+            400
+        } else {
+            405
+        };
+        return send_response(
+            respond,
+            &cfg,
+            quota_peer.ip(),
+            bad(
+                status,
+                "request body is not accepted by a static-only configuration",
+            ),
+            req.is_head(),
+        )
+        .await
+        .is_err();
+    }
+    if has_body {
+        // HTTP/2 owns the wire framing, but the shared policy/cache pipeline
+        // still needs an explicit marker that DATA is pending. In particular,
+        // a GET-with-body must not consume a cache entry before the body has
+        // been validated and drained. `Chunked` is only the no-declared-size
+        // sentinel here; the h2 adapter remains the sole DATA parser.
+        req.framing = declared
+            .map(crate::verified::BodyFraming::Length)
+            .unwrap_or(crate::verified::BodyFraming::Chunked);
+    }
     let mut phase = vapache_verified::RequestPhase::Head;
     let mut early = None;
     let mut early_remote_user = None;
-    let mut body_continuation = None;
+    let mut prepared_handler = None;
     let mut body_remote_user = None;
+    let mut drain_after_body = None;
     let mut recv = Some(recv);
     if has_body {
         // Route, rewrite and authorization complete before DATA is accepted.
@@ -1078,7 +1193,7 @@ async fn handle_stream(
             Ok((
                 returned_req,
                 crate::server::BodyRouteDecision::Read {
-                    continuation,
+                    handler,
                     remote_user,
                 },
             )) => {
@@ -1088,8 +1203,18 @@ async fn handle_stream(
                     vapache_verified::RequestPhaseEvent::RouteNeedsBody,
                 )
                 .expect("HTTP/2 body route phase transition");
-                body_continuation = Some(continuation);
+                prepared_handler = Some(handler);
                 body_remote_user = remote_user;
+            }
+            Ok((returned_req, crate::server::BodyRouteDecision::Drain(response, remote_user))) => {
+                req = returned_req;
+                phase = vapache_verified::request_phase_step(
+                    phase,
+                    vapache_verified::RequestPhaseEvent::RouteNeedsDrain,
+                )
+                .expect("HTTP/2 static body-drain phase transition");
+                body_remote_user = remote_user.clone();
+                drain_after_body = Some((response, remote_user));
             }
             Ok((
                 returned_req,
@@ -1112,9 +1237,185 @@ async fn handle_stream(
                 return true;
             }
         }
+    } else {
+        // Bodyless dynamic requests use the same prepared-handler IR.  Route
+        // and authorization run under stream admission, then the
+        // potentially slow backend phase runs independently of that worker.
+        let probe_cfg = cfg.clone();
+        let probe_local_ip = local_ip.clone();
+        let mut probe_req = req;
+        let probed = tokio::task::spawn_blocking(move || {
+            let decision = crate::server::probe_prepared_handler(
+                &probe_cfg,
+                &mut probe_req,
+                peer,
+                &probe_local_ip,
+                local_port,
+                true,
+            );
+            (probe_req, decision)
+        })
+        .await;
+        match probed {
+            Ok((
+                returned_req,
+                crate::server::PreparedRouteDecision::Prepared {
+                    handler,
+                    remote_user,
+                },
+            )) => {
+                req = returned_req;
+                phase = vapache_verified::request_phase_step(
+                    phase,
+                    vapache_verified::RequestPhaseEvent::RoutePrepared,
+                )
+                .expect("HTTP/2 prepared route phase transition");
+                prepared_handler = Some(handler);
+                body_remote_user = remote_user;
+            }
+            Ok((
+                returned_req,
+                crate::server::PreparedRouteDecision::Respond(response, remote_user),
+            )) => {
+                req = returned_req;
+                phase = vapache_verified::request_phase_step(
+                    phase,
+                    vapache_verified::RequestPhaseEvent::RouteReady,
+                )
+                .expect("HTTP/2 bodyless route phase transition");
+                phase = vapache_verified::request_phase_step(
+                    phase,
+                    vapache_verified::RequestPhaseEvent::DispatchComplete,
+                )
+                .expect("HTTP/2 bodyless dispatch phase transition");
+                early = Some(response);
+                early_remote_user = remote_user;
+            }
+            Err(_) => {
+                logger.error("HTTP/2 request probe task failed");
+                return true;
+            }
+        }
     }
 
-    if has_body && early.is_none() {
+    let mut streamed = None;
+    if has_body
+        && early.is_none()
+        && declared.is_some_and(|length| length > crate::http::MAX_REQUEST_BODY_IN_MEMORY)
+        && prepared_handler.is_some()
+    {
+        let length = declared.expect("checked fixed HTTP/2 body length");
+        match crate::http::install_streaming_request_body(&mut req, length, &cfg.resource_budget) {
+            Ok(sender) => {
+                req.headers.hold_resident(
+                    request_resident
+                        .take()
+                        .expect("streaming HTTP/2 body retained its resident lease"),
+                );
+                phase = vapache_verified::request_phase_step(
+                    phase,
+                    vapache_verified::RequestPhaseEvent::BackendStarted,
+                )
+                .expect("HTTP/2 streaming backend phase transition");
+                let mut rejected_req = req.clone();
+                let dispatch_cfg = cfg.clone();
+                let handler = prepared_handler
+                    .take()
+                    .expect("streaming route retained its prepared handler");
+                let remote_user = body_remote_user.take();
+                let backend_req = req.clone();
+                let mut backend = tokio::task::spawn_blocking(move || {
+                    let mut req = backend_req;
+                    let response = crate::server::execute_prepared_handler(
+                        &dispatch_cfg,
+                        &mut req,
+                        peer,
+                        local_port,
+                        true,
+                        handler,
+                    );
+                    (req, response)
+                });
+                let body_timeout = cfg
+                    .request_body_timeout
+                    .max(std::time::Duration::from_secs(1));
+                let body_future = stream_body(
+                    recv.take()
+                        .expect("streaming route retained receive stream"),
+                    sender,
+                    length,
+                    cfg.limit_request_body,
+                    body_timeout,
+                    cfg.request_body_min_rate,
+                );
+                tokio::pin!(body_future);
+                let mut reset_watch = std::future::poll_fn(|cx| respond.poll_reset(cx));
+                let backend_result = tokio::select! {
+                    biased;
+                    _ = &mut reset_watch => {
+                        if let Some(scope) = rejected_req.request_scope() {
+                            scope.cancel();
+                        }
+                        drop(backend);
+                        return true;
+                    }
+                    result = &mut backend => Some(result),
+                    result = &mut body_future => {
+                        match result {
+                            Ok(()) | Err(H2ReadFailure::BackendClosed) => Some(backend.await),
+                            Err(H2ReadFailure::Reset) => {
+                                if let Some(scope) = rejected_req.request_scope() {
+                                    scope.cancel();
+                                }
+                                drop(backend);
+                                return true;
+                            }
+                            Err(H2ReadFailure::Response(response)) => {
+                                if let Some(scope) = rejected_req.request_scope() {
+                                    scope.cancel();
+                                }
+                                drop(backend);
+                                rejected_req.clear_streaming_body();
+                                phase = vapache_verified::request_phase_step(
+                                    phase,
+                                    vapache_verified::RequestPhaseEvent::BodyErrorResponse,
+                                )
+                                .expect("HTTP/2 streaming body error phase transition");
+                                req = rejected_req;
+                                early = Some(response);
+                                early_remote_user = remote_user.clone();
+                                None
+                            }
+                        }
+                    }
+                };
+                if let Some(result) = backend_result {
+                    let Ok((req, response)) = result else {
+                        logger.error("HTTP/2 backend task failed");
+                        return true;
+                    };
+                    phase = vapache_verified::request_phase_step(
+                        phase,
+                        vapache_verified::RequestPhaseEvent::BackendComplete,
+                    )
+                    .expect("HTTP/2 streaming backend completion transition");
+                    streamed = Some((req, response, remote_user));
+                }
+            }
+            Err(_) => {
+                phase = vapache_verified::request_phase_step(
+                    phase,
+                    vapache_verified::RequestPhaseEvent::BodyErrorResponse,
+                )
+                .expect("HTTP/2 streaming admission failure transition");
+                early = Some(bad(503, "request-body capacity exhausted"));
+                early_remote_user = body_remote_user.take();
+                drop(recv.take());
+            }
+        }
+    }
+
+    if has_body && early.is_none() && streamed.is_none() {
         let max_body = cfg.limit_request_body.min(crate::http::MAX_BODY_BUFFERED);
         let body_timeout = cfg
             .request_body_timeout
@@ -1131,7 +1432,9 @@ async fn handle_stream(
                 req.resource_context()
                     .expect("HTTP/2 request scope was bound")
                     .clone(),
-                &mut request_resident,
+                request_resident
+                    .as_mut()
+                    .expect("buffered HTTP/2 body retained its resident lease"),
             );
             tokio::pin!(body_future);
             // `SendResponse::poll_reset` is the h2 API for a client RST_STREAM
@@ -1161,16 +1464,33 @@ async fn handle_stream(
                     .is_err();
                     // coverage:ignore-stop
                 }
-                req.body = body.bytes;
-                req.body_spool = body.spool;
-                phase = vapache_verified::request_phase_step(
-                    phase,
-                    vapache_verified::RequestPhaseEvent::BodyComplete,
-                )
-                .expect("HTTP/2 body completion phase transition");
+                if let Some((response, remote_user)) = drain_after_body.take() {
+                    req.body = body.bytes;
+                    req.body_spool = body.spool;
+                    req.discard_body();
+                    phase = vapache_verified::request_phase_step(
+                        phase,
+                        vapache_verified::RequestPhaseEvent::BodyDiscarded,
+                    )
+                    .expect("HTTP/2 body discard phase transition");
+                    early = Some(response);
+                    early_remote_user = remote_user;
+                } else {
+                    req.body = body.bytes;
+                    req.body_spool = body.spool;
+                    phase = vapache_verified::request_phase_step(
+                        phase,
+                        vapache_verified::RequestPhaseEvent::BodyComplete,
+                    )
+                    .expect("HTTP/2 body completion phase transition");
+                }
             }
             // The biased `poll_reset` arm above observes this state first.
             Err(H2ReadFailure::Reset) => return true, // coverage:ignore-line - reset-watch invariant
+            Err(H2ReadFailure::BackendClosed) => {
+                logger.error("buffered HTTP/2 body unexpectedly lost its backend");
+                return true;
+            }
             Err(H2ReadFailure::Response(response)) => {
                 phase = vapache_verified::request_phase_step(
                     phase,
@@ -1181,60 +1501,65 @@ async fn handle_stream(
                 early_remote_user = body_remote_user.take();
             }
         }
-    } else if !has_body {
-        phase = vapache_verified::request_phase_step(
-            phase,
-            vapache_verified::RequestPhaseEvent::RouteReady,
-        )
-        .expect("HTTP/2 bodyless route phase transition");
     }
-    req.headers.hold_resident(request_resident);
+    if let Some(request_resident) = request_resident.take() {
+        req.headers.hold_resident(request_resident);
+    }
 
-    let (req, resp, remote_user) = match early {
-        Some(resp) => (req, resp, early_remote_user),
-        None => {
-            // Dispatch runs in Tokio's bounded blocking pool. It must not
-            // consume the response-body read permits: those protect only the
-            // short descriptor read itself, whereas dispatch duration and
-            // concurrency are already bounded by H2 stream/client quotas.
-            let dispatch_cfg = cfg.clone();
-            let dispatch_local_ip = local_ip.clone();
-            let dispatched = tokio::task::spawn_blocking(move || {
-                let mut req = req;
-                let (resp, remote_user) = match body_continuation {
-                    Some(continuation) => (
-                        crate::server::execute_body_continuation(
+    let (req, resp, remote_user) = if let Some(streamed) = streamed {
+        streamed
+    } else {
+        match early {
+            Some(resp) => (req, resp, early_remote_user),
+            None => {
+                // Dispatch runs in Tokio's bounded blocking pool. It must not
+                // consume the response-body read permits: those protect only the
+                // short descriptor read itself, whereas dispatch duration and
+                // concurrency are already bounded by H2 stream/client quotas.
+                let dispatch_cfg = cfg.clone();
+                let dispatch_local_ip = local_ip.clone();
+                let runs_backend = prepared_handler.is_some();
+                let dispatched = tokio::task::spawn_blocking(move || {
+                    let mut req = req;
+                    let (resp, remote_user) = match prepared_handler {
+                        Some(handler) => (
+                            crate::server::execute_prepared_handler(
+                                &dispatch_cfg,
+                                &mut req,
+                                peer,
+                                local_port,
+                                true,
+                                handler,
+                            ),
+                            body_remote_user,
+                        ),
+                        None => crate::server::dispatch_with_scheme_and_identity(
                             &dispatch_cfg,
-                            &mut req,
+                            &req,
                             peer,
+                            &dispatch_local_ip,
                             local_port,
                             true,
-                            continuation,
                         ),
-                        body_remote_user,
-                    ),
-                    None => crate::server::dispatch_with_scheme_and_identity(
-                        &dispatch_cfg,
-                        &req,
-                        peer,
-                        &dispatch_local_ip,
-                        local_port,
-                        true,
-                    ),
+                    };
+                    (req, resp, remote_user)
+                })
+                .await;
+                let Ok((req, resp, remote_user)) = dispatched else {
+                    logger.error("HTTP/2 request dispatcher task failed");
+                    return true;
                 };
+                phase = vapache_verified::request_phase_step(
+                    phase,
+                    if runs_backend {
+                        vapache_verified::RequestPhaseEvent::BackendComplete
+                    } else {
+                        vapache_verified::RequestPhaseEvent::DispatchComplete
+                    },
+                )
+                .expect("HTTP/2 backend/dispatch phase transition");
                 (req, resp, remote_user)
-            })
-            .await;
-            let Ok((req, resp, remote_user)) = dispatched else {
-                logger.error("HTTP/2 request dispatcher task failed");
-                return true;
-            };
-            phase = vapache_verified::request_phase_step(
-                phase,
-                vapache_verified::RequestPhaseEvent::DispatchComplete,
-            )
-            .expect("HTTP/2 dispatch phase transition");
-            (req, resp, remote_user)
+            }
         }
     };
     let head_only = req.is_head();
@@ -1865,6 +2190,92 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn h2_large_proxy_upload_streams_through_the_bounded_body_channel() {
+        use std::io::{Read as _, Write as _};
+
+        let body_len = crate::http::MAX_REQUEST_BODY_IN_MEMORY as usize + 64 * 1024;
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let upstream_thread = std::thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let mut request_head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request_head.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request_head.push(byte[0]);
+            }
+            assert!(String::from_utf8_lossy(&request_head)
+                .contains(&format!("Content-Length: {body_len}")));
+            let mut received = 0usize;
+            let mut chunk = [0u8; 64 * 1024];
+            while received < body_len {
+                let want = chunk.len().min(body_len - received);
+                let read = socket.read(&mut chunk[..want]).unwrap();
+                assert_ne!(read, 0);
+                assert!(chunk[..read].iter().all(|byte| *byte == b'h'));
+                received += read;
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n")
+                .unwrap();
+        });
+
+        let (cfg, logger, dir) = test_config_with_extra(
+            "streaming-proxy-upload",
+            &format!("ProxyPass /upload http://127.0.0.1:{upstream_port}/upload"),
+        );
+        let body = vec![b'h'; body_len];
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/upload")
+            .header("content-length", body_len.to_string())
+            .body(())
+            .unwrap();
+        let (status, response_body, reset) = round_trip(cfg, logger, request, &body).await;
+        assert_eq!(status, 200);
+        assert_eq!(response_body, b"ok\n");
+        assert!(!reset);
+
+        upstream_thread.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_get_with_body_bypasses_a_preexisting_cache_entry() {
+        let name = "body-cache-bypass";
+        let root = std::env::temp_dir().join(format!("vapache-h2-{name}-{}", std::process::id()));
+        let extra = format!(
+            "CacheRoot \"{}\"\nCacheEnable disk /",
+            root.join("cache").display()
+        );
+        let (cfg, logger, dir) = test_config_with_extra(name, &extra);
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/file.txt")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            round_trip(cfg.clone(), logger.clone(), request, &[])
+                .await
+                .1,
+            b"hello h2"
+        );
+
+        fs::write(dir.join("www/file.txt"), b"changed after cache").unwrap();
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/file.txt")
+            .header("content-length", "1")
+            .body(())
+            .unwrap();
+        let (status, body, reset) = round_trip(cfg, logger, request, b"x").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"changed after cache");
+        assert!(!reset);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn h2_adapter_handles_files_heads_bounds_and_body_errors() {
         let (cfg, logger, dir) = test_config("adapter");
         let read_leases: Vec<_> = (0..crate::resource::MAX_RESPONSE_BODY_READS)
@@ -2039,9 +2450,30 @@ mod tests {
             .body(())
             .unwrap();
         assert_eq!(
-            round_trip(Arc::new(limited), logger, request, b"too large")
+            round_trip(Arc::new(limited), logger.clone(), request, b"too large")
                 .await
                 .0,
+            413
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/__body_test")
+            .header("content-length", "9")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            round_trip(
+                Arc::new({
+                    let mut limited = (*cfg).clone();
+                    limited.limit_request_body = 2;
+                    limited
+                }),
+                logger.clone(),
+                request,
+                b"too large",
+            )
+            .await
+            .0,
             413
         );
         fs::remove_dir_all(dir).unwrap();

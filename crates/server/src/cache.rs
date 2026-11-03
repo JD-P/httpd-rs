@@ -273,13 +273,16 @@ fn disk_usage() -> &'static Mutex<HashMap<PathBuf, DiskUsageState>> {
 }
 
 fn ensure_disk_usage(root: &Path) -> bool {
-    if disk_usage()
+    let mut roots = disk_usage()
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .contains_key(root)
-    {
+        .unwrap_or_else(|error| error.into_inner());
+    if crate::fault::hit("cache.scan.concurrent").is_err() {
+        roots.insert(root.to_path_buf(), DiskUsageState::default());
+    }
+    if roots.contains_key(root) {
         return true;
     }
+    drop(roots);
     // Cold-start scans are bounded, but letting every first request perform
     // the same walk in parallel would multiply that bound by the worker cap.
     // Serialize only index construction; steady-state accounting and file I/O
@@ -394,15 +397,20 @@ fn write_cache_temp(path: &Path, data: &[u8]) -> io::Result<()> {
     // A previous crash may leave the predictable temporary name behind.
     // Unlink it, then use create_new so a racing symlink/FIFO is never opened.
     let _ = fs::remove_file(path);
+    crate::fault::hit("cache.temp.open")?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)?;
+    crate::fault::hit("cache.temp.write")?;
     file.write_all(data)
 }
 
 fn scan_disk_usage(root: &Path) -> Option<DiskUsageState> {
+    if crate::fault::hit("cache.scan").is_err() {
+        return None;
+    }
     let mut state = DiskUsageState::default();
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     let mut scanned = 0usize;
@@ -415,7 +423,7 @@ fn scan_disk_usage(root: &Path) -> Option<DiskUsageState> {
         };
         for entry in read.flatten() {
             scanned = scanned.checked_add(1)?;
-            if scanned > MAX_DISK_SCAN_RECORDS {
+            if crate::fault::hit("cache.scan.limit").is_err() || scanned > MAX_DISK_SCAN_RECORDS {
                 return None;
             }
             let path = entry.path();
@@ -1688,7 +1696,13 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
         release_disk_reservation(root, &stem, generation);
         return;
     }
-    if fs::rename(&body_tmp, &body_path).is_err() || fs::rename(&meta_tmp, &meta_path).is_err() {
+    if crate::fault::hit("cache.rename.body")
+        .and_then(|()| fs::rename(&body_tmp, &body_path))
+        .is_err()
+        || crate::fault::hit("cache.rename.meta")
+            .and_then(|()| fs::rename(&meta_tmp, &meta_path))
+            .is_err()
+    {
         let _ = fs::remove_file(&body_tmp);
         let _ = fs::remove_file(&meta_tmp);
         let _ = fs::remove_file(&body_path);
@@ -1705,16 +1719,25 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
                 .unwrap_or(meta.len() as u64),
         );
     let mut roots = disk_usage().lock().unwrap_or_else(|e| e.into_inner());
+    if crate::fault::hit("cache.commit.usage").is_err() {
+        roots.remove(root);
+    }
     let Some(usage) = roots.get_mut(root) else {
         drop(roots);
         remove_disk_stem_files(&stem);
         return;
     };
+    if crate::fault::hit("cache.commit.reservation").is_err() {
+        usage.stems.remove(&stem);
+    }
     let Some((reserved, _, current_generation)) = usage.stems.get_mut(&stem) else {
         drop(roots);
         remove_disk_stem_files(&stem);
         return;
     };
+    if crate::fault::hit("cache.commit.generation").is_err() {
+        *current_generation = current_generation.wrapping_add(1);
+    }
     if *current_generation != generation {
         drop(roots);
         remove_disk_stem_files(&stem);
@@ -1787,7 +1810,10 @@ fn disk_load_accounted(
     if entry.body_len <= MAX_MEMORY_BODY as u64 {
         resident.reserve(entry.body_len).ok()?;
         entry.body.resize(entry.body_len as usize, 0);
-        if body.read_exact(&mut entry.body).is_err() {
+        if crate::fault::hit("cache.body.read")
+            .and_then(|()| body.read_exact(&mut entry.body))
+            .is_err()
+        {
             remove_disk_stem(cfg, &stem);
             return None;
         }
@@ -2195,6 +2221,29 @@ mod tests {
             target,
             fingerprint,
         );
+        let memory_key = format!("{key}memory");
+        disk_store(&cfg, &memory_key, &entry);
+        cfg.cache.max_memory_size = 1024 * 1024;
+        let memory_hit = lookup(
+            &cfg,
+            None,
+            &request,
+            "warm.test",
+            "/path",
+            &scope,
+            peer,
+            &crate::access::test_grant(),
+            &memory_key,
+            target,
+        )
+        .expect("warm memory-admitted hit");
+        assert!(matches!(memory_hit.body, crate::http::Body::Bytes(_)));
+        assert!(entries()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entries
+            .contains_key(&memory_key));
+
         disk_store(&cfg, &key, &entry);
         // A disk-only configuration must still serve small warm entries; it
         // simply declines to retain the decoded body in the memory cache.
@@ -3598,6 +3647,42 @@ CacheIgnoreQueryString On\n\
             "127.0.0.1",
         )
         .is_none());
+
+        let static_cfg = route_config("static-query", "");
+        fs::write(www.join("static.txt"), b"static").unwrap();
+        let mut static_query = test_request();
+        static_query.target = b"/static.txt?a=1".to_vec();
+        static_query.raw_path = b"/static.txt".to_vec();
+        static_query.query = b"a=1".to_vec();
+        assert!(request_scope(
+            &static_cfg,
+            None,
+            &static_query,
+            "127.0.0.1".parse().unwrap(),
+            "/static.txt",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .is_some());
+        assert!(static_query
+            .charge_policy_work(crate::resource::MAX_POLICY_WORK_UNITS)
+            .is_err());
+        assert!(request_scope(
+            &static_cfg,
+            None,
+            &static_query,
+            "127.0.0.1".parse().unwrap(),
+            "/static.txt",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .is_none());
         dynamic.query.clear();
         dynamic.target = b"/proxy/item".to_vec();
         assert!(request_scope(
@@ -3982,6 +4067,10 @@ CacheIgnoreQueryString On\n\
         assert!(disk_stem(Path::new("plain")).is_none());
         assert_eq!(disk_stem(Path::new("x.body")).unwrap(), PathBuf::from("x"));
         assert_eq!(disk_stem(Path::new("x.meta")).unwrap(), PathBuf::from("x"));
+        assert!(open_cache_regular(&cache_root, MAX_DISK_META_BYTES).is_none());
+        let too_large_meta = cache_root.join("too-large.meta");
+        fs::write(&too_large_meta, b"xx").unwrap();
+        assert!(open_cache_regular(&too_large_meta, 1).is_none());
 
         let response = Response::bytes(200, "text/plain", b"x".to_vec());
         assert_eq!(
@@ -4011,6 +4100,10 @@ CacheIgnoreQueryString On\n\
         req.headers = Default::default();
         req.headers
             .insert("pragma", b"extension=\xff, NO-CACHE".to_vec());
+        assert!(!request_allows_lookup(&cfg, &req));
+        req.headers = Default::default();
+        req.headers
+            .insert("cache-control", b"public, no-cache   ".to_vec());
         assert!(!request_allows_lookup(&cfg, &req));
         cfg.cache.ignore_cache_control = true;
         assert!(request_allows_lookup(&cfg, &req));
@@ -4419,6 +4512,17 @@ CacheIgnoreQueryString On\n\
         assert!(decode_meta_key(b"V4\nK YQ==\n").is_none());
         assert!(decode_meta_key(b"V5\nS 200\n").is_none());
 
+        let mut invalid_conditional = test_request();
+        invalid_conditional
+            .headers
+            .insert("if-modified-since", b"not-a-date".to_vec());
+        let mut conditional_response = Response::new(200);
+        assert!(!conditional_hit(
+            &invalid_conditional,
+            &disk_entry(b"x", unix_now() + 60),
+            &mut conditional_response,
+        ));
+
         let legacy_key = "pre-p26-trailing-slash";
         let legacy_entry = disk_entry(b"SECRET-CONTENT", unix_now() + 60);
         let legacy_stem = cache_stem(&cfg, legacy_key).unwrap();
@@ -4444,6 +4548,152 @@ CacheIgnoreQueryString On\n\
         }
         fs::write(nested.join("entry.body"), b"body").unwrap();
         assert!(scan_disk_usage(root).is_none());
+        disk_usage().lock().unwrap().remove(root);
+        assert!(!ensure_disk_usage(root));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_memory_eviction_state_is_bounded_and_self_healing() {
+        let (dir, mut cfg) = disk_test_config("memory-eviction-state");
+        cfg.cache.max_memory_size = u64::MAX;
+        let entry = |tag: u8, vary: Vec<(String, Vec<u8>)>| {
+            Arc::new(Entry {
+                vary,
+                ..disk_entry(&[tag], unix_now() + 60)
+            })
+        };
+
+        // Amortized queue compaction drops stale identities without cloning
+        // cache keys or retaining dead Weak references indefinitely.
+        let stale = entry(1, Vec::new());
+        let mut compact = MemoryCache::default();
+        compact.eviction = std::iter::repeat_n(
+            (memory_entry_id(&stale), 1, Arc::downgrade(&stale)),
+            MAX_ENTRIES * 8 + 1,
+        )
+        .collect();
+        let live = entry(2, Vec::new());
+        track_memory_entry(&mut compact, "live", &live);
+        assert_eq!(compact.eviction.len(), 1);
+
+        // Every defensive skip in eviction is reachable from a malformed or
+        // interrupted snapshot, and each one must terminate without an O(n)
+        // fallback scan.
+        let target = entry(3, Vec::new());
+        let id = memory_entry_id(&target);
+        let mut missing_location = MemoryCache::default();
+        missing_location
+            .eviction
+            .push_back((id, 1, Arc::downgrade(&target)));
+        assert!(!evict_oldest_memory(&mut missing_location));
+
+        let mut stale_generation = MemoryCache::default();
+        stale_generation
+            .locations
+            .insert(id, (2, "stale-generation".into()));
+        stale_generation
+            .eviction
+            .push_back((id, 1, Arc::downgrade(&target)));
+        assert!(!evict_oldest_memory(&mut stale_generation));
+
+        let expired = entry(4, Vec::new());
+        let expired_id = memory_entry_id(&expired);
+        let expired_weak = Arc::downgrade(&expired);
+        drop(expired);
+        let mut dead_weak = MemoryCache::default();
+        dead_weak.locations.insert(expired_id, (1, "dead".into()));
+        dead_weak.eviction.push_back((expired_id, 1, expired_weak));
+        assert!(!evict_oldest_memory(&mut dead_weak));
+
+        let mut missing_bucket = MemoryCache::default();
+        missing_bucket
+            .locations
+            .insert(id, (1, "missing-bucket".into()));
+        missing_bucket
+            .eviction
+            .push_back((id, 1, Arc::downgrade(&target)));
+        assert!(!evict_oldest_memory(&mut missing_bucket));
+
+        for keep_nonempty in [false, true] {
+            let mut wrong_bucket = MemoryCache::default();
+            wrong_bucket
+                .locations
+                .insert(id, (1, "wrong-bucket".into()));
+            wrong_bucket
+                .eviction
+                .push_back((id, 1, Arc::downgrade(&target)));
+            wrong_bucket.entries.insert(
+                "wrong-bucket".into(),
+                keep_nonempty
+                    .then(|| vec![entry(5, Vec::new())])
+                    .unwrap_or_default(),
+            );
+            assert!(!evict_oldest_memory(&mut wrong_bucket));
+            assert_eq!(
+                wrong_bucket.entries.contains_key("wrong-bucket"),
+                keep_nonempty
+            );
+        }
+
+        let mut valid = MemoryCache::default();
+        valid.locations.insert(id, (1, "valid".into()));
+        valid.eviction.push_back((id, 1, Arc::downgrade(&target)));
+        let survivor = entry(9, Vec::new());
+        valid
+            .entries
+            .insert("valid".into(), vec![target.clone(), survivor.clone()]);
+        valid.bytes = memory_entry_size("valid", &target)
+            .saturating_add(memory_entry_size("valid", &survivor));
+        assert!(evict_oldest_memory(&mut valid));
+        assert_eq!(valid.entries["valid"].len(), 1);
+        assert_eq!(valid.bytes, memory_entry_size("valid", &survivor));
+
+        let oversized = entry(6, Vec::new());
+        let mut too_small = cfg.clone();
+        too_small.cache.max_memory_size = 1;
+        insert_memory_into(&too_small, &mut MemoryCache::default(), "large", oversized);
+
+        let old = entry(7, vec![("accept".into(), b"a".to_vec())]);
+        let replacement = entry(8, vec![("accept".into(), b"a".to_vec())]);
+        let mut replace = MemoryCache::default();
+        replace.bytes = memory_entry_size("replace", &old);
+        replace.entries.insert("replace".into(), vec![old]);
+        insert_memory_into(&cfg, &mut replace, "replace", replacement);
+        assert_eq!(replace.entries["replace"].len(), 1);
+
+        let root = cfg.cache.root.as_ref().unwrap().clone();
+        let store_key = "malformed-disk-queue";
+        let store_stem = cache_stem(&cfg, store_key).unwrap();
+        let missing = root.join("missing-victim");
+        let stale_victim = root.join("stale-victim");
+        let valid_victim = root.join("valid-victim");
+        let mut usage = DiskUsageState {
+            total: 2_000_000,
+            next_generation: 9,
+            ..DiskUsageState::default()
+        };
+        usage
+            .stems
+            .insert(stale_victim.clone(), (1, SystemTime::UNIX_EPOCH, 2));
+        usage
+            .stems
+            .insert(valid_victim.clone(), (2_000_000, SystemTime::UNIX_EPOCH, 3));
+        usage.eviction.extend([
+            (store_stem.clone(), 1),
+            (missing.clone(), 1),
+            (stale_victim, 1),
+            (valid_victim, 3),
+        ]);
+        usage
+            .eviction
+            .extend(std::iter::repeat_n((missing, 1), MAX_DISK_ENTRIES * 8 + 1));
+        disk_usage().lock().unwrap().insert(root.clone(), usage);
+        cfg.cache.max_disk_size = 1_000_000;
+        disk_store(&cfg, store_key, &disk_entry(b"queued", unix_now() + 60));
+        assert!(disk_load(&cfg, store_key).is_some());
+
+        release_disk_reservation(&dir.join("absent-root"), Path::new("missing"), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4534,6 +4784,70 @@ CacheIgnoreQueryString On\n\
         invalidate_disk(&bad_root);
         invalidate(&bad_root, "host", "/x");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn injected_disk_cache_failures_clean_up_reservations_and_partial_files() {
+        let _fault_guard = crate::fault::test_guard();
+        let (dir, mut cfg) = disk_test_config("injected-disk-failures");
+        cfg.cache.max_disk_size = u64::MAX;
+        cfg.cache.max_file_size = 1_000_000;
+        prepare(&cfg);
+        let root = cfg.cache.root.clone().unwrap();
+
+        crate::fault::configure("cache.scan", 0, io::ErrorKind::PermissionDenied);
+        assert!(scan_disk_usage(&root).is_none());
+        crate::fault::configure("cache.scan", 0, io::ErrorKind::PermissionDenied);
+        assert!(!ensure_disk_usage(&root));
+        crate::fault::configure("cache.scan", 0, io::ErrorKind::PermissionDenied);
+        disk_store(&cfg, "scan-failure", &disk_entry(b"body", unix_now() + 60));
+        assert!(!cache_stem(&cfg, "scan-failure")
+            .unwrap()
+            .with_extension("body")
+            .exists());
+
+        crate::fault::configure("cache.scan.concurrent", 0, io::ErrorKind::AlreadyExists);
+        assert!(ensure_disk_usage(&root));
+        disk_usage().lock().unwrap().remove(&root);
+
+        fs::write(root.join("scan-limit-record"), b"x").unwrap();
+        crate::fault::configure("cache.scan.limit", 0, io::ErrorKind::OutOfMemory);
+        assert!(scan_disk_usage(&root).is_none());
+        fs::remove_file(root.join("scan-limit-record")).unwrap();
+
+        for (index, boundary) in [
+            "cache.temp.open",
+            "cache.temp.write",
+            "cache.rename.body",
+            "cache.rename.meta",
+            "cache.commit.usage",
+            "cache.commit.reservation",
+            "cache.commit.generation",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = format!("fault-{index}");
+            let stem = cache_stem(&cfg, &key).unwrap();
+            crate::fault::configure(boundary, 0, io::ErrorKind::PermissionDenied);
+            disk_store(&cfg, &key, &disk_entry(b"body", unix_now() + 60));
+            assert!(!stem.with_extension("body").exists(), "{boundary}");
+            assert!(!stem.with_extension("meta").exists(), "{boundary}");
+            assert!(!stem.with_extension("body.tmp").exists(), "{boundary}");
+            assert!(!stem.with_extension("meta.tmp").exists(), "{boundary}");
+        }
+
+        let key = "body-read-fault";
+        disk_store(&cfg, key, &disk_entry(b"body", unix_now() + 60));
+        let stem = cache_stem(&cfg, key).unwrap();
+        crate::fault::configure("cache.body.read", 0, io::ErrorKind::UnexpectedEof);
+        assert!(disk_load(&cfg, key).is_none());
+        assert!(!stem.with_extension("body").exists());
+        assert!(!stem.with_extension("meta").exists());
+
+        disk_usage().lock().unwrap().remove(&root);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -196,8 +196,13 @@ fn read_small_uncached(
     let raw = read_bounded(&file)?;
     let (parsed, parsed_weight) = parse_auth_file(&raw)?;
     let data = Arc::new(parsed);
-    let after = file.metadata().ok()?;
-    if auth_key(path, &after) != key || !path_names_key(path, &key) {
+    let after = crate::fault::hit("auth.post_read.metadata")
+        .and_then(|()| file.metadata())
+        .ok()?;
+    if crate::fault::hit("auth.post_read.identity").is_err()
+        || auth_key(path, &after) != key
+        || !path_names_key(path, &key)
+    {
         return None;
     }
     let weight = parsed_weight
@@ -238,7 +243,7 @@ fn path_names_key(path: &Path, key: &AuthFileKey) -> bool {
     let Ok(file) = crate::files::open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0) else {
         return false;
     };
-    let Ok(meta) = file.metadata() else {
+    let Ok(meta) = crate::fault::hit("auth.path.metadata").and_then(|()| file.metadata()) else {
         return false;
     };
     meta.is_file() && meta.dev() == key.dev && meta.ino() == key.ino
@@ -585,6 +590,9 @@ mod tests {
         let directory = temp_path("directory");
         std::fs::create_dir(&directory).unwrap();
         assert!(read_small(&directory, true).is_none());
+        // A repeated failure is served from the short negative cache rather
+        // than reopening an attacker-selected path on every request.
+        assert!(read_small(&directory, true).is_none());
         assert!(groups_for(&directory.join("missing"), "alice", true).is_none());
         std::fs::remove_dir(directory).unwrap();
         assert!(read_bounded(std::io::Cursor::new(vec![
@@ -594,6 +602,7 @@ mod tests {
         .is_none());
 
         assert!(!verify_password(b"x", "{SHA}%%%"));
+        assert!(!verify_password(b"x", "{SHA}eA=="));
         assert!(!verify_password(b"x", "{SSHA}%%%"));
         assert!(!verify_password(b"x", "{SSHA}eA=="));
         assert!(!verify_password(
@@ -604,6 +613,151 @@ mod tests {
         assert!(!md5_crypt_matches(b"x", "$1$x$bad", "$apr1$"));
         assert!(!md5_crypt_matches(b"x", "$apr1$missing", "$apr1$"));
         assert!(!md5_crypt_matches(b"x", "$apr1$123456789$bad", "$apr1$"));
+
+        let missing = temp_path("identity-missing");
+        let missing_key = AuthFileKey {
+            path: missing.clone(),
+            dev: 0,
+            ino: 0,
+            size: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            ctime: 0,
+            ctime_nsec: 0,
+        };
+        assert!(!path_names_key(&missing, &missing_key));
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn injected_post_open_auth_file_races_fail_closed() {
+        let _fault_guard = crate::fault::test_guard();
+        let path = temp_path("post-open-faults");
+        std::fs::write(&path, "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n").unwrap();
+
+        crate::fault::configure(
+            "auth.post_read.metadata",
+            0,
+            std::io::ErrorKind::PermissionDenied,
+        );
+        assert!(read_small_uncached(&path, true, 0).is_none());
+
+        crate::fault::configure(
+            "auth.post_read.identity",
+            0,
+            std::io::ErrorKind::InvalidData,
+        );
+        assert!(read_small_uncached(&path, true, 0).is_none());
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        let key = auth_key(&path, &metadata);
+        crate::fault::configure(
+            "auth.path.metadata",
+            0,
+            std::io::ErrorKind::PermissionDenied,
+        );
+        assert!(!path_names_key(&path, &key));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn password_hashing_fails_closed_when_expensive_work_is_saturated() {
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let context = budget.context("127.0.0.1".parse().unwrap());
+        crate::resource::with_resource_context(context.clone(), || {
+            let _leases = (0..crate::resource::MAX_EXPENSIVE_OPS_PER_CLIENT)
+                .map(|_| crate::resource::try_expensive_in(&context).unwrap())
+                .collect::<Vec<_>>();
+            assert!(!verify_password(
+                b"secret",
+                "$apr1$gqijKP2Z$nBjZURLWP3/zSfPLTfhVM0"
+            ));
+            assert!(!verify_password(b"secret", "$1$salt$hash"));
+            assert!(!verify_password(
+                b"secret",
+                "$2y$05$lFdvgVrS6ROEENEOjKS5h.y4SA05OvKSOFRPC1BcjARNhNt.DQ8jC"
+            ));
+        });
+    }
+
+    #[test]
+    fn auth_group_index_has_a_resident_memory_ceiling() {
+        let oversized_name = format!("{}:x", "n".repeat(MAX_AUTH_CACHE_BYTES + 1));
+        assert!(parse_auth_file(&oversized_name).is_none());
+
+        // The source is comfortably below the 4 MiB file ceiling, but every
+        // indexed membership has independent HashMap/Vec ownership.
+        let members = "x ".repeat(300_000);
+        assert!(parse_auth_file(&format!("group:{members}")).is_none());
+    }
+
+    #[test]
+    fn auth_file_caches_evict_at_their_entry_ceiling() {
+        let parsed = Arc::new(ParsedAuthFile {
+            users: HashMap::new(),
+            groups_by_user: HashMap::new(),
+        });
+        {
+            let mut cache = auth_file_cache().lock().unwrap();
+            cache.entries.clear();
+            cache.failures.clear();
+            cache.bytes = 0;
+            for index in 0..MAX_AUTH_CACHE_ENTRIES {
+                cache.entries.insert(
+                    AuthFileKey {
+                        path: temp_path(&format!("cached-{index}")),
+                        dev: 0,
+                        ino: index as u64,
+                        size: 0,
+                        mtime: 0,
+                        mtime_nsec: 0,
+                        ctime: 0,
+                        ctime_nsec: 0,
+                    },
+                    (Arc::clone(&parsed), 1),
+                );
+                cache.bytes += 1;
+                cache.failures.insert(
+                    (temp_path(&format!("failed-{index}")), true, 0),
+                    Instant::now(),
+                );
+            }
+        }
+
+        let valid = temp_path("cache-eviction-valid");
+        std::fs::write(&valid, "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n").unwrap();
+        assert!(read_small(&valid, true).is_some());
+        let missing = temp_path("cache-eviction-missing");
+        assert!(read_small(&missing, true).is_none());
+
+        let mut cache = auth_file_cache().lock().unwrap();
+        assert!(cache.entries.len() <= MAX_AUTH_CACHE_ENTRIES);
+        assert!(cache.failures.len() <= MAX_AUTH_CACHE_ENTRIES);
+        cache.entries.clear();
+        cache.failures.clear();
+        cache.bytes = 0;
+        drop(cache);
+        std::fs::remove_file(valid).unwrap();
+
+        // Exercise the defensive recovery for an inconsistent accounting
+        // snapshot: the byte counter says eviction is required, but no entry
+        // exists to evict. The valid file must still be parsed successfully.
+        let accounted = temp_path("cache-accounting-recovery");
+        std::fs::write(&accounted, "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n").unwrap();
+        {
+            let mut cache = auth_file_cache().lock().unwrap();
+            cache.entries.clear();
+            cache.failures.clear();
+            cache.bytes = MAX_AUTH_CACHE_BYTES + 1;
+        }
+        assert!(read_small(&accounted, true).is_some());
+        {
+            let mut cache = auth_file_cache().lock().unwrap();
+            cache.entries.clear();
+            cache.failures.clear();
+            cache.bytes = 0;
+        }
+        std::fs::remove_file(accounted).unwrap();
     }
 
     #[test]

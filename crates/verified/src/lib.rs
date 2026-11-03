@@ -3332,6 +3332,129 @@ pub proof fn response_body_read_lease_excludes_client_occupancy()
 {
 }
 
+/// Ownership of response resources while an asynchronous output pump lends
+/// them to a blocking descriptor read.  Cancellation of the outer socket
+/// future cannot release the descriptors/backend lease until the read task
+/// itself has stopped touching them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OutputOwnershipPhase {
+    ResponseOwned,
+    ReadTaskOwned,
+    ReadTaskCancelled,
+    Released,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OutputOwnershipEvent {
+    BeginRead,
+    ReadComplete,
+    Cancel,
+    Finish,
+}
+
+pub open spec fn output_ownership_step_spec(
+    phase: OutputOwnershipPhase,
+    event: OutputOwnershipEvent,
+) -> Option<OutputOwnershipPhase> {
+    match (phase, event) {
+        (OutputOwnershipPhase::ResponseOwned, OutputOwnershipEvent::BeginRead) => {
+            Some(OutputOwnershipPhase::ReadTaskOwned)
+        }
+        (OutputOwnershipPhase::ReadTaskOwned, OutputOwnershipEvent::ReadComplete) => {
+            Some(OutputOwnershipPhase::ResponseOwned)
+        }
+        (OutputOwnershipPhase::ReadTaskOwned, OutputOwnershipEvent::Cancel) => {
+            Some(OutputOwnershipPhase::ReadTaskCancelled)
+        }
+        (OutputOwnershipPhase::ReadTaskCancelled, OutputOwnershipEvent::ReadComplete) => {
+            Some(OutputOwnershipPhase::Released)
+        }
+        (OutputOwnershipPhase::ResponseOwned, OutputOwnershipEvent::Cancel)
+        | (OutputOwnershipPhase::ResponseOwned, OutputOwnershipEvent::Finish) => {
+            Some(OutputOwnershipPhase::Released)
+        }
+        _ => None,
+    }
+}
+
+pub fn output_ownership_step(
+    phase: OutputOwnershipPhase,
+    event: OutputOwnershipEvent,
+) -> (next: Option<OutputOwnershipPhase>)
+    ensures next == output_ownership_step_spec(phase, event),
+{
+    match (phase, event) {
+        (OutputOwnershipPhase::ResponseOwned, OutputOwnershipEvent::BeginRead) => {
+            Some(OutputOwnershipPhase::ReadTaskOwned)
+        }
+        (OutputOwnershipPhase::ReadTaskOwned, OutputOwnershipEvent::ReadComplete) => {
+            Some(OutputOwnershipPhase::ResponseOwned)
+        }
+        (OutputOwnershipPhase::ReadTaskOwned, OutputOwnershipEvent::Cancel) => {
+            Some(OutputOwnershipPhase::ReadTaskCancelled)
+        }
+        (OutputOwnershipPhase::ReadTaskCancelled, OutputOwnershipEvent::ReadComplete) => {
+            Some(OutputOwnershipPhase::Released)
+        }
+        (OutputOwnershipPhase::ResponseOwned, OutputOwnershipEvent::Cancel)
+        | (OutputOwnershipPhase::ResponseOwned, OutputOwnershipEvent::Finish) => {
+            Some(OutputOwnershipPhase::Released)
+        }
+        _ => None,
+    }
+}
+
+pub proof fn output_cancel_preserves_active_read_ownership()
+    ensures
+        output_ownership_step_spec(
+            OutputOwnershipPhase::ReadTaskOwned,
+            OutputOwnershipEvent::Cancel,
+        ) == Some(OutputOwnershipPhase::ReadTaskCancelled),
+        output_ownership_step_spec(
+            OutputOwnershipPhase::ReadTaskCancelled,
+            OutputOwnershipEvent::ReadComplete,
+        ) == Some(OutputOwnershipPhase::Released),
+{
+}
+
+pub proof fn released_output_ownership_is_terminal(event: OutputOwnershipEvent)
+    ensures output_ownership_step_spec(OutputOwnershipPhase::Released, event).is_none(),
+{
+}
+
+/// The side-effecting target represented by a prepared route.  The request
+/// adapters carry this typed value across body acquisition and scheduler
+/// boundaries instead of retaining an opaque closure.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PreparedHandlerKind {
+    Proxy,
+    FastCgi,
+    Cgi,
+}
+
+pub open spec fn prepared_handler_needs_dynamic_lease_spec(kind: PreparedHandlerKind) -> bool {
+    match kind {
+        PreparedHandlerKind::Proxy
+        | PreparedHandlerKind::FastCgi
+        | PreparedHandlerKind::Cgi => true,
+    }
+}
+
+pub fn prepared_handler_needs_dynamic_lease(kind: PreparedHandlerKind) -> (needed: bool)
+    ensures needed == prepared_handler_needs_dynamic_lease_spec(kind),
+{
+    match kind {
+        PreparedHandlerKind::Proxy
+        | PreparedHandlerKind::FastCgi
+        | PreparedHandlerKind::Cgi => true,
+    }
+}
+
+pub proof fn every_prepared_handler_has_bounded_dynamic_admission(kind: PreparedHandlerKind)
+    ensures prepared_handler_needs_dynamic_lease_spec(kind),
+{
+}
+
 /// Protocol-independent request lifecycle used by the HTTP/1 and HTTP/2
 /// adapters.  In particular, body acquisition is reachable only after the
 /// policy route selects a body-consuming handler, while an early denial can
@@ -3340,7 +3463,9 @@ pub proof fn response_body_read_lease_excludes_client_occupancy()
 pub enum RequestPhase {
     Head,
     Body,
+    BodyBackend,
     Dispatch,
+    Backend,
     Output,
     Closed,
 }
@@ -3348,11 +3473,16 @@ pub enum RequestPhase {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RequestPhaseEvent {
     RouteNeedsBody,
+    RouteNeedsDrain,
+    RoutePrepared,
     RouteReady,
     EarlyResponse,
     BodyComplete,
+    BodyDiscarded,
+    BackendStarted,
     BodyErrorResponse,
     DispatchComplete,
+    BackendComplete,
     OutputComplete,
     Cancel,
 }
@@ -3363,14 +3493,29 @@ pub open spec fn request_phase_step_spec(
 ) -> Option<RequestPhase> {
     match (phase, event) {
         (RequestPhase::Head, RequestPhaseEvent::RouteNeedsBody) => Some(RequestPhase::Body),
+        (RequestPhase::Head, RequestPhaseEvent::RouteNeedsDrain) => Some(RequestPhase::Body),
+        (RequestPhase::Head, RequestPhaseEvent::RoutePrepared) => Some(RequestPhase::Backend),
         (RequestPhase::Head, RequestPhaseEvent::RouteReady) => Some(RequestPhase::Dispatch),
         (RequestPhase::Head, RequestPhaseEvent::EarlyResponse) => Some(RequestPhase::Output),
-        (RequestPhase::Body, RequestPhaseEvent::BodyComplete) => Some(RequestPhase::Dispatch),
+        (RequestPhase::Body, RequestPhaseEvent::BodyComplete) => Some(RequestPhase::Backend),
+        (RequestPhase::Body, RequestPhaseEvent::BodyDiscarded) => Some(RequestPhase::Output),
+        (RequestPhase::Body, RequestPhaseEvent::BackendStarted) => {
+            Some(RequestPhase::BodyBackend)
+        }
+        (RequestPhase::BodyBackend, RequestPhaseEvent::BackendComplete) => {
+            Some(RequestPhase::Output)
+        }
+        (RequestPhase::BodyBackend, RequestPhaseEvent::BodyErrorResponse) => {
+            Some(RequestPhase::Output)
+        }
         (RequestPhase::Body, RequestPhaseEvent::BodyErrorResponse) => Some(RequestPhase::Output),
         (RequestPhase::Dispatch, RequestPhaseEvent::DispatchComplete) => Some(RequestPhase::Output),
+        (RequestPhase::Backend, RequestPhaseEvent::BackendComplete) => Some(RequestPhase::Output),
         (RequestPhase::Head, RequestPhaseEvent::Cancel)
         | (RequestPhase::Body, RequestPhaseEvent::Cancel)
+        | (RequestPhase::BodyBackend, RequestPhaseEvent::Cancel)
         | (RequestPhase::Dispatch, RequestPhaseEvent::Cancel)
+        | (RequestPhase::Backend, RequestPhaseEvent::Cancel)
         | (RequestPhase::Output, RequestPhaseEvent::Cancel)
         | (RequestPhase::Output, RequestPhaseEvent::OutputComplete) => Some(RequestPhase::Closed),
         _ => None,
@@ -3385,14 +3530,29 @@ pub fn request_phase_step(
 {
     match (phase, event) {
         (RequestPhase::Head, RequestPhaseEvent::RouteNeedsBody) => Some(RequestPhase::Body),
+        (RequestPhase::Head, RequestPhaseEvent::RouteNeedsDrain) => Some(RequestPhase::Body),
+        (RequestPhase::Head, RequestPhaseEvent::RoutePrepared) => Some(RequestPhase::Backend),
         (RequestPhase::Head, RequestPhaseEvent::RouteReady) => Some(RequestPhase::Dispatch),
         (RequestPhase::Head, RequestPhaseEvent::EarlyResponse) => Some(RequestPhase::Output),
-        (RequestPhase::Body, RequestPhaseEvent::BodyComplete) => Some(RequestPhase::Dispatch),
+        (RequestPhase::Body, RequestPhaseEvent::BodyComplete) => Some(RequestPhase::Backend),
+        (RequestPhase::Body, RequestPhaseEvent::BodyDiscarded) => Some(RequestPhase::Output),
+        (RequestPhase::Body, RequestPhaseEvent::BackendStarted) => {
+            Some(RequestPhase::BodyBackend)
+        }
+        (RequestPhase::BodyBackend, RequestPhaseEvent::BackendComplete) => {
+            Some(RequestPhase::Output)
+        }
+        (RequestPhase::BodyBackend, RequestPhaseEvent::BodyErrorResponse) => {
+            Some(RequestPhase::Output)
+        }
         (RequestPhase::Body, RequestPhaseEvent::BodyErrorResponse) => Some(RequestPhase::Output),
         (RequestPhase::Dispatch, RequestPhaseEvent::DispatchComplete) => Some(RequestPhase::Output),
+        (RequestPhase::Backend, RequestPhaseEvent::BackendComplete) => Some(RequestPhase::Output),
         (RequestPhase::Head, RequestPhaseEvent::Cancel)
         | (RequestPhase::Body, RequestPhaseEvent::Cancel)
+        | (RequestPhase::BodyBackend, RequestPhaseEvent::Cancel)
         | (RequestPhase::Dispatch, RequestPhaseEvent::Cancel)
+        | (RequestPhase::Backend, RequestPhaseEvent::Cancel)
         | (RequestPhase::Output, RequestPhaseEvent::Cancel)
         | (RequestPhase::Output, RequestPhaseEvent::OutputComplete) => Some(RequestPhase::Closed),
         _ => None,
@@ -3405,7 +3565,16 @@ pub proof fn request_body_requires_route_selection(
 )
     ensures
         request_phase_step_spec(phase, event) == Some(RequestPhase::Body)
-            ==> phase == RequestPhase::Head && event == RequestPhaseEvent::RouteNeedsBody,
+            ==> phase == RequestPhase::Head
+                && (event == RequestPhaseEvent::RouteNeedsBody
+                    || event == RequestPhaseEvent::RouteNeedsDrain),
+{
+}
+
+pub proof fn discarded_request_body_advances_directly_to_output()
+    ensures
+        request_phase_step_spec(RequestPhase::Body, RequestPhaseEvent::BodyDiscarded)
+            == Some(RequestPhase::Output),
 {
 }
 

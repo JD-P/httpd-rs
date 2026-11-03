@@ -1062,7 +1062,7 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | Stream | Explicit bound |
 |---|---|
 | HTTP/1 request line/head | `LimitRequestLine`, `LimitRequestFields`, `LimitRequestFieldSize`, total head cap |
-| HTTP/1 request body | `LimitRequestBody`, hard absolute body deadline plus configured header/body `MinRate` enforcement that cannot extend it, at most 65,536 chunks and 1 MiB of chunk framing independent of decoded size; fixed bodies no larger than 1 MiB stay resident, while known-larger and chunked bodies provide a 64 KiB actual-byte prefix before an `O_EXCL`, mode-0600 spool file is acquired; the shared quota reserves only bytes actually received |
+| HTTP/1 request body | `LimitRequestBody`, hard absolute body deadline plus configured header/body `MinRate` enforcement that cannot extend it, at most 65,536 chunks and 1 MiB of chunk framing independent of decoded size; fixed bodies no larger than 1 MiB stay resident, known-larger dynamic uploads stream through a resource-accounted four-chunk channel, and chunked bodies provide a 64 KiB actual-byte prefix before an `O_EXCL`, mode-0600 spool file is acquired; the shared quota reserves only bytes actually received or the fixed channel capacity |
 | HTTP/1 chunked trailers | trailer count and byte budget within the same hard body deadline |
 | Proxy routing/response head | HTTP and FastCGI prefix/regex route scans consume the fail-sticky request-work budget; response line, header-count and total-head caps |
 | Proxy response body | fixed-length/chunked/EOF body capped at 64 MiB; chunked responses additionally allow at most 65,536 chunks and 1 MiB of framing; large fixed bodies stream, chunked/EOF bodies spill to the shared unlinked-file tier above 256 KiB, and oversize responses do not trigger balancer failover amplification |
@@ -1072,9 +1072,9 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | FastCGI path/records | each `PATH_INFO` filesystem prefix consumes the fail-sticky request-work budget; synthesized paths pass the shared 256-component/512-KiB cumulative-prefix gate; fixed record/header sizes, stdout spool cap and stderr cap |
 | FastCGI response head | bounded prefix/header scan before body streaming |
 | Aggregate dynamic I/O | RAII byte/file reservations across request, response, CGI-worker and FastCGI/proxy spools; each client may retain at most one quarter of configured spool bytes/files; 128 MiB request and response resident ceilings with a 32 MiB retained/transient response share per client; shared CGI/FastCGI concurrency slots; 32 response-body descriptor reads and 8 per client, held only for the read syscall and never for dispatch or a downstream socket wait |
-| Request phase lifecycle | HTTP/1 and HTTP/2 route and authorize before accepting a body; a body-consuming route returns an owned one-shot handler continuation, so rewrites/authentication are not repeated and cannot select a different sink after upload. Request-worker permits cover head/policy compilation and handler dispatch, but not body socket waits or output waits. Body errors transition to bounded error output/cancellation, and route-selected CGI descriptors remain exactly charged while the continuation waits for its body |
-| HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error; the event-driven output pump holds no request-worker lease, reads file/upstream bodies under short 64 KiB descriptor-read permits, yields after at most 256 KiB of writable progress, and retains response/descriptor/backend ownership through completion or cancellation |
-| HTTP/2 | verified settings, header-state, flow-control and reset budgets; a refillable connection token bucket bounds SETTINGS, PING, PRIORITY and tiny WINDOW_UPDATE work; at most 32 streams per connection, 64 per validated effective-client quota key and 256 process-wide, acquired client-first so rejection cannot retain a global slot. Each request has a 64 KiB resident body prefix before using the shared request-spool quota and enforces body `MinRate` inside its hard deadline. Dispatch uses the bounded blocking pool without consuming response-read permits. Response file/stream reads wait for assigned flow-control capacity, use at most 64 KiB per chunk, retain response-resident accounting until h2 releases every queued chunk/byte slice, and hold response-body read permits only during the actual read. Send deadlines renew on flow-control progress; connection idle expiry runs only when no stream is active |
+| Request phase lifecycle | HTTP/1 and HTTP/2 route and authorize before accepting a body; dynamic routes return explicit Proxy/FastCGI/CGI IR, so rewrites/authentication are not repeated and cannot select a different sink after upload. Successful static routes drain request data under the same body bounds before reusing the connection, while static-only deployments retain their early body-rejection optimization. Request-worker permits cover head/policy compilation, but not backend waits, WebSocket tunnel lifetime, body socket waits or output waits. The verified lifecycle has distinct Body, concurrent BodyBackend, Backend, Output and Closed states, including a proved body-discard transition directly to output. Body errors transition to bounded error output/cancellation, and route-selected CGI descriptors remain exactly charged while the prepared handler waits for its body |
+| HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error; the event-driven output pump holds no request-worker lease, uses nonblocking `sendfile(2)` for plain file responses in 256 KiB fairness quanta, falls back to short 64 KiB descriptor-read permits for TLS/unsupported sources, and retains response/descriptor/backend ownership through completion or cancellation. The verified ownership state machine prevents outer cancellation from releasing a lease while a blocking read task still owns it |
+| HTTP/2 | verified settings, header-state, flow-control and reset budgets; a refillable connection token bucket bounds SETTINGS, PING, PRIORITY and tiny WINDOW_UPDATE work; at most 32 streams per connection, 64 per validated effective-client quota key and 256 process-wide, acquired client-first so rejection cannot retain a global slot. Known-length dynamic uploads above 1 MiB stream through the same bounded channel as HTTP/1; unknown-length bodies retain the 64 KiB resident prefix and shared request-spool quota. Both enforce body `MinRate` inside the hard deadline. Backend dispatch uses the bounded blocking pool without retaining request-worker or response-read permits. Response file/stream reads wait for assigned flow-control capacity, use at most 64 KiB per chunk, retain response-resident accounting until h2 releases every queued chunk/byte slice, and hold response-body read permits only during the actual read. Send deadlines renew on flow-control progress; connection idle expiry runs only when no stream is active |
 | Compression/PCRE/password hashing | fixed input/cost bounds and a shared 32-operation CPU-work admission gate; optional compression falls back to identity under pressure |
 | Autoindex | at most 4096 examined directory records (including filtered names), 4096 rendered entries and 4 MiB of generated HTML |
 | DNS authorization | eight resolver workers, queue length 64, two-second caller deadline and bounded copied host operands |
@@ -1763,7 +1763,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **635 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **644 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1773,7 +1773,12 @@ construction: there is no second production interleaver.
 - `RequestPhase`, `RequestPhaseEvent` and `request_phase_step`, consumed by
   both protocol adapters.  The transition proof makes body acquisition
   reachable only after routing selects a body-consuming sink; early policy
-  responses bypass body input, and output/cancellation terminate the request.
+  responses bypass body input, prepared backends have their own phase (plus a
+  concurrent body/backend phase for streaming uploads), and output/cancellation
+  terminate the request. `OutputOwnershipPhase` proves cancellation transfers
+  an active read to a cancelled-read owner rather than releasing its leases;
+  `PreparedHandlerKind` proves every typed backend IR kind requires bounded
+  dynamic admission.
 - `ipv4_mapped_to_v4`, consumed by `access::canonical_ip` at the connection
   and RemoteIP boundaries; `vhost_address_admit` and
   `vhost_address_precedence`, consumed by `Config::select_vhost` and the TLS
@@ -2300,13 +2305,16 @@ are tracked separately from the proof ledger:
 
 ```sh
 tests/coverage.sh
-python3 tests/security_coverage.py --check
+python3 tests/security_coverage.py --strict
 ```
 
 The tracker measures **production lines before each file's test module** and
-sets a fail-closed 100% target for every listed server module. The current
-full-tree snapshot is 20,020/20,548 lines (97.43%); the new aggregate resource
-accounting module is 62/62. Security-critical targets include:
+sets a 100% target for every listed server module. The current full-tree
+fail-closed floor is 29,460/32,026 lines (91.99%); asynchronous cancellation
+tests may cover one or two additional race-dependent lines. The CI `--check` mode enforces a
+per-module monotone baseline: the number of covered lines cannot decrease and
+the number of missed lines cannot increase. `--strict` remains the absolute
+zero-debt check. Security-critical targets include:
 
 - `fastcgi.rs` — record parsing, spooling, script/PATH_INFO containment,
   environment derivation, error paths and process boundary;
@@ -2316,10 +2324,18 @@ accounting module is 62/62. Security-critical targets include:
   policy and listener construction.
 
 The remaining debt in high-risk surfaces (`cgi`, `h2`, `proxy`, `server`,
-`htaccess`, `config`, `expr`, `rewrite`) remains visible as a gate failure
-rather than being silently removed from enforcement. A module is not
-considered closed merely because its test module is covered; the tracker
-excludes test-only code from the denominator.
+`htaccess`, `config`, `expr`, `rewrite`) remains visible in the report and may
+only move downward without an explicit review of
+`tests/security_coverage_baseline.json`. A module is not considered closed
+merely because its test module is covered; the tracker excludes test-only code
+from the denominator. The quality workflow installs Apache and runs the full
+grammar/validity/semantic corpus before applying the ratchet.
+`docs/coverage-debt.md` records why the remaining lines are not reached and
+which deterministic harness boundary is needed to reach them; absence of a
+test is not treated as evidence that a branch is unreachable.
+Coverage builds disable ThinLTO only for instrumentation and pair every raw
+profile with its exact executable build ID before export; this avoids the Rust
+1.99 mismatched-profile failure without changing production artifacts.
 
 ## 12. Known gaps before formal proof
 

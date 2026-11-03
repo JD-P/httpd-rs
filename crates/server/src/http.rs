@@ -116,11 +116,17 @@ pub struct Headers {
     // The validated source identity and request-local resource ledger travel
     // with every clone/internal rewrite of this request.
     request_scope: Option<crate::resource::RequestScope>,
-    // A body probe executes the ordinary mapping/rewrite/authorization flow
+    // A handler probe executes the ordinary mapping/rewrite/authorization flow
     // but stops before an authorized content handler performs side effects.
     // It lives in the request rather than thread-local state so internal
     // rewrites and cloned requests cannot accidentally escape the probe.
-    body_probe: bool,
+    handler_probe: bool,
+    // Fixed-length uploads can be consumed by a prepared backend through a
+    // bounded channel while the socket task continues reading asynchronously.
+    streaming_body: Option<std::sync::Arc<StreamingBody>>,
+    // Drained bodies release their resident/spool storage before a slow
+    // response finishes while retaining exact logging and cache accounting.
+    discarded_body_len: u64,
 }
 
 impl Headers {
@@ -198,12 +204,20 @@ impl Headers {
         self.request_scope.as_ref()
     }
 
-    pub(crate) fn set_body_probe(&mut self, enabled: bool) {
-        self.body_probe = enabled;
+    pub(crate) fn set_handler_probe(&mut self, enabled: bool) {
+        self.handler_probe = enabled;
     }
 
-    pub(crate) fn is_body_probe(&self) -> bool {
-        self.body_probe
+    pub(crate) fn is_handler_probe(&self) -> bool {
+        self.handler_probe
+    }
+
+    fn install_streaming_body(&mut self, body: StreamingBody) {
+        self.streaming_body = Some(std::sync::Arc::new(body));
+    }
+
+    fn clear_streaming_body(&mut self) {
+        self.streaming_body = None;
     }
 }
 
@@ -458,6 +472,53 @@ pub struct Request {
     pub framing: BodyFraming,
 }
 
+#[derive(Debug)]
+struct StreamingBody {
+    len: u64,
+    receiver: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+    _lease: ResidentLease,
+}
+
+pub(crate) enum RequestBodyReader {
+    File(File),
+    Stream {
+        receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        current: std::io::Cursor<Vec<u8>>,
+        remaining: u64,
+    },
+}
+
+impl Read for RequestBodyReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        match self {
+            RequestBodyReader::File(file) => file.read(output),
+            RequestBodyReader::Stream {
+                receiver,
+                current,
+                remaining,
+            } => {
+                if output.is_empty() || *remaining == 0 {
+                    return Ok(0);
+                }
+                loop {
+                    let read = current.read(output)?;
+                    if read > 0 {
+                        *remaining = remaining.saturating_sub(read as u64);
+                        return Ok(read);
+                    }
+                    let Some(next) = receiver.blocking_recv() else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "request body stream ended early",
+                        ));
+                    };
+                    *current = std::io::Cursor::new(next);
+                }
+            }
+        }
+    }
+}
+
 impl Request {
     pub fn header(&self, name: &str) -> Option<&[u8]> {
         self.headers.get(name)
@@ -472,14 +533,53 @@ impl Request {
     }
 
     pub fn body_len(&self) -> u64 {
-        self.body_spool
+        self.headers
+            .streaming_body
             .as_ref()
-            .map(|b| b.len)
+            .map(|body| body.len)
+            .or_else(|| self.body_spool.as_ref().map(|body| body.len))
             .unwrap_or(self.body.len() as u64)
+            .max(self.headers.discarded_body_len)
     }
 
-    pub fn body_reader(&self) -> Option<io::Result<File>> {
-        self.body_spool.as_ref().map(|b| b.reader())
+    pub(crate) fn body_reader(&self) -> Option<io::Result<RequestBodyReader>> {
+        if let Some(body) = &self.headers.streaming_body {
+            let receiver = match body.receiver.lock() {
+                Ok(mut receiver) => receiver.take(),
+                Err(_) => {
+                    return Some(Err(io::Error::other("request body stream lock poisoned")));
+                }
+            };
+            return Some(match receiver {
+                Some(receiver) => Ok(RequestBodyReader::Stream {
+                    receiver,
+                    current: std::io::Cursor::new(Vec::new()),
+                    remaining: body.len,
+                }),
+                None => Err(io::Error::other("request body stream already consumed")),
+            });
+        }
+        self.body_spool
+            .as_ref()
+            .map(|body| body.reader().map(RequestBodyReader::File))
+    }
+
+    pub(crate) fn clear_streaming_body(&mut self) {
+        self.headers.clear_streaming_body();
+    }
+
+    pub(crate) fn discard_body(&mut self) {
+        self.headers.discarded_body_len = self.body_len();
+        self.headers.clear_streaming_body();
+        self.body.clear();
+        self.body_spool = None;
+    }
+
+    pub(crate) fn clear_body_for_internal_subrequest(&mut self) {
+        self.headers.discarded_body_len = 0;
+        self.headers.clear_streaming_body();
+        self.body.clear();
+        self.body_spool = None;
     }
 
     pub(crate) fn charge_policy_work(&self, amount: u64) -> Result<(), &'static str> {
@@ -506,12 +606,12 @@ impl Request {
         self.headers.request_scope()
     }
 
-    pub(crate) fn body_probe(&self) -> bool {
-        self.headers.is_body_probe()
+    pub(crate) fn handler_probe(&self) -> bool {
+        self.headers.is_handler_probe()
     }
 
-    pub(crate) fn set_body_probe(&mut self, enabled: bool) {
-        self.headers.set_body_probe(enabled);
+    pub(crate) fn set_handler_probe(&mut self, enabled: bool) {
+        self.headers.set_handler_probe(enabled);
     }
 }
 
@@ -737,6 +837,159 @@ impl ParsedRequestHead {
         self.request.headers.hold_resident(self.resident);
         self.request
     }
+}
+
+const STREAMING_BODY_CHUNK: usize = 64 * 1024;
+const STREAMING_BODY_CHANNEL_CHUNKS: usize = 4;
+
+pub(crate) struct StreamingBodyPump {
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    length: u64,
+    expect_continue: bool,
+    scope: Option<crate::resource::RequestScope>,
+}
+
+/// Transfer a fixed-length body into a bounded backend reader. The channel's
+/// maximum resident footprint is reserved before either side starts, so
+/// downstream backpressure stops socket reads without creating unaccounted
+/// heap growth.
+pub(crate) fn prepare_streaming_request_body(
+    head: ParsedRequestHead,
+    limits: &Limits,
+) -> Result<(Request, StreamingBodyPump), (Request, io::Error)> {
+    let (mut request, request_resident) = head.into_parts();
+    let BodyFraming::Length(length) = request.framing else {
+        return Err((
+            request,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "streaming upload requires a fixed content length",
+            ),
+        ));
+    };
+    let sender = match install_streaming_request_body(&mut request, length, &limits.resource_budget)
+    {
+        Ok(sender) => sender,
+        Err(error) => return Err((request, error)),
+    };
+    request.headers.hold_resident(request_resident);
+    let pump = StreamingBodyPump {
+        sender,
+        length,
+        expect_continue: request.expect_continue,
+        scope: request.request_scope().cloned(),
+    };
+    Ok((request, pump))
+}
+
+pub(crate) fn install_streaming_request_body(
+    request: &mut Request,
+    length: u64,
+    resource_budget: &std::sync::Arc<ResourceBudget>,
+) -> io::Result<tokio::sync::mpsc::Sender<Vec<u8>>> {
+    let context = request.resource_context().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "streaming upload has no resource context",
+        )
+    })?;
+    let mut lease = resource_budget.try_request_bytes_in(context)?;
+    let channel_bytes =
+        length.min((STREAMING_BODY_CHUNK * (STREAMING_BODY_CHANNEL_CHUNKS + 1)) as u64);
+    lease.reserve(channel_bytes)?;
+    let (sender, receiver) = tokio::sync::mpsc::channel(STREAMING_BODY_CHANNEL_CHUNKS);
+    request.headers.install_streaming_body(StreamingBody {
+        len: length,
+        receiver: std::sync::Mutex::new(Some(receiver)),
+        _lease: lease,
+    });
+    Ok(sender)
+}
+
+async fn send_streaming_body_chunk(
+    sender: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    chunk: Vec<u8>,
+    deadline: Instant,
+) -> io::Result<()> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))?;
+    tokio::time::timeout(remaining, sender.send(chunk))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))?
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "backend stopped reading upload"))
+}
+
+pub(crate) async fn pump_streaming_request_body<S>(
+    stream: &mut S,
+    buffered: &mut Vec<u8>,
+    limits: &Limits,
+    pump: StreamingBodyPump,
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = Instant::now()
+        .checked_add(limits.body_timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))?;
+    let started = Instant::now();
+    if pump.expect_continue {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))?;
+        tokio::time::timeout(remaining, async {
+            tokio::io::AsyncWriteExt::write_all(stream, b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+            tokio::io::AsyncWriteExt::flush(stream).await
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))??;
+    }
+
+    let mut received = 0u64;
+    while received < pump.length {
+        if pump
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.is_cancelled())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "request scope cancelled",
+            ));
+        }
+        let remaining = pump.length - received;
+        let chunk = if !buffered.is_empty() {
+            let take = usize::try_from(
+                remaining
+                    .min(STREAMING_BODY_CHUNK as u64)
+                    .min(buffered.len() as u64),
+            )
+            .unwrap_or(buffered.len());
+            buffered.drain(..take).collect::<Vec<_>>()
+        } else {
+            let want = remaining.min(STREAMING_BODY_CHUNK as u64) as usize;
+            let mut chunk = vec![0u8; want];
+            crate::fault::hit("http.body.stream.read")?;
+            let read = async_read_with_deadline(stream, &mut chunk, deadline).await?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF in request body",
+                ));
+            }
+            chunk.truncate(read);
+            chunk
+        };
+        received += chunk.len() as u64;
+        send_streaming_body_chunk(&pump.sender, chunk, deadline).await?;
+        if !minimum_read_rate_ok(started, received, limits.body_min_rate) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "request body minimum rate not met",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Parse and authorize one complete request head without consuming any body
@@ -1612,7 +1865,9 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
             resident_lease: None,
             policy_budget: std::sync::Arc::new(crate::resource::RequestPolicyBudget::default()),
             request_scope: None,
-            body_probe: false,
+            handler_probe: false,
+            streaming_body: None,
+            discarded_body_len: 0,
         },
         body: Vec::new(),
         body_spool: None,
@@ -1710,15 +1965,55 @@ pub struct Response {
 
 enum ResponseFlow {
     Normal,
-    BodyRequired(Option<BodyContinuation>),
+    PreparedHandler(Option<Box<crate::server::PreparedHandler>>),
 }
-
-pub(crate) type BodyContinuation =
-    Box<dyn FnOnce(&crate::config::Config, &mut Request) -> Response + Send>;
 
 struct ResponseOwnership {
     _descriptor_leases: Vec<crate::resource::DescriptorLease>,
     _dynamic_lease: Option<crate::resource::DynamicLease>,
+    phase: vapache_verified::OutputOwnershipPhase,
+}
+
+impl ResponseOwnership {
+    fn advance(&mut self, event: vapache_verified::OutputOwnershipEvent) {
+        self.phase = vapache_verified::output_ownership_step(self.phase, event)
+            .expect("illegal response ownership transition");
+    }
+
+    fn begin_read(mut self) -> Self {
+        self.advance(vapache_verified::OutputOwnershipEvent::BeginRead);
+        self
+    }
+
+    fn complete_read(mut self) -> Self {
+        self.advance(vapache_verified::OutputOwnershipEvent::ReadComplete);
+        self
+    }
+
+    fn finish(mut self) {
+        self.advance(vapache_verified::OutputOwnershipEvent::Finish);
+    }
+}
+
+impl Drop for ResponseOwnership {
+    fn drop(&mut self) {
+        use vapache_verified::{OutputOwnershipEvent as Event, OutputOwnershipPhase as Phase};
+
+        // The ownership value itself travels into each blocking read task. If
+        // the awaiting socket future is cancelled, dropping its JoinHandle
+        // cannot drop this value until that task returns. Project every
+        // implicit Rust drop into the verified cancellation path so the
+        // executable ownership state and the RAII lease lifetime agree.
+        match self.phase {
+            Phase::ResponseOwned => self.advance(Event::Cancel),
+            Phase::ReadTaskOwned => {
+                self.advance(Event::Cancel);
+                self.advance(Event::ReadComplete);
+            }
+            Phase::ReadTaskCancelled => self.advance(Event::ReadComplete),
+            Phase::Released => {}
+        }
+    }
 }
 
 pub const MAX_RESPONSE_HEADERS: usize = 256;
@@ -1754,19 +2049,19 @@ impl Response {
         }
     }
 
-    pub(crate) fn body_required(continuation: BodyContinuation) -> Self {
+    pub(crate) fn prepared_handler(handler: crate::server::PreparedHandler) -> Self {
         let mut response = Self::new(204);
-        response.flow = ResponseFlow::BodyRequired(Some(continuation));
+        response.flow = ResponseFlow::PreparedHandler(Some(Box::new(handler)));
         response
     }
 
-    pub(crate) fn requires_body(&self) -> bool {
-        matches!(self.flow, ResponseFlow::BodyRequired(_))
+    pub(crate) fn has_prepared_handler(&self) -> bool {
+        matches!(self.flow, ResponseFlow::PreparedHandler(_))
     }
 
-    pub(crate) fn take_body_continuation(&mut self) -> Option<BodyContinuation> {
+    pub(crate) fn take_prepared_handler(&mut self) -> Option<crate::server::PreparedHandler> {
         match &mut self.flow {
-            ResponseFlow::BodyRequired(continuation) => continuation.take(),
+            ResponseFlow::PreparedHandler(handler) => handler.take().map(|handler| *handler),
             ResponseFlow::Normal => None,
         }
     }
@@ -1783,6 +2078,7 @@ impl Response {
         ResponseOwnership {
             _descriptor_leases: std::mem::take(&mut self.descriptor_leases),
             _dynamic_lease: self.dynamic_lease.take(),
+            phase: vapache_verified::OutputOwnershipPhase::ResponseOwned,
         }
     }
 
@@ -2492,13 +2788,14 @@ async fn async_read_stream_chunk(
         Some(context) => Some(context.budget().try_response_body_read_in(context)?),
         None => None,
     };
+    let ownership = ownership.begin_read();
     tokio::task::spawn_blocking(move || {
         let _lease = lease;
         let mut reader = reader;
         let mut bytes = vec![0u8; want];
         let read = reader.read(&mut bytes)?;
         bytes.truncate(read);
-        Ok((reader, bytes, read, ownership))
+        Ok((reader, bytes, read, ownership.complete_read()))
     })
     .await
     .map_err(|error| io::Error::other(format!("response body reader failed: {error}")))?
@@ -2515,12 +2812,13 @@ async fn async_read_file_chunk(
         Some(context) => Some(context.budget().try_response_body_read_in(context)?),
         None => None,
     };
+    let ownership = ownership.begin_read();
     tokio::task::spawn_blocking(move || {
         let _lease = lease;
         let mut bytes = vec![0u8; want];
         let read = file.read_at(&mut bytes, offset)?;
         bytes.truncate(read);
-        Ok((file, bytes, read, ownership))
+        Ok((file, bytes, read, ownership.complete_read()))
     })
     .await
     .map_err(|error| io::Error::other(format!("response file reader failed: {error}")))?
@@ -2621,6 +2919,112 @@ where
             }
         }
     }
+    ownership.finish();
+    tokio::time::timeout(opts.write_timeout, tokio::io::AsyncWriteExt::flush(stream))
+        .await
+        .map_err(|_| write_timeout_error())??;
+    Ok(sent)
+}
+
+/// Plain-TCP specialization of the asynchronous output pump. Regular bodies
+/// share the transport-independent path above; file bodies use non-blocking
+/// `sendfile(2)` in bounded quanta and fall back to accounted userspace reads
+/// when the source filesystem does not support zero-copy transfer.
+pub(crate) async fn write_response_async_plain(
+    stream: &mut tokio::net::TcpStream,
+    resp: &mut Response,
+    opts: &ResponseOptions<'_>,
+    scope: Option<&crate::resource::RequestScope>,
+) -> io::Result<u64> {
+    if !matches!(&resp.body, Body::File { .. }) {
+        return write_response_async(stream, resp, opts, scope).await;
+    }
+
+    let (head, no_body_status, _) = serialize_response_head(resp, opts)?;
+    async_write_progress(stream, &head, opts.write_timeout, scope).await?;
+    if opts.head_only || no_body_status {
+        tokio::time::timeout(opts.write_timeout, tokio::io::AsyncWriteExt::flush(stream))
+            .await
+            .map_err(|_| write_timeout_error())??;
+        return Ok(0);
+    }
+
+    let Body::File {
+        file,
+        mut offset,
+        mut len,
+    } = std::mem::replace(&mut resp.body, Body::Empty)
+    else {
+        unreachable!("plain file response changed after specialization check")
+    };
+    let mut ownership = resp.take_output_ownership();
+    let mut sent = 0u64;
+    let mut fallback = false;
+    while len > 0 && !fallback {
+        if scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "request scope cancelled",
+            ));
+        }
+        let count = len.min(ASYNC_OUTPUT_QUANTUM as u64) as usize;
+        let transfer = tokio::time::timeout(opts.write_timeout, async {
+            loop {
+                stream.writable().await?;
+                let socket = stream.as_fd();
+                match stream.try_io(tokio::io::Interest::WRITABLE, || {
+                    rustix::fs::sendfile(socket, file.as_fd(), Some(&mut offset), count)
+                        .map_err(io::Error::from)
+                }) {
+                    Ok(written) => return Ok::<usize, io::Error>(written),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await;
+        match transfer {
+            Err(_) => return Err(write_timeout_error()),
+            Ok(Ok(0)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short file response body",
+                ));
+            }
+            Ok(Ok(written)) => {
+                sent += written as u64;
+                len -= written as u64;
+                tokio::task::yield_now().await;
+            }
+            // Pipes, synthetic descriptors and some filesystems cannot be
+            // sendfile sources. Resume at the explicit offset through the
+            // same bounded reader used by TLS output.
+            Ok(Err(_)) => fallback = true,
+        }
+    }
+
+    if len > 0 {
+        let context = scope.map(|scope| scope.context().clone());
+        let mut file = file;
+        while len > 0 {
+            let want = len.min(64 * 1024) as usize;
+            let (next_file, chunk, read, next_ownership) =
+                async_read_file_chunk(file, offset, want, context.clone(), ownership).await?;
+            file = next_file;
+            ownership = next_ownership;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short file response body",
+                ));
+            }
+            async_write_progress(stream, &chunk, opts.write_timeout, scope).await?;
+            sent += read as u64;
+            len -= read as u64;
+            offset = offset.saturating_add(read as u64);
+        }
+    }
+    ownership.finish();
     tokio::time::timeout(opts.write_timeout, tokio::io::AsyncWriteExt::flush(stream))
         .await
         .map_err(|_| write_timeout_error())??;
@@ -3422,6 +3826,75 @@ mod tests {
             .unwrap()
             + 4;
         assert_eq!(&wire[split..], vec![b'x'; expected]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_request_body_is_bounded_and_single_consumer() {
+        let budget = std::sync::Arc::new(ResourceBudget::default());
+        let length = STREAMING_BODY_CHUNK * (STREAMING_BODY_CHANNEL_CHUNKS + 1);
+        let mut request = parse_head(
+            format!("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: {length}\r\n\r\n")
+                .as_bytes(),
+            &Limits::default(),
+        )
+        .unwrap();
+        request
+            .headers
+            .bind_request_scope(crate::resource::RequestScope::new(
+                budget.context("127.0.0.1".parse().unwrap()),
+            ));
+        let sender = install_streaming_request_body(&mut request, length as u64, &budget).unwrap();
+        for _ in 0..STREAMING_BODY_CHANNEL_CHUNKS {
+            sender.try_send(vec![b'x'; STREAMING_BODY_CHUNK]).unwrap();
+        }
+        assert!(matches!(
+            sender.try_send(vec![b'x'; STREAMING_BODY_CHUNK]),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
+
+        let mut reader = request.body_reader().unwrap().unwrap();
+        let consumer = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        sender.send(vec![b'x'; STREAMING_BODY_CHUNK]).await.unwrap();
+        let bytes = consumer.join().unwrap();
+        assert_eq!(bytes, vec![b'x'; length]);
+        assert!(request.body_reader().unwrap().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plain_async_file_output_uses_socket_sendfile_path() {
+        let body = vec![b'z'; ASYNC_OUTPUT_QUANTUM * 2 + 31];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected = body.clone();
+        let writer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let file = temp_file(&body);
+            let mut response = Response::new(200);
+            response.body = Body::File {
+                file,
+                offset: 0,
+                len: body.len() as u64,
+            };
+            write_response_async_plain(&mut socket, &mut response, &response_options(), None)
+                .await
+                .unwrap()
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut wire = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(writer.await.unwrap(), expected.len() as u64);
+        let split = wire
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert_eq!(&wire[split..], expected);
     }
 
     #[tokio::test(flavor = "current_thread")]

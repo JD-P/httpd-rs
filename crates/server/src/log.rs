@@ -812,6 +812,7 @@ impl Logger {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn escape_control() {
@@ -823,6 +824,17 @@ mod tests {
             .is_err());
         assert!(message.0.is_char_boundary(message.0.len()));
         assert!(message.0.len() <= MAX_STDERR_MESSAGE_BYTES);
+        let mut split_codepoint = BoundedMessage(String::new());
+        assert!(split_codepoint
+            .write_str(&"€".repeat(MAX_STDERR_MESSAGE_BYTES))
+            .is_err());
+        assert!(split_codepoint.0.is_char_boundary(split_codepoint.0.len()));
+        let mut full = BoundedMessage("x".repeat(MAX_STDERR_MESSAGE_BYTES));
+        assert!(full.write_str("more").is_err());
+
+        let stderr_guard = try_writer(&STDERR_WRITER_BUSY).unwrap();
+        bounded_stderr(format_args!("deliberately dropped"));
+        drop(stderr_guard);
 
         static TEST_GATE: AtomicBool = AtomicBool::new(false);
         let first = try_writer(&TEST_GATE).unwrap();
@@ -843,7 +855,84 @@ mod tests {
         capped.write_all(b"abcd").unwrap();
         capped.flush().unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 2);
+        capped.bytes = MAX_LOG_FILE_BYTES;
+        assert_eq!(capped.write(b"discarded").unwrap(), 9);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 2);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn configured_log_identity_and_target_errors_are_explicit() {
+        assert_eq!(configured_user_id("123").unwrap(), 123);
+        assert_eq!(
+            configured_user_id(&crate::files::effective_uid().to_string()).unwrap(),
+            crate::files::effective_uid()
+        );
+        assert!(configured_user_id("bad\0user").is_err());
+        assert!(configured_user_id("vapache-user-that-does-not-exist").is_err());
+        assert!(open_log("/dev/zero", Path::new("/"), None).is_err());
+
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-log-errors-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("loop", dir.join("loop")).unwrap();
+        assert!(open_log("loop/error.log", &dir, None).is_err());
+
+        let target = dir.join("target.log");
+        let linked = dir.join("linked.log");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+        assert!(open_log(linked.to_str().unwrap(), &dir, None).is_err());
+        assert!(open_log("", Path::new(""), None).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn access_log_drops_a_line_while_the_bounded_writer_is_busy() {
+        let logger = Logger {
+            error: Mutex::new(Box::new(Vec::<u8>::new())),
+            error_path: "/dev/null".into(),
+            root: PathBuf::from("/"),
+            service_uid: None,
+            level: Level::Info,
+            access: vec![AccessLog {
+                path: "memory".into(),
+                format: "%h".into(),
+                vhost: None,
+                writer: Mutex::new(Box::new(Vec::<u8>::new())),
+                discard: false,
+            }],
+            resource_budget: std::sync::Arc::new(crate::resource::ResourceBudget::default()),
+            errors: Mutex::new(Vec::new()),
+        };
+        let entry = AccessEntry {
+            remote_ip: "192.0.2.1",
+            remote_port: 1234,
+            local_ip: "127.0.0.1",
+            local_port: 80,
+            server_name: "example.test",
+            method: "GET",
+            uri: b"/",
+            remote_user: None,
+            protocol: "HTTP/1.1",
+            status: 200,
+            bytes_sent: 0,
+            bytes_in: 0,
+            referer: "",
+            user_agent: "",
+            host: "example.test",
+            vhost_index: None,
+            started: Instant::now(),
+        };
+
+        let busy = try_writer(&LOG_WRITER_BUSY).unwrap();
+        logger.access(&entry);
+        drop(busy);
+        logger.access(&entry);
     }
 
     #[test]
@@ -1046,11 +1135,26 @@ mod tests {
             vhost_index: None,
             started: Instant::now(),
         };
+
+        let log_guard = try_writer(&LOG_WRITER_BUSY).unwrap();
+        assert!(LOG_WRITER_BUSY.load(Ordering::Acquire));
+        logger.error("deliberately dropped");
+        logger.access(&entry);
+        drop(log_guard);
         logger.access(&entry);
         logger.access(&AccessEntry {
             vhost_index: Some(0),
             ..entry
         });
+
+        let mut saturated_logger = Logger::new(&cfg).unwrap();
+        saturated_logger.resource_budget = Arc::new(crate::resource::ResourceBudget::default());
+        assert!(saturated_logger
+            .resource_budget
+            .try_log_bytes(None, crate::resource::MAX_LOG_BYTES_PER_SECOND));
+        saturated_logger.error("rate limited");
+        saturated_logger.access(&entry);
+
         logger.reopen().unwrap();
         drop(logger);
         assert!(std::fs::read_to_string(dir.join("logs/error.log"))

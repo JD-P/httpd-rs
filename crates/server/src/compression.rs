@@ -543,6 +543,8 @@ mod tests {
     use super::*;
     use crate::config::{CompressionKind, CompressionRule, Scope, UnsupportedFilterRule};
     use crate::http::{Body, Headers, Request, Response, Version};
+    use crate::resource::{RequestScope, ResourceBudget};
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn request(accept: &str) -> Request {
         let mut headers = Headers::default();
@@ -571,6 +573,14 @@ mod tests {
         r.headers.push((Cow::Borrowed("ETag"), b"\"abc\"".to_vec()));
         r.body = Body::Bytes(body.to_vec());
         r
+    }
+
+    fn request_in_budget(accept: &str, budget: &Arc<ResourceBudget>, client: IpAddr) -> Request {
+        let mut request = request(accept);
+        request
+            .headers
+            .bind_request_scope(RequestScope::new(budget.context(client)));
+        request
     }
 
     #[test]
@@ -674,6 +684,68 @@ mod tests {
             .push((Cow::Borrowed("Cache-Control"), b"no-transform".to_vec()));
         finalize(&scope, &request("gzip"), &mut r, b"/x.html");
         assert!(header(&r, "content-encoding").is_none());
+    }
+
+    #[test]
+    fn conditional_etag_honors_no_transform() {
+        let mut scope = Scope::default();
+        scope
+            .compression_policy
+            .compression_rules
+            .push(CompressionRule::Set(vec![CompressionKind::Gzip]));
+        let mut r = response(b"hello", "text/html");
+        r.headers.push((
+            Cow::Borrowed("Cache-Control"),
+            b"public, No-Transform".to_vec(),
+        ));
+        assert_eq!(
+            conditional_static_etag(&scope, &request("gzip"), &r, b"/x.html", 5).as_deref(),
+            Some("\"abc\"")
+        );
+    }
+
+    #[test]
+    fn compression_pressure_preserves_identity_representation() {
+        let mut scope = Scope::default();
+        scope
+            .compression_policy
+            .compression_rules
+            .push(CompressionRule::Set(vec![CompressionKind::Gzip]));
+        let client = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        let expensive_budget = Arc::new(ResourceBudget::default());
+        let expensive_request = request_in_budget("gzip", &expensive_budget, client);
+        let context = expensive_request.resource_context().unwrap();
+        let _expensive = (0..crate::resource::MAX_EXPENSIVE_OPS_PER_CLIENT)
+            .map(|_| crate::resource::try_expensive_in(context).unwrap())
+            .collect::<Vec<_>>();
+        let mut under_cpu_pressure = response(b"identity", "text/plain");
+        finalize_budgeted(
+            &scope,
+            &expensive_request,
+            &mut under_cpu_pressure,
+            b"/x.txt",
+            &expensive_budget,
+        );
+        assert_eq!(under_cpu_pressure.body_len(), 8);
+        assert!(header(&under_cpu_pressure, "content-encoding").is_none());
+
+        let resident_budget = Arc::new(ResourceBudget::default());
+        let mut occupied = resident_budget.try_response_bytes_for(client);
+        occupied
+            .reserve(crate::resource::MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT)
+            .unwrap();
+        let resident_request = request_in_budget("gzip", &resident_budget, client);
+        let mut under_memory_pressure = response(b"identity", "text/plain");
+        finalize_budgeted(
+            &scope,
+            &resident_request,
+            &mut under_memory_pressure,
+            b"/x.txt",
+            &resident_budget,
+        );
+        assert_eq!(under_memory_pressure.body_len(), 8);
+        assert!(header(&under_memory_pressure, "content-encoding").is_none());
     }
 
     #[test]

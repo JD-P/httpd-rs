@@ -2145,6 +2145,236 @@ mod tests {
     }
 
     #[test]
+    fn coverable_rewrite_budget_and_byte_error_paths_fail_closed() {
+        let root = Path::new("/tmp");
+        let old = root.join("old");
+        let simple_scope = || {
+            let mut scope = Scope::default();
+            scope.rewrite_policy.rewrite_engine = Some(true);
+            scope.rewrite_policy.rewrite_rules.push(
+                parse_rewrite_rule(&["^/old$".into(), "/new".into(), "[L]".into()], "/", false)
+                    .unwrap(),
+            );
+            scope
+        };
+
+        let expansion_exhausted = req();
+        assert!(expansion_exhausted
+            .charge_policy_expansion(crate::resource::MAX_POLICY_EXPANSION_BYTES + 1)
+            .is_err());
+        assert!(matches!(
+            process(
+                &simple_scope(),
+                &expansion_exhausted,
+                &ctx("/old", &old, root)
+            ),
+            Outcome::Error(ref error) if error.contains("expansion limit")
+        ));
+
+        let work_exhausted = req();
+        work_exhausted
+            .charge_policy_work(crate::resource::MAX_POLICY_WORK_UNITS)
+            .unwrap();
+        assert!(matches!(
+            process(&simple_scope(), &work_exhausted, &ctx("/old", &old, root)),
+            Outcome::Error(ref error) if error.contains("work limit")
+        ));
+
+        let mut target_scope = Scope::default();
+        target_scope.rewrite_policy.rewrite_engine = Some(true);
+        target_scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &[
+                    "^/old$".into(),
+                    "x".repeat(MAX_REWRITE_OUTPUT_BYTES),
+                    "[L]".into(),
+                ],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            process(&target_scope, &req(), &ctx("/old", &old, root)),
+            Outcome::Error(ref error) if error.contains("target exceeds")
+        ));
+
+        let original_query = vec![b'x'; MAX_REWRITE_OUTPUT_BYTES + 1];
+        let mut large_query_ctx = ctx("/old", &old, root);
+        large_query_ctx.query = &original_query;
+        assert!(matches!(
+            process(&simple_scope(), &req(), &large_query_ctx),
+            Outcome::Error(ref error) if error.contains("query exceeds")
+        ));
+
+        let mut append_scope = Scope::default();
+        append_scope.rewrite_policy.rewrite_engine = Some(true);
+        append_scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/old$".into(), "/new?a=b".into(), "[QSA,L]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            process(&append_scope, &req(), &large_query_ctx),
+            Outcome::Error(ref error) if error.contains("query exceeds")
+        ));
+
+        for flag in ["[P,L]", "[R,L]"] {
+            let mut scope = Scope::default();
+            scope.rewrite_policy.rewrite_engine = Some(true);
+            scope.rewrite_policy.rewrite_rules.push(
+                parse_rewrite_rule(
+                    &[
+                        "^/old$".into(),
+                        "http://example.test/new".into(),
+                        flag.into(),
+                    ],
+                    "/",
+                    false,
+                )
+                .unwrap(),
+            );
+            let invalid_query = [0xff];
+            let mut invalid_ctx = ctx("/old", &old, root);
+            invalid_ctx.query = &invalid_query;
+            assert!(matches!(
+                process(&scope, &req(), &invalid_ctx),
+                Outcome::Error(ref error) if error.contains("non-UTF-8 query")
+            ));
+        }
+
+        let mut invalid_header = req();
+        invalid_header.headers.insert("host", vec![0xff]);
+        let context = ctx("/old", &old, root);
+        assert!(variable_value(
+            "QUERY_STRING",
+            &invalid_header,
+            &context,
+            "/old",
+            &[0xff],
+            &[],
+            &[]
+        )
+        .is_err());
+        assert!(variable_value(
+            "HTTP_HOST",
+            &invalid_header,
+            &context,
+            "/old",
+            b"",
+            &[],
+            &[]
+        )
+        .is_err());
+        assert!(variable_value(
+            "HTTP:Host",
+            &invalid_header,
+            &context,
+            "/old",
+            b"",
+            &[],
+            &[]
+        )
+        .is_err());
+        assert!(same_host_internal(&context, &invalid_header, "ftp://example.test/x").is_none());
+
+        assert!(expand_vars_bytes(
+            "%{%1}",
+            &req(),
+            &context,
+            "/old",
+            b"",
+            &[vec![0xff]],
+            &[],
+            &[]
+        )
+        .is_err());
+        let oversized = vec![b'x'; MAX_REWRITE_OUTPUT_BYTES + 1];
+        assert!(expand_vars_bytes(
+            "%{ENV:X}",
+            &req(),
+            &context,
+            "/old",
+            b"",
+            &[],
+            &[],
+            &[("X".into(), oversized.clone())]
+        )
+        .is_err());
+        let oversized_capture = vec![b'x'; MAX_REWRITE_OUTPUT_BYTES + 1];
+        assert!(expand_vars_bytes(
+            "%{%1}",
+            &req(),
+            &context,
+            "/old",
+            b"",
+            &[Vec::new(), oversized_capture.clone()],
+            &[],
+            &[]
+        )
+        .is_err());
+        assert!(expand_backrefs_bytes(
+            "%{$1}",
+            &[Vec::new(), vec![0xff]],
+            &[],
+            &req(),
+            &context,
+            "/old",
+            b"",
+            &[],
+            &[],
+            false,
+            None
+        )
+        .is_err());
+        assert!(expand_backrefs_bytes(
+            "%{$1}",
+            &[Vec::new(), oversized_capture],
+            &[],
+            &req(),
+            &context,
+            "/old",
+            b"",
+            &[],
+            &[],
+            false,
+            None
+        )
+        .is_err());
+        assert!(expand_backrefs_bytes(
+            "${QUERY_STRING}",
+            &[],
+            &[],
+            &req(),
+            &context,
+            "/old",
+            &oversized,
+            &[],
+            &[],
+            false,
+            None
+        )
+        .is_err());
+        assert!(expand_backrefs_bytes(
+            "$1",
+            &[Vec::new(), oversized],
+            &[],
+            &req(),
+            &context,
+            "/old",
+            b"",
+            &[],
+            &[],
+            false,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
     fn qsa_keeps_substitution_query_first() {
         let mut scope = Scope::default();
         scope.rewrite_policy.rewrite_engine = Some(true);
@@ -3819,6 +4049,10 @@ mod tests {
         fs::rename(&path, &displaced).unwrap();
         assert!(!program.binding_intact());
         assert_eq!(run_prg_map(&program, "value"), "");
+        assert_eq!(
+            run_prg_map_timeout(&program, "value", Duration::from_millis(10)),
+            ""
+        );
         fs::write(&path, "#!/bin/sh\nprintf 'attacker\\n'\n").unwrap();
         fs::set_permissions(&path, mode.clone()).unwrap();
         assert!(!program.binding_intact());
@@ -3841,6 +4075,24 @@ mod tests {
         fs::set_permissions(&invalid, std::fs::Permissions::from_mode(0o700)).unwrap();
         let invalid_program = RewriteProgram::bind(invalid, Vec::new()).unwrap();
         assert_eq!(run_prg_map(&invalid_program, "value"), "");
+
+        let saturated_budget = std::sync::Arc::new(crate::resource::ResourceBudget::default());
+        let saturated_context = saturated_budget.context(std::net::IpAddr::from([127, 0, 0, 2]));
+        crate::resource::with_resource_context(saturated_context.clone(), || {
+            let prg_leases = std::iter::from_fn(try_prg_map).collect::<Vec<_>>();
+            assert!(!prg_leases.is_empty());
+            assert_eq!(run_prg_map(&invalid_program, "value"), "");
+        });
+
+        let expensive_budget = std::sync::Arc::new(crate::resource::ResourceBudget::default());
+        let expensive_context = expensive_budget.context(std::net::IpAddr::from([127, 0, 0, 3]));
+        crate::resource::with_resource_context(expensive_context.clone(), || {
+            let expensive = (0..crate::resource::MAX_EXPENSIVE_OPS_PER_CLIENT)
+                .map(|_| crate::resource::try_expensive_in(&expensive_context).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(run_prg_map(&invalid_program, "value"), "");
+            drop(expensive);
+        });
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -58,6 +58,16 @@ and key reads, and CGI spawn. Integration tests sweep short-read boundaries,
 retry `EINTR`, and require every other injected failure to remain fail closed.
 The feature is off in production and the hook compiles to success.
 
+`tests/chaos.sh` complements those hooks with an isolated nightly container.
+It runs the release daemon with a read-only root, no external network, cgroup
+memory/PID/CPU limits and a small descriptor limit; injects real `openat2(2)`
+and `sendfile(2)` failures with `strace`; and kills the privileged TLS file
+broker before a reload. The checks require complete response bodies, continued
+server health and atomic retention of the previous TLS configuration. The
+container drops all capabilities and adds back only identity switching,
+fixture access/ownership, child termination, and (for the syscall scenario
+only) ptrace.
+
 Weekly Miri runs exercise pure parser and resource paths. Nightly ASan runs the
 library except the intentionally forking CGI test, LSan runs standalone
 property/failpoint binaries with clean process-global state, and TSan runs the

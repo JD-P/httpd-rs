@@ -1,5 +1,6 @@
 #![cfg(feature = "fault-injection")]
 
+use std::collections::HashMap;
 use std::io;
 use vapached::files::Target;
 use vapached::http::{read_request, Limits, ReadError};
@@ -94,6 +95,24 @@ fn injected_secure_open_failure_never_returns_a_file() {
     let error = vapached::files::require_secure_path_resolution().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     assert!(error.to_string().contains("requires Linux openat2"));
+    vapached::fault::clear();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn injected_configuration_open_failure_is_reported_without_partial_policy() {
+    let _fault_guard = vapached::fault::test_guard();
+    let root =
+        std::env::temp_dir().join(format!("vapache-failpoint-config-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let config = root.join("httpd.conf");
+    std::fs::write(&config, "Listen 127.0.0.1:0\n").unwrap();
+
+    vapached::fault::configure("fs.openat2", 0, io::ErrorKind::PermissionDenied);
+    let result =
+        vapached::config::Config::load(&config, &root, &HashMap::new(), &HashMap::new(), false);
+    assert!(result.is_err());
     vapached::fault::clear();
     let _ = std::fs::remove_dir_all(root);
 }
