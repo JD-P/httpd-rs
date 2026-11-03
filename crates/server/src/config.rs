@@ -1127,6 +1127,10 @@ pub struct ProxyReverseRule {
 #[derive(Debug, Clone)]
 pub struct RewriteProgram {
     pub(crate) path: PathBuf,
+    /// Canonical root-controlled source whose parents belong in the
+    /// privileged administrative-input manifest. The configured spelling is
+    /// retained separately for the runtime binding check.
+    pub(crate) admin_trust_path: Option<PathBuf>,
     pub(crate) args: Vec<String>,
     pub(crate) file: Arc<File>,
     dev: u64,
@@ -1141,10 +1145,32 @@ pub struct RewriteProgram {
 
 impl RewriteProgram {
     pub(crate) fn bind(path: PathBuf, args: Vec<String>) -> std::io::Result<Self> {
-        let mut source = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(&path)?;
+        Self::bind_with_trust(path, args, crate::files::AdminFileTrust::ProcessOwned)
+    }
+
+    pub(crate) fn bind_with_trust(
+        path: PathBuf,
+        args: Vec<String>,
+        trust: crate::files::AdminFileTrust,
+    ) -> std::io::Result<Self> {
+        let (mut source, admin_trust_path) = if trust == crate::files::AdminFileTrust::RootOwned {
+            // Root-controlled symlink spellings such as /bin -> /usr/bin are
+            // compatible, but the resolved executable itself must be a
+            // root-owned non-writable regular file opened without symlinks.
+            let canonical = std::fs::canonicalize(&path)?;
+            (
+                crate::files::validate_root_owned_admin_file(&canonical)?,
+                Some(canonical),
+            )
+        } else {
+            (
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_CLOEXEC)
+                    .open(&path)?,
+                None,
+            )
+        };
         let meta = source.metadata()?;
         if !meta.is_file() {
             return Err(std::io::Error::new(
@@ -1224,6 +1250,7 @@ impl RewriteProgram {
         }
         Ok(Self {
             path,
+            admin_trust_path,
             args,
             file: Arc::new(file),
             dev: meta.dev(),
@@ -6606,7 +6633,11 @@ impl Compile {
                         } else {
                             self.cfg.server_root.join(program)
                         };
-                        let program = match RewriteProgram::bind(prog_path.clone(), args_rest) {
+                        let program = match RewriteProgram::bind_with_trust(
+                            prog_path.clone(),
+                            args_rest,
+                            self.cfg.admin_file_trust,
+                        ) {
                             Ok(program) => program,
                             Err(error) => {
                                 self.errors.push(ConfigError {
@@ -6620,6 +6651,16 @@ impl Compile {
                                 return;
                             }
                         };
+                        if let Some(trusted) = &program.admin_trust_path {
+                            if !self
+                                .cfg
+                                .admin_input_targets
+                                .iter()
+                                .any(|known| known == trusted)
+                            {
+                                self.cfg.admin_input_targets.push(trusted.clone());
+                            }
+                        }
                         scope
                             .rewrite_policy
                             .rewrite_maps
@@ -7787,11 +7828,21 @@ impl Compile {
             }
             "sslproxycacertificatefile" => {
                 let p = PathBuf::from(first());
-                scope.proxy_policy.proxy_ca_file = Some(if p.is_absolute() {
+                let full = if p.is_absolute() {
                     p
                 } else {
                     self.cfg.server_root.join(p)
-                });
+                };
+                if !self
+                    .cfg
+                    .admin_input_targets
+                    .iter()
+                    .any(|known| known == &full)
+                {
+                    self.cfg.admin_input_targets.push(full.clone());
+                }
+                scope.proxy_policy.proxy_ca_file = Some(full);
+                scope.proxy_policy.proxy_ca_trust = self.cfg.admin_file_trust;
                 scope.proxy_policy.tls_config_cache =
                     std::sync::Arc::new(crate::scope_policy::ProxyTlsConfigCache::default());
             }
@@ -14795,6 +14846,9 @@ Require all granted\n\
             s.proxy_policy.proxy_ca_file.as_deref(),
             Some(Path::new("/tmp/rel/ca.pem"))
         );
+        assert!(c
+            .admin_input_targets
+            .contains(&PathBuf::from("/tmp/rel/ca.pem")));
         assert_eq!(
             c.vhosts[0].ssl.cert_file.as_deref(),
             Some(Path::new("/tmp/rel/cert.pem"))

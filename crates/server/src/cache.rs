@@ -719,50 +719,63 @@ pub fn request_scope_with_plan(
     let current_rel = fs_path.strip_prefix(&root).unwrap_or(&rel);
     let mut directory_target = false;
     let mut index_selected = false;
-    if let crate::files::Target::Directory { file, .. } =
-        crate::files::resolve_target_checked(&root, current_rel, follow, owner_match_only)
-    {
-        directory_target = true;
-        if let Some(index) =
-            crate::files::directory_index_target(cfg, &scope, req, &file, &url_path, &req.raw_path)
-        {
-            // The cache identity must preserve the exact index name bytes.
-            // Reject a non-UTF-8 index name rather than sharing a lossy key.
-            let index_name = std::str::from_utf8(&index.name).ok()?;
-            let index_url = format!("{}/{}", url_path.trim_end_matches('/'), index_name);
-            let index_fs = crate::files::fd_path(&index.file)?;
-            let target = crate::request_plan::CanonicalTarget::from_url_path(&index_url)?;
-            let index_plan = crate::request_plan::RequestPlan::from_fs_target_for_request(
-                cfg,
-                vhost,
-                target,
-                root.clone(),
-                index_fs.clone(),
-                script_alias,
-                req,
-            )
-            .ok()?;
-            let mut index_scope = index_plan.effective_scope(cfg, vhost, req, peer);
-            // The selected index has its own URL identity; conjoin that
-            // lexical scope and the directory URL's non-handler policy.
-            let lexical = crate::request_plan::CanonicalTarget::from_url_path(&index_url)?;
-            let lexical_plan =
-                crate::request_plan::RequestPlan::resolve_for_request(cfg, vhost, lexical, req)
-                    .ok()?;
-            let lexical_scope = lexical_plan.effective_scope(cfg, vhost, req, peer);
-            index_scope.restrict_with(&lexical_scope);
-            index_scope.restrict_policy_with(&scope);
-            scope = index_scope;
-            fs_path = index_fs;
-            cache_url_path = index_url;
-            index_selected = true;
+    let mut opened_actual = None;
+    match crate::files::resolve_target_checked(&root, current_rel, follow, owner_match_only) {
+        crate::files::Target::File { file, .. } => {
+            opened_actual = Some(crate::files::fd_path(&file)?);
         }
+        crate::files::Target::Directory { file, .. } => {
+            directory_target = true;
+            if let Some(index) = crate::files::directory_index_target(
+                cfg,
+                &scope,
+                req,
+                &file,
+                &url_path,
+                &req.raw_path,
+            ) {
+                // The cache identity must preserve the exact index name bytes.
+                // Reject a non-UTF-8 index name rather than sharing a lossy key.
+                let index_name = std::str::from_utf8(&index.name).ok()?;
+                let index_url = format!("{}/{}", url_path.trim_end_matches('/'), index_name);
+                let index_fs = crate::files::fd_path(&index.file)?;
+                let target = crate::request_plan::CanonicalTarget::from_url_path(&index_url)?;
+                let index_plan = crate::request_plan::RequestPlan::from_fs_target_for_request(
+                    cfg,
+                    vhost,
+                    target,
+                    root.clone(),
+                    index_fs.clone(),
+                    script_alias,
+                    req,
+                )
+                .ok()?;
+                let mut index_scope = index_plan.effective_scope(cfg, vhost, req, peer);
+                // The selected index has its own URL identity; conjoin that
+                // lexical scope and the directory URL's non-handler policy.
+                let lexical = crate::request_plan::CanonicalTarget::from_url_path(&index_url)?;
+                let lexical_plan =
+                    crate::request_plan::RequestPlan::resolve_for_request(cfg, vhost, lexical, req)
+                        .ok()?;
+                let lexical_scope = lexical_plan.effective_scope(cfg, vhost, req, peer);
+                index_scope.restrict_with(&lexical_scope);
+                index_scope.restrict_policy_with(&scope);
+                scope = index_scope;
+                fs_path = index_fs;
+                cache_url_path = index_url;
+                index_selected = true;
+            } else {
+                opened_actual = Some(crate::files::fd_path(&file)?);
+            }
+        }
+        crate::files::Target::Forbidden => return None,
+        crate::files::Target::NotFound => {}
     }
     // The opened/canonical target may differ from the URL-mapped path when a
     // document root, alias target or in-root component is a symlink.  The
     // cache must use the same two-identity meet as dispatch before deciding
     // that a representation is servable (F60/I61).
-    if let Ok(actual) = std::fs::canonicalize(&fs_path) {
+    if let Some(actual) = opened_actual {
         if actual != fs_path {
             let target = crate::request_plan::CanonicalTarget::from_url_path(&cache_url_path)?;
             let target_plan = crate::request_plan::RequestPlan::from_fs_target_for_request(
@@ -3667,6 +3680,21 @@ CacheDisable /disabled\n\
             symlink.target,
             fs::canonicalize(www.join("real.txt")).unwrap()
         );
+        // Cache admission must consume the same owner-match policy as live
+        // dispatch.  Otherwise a representation populated while the link was
+        // admissible could remain reachable after the link owner changed.
+        if crate::files::effective_uid() == 0 {
+            let link = www.join("alias.txt");
+            rustix::fs::chownat(
+                rustix::fs::CWD,
+                &link,
+                Some(rustix::fs::Uid::from_raw(1)),
+                None,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
+            assert!(call("/alias.txt").is_none());
+        }
         assert!(call("/empty/").is_some());
         assert!(call("/disabled/file.txt").is_none());
         assert!(call("/method/file.txt").is_none());

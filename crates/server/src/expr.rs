@@ -7,7 +7,7 @@
 use crate::http::Request;
 use std::io::Read;
 use std::net::IpAddr;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 /// Request-time expression evaluation must not turn `file()` into an
@@ -717,9 +717,10 @@ fn cmp(left: &Value, op: &str, right: &Value) -> bool {
 /// Resolve an expression file argument beneath the document root.  `.htaccess`
 /// authors can use `Require expr`/`RewriteCond expr`; allowing absolute or
 /// parent-relative paths there would let a local author read files with the
-/// httpd user's privileges (CVE-2026-24072 / CVE-2026-44119).  Existing paths
-/// are canonicalized and must still be under the canonical document root.
-fn confined_expr_path(ctx: &Context<'_>, raw: &str, must_exist: bool) -> Option<PathBuf> {
+/// httpd user's privileges (CVE-2026-24072 / CVE-2026-44119). The result is
+/// kept relative so the actual probe can consume it through the retained
+/// mapping-root descriptor without a path re-walk after canonicalization.
+fn confined_expr_relative(raw: &str) -> Option<PathBuf> {
     let path = Path::new(raw);
     let absolute = path.is_absolute();
     let parent_relative = path.components().any(|c| {
@@ -731,36 +732,12 @@ fn confined_expr_path(ctx: &Context<'_>, raw: &str, must_exist: bool) -> Option<
     if !vapache_verified::expr_file_test_admit(absolute, parent_relative, true) {
         return None;
     }
-    let joined = ctx.docroot.join(path);
-    if !must_exist {
-        return Some(joined);
-    }
-    let root = std::fs::canonicalize(ctx.docroot).ok()?;
-    let target = std::fs::canonicalize(&joined).ok()?;
-    // Consume the same verified component-aware containment kernel as the
-    // rewrite, alias and FastCGI paths instead of a local `starts_with`:
-    // containment is one story (`path_under_base`) everywhere, and its
-    // reflexivity/transitivity lemmas hold for this check too.
-    if vapache_verified::path_under_base(
-        target.as_os_str().as_encoded_bytes(),
-        root.as_os_str().as_encoded_bytes(),
-    ) {
-        Some(target)
-    } else {
-        None
-    }
+    Some(path.to_path_buf())
 }
 
-fn read_expr_file(path: &Path) -> Result<String, String> {
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .read(true)
-        // O_NONBLOCK prevents a replaced FIFO from pinning a worker before
-        // descriptor metadata can reject it. O_NOFOLLOW closes the final-name
-        // replacement window after the confinement check.
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let file = options.open(path).map_err(|error| error.to_string())?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
+fn read_expr_file(root: &Path, relative: &Path) -> Result<String, String> {
+    let (file, metadata) =
+        crate::files::open_read_beneath(root, relative).map_err(|error| error.to_string())?;
     if !vapache_verified::expr_file_read_admit(
         metadata.is_file(),
         metadata.len(),
@@ -768,7 +745,23 @@ fn read_expr_file(path: &Path) -> Result<String, String> {
     ) {
         return Err("expression file must be a regular file no larger than 64 KiB".into());
     }
-    read_expr_file_contents(file, metadata.len() as usize)
+    let data = read_expr_file_contents(&file, metadata.len() as usize)?;
+    let after = file.metadata().map_err(|error| error.to_string())?;
+    if !vapache_verified::descriptor_snapshot_admit(
+        metadata.is_file() && after.is_file(),
+        metadata.dev() == after.dev() && metadata.ino() == after.ino(),
+        metadata.len() == after.len()
+            && data.len() as u64 == metadata.len()
+            && metadata.mtime() == after.mtime()
+            && metadata.mtime_nsec() == after.mtime_nsec()
+            && metadata.ctime() == after.ctime()
+            && metadata.ctime_nsec() == after.ctime_nsec()
+            && metadata.mode() == after.mode(),
+        data.len() as u64 <= MAX_EXPR_FILE_BYTES,
+    ) {
+        return Err("expression file changed while it was being read".into());
+    }
+    Ok(data)
 }
 
 fn read_expr_file_contents(reader: impl Read, initial_len: usize) -> Result<String, String> {
@@ -900,29 +893,19 @@ impl Expr {
             ),
             Expr::FileTest(op, e) => {
                 let raw = e.eval_budgeted(ctx, budget)?.string();
-                // File tests are a metadata oracle too.  Use the same
-                // canonical document-root confinement as file()/filesize();
-                // an absolute path or a symlink leaving the root must not be
-                // observable through `.htaccess` expressions (F45/I42).
-                let p = confined_expr_path(ctx, &raw, true);
-                let meta = p.as_deref().map(std::fs::symlink_metadata);
+                // File tests are a metadata oracle too. Inspect only the
+                // descriptor returned by the confined mapping-root walk; a
+                // post-canonicalization pathname stat can race outside it.
+                let meta = confined_expr_relative(&raw).and_then(|relative| {
+                    crate::files::probe_beneath(ctx.docroot, &relative, false)
+                        .ok()
+                        .map(|(_, metadata)| metadata)
+                });
                 Value::Bool(match op.as_str() {
-                    "-f" => meta
-                        .as_ref()
-                        .and_then(|m| m.as_ref().ok())
-                        .map(|m| m.is_file())
-                        .unwrap_or(false),
-                    "-d" => meta
-                        .as_ref()
-                        .and_then(|m| m.as_ref().ok())
-                        .map(|m| m.is_dir())
-                        .unwrap_or(false),
-                    "-e" | "-F" | "-U" => meta.as_ref().map(|m| m.is_ok()).unwrap_or(false),
-                    "-s" => meta
-                        .as_ref()
-                        .and_then(|m| m.as_ref().ok())
-                        .map(|m| m.len() > 0)
-                        .unwrap_or(false),
+                    "-f" => meta.as_ref().is_some_and(|m| m.is_file()),
+                    "-d" => meta.as_ref().is_some_and(|m| m.is_dir()),
+                    "-e" | "-F" | "-U" => meta.is_some(),
+                    "-s" => meta.as_ref().is_some_and(|m| m.is_file() && m.len() > 0),
                     "-R" => {
                         let spec = e.eval_budgeted(ctx, budget)?.string();
                         crate::config::parse_ip_net(&spec)
@@ -981,16 +964,21 @@ impl Expr {
                             .unwrap_or_default(),
                     ),
                     "file" => {
-                        let p = confined_expr_path(ctx, &arg(0), true).ok_or_else(|| {
+                        let relative = confined_expr_relative(&arg(0)).ok_or_else(|| {
                             "expression file path escapes DOCUMENT_ROOT".to_string()
                         })?;
-                        Value::Str(read_expr_file(&p)?)
+                        Value::Str(read_expr_file(ctx.docroot, &relative)?)
                     }
                     "filesize" => {
-                        let p = confined_expr_path(ctx, &arg(0), true).ok_or_else(|| {
+                        let relative = confined_expr_relative(&arg(0)).ok_or_else(|| {
                             "expression file path escapes DOCUMENT_ROOT".to_string()
                         })?;
-                        Value::Int(std::fs::metadata(p).map(|m| m.len() as i64).unwrap_or(0))
+                        let size = crate::files::probe_beneath(ctx.docroot, &relative, false)
+                            .ok()
+                            .filter(|(_, metadata)| metadata.is_file())
+                            .map(|(_, metadata)| metadata.len() as i64)
+                            .unwrap_or(0);
+                        Value::Int(size)
                     }
                     "toupper" => Value::Str(arg(0).to_ascii_uppercase()),
                     "tolower" => Value::Str(arg(0).to_ascii_lowercase()),
@@ -1694,7 +1682,8 @@ mod tests {
             .unwrap()
             .eval(&mut c)
             .is_err());
-        // FileTest uses the same canonical confinement as file()/filesize().
+        // FileTest uses the same descriptor-relative confinement as
+        // file()/filesize().
         for expr in [
             "-f '/etc/passwd'",
             "-e '/etc/passwd'",
@@ -1712,6 +1701,15 @@ mod tests {
         std::fs::write(&outside_file, "outside").unwrap();
         std::os::unix::fs::symlink(&outside_file, dir.join("escape")).unwrap();
         assert!(!parse("-f 'escape'").unwrap().eval(&mut c).unwrap().truthy());
+        assert!(parse("file('escape') = 'outside'")
+            .unwrap()
+            .eval(&mut c)
+            .is_err());
+        assert!(parse("filesize('escape') = 0")
+            .unwrap()
+            .eval(&mut c)
+            .unwrap()
+            .truthy());
         let _ = std::fs::remove_file(&outside_file);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1819,8 +1817,8 @@ mod tests {
         assert_eq!(function_arg(&c, "REQUEST_METHOD").unwrap(), "GET");
         assert_eq!(function_arg(&c, "%{REQUEST_METHOD}").unwrap(), "GET");
         assert_eq!(
-            confined_expr_path(&c, "relative.txt", false),
-            Some(PathBuf::from("/tmp/relative.txt"))
+            confined_expr_relative("relative.txt"),
+            Some(PathBuf::from("relative.txt"))
         );
     }
 

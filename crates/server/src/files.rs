@@ -96,6 +96,12 @@ pub enum AdminFileTrust {
     RootOwned,
 }
 
+impl Default for AdminFileTrust {
+    fn default() -> Self {
+        Self::ProcessOwned
+    }
+}
+
 impl AdminFileTrust {
     pub fn for_current_process() -> Self {
         if effective_uid() == 0 {
@@ -400,6 +406,23 @@ pub fn validate_service_immutable_file(path: &Path, service_uid: u32) -> io::Res
     Ok(file)
 }
 
+/// Open a canonical administrative executable/input that must remain under
+/// root's mutation authority. Callers that begin with a symlinked spelling
+/// first canonicalize it, retain that original spelling for later binding
+/// checks, and register its parents in the configuration trust manifest.
+pub(crate) fn validate_root_owned_admin_file(path: &Path) -> io::Result<File> {
+    validate_admin_parents(path, u32::MAX)?;
+    let file = open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "privileged administrative input is not a root-owned, non-writable regular file",
+        ));
+    }
+    Ok(file)
+}
+
 /// Create/open every directory component from a retained descriptor.  No
 /// pathname fallback is provided: the daemon already requires `openat2`, and
 /// weakening privileged output creation would reintroduce the exact rename
@@ -601,6 +624,27 @@ fn open_component_nofollow(dir: &File, name: &OsString, flags: i32) -> io::Resul
     )
 }
 
+/// Reopen a non-symlink component with usable I/O flags while retaining the
+/// identity established by the preceding `O_PATH|O_NOFOLLOW` probe.  Opening
+/// the pathname twice without this comparison lets a concurrent rename swap
+/// in a different file or directory after the owner-match decision.
+fn reopen_pinned_component(
+    dir: &File,
+    name: &OsString,
+    flags: i32,
+    pinned: &Metadata,
+) -> io::Result<File> {
+    let file = open_component_nofollow(dir, name, flags)?;
+    let reopened = file.metadata()?;
+    if !vapache_verified::owner_component_reopen_admit(
+        pinned.dev() == reopened.dev(),
+        pinned.ino() == reopened.ino(),
+    ) {
+        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+    }
+    Ok(file)
+}
+
 /// Read the contents of an already-open `O_PATH|O_NOFOLLOW` symlink.  Linux's
 /// empty-path `readlinkat` form binds the bytes to that inode even if its
 /// directory entry is concurrently replaced.
@@ -686,17 +730,18 @@ fn resolve_owner_components(
                     if directories.len() >= MAX_OWNER_PATH_DIRECTORIES {
                         return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
                     }
-                    let directory = open_component_nofollow(
+                    let directory = reopen_pinned_component(
                         current,
                         name,
                         libc::O_RDONLY | libc::O_NONBLOCK | libc::O_DIRECTORY,
+                        &pinned_meta,
                     )?;
                     directories.push(Arc::new(directory));
                     index += 1;
                     continue;
                 }
 
-                let file = open_component_nofollow(current, name, final_flags)?;
+                let file = reopen_pinned_component(current, name, final_flags, &pinned_meta)?;
                 let meta = file.metadata()?;
                 let directories = if meta.is_dir() {
                     if directories.len() >= MAX_OWNER_PATH_DIRECTORIES {
@@ -911,6 +956,49 @@ fn open_beneath(root: &Path, rel: &Path, flags: u64, follow: bool) -> OpenResult
     openat2_file(&root_file, &rel_c, &how)
 }
 
+/// Inspect a rewrite-controlled path through the same retained mapping-root
+/// descriptor and kernel containment boundary used by dispatch.  `nofollow`
+/// applies only to the final component: intermediate symlinks may resolve
+/// within the root, while `RESOLVE_BENEATH` rejects an escape.
+pub(crate) fn probe_beneath(
+    root: &Path,
+    rel: &Path,
+    nofollow: bool,
+) -> io::Result<(File, Metadata)> {
+    if rel.as_os_str().is_empty() {
+        if nofollow {
+            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        let file = root_file(root)?.try_clone()?;
+        let metadata = file.metadata()?;
+        return Ok((file, metadata));
+    }
+    // O_PATH never opens the underlying device/FIFO, so it cannot block.
+    // Linux openat2 rejects O_PATH|O_NONBLOCK as an invalid flag set.
+    let mut flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
+    if nofollow {
+        flags |= libc::O_NOFOLLOW as u64;
+    }
+    let file = open_beneath(root, rel, flags, true)?;
+    let metadata = file.metadata()?;
+    Ok((file, metadata))
+}
+
+/// Open a request-controlled regular-file candidate for bounded reading
+/// without re-walking an already-canonicalized pathname. The caller still
+/// validates the descriptor type, size and version around the read.
+pub(crate) fn open_read_beneath(root: &Path, rel: &Path) -> io::Result<(File, Metadata)> {
+    if rel.as_os_str().is_empty() {
+        let file = root_file(root)?.try_clone()?;
+        let metadata = file.metadata()?;
+        return Ok((file, metadata));
+    }
+    let flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW) as u64;
+    let file = open_beneath(root, rel, flags, true)?;
+    let metadata = file.metadata()?;
+    Ok((file, metadata))
+}
+
 /// Refuse to serve when the kernel cannot enforce descriptor-relative path
 /// containment.  A canonicalize-then-open fallback has an unavoidable rename
 /// race and is not an acceptable security boundary.
@@ -944,6 +1032,29 @@ fn open_at(dir: &File, name: &[u8], follow: bool) -> OpenResult {
         how.resolve |= RESOLVE_NO_SYMLINKS;
     }
     openat2_file(dir, &c, &how)
+}
+
+/// Open one directory child under the effective symlink policy.  In
+/// particular, `SymLinksIfOwnerMatch` must not be collapsed to ordinary
+/// following for DirectoryIndex/cache probes or autoindex metadata.
+fn open_at_with_symlink_policy(
+    dir: &File,
+    name: &[u8],
+    follow_symlinks: bool,
+    owner_match_only: bool,
+) -> OpenResult {
+    if !owner_match_only {
+        return open_at(dir, name, follow_symlinks);
+    }
+    let component = OwnedPathComponent::Normal(OsString::from_vec(name.to_vec()));
+    let mut symlinks = 0usize;
+    let resolved = resolve_owner_components(
+        vec![Arc::new(dir.try_clone()?)],
+        &[component],
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        &mut symlinks,
+    )?;
+    Ok(resolved.file)
 }
 
 pub fn mime_type(cfg: &Config, scope: &Scope, name: &[u8]) -> Option<String> {
@@ -1294,7 +1405,8 @@ fn directory_action(
     dir: &File,
     url_path: &str,
     raw_path: &[u8],
-    follow: bool,
+    follow_symlinks: bool,
+    owner_match_only: bool,
 ) -> DirAction {
     let has_slash = url_path.ends_with('/');
     let slash_enabled = scope.content_policy.directory_slash.unwrap_or(true);
@@ -1317,7 +1429,9 @@ fn directory_action(
         if name.contains('/') || name == ".." || name == "." || name.is_empty() {
             continue;
         }
-        if let Ok(f) = open_at(dir, name.as_bytes(), follow) {
+        if let Ok(f) =
+            open_at_with_symlink_policy(dir, name.as_bytes(), follow_symlinks, owner_match_only)
+        {
             if let Ok(m) = f.metadata() {
                 if m.is_file() {
                     return DirAction::Index(f, m, name.into_bytes());
@@ -1389,7 +1503,13 @@ fn directory_action(
                 ) {
                     return DirAction::Overloaded;
                 }
-                let meta = ent.metadata().ok();
+                // Never follow an autoindex entry with an unconfined pathname
+                // stat. The same descriptor-relative symlink policy used by
+                // serving decides whether target metadata may be disclosed.
+                let meta =
+                    open_at_with_symlink_policy(dir, &name, follow_symlinks, owner_match_only)
+                        .and_then(|file| file.metadata())
+                        .ok();
                 let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
                 let size = meta.as_ref().map(|m| m.size()).unwrap_or(0);
                 entries.push((name, is_dir, size));
@@ -1422,13 +1542,20 @@ pub fn directory_index_target(
     url_path: &str,
     raw_path: &[u8],
 ) -> Option<DirectoryIndex> {
-    let follow = scope
-        .effective_options()
-        .contains(crate::config::Options::FOLLOW_SYMLINKS)
-        || scope
-            .effective_options()
-            .contains(crate::config::Options::SYMLINKS_IF_OWNER_MATCH);
-    match directory_action(cfg, scope, req, dir, url_path, raw_path, follow) {
+    let options = scope.effective_options();
+    let follow_symlinks = options.contains(crate::config::Options::FOLLOW_SYMLINKS);
+    let owner_match_only =
+        !follow_symlinks && options.contains(crate::config::Options::SYMLINKS_IF_OWNER_MATCH);
+    match directory_action(
+        cfg,
+        scope,
+        req,
+        dir,
+        url_path,
+        raw_path,
+        follow_symlinks,
+        owner_match_only,
+    ) {
         DirAction::Index(file, meta, name) => Some(DirectoryIndex { name, file, meta }),
         _ => None,
     }
@@ -1462,13 +1589,20 @@ fn serve_directory_inner(
     peer: std::net::IpAddr,
     local_ip: &str,
 ) -> Response {
-    let follow = scope
-        .effective_options()
-        .contains(crate::config::Options::FOLLOW_SYMLINKS)
-        || scope
-            .effective_options()
-            .contains(crate::config::Options::SYMLINKS_IF_OWNER_MATCH);
-    match directory_action(cfg, scope, req, &dir, url_path, raw_path, follow) {
+    let options = scope.effective_options();
+    let follow_symlinks = options.contains(crate::config::Options::FOLLOW_SYMLINKS);
+    let owner_match_only =
+        !follow_symlinks && options.contains(crate::config::Options::SYMLINKS_IF_OWNER_MATCH);
+    match directory_action(
+        cfg,
+        scope,
+        req,
+        &dir,
+        url_path,
+        raw_path,
+        follow_symlinks,
+        owner_match_only,
+    ) {
         DirAction::Redirect(loc) => {
             let canonical_authority = if (!crate::expr::request_is_https() && port == 80)
                 || (crate::expr::request_is_https() && port == 443)
@@ -2059,6 +2193,26 @@ mod tests {
     }
 
     #[test]
+    fn owner_match_reopen_rejects_non_symlink_substitution() {
+        let (root, _) = config("owner-reopen-substitution");
+        let selected = root.join("selected.txt");
+        std::fs::write(&selected, b"authorized").unwrap();
+        let dir = File::open(&root).unwrap();
+        let name = OsString::from("selected.txt");
+        let pinned = open_component_nofollow(&dir, &name, libc::O_PATH).unwrap();
+        let pinned_meta = pinned.metadata().unwrap();
+
+        std::fs::rename(&selected, root.join("authorized.txt")).unwrap();
+        std::fs::write(&selected, b"substituted").unwrap();
+        let error =
+            reopen_pinned_component(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, &pinned_meta)
+                .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert!(!vapache_verified::owner_component_reopen_admit(true, false));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn resolution_metadata_mime_and_fallback_edges() {
         let (root, mut cfg) = config("resolution");
         std::fs::write(root.join("plain.txt"), b"hello").unwrap();
@@ -2117,11 +2271,17 @@ mod tests {
             ),
             Target::NotFound
         ));
-        if unsafe { libc::geteuid() } == 0 {
+        if effective_uid() == 0 {
             let link = root.join("different-owner-link");
             std::os::unix::fs::symlink("plain.txt", &link).unwrap();
-            let link_c = CString::new(link.as_os_str().as_encoded_bytes()).unwrap();
-            assert_eq!(unsafe { libc::lchown(link_c.as_ptr(), 1, u32::MAX) }, 0);
+            rustix::fs::chownat(
+                rustix::fs::CWD,
+                &link,
+                Some(rustix::fs::Uid::from_raw(1)),
+                None,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
             assert!(matches!(
                 resolve_target_checked(&root, Path::new("different-owner-link"), true, true,),
                 Target::Forbidden
@@ -2607,7 +2767,7 @@ mod tests {
         let mut req = request("GET", b"/dir");
         req.query = b"raw=\xff&escaped=%FE".to_vec();
         let mut scope = Scope::default();
-        match directory_action(&cfg, &scope, &req, &dir, "/dir", b"/dir", true) {
+        match directory_action(&cfg, &scope, &req, &dir, "/dir", b"/dir", true, false) {
             DirAction::Redirect(loc) => {
                 assert_eq!(loc, b"/dir/?raw=%FF&escaped=%FE")
             }
@@ -2622,7 +2782,16 @@ mod tests {
         scope.options.push_add(crate::config::Options::INDEXES);
         scope.content_policy.index_ignore.push("visible".into());
         assert!(matches!(
-            directory_action(&cfg, &scope, &request("GET", b"/"), &dir, "/", b"/", true),
+            directory_action(
+                &cfg,
+                &scope,
+                &request("GET", b"/"),
+                &dir,
+                "/",
+                b"/",
+                true,
+                false,
+            ),
             DirAction::List(_)
         ));
 
@@ -2863,10 +3032,100 @@ mod tests {
                 "/",
                 b"/",
                 true,
+                false,
             ),
             DirAction::Overloaded
         ));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn autoindex_does_not_follow_disallowed_symlink_for_metadata() {
+        let (root, cfg) = config("autoindex-symlink-metadata");
+        let listed = root.join("listed");
+        std::fs::create_dir(&listed).unwrap();
+        let secret = root.join("secret.bin");
+        std::fs::write(&secret, b"sensitive metadata").unwrap();
+        std::os::unix::fs::symlink(&secret, listed.join("outside-link")).unwrap();
+
+        let mut scope = Scope::default();
+        scope.options.push_add(crate::config::Options::INDEXES);
+        scope
+            .options
+            .push_remove(crate::config::Options::FOLLOW_SYMLINKS);
+        scope
+            .options
+            .push_remove(crate::config::Options::SYMLINKS_IF_OWNER_MATCH);
+        let action = directory_action(
+            &cfg,
+            &scope,
+            &request("GET", b"/listed/"),
+            &File::open(&listed).unwrap(),
+            "/listed/",
+            b"/listed/",
+            false,
+            false,
+        );
+        let DirAction::List(entries) = action else {
+            panic!("expected autoindex entries");
+        };
+        let (_, is_dir, size) = entries
+            .iter()
+            .find(|(name, _, _)| name == b"outside-link")
+            .expect("symlink remains name-visible");
+        assert!(!is_dir);
+        assert_eq!(*size, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directory_index_preserves_owner_match_policy() {
+        let (root, mut cfg) = config("directory-index-owner-match");
+        let listed = root.join("listed");
+        std::fs::create_dir(&listed).unwrap();
+        std::fs::write(listed.join("target.html"), b"index").unwrap();
+        let link = listed.join("index.html");
+        std::os::unix::fs::symlink("target.html", &link).unwrap();
+        cfg.directory_index = vec!["index.html".into()];
+
+        let mut scope = Scope::default();
+        scope
+            .options
+            .push_remove(crate::config::Options::FOLLOW_SYMLINKS);
+        scope
+            .options
+            .push_add(crate::config::Options::SYMLINKS_IF_OWNER_MATCH);
+        let dir = File::open(&listed).unwrap();
+        assert!(directory_index_target(
+            &cfg,
+            &scope,
+            &request("GET", b"/listed/"),
+            &dir,
+            "/listed/",
+            b"/listed/",
+        )
+        .is_some());
+
+        if effective_uid() == 0 {
+            rustix::fs::chownat(
+                rustix::fs::CWD,
+                &link,
+                Some(rustix::fs::Uid::from_raw(1)),
+                None,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
+            assert!(directory_index_target(
+                &cfg,
+                &scope,
+                &request("GET", b"/listed/"),
+                &dir,
+                "/listed/",
+                b"/listed/",
+            )
+            .is_none());
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

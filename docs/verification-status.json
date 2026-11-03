@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-03",
   "verus": {
-    "verified_functions": 651,
+    "verified_functions": 655,
     "errors": 0
   },
   "obligations": [
@@ -144,7 +144,7 @@
       "title": "Autoindex policy and /dir versus /dir/ authorization",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "IndexIgnore filters listing entries in main config and .htaccess; DirectorySlash Off reauthorizes a no-slash directory target as the canonical trailing-slash URL before index/listing dispatch"
+      "evidence": "IndexIgnore filters listing entries in main config and .htaccess; DirectorySlash Off reauthorizes a no-slash directory target as the canonical trailing-slash URL before index/listing dispatch. DirectoryIndex probes and autoindex metadata use the same descriptor-relative FollowSymLinks/SymLinksIfOwnerMatch decision as live serving, so a forbidden link cannot disclose target type/size or select an index. Cache admission reuses that resolver and refuses Forbidden targets. owner_component_reopen_admit rejects a device/inode substitution between the owner walk's no-follow probe and usable reopen; unit cases cover ordinary-component substitution, owner-mismatched index links, autoindex metadata and cache admission."
     },
     {
       "id": "alias_base_containment",
@@ -158,7 +158,7 @@
       "title": "Internal rewrite filesystem targets never change the authorization base",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "verified rewrite_filesystem_shape_admit rejects external, passthrough and relative substitutions before filesystem lookup; rewrite_filesystem_candidate_admit composes that shape gate with the existing is-file and component-aware path_under_base containment checks. The runtime consumes both verified gates directly, UnsafePrefixStat cannot re-root at the target parent, and rewrite-condition file tests probe the canonicalized target path rather than its lexical spelling. The rewrite target scope remains conjoined with both rewritten and original URL policy."
+      "evidence": "verified rewrite_filesystem_shape_admit rejects external, passthrough and relative substitutions before filesystem lookup; rewrite_filesystem_candidate_admit composes that shape gate with an opened regular-file descriptor and component-aware path_under_base check. The admitted FilesystemTarget retains the original mapping root, root-relative path and opened actual path through dispatch; rewrite_filesystem_binding_admit and rewrite_filesystem_binding_rejects_reroot exclude the former target-parent re-rooting behavior. UnsafePrefixStat cannot change the authorization base, and rewrite-condition file tests use descriptor-relative RESOLVE_BENEATH probes rather than canonicalize-then-stat. A deterministic parent-replacement regression verifies the retained root rejects an outside symlink after selection. The rewrite target scope remains conjoined with both rewritten and original URL policy."
     },
     {
       "id": "fastcgi_script_containment",
@@ -235,7 +235,7 @@
       "title": "Expression file tests use the document-root confinement",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "Expr::FileTest consumes confined_expr_path for -f/-d/-e/-s/-F/-U, rejecting absolute, parent-relative and escaping-symlink arguments; the containment check consumes the verified component-aware path_under_base kernel. Config compilation binds the effective default or explicit DocumentRoot into every global/vhost scope, and synthetic empty-root scopes fail closed rather than falling back to '/'. Main-config <IfFile> uses a separate operator-supplied Expr::IfFile; unit and P14 regressions cover absent-DocumentRoot, absolute, parent-relative and escaping-symlink cases; rewrite condition file tests also canonicalize and consume path_under_base."
+      "evidence": "Expr::FileTest consumes confined_expr_relative for -f/-d/-e/-s/-F/-U, rejecting absolute and parent-relative arguments, then inspects only a descriptor opened beneath the retained document/alias-root with openat2 RESOLVE_BENEATH. file() uses the same root-relative walk with O_NOFOLLOW/O_NONBLOCK, a 64 KiB ceiling and a before/after descriptor version check; filesize() uses descriptor metadata. Escaping symlinks therefore cannot become metadata/read oracles through a canonicalize-to-path race. Config compilation binds the effective default or explicit DocumentRoot into every global/vhost scope, and synthetic empty-root scopes fail closed rather than falling back to '/'. Main-config <IfFile> remains a separate operator-supplied execute-on-read condition; unit and P14 regressions cover absent-DocumentRoot, absolute, parent-relative and escaping-symlink cases. Rewrite condition file tests use the same descriptor-relative probe, with final no-follow metadata for -l."
     },
     {
       "id": "require_none_multi",
@@ -347,7 +347,7 @@
       "title": "RewriteMap sources are validated and bounded at load time",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "txt/rnd map loads fail closed when missing, unreadable, invalid UTF-8 or larger than MAX_REWRITEMAP; int maps reject unknown functions. prg helpers resolve against ServerRoot, must be executable regular files no larger than 64 MiB, and are copied from one descriptor snapshot into a sealed memfd. Each lookup reopens the configured pathname only to verify the original dev/inode/version, then executes the immutable descriptor with a process-group deadline and 8 KiB output cap. Rename replacement, same-inode mutation, non-file/oversized helpers, sealing and shebang execution are regression-tested; descriptor_snapshot_admit is the executable identity/version gate."
+      "evidence": "txt/rnd map loads fail closed when missing, unreadable, invalid UTF-8 or larger than MAX_REWRITEMAP; int maps reject unknown functions. prg helpers resolve against ServerRoot, must be executable regular files no larger than 64 MiB, and are copied from one descriptor snapshot into a sealed memfd. A configuration generation loaded while privileged additionally requires the canonical helper and its parent tree to be root-controlled; root-owned compatibility spellings such as /bin -> /usr/bin remain supported, and the canonical source enters the administrative-input manifest. Each lookup reopens the configured spelling only to verify the original dev/inode/version, then executes the immutable descriptor with a process-group deadline and 8 KiB output cap. Rename replacement, same-inode mutation, service-owned privileged helpers, non-file/oversized helpers, sealing and shebang execution are regression-tested; descriptor_snapshot_admit is the executable identity/version gate."
     },
     {
       "id": "htaccess_cookie_grammar",
@@ -473,7 +473,7 @@
       "title": "Privilege drop and process-control identity fail closed",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "service_identity_admit is consumed before binding/startup and again by drop_privileges; its proofs reject uid/gid zero and require an already-unprivileged process to match both configured effective IDs. pid_control_admit is consumed after pidfd_open and proves that special/non-positive PIDs, UID changes or any recorded identity mismatch cannot reach pidfd_send_signal. Runtime binds the sidecar to boot ID, process start time and executable device/inode, validates root-owned PID artifacts and refreshes the recorded UID after setresuid. Root-owned administrative-input trust is captured before privilege drop and retained across reload; every discovered include/TLS/types/map parent is checked against the service uid, including empty optional includes. Reload rejects changes to startup-only identity, pid, root, backlog and listener fields and now prepares logs, TLS/OCSP and background generations before one commit point. A pre-thread root TLS broker accepts only numeric IDs from an exact startup allowlist, closes inherited descriptors and standard streams, disables dumps/new privileges, installs tight rlimits plus a seccomp read-only syscall profile, enforces root-owned stable bounded reads and exits with its parent. Root-capable lifecycle tests cover same-path rotation and mutable replacement rejection; separate tests prove rlimits/dump state and that an unlisted syscall is killed. Kernel pidfd/procfs identity semantics, daemon fork orchestration and filesystem ownership enforcement remain outside Verus and are covered by lifecycle/integration tests."
+      "evidence": "service_identity_admit is consumed before binding/startup and again by drop_privileges; its proofs reject uid/gid zero and require an already-unprivileged process to match both configured effective IDs. pid_control_admit is consumed after pidfd_open and proves that special/non-positive PIDs, UID changes or any recorded identity mismatch cannot reach pidfd_send_signal. Runtime binds the sidecar to boot ID, process start time and executable device/inode, validates root-owned PID artifacts and refreshes the recorded UID after setresuid. Root-owned administrative-input trust is captured before privilege drop and retained across reload; every discovered include/TLS/types/map/proxy-CA parent is checked against the service uid, including empty optional includes, and privileged RewriteMap programs require a root-controlled canonical source before sealing. Reload rejects changes to startup-only identity, pid, root, backlog and listener fields and now prepares logs, TLS/OCSP and background generations before one commit point. A pre-thread root TLS broker accepts only numeric IDs from an exact startup allowlist, closes inherited descriptors and standard streams, disables dumps/new privileges, installs tight rlimits plus a seccomp read-only syscall profile, enforces root-owned stable bounded reads and exits with its parent. Root-capable lifecycle tests cover same-path rotation and mutable replacement rejection; separate tests prove rlimits/dump state and that an unlisted syscall is killed. Kernel pidfd/procfs identity semantics, daemon fork orchestration and filesystem ownership enforcement remain outside Verus and are covered by lifecycle/integration tests."
     }
   ],
   "minimum_weighted_score": 3.5,

@@ -376,7 +376,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **648 verified functions, 0 errors** (percent-decoding,
+Current result: **655 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
@@ -553,7 +553,7 @@ Current ledger: **53.7% weighted obligations**, **5/6 proof debt**,
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **108 adversarial replay cases** covering the findings classes,
-and **651 Verus functions with 0 errors** (including the I3 fast-path
+and **655 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -766,7 +766,7 @@ current instrumented suite is 658 Rust library tests, 8 CLI unit tests, 24 Rust
 integration/property tests, 168 conformance tests and 333 fixed configuration
 cases. The module-by-module reason for the remaining debt and the intended test
 mechanism for each major module are tracked in `docs/coverage-debt.md`.
-The separate Verus gate proves 651 functions with 0 errors; proof-only code is
+The separate Verus gate proves 655 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

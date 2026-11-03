@@ -4791,7 +4791,7 @@ fn dispatch_inner(
     let mut rewrite_rounds = 0usize;
     let mut stop_rewriting = false;
     let mut rewrite_effects = crate::rewrite::Effects::default();
-    let mut rewrite_filesystem: Option<PathBuf> = None;
+    let mut rewrite_filesystem: Option<crate::rewrite::FilesystemTarget> = None;
     // The first loop iteration evaluates the original URL with no rewrite
     // effects.  If a later internal rewrite leaves the environment and query
     // unchanged, that exact scope can authorize the original URL again instead
@@ -5245,17 +5245,13 @@ fn dispatch_inner(
     let req: &Request = owned_req.as_ref().unwrap_or(req);
     apply_rewrite_effects(&mut scope, &rewrite_effects);
     if let Some(filesystem) = rewrite_filesystem {
-        root = filesystem
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("/"));
-        rel = PathBuf::from(
-            filesystem
-                .file_name()
-                .map(|n| n.to_os_string())
-                .unwrap_or_default(),
-        );
-        fs_path = root.join(&rel);
+        // Keep the exact document/alias root that admitted this target.
+        // Re-rooting at `filesystem.parent()` would let a writable content
+        // directory be replaced after the rewrite check and escape the
+        // original mapping through a parent-path TOCTOU race.
+        root = filesystem.root;
+        rel = filesystem.rel;
+        fs_path = filesystem.path;
         // The rewrite changed the filesystem target after the scope was
         // evaluated for the URL mapping.  Re-evaluate against the target so
         // <Directory>, <Files> and target .htaccess policy cannot be skipped.

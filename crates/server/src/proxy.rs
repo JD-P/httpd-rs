@@ -396,6 +396,7 @@ struct HealthSpec {
     passes: u32,
     fails: u32,
     ca_file: Option<std::path::PathBuf>,
+    ca_trust: crate::files::AdminFileTrust,
 }
 
 fn health_map() -> &'static Mutex<HashMap<String, MemberHealth>> {
@@ -475,6 +476,7 @@ fn balancer_specs(cfg: &Config, balancer: &Balancer) -> Vec<HealthSpec> {
             passes,
             fails,
             ca_file: cfg.global.proxy_policy.proxy_ca_file.clone(),
+            ca_trust: cfg.global.proxy_policy.proxy_ca_trust,
         });
     }
     out
@@ -584,6 +586,7 @@ fn check_health(spec: &HealthSpec) -> bool {
     };
     let mut scope = Scope::default();
     scope.proxy_policy.proxy_ca_file = spec.ca_file.clone();
+    scope.proxy_policy.proxy_ca_trust = spec.ca_trust;
     let timeout = Duration::from_secs(5);
     let deadline = Instant::now() + timeout;
     let Ok(stream) = connect(&backend, &scope, timeout, deadline) else {
@@ -2193,26 +2196,12 @@ where
 fn build_client_config(scope: &Scope) -> Result<Arc<rustls::ClientConfig>, String> {
     let mut roots = RootCertStore::empty();
     if let Some(path) = &scope.proxy_policy.proxy_ca_file {
-        let mut file = crate::files::open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0)
-            .map_err(|error| format!("cannot open proxy CA {}: {error}", path.display()))?;
-        let metadata = file
-            .metadata()
-            .map_err(|error| format!("cannot inspect proxy CA {}: {error}", path.display()))?;
-        if !metadata.is_file() || metadata.len() > MAX_PROXY_CA_BYTES {
-            return Err(format!(
-                "proxy CA {} is not a regular file within the {} byte limit",
-                path.display(),
-                MAX_PROXY_CA_BYTES
-            ));
-        }
-        let mut data = Vec::with_capacity(metadata.len() as usize);
-        Read::by_ref(&mut file)
-            .take(MAX_PROXY_CA_BYTES + 1)
-            .read_to_end(&mut data)
-            .map_err(|error| format!("cannot read proxy CA {}: {error}", path.display()))?;
-        if data.len() as u64 > MAX_PROXY_CA_BYTES {
-            return Err(format!("proxy CA {} is too large", path.display()));
-        }
+        let data = crate::files::read_admin_file_with_trust(
+            path,
+            MAX_PROXY_CA_BYTES,
+            scope.proxy_policy.proxy_ca_trust,
+        )
+        .map_err(|error| format!("cannot read proxy CA {}: {error}", path.display()))?;
         let mut added = 0usize;
         for cert in CertificateDer::pem_slice_iter(&data) {
             let cert =
@@ -4973,6 +4962,7 @@ mod coverage_tests {
             passes: 1,
             fails: 1,
             ca_file: None,
+            ca_trust: crate::files::AdminFileTrust::ProcessOwned,
         };
         assert!(!check_health(&spec));
 
@@ -5385,6 +5375,7 @@ mod coverage_tests {
             passes: 1,
             fails: 1,
             ca_file: None,
+            ca_trust: crate::files::AdminFileTrust::ProcessOwned,
         }
     }
 
@@ -6276,6 +6267,27 @@ mod coverage_tests {
         let first = client_config(&scope).unwrap();
         let second = client_config(&scope).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn privileged_proxy_ca_rejects_service_owned_input() {
+        if crate::files::effective_uid() != 0 {
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("vapache-proxy-ca-trust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let ca = dir.join("ca.pem");
+        std::fs::write(&ca, b"not a trusted administrative certificate").unwrap();
+        rustix::fs::chown(&ca, Some(rustix::fs::Uid::from_raw(1)), None).unwrap();
+
+        let mut scope = Scope::default();
+        scope.proxy_policy.proxy_ca_file = Some(ca);
+        scope.proxy_policy.proxy_ca_trust = crate::files::AdminFileTrust::RootOwned;
+        let error = build_client_config(&scope).unwrap_err();
+        assert!(error.contains("root-owned"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -1967,6 +1967,31 @@ pub proof fn descriptor_snapshot_admit_implies_stable_inode(
 {
 }
 
+/// A component inspected through `O_PATH|O_NOFOLLOW` may be reopened with
+/// readable flags only when both descriptors still identify the same inode.
+/// This is the owner-match walk's non-symlink rename-race boundary.
+pub open spec fn owner_component_reopen_spec(same_device: bool, same_inode: bool) -> bool {
+    same_device && same_inode
+}
+
+pub fn owner_component_reopen_admit(
+    same_device: bool,
+    same_inode: bool,
+) -> (ok: bool)
+    ensures ok == owner_component_reopen_spec(same_device, same_inode),
+{
+    same_device && same_inode
+}
+
+pub proof fn owner_component_reopen_rejects_substitution(
+    same_device: bool,
+    same_inode: bool,
+)
+    ensures
+        !same_device || !same_inode ==> !owner_component_reopen_spec(same_device, same_inode),
+{
+}
+
 /// Query-state operation after splitting the expanded substitution.  The
 /// returned action is consumed directly by `mod_rewrite`'s runtime path so
 /// QSA/QSD precedence and the no-target-query preservation rule cannot drift
@@ -2728,6 +2753,34 @@ pub proof fn rewrite_filesystem_candidate_is_local_and_contained(
             is_file,
             under_base,
         ) ==> !external && !passthrough && absolute && is_file && under_base,
+{
+}
+
+/// A contained rewrite target remains safe at dispatch only when the mapping
+/// root that admitted it is retained and the selected path is represented as
+/// a relative child of that root. Re-rooting at the target's parent would
+/// discard the containment witness under a concurrent rename.
+pub open spec fn rewrite_filesystem_binding_spec(
+    mapping_root_retained: bool,
+    relative_below_root: bool,
+) -> bool {
+    mapping_root_retained && relative_below_root
+}
+
+pub fn rewrite_filesystem_binding_admit(
+    mapping_root_retained: bool,
+    relative_below_root: bool,
+) -> (ok: bool)
+    ensures
+        ok == rewrite_filesystem_binding_spec(mapping_root_retained, relative_below_root),
+{
+    mapping_root_retained && relative_below_root
+}
+
+pub proof fn rewrite_filesystem_binding_rejects_reroot(
+    relative_below_root: bool,
+)
+    ensures !rewrite_filesystem_binding_spec(false, relative_below_root),
 {
 }
 

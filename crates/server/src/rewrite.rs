@@ -86,6 +86,16 @@ pub struct Context<'a> {
     pub server_name: &'a str,
 }
 
+/// A filesystem rewrite remains relative to the document/alias root that
+/// admitted it.  Retaining this pair prevents dispatch from turning the
+/// target's mutable parent pathname into a new virtual root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesystemTarget {
+    pub(crate) path: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) rel: PathBuf,
+}
+
 impl<'a> Context<'a> {
     /// Build the rewrite context from the same immutable plan dispatch used
     /// for mapping and access-file collection.
@@ -414,10 +424,10 @@ pub enum Outcome {
         /// `[END]` was used: the caller should not start another rewrite pass.
         final_pass: bool,
         effects: Effects,
-        /// An absolute filesystem path selected by a prefix-stat rewrite.
-        /// When present the caller serves this file instead of resolving the
-        /// URL path under the document root.
-        filesystem: Option<PathBuf>,
+        /// An absolute filesystem path selected by a prefix-stat rewrite,
+        /// together with the mapping root that must remain its resolution
+        /// base.
+        filesystem: Option<FilesystemTarget>,
     },
     Redirect {
         status: u16,
@@ -462,7 +472,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
     let mut final_pass = false;
     let mut cond_caps: Vec<Vec<u8>> = Vec::new();
     let mut effects = Effects::default();
-    let mut filesystem_override: Option<PathBuf> = None;
+    let mut filesystem_override: Option<FilesystemTarget> = None;
     let mut env: RequestEnvironment = scope.authorization_env(req, ctx.url_path, ctx.peer);
     if req.policy_budget_failed() {
         return Outcome::Error("request policy expansion limit exceeded".into());
@@ -743,21 +753,46 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             let docroot = fs::canonicalize(ctx.docroot).ok();
             match (candidate, docroot) {
                 (Some(candidate), Some(docroot)) => {
+                    let relative = candidate.strip_prefix(&docroot).ok();
+                    let opened = relative.and_then(|relative| {
+                        crate::files::probe_beneath(ctx.docroot, relative, false).ok()
+                    });
+                    let actual = opened
+                        .as_ref()
+                        .and_then(|(file, _)| crate::files::fd_path(file));
+                    let actual_under_root = actual.as_ref().is_some_and(|actual| {
+                        vapache_verified::path_under_base(
+                            actual.as_os_str().as_encoded_bytes(),
+                            docroot.as_os_str().as_encoded_bytes(),
+                        )
+                    });
+                    let is_file = opened
+                        .as_ref()
+                        .is_some_and(|(_, metadata)| metadata.is_file());
                     // `UnsafePrefixStat` may relax what the rule is allowed to
                     // stat, but it must never relax the base used to authorize
-                    // and serve the result.  A rewrite names one file inside
-                    // the current root, not a new root.
+                    // and serve the result. The descriptor probe and retained
+                    // relative path keep that decision attached to the same
+                    // mapping root even if a content directory is renamed.
                     if vapache_verified::rewrite_filesystem_candidate_admit(
                         external,
                         rule.flags.passthrough,
                         absolute,
-                        candidate.is_file(),
-                        vapache_verified::path_under_base(
-                            candidate.as_os_str().as_encoded_bytes(),
-                            docroot.as_os_str().as_encoded_bytes(),
-                        ),
+                        is_file,
+                        actual_under_root,
                     ) {
-                        Some(candidate)
+                        let relative = relative.expect("admitted rewrite target is relative");
+                        let actual = actual.expect("admitted rewrite target has a descriptor path");
+                        if !vapache_verified::rewrite_filesystem_binding_admit(true, true) {
+                            return Outcome::Error(
+                                "filesystem rewrite lost its mapping-root binding".into(),
+                            );
+                        }
+                        Some(FilesystemTarget {
+                            path: actual,
+                            root: ctx.docroot.to_path_buf(),
+                            rel: relative.to_path_buf(),
+                        })
                     } else {
                         None
                     }
@@ -1011,21 +1046,13 @@ fn eval_cond(
             .map_err(|_| "non-UTF-8 RewriteCond input is only valid for regex matching".to_string())
     };
     let result = if let Some(rest) = pattern.strip_prefix("-f") {
-        rest.is_empty() && file_test(text_value()?, ctx, |_, real| real.is_file())
+        rest.is_empty() && file_test(text_value()?, ctx, FileTest::Regular)
     } else if let Some(rest) = pattern.strip_prefix("-d") {
-        rest.is_empty() && file_test(text_value()?, ctx, |_, real| real.is_dir())
+        rest.is_empty() && file_test(text_value()?, ctx, FileTest::Directory)
     } else if let Some(rest) = pattern.strip_prefix("-s") {
-        rest.is_empty()
-            && file_test(text_value()?, ctx, |_, real| {
-                fs::metadata(real).map(|m| m.len() > 0).unwrap_or(false)
-            })
+        rest.is_empty() && file_test(text_value()?, ctx, FileTest::Nonempty)
     } else if let Some(rest) = pattern.strip_prefix("-l") {
-        rest.is_empty()
-            && file_test(text_value()?, ctx, |p, _| {
-                fs::symlink_metadata(p)
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false)
-            })
+        rest.is_empty() && file_test(text_value()?, ctx, FileTest::Symlink)
     } else if let Some(rest) = pattern.strip_prefix(">=") {
         compare_cond(text_value()?, rest, cond.flags.nocase) != std::cmp::Ordering::Less
     } else if let Some(rest) = pattern.strip_prefix("<=") {
@@ -1085,7 +1112,15 @@ fn compare_cond(value: &str, expected: &str, nocase: bool) -> std::cmp::Ordering
     }
 }
 
-fn file_test(value: &str, ctx: &Context<'_>, test: impl Fn(&Path, &Path) -> bool) -> bool {
+#[derive(Clone, Copy)]
+enum FileTest {
+    Regular,
+    Directory,
+    Nonempty,
+    Symlink,
+}
+
+fn file_test(value: &str, ctx: &Context<'_>, test: FileTest) -> bool {
     let p = PathBuf::from(value);
     let p = if p.is_absolute() {
         p
@@ -1102,26 +1137,22 @@ fn file_test(value: &str, ctx: &Context<'_>, test: impl Fn(&Path, &Path) -> bool
     {
         return false;
     }
-    // Lexical containment is not enough: a symlink inside the document root
-    // can point at an outside file and turn `-f`/`-d`/`-s` into a metadata
-    // oracle.  Canonicalize both sides and reuse the verified component-aware
-    // containment kernel (with its reflexivity/transitivity lemmas) before
-    // the metadata test.  The test closure receives both spellings: `-l`
-    // inspects the lexical link itself, while `-f`/`-d`/`-s` inspect the
-    // canonicalized target so the probe cannot race back through a symlink.
-    let Ok(root) = fs::canonicalize(ctx.docroot) else {
+    let Ok(relative) = p.strip_prefix(ctx.docroot) else {
         return false;
     };
-    let Ok(real) = fs::canonicalize(&p) else {
+    // The final-component O_NOFOLLOW used for `-l` still allows intermediate
+    // links, but the descriptor-relative RESOLVE_BENEATH walk prevents every
+    // probe from becoming an outside-root metadata oracle under rename.
+    let nofollow = matches!(test, FileTest::Symlink);
+    let Ok((_, metadata)) = crate::files::probe_beneath(ctx.docroot, relative, nofollow) else {
         return false;
     };
-    if !vapache_verified::path_under_base(
-        real.as_os_str().as_encoded_bytes(),
-        root.as_os_str().as_encoded_bytes(),
-    ) {
-        return false;
+    match test {
+        FileTest::Regular => metadata.is_file(),
+        FileTest::Directory => metadata.is_dir(),
+        FileTest::Nonempty => metadata.is_file() && metadata.len() > 0,
+        FileTest::Symlink => metadata.file_type().is_symlink(),
     }
-    test(&p, &real)
 }
 
 fn expand_vars_bytes(
@@ -2479,7 +2510,7 @@ mod tests {
             Outcome::Internal {
                 filesystem: Some(p),
                 ..
-            } if p == target
+            } if p.path == target && p.root == docroot
         ));
         // With [PT] the same substitution stays in URL space (F67): no
         // filesystem override, and the dispatcher re-maps the URL next round.
@@ -2590,7 +2621,8 @@ mod tests {
         };
         assert!(matches!(
             run(&inside_query, "[L]"),
-            Outcome::Internal { filesystem: Some(path), .. } if path == inside
+            Outcome::Internal { filesystem: Some(path), .. }
+                if path.path == inside && path.root == docroot
         ));
         assert!(matches!(
             run(&outside_query, "[L]"),
@@ -2608,6 +2640,64 @@ mod tests {
                 filesystem: None,
                 ..
             }
+        ));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn filesystem_rewrite_retains_root_across_parent_substitution() {
+        let base =
+            std::env::temp_dir().join(format!("vp-rewrite-root-race-{}", std::process::id()));
+        let docroot = base.join("www");
+        let mutable = docroot.join("mutable");
+        let outside = base.join("outside");
+        fs::create_dir_all(&mutable).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let selected = mutable.join("selected.txt");
+        fs::write(&selected, "inside").unwrap();
+        fs::write(outside.join("selected.txt"), "outside").unwrap();
+
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &[
+                    "^/q$".into(),
+                    selected.to_string_lossy().into_owned(),
+                    "[L]".into(),
+                ],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let c = Context {
+            url_path: "/q",
+            fs_path: &docroot,
+            docroot: &docroot,
+            server_root: &base,
+            query: b"",
+            peer: "127.0.0.1".parse().unwrap(),
+            port: 80,
+            https: false,
+            server_name: "localhost",
+        };
+        let Outcome::Internal {
+            filesystem: Some(target),
+            ..
+        } = process(&scope, &r, &c)
+        else {
+            panic!("expected filesystem rewrite target");
+        };
+        assert_eq!(target.root, docroot);
+        assert_eq!(target.rel, PathBuf::from("mutable/selected.txt"));
+
+        fs::rename(&mutable, docroot.join("displaced")).unwrap();
+        std::os::unix::fs::symlink(&outside, &mutable).unwrap();
+        assert!(matches!(
+            crate::files::resolve_target_checked(&target.root, &target.rel, true, false),
+            crate::files::Target::Forbidden
         ));
         let _ = fs::remove_dir_all(&base);
     }
@@ -3582,14 +3672,14 @@ mod tests {
         assert_eq!(compare_cond("10", "9", false), std::cmp::Ordering::Greater);
         assert_eq!(compare_cond("ABC", "abc", true), std::cmp::Ordering::Equal);
         assert_eq!(compare_cond("ABC", "abc", false), std::cmp::Ordering::Less);
-        assert!(file_test("file.txt", &c, |_, real| real.is_file()));
+        assert!(file_test("file.txt", &c, FileTest::Regular));
         assert!(file_test(
             &dir.join("file.txt").to_string_lossy(),
             &c,
-            |_, real| real.is_file()
+            FileTest::Regular,
         ));
-        assert!(!file_test("../etc/passwd", &c, |_, _| true));
-        assert!(!file_test("/etc/passwd", &c, |_, _| true));
+        assert!(!file_test("../etc/passwd", &c, FileTest::Regular));
+        assert!(!file_test("/etc/passwd", &c, FileTest::Regular));
         let outside = std::env::temp_dir().join(format!(
             "vapache-rewrite-outside-{}-{}",
             std::process::id(),
@@ -3597,15 +3687,16 @@ mod tests {
         ));
         fs::write(&outside, "outside").unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("escape.txt")).unwrap();
-        assert!(!file_test("escape.txt", &c, |_, _| true));
+        assert!(!file_test("escape.txt", &c, FileTest::Regular));
+        assert!(file_test("escape.txt", &c, FileTest::Symlink));
         // A symlink that stays inside the root still works normally.
-        assert!(file_test("link.txt", &c, |_, real| real.is_file()));
-        // Missing probed paths and missing roots fail closed at canonicalize.
-        assert!(!file_test("missing.txt", &c, |_, _| true));
+        assert!(file_test("link.txt", &c, FileTest::Regular));
+        // Missing probed paths and missing roots fail closed at openat2.
+        assert!(!file_test("missing.txt", &c, FileTest::Regular));
         let missing_root = dir.join("missing-root");
         let missing_target = missing_root.join("x");
         let c_missing = ctx("/x", &missing_target, &missing_root);
-        assert!(!file_test("file.txt", &c_missing, |_, _| true));
+        assert!(!file_test("file.txt", &c_missing, FileTest::Regular));
         let _ = fs::remove_file(&outside);
 
         assert_eq!(
@@ -4095,6 +4186,43 @@ mod tests {
         });
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn privileged_rewrite_program_requires_root_owned_executable() {
+        if crate::files::effective_uid() != 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        // A root-controlled compatibility symlink such as /bin -> /usr/bin
+        // resolves to a trusted executable and remains supported.
+        let trusted = RewriteProgram::bind_with_trust(
+            PathBuf::from("/bin/true"),
+            Vec::new(),
+            crate::files::AdminFileTrust::RootOwned,
+        )
+        .unwrap();
+        assert_eq!(
+            trusted.admin_trust_path.as_deref(),
+            Some(std::fs::canonicalize("/bin/true").unwrap().as_path())
+        );
+
+        let dir =
+            std::env::temp_dir().join(format!("vapache-prg-root-trust-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let program = dir.join("worker");
+        fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        rustix::fs::chown(&program, Some(rustix::fs::Uid::from_raw(1)), None).unwrap();
+        assert!(RewriteProgram::bind_with_trust(
+            program,
+            Vec::new(),
+            crate::files::AdminFileTrust::RootOwned,
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

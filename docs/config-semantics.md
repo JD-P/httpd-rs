@@ -448,18 +448,24 @@ transforms.  In particular:
   rewritten target policy, and an absolute rewrite target is only admitted
   when its canonical file remains below the current document/alias root, so a
   rewrite cannot name a new root or launder a protected upload into an
-  executable directory (I61);
+  executable directory (I61). The admitted target retains that mapping root
+  and its relative path through dispatch; it is never re-rooted at the
+  selected file's parent;
 - an `.htaccess` walk covers every applicable ancestor of an alias or document
   root target, so parent access files outside `DocumentRoot` cannot be skipped
   (I47); the URL-selected alias root is used only for URL-base derivation
   (I48);
 - `SymLinksIfOwnerMatch` compares each symlink owner with the resolved target
   owner unless unconditional `FollowSymLinks` is also enabled. The owner-only
-  walk pins every directory and symlink descriptor, reads the link through
-  that descriptor, and resolves its target from the pinned parent; a rename
-  cannot make the ownership check and returned file refer to different
-  objects. Relative targets cannot climb above the mapping root, symlink depth
-  is capped at 40, and at most 64 directory descriptors are retained.
+  walk pins every directory, ordinary component and symlink descriptor,
+  compares device/inode when an ordinary component is reopened with usable
+  flags, reads a link through its descriptor, and resolves its target from the
+  pinned parent; a rename cannot make the ownership check and returned file
+  refer to different objects. `DirectoryIndex`, autoindex metadata and cache
+  admission consume this same policy instead of treating owner-match as
+  unconditional following. Relative targets cannot climb above the mapping
+  root, symlink depth is capped at 40, and at most 64 directory descriptors are
+  retained.
 
 The complete transform inventory and the original/current target gate are
 specified in I30.  The CGI/FastCGI execution boundary is closed in I31 and the
@@ -942,7 +948,7 @@ conversion:
 | prefix alias, `ScriptAlias` | `map_path` root + rel | target scope, alias-root access walk, file grant |
 | `AliasMatch`, `ScriptAliasMatch` | capture-expanded target inside stable alias base | mapping failure outside base; target scope, file grant |
 | internal URL rewrite | canonical rewritten URL | target scope + original-URL gate with rewrite effects; original and target policy meet (I61) |
-| internal filesystem rewrite | canonical file below current root | target scope + rewritten URL scope meet, original-URL gate, file inode grant |
+| internal filesystem rewrite | opened file plus relative path below the retained mapping root | descriptor-relative containment, target scope + rewritten URL scope meet, original-URL gate, file inode grant |
 | CGI `PATH_INFO` | `find_script_checked` actual script | script scope, inode-bound CGI grant |
 | FastCGI `ProxyPassMatch`/`PATH_INFO` | opened script inode + `PATH_INFO` | actual descriptor-path scope, inode- and backend-bound FastCGI grant |
 | `SetHandler proxy:fcgi` | opened contained handler script | actual descriptor-path scope, inode- and backend-bound FastCGI grant |
@@ -1082,8 +1088,8 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | Compression/PCRE/password hashing | fixed input/cost bounds and a shared 32-operation CPU-work admission gate; optional compression falls back to identity under pressure |
 | Autoindex | at most 4096 examined directory records (including filtered names), 4096 rendered entries and 4 MiB of generated HTML |
 | DNS authorization | eight resolver workers, queue length 64, two-second caller deadline and bounded copied host operands |
-| Expression `file()` | confined regular descriptor, `O_NONBLOCK`/`O_NOFOLLOW`, 64 KiB read ceiling |
-| Administrative inputs | regular descriptors with stable before/after metadata; symlinks are forbidden except for a root-owned final TLS-material link between root-owned non-writable trees (the Certbot `live` → `archive` shape); retained root trust and service-nonwritable parents across reload; authentication databases additionally require strict UTF-8 and service-immutable parents/files unless `MutableAuthFiles` is enabled; 4 MiB per configuration/certificate/TypesConfig/auth file, 1 MiB per key/envvars file, existing RewriteMap limit, and 16 MiB aggregate configuration text |
+| Expression filesystem functions | `-f`/`-d`/`-e`/`-s`/`-F`/`-U`, `file()` and `filesize()` resolve relative to the retained document/alias-root descriptor with `RESOLVE_BENEATH`; `file()` uses `O_NONBLOCK`/`O_NOFOLLOW`, a stable before/after descriptor snapshot and a 64 KiB read ceiling |
+| Administrative inputs | regular descriptors with stable before/after metadata; symlinks are forbidden except for a root-owned final TLS-material link between root-owned non-writable trees (the Certbot `live` → `archive` shape), and a root-controlled RewriteMap program spelling whose canonical executable is separately validated and snapshotted; retained root trust and service-nonwritable parents across reload; proxy CA files consume the same retained trust; authentication databases additionally require strict UTF-8 and service-immutable parents/files unless `MutableAuthFiles` is enabled; 4 MiB per configuration/certificate/TypesConfig/auth file, 1 MiB per key/envvars file, existing RewriteMap limit, and 16 MiB aggregate configuration text |
 
 A malformed or over-limit stream produces an error response or connection
 close; request-spool exhaustion specifically produces `503` and releases its
@@ -1775,7 +1781,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **648 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **655 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1893,6 +1899,12 @@ construction: there is no second production interleaver.
   accepting the snapshot. Program bytes are sealed in a memfd; every lookup
   checks the source pathname's original inode/version and executes only that
   immutable descriptor.
+- `owner_component_reopen_admit` and
+  `rewrite_filesystem_binding_admit`. The owner-match walker rejects an
+  ordinary component whose device/inode changes between its no-follow probe
+  and usable reopen, and filesystem rewrites reach dispatch only with their
+  original mapping root plus a relative-below-root witness. The corresponding
+  rejection lemmas exclude component substitution and parent re-rooting.
 - `alias_file_target_split`, `alias_access_root_admit`,
   `handler_name_from_target`, `limit_directive_effect`,
   `cgi_actual_target_admit`, `capture_only_alias_admit`,
@@ -1900,8 +1912,9 @@ construction: there is no second production interleaver.
   `expr_file_test_admit`.  These are the pass-4 disposition predicates for
   single-file aliases, `<Limit>` effects, actual-target handler
   reauthorization, capture-only aliases, exclusive spool creation, disk-cache
-  quota and expression file-test confinement (I35–I42).  `confined_expr_path`
-  consumes `expr_file_test_admit`; the remaining predicates document and
+  quota and expression file-test confinement (I35–I42).
+  `confined_expr_relative` consumes `expr_file_test_admit`, and all file
+  observations then use the descriptor-relative root walk; the remaining predicates document and
   mechanize the runtime branches exercised by the F39–F45 replay suite.
 - `combine_or_all`, `require_none_multi`, `require_none_multi_result`,
   `vhost_address_admit`, `vhost_address_precedence`,
@@ -2277,7 +2290,7 @@ The current ledger (2026-11-03) is:
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **651 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **655 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

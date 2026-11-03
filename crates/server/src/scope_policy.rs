@@ -1068,6 +1068,7 @@ pub struct ProxyPolicy {
     pub proxy_passes: Vec<crate::config::ProxyPassRule>,
     pub proxy_reverses: Vec<crate::config::ProxyReverseRule>,
     pub proxy_ca_file: Option<std::path::PathBuf>,
+    pub(crate) proxy_ca_trust: crate::files::AdminFileTrust,
     pub(crate) tls_config_cache: std::sync::Arc<ProxyTlsConfigCache>,
 }
 
@@ -1078,6 +1079,7 @@ impl ProxyPolicy {
         crate::verified::append_vec(&mut self.proxy_reverses, &child.proxy_reverses);
         if child.proxy_ca_file.is_some() {
             self.proxy_ca_file = child.proxy_ca_file.clone();
+            self.proxy_ca_trust = child.proxy_ca_trust;
             self.tls_config_cache = child.tls_config_cache.clone();
         }
     }
