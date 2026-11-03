@@ -625,6 +625,7 @@ pub enum ParseError {
     PayloadTooLarge,
     MethodNotAllowed,
     LengthRequired,
+    ExpectationFailed,
     NotImplemented(&'static str),
 }
 
@@ -638,6 +639,7 @@ impl ParseError {
             ParseError::PayloadTooLarge => 413,
             ParseError::MethodNotAllowed => 405,
             ParseError::LengthRequired => 411,
+            ParseError::ExpectationFailed => 417,
             ParseError::NotImplemented(_) => 501,
         }
     }
@@ -652,6 +654,7 @@ impl ParseError {
             ParseError::PayloadTooLarge => "Request Entity Too Large".into(),
             ParseError::MethodNotAllowed => "Method Not Allowed".into(),
             ParseError::LengthRequired => "Length Required".into(),
+            ParseError::ExpectationFailed => "Expectation Failed".into(),
             ParseError::NotImplemented(m) => format!("Not implemented: {m}"),
         }
     }
@@ -1921,6 +1924,10 @@ fn head_error(e: HeadError) -> ParseError {
         HeadError::BothTransferEncodingAndContentLength => {
             ParseError::BadRequest("both Transfer-Encoding and Content-Length")
         }
+        HeadError::DuplicateTransferEncoding => {
+            ParseError::BadRequest("duplicate Transfer-Encoding")
+        }
+        HeadError::DuplicateContentLength => ParseError::BadRequest("duplicate Content-Length"),
         HeadError::TransferEncodingInHttp10 => {
             ParseError::BadRequest("Transfer-Encoding in HTTP/1.0 request")
         }
@@ -1931,6 +1938,14 @@ fn head_error(e: HeadError) -> ParseError {
         HeadError::ConflictingContentLength => {
             ParseError::BadRequest("conflicting Content-Length values")
         }
+        HeadError::DuplicateConnection => ParseError::BadRequest("duplicate Connection header"),
+        HeadError::ForbiddenProxyConnection => {
+            ParseError::BadRequest("Proxy-Connection is not accepted")
+        }
+        HeadError::InvalidConnection => ParseError::BadRequest("invalid Connection options"),
+        HeadError::DuplicateExpect => ParseError::BadRequest("duplicate Expect header"),
+        HeadError::UnsupportedExpectation => ParseError::ExpectationFailed,
+        HeadError::InvalidTe => ParseError::BadRequest("invalid TE header"),
     }
 }
 
@@ -3256,8 +3271,7 @@ mod tests {
         assert_eq!(req.framing, BodyFraming::None);
 
         let raw = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n";
-        let req = parse_head(raw, &limits()).unwrap();
-        assert_eq!(req.framing, BodyFraming::Length(5));
+        assert!(parse_head(raw, &limits()).is_err());
 
         for raw in [
             &b"POST /x HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
@@ -3340,7 +3354,9 @@ mod tests {
     fn rejects_smuggling_vectors() {
         let cases: &[&[u8]] = &[
             b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n",
             b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
             b"GET / HTTP/1.1\r\nHost : x\r\n\r\n",
             b"GET / HTTP/1.1\r\n Host: x\r\n\r\n",
             b"GET / HTTP/1.1\r\nHost: x\r\nX: a\r\n folded\r\n\r\n",
@@ -3349,6 +3365,16 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
             b"GET / HTTP/1.1\r\n\r\n",
             b"GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n",
+            b"\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\nProxy-Connection: keep-alive\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close, keep-alive\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: content-length\r\nContent-Length: 0\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: x,,y\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: authorization\r\nAuthorization: Basic eDp5\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close, close\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\nTE: trailers\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: TE\r\nTE: gzip\r\n\r\n",
         ];
         for c in cases {
             assert!(parse_head(c, &limits()).is_err());
@@ -3382,22 +3408,45 @@ mod tests {
         )
         .unwrap();
         assert!(!req.keep_alive);
-        // `close` is sticky regardless of token order.
-        for header in [
-            "close, keep-alive",
-            "keep-alive, close",
-            "keep-alive, close, keep-alive",
-        ] {
+        // Contradictory persistence tokens are rejected instead of relying on
+        // a hop-specific first/last/close-wins interpretation.
+        for header in ["close, keep-alive", "keep-alive, close"] {
             let raw = format!("GET / HTTP/1.1\r\nHost: x\r\nConnection: {header}\r\n\r\n");
-            let req = parse_head(raw.as_bytes(), &limits()).unwrap();
-            assert!(!req.keep_alive, "{header}");
+            assert!(parse_head(raw.as_bytes(), &limits()).is_err(), "{header}");
         }
-        let req = parse_head(
+        assert!(parse_head(
             b"GET / HTTP/1.0\r\nConnection: keep-alive, close\r\n\r\n",
             &limits(),
         )
+        .is_err());
+
+        let req = parse_head(
+            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: TE\r\nTE: trailers\r\n\r\n",
+            &limits(),
+        )
         .unwrap();
-        assert!(!req.keep_alive);
+        assert!(req.keep_alive);
+    }
+
+    #[test]
+    fn expectations_are_single_canonical_and_body_bound() {
+        let accepted = parse_head(
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\n",
+            &limits(),
+        )
+        .unwrap();
+        assert!(accepted.expect_continue);
+
+        for raw in [
+            b"GET / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nExpect: other\r\n\r\n",
+            b"POST / HTTP/1.0\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\n",
+        ] {
+            let error = parse_head(raw, &limits()).unwrap_err();
+            assert_eq!(error.status(), 417, "{raw:?}");
+        }
+        let duplicate = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nExpect: 100-continue\r\nExpect: 100-continue\r\n\r\n";
+        assert_eq!(parse_head(duplicate, &limits()).unwrap_err().status(), 400);
     }
 
     #[test]
@@ -3807,6 +3856,7 @@ mod tests {
             ParseError::VersionNotSupported,
             ParseError::PayloadTooLarge,
             ParseError::LengthRequired,
+            ParseError::ExpectationFailed,
             ParseError::NotImplemented("x"),
         ];
         for error in errors {
@@ -3851,10 +3901,18 @@ mod tests {
             NotOriginForm,
             FragmentInTarget,
             BothTransferEncodingAndContentLength,
+            DuplicateTransferEncoding,
+            DuplicateContentLength,
             TransferEncodingInHttp10,
             UnsupportedTransferCoding,
             InvalidContentLength,
             ConflictingContentLength,
+            DuplicateConnection,
+            ForbiddenProxyConnection,
+            InvalidConnection,
+            DuplicateExpect,
+            UnsupportedExpectation,
+            InvalidTe,
         ];
         for error in errors {
             let mapped = head_error(error);

@@ -519,7 +519,7 @@ OVERRIDES: dict[str, tuple[str, str, str, str, str, str]] = {
     "CVE-2015-8852": (
         "prevented", "http-framing",
         "a bare carriage return plus duplicate Content-Length fields created a response-splitting boundary across stacked servers",
-        "Vapache requires exact CRLF lines, rejects bare controls, requires duplicate Content-Length values to agree, rejects CL plus TE, and reconstructs proxy framing",
+        "Vapache requires exact CRLF lines, rejects bare controls and every duplicate Content-Length field (including equal values), rejects CL plus TE, and reconstructs proxy framing",
         "high", "NVD/CNA description and HTTP/proxy framing review",
     ),
     "CVE-2016-0742": (
@@ -783,7 +783,7 @@ OVERRIDES: dict[str, tuple[str, str, str, str, str, str]] = {
     "CVE-2020-15049": (
         "prevented", "http-framing",
         "signed or non-HTTP-whitespace Content-Length values were parsed differently by adjacent hops",
-        "Content-Length is accepted only as non-empty ASCII decimal digits after SP/HTAB OWS trimming, with duplicates required to agree and CL/TE rejected",
+        "Content-Length is accepted only as one non-empty ASCII decimal field after SP/HTAB OWS trimming; duplicates and every CL/TE combination are rejected",
         "high", "NVD/CNA description and verified framing parser tests",
     ),
     "CVE-2020-1944": (
@@ -807,7 +807,7 @@ OVERRIDES: dict[str, tuple[str, str, str, str, str, str]] = {
     "CVE-2021-32565": (
         "prevented", "http-framing",
         "invalid Content-Length syntax was accepted under a different boundary than an adjacent hop",
-        "Content-Length is non-empty checked ASCII decimal, duplicates must agree, overflow fails, and any Transfer-Encoding combination is rejected before body processing",
+        "Content-Length is one non-empty checked ASCII decimal field; duplicates, overflow and every Transfer-Encoding combination fail before body processing",
         "high", "Traffic Server advisory and verified Content-Length parser tests",
     ),
     "CVE-2021-38161": (
@@ -1065,7 +1065,7 @@ OVERRIDES: dict[str, tuple[str, str, str, str, str, str]] = {
     "CVE-2024-53271": (
         "prevented", "proxy",
         "a non-101 informational upstream response entered an ordinary final-response path",
-        "normal reverse-proxy responses reject every 1xx status; WebSocket upgrades use a separate exact 101 handshake path",
+        "normal reverse-proxy responses reject every 1xx status; WebSocket upgrades use a separate exact 101 path that rejects response framing metadata and reconstructs the switching head",
         "high", "NVD/CNA description and upstream status parser regression tests",
     ),
     "CVE-2025-55754": (
@@ -2139,7 +2139,7 @@ OVERRIDES: dict[str, tuple[str, str, str, str, str, str]] = {
     "CVE-2024-23326": (
         "prevented", "websocket",
         "a 200 response carrying Upgrade metadata was mistaken for a completed protocol switch",
-        "ordinary proxying never enters tunnel mode and strips hop-by-hop response fields; the separate WebSocket path requires exact 101, Upgrade, Connection and Sec-WebSocket-Accept validation",
+        "ordinary proxying never enters tunnel mode and strips hop-by-hop response fields; the separate WebSocket path requires exact 101, Upgrade, Connection and Sec-WebSocket-Accept validation, rejects CL/TE, and reconstructs the switching head",
         "high", "Envoy advisory and split ordinary/WebSocket proxy response paths",
     ),
     "CVE-2024-31617": (
@@ -2157,7 +2157,7 @@ OVERRIDES: dict[str, tuple[str, str, str, str, str, str]] = {
     "CVE-2025-30346": (
         "prevented", "http-framing",
         "a duplicate Host or Content-Length error kept the connection alive with its unread body becoming a later request",
-        "duplicate Host and conflicting/malformed Content-Length fail during head parsing, and every read error forces connection close before buffered bytes can be parsed again",
+        "duplicate Host and every duplicate or malformed Content-Length fail during head parsing, and every read error forces connection close before buffered bytes can be parsed again",
         "high", "VSV00015 advisory and request-error connection lifecycle review",
     ),
     "CVE-2026-58153": (
@@ -3339,7 +3339,7 @@ OVERRIDES: dict[str, tuple[str, str, str, str, str, str]] = {
     "CVE-2017-7658": (
         "prevented", "http-framing",
         "duplicate Content-Length and Content-Length plus Transfer-Encoding produced a different body boundary across hops",
-        "Vapache requires all Content-Length values to agree and rejects every request containing both Content-Length and Transfer-Encoding before reading or proxying a body",
+        "Vapache accepts exactly one valid Content-Length field and rejects every duplicate or Content-Length plus Transfer-Encoding request before reading or proxying a body",
         "high", "Jetty advisory and verified request-framing review",
     ),
     "CVE-2018-8037": (

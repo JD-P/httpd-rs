@@ -154,6 +154,53 @@ proptest! {
     ) {
         prop_assert_eq!(parse_once(&wire, wire.len().max(1)), parse_once(&wire, chunk));
     }
+
+    #[test]
+    fn content_length_consumes_exactly_one_message(
+        body in prop::collection::vec(any::<u8>(), 0..4096),
+        chunk in 1usize..128,
+    ) {
+        let mut wire = format!(
+            "POST /first HTTP/1.1\r\nHost: example.test\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        wire.extend_from_slice(&body);
+        wire.extend_from_slice(
+            b"GET /second HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        );
+
+        let (first, second, remainder) = parse_two(&wire, chunk)?;
+        prop_assert_eq!(first.target, b"/first");
+        prop_assert_eq!(first.body, body);
+        prop_assert_eq!(second.target, b"/second");
+        prop_assert!(second.body.is_empty());
+        prop_assert!(remainder.is_empty());
+    }
+
+    #[test]
+    fn chunked_consumes_exactly_one_message(
+        body in prop::collection::vec(any::<u8>(), 0..4096),
+        chunk in 1usize..128,
+    ) {
+        let mut wire = b"POST /first HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        if !body.is_empty() {
+            wire.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+            wire.extend_from_slice(&body);
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        wire.extend_from_slice(
+            b"GET /second HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        );
+
+        let (first, second, remainder) = parse_two(&wire, chunk)?;
+        prop_assert_eq!(first.target, b"/first");
+        prop_assert_eq!(first.body, body);
+        prop_assert_eq!(second.target, b"/second");
+        prop_assert!(second.body.is_empty());
+        prop_assert!(remainder.is_empty());
+    }
 }
 
 #[derive(Debug)]
@@ -212,6 +259,31 @@ fn parse_once(wire: &[u8], chunk: usize) -> String {
         Err(ReadError::Parse(error)) => format!("parse:{}:{}", error.status(), error.message()),
         Err(ReadError::Io(error)) => format!("io:{:?}", error.kind()),
     }
+}
+
+fn parse_two(
+    wire: &[u8],
+    chunk: usize,
+) -> Result<(vapached::http::Request, vapached::http::Request, Vec<u8>), TestCaseError> {
+    let mut stream = Fragmented {
+        input: wire,
+        offset: 0,
+        chunk,
+    };
+    let mut buffered = Vec::new();
+    let limits = Limits::default();
+    let context = limits
+        .resource_budget
+        .context(std::net::IpAddr::from([192, 0, 2, 2]));
+    vapached::resource::with_resource_context(context, || {
+        let first = read_request(&mut stream, &mut buffered, &limits, |_| {})
+            .map_err(|error| TestCaseError::fail(format!("first request: {error:?}")))?
+            .ok_or_else(|| TestCaseError::fail("first request: unexpected EOF"))?;
+        let second = read_request(&mut stream, &mut buffered, &limits, |_| {})
+            .map_err(|error| TestCaseError::fail(format!("second request: {error:?}")))?
+            .ok_or_else(|| TestCaseError::fail("second request: unexpected EOF"))?;
+        Ok((first, second, buffered))
+    })
 }
 
 #[test]

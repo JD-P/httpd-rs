@@ -5567,10 +5567,18 @@ pub enum HeadError {
     NotOriginForm,
     FragmentInTarget,
     BothTransferEncodingAndContentLength,
+    DuplicateTransferEncoding,
+    DuplicateContentLength,
     TransferEncodingInHttp10,
     UnsupportedTransferCoding,
     InvalidContentLength,
     ConflictingContentLength,
+    DuplicateConnection,
+    ForbiddenProxyConnection,
+    InvalidConnection,
+    DuplicateExpect,
+    UnsupportedExpectation,
+    InvalidTe,
 }
 
 /// How the body of a request is delimited.  `Chunked` is only produced for
@@ -6882,12 +6890,18 @@ fn split_target(target: &[u8]) -> (res: Result<(Vec<u8>, Vec<u8>), HeadError>)
     Ok((path, query))
 }
 
-fn apply_connection_tokens(value: &[u8], keep_alive: bool) -> (out: bool) {
-    // `close` is sticky: a later `keep-alive` token must not re-enable a
-    // connection that either side asked to close (RFC 9110 connection options
-    // are a set, not a last-token-wins list).
-    let mut out = keep_alive;
+fn parse_connection_options(
+    value: &[u8],
+    keep_alive: bool,
+) -> (out: Result<(bool, bool), HeadError>) {
+    // Strictly validate the entire comma list. Silently ignoring an empty or
+    // malformed member lets adjacent hops select different connection state.
+    // The second result records whether the TE field was nominated for this
+    // hop, as RFC 9110 requires.
     let mut saw_close = false;
+    let mut saw_keep_alive = false;
+    let mut saw_te = false;
+    let mut saw_upgrade = false;
     let mut i: usize = 0;
     while i <= value.len()
         invariant i <= value.len(),
@@ -6903,20 +6917,53 @@ fn apply_connection_tokens(value: &[u8], keep_alive: bool) -> (out: bool) {
         let sub = &value[i..e];
         let (ts, te) = trim_range(sub);
         let tok = &sub[ts..te];
-        if te > ts {
-            if eq_ignore_ascii_case(tok, b"close") {
-                saw_close = true;
-                out = false;
-            } else if eq_ignore_ascii_case(tok, b"keep-alive") && !saw_close {
-                out = true;
+        if te == ts || !valid_token(tok) {
+            return Err(HeadError::InvalidConnection);
+        }
+        if eq_ignore_ascii_case(tok, b"close") {
+            if saw_close {
+                return Err(HeadError::InvalidConnection);
             }
+            saw_close = true;
+        } else if eq_ignore_ascii_case(tok, b"keep-alive") {
+            if saw_keep_alive {
+                return Err(HeadError::InvalidConnection);
+            }
+            saw_keep_alive = true;
+        } else if eq_ignore_ascii_case(tok, b"te") {
+            if saw_te {
+                return Err(HeadError::InvalidConnection);
+            }
+            saw_te = true;
+        } else if eq_ignore_ascii_case(tok, b"upgrade") {
+            if saw_upgrade {
+                return Err(HeadError::InvalidConnection);
+            }
+            saw_upgrade = true;
+        } else {
+            // Vapache implements only persistence, WebSocket Upgrade and TE.
+            // Accepting an arbitrary field nomination would let an adjacent
+            // intermediary erase a security field (Authorization,
+            // X-Forwarded-*, etc.) that Vapache still interprets, or vice
+            // versa. Unknown connection extensions therefore fail closed.
+            return Err(HeadError::InvalidConnection);
         }
         if e == value.len() {
             break;
         }
         i = e + 1;
     }
-    out
+    if saw_close && saw_keep_alive {
+        return Err(HeadError::InvalidConnection);
+    }
+    let persistent = if saw_close {
+        false
+    } else if saw_keep_alive {
+        true
+    } else {
+        keep_alive
+    };
+    Ok((persistent, saw_te))
 }
 
 /// Determine how a request body is framed, rejecting every ambiguous
@@ -6952,6 +6999,9 @@ fn request_framing(
             lemma_has_header_range_snoc(headers@, 0, i as int, name_transfer_encoding());
         }
         if te_here {
+            if te_seen {
+                return Err(HeadError::DuplicateTransferEncoding);
+            }
             assert(headers@[i as int].0@ == b"transfer-encoding"@);
             assert(headers@[i as int].0@ == name_transfer_encoding());
             te_seen = true;
@@ -6976,6 +7026,9 @@ fn request_framing(
             lemma_has_header_range_snoc(headers@, 0, j as int, name_content_length());
         }
         if cl_here {
+            if cl_seen {
+                return Err(HeadError::DuplicateContentLength);
+            }
             assert(headers@[j as int].0@ == b"content-length"@);
             assert(headers@[j as int].0@ == name_content_length());
             cl_seen = true;
@@ -7127,17 +7180,14 @@ pub fn parse_request_head(
         z = z + 1;
     }
 
-    let mut pos: usize = 0;
-    while pos < head.len() && pos < head.len() - 1
-        && head[pos] == b'\r' && head[pos + 1] == b'\n'
-        invariant pos <= head.len(),
-        decreases head.len() - pos,
-    {
-        pos = pos + 2;
-        if pos > 64 {
-            return Err(HeadError::TooManyEmptyLines);
-        }
+    // RFC 9112 permits recipients to ignore one leading empty line, but that
+    // tolerance is not safe at a proxy boundary: many adjacent parsers reject
+    // it or assign it to the preceding message. Vapache accepts only the
+    // canonical request-line-at-byte-zero representation.
+    if head.len() >= 2 && head[0] == b'\r' && head[1] == b'\n' {
+        return Err(HeadError::TooManyEmptyLines);
     }
+    let pos: usize = 0;
 
     let line_end = match find_crlf(head, pos) {
         Some(i) => i,
@@ -7400,6 +7450,7 @@ pub fn parse_request_head(
 
     let mut conn_idx: Option<usize> = None;
     let mut expect_idx: Option<usize> = None;
+    let mut te_idx: Option<usize> = None;
     let mut fi: usize = 0;
     while fi < headers.len()
         invariant
@@ -7412,34 +7463,78 @@ pub fn parse_request_head(
                 Some(i) => i < headers.len(),
                 None => true,
             },
+            match te_idx {
+                Some(i) => i < headers.len(),
+                None => true,
+            },
         decreases headers.len() - fi,
     {
-        if conn_idx.is_none() && bytes_eq(&headers[fi].0, b"connection") {
+        if bytes_eq(&headers[fi].0, b"connection") {
+            if conn_idx.is_some() {
+                return Err(HeadError::DuplicateConnection);
+            }
             conn_idx = Some(fi);
         }
-        if expect_idx.is_none() && bytes_eq(&headers[fi].0, b"expect") {
+        if bytes_eq(&headers[fi].0, b"proxy-connection") {
+            return Err(HeadError::ForbiddenProxyConnection);
+        }
+        if bytes_eq(&headers[fi].0, b"expect") {
+            if expect_idx.is_some() {
+                return Err(HeadError::DuplicateExpect);
+            }
             expect_idx = Some(fi);
+        }
+        if bytes_eq(&headers[fi].0, b"te") {
+            if te_idx.is_some() {
+                return Err(HeadError::InvalidTe);
+            }
+            te_idx = Some(fi);
         }
         fi = fi + 1;
     }
     let mut keep_alive = version == HttpVersion::Http11;
+    let mut connection_has_te = false;
     match conn_idx {
         Some(idx) => {
-            keep_alive = apply_connection_tokens(&headers[idx].1, keep_alive);
+            match parse_connection_options(&headers[idx].1, keep_alive) {
+                Ok((persistent, has_te)) => {
+                    keep_alive = persistent;
+                    connection_has_te = has_te;
+                }
+                Err(e) => return Err(e),
+            }
         }
         None => {}
     }
-    let expect_continue = match expect_idx {
+    match te_idx {
         Some(idx) => {
-            let (es, ee) = trim_range(&headers[idx].1);
-            eq_ignore_ascii_case(&headers[idx].1[es..ee], b"100-continue")
+            let (ts, te) = trim_range(&headers[idx].1);
+            if !connection_has_te
+                || !eq_ignore_ascii_case(&headers[idx].1[ts..te], b"trailers")
+            {
+                return Err(HeadError::InvalidTe);
+            }
         }
-        None => false,
-    };
+        None => {}
+    }
 
     let framing = match request_framing(version, &headers) {
         Ok(f) => f,
         Err(e) => return Err(e),
+    };
+
+    let expect_continue = match expect_idx {
+        Some(idx) => {
+            let (es, ee) = trim_range(&headers[idx].1);
+            if version != HttpVersion::Http11
+                || framing == BodyFraming::None
+                || !eq_ignore_ascii_case(&headers[idx].1[es..ee], b"100-continue")
+            {
+                return Err(HeadError::UnsupportedExpectation);
+            }
+            true
+        }
+        None => false,
     };
 
     Ok(ParsedHead {

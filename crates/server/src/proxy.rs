@@ -1341,7 +1341,10 @@ fn error(
 }
 
 pub fn is_websocket(req: &Request) -> bool {
-    if req.method != "GET" {
+    if req.method != "GET"
+        || req.expect_continue
+        || !matches!(req.framing, crate::verified::BodyFraming::None)
+    {
         return false;
     }
     let upgrade = req
@@ -1393,22 +1396,29 @@ fn websocket_accept(key: &str) -> Option<String> {
     Some(STANDARD.encode(hasher.finalize()))
 }
 
-fn response_header<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    head.split(|byte| *byte == b'\n').skip(1).find_map(|line| {
-        let line = line.strip_suffix(b"\r")?;
-        let colon = line.iter().position(|byte| *byte == b':')?;
-        let field_name = trim_ascii_bytes(&line[..colon]);
-        field_name
-            .eq_ignore_ascii_case(name)
-            .then(|| trim_ascii_bytes(&line[colon + 1..]))
-    })
+struct AsyncResponseHead {
+    head: Vec<u8>,
+    initial: Vec<u8>,
 }
 
-async fn read_async_head<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Vec<u8>> {
+async fn read_async_head<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> std::io::Result<AsyncResponseHead> {
     let mut response = Vec::new();
     loop {
         if let Some(p) = response.windows(4).position(|w| w == b"\r\n\r\n") {
-            return Ok(response[..p + 4].to_vec());
+            let end = p + 4;
+            if end > MAX_PROXY_HEAD {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "websocket headers too large",
+                ));
+            }
+            let initial = response.split_off(end);
+            return Ok(AsyncResponseHead {
+                head: response,
+                initial,
+            });
         }
         if response.len() > MAX_PROXY_HEAD {
             return Err(std::io::Error::new(
@@ -1426,6 +1436,145 @@ async fn read_async_head<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Resul
         }
         response.extend_from_slice(&buf[..n]);
     }
+}
+
+fn strict_connection_tokens(value: &[u8]) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for raw in value.split(|byte| *byte == b',') {
+        let token = trim_ascii_bytes(raw);
+        if token.is_empty() || !crate::verified::valid_token(token) {
+            return None;
+        }
+        let token = String::from_utf8(token.to_ascii_lowercase()).ok()?;
+        if out.iter().any(|existing| existing == &token) {
+            return None;
+        }
+        out.push(token);
+    }
+    Some(out)
+}
+
+fn websocket_response_status(head: &[u8]) -> std::io::Result<u16> {
+    let mut reader = BufReader::new(std::io::Cursor::new(head));
+    let status_line = read_line(&mut reader)?;
+    parse_proxy_status_line(&status_line).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad websocket backend status",
+        )
+    })
+}
+
+/// Reconstruct a WebSocket switching response instead of forwarding the
+/// backend's raw HTTP/1 bytes. A 101 changes the protocol interpretation of
+/// every following octet, so duplicate handshake fields or CL/TE metadata are
+/// response-desynchronization hazards even when the required first value is
+/// correct.
+fn canonical_websocket_switching_head(
+    head: &[u8],
+    expected_accept: &str,
+) -> std::io::Result<Vec<u8>> {
+    let mut reader = BufReader::new(std::io::Cursor::new(head));
+    let status_line = read_line(&mut reader)?;
+    if parse_proxy_status_line(&status_line) != Some(101) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "websocket backend did not switch protocols",
+        ));
+    }
+
+    let mut saw_upgrade = false;
+    let mut saw_connection = false;
+    let mut saw_accept = false;
+    let mut forwarded = Vec::new();
+    loop {
+        let line = read_line(&mut reader)?;
+        if line.is_empty() {
+            break;
+        }
+        let colon = line.iter().position(|byte| *byte == b':').ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed websocket backend header",
+            )
+        })?;
+        let name = &line[..colon];
+        let value = trim_ascii_bytes(&line[colon + 1..]);
+        if !crate::verified::proxy_response_header_admit(name, value) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid websocket backend header",
+            ));
+        }
+        let lower = name.to_ascii_lowercase();
+        match lower.as_slice() {
+            b"upgrade" => {
+                let canonical = strict_connection_tokens(value)
+                    .is_some_and(|tokens| tokens.as_slice() == ["websocket"]);
+                if saw_upgrade || !canonical {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "ambiguous websocket Upgrade header",
+                    ));
+                }
+                saw_upgrade = true;
+            }
+            b"connection" => {
+                let canonical = strict_connection_tokens(value)
+                    .is_some_and(|tokens| tokens.as_slice() == ["upgrade"]);
+                if saw_connection || !canonical {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "ambiguous websocket Connection header",
+                    ));
+                }
+                saw_connection = true;
+            }
+            b"sec-websocket-accept" => {
+                if saw_accept || value != expected_accept.as_bytes() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid websocket accept value",
+                    ));
+                }
+                saw_accept = true;
+            }
+            b"content-length"
+            | b"transfer-encoding"
+            | b"proxy-connection"
+            | b"keep-alive"
+            | b"proxy-authenticate"
+            | b"proxy-authorization"
+            | b"trailer"
+            | b"te" => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "framing metadata in websocket switching response",
+                ));
+            }
+            _ => forwarded.push((name.to_vec(), value.to_vec())),
+        }
+    }
+    if !saw_upgrade || !saw_connection || !saw_accept {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "incomplete websocket switching response",
+        ));
+    }
+
+    let mut canonical =
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            .to_vec();
+    append_proxy_header(
+        &mut canonical,
+        b"Sec-WebSocket-Accept",
+        expected_accept.as_bytes(),
+    );
+    for (name, value) in forwarded {
+        append_proxy_header(&mut canonical, &name, &value);
+    }
+    canonical.extend_from_slice(b"\r\n");
+    Ok(canonical)
 }
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -1976,14 +2125,7 @@ where
         .map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "WebSocket handshake timeout")
         })??;
-    let status = response
-        .split(|byte| *byte == b'\n')
-        .next()
-        .and_then(|line| line.strip_suffix(b"\r"))
-        .and_then(|line| std::str::from_utf8(line).ok())
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
+    let status = websocket_response_status(&response.head)?;
     if status == 101 {
         let key = req.header_str("sec-websocket-key").unwrap_or("");
         let expected = websocket_accept(key).ok_or_else(|| {
@@ -1992,34 +2134,41 @@ where
                 "invalid WebSocket client key",
             )
         })?;
-        let upgrade_ok = response_header(&response, b"upgrade")
-            .map(|v| {
-                v.split(|byte| *byte == b',')
-                    .any(|token| trim_ascii_bytes(token).eq_ignore_ascii_case(b"websocket"))
-            })
-            .unwrap_or(false);
-        let connection_ok = response_header(&response, b"connection")
-            .map(|v| {
-                v.split(|byte| *byte == b',')
-                    .any(|token| trim_ascii_bytes(token).eq_ignore_ascii_case(b"upgrade"))
-            })
-            .unwrap_or(false);
-        let accept_ok = response_header(&response, b"sec-websocket-accept")
-            .map(|v| v.eq_ignore_ascii_case(expected.as_bytes()))
-            .unwrap_or(false);
-        if !upgrade_ok || !connection_ok || !accept_ok {
+        let canonical = canonical_websocket_switching_head(&response.head, &expected)?;
+        tokio::time::timeout(timeout, client.write_all(&canonical))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "WebSocket response timeout")
+            })??;
+        if !response.initial.is_empty() {
+            tokio::time::timeout(timeout, client.write_all(&response.initial))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "WebSocket initial response timeout",
+                    )
+                })??;
+        }
+    } else {
+        if status < 200 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "invalid WebSocket backend handshake",
+                "unexpected interim websocket backend response",
             ));
         }
-    }
-    tokio::time::timeout(timeout, client.write_all(&response))
-        .await
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "WebSocket response timeout")
-        })??;
-    if status != 101 {
+        // No backend body has been consumed. Reconstruct a complete
+        // zero-length response rather than forwarding CL/TE metadata that
+        // would make the client wait for or reinterpret bytes we do not own.
+        let rejection = format!(
+            "HTTP/1.1 {status} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            crate::http::reason_phrase(status)
+        );
+        tokio::time::timeout(timeout, client.write_all(rejection.as_bytes()))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "WebSocket response timeout")
+            })??;
         return Ok(());
     }
     if !initial.is_empty() {
@@ -2289,7 +2438,7 @@ fn proxy_once_budgeted(
     head.extend_from_slice(&path);
     head.extend_from_slice(
         format!(
-            " HTTP/1.1\r\nHost: {}:{}\r\nConnection: keep-alive\r\n",
+            " HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n",
             target.backend.host, target.backend.port
         )
         .as_bytes(),
@@ -4613,19 +4762,24 @@ mod coverage_tests {
     fn websocket_and_header_helpers() {
         assert!(websocket_accept("not-base64").is_none());
         assert!(websocket_accept("c2hvcnQ=").is_none());
-        assert!(websocket_accept("dGhlIHNhbXBsZSBub25jZQ==").is_some());
-
-        let head = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
-        assert_eq!(
-            response_header(head, b"upgrade"),
-            Some(b"websocket".as_slice())
+        let accept = websocket_accept("dGhlIHNhbXBsZSBub25jZQ==").unwrap();
+        let good = format!(
+            "HTTP/1.1 101 Anything\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\nX-Raw: abc\r\n\r\n"
         );
-        assert_eq!(response_header(head, b"missing"), None);
-        assert_eq!(response_header(b"HTTP/1.1 101 \xff\r\n", b"x"), None);
-        assert_eq!(
-            response_header(b"HTTP/1.1 101 OK\r\nX-Raw: a\xffb\r\n\r\n", b"x-raw"),
-            Some(b"a\xffb".as_slice())
-        );
+        let canonical = canonical_websocket_switching_head(good.as_bytes(), &accept).unwrap();
+        assert!(canonical.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
+        assert!(canonical
+            .windows(b"X-Raw: abc\r\n".len())
+            .any(|window| window == b"X-Raw: abc\r\n"));
+        for bad in [
+            format!("HTTP/1.1 101 OK\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nContent-Length: 0\r\n\r\n"),
+            format!("HTTP/1.1 101 OK\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nProxy-Authenticate: Basic\r\n\r\n"),
+            format!("HTTP/1.1 101 OK\r\nUpgrade: websocket\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"),
+            format!("HTTP/1.1 101 OK\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"),
+            format!("HTTP/1.1 101 OK\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"),
+        ] {
+            assert!(canonical_websocket_switching_head(bad.as_bytes(), &accept).is_err());
+        }
 
         assert_eq!(encode_proxy_path("/a b%\u{7f}?#"), "/a%20b%25%7F%3F%23");
         assert!(hop_by_hop("Proxy-Authorization"));
@@ -4664,6 +4818,11 @@ mod coverage_tests {
         r.headers
             .insert("connection", b"keep-alive, \xff, Upgrade".to_vec());
         assert!(is_websocket(&r));
+        r.framing = crate::verified::BodyFraming::Length(1);
+        assert!(!is_websocket(&r));
+        r.framing = crate::verified::BodyFraming::None;
+        r.expect_continue = true;
+        assert!(!is_websocket(&r));
     }
 
     #[test]
@@ -5257,7 +5416,18 @@ mod coverage_tests {
                 .unwrap();
         });
         let head = read_async_head(&mut client).await.unwrap();
-        assert!(head.ends_with(b"\r\n\r\n"));
+        assert!(head.head.ends_with(b"\r\n\r\n"));
+        assert!(head.initial.is_empty());
+
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            server
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\nfirst-frame")
+                .await
+                .unwrap();
+        });
+        let head = read_async_head(&mut client).await.unwrap();
+        assert_eq!(head.initial, b"first-frame");
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -5430,7 +5600,9 @@ mod coverage_tests {
     async fn websocket_async_success_query_and_initial() {
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let accept = websocket_accept(key).unwrap();
-        let (port, upstream) = spawn_upstream(ws_101(&accept), true).await;
+        let mut switching_response = ws_101(&accept);
+        switching_response.extend_from_slice(b"first-frame");
+        let (port, upstream) = spawn_upstream(switching_response, true).await;
         let mut r = ws_request(key);
         r.query = b"x=\xff".to_vec();
         r.headers.insert("x-raw", b"a\xffb".to_vec());
@@ -5454,12 +5626,20 @@ mod coverage_tests {
             )
             .await
         });
-        let mut response = vec![0u8; 4096];
-        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut response))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(String::from_utf8_lossy(&response[..n]).contains("101 Switching Protocols"));
+        let mut response = Vec::new();
+        while !response
+            .windows(b"first-frame".len())
+            .any(|window| window == b"first-frame")
+        {
+            let mut chunk = [0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut chunk))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(n, 0);
+            response.extend_from_slice(&chunk[..n]);
+        }
+        assert!(String::from_utf8_lossy(&response).contains("101 Switching Protocols"));
         drop(client);
         let result = tokio::time::timeout(Duration::from_secs(2), task)
             .await

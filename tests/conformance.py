@@ -2070,6 +2070,42 @@ class StaticTests(Base):
         )
         self.assertEqual(parse_response(out)[0], 400)
 
+        # Although RFC 9110 permits identical list values, accepting them at
+        # a proxy boundary leaves the message length dependent on an adjacent
+        # parser's duplicate-field policy.  Vapache deliberately requires one
+        # canonical field line.
+        out = raw(
+            VP_PORT,
+            b"POST /cgi-bin/env.sh HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n"
+            b"Content-Length: 4\r\n\r\n1234",
+        )
+        self.assertEqual(parse_response(out)[0], 400)
+
+    def test_ambiguous_hop_metadata_rejected(self):
+        cases = [
+            b"\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close, keep-alive\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nProxy-Connection: keep-alive\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nTE: trailers\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: content-length\r\nContent-Length: 0\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: authorization\r\nAuthorization: Basic eDp5\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close, close\r\n\r\n",
+        ]
+        for request in cases:
+            with self.subTest(request=request):
+                self.assertEqual(parse_response(raw(VP_PORT, request))[0], 400)
+
+    def test_unsupported_expectation_is_417(self):
+        for request in [
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nExpect: something-else\r\n\r\nx",
+            b"POST / HTTP/1.0\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\nx",
+        ]:
+            with self.subTest(request=request):
+                self.assertEqual(parse_response(raw(VP_PORT, request))[0], 417)
+
     def test_obs_fold_rejected(self):
         out = raw(VP_PORT, b"GET / HTTP/1.1\r\nHost: localhost\r\nX: a\r\n b\r\n\r\n")
         self.assertEqual(parse_response(out)[0], 400)
