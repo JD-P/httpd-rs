@@ -71,6 +71,52 @@ unconsumed upstream bytes could poison a later request. Client request heads
 are still reconstructed from parsed fields and decoded body length; raw client
 framing is never forwarded.
 
+### D4: mixed CGI line endings could move the response boundary
+
+CGI permits CRLF and LF header lines. The in-memory CGI parser and the
+file-backed FastCGI path searched for a CRLF terminator before considering an
+earlier LF terminator. A script could therefore place an LF boundary first and
+a CRLF boundary in its body; the latter was selected and body bytes such as
+`Status` or `Location` were promoted into response metadata.
+
+Both paths now share one boundary selector that chooses the earliest delimiter
+by byte position. CGI metadata is also singular where its meaning is singular:
+duplicate `Status`, `Location`, or `Connection` fields are rejected, the
+complete `Connection` list is parsed strictly, and hop-by-hop nominations
+cannot erase or reinterpret CGI framing or status fields.
+
+### D5: response Content-Length ownership depended on protocol path
+
+HTTP/1 and HTTP/2 did not apply one status-aware rule to an application-supplied
+`Content-Length`. In particular, a 1xx or 204 response could retain a configured
+length even though it cannot carry a body, while HEAD and 304 metadata was not
+validated consistently.
+
+Both writers now consume the same decision: strip caller framing, never emit a
+length for 1xx or 204, compute the actual length for an ordinary response, and
+preserve only one strictly parsed, canonically serialized length for HEAD or
+304. Duplicate, list-form, signed, or otherwise non-decimal preserved lengths
+fail closed.
+
+### D6: HTTP/2 request lengths were normalized differently from HTTP/1
+
+The HTTP/2 adapter formerly accepted equal repeated lengths and Unicode
+whitespace through generic string trimming. It also retained the raw spelling
+when translating a request to CGI or FastCGI. That created an interpretation
+boundary even though the adapter later checked the DATA length.
+
+The adapter now accepts exactly one field, ASCII SP/HTAB around one unsigned
+decimal value, and replaces it with its canonical decimal spelling before
+routing. Equal duplicates, comma lists, Unicode whitespace, signs, and overflow
+are rejected. The declared value must still equal the received DATA length.
+
+### D7: WebSocket switching was not restricted to HTTP/1.1 on both hops
+
+Upgrade is an HTTP/1.1 transition, but an otherwise valid HTTP/1.0 client or an
+HTTP/1.0 backend 101 could enter the tunnel path. Vapache now requires HTTP/1.1
+on the client request and the backend switching response in addition to the
+existing exact handshake checks.
+
 ## Preserved invariants
 
 - HTTP/1 body readers consume exactly the selected fixed length or the complete
@@ -81,9 +127,12 @@ framing is never forwarded.
   make one verified CL/TE/EOF framing decision, decode chunking, and are
   reserialized. Upstream sockets are not pooled.
 - CGI and FastCGI response fields are parsed into the internal response model;
-  their raw framing fields are not sent to the client.
+  their earliest wire boundary wins and raw framing fields are not sent to the
+  client.
 - WebSocket is the only raw tunnel and is entered only after the reconstructed
-  101 has passed complete handshake validation.
+  HTTP/1.1 101 has passed complete handshake validation.
+- HTTP/1 and HTTP/2 response writers own framing and share the same
+  status-aware `Content-Length` preservation rule.
 
 ## Regression and proof coverage
 
@@ -95,7 +144,8 @@ framing is never forwarded.
   pipelined request under arbitrary 1–127-byte read fragmentation. The first
   body and second request must remain exact and no bytes may remain.
 - Live conformance cases exercise the strict rejection behavior and 417
-  expectation response.
+  expectation response, CGI mixed-boundary handling, 204 length stripping,
+  and HTTP/1.0 WebSocket rejection.
 - The revised request-head compiler verifies under Verus: 648 functions and
   zero errors at the time of this review.
 

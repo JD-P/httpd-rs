@@ -8,7 +8,7 @@
 use crate::config::{
     Balancer, BalancerMember, Config, HealthTemplate, ProxyReverseRule, Scope, VHost,
 };
-use crate::http::{Body, Request, Response};
+use crate::http::{Body, Request, Response, Version};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
 use rustls::pki_types::pem::PemObject;
@@ -1342,6 +1342,7 @@ fn error(
 
 pub fn is_websocket(req: &Request) -> bool {
     if req.method != "GET"
+        || req.version != Version::Http11
         || req.expect_continue
         || !matches!(req.framing, crate::verified::BodyFraming::None)
     {
@@ -1457,6 +1458,12 @@ fn strict_connection_tokens(value: &[u8]) -> Option<Vec<String>> {
 fn websocket_response_status(head: &[u8]) -> std::io::Result<u16> {
     let mut reader = BufReader::new(std::io::Cursor::new(head));
     let status_line = read_line(&mut reader)?;
+    if !status_line.starts_with(b"HTTP/1.1 ") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "websocket backend response is not HTTP/1.1",
+        ));
+    }
     parse_proxy_status_line(&status_line).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1476,7 +1483,8 @@ fn canonical_websocket_switching_head(
 ) -> std::io::Result<Vec<u8>> {
     let mut reader = BufReader::new(std::io::Cursor::new(head));
     let status_line = read_line(&mut reader)?;
-    if parse_proxy_status_line(&status_line) != Some(101) {
+    if !status_line.starts_with(b"HTTP/1.1 ") || parse_proxy_status_line(&status_line) != Some(101)
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "websocket backend did not switch protocols",
@@ -4772,6 +4780,7 @@ mod coverage_tests {
             .windows(b"X-Raw: abc\r\n".len())
             .any(|window| window == b"X-Raw: abc\r\n"));
         for bad in [
+            format!("HTTP/1.0 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"),
             format!("HTTP/1.1 101 OK\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nContent-Length: 0\r\n\r\n"),
             format!("HTTP/1.1 101 OK\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nProxy-Authenticate: Basic\r\n\r\n"),
             format!("HTTP/1.1 101 OK\r\nUpgrade: websocket\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"),
@@ -4815,6 +4824,9 @@ mod coverage_tests {
         r.headers
             .push("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
         assert!(is_websocket(&r));
+        r.version = Version::Http10;
+        assert!(!is_websocket(&r));
+        r.version = Version::Http11;
         r.headers
             .insert("connection", b"keep-alive, \xff, Upgrade".to_vec());
         assert!(is_websocket(&r));

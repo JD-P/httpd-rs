@@ -12,7 +12,7 @@ use crate::http::{
 };
 use crate::log::{AccessEntry, Logger};
 use crate::resource::{ResidentLease, ResourceBudget};
-use crate::util::http_date_now;
+use crate::util::{http_date_now, trim_ascii};
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, StatusCode};
 use std::cmp::Reverse;
@@ -304,24 +304,24 @@ fn head_error_response(decision: vapache_verified::H2HeadDecision) -> Option<Res
     }
 }
 
-fn declared_content_length(headers: &crate::http::Headers) -> Result<Option<u64>, ()> {
+fn canonicalize_content_length(headers: &mut crate::http::Headers) -> Result<Option<u64>, ()> {
     let mut declared = None;
     for value in headers.get_all("content-length") {
-        // A repeated Content-Length is canonicalized into a comma list with
-        // the other H2 fields. RFC 9110 permits that representation only when
-        // every value is valid and identical.
-        for item in value.split(|byte| *byte == b',') {
-            let Some(n) = std::str::from_utf8(item)
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-            else {
-                return Err(());
-            };
-            if declared.is_some_and(|previous| previous != n) {
-                return Err(());
-            }
-            declared = Some(n);
+        // Match the strict HTTP/1 boundary: one decimal field, with only
+        // HTTP OWS around it. `Headers::push_merged` exposes duplicates as a
+        // comma list, so this also rejects identical repeated values rather
+        // than passing a non-canonical CONTENT_LENGTH to CGI/FastCGI.
+        if declared.is_some() || value.contains(&b',') {
+            return Err(());
         }
+        let value = trim_ascii(value);
+        let Some(length) = vapache_verified::parse_decimal_u64(value) else {
+            return Err(());
+        };
+        declared = Some(length);
+    }
+    if let Some(length) = declared {
+        headers.insert("content-length", length.to_string().into_bytes());
     }
     Ok(declared)
 }
@@ -624,24 +624,20 @@ async fn send_response_with_admission(
         || status == StatusCode::NOT_MODIFIED
         || head_only;
     let body_len = resp.body_len();
+    let preserved_content_length =
+        crate::http::preserved_response_content_length(&resp, head_only)?;
 
     let mut out = http::Response::builder().status(status);
     {
         let headers = out.headers_mut().expect("response builder");
         let mut have_date = false;
         let mut have_server = false;
-        let mut declared_len = None;
         for (name, value) in resp.headers.drain(..) {
             let lname = name.to_ascii_lowercase();
             match lname.as_str() {
                 "date" => have_date = true,
                 "server" => have_server = true,
-                "content-length" => {
-                    declared_len = std::str::from_utf8(&value)
-                        .ok()
-                        .and_then(|v| v.trim().parse::<u64>().ok());
-                    continue;
-                }
+                "content-length" => continue,
                 // Connection-specific header fields are forbidden in HTTP/2.
                 "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding"
                 | "upgrade" => continue,
@@ -670,17 +666,21 @@ async fn send_response_with_admission(
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad server"))?,
             );
         }
-        if !no_body || status == StatusCode::OK {
-            // HEAD has no body but must advertise the selected
-            // representation's length, which the file layer already supplied.
-            let cl = if head_only {
-                declared_len.unwrap_or(body_len)
-            } else {
-                body_len
-            };
+        if let Some(length) = preserved_content_length {
             headers.append(
                 HeaderName::from_static("content-length"),
-                HeaderValue::from_str(&cl.to_string())
+                HeaderValue::from_str(&length.to_string())
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad length"))?,
+            );
+        } else if !status.is_informational()
+            && status != StatusCode::NO_CONTENT
+            && status != StatusCode::NOT_MODIFIED
+        {
+            // Body-bearing responses and HEAD responses without an explicit
+            // representation length use the actual selected body length.
+            headers.append(
+                HeaderName::from_static("content-length"),
+                HeaderValue::from_str(&body_len.to_string())
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad length"))?,
             );
         }
@@ -1161,7 +1161,7 @@ async fn handle_stream(
             .await
             .is_err();
     }
-    let declared = match declared_content_length(&headers) {
+    let declared = match canonicalize_content_length(&mut headers) {
         Ok(declared) => declared,
         Err(()) => {
             // h2 validates Content-Length syntax and duplicates before
@@ -3326,15 +3326,33 @@ mod tests {
         }
 
         let mut headers = crate::http::Headers::default();
-        assert_eq!(declared_content_length(&headers), Ok(None));
+        assert_eq!(canonicalize_content_length(&mut headers), Ok(None));
         headers.push_merged("content-length", b"7");
-        headers.push_merged("content-length", b"7");
-        assert_eq!(declared_content_length(&headers), Ok(Some(7)));
-        headers.push_merged("content-length", b"8");
-        assert_eq!(declared_content_length(&headers), Err(()));
+        assert_eq!(canonicalize_content_length(&mut headers), Ok(Some(7)));
+        assert_eq!(headers.get("content-length"), Some(b"7".as_slice()));
+
+        let mut duplicate = crate::http::Headers::default();
+        duplicate.push_merged("content-length", b"7");
+        duplicate.push_merged("content-length", b"7");
+        assert_eq!(canonicalize_content_length(&mut duplicate), Err(()));
+
+        let mut ascii_ows = crate::http::Headers::default();
+        ascii_ows.push("content-length", b"\t7 ".to_vec());
+        assert_eq!(canonicalize_content_length(&mut ascii_ows), Ok(Some(7)));
+        assert_eq!(ascii_ows.get("content-length"), Some(b"7".as_slice()));
+
+        let mut unicode_ows = crate::http::Headers::default();
+        unicode_ows.push("content-length", b"\xc2\xa07".to_vec());
+        assert_eq!(canonicalize_content_length(&mut unicode_ows), Err(()));
+
+        let mut conflicting = crate::http::Headers::default();
+        conflicting.push_merged("content-length", b"7");
+        conflicting.push_merged("content-length", b"8");
+        assert_eq!(canonicalize_content_length(&mut conflicting), Err(()));
+
         let mut malformed = crate::http::Headers::default();
         malformed.push("content-length", b"not-a-number".to_vec());
-        assert_eq!(declared_content_length(&malformed), Err(()));
+        assert_eq!(canonicalize_content_length(&mut malformed), Err(()));
     }
 
     #[test]

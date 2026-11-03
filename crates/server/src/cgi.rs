@@ -1395,6 +1395,8 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
     let mut location: Option<Vec<u8>> = None;
     let mut connection_tokens: Vec<String> = Vec::new();
     let mut saw_status = false;
+    let mut saw_location = false;
+    let mut saw_connection = false;
     for line in head.split(|b| *b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
@@ -1413,6 +1415,9 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
             .map_err(|_| ())?
             .to_ascii_lowercase();
         if lname == "status" {
+            if saw_status {
+                return Err(());
+            }
             let s = std::str::from_utf8(value).map_err(|_| ())?;
             let code = s.split_whitespace().next().ok_or(())?;
             status = code.parse().map_err(|_| ())?;
@@ -1423,18 +1428,23 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
             continue;
         }
         if lname == "connection" {
-            connection_tokens.extend(
-                String::from_utf8_lossy(value)
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|token| {
-                        !token.is_empty()
-                            && token
-                                .bytes()
-                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-                    })
-                    .map(str::to_ascii_lowercase),
-            );
+            if saw_connection {
+                return Err(());
+            }
+            saw_connection = true;
+            for raw in value.split(|byte| *byte == b',') {
+                let token = trim_ascii(raw);
+                if token.is_empty() || !valid_token(token) {
+                    return Err(());
+                }
+                let token = std::str::from_utf8(token)
+                    .map_err(|_| ())?
+                    .to_ascii_lowercase();
+                if connection_tokens.iter().any(|existing| existing == &token) {
+                    return Err(());
+                }
+                connection_tokens.push(token);
+            }
             continue;
         }
         let framing = lname == "content-length" || lname == "transfer-encoding";
@@ -1443,6 +1453,7 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
             "keep-alive"
                 | "proxy-authenticate"
                 | "proxy-authorization"
+                | "proxy-connection"
                 | "te"
                 | "trailer"
                 | "upgrade"
@@ -1451,9 +1462,21 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
             continue;
         }
         if lname == "location" {
+            if saw_location {
+                return Err(());
+            }
+            saw_location = true;
             location = Some(value.to_vec());
         }
         headers.push(&lname, value.to_vec());
+    }
+    if connection_tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "status" | "content-length" | "transfer-encoding" | "connection" | "proxy-connection"
+        )
+    }) {
+        return Err(());
     }
     for token in &connection_tokens {
         if !vapache_verified::cgi_response_header_admit(false, false, true) {
@@ -1514,20 +1537,41 @@ pub fn fuzz_parse_cgi_response(data: &[u8]) {
     let _ = parse_cgi_response(data, Version::Http11);
 }
 
+/// Return the end of the first CGI header delimiter on the byte stream.
+/// CGI permits either CRLF or LF line endings. Selecting by delimiter type
+/// before position can skip an earlier LF boundary and promote attacker-
+/// controlled body lines into response headers.
+pub(crate) fn cgi_head_end(data: &[u8]) -> Option<usize> {
+    let crlf = data
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|start| (start, 4usize));
+    let lf = data
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|start| (start, 2usize));
+    let (start, width) = match (crlf, lf) {
+        (Some(left), Some(right)) => {
+            if left.0 <= right.0 {
+                left
+            } else {
+                right
+            }
+        }
+        (Some(delimiter), None) | (None, Some(delimiter)) => delimiter,
+        (None, None) => return None,
+    };
+    (start <= MAX_HEADER).then_some(start + width)
+}
+
 fn split_cgi_head(data: &[u8]) -> Option<(&[u8], &[u8])> {
-    if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-        if p > MAX_HEADER {
-            return None;
-        }
-        return Some((&data[..p], &data[p + 4..]));
-    }
-    if let Some(p) = data.windows(2).position(|w| w == b"\n\n") {
-        if p > MAX_HEADER {
-            return None;
-        }
-        return Some((&data[..p], &data[p + 2..]));
-    }
-    None
+    let end = cgi_head_end(data)?;
+    let width = if end >= 4 && &data[end - 4..end] == b"\r\n\r\n" {
+        4
+    } else {
+        2
+    };
+    Some((&data[..end - width], &data[end..]))
 }
 
 /// Decide whether a filename should be handled by CGI given the scopes and
@@ -2182,6 +2226,10 @@ mod tests {
             b"Status: 99 Nope\r\n\r\n",
             b"Status: 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
             b"Status: nope\r\n\r\n",
+            b"Status: 200 OK\r\nStatus: 201 Created\r\n\r\n",
+            b"Location: /one\r\nLocation: /two\r\n\r\n",
+            b"Connection: X-Hop,,close\r\nX-Hop: value\r\n\r\n",
+            b"Connection: Status\r\nStatus: 200 OK\r\n\r\n",
             b"MissingColon\r\n\r\n",
         ] {
             assert!(parse_cgi_response(data, Version::Http11).is_err());
@@ -2197,7 +2245,7 @@ mod tests {
         assert!(response_header(&framed, "connection").is_none());
 
         let hop = parse_cgi_response(
-            b"Connection: X-Secret, Upgrade\r\nX-Secret: leak\r\nUpgrade: websocket\r\nTE: trailers\r\nProxy-Authorization: secret\r\nContent-Type: text/plain\r\n\r\nbody",
+            b"Connection: X-Secret, Upgrade\r\nX-Secret: leak\r\nUpgrade: websocket\r\nTE: trailers\r\nProxy-Authorization: secret\r\nProxy-Connection: close\r\nContent-Type: text/plain\r\n\r\nbody",
             Version::Http11,
         )
         .unwrap();
@@ -2207,6 +2255,7 @@ mod tests {
             "upgrade",
             "te",
             "proxy-authorization",
+            "proxy-connection",
         ] {
             assert!(response_header(&hop, name).is_none(), "{name}");
         }
@@ -2234,6 +2283,24 @@ mod tests {
         )
         .unwrap();
         assert!(response_header(&empty_part, "x--y").is_some());
+
+        // The first delimiter wins regardless of line-ending style. A later
+        // CRLF delimiter in attacker-controlled body bytes must remain body,
+        // never become Status/Location response metadata.
+        let mixed = parse_cgi_response(
+            b"Content-Type: text/plain\n\nStatus: 302 Found\r\nLocation: /injected\r\n\r\nbody",
+            Version::Http11,
+        )
+        .unwrap();
+        assert_eq!(mixed.status, 200);
+        assert!(response_header(&mixed, "location").is_none());
+        match mixed.body {
+            Body::Bytes(body) => assert_eq!(
+                body,
+                b"Status: 302 Found\r\nLocation: /injected\r\n\r\nbody"
+            ),
+            _ => panic!("expected in-memory CGI body"),
+        }
 
         let mut lf = b"X-Test: ".to_vec();
         lf.extend(std::iter::repeat(b'a').take(MAX_HEADER + 1));
@@ -2633,6 +2700,14 @@ mod tests {
         );
 
         assert!(split_cgi_head(b"X-Test: y\n\nbody").is_some());
+        assert_eq!(
+            cgi_head_end(b"X: y\n\nbody\r\n\r\nmore"),
+            Some(b"X: y\n\n".len())
+        );
+        assert_eq!(
+            cgi_head_end(b"X: y\r\n\r\nbody\n\nmore"),
+            Some(b"X: y\r\n\r\n".len())
+        );
         let mut lf = b"X-Test: ".to_vec();
         lf.extend(std::iter::repeat(b'a').take(MAX_HEADER + 1));
         lf.extend_from_slice(b"\n\n");

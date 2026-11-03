@@ -2115,6 +2115,42 @@ pub(crate) fn response_headers_admitted(resp: &Response) -> bool {
     )
 }
 
+/// Return the single canonical representation length that may be emitted on
+/// a bodyless HEAD/304 response. Informational and 204 responses can never
+/// carry Content-Length. Other body-bearing responses ignore caller framing
+/// and are serialized from `Response::body_len` by the transport writer.
+pub(crate) fn preserved_response_content_length(
+    resp: &Response,
+    head_only: bool,
+) -> io::Result<Option<u64>> {
+    let status_forbids_length = (100..200).contains(&resp.status) || resp.status == 204;
+    let may_preserve = !status_forbids_length && (head_only || resp.status == 304);
+    if !may_preserve {
+        return Ok(None);
+    }
+    let mut values = resp
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"));
+    let Some((_, value)) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "duplicate response Content-Length",
+        ));
+    }
+    vapache_verified::parse_decimal_u64(value)
+        .map(Some)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid response Content-Length",
+            )
+        })
+}
+
 impl Response {
     pub fn new(status: u16) -> Self {
         Response {
@@ -2614,15 +2650,10 @@ fn serialize_response_head(
         }
     }
     let no_body_status = status == 204 || status == 304 || (100..200).contains(&status);
-    // For a HEAD response there is no body to frame, and a 204/304/1xx status
-    // has no body by definition.  Preserve an explicitly supplied
-    // Content-Length there (HEAD mirrors the GET representation); for every
-    // body-bearing response the writer computes it from the bytes it will send.
-    let preserve_content_length = (opts.head_only || no_body_status)
-        && resp
-            .headers
-            .iter()
-            .any(|(n, _)| n.eq_ignore_ascii_case("content-length"));
+    // HEAD and 304 may advertise a selected representation length. The
+    // shared helper validates and canonicalizes exactly one such field; 1xx
+    // and 204 always strip it as RFC 9110 requires.
+    let preserved_content_length = preserved_response_content_length(resp, opts.head_only)?;
 
     let mut head = Vec::with_capacity(512);
     head.extend_from_slice(b"HTTP/1.1 ");
@@ -2646,9 +2677,7 @@ fn serialize_response_head(
         // would desynchronize a keep-alive connection (request/response
         // smuggling for the next request on the socket).
         if name.eq_ignore_ascii_case("content-length") {
-            if !preserve_content_length {
-                continue;
-            }
+            continue;
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             continue;
         }
@@ -2670,7 +2699,11 @@ fn serialize_response_head(
         head.extend_from_slice(value);
         head.extend_from_slice(b"\r\n");
     }
-    if !preserve_content_length && !no_body_status {
+    if let Some(length) = preserved_content_length {
+        head.extend_from_slice(b"Content-Length: ");
+        push_decimal(&mut head, length);
+        head.extend_from_slice(b"\r\n");
+    } else if !no_body_status {
         head.extend_from_slice(b"Content-Length: ");
         push_decimal(&mut head, body_len);
         head.extend_from_slice(b"\r\n");
@@ -5235,6 +5268,58 @@ mod tests {
         let head = String::from_utf8_lossy(&writer.data);
         assert!(head.contains("Content-Length: 12\r\n"), "{head}");
         assert!(!head.contains("Content-Length: 3\r\n"), "{head}");
+
+        // Informational/204 responses must never carry Content-Length, even
+        // when a handler or Header directive supplied one.
+        for status in [101, 204] {
+            let mut writer = TestWriter {
+                data: Vec::new(),
+                fd: None,
+            };
+            let mut response = Response::new(status);
+            response
+                .headers
+                .push((Cow::Borrowed("Content-Length"), b"12".to_vec()));
+            assert_eq!(
+                write_response(&mut writer, &mut response, &response_options()).unwrap(),
+                0
+            );
+            let head = String::from_utf8_lossy(&writer.data);
+            assert!(!head.contains("Content-Length"), "{head}");
+        }
+
+        // 304 may advertise one selected-representation length, but it is
+        // parsed and emitted canonically rather than copied byte-for-byte.
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response::new(304);
+        response
+            .headers
+            .push((Cow::Borrowed("Content-Length"), b"00012".to_vec()));
+        write_response(&mut writer, &mut response, &response_options()).unwrap();
+        let head = String::from_utf8_lossy(&writer.data);
+        assert!(head.contains("Content-Length: 12\r\n"), "{head}");
+        assert!(!head.contains("00012"), "{head}");
+
+        for values in [
+            vec![b"12".to_vec(), b"12".to_vec()],
+            vec![b"12, 12".to_vec()],
+            vec![b" 12".to_vec()],
+        ] {
+            let mut writer = TestWriter {
+                data: Vec::new(),
+                fd: None,
+            };
+            let mut response = Response::new(304);
+            for value in values {
+                response
+                    .headers
+                    .push((Cow::Borrowed("Content-Length"), value));
+            }
+            assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
+        }
     }
 
     #[test]

@@ -355,12 +355,28 @@ def tree():
         "printf 'redirecting\\n'\n"
     )
     script3.chmod(0o755)
+    script4 = www / "cgi-bin" / "mixed-boundary.sh"
+    script4.write_text(
+        "#!/bin/sh\n"
+        "printf 'Content-Type: text/plain\\n\\n'\n"
+        "printf 'Status: 302 Found\\r\\n'\n"
+        "printf 'Location: /injected\\r\\n\\r\\n'\n"
+        "printf 'body\\n'\n"
+    )
+    script4.chmod(0o755)
+    script5 = www / "cgi-bin" / "no-content.sh"
+    script5.write_text(
+        "#!/bin/sh\n"
+        "printf 'Status: 204 No Content\\r\\n'\n"
+        "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+    )
+    script5.chmod(0o755)
     for p in www.rglob("*"):
         if p.is_file() and not p.is_symlink():
             os.chmod(p, 0o644)
     for p in [www, www / "dir", www / "noidx", www / "list", www / "cgi-bin", www / "vhost"]:
         os.chmod(p, 0o755)
-    for p in [www / "cgi-bin" / "env.sh", www / "cgi-bin" / "status.sh", www / "cgi-bin" / "redirect.sh", www / "dir-cgi" / "index.cgi", www / "errorcgi" / "err.cgi"]:
+    for p in [www / "cgi-bin" / "env.sh", www / "cgi-bin" / "status.sh", www / "cgi-bin" / "redirect.sh", www / "cgi-bin" / "mixed-boundary.sh", www / "cgi-bin" / "no-content.sh", www / "dir-cgi" / "index.cgi", www / "errorcgi" / "err.cgi"]:
         p.chmod(0o755)
     cert = BASE / "cert.pem"
     key = BASE / "key.pem"
@@ -822,6 +838,9 @@ def common(port, root, apache, tls_port):
         '<Location "/server-status">',
         "    SetHandler server-status",
         "    Require local",
+        "</Location>",
+        '<Location "/cgi-bin/no-content.sh">',
+        "    Header set Content-Length 12",
         "</Location>",
         '<Location "/access/expr.txt">',
         '    Require expr "%{REQUEST_METHOD} == \'GET\'"',
@@ -2277,26 +2296,31 @@ class ProxyTests(Base):
 
     def test_websocket_requires_valid_handshake(self):
         import base64, os
-        key = base64.b64encode(os.urandom(16)).decode()
-        s = socket.create_connection(("127.0.0.1", VP_PORT), timeout=5)
-        s.sendall(
-            (
-                "GET /ws HTTP/1.1\r\n"
-                f"Host: localhost:{VP_PORT}\r\n"
-                "Upgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                f"Sec-WebSocket-Key: {key}\r\n"
-                "Sec-WebSocket-Version: 12\r\n\r\n"
-            ).encode()
-        )
-        data = b""
-        while b"\r\n\r\n" not in data:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-        s.close()
-        self.assertNotIn(b"101", data.split(b"\r\n", 1)[0])
+
+        def rejected(version, websocket_version):
+            key = base64.b64encode(os.urandom(16)).decode()
+            s = socket.create_connection(("127.0.0.1", VP_PORT), timeout=5)
+            s.sendall(
+                (
+                    f"GET /ws {version}\r\n"
+                    f"Host: localhost:{VP_PORT}\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {key}\r\n"
+                    f"Sec-WebSocket-Version: {websocket_version}\r\n\r\n"
+                ).encode()
+            )
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            s.close()
+            self.assertNotIn(b"101", data.split(b"\r\n", 1)[0])
+
+        rejected("HTTP/1.1", "12")
+        rejected("HTTP/1.0", "13")
 
     def test_websocket_normalized_path_acl(self):
         import base64, os
@@ -2436,6 +2460,21 @@ class CgiTests(Base):
         self.assertEqual(st, 302)
         self.assertEqual(h["location"][0], "/hello.txt")
         self.differential("cgi redirect", "/cgi-bin/redirect.sh")
+
+    def test_cgi_body_cannot_be_promoted_to_headers(self):
+        st, h, body = self.get("/cgi-bin/mixed-boundary.sh")
+        self.assertEqual(st, 200)
+        self.assertNotIn("location", h)
+        self.assertEqual(
+            body,
+            b"Status: 302 Found\r\nLocation: /injected\r\n\r\nbody\n",
+        )
+
+    def test_204_strips_configured_content_length(self):
+        st, h, body = self.get("/cgi-bin/no-content.sh")
+        self.assertEqual(st, 204)
+        self.assertNotIn("content-length", h)
+        self.assertEqual(body, b"")
 
     def test_cgi_path_info(self):
         st, _, b = self.get("/cgi-bin/env.sh/more/path")

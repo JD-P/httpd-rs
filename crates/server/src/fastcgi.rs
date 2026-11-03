@@ -1162,14 +1162,9 @@ fn response_from_spool(spool: Spool, version: crate::http::Version) -> io::Resul
             let prefix_len = len.min(128 * 1024) as usize;
             let mut prefix = vec![0u8; prefix_len];
             file.read_exact(&mut prefix)?;
-            let head_end = prefix
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map(|p| p + 4)
-                .or_else(|| prefix.windows(2).position(|w| w == b"\n\n").map(|p| p + 2))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "FastCGI headers too large")
-                })?;
+            let head_end = cgi::cgi_head_end(&prefix).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "FastCGI headers too large")
+            })?;
             let mut head = prefix[..head_end].to_vec();
             if !head.ends_with(b"\r\n\r\n") {
                 head.extend_from_slice(b"\r\n\r\n");
@@ -2714,6 +2709,32 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(empty.body, Body::Empty));
+
+        let mixed_wire =
+            b"Content-Type: text/plain\n\nStatus: 302 Found\r\nLocation: /injected\r\n\r\nbody";
+        let mixed = response_from_spool(spool_from_bytes(mixed_wire), crate::http::Version::Http11)
+            .unwrap();
+        assert_eq!(mixed.status, 200);
+        assert!(mixed
+            .headers
+            .iter()
+            .all(|(name, _)| !name.eq_ignore_ascii_case("location")));
+        match mixed.body {
+            Body::File {
+                mut file,
+                offset,
+                len,
+            } => {
+                file.seek(SeekFrom::Start(offset)).unwrap();
+                let mut body = vec![0u8; len as usize];
+                file.read_exact(&mut body).unwrap();
+                assert_eq!(
+                    body,
+                    b"Status: 302 Found\r\nLocation: /injected\r\n\r\nbody"
+                );
+            }
+            _ => panic!("expected file-backed FastCGI body"),
+        }
 
         assert!(response_from_spool(
             spool_from_bytes(b"Content-Type\r\n\r\n"),
