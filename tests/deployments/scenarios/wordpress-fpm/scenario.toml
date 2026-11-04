@@ -1,0 +1,23 @@
+id = "wordpress-fpm"
+title = "WordPress through PHP-FPM"
+nightly = true
+timeout_seconds = 420
+disk_mb = 2048
+modes = ["fastcgi", "rewrite", "cookies", "database"]
+upstreams = ["WordPress 6.8.3 with PHP 8.3 FPM", "MariaDB 11.8.3"]
+images = [
+  "wordpress@sha256:906c25725c2edccb7809851f61f98560ea73b6c01d482d69d1b9fdf04b5ff75f",
+  "mariadb@sha256:ae6119716edac6998ae85508431b3d2e666530ddf4e94c61a10710caec9b0f71",
+]
+prerequisites = ["docker"]
+
+[dimensions]
+permalinks = ["plain", "pretty"]
+asset_cache = ["off", "disk"]
+reload = ["none", "after-start"]
+
+[canonical]
+permalinks = "pretty"
+asset_cache = "disk"
+reload = "after-start"
+

@@ -1,0 +1,100 @@
+name: real-application-integration
+
+on:
+  schedule:
+    - cron: "53 4 * * *"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Fixed nightly set, stochastic sample, or exhaustive Cartesian set
+        type: choice
+        options: [nightly, sample, full]
+        default: sample
+      scenario:
+        description: Optional single scenario id
+        type: string
+        required: false
+      sample_count:
+        description: Cases selected by the stochastic sample profile
+        type: number
+        default: 8
+      seed:
+        description: Optional integer seed (blank chooses and records a random seed)
+        type: string
+        required: false
+      benchmark:
+        description: Run the short application load workloads
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: real-applications-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  applications:
+    # One runner intentionally executes scenarios in series. This bounds both
+    # Actions usage and peak Docker storage; the harness removes each pinned
+    # application image before proceeding.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install application and workload prerequisites
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git gitweb libcgi-pm-perl perl
+      - name: Install differential benchmark tools
+        if: ${{ inputs.benchmark == true }}
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: sudo apt-get install -y apache2 wrk
+      - name: Build Vapache once for every scenario
+        run: cargo build --locked --release -p vapached
+      - name: Run real-application deployments
+        env:
+          INPUT_PROFILE: ${{ inputs.profile }}
+          INPUT_SCENARIO: ${{ inputs.scenario }}
+          INPUT_SAMPLE_COUNT: ${{ inputs.sample_count }}
+          INPUT_SEED: ${{ inputs.seed }}
+          INPUT_BENCHMARK: ${{ inputs.benchmark }}
+        run: |
+          profile=${INPUT_PROFILE:-nightly}
+          sample_count=${INPUT_SAMPLE_COUNT:-8}
+          args=(
+            --profile "$profile"
+            --sample-count "$sample_count"
+            --vapached target/release/vapached
+            --artifacts deployment-results
+            --remove-images
+          )
+          if [ -n "$INPUT_SCENARIO" ]; then
+            args+=(--scenario "$INPUT_SCENARIO")
+          fi
+          if [ -n "$INPUT_SEED" ]; then
+            args+=(--seed "$INPUT_SEED")
+          fi
+          if [ "$INPUT_BENCHMARK" = true ]; then
+            args+=(--benchmark)
+          fi
+          python3 tests/deployments/harness.py "${args[@]}"
+      - name: Show reclaimed container storage
+        if: always()
+        run: docker system df
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: real-application-results-${{ github.run_id }}
+          path: deployment-results
+          if-no-files-found: warn
+          retention-days: 30
+

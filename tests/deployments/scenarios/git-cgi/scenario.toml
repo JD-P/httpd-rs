@@ -1,0 +1,20 @@
+id = "git-cgi"
+title = "Gitweb and Git smart HTTP CGI"
+nightly = true
+timeout_seconds = 180
+disk_mb = 512
+modes = ["cgi", "path-info", "request-body"]
+upstreams = ["Gitweb and git-http-backend from Ubuntu 24.04; exact git --version captured per run"]
+images = []
+prerequisites = ["git", "perl"]
+
+[dimensions]
+application = ["gitweb", "smart-http"]
+access = ["open", "basic"]
+reload = ["none", "after-start"]
+
+[canonical]
+application = "smart-http"
+access = "basic"
+reload = "after-start"
+

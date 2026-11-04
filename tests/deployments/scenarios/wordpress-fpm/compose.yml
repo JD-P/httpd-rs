@@ -1,0 +1,83 @@
+services:
+  database:
+    image: mariadb@sha256:ae6119716edac6998ae85508431b3d2e666530ddf4e94c61a10710caec9b0f71
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: vapache-integration-db
+      MARIADB_ROOT_PASSWORD: vapache-integration-root
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+      - /run/mysqld:rw,nosuid,nodev,size=32m
+    volumes:
+      - database:/var/lib/mysql
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  wordpress:
+    image: wordpress@sha256:906c25725c2edccb7809851f61f98560ea73b6c01d482d69d1b9fdf04b5ff75f
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    environment:
+      WORDPRESS_DB_HOST: database
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: vapache-integration-db
+      WORDPRESS_TABLE_PREFIX: wp_
+      WORDPRESS_DEBUG: "0"
+    depends_on:
+      database:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+    volumes:
+      - type: bind
+        source: ${WORDPRESS_ROOT:?}
+        target: /var/www/html
+      - type: bind
+        source: ${PHP_RUN:?}
+        target: /run/vapache-php
+      - type: bind
+        source: ${FPM_CONFIG:?}
+        target: /usr/local/etc/php-fpm.d/zz-vapache-integration.conf
+        read_only: true
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/vapache-php/php-fpm.sock"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+networks:
+  application:
+    internal: true
+
+volumes:
+  database:
+

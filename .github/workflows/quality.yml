@@ -62,6 +62,8 @@ jobs:
         run: tests/certbot_apache_shim.sh
       - name: Privileged control-plane security invariants
         run: tests/control_plane_security.sh
+      - name: Real-application deployment harness invariants
+        run: python3 tests/deployments/selftest.py
 
   production-coverage:
     runs-on: ubuntu-24.04

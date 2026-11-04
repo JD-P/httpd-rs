@@ -1,0 +1,22 @@
+id = "hugo-static"
+title = "Hugo generated static site"
+nightly = true
+timeout_seconds = 180
+disk_mb = 768
+modes = ["static", "access", "compression", "cache"]
+upstreams = ["Hugo 0.152.2"]
+images = ["ghcr.io/gohugoio/hugo@sha256:d2952bdcfa3b0b25ca3d2104394c2883ffa86abb88855515f01b23b5e8f1355b"]
+prerequisites = ["docker"]
+
+[dimensions]
+access = ["open", "basic"]
+cache = ["off", "disk"]
+encoding = ["gzip", "brotli"]
+reload = ["none", "after-start"]
+
+[canonical]
+access = "basic"
+cache = "disk"
+encoding = "brotli"
+reload = "after-start"
+

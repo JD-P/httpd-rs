@@ -1,0 +1,41 @@
+services:
+  grafana:
+    image: grafana/grafana@sha256:74144189b38447facf737dfd0f3906e42e0776212bf575dc3334c3609183adf7
+    user: "472:472"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:?}
+      GF_SERVER_SERVE_FROM_SUB_PATH: ${GRAFANA_SUBPATH:?}
+      GF_PATHS_LOGS: /tmp/grafana-logs
+      GRAFANA_HEALTH_PATH: ${GRAFANA_HEALTH_PATH-}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,uid=472,gid=472
+    volumes:
+      - data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:?}:3000"
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000$${GRAFANA_HEALTH_PATH}/api/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+networks:
+  application:
+    internal: true
+
+volumes:
+  data:
+

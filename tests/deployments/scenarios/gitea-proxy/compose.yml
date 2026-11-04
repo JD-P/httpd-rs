@@ -1,0 +1,45 @@
+services:
+  gitea:
+    image: gitea/gitea@sha256:af07b88edbb2173d20932f9c75ebcf4e61d7d5c2d6a7ab5cc6b97cba28aea352
+    user: "${HOST_UID:?}:${HOST_GID:?}"
+    entrypoint: ["/usr/local/bin/gitea"]
+    command: ["web", "--config", "/data/gitea/conf/app.ini"]
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      HOME: /data/gitea
+      USER: runner
+      GITEA_WORK_DIR: /data/gitea
+      GITEA_CUSTOM: /data/gitea
+      GITEA_HEALTH_PATH: ${GITEA_HEALTH_PATH-}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,uid=${HOST_UID:?},gid=${HOST_GID:?}
+    volumes:
+      - type: bind
+        source: ${GITEA_DATA:?}
+        target: /data/gitea
+      - type: bind
+        source: ${GITEA_PASSWD:?}
+        target: /etc/passwd
+        read_only: true
+      - type: bind
+        source: ${GITEA_GROUP:?}
+        target: /etc/group
+        read_only: true
+    ports:
+      - "127.0.0.1:${GITEA_PORT:?}:3000"
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000$${GITEA_HEALTH_PATH}/api/v1/version"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+networks:
+  application:
+    internal: true
+

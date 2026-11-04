@@ -1,0 +1,20 @@
+id = "grafana-proxy"
+title = "Grafana HTTP and WebSocket reverse proxy"
+nightly = true
+timeout_seconds = 300
+disk_mb = 1024
+modes = ["reverse-proxy", "websocket", "redirects", "cookies"]
+upstreams = ["Grafana 12.2.0"]
+images = ["grafana/grafana@sha256:74144189b38447facf737dfd0f3906e42e0776212bf575dc3334c3609183adf7"]
+prerequisites = ["docker"]
+
+[dimensions]
+mount = ["root", "subpath"]
+reload = ["none", "after-start"]
+websocket = ["handshake", "message"]
+
+[canonical]
+mount = "subpath"
+reload = "after-start"
+websocket = "message"
+
