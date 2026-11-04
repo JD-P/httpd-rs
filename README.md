@@ -383,6 +383,15 @@ port 443 listener can bind. Webroot and DNS authenticators remain supported.
 If `vapache-switch` has not been run, pass
 `--apache-ctl /usr/lib/vapache/certbot-apachectl` explicitly.
 
+For first issuance, start with an HTTP-only virtual host and let
+`certbot --apache` add the TLS configuration after the certificate exists.
+Like Apache, Vapache rejects an enabled TLS virtual host whose certificate is
+missing. If that virtual host already points into a nonexistent
+`/etc/letsencrypt/live/` lineage, Vapache's configuration error prints the
+literal `certbot certonly --standalone` command needed to create it before
+retrying `sudo vapachectl configtest`; the standalone authenticator requires
+port 80 to be free.
+
 ## Verify
 
 The security kernels live in `crates/verified` and are checked with Verus:

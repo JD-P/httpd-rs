@@ -53,6 +53,14 @@ retain a graceful reload. For a new certificate, invoke Certbot with:
 sudo certbot --apache -d example.com
 ```
 
+That first-issuance path expects an HTTP-only virtual host; Certbot adds the
+TLS virtual host after it has created the certificate. If an enabled TLS
+virtual host already points at a nonexistent `/etc/letsencrypt/live/` lineage,
+Vapache keeps the configuration invalid and prints the literal
+`certbot certonly --standalone` command needed to create the lineage before
+retrying `sudo vapachectl configtest`. Port 80 must be free while the
+standalone authenticator runs.
+
 Without first running `vapache-switch`, pass
 `--apache-ctl /usr/lib/vapache/certbot-apachectl` explicitly.
 Package removal deletes only these exact Vapache settings and hook from

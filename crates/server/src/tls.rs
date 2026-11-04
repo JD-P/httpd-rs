@@ -704,6 +704,91 @@ fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
     })
 }
 
+fn certbot_live_lineage(path: &Path) -> Option<&str> {
+    let relative = path.strip_prefix("/etc/letsencrypt/live").ok()?;
+    let mut components = relative.components();
+    let lineage = components.next()?.as_os_str().to_str()?;
+    components.next()?;
+    if components.next().is_some()
+        || lineage.is_empty()
+        || lineage.starts_with('-')
+        || !lineage
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(lineage)
+}
+
+fn certbot_domain(server_name: Option<&str>) -> Option<&str> {
+    let mut name = server_name?;
+    if let Some((_, authority)) = name.rsplit_once("://") {
+        name = authority;
+    }
+    if let Some((host, port)) = name.rsplit_once(':') {
+        if !host.contains(':') && !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            name = host;
+        }
+    }
+    name = name.trim_end_matches('.');
+    if name.len() > 253
+        || !name.contains('.')
+        || name.parse::<IpAddr>().is_ok()
+        || name.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn certbot_first_issuance_error(
+    error: String,
+    ssl: &SslConfig,
+    server_name: Option<&str>,
+) -> String {
+    let missing = [ssl.cert_file.as_deref(), ssl.key_file.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|path| {
+            certbot_live_lineage(path).is_some()
+                && error.contains(&path.display().to_string())
+                && std::fs::metadata(path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        });
+    let Some(path) = missing else {
+        return error;
+    };
+    let Some(lineage) = certbot_live_lineage(path) else {
+        return error;
+    };
+    let domain = certbot_domain(server_name).or_else(|| certbot_domain(Some(lineage)));
+    let Some(domain) = domain else {
+        return format!(
+            "{error}\n{} is a missing Certbot live-lineage file; obtain that certificate before enabling this TLS configuration, then run `sudo vapachectl configtest` again",
+            path.display()
+        );
+    };
+    let cert_name = if lineage.eq_ignore_ascii_case(domain) {
+        String::new()
+    } else {
+        format!(" --cert-name {lineage}")
+    };
+    format!(
+        "{error}\n{} is a missing Certbot live-lineage file. For first issuance, obtain it before enabling this TLS configuration:\n  sudo certbot certonly --standalone{cert_name} -d {domain}\nThen run `sudo vapachectl configtest` again.",
+        path.display()
+    )
+}
+
 fn read_crls(path: &Path) -> Result<Vec<CertificateRevocationListDer<'static>>, String> {
     let data = read_tls_admin_file(path, MAX_TLS_CRL_BYTES)
         .map_err(|e| format!("cannot open client CRL {}: {e}", path.display()))?;
@@ -1448,13 +1533,17 @@ pub(crate) fn prepare_server_config(
     // not below a legacy logs directory that older releases handed to the
     // service account.
     let ocsp_cache_dir = cfg.server_root.join(".vapache-ocsp-cache");
+    let default_server_name = (!global_only)
+        .then(|| vhosts[0].server_name.as_deref())
+        .flatten();
     let (default_cert, default_refresh) = load_key_with_ocsp_accounted(
         default_ssl,
         &provider,
         Some(&ocsp_cache_dir),
         true,
         Some(&cfg.resource_budget),
-    )?;
+    )
+    .map_err(|error| certbot_first_issuance_error(error, default_ssl, default_server_name))?;
     let default_key: SharedKey = Arc::new(RwLock::new(default_cert));
     let mut refreshes = Vec::new();
     if let Some(mut refresh) = default_refresh {
@@ -1480,7 +1569,10 @@ pub(crate) fn prepare_server_config(
                     Some(&ocsp_cache_dir),
                     true,
                     Some(&cfg.resource_budget),
-                )?;
+                )
+                .map_err(|error| {
+                    certbot_first_issuance_error(error, &v.ssl, v.server_name.as_deref())
+                })?;
                 let shared = Arc::new(RwLock::new(cert));
                 if let Some(mut refresh) = refresh {
                     refresh.key = Arc::downgrade(&shared);
@@ -1805,6 +1897,75 @@ mod tests {
             ..SslConfig::default()
         };
         assert!(load_key(&ssl, &provider, None).is_err());
+    }
+
+    #[test]
+    fn missing_certbot_lineage_has_first_issuance_command() {
+        let ssl = SslConfig {
+            engine: true,
+            cert_file: Some("/etc/letsencrypt/live/new.example/fullchain.pem".into()),
+            key_file: Some("/etc/letsencrypt/live/new.example/privkey.pem".into()),
+            ..SslConfig::default()
+        };
+        let error = certbot_first_issuance_error(
+            "cannot open certificate /etc/letsencrypt/live/new.example/fullchain.pem".into(),
+            &ssl,
+            Some("new.example:443"),
+        );
+        assert!(error.contains("sudo certbot certonly --standalone -d new.example"));
+        assert!(error.contains("sudo vapachectl configtest"));
+    }
+
+    #[test]
+    fn missing_named_certbot_lineage_preserves_cert_name() {
+        let ssl = SslConfig {
+            engine: true,
+            cert_file: Some("/etc/letsencrypt/live/site-lineage/fullchain.pem".into()),
+            ..SslConfig::default()
+        };
+        let error = certbot_first_issuance_error(
+            "cannot open certificate /etc/letsencrypt/live/site-lineage/fullchain.pem".into(),
+            &ssl,
+            Some("www.example.test"),
+        );
+        assert!(error.contains(
+            "sudo certbot certonly --standalone --cert-name site-lineage -d www.example.test"
+        ));
+    }
+
+    #[test]
+    fn ordinary_missing_certificate_does_not_suggest_certbot() {
+        let ssl = SslConfig {
+            engine: true,
+            cert_file: Some("/does/not/exist.pem".into()),
+            ..SslConfig::default()
+        };
+        assert_eq!(
+            certbot_first_issuance_error(
+                "cannot open certificate".into(),
+                &ssl,
+                Some("example.test")
+            ),
+            "cannot open certificate"
+        );
+    }
+
+    #[test]
+    fn unrelated_tls_error_does_not_blame_a_missing_certbot_sibling() {
+        let ssl = SslConfig {
+            engine: true,
+            cert_file: Some("/etc/letsencrypt/live/example.test/fullchain.pem".into()),
+            key_file: Some("/etc/letsencrypt/live/example.test/privkey.pem".into()),
+            ..SslConfig::default()
+        };
+        assert_eq!(
+            certbot_first_issuance_error(
+                "cannot parse certificate /some/other/certificate.pem".into(),
+                &ssl,
+                Some("example.test")
+            ),
+            "cannot parse certificate /some/other/certificate.pem"
+        );
     }
 
     #[cfg(feature = "fault-injection")]

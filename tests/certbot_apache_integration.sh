@@ -50,6 +50,26 @@ if [[ "$override" == 1 ]]; then
     install -m 0755 /current/vapached /usr/sbin/vapached
 fi
 
+# A pre-provisioned TLS vhost may name its future Certbot lineage before the
+# first certificate exists. Keep that state fail-closed, but make the recovery
+# command concrete instead of leaving the administrator in a bootstrap loop.
+cat >/etc/apache2/sites-enabled/vapache-missing-cert.conf <<'EOF'
+Listen 127.0.0.1:9443
+<VirtualHost 127.0.0.1:9443>
+ServerName example.test
+SSLEngine On
+SSLCertificateFile /etc/letsencrypt/live/example.test/fullchain.pem
+SSLCertificateKeyFile /etc/letsencrypt/live/example.test/privkey.pem
+</VirtualHost>
+EOF
+if /usr/sbin/vapachectl configtest >/tmp/missing-cert.log 2>&1; then
+    echo 'Vapache accepted a nonexistent Certbot lineage' >&2
+    exit 1
+fi
+grep -Fq 'sudo certbot certonly --standalone -d example.test' \
+    /tmp/missing-cert.log
+rm -f /etc/apache2/sites-enabled/vapache-missing-cert.conf
+
 install -d -m 0700 \
     /etc/letsencrypt/archive/example.test \
     /etc/letsencrypt/live/example.test \
