@@ -721,6 +721,14 @@ fn certbot_live_lineage(path: &Path) -> Option<&str> {
     Some(lineage)
 }
 
+/// A Certbot live-lineage input may legitimately be named before first
+/// issuance. The caller must still prove that the path is an SSL certificate
+/// or key input; this helper only recognizes the conventional missing path.
+pub(crate) fn missing_certbot_live_file(path: &Path) -> bool {
+    certbot_live_lineage(path).is_some()
+        && std::fs::metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn certbot_domain(server_name: Option<&str>) -> Option<&str> {
     let mut name = server_name?;
     if let Some((_, authority)) = name.rsplit_once("://") {
@@ -760,10 +768,7 @@ fn certbot_first_issuance_error(
         .into_iter()
         .flatten()
         .find(|path| {
-            certbot_live_lineage(path).is_some()
-                && error.contains(&path.display().to_string())
-                && std::fs::metadata(path)
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            missing_certbot_live_file(path) && error.contains(&path.display().to_string())
         });
     let Some(path) = missing else {
         return error;
@@ -1901,6 +1906,10 @@ mod tests {
 
     #[test]
     fn missing_certbot_lineage_has_first_issuance_command() {
+        assert!(missing_certbot_live_file(Path::new(
+            "/etc/letsencrypt/live/new.example/fullchain.pem"
+        )));
+        assert!(!missing_certbot_live_file(Path::new("/does/not/exist.pem")));
         let ssl = SslConfig {
             engine: true,
             cert_file: Some("/etc/letsencrypt/live/new.example/fullchain.pem".into()),

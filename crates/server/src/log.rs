@@ -329,8 +329,9 @@ impl Logger {
             let fmt = if cl.format.starts_with('"') && cl.format.ends_with('"') {
                 cl.format[1..cl.format.len() - 1].to_string()
             } else {
-                cfg.log_formats
-                    .get(&cl.format)
+                vhost
+                    .and_then(|index| cfg.vhosts[index].log_formats.get(&cl.format))
+                    .or_else(|| cfg.log_formats.get(&cl.format))
                     .cloned()
                     .unwrap_or_else(|| cl.format.clone())
             };
@@ -379,8 +380,9 @@ impl Logger {
             let format = if cl.format.starts_with('"') && cl.format.ends_with('"') {
                 cl.format[1..cl.format.len() - 1].to_string()
             } else {
-                cfg.log_formats
-                    .get(&cl.format)
+                vhost
+                    .and_then(|index| cfg.vhosts[index].log_formats.get(&cl.format))
+                    .or_else(|| cfg.log_formats.get(&cl.format))
                     .cloned()
                     .unwrap_or_else(|| cl.format.clone())
             };
@@ -1132,6 +1134,7 @@ mod tests {
                  CustomLog logs/access.log common\n\
                  CustomLog /dev/null \"%h\"\n\
                  <VirtualHost 127.0.0.1:0>\n\
+                 LogFormat \"%v %h\" common\n\
                  CustomLog logs/vhost.log common\n\
                  </VirtualHost>\n",
                 dir.display()
@@ -1146,6 +1149,7 @@ mod tests {
         });
         let logger = Logger::new(&cfg).unwrap();
         assert_eq!(logger.access_log_count(), 4);
+        assert_eq!(logger.access[3].format, "%v %h");
         assert!(logger.configuration_matches(&cfg));
         let mut changed_logging = cfg.clone();
         changed_logging.log_level = "debug".into();
@@ -1211,7 +1215,7 @@ mod tests {
             .contains("192.0.2.1 200 5"));
         assert!(std::fs::read_to_string(dir.join("logs/vhost.log"))
             .unwrap()
-            .contains("192.0.2.1 200 5"));
+            .contains("example.test 192.0.2.1"));
 
         let budget = std::sync::Arc::new(crate::resource::ResourceBudget::default());
         assert!(open_log("syslog:local0", &dir, None, &budget).is_ok());

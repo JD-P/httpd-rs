@@ -76,6 +76,11 @@ impl Drop for ConfigGenerationGuard {
 /// effectively unbounded thread/HTTP2-connection ceiling.
 pub const MAX_IMPLEMENTED_REQUEST_WORKERS: usize = 512;
 
+// Certbot 4.x's Apache installer emits this Mozilla-derived TLS 1.2 policy.
+// Rustls offers the six ECDHE suites in this list and no DHE/anonymous suite,
+// so its fixed policy is a strict subset of the expression.
+const CERTBOT_APACHE_TLS12_CIPHER_SUPERSET: &str = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApacheMpmTuning {
     pub start_servers: Option<u32>,
@@ -2416,6 +2421,7 @@ pub struct VHost {
     pub rules: Vec<ScopeRule>,
     pub directory_index: DirectoryRuleIndex,
     pub proxy_containers: Vec<ProxyContainer>,
+    pub log_formats: HashMap<String, String>,
     pub custom_logs: Vec<CustomLog>,
     pub error_log: Option<String>,
     pub server_admin: Option<String>,
@@ -3556,6 +3562,14 @@ impl Config {
             return Ok(());
         }
         for target in &self.admin_input_targets {
+            // A newly configured Certbot lineage does not exist until first
+            // issuance. Defer only missing certificate/key paths here so TLS
+            // validation can emit the concrete bootstrap command. Once the
+            // lineage exists, this exception disappears and the complete
+            // root-owned parent chain is validated before any key is read.
+            if self.missing_certbot_bootstrap_input(target) {
+                continue;
+            }
             crate::files::validate_admin_parents(target, service_uid).map_err(|error| {
                 format!(
                     "administrative input parent for {} is unsafe: {error}",
@@ -3564,6 +3578,17 @@ impl Config {
             })?;
         }
         Ok(())
+    }
+
+    fn missing_certbot_bootstrap_input(&self, target: &Path) -> bool {
+        if !crate::tls::missing_certbot_live_file(target) {
+            return false;
+        }
+        std::iter::once(&self.ssl)
+            .chain(self.vhosts.iter().map(|vhost| &vhost.ssl))
+            .any(|ssl| {
+                ssl.cert_file.as_deref() == Some(target) || ssl.key_file.as_deref() == Some(target)
+            })
     }
 
     /// Authentication databases are operator-controlled by default. The
@@ -5836,6 +5861,7 @@ impl Compile {
                                 rules: Vec::new(),
                                 directory_index: DirectoryRuleIndex::default(),
                                 proxy_containers: Vec::new(),
+                                log_formats: HashMap::new(),
                                 custom_logs: Vec::new(),
                                 error_log: None,
                                 server_admin: None,
@@ -6200,7 +6226,6 @@ impl Compile {
                 | "group"
                 | "pidfile"
                 | "loglevel"
-                | "logformat"
                 | "remoteipheader"
                 | "remoteipinternalproxy"
                 | "remoteiptrustedproxy"
@@ -7693,7 +7718,11 @@ impl Compile {
                 if args.len() >= 2 {
                     let fmt = args[0].clone();
                     let nick = args[1].clone();
-                    self.cfg.log_formats.insert(nick, fmt);
+                    if let Some(i) = self.current_vhost {
+                        self.vhosts_raw[i].log_formats.insert(nick, fmt);
+                    } else {
+                        self.cfg.log_formats.insert(nick, fmt);
+                    }
                 }
             }
             "customlog" => {
@@ -8583,13 +8612,23 @@ impl Compile {
                 // no anonymous suites. Accept only that exact known superset;
                 // every policy that could remove a Rustls suite or request a
                 // different one remains a hard error.
-                if name == "sslciphersuite"
-                    && args.len() == 1
-                    && args[0].eq_ignore_ascii_case("HIGH:!aNULL")
-                {
+                let compatible_superset = (name == "sslciphersuite" && args.len() == 1)
+                    .then(|| {
+                        if args[0].eq_ignore_ascii_case("HIGH:!aNULL") {
+                            Some("distribution HIGH:!aNULL")
+                        } else if args[0]
+                            .eq_ignore_ascii_case(CERTBOT_APACHE_TLS12_CIPHER_SUPERSET)
+                        {
+                            Some("Certbot TLS 1.2")
+                        } else {
+                            None
+                        }
+                    })
+                    .flatten();
+                if let Some(policy) = compatible_superset {
                     self.warn(format!(
-                        "{}:{}: SSLCipherSuite HIGH:!aNULL is satisfied by Rustls' smaller authenticated modern cipher set",
-                        loc.file, loc.line
+                        "{}:{}: the {policy} SSLCipherSuite policy is satisfied by Rustls' smaller authenticated modern cipher set",
+                        loc.file, loc.line,
                     ));
                 } else {
                     self.directive_error(
@@ -11994,6 +12033,32 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
             Some(std::path::Path::new("/etc/ssl/key.pem"))
         );
         assert!(v.ssl.protocols.as_deref().unwrap().contains("TLSv1.1"));
+    }
+
+    #[test]
+    fn missing_certbot_parent_validation_is_deferred_only_for_tls_bootstrap_inputs() {
+        let cert = Path::new(
+            "/etc/letsencrypt/live/vapache-bootstrap-does-not-exist.invalid/fullchain.pem",
+        );
+        let key =
+            Path::new("/etc/letsencrypt/live/vapache-bootstrap-does-not-exist.invalid/privkey.pem");
+        let cfg = load_text(
+            &format!(
+                "Listen 127.0.0.1:0\nSSLCertificateFile {}\nSSLCertificateKeyFile {}\n",
+                cert.display(),
+                key.display()
+            ),
+            false,
+        )
+        .unwrap();
+        assert!(cfg.missing_certbot_bootstrap_input(cert));
+        assert!(cfg.missing_certbot_bootstrap_input(key));
+        assert!(!cfg.missing_certbot_bootstrap_input(Path::new(
+            "/etc/letsencrypt/live/vapache-bootstrap-does-not-exist.invalid/unrelated.pem"
+        )));
+        assert!(!cfg.missing_certbot_bootstrap_input(Path::new(
+            "/tmp/vapache-bootstrap-does-not-exist.pem"
+        )));
     }
 
     #[test]
@@ -15741,12 +15806,17 @@ Require all granted\n\
         err("SSLCARevocationCheck maybe\n");
         err("SSLProtocol\n");
         err("SSLCipherSuite HIGH\n");
-        let stock_cipher_policy =
-            load_text("Listen 127.0.0.1:0\nSSLCipherSuite HIGH:!aNULL\n", false).unwrap();
-        assert!(stock_cipher_policy
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("smaller authenticated modern cipher set")));
+        for policy in ["HIGH:!aNULL", CERTBOT_APACHE_TLS12_CIPHER_SUPERSET] {
+            let compatible = load_text(
+                &format!("Listen 127.0.0.1:0\nSSLCipherSuite {policy}\n"),
+                false,
+            )
+            .unwrap();
+            assert!(compatible
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("smaller authenticated modern cipher set")));
+        }
         err("LogLevel ssl:info\n");
         err("DeflateBufferSize 4096\n");
         err("AuthBasicProvider ldap\n");

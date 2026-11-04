@@ -67,7 +67,10 @@ if /usr/sbin/vapachectl configtest >/tmp/missing-cert.log 2>&1; then
     exit 1
 fi
 grep -Fq 'sudo certbot certonly --standalone -d example.test' \
-    /tmp/missing-cert.log
+    /tmp/missing-cert.log || {
+        cat /tmp/missing-cert.log >&2
+        exit 1
+    }
 rm -f /etc/apache2/sites-enabled/vapache-missing-cert.conf
 
 install -d -m 0700 \

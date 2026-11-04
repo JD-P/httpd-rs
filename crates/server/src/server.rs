@@ -8678,6 +8678,7 @@ mod tests {
             rules: Vec::new(),
             directory_index: Default::default(),
             proxy_containers: Vec::new(),
+            log_formats: Default::default(),
             custom_logs: Vec::new(),
             error_log: None,
             server_admin: None,
