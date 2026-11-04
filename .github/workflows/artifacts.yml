@@ -40,20 +40,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y binutils file musl-tools rpm
 
-      - name: Build portable static vapached
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build --locked --release -p vapached --target "$TARGET"
-
-      - name: Verify and package the release
+      - name: Build and reproduce the complete release
         id: package
         shell: bash
         run: |
           set -euo pipefail
-          binary="target/$TARGET/release/vapached"
           version=$(cargo metadata --locked --no-deps --format-version 1 \
             | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "vapached"))')
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+            tests/reproducible_build.sh --target "$TARGET" --output release
+          binary="release/vapached-${version}-linux-x86_64-musl"
           file "$binary"
           if readelf -d "$binary" 2>/dev/null | grep -q '(NEEDED)'; then
             echo "portable binary unexpectedly has dynamic dependencies" >&2
@@ -61,11 +57,6 @@ jobs:
           fi
           "$binary" -v
           python3 tests/native_dependency_policy.py --binary "$binary"
-          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
-            packaging/build-linux-packages.sh \
-              --binary "$binary" \
-              --version "$version" \
-              --output release
           echo "version=$version" >>"$GITHUB_OUTPUT"
 
       - name: Inspect package payloads

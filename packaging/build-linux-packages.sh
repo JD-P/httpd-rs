@@ -4,7 +4,8 @@ set -euo pipefail
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 LC_ALL=C
-export LC_ALL
+TZ=UTC
+export LC_ALL TZ
 unset CDPATH ENV BASH_ENV
 umask 022
 
@@ -46,6 +47,13 @@ done
     echo "packaging: unsupported version: $version" >&2
     exit 1
 }
+
+source_date_epoch=${SOURCE_DATE_EPOCH:-0}
+[[ "$source_date_epoch" =~ ^[0-9]+$ ]] || {
+    echo "packaging: SOURCE_DATE_EPOCH must be a non-negative integer" >&2
+    exit 1
+}
+export SOURCE_DATE_EPOCH="$source_date_epoch"
 
 for command in dpkg-deb rpmbuild readelf sha256sum tar gzip; do
     command -v "$command" >/dev/null || {
@@ -97,7 +105,6 @@ install -Dm 0644 "$script_dir/README.md" \
     "$archive_root/usr/share/doc/vapache/PACKAGING.md"
 install -Dm 0644 "$repo_root/LICENSE" "$archive_root/usr/share/licenses/vapache/LICENSE"
 
-source_date_epoch=${SOURCE_DATE_EPOCH:-0}
 tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
     -C "$work_dir" -cf - "$(basename -- "$archive_root")" \
     | gzip -n >"$output/$archive_name"
@@ -181,6 +188,9 @@ fi
 exit 0
 EOF
 chmod 0755 "$deb_root/DEBIAN/postinst" "$deb_root/DEBIAN/prerm" "$deb_root/DEBIAN/postrm"
+# dpkg-deb uses the staged mtimes for data.tar. Normalize leaves first and
+# directories last so touching a child cannot perturb its parent's mtime.
+find "$deb_root" -depth -exec touch -h -d "@$source_date_epoch" -- {} +
 dpkg-deb --root-owner-group -Zxz -z9 --build "$deb_root" "$output/$deb_name"
 
 rpm_top="$work_dir/rpm"
@@ -244,6 +254,7 @@ install -Dm 0644 %{SOURCE7} %{buildroot}/usr/lib/systemd/system/vapache.service
 install -Dm 0644 %{SOURCE8} %{buildroot}/usr/share/doc/vapache/README.md
 install -Dm 0644 %{SOURCE9} %{buildroot}/usr/share/doc/vapache/PACKAGING.md
 install -Dm 0644 %{SOURCE10} %{buildroot}/usr/share/licenses/vapache/LICENSE
+find %{buildroot} -depth -exec touch -h -d '@${source_date_epoch}' -- {} +
 
 %post
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -295,7 +306,13 @@ fi
 %doc /usr/share/doc/vapache/PACKAGING.md
 %license /usr/share/licenses/vapache/LICENSE
 EOF
-rpmbuild --define "_topdir $rpm_top" --define "_build_id_links none" \
+find "$rpm_top/SOURCES" "$rpm_top/SPECS" -depth \
+    -exec touch -h -d "@$source_date_epoch" -- {} +
+rpmbuild --define "_topdir $rpm_top" \
+    --define "_build_id_links none" \
+    --define "_buildhost reproducible.invalid" \
+    --define "use_source_date_epoch_as_buildtime 1" \
+    --define "clamp_mtime_to_source_date_epoch 1" \
     -bb "$rpm_top/SPECS/vapache.spec"
 rpm_path=$(find "$rpm_top/RPMS" -type f -name '*.rpm' -print -quit)
 [[ -n "$rpm_path" ]] || {

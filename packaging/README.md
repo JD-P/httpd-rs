@@ -72,6 +72,20 @@ therefore has no glibc version floor. Vapache still requires Linux 5.9 or newer
 for its fail-closed `openat2` path-resolution and `close_range`
 descriptor-isolation boundaries.
 
+Release artifacts are reproducible. The workflow uses the pinned Rust
+toolchain and the commit timestamp as `SOURCE_DATE_EPOCH`, remaps checkout,
+target, and tool-cache paths out of the executable, and normalizes archive and
+package ownership, timestamps, RPM build host, and RPM build time. The release
+gate builds in two different source and target paths and requires identical
+bytes for the loose executable, tarball, Debian package, RPM package, and
+`SHA256SUMS` before anything is uploaded. Run the same gate locally with:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+sudo apt-get install binutils musl-tools rpm
+tests/reproducible_build.sh --output release
+```
+
 All privileged helpers replace inherited command lookup with the fixed system
 path, reject shell startup environments, validate executable overrides and the
 complete ownership chain of every mutable path, and serialize snapshot/service
