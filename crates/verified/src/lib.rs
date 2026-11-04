@@ -35,6 +35,42 @@ verus! {
 // Shared specs
 // ---------------------------------------------------------------------------
 
+/// A request may begin policy-bearing work only while the immutable
+/// configuration generation which accepted its transport is current.
+pub open spec fn configuration_generation_admit_spec(retired: bool) -> bool {
+    !retired
+}
+
+pub fn configuration_generation_admit(retired: bool) -> (admit: bool)
+    ensures admit == configuration_generation_admit_spec(retired),
+{
+    !retired
+}
+
+pub proof fn retired_configuration_generation_rejects_new_work()
+    ensures !configuration_generation_admit_spec(true),
+{
+}
+
+/// Cache work is generation-local. In particular, an old request which
+/// completes after a reload cannot publish its representation into the new
+/// generation merely by observing the new process-wide epoch at store time.
+pub open spec fn cache_generation_admit_spec(request_epoch: u64, current_epoch: u64) -> bool {
+    request_epoch == current_epoch
+}
+
+pub fn cache_generation_admit(request_epoch: u64, current_epoch: u64) -> (admit: bool)
+    ensures admit == cache_generation_admit_spec(request_epoch, current_epoch),
+{
+    request_epoch == current_epoch
+}
+
+pub proof fn stale_cache_generation_rejects_work(request_epoch: u64, current_epoch: u64)
+    requires request_epoch != current_epoch,
+    ensures !cache_generation_admit_spec(request_epoch, current_epoch),
+{
+}
+
 /// Bytes that may appear in a decoded URI path before UTF-8 validation:
 /// visible ASCII except `\`, plus non-ASCII bytes. A space is permitted after
 /// percent-decoding (`%20`), matching Apache, and cannot appear literally in

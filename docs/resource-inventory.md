@@ -8,6 +8,20 @@ then process scope and its physical parent. A rejection rolls back every lower
 scope. RAII leases release every charge on errors, resets, timeouts, and normal
 completion.
 
+The budget is deliberately shared, but policy-bearing mutable state is not.
+Each immutable configuration owns a retirement flag, admission gate and cache epoch; proxy
+health/failure observations, balancer counters and parsed `.htaccess` IR are
+namespaced by its generation ID. The final `Config` clone removes those
+records. A successful reload retires transports before new listener admission;
+HTTP/1 keep-alive, H2 streams and WebSocket tunnels cannot create new work
+under old policy. Rejected candidates do not retire the still-current state.
+Admission decisions hold the generation gate's read side; reload commit takes
+the write side, so a request is ordered entirely before or after retirement.
+One process-wide read/write barrier covers only final cache publication and
+administrative generation cleanup, ensuring a retired request cannot recreate
+an old-root entry after reload without serializing ordinary cache reads or
+response construction.
+
 The slot ledger covers pending connections, HTTP/1 workers, slow-body workers,
 TLS handshakes, HTTP/2 connections, ordinary streams and a shared source-fair
 slow-output class, dynamic backend requests, blocking response reads,
@@ -79,8 +93,9 @@ Some mutable state is intentionally process-owned rather than request-owned:
 - bounded content, authentication, `.htaccess`, DNS, proxy-health, OCSP, H2
   buffer, and TLS-session caches;
 - bounded DNS/helper queues and the fixed Tokio/CGI worker pools;
-- configuration-generation state, signal flags, logging serialization, and
-  privileged TLS file-broker state;
+- configuration-generation state (including the monotonic process-local ID
+  allocator and cache-publication barrier), signal flags, logging
+  serialization, and privileged TLS file-broker state;
 - telemetry counters, thread-local formatting buffers, request-local metadata
   memoization, and collision-resistant temporary-name counters.
 

@@ -3423,8 +3423,8 @@ OVERRIDES: dict[str, tuple[str, str, str, str, str, str]] = {
     "CVE-2026-58164": (
         "prevented", "admin-control-plane",
         "concurrent remap configuration replacement left stale references and a validation/use race",
-        "Vapache loads a complete immutable Config generation, prepares every fallible listener/TLS/background resource, then swaps generations at one commit boundary; active requests retain their Arc-owned generation",
-        "high", "Traffic Server advisory and transactional reload ownership review",
+        "Vapache prepares every fallible candidate resource before commit; a generation-local read/write gate linearizes H1/H2 admission against retirement, active requests retain Arc-owned immutable policy, and commit closes old H1/WebSocket transports, sends H2 GOAWAY, and generation-namespaces cache publication, access-file IR and proxy health state",
+        "high", "Traffic Server advisory, transactional reload ownership review, and graceful-reload generation-isolation regressions",
     ),
     "CVE-2026-65927": (
         "prevented", "rewrite",

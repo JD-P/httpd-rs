@@ -474,7 +474,8 @@ per-request limit cannot contain:
 - connection admission is a compare/exchange reservation with RAII release.
   Injected thread-spawn failure returns the slot, and `EMFILE`/`ENFILE` accept
   failures back off instead of hot-spinning. Proxy health-check reloads cancel
-  the previous generation and old checks cannot publish stale state.
+  the previous worker; active/passive observations and selection counters are
+  generation-keyed, so old requests cannot consume candidate state.
 
 The executable Verus gates are `cache_invalidation_status_admit`,
 `autoindex_append_admit`, `bcrypt_cost_admit` and

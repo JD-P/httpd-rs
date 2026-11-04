@@ -695,9 +695,17 @@ ensures cfg'.epoch = cfg.epoch + 1
         forall e in cache: e.epoch < cfg'.epoch
 ```
 
-`cache_lookup_admit` takes a `generation_match` conjunct, disk metadata stores
-the epoch, and reload clears both memory and persisted representations before
-bumping the generation.  A CGI `PATH_INFO` request is resolved to the actual
+`cache_lookup_admit` takes a `generation_match` conjunct and disk metadata
+stores the epoch. Each immutable `Config` generation owns a clone-shared epoch
+cell; a request captures that value while compiling its cache policy, and both
+lookup and store require equality with the same cell. Final publication takes
+the read side of a cache-generation barrier. Reload takes the write side,
+retires the old cell, advances the candidate and clears both roots. An old
+store therefore either precedes cleanup or is rejected; it can neither adopt
+the candidate epoch nor recreate files on an abandoned cache root. Reload
+closes the old request-admission gate before this cache transition, preventing
+new old-policy stores during cleanup. A CGI
+`PATH_INFO` request is resolved to the actual
 script target (and that script's policy) for both the fingerprint and the key,
 so a later `<Files "script.cgi">` deny cannot leave a usable path-info entry.
 Authorization still runs on every hit; the cache is a derived view, never an
@@ -727,13 +735,23 @@ process is now unprivileged. Directives whose effects live in process identity,
 the pid guard, path base or kernel listeners require a full restart instead of
 creating a configuration/runtime split.
 
-Reload itself uses a prepare/commit boundary. The candidate logger, listener
+Reload itself uses a prepare/commit boundary. Listener-stop and generation
+retirement are separate states: a rejected candidate resumes the same live
+generation and does not invalidate its established connections. The candidate logger, listener
 clones, complete TLS configuration, initial OCSP state and pending refresh
 workers are prepared before any live generation changes. A preparation error
 rejects the whole candidate; it cannot combine new policy with old logs or
-stop the old health-check generation. Only after every fallible step succeeds
-are OCSP/health workers activated, the configuration/logger/listener set
-swapped, and the cache generation invalidated.
+retire the old generation. Only after every fallible step succeeds are
+OCSP/health workers activated, the candidate cache epoch committed and the
+old generation retired before listener admission resumes. HTTP/1 closes after
+an admitted response, HTTP/2 sends GOAWAY and drains admitted streams, and
+WebSocket tunnels close; none can begin new old-policy work. Access-file IR and
+the asynchronous protocols share an event-driven retirement broadcast rather
+than per-connection polling. H1/H2 policy admission takes a generation-local
+read gate, while commit takes the write side before broadcasting retirement;
+there is no flag-check/commit race. Access-file IR and proxy active/passive
+health state are keyed by immutable configuration ID and
+are removed only when the last request-owned `Config` clone drops.
 
 TLS is the one root-only input that must support same-path rotation during a
 graceful reload. Before threads and privilege drop, the parent forks a broker
@@ -1800,7 +1818,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **694 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **698 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -2332,7 +2350,7 @@ The current ledger (2026-11-04) is:
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **694 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **698 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

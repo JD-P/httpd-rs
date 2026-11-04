@@ -1798,6 +1798,7 @@ pub(crate) async fn serve<G, F>(
     local_ip: String,
     local_port: u16,
     tls_identity: crate::tls::TlsConnectionIdentity,
+    retired: tokio::sync::watch::Receiver<bool>,
     on_ready: F,
 ) -> io::Result<()>
 where
@@ -1811,6 +1812,7 @@ where
         local_ip,
         local_port,
         tls_identity,
+        retired,
         on_ready,
     )
     .await
@@ -1824,6 +1826,7 @@ async fn serve_io<T, G, F>(
     local_ip: String,
     local_port: u16,
     tls_identity: crate::tls::TlsConnectionIdentity,
+    mut retired: tokio::sync::watch::Receiver<bool>,
     on_ready: F,
 ) -> io::Result<()>
 where
@@ -1848,10 +1851,25 @@ where
     let preface_timeout = cfg
         .request_header_timeout
         .max(std::time::Duration::from_secs(1));
-    let mut conn = tokio::time::timeout(preface_timeout, builder.handshake(io))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP/2 preface timed out"))?
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let handshake = tokio::time::timeout(preface_timeout, builder.handshake(io));
+    tokio::pin!(handshake);
+    let mut conn = loop {
+        tokio::select! {
+            biased;
+            result = &mut handshake => {
+                break result
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP/2 preface timed out"))?
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            }
+            result = retired.changed() => {
+                if result.is_err() || !vapache_verified::configuration_generation_admit(
+                    *retired.borrow(),
+                ) {
+                    return Ok(());
+                }
+            }
+        }
+    };
     // h2's server handshake consumes the 24-byte connection preface but does
     // not wait for the client's mandatory initial SETTINGS. Keep this socket
     // in lightweight admission until `accept` has processed SETTINGS and the
@@ -1875,6 +1893,9 @@ where
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let mut reset_reclaims: BinaryHeap<Reverse<(Instant, u64)>> = BinaryHeap::new();
     let idle_timeout = cfg.timeout.max(cfg.keep_alive_timeout).max(H2_IDLE_FLOOR);
+    let idle_timer = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle_timer);
+    let mut draining = false;
     loop {
         let reclaim_deadline = reset_reclaims.peek().map(|entry| entry.0 .0);
         let reclaim_timer = tokio::time::sleep_until(
@@ -1885,7 +1906,17 @@ where
         tokio::pin!(reclaim_timer);
         tokio::select! {
             biased;
-            _ = &mut initial_request_deadline, if ready_callback.is_some() => {
+            result = retired.changed(), if !draining => {
+                if result.is_err() || !vapache_verified::configuration_generation_admit(
+                    *retired.borrow(),
+                ) {
+                    // Emit GOAWAY, refuse new streams in the h2 state machine,
+                    // and keep polling until already-admitted tasks finish.
+                    conn.graceful_shutdown();
+                    draining = true;
+                }
+            }
+            _ = &mut initial_request_deadline, if ready_callback.is_some() && !draining => {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "HTTP/2 initial SETTINGS/request head timed out",
@@ -1915,6 +1946,9 @@ where
                             // coverage:ignore-stop
                         };
                         budget = next;
+                        if budget.active == 0 {
+                            idle_timer.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                        }
                         if reset && stream_ids.schedule_purge(stream_id) {
                             reset_reclaims.push(Reverse((Instant::now() + H2_RESET_RECLAIM, stream_id)));
                         }
@@ -1953,7 +1987,12 @@ where
                     }
                 }
             }
-            _ = tokio::time::sleep(idle_timeout), if budget.active == 0 => {
+            _ = tokio::time::sleep(Duration::from_millis(50)), if draining && budget.active == 0 => {
+                // Give the state machine one scheduling turn to flush GOAWAY,
+                // then release an otherwise idle retired transport.
+                break;
+            }
+            _ = &mut idle_timer, if budget.active == 0 => {
                 logger.error("HTTP/2 connection idle timeout");
                 conn.abrupt_shutdown(h2::Reason::NO_ERROR);
                 break;
@@ -1964,17 +2003,27 @@ where
                 };
                 let (request, mut respond) =
                     result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                if let Some(callback) = ready_callback.take() {
-                    established_guard = Some(callback()?);
+                if draining {
+                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    continue;
                 }
                 let stream_id = respond.stream_id().as_u32() as u64;
-                let admission = match admit_stream_before_spawn(&cfg, peer, &request) {
-                    Ok(admission) => admission,
-                    Err(_) => {
+                let admission = match cfg.admit_generation_work(|| {
+                    admit_stream_before_spawn(&cfg, peer, &request)
+                }) {
+                    Some(Ok(admission)) => admission,
+                    None | Some(Err(_)) => {
+                        if !vapache_verified::configuration_generation_admit(*retired.borrow()) {
+                            conn.graceful_shutdown();
+                            draining = true;
+                        }
                         respond.send_reset(h2::Reason::REFUSED_STREAM);
                         continue;
                     }
                 };
+                if let Some(callback) = ready_callback.take() {
+                    established_guard = Some(callback()?);
+                }
                 let Some(next) = vapache_verified::h2_budget_step(
                     budget,
                     vapache_verified::H2BudgetEvent::Begin,
@@ -2793,6 +2842,7 @@ mod tests {
             let (cfg, logger, dir) = test_config(if reset { "serve-reset" } else { "serve-ok" });
             let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
             let tls_identity = test_tls_identity(&cfg);
+            let (_retire, retired) = tokio::sync::watch::channel(false);
             let server = tokio::spawn(serve_io(
                 cfg,
                 logger,
@@ -2801,6 +2851,7 @@ mod tests {
                 "127.0.0.1".into(),
                 443,
                 tls_identity,
+                retired,
                 || Ok(()),
             ));
             let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
@@ -2841,6 +2892,67 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn retired_h2_generation_refuses_new_streams() {
+        let (cfg, logger, dir) = test_config("retired-generation");
+        let drain_len = 256 * 1024;
+        fs::write(dir.join("www/drain.bin"), vec![b'd'; drain_len]).unwrap();
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let tls_identity = test_tls_identity(&cfg);
+        let retired = cfg.generation_retirement();
+        let server = tokio::spawn(serve_io(
+            cfg.clone(),
+            logger,
+            server_io,
+            "127.0.0.1:12345".parse().unwrap(),
+            "127.0.0.1".into(),
+            443,
+            tls_identity,
+            retired,
+            || Ok(()),
+        ));
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+
+        let request = http::Request::builder()
+            .uri("https://localhost/drain.bin")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Retirement must refuse later streams without truncating a response
+        // whose body was already admitted and is blocked on H2 flow control.
+        cfg.retire_generation();
+        let mut body = response.into_body();
+        let mut received = 0usize;
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            received += chunk.len();
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+        }
+        assert_eq!(received, drain_len);
+        let stale = http::Request::builder()
+            .uri("https://localhost/file.txt")
+            .body(())
+            .unwrap();
+        let refused = match client.send_request(stale, true) {
+            Err(_) => true,
+            Ok((response, _)) => response.await.is_err(),
+        };
+        assert!(refused, "retired HTTP/2 generation accepted a new stream");
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        driver.abort();
+        let _ = driver.await;
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn h2_preface_and_initial_settings_must_arrive_before_header_deadline() {
         let (cfg, logger, dir) = test_config("preface-timeout");
         let mut short = (*cfg).clone();
@@ -2848,6 +2960,7 @@ mod tests {
         let cfg = Arc::new(short);
         for preface in [None, Some(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..])] {
             let (mut client_io, server_io) = tokio::io::duplex(1024);
+            let (_retire, retired) = tokio::sync::watch::channel(false);
             if let Some(preface) = preface {
                 client_io.write_all(preface).await.unwrap();
             }
@@ -2864,6 +2977,7 @@ mod tests {
                     "127.0.0.1".into(),
                     443,
                     tls_identity,
+                    retired,
                     move || {
                         admitted_by_callback.store(true, std::sync::atomic::Ordering::Release);
                         Ok(())
@@ -2889,6 +3003,7 @@ mod tests {
 
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
         let tls_identity = test_tls_identity(&cfg);
+        let (_retire, retired) = tokio::sync::watch::channel(false);
         let server = tokio::spawn(serve_io(
             cfg.clone(),
             logger.clone(),
@@ -2897,6 +3012,7 @@ mod tests {
             "127.0.0.1".into(),
             443,
             tls_identity,
+            retired,
             || Ok(()),
         ));
         let (_client, connection) = h2::client::handshake(client_io).await.unwrap();
@@ -2913,6 +3029,7 @@ mod tests {
         fs::write(dir.join("www/large.bin"), large).unwrap();
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
         let tls_identity = test_tls_identity(&cfg);
+        let (_retire, retired) = tokio::sync::watch::channel(false);
         let server = tokio::spawn(serve_io(
             cfg,
             logger,
@@ -2921,6 +3038,7 @@ mod tests {
             "127.0.0.1".into(),
             443,
             tls_identity,
+            retired,
             || Ok(()),
         ));
         let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
@@ -2959,6 +3077,7 @@ mod tests {
 
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
         let tls_identity = test_tls_identity(&cfg);
+        let (_retire, retired) = tokio::sync::watch::channel(false);
         let server = tokio::spawn(serve_io(
             cfg,
             logger,
@@ -2967,6 +3086,7 @@ mod tests {
             "127.0.0.1".into(),
             443,
             tls_identity,
+            retired,
             || Ok(()),
         ));
         let mut builder = h2::client::Builder::new();

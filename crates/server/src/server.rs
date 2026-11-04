@@ -337,6 +337,7 @@ fn admission_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
 pub struct Server {
     cfg: Arc<Config>,
     logger: Arc<Logger>,
+    /// Stops listener admission so the main thread can prepare a reload.
     stop: Arc<AtomicBool>,
 }
 
@@ -351,6 +352,10 @@ impl Server {
 
     pub fn stop_flag(&self) -> Arc<AtomicBool> {
         self.stop.clone()
+    }
+
+    pub fn retire_generation(&self) {
+        self.cfg.retire_generation();
     }
 
     pub fn run(&self, bound: &[Bound]) -> io::Result<()> {
@@ -431,6 +436,7 @@ impl Server {
                             let peer = access::canonical_socket_addr(peer);
                             let cfg = self.cfg.clone();
                             let logger = self.logger.clone();
+                            let retired = cfg.generation_retirement();
                             let descriptor_guard = match cfg.resource_budget.try_descriptor() {
                                 Ok(guard) => guard,
                                 Err(_) => {
@@ -482,6 +488,7 @@ impl Server {
                                     pending_guard,
                                     lifetime_guard,
                                     descriptor_guard,
+                                    retired,
                                 )
                                 .await;
                             });
@@ -541,6 +548,10 @@ fn pending_connection_limit(worker_limit: usize) -> usize {
         .max(1)
         .saturating_mul(2)
         .clamp(64, MAX_PENDING_CONNECTIONS)
+}
+
+fn generation_accepts_new_work(retired: &tokio::sync::watch::Receiver<bool>) -> bool {
+    vapache_verified::configuration_generation_admit(*retired.borrow())
 }
 
 fn body_worker_limit(worker_limit: usize) -> usize {
@@ -825,6 +836,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
     mut initial_resource_context: Option<crate::resource::ResourceContext>,
     mut request_worker: Option<WorkerGuard>,
     mut general_connection: Option<crate::resource::SlotLease>,
+    generation_retired: Option<tokio::sync::watch::Receiver<bool>>,
     served: &mut usize,
     single_request: bool,
 ) -> io::Result<bool> {
@@ -1225,6 +1237,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                         host,
                         &buf,
                         general_connection.take(),
+                        generation_retired.clone(),
                     ));
                     return Ok(false);
                 }
@@ -1255,6 +1268,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                             host,
                             buf_ref,
                             general_connection.take(),
+                            generation_retired.clone(),
                         )
                         .await
                     });
@@ -1391,6 +1405,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
         initial_reservation,
         initial_body_guard,
         initial_resource_context,
+        None,
         None,
         None,
         &mut served,
@@ -2429,6 +2444,7 @@ async fn admit_plain_connection(
     pending_guard: crate::resource::SlotLease,
     lifetime_guard: ConnectionLifetimeGuard,
     descriptor_guard: crate::resource::DescriptorLease,
+    retired: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     let _lifetime_guard = lifetime_guard;
     let _descriptor_guard = descriptor_guard;
@@ -2461,10 +2477,12 @@ async fn admit_plain_connection(
         }
         Err(error) => return Err(error),
     };
-    let first_admission = match preflight_h1_admission(&cfg, peer, &initial, head_end, false, None)
-    {
-        Ok(admission) => admission,
-        Err(status) => {
+    let first_admission = match cfg.admit_generation_work(|| {
+        preflight_h1_admission(&cfg, peer, &initial, head_end, false, None)
+    }) {
+        None => return Ok(()),
+        Some(Ok(admission)) => admission,
+        Some(Err(status)) => {
             reject_h1_async(&mut stream, &cfg, status).await;
             return Ok(());
         }
@@ -2482,13 +2500,18 @@ async fn admit_plain_connection(
     loop {
         let admission = match next_admission.take() {
             Some(admission) => admission,
-            None => match preflight_h1_admission(&cfg, peer, &initial, head_end, false, None) {
-                Ok(admission) => admission,
-                Err(status) => {
-                    reject_h1_async(&mut stream, &cfg, status).await;
-                    return Ok(());
+            None => {
+                match cfg.admit_generation_work(|| {
+                    preflight_h1_admission(&cfg, peer, &initial, head_end, false, None)
+                }) {
+                    None => return Ok(()),
+                    Some(Ok(admission)) => admission,
+                    Some(Err(status)) => {
+                        reject_h1_async(&mut stream, &cfg, status).await;
+                        return Ok(());
+                    }
                 }
-            },
+            }
         };
         let body_guard = if admission.has_body {
             match try_reserve_body_worker(&admission.context, cfg.max_request_workers) {
@@ -2518,6 +2541,7 @@ async fn admit_plain_connection(
             .websocket
             .then(|| established_guard.take())
             .flatten();
+        let retired_worker = retired.clone();
         let result = if admission.websocket {
             spawn_connection_worker(move || {
                 let mut blocking = blocking;
@@ -2535,6 +2559,7 @@ async fn admit_plain_connection(
                     Some(admission.context),
                     Some(worker_guard),
                     websocket_connection_guard,
+                    Some(retired_worker),
                     &mut served,
                     true,
                 );
@@ -2725,6 +2750,10 @@ async fn admit_plain_connection(
             }
             Err(ReadError::Io(error)) => return Err(error),
         };
+        if !generation_accepts_new_work(&retired) {
+            deferred.keep_alive = false;
+            deferred.request.keep_alive = false;
+        }
         let was_slow = match send_h1_response_plain(
             &mut stream,
             &cfg,
@@ -2800,6 +2829,7 @@ async fn admit_tls_connection(
     pending_guard: crate::resource::SlotLease,
     lifetime_guard: ConnectionLifetimeGuard,
     descriptor_guard: crate::resource::DescriptorLease,
+    retired: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     let _descriptor_guard = descriptor_guard;
     let transport_context = cfg.resource_budget.context(peer.ip());
@@ -2825,6 +2855,9 @@ async fn admit_tls_connection(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
     drop(handshake_guard);
+    if !generation_accepts_new_work(&retired) {
+        return Ok(());
+    }
     let tls_identity = crate::tls::TlsConnectionIdentity::capture(
         &cfg,
         local_ip.parse().ok(),
@@ -2845,6 +2878,7 @@ async fn admit_tls_connection(
                 local_ip,
                 local_port,
                 tls_identity,
+                retired,
                 move || {
                     let established = try_reserve_h2_connection(&h2_context, connection_limit)
                         .ok_or_else(|| {
@@ -2890,14 +2924,16 @@ async fn admit_tls_connection(
         }
         Err(error) => return Err(error),
     };
-    let first_admission =
-        match preflight_h1_admission(&cfg, peer, &initial, head_end, true, Some(&tls_identity)) {
-            Ok(admission) => admission,
-            Err(status) => {
-                reject_h1_async(&mut tls, &cfg, status).await;
-                return Ok(());
-            }
-        };
+    let first_admission = match cfg.admit_generation_work(|| {
+        preflight_h1_admission(&cfg, peer, &initial, head_end, true, Some(&tls_identity))
+    }) {
+        None => return Ok(()),
+        Some(Ok(admission)) => admission,
+        Some(Err(status)) => {
+            reject_h1_async(&mut tls, &cfg, status).await;
+            return Ok(());
+        }
+    };
     let Some(established_guard) =
         try_reserve_h1_connection(&first_admission.context, cfg.max_request_workers)
     else {
@@ -2913,20 +2949,25 @@ async fn admit_tls_connection(
     loop {
         let admission = match next_admission.take() {
             Some(admission) => admission,
-            None => match preflight_h1_admission(
-                &cfg,
-                peer,
-                &initial,
-                head_end,
-                true,
-                Some(&tls_identity),
-            ) {
-                Ok(admission) => admission,
-                Err(status) => {
-                    reject_h1_async(&mut tls, &cfg, status).await;
-                    return Ok(());
+            None => {
+                match cfg.admit_generation_work(|| {
+                    preflight_h1_admission(
+                        &cfg,
+                        peer,
+                        &initial,
+                        head_end,
+                        true,
+                        Some(&tls_identity),
+                    )
+                }) {
+                    None => return Ok(()),
+                    Some(Ok(admission)) => admission,
+                    Some(Err(status)) => {
+                        reject_h1_async(&mut tls, &cfg, status).await;
+                        return Ok(());
+                    }
                 }
-            },
+            }
         };
         let body_guard = if admission.has_body {
             match try_reserve_body_worker(&admission.context, cfg.max_request_workers) {
@@ -2954,6 +2995,7 @@ async fn admit_tls_connection(
             .websocket
             .then(|| established_guard.take())
             .flatten();
+        let retired_worker = retired.clone();
         let result = if admission.websocket {
             spawn_connection_worker(move || {
                 let mut bridge = bridge;
@@ -2971,6 +3013,7 @@ async fn admit_tls_connection(
                     Some(admission.context),
                     Some(worker_guard),
                     websocket_connection_guard,
+                    Some(retired_worker),
                     &mut served,
                     true,
                 );
@@ -3164,6 +3207,10 @@ async fn admit_tls_connection(
             }
             Err(ReadError::Io(error)) => return Err(error),
         };
+        if !generation_accepts_new_work(&retired) {
+            deferred.keep_alive = false;
+            deferred.request.keep_alive = false;
+        }
         let was_slow = match send_h1_response(
             &mut tls,
             &cfg,
@@ -3240,6 +3287,7 @@ async fn admit_connection(
     pending_guard: crate::resource::SlotLease,
     lifetime_guard: ConnectionLifetimeGuard,
     descriptor_guard: crate::resource::DescriptorLease,
+    retired: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     if let Some(tls_config) = tls_config {
         admit_tls_connection(
@@ -3253,6 +3301,7 @@ async fn admit_connection(
             pending_guard,
             lifetime_guard,
             descriptor_guard,
+            retired,
         )
         .await
     } else {
@@ -3266,6 +3315,7 @@ async fn admit_connection(
             pending_guard,
             lifetime_guard,
             descriptor_guard,
+            retired,
         )
         .await
     }
@@ -3739,6 +3789,7 @@ impl PreparedHandler {
                             &cache.key,
                             &cache.target,
                             cache.backend_transport_visible,
+                            cache.epoch,
                         );
                     }
                     if must_invalidate {
@@ -3755,7 +3806,7 @@ impl PreparedHandler {
                     // Correctness cannot wait for filesystem capacity: make
                     // every persisted representation stale immediately and
                     // let later bounded maintenance remove the files.
-                    crate::cache::invalidate_generation_only();
+                    crate::cache::invalidate_generation_only(cfg);
                 }
                 response
             }
@@ -4085,6 +4136,7 @@ fn dispatch_inner_request(
             &cache_ctx.key,
             &cache_ctx.target,
             cache_ctx.backend_transport_visible,
+            cache_ctx.epoch,
         ) {
             return resp;
         }
@@ -4129,6 +4181,7 @@ fn dispatch_inner_request(
                 &cache_ctx.key,
                 &cache_ctx.target,
                 cache_ctx.backend_transport_visible,
+                cache_ctx.epoch,
             );
         }
         let unsafe_method = !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");

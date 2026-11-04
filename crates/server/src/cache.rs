@@ -25,7 +25,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::SystemTime;
 
 const MAX_ENTRIES: usize = 4096;
@@ -57,8 +57,21 @@ fn current_epoch() -> u64 {
     CACHE_EPOCH.load(Ordering::SeqCst)
 }
 
+pub(crate) fn active_epoch() -> u64 {
+    current_epoch()
+}
+
 fn bump_epoch() -> u64 {
     CACHE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Linearizes the final publication of a cache entry with administrative
+/// generation changes. Stores share the read side only for their final disk
+/// and memory commit; reload takes the write side, retires the old epoch, then
+/// removes every old representation before allowing another store to commit.
+fn generation_barrier() -> &'static RwLock<()> {
+    static BARRIER: OnceLock<RwLock<()>> = OnceLock::new();
+    BARRIER.get_or_init(|| RwLock::new(()))
 }
 // Authorization is not hop-by-hop, but it is identity-bearing metadata and
 // must never be persisted in the shared response cache. Transport-owned and
@@ -527,6 +540,9 @@ fn prefix_matches(path: &str, prefix: &str) -> bool {
 }
 
 pub struct CacheContext {
+    /// Epoch captured when this request's policy/cache plan was compiled.
+    /// It must never be replaced with the process-global epoch at completion.
+    pub epoch: u64,
     pub scope: Scope,
     pub grant: AccessGrant,
     /// Fully qualified cache key binding listener, vhost, URL, mapped target
@@ -912,6 +928,7 @@ pub fn request_scope_with_plan(
         fingerprint,
     );
     Some(CacheContext {
+        epoch: cfg.cache_epoch(),
         scope,
         grant,
         key,
@@ -1251,7 +1268,12 @@ pub fn lookup(
     cache_key: &str,
     target: &std::path::Path,
     backend_transport_visible: bool,
+    request_epoch: u64,
 ) -> Option<Response> {
+    let active_epoch = cfg.cache_epoch();
+    if !vapache_verified::cache_generation_admit(request_epoch, active_epoch) {
+        return None;
+    }
     let fingerprint = cache_policy_fingerprint(scope, req, peer, target, backend_transport_visible);
     if !grant.require_sink(
         &crate::access::ResourceKey::cache_policy(vhost, req, host, path, fingerprint),
@@ -1291,7 +1313,7 @@ pub fn lookup(
                     true,
                     entry.policy == fingerprint,
                     vary_matches(&entry, req),
-                    entry.epoch == current_epoch(),
+                    entry.epoch == request_epoch,
                     entry.expires,
                     now,
                 )
@@ -1317,7 +1339,7 @@ pub fn lookup(
                 true,
                 loaded.policy == fingerprint,
                 vary_matches(&loaded, req),
-                loaded.epoch == current_epoch(),
+                loaded.epoch == request_epoch,
                 loaded.expires,
                 now,
             ) || !request_freshness_allows(request_cache_policy, &loaded, now)
@@ -2041,7 +2063,7 @@ fn disk_load_accounted(
     // A reload changes the generation and expiry makes the representation
     // unusable.  Remove both files instead of leaving them to fill the cache
     // filesystem (F44).
-    if entry.epoch != current_epoch() || entry.expires <= unix_now() {
+    if entry.epoch != cfg.cache_epoch() || entry.expires <= unix_now() {
         remove_disk_stem(cfg, &stem);
         return None;
     }
@@ -2089,7 +2111,11 @@ pub fn store(
     cache_key: &str,
     target: &std::path::Path,
     backend_transport_visible: bool,
+    request_epoch: u64,
 ) {
+    if !vapache_verified::cache_generation_admit(request_epoch, cfg.cache_epoch()) {
+        return;
+    }
     // A local ErrorDocument marks the response itself ineligible before this
     // boundary. Response-local provenance cannot bleed between async tasks.
     if !resp.shared_cache_eligible() || !crate::http::response_headers_valid(resp) {
@@ -2209,7 +2235,10 @@ pub fn store(
         stored: now.saturating_sub(i64::try_from(response_age).unwrap_or(i64::MAX)),
         expires: vapache_verified::cache_expiry(now, ttl),
         policy: fingerprint,
-        epoch: current_epoch(),
+        // Bind the entry to the epoch authorized when this request began.
+        // A concurrent reload can make it stale, but can never relabel it as
+        // a candidate-generation response.
+        epoch: request_epoch,
         vary,
         _resident: None,
     };
@@ -2240,6 +2269,12 @@ pub fn store(
                 .map(Arc::new);
         }
     }
+    let _generation = generation_barrier()
+        .read()
+        .unwrap_or_else(|error| error.into_inner());
+    if !vapache_verified::cache_generation_admit(request_epoch, cfg.cache_epoch()) {
+        return;
+    }
     disk_store(cfg, &key, &entry);
     insert_memory(cfg, &key, Arc::new(entry));
     if cfg.cache.header {
@@ -2255,13 +2290,39 @@ pub fn store(
 /// The epoch bump additionally rejects any stale file a concurrent writer could
 /// recreate while cleanup is in progress.
 pub fn clear(cfg: &Config) {
-    bump_epoch();
+    let _generation = generation_barrier()
+        .write()
+        .unwrap_or_else(|error| error.into_inner());
+    cfg.set_cache_epoch(bump_epoch());
     *entries().lock().unwrap_or_else(|e| e.into_inner()) = MemoryCache::default();
     invalidate_disk(cfg);
 }
 
-pub(crate) fn invalidate_generation_only() {
-    bump_epoch();
+/// Commit a cache generation transition. Both roots are invalidated because
+/// a reload may move CacheRoot to another filesystem; clearing only the new
+/// root would strand stale, capacity-accounted files on the retired mount.
+pub fn clear_reload(previous: &Config, candidate: &Config) {
+    let _generation = generation_barrier()
+        .write()
+        .unwrap_or_else(|error| error.into_inner());
+    // Retire the old cell as well as advancing the candidate. A store that
+    // acquired the read side first completes before cleanup; a later old
+    // store observes the retired cell and cannot recreate files on an
+    // abandoned CacheRoot after that root has been cleared.
+    previous.set_cache_epoch(bump_epoch());
+    candidate.set_cache_epoch(bump_epoch());
+    *entries().lock().unwrap_or_else(|e| e.into_inner()) = MemoryCache::default();
+    invalidate_disk(previous);
+    if previous.cache.root != candidate.cache.root {
+        invalidate_disk(candidate);
+    }
+}
+
+pub(crate) fn invalidate_generation_only(cfg: &Config) {
+    let _generation = generation_barrier()
+        .write()
+        .unwrap_or_else(|error| error.into_inner());
+    cfg.set_cache_epoch(bump_epoch());
     *entries().lock().unwrap_or_else(|e| e.into_inner()) = MemoryCache::default();
 }
 
@@ -2323,7 +2384,10 @@ fn invalidate_disk_prefix(cfg: &Config, prefix: &[u8]) {
         // A bounded scan could not establish which persisted entries are
         // affected. Advance the generation so none of them can be served,
         // and release the bounded in-memory cache as the fail-closed path.
-        bump_epoch();
+        let _generation = generation_barrier()
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        cfg.set_cache_epoch(bump_epoch());
         *entries().lock().unwrap_or_else(|e| e.into_inner()) = MemoryCache::default();
         return;
     }
@@ -2578,7 +2642,7 @@ mod tests {
             stored: unix_now(),
             expires: unix_now() + 60,
             policy: [7u8; 32],
-            epoch: current_epoch(),
+            epoch: cfg.cache_epoch(),
             vary: vec![("accept".into(), b"text/plain".to_vec())],
             _resident: None,
         };
@@ -2641,6 +2705,7 @@ mod tests {
             &memory_key,
             target,
             false,
+            cfg.cache_epoch(),
         )
         .expect("warm memory-admitted hit");
         assert!(matches!(memory_hit.body, crate::http::Body::Bytes(_)));
@@ -2666,6 +2731,7 @@ mod tests {
             &key,
             target,
             false,
+            cfg.cache_epoch(),
         )
         .expect("warm hit");
         match hit.body {
@@ -2682,7 +2748,7 @@ mod tests {
         let peer = "127.0.0.1:12345".parse().unwrap();
         let scope = Scope::default();
         let target = std::path::Path::new("/srv/large.bin");
-        let mut entry = disk_entry(&vec![b'z'; 128 * 1024], unix_now() + 60);
+        let mut entry = disk_entry(&cfg, &vec![b'z'; 128 * 1024], unix_now() + 60);
         entry.policy = cache_policy_fingerprint(&scope, &request, peer, target, false);
         let key = "host\n/large.bin\n";
         disk_store(&cfg, key, &entry);
@@ -2698,6 +2764,7 @@ mod tests {
             key,
             target,
             false,
+            cfg.cache_epoch(),
         )
         .expect("large cache hit");
         match hit.body {
@@ -2731,7 +2798,7 @@ mod tests {
             stored: unix_now(),
             expires: unix_now() + 60,
             policy: [7u8; 32],
-            epoch: current_epoch().saturating_sub(1),
+            epoch: cfg.cache_epoch().saturating_sub(1),
             vary: Vec::new(),
             _resident: None,
         };
@@ -4317,7 +4384,7 @@ CacheIgnoreQueryString On\n\
         (dir, cfg)
     }
 
-    fn disk_entry(body: &[u8], expires: i64) -> Entry {
+    fn disk_entry(cfg: &Config, body: &[u8], expires: i64) -> Entry {
         Entry {
             status: 200,
             headers: vec![("content-type".into(), b"text/plain".to_vec())],
@@ -4326,7 +4393,7 @@ CacheIgnoreQueryString On\n\
             stored: unix_now(),
             expires,
             policy: [7u8; 32],
-            epoch: current_epoch(),
+            epoch: cfg.cache_epoch(),
             vary: Vec::new(),
             _resident: None,
         }
@@ -4376,7 +4443,7 @@ CacheIgnoreQueryString On\n\
             target,
             fingerprint,
         );
-        let entry = disk_entry(b"cached", unix_now() + 60);
+        let entry = disk_entry(&cfg, b"cached", unix_now() + 60);
         disk_store(&cfg, &selected_index, &entry);
         disk_store(&cfg, &unrelated, &entry);
         let selected_stem = cache_stem(&cfg, &selected_index).unwrap();
@@ -4486,7 +4553,7 @@ CacheIgnoreQueryString On\n\
             for path in paths {
                 memory.entries.insert(
                     key(path),
-                    vec![Arc::new(disk_entry(path.as_bytes(), unix_now() + 60))],
+                    vec![Arc::new(disk_entry(&cfg, path.as_bytes(), unix_now() + 60))],
                 );
             }
         }
@@ -4515,14 +4582,14 @@ CacheIgnoreQueryString On\n\
         disk_store(
             &cfg,
             "first",
-            &disk_entry(&vec![b'a'; 4_000], unix_now() + 60),
+            &disk_entry(&cfg, &vec![b'a'; 4_000], unix_now() + 60),
         );
         let first = cache_stem(&cfg, "first").unwrap();
         assert!(first.with_extension("body").is_file());
         disk_store(
             &cfg,
             "second",
-            &disk_entry(&vec![b'b'; 4_000], unix_now() + 60),
+            &disk_entry(&cfg, &vec![b'b'; 4_000], unix_now() + 60),
         );
         let second = cache_stem(&cfg, "second").unwrap();
         assert!(second.with_extension("body").is_file());
@@ -4534,20 +4601,24 @@ CacheIgnoreQueryString On\n\
         disk_store(
             &cfg,
             "oversize",
-            &disk_entry(&vec![b'c'; 1_024], unix_now() + 60),
+            &disk_entry(&cfg, &vec![b'c'; 1_024], unix_now() + 60),
         );
         let oversize = cache_stem(&cfg, "oversize").unwrap();
         assert!(!oversize.with_extension("body").exists());
 
         cfg.cache.max_disk_size = 20_000;
         for key in ["break-a", "break-b", "break-c"] {
-            disk_store(&cfg, key, &disk_entry(&vec![b'd'; 1_000], unix_now() + 60));
+            disk_store(
+                &cfg,
+                key,
+                &disk_entry(&cfg, &vec![b'd'; 1_000], unix_now() + 60),
+            );
         }
         cfg.cache.max_disk_size = 4_000;
         disk_store(
             &cfg,
             "break-new",
-            &disk_entry(&vec![b'e'; 1_000], unix_now() + 60),
+            &disk_entry(&cfg, &vec![b'e'; 1_000], unix_now() + 60),
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4557,8 +4628,8 @@ CacheIgnoreQueryString On\n\
         let (dir, mut cfg) = disk_test_config("memory-quota");
         let mut cache = MemoryCache::default();
         cfg.cache.max_memory_size = 1_600;
-        let first = Arc::new(disk_entry(&vec![b'a'; 700], unix_now() + 60));
-        let second = Arc::new(disk_entry(&vec![b'b'; 700], unix_now() + 60));
+        let first = Arc::new(disk_entry(&cfg, &vec![b'a'; 700], unix_now() + 60));
+        let second = Arc::new(disk_entry(&cfg, &vec![b'b'; 700], unix_now() + 60));
         insert_memory_into(&cfg, &mut cache, "first", first);
         insert_memory_into(&cfg, &mut cache, "second", second);
         assert!(cache.bytes <= cfg.cache.max_memory_size);
@@ -4566,6 +4637,7 @@ CacheIgnoreQueryString On\n\
         assert!(cache.entries.contains_key("second"));
 
         let large = Arc::new(disk_entry(
+            &cfg,
             &vec![b'x'; MAX_MEMORY_BODY + 1],
             unix_now() + 60,
         ));
@@ -4577,7 +4649,7 @@ CacheIgnoreQueryString On\n\
             &cfg,
             &mut cache,
             "disabled",
-            Arc::new(disk_entry(b"x", unix_now() + 60)),
+            Arc::new(disk_entry(&cfg, b"x", unix_now() + 60)),
         );
         assert!(!cache.entries.contains_key("disabled"));
         let _ = fs::remove_dir_all(&dir);
@@ -4599,7 +4671,7 @@ CacheIgnoreQueryString On\n\
                 disk_store(
                     &cfg,
                     "shared-key",
-                    &disk_entry(&vec![value; 4096], unix_now() + 60),
+                    &disk_entry(&cfg, &vec![value; 4096], unix_now() + 60),
                 );
             }));
         }
@@ -4618,7 +4690,7 @@ CacheIgnoreQueryString On\n\
     #[test]
     fn disk_cache_deletes_expired_entries_on_lookup() {
         let (dir, cfg) = disk_test_config("expired");
-        disk_store(&cfg, "expired", &disk_entry(b"stale", unix_now() - 1));
+        disk_store(&cfg, "expired", &disk_entry(&cfg, b"stale", unix_now() - 1));
         let stem = cache_stem(&cfg, "expired").unwrap();
         assert!(stem.with_extension("body").is_file());
         assert!(disk_load(&cfg, "expired").is_none());
@@ -4685,7 +4757,11 @@ CacheIgnoreQueryString On\n\
         let mut no_root = cfg.clone();
         no_root.cache.root = None;
         remove_disk_stem(&no_root, Path::new("unused"));
-        disk_store(&no_root, "no-root", &disk_entry(b"x", unix_now() + 60));
+        disk_store(
+            &no_root,
+            "no-root",
+            &disk_entry(&no_root, b"x", unix_now() + 60),
+        );
 
         let mut req = test_request();
         req.headers.insert("authorization", b"Basic eA==".to_vec());
@@ -4730,7 +4806,7 @@ CacheIgnoreQueryString On\n\
         assert_eq!(policy.max_age, Some(10));
         assert_eq!(policy.min_fresh, Some(20));
         let now = unix_now();
-        let mut constrained = disk_entry(b"x", now + 60);
+        let mut constrained = disk_entry(&cfg, b"x", now + 60);
         constrained.stored = now - 11;
         assert!(!request_freshness_allows(policy, &constrained, now));
         constrained.stored = now - 10;
@@ -4825,7 +4901,7 @@ CacheIgnoreQueryString On\n\
                     stored: unix_now() - 10,
                     expires: unix_now() - 1,
                     policy,
-                    epoch: current_epoch(),
+                    epoch: cfg.cache_epoch(),
                     vary: Vec::new(),
                     _resident: None,
                 }),
@@ -4840,7 +4916,7 @@ CacheIgnoreQueryString On\n\
                     stored: unix_now(),
                     expires: unix_now() + 60,
                     policy,
-                    epoch: current_epoch(),
+                    epoch: cfg.cache_epoch(),
                     vary: Vec::new(),
                     _resident: None,
                 }),
@@ -4874,6 +4950,7 @@ CacheIgnoreQueryString On\n\
             &key,
             Path::new("/tmp/target"),
             false,
+            cfg.cache_epoch(),
         )
         .unwrap();
         assert_eq!(hit.status, 304);
@@ -4901,6 +4978,7 @@ CacheIgnoreQueryString On\n\
             &key,
             Path::new("/tmp/target"),
             false,
+            cfg.cache_epoch(),
         )
         .unwrap();
         assert_eq!(body_hit.body_len(), 5);
@@ -4923,6 +5001,7 @@ CacheIgnoreQueryString On\n\
             "wrong-grant-lookup",
             Path::new("/tmp/target"),
             false,
+            cfg.cache_epoch(),
         )
         .is_none());
         let mut no_cache = req.clone();
@@ -4941,6 +5020,7 @@ CacheIgnoreQueryString On\n\
             "no-cache-lookup",
             Path::new("/tmp/target"),
             false,
+            cfg.cache_epoch(),
         )
         .is_none());
 
@@ -4950,7 +5030,7 @@ CacheIgnoreQueryString On\n\
             vec![Arc::new(Entry {
                 policy,
                 expires: unix_now() - 1,
-                ..disk_entry(b"old", unix_now() - 1)
+                ..disk_entry(&cfg, b"old", unix_now() - 1)
             })],
         );
         assert!(lookup(
@@ -4965,6 +5045,7 @@ CacheIgnoreQueryString On\n\
             &expired_key,
             Path::new("/tmp/target"),
             false,
+            cfg.cache_epoch(),
         )
         .is_none());
         assert!(!entries().lock().unwrap().entries.contains_key(&expired_key));
@@ -4972,7 +5053,7 @@ CacheIgnoreQueryString On\n\
         let mismatched_key = "disk-policy-mismatch";
         let mismatched = Entry {
             policy: [9; 32],
-            ..disk_entry(b"disk", unix_now() + 60)
+            ..disk_entry(&cfg, b"disk", unix_now() + 60)
         };
         disk_store(&cfg, mismatched_key, &mismatched);
         entries().lock().unwrap().entries.remove(mismatched_key);
@@ -4988,6 +5069,7 @@ CacheIgnoreQueryString On\n\
             mismatched_key,
             Path::new("/tmp/target"),
             false,
+            cfg.cache_epoch(),
         )
         .is_none());
 
@@ -5053,7 +5135,7 @@ CacheIgnoreQueryString On\n\
         ims_req.headers.insert("if-modified-since", ims.clone());
         let ims_entry = Entry {
             headers: vec![("last-modified".into(), ims)],
-            ..disk_entry(b"body", unix_now() + 60)
+            ..disk_entry(&cfg, b"body", unix_now() + 60)
         };
         let mut ims_response = Response::bytes(200, "text/plain", b"body".to_vec());
         assert!(conditional_hit(&ims_req, &ims_entry, &mut ims_response));
@@ -5073,7 +5155,7 @@ CacheIgnoreQueryString On\n\
 
         let weak_entry = Entry {
             headers: vec![("etag".into(), b"W/\"tag\"".to_vec())],
-            ..disk_entry(b"body", unix_now() + 60)
+            ..disk_entry(&cfg, b"body", unix_now() + 60)
         };
         let mut strong_req = test_request();
         strong_req
@@ -5089,7 +5171,7 @@ CacheIgnoreQueryString On\n\
 
         let comma_entry = Entry {
             headers: vec![("etag".into(), b"\"tag,part\"".to_vec())],
-            ..disk_entry(b"body", unix_now() + 60)
+            ..disk_entry(&cfg, b"body", unix_now() + 60)
         };
         let mut comma_req = test_request();
         comma_req.headers.insert(
@@ -5133,7 +5215,7 @@ CacheIgnoreQueryString On\n\
 
         let malformed_entry = Entry {
             headers: vec![("etag".into(), b"tag".to_vec())],
-            ..disk_entry(b"body", unix_now() + 60)
+            ..disk_entry(&cfg, b"body", unix_now() + 60)
         };
         let mut malformed_req = test_request();
         malformed_req
@@ -5186,12 +5268,12 @@ CacheIgnoreQueryString On\n\
         let mut conditional_response = Response::new(200);
         assert!(!conditional_hit(
             &invalid_conditional,
-            &disk_entry(b"x", unix_now() + 60),
+            &disk_entry(&cfg, b"x", unix_now() + 60),
             &mut conditional_response,
         ));
 
         let legacy_key = "pre-strict-response-cache-policy";
-        let legacy_entry = disk_entry(b"SECRET-CONTENT", unix_now() + 60);
+        let legacy_entry = disk_entry(&cfg, b"SECRET-CONTENT", unix_now() + 60);
         let legacy_stem = cache_stem(&cfg, legacy_key).unwrap();
         fs::create_dir_all(legacy_stem.parent().unwrap()).unwrap();
         let mut legacy_meta = encode_meta(legacy_key, &legacy_entry);
@@ -5225,12 +5307,16 @@ CacheIgnoreQueryString On\n\
         let (dir, cfg) = disk_test_config("disk-stripe-contention");
         prepare(&cfg);
         let key = "contended-key";
-        let original = disk_entry(b"original", unix_now() + 60);
+        let original = disk_entry(&cfg, b"original", unix_now() + 60);
         disk_store(&cfg, key, &original);
         let stem = cache_stem(&cfg, key).unwrap();
         let guard = disk_io_lock(&stem).lock().unwrap();
         assert!(disk_load(&cfg, key).is_none());
-        disk_store(&cfg, key, &disk_entry(b"replacement", unix_now() + 60));
+        disk_store(
+            &cfg,
+            key,
+            &disk_entry(&cfg, b"replacement", unix_now() + 60),
+        );
         drop(guard);
         assert_eq!(disk_load(&cfg, key).unwrap().body, b"original");
         disk_usage()
@@ -5247,7 +5333,7 @@ CacheIgnoreQueryString On\n\
         let entry = |tag: u8, vary: Vec<(String, Vec<u8>)>| {
             Arc::new(Entry {
                 vary,
-                ..disk_entry(&[tag], unix_now() + 60)
+                ..disk_entry(&cfg, &[tag], unix_now() + 60)
             })
         };
 
@@ -5377,7 +5463,11 @@ CacheIgnoreQueryString On\n\
             .extend(std::iter::repeat_n((missing, 1), MAX_DISK_ENTRIES * 8 + 1));
         disk_usage().lock().unwrap().insert(root.clone(), usage);
         cfg.cache.max_disk_size = 1_000_000;
-        disk_store(&cfg, store_key, &disk_entry(b"queued", unix_now() + 60));
+        disk_store(
+            &cfg,
+            store_key,
+            &disk_entry(&cfg, b"queued", unix_now() + 60),
+        );
         assert!(disk_load(&cfg, store_key).is_some());
 
         release_disk_reservation(&dir.join("absent-root"), Path::new("missing"), 1);
@@ -5402,7 +5492,7 @@ CacheIgnoreQueryString On\n\
         assert!(disk_load(&cfg, "bad-meta").is_none());
         assert!(!bad_stem.with_extension("body").exists());
 
-        let missing_body = disk_entry(b"gone", unix_now() + 60);
+        let missing_body = disk_entry(&cfg, b"gone", unix_now() + 60);
         disk_store(&cfg, "missing-body", &missing_body);
         let missing_stem = cache_stem(&cfg, "missing-body").unwrap();
         fs::remove_file(missing_stem.with_extension("body")).unwrap();
@@ -5412,7 +5502,11 @@ CacheIgnoreQueryString On\n\
         fs::write(&victim, b"untouched").unwrap();
         let safe_stem = cache_stem(&cfg, "safe-temp").unwrap();
         std::os::unix::fs::symlink(&victim, safe_stem.with_extension("body.tmp")).unwrap();
-        disk_store(&cfg, "safe-temp", &disk_entry(b"cached", unix_now() + 60));
+        disk_store(
+            &cfg,
+            "safe-temp",
+            &disk_entry(&cfg, b"cached", unix_now() + 60),
+        );
         assert_eq!(fs::read(&victim).unwrap(), b"untouched");
         assert!(disk_load(&cfg, "safe-temp").is_some());
         fs::remove_file(safe_stem.with_extension("body")).unwrap();
@@ -5424,12 +5518,20 @@ CacheIgnoreQueryString On\n\
         fs::write(&root_file, b"x").unwrap();
         cfg.cache.root = Some(root_file.clone());
         cfg.cache.max_disk_size = u64::MAX;
-        disk_store(&cfg, "write-fails", &disk_entry(b"x", unix_now() + 60));
+        disk_store(
+            &cfg,
+            "write-fails",
+            &disk_entry(&cfg, b"x", unix_now() + 60),
+        );
 
         cfg.cache.root = Some(root.clone());
         let rename_stem = cache_stem(&cfg, "rename-fails").unwrap();
         fs::create_dir_all(rename_stem.with_extension("meta")).unwrap();
-        disk_store(&cfg, "rename-fails", &disk_entry(b"x", unix_now() + 60));
+        disk_store(
+            &cfg,
+            "rename-fails",
+            &disk_entry(&cfg, b"x", unix_now() + 60),
+        );
         assert!(!rename_stem.with_extension("body").exists());
         fs::remove_dir_all(rename_stem.with_extension("meta")).unwrap();
 
@@ -5446,7 +5548,7 @@ CacheIgnoreQueryString On\n\
         disk_store(
             &cfg,
             "accounting-refuses",
-            &disk_entry(b"x", unix_now() + 60),
+            &disk_entry(&cfg, b"x", unix_now() + 60),
         );
 
         fs::write(root.join("orphan.body.tmp"), b"x").unwrap();
@@ -5492,7 +5594,11 @@ CacheIgnoreQueryString On\n\
         crate::fault::configure("cache.scan", 0, io::ErrorKind::PermissionDenied);
         assert!(!ensure_disk_usage(&root, &cfg.resource_budget));
         crate::fault::configure("cache.scan", 0, io::ErrorKind::PermissionDenied);
-        disk_store(&cfg, "scan-failure", &disk_entry(b"body", unix_now() + 60));
+        disk_store(
+            &cfg,
+            "scan-failure",
+            &disk_entry(&cfg, b"body", unix_now() + 60),
+        );
         assert!(!cache_stem(&cfg, "scan-failure")
             .unwrap()
             .with_extension("body")
@@ -5522,7 +5628,7 @@ CacheIgnoreQueryString On\n\
             let key = format!("fault-{index}");
             let stem = cache_stem(&cfg, &key).unwrap();
             crate::fault::configure(boundary, 0, io::ErrorKind::PermissionDenied);
-            disk_store(&cfg, &key, &disk_entry(b"body", unix_now() + 60));
+            disk_store(&cfg, &key, &disk_entry(&cfg, b"body", unix_now() + 60));
             assert!(!stem.with_extension("body").exists(), "{boundary}");
             assert!(!stem.with_extension("meta").exists(), "{boundary}");
             assert!(!stem.with_extension("body.tmp").exists(), "{boundary}");
@@ -5530,7 +5636,7 @@ CacheIgnoreQueryString On\n\
         }
 
         let key = "body-read-fault";
-        disk_store(&cfg, key, &disk_entry(b"body", unix_now() + 60));
+        disk_store(&cfg, key, &disk_entry(&cfg, b"body", unix_now() + 60));
         let stem = cache_stem(&cfg, key).unwrap();
         crate::fault::configure("cache.body.read", 0, io::ErrorKind::UnexpectedEof);
         assert!(disk_load(&cfg, key).is_none());
@@ -5560,9 +5666,51 @@ CacheIgnoreQueryString On\n\
                     grant: &AccessGrant,
                     key: &str| {
             store(
-                cfg, None, req, "host", "/x", &scope, peer, response, grant, key, target, false,
+                cfg,
+                None,
+                req,
+                "host",
+                "/x",
+                &scope,
+                peer,
+                response,
+                grant,
+                key,
+                target,
+                false,
+                cfg.cache_epoch(),
             )
         };
+
+        let stale_key = format!("stale-generation-store-{}", std::process::id());
+        entries()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entries
+            .remove(&stale_key);
+        let stale_epoch = cfg.cache_epoch();
+        invalidate_generation_only(&cfg);
+        let mut stale_response = Response::bytes(200, "text/plain", b"stale".to_vec());
+        store(
+            &cfg,
+            None,
+            &base_req,
+            "host",
+            "/x",
+            &scope,
+            peer,
+            &mut stale_response,
+            &good,
+            &stale_key,
+            target,
+            false,
+            stale_epoch,
+        );
+        assert!(!entries()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entries
+            .contains_key(&stale_key));
 
         let wrong_key = crate::access::ResourceKey::cache(None, &base_req, "other", "/other");
         let wrong_grant =
@@ -5786,7 +5934,7 @@ CacheIgnoreQueryString On\n\
                 &cfg,
                 &mut map,
                 "new-key",
-                Arc::new(disk_entry(b"ok", unix_now() + 60)),
+                Arc::new(disk_entry(&cfg, b"ok", unix_now() + 60)),
             );
             assert!(map.entries.len() <= MAX_ENTRIES);
             assert!(map.entries.contains_key("new-key"));
@@ -5832,7 +5980,7 @@ CacheIgnoreQueryString On\n\
                         stored: unix_now(),
                         expires: unix_now() + 60,
                         policy,
-                        epoch: current_epoch(),
+                        epoch: cfg.cache_epoch(),
                         vary: vec![("x-variant".into(), vec![i as u8])],
                         _resident: None,
                     })
@@ -5847,7 +5995,7 @@ CacheIgnoreQueryString On\n\
             stored: unix_now(),
             expires: unix_now() + 60,
             policy,
-            epoch: current_epoch(),
+            epoch: cfg.cache_epoch(),
             vary: vec![("x-variant".into(), b"new".to_vec())],
             _resident: None,
         });

@@ -151,6 +151,40 @@ fn http_body(port: u16, path: &str) -> Vec<u8> {
         .unwrap_or_default()
 }
 
+fn keepalive_body(stream: &mut TcpStream, path: &str) -> Option<Vec<u8>> {
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 {
+            return None;
+        }
+        response.extend_from_slice(&chunk[..read]);
+        let Some(split) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&response[..split]);
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+            })
+            .unwrap_or(0);
+        if response.len() >= split + 4 + length {
+            return Some(response[split + 4..split + 4 + length].to_vec());
+        }
+    }
+}
+
 fn wait_success(mut child: Child) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -361,9 +395,24 @@ fn foreground_reload_reopen_bind_and_actions() {
     assert!(output(&root, &config, &["-k", "graceful"]).status.success());
     thread::sleep(Duration::from_millis(150));
 
+    let mut old_generation = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    old_generation
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    assert_eq!(
+        keepalive_body(&mut old_generation, "/index.txt"),
+        Some(b"ok\n".to_vec())
+    );
+
     fs::write(&config, "Listen invalid\n").unwrap();
     signal(pid, libc::SIGHUP);
     thread::sleep(Duration::from_millis(150));
+    // A rejected candidate stops listener admission only while it is checked;
+    // it must not retire connections whose configuration remains current.
+    assert_eq!(
+        keepalive_body(&mut old_generation, "/index.txt"),
+        Some(b"ok\n".to_vec())
+    );
 
     let occupied = TcpListener::bind(("127.0.0.1", free_port())).unwrap();
     fs::write(
@@ -414,6 +463,10 @@ fn foreground_reload_reopen_bind_and_actions() {
     .unwrap();
     signal(pid, libc::SIGHUP);
     wait_until(|| http_body(port, "/index.txt") == b"candidate\n");
+    // The successful commit retires the transport's immutable generation.
+    // The old socket may finish an already-admitted request, but cannot begin
+    // another request under the stale DocumentRoot/policy.
+    assert_eq!(keepalive_body(&mut old_generation, "/index.txt"), None);
     assert!(output(&root, &config, &["-k", "stop"]).status.success());
     wait_success(child);
 

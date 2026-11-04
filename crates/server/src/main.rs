@@ -1291,6 +1291,7 @@ fn main() {
             logger.error(&format!("server loop failed: {e}")); // coverage:ignore-line - external fd failure
         }
         if STOP.load(Ordering::SeqCst) && !RELOAD.load(Ordering::SeqCst) {
+            srv.retire_generation();
             let deadline = std::time::Instant::now() + cfg.graceful_shutdown_timeout;
             while server::active_connections() > 0 && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1376,10 +1377,16 @@ fn main() {
             logger.error("reload rejected; continuing with previous configuration");
             continue;
         }
+        // Commit atomically from the request path's perspective: close the old
+        // admission gate first, then retire its cache epoch and install the
+        // candidate epoch before the listener loop can admit a candidate-
+        // generation connection. In-flight old requests retain immutable
+        // policy and may finish, but cannot publish into this generation.
+        srv.retire_generation();
+        vapached::cache::clear_reload(&cfg, &new_cfg);
         cfg = new_cfg;
         bound = new_bound;
         logger = new_logger;
-        vapached::cache::clear(&cfg);
         logger.info("configuration reloaded; cache generation invalidated");
     }
     vapached::cgi::shutdown_pool();

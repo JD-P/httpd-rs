@@ -378,15 +378,18 @@ fn dead_map() -> &'static Mutex<HashMap<String, std::time::Instant>> {
     DEAD.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn mark_dead(name: &str, member: &str) {
+fn mark_dead(generation: u64, name: &str, member: &str) {
     let mut guard = dead_map().lock().unwrap_or_else(|e| e.into_inner());
-    guard.insert(format!("{name}|{member}"), std::time::Instant::now());
+    guard.insert(
+        format!("{generation}|{name}|{member}"),
+        std::time::Instant::now(),
+    );
 }
 
-fn is_dead(name: &str, member: &str) -> bool {
+fn is_dead(generation: u64, name: &str, member: &str) -> bool {
     let key = parse_http_url(member)
-        .map(|b| format!("{name}|{}:{}", b.host, b.port))
-        .unwrap_or_else(|| format!("{name}|{member}"));
+        .map(|b| format!("{generation}|{name}|{}:{}", b.host, b.port))
+        .unwrap_or_else(|| format!("{generation}|{name}|{member}"));
     let guard = dead_map().lock().unwrap_or_else(|e| e.into_inner());
     guard
         .get(&key)
@@ -419,14 +422,57 @@ fn health_map() -> &'static Mutex<HashMap<String, MemberHealth>> {
     HEALTH.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn health_key(name: &str, member: &str) -> String {
-    format!("{name}|{member}")
+struct HealthGeneration {
+    id: u64,
+    signature: String,
+    stop: Arc<AtomicBool>,
 }
 
-fn member_is_healthy(name: &str, member: &str) -> bool {
+fn health_generation() -> &'static Mutex<Option<HealthGeneration>> {
+    static GENERATION: OnceLock<Mutex<Option<HealthGeneration>>> = OnceLock::new();
+    GENERATION.get_or_init(|| Mutex::new(None))
+}
+
+fn balancer_counters() -> &'static Mutex<HashMap<String, usize>> {
+    static COUNTERS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    COUNTERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Called by the last clone of an immutable Config generation. Mutable
+/// routing observations live exactly as long as requests which can still use
+/// that Config, so repeated administrative reloads cannot leak state.
+pub(crate) fn drop_generation_state(generation: u64) {
+    let prefix = format!("{generation}|");
+    dead_map()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|key, _| !key.starts_with(&prefix));
+    health_map()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|key, _| !key.starts_with(&prefix));
+    balancer_counters()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|key, _| !key.starts_with(&prefix));
+    let mut active = health_generation()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if active.as_ref().is_some_and(|state| state.id == generation) {
+        if let Some(state) = active.take() {
+            state.stop.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn health_key(generation: u64, name: &str, member: &str) -> String {
+    format!("{generation}|{name}|{member}")
+}
+
+fn member_is_healthy(generation: u64, name: &str, member: &str) -> bool {
     let guard = health_map().lock().unwrap_or_else(|e| e.into_inner());
     guard
-        .get(&health_key(name, member))
+        .get(&health_key(generation, name, member))
         .map(|h| h.healthy)
         .unwrap_or(true)
 }
@@ -483,7 +529,7 @@ fn balancer_specs(cfg: &Config, balancer: &Balancer) -> Vec<HealthSpec> {
         let passes = member.hcpasses.or(health.passes).unwrap_or(1);
         let fails = member.hcfails.or(health.fails).unwrap_or(1);
         out.push(HealthSpec {
-            key: health_key(&balancer.name, &member.url),
+            key: health_key(cfg.generation, &balancer.name, &member.url),
             url: member.url.clone(),
             method,
             uri,
@@ -501,12 +547,6 @@ fn balancer_specs(cfg: &Config, balancer: &Balancer) -> Vec<HealthSpec> {
 /// health-check template or member parameters.  The server calls this before
 /// dropping privileges; the lightweight checker threads only use TCP.
 pub fn start_health_checks(cfg: &Config) {
-    struct HealthGeneration {
-        signature: String,
-        stop: Arc<AtomicBool>,
-    }
-    static GENERATION: OnceLock<Mutex<Option<HealthGeneration>>> = OnceLock::new();
-
     let mut groups = Vec::new();
     let mut signature = String::new();
     for balancer in &cfg.balancers {
@@ -532,12 +572,12 @@ pub fn start_health_checks(cfg: &Config) {
         groups.push(specs);
     }
 
-    let generation = GENERATION.get_or_init(|| Mutex::new(None));
+    let generation = health_generation();
     let stop = {
         let mut current = generation.lock().unwrap_or_else(|error| error.into_inner());
         if current
             .as_ref()
-            .is_some_and(|running| running.signature == signature)
+            .is_some_and(|running| running.id == cfg.generation && running.signature == signature)
         {
             return;
         }
@@ -546,19 +586,16 @@ pub fn start_health_checks(cfg: &Config) {
         }
         let stop = Arc::new(AtomicBool::new(false));
         *current = Some(HealthGeneration {
+            id: cfg.generation,
             signature,
             stop: Arc::clone(&stop),
         });
         stop
     };
-    dead_map()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clear();
-    health_map()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clear();
+    // Retain the old namespace while its already-admitted requests drain.
+    // The new generation cannot observe it because every key includes the
+    // immutable Config identity. The last old Config clone removes that
+    // namespace and its counters after the overlap window closes.
 
     for specs in groups {
         let stop = Arc::clone(&stop);
@@ -700,6 +737,7 @@ fn trim_ascii_bytes(mut value: &[u8]) -> &[u8] {
 }
 
 fn next_balancer_member(
+    generation: u64,
     balancer: &Balancer,
     req: Option<&Request>,
     exclude: Option<&HashSet<String>>,
@@ -715,13 +753,13 @@ fn next_balancer_member(
             .unwrap_or(false)
     };
     let available = |m: &&BalancerMember| {
-        (!active || member_is_healthy(&balancer.name, &m.url)) && !is_excluded(m)
+        (!active || member_is_healthy(generation, &balancer.name, &m.url)) && !is_excluded(m)
     };
     if let Some(route) = sticky_route(balancer, req, sticky_override) {
         if let Some(member) = balancer.members.iter().find(|m| {
             m.route.as_deref() == Some(route.as_str())
-                && (!active || member_is_healthy(&balancer.name, &m.url))
-                && !is_dead(&balancer.name, &m.url)
+                && (!active || member_is_healthy(generation, &balancer.name, &m.url))
+                && !is_dead(generation, &balancer.name, &m.url)
                 && !is_excluded(m)
         }) {
             return parse_http_url(&member.url);
@@ -734,17 +772,18 @@ fn next_balancer_member(
     let not_dead: Vec<&BalancerMember> = viable
         .iter()
         .copied()
-        .filter(|m| !is_dead(&balancer.name, &m.url))
+        .filter(|m| !is_dead(generation, &balancer.name, &m.url))
         .collect();
     if !not_dead.is_empty() {
         viable = not_dead;
     }
-    static COUNTERS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
-    let counters = COUNTERS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = counters.lock().unwrap_or_else(|e| e.into_inner());
-    let start = *guard.entry(balancer.name.clone()).or_insert(0);
+    let mut guard = balancer_counters()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let counter_key = format!("{generation}|{}", balancer.name);
+    let start = *guard.entry(counter_key.clone()).or_insert(0);
     let index = start % viable.len();
-    *guard.entry(balancer.name.clone()).or_insert(0) = start.wrapping_add(1);
+    *guard.entry(counter_key).or_insert(0) = start.wrapping_add(1);
     parse_http_url(&viable[index].url)
 }
 
@@ -758,7 +797,7 @@ fn resolve_backend(
     if let Some(name) = raw.trim().strip_prefix("balancer://") {
         let name = name.trim_end_matches('/');
         let balancer = cfg.balancers.iter().find(|b| b.name == name)?;
-        let backend = next_balancer_member(balancer, req, None, sticky_override)?;
+        let backend = next_balancer_member(cfg.generation, balancer, req, None, sticky_override)?;
         let path = join_path(&backend.base, suffix);
         return Some((backend, path));
     }
@@ -2240,6 +2279,7 @@ async fn websocket_copy_idle<A, B>(
     client: &mut A,
     upstream: &mut B,
     idle: Duration,
+    mut generation_retired: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> std::io::Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -2249,6 +2289,21 @@ where
     let mut upstream_buf = [0u8; 16 * 1024];
     loop {
         tokio::select! {
+            result = async {
+                generation_retired.as_mut().expect("guarded retirement receiver").changed().await
+            }, if generation_retired.is_some() => {
+                let retired = generation_retired
+                    .as_ref()
+                    .is_none_or(|state| *state.borrow());
+                if result.is_err() || !vapache_verified::configuration_generation_admit(retired) {
+                    let _ = client.shutdown().await;
+                    let _ = upstream.shutdown().await;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "configuration generation retired",
+                    ));
+                }
+            }
             result = client.read(&mut client_buf) => {
                 let read = result?;
                 if read == 0 {
@@ -2306,7 +2361,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     websocket_async_with_connection(
-        cfg, scope, req, target, grant, resource, client, peer, https, host, initial, None,
+        cfg, scope, req, target, grant, resource, client, peer, https, host, initial, None, None,
     )
     .await
 }
@@ -2329,10 +2384,20 @@ pub(crate) async fn websocket_async_with_connection<S>(
     host: &str,
     initial: &[u8],
     general_connection: Option<crate::resource::SlotLease>,
+    generation_retired: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    if generation_retired
+        .as_ref()
+        .is_some_and(|retired| !vapache_verified::configuration_generation_admit(*retired.borrow()))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "configuration generation retired",
+        ));
+    }
     // Parse the client's complete optional negotiation surface before any
     // routing side effect or upstream connection. The resulting typed offer
     // is the authority used to validate the backend's 101 selection.
@@ -2441,6 +2506,15 @@ where
         .map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "WebSocket handshake timeout")
         })??;
+    if generation_retired
+        .as_ref()
+        .is_some_and(|retired| !vapache_verified::configuration_generation_admit(*retired.borrow()))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "configuration generation retired",
+        ));
+    }
     let status = websocket_response_status(&response.head)?;
     if status == 101 {
         let key = req.header_str("sec-websocket-key").unwrap_or("");
@@ -2502,7 +2576,13 @@ where
     // Once 101 has reached the client an HTTP error can no longer be sent.
     // Tunnel closure (including the idle deadline) is the protocol-correct
     // failure signal, so consume the transport error here.
-    let _ = websocket_copy_idle(&mut client, upstream.as_mut(), WEBSOCKET_IDLE_TIMEOUT).await;
+    let _ = websocket_copy_idle(
+        &mut client,
+        upstream.as_mut(),
+        WEBSOCKET_IDLE_TIMEOUT,
+        generation_retired,
+    )
+    .await;
     Ok(())
 }
 
@@ -3164,7 +3244,7 @@ fn alternate_target(
 ) -> Option<Target> {
     let name = target.balancer.as_ref()?;
     let balancer = cfg.balancers.iter().find(|b| b.name == *name)?;
-    let backend = next_balancer_member(balancer, Some(req), Some(tried), None)?;
+    let backend = next_balancer_member(cfg.generation, balancer, Some(req), Some(tried), None)?;
     let path = join_path(&backend.base, &target.suffix);
     let proxy_url = canonical_proxy_url(&backend, &path);
     Some(Target {
@@ -3483,6 +3563,7 @@ pub fn execute(
                     }
                     if let Some(name) = &current.balancer {
                         mark_dead(
+                            cfg.generation,
                             name,
                             &format!("{}:{}", current.backend.host, current.backend.port),
                         );
@@ -3575,6 +3656,7 @@ pub fn execute(
                 }
                 if let Some(name) = &current.balancer {
                     mark_dead(
+                        cfg.generation,
                         name,
                         &format!("{}:{}", current.backend.host, current.backend.port),
                     );
@@ -5323,23 +5405,23 @@ mod coverage_tests {
         );
         assert_eq!(sticky_route(&balancer, None, None), None);
 
-        assert!(next_balancer_member(&balancer, None, None, None).is_none());
+        assert!(next_balancer_member(0, &balancer, None, None, None).is_none());
         balancer.members.push(BalancerMember {
             url: "http://127.0.0.1:9001".into(),
             route: Some("1".into()),
             ..BalancerMember::default()
         });
-        assert!(next_balancer_member(&balancer, Some(&r), None, None).is_some());
+        assert!(next_balancer_member(0, &balancer, Some(&r), None, None).is_some());
         // A sticky route that names no member must fall through to the
         // available-member selection rather than failing the request.
         r.headers = Headers::default();
         r.headers.push("Cookie", "route=node.2");
-        assert!(next_balancer_member(&balancer, Some(&r), None, None).is_some());
+        assert!(next_balancer_member(0, &balancer, Some(&r), None, None).is_some());
         let mut tried = HashSet::new();
         tried.insert(backend_key(
             &parse_http_url("http://127.0.0.1:9001").unwrap(),
         ));
-        assert!(next_balancer_member(&balancer, None, Some(&tried), None).is_none());
+        assert!(next_balancer_member(0, &balancer, None, Some(&tried), None).is_none());
     }
 
     #[test]
@@ -5956,6 +6038,23 @@ mod coverage_tests {
             &spec,
             &bad
         ));
+    }
+
+    #[test]
+    fn backend_health_and_failure_state_is_generation_scoped() {
+        let old_generation = u64::MAX - std::process::id() as u64;
+        let new_generation = old_generation - 1;
+        let name = "generation-isolation";
+        let member = "http://127.0.0.1:65534";
+        let mut spec = health_spec();
+        spec.key = health_key(old_generation, name, member);
+        update_health(&spec, false);
+        mark_dead(old_generation, name, "127.0.0.1:65534");
+
+        assert!(!member_is_healthy(old_generation, name, member));
+        assert!(is_dead(old_generation, name, member));
+        assert!(member_is_healthy(new_generation, name, member));
+        assert!(!is_dead(new_generation, name, member));
     }
 
     #[test]
@@ -7036,10 +7135,31 @@ mod coverage_tests {
             &mut client_tunnel,
             &mut upstream_tunnel,
             Duration::from_millis(10),
+            None,
         )
         .await
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn websocket_tunnel_closes_when_generation_retires() {
+        let (mut client_tunnel, _client_peer) = tokio::io::duplex(64);
+        let (mut upstream_tunnel, _upstream_peer) = tokio::io::duplex(64);
+        let (signal, retired) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            signal.send_replace(true);
+        });
+        let error = websocket_copy_idle(
+            &mut client_tunnel,
+            &mut upstream_tunnel,
+            Duration::from_secs(1),
+            Some(retired),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
     }
 }
 #[cfg(test)]

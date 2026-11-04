@@ -703,6 +703,7 @@ struct Parsed {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
+    config_generation: u64,
     path: PathBuf,
     server_root: PathBuf,
     dev: u64,
@@ -774,6 +775,17 @@ impl AccessFileCache {
 fn cache() -> &'static Mutex<AccessFileCache> {
     static CACHE: OnceLock<Mutex<AccessFileCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(AccessFileCache::default()))
+}
+
+pub(crate) fn drop_generation_state(generation: u64) {
+    let mut cache = cache().lock().unwrap_or_else(|error| error.into_inner());
+    cache
+        .entries
+        .retain(|key, _| key.config_generation != generation);
+    cache.bytes = cache
+        .entries
+        .values()
+        .fold(0usize, |total, (_, weight)| total.saturating_add(*weight));
 }
 
 struct OpenedAccessFile {
@@ -870,6 +882,7 @@ fn parse_cached(
 ) -> Result<Arc<Parsed>, String> {
     let meta = &opened.meta;
     let key = CacheKey {
+        config_generation: cfg.generation,
         path: path.to_path_buf(),
         server_root: cfg.server_root.clone(),
         dev: meta.dev(),
@@ -5100,6 +5113,7 @@ mod tests {
             for n in 0..512 {
                 guard.insert(
                     CacheKey {
+                        config_generation: cfg.generation,
                         path: dir.join(format!("dummy-{n}")),
                         server_root: cfg.server_root.clone(),
                         dev: 0,
@@ -5135,6 +5149,41 @@ mod tests {
         fs::write(&big, vec![b'#'; (MAX_HTACCESS + 1) as usize]).unwrap();
         assert!(parse_file(&cfg, &big, OverrideMode::All, "/").is_err());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn access_file_cache_is_partitioned_by_configuration_generation() {
+        let dir = tempdir("generation-cache");
+        let file = dir.join(".htaccess");
+        fs::write(&file, "<IfDefine PROD>\nRequire all granted\n</IfDefine>\n").unwrap();
+        let with_define = config(&dir, "Listen 127.0.0.1:0\nDefine PROD\n");
+        let without_define = config(&dir, "Listen 127.0.0.1:0\n");
+        let identity = crate::request_plan::LayerIdentity::with_url_mount(&dir, &dir, "/");
+
+        let first = parse_cached(
+            &with_define,
+            &file,
+            OverrideMode::All,
+            &[],
+            NonfatalMode::None,
+            &identity,
+            open_access_file(&file).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert!(first.scope.authorization.requires.is_some());
+
+        let second = parse_cached(
+            &without_define,
+            &file,
+            OverrideMode::All,
+            &[],
+            NonfatalMode::None,
+            &identity,
+            open_access_file(&file).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert!(second.scope.authorization.requires.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

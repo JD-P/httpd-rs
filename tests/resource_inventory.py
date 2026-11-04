@@ -28,10 +28,12 @@ EXPECTED_PHYSICAL = {"FileDescriptor", "Task", "ResidentMemory"}
 ALLOWED_MUTABLE_STATICS = {
     ("access.rs", "SENDER"),
     ("auth.rs", "CACHE"), ("auth.rs", "NEXT_TEMP"),
-    ("cache.rs", "CACHE_EPOCH"), ("cache.rs", "CACHE"),
+    ("cache.rs", "CACHE_EPOCH"), ("cache.rs", "BARRIER"),
+    ("cache.rs", "CACHE"),
     ("cache.rs", "USAGE"), ("cache.rs", "SCAN"), ("cache.rs", "LOCKS"),
     ("cgi.rs", "POOL"),
     ("config.rs", "NEXT"), ("config.rs", "NEXT_FIXTURE"),
+    ("config.rs", "NEXT_CONFIG_GENERATION"),
     ("expr.rs", "REQUEST_HTTPS"), ("expr.rs", "REQUEST_PORT"),
     ("expr.rs", "REQUEST_SERVER_NAME"),
     ("fastcgi.rs", "COUNTER"),

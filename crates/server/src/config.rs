@@ -35,8 +35,39 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+static NEXT_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_config_generation() -> u64 {
+    let mut current = NEXT_CONFIG_GENERATION.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .expect("configuration generation space exhausted");
+        match NEXT_CONFIG_GENERATION.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return current,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConfigGenerationGuard(u64);
+
+impl Drop for ConfigGenerationGuard {
+    fn drop(&mut self) {
+        crate::proxy::drop_generation_state(self.0);
+        crate::htaccess::drop_generation_state(self.0);
+    }
+}
 
 /// Vapache has one process-wide HTTP/1 worker pool rather than Apache's
 /// multi-process MPM topology.  Keep configuration compatibility within the
@@ -2955,6 +2986,22 @@ impl Capabilities {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Process-local identity of this immutable compiled configuration. Clones
+    /// retain the identity; a separately compiled reload candidate receives a
+    /// new one. It namespaces mutable observations which cannot safely cross
+    /// a generation boundary (for example active backend health state).
+    pub(crate) generation: u64,
+    _generation_guard: Arc<ConfigGenerationGuard>,
+    /// Linearizes policy-bearing request/stream admission against retirement.
+    /// The read side is held only for the admission decision; commit takes the
+    /// write side before broadcasting retirement.
+    generation_admission: Arc<RwLock<()>>,
+    generation_retired: tokio::sync::watch::Sender<bool>,
+    /// Cache epoch owned by this immutable policy generation. The atomic is
+    /// shared by clones so unsafe-method invalidation updates future requests,
+    /// but a reload candidate receives a distinct cell and cannot relabel an
+    /// old generation's in-flight stores.
+    cache_epoch: Arc<AtomicU64>,
     pub server_root: PathBuf,
     pub server_name: Option<String>,
     pub server_admin: String,
@@ -3204,6 +3251,37 @@ impl Config {
 
     pub fn capability_enabled(&self, capability: Capability) -> bool {
         self.capabilities.contains(capability)
+    }
+
+    pub(crate) fn cache_epoch(&self) -> u64 {
+        self.cache_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_cache_epoch(&self, epoch: u64) {
+        self.cache_epoch.store(epoch, Ordering::Release);
+    }
+
+    pub(crate) fn generation_retirement(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.generation_retired.subscribe()
+    }
+
+    pub(crate) fn admit_generation_work<T>(&self, work: impl FnOnce() -> T) -> Option<T> {
+        let _admission = self
+            .generation_admission
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        if !vapache_verified::configuration_generation_admit(*self.generation_retired.borrow()) {
+            return None;
+        }
+        Some(work())
+    }
+
+    pub(crate) fn retire_generation(&self) {
+        let _commit = self
+            .generation_admission
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        self.generation_retired.send_replace(true);
     }
 
     pub(crate) fn module_loaded(&self, name: &str) -> bool {
@@ -5027,7 +5105,13 @@ impl Compile {
             v.sort();
             v
         };
+        let generation = next_config_generation();
         let cfg = Config {
+            generation,
+            _generation_guard: Arc::new(ConfigGenerationGuard(generation)),
+            generation_admission: Arc::new(RwLock::new(())),
+            generation_retired: tokio::sync::watch::channel(false).0,
+            cache_epoch: Arc::new(AtomicU64::new(crate::cache::active_epoch())),
             server_root: server_root.clone(),
             server_name: None,
             server_admin: "you@example.com".into(),
@@ -14114,6 +14198,29 @@ ServerName localhost\n\
             assert!(error.contains(directive), "{error}");
         }
         assert!(cfg.validate_reload_from(&cfg).is_ok());
+    }
+
+    #[test]
+    fn generation_retirement_linearizes_after_admission_readers() {
+        let cfg = Arc::new(load_text("Listen 127.0.0.1:8080\n", false).unwrap());
+        let admission = cfg
+            .generation_admission
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let retiring = cfg.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            retiring.retire_generation();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(admission);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        assert!(cfg.admit_generation_work(|| ()).is_none());
     }
 
     #[test]

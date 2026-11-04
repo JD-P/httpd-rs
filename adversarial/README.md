@@ -9,6 +9,7 @@ prevents re-deriving them from scratch.
 
 | Path | Contents |
 |---|---|
+| `graceful-reload-generation-review.md` | Reload isolation campaign: transport retirement, H1/H2/WebSocket drain semantics, request-captured cache epochs, generation-scoped access-file IR and proxy health state |
 | `authentication-identity-review.md` | Basic/provider campaign: byte-exact scheme grammar, explicit group-provider failure, complete credential-cache snapshots, and request-owned identity through canonical targets, failover and CGI/FastCGI export |
 | `backend-response-review.md` | Malicious HTTP/CGI/FastCGI response campaign: complete cache-policy parsing, normalization provenance, H1/H2 malformed-field behavior, FastCGI record identity, and V7 cache-generation invalidation |
 | `shared-cache-identity-review.md` | Shared-cache isolation campaign: complete request/transport/policy identity, fail-closed request directives and admission, and canonical same-origin unsafe-method invalidation |
