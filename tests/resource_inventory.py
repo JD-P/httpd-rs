@@ -59,6 +59,7 @@ ALLOWED_MUTABLE_STATICS = {
     ("resource.rs", "CURRENT_CONTEXT"), ("resource.rs", "BUDGET"),
     ("server.rs", "ACTIVE_CONNECTIONS"),
     ("server.rs", "ADMISSION_RUNTIME"),
+    ("server.rs", "CONNECTION_WORK_POOL"),
     ("server.rs", "ADMISSION_TEST_LOCK"),
     ("status.rs", "START"), ("status.rs", "REQUESTS"),
     ("status.rs", "BYTES"),

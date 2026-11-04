@@ -93,6 +93,8 @@ Some mutable state is intentionally process-owned rather than request-owned:
 - bounded content, authentication, `.htaccess`, DNS, proxy-health, OCSP, H2
   buffer, and TLS-session caches;
 - bounded DNS/helper queues and the fixed Tokio/CGI worker pools;
+- the process-owned HTTP/1 connection work pool, fixed at 64 threads with a
+  fail-closed 1,024-job queue;
 - configuration-generation state (including the monotonic process-local ID
   allocator and cache-publication barrier), signal flags, logging
   serialization, and privileged TLS file-broker state;

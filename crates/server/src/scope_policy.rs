@@ -902,6 +902,22 @@ impl MappingPolicy {
         }
         crate::verified::append_vec(&mut self.unsupported_filters, &child.unsupported_filters);
     }
+
+    /// Apache gives a virtual host's URL-translation entries precedence over
+    /// inherited main-server entries.  Normal scope merging appends child
+    /// entries because extension handlers are resolved from the end; Alias
+    /// and Redirect tables are first-match tables and therefore need the
+    /// opposite order at this one server-to-vhost boundary.
+    pub fn prefer_virtual_host_routes(
+        &mut self,
+        inherited_aliases: usize,
+        inherited_redirects: usize,
+    ) {
+        debug_assert!(inherited_aliases <= self.aliases.len());
+        debug_assert!(inherited_redirects <= self.redirects.len());
+        self.aliases.rotate_left(inherited_aliases);
+        self.redirects.rotate_left(inherited_redirects);
+    }
 }
 
 #[cfg(test)]
@@ -942,6 +958,38 @@ mod content_mapping_tests {
         parent.merge_child(&child);
         assert_eq!(parent.handlers.len(), 2);
         assert_eq!(parent.unsupported_filters, vec!["INCLUDES".to_string()]);
+    }
+
+    #[test]
+    fn virtual_host_first_match_routes_precede_inherited_routes() {
+        let mut policy = MappingPolicy::default();
+        policy.aliases.push(crate::config::Alias::prefix(
+            "/same".into(),
+            "/global".into(),
+            false,
+        ));
+        policy.redirects.push(crate::config::Redirect {
+            status: 302,
+            from: "/same".into(),
+            to: "https://global.example/".into(),
+            regex: None,
+        });
+        let mut child = MappingPolicy::default();
+        child.aliases.push(crate::config::Alias::prefix(
+            "/same".into(),
+            "/vhost".into(),
+            false,
+        ));
+        child.redirects.push(crate::config::Redirect {
+            status: 302,
+            from: "/same".into(),
+            to: "https://vhost.example/".into(),
+            regex: None,
+        });
+        policy.merge_child(&child);
+        policy.prefer_virtual_host_routes(1, 1);
+        assert_eq!(policy.aliases[0].fs_path, std::path::Path::new("/vhost"));
+        assert_eq!(policy.redirects[0].to, "https://vhost.example/");
     }
 }
 
@@ -1143,6 +1191,56 @@ impl ProxyPolicy {
             self.tls_config_cache = child.tls_config_cache.clone();
         }
     }
+
+    /// ProxyPass and ProxyPassMatch share Apache's first-match route table.
+    /// Main-server entries are collected before virtual-host entries even
+    /// when their source text occurs after the `<VirtualHost>` block. Rebase
+    /// only the appended child entries so lexical order remains stable within
+    /// each source scope but cannot cross that hierarchy boundary.
+    pub fn order_virtual_host_routes_after(&mut self, parent: &ProxyPolicy) {
+        debug_assert!(parent.proxy_passes.len() <= self.proxy_passes.len());
+        debug_assert!(parent.proxy_rules.len() <= self.proxy_rules.len());
+
+        let global_max = parent
+            .proxy_passes
+            .iter()
+            .map(|route| route.route_order)
+            .chain(parent.proxy_rules.iter().map(|route| route.route_order))
+            .max()
+            .unwrap_or(0);
+        let local_min = self
+            .proxy_passes
+            .iter()
+            .skip(parent.proxy_passes.len())
+            .map(|route| route.route_order)
+            .chain(
+                self.proxy_rules
+                    .iter()
+                    .skip(parent.proxy_rules.len())
+                    .map(|route| route.route_order),
+            )
+            .min()
+            .unwrap_or(0);
+
+        for order in self
+            .proxy_passes
+            .iter_mut()
+            .skip(parent.proxy_passes.len())
+            .map(|route| &mut route.route_order)
+            .chain(
+                self.proxy_rules
+                    .iter_mut()
+                    .skip(parent.proxy_rules.len())
+                    .map(|route| &mut route.route_order),
+            )
+        {
+            let local_rank = order
+                .checked_sub(local_min)
+                .expect("local proxy route rank is bounded by its minimum");
+            *order = vapache_verified::configuration_child_merge_order(global_max, local_rank)
+                .expect("the 16 MiB aggregate configuration bound keeps route order in usize");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1199,5 +1297,29 @@ mod final_policy_tests {
             proxy.proxy_ca_file.as_deref(),
             Some(std::path::Path::new("/new-ca.pem"))
         );
+    }
+
+    #[test]
+    fn virtual_host_proxy_routes_follow_all_main_server_routes() {
+        let pass = |backend: &str, order| crate::config::ProxyPassRule {
+            prefix: "/same".into(),
+            backend: backend.into(),
+            sticky_cookie: None,
+            fail_on_status: Vec::new(),
+            route_order: order,
+        };
+        let mut parent = ProxyPolicy::default();
+        parent.proxy_passes.push(pass("http://global/", 9));
+        let mut child = ProxyPolicy::default();
+        child.proxy_passes.push(pass("http://vhost/", 2));
+        parent.merge_child(&child);
+
+        let inherited = ProxyPolicy {
+            proxy_passes: vec![pass("http://global/", 9)],
+            ..ProxyPolicy::default()
+        };
+        parent.order_virtual_host_routes_after(&inherited);
+        assert_eq!(parent.proxy_passes[0].route_order, 9);
+        assert_eq!(parent.proxy_passes[1].route_order, 10);
     }
 }

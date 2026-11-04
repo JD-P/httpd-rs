@@ -9,6 +9,7 @@ prevents re-deriving them from scratch.
 
 | Path | Contents |
 |---|---|
+| `vhost-configuration-isolation-review.md` | Multi-vhost compiler campaign: explicit main/vhost rule generations, module-specific Alias/Redirect versus ProxyPass precedence, address/name selection, reload, and an Apache differential matrix |
 | `http2-stream-lifecycle-review.md` | HTTP/2 ownership campaign: connection-owned stream tasks, reset-aware blocking phases and backends, request-trailer policy, generation retirement, flow-control coverage, and an executable verified lifecycle |
 | `graceful-reload-generation-review.md` | Reload isolation campaign: transport retirement, H1/H2/WebSocket drain semantics, request-captured cache epochs, generation-scoped access-file IR and proxy health state |
 | `authentication-identity-review.md` | Basic/provider campaign: byte-exact scheme grammar, explicit group-provider failure, complete credential-cache snapshots, and request-owned identity through canonical targets, failover and CGI/FastCGI export |

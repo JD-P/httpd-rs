@@ -102,6 +102,9 @@ python3 tests/config_semantics.py \
     --random 300 --seed 2469 \
     --stateful 256 --stateful-seed 1818
 
+step "multi-vhost configuration isolation and reload semantics"
+python3 tests/vhost_semantics.py
+
 step "end-to-end Apache differential conformance"
 python3 tests/conformance.py --differential
 

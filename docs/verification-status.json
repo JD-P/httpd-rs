@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-04",
   "verus": {
-    "verified_functions": 702,
+    "verified_functions": 706,
     "errors": 0
   },
   "obligations": [
@@ -18,7 +18,7 @@
       "title": "Directory < Files < Location < Condition",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "config_rule_phase, config_deferred_slot and config_rule_precedes are executable specifications consumed through an exhaustive MatchKind projection by phase collection and the recursive nested-rule sorter; config_rule_order_is_asymmetric proves the comparator cannot order a pair both ways. access_plan_interleaves proves the exact source/depth plan consumed by the runtime: DirectoryConfig then optional DirectoryAccess at each root-to-leaf depth, Directory own-path and DirectoryMatch, BaseFiles, FilesConfig then optional FilesAccess at each depth, DirectoryMatch Files, Location, config conditions and access conditions. P29 makes both executable plan builders iterative; their loop invariants prove equality to the same recursive specifications without an input-dependent call stack. condition_source_plan_exec is consumed by request_plan when it applies config conditions before access-file conditions, and its proof ties that order to the access-plan tail. Access-file IfFile is evaluated while parsing against an absolute ServerRoot path and its children retain their native Directory/Files phases; iffile_exec_on_read_admit is consumed at that splice. Main and access-file inputs consume verified lexical/tag/argument/depth kernels and are sealed into immutable programs with exact section mates plus semantic directive/section values before effects. Standard-library sort correctness and exact Apache-equivalence of those safe-Rust constructors remain outside Verus."
+      "evidence": "config_rule_phase, config_deferred_slot and config_rule_precedes are executable specifications consumed through an exhaustive MatchKind projection by phase collection and the recursive nested-rule sorter; config_rule_order_is_asymmetric proves the comparator cannot order a pair both ways. configuration_child_merge_order is consumed when main-server and virtual-host rule generations are combined; checked arithmetic proves every child order follows the parent maximum while preserving child-local order. access_plan_interleaves proves the exact source/depth plan consumed by the runtime: DirectoryConfig then optional DirectoryAccess at each root-to-leaf depth, Directory own-path and DirectoryMatch, BaseFiles, FilesConfig then optional FilesAccess at each depth, DirectoryMatch Files, Location, config conditions and access conditions. P29 makes both executable plan builders iterative; their loop invariants prove equality to the same recursive specifications without an input-dependent call stack. condition_source_plan_exec is consumed by request_plan when it applies config conditions before access-file conditions, and its proof ties that order to the access-plan tail. Access-file IfFile is evaluated while parsing against an absolute ServerRoot path and its children retain their native Directory/Files phases; iffile_exec_on_read_admit is consumed at that splice. Main and access-file inputs consume verified lexical/tag/argument/depth kernels and are sealed into immutable programs with exact section mates plus semantic directive/section values before effects. Standard-library sort correctness and exact Apache-equivalence of those safe-Rust constructors remain outside Verus."
     },
     {
       "id": "htaccess_interleave",
@@ -67,7 +67,7 @@
       "title": "Ordered competing request-to-resource mappings",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "first_match_is_first and first_match_none_means_no_match prove that the selected match bit is the first true one and that no bit means no match, so a later overlapping route cannot win; Alias/AliasMatch/ScriptAliasMatch and Redirect/RedirectMatch use this order, ProxyPass/ProxyPassMatch share one route_order space, handler operations use last-match wins, and unit/differential tests cover order reversal; flattening the runtime tables to the match-bit vector remains outside Verus"
+      "evidence": "first_match_is_first and first_match_none_means_no_match prove that the selected match bit is the first true one and that no bit means no match, so a later overlapping route cannot win; Alias/AliasMatch/ScriptAliasMatch and Redirect/RedirectMatch use vhost-before-main first-match tables, ProxyPass/ProxyPassMatch share one main-before-vhost route_order space, and handler operations use last-match wins. configuration_child_merge_order gives proxy routes a checked generation boundary. The multi-vhost Apache differential matrix covers both lexical placements, prefix/regex routes, two tenants and reload; flattening the runtime tables to the match-bit vector remains outside Verus"
     },
     {
       "id": "transform_reauthorization",

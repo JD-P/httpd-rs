@@ -242,7 +242,12 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
     put("SERVER_NAME", ctx.server_name.to_string());
     put("SERVER_ADDR", ctx.local_ip.to_string());
     put("SERVER_PORT", ctx.local_port.to_string());
-    put("SERVER_ADMIN", ctx.cfg.server_admin.clone());
+    put(
+        "SERVER_ADMIN",
+        ctx.vhost
+            .and_then(|vhost| vhost.server_admin.clone())
+            .unwrap_or_else(|| ctx.cfg.server_admin.clone()),
+    );
     put("DOCUMENT_ROOT", ctx.docroot.to_string_lossy().into_owned());
     put("REQUEST_METHOD", ctx.req.method.clone());
     // Apache's CGI REQUEST_URI is the canonical URL path, without the query
@@ -1957,6 +1962,38 @@ mod tests {
                 .find(|(key, _)| key == "QUERY_STRING")
                 .map(|(_, value)| value.as_os_str().as_bytes()),
             Some(b"x=\xff".as_slice())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn virtual_host_server_admin_is_exported_without_cross_tenant_fallback() {
+        let dir = tempdir("vhost-server-admin");
+        let path = dir.join("httpd.conf");
+        fs::write(
+            &path,
+            format!(
+                "{}Listen 127.0.0.1:19083\n\
+                 ServerAdmin global@example.test\n\
+                 <VirtualHost *:19083>\n\
+                 ServerName tenant.test\n\
+                 ServerAdmin tenant@example.test\n\
+                 </VirtualHost>\n",
+                crate::config::TEST_CAPABILITIES
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        let req = request("/cgi-bin/env.sh", Vec::new());
+        let mut ctx = test_ctx(&cfg, &req, &dir, Path::new("cgi-bin/env.sh"), None);
+        ctx.vhost = cfg.vhosts.first();
+        let env = build_env(&ctx);
+        assert_eq!(
+            env.iter()
+                .find(|(name, _)| name == "SERVER_ADMIN")
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+                .as_deref(),
+            Some("tenant@example.test")
         );
         let _ = fs::remove_dir_all(&dir);
     }

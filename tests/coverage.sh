@@ -63,6 +63,11 @@ PYTHONDONTWRITEBYTECODE=1 \
 VAPACHED="$PWD/target/cov/release/vapached" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
+    python3 tests/vhost_semantics.py
+
+VAPACHED="$PWD/target/cov/release/vapached" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
+PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/conformance.py
 
 VAPACHED="$PWD/target/cov/release/vapached" \

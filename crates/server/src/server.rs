@@ -1493,7 +1493,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
             Err(_) => return Ok(false),
         };
         crate::status::hit(body_sent);
-        if logger.wants_access_log() {
+        if logger.wants_request_log(resp.status) {
             let host = host_header(&req).unwrap_or("");
             let server_name = server_name_for(&cfg, &req, &local_ip, local_port);
             let vhost_idx = cfg
@@ -2412,7 +2412,7 @@ fn log_h1_response(
     body_sent: u64,
 ) {
     crate::status::hit(body_sent);
-    if !logger.wants_access_log() {
+    if !logger.wants_request_log(deferred.response.status) {
         return;
     }
     let request = &deferred.request;
@@ -8681,6 +8681,7 @@ mod tests {
             log_formats: Default::default(),
             custom_logs: Vec::new(),
             error_log: None,
+            log_level: None,
             server_admin: None,
             protocols: cfg.protocols.clone(),
             ssl: Default::default(),

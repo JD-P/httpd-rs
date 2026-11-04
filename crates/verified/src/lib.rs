@@ -9577,6 +9577,41 @@ pub proof fn config_rule_order_is_asymmetric(
 {
 }
 
+/// Give a virtual-host rule an order strictly after every main-server rule
+/// while preserving the virtual host's local source order.  The checked
+/// result makes the compiler's cross-scope precedence explicit and prevents
+/// an arithmetic wrap from turning a child rule back into an early rule.
+pub fn configuration_child_merge_order(
+    global_max: usize,
+    local_rank: usize,
+) -> (order: Option<usize>)
+    ensures
+        match order {
+            Some(value) =>
+                value as int == global_max as int + 1 + local_rank as int
+                    && value > global_max,
+            None => global_max as int + 1 + local_rank as int > usize::MAX as int,
+        },
+{
+    match global_max.checked_add(1) {
+        Some(first_local) => first_local.checked_add(local_rank),
+        None => None,
+    }
+}
+
+pub proof fn configuration_child_merge_order_preserves_local_order(
+    global_max: int,
+    first_rank: int,
+    second_rank: int,
+)
+    requires
+        first_rank >= 0,
+        first_rank < second_rank,
+    ensures
+        global_max + 1 + first_rank < global_max + 1 + second_rank,
+{
+}
+
 /// Canonical stage order emitted by a pure verified compiler. Config and
 /// access-file sources are separate typed steps carrying their exact depth;
 /// the runtime no longer hides source ordering inside one imperative branch.

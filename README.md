@@ -400,7 +400,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **702 verified functions, 0 errors** (percent-decoding,
+Current result: **706 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
@@ -641,6 +641,7 @@ Security-sensitive configuration semantics are checked separately:
 python3 tests/config_semantics.py  # 339 fixed differential cases
 python3 tests/config_semantics.py --random 300 --seed 7  # deterministic randomized matrix
 python3 tests/config_semantics.py --stateful 256 --stateful-seed 1818
+python3 tests/vhost_semantics.py  # multi-vhost startup/reload differential matrix
 python3 tests/config_validity.py  # context acceptance matrix (Apache -t vs vapached -t)
 python3 tests/config_grammar.py   # finite valid/invalid grammar matrix
 tests/pre_adversarial.sh         # fail-closed full gate, including real PHP-FPM
@@ -683,6 +684,14 @@ duplicate `AllowOverride` ordering and all four `Nonfatal` behaviors. It caught
 several fail-open ordering bugs during development, including conditional
 sections being applied before a later grant, `<Location "/x/">` matching the
 file `/x`, and access-file merges being ordered after `<Files>`.
+
+`vhost_semantics.py` generates two-tenant configurations and checks the
+server/vhost hierarchy independently for authorization sections, filesystem
+and redirect maps, prefix/regex proxy routes, rewrite/MIME/error/index policy,
+name/address selection, per-vhost error/access logging, includes, and graceful
+reload. Apache is the oracle; the retained cases pin the module-specific
+distinction between vhost-first Alias/Redirect tables and main-server-first
+ProxyPass tables, plus `CustomLog` replacement rather than supplementation.
 
 ### Apache CVE triage
 

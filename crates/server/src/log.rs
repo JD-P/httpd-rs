@@ -6,13 +6,14 @@
 use crate::config::{Config, CustomLog};
 use crate::util::{http_date, unix_now};
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::io::{self, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// One request must never expand a configured LogFormat into an allocation or
@@ -164,14 +165,20 @@ impl Level {
 }
 
 pub struct Logger {
-    error: Mutex<Box<dyn Write + Send>>,
-    error_path: String,
+    error: ErrorLog,
+    vhost_errors: Vec<ErrorLog>,
     root: PathBuf,
     service_uid: Option<u32>,
-    level: Level,
     access: Vec<AccessLog>,
+    vhost_overrides_global_access: Vec<bool>,
     resource_budget: std::sync::Arc<crate::resource::ResourceBudget>,
     pub errors: Mutex<Vec<String>>,
+}
+
+struct ErrorLog {
+    path: String,
+    level: Level,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
 }
 
 struct AccessLog {
@@ -312,12 +319,45 @@ impl Logger {
         let service_uid = running_privileged()
             .then(|| configured_user_id(&cfg.user))
             .transpose()?;
-        let error = open_log(
+        let error_writer = Arc::new(Mutex::new(open_log(
             &cfg.error_log,
             &cfg.server_root,
             service_uid,
             &cfg.resource_budget,
-        )?;
+        )?));
+        let error = ErrorLog {
+            path: cfg.error_log.clone(),
+            level: Level::parse(&cfg.log_level),
+            writer: error_writer.clone(),
+        };
+        let mut error_writers = HashMap::new();
+        error_writers.insert(cfg.error_log.clone(), error_writer);
+        let mut vhost_errors = Vec::with_capacity(cfg.vhosts.len());
+        for vhost in &cfg.vhosts {
+            let path = vhost
+                .error_log
+                .as_deref()
+                .unwrap_or(&cfg.error_log)
+                .to_string();
+            let writer = match error_writers.get(&path) {
+                Some(writer) => writer.clone(),
+                None => {
+                    let writer = Arc::new(Mutex::new(open_log(
+                        &path,
+                        &cfg.server_root,
+                        service_uid,
+                        &cfg.resource_budget,
+                    )?));
+                    error_writers.insert(path.clone(), writer.clone());
+                    writer
+                }
+            };
+            vhost_errors.push(ErrorLog {
+                path,
+                level: Level::parse(vhost.log_level.as_deref().unwrap_or(&cfg.log_level)),
+                writer,
+            });
+        }
         let mut access = Vec::new();
         let mut add = |cl: &CustomLog, vhost: Option<usize>| -> std::io::Result<()> {
             let w = open_log(
@@ -353,12 +393,16 @@ impl Logger {
             }
         }
         Ok(Logger {
-            error: Mutex::new(error),
-            error_path: cfg.error_log.clone(),
+            error,
+            vhost_errors,
             root: cfg.server_root.clone(),
             service_uid,
-            level: Level::parse(&cfg.log_level),
             access,
+            vhost_overrides_global_access: cfg
+                .vhosts
+                .iter()
+                .map(|vhost| !vhost.custom_logs.is_empty())
+                .collect(),
             resource_budget: cfg.resource_budget.clone(),
             errors: Mutex::new(Vec::new()),
         })
@@ -369,9 +413,31 @@ impl Logger {
     /// an inherited descriptor remains writable even when an absolute Apache
     /// log directory is intentionally not traversable by the service account.
     pub fn configuration_matches(&self, cfg: &Config) -> bool {
-        if self.error_path != cfg.error_log
+        if self.error.path != cfg.error_log
             || self.root != cfg.server_root
-            || self.level != Level::parse(&cfg.log_level)
+            || self.error.level != Level::parse(&cfg.log_level)
+            || self.vhost_errors.len() != cfg.vhosts.len()
+            || self.vhost_overrides_global_access.len() != cfg.vhosts.len()
+        {
+            return false;
+        }
+        if !self
+            .vhost_errors
+            .iter()
+            .zip(&cfg.vhosts)
+            .all(|(actual, vhost)| {
+                actual.path == vhost.error_log.as_deref().unwrap_or(&cfg.error_log)
+                    && actual.level
+                        == Level::parse(vhost.log_level.as_deref().unwrap_or(&cfg.log_level))
+            })
+        {
+            return false;
+        }
+        if !self
+            .vhost_overrides_global_access
+            .iter()
+            .zip(&cfg.vhosts)
+            .all(|(actual, vhost)| *actual == !vhost.custom_logs.is_empty())
         {
             return false;
         }
@@ -432,8 +498,11 @@ impl Logger {
                     self.root.join(p)
                 }
             };
-            let mut paths = vec![full(&self.error_path)];
+            let mut paths = vec![full(&self.error.path)];
+            paths.extend(self.vhost_errors.iter().map(|error| full(&error.path)));
             paths.extend(self.access.iter().map(|a| full(&a.path)));
+            paths.sort();
+            paths.dedup();
             for path in paths {
                 let Ok(file) = crate::files::open_admin_path(
                     &path,
@@ -456,12 +525,21 @@ impl Logger {
 
     /// Reopen error/access logs after log rotation (`SIGUSR1`).
     pub fn reopen(&self) -> std::io::Result<()> {
-        let error = open_log(
-            &self.error_path,
-            &self.root,
-            self.service_uid,
-            &self.resource_budget,
-        )?;
+        let mut error_writers = Vec::new();
+        let mut seen_error_paths = HashSet::new();
+        for error in std::iter::once(&self.error).chain(&self.vhost_errors) {
+            if seen_error_paths.insert(error.path.clone()) {
+                error_writers.push((
+                    error.writer.clone(),
+                    open_log(
+                        &error.path,
+                        &self.root,
+                        self.service_uid,
+                        &self.resource_budget,
+                    )?,
+                ));
+            }
+        }
         let mut access_writers = Vec::new();
         for entry in &self.access {
             access_writers.push(open_log(
@@ -471,7 +549,9 @@ impl Logger {
                 &self.resource_budget,
             )?);
         }
-        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = error;
+        for (slot, writer) in error_writers {
+            *slot.lock().unwrap_or_else(|error| error.into_inner()) = writer;
+        }
         for (entry, writer) in self.access.iter().zip(access_writers) {
             *entry.writer.lock().unwrap_or_else(|e| e.into_inner()) = writer;
         }
@@ -479,7 +559,14 @@ impl Logger {
     }
 
     pub fn log(&self, level: Level, module: &str, msg: &str) {
-        if level > self.level {
+        self.log_for(None, level, module, msg);
+    }
+
+    fn log_for(&self, vhost: Option<usize>, level: Level, module: &str, msg: &str) {
+        let target = vhost
+            .and_then(|index| self.vhost_errors.get(index))
+            .unwrap_or(&self.error);
+        if level > target.level {
             return;
         }
         // Error-log messages can contain request-derived text.  Escape terminal
@@ -512,7 +599,7 @@ impl Logger {
         let Some(_writer_guard) = try_writer(&LOG_WRITER_BUSY) else {
             return;
         };
-        if let Ok(mut w) = self.error.try_lock() {
+        if let Ok(mut w) = target.writer.try_lock() {
             let _ = w.write_all(line.as_bytes());
             let _ = w.flush();
         }
@@ -534,6 +621,28 @@ impl Logger {
         self.access.iter().any(|log| !log.discard)
     }
 
+    pub fn wants_request_log(&self, status: u16) -> bool {
+        self.wants_access_log()
+            || (status >= 500
+                && (self.error.level >= Level::Error
+                    || self
+                        .vhost_errors
+                        .iter()
+                        .any(|error| error.level >= Level::Error)))
+            || (status == 403
+                && (self.error.level >= Level::Error
+                    || self
+                        .vhost_errors
+                        .iter()
+                        .any(|error| error.level >= Level::Error)))
+            || (status >= 400
+                && (self.error.level >= Level::Info
+                    || self
+                        .vhost_errors
+                        .iter()
+                        .any(|error| error.level >= Level::Info)))
+    }
+
     pub fn access(&self, e: &AccessEntry) {
         ACCESS_LINE.with(|buf| {
             let mut line = buf.borrow_mut();
@@ -545,6 +654,17 @@ impl Logger {
                     if Some(v) != e.vhost_index {
                         continue;
                     }
+                } else if e.vhost_index.is_some_and(|index| {
+                    self.vhost_overrides_global_access
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false)
+                }) {
+                    // Apache inherits main-server CustomLog directives only
+                    // when the selected virtual host has no CustomLog of its
+                    // own. A local log replaces, rather than supplements, the
+                    // inherited access-log set.
+                    continue;
                 }
                 line.clear();
                 format_access_into(&mut line, &log.format, e);
@@ -565,6 +685,26 @@ impl Logger {
                 }
             }
         });
+        let level = if e.status >= 500 || e.status == 403 {
+            Some(Level::Error)
+        } else if e.status >= 400 {
+            Some(Level::Info)
+        } else {
+            None
+        };
+        if let Some(level) = level {
+            self.log_for(
+                e.vhost_index,
+                level,
+                "request",
+                &format!(
+                    "request failed with status {}: {} {}",
+                    e.status,
+                    e.method,
+                    String::from_utf8_lossy(e.uri)
+                ),
+            );
+        }
     }
 }
 
@@ -942,11 +1082,14 @@ mod tests {
     #[test]
     fn access_log_drops_a_line_while_the_bounded_writer_is_busy() {
         let logger = Logger {
-            error: Mutex::new(Box::new(Vec::<u8>::new())),
-            error_path: "/dev/null".into(),
+            error: ErrorLog {
+                path: "/dev/null".into(),
+                level: Level::Info,
+                writer: Arc::new(Mutex::new(Box::new(Vec::<u8>::new()))),
+            },
+            vhost_errors: Vec::new(),
             root: PathBuf::from("/"),
             service_uid: None,
-            level: Level::Info,
             access: vec![AccessLog {
                 path: "memory".into(),
                 format: "%h".into(),
@@ -954,6 +1097,7 @@ mod tests {
                 writer: Mutex::new(Box::new(Vec::<u8>::new())),
                 discard: false,
             }],
+            vhost_overrides_global_access: Vec::new(),
             resource_budget: std::sync::Arc::new(crate::resource::ResourceBudget::default()),
             errors: Mutex::new(Vec::new()),
         };
@@ -1129,11 +1273,13 @@ mod tests {
                 "ServerRoot \"{}\"\n\
                  Listen 127.0.0.1:0\n\
                  ErrorLog logs/error.log\n\
-                 LogLevel info\n\
+                 LogLevel warn\n\
                  LogFormat \"%h %>s %b\" common\n\
                  CustomLog logs/access.log common\n\
                  CustomLog /dev/null \"%h\"\n\
                  <VirtualHost 127.0.0.1:0>\n\
+                 ErrorLog logs/vhost-error.log\n\
+                 LogLevel info\n\
                  LogFormat \"%v %h\" common\n\
                  CustomLog logs/vhost.log common\n\
                  </VirtualHost>\n",
@@ -1148,6 +1294,10 @@ mod tests {
             condition: None,
         });
         let logger = Logger::new(&cfg).unwrap();
+        assert_eq!(cfg.log_level, "warn");
+        assert_eq!(cfg.vhosts[0].log_level.as_deref(), Some("info"));
+        assert_eq!(logger.error.path, "logs/error.log");
+        assert_eq!(logger.vhost_errors[0].path, "logs/vhost-error.log");
         assert_eq!(logger.access_log_count(), 4);
         assert_eq!(logger.access[3].format, "%v %h");
         assert!(logger.configuration_matches(&cfg));
@@ -1193,6 +1343,14 @@ mod tests {
         drop(log_guard);
         logger.access(&entry);
         logger.access(&AccessEntry {
+            server_name: "tenant.test",
+            vhost_index: Some(0),
+            ..entry
+        });
+        logger.access(&AccessEntry {
+            server_name: "tenant.test",
+            status: 404,
+            uri: b"/tenant-missing",
             vhost_index: Some(0),
             ..entry
         });
@@ -1213,9 +1371,18 @@ mod tests {
         assert!(std::fs::read_to_string(dir.join("logs/access.log"))
             .unwrap()
             .contains("192.0.2.1 200 5"));
+        assert!(!std::fs::read_to_string(dir.join("logs/access.log"))
+            .unwrap()
+            .contains("tenant-missing"));
         assert!(std::fs::read_to_string(dir.join("logs/vhost.log"))
             .unwrap()
-            .contains("example.test 192.0.2.1"));
+            .contains("tenant.test 192.0.2.1"));
+        assert!(std::fs::read_to_string(dir.join("logs/vhost-error.log"))
+            .unwrap()
+            .contains("request failed with status 404: GET /tenant-missing"));
+        assert!(!std::fs::read_to_string(dir.join("logs/error.log"))
+            .unwrap()
+            .contains("tenant-missing"));
 
         let budget = std::sync::Arc::new(crate::resource::ResourceBudget::default());
         assert!(open_log("syslog:local0", &dir, None, &budget).is_ok());

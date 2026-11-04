@@ -2424,6 +2424,7 @@ pub struct VHost {
     pub log_formats: HashMap<String, String>,
     pub custom_logs: Vec<CustomLog>,
     pub error_log: Option<String>,
+    pub log_level: Option<String>,
     pub server_admin: Option<String>,
     pub protocols: Vec<HttpProtocol>,
     pub ssl: SslConfig,
@@ -5614,9 +5615,14 @@ impl Compile {
                 v.scope.rewrite_policy.rewrite_match_base = None;
             }
             v.scope.merge(&v.delta);
-            let mut rules = global_rules.clone();
-            rules.extend(v.rules.clone());
-            sort_rules(&mut rules);
+            v.scope.mapping_policy.prefer_virtual_host_routes(
+                global_scope.mapping_policy.aliases.len(),
+                global_scope.mapping_policy.redirects.len(),
+            );
+            v.scope
+                .proxy_policy
+                .order_virtual_host_routes_after(&global_scope.proxy_policy);
+            let rules = merge_virtual_host_rules(&global_rules, &v.rules);
             v.directory_index = DirectoryRuleIndex::build(&rules);
             v.rules = rules;
             let mut proxy_containers = self.cfg.proxy_containers.clone();
@@ -5864,6 +5870,7 @@ impl Compile {
                                 log_formats: HashMap::new(),
                                 custom_logs: Vec::new(),
                                 error_log: None,
+                                log_level: None,
                                 server_admin: None,
                                 protocols: Vec::new(),
                                 ssl: SslConfig::default(),
@@ -6225,7 +6232,6 @@ impl Compile {
                 | "user"
                 | "group"
                 | "pidfile"
-                | "loglevel"
                 | "remoteipheader"
                 | "remoteipinternalproxy"
                 | "remoteiptrustedproxy"
@@ -6283,6 +6289,14 @@ impl Compile {
                 format!(
                     "directive '{name}' is not supported outside global server context; refusing to globalize a scoped Apache value"
                 ),
+            );
+            return;
+        }
+        if name == "loglevel" && !matches!(section, SectionKind::Server | SectionKind::VirtualHost)
+        {
+            self.directive_error(
+                loc,
+                "directive 'loglevel' is only supported in server or virtual-host context",
             );
             return;
         }
@@ -7709,7 +7723,11 @@ impl Compile {
                         "module-specific LogLevel is not implemented; refusing to replace the configured audit policy with a global level",
                     );
                 } else if args.iter().all(|value| valid_level(value)) {
-                    self.cfg.log_level = first();
+                    if let Some(i) = self.current_vhost {
+                        self.vhosts_raw[i].log_level = Some(first());
+                    } else {
+                        self.cfg.log_level = first();
+                    }
                 } else {
                     self.directive_error(loc, "LogLevel contains an invalid level");
                 }
@@ -9573,6 +9591,29 @@ fn sort_rules(rules: &mut [ScopeRule]) {
             _ => std::cmp::Ordering::Equal,
         }
     });
+}
+
+/// Merge main-server and virtual-host section rules with an explicit
+/// generation boundary. Apache collects the main-server rules first and then
+/// appends the selected virtual host's rules; lexical placement of the
+/// `<VirtualHost>` block does not let a later global rule override its peer in
+/// the vhost. Rule phases and path specificity are still sorted canonically,
+/// while equal-specificity rules retain this server-before-vhost precedence.
+fn merge_virtual_host_rules(global: &[ScopeRule], local: &[ScopeRule]) -> Vec<ScopeRule> {
+    let global_max = global.iter().map(|rule| rule.order).max().unwrap_or(0);
+    let local_min = local.iter().map(|rule| rule.order).min().unwrap_or(0);
+    let mut rules = global.to_vec();
+    rules.extend(local.iter().cloned().map(|mut rule| {
+        let local_rank = rule
+            .order
+            .checked_sub(local_min)
+            .expect("local rule rank is bounded by its minimum");
+        rule.order = vapache_verified::configuration_child_merge_order(global_max, local_rank)
+            .expect("the 16 MiB aggregate configuration bound keeps rule order in usize");
+        rule
+    }));
+    sort_rules(&mut rules);
+    rules
 }
 
 pub(crate) fn parse_allow_methods(args: &[String]) -> Result<AllowMethods, String> {
@@ -12530,6 +12571,63 @@ SSLOptions +StrictRequire\n";
                 RulePhase::Location,
                 RulePhase::Condition
             ]
+        );
+    }
+
+    #[test]
+    fn virtual_host_rules_follow_main_server_rules_regardless_of_lexical_order() {
+        let c = load_text(
+            "Listen 127.0.0.1:19081\n\
+             <VirtualHost *:19081>\n\
+             ServerName child.test\n\
+             DocumentRoot /srv/site\n\
+             <Directory /srv/site>\nRequire all granted\n</Directory>\n\
+             <Location /asset>\nRequire all granted\n</Location>\n\
+             </VirtualHost>\n\
+             <Directory /srv/site>\nRequire all denied\n</Directory>\n\
+             <Location /asset>\nRequire all denied\n</Location>\n",
+            false,
+        )
+        .unwrap();
+        let vhost = c
+            .select_vhost(
+                Some("127.0.0.1".parse().unwrap()),
+                19081,
+                Some("child.test"),
+            )
+            .unwrap();
+        let scope = c.effective_scope(Some(vhost), Path::new("/srv/site/asset"), "/asset");
+        assert!(matches!(
+            scope.authorization.requires,
+            Some(AuthPolicy::List(ref entries))
+                if entries.iter().any(|entry| {
+                    matches!(entry.node, RequireNode::Provider(Require::AllGranted))
+                })
+        ));
+    }
+
+    #[test]
+    fn virtual_host_first_match_mappings_precede_inherited_mappings() {
+        let c = load_text(
+            "Listen 127.0.0.1:19082\n\
+             <VirtualHost *:19082>\n\
+             ServerName child.test\n\
+             Alias /same /vhost\n\
+             Redirect 302 /jump https://vhost.example/\n\
+             </VirtualHost>\n\
+             Alias /same /global\n\
+             Redirect 302 /jump https://global.example/\n",
+            false,
+        )
+        .unwrap();
+        let vhost = &c.vhosts[0];
+        assert_eq!(
+            vhost.scope.mapping_policy.aliases[0].fs_path,
+            Path::new("/vhost")
+        );
+        assert_eq!(
+            vhost.scope.mapping_policy.redirects[0].to,
+            "https://vhost.example/"
         );
     }
 
@@ -15726,7 +15824,7 @@ Require all granted\n\
         err("<Directory /x>\nProxyPass /p http://127.0.0.1:1/\n</Directory>\n");
         err("<Directory /x>\nCacheEnable disk /\n</Directory>\n");
         err("<Directory /x>\nLimitRequestBody 1\n</Directory>\n");
-        err("<VirtualHost *:80>\nLogLevel debug\n</VirtualHost>\n");
+        err("<Directory /x>\nLogLevel debug\n</Directory>\n");
         err("<VirtualHost *:80>\nRemoteIPHeader X-Real-IP\n</VirtualHost>\n");
         err("<Proxy>\n</Proxy>\n");
         err("<ProxyMatch (>\n</ProxyMatch>\n");
