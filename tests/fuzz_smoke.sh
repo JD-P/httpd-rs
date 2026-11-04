@@ -1,12 +1,13 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
+NIGHTLY=${VAPACHE_NIGHTLY_TOOLCHAIN:-nightly}
 
-if ! cargo +nightly fuzz --version >/dev/null 2>&1; then
+if ! cargo +"$NIGHTLY" fuzz --version >/dev/null 2>&1; then
     echo "fuzz-smoke: cargo-fuzz is required" >&2
     exit 2
 fi
-cargo +nightly --version >/dev/null
+cargo +"$NIGHTLY" --version >/dev/null
 cargo check --manifest-path fuzz/Cargo.toml
 
 runs=${FUZZ_SMOKE_RUNS:-64}
@@ -26,6 +27,6 @@ for target in $targets; do
         || dictionary="-dict=fuzz/dictionaries/$target.dict"
     target_runs=$runs
     [ "$target" != rewrite_expr ] || target_runs=$rewrite_expr_runs
-    cargo +nightly fuzz run "$target" "$corpus_root/$target" -- \
+    cargo +"$NIGHTLY" fuzz run "$target" "$corpus_root/$target" -- \
         -runs="$target_runs" -timeout=5 -max_len=262144 $dictionary
 done

@@ -7,6 +7,7 @@ set -eu
 cd "$(dirname "$0")/.."
 REPO_ROOT=$PWD
 LOCAL_SETUP=$(dirname "$REPO_ROOT")/.vapache-setup
+NIGHTLY=${VAPACHE_NIGHTLY_TOOLCHAIN:-nightly}
 
 PATH="$REPO_ROOT/../verus-bin:$REPO_ROOT/../.cargo/bin:$PATH"
 export PATH
@@ -23,8 +24,8 @@ step() {
 command -v cargo >/dev/null 2>&1 || fail "cargo is required"
 command -v cargo-verus >/dev/null 2>&1 || fail "cargo-verus is required"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"
-cargo +nightly --version >/dev/null 2>&1 || fail "a nightly Rust toolchain is required for cargo-fuzz"
-cargo +nightly fuzz --version >/dev/null 2>&1 || fail "cargo-fuzz is required"
+cargo +"$NIGHTLY" --version >/dev/null 2>&1 || fail "a nightly Rust toolchain is required for cargo-fuzz"
+cargo +"$NIGHTLY" fuzz --version >/dev/null 2>&1 || fail "cargo-fuzz is required"
 
 if [ -n "${APACHE:-}" ]; then
     [ -x "$APACHE" ] || fail "APACHE is not executable: $APACHE"

@@ -2,6 +2,7 @@
 set -eu
 
 cd "$(dirname "$0")/.."
+NIGHTLY=${VAPACHE_NIGHTLY_TOOLCHAIN:-nightly}
 sanitizer=${1:-address}
 case "$sanitizer" in
     address|leak|thread) ;;
@@ -18,21 +19,21 @@ case "$sanitizer" in
     address)
         # ASan's runtime is not fork-safe. Exercise the entire library except
         # the test whose purpose is to fork a CGI worker.
-        cargo +nightly test -p vapached --lib --all-features \
+        cargo +"$NIGHTLY" test -p vapached --lib --all-features \
             --target x86_64-unknown-linux-gnu -- --test-threads=1 \
             --skip cgi::tests::child_process_and_worker_main_paths
         ;;
     leak)
         # The unit-test binary intentionally owns process-global regex and
         # Loom state. Standalone integration binaries give LSan a clean exit.
-        cargo +nightly test -p vapached --all-features \
+        cargo +"$NIGHTLY" test -p vapached --all-features \
             --test properties --test failpoints --test fault_injection \
             --target x86_64-unknown-linux-gnu -- --test-threads=1
         ;;
     thread)
         # TSan needs an instrumented standard library and is aimed at the
         # real multi-threaded admission path; Loom explores the model space.
-        cargo +nightly test -Zbuild-std -p vapached --lib \
+        cargo +"$NIGHTLY" test -Zbuild-std -p vapached --lib \
             resource::tests::concurrent_dynamic_admission_never_exceeds_the_limit \
             --target x86_64-unknown-linux-gnu -- --exact --test-threads=1
         ;;

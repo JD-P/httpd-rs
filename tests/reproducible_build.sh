@@ -95,6 +95,10 @@ copy_source "$source_a"
 copy_source "$source_b"
 
 build_once "$source_a" "$target_a" "$artifacts_a"
+# The packaged artifact set is self-contained. Keeping the first Cargo target
+# tree while compiling the second copy only doubles peak disk consumption and
+# does not strengthen the byte-for-byte comparison below.
+rm -rf -- "$target_a"
 build_once "$source_b" "$target_b" "$artifacts_b"
 
 (

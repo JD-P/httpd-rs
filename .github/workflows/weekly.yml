@@ -11,19 +11,20 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  VAPACHE_NIGHTLY_TOOLCHAIN: nightly-2026-10-29
 
 jobs:
   mutation:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
-      - run: cargo install cargo-mutants --locked
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: cargo install cargo-mutants --version 27.1.0 --locked
       - name: Security-kernel mutation score
         env:
           MUTATION_TIMEOUT: 360
         run: tests/mutation.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: mutation-results
@@ -33,39 +34,37 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: |
-          rustup toolchain install nightly --profile minimal --component miri --component rust-src
-          cargo install cargo-careful --locked
+          rustup toolchain install "$VAPACHE_NIGHTLY_TOOLCHAIN" \
+            --profile minimal --component miri --component rust-src
+          cargo install cargo-careful --version 0.4.10 --locked
       - name: Standard-library precondition checks
         run: tests/careful.sh
       - name: Miri on pure parser and budget tests
         run: |
-          cargo +nightly miri test -p vapached --lib resource::tests::aggregate_spool_and_dynamic_limits_release_on_drop -- --exact
-          cargo +nightly miri test -p vapached --lib http::tests::parse_basic -- --exact
+          cargo +"$VAPACHE_NIGHTLY_TOOLCHAIN" miri test -p vapached --lib resource::tests::aggregate_spool_and_dynamic_limits_release_on_drop -- --exact
+          cargo +"$VAPACHE_NIGHTLY_TOOLCHAIN" miri test -p vapached --lib http::tests::parse_basic -- --exact
 
   packaging:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 2
-      - name: Install portable target and packaging tools
-        run: |
-          rustup target add x86_64-unknown-linux-musl
-          sudo apt-get update
-          sudo apt-get install -y binutils musl-tools rpm
+      - name: Verify container builder availability
+        run: docker --version
       - run: |
-          cargo install cargo-cyclonedx --locked
-          cargo install cargo-semver-checks --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo install cargo-semver-checks --version 0.51.0 --locked
       - name: Reproducible release artifacts
-        run: tests/reproducible_build.sh
+        run: packaging/run-reproducible-build.sh
       - name: CycloneDX SBOM
         run: cargo cyclonedx --all --format json
       - name: Public API compatibility
         run: cargo semver-checks check-release --baseline-rev HEAD~1
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom
           path: "**/*.cdx.json"
@@ -74,7 +73,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Internal suite for the patched h2 fork
         # The vendored production tree intentionally omits upstream's large
         # JSON fixture corpus; strict h2spec exercises those wire behaviors.
@@ -90,7 +89,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Apache reference and benchmark client
         run: |
           sudo apt-get update
@@ -100,7 +99,7 @@ jobs:
         run: |
           python3 bench/bench.py --quick
           python3 tests/performance_regression.py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: performance-results

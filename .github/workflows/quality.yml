@@ -16,15 +16,16 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  VAPACHE_NIGHTLY_TOOLCHAIN: nightly-2026-10-29
 
 jobs:
   rust:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -68,7 +69,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install coverage and Apache reference tools
         run: |
           rustup show active-toolchain
@@ -81,7 +82,7 @@ jobs:
   verus:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
       - name: Install matching Verus release
@@ -92,11 +93,11 @@ jobs:
   fuzz-smoke:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install toolchains and cargo-fuzz
         run: |
-          rustup toolchain install nightly --profile minimal
-          cargo install cargo-fuzz --locked
+          rustup toolchain install "$VAPACHE_NIGHTLY_TOOLCHAIN" --profile minimal
+          cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Compile and smoke every fuzz target
         env:
           FUZZ_SMOKE_RUNS: 128
@@ -105,15 +106,17 @@ jobs:
   supply-chain:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install policy tools
         run: |
-          cargo install cargo-deny --locked
-          cargo install cargo-audit --locked
-          cargo install cargo-vet --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-vet --version 0.10.3 --locked
       - name: License, source, duplicate and advisory policy
         run: cargo deny check
       - name: RustSec audit
         run: cargo audit --deny warnings
       - name: Dependency review ledger
-        run: cargo vet --locked
+        run: |
+          python3 tests/dependency_audit_policy.py
+          cargo vet --locked

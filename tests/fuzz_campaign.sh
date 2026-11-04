@@ -4,12 +4,13 @@
 set -eu
 
 cd "$(dirname "$0")/.."
+NIGHTLY=${VAPACHE_NIGHTLY_TOOLCHAIN:-nightly}
 
-if ! cargo +nightly fuzz --version >/dev/null 2>&1; then
+if ! cargo +"$NIGHTLY" fuzz --version >/dev/null 2>&1; then
     echo "fuzz-campaign: cargo-fuzz is required" >&2
     exit 2
 fi
-cargo +nightly --version >/dev/null
+cargo +"$NIGHTLY" --version >/dev/null
 
 SECONDS_PER_TARGET=${FUZZ_SECONDS_PER_TARGET:-300}
 MAX_LEN=${FUZZ_MAX_LEN:-1048576}
@@ -22,7 +23,7 @@ for target in $TARGETS; do
     dictionary=
     [ ! -f "fuzz/dictionaries/$target.dict" ] \
         || dictionary="-dict=fuzz/dictionaries/$target.dict"
-    cargo +nightly fuzz run "$target" "$corpus" -- \
+    cargo +"$NIGHTLY" fuzz run "$target" "$corpus" -- \
         -max_total_time="$SECONDS_PER_TARGET" \
         -timeout=10 \
         -rss_limit_mb=4096 \

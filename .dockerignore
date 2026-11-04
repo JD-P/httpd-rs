@@ -1,0 +1,9 @@
+.git
+.tools
+*.profraw
+coverage
+release
+target
+fuzz/artifacts
+fuzz/corpus
+adversarial/**/target

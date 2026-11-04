@@ -73,18 +73,23 @@ for its fail-closed `openat2` path-resolution and `close_range`
 descriptor-isolation boundaries.
 
 Release artifacts are reproducible. The workflow uses the pinned Rust
-toolchain and the commit timestamp as `SOURCE_DATE_EPOCH`, remaps checkout,
-target, and tool-cache paths out of the executable, and normalizes archive and
-package ownership, timestamps, RPM build host, and RPM build time. The release
-gate builds in two different source and target paths and requires identical
-bytes for the loose executable, tarball, Debian package, RPM package, and
-`SHA256SUMS` before anything is uploaded. Run the same gate locally with:
+toolchain in a digest-pinned container, an exact-version Debian package set,
+and the commit timestamp as `SOURCE_DATE_EPOCH`. It remaps checkout, target, and
+tool-cache paths out of the executable and normalizes archive and package
+ownership, timestamps, RPM build host, and RPM build time. The release run is
+network-isolated after Cargo has verified every source against `Cargo.lock`.
+The gate builds in two different source and target paths and requires
+identical bytes for the loose executable, tarball, Debian package, RPM package,
+and `SHA256SUMS` before anything is uploaded. Run the same gate locally with:
 
 ```sh
-rustup target add x86_64-unknown-linux-musl
-sudo apt-get install binutils musl-tools rpm
-tests/reproducible_build.sh --output release
+packaging/run-reproducible-build.sh --output release
 ```
+
+GitHub also emits an artifact attestation for every file in the release set.
+For a tagged build, verify a downloaded asset against GitHub's build
+provenance with `gh attestation verify ASSET --repo JD-P/vapache`, in addition
+to checking `SHA256SUMS`.
 
 All privileged helpers replace inherited command lookup with the fixed system
 path, reject shell startup environments, validate executable overrides and the

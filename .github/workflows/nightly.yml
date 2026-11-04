@@ -15,6 +15,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  VAPACHE_NIGHTLY_TOOLCHAIN: nightly-2026-10-29
 
 jobs:
   sustained-fuzzing:
@@ -38,16 +39,16 @@ jobs:
           - tls_policy
           - ocsp_der
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: |
-          rustup toolchain install nightly --profile minimal
-          cargo install cargo-fuzz --locked
+          rustup toolchain install "$VAPACHE_NIGHTLY_TOOLCHAIN" --profile minimal
+          cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Fuzz ${{ matrix.target }}
         env:
           FUZZ_TARGETS: ${{ matrix.target }}
           FUZZ_SECONDS_PER_TARGET: ${{ inputs.fuzz_seconds || '900' }}
         run: tests/fuzz_campaign.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: fuzz-${{ matrix.target }}
@@ -63,8 +64,8 @@ jobs:
       matrix:
         sanitizer: [address, leak, thread]
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install nightly --profile minimal --component rust-src
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install "$VAPACHE_NIGHTLY_TOOLCHAIN" --profile minimal --component rust-src
       - name: ${{ matrix.sanitizer }} sanitizer
         run: tests/sanitizers.sh ${{ matrix.sanitizer }}
 
@@ -72,13 +73,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install external reference implementations
         run: |
           sudo apt-get update
           sudo apt-get install -y apache2 php-fpm curl libcurl4-openssl-dev
-          rustup toolchain install nightly --profile minimal
-          cargo install cargo-fuzz --locked
+          rustup toolchain install "$VAPACHE_NIGHTLY_TOOLCHAIN" --profile minimal
+          cargo install cargo-fuzz --version 0.13.2 --locked
           tests/ci/install_verus.sh .tools/verus
       - name: Fail-closed pre-adversarial gate
         run: tests/pre_adversarial.sh
@@ -87,13 +88,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: cargo build --locked --release -p vapached
       - name: Install h2spec
         run: |
           curl --fail --location --retry 3 \
             https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz \
             -o /tmp/h2spec.tar.gz
+          printf '%s  %s\n' \
+            157ee0de702e01ad40e752dbf074b366027e550c8e7504f9450da2809e279318 \
+            /tmp/h2spec.tar.gz | sha256sum --check -
           mkdir -p .tools/h2spec
           tar -xzf /tmp/h2spec.tar.gz -C .tools/h2spec
       - name: TLS policy suite
@@ -110,7 +114,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build release daemon
         run: cargo build --locked --release -p vapached
       - name: Inject process, syscall and resource failures
@@ -124,13 +128,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - run: cargo install cargo-llvm-cov --locked
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: cargo install cargo-llvm-cov --version 0.9.1 --locked
       - name: LLVM branch coverage
         run: >-
           cargo llvm-cov --workspace --all-features --branch --lcov
           --output-path branch-coverage.lcov
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: branch-coverage
           path: branch-coverage.lcov

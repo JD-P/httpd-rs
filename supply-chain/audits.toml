@@ -1,4 +1,26 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.bitflags]]
+who = "Vapache project dependency review <noreply@github.com>"
+criteria = "safe-to-deploy"
+delta = "2.11.1 -> 2.13.2"
+notes = "Reviewed the delta: declarative flag macro/API changes only; no build script, network, process execution, or new unsafe implementation."
+
+[[audits.linux-raw-sys]]
+who = "Vapache project dependency review <noreply@github.com>"
+criteria = "safe-to-deploy"
+version = "0.12.1"
+notes = "Reviewed generated Linux UAPI bindings and architecture selection used by rustix; no runtime initialization, external process execution, or network-capable build logic."
+
+[[audits.rustix]]
+who = "Vapache project dependency review <noreply@github.com>"
+criteria = "safe-to-deploy"
+version = "1.1.6"
+notes = "Reviewed the Linux event/fs/net feature surface used by Vapache, syscall wrapper boundaries, cfg selection, and build.rs compiler probes; build code invokes only Cargo-selected rustc and performs no network access."
+
+[[audits.smallvec]]
+who = "Vapache project dependency review <noreply@github.com>"
+criteria = "safe-to-deploy"
+delta = "1.15.2 -> 1.16.4"
+notes = "Reviewed the delta and unsafe storage/drop paths used by vapache-pcre2; no build script or external execution, with upstream tests covering inline/heap transitions."
