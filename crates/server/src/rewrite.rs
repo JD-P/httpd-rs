@@ -1347,13 +1347,7 @@ fn variable_value(
             }
             map_value(map, key)
         }
-        "THE_REQUEST" => format!(
-            "{} {} {}",
-            req.method,
-            String::from_utf8(req.target.clone())
-                .map_err(|_| "request target is not valid UTF-8".to_string())?,
-            req.version.as_str()
-        ),
+        "THE_REQUEST" => req.wire_request_line().map_err(str::to_string)?,
         _ => return Err(format!("unsupported mod_rewrite variable '%{{{name}}}'")),
     })
 }

@@ -3686,6 +3686,275 @@ pub proof fn request_closed_phase_is_absorbing(event: RequestPhaseEvent)
 {
 }
 
+/// A request that is selected without returning to the wire parser.  The two
+/// currently supported transitions deliberately have different semantics:
+/// DirectoryIndex is the selected application resource, while ErrorDocument
+/// is a bodyless recovery request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InternalRequestKind {
+    DirectoryIndex,
+    ErrorDocument,
+}
+
+/// Concrete projection consumed by the runtime when it constructs an
+/// internal request.  The wire method/target/version are always retained for
+/// THE_REQUEST and audit identity; only the canonical dispatch state changes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InternalRequestProjection {
+    pub preserve_wire_target: bool,
+    pub preserve_wire_method: bool,
+    pub preserve_wire_version: bool,
+    pub preserve_method: bool,
+    pub preserve_body: bool,
+    pub preserve_query: bool,
+    pub preserve_client_identity: bool,
+    pub strip_entity_and_hop_headers: bool,
+}
+
+pub open spec fn internal_request_projection_spec(
+    kind: InternalRequestKind,
+) -> InternalRequestProjection {
+    match kind {
+        InternalRequestKind::DirectoryIndex => InternalRequestProjection {
+            preserve_wire_target: true,
+            preserve_wire_method: true,
+            preserve_wire_version: true,
+            preserve_method: true,
+            preserve_body: true,
+            preserve_query: true,
+            preserve_client_identity: true,
+            strip_entity_and_hop_headers: false,
+        },
+        InternalRequestKind::ErrorDocument => InternalRequestProjection {
+            preserve_wire_target: true,
+            preserve_wire_method: true,
+            preserve_wire_version: true,
+            preserve_method: false,
+            preserve_body: false,
+            preserve_query: false,
+            preserve_client_identity: true,
+            strip_entity_and_hop_headers: true,
+        },
+    }
+}
+
+pub fn internal_request_projection(
+    kind: InternalRequestKind,
+) -> (projection: InternalRequestProjection)
+    ensures projection == internal_request_projection_spec(kind),
+{
+    match kind {
+        InternalRequestKind::DirectoryIndex => InternalRequestProjection {
+            preserve_wire_target: true,
+            preserve_wire_method: true,
+            preserve_wire_version: true,
+            preserve_method: true,
+            preserve_body: true,
+            preserve_query: true,
+            preserve_client_identity: true,
+            strip_entity_and_hop_headers: false,
+        },
+        InternalRequestKind::ErrorDocument => InternalRequestProjection {
+            preserve_wire_target: true,
+            preserve_wire_method: true,
+            preserve_wire_version: true,
+            preserve_method: false,
+            preserve_body: false,
+            preserve_query: false,
+            preserve_client_identity: true,
+            strip_entity_and_hop_headers: true,
+        },
+    }
+}
+
+pub proof fn directory_index_preserves_application_request()
+    ensures
+        internal_request_projection_spec(InternalRequestKind::DirectoryIndex)
+            == (InternalRequestProjection {
+                preserve_wire_target: true,
+                preserve_wire_method: true,
+                preserve_wire_version: true,
+                preserve_method: true,
+                preserve_body: true,
+                preserve_query: true,
+                preserve_client_identity: true,
+                strip_entity_and_hop_headers: false,
+            }),
+{
+}
+
+/// Apache's directory fixup admits GET and POST before selecting the index;
+/// HEAD follows GET semantics in Vapache. The selected target still applies
+/// its own method policy, so admitting POST here does not make static files
+/// accept it.
+pub open spec fn directory_index_method_spec(
+    is_get: bool,
+    is_head: bool,
+    is_post: bool,
+) -> bool {
+    is_get || is_head || is_post
+}
+
+pub fn directory_index_method_admit(
+    is_get: bool,
+    is_head: bool,
+    is_post: bool,
+) -> (ok: bool)
+    ensures ok == directory_index_method_spec(is_get, is_head, is_post),
+{
+    is_get || is_head || is_post
+}
+
+pub proof fn directory_index_post_reaches_target_selection()
+    ensures directory_index_method_spec(false, false, true),
+{
+}
+
+pub proof fn error_document_cannot_replay_application_request()
+    ensures
+        internal_request_projection_spec(InternalRequestKind::ErrorDocument)
+            == (InternalRequestProjection {
+                preserve_wire_target: true,
+                preserve_wire_method: true,
+                preserve_wire_version: true,
+                preserve_method: false,
+                preserve_body: false,
+                preserve_query: false,
+                preserve_client_identity: true,
+                strip_entity_and_hop_headers: true,
+            }),
+{
+}
+
+/// Error recovery is a single internal transition.  Keeping the depth in the
+/// request (rather than a thread-local flag) makes interleaved async requests
+/// independent and ensures a failing error target cannot recursively select
+/// itself.
+pub open spec fn error_document_depth_step_spec(depth: u8, limit: u8) -> Option<u8> {
+    if depth >= limit {
+        None
+    } else {
+        Some((depth + 1) as u8)
+    }
+}
+
+pub fn error_document_depth_step(depth: u8, limit: u8) -> (next: Option<u8>)
+    ensures
+        next == error_document_depth_step_spec(depth, limit),
+        match next {
+            Some(value) => depth < limit && value == depth + 1 && value <= limit,
+            None => depth >= limit,
+        },
+{
+    if depth >= limit {
+        None
+    } else {
+        Some(depth + 1)
+    }
+}
+
+pub proof fn error_document_limit_one_is_non_recursive(depth: u8)
+    ensures
+        error_document_depth_step_spec(depth, 1).is_some() ==> depth == 0,
+        error_document_depth_step_spec(1, 1).is_none(),
+{
+}
+
+/// Syntax gate shared by configuration compilation and runtime projection.
+/// A local transition is an origin-form path plus an optional query; it can
+/// never contain a fragment, raw control/DEL byte, or backslash.
+pub open spec fn internal_request_target_spec(
+    absolute_path: bool,
+    path_nonempty: bool,
+    has_fragment: bool,
+    has_forbidden_byte: bool,
+) -> bool {
+    absolute_path && path_nonempty && !has_fragment && !has_forbidden_byte
+}
+
+pub fn internal_request_target_admit(
+    absolute_path: bool,
+    path_nonempty: bool,
+    has_fragment: bool,
+    has_forbidden_byte: bool,
+) -> (ok: bool)
+    ensures ok == internal_request_target_spec(
+        absolute_path,
+        path_nonempty,
+        has_fragment,
+        has_forbidden_byte,
+    ),
+{
+    absolute_path && path_nonempty && !has_fragment && !has_forbidden_byte
+}
+
+pub proof fn internal_request_target_rejects_wire_ambiguity(
+    absolute_path: bool,
+    path_nonempty: bool,
+)
+    ensures
+        !internal_request_target_spec(absolute_path, path_nonempty, true, false),
+        !internal_request_target_spec(absolute_path, path_nonempty, false, true),
+{
+}
+
+/// DirectoryIndex selection first probes a filesystem name and then maps the
+/// corresponding URL. Until Vapache implements Apache's full URI-subrequest
+/// form, only one literal, unescaped path component can make those identities
+/// equal. Reject delimiters and percent escapes instead of opening one file
+/// and internally dispatching another.
+pub open spec fn directory_index_name_spec(
+    nonempty: bool,
+    dot_segment: bool,
+    has_separator: bool,
+    has_url_delimiter: bool,
+    has_percent_escape: bool,
+    has_forbidden_byte: bool,
+) -> bool {
+    nonempty
+        && !dot_segment
+        && !has_separator
+        && !has_url_delimiter
+        && !has_percent_escape
+        && !has_forbidden_byte
+}
+
+pub fn directory_index_name_admit(
+    nonempty: bool,
+    dot_segment: bool,
+    has_separator: bool,
+    has_url_delimiter: bool,
+    has_percent_escape: bool,
+    has_forbidden_byte: bool,
+) -> (ok: bool)
+    ensures ok == directory_index_name_spec(
+        nonempty,
+        dot_segment,
+        has_separator,
+        has_url_delimiter,
+        has_percent_escape,
+        has_forbidden_byte,
+    ),
+{
+    nonempty
+        && !dot_segment
+        && !has_separator
+        && !has_url_delimiter
+        && !has_percent_escape
+        && !has_forbidden_byte
+}
+
+pub proof fn directory_index_name_cannot_change_url_identity(
+    nonempty: bool,
+    dot_segment: bool,
+)
+    ensures
+        !directory_index_name_spec(nonempty, dot_segment, true, false, false, false),
+        !directory_index_name_spec(nonempty, dot_segment, false, true, false, false),
+        !directory_index_name_spec(nonempty, dot_segment, false, false, true, false),
+{
+}
+
 /// Overflow-free length transition for regex capture substitution. Runtime
 /// expansion allocates only after this transition admits the resulting value.
 pub fn capture_expansion_len(

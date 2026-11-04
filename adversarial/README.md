@@ -11,6 +11,7 @@ prevents re-deriving them from scratch.
 |---|---|
 | `backend-response-review.md` | Malicious HTTP/CGI/FastCGI response campaign: complete cache-policy parsing, normalization provenance, H1/H2 malformed-field behavior, FastCGI record identity, and V7 cache-generation invalidation |
 | `http-desynchronization-review.md` | Cross-hop HTTP/1 framing and protocol-transition review: strict verified request metadata, exact fragmented pipeline properties, canonical single-use proxying, and reconstructed WebSocket 101 responses |
+| `internal-request-transition-review.md` | Synthetic request campaign: typed DirectoryIndex/ErrorDocument projections, immutable wire identity, body/query/hop-state isolation, request-owned recursion, response-owned cache provenance, and deferred CGI execution regressions |
 | `tls-mtls-state-review.md` | TLS/mTLS state campaign: immutable negotiated identity, SNI/Host policy binding, resolver parity, resumed client identity, expiring sessions, CRL-backed revocation, validity-driven OCSP staples, strict responder URLs and HTTPS proxy verification |
 | `apache-if-files-nesting.md` | Apache 2.4.69 configuration-validation bug: unsupported `<Files>`/request-time `<If>` nesting passes configtest but its policy is not evaluated on ordinary requests; source analysis, impact, reproduction, and Vapache disposition |
 | `findings.md` | Pass 3 write-ups (F31–F36, F38) |

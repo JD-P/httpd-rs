@@ -23,6 +23,37 @@ pub(crate) const MAX_POLICY_PATH_COMPONENTS: usize = 256;
 /// into quadratic allocation/copy work.
 pub(crate) const MAX_POLICY_ANCESTOR_BYTES: usize = 512 * 1024;
 
+/// Parse and validate a configuration-selected internal request target.
+/// This is shared by configuration sealing and runtime projection so a value
+/// accepted at startup cannot acquire a second, looser interpretation later.
+pub(crate) fn split_internal_request_target(url: &str) -> Option<(&str, Option<&[u8]>)> {
+    let (path, query) = match url.split_once('?') {
+        Some((path, query)) => (path, Some(query.as_bytes())),
+        None => (url, None),
+    };
+    let has_fragment = url.as_bytes().contains(&b'#');
+    let has_forbidden_byte = url
+        .as_bytes()
+        .iter()
+        .any(|byte| *byte == 0x7f || *byte <= b' ' || *byte == b'\\');
+    if !vapache_verified::internal_request_target_admit(
+        path.starts_with('/'),
+        !path.is_empty(),
+        has_fragment,
+        has_forbidden_byte,
+    ) {
+        return None;
+    }
+    // Decode with the most permissive slash policy only for syntax checking;
+    // the selected listener's AllowEncodedSlashes policy is still enforced by
+    // the real request plan. This catches malformed escapes, encoded controls,
+    // encoded backslashes and non-UTF-8 canonical paths at startup.
+    let decoded = vapache_verified::percent_decode_path(path.as_bytes(), true)?;
+    let normalized = crate::verified::normalize_uri_path(&decoded)?;
+    std::str::from_utf8(&normalized).ok()?;
+    Some((path, query))
+}
+
 fn next_policy_ancestor_work(
     path: &Path,
     components: usize,

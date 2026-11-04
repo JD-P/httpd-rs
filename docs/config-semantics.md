@@ -546,16 +546,24 @@ class from the findings.
 
 ```text
 DirectoryIndex and local ErrorDocument dispatch go through the normal dispatcher
-subrequest(req, url) retains method, headers, peer and authenticated identity
+DirectoryIndex retains method, body, query, headers, peer and authenticated identity
+ErrorDocument becomes a bodyless GET using only its configured target query
+both retain the original wire method/target/version for THE_REQUEST and reselect the canonical URL
 subrequest target policy is evaluated exactly like a client request
-ErrorDocument recursion is depth-limited and cannot replace a failed target
+ErrorDocument recursion depth follows the request and cannot replace a failed target
 ```
 
 The original directory access check happens before a `DirectoryIndex`
 subrequest, and the subrequest re-checks its target.  An `ErrorDocument` may
 intentionally run after a denied or missing original resource, but it still
 runs through target authorization, handler selection and `.htaccess` review;
-it cannot recursively invoke itself.
+it cannot recursively invoke itself.  Its recovery projection removes entity,
+conditional-range and hop-by-hop/upgrade metadata (including fields nominated
+by `Connection`) before a local or proxied handler runs.  Cache exclusion is a
+property of the returned response rather than executor-thread state.
+Until Apache-style arbitrary URI index candidates are implemented,
+`DirectoryIndex` values must be literal, unescaped single-component names;
+this keeps the file probed during selection identical to the URL dispatched.
 
 ### I16 — Trusted input boundary
 
@@ -954,8 +962,8 @@ conversion:
 | FastCGI `ProxyPassMatch`/`PATH_INFO` | opened script inode + `PATH_INFO` | actual descriptor-path scope, inode- and backend-bound FastCGI grant |
 | `SetHandler proxy:fcgi` | opened contained handler script | actual descriptor-path scope, inode- and backend-bound FastCGI grant |
 | symlink resolution | opened descriptor path | target scope, file inode grant |
-| `DirectoryIndex` | index subrequest URL | normal dispatcher authorization for the index target |
-| local `ErrorDocument` | error-document subrequest URL | normal dispatcher authorization; recursion bound |
+| `DirectoryIndex` | index subrequest URL; original method/body/query | normal dispatcher authorization for the index target; selected target decides POST support |
+| local `ErrorDocument` | configured error path/query; bodyless GET; immutable original wire method/target/version | normal dispatcher authorization; request-owned recursion bound; response-owned cache exclusion |
 | `DirectorySlash Off` | canonical trailing-slash URL | reauthorize before index/autoindex |
 | proxy route / balancer failover | concrete member URL + binding | `<Proxy>` reauthorization, backend-bound proxy grant |
 | cache `PATH_INFO` | actual CGI script target | cache policy grant bound to script target |
@@ -1786,7 +1794,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **655 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **680 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1802,6 +1810,14 @@ construction: there is no second production interleaver.
   an active read to a cancelled-read owner rather than releasing its leases;
   `PreparedHandlerKind` proves every typed backend IR kind requires bounded
   dynamic admission.
+- `InternalRequestKind`, `internal_request_projection`,
+  `error_document_depth_step` and `internal_request_target_admit`, consumed by
+  the sole internal dispatcher and configuration compiler. `DirectoryIndex`
+  preserves application method/body/query state; local `ErrorDocument`
+  projects a bodyless GET with its configured query, while both retain the
+  wire method/target/version and client identity. Concrete header mutation
+  remains covered by runtime refinement tests. `directory_index_name_admit`
+  additionally binds the literal filename probe to the internal URL component.
 - `ipv4_mapped_to_v4`, consumed by `access::canonical_ip` at the connection
   and RemoteIP boundaries; `vhost_address_admit` and
   `vhost_address_precedence`, consumed by `Config::select_vhost` and the TLS
@@ -2299,9 +2315,9 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus
 ```
 
-The current ledger (2026-11-03) is:
+The current ledger (2026-11-04) is:
 
-- weighted obligations: **36.0 / 67.0 (53.7%)** if partial obligations receive
+- weighted obligations: **36.5 / 68.0 (53.7%)** if partial obligations receive
   half credit;
 - proof debt: **5 / 6** — 0 named unverified security components, 0 partially
   bound sinks, 5 assumptions and 0 accepted unmodeled security-directive
@@ -2310,7 +2326,7 @@ The current ledger (2026-11-03) is:
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **655 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **680 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

@@ -3627,6 +3627,7 @@ pub(crate) enum PreparedHandler {
         scope: Scope,
         status: u16,
         url_path: String,
+        internal_target: String,
         port: u16,
         host: String,
     },
@@ -3742,10 +3743,21 @@ impl PreparedHandler {
                 scope,
                 status,
                 url_path,
+                internal_target,
                 port,
                 host,
             } => {
-                let response = handler.execute(cfg, req);
+                // Routing happened against the same projection during the
+                // head phase. Rebuild it from the now-complete outer request
+                // so a deferred handler cannot regain the original method,
+                // body, query, framing or upgrade state.
+                let mut internal = project_internal_request(
+                    req,
+                    &internal_target,
+                    vapache_verified::InternalRequestKind::ErrorDocument,
+                )
+                .expect("a prepared ErrorDocument retained its validated target");
+                let response = handler.execute(cfg, &mut internal);
                 crate::files::finalize_prepared_error_document(
                     cfg, &scope, status, req, &url_path, port, &host, response,
                 )
@@ -3926,7 +3938,6 @@ pub(crate) fn execute_prepared_handler(
     tls: bool,
     handler: PreparedHandler,
 ) -> Response {
-    crate::files::reset_local_error_document_response();
     debug_assert!(vapache_verified::prepared_handler_needs_dynamic_lease(
         handler.kind()
     ));
@@ -3950,9 +3961,6 @@ fn dispatch_inner_request(
     local_ip: &str,
     local_port: u16,
 ) -> Response {
-    // Each outer request starts without error-document provenance; the
-    // internal subrequest sets it before this request's cache store runs.
-    crate::files::reset_local_error_document_response();
     // Filesystem lookup is deliberately admitted as its own bounded phase.
     // Dynamic backends execute after this function returns a prepared handler,
     // so a stalled mount/cache/access-file lookup cannot consume the entire
@@ -4106,31 +4114,59 @@ fn dispatch_inner_request(
     resp
 }
 
-/// Perform an internal subrequest (DirectoryIndex or a local ErrorDocument)
-/// through the normal dispatcher so handlers, access rules and `.htaccess`
-/// overrides are applied exactly as for a client request.
+fn project_internal_request(
+    req: &Request,
+    url: &str,
+    kind: vapache_verified::InternalRequestKind,
+) -> Option<Request> {
+    let (path, target_query) = crate::util::split_internal_request_target(url)?;
+    let projection = vapache_verified::internal_request_projection(kind);
+    debug_assert!(projection.preserve_wire_target);
+    debug_assert!(projection.preserve_wire_method);
+    debug_assert!(projection.preserve_wire_version);
+    debug_assert!(projection.preserve_client_identity);
+    let mut internal = req.clone();
+    // Request::target is the original wire request-target and backs
+    // %{THE_REQUEST}; it must not become a synthetic target. raw_path is the
+    // canonicalization input for the newly selected resource.
+    internal.raw_path = path.as_bytes().to_vec();
+    if !projection.preserve_query {
+        internal.query = target_query.unwrap_or_default().to_vec();
+    }
+    if !projection.preserve_body {
+        if !internal.prepare_error_document_transition() {
+            return None;
+        }
+    }
+    if !projection.preserve_method {
+        internal.method = "GET".to_string();
+    }
+    debug_assert_eq!(
+        projection.strip_entity_and_hop_headers,
+        !projection.preserve_body
+    );
+    Some(internal)
+}
+
+/// Perform one typed internal request through the normal dispatcher so
+/// handlers, access rules and `.htaccess` overrides are applied exactly as
+/// for a client request while transition-specific state is projected once.
 pub(crate) fn internal_dispatch(
     cfg: &Config,
     req: &Request,
     url: &str,
+    kind: vapache_verified::InternalRequestKind,
     peer: SocketAddr,
     local_ip: &str,
     local_port: u16,
 ) -> Response {
-    let mut internal = req.clone();
-    let mut target = url.as_bytes().to_vec();
-    if !internal.query.is_empty() {
-        target.push(b'?');
-        target.extend_from_slice(&internal.query);
-    }
-    internal.target = target;
-    internal.raw_path = url.as_bytes().to_vec();
-    internal.clear_body_for_internal_subrequest();
-    internal.framing = crate::verified::BodyFraming::None;
-    internal.expect_continue = false;
-    internal.headers.remove("content-length");
-    internal.headers.remove("transfer-encoding");
-    internal.headers.remove("expect");
+    let Some(internal) = project_internal_request(req, url, kind) else {
+        return Response::bytes(
+            500,
+            "text/plain; charset=UTF-8",
+            b"Invalid or recursive internal request\n".to_vec(),
+        );
+    };
     let host = host_header(&internal).unwrap_or("");
     let vhost = cfg.select_vhost(
         local_ip.parse().ok(),
@@ -6010,7 +6046,16 @@ fn dispatch_inner(
             if req.method == "OPTIONS" {
                 return options_response(cfg, &scope, None);
             }
-            if req.method != "GET" && req.method != "HEAD" {
+            // Apache's mod_dir admits POST long enough to select a
+            // DirectoryIndex. The selected target then decides whether POST
+            // is meaningful (CGI/FastCGI/proxy may consume it; a static index
+            // returns 405). Rejecting here made the internal transition
+            // impossible for application indexes.
+            if !vapache_verified::directory_index_method_admit(
+                req.method == "GET",
+                req.method == "HEAD",
+                req.method == "POST",
+            ) {
                 let mut r = error_response(
                     cfg,
                     vhost,
@@ -6024,7 +6069,7 @@ fn dispatch_inner(
                     local_ip,
                 );
                 r.headers
-                    .push(("Allow".into(), b"GET, HEAD, OPTIONS".to_vec()));
+                    .push(("Allow".into(), b"GET, HEAD, POST, OPTIONS".to_vec()));
                 return r;
             }
             // With `DirectorySlash Off`, Apache does not redirect `/dir` to
@@ -6064,7 +6109,32 @@ fn dispatch_inner(
                     auth_url.trim_end_matches('/'),
                     String::from_utf8_lossy(&name)
                 );
-                return internal_dispatch(cfg, req, &index_url, peer, local_ip, local_port);
+                return internal_dispatch(
+                    cfg,
+                    req,
+                    &index_url,
+                    vapache_verified::InternalRequestKind::DirectoryIndex,
+                    peer,
+                    local_ip,
+                    local_port,
+                );
+            }
+            if req.method == "POST" {
+                let mut r = error_response(
+                    cfg,
+                    vhost,
+                    &scope,
+                    405,
+                    req,
+                    &url_path,
+                    local_port,
+                    &server_name,
+                    peer.ip(),
+                    local_ip,
+                );
+                r.headers
+                    .push(("Allow".into(), b"GET, HEAD, OPTIONS".to_vec()));
+                return r;
             }
             let Some(actual_path) = crate::files::fd_path_cow(&file, &fs_path) else {
                 return error_response(
@@ -7211,6 +7281,183 @@ mod tests {
 
     fn cov_peer() -> SocketAddr {
         "127.0.0.1:12345".parse().unwrap()
+    }
+
+    #[test]
+    fn internal_request_kinds_project_state_without_forging_wire_identity() {
+        let mut outer = cov_req("POST", "/missing?original=1");
+        outer.raw_path = b"/missing".to_vec();
+        outer.query = b"original=1".to_vec();
+        outer.body = b"payload".to_vec();
+        outer.framing = crate::verified::BodyFraming::Length(7);
+        outer.expect_continue = true;
+        outer.headers.insert("host", b"example.test".to_vec());
+        outer
+            .headers
+            .insert("authorization", b"Basic dXNlcjpwYXNz".to_vec());
+        outer.headers.insert("content-length", b"7".to_vec());
+        outer.headers.insert("content-type", b"text/plain".to_vec());
+        outer.headers.insert("content-language", b"en".to_vec());
+        outer.headers.insert("range", b"bytes=0-1".to_vec());
+        outer.headers.insert("if-custom", b"state".to_vec());
+        outer.headers.insert("upgrade", b"websocket".to_vec());
+        outer
+            .headers
+            .insert("sec-websocket-protocol", b"chat".to_vec());
+        outer
+            .headers
+            .insert("connection", b"Upgrade, X-Hop".to_vec());
+        outer.headers.insert("x-hop", b"secret".to_vec());
+
+        let index = project_internal_request(
+            &outer,
+            "/dir/index.php",
+            vapache_verified::InternalRequestKind::DirectoryIndex,
+        )
+        .unwrap();
+        assert_eq!(index.target, outer.target);
+        assert_eq!(index.raw_path, b"/dir/index.php");
+        assert_eq!(index.method, "POST");
+        assert_eq!(index.query, b"original=1");
+        assert_eq!(index.body, b"payload");
+        assert_eq!(index.framing, crate::verified::BodyFraming::Length(7));
+        assert_eq!(index.header("x-hop"), Some(b"secret".as_slice()));
+
+        let error = project_internal_request(
+            &outer,
+            "/errors/show.php?status=404?detail=missing",
+            vapache_verified::InternalRequestKind::ErrorDocument,
+        )
+        .unwrap();
+        assert_eq!(error.target, outer.target);
+        assert_eq!(error.wire_method(), "POST");
+        assert_eq!(error.wire_target(), outer.target);
+        assert_eq!(error.wire_version(), outer.version);
+        assert_eq!(
+            error.wire_request_line().unwrap(),
+            "POST /missing?original=1 HTTP/1.1"
+        );
+        assert_eq!(error.raw_path, b"/errors/show.php");
+        assert_eq!(error.method, "GET");
+        assert_eq!(error.query, b"status=404?detail=missing");
+        assert_eq!(error.body_len(), 0);
+        assert_eq!(error.framing, crate::verified::BodyFraming::None);
+        assert!(!error.expect_continue);
+        assert_eq!(error.header("host"), Some(b"example.test".as_slice()));
+        assert!(error.header("authorization").is_some());
+        for stripped in [
+            "content-length",
+            "content-type",
+            "content-language",
+            "range",
+            "if-custom",
+            "upgrade",
+            "sec-websocket-protocol",
+            "connection",
+            "x-hop",
+        ] {
+            assert!(error.header(stripped).is_none(), "{stripped}");
+        }
+        assert_eq!(error.error_document_depth(), 1);
+        assert!(project_internal_request(
+            &error,
+            "/errors/again",
+            vapache_verified::InternalRequestKind::ErrorDocument,
+        )
+        .is_none());
+
+        for invalid in [
+            "relative",
+            "/fragment#part",
+            "/bad\\path",
+            "/bad\npath",
+            "/bad%zz",
+            "/bad%0dpath",
+            "/bad%ffpath",
+        ] {
+            assert!(project_internal_request(
+                &outer,
+                invalid,
+                vapache_verified::InternalRequestKind::ErrorDocument,
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn deferred_dynamic_internal_requests_apply_the_same_projection_at_execution() {
+        let _test_guard = ADMISSION_TEST_LOCK.lock().unwrap();
+        let dir = cov_dir("internal-transition-cgi");
+        std::fs::create_dir_all(dir.join("www/app")).unwrap();
+        let script = "#!/bin/sh\n\
+            IFS= read -r body || true\n\
+            printf 'Content-Type: text/plain\\r\\n\\r\\n'\n\
+            printf '%s|%s|%s|%s' \"$REQUEST_METHOD\" \"$QUERY_STRING\" \"${CONTENT_LENGTH-unset}\" \"$body\"\n";
+        for path in [dir.join("www/error.cgi"), dir.join("www/app/index.cgi")] {
+            std::fs::write(&path, script).unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            use std::os::unix::fs::PermissionsExt as _;
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "AddHandler cgi-script .cgi\n\
+                 ErrorDocument 404 /error.cgi?configured=1\n\
+                 ErrorDocument 405 /error.cgi?configured=1\n\
+                 <Directory \"{}/www\">\nOptions +ExecCGI\nRequire all granted\n</Directory>\n\
+                 <Directory \"{}/www/app\">\nOptions +ExecCGI\nDirectoryIndex index.cgi\n</Directory>\n",
+                dir.display(),
+                dir.display(),
+            ),
+        );
+
+        fn has_error_finalizer(handler: &PreparedHandler) -> bool {
+            match handler {
+                PreparedHandler::FinalizeErrorDocument { .. } => true,
+                PreparedHandler::FinalizeDispatch { handler, .. } => has_error_finalizer(handler),
+                PreparedHandler::Proxy { .. }
+                | PreparedHandler::FastCgi { .. }
+                | PreparedHandler::Cgi { .. } => false,
+            }
+        }
+        let execute = |mut req: Request| {
+            let expected_error = req.raw_path == b"/missing";
+            let handler =
+                match probe_prepared_handler(&cfg, &mut req, cov_peer(), "127.0.0.1", 80, false) {
+                    PreparedRouteDecision::Prepared { handler, .. } => handler,
+                    PreparedRouteDecision::Respond(response, _) => {
+                        panic!("expected prepared CGI handler, got {}", response.status)
+                    }
+                };
+            assert_eq!(has_error_finalizer(&handler), expected_error);
+            let response = execute_prepared_handler(&cfg, &mut req, cov_peer(), 80, false, handler);
+            assert!(matches!(response.status, 200 | 404 | 405));
+            match response.body {
+                Body::Bytes(body) => String::from_utf8(body).unwrap(),
+                _ => panic!("CGI response was not resident"),
+            }
+        };
+
+        let mut error = cov_req("POST", "/missing?original=1");
+        error.raw_path = b"/missing".to_vec();
+        error.query = b"original=1".to_vec();
+        error.body = b"payload\n".to_vec();
+        error.framing = crate::verified::BodyFraming::Length(8);
+        error.headers.insert("content-length", b"8".to_vec());
+        error.headers.insert("content-type", b"text/plain".to_vec());
+        assert_eq!(execute(error), "GET|configured=1|unset|");
+
+        let mut index = cov_req("POST", "/app/?original=1");
+        index.raw_path = b"/app/".to_vec();
+        index.query = b"original=1".to_vec();
+        index.body = b"payload\n".to_vec();
+        index.framing = crate::verified::BodyFraming::Length(8);
+        index.headers.insert("content-length", b"8".to_vec());
+        index.headers.insert("content-type", b"text/plain".to_vec());
+        assert_eq!(execute(index), "POST|original=1|8|payload");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

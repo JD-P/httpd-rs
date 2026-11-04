@@ -93,6 +93,7 @@ pub(crate) enum PayloadValueSchema {
     LegacyHosts,
     FileEtag,
     ErrorDocument,
+    DirectoryIndex,
     Header,
     Redirect {
         forced_status: Option<u16>,
@@ -291,6 +292,25 @@ impl SealedPayload {
         }
         let value = match schema.value {
             PayloadValueSchema::Tokens => SealedValue::Tokens,
+            PayloadValueSchema::DirectoryIndex => {
+                for name in &args {
+                    let bytes = name.as_bytes();
+                    if !vapache_verified::directory_index_name_admit(
+                        !name.is_empty(),
+                        matches!(name.as_str(), "." | ".."),
+                        bytes.iter().any(|byte| matches!(*byte, b'/' | b'\\')),
+                        bytes.iter().any(|byte| matches!(*byte, b'?' | b'#')),
+                        bytes.contains(&b'%'),
+                        bytes.iter().any(|byte| *byte <= b' ' || *byte == 0x7f),
+                    ) {
+                        return Err(
+                            "DirectoryIndex currently requires literal single-component names"
+                                .to_string(),
+                        );
+                    }
+                }
+                SealedValue::Tokens
+            }
             PayloadValueSchema::OnOff => match args.as_slice() {
                 [value] if value.eq_ignore_ascii_case("on") => SealedValue::OnOff(true),
                 [value] if value.eq_ignore_ascii_case("off") => SealedValue::OnOff(false),
@@ -353,6 +373,12 @@ impl SealedPayload {
                 let document = if target.starts_with("http://") || target.starts_with("https://") {
                     crate::config::ErrorDoc::External(target)
                 } else if target.starts_with('/') {
+                    if crate::util::split_internal_request_target(&target).is_none() {
+                        return Err(
+                            "local ErrorDocument requires an unambiguous absolute URL-path"
+                                .to_string(),
+                        );
+                    }
                     crate::config::ErrorDoc::Local(target)
                 } else {
                     crate::config::ErrorDoc::Text(target)

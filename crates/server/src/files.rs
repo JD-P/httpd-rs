@@ -1661,6 +1661,7 @@ fn serve_directory_inner(
                 cfg,
                 req,
                 &index_url,
+                vapache_verified::InternalRequestKind::DirectoryIndex,
                 std::net::SocketAddr::new(peer, 0),
                 local_ip,
                 port,
@@ -1963,6 +1964,10 @@ pub fn error_response(
             scope: scope.clone(),
             status,
             url_path: url_path.to_string(),
+            internal_target: match scope.error_document(status) {
+                Some(ErrorDoc::Local(path)) => path.clone(),
+                _ => unreachable!("a prepared local ErrorDocument retained its target"),
+            },
             port,
             host: host.to_string(),
         });
@@ -2003,23 +2008,6 @@ fn error_message(status: u16, url: &str) -> String {
     }
 }
 
-thread_local! {
-    static IN_ERROR_DOCUMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Set for the duration of one outer request when the returned response
-    /// was produced by a local `ErrorDocument` internal subrequest.  The cache
-    /// uses this provenance marker to avoid storing the error body under the
-    /// URL that failed (F56/I52).
-    static LOCAL_ERROR_DOCUMENT_RESPONSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-pub(crate) fn reset_local_error_document_response() {
-    LOCAL_ERROR_DOCUMENT_RESPONSE.with(|active| active.set(false));
-}
-
-pub(crate) fn mark_local_error_document_response() {
-    LOCAL_ERROR_DOCUMENT_RESPONSE.with(|active| active.set(true));
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finalize_prepared_error_document(
     cfg: &Config,
@@ -2034,9 +2022,12 @@ pub(crate) fn finalize_prepared_error_document(
     if response.status >= 300 {
         response = default_error_response(cfg, status, url_path, port, host);
     } else {
-        mark_local_error_document_response();
         response.status = status;
     }
+    // Provenance must travel with the response across async scheduling and
+    // cache-store boundaries. A thread-local marker can be reset by another
+    // request and is unnecessary when the response already owns this bit.
+    response.forbid_shared_cache();
     if scope
         .header_policy
         .apply(&mut response.headers, false)
@@ -2054,15 +2045,6 @@ pub(crate) fn finalize_prepared_error_document(
     response
 }
 
-pub(crate) fn local_error_document_response() -> bool {
-    LOCAL_ERROR_DOCUMENT_RESPONSE.with(|active| active.get())
-}
-
-#[cfg(test)]
-pub(crate) fn set_local_error_document_response_for_test(value: bool) {
-    LOCAL_ERROR_DOCUMENT_RESPONSE.with(|active| active.set(value));
-}
-
 fn serve_error_document(
     cfg: &Config,
     _vhost: Option<&VHost>,
@@ -2073,26 +2055,25 @@ fn serve_error_document(
     local_ip: &str,
     local_port: u16,
 ) -> Option<Response> {
-    // Avoid recursion when an error document itself fails (for example a
-    // missing ErrorDocument target).
-    if IN_ERROR_DOCUMENT.with(|active| active.replace(true)) {
+    // Avoid recursion when an error document itself fails. The depth follows
+    // the request, so unrelated async tasks cannot affect this decision.
+    if req.error_document_depth() >= 1 {
         return None;
     }
-    let response = crate::server::internal_dispatch(
+    let mut response = crate::server::internal_dispatch(
         cfg,
         req,
         path,
+        vapache_verified::InternalRequestKind::ErrorDocument,
         std::net::SocketAddr::new(peer, 0),
         local_ip,
         local_port,
     );
-    IN_ERROR_DOCUMENT.with(|active| active.set(false));
     if response.status >= 300 {
         return None;
     }
-    LOCAL_ERROR_DOCUMENT_RESPONSE.with(|active| active.set(true));
-    let mut response = response;
     response.status = status;
+    response.forbid_shared_cache();
     Some(response)
 }
 
@@ -2904,11 +2885,12 @@ mod tests {
         for status in [408, 413, 414, 505, 599] {
             assert!(!error_message(status, "/x").is_empty());
         }
-        IN_ERROR_DOCUMENT.with(|active| active.set(true));
+        let mut recursive = request("GET", b"/");
+        assert!(recursive.prepare_error_document_transition());
         assert!(serve_error_document(
             &cfg,
             None,
-            &request("GET", b"/"),
+            &recursive,
             "/missing",
             500,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -2916,7 +2898,6 @@ mod tests {
             80
         )
         .is_none());
-        IN_ERROR_DOCUMENT.with(|active| active.set(false));
         let local = serve_error_document(
             &cfg,
             None,
@@ -2929,8 +2910,7 @@ mod tests {
         )
         .expect("existing local error document");
         assert_eq!(local.status, 404);
-        assert!(local_error_document_response());
-        reset_local_error_document_response();
+        assert!(!local.shared_cache_eligible());
         assert_eq!(simple_html(302, "go", Some("/next")).status, 302);
 
         crate::expr::with_connection(true, 443, || {

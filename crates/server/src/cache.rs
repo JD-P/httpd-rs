@@ -2038,14 +2038,8 @@ pub fn store(
     cache_key: &str,
     target: &std::path::Path,
 ) {
-    // An ErrorDocument body belongs to the internal error target, not to the
-    // URL that failed.  Never persist it under the original key (F56/I52).
-    if !vapache_verified::cache_local_error_document_admit(
-        crate::files::local_error_document_response(),
-        true,
-    ) {
-        return;
-    }
+    // A local ErrorDocument marks the response itself ineligible before this
+    // boundary. Response-local provenance cannot bleed between async tasks.
     if !resp.shared_cache_eligible() || !crate::http::response_headers_valid(resp) {
         return;
     }
@@ -5202,9 +5196,9 @@ CacheIgnoreQueryString On\n\
         let wrong_grant =
             crate::access::grant_if_allowed(crate::access::Access::Allowed, wrong_key).unwrap();
         let mut response = Response::bytes(200, "text/plain", b"ok".to_vec());
-        crate::files::set_local_error_document_response_for_test(true);
+        response.forbid_shared_cache();
         call(&cfg, &base_req, &mut response, &good, "local-error");
-        crate::files::set_local_error_document_response_for_test(false);
+        response = Response::bytes(200, "text/plain", b"ok".to_vec());
         call(&cfg, &base_req, &mut response, &wrong_grant, "wrong-grant");
 
         for mut req in [

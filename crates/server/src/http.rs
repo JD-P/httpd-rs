@@ -128,6 +128,22 @@ pub struct Headers {
     // Drained bodies release their resident/spool storage before a slow
     // response finishes while retaining exact logging and cache accounting.
     discarded_body_len: u64,
+    // Local ErrorDocument recursion belongs to the request transition, not
+    // to an executor thread.  Keeping it here makes concurrently interleaved
+    // async requests independent while clones preserve the bound.
+    error_document_depth: u8,
+    // Internal recovery changes the dispatch method to GET, but Apache's
+    // THE_REQUEST remains the exact client request line. Keep that immutable
+    // identity separately from the mutable synthetic-request fields and
+    // share it across clones without copying the bounded request target.
+    wire_identity: Option<std::sync::Arc<WireRequestIdentity>>,
+}
+
+#[derive(Debug)]
+struct WireRequestIdentity {
+    method: String,
+    target: Vec<u8>,
+    version: Version,
 }
 
 impl Headers {
@@ -219,6 +235,53 @@ impl Headers {
 
     fn clear_streaming_body(&mut self) {
         self.streaming_body = None;
+    }
+
+    fn strip_internal_recovery_headers(&mut self) {
+        // Remove fields nominated by Connection before removing Connection
+        // itself. Otherwise a synthetic recovery request could accidentally
+        // promote a hop-by-hop extension field to an end-to-end backend field.
+        let nominated: HashSet<String> = self
+            .get_all("connection")
+            .flat_map(|value| value.split(|byte| *byte == b','))
+            .filter_map(|token| {
+                let token = token
+                    .iter()
+                    .copied()
+                    .skip_while(|byte| matches!(byte, b' ' | b'\t'))
+                    .collect::<Vec<_>>();
+                let end = token
+                    .iter()
+                    .rposition(|byte| !matches!(byte, b' ' | b'\t'))
+                    .map(|index| index + 1)
+                    .unwrap_or(0);
+                std::str::from_utf8(&token[..end])
+                    .ok()
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_ascii_lowercase)
+            })
+            .collect();
+        self.entries.retain(|(name, _)| {
+            !nominated.contains(name)
+                && !name.starts_with("content-")
+                && !name.starts_with("if-")
+                && !name.starts_with("sec-websocket-")
+                && !matches!(
+                    name.as_str(),
+                    "connection"
+                        | "keep-alive"
+                        | "proxy-connection"
+                        | "transfer-encoding"
+                        | "upgrade"
+                        | "te"
+                        | "trailer"
+                        | "expect"
+                        | "digest"
+                        | "want-digest"
+                        | "range"
+                        | "http2-settings"
+                )
+        });
     }
 }
 
@@ -581,6 +644,66 @@ impl Request {
         self.headers.clear_streaming_body();
         self.body.clear();
         self.body_spool = None;
+    }
+
+    pub(crate) fn prepare_error_document_transition(&mut self) -> bool {
+        let Some(depth) =
+            vapache_verified::error_document_depth_step(self.headers.error_document_depth, 1)
+        else {
+            return false;
+        };
+        if self.headers.wire_identity.is_none() {
+            self.headers.wire_identity = Some(std::sync::Arc::new(WireRequestIdentity {
+                method: self.method.clone(),
+                target: self.target.clone(),
+                version: self.version,
+            }));
+        }
+        self.headers.error_document_depth = depth;
+        self.headers.strip_internal_recovery_headers();
+        self.clear_body_for_internal_subrequest();
+        self.framing = BodyFraming::None;
+        self.expect_continue = false;
+        true
+    }
+
+    pub(crate) fn error_document_depth(&self) -> u8 {
+        self.headers.error_document_depth
+    }
+
+    pub(crate) fn wire_method(&self) -> &str {
+        self.headers
+            .wire_identity
+            .as_ref()
+            .map(|identity| identity.method.as_str())
+            .unwrap_or(&self.method)
+    }
+
+    pub(crate) fn wire_target(&self) -> &[u8] {
+        self.headers
+            .wire_identity
+            .as_ref()
+            .map(|identity| identity.target.as_slice())
+            .unwrap_or(&self.target)
+    }
+
+    pub(crate) fn wire_version(&self) -> Version {
+        self.headers
+            .wire_identity
+            .as_ref()
+            .map(|identity| identity.version)
+            .unwrap_or(self.version)
+    }
+
+    pub(crate) fn wire_request_line(&self) -> Result<String, &'static str> {
+        let target = std::str::from_utf8(self.wire_target())
+            .map_err(|_| "request target is not valid UTF-8")?;
+        Ok(format!(
+            "{} {} {}",
+            self.wire_method(),
+            target,
+            self.wire_version().as_str()
+        ))
     }
 
     pub(crate) fn charge_policy_work(&self, amount: u64) -> Result<(), &'static str> {
@@ -1872,6 +1995,8 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
             handler_probe: false,
             streaming_body: None,
             discarded_body_len: 0,
+            error_document_depth: 0,
+            wire_identity: None,
         },
         body: Vec::new(),
         body_spool: None,

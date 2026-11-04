@@ -2490,6 +2490,7 @@ fn access_directive_schema(name: &str) -> PayloadSchema {
         "allow" | "deny" => PayloadValueSchema::LegacyHosts,
         "fileetag" => PayloadValueSchema::FileEtag,
         "errordocument" => PayloadValueSchema::ErrorDocument,
+        "directoryindex" => PayloadValueSchema::DirectoryIndex,
         "header" => PayloadValueSchema::Header,
         "redirect" => PayloadValueSchema::Redirect {
             forced_status: None,
@@ -4876,6 +4877,10 @@ mod tests {
             ("ErrorDocument x /x\n", false),
             ("ErrorDocument 404 http://example.test/x\n", true),
             ("ErrorDocument 404 plain text\n", false),
+            ("DirectoryIndex index.html\n", true),
+            ("DirectoryIndex index%2ehtml\n", false),
+            ("DirectoryIndex index.html?variant=1\n", false),
+            ("DirectoryIndex nested/index.html\n", false),
             ("Order bogus\n", false),
             ("Allow all\n", false),
             ("Allow from bogus\n", false),

@@ -3680,6 +3680,7 @@ fn directive_payload_schema(name: &str) -> PayloadSchema {
         "allow" | "deny" => PayloadValueSchema::LegacyHosts,
         "fileetag" => PayloadValueSchema::FileEtag,
         "errordocument" => PayloadValueSchema::ErrorDocument,
+        "directoryindex" => PayloadValueSchema::DirectoryIndex,
         "header" => PayloadValueSchema::Header,
         "redirect" => PayloadValueSchema::Redirect {
             forced_status: None,
@@ -15057,6 +15058,15 @@ Require all granted\n\
         err("<Directory /x>\nAllow all\n</Directory>\n");
         err("<Directory /x>\nDeny from host.example\n</Directory>\n");
         err("ErrorDocument nope /x\n");
+        err("ErrorDocument 404 /error#fragment\n");
+        err("ErrorDocument 404 /bad\\\\path\n");
+        err("ErrorDocument 404 \"/error page\"\n");
+        err("ErrorDocument 404 /bad%zz\n");
+        err("ErrorDocument 404 /bad%0dpath\n");
+        err("ErrorDocument 404 /bad%ffpath\n");
+        err("DirectoryIndex index%2ehtml\n");
+        err("DirectoryIndex index.html?variant=1\n");
+        err("DirectoryIndex nested/index.html\n");
         err("<Directory /x>\nAliasMatch ( /x\n</Directory>\n");
         err("<Directory /x>\nAliasMatch onlyone\n</Directory>\n");
         err("<Directory /x>\nRedirectMatch ( /x\n</Directory>\n");
