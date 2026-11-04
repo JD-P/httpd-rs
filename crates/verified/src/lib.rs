@@ -2214,6 +2214,30 @@ pub proof fn cache_invalidation_preserves_unrelated_keyed_entry(
 {
 }
 
+/// A response-selected invalidation URI is usable only after its authority is
+/// proved equal to the effective request origin and its path has one canonical
+/// cache identity. Cross-origin Location values can never evict local entries.
+pub open spec fn cache_invalidation_target_spec(
+    same_origin: bool,
+    canonical_path: bool,
+) -> bool {
+    same_origin && canonical_path
+}
+
+pub fn cache_invalidation_target_admit(
+    same_origin: bool,
+    canonical_path: bool,
+) -> (admit: bool)
+    ensures admit == cache_invalidation_target_spec(same_origin, canonical_path),
+{
+    same_origin && canonical_path
+}
+
+pub proof fn cross_origin_cache_invalidation_is_rejected(canonical_path: bool)
+    ensures !cache_invalidation_target_spec(false, canonical_path),
+{
+}
+
 /// RFC cache invalidation is an effect of a successful unsafe request, not of
 /// an attacker-controlled failing POST/PUT. This also prevents a rejected
 /// request from forcing an O(cache-size) invalidation walk.
@@ -5429,17 +5453,150 @@ pub proof fn cache_fingerprint_field_injective(a: Seq<u8>, b: Seq<u8>)
     assert(cache_fingerprint_field_spec(b).skip(4) == b);
 }
 
-/// Cache store request gate: only a bodyless GET without credentials may
-/// populate the shared cache.  The runtime consumes this predicate before it
-/// inspects response headers or buffers the body.
-pub fn cache_store_request_admit(
-    method_get: bool,
+/// Transport values exported to CGI/FastCGI but not represented by ordinary
+/// HTTP fields.  If these bytes are absent from the cache identity, two
+/// requests can share a representation even though the application observes
+/// different SERVER_PROTOCOL or REMOTE_PORT values.
+pub open spec fn cache_transport_identity_spec(
+    protocol: u8,
+    remote_port: u16,
+    backend_transport_visible: bool,
+) -> Seq<u8> {
+    let selected_port = if backend_transport_visible { remote_port } else { 0 };
+    seq![
+        protocol,
+        if backend_transport_visible { 1u8 } else { 0u8 },
+        (selected_port / 256) as u8,
+        (selected_port % 256) as u8,
+    ]
+}
+
+pub fn cache_transport_identity(
+    protocol: u8,
+    remote_port: u16,
+    backend_transport_visible: bool,
+) -> (out: Vec<u8>)
+    ensures
+        out@ == cache_transport_identity_spec(
+            protocol,
+            remote_port,
+            backend_transport_visible,
+        ),
+{
+    let selected_port = if backend_transport_visible {
+        remote_port
+    } else {
+        0
+    };
+    let mut out = Vec::new();
+    out.push(protocol);
+    out.push(if backend_transport_visible { 1u8 } else { 0u8 });
+    out.push((selected_port / 256) as u8);
+    out.push((selected_port % 256) as u8);
+    out
+}
+
+pub proof fn cache_transport_identity_is_exact(
+    protocol_a: u8,
+    port_a: u16,
+    visible_a: bool,
+    protocol_b: u8,
+    port_b: u16,
+    visible_b: bool,
+)
+    requires
+        cache_transport_identity_spec(protocol_a, port_a, visible_a)
+            == cache_transport_identity_spec(protocol_b, port_b, visible_b),
+    ensures
+        protocol_a == protocol_b,
+        visible_a == visible_b,
+        visible_a ==> port_a == port_b,
+{
+}
+
+/// Cache lookup gate: a shared representation can satisfy only a bodyless,
+/// unframed GET/HEAD without identity-bearing credentials. Checking both the
+/// framing marker and the current body closes the head-phase and fully-read
+/// request paths with the same rule.
+pub fn cache_lookup_request_admit(
+    method_eligible: bool,
+    no_framing: bool,
     body_empty: bool,
     credential_free: bool,
 ) -> (ok: bool)
-    ensures ok == (method_get && body_empty && credential_free),
+    ensures ok == (method_eligible && no_framing && body_empty && credential_free),
 {
-    method_get && body_empty && credential_free
+    method_eligible && no_framing && body_empty && credential_free
+}
+
+/// Cache store request gate: only an unframed, bodyless GET without
+/// credentials or a request `no-store` directive may populate the shared
+/// cache.  The runtime consumes this predicate before it inspects response
+/// headers or buffers the body.
+pub fn cache_store_request_admit(
+    method_get: bool,
+    no_framing: bool,
+    body_empty: bool,
+    credential_free: bool,
+    request_storage_allowed: bool,
+) -> (ok: bool)
+    ensures
+        ok == (method_get
+            && no_framing
+            && body_empty
+            && credential_free
+            && request_storage_allowed),
+{
+    method_get && no_framing && body_empty && credential_free && request_storage_allowed
+}
+
+pub open spec fn cache_request_freshness_spec(
+    origin_fresh: bool,
+    current_age: u64,
+    max_age: Option<u64>,
+    remaining: u64,
+    min_fresh: Option<u64>,
+) -> bool {
+    origin_fresh
+        && match max_age {
+            Some(limit) => current_age <= limit,
+            None => true,
+        }
+        && match min_fresh {
+            Some(required) => remaining >= required,
+            None => true,
+        }
+}
+
+/// Apply request `max-age` and `min-fresh` as additional restrictions to the
+/// response's own freshness lifetime. Request directives can never make an
+/// origin-stale entry admissible.
+pub fn cache_request_freshness_admit(
+    origin_fresh: bool,
+    current_age: u64,
+    max_age: Option<u64>,
+    remaining: u64,
+    min_fresh: Option<u64>,
+) -> (ok: bool)
+    ensures
+        ok == cache_request_freshness_spec(
+            origin_fresh,
+            current_age,
+            max_age,
+            remaining,
+            min_fresh,
+        ),
+        ok ==> origin_fresh,
+{
+    origin_fresh
+        && match max_age {
+            Some(limit) => current_age <= limit,
+            None => true,
+        }
+        && match min_fresh {
+            Some(required) => remaining >= required,
+            None => true,
+        }
 }
 
 /// Only these statuses carry reusable representations.  Everything else is

@@ -3616,7 +3616,9 @@ pub(crate) enum PreparedHandler {
         vhost_index: Option<usize>,
         cache: Option<Box<crate::cache::CacheContext>>,
         host: String,
-        peer: std::net::IpAddr,
+        peer: SocketAddr,
+        local_port: u16,
+        https: bool,
         invalidation_path: String,
     },
     /// A local ErrorDocument is an explicit response transformation: execute
@@ -3697,6 +3699,8 @@ impl PreparedHandler {
                 cache,
                 host,
                 peer,
+                local_port,
+                https,
                 invalidation_path,
             } => {
                 let mut response = handler.execute(cfg, req);
@@ -3710,7 +3714,7 @@ impl PreparedHandler {
                 let context = req
                     .resource_context()
                     .cloned()
-                    .unwrap_or_else(|| cfg.resource_budget.context(peer));
+                    .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
                 if let Ok(_filesystem_work) = cfg.resource_budget.try_filesystem_work_in(&context) {
                     if let Some(cache) = cache {
                         crate::cache::store(
@@ -3725,10 +3729,18 @@ impl PreparedHandler {
                             &cache.grant,
                             &cache.key,
                             &cache.target,
+                            cache.backend_transport_visible,
                         );
                     }
                     if must_invalidate {
-                        crate::cache::invalidate(cfg, &host, &invalidation_path);
+                        crate::cache::invalidate_unsafe_response(
+                            cfg,
+                            &host,
+                            &invalidation_path,
+                            local_port,
+                            https,
+                            &response,
+                        );
                     }
                 } else if must_invalidate {
                     // Correctness cannot wait for filesystem capacity: make
@@ -4025,7 +4037,7 @@ fn dispatch_inner_request(
                 cfg,
                 vhost,
                 req,
-                peer.ip(),
+                peer,
                 plan,
                 &path,
                 local_port,
@@ -4059,10 +4071,11 @@ fn dispatch_inner_request(
             host,
             &cache_ctx.path,
             &cache_ctx.scope,
-            peer.ip(),
+            peer,
             &cache_ctx.grant,
             &cache_ctx.key,
             &cache_ctx.target,
+            cache_ctx.backend_transport_visible,
         ) {
             return resp;
         }
@@ -4086,7 +4099,9 @@ fn dispatch_inner_request(
             vhost_index: selected_vhost_index(cfg, vhost),
             cache: cache_scope.map(Box::new),
             host: host.to_string(),
-            peer: peer.ip(),
+            peer,
+            local_port,
+            https: https_for_cache,
             invalidation_path: invalidation_path.as_deref().unwrap_or(&path).to_string(),
         };
         resp = Response::prepared_handler(finalizer);
@@ -4099,16 +4114,24 @@ fn dispatch_inner_request(
                 host,
                 &cache_ctx.path,
                 &cache_ctx.scope,
-                peer.ip(),
+                peer,
                 &mut resp,
                 &cache_ctx.grant,
                 &cache_ctx.key,
                 &cache_ctx.target,
+                cache_ctx.backend_transport_visible,
             );
         }
         let unsafe_method = !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
         if vapache_verified::cache_invalidation_status_admit(unsafe_method, resp.status) {
-            crate::cache::invalidate(cfg, host, invalidation_path.as_deref().unwrap_or(&path));
+            crate::cache::invalidate_unsafe_response(
+                cfg,
+                host,
+                invalidation_path.as_deref().unwrap_or(&path),
+                local_port,
+                https_for_cache,
+                &resp,
+            );
         }
     }
     resp

@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-04",
   "verus": {
-    "verified_functions": 680,
+    "verified_functions": 686,
     "errors": 0
   },
   "obligations": [
@@ -116,7 +116,7 @@
       "title": "Reload advances a cache generation and stale entries are never served",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "cache_lookup_admit binds key/policy/Vary/generation/freshness; cache_lookup_hit_requires_binding and cache_lookup_rejects_stale mechanize the consequences. Conditional hits consume cache_if_none_match_matches and cache_conditional_hit_admit: the complete strict list scanner proves star or a validated stored tag witness, weak comparison validates both opaque tags, quoted commas remain inside a candidate, empty/trailing/malformed members fail closed, and If-None-Match has precedence even on a non-match. Disk metadata records the epoch, reload clears memory/disk and bumps the epoch, and PATH_INFO keys resolve to the actual CGI script; expiry uses verified saturating cache_expiry so positive TTLs cannot wrap into the past; admission is verified, reload orchestration is not"
+      "evidence": "cache_lookup_admit binds key/policy/Vary/generation/freshness; cache_lookup_hit_requires_binding and cache_lookup_rejects_stale mechanize the consequences. cache_request_freshness_admit applies request max-age/min-fresh only as additional restrictions and proves they cannot revive an origin-stale entry. Conditional hits consume cache_if_none_match_matches and cache_conditional_hit_admit: the complete strict list scanner proves star or a validated stored tag witness, weak comparison validates both opaque tags, quoted commas remain inside a candidate, empty/trailing/malformed members fail closed, and If-None-Match has precedence even on a non-match. Disk metadata records the epoch, reload clears memory/disk and bumps the epoch, and PATH_INFO keys resolve to the actual CGI script; expiry uses verified saturating cache_expiry so positive TTLs cannot wrap into the past; admission is verified, reload orchestration is not"
     },
     {
       "id": "resolve_root_identity",
@@ -179,7 +179,7 @@
       "title": "Cache keys bind request inputs that select authorization branches",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "cache_policy_material destructures Scope and hashes every policy slice (rewrite maps canonicalized); cache_policy_fingerprint frames each exact field with the verified injective cache_fingerprint_field and uses a 256-bit SHA-256 digest instead of the old 64-bit DefaultHasher; the digest also binds all request headers, peer, method and target. V7 disk metadata stores the complete base key, lookup consumes cache_disk_key_admit for an exact metadata-key match, and V6 and older metadata are deliberately ineligible after strict complete response cache-policy admission. Cache-Control is parsed across every field line with quoted-string ownership; malformed policy, qualified private/no-cache, conflicting TTLs, invalid Vary and ambiguous singleton metadata fail closed. cache_trailing_slash_target_admit rejects an unchanged regular-file representation ending in slash before lookup; canonical unsafe-method invalidation consumes cache_invalidation_remove_admit so unrelated keyed entries survive. The unit matrix mutates every policy field plus listener/vhost/URL/query/target/header dimensions, and F34 replay verifies header partitioning"
+      "evidence": "cache_policy_material destructures Scope and hashes every policy slice (rewrite maps canonicalized); cache_policy_fingerprint frames each exact field with the verified injective cache_fingerprint_field and uses a 256-bit SHA-256 digest instead of the old 64-bit DefaultHasher. The digest binds all request headers, peer address, method, target and HTTP protocol; CGI/FastCGI/custom-handler entries additionally bind the peer port exported to the backend, while static entries use a canonical zero port and remain reusable across connections. V7 disk metadata stores the complete base key, lookup consumes cache_disk_key_admit for an exact metadata-key match, and V6 and older metadata are deliberately ineligible after strict complete response cache-policy admission. Cache-Control is parsed across every field line with quoted-string ownership; malformed response or request policy, qualified private/no-cache, conflicting TTLs, invalid Vary and ambiguous singleton metadata fail closed. cache_trailing_slash_target_admit rejects an unchanged regular-file representation ending in slash before lookup. Successful unsafe responses invalidate the request URI plus only canonical same-origin Location/Content-Location targets; cache_invalidation_target_admit rejects cross-origin targets and cache_invalidation_remove_admit preserves unrelated keyed entries. The unit matrix mutates every policy field plus listener/vhost/URL/query/target/header/protocol/port dimensions, and F34 replay verifies header partitioning"
     },
     {
       "id": "proxy_serialization_safety",
@@ -424,7 +424,7 @@
       "title": "Only bodyless credential-free GETs with safe response shape enter the cache",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "cache_store_request_admit, cache_store_status_admit, cache_store_control_admit, cache_store_shape_admit and cache_store_ttl_admit mechanize the runtime store gates for method/body/credentials, cacheable statuses, Cache-Control overrides, Set-Cookie/Vary:*/size and positive freshness. cache_remaining_freshness proves origin Age/apparent age cannot increase the freshness lifetime and returns zero once consumed; explicit lifetimes are never raised by CacheMinExpire. cache_ttl_clamp returns zero for reversed CacheMinExpire/CacheMaxExpire instead of panicking on heuristic freshness. Unit matrix plus conformance cache cases exercise each branch"
+      "evidence": "cache_lookup_request_admit and cache_store_request_admit mechanize bodyless, unframed and credential-free request gates; Authorization, Proxy-Authorization and Cookie cannot enter the shared cache, and request no-store independently forbids storage. cache_store_status_admit, cache_store_control_admit, cache_store_shape_admit and cache_store_ttl_admit cover cacheable statuses, response Cache-Control overrides, Set-Cookie/Vary:*/size and positive freshness. cache_remaining_freshness proves origin Age/apparent age cannot increase the freshness lifetime and returns zero once consumed; explicit lifetimes are never raised by CacheMinExpire. cache_ttl_clamp returns zero for reversed CacheMinExpire/CacheMaxExpire instead of panicking on heuristic freshness. Unit matrix plus conformance cache cases exercise each branch"
     },
     {
       "id": "location_glob_parse_binding",

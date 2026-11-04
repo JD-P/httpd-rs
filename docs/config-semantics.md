@@ -1794,7 +1794,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **680 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **686 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -2326,7 +2326,7 @@ The current ledger (2026-11-04) is:
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **680 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **686 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

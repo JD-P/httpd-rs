@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
@@ -533,6 +533,10 @@ pub struct CacheContext {
     /// and policy.  Lookup and store must use this exact key.
     pub key: String,
     pub target: std::path::PathBuf,
+    /// CGI/FastCGI/custom handlers can observe SERVER_PROTOCOL and
+    /// REMOTE_PORT. Static representations cannot, and retaining this bit
+    /// keeps their cache entries reusable across client connections.
+    pub backend_transport_visible: bool,
     /// Effective cache URL.  For a directory request this is the selected
     /// `DirectoryIndex` URL, so lookup and store authorize the same resource.
     pub path: String,
@@ -548,7 +552,7 @@ pub fn request_scope(
     cfg: &Config,
     vhost: Option<&VHost>,
     req: &Request,
-    peer: IpAddr,
+    peer: SocketAddr,
     path: &str,
     local_port: u16,
     https: bool,
@@ -579,7 +583,7 @@ pub fn request_scope_with_plan(
     cfg: &Config,
     vhost: Option<&VHost>,
     req: &Request,
-    peer: IpAddr,
+    peer: SocketAddr,
     plan: &crate::request_plan::RequestPlan,
     path: &str,
     local_port: u16,
@@ -588,7 +592,12 @@ pub fn request_scope_with_plan(
     host: &str,
     local_ip: &str,
 ) -> Option<CacheContext> {
-    if req.method != "GET" && req.method != "HEAD" {
+    if !vapache_verified::cache_lookup_request_admit(
+        matches!(req.method.as_str(), "GET" | "HEAD"),
+        matches!(req.framing, crate::verified::BodyFraming::None),
+        req.body_len() == 0,
+        !request_has_shared_cache_credentials(req),
+    ) {
         return None;
     }
     if req.header("range").is_some() {
@@ -628,7 +637,7 @@ pub fn request_scope_with_plan(
     let rel = plan.rel().to_path_buf();
     let script_alias = plan.script_alias();
     let mapped_fs_path = plan.fs_path().to_path_buf();
-    let mut scope = plan.effective_scope(cfg, vhost, req, peer);
+    let mut scope = plan.effective_scope(cfg, vhost, req, peer.ip());
     // Cache lookup must not bypass rewrite rules.  If any rule would produce
     // an outcome (including F/G/redirects or a target/file change), run the
     // normal dispatcher instead of serving a stale representation.
@@ -636,7 +645,7 @@ pub fn request_scope_with_plan(
         plan,
         &cfg.server_root,
         &req.query,
-        peer,
+        peer.ip(),
         local_port,
         https,
         server_name,
@@ -691,7 +700,7 @@ pub fn request_scope_with_plan(
                     req,
                 )
                 .ok()?;
-                let mut script_scope = script_plan.effective_scope(cfg, vhost, req, peer);
+                let mut script_scope = script_plan.effective_scope(cfg, vhost, req, peer.ip());
                 // The PATH_INFO script target must keep the lexical script
                 // URL's execution/list policy as well as its own canonical
                 // policy.  The handler map comes from the script URL, not the
@@ -700,7 +709,7 @@ pub fn request_scope_with_plan(
                 let lexical_plan =
                     crate::request_plan::RequestPlan::resolve_for_request(cfg, vhost, lexical, req)
                         .ok()?;
-                let lexical_scope = lexical_plan.effective_scope(cfg, vhost, req, peer);
+                let lexical_scope = lexical_plan.effective_scope(cfg, vhost, req, peer.ip());
                 script_scope.restrict_with(&lexical_scope);
                 script_scope.restrict_policy_with(&scope);
                 scope = script_scope;
@@ -746,14 +755,14 @@ pub fn request_scope_with_plan(
                     req,
                 )
                 .ok()?;
-                let mut index_scope = index_plan.effective_scope(cfg, vhost, req, peer);
+                let mut index_scope = index_plan.effective_scope(cfg, vhost, req, peer.ip());
                 // The selected index has its own URL identity; conjoin that
                 // lexical scope and the directory URL's non-handler policy.
                 let lexical = crate::request_plan::CanonicalTarget::from_url_path(&index_url)?;
                 let lexical_plan =
                     crate::request_plan::RequestPlan::resolve_for_request(cfg, vhost, lexical, req)
                         .ok()?;
-                let lexical_scope = lexical_plan.effective_scope(cfg, vhost, req, peer);
+                let lexical_scope = lexical_plan.effective_scope(cfg, vhost, req, peer.ip());
                 index_scope.restrict_with(&lexical_scope);
                 index_scope.restrict_policy_with(&scope);
                 scope = index_scope;
@@ -784,7 +793,7 @@ pub fn request_scope_with_plan(
                 req,
             )
             .ok()?;
-            let mut target_scope = target_plan.effective_scope(cfg, vhost, req, peer);
+            let mut target_scope = target_plan.effective_scope(cfg, vhost, req, peer.ip());
             target_scope.restrict_with(&scope);
             scope = target_scope;
             fs_path = actual;
@@ -818,38 +827,36 @@ pub fn request_scope_with_plan(
             return None;
         }
     }
+    // Classify dynamic handlers for both query isolation and transport
+    // identity. CGI/FastCGI/custom handlers can observe connection metadata;
+    // a static response cannot, so binding its key to the ephemeral peer port
+    // would turn every new connection into a cache miss.
+    let name = fs_path
+        .file_name()
+        .map(|n| n.as_encoded_bytes())
+        .unwrap_or(b"");
+    let handler = crate::config::effective_handler(&scope, name)
+        .map(str::trim)
+        .filter(|h| {
+            !h.is_empty()
+                && !h.eq_ignore_ascii_case("default-handler")
+                && !h.eq_ignore_ascii_case("none")
+        })
+        .is_some();
+    let fastcgi =
+        crate::fastcgi::match_proxy_for_request(&scope, &cache_url_path, &root, req).is_some();
+    if req.policy_budget_failed() {
+        return None;
+    }
+    let backend_transport_visible =
+        script_alias || crate::cgi::is_cgi(cfg, &scope, name, false) || handler || fastcgi;
+    let proxy_route_match = crate::proxy::matches_route_req(&scope, &cache_url_path, req).ok()?;
+    let dynamic = backend_transport_visible || proxy_route_match;
     // `CacheIgnoreQueryString` is safe for static representations, but a
     // query-driven CGI/FastCGI/proxy/server-status/SetHandler response cannot
-    // be shared across distinct queries.  Classify every non-default handler,
+    // be shared across distinct queries. Classify every non-default handler,
     // not just the proxy forms known to `match_proxy` (F52/F54/I49/I53).
-    let mut proxy_route_match = None;
     if cfg.cache.ignore_query_string && !req.query.is_empty() {
-        let name = fs_path
-            .file_name()
-            .map(|n| n.as_encoded_bytes())
-            .unwrap_or(b"");
-        let handler = crate::config::effective_handler(&scope, name)
-            .map(str::trim)
-            .filter(|h| {
-                !h.is_empty()
-                    && !h.eq_ignore_ascii_case("default-handler")
-                    && !h.eq_ignore_ascii_case("none")
-            })
-            .is_some();
-        let fastcgi =
-            crate::fastcgi::match_proxy_for_request(&scope, &cache_url_path, &root, req).is_some();
-        if req.policy_budget_failed() {
-            return None;
-        }
-        let dynamic_without_proxy =
-            script_alias || crate::cgi::is_cgi(cfg, &scope, name, false) || handler || fastcgi;
-        let dynamic = if dynamic_without_proxy {
-            true
-        } else {
-            let matched = crate::proxy::matches_route_req(&scope, &cache_url_path, req).ok()?;
-            proxy_route_match = Some(matched);
-            matched
-        };
         if !vapache_verified::cache_dynamic_handler_admit(handler, dynamic) {
             // `dynamic` includes `handler` as a disjunct, so the verified
             // predicate proves that this fail-closed guard cannot reject.
@@ -867,13 +874,14 @@ pub fn request_scope_with_plan(
     }
     // Never bypass per-directory access control or a rewrite-set environment
     // requirement by serving a cached object without running dispatch.
-    let fingerprint = cache_policy_fingerprint(&scope, req, peer, &fs_path);
+    let fingerprint =
+        cache_policy_fingerprint(&scope, req, peer, &fs_path, backend_transport_visible);
     let resource =
         crate::access::ResourceKey::cache_policy(vhost, req, host, &cache_url_path, fingerprint);
     let grant = match crate::access::check_grant(
         &scope,
         req,
-        peer,
+        peer.ip(),
         None,
         &cache_url_path,
         Some(&fs_path),
@@ -887,10 +895,6 @@ pub fn request_scope_with_plan(
     if !scope.method_allowed(&req.method) {
         return None;
     }
-    let proxy_route_match = match proxy_route_match {
-        Some(matched) => matched,
-        None => crate::proxy::matches_route_req(&scope, &cache_url_path, req).ok()?,
-    };
     if proxy_route_match {
         return None;
     }
@@ -912,6 +916,7 @@ pub fn request_scope_with_plan(
         grant,
         key,
         target: fs_path,
+        backend_transport_visible,
         path: cache_url_path,
     })
 }
@@ -1047,8 +1052,9 @@ fn cache_policy_material(scope: &Scope) -> String {
 fn cache_policy_fingerprint(
     scope: &Scope,
     req: &Request,
-    peer: IpAddr,
+    peer: SocketAddr,
     target: &std::path::Path,
+    backend_transport_visible: bool,
 ) -> PolicyFingerprint {
     // Length-prefix every field so concatenation cannot make two different
     // material tuples look identical.  Hash the exact bytes with SHA-256; a
@@ -1056,7 +1062,19 @@ fn cache_policy_fingerprint(
     // for a value that decides whether two cache entries may be shared.
     let mut material = Vec::new();
     fingerprint_field(&mut material, cache_policy_material(scope).as_bytes());
-    fingerprint_field(&mut material, peer.to_string().as_bytes());
+    fingerprint_field(&mut material, peer.ip().to_string().as_bytes());
+    fingerprint_field(
+        &mut material,
+        &vapache_verified::cache_transport_identity(
+            match req.version {
+                crate::http::Version::Http10 => 10,
+                crate::http::Version::Http11 => 11,
+                crate::http::Version::Http2 => 20,
+            },
+            peer.port(),
+            backend_transport_visible,
+        ),
+    );
     fingerprint_field(&mut material, req.method.as_bytes());
     fingerprint_field(&mut material, target.as_os_str().as_bytes());
     // Configuration expressions (`Require expr`, `SetEnvIf`, rewrite
@@ -1081,36 +1099,60 @@ fn fingerprint_field(out: &mut Vec<u8>, field: &[u8]) {
     out.extend_from_slice(&vapache_verified::cache_fingerprint_field(field));
 }
 
-fn request_allows_lookup(cfg: &Config, req: &Request) -> bool {
-    if req.header("authorization").is_some() {
-        return false;
-    }
-    if cfg.cache.ignore_cache_control {
-        return true;
-    }
-    if let Some(pragma) = req.header("pragma") {
-        if pragma
-            .windows(b"no-cache".len())
-            .any(|window| window.eq_ignore_ascii_case(b"no-cache"))
-        {
-            return false;
-        }
-    }
-    let Some(cc) = req.header("cache-control") else {
-        return true;
-    };
-    !cc.split(|byte| *byte == b',').any(|value| {
-        let mut value = value;
-        while value.first().is_some_and(u8::is_ascii_whitespace) {
-            value = &value[1..];
-        }
-        while value.last().is_some_and(u8::is_ascii_whitespace) {
-            value = &value[..value.len() - 1];
-        }
-        value.eq_ignore_ascii_case(b"no-cache")
-            || value.eq_ignore_ascii_case(b"no-store")
-            || value.eq_ignore_ascii_case(b"max-age=0")
+fn request_has_shared_cache_credentials(req: &Request) -> bool {
+    ["authorization", "proxy-authorization", "cookie"]
+        .iter()
+        .any(|name| req.header(name).is_some())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RequestCachePolicy {
+    no_cache: bool,
+    no_store: bool,
+    max_age: Option<u64>,
+    min_fresh: Option<u64>,
+}
+
+fn parsed_request_cache_policy(req: &Request) -> Option<RequestCachePolicy> {
+    let directives =
+        crate::http::parse_cache_control_values(req.headers.get_all("cache-control")).ok()?;
+    Some(RequestCachePolicy {
+        no_cache: directives
+            .iter()
+            .any(|directive| directive.name == "no-cache"),
+        no_store: directives
+            .iter()
+            .any(|directive| directive.name == "no-store"),
+        max_age: directive_seconds(&directives, "max-age").ok()?,
+        min_fresh: directive_seconds(&directives, "min-fresh").ok()?,
     })
+}
+
+fn request_lookup_policy(cfg: &Config, req: &Request) -> Option<RequestCachePolicy> {
+    if cfg.cache.ignore_cache_control {
+        return Some(RequestCachePolicy::default());
+    }
+    if req.headers.get_all("pragma").any(|pragma| {
+        pragma
+            .split(|byte| *byte == b',')
+            .any(|token| crate::util::trim_ascii(token).eq_ignore_ascii_case(b"no-cache"))
+    }) {
+        return None;
+    }
+    let policy = parsed_request_cache_policy(req)?;
+    (!policy.no_cache && !policy.no_store && policy.max_age != Some(0)).then_some(policy)
+}
+
+fn request_freshness_allows(policy: RequestCachePolicy, entry: &Entry, now: i64) -> bool {
+    let current_age = u64::try_from(now.saturating_sub(entry.stored).max(0)).unwrap_or(u64::MAX);
+    let remaining = u64::try_from(entry.expires.saturating_sub(now).max(0)).unwrap_or(u64::MAX);
+    vapache_verified::cache_request_freshness_admit(
+        now < entry.expires,
+        current_age,
+        policy.max_age,
+        remaining,
+        policy.min_fresh,
+    )
 }
 
 fn combined_header(headers: &[(String, Vec<u8>)], name: &str) -> Option<String> {
@@ -1204,27 +1246,34 @@ pub fn lookup(
     host: &str,
     path: &str,
     scope: &Scope,
-    peer: IpAddr,
+    peer: SocketAddr,
     grant: &AccessGrant,
     cache_key: &str,
     target: &std::path::Path,
+    backend_transport_visible: bool,
 ) -> Option<Response> {
-    let fingerprint = cache_policy_fingerprint(scope, req, peer, target);
+    let fingerprint = cache_policy_fingerprint(scope, req, peer, target, backend_transport_visible);
     if !grant.require_sink(
         &crate::access::ResourceKey::cache_policy(vhost, req, host, path, fingerprint),
         vapache_verified::TransformSink::Cache,
     ) {
         return None;
     }
-    if !request_allows_lookup(cfg, req) {
+    if !vapache_verified::cache_lookup_request_admit(
+        matches!(req.method.as_str(), "GET" | "HEAD"),
+        matches!(req.framing, crate::verified::BodyFraming::None),
+        req.body_len() == 0,
+        !request_has_shared_cache_credentials(req),
+    ) {
         return None;
     }
+    let request_cache_policy = request_lookup_policy(cfg, req)?;
     let key = cache_key.to_string();
     let now = unix_now();
     let cache_context = req
         .resource_context()
         .cloned()
-        .unwrap_or_else(|| cfg.resource_budget.context(peer));
+        .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
     let mut found: Option<Arc<Entry>> = None;
     let mut response_resident = None;
     {
@@ -1246,6 +1295,7 @@ pub fn lookup(
                     entry.expires,
                     now,
                 )
+                && request_freshness_allows(request_cache_policy, &entry, now)
             {
                 // Arc cloning is constant-size and does not copy the cached
                 // representation while the process-wide lock is held.
@@ -1270,7 +1320,8 @@ pub fn lookup(
                 loaded.epoch == current_epoch(),
                 loaded.expires,
                 now,
-            ) {
+            ) || !request_freshness_allows(request_cache_policy, &loaded, now)
+            {
                 return None;
             }
             // Cover the response-body clone while the decoded disk entry is
@@ -2032,18 +2083,19 @@ pub fn store(
     host: &str,
     path: &str,
     scope: &Scope,
-    peer: IpAddr,
+    peer: SocketAddr,
     resp: &mut Response,
     grant: &AccessGrant,
     cache_key: &str,
     target: &std::path::Path,
+    backend_transport_visible: bool,
 ) {
     // A local ErrorDocument marks the response itself ineligible before this
     // boundary. Response-local provenance cannot bleed between async tasks.
     if !resp.shared_cache_eligible() || !crate::http::response_headers_valid(resp) {
         return;
     }
-    let fingerprint = cache_policy_fingerprint(scope, req, peer, target);
+    let fingerprint = cache_policy_fingerprint(scope, req, peer, target, backend_transport_visible);
     if !grant.require_sink(
         &crate::access::ResourceKey::cache_policy(vhost, req, host, path, fingerprint),
         vapache_verified::TransformSink::Cache,
@@ -2053,11 +2105,16 @@ pub fn store(
     // Credentialed responses are never placed in the shared cache.  The
     // cache has no identity dimension, so storing one and hoping a later
     // policy check rejects a different identity is not sufficient.
-    let credential_free = req.header("authorization").is_none() && req.header("cookie").is_none();
+    let Some(request_cache_policy) = parsed_request_cache_policy(req) else {
+        return;
+    };
+    let credential_free = !request_has_shared_cache_credentials(req);
     if !vapache_verified::cache_store_request_admit(
         req.method == "GET",
+        matches!(req.framing, crate::verified::BodyFraming::None),
         req.body_len() == 0,
         credential_free,
+        !request_cache_policy.no_store,
     ) {
         return;
     }
@@ -2105,7 +2162,7 @@ pub fn store(
         Some(context) => context,
         #[cfg(test)]
         None => {
-            fallback_context = cfg.resource_budget.context(peer);
+            fallback_context = cfg.resource_budget.context(peer.ip());
             &fallback_context
         }
         #[cfg(not(test))]
@@ -2159,7 +2216,7 @@ pub fn store(
     let cache_context = req
         .resource_context()
         .cloned()
-        .unwrap_or_else(|| cfg.resource_budget.context(peer));
+        .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
     let cache_write_bytes =
         body_len.saturating_add(entry.headers.iter().fold(256u64, |total, (name, value)| {
             total
@@ -2333,6 +2390,142 @@ pub fn invalidate(cfg: &Config, host: &str, path: &str) {
     invalidate_disk_prefix(cfg, prefix.as_bytes());
 }
 
+fn invalidation_location_path(
+    cfg: &Config,
+    value: &[u8],
+    request_path: &str,
+    host: &str,
+    local_port: u16,
+    https: bool,
+) -> Option<String> {
+    let value = crate::util::trim_ascii(value);
+    if value.is_empty()
+        || value
+            .iter()
+            .any(|byte| *byte <= b' ' || *byte == 0x7f || *byte == b'\\')
+    {
+        return None;
+    }
+    let value = std::str::from_utf8(value).ok()?;
+    let without_fragment = value.split_once('#').map_or(value, |(head, _)| head);
+    let reference = without_fragment
+        .split_once('?')
+        .map_or(without_fragment, |(head, _)| head);
+    let (same_origin, raw_path) = if let Some(rest) = reference.strip_prefix("//") {
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let target_default = if https { 443 } else { 80 };
+        let target = crate::util::parse_http_authority(authority.as_bytes(), target_default)?;
+        let request = crate::util::parse_http_authority(host.as_bytes(), local_port)?;
+        (
+            vapache_verified::authority_endpoint_equal(
+                target.0.as_bytes(),
+                target.1,
+                https,
+                request.0.as_bytes(),
+                request.1,
+                https,
+            ),
+            format!("/{path}"),
+        )
+    } else if let Some((scheme, rest)) = reference.split_once("://") {
+        let target_tls = if scheme.eq_ignore_ascii_case("http") {
+            false
+        } else if scheme.eq_ignore_ascii_case("https") {
+            true
+        } else {
+            return None;
+        };
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let target_default = if target_tls { 443 } else { 80 };
+        let target = crate::util::parse_http_authority(authority.as_bytes(), target_default)?;
+        let request = crate::util::parse_http_authority(host.as_bytes(), local_port)?;
+        (
+            vapache_verified::authority_endpoint_equal(
+                target.0.as_bytes(),
+                target.1,
+                target_tls,
+                request.0.as_bytes(),
+                request.1,
+                https,
+            ),
+            format!("/{path}"),
+        )
+    } else if reference.starts_with('/') {
+        (true, reference.to_string())
+    } else if reference.is_empty() {
+        (true, request_path.to_string())
+    } else {
+        // A colon in the first path segment makes this an absolute URI with
+        // an unsupported scheme, not a relative-path reference. Treating it
+        // as a local path would let a response-selected foreign namespace
+        // evict a same-origin cache entry.
+        if reference
+            .split('/')
+            .next()
+            .is_some_and(|segment| segment.contains(':'))
+        {
+            return None;
+        }
+        let base = request_path.rsplit_once('/').map_or("/", |(directory, _)| {
+            if directory.is_empty() {
+                "/"
+            } else {
+                directory
+            }
+        });
+        (
+            true,
+            format!("{}/{}", base.trim_end_matches('/'), reference),
+        )
+    };
+    if !same_origin {
+        return None;
+    }
+    let allow_encoded = cfg.encoded_slashes == crate::config::EncodedSlashes::On;
+    let canonical =
+        crate::request_plan::CanonicalTarget::from_raw_path(raw_path.as_bytes(), allow_encoded)
+            .ok()?;
+    vapache_verified::cache_invalidation_target_admit(same_origin, true)
+        .then_some(canonical.url_path)
+}
+
+/// Invalidate the effective request URI and the two response-selected URI
+/// fields named by RFC 9111. Each response field is accepted only when it is
+/// unambiguous, canonicalizable and same-origin; at most three targeted cache
+/// invalidations can result from one unsafe request.
+pub fn invalidate_unsafe_response(
+    cfg: &Config,
+    host: &str,
+    request_path: &str,
+    local_port: u16,
+    https: bool,
+    response: &Response,
+) {
+    let mut paths = vec![request_path.to_string()];
+    for field in ["location", "content-location"] {
+        let mut values = response
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(field))
+            .map(|(_, value)| value.as_slice());
+        let value = values.next();
+        if values.next().is_some() {
+            continue;
+        }
+        let Some(path) = value.and_then(|value| {
+            invalidation_location_path(cfg, value, request_path, host, local_port, https)
+        }) else {
+            continue;
+        };
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    for path in paths {
+        invalidate(cfg, host, &path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2412,9 +2605,9 @@ mod tests {
             framing: crate::verified::BodyFraming::None,
         };
         let scope = Scope::default();
-        let peer = "127.0.0.1".parse().unwrap();
+        let peer = "127.0.0.1:12345".parse().unwrap();
         let target = std::path::Path::new("/srv/path");
-        let fingerprint = cache_policy_fingerprint(&scope, &request, peer, target);
+        let fingerprint = cache_policy_fingerprint(&scope, &request, peer, target, false);
         let entry = Entry {
             policy: fingerprint,
             vary: Vec::new(),
@@ -2447,6 +2640,7 @@ mod tests {
             &crate::access::test_grant(),
             &memory_key,
             target,
+            false,
         )
         .expect("warm memory-admitted hit");
         assert!(matches!(memory_hit.body, crate::http::Body::Bytes(_)));
@@ -2471,6 +2665,7 @@ mod tests {
             &crate::access::test_grant(),
             &key,
             target,
+            false,
         )
         .expect("warm hit");
         match hit.body {
@@ -2484,11 +2679,11 @@ mod tests {
     fn large_cache_hit_is_served_from_the_disk_body_file() {
         let (dir, cfg) = disk_test_config("file-body");
         let request = test_request();
-        let peer = "127.0.0.1".parse().unwrap();
+        let peer = "127.0.0.1:12345".parse().unwrap();
         let scope = Scope::default();
         let target = std::path::Path::new("/srv/large.bin");
         let mut entry = disk_entry(&vec![b'z'; 128 * 1024], unix_now() + 60);
-        entry.policy = cache_policy_fingerprint(&scope, &request, peer, target);
+        entry.policy = cache_policy_fingerprint(&scope, &request, peer, target, false);
         let key = "host\n/large.bin\n";
         disk_store(&cfg, key, &entry);
         let hit = lookup(
@@ -2502,6 +2697,7 @@ mod tests {
             &crate::access::test_grant(),
             key,
             target,
+            false,
         )
         .expect("large cache hit");
         match hit.body {
@@ -2597,7 +2793,7 @@ AddHandler cgi-script .cgi\n\
             &cfg,
             None,
             &request,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             "/cgi/wallet.cgi/foo",
             80,
             false,
@@ -2650,7 +2846,7 @@ AddHandler cgi-script .cgi\n\
             &cfg,
             None,
             &req,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             "/app/x",
             80,
             false,
@@ -2678,7 +2874,7 @@ AddHandler cgi-script .cgi\n\
         )
         .unwrap();
         let scope = Scope::default();
-        let peer = "127.0.0.1".parse().unwrap();
+        let peer = "127.0.0.1:12345".parse().unwrap();
         let target = std::path::Path::new("/srv/tenant.txt");
         let request = |tenant: &str| {
             let mut headers = crate::http::Headers::default();
@@ -2697,8 +2893,8 @@ AddHandler cgi-script .cgi\n\
                 framing: crate::verified::BodyFraming::None,
             }
         };
-        let alpha = cache_policy_fingerprint(&scope, &request("alpha"), peer, target);
-        let beta = cache_policy_fingerprint(&scope, &request("beta"), peer, target);
+        let alpha = cache_policy_fingerprint(&scope, &request("alpha"), peer, target, false);
+        let beta = cache_policy_fingerprint(&scope, &request("beta"), peer, target, false);
         assert_ne!(alpha, beta, "tenant header must partition the cache");
         let _ = cfg;
         let _ = fs::remove_dir_all(&dir);
@@ -2707,9 +2903,10 @@ AddHandler cgi-script .cgi\n\
     #[test]
     fn cache_policy_fingerprint_binds_every_policy_field() {
         let request = test_request();
-        let peer = "127.0.0.1".parse().unwrap();
+        let peer = "127.0.0.1:12345".parse().unwrap();
         let target = std::path::Path::new("/srv/x");
-        let fingerprint = |scope: &Scope| cache_policy_fingerprint(scope, &request, peer, target);
+        let fingerprint =
+            |scope: &Scope| cache_policy_fingerprint(scope, &request, peer, target, false);
         let baseline = fingerprint(&Scope::default());
 
         let cases: Vec<(&str, fn(&mut Scope))> =
@@ -3057,7 +3254,7 @@ AddHandler cgi-script .cgi\n\
     #[test]
     fn cache_policy_material_is_stable_for_rewrite_map_order() {
         let request = test_request();
-        let peer = "127.0.0.1".parse().unwrap();
+        let peer = "127.0.0.1:12345".parse().unwrap();
         let target = std::path::Path::new("/srv/x");
         let scope_with = |entries: [(&str, &str); 2]| {
             let mut scope = Scope::default();
@@ -3075,8 +3272,8 @@ AddHandler cgi-script .cgi\n\
         let a = scope_with([("a", "1"), ("b", "2")]);
         let b = scope_with([("b", "2"), ("a", "1")]);
         assert_eq!(
-            cache_policy_fingerprint(&a, &request, peer, target),
-            cache_policy_fingerprint(&b, &request, peer, target),
+            cache_policy_fingerprint(&a, &request, peer, target, false),
+            cache_policy_fingerprint(&b, &request, peer, target, false),
             "rewrite map iteration order must not change the cache fingerprint"
         );
     }
@@ -3304,10 +3501,11 @@ AddHandler cgi-script .cgi\n\
         );
 
         let request = test_request();
-        let peer = "127.0.0.1".parse().unwrap();
-        let fingerprint = |req: &crate::http::Request, peer: IpAddr, target: &std::path::Path| {
-            cache_policy_fingerprint(&Scope::default(), req, peer, target)
-        };
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let fingerprint =
+            |req: &crate::http::Request, peer: SocketAddr, target: &std::path::Path| {
+                cache_policy_fingerprint(&Scope::default(), req, peer, target, true)
+            };
         let baseline_fp = fingerprint(&request, peer, target);
         let mut other = test_request();
         other.method = "HEAD".into();
@@ -3319,8 +3517,33 @@ AddHandler cgi-script .cgi\n\
         assert_ne!(baseline_fp, fingerprint(&other, peer, target), "header");
         assert_ne!(
             baseline_fp,
-            fingerprint(&request, "127.0.0.2".parse().unwrap(), target),
+            fingerprint(&request, "127.0.0.2:12345".parse().unwrap(), target),
             "peer"
+        );
+        assert_ne!(
+            baseline_fp,
+            fingerprint(&request, "127.0.0.1:12346".parse().unwrap(), target),
+            "CGI REMOTE_PORT"
+        );
+        other = test_request();
+        other.version = crate::http::Version::Http2;
+        assert_ne!(
+            baseline_fp,
+            fingerprint(&other, peer, target),
+            "CGI SERVER_PROTOCOL"
+        );
+        let static_fingerprint = |req: &crate::http::Request, peer: SocketAddr| {
+            cache_policy_fingerprint(&Scope::default(), req, peer, target, false)
+        };
+        assert_eq!(
+            static_fingerprint(&request, peer),
+            static_fingerprint(&request, "127.0.0.1:12346".parse().unwrap()),
+            "static entries must remain reusable across source ports"
+        );
+        assert_ne!(
+            static_fingerprint(&request, peer),
+            static_fingerprint(&other, peer),
+            "protocol adapters retain distinct cache identities"
         );
         assert_ne!(
             baseline_fp,
@@ -3394,7 +3617,7 @@ AddHandler cgi-script .cgi\n\
             &cfg,
             None,
             &request,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             "/cgi/wallet.cgi",
             80,
             false,
@@ -3500,7 +3723,7 @@ CacheEnable disk /\n\
             &cfg,
             None,
             &request,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             "/\u{fffd}",
             80,
             false,
@@ -3571,7 +3794,7 @@ CacheIgnoreQueryString On\n\
                     &cfg,
                     None,
                     &request,
-                    "127.0.0.1".parse().unwrap(),
+                    "127.0.0.1:12345".parse().unwrap(),
                     "/direct.php",
                     80,
                     false,
@@ -3582,6 +3805,23 @@ CacheIgnoreQueryString On\n\
                 .is_none(),
                 "dynamic handler {handler} was treated as static"
             );
+            let mut unqueried = request.clone();
+            unqueried.target = b"/direct.php".to_vec();
+            unqueried.query.clear();
+            let context = request_scope(
+                &cfg,
+                None,
+                &unqueried,
+                "127.0.0.1:12345".parse().unwrap(),
+                "/direct.php",
+                80,
+                false,
+                "localhost",
+                "localhost",
+                "127.0.0.1",
+            )
+            .expect("unqueried dynamic handler cache scope");
+            assert!(context.backend_transport_visible);
             let _ = fs::remove_dir_all(&dir);
         }
     }
@@ -3639,7 +3879,7 @@ ErrorDocument 404 /404.html\n\
             &cfg,
             None,
             &request,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             "/missing",
             80,
             false,
@@ -3704,7 +3944,7 @@ DirectoryIndex index.html\n\
             &cfg,
             None,
             &request,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             "/dir/",
             80,
             false,
@@ -3725,7 +3965,7 @@ DirectoryIndex index.html\n\
             &cfg,
             None,
             &request,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             "/dir/",
             80,
             false,
@@ -3781,7 +4021,7 @@ CacheDisable /disabled\n\
                 &cfg,
                 None,
                 &req,
-                "127.0.0.1".parse().unwrap(),
+                "127.0.0.1:12345".parse().unwrap(),
                 path,
                 80,
                 false,
@@ -3848,7 +4088,7 @@ CacheIgnoreQueryString On\n\
             &fastcgi_cfg,
             None,
             &dynamic,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             "/fcgi/test.php",
             80,
             false,
@@ -3865,7 +4105,7 @@ CacheIgnoreQueryString On\n\
             &proxy_cfg,
             None,
             &dynamic,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             "/proxy/item",
             80,
             false,
@@ -3881,11 +4121,11 @@ CacheIgnoreQueryString On\n\
         static_query.target = b"/static.txt?a=1".to_vec();
         static_query.raw_path = b"/static.txt".to_vec();
         static_query.query = b"a=1".to_vec();
-        assert!(request_scope(
+        let static_scope = request_scope(
             &static_cfg,
             None,
             &static_query,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             "/static.txt",
             80,
             false,
@@ -3893,7 +4133,8 @@ CacheIgnoreQueryString On\n\
             "localhost",
             "127.0.0.1",
         )
-        .is_some());
+        .expect("static query remains cacheable");
+        assert!(!static_scope.backend_transport_visible);
         assert!(static_query
             .charge_policy_work(crate::resource::MAX_POLICY_WORK_UNITS)
             .is_err());
@@ -3901,7 +4142,7 @@ CacheIgnoreQueryString On\n\
             &static_cfg,
             None,
             &static_query,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             "/static.txt",
             80,
             false,
@@ -3916,7 +4157,7 @@ CacheIgnoreQueryString On\n\
             &proxy_cfg,
             None,
             &dynamic,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             "/proxy/item",
             80,
             false,
@@ -3984,16 +4225,22 @@ CacheIgnoreQueryString On\n\
     #[test]
     fn verified_cache_store_and_accounting_gates_cover_edge_cases() {
         assert!(vapache_verified::cache_store_request_admit(
-            true, true, true
+            true, true, true, true, true
         ));
         assert!(!vapache_verified::cache_store_request_admit(
-            false, true, true
+            false, true, true, true, true
         ));
         assert!(!vapache_verified::cache_store_request_admit(
-            true, false, true
+            true, false, true, true, true
         ));
         assert!(!vapache_verified::cache_store_request_admit(
-            true, true, false
+            true, true, false, true, true
+        ));
+        assert!(!vapache_verified::cache_store_request_admit(
+            true, true, true, false, true
+        ));
+        assert!(!vapache_verified::cache_store_request_admit(
+            true, true, true, true, false
         ));
 
         assert!(vapache_verified::cache_store_status_admit(200));
@@ -4186,6 +4433,82 @@ CacheIgnoreQueryString On\n\
     }
 
     #[test]
+    fn unsafe_response_invalidates_only_canonical_same_origin_targets() {
+        let (dir, cfg) = disk_test_config("response-invalidation");
+        let host = "cache.example:8443";
+        assert_eq!(
+            invalidation_location_path(
+                &cfg,
+                b"https://cache.example:8443/a/../object?fresh=1#part",
+                "/update",
+                host,
+                8443,
+                true,
+            )
+            .as_deref(),
+            Some("/object")
+        );
+        assert_eq!(
+            invalidation_location_path(&cfg, b"../relative", "/api/update", host, 8443, true,)
+                .as_deref(),
+            Some("/relative")
+        );
+        for rejected in [
+            b"http://cache.example:8443/object".as_slice(),
+            b"https://other.example:8443/object".as_slice(),
+            b"https://cache.example:9443/object".as_slice(),
+            b"mailto:cache.example/object".as_slice(),
+            b"/bad\\path".as_slice(),
+        ] {
+            assert!(
+                invalidation_location_path(&cfg, rejected, "/update", host, 8443, true,).is_none()
+            );
+        }
+
+        let key = |path: &str| {
+            base_key(
+                &cfg,
+                None,
+                "127.0.0.1",
+                8443,
+                true,
+                host,
+                path,
+                path,
+                b"",
+                Path::new("/srv/item"),
+                [7u8; 32],
+            )
+        };
+        let paths = ["/update", "/object", "/relative", "/unrelated"];
+        {
+            let mut memory = entries().lock().unwrap_or_else(|error| error.into_inner());
+            for path in paths {
+                memory.entries.insert(
+                    key(path),
+                    vec![Arc::new(disk_entry(path.as_bytes(), unix_now() + 60))],
+                );
+            }
+        }
+        let mut response = Response::new(204);
+        response.headers.push((
+            Cow::Borrowed("Location"),
+            b"https://cache.example:8443/object".to_vec(),
+        ));
+        response
+            .headers
+            .push((Cow::Borrowed("Content-Location"), b"relative".to_vec()));
+        invalidate_unsafe_response(&cfg, host, "/update", 8443, true, &response);
+        let memory = entries().lock().unwrap_or_else(|error| error.into_inner());
+        for removed in ["/update", "/object", "/relative"] {
+            assert!(!memory.entries.contains_key(&key(removed)), "{removed}");
+        }
+        assert!(memory.entries.contains_key(&key("/unrelated")));
+        drop(memory);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn disk_cache_enforces_total_quota_and_rejects_oversize_entries() {
         let (dir, mut cfg) = disk_test_config("evict");
         cfg.cache.max_disk_size = 6_000;
@@ -4366,30 +4689,71 @@ CacheIgnoreQueryString On\n\
 
         let mut req = test_request();
         req.headers.insert("authorization", b"Basic eA==".to_vec());
-        assert!(!request_allows_lookup(&cfg, &req));
+        assert!(request_has_shared_cache_credentials(&req));
+        assert!(!vapache_verified::cache_lookup_request_admit(
+            true,
+            true,
+            true,
+            !request_has_shared_cache_credentials(&req),
+        ));
         req.headers = Default::default();
         req.headers.insert("pragma", b"NO-CACHE".to_vec());
-        assert!(!request_allows_lookup(&cfg, &req));
+        assert!(request_lookup_policy(&cfg, &req).is_none());
         req.headers.insert("cache-control", b"public".to_vec());
-        assert!(!request_allows_lookup(&cfg, &req));
+        assert!(request_lookup_policy(&cfg, &req).is_none());
         req.headers = Default::default();
         req.headers
             .insert("cache-control", b"private, max-age=0".to_vec());
-        assert!(!request_allows_lookup(&cfg, &req));
+        assert!(request_lookup_policy(&cfg, &req).is_none());
         req.headers
             .insert("cache-control", b"public, \xff, no-cache".to_vec());
-        assert!(!request_allows_lookup(&cfg, &req));
+        assert!(request_lookup_policy(&cfg, &req).is_none());
         req.headers = Default::default();
         req.headers
             .insert("pragma", b"extension=\xff, NO-CACHE".to_vec());
-        assert!(!request_allows_lookup(&cfg, &req));
+        assert!(request_lookup_policy(&cfg, &req).is_none());
         req.headers = Default::default();
         req.headers
             .insert("cache-control", b"public, no-cache   ".to_vec());
-        assert!(!request_allows_lookup(&cfg, &req));
+        assert!(request_lookup_policy(&cfg, &req).is_none());
         cfg.cache.ignore_cache_control = true;
-        assert!(request_allows_lookup(&cfg, &req));
+        assert!(request_lookup_policy(&cfg, &req).is_some());
         cfg.cache.ignore_cache_control = false;
+
+        req.headers = Default::default();
+        req.headers
+            .insert("cache-control", b"max-age = 000".to_vec());
+        assert!(request_lookup_policy(&cfg, &req).is_none());
+        req.headers
+            .insert("cache-control", b"max-age=10, min-fresh=20".to_vec());
+        let policy = request_lookup_policy(&cfg, &req).unwrap();
+        assert_eq!(policy.max_age, Some(10));
+        assert_eq!(policy.min_fresh, Some(20));
+        let now = unix_now();
+        let mut constrained = disk_entry(b"x", now + 60);
+        constrained.stored = now - 11;
+        assert!(!request_freshness_allows(policy, &constrained, now));
+        constrained.stored = now - 10;
+        constrained.expires = now + 19;
+        assert!(!request_freshness_allows(policy, &constrained, now));
+        constrained.expires = now + 20;
+        assert!(request_freshness_allows(policy, &constrained, now));
+
+        req.headers = Default::default();
+        req.headers
+            .insert("proxy-authorization", b"Basic eA==".to_vec());
+        assert!(request_has_shared_cache_credentials(&req));
+        req.headers = Default::default();
+        req.headers.insert("cache-control", b"no-store".to_vec());
+        assert!(parsed_request_cache_policy(&req).unwrap().no_store);
+        req.framing = crate::verified::BodyFraming::Length(0);
+        assert!(!vapache_verified::cache_lookup_request_admit(
+            true,
+            matches!(req.framing, crate::verified::BodyFraming::None),
+            req.body_len() == 0,
+            true,
+        ));
+        req.framing = crate::verified::BodyFraming::None;
 
         let headers = vec![
             ("Vary".into(), b"Accept-Encoding,,*".to_vec()),
@@ -4445,8 +4809,9 @@ CacheIgnoreQueryString On\n\
         let policy = cache_policy_fingerprint(
             &Scope::default(),
             &req,
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             Path::new("/tmp/target"),
+            false,
         );
         let key = "lookup-edges".to_string();
         entries().lock().unwrap().entries.insert(
@@ -4492,8 +4857,9 @@ CacheIgnoreQueryString On\n\
             cache_policy_fingerprint(
                 &Scope::default(),
                 &conditional,
-                "127.0.0.1".parse().unwrap(),
+                "127.0.0.1:12345".parse().unwrap(),
                 Path::new("/tmp/target"),
+                false,
             );
         drop(memory);
         let hit = lookup(
@@ -4503,10 +4869,11 @@ CacheIgnoreQueryString On\n\
             "host",
             "/x",
             &Scope::default(),
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             &crate::access::test_grant(),
             &key,
             Path::new("/tmp/target"),
+            false,
         )
         .unwrap();
         assert_eq!(hit.status, 304);
@@ -4529,10 +4896,11 @@ CacheIgnoreQueryString On\n\
             "host",
             "/x",
             &Scope::default(),
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             &crate::access::test_grant(),
             &key,
             Path::new("/tmp/target"),
+            false,
         )
         .unwrap();
         assert_eq!(body_hit.body_len(), 5);
@@ -4550,10 +4918,11 @@ CacheIgnoreQueryString On\n\
             "host",
             "/x",
             &Scope::default(),
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             &wrong_grant,
             "wrong-grant-lookup",
             Path::new("/tmp/target"),
+            false,
         )
         .is_none());
         let mut no_cache = req.clone();
@@ -4567,10 +4936,11 @@ CacheIgnoreQueryString On\n\
             "host",
             "/x",
             &Scope::default(),
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             &crate::access::test_grant(),
             "no-cache-lookup",
             Path::new("/tmp/target"),
+            false,
         )
         .is_none());
 
@@ -4590,10 +4960,11 @@ CacheIgnoreQueryString On\n\
             "host",
             "/x",
             &Scope::default(),
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             &crate::access::test_grant(),
             &expired_key,
             Path::new("/tmp/target"),
+            false,
         )
         .is_none());
         assert!(!entries().lock().unwrap().entries.contains_key(&expired_key));
@@ -4612,10 +4983,11 @@ CacheIgnoreQueryString On\n\
             "host",
             "/x",
             &Scope::default(),
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:12345".parse().unwrap(),
             &crate::access::test_grant(),
             mismatched_key,
             Path::new("/tmp/target"),
+            false,
         )
         .is_none());
 
@@ -5178,7 +5550,7 @@ CacheIgnoreQueryString On\n\
         cfg.cache.default_expire = 60;
         cfg.cache.ignore_no_last_mod = true;
         let scope = Scope::default();
-        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let target = Path::new("/tmp/cache-target");
         let base_req = test_request();
         let good = crate::access::test_grant();
@@ -5188,7 +5560,7 @@ CacheIgnoreQueryString On\n\
                     grant: &AccessGrant,
                     key: &str| {
             store(
-                cfg, None, req, "host", "/x", &scope, peer, response, grant, key, target,
+                cfg, None, req, "host", "/x", &scope, peer, response, grant, key, target, false,
             )
         };
 
@@ -5226,6 +5598,38 @@ CacheIgnoreQueryString On\n\
             let mut response = Response::bytes(200, "text/plain", b"ok".to_vec());
             call(&cfg, &req, &mut response, &good, "bad-request");
             req.headers = Default::default();
+        }
+        for (key, req) in [
+            ("proxy-credential-request", {
+                let mut request = base_req.clone();
+                request
+                    .headers
+                    .insert("proxy-authorization", b"Basic eA==".to_vec());
+                request
+            }),
+            ("framed-empty-request", {
+                let mut request = base_req.clone();
+                request.framing = crate::verified::BodyFraming::Length(0);
+                request
+            }),
+            ("request-no-store", {
+                let mut request = base_req.clone();
+                request
+                    .headers
+                    .insert("cache-control", b"no-store".to_vec());
+                request
+            }),
+            ("malformed-request-cache-control", {
+                let mut request = base_req.clone();
+                request
+                    .headers
+                    .insert("cache-control", b"max-age=\"unterminated".to_vec());
+                request
+            }),
+        ] {
+            let mut response = Response::bytes(200, "text/plain", b"ok".to_vec());
+            call(&cfg, &req, &mut response, &good, key);
+            assert!(!entries().lock().unwrap().entries.contains_key(key));
         }
 
         let mut response = Response::bytes(500, "text/plain", b"no".to_vec());
@@ -5414,7 +5818,7 @@ CacheIgnoreQueryString On\n\
         }
         entries().lock().unwrap().entries.remove("new-key");
 
-        let policy = cache_policy_fingerprint(&scope, &base_req, peer, target);
+        let policy = cache_policy_fingerprint(&scope, &base_req, peer, target, false);
         let mut variants = MemoryCache::default();
         variants.entries.insert(
             "variants".into(),
