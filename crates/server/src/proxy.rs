@@ -183,6 +183,7 @@ impl<T: Read + Write + Send> ReadWrite for T {}
 struct DeadlineStream {
     inner: Box<dyn ReadWrite>,
     deadline: Instant,
+    scope: Option<crate::resource::RequestScope>,
 }
 
 impl DeadlineStream {
@@ -192,11 +193,26 @@ impl DeadlineStream {
             "proxy exchange deadline exceeded",
         )
     }
+
+    fn cancelled(&self) -> Option<std::io::Error> {
+        self.scope
+            .as_ref()
+            .is_some_and(crate::resource::RequestScope::is_cancelled)
+            .then(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "proxy request scope cancelled",
+                )
+            })
+    }
 }
 
 impl Read for DeadlineStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
+            if let Some(error) = self.cancelled() {
+                return Err(error);
+            }
             if Instant::now() >= self.deadline {
                 return Err(self.timed_out());
             }
@@ -215,6 +231,9 @@ impl Read for DeadlineStream {
 impl Write for DeadlineStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         loop {
+            if let Some(error) = self.cancelled() {
+                return Err(error);
+            }
             if Instant::now() >= self.deadline {
                 return Err(self.timed_out());
             }
@@ -231,6 +250,9 @@ impl Write for DeadlineStream {
 
     fn flush(&mut self) -> std::io::Result<()> {
         loop {
+            if let Some(error) = self.cancelled() {
+                return Err(error);
+            }
             if Instant::now() >= self.deadline {
                 return Err(self.timed_out());
             }
@@ -641,7 +663,7 @@ fn check_health(spec: &HealthSpec) -> bool {
     scope.proxy_policy.proxy_ca_trust = spec.ca_trust;
     let timeout = Duration::from_secs(5);
     let deadline = Instant::now() + timeout;
-    let Ok(stream) = connect(&backend, &scope, timeout, deadline) else {
+    let Ok(stream) = connect(&backend, &scope, timeout, deadline, None) else {
         return false;
     };
     check_health_stream(stream, spec, &backend)
@@ -2108,6 +2130,21 @@ pub(crate) fn resolve_backend_addrs(
     port: u16,
     timeout: Duration,
 ) -> std::io::Result<Vec<SocketAddr>> {
+    resolve_backend_addrs_cancellable(host, port, timeout, None)
+}
+
+pub(crate) fn resolve_backend_addrs_cancellable(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    request_scope: Option<&crate::resource::RequestScope>,
+) -> std::io::Result<Vec<SocketAddr>> {
+    if request_scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "proxy request scope cancelled",
+        ));
+    }
     if let Some(addresses) = literal_backend_addrs(host, port) {
         return Ok(addresses);
     }
@@ -2122,16 +2159,33 @@ pub(crate) fn resolve_backend_addrs(
     {
         return Ok(addresses);
     }
-    let addresses = submit_dns(host, port, timeout)?
-        .recv_timeout(timeout)
-        .map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy DNS timeout")
+    let rx = submit_dns(host, port, timeout)?;
+    let deadline = Instant::now() + timeout;
+    let addresses = loop {
+        if request_scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "proxy request scope cancelled",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "proxy DNS timeout",
+            ));
+        }
+        match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(result) => break result?,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "proxy DNS worker stopped",
+                ));
             }
-            mpsc::RecvTimeoutError::Disconnected => {
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "proxy DNS worker stopped")
-            }
-        })??;
+        }
+    };
     let mut cache = dns_cache()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -2630,22 +2684,52 @@ fn client_config(scope: &Scope) -> std::io::Result<Arc<rustls::ClientConfig>> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-fn connect_tcp(backend: &HttpBackend, timeout: Duration) -> std::io::Result<TcpStream> {
+fn connect_tcp(
+    backend: &HttpBackend,
+    timeout: Duration,
+    scope: Option<&crate::resource::RequestScope>,
+) -> std::io::Result<TcpStream> {
     crate::fault::hit("proxy.connect")?;
+    if scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "proxy request scope cancelled",
+        ));
+    }
     let deadline = Instant::now() + timeout;
     let mut tcp = None;
     let mut last = None;
-    for addr in resolve_backend_addrs(&backend.host, backend.port, timeout)? {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match TcpStream::connect_timeout(&addr, remaining) {
-            Ok(s) => {
-                tcp = Some(s);
+    for addr in resolve_backend_addrs_cancellable(&backend.host, backend.port, timeout, scope)? {
+        loop {
+            if scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "proxy request scope cancelled",
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 break;
             }
-            Err(e) => last = Some(e),
+            match TcpStream::connect_timeout(&addr, remaining.min(Duration::from_secs(1))) {
+                Ok(stream) => {
+                    tcp = Some(stream);
+                    break;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::TimedOut
+                        && Instant::now() < deadline =>
+                {
+                    last = Some(error);
+                }
+                Err(error) => {
+                    last = Some(error);
+                    break;
+                }
+            }
+        }
+        if tcp.is_some() {
+            break;
         }
     }
     let tcp = tcp.ok_or_else(|| {
@@ -2670,8 +2754,9 @@ fn connect(
     scope: &Scope,
     timeout: Duration,
     deadline: Instant,
+    request_scope: Option<&crate::resource::RequestScope>,
 ) -> std::io::Result<Box<dyn ReadWrite>> {
-    let tcp = connect_tcp(backend, timeout)?;
+    let tcp = connect_tcp(backend, timeout, request_scope)?;
     let inner: Box<dyn ReadWrite> = if !backend.tls {
         Box::new(tcp)
     } else {
@@ -2681,7 +2766,11 @@ fn connect(
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Box::new(StreamOwned::new(conn, tcp))
     };
-    Ok(Box::new(DeadlineStream { inner, deadline }))
+    Ok(Box::new(DeadlineStream {
+        inner,
+        deadline,
+        scope: request_scope.cloned(),
+    }))
 }
 
 fn backend_key(backend: &HttpBackend) -> String {
@@ -3520,6 +3609,7 @@ pub fn execute(
             &active_scope,
             remaining,
             exchange_deadline,
+            req.request_scope(),
         ) {
             Ok(stream) => (
                 proxy_once_budgeted(
@@ -3773,6 +3863,56 @@ mod tests {
     use std::fs;
     use std::net::TcpListener;
 
+    #[test]
+    fn proxy_deadline_stream_observes_request_cancellation() {
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let scope = crate::resource::RequestScope::new(
+            budget.context(std::net::IpAddr::from([127, 0, 0, 1])),
+        );
+        scope.cancel();
+        let mut stream = DeadlineStream {
+            inner: Box::new(std::io::Cursor::new(b"reply".to_vec())),
+            deadline: Instant::now() + Duration::from_secs(1),
+            scope: Some(scope.clone()),
+        };
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            stream.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            stream.write(b"x").unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            stream.flush().unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+        let backend = HttpBackend {
+            host: "127.0.0.1".into(),
+            port: 9,
+            base: "/".into(),
+            tls: false,
+        };
+        assert_eq!(
+            connect_tcp(&backend, Duration::from_secs(1), Some(&scope))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            resolve_backend_addrs_cancellable(
+                "cancelled.invalid",
+                80,
+                Duration::from_secs(1),
+                Some(&scope),
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+    }
+
     #[cfg(feature = "fault-injection")]
     #[test]
     fn injected_proxy_transport_failures_retry_or_propagate() {
@@ -3781,6 +3921,7 @@ mod tests {
         let mut reader = DeadlineStream {
             inner: Box::new(std::io::Cursor::new(b"reply".to_vec())),
             deadline,
+            scope: None,
         };
         crate::fault::configure("proxy.read", 0, std::io::ErrorKind::WouldBlock);
         let mut byte = [0u8; 1];
@@ -3795,6 +3936,7 @@ mod tests {
         let mut writer = DeadlineStream {
             inner: Box::new(std::io::Cursor::new(Vec::new())),
             deadline,
+            scope: None,
         };
         crate::fault::configure("proxy.write", 0, std::io::ErrorKind::TimedOut);
         assert_eq!(writer.write(b"request").unwrap(), 7);
@@ -3804,6 +3946,7 @@ mod tests {
         let mut expired = DeadlineStream {
             inner: Box::new(std::io::Cursor::new(Vec::new())),
             deadline: Instant::now() - Duration::from_millis(1),
+            scope: None,
         };
         assert_eq!(
             expired.read(&mut byte).unwrap_err().kind(),
@@ -4108,7 +4251,7 @@ mod more_tests {
             tls: false,
         };
         crate::fault::configure("proxy.connect", 0, std::io::ErrorKind::PermissionDenied);
-        let error = connect_tcp(&backend, Duration::from_secs(1)).unwrap_err();
+        let error = connect_tcp(&backend, Duration::from_secs(1), None).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 

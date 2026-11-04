@@ -442,6 +442,7 @@ pub fn execute(ctx: &CgiContext) -> Response {
         false,
         None,
         Some(&mut response_lease),
+        ctx.req.request_scope(),
     ) {
         Ok((out, stderr)) => {
             if !stderr.trim().is_empty() {
@@ -512,7 +513,10 @@ fn execute_via_pool(
         .try_response_bytes_in(resource_context)
     {
         Ok(lease) => lease,
-        Err(_) => return Some(cgi_status_error(ctx, 503)),
+        Err(_) => {
+            worker.terminate();
+            return Some(cgi_status_error(ctx, 503));
+        }
     };
     let incremental_spool = stream_body.then(|| worker_spool_lease.as_mut()).flatten();
     match exchange(
@@ -525,6 +529,7 @@ fn execute_via_pool(
         expected,
         Some(&mut response_lease),
         incremental_spool,
+        ctx.req.request_scope(),
     ) {
         Ok((out, stderr)) => {
             pool.put(worker);
@@ -547,6 +552,7 @@ fn execute_via_pool(
         }
         Err(e) => {
             // Do not retry locally: the script may already have run.
+            worker.terminate();
             eprintln!("vapached: CGI worker failed: {e}");
             Some(cgi_error(ctx))
         }
@@ -584,6 +590,16 @@ struct CgiWorker {
     child: Child,
 }
 
+impl CgiWorker {
+    fn terminate(mut self) {
+        let pid = self.child.id() as i32;
+        drop(self.stream);
+        kill_group(pid);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 struct CgiPool {
     workers: Mutex<Vec<CgiWorker>>,
     ready: Condvar,
@@ -612,7 +628,7 @@ impl CgiPool {
         let mut guard = self.workers.lock().unwrap_or_else(|e| e.into_inner());
         if self.closed.load(Ordering::Relaxed) {
             drop(guard);
-            drop(worker);
+            worker.terminate();
             return;
         }
         guard.push(worker);
@@ -636,16 +652,8 @@ fn shutdown_pool_inner(pool: &CgiPool) {
         let mut guard = pool.workers.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *guard)
     };
-    for mut worker in workers {
-        drop(worker.stream);
-        for _ in 0..100 {
-            if !matches!(worker.child.try_wait(), Ok(None)) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let _ = worker.child.kill();
-        let _ = worker.child.wait();
+    for worker in workers {
+        worker.terminate();
     }
 }
 
@@ -940,7 +948,9 @@ fn worker_request(stream: &mut UnixStream) -> Result<bool, String> {
     };
     let timeout = Duration::from_secs(read_u64(stream)?.clamp(1, 3600));
 
-    let result = run_local(&script, &cwd, &env, &body, timeout, true, expected, None);
+    let result = run_local(
+        &script, &cwd, &env, &body, timeout, true, expected, None, None,
+    );
     match result {
         Ok((out, stderr)) => {
             write_u8(stream, 1)?;
@@ -968,6 +978,88 @@ fn send_timeout(stream: &mut impl Write, timeout: Duration) -> Result<(), String
     }
 }
 
+struct CgiExchangeStream<'a> {
+    inner: &'a mut UnixStream,
+    deadline: Instant,
+    scope: Option<crate::resource::RequestScope>,
+}
+
+impl CgiExchangeStream<'_> {
+    fn interrupted(&self) -> Option<std::io::Error> {
+        if self
+            .scope
+            .as_ref()
+            .is_some_and(crate::resource::RequestScope::is_cancelled)
+        {
+            Some(std::io::Error::new(
+                // `read_exact`/`write_all` transparently retry Interrupted;
+                // cancellation must be terminal for the worker protocol.
+                std::io::ErrorKind::ConnectionAborted,
+                "CGI request scope cancelled",
+            ))
+        } else if Instant::now() >= self.deadline {
+            Some(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "CGI worker exchange deadline exceeded",
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+impl Read for CgiExchangeStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if let Some(error) = self.interrupted() {
+                return Err(error);
+            }
+            match self.inner.read(buf) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Write for CgiExchangeStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        loop {
+            if let Some(error) = self.interrupted() {
+                return Err(error);
+            }
+            match self.inner.write(buf) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        loop {
+            if let Some(error) = self.interrupted() {
+                return Err(error);
+            }
+            match self.inner.flush() {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+}
+
 fn exchange(
     stream: &mut UnixStream,
     path: &Path,
@@ -978,24 +1070,37 @@ fn exchange(
     expected: Option<(u64, u64)>,
     response_lease: Option<&mut crate::resource::ResidentLease>,
     mut request_spool_lease: Option<&mut crate::resource::SpoolLease>,
+    request_scope: Option<&crate::resource::RequestScope>,
 ) -> Result<(Vec<u8>, String), String> {
-    write_bytes(stream, path.as_os_str().as_bytes())?;
+    let quantum = timeout.min(Duration::from_millis(100));
+    stream
+        .set_read_timeout(Some(quantum))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(quantum))
+        .map_err(|error| error.to_string())?;
+    let mut stream = CgiExchangeStream {
+        inner: stream,
+        deadline: Instant::now() + timeout,
+        scope: request_scope.cloned(),
+    };
+    write_bytes(&mut stream, path.as_os_str().as_bytes())?;
     match expected {
         Some((dev, ino)) => {
-            write_u8(stream, 1)?;
-            write_u64(stream, dev)?;
-            write_u64(stream, ino)?;
+            write_u8(&mut stream, 1)?;
+            write_u64(&mut stream, dev)?;
+            write_u64(&mut stream, ino)?;
         }
-        None => write_u8(stream, 0)?,
+        None => write_u8(&mut stream, 0)?,
     }
-    write_bytes(stream, cwd.as_os_str().as_bytes())?;
-    write_u32(stream, env.len() as u32)?;
+    write_bytes(&mut stream, cwd.as_os_str().as_bytes())?;
+    write_u32(&mut stream, env.len() as u32)?;
     for (k, v) in env {
-        write_bytes(stream, k.as_os_str().as_bytes())?;
-        write_bytes(stream, v.as_os_str().as_bytes())?;
+        write_bytes(&mut stream, k.as_os_str().as_bytes())?;
+        write_bytes(&mut stream, v.as_os_str().as_bytes())?;
     }
     let body_len = body.len();
-    write_u64(stream, body_len)?;
+    write_u64(&mut stream, body_len)?;
     let mut reader = body.reader().map_err(|e| e.to_string())?;
     let mut copied = 0u64;
     let mut chunk = [0u8; 64 * 1024];
@@ -1018,12 +1123,12 @@ fn exchange(
     // A worker that already produced its full response may close as soon as
     // the body is consumed; a broken pipe on the final metadata write does not
     // invalidate the response we can still read.
-    send_timeout(stream, timeout)?;
+    send_timeout(&mut stream, timeout)?;
 
-    let ok = read_u8(stream)?;
-    let out =
-        read_bytes_budgeted(stream, MAX_OUTPUT as u32, false, response_lease)?.unwrap_or_default();
-    let err = read_bytes(stream, MAX_STDERR as u32, false)?.unwrap_or_default();
+    let ok = read_u8(&mut stream)?;
+    let out = read_bytes_budgeted(&mut stream, MAX_OUTPUT as u32, false, response_lease)?
+        .unwrap_or_default();
+    let err = read_bytes(&mut stream, MAX_STDERR as u32, false)?.unwrap_or_default();
     let err = String::from_utf8_lossy(&err).into_owned();
     if ok == 0 {
         return Err(if err.is_empty() {
@@ -1114,6 +1219,7 @@ fn feed_stdin(
     body: &BodySource,
     body_len: u64,
     deadline: Instant,
+    request_scope: Option<crate::resource::RequestScope>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let mut stdin = stdin;
     if body_len == 0 {
@@ -1135,6 +1241,12 @@ fn feed_stdin(
             let mut start = 0usize;
             let mut end = 0usize;
             loop {
+                if request_scope
+                    .as_ref()
+                    .is_some_and(crate::resource::RequestScope::is_cancelled)
+                {
+                    return;
+                }
                 if Instant::now() >= deadline {
                     return;
                 }
@@ -1197,6 +1309,7 @@ fn run_local(
     worker_prepared: bool,
     expected: Option<(u64, u64)>,
     mut response_lease: Option<&mut crate::resource::ResidentLease>,
+    request_scope: Option<&crate::resource::RequestScope>,
 ) -> Result<(Vec<u8>, String), String> {
     // In the worker path, set the child's cwd in the worker before spawning
     // instead of asking `Command` for a per-child chdir.  This keeps the spawn
@@ -1263,11 +1376,20 @@ fn run_local(
     let stdin_thread = child
         .stdin
         .take()
-        .and_then(|stdin| feed_stdin(stdin, body, body_len, deadline));
+        .and_then(|stdin| feed_stdin(stdin, body, body_len, deadline, request_scope.cloned()));
+    let stderr_scope = request_scope.cloned();
     let stderr_thread = child.stderr.take().map(|e| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = read_limited_with_deadline(e, deadline, &mut buf, MAX_STDERR, true, None);
+            let _ = read_limited_with_deadline(
+                e,
+                deadline,
+                &mut buf,
+                MAX_STDERR,
+                true,
+                None,
+                stderr_scope.as_ref(),
+            );
             buf
         })
     });
@@ -1278,10 +1400,16 @@ fn run_local(
         .take()
         .ok_or_else(|| "CGI stdout unavailable".to_string())
         .and_then(|stdout| {
-            read_with_deadline(stdout, deadline, &mut out, response_lease.as_deref_mut())
+            read_with_deadline(
+                stdout,
+                deadline,
+                &mut out,
+                response_lease.as_deref_mut(),
+                request_scope,
+            )
         });
     let waited = if read_result.is_ok() {
-        wait_with_deadline(&mut child, pid, deadline)
+        wait_with_deadline(&mut child, pid, deadline, request_scope)
     } else {
         kill_group(pid);
         let _ = child.wait();
@@ -1308,8 +1436,18 @@ fn kill_group(pid: i32) {
     }
 }
 
-fn wait_with_deadline(child: &mut Child, pid: i32, deadline: Instant) -> Result<(), String> {
+fn wait_with_deadline(
+    child: &mut Child,
+    pid: i32,
+    deadline: Instant,
+    request_scope: Option<&crate::resource::RequestScope>,
+) -> Result<(), String> {
     while matches!(child.try_wait(), Ok(None)) {
+        if request_scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+            kill_group(pid);
+            let _ = child.wait();
+            return Err("CGI request scope cancelled".into());
+        }
         if Instant::now() >= deadline {
             kill_group(pid);
             let _ = child.wait();
@@ -1335,8 +1473,17 @@ fn read_with_deadline(
     deadline: Instant,
     out: &mut Vec<u8>,
     resident: Option<&mut crate::resource::ResidentLease>,
+    request_scope: Option<&crate::resource::RequestScope>,
 ) -> Result<(), String> {
-    read_limited_with_deadline(reader, deadline, out, MAX_OUTPUT, false, resident)
+    read_limited_with_deadline(
+        reader,
+        deadline,
+        out,
+        MAX_OUTPUT,
+        false,
+        resident,
+        request_scope,
+    )
 }
 
 fn read_limited_with_deadline(
@@ -1346,10 +1493,14 @@ fn read_limited_with_deadline(
     limit: usize,
     truncate_at_limit: bool,
     mut resident: Option<&mut crate::resource::ResidentLease>,
+    request_scope: Option<&crate::resource::RequestScope>,
 ) -> Result<(), String> {
     let fd = reader.as_raw_fd();
     let mut chunk = [0u8; 64 * 1024];
     loop {
+        if request_scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+            return Err("CGI request scope cancelled".into());
+        }
         let now = Instant::now();
         if now >= deadline {
             return Err("CGI timeout".into());
@@ -1910,10 +2061,70 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         assert!(result.is_err());
         assert!(start.elapsed() < Duration::from_secs(2));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cgi_execution_and_worker_exchange_observe_request_cancellation() {
+        let dir = tempdir("request-cancel");
+        let path = script(&dir, "slow.sh", "#!/bin/sh\nsleep 5\n");
+        let budget = std::sync::Arc::new(crate::resource::ResourceBudget::default());
+        let scope = crate::resource::RequestScope::new(
+            budget.context(std::net::IpAddr::from([127, 0, 0, 1])),
+        );
+        let cancel = scope.clone();
+        let cancellation = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            cancel.cancel();
+        });
+        let started = Instant::now();
+        let error = run_local(
+            &path,
+            &dir,
+            &[],
+            &BodySource::Bytes(Vec::new()),
+            Duration::from_secs(5),
+            false,
+            None,
+            None,
+            Some(&scope),
+        )
+        .unwrap_err();
+        cancellation.join().unwrap();
+        assert!(error.contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let scope = crate::resource::RequestScope::new(
+            budget.context(std::net::IpAddr::from([127, 0, 0, 1])),
+        );
+        let cancel = scope.clone();
+        let cancellation = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            cancel.cancel();
+        });
+        let (mut parent, _worker) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let error = exchange(
+            &mut parent,
+            Path::new("/bin/true"),
+            Path::new("/"),
+            &[],
+            &BodySource::Bytes(Vec::new()),
+            Duration::from_secs(5),
+            None,
+            None,
+            None,
+            Some(&scope),
+        )
+        .unwrap_err();
+        cancellation.join().unwrap();
+        assert!(error.contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[cfg(feature = "fault-injection")]
@@ -1934,6 +2145,7 @@ mod tests {
             &BodySource::Bytes(Vec::new()),
             Duration::from_secs(1),
             false,
+            None,
             None,
             None,
         )
@@ -1975,6 +2187,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(out, b"out");
@@ -1997,6 +2210,7 @@ mod tests {
             &[],
             &BodySource::Bytes(Vec::new()),
             Duration::from_secs(1),
+            None,
             None,
             None,
             None,
@@ -2504,6 +2718,7 @@ mod tests {
             &bad,
             64 * 1024,
             Instant::now() + Duration::from_millis(100),
+            None,
         )
         .is_none());
         let _ = child.wait();
@@ -2540,6 +2755,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert_eq!(err, "CGI worker reported failure");
@@ -2567,6 +2783,7 @@ mod tests {
                 &[],
                 &BodySource::File(file),
                 Duration::from_secs(1),
+                None,
                 None,
                 None,
                 None,
@@ -2638,6 +2855,7 @@ mod tests {
             false,
             Some((0, 0)),
             None,
+            None,
         )
         .is_err());
 
@@ -2649,6 +2867,7 @@ mod tests {
             &BodySource::Bytes(vec![b'x'; 32 * 1024]),
             Duration::from_secs(1),
             false,
+            None,
             None,
             None,
         )
@@ -2666,6 +2885,7 @@ mod tests {
             &BodySource::Bytes(Vec::new()),
             Duration::from_millis(50),
             false,
+            None,
             None,
             None,
         )
@@ -2691,6 +2911,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .is_err());
         assert!(escaped_started.elapsed() < Duration::from_millis(750));
@@ -2700,6 +2921,7 @@ mod tests {
             BadFd,
             Instant::now() + Duration::from_millis(100),
             &mut out,
+            None,
             None,
         )
         .is_ok());
@@ -2717,6 +2939,7 @@ mod tests {
             Instant::now() + Duration::from_millis(100),
             &mut out,
             None,
+            None,
         )
         .is_err());
         drop(null);
@@ -2728,6 +2951,7 @@ mod tests {
                 flood,
                 Instant::now() + Duration::from_secs(10),
                 &mut out,
+                None,
                 None,
             )
             .unwrap_err(),

@@ -12499,21 +12499,46 @@ pub enum H2StreamPhase {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum H2StreamEvent {
     Begin,
-    End,
+    Finish,
     Reset,
     Reclaim,
+    ConnectionClose,
 }
 
-pub open spec fn h2_stream_phase_step(
+pub open spec fn h2_stream_phase_step_spec(
     phase: H2StreamPhase,
     event: H2StreamEvent,
 ) -> Option<H2StreamPhase> {
     match (phase, event) {
         (H2StreamPhase::Idle, H2StreamEvent::Begin) => Some(H2StreamPhase::Active),
-        (H2StreamPhase::Active, H2StreamEvent::End) => Some(H2StreamPhase::AwaitingReset),
+        (H2StreamPhase::Active, H2StreamEvent::Finish) => Some(H2StreamPhase::Closed),
         (H2StreamPhase::Active, H2StreamEvent::Reset) => Some(H2StreamPhase::AwaitingReset),
-        (H2StreamPhase::AwaitingReset, H2StreamEvent::End) => Some(H2StreamPhase::Closed),
         (H2StreamPhase::AwaitingReset, H2StreamEvent::Reclaim) => Some(H2StreamPhase::Closed),
+        (H2StreamPhase::Active, H2StreamEvent::ConnectionClose)
+        | (H2StreamPhase::AwaitingReset, H2StreamEvent::ConnectionClose) => {
+            Some(H2StreamPhase::Closed)
+        },
+        _ => None,
+    }
+}
+
+/// Executable transition consumed by the H2 adapter, proved identical to the
+/// lifecycle model above.
+pub fn h2_stream_phase_step(
+    phase: H2StreamPhase,
+    event: H2StreamEvent,
+) -> (next: Option<H2StreamPhase>)
+    ensures next == h2_stream_phase_step_spec(phase, event),
+{
+    match (phase, event) {
+        (H2StreamPhase::Idle, H2StreamEvent::Begin) => Some(H2StreamPhase::Active),
+        (H2StreamPhase::Active, H2StreamEvent::Finish) => Some(H2StreamPhase::Closed),
+        (H2StreamPhase::Active, H2StreamEvent::Reset) => Some(H2StreamPhase::AwaitingReset),
+        (H2StreamPhase::AwaitingReset, H2StreamEvent::Reclaim) => Some(H2StreamPhase::Closed),
+        (H2StreamPhase::Active, H2StreamEvent::ConnectionClose)
+        | (H2StreamPhase::AwaitingReset, H2StreamEvent::ConnectionClose) => {
+            Some(H2StreamPhase::Closed)
+        },
         _ => None,
     }
 }
@@ -12524,7 +12549,7 @@ pub proof fn h2_closed_phase_is_absorbing(
     event: H2StreamEvent,
 )
     ensures
-        h2_stream_phase_step(H2StreamPhase::Closed, event).is_none(),
+        h2_stream_phase_step_spec(H2StreamPhase::Closed, event).is_none(),
 {
 }
 
@@ -12533,9 +12558,34 @@ pub proof fn h2_stream_phase_preserves_no_reopen(
     event: H2StreamEvent,
 )
     ensures
-        h2_stream_phase_step(phase, event)
+        h2_stream_phase_step_spec(phase, event)
                 == Some(H2StreamPhase::Active)
             ==> phase == H2StreamPhase::Idle && event == H2StreamEvent::Begin,
+{
+}
+
+pub proof fn h2_normal_finish_closes_without_reset_reclaim()
+    ensures
+        h2_stream_phase_step_spec(H2StreamPhase::Active, H2StreamEvent::Finish)
+            == Some(H2StreamPhase::Closed),
+{
+}
+
+pub proof fn h2_reset_requires_reclaim_to_close()
+    ensures
+        h2_stream_phase_step_spec(H2StreamPhase::Active, H2StreamEvent::Reset)
+            == Some(H2StreamPhase::AwaitingReset),
+        h2_stream_phase_step_spec(H2StreamPhase::AwaitingReset, H2StreamEvent::Reclaim)
+            == Some(H2StreamPhase::Closed),
+{
+}
+
+pub proof fn h2_connection_close_terminates_admitted_phase(phase: H2StreamPhase)
+    requires
+        phase == H2StreamPhase::Active || phase == H2StreamPhase::AwaitingReset,
+    ensures
+        h2_stream_phase_step_spec(phase, H2StreamEvent::ConnectionClose)
+            == Some(H2StreamPhase::Closed),
 {
 }
 

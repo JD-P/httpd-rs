@@ -391,7 +391,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **698 verified functions, 0 errors** (percent-decoding,
+Current result: **702 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
@@ -473,7 +473,7 @@ opts in with `VapacheCapability <name> On`:
 | `RewriteProgram` | external `RewriteMap prg` helpers |
 | `ServerStatus` | the generated `server-status` handler |
 | `AbsoluteRequestTarget` | HTTP/1 absolute-form request targets |
-| `RequestTrailers` | non-empty HTTP/1 chunked request trailers |
+| `RequestTrailers` | non-empty HTTP/1 chunked or HTTP/2 request trailers |
 
 Declarations are process-global, order independent, and final-state checked;
 they are rejected in virtual hosts, directory/location sections, and access
@@ -787,7 +787,7 @@ current instrumented suite is 691 Rust library tests, 8 CLI unit tests, 31 Rust
 integration/property tests, 168 conformance tests and 333 fixed configuration
 cases. The module-by-module reason for the remaining debt and the intended test
 mechanism for each major module are tracked in `docs/coverage-debt.md`.
-The separate Verus gate proves 698 functions with 0 errors; proof-only code is
+The separate Verus gate proves 702 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

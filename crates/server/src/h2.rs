@@ -46,7 +46,6 @@ const H2_SLOW_CLASSIFY_GRACE: Duration = Duration::from_millis(2);
 #[derive(Clone, Copy)]
 enum H2TaskEvent {
     Ended { stream_id: u64, reset: bool },
-    Reclaimed { stream_id: u64 },
 }
 
 /// Adapter-side stream identity ledger.  This is the runtime projection of
@@ -105,6 +104,20 @@ struct H2TaskEventGuard {
     tx: mpsc::UnboundedSender<H2TaskEvent>,
     stream_id: u64,
     reset: bool,
+}
+
+/// Cancellation authority exists from stream admission, before the decoded
+/// request is assembled. Dropping the connection-owned task therefore
+/// cancels backend/body work even if the task exits during header projection
+/// or while a blocking dispatcher owns a clone of the request.
+struct H2RequestCancelGuard {
+    scope: crate::resource::RequestScope,
+}
+
+impl Drop for H2RequestCancelGuard {
+    fn drop(&mut self) {
+        self.scope.cancel();
+    }
 }
 
 impl Drop for H2TaskEventGuard {
@@ -340,6 +353,7 @@ async fn read_body(
     max_spool_files: u64,
     resource_context: crate::resource::ResourceContext,
     resident: &mut crate::resource::ResidentLease,
+    allow_trailers: bool,
 ) -> Result<H2RequestBody, H2ReadFailure> {
     // HTTP/2 can run many request bodies concurrently on one connection.  A
     // small per-stream prefix keeps ordinary forms cheap while the process-
@@ -423,6 +437,7 @@ async fn read_body(
         }
         debug_assert_eq!(body.len(), budget.len);
     }
+    read_trailers(&mut recv, started, timeout, allow_trailers).await?;
     let len = body.len();
     let (bytes, spool) = body.finish();
     Ok(H2RequestBody { bytes, spool, len })
@@ -435,6 +450,7 @@ async fn stream_body(
     limit: u64,
     timeout: std::time::Duration,
     min_rate: u64,
+    allow_trailers: bool,
 ) -> Result<(), H2ReadFailure> {
     let mut budget = vapache_verified::h2_body_init(limit);
     let mut framing = vapache_verified::ChunkFramingState {
@@ -494,8 +510,67 @@ async fn stream_body(
             return Err(H2ReadFailure::Reset);
         }
     }
+    read_trailers(&mut recv, started, timeout, allow_trailers).await?;
     if budget.len != declared {
         return Err(H2ReadFailure::Response(bad(400, "Content-Length mismatch")));
+    }
+    Ok(())
+}
+
+const H2_MAX_REQUEST_TRAILERS: usize = 64;
+const H2_MAX_REQUEST_TRAILER_BYTES: usize = 64 * 1024;
+
+/// Consume the terminal trailer block instead of dropping it unseen. The h2
+/// codec owns HPACK and END_STREAM validation, while this adapter owns the
+/// same capability, routing-field and size policy as HTTP/1 chunked bodies.
+async fn read_trailers(
+    recv: &mut h2::RecvStream,
+    started: Instant,
+    timeout: Duration,
+    allow_trailers: bool,
+) -> Result<(), H2ReadFailure> {
+    let remaining = timeout.saturating_sub(started.elapsed());
+    let trailers = match tokio::time::timeout(remaining, recv.trailers()).await {
+        Err(_) => return Err(H2ReadFailure::Response(bad(408, "request body timeout"))),
+        Ok(Err(error)) if error.is_reset() => return Err(H2ReadFailure::Reset),
+        Ok(Err(_)) => {
+            return Err(H2ReadFailure::Response(bad(
+                400,
+                "malformed HTTP/2 request trailers",
+            )))
+        }
+        Ok(Ok(trailers)) => trailers,
+    };
+    let Some(trailers) = trailers else {
+        return Ok(());
+    };
+    if !vapache_verified::capability_admit(allow_trailers, !trailers.is_empty()) {
+        return Err(H2ReadFailure::Response(bad(
+            400,
+            "request trailers are disabled",
+        )));
+    }
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (name, value) in trailers.iter() {
+        count = count.saturating_add(1);
+        bytes = bytes
+            .saturating_add(name.as_str().len())
+            .saturating_add(value.as_bytes().len())
+            .saturating_add(2);
+        if count > H2_MAX_REQUEST_TRAILERS || bytes > H2_MAX_REQUEST_TRAILER_BYTES {
+            return Err(H2ReadFailure::Response(bad(
+                400,
+                "request trailers are too large",
+            )));
+        }
+        let mut line = Vec::with_capacity(name.as_str().len() + value.as_bytes().len() + 1);
+        line.extend_from_slice(name.as_str().as_bytes());
+        line.push(b':');
+        line.extend_from_slice(value.as_bytes());
+        if !crate::http::valid_trailer_field(&line) {
+            return Err(H2ReadFailure::Response(bad(400, "invalid request trailer")));
+        }
     }
     Ok(())
 }
@@ -887,6 +962,7 @@ async fn send_response(
 struct H2StreamAdmission {
     quota_peer: SocketAddr,
     resource_context: crate::resource::ResourceContext,
+    request_scope: crate::resource::RequestScope,
     quota_identity_valid: bool,
     stream_quota: crate::resource::CombinedH2Lease,
 }
@@ -939,6 +1015,7 @@ fn admit_stream_before_spawn(
     }
     let quota_peer = cfg.client_addr_from_headers(peer, &quota_headers);
     let resource_context = cfg.resource_budget.context(quota_peer.ip());
+    let request_scope = crate::resource::RequestScope::new(resource_context.clone());
     let stream_quota = cfg.resource_budget.try_h2_stream_in(&resource_context)?;
     if let Err(error) = cfg.resource_budget.try_request_rate(&resource_context) {
         drop(stream_quota);
@@ -947,9 +1024,31 @@ fn admit_stream_before_spawn(
     Ok(H2StreamAdmission {
         quota_peer,
         resource_context,
+        request_scope,
         quota_identity_valid,
         stream_quota,
     })
+}
+
+/// Await one blocking policy/backend phase while the response handle remains
+/// reset-observable. A peer reset cancels the shared request scope before the
+/// async owner drops its JoinHandle; synchronous backend code therefore sees
+/// cancellation at its next bounded I/O checkpoint.
+async fn blocking_task_or_reset<T>(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    task: &mut tokio::task::JoinHandle<T>,
+    scope: &crate::resource::RequestScope,
+) -> Option<Result<T, tokio::task::JoinError>> {
+    let reset = std::future::poll_fn(|cx| respond.poll_reset(cx));
+    tokio::pin!(reset);
+    tokio::select! {
+        biased;
+        _ = &mut reset => {
+            scope.cancel();
+            None
+        }
+        result = task => Some(result),
+    }
 }
 
 async fn handle_stream(
@@ -973,6 +1072,7 @@ async fn handle_stream(
     let H2StreamAdmission {
         quota_peer,
         resource_context,
+        request_scope,
         quota_identity_valid,
         stream_quota,
     } = admission;
@@ -1190,7 +1290,7 @@ async fn handle_stream(
             // coverage:ignore-stop
         }
     };
-    headers.bind_request_scope(crate::resource::RequestScope::new(resource_context));
+    headers.bind_request_scope(request_scope.clone());
     let mut req = Request {
         method,
         target,
@@ -1226,7 +1326,7 @@ async fn handle_stream(
         .is_err();
     }
     let peer = cfg.client_addr(peer, &req);
-    let _request_scope_guard = req.request_scope().map(|scope| scope.guard());
+    let _request_scope_guard = request_scope.guard();
     if peer != quota_peer {
         // Admission and dispatch must never disagree about the effective
         // source. Fail the stream closed if a future header-canonicalization
@@ -1291,7 +1391,7 @@ async fn handle_stream(
         let probe_cfg = cfg.clone();
         let probe_local_ip = local_ip.clone();
         let mut probe_req = req;
-        let probed = tokio::task::spawn_blocking(move || {
+        let mut probed = tokio::task::spawn_blocking(move || {
             let decision = crate::server::probe_request_body(
                 &probe_cfg,
                 &mut probe_req,
@@ -1301,8 +1401,11 @@ async fn handle_stream(
                 true,
             );
             (probe_req, decision)
-        })
-        .await;
+        });
+        let Some(probed) = blocking_task_or_reset(&mut respond, &mut probed, &request_scope).await
+        else {
+            return true;
+        };
         match probed {
             Ok((
                 returned_req,
@@ -1358,7 +1461,7 @@ async fn handle_stream(
         let probe_cfg = cfg.clone();
         let probe_local_ip = local_ip.clone();
         let mut probe_req = req;
-        let probed = tokio::task::spawn_blocking(move || {
+        let mut probed = tokio::task::spawn_blocking(move || {
             let decision = crate::server::probe_prepared_handler(
                 &probe_cfg,
                 &mut probe_req,
@@ -1368,8 +1471,11 @@ async fn handle_stream(
                 true,
             );
             (probe_req, decision)
-        })
-        .await;
+        });
+        let Some(probed) = blocking_task_or_reset(&mut respond, &mut probed, &request_scope).await
+        else {
+            return true;
+        };
         match probed {
             Ok((
                 returned_req,
@@ -1461,6 +1567,7 @@ async fn handle_stream(
                     cfg.limit_request_body,
                     body_timeout,
                     cfg.request_body_min_rate,
+                    cfg.capability_enabled(crate::config::Capability::RequestTrailers),
                 );
                 tokio::pin!(body_future);
                 let mut reset_watch = std::future::poll_fn(|cx| respond.poll_reset(cx));
@@ -1476,7 +1583,14 @@ async fn handle_stream(
                     result = &mut backend => Some(result),
                     result = &mut body_future => {
                         match result {
-                            Ok(()) | Err(H2ReadFailure::BackendClosed) => Some(backend.await),
+                            Ok(()) | Err(H2ReadFailure::BackendClosed) => {
+                                blocking_task_or_reset(
+                                    &mut respond,
+                                    &mut backend,
+                                    &request_scope,
+                                )
+                                .await
+                            }
                             Err(H2ReadFailure::Reset) => {
                                 if let Some(scope) = rejected_req.request_scope() {
                                     scope.cancel();
@@ -1549,6 +1663,7 @@ async fn handle_stream(
                 request_resident
                     .as_mut()
                     .expect("buffered HTTP/2 body retained its resident lease"),
+                cfg.capability_enabled(crate::config::Capability::RequestTrailers),
             );
             tokio::pin!(body_future);
             // `SendResponse::poll_reset` is the h2 API for a client RST_STREAM
@@ -1633,7 +1748,7 @@ async fn handle_stream(
                 let dispatch_cfg = cfg.clone();
                 let dispatch_local_ip = local_ip.clone();
                 let runs_backend = prepared_handler.is_some();
-                let dispatched = tokio::task::spawn_blocking(move || {
+                let mut dispatched = tokio::task::spawn_blocking(move || {
                     let mut req = req;
                     let (resp, remote_user) = match prepared_handler {
                         Some(handler) => (
@@ -1657,8 +1772,12 @@ async fn handle_stream(
                         ),
                     };
                     (req, resp, remote_user)
-                })
-                .await;
+                });
+                let Some(dispatched) =
+                    blocking_task_or_reset(&mut respond, &mut dispatched, &request_scope).await
+                else {
+                    return true;
+                };
                 let Ok((req, resp, remote_user)) = dispatched else {
                     logger.error("HTTP/2 request dispatcher task failed");
                     return true;
@@ -1743,6 +1862,26 @@ fn h2_task_end(
     budget: vapache_verified::H2Budget,
     reset: bool,
 ) -> Option<vapache_verified::H2Budget> {
+    let active = vapache_verified::h2_stream_phase_step(
+        vapache_verified::H2StreamPhase::Idle,
+        vapache_verified::H2StreamEvent::Begin,
+    )?;
+    let ended = vapache_verified::h2_stream_phase_step(
+        active,
+        if reset {
+            vapache_verified::H2StreamEvent::Reset
+        } else {
+            vapache_verified::H2StreamEvent::Finish
+        },
+    )?;
+    debug_assert_eq!(
+        if reset {
+            vapache_verified::h2_stream_phase_step(ended, vapache_verified::H2StreamEvent::Reclaim)
+        } else {
+            Some(ended)
+        },
+        Some(vapache_verified::H2StreamPhase::Closed)
+    );
     let finished =
         vapache_verified::h2_budget_step(budget, vapache_verified::H2BudgetEvent::Finish)?;
     if reset {
@@ -1891,12 +2030,13 @@ where
     );
     let mut stream_ids = H2StreamIds::default();
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let mut tasks = tokio::task::JoinSet::new();
     let mut reset_reclaims: BinaryHeap<Reverse<(Instant, u64)>> = BinaryHeap::new();
     let idle_timeout = cfg.timeout.max(cfg.keep_alive_timeout).max(H2_IDLE_FLOOR);
     let idle_timer = tokio::time::sleep(idle_timeout);
     tokio::pin!(idle_timer);
     let mut draining = false;
-    loop {
+    let outcome: io::Result<()> = 'connection: loop {
         let reclaim_deadline = reset_reclaims.peek().map(|entry| entry.0 .0);
         let reclaim_timer = tokio::time::sleep_until(
             reclaim_deadline
@@ -1917,7 +2057,7 @@ where
                 }
             }
             _ = &mut initial_request_deadline, if ready_callback.is_some() && !draining => {
-                return Err(io::Error::new(
+                break 'connection Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "HTTP/2 initial SETTINGS/request head timed out",
                 ));
@@ -1942,7 +2082,7 @@ where
                             // coverage:ignore-start - verified budget invariant
                             logger.error("HTTP/2 stream/reset budget exhausted; closing connection");
                             conn.abrupt_shutdown(h2::Reason::ENHANCE_YOUR_CALM);
-                            break;
+                            break 'connection Ok(());
                             // coverage:ignore-stop
                         };
                         budget = next;
@@ -1953,18 +2093,11 @@ where
                             reset_reclaims.push(Reverse((Instant::now() + H2_RESET_RECLAIM, stream_id)));
                         }
                     }
-                    H2TaskEvent::Reclaimed { stream_id } => {
-                        if !stream_ids.reclaim(stream_id) {
-                            // Reclaim is scheduled once by `schedule_purge`.
-                            continue; // coverage:ignore-line - purge-set invariant
-                        }
-                        if let Some(next) = vapache_verified::h2_budget_step(
-                            budget,
-                            vapache_verified::H2BudgetEvent::Reclaim,
-                        ) {
-                            budget = next;
-                        }
-                    }
+                }
+            }
+            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                if let Err(error) = result {
+                    logger.error(&format!("HTTP/2 stream task failed: {error}"));
                 }
             }
             _ = &mut reclaim_timer, if reclaim_deadline.is_some() => {
@@ -1990,19 +2123,23 @@ where
             _ = tokio::time::sleep(Duration::from_millis(50)), if draining && budget.active == 0 => {
                 // Give the state machine one scheduling turn to flush GOAWAY,
                 // then release an otherwise idle retired transport.
-                break;
+                break 'connection Ok(());
             }
             _ = &mut idle_timer, if budget.active == 0 => {
                 logger.error("HTTP/2 connection idle timeout");
                 conn.abrupt_shutdown(h2::Reason::NO_ERROR);
-                break;
+                break 'connection Ok(());
             }
             accepted = conn.accept() => {
                 let Some(result) = accepted else {
-                    break;
+                    break 'connection Ok(());
                 };
-                let (request, mut respond) =
-                    result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let (request, mut respond) = match result {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        break 'connection Err(io::Error::new(io::ErrorKind::InvalidData, error));
+                    }
+                };
                 if draining {
                     respond.send_reset(h2::Reason::REFUSED_STREAM);
                     continue;
@@ -2022,7 +2159,10 @@ where
                     }
                 };
                 if let Some(callback) = ready_callback.take() {
-                    established_guard = Some(callback()?);
+                    established_guard = match callback() {
+                        Ok(guard) => Some(guard),
+                        Err(error) => break 'connection Err(error),
+                    };
                 }
                 let Some(next) = vapache_verified::h2_budget_step(
                     budget,
@@ -2046,7 +2186,7 @@ where
                     // coverage:ignore-start - upstream h2 identity invariant
                     logger.error("HTTP/2 duplicate stream identifier; closing connection");
                     conn.abrupt_shutdown(h2::Reason::PROTOCOL_ERROR);
-                    break;
+                    break 'connection Ok(());
                     // coverage:ignore-stop
                 }
                 let cfg = cfg.clone();
@@ -2054,7 +2194,11 @@ where
                 let local_ip = local_ip.clone();
                 let tls_identity = tls_identity.clone();
                 let tx = events_tx.clone();
-                tokio::spawn(async move {
+                let request_scope = admission.request_scope.clone();
+                tasks.spawn(async move {
+                    let _cancel = H2RequestCancelGuard {
+                        scope: request_scope,
+                    };
                     let mut done = H2TaskEventGuard {
                         tx,
                         stream_id,
@@ -2079,9 +2223,23 @@ where
                 });
             }
         }
-    }
+    };
+    // `JoinSet` is the connection's ownership boundary. A connection error,
+    // idle timeout, GOAWAY completion, callback failure, or generation drain
+    // cannot detach request tasks. Aborting first drops each cancellation
+    // guard; blocking backend clones observe the shared request scope and
+    // retain their ordinary deadline as a final fail-safe.
+    debug_assert_eq!(
+        vapache_verified::h2_stream_phase_step(
+            vapache_verified::H2StreamPhase::Active,
+            vapache_verified::H2StreamEvent::ConnectionClose,
+        ),
+        Some(vapache_verified::H2StreamPhase::Closed)
+    );
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
     drop(established_guard);
-    Ok(())
+    outcome
 }
 
 #[cfg(test)]
@@ -2138,6 +2296,232 @@ mod tests {
         )
     }
 
+    fn stalling_upstream() -> (
+        u16,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Receiver<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            use std::io::Read as _;
+
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read_exact(&mut byte).is_err() {
+                    return;
+                }
+                head.push(byte[0]);
+            }
+            let _ = accepted_tx.send(());
+            // Never produce response headers. A reset/connection close must
+            // cancel the request scope and close this backend transport.
+            while matches!(stream.read(&mut byte), Ok(1)) {}
+            let _ = closed_tx.send(());
+        });
+        (port, accepted_rx, closed_rx, thread)
+    }
+
+    struct InjectReadFailure<T> {
+        inner: T,
+        fail: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for InjectReadFailure<T> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            use std::future::Future as _;
+
+            if std::pin::Pin::new(&mut self.fail).poll(cx).is_ready() {
+                return std::task::Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "injected HTTP/2 transport failure",
+                )));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for InjectReadFailure<T> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    async fn wait_for_request_resources_to_drain(cfg: &Config) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if cfg.resource_budget.extended_usage().0 == 0 && cfg.resource_budget.usage().2 == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("HTTP/2 request resources did not drain after cancellation");
+    }
+
+    #[derive(Clone, Copy)]
+    enum StreamBodyReceiver {
+        Drain,
+        Drop,
+        Stall,
+    }
+
+    enum StreamBodyEnd {
+        Data,
+        Trailers(http::HeaderMap),
+        Reset,
+        Open,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum StreamBodyOutcome {
+        Complete,
+        Reset,
+        BackendClosed,
+        Response(u16),
+    }
+
+    async fn stream_body_case(
+        chunks: &[&[u8]],
+        end: StreamBodyEnd,
+        receiver: StreamBodyReceiver,
+        declared: u64,
+        limit: u64,
+        timeout: Duration,
+        min_rate: u64,
+        allow_trailers: bool,
+        delay_before_first_chunk: Duration,
+    ) -> StreamBodyOutcome {
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (request, _) = connection.accept().await.unwrap().unwrap();
+            let (sender, mut receiver_channel) = tokio::sync::mpsc::channel(1);
+            let drain = match receiver {
+                StreamBodyReceiver::Drain => Some(tokio::spawn(async move {
+                    while receiver_channel.recv().await.is_some() {}
+                })),
+                StreamBodyReceiver::Drop => {
+                    drop(receiver_channel);
+                    None
+                }
+                StreamBodyReceiver::Stall => {
+                    // Retain but deliberately do not poll the backend side.
+                    let _receiver = receiver_channel;
+                    let result = stream_body(
+                        request.into_body(),
+                        sender,
+                        declared,
+                        limit,
+                        timeout,
+                        min_rate,
+                        allow_trailers,
+                    )
+                    .await;
+                    return result;
+                }
+            };
+            let body = stream_body(
+                request.into_body(),
+                sender,
+                declared,
+                limit,
+                timeout,
+                min_rate,
+                allow_trailers,
+            );
+            tokio::pin!(body);
+            let result = loop {
+                tokio::select! {
+                    result = &mut body => break result,
+                    accepted = connection.accept() => {
+                        if accepted.is_none() {
+                            break Err(H2ReadFailure::Reset);
+                        }
+                    }
+                }
+            };
+            if let Some(drain) = drain {
+                drain.abort();
+            }
+            result
+        });
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/upload")
+            .body(())
+            .unwrap();
+        let (_response, mut send) = client.send_request(request, false).unwrap();
+        if !delay_before_first_chunk.is_zero() {
+            tokio::time::sleep(delay_before_first_chunk).await;
+        }
+        for (index, chunk) in chunks.iter().enumerate() {
+            send.reserve_capacity(chunk.len());
+            let capacity = std::future::poll_fn(|cx| send.poll_capacity(cx))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(capacity >= chunk.len());
+            let last = matches!(end, StreamBodyEnd::Data) && index + 1 == chunks.len();
+            send.send_data(Bytes::copy_from_slice(chunk), last).unwrap();
+        }
+        match end {
+            StreamBodyEnd::Data if chunks.is_empty() => {
+                send.send_data(Bytes::new(), true).unwrap();
+            }
+            StreamBodyEnd::Trailers(trailers) => send.send_trailers(trailers).unwrap(),
+            StreamBodyEnd::Reset => send.send_reset(h2::Reason::CANCEL),
+            StreamBodyEnd::Data | StreamBodyEnd::Open => {}
+        }
+        let result = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("stream-body case did not terminate")
+            .unwrap();
+        drop((send, client));
+        driver.abort();
+        let _ = driver.await;
+        match result {
+            Ok(()) => StreamBodyOutcome::Complete,
+            Err(H2ReadFailure::Reset) => StreamBodyOutcome::Reset,
+            Err(H2ReadFailure::BackendClosed) => StreamBodyOutcome::BackendClosed,
+            Err(H2ReadFailure::Response(response)) => StreamBodyOutcome::Response(response.status),
+        }
+    }
+
     async fn round_trip(
         cfg: Arc<Config>,
         logger: Arc<Logger>,
@@ -2153,6 +2537,27 @@ mod tests {
         request: http::Request<()>,
         body: &[u8],
         sni: Option<&str>,
+    ) -> (u16, Vec<u8>, bool) {
+        round_trip_with_sni_and_trailers(cfg, logger, request, body, sni, None).await
+    }
+
+    async fn round_trip_with_trailers(
+        cfg: Arc<Config>,
+        logger: Arc<Logger>,
+        request: http::Request<()>,
+        body: &[u8],
+        trailers: http::HeaderMap,
+    ) -> (u16, Vec<u8>, bool) {
+        round_trip_with_sni_and_trailers(cfg, logger, request, body, None, Some(trailers)).await
+    }
+
+    async fn round_trip_with_sni_and_trailers(
+        cfg: Arc<Config>,
+        logger: Arc<Logger>,
+        request: http::Request<()>,
+        body: &[u8],
+        sni: Option<&str>,
+        trailers: Option<http::HeaderMap>,
     ) -> (u16, Vec<u8>, bool) {
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
         let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
@@ -2206,7 +2611,7 @@ mod tests {
         let driver = tokio::spawn(async move { connection.await.unwrap() });
         let request_label = format!("{} {}", request.method(), request.uri());
         let head_only = request.method() == http::Method::HEAD;
-        let end = body.is_empty();
+        let end = body.is_empty() && trailers.is_none();
         let (response, mut send) = client.send_request(request, end).unwrap();
         if !end {
             let mut offset = 0usize;
@@ -2219,7 +2624,7 @@ mod tests {
                     break;
                 };
                 let take = capacity.min(body.len() - offset);
-                let last = offset + take == body.len();
+                let last = offset + take == body.len() && trailers.is_none();
                 if send
                     .send_data(Bytes::copy_from_slice(&body[offset..offset + take]), last)
                     .is_err()
@@ -2227,6 +2632,9 @@ mod tests {
                     break;
                 }
                 offset += take;
+            }
+            if let Some(trailers) = trailers {
+                send.send_trailers(trailers).unwrap();
             }
         }
         let response = tokio::time::timeout(std::time::Duration::from_secs(2), response)
@@ -2260,6 +2668,15 @@ mod tests {
         cfg: Arc<Config>,
         response: Response,
         head_only: bool,
+    ) -> (io::Result<u64>, u16, http::HeaderMap, Vec<u8>) {
+        response_round_trip_with_window(cfg, response, head_only, None).await
+    }
+
+    async fn response_round_trip_with_window(
+        cfg: Arc<Config>,
+        response: Response,
+        head_only: bool,
+        initial_window: Option<u32>,
     ) -> (io::Result<u64>, u16, http::HeaderMap, Vec<u8>) {
         let (client_io, server_io) = tokio::io::duplex(32 * 1024 * 1024);
         let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
@@ -2296,7 +2713,11 @@ mod tests {
             }
             result
         });
-        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let mut builder = h2::client::Builder::new();
+        if let Some(initial_window) = initial_window {
+            builder.initial_window_size(initial_window);
+        }
+        let (mut client, connection) = builder.handshake::<_, Bytes>(client_io).await.unwrap();
         let driver = tokio::spawn(async move { connection.await });
         let request = http::Request::builder()
             .method(if head_only { "HEAD" } else { "GET" })
@@ -2489,6 +2910,234 @@ mod tests {
         assert_eq!(body, b"changed after cache");
         assert!(!reset);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_request_trailers_are_capability_gated_and_route_neutral() {
+        let (cfg, logger, dir) = test_config("trailers-disabled");
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/file.txt")
+            .header("content-length", "1")
+            .body(())
+            .unwrap();
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-checksum", http::HeaderValue::from_static("ok"));
+        let (status, _, reset) =
+            round_trip_with_trailers(cfg, logger, request, b"x", trailers).await;
+        assert_eq!(status, 400);
+        assert!(!reset);
+        fs::remove_dir_all(dir).unwrap();
+
+        let (cfg, logger, dir) =
+            test_config_with_extra("trailers-enabled", "VapacheCapability RequestTrailers On");
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/file.txt")
+            .header("content-length", "1")
+            .body(())
+            .unwrap();
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-checksum", http::HeaderValue::from_static("ok"));
+        let (status, body, reset) =
+            round_trip_with_trailers(cfg.clone(), logger.clone(), request, b"x", trailers).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello h2");
+        assert!(!reset);
+
+        // Trailer fields are never allowed to alter framing or routing after
+        // authorization and handler selection have already completed.
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/file.txt")
+            .header("content-length", "1")
+            .body(())
+            .unwrap();
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("content-length", http::HeaderValue::from_static("0"));
+        assert_eq!(
+            round_trip_with_trailers(cfg.clone(), logger.clone(), request, b"x", trailers)
+                .await
+                .0,
+            400
+        );
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/file.txt")
+            .header("content-length", "1")
+            .body(())
+            .unwrap();
+        let mut trailers = http::HeaderMap::new();
+        for index in 0..=H2_MAX_REQUEST_TRAILERS {
+            trailers.insert(
+                http::HeaderName::from_bytes(format!("x-trailer-{index}").as_bytes()).unwrap(),
+                http::HeaderValue::from_static("v"),
+            );
+        }
+        assert_eq!(
+            round_trip_with_trailers(cfg, logger, request, b"x", trailers)
+                .await
+                .0,
+            400
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_request_body_covers_terminal_and_failure_states() {
+        assert_eq!(
+            stream_body_case(
+                &[b"a", b"b"],
+                StreamBodyEnd::Data,
+                StreamBodyReceiver::Drain,
+                2,
+                2,
+                Duration::from_secs(1),
+                0,
+                false,
+                Duration::ZERO,
+            )
+            .await,
+            StreamBodyOutcome::Complete
+        );
+        assert_eq!(
+            stream_body_case(
+                &[b"ab"],
+                StreamBodyEnd::Data,
+                StreamBodyReceiver::Drain,
+                2,
+                1,
+                Duration::from_secs(1),
+                0,
+                false,
+                Duration::ZERO,
+            )
+            .await,
+            StreamBodyOutcome::Response(413)
+        );
+        assert_eq!(
+            stream_body_case(
+                &[b"ab"],
+                StreamBodyEnd::Data,
+                StreamBodyReceiver::Drain,
+                1,
+                2,
+                Duration::from_secs(1),
+                0,
+                false,
+                Duration::ZERO,
+            )
+            .await,
+            StreamBodyOutcome::Response(400)
+        );
+        assert_eq!(
+            stream_body_case(
+                &[b"a"],
+                StreamBodyEnd::Data,
+                StreamBodyReceiver::Drain,
+                2,
+                2,
+                Duration::from_secs(1),
+                0,
+                false,
+                Duration::ZERO,
+            )
+            .await,
+            StreamBodyOutcome::Response(400)
+        );
+        assert_eq!(
+            stream_body_case(
+                &[b"a"],
+                StreamBodyEnd::Data,
+                StreamBodyReceiver::Drop,
+                1,
+                1,
+                Duration::from_secs(1),
+                0,
+                false,
+                Duration::ZERO,
+            )
+            .await,
+            StreamBodyOutcome::BackendClosed
+        );
+        assert_eq!(
+            stream_body_case(
+                &[b"a", b"b"],
+                StreamBodyEnd::Data,
+                StreamBodyReceiver::Stall,
+                2,
+                2,
+                Duration::from_millis(20),
+                0,
+                false,
+                Duration::ZERO,
+            )
+            .await,
+            StreamBodyOutcome::Response(408)
+        );
+        assert_eq!(
+            stream_body_case(
+                &[],
+                StreamBodyEnd::Open,
+                StreamBodyReceiver::Drain,
+                0,
+                1,
+                Duration::from_millis(20),
+                0,
+                false,
+                Duration::ZERO,
+            )
+            .await,
+            StreamBodyOutcome::Response(408)
+        );
+        assert_eq!(
+            stream_body_case(
+                &[],
+                StreamBodyEnd::Reset,
+                StreamBodyReceiver::Drain,
+                0,
+                1,
+                Duration::from_secs(1),
+                0,
+                false,
+                Duration::ZERO,
+            )
+            .await,
+            StreamBodyOutcome::Reset
+        );
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-checksum", http::HeaderValue::from_static("ok"));
+        assert_eq!(
+            stream_body_case(
+                &[b"a"],
+                StreamBodyEnd::Trailers(trailers),
+                StreamBodyReceiver::Drain,
+                1,
+                1,
+                Duration::from_secs(1),
+                0,
+                true,
+                Duration::ZERO,
+            )
+            .await,
+            StreamBodyOutcome::Complete
+        );
+        assert_eq!(
+            stream_body_case(
+                &[b"a"],
+                StreamBodyEnd::Data,
+                StreamBodyReceiver::Drain,
+                1,
+                1,
+                Duration::from_secs(2),
+                1024,
+                false,
+                Duration::from_millis(1_050),
+            )
+            .await,
+            StreamBodyOutcome::Response(408)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2892,6 +3541,191 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn h2_reset_cancels_backend_without_poisoning_other_streams() {
+        let (port, accepted, closed, upstream) = stalling_upstream();
+        let (cfg, logger, dir) = test_config_with_extra(
+            "reset-backend-isolation",
+            &format!("ProxyPass /slow http://127.0.0.1:{port}/"),
+        );
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let tls_identity = test_tls_identity(&cfg);
+        let (_retire, retired) = tokio::sync::watch::channel(false);
+        let server_cfg = cfg.clone();
+        let server = tokio::spawn(serve_io(
+            server_cfg,
+            logger,
+            server_io,
+            "127.0.0.1:12345".parse().unwrap(),
+            "127.0.0.1".into(),
+            443,
+            tls_identity,
+            retired,
+            || Ok(()),
+        ));
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+
+        let request = http::Request::builder()
+            .uri("https://localhost/slow")
+            .body(())
+            .unwrap();
+        let (slow_response, mut slow_send) = client.send_request(request, true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), accepted)
+            .await
+            .expect("proxy request did not reach the upstream")
+            .unwrap();
+        assert_eq!(cfg.resource_budget.usage().2, 1);
+        slow_send.send_reset(h2::Reason::CANCEL);
+        drop(slow_response);
+
+        let request = http::Request::builder()
+            .uri("https://localhost/file.txt")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        let mut response = tokio::time::timeout(Duration::from_secs(1), response)
+            .await
+            .expect("unrelated HTTP/2 stream stalled behind a reset backend")
+            .unwrap()
+            .into_body();
+        let mut body = Vec::new();
+        while let Some(chunk) = response.data().await {
+            let chunk = chunk.unwrap();
+            response
+                .flow_control()
+                .release_capacity(chunk.len())
+                .unwrap();
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, b"hello h2");
+        wait_for_request_resources_to_drain(&cfg).await;
+        closed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled proxy transport remained open");
+
+        drop((slow_send, client));
+        driver.abort();
+        let _ = driver.await;
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        upstream.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_connection_close_cancels_owned_backend_tasks() {
+        let (port, accepted, closed, upstream) = stalling_upstream();
+        let (cfg, logger, dir) = test_config_with_extra(
+            "close-backend-ownership",
+            &format!("ProxyPass /slow http://127.0.0.1:{port}/"),
+        );
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let tls_identity = test_tls_identity(&cfg);
+        let (_retire, retired) = tokio::sync::watch::channel(false);
+        let server_cfg = cfg.clone();
+        let server = tokio::spawn(serve_io(
+            server_cfg,
+            logger,
+            server_io,
+            "127.0.0.1:12345".parse().unwrap(),
+            "127.0.0.1".into(),
+            443,
+            tls_identity,
+            retired,
+            || Ok(()),
+        ));
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+        let request = http::Request::builder()
+            .uri("https://localhost/slow")
+            .body(())
+            .unwrap();
+        let (_response, _send) = client.send_request(request, true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), accepted)
+            .await
+            .expect("proxy request did not reach the upstream")
+            .unwrap();
+        assert_eq!(cfg.resource_budget.usage().2, 1);
+
+        drop(client);
+        driver.abort();
+        let _ = driver.await;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("HTTP/2 connection owner retained a detached backend task")
+            .unwrap()
+            .unwrap();
+        wait_for_request_resources_to_drain(&cfg).await;
+        closed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("connection-owned proxy transport remained open");
+        upstream.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_transport_error_cancels_owned_backend_tasks() {
+        let (port, accepted, closed, upstream) = stalling_upstream();
+        let (cfg, logger, dir) = test_config_with_extra(
+            "transport-error-backend-ownership",
+            &format!("ProxyPass /slow http://127.0.0.1:{port}/"),
+        );
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let (fail_tx, fail_rx) = tokio::sync::oneshot::channel();
+        let server_io = InjectReadFailure {
+            inner: server_io,
+            fail: fail_rx,
+        };
+        let tls_identity = test_tls_identity(&cfg);
+        let (_retire, retired) = tokio::sync::watch::channel(false);
+        let server_cfg = cfg.clone();
+        let server = tokio::spawn(serve_io(
+            server_cfg,
+            logger,
+            server_io,
+            "127.0.0.1:12345".parse().unwrap(),
+            "127.0.0.1".into(),
+            443,
+            tls_identity,
+            retired,
+            || Ok(()),
+        ));
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+        let request = http::Request::builder()
+            .uri("https://localhost/slow")
+            .body(())
+            .unwrap();
+        let (_response, _send) = client.send_request(request, true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), accepted)
+            .await
+            .expect("proxy request did not reach the upstream")
+            .unwrap();
+        assert_eq!(cfg.resource_budget.usage().2, 1);
+
+        fail_tx.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("HTTP/2 transport error retained a detached backend task")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        wait_for_request_resources_to_drain(&cfg).await;
+        closed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("transport-error proxy transport remained open");
+
+        drop(client);
+        driver.abort();
+        let _ = driver.await;
+        upstream.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn retired_h2_generation_refuses_new_streams() {
         let (cfg, logger, dir) = test_config("retired-generation");
         let drain_len = 256 * 1024;
@@ -2990,6 +3824,39 @@ mod tests {
             assert_eq!(result.kind(), io::ErrorKind::TimedOut);
             assert!(!admitted.load(std::sync::atomic::Ordering::Acquire));
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retiring_generation_cancels_an_incomplete_h2_handshake() {
+        let (cfg, logger, dir) = test_config("preface-retirement");
+        let (_client_io, server_io) = tokio::io::duplex(1024);
+        let (retire, retired) = tokio::sync::watch::channel(false);
+        let admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_admitted = admitted.clone();
+        let tls_identity = test_tls_identity(&cfg);
+        let server = tokio::spawn(serve_io(
+            cfg,
+            logger,
+            server_io,
+            "127.0.0.1:12345".parse().unwrap(),
+            "127.0.0.1".into(),
+            443,
+            tls_identity,
+            retired,
+            move || {
+                callback_admitted.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            },
+        ));
+        tokio::task::yield_now().await;
+        retire.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("retired incomplete H2 handshake did not terminate")
+            .unwrap()
+            .unwrap();
+        assert!(!admitted.load(std::sync::atomic::Ordering::Acquire));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3184,6 +4051,39 @@ mod tests {
         assert_eq!(rollover.checkpoint, rollover.absolute_deadline);
     }
 
+    #[test]
+    fn response_body_buffer_pool_reuses_only_bounded_chunks() {
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let client = std::net::IpAddr::from([127, 0, 0, 1]);
+        let resident = Arc::new(Mutex::new(
+            response_chunk_lease(&budget, client, POOL_MAX_CAPACITY).unwrap(),
+        ));
+        let mut buffer = Vec::with_capacity(POOL_MAX_CAPACITY);
+        buffer.extend_from_slice(b"old data");
+        drop(PooledBuffer {
+            buf: Some(buffer),
+            _resident: resident,
+        });
+        let reused = take_body_buffer(POOL_MAX_CAPACITY);
+        assert!(reused.is_empty());
+        assert!(reused.capacity() >= POOL_MAX_CAPACITY);
+
+        // Empty and out-of-range owners exercise the no-op drop paths; they
+        // must not change accounting or retain attacker-sized allocations.
+        let resident = Arc::new(Mutex::new(
+            response_chunk_lease(&budget, client, 1).unwrap(),
+        ));
+        drop(PooledBuffer {
+            buf: None,
+            _resident: resident.clone(),
+        });
+        drop(PooledBuffer {
+            buf: Some(Vec::with_capacity(1)),
+            _resident: resident,
+        });
+        assert_eq!(budget.extended_usage().2, 0);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn admitted_slow_stream_body_checks_deadlines_after_each_read() {
         let (cfg, _logger, dir) = test_config("progressing-stream-response");
@@ -3328,6 +4228,18 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn response_sender_covers_stream_and_every_file_strategy() {
         let (cfg, _logger, dir) = test_config("response-bodies");
+        let split = vec![b'b'; 128 * 1024];
+        let (result, status, _, body) = response_round_trip_with_window(
+            cfg.clone(),
+            Response::bytes(200, "application/octet-stream", split.clone()),
+            false,
+            Some(1024),
+        )
+        .await;
+        assert_eq!(result.unwrap(), split.len() as u64);
+        assert_eq!(status, 200);
+        assert_eq!(body, split);
+
         let mut stream = Response::new(200);
         stream.body = Body::Stream {
             reader: Box::new(&b"stream body"[..]),
@@ -3825,6 +4737,32 @@ mod tests {
 
     #[test]
     fn h2_budget_transitions_preserve_limits() {
+        use vapache_verified::{H2StreamEvent, H2StreamPhase};
+
+        let active =
+            vapache_verified::h2_stream_phase_step(H2StreamPhase::Idle, H2StreamEvent::Begin)
+                .unwrap();
+        assert_eq!(
+            vapache_verified::h2_stream_phase_step(active, H2StreamEvent::Finish),
+            Some(H2StreamPhase::Closed)
+        );
+        let awaiting =
+            vapache_verified::h2_stream_phase_step(active, H2StreamEvent::Reset).unwrap();
+        assert_eq!(awaiting, H2StreamPhase::AwaitingReset);
+        assert_eq!(
+            vapache_verified::h2_stream_phase_step(awaiting, H2StreamEvent::Reclaim),
+            Some(H2StreamPhase::Closed)
+        );
+        assert_eq!(
+            vapache_verified::h2_stream_phase_step(active, H2StreamEvent::ConnectionClose),
+            Some(H2StreamPhase::Closed)
+        );
+        assert!(vapache_verified::h2_stream_phase_step(
+            H2StreamPhase::Closed,
+            H2StreamEvent::Begin
+        )
+        .is_none());
+
         let budget = vapache_verified::h2_budget_new(2, 1);
         let budget = vapache_verified::h2_budget_begin(budget).unwrap();
         let budget = vapache_verified::h2_budget_begin(budget).unwrap();

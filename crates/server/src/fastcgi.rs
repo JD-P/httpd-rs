@@ -684,7 +684,11 @@ fn validate_unix_endpoint(
     Ok(meta)
 }
 
-fn connect_unix_timeout(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+fn connect_unix_timeout(
+    path: &Path,
+    deadline: Instant,
+    request_scope: Option<&crate::resource::RequestScope>,
+) -> io::Result<UnixStream> {
     let bytes = path.as_os_str().as_bytes();
     // SAFETY: every bit pattern is valid for sockaddr_un; this temporary is
     // used only to obtain the platform sun_path capacity.
@@ -754,6 +758,12 @@ fn connect_unix_timeout(path: &Path, deadline: Instant) -> io::Result<UnixStream
             return Err(error);
         }
         loop {
+            if request_scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "FastCGI request scope cancelled",
+                ));
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(io::Error::new(
@@ -761,7 +771,7 @@ fn connect_unix_timeout(path: &Path, deadline: Instant) -> io::Result<UnixStream
                     "FastCGI Unix connection deadline exceeded",
                 ));
             }
-            let wait = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+            let wait = remaining.min(Duration::from_millis(100)).as_millis().max(1) as i32;
             let mut poll = libc::pollfd {
                 fd,
                 events: libc::POLLOUT,
@@ -820,6 +830,7 @@ fn connect(
     backend: &Backend,
     timeout: Duration,
     policy: Option<&FastCgiStablePathPolicy>,
+    request_scope: Option<&crate::resource::RequestScope>,
 ) -> io::Result<Box<dyn ReadWrite>> {
     let deadline = Instant::now() + timeout;
     match &backend.transport {
@@ -827,7 +838,7 @@ fn connect(
             let before = policy
                 .map(|policy| validate_unix_endpoint(policy, path))
                 .transpose()?;
-            let s = connect_unix_timeout(path, deadline)?;
+            let s = connect_unix_timeout(path, deadline, request_scope)?;
             if let (Some(policy), Some(before)) = (policy, before) {
                 let after = validate_unix_endpoint(policy, path)?;
                 if before.dev() != after.dev()
@@ -855,6 +866,7 @@ fn connect(
             Ok(Box::new(DeadlineStream {
                 inner: Box::new(s),
                 deadline,
+                scope: request_scope.cloned(),
             }))
         }
         Transport::Tcp(host, port) => {
@@ -866,32 +878,55 @@ fn connect(
             }
             let mut last = None;
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let addrs = crate::proxy::resolve_backend_addrs(host, *port, remaining)?;
+            let addrs = crate::proxy::resolve_backend_addrs_cancellable(
+                host,
+                *port,
+                remaining,
+                request_scope,
+            )?;
             for addr in addrs {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                match TcpStream::connect_timeout(&addr, remaining) {
-                    Ok(s) => {
-                        crate::resource::configure_transport_fd(&s)?;
-                        let quantum = deadline
-                            .saturating_duration_since(Instant::now())
-                            .min(Duration::from_secs(1));
-                        if quantum.is_zero() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                "FastCGI connection deadline exceeded",
-                            ));
-                        }
-                        s.set_read_timeout(Some(quantum))?;
-                        s.set_write_timeout(Some(quantum))?;
-                        return Ok(Box::new(DeadlineStream {
-                            inner: Box::new(s),
-                            deadline,
-                        }));
+                loop {
+                    if request_scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "FastCGI request scope cancelled",
+                        ));
                     }
-                    Err(e) => last = Some(e),
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match TcpStream::connect_timeout(&addr, remaining.min(Duration::from_secs(1))) {
+                        Ok(s) => {
+                            crate::resource::configure_transport_fd(&s)?;
+                            let quantum = deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_secs(1));
+                            if quantum.is_zero() {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "FastCGI connection deadline exceeded",
+                                ));
+                            }
+                            s.set_read_timeout(Some(quantum))?;
+                            s.set_write_timeout(Some(quantum))?;
+                            return Ok(Box::new(DeadlineStream {
+                                inner: Box::new(s),
+                                deadline,
+                                scope: request_scope.cloned(),
+                            }));
+                        }
+                        Err(error)
+                            if error.kind() == io::ErrorKind::TimedOut
+                                && Instant::now() < deadline =>
+                        {
+                            last = Some(error);
+                        }
+                        Err(error) => {
+                            last = Some(error);
+                            break;
+                        }
+                    }
                 }
             }
             Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address")))
@@ -905,6 +940,7 @@ impl<T: Read + Write> ReadWrite for T {}
 struct DeadlineStream {
     inner: Box<dyn ReadWrite>,
     deadline: Instant,
+    scope: Option<crate::resource::RequestScope>,
 }
 
 impl DeadlineStream {
@@ -914,11 +950,26 @@ impl DeadlineStream {
             "FastCGI exchange deadline exceeded",
         )
     }
+
+    fn cancellation_error(&self) -> Option<io::Error> {
+        self.scope
+            .as_ref()
+            .is_some_and(crate::resource::RequestScope::is_cancelled)
+            .then(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "FastCGI request scope cancelled",
+                )
+            })
+    }
 }
 
 impl Read for DeadlineStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
+            if let Some(error) = self.cancellation_error() {
+                return Err(error);
+            }
             if Instant::now() >= self.deadline {
                 return Err(self.timeout_error());
             }
@@ -937,6 +988,9 @@ impl Read for DeadlineStream {
 impl Write for DeadlineStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         loop {
+            if let Some(error) = self.cancellation_error() {
+                return Err(error);
+            }
             if Instant::now() >= self.deadline {
                 return Err(self.timeout_error());
             }
@@ -953,6 +1007,9 @@ impl Write for DeadlineStream {
 
     fn flush(&mut self) -> io::Result<()> {
         loop {
+            if let Some(error) = self.cancellation_error() {
+                return Err(error);
+            }
             if Instant::now() >= self.deadline {
                 return Err(self.timeout_error());
             }
@@ -1562,7 +1619,7 @@ fn execute_inner(
     let result = (|| -> io::Result<Response> {
         let timeout = base.cfg.timeout.max(Duration::from_secs(5));
         let policy = stable_policy_for(base.cfg, &target.backend)?;
-        let mut stream = connect(&target.backend, timeout, policy)?;
+        let mut stream = connect(&target.backend, timeout, policy, base.req.request_scope())?;
         let params = build_params(&env);
         if let Some(policy) = policy {
             enforce_stable_fastcgi_path(policy, target.script_filename())?;
@@ -1642,6 +1699,44 @@ mod tests {
         Config::load(&path, root, &HashMap::new(), &HashMap::new(), false).unwrap()
     }
 
+    #[test]
+    fn fastcgi_deadline_stream_observes_request_cancellation() {
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let scope = crate::resource::RequestScope::new(
+            budget.context(std::net::IpAddr::from([127, 0, 0, 1])),
+        );
+        scope.cancel();
+        let mut stream = DeadlineStream {
+            inner: Box::new(std::io::Cursor::new(b"reply".to_vec())),
+            deadline: Instant::now() + Duration::from_secs(1),
+            scope: Some(scope.clone()),
+        };
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            stream.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            stream.write(b"x").unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            stream.flush().unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        let backend = Backend {
+            transport: Transport::Tcp("127.0.0.1".into(), 9),
+            prefix: String::new(),
+        };
+        assert_eq!(
+            connect(&backend, Duration::from_secs(1), None, Some(&scope),)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+    }
+
     #[cfg(feature = "fault-injection")]
     #[test]
     fn injected_fastcgi_transport_failures_retry_or_propagate() {
@@ -1651,6 +1746,7 @@ mod tests {
         let mut reader = DeadlineStream {
             inner: Box::new(std::io::Cursor::new(b"reply".to_vec())),
             deadline,
+            scope: None,
         };
         crate::fault::configure("fastcgi.read", 0, io::ErrorKind::WouldBlock);
         let mut byte = [0u8; 1];
@@ -1665,6 +1761,7 @@ mod tests {
         let mut writer = DeadlineStream {
             inner: Box::new(std::io::Cursor::new(Vec::new())),
             deadline,
+            scope: None,
         };
         crate::fault::configure("fastcgi.write", 0, io::ErrorKind::TimedOut);
         assert_eq!(writer.write(b"request").unwrap(), 7);
@@ -1674,6 +1771,7 @@ mod tests {
         let mut expired = DeadlineStream {
             inner: Box::new(std::io::Cursor::new(Vec::new())),
             deadline: Instant::now() - Duration::from_millis(1),
+            scope: None,
         };
         assert_eq!(
             expired.read(&mut byte).unwrap_err().kind(),
@@ -1687,7 +1785,7 @@ mod tests {
 
         crate::fault::configure("fastcgi.unix.socket", 0, io::ErrorKind::PermissionDenied);
         assert_eq!(
-            connect_unix_timeout(Path::new("/tmp/unreached.sock"), deadline)
+            connect_unix_timeout(Path::new("/tmp/unreached.sock"), deadline, None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::PermissionDenied
@@ -1733,9 +1831,14 @@ mod tests {
             endpoint_owner_uid: None,
             trusted_owner_uids: vec![0],
         };
-        let err = connect(&tcp_backend, Duration::from_millis(1), Some(&tcp_policy))
-            .err()
-            .unwrap();
+        let err = connect(
+            &tcp_backend,
+            Duration::from_millis(1),
+            Some(&tcp_policy),
+            None,
+        )
+        .err()
+        .unwrap();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -1788,7 +1891,7 @@ mod tests {
         assert!(stable_policy_for(&cfg, &unregistered).is_err());
 
         let accept = std::thread::spawn(move || listener.accept().unwrap());
-        connect(&backend, Duration::from_secs(2), Some(&policy)).unwrap();
+        connect(&backend, Duration::from_secs(2), Some(&policy), None).unwrap();
         drop(accept.join().unwrap());
 
         let file = dir.join("script.php");
@@ -2618,14 +2721,14 @@ mod tests {
             transport: Transport::Tcp("127.0.0.1".into(), port),
             prefix: String::new(),
         };
-        assert!(connect(&backend, Duration::from_secs(2), None).is_ok());
+        assert!(connect(&backend, Duration::from_secs(2), None, None).is_ok());
         handle.join().unwrap();
 
         let dead = Backend {
             transport: Transport::Tcp("127.0.0.1".into(), 1),
             prefix: String::new(),
         };
-        assert!(connect(&dead, Duration::from_millis(100), None).is_err());
+        assert!(connect(&dead, Duration::from_millis(100), None, None).is_err());
     }
 
     #[test]
