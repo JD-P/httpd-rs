@@ -137,6 +137,47 @@ jobs:
             fi
             cmp /tmp/served.html /var/www/html/index.html
             test "$before" = "$(config_digest)"
+
+            # An installed service must snapshot newly edited Apache policy,
+            # retire the old request generation, and apply the replacement.
+            printf "%s\n" \
+              "<Location />" \
+              "Require all denied" \
+              "</Location>" \
+              >/etc/apache2/conf-available/vapache-reload-test.conf
+            ln -s ../conf-available/vapache-reload-test.conf \
+              /etc/apache2/conf-enabled/vapache-reload-test.conf
+            /usr/sbin/vapachectl graceful
+            denied=0
+            for attempt in $(seq 1 100); do
+              status=$(curl --noproxy "*" --silent --output /dev/null \
+                --write-out "%{http_code}" http://127.0.0.1/ || true)
+              if [ "$status" = 403 ]; then
+                denied=1
+                break
+              fi
+              sleep 0.1
+            done
+            test "$denied" -eq 1
+
+            printf "%s\n" \
+              "<Location />" \
+              "Require all granted" \
+              "</Location>" \
+              >/etc/apache2/conf-available/vapache-reload-test.conf
+            /usr/sbin/vapachectl graceful
+            granted=0
+            for attempt in $(seq 1 100); do
+              status=$(curl --noproxy "*" --silent --output /tmp/reloaded.html \
+                --write-out "%{http_code}" http://127.0.0.1/ || true)
+              if [ "$status" = 200 ] \
+                  && cmp -s /tmp/reloaded.html /var/www/html/index.html; then
+                granted=1
+                break
+              fi
+              sleep 0.1
+            done
+            test "$granted" -eq 1
           '
 
       - name: Validate the stock Debian 13 SSL configuration
@@ -260,12 +301,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
           tag=${RELEASE_TAG:-$GITHUB_REF_NAME}
           if [[ ! "$tag" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]]; then
             echo "invalid release tag: $tag" >&2
+            exit 1
+          fi
+          if [[ "$tag" != "v$PACKAGE_VERSION" ]]; then
+            echo "release tag $tag does not match crate/package version $PACKAGE_VERSION" >&2
             exit 1
           fi
           if [[ "$(git rev-list -n 1 "$tag")" != "$(git rev-parse HEAD)" ]]; then

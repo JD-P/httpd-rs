@@ -44,6 +44,10 @@ jobs:
         run: |
           cargo build --locked -p vapached
           python3 tests/native_dependency_policy.py --binary target/debug/vapached
+      - name: Packaged graceful configuration reload
+        env:
+          VAPACHE_TEST_BINARY: target/debug/vapached
+        run: tests/vapachectl_reload.sh
       - name: Unsafe boundary budget
         run: python3 tests/unsafe_inventory.py
       - name: Resource ownership inventory
