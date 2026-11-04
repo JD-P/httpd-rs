@@ -1215,7 +1215,7 @@ OVERRIDES: dict[str, tuple[str, str, str, str, str, str]] = {
     "CVE-2026-5795": (
         "prevented", "request-lifecycle",
         "an early authentication return left thread-local identity state visible to the next request",
-        "Vapache clears its request identity before every dispatch and destructively takes it afterward; HTTP/1 requests are sequential and HTTP/2 dispatches run inside the same reset/take boundary",
+        "Vapache stores authenticated identity in a request-owned cell shared only by internal clones; the binding is monotonic, reset at top-level dispatch, snapshotted for logging, and retained until the logical request dies",
         "high", "vendor advisory and Vapache request identity lifecycle review",
     ),
     "CVE-2026-58150": (

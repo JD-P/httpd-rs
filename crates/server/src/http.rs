@@ -137,6 +137,11 @@ pub struct Headers {
     // identity separately from the mutable synthetic-request fields and
     // share it across clones without copying the bounded request target.
     wire_identity: Option<std::sync::Arc<WireRequestIdentity>>,
+    // HTTP authentication belongs to the logical request, not the executor
+    // thread that happens to evaluate one of its transitions. Clones used by
+    // internal redirects share this monotonic binding; unrelated requests do
+    // not, even when a worker thread is reused or HTTP/2 tasks interleave.
+    authenticated_identity: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Debug)]
@@ -590,6 +595,38 @@ impl Request {
 
     pub fn header_str(&self, name: &str) -> Option<&str> {
         self.header(name).and_then(|v| std::str::from_utf8(v).ok())
+    }
+
+    pub(crate) fn reset_authenticated_identity(&self) {
+        *self
+            .headers
+            .authenticated_identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    pub(crate) fn record_authenticated_identity(&self, user: &str) -> bool {
+        let mut current = self
+            .headers
+            .authenticated_identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let same_identity = current.as_deref() == Some(user);
+        if !vapache_verified::request_identity_record_admit(current.is_some(), same_identity) {
+            return false;
+        }
+        if current.is_none() {
+            *current = Some(user.to_string());
+        }
+        true
+    }
+
+    pub(crate) fn authenticated_identity(&self) -> Option<String> {
+        self.headers
+            .authenticated_identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     pub fn is_head(&self) -> bool {
@@ -1997,6 +2034,7 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
             discarded_body_len: 0,
             error_document_depth: 0,
             wire_identity: None,
+            authenticated_identity: Default::default(),
         },
         body: Vec::new(),
         body_spool: None,

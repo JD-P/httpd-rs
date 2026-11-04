@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-04",
   "verus": {
-    "verified_functions": 686,
+    "verified_functions": 694,
     "errors": 0
   },
   "obligations": [
@@ -32,7 +32,7 @@
       "title": "Require/PolicyResult semantics",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "PolicyResult combinators and require_none are verified; expression integer/string comparisons run through expr_compare_ints/expr_compare_strs. P27 replaces recursive runtime glob execution with stack-safe iterative DP and consumes glob_match_resource_admit before request-controlled expression matching; exhaustive small-input tests refine both iterative dialects against the Verus fnmatch_spec/expr_glob_spec semantic oracles. A full proof that the DP implementation refines those recursive specifications remains outside Verus. P28 caps each expression value/concatenation at 1 MiB and one recursive evaluation at 4 MiB, with bounded_expansion_append_admit consumed before allocation and errors propagated fail-closed. P15 expression regexes compile through the safe-Rust non-backtracking PCRE2 compatibility frontend at configuration load; expr_regex_result proves an evaluation error cannot grant through negation, regex_engine_mode_admit excludes recursive backtracking/JIT, and the compile/capture/match resource predicates bound allocation and pattern-times-subject work. The admitted regex dialect is differentially checked against the test-only PCRE2 10.46 oracle. auth_file_immutable_admit is consumed by the no-symlink authentication-file opener; its proofs reject service ownership and group/other write authority. Strict UTF-8 decoding, provider/hash semantics, parent-chain kernel enforcement and the Rust automata backend's internal matching semantics remain outside the model."
+      "evidence": "PolicyResult combinators and require_none are verified; expression integer/string comparisons run through expr_compare_ints/expr_compare_strs. P27 replaces recursive runtime glob execution with stack-safe iterative DP and consumes glob_match_resource_admit before request-controlled expression matching; exhaustive small-input tests refine both iterative dialects against the Verus fnmatch_spec/expr_glob_spec semantic oracles. A full proof that the DP implementation refines those recursive specifications remains outside Verus. P28 caps each expression value/concatenation at 1 MiB and one recursive evaluation at 4 MiB, with bounded_expansion_append_admit consumed before allocation and errors propagated fail-closed. P15 expression regexes compile through the safe-Rust non-backtracking PCRE2 compatibility frontend at configuration load; expr_regex_result proves an evaluation error cannot grant through negation, regex_engine_mode_admit excludes recursive backtracking/JIT, and the compile/capture/match resource predicates bound allocation and pattern-times-subject work. The admitted regex dialect is differentially checked against the test-only PCRE2 10.46 oracle. auth_file_immutable_admit is consumed by the no-symlink authentication-file opener; its proofs reject service ownership and group/other write authority. The authentication campaign adds byte-oriented Basic scheme admission, exact credential-cache snapshot reuse and group_provider_result, whose proof makes unavailable group data Denied even under negation. Strict UTF-8 decoding, cryptographic hash implementations, parent-chain kernel enforcement and the Rust automata backend's internal matching semantics remain outside the model."
     },
     {
       "id": "require_none_never_grants",
@@ -81,7 +81,7 @@
       "title": "Scheme, peer, canonical name and identity have trusted sources",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "HTTPS/REQUEST_SCHEME come from listener TLS state, UseCanonicalName uses ServerName, and identity comes from verified authenticators. HTTP Host, absolute-form and HTTP/2 authorities consume parse_http_authority_endpoint, which owns complete bracket/colon splitting, registered-name validation and normalization, checked ports, and compressed or embedded-IPv4 IPv6 parsing; the runtime only renders the typed host result. Controls/whitespace, malformed percent escapes, ambiguous unbracketed literals and numeric overflow cannot enter the canonical authority identity. RemoteIP retains Apache's internal/trusted proxy classes; remoteip_next_internal and remoteip_candidate_admit mechanize the one-way class transition and rejection of private values presented by an external chain. The parser/walk projection and broader context-construction refinement remain partial."
+      "evidence": "HTTPS/REQUEST_SCHEME come from listener TLS state, UseCanonicalName uses ServerName, and identity comes from verified authenticators. HTTP authentication identity is owned by the logical Request and shared only by its internal clones; request_identity_record_admit permits the first binding and same-user confirmation while proving a conflicting overwrite impossible. Canonical-target checks and proxy failover independently authorize their targets without erasing the established identity. HTTP Host, absolute-form and HTTP/2 authorities consume parse_http_authority_endpoint, which owns complete bracket/colon splitting, registered-name validation and normalization, checked ports, and compressed or embedded-IPv4 IPv6 parsing; the runtime only renders the typed host result. Controls/whitespace, malformed percent escapes, ambiguous unbracketed literals and numeric overflow cannot enter the canonical authority identity. RemoteIP retains Apache's internal/trusted proxy classes; remoteip_next_internal and remoteip_candidate_admit mechanize the one-way class transition and rejection of private values presented by an external chain. The parser/walk projection and broader context-construction refinement remain partial."
     },
     {
       "id": "resource_bounds",
@@ -193,7 +193,7 @@
       "title": "Authenticated identity reaches CGI and FastCGI environment",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "the access-grant identity is carried into CgiContext and build_env emits REMOTE_USER/AUTH_TYPE for local CGI and FastCGI; configured environment entries remain unable to override reserved names; unit and F38 replay cases cover Basic auth"
+      "evidence": "the request-owned authenticated identity is retained in every access grant across resolved-target reauthorization and proxy failover; CgiContext/build_env emit REMOTE_USER and AUTH_TYPE=Basic for local CGI and FastCGI even when the canonical target scope does not repeat the lexical AuthType. Configured environment entries remain unable to override reserved names. Unit, F38 and Apache-differential symlinked-CGI cases cover isolation and lifetime."
     },
     {
       "id": "alias_file_target_split",
@@ -493,7 +493,7 @@
       "when VapacheCapability UnstableFastCgiPaths is explicitly enabled, an external FastCGI backend opens SCRIPT_FILENAME after vapache's final descriptor/inode check and the deployment must provide the read-only script-tree invariant that VapacheFastCGIStablePath otherwise machine-enforces",
       "h2 wire framing, TLS client-certificate chain validation, and CGI/proxy protocol details are outside the model",
       "safe-Rust semantic payload constructors match Apache semantics; construction is sealed before effects and consumes verified lexical quote/escape, tag, argument/schema, decimal and section-structure kernels, with differential Apache oracles covering the remaining refinement",
-      "authorization backends implement their stated contracts"
+      "the safe-Rust bcrypt, SHA-1, salted SHA-1 and MD5-crypt implementations satisfy their documented cryptographic and format contracts"
     ],
     "unmodeled_security_directive_classes": [],
     "max_unverified_security_components": 0,
@@ -513,7 +513,7 @@
     "minimum_policy_key_bound": 3
   },
   "adversarial": {
-    "conformance": 165,
+    "conformance": 176,
     "semantics": 339,
     "random": 300,
     "finding_replay_cases": 108,
@@ -639,6 +639,10 @@
     "Process-global compatibility capability admission and disabled-surface rejection",
     "Privilege-drop service identity and pidfd process-control admission",
     "WebSocket negotiation selection syntax, offered-set and uniqueness admission",
-    "Typed DirectoryIndex and ErrorDocument internal-request projection, probe/URL identity, target syntax and recursion admission"
+    "Typed DirectoryIndex and ErrorDocument internal-request projection, probe/URL identity, target syntax and recursion admission",
+    "Byte-oriented Basic authentication scheme and ASCII-separator admission",
+    "Complete authentication-file cache snapshot reuse admission",
+    "Monotonic request-owned authenticated-identity transition",
+    "Fail-closed unavailable group-provider result under positive and negated rules"
   ]
 }

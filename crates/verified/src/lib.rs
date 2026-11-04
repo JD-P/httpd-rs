@@ -4845,6 +4845,127 @@ pub proof fn auth_type_requires_authorization(auth_type_set: bool, has_require: 
 {
 }
 
+/// Authentication header parsing must agree with Apache's byte-oriented
+/// grammar. In particular, Unicode whitespace decoded from obs-text bytes is
+/// not a separator between the scheme and token.
+pub open spec fn basic_authorization_shape_spec(
+    scheme_basic: bool,
+    ascii_separator: bool,
+    token_nonempty: bool,
+    token_has_no_ascii_whitespace: bool,
+) -> bool {
+    scheme_basic && ascii_separator && token_nonempty && token_has_no_ascii_whitespace
+}
+
+pub fn basic_authorization_shape_admit(
+    scheme_basic: bool,
+    ascii_separator: bool,
+    token_nonempty: bool,
+    token_has_no_ascii_whitespace: bool,
+) -> (ok: bool)
+    ensures ok == basic_authorization_shape_spec(
+        scheme_basic,
+        ascii_separator,
+        token_nonempty,
+        token_has_no_ascii_whitespace,
+    ),
+{
+    scheme_basic && ascii_separator && token_nonempty && token_has_no_ascii_whitespace
+}
+
+pub proof fn basic_authorization_rejects_non_ascii_separator(
+    scheme_basic: bool,
+    token_nonempty: bool,
+    token_has_no_ascii_whitespace: bool,
+)
+    ensures !basic_authorization_shape_spec(
+        scheme_basic,
+        false,
+        token_nonempty,
+        token_has_no_ascii_whitespace,
+    ),
+{
+}
+
+/// A parsed authentication database may be reused only while both the opened
+/// object and the path name the exact metadata snapshot that was parsed.
+pub open spec fn auth_cache_snapshot_spec(regular_file: bool, exact_snapshot: bool) -> bool {
+    regular_file && exact_snapshot
+}
+
+pub fn auth_cache_snapshot_admit(regular_file: bool, exact_snapshot: bool) -> (ok: bool)
+    ensures ok == auth_cache_snapshot_spec(regular_file, exact_snapshot),
+{
+    regular_file && exact_snapshot
+}
+
+pub proof fn auth_cache_rejects_changed_snapshot(regular_file: bool)
+    ensures !auth_cache_snapshot_spec(regular_file, false),
+{
+}
+
+/// An authenticated identity is request-owned and monotonic: the first
+/// successful provider binds it, the same user may be observed again, and a
+/// different user can never overwrite it during an internal transition.
+pub open spec fn request_identity_record_spec(current_present: bool, same_identity: bool) -> bool {
+    !current_present || same_identity
+}
+
+pub fn request_identity_record_admit(
+    current_present: bool,
+    same_identity: bool,
+) -> (ok: bool)
+    ensures ok == request_identity_record_spec(current_present, same_identity),
+{
+    !current_present || same_identity
+}
+
+pub proof fn conflicting_request_identity_is_rejected()
+    ensures !request_identity_record_spec(true, false),
+{
+}
+
+/// Group-provider lookup failure is an authorization error, not an empty
+/// membership set. This is security-significant for negated group rules.
+pub open spec fn group_provider_result_spec(
+    lookup_available: bool,
+    member: bool,
+    negated: bool,
+) -> PolicyResult {
+    if !lookup_available {
+        PolicyResult::Denied
+    } else if negated {
+        if member { PolicyResult::Denied } else { PolicyResult::Neutral }
+    } else if member {
+        PolicyResult::Granted
+    } else {
+        PolicyResult::Denied
+    }
+}
+
+pub fn group_provider_result(
+    lookup_available: bool,
+    member: bool,
+    negated: bool,
+) -> (result: PolicyResult)
+    ensures result == group_provider_result_spec(lookup_available, member, negated),
+{
+    if !lookup_available {
+        PolicyResult::Denied
+    } else if negated {
+        if member { PolicyResult::Denied } else { PolicyResult::Neutral }
+    } else if member {
+        PolicyResult::Granted
+    } else {
+        PolicyResult::Denied
+    }
+}
+
+pub proof fn unavailable_group_provider_never_grants(member: bool, negated: bool)
+    ensures group_provider_result_spec(false, member, negated) == PolicyResult::Denied,
+{
+}
+
 /// P12 static-audit follow-up: `Require method` operands are admitted only
 /// when the parser saw at least one method and every spelling is an exact
 /// supported token.  In particular, silently uppercasing `get` into `GET`

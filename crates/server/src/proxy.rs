@@ -3250,7 +3250,10 @@ fn authorize_failover(
         resource.fs_path.as_deref(),
         Some(target.proxy_url.as_str()),
     );
-    next_resource.identity = identity.map(|i| i.user);
+    next_resource.identity = identity
+        .map(|i| i.user)
+        .or_else(|| resource.identity.clone())
+        .or_else(|| req.authenticated_identity());
     let grant = crate::access::grant_if_allowed(access, next_resource.clone())?;
     let bound = grant.bind_proxy(
         &next_resource,

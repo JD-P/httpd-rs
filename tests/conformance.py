@@ -124,6 +124,9 @@ def tree():
     (www / "access" / "errordoc").mkdir(parents=True, exist_ok=True)
     (www / "auth" / "user").mkdir(parents=True, exist_ok=True)
     (www / "auth" / "group").mkdir(parents=True, exist_ok=True)
+    (www / "auth" / "group-duplicate").mkdir(parents=True, exist_ok=True)
+    (www / "group-unavailable").mkdir(parents=True, exist_ok=True)
+    (www / "protected-cgi").mkdir(parents=True, exist_ok=True)
     for sub in ("deny", "auth", "options", "header", "bad", "rewrite", "rewrite-base", "cat-auth", "cat-options", "cat-bad", "cat-fileinfo", "cat-execcgi", "cat-optbad", "compress", "if", "limit", "allowmethods", "elseif", "idx-deny", "errordoc"):
         (www / "htaccess" / sub).mkdir(parents=True, exist_ok=True)
     (www / "dir").mkdir(exist_ok=True)
@@ -197,6 +200,8 @@ def tree():
     (www / "auth" / "protected.txt").write_text("auth secret\n")
     (www / "auth" / "user" / "alice.txt").write_text("alice area\n")
     (www / "auth" / "group" / "staff.txt").write_text("staff area\n")
+    (www / "auth" / "group-duplicate" / "staff.txt").write_text("staff area\n")
+    (www / "group-unavailable" / "staff.txt").write_text("staff area\n")
     (www / "htaccess" / "deny" / "secret.txt").write_text("htaccess deny\n")
     (www / "htaccess" / "auth" / "secret.txt").write_text("htaccess auth\n")
     (www / "htaccess" / "auth" / "private.txt").write_text("htaccess auth\n")
@@ -314,6 +319,7 @@ def tree():
         sha_line("alice", "alicepw") + "\n" + sha_line("bob", "bobpw") + "\n"
     )
     (BASE / ".htgroup").write_text("staff: alice\n")
+    (BASE / ".htgroup-duplicate").write_text("staff: alice\nstaff: bob\n")
     os.chmod(BASE / ".htpasswd", 0o644)
     os.chmod(BASE / ".htgroup", 0o644)
     (www / "link.txt").symlink_to("hello.txt")
@@ -334,9 +340,12 @@ def tree():
         "printf 'ALLOW_ME=%s\\n' \"$ALLOW_ME\"\n"
         "printf 'CONTENT_TYPE=%s\\n' \"$CONTENT_TYPE\"\n"
         "printf 'TRANSFER_ENCODING=%s\\n' \"$HTTP_TRANSFER_ENCODING\"\n"
+        "printf 'REMOTE_USER=%s\\n' \"$REMOTE_USER\"\n"
+        "printf 'AUTH_TYPE=%s\\n' \"$AUTH_TYPE\"\n"
         "printf 'BODY='; cat\n"
     )
     script.chmod(0o755)
+    (www / "protected-cgi" / "who.sh").symlink_to("../cgi-bin/env.sh")
     script2 = www / "cgi-bin" / "status.sh"
     script2.write_text(
         "#!/bin/sh\n"
@@ -382,7 +391,7 @@ def tree():
     for p in www.rglob("*"):
         if p.is_file() and not p.is_symlink():
             os.chmod(p, 0o644)
-    for p in [www, www / "dir", www / "noidx", www / "list", www / "cgi-bin", www / "vhost"]:
+    for p in [www, www / "dir", www / "noidx", www / "list", www / "cgi-bin", www / "protected-cgi", www / "vhost"]:
         os.chmod(p, 0o755)
     for p in [www / "cgi-bin" / "env.sh", www / "cgi-bin" / "status.sh", www / "cgi-bin" / "redirect.sh", www / "cgi-bin" / "mixed-boundary.sh", www / "cgi-bin" / "no-content.sh", www / "cgi-bin" / "reset-content.sh", www / "dir-cgi" / "index.cgi", www / "errorcgi" / "err.cgi"]:
         p.chmod(0o755)
@@ -996,6 +1005,14 @@ def common(port, root, apache, tls_port):
         "    AllowOverride None",
         "    Require all granted",
         "</Directory>",
+        f'<Directory "{BASE}/www/protected-cgi">',
+        "    Options ExecCGI FollowSymLinks",
+        "    AllowOverride None",
+        "    AuthType Basic",
+        '    AuthName "Protected CGI Realm"',
+        f'    AuthUserFile "{BASE}/.htpasswd"',
+        "    Require valid-user",
+        "</Directory>",
         f'<Directory "{BASE}/www/htaccess">',
         "    AllowOverride All",
         "</Directory>",
@@ -1093,6 +1110,22 @@ def common(port, root, apache, tls_port):
         f'    AuthUserFile "{BASE}/.htpasswd"',
         f'    AuthGroupFile "{BASE}/.htgroup"',
         "    Require group staff",
+        "</Location>",
+        '<Location "/auth/group-duplicate/">',
+        "    AuthType Basic",
+        '    AuthName "Duplicate Group Realm"',
+        f'    AuthUserFile "{BASE}/.htpasswd"',
+        f'    AuthGroupFile "{BASE}/.htgroup-duplicate"',
+        "    Require group staff",
+        "</Location>",
+        '<Location "/group-unavailable/">',
+        "    AuthType Basic",
+        '    AuthName "Unavailable Group Realm"',
+        f'    AuthUserFile "{BASE}/.htpasswd"',
+        "    <RequireAll>",
+        "        Require valid-user",
+        "        Require not group banned",
+        "    </RequireAll>",
         "</Location>",
         "<IfModule mod_deflate.c>",
         "    AddOutputFilterByType DEFLATE text/html text/plain text/css text/javascript application/javascript",
@@ -2574,6 +2607,32 @@ class AuthTests(Base):
         )
         self.assertEqual(st, 401)
 
+    def test_basic_scheme_uses_ascii_separator(self):
+        import base64
+
+        token = base64.b64encode(b"alice:alicepw")
+        request = (
+            b"GET /auth/protected.txt HTTP/1.1\r\n"
+            + f"Host: localhost:{VP_PORT}\r\n".encode()
+            + b"Connection: close\r\nAuthorization: Basic\xe2\x80\x83"
+            + token
+            + b"\r\n\r\n"
+        )
+        vapache = parse_response(raw(VP_PORT, request))
+        self.assertIsNotNone(vapache)
+        self.assertEqual(vapache[0], 401)
+        if DIFFERENTIAL:
+            apache_request = request.replace(
+                f"localhost:{VP_PORT}".encode(), f"localhost:{AP_PORT}".encode()
+            )
+            apache = parse_response(raw(AP_PORT, apache_request))
+            if apache is None or apache[0] != vapache[0]:
+                DIFFS.append(
+                    (
+                        "Basic auth non-ASCII separator",
+                        f"status {apache[0] if apache else None} != {vapache[0]}",
+                    )
+                )
     def test_basic_user_and_group_providers(self):
         st, _, b = self.get("/auth/user/alice.txt", headers=self.basic("alice", "alicepw"))
         self.assertEqual((st, b), (200, b"alice area\n"))
@@ -2584,6 +2643,41 @@ class AuthTests(Base):
         self.assertEqual((st, b), (200, b"staff area\n"))
         st, _, _ = self.get("/auth/group/staff.txt", headers=self.basic("bob", "bobpw"))
         self.assertEqual(st, 403)
+
+    def test_group_provider_ambiguity_and_failure(self):
+        st, _, _ = self.get(
+            "/auth/group-duplicate/staff.txt", headers=self.basic("bob", "bobpw")
+        )
+        self.assertEqual(st, 200)
+        self.differential(
+            "duplicate group records",
+            "/auth/group-duplicate/staff.txt",
+            headers=self.basic("bob", "bobpw"),
+        )
+        st, _, _ = self.get(
+            "/group-unavailable/staff.txt",
+            headers=self.basic("alice", "alicepw"),
+        )
+        self.assertEqual(st, 403)
+        self.differential(
+            "negative group without provider",
+            "/group-unavailable/staff.txt",
+            headers=self.basic("alice", "alicepw"),
+        )
+
+    def test_authenticated_identity_survives_resolved_target_reauthorization(self):
+        st, _, body = self.get(
+            "/protected-cgi/who.sh", headers=self.basic("alice", "alicepw")
+        )
+        self.assertEqual(st, 200, body)
+        self.assertIn(b"REMOTE_USER=alice\n", body)
+        self.assertIn(b"AUTH_TYPE=Basic\n", body)
+        self.differential(
+            "authenticated resolved CGI identity",
+            "/protected-cgi/who.sh",
+            headers=self.basic("alice", "alicepw"),
+            compare_body=True,
+        )
 
     def test_basic_htaccess_not_required_for_auth(self):
         # The auth file itself is outside the document root and must not be

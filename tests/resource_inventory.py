@@ -27,8 +27,7 @@ EXPECTED_PHYSICAL = {"FileDescriptor", "Task", "ResidentMemory"}
 # docs/resource-inventory.md.
 ALLOWED_MUTABLE_STATICS = {
     ("access.rs", "SENDER"),
-    ("auth.rs", "REQUEST_IDENTITY"), ("auth.rs", "CACHE"),
-    ("auth.rs", "NEXT_TEMP"),
+    ("auth.rs", "CACHE"), ("auth.rs", "NEXT_TEMP"),
     ("cache.rs", "CACHE_EPOCH"), ("cache.rs", "CACHE"),
     ("cache.rs", "USAGE"), ("cache.rs", "SCAN"), ("cache.rs", "LOCKS"),
     ("cgi.rs", "POOL"),
@@ -40,8 +39,6 @@ ALLOWED_MUTABLE_STATICS = {
     ("files.rs", "DIR"), ("files.rs", "REQUEST_ROOT_FDS"),
     ("files.rs", "REQUEST_METADATA"),
     ("files.rs", "REQUEST_SYMLINK_METADATA"),
-    ("files.rs", "IN_ERROR_DOCUMENT"),
-    ("files.rs", "LOCAL_ERROR_DOCUMENT_RESPONSE"),
     ("h2.rs", "POOL"), ("htaccess.rs", "CACHE"),
     ("htaccess.rs", "TEST_REJECT_SPEC"),
     ("htaccess.rs", "TEST_UNHANDLED_SPEC"),

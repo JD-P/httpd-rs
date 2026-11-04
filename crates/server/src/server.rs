@@ -3371,6 +3371,10 @@ fn helper_access_response(
     local_ip: &str,
     resource: &mut access::ResourceKey,
 ) -> Result<access::AccessGrant, Response> {
+    // A canonical target must authorize its own scope, but an allow that does
+    // not itself require credentials must not erase the identity established
+    // by an earlier URL/transform gate for this same logical request.
+    let inherited_identity = req.authenticated_identity();
     // F63/I63: the mapped filesystem path binds `%{REQUEST_FILENAME}` in
     // `Require expr`.
     let mut access = access::check(scope, req, peer, None, url_path, Some(fs_path));
@@ -3393,6 +3397,9 @@ fn helper_access_response(
     }
     match access {
         Access::Allowed => {
+            if resource.identity.is_none() {
+                resource.identity = inherited_identity;
+            }
             Ok(access::grant_if_allowed(access, resource.clone()).expect("allowed grant"))
         }
         Access::Denied => Err(error_response(
@@ -3573,7 +3580,7 @@ pub(crate) fn dispatch_with_scheme_and_identity(
     local_port: u16,
     tls: bool,
 ) -> (Response, Option<String>) {
-    crate::auth::reset_request_identity();
+    req.reset_authenticated_identity();
     let context = req
         .resource_context()
         .cloned()
@@ -3583,7 +3590,9 @@ pub(crate) fn dispatch_with_scheme_and_identity(
             dispatch_inner_request(cfg, req, peer, local_ip, local_port)
         })
     });
-    let remote_user = crate::auth::take_request_identity();
+    // Logging receives a snapshot. The request-owned binding remains live for
+    // deferred CGI/FastCGI execution and any internal request it produces.
+    let remote_user = req.authenticated_identity();
     (response, remote_user)
 }
 
@@ -6724,14 +6733,10 @@ fn run_fastcgi(
     }
     // coverage:ignore-stop
     let remote_user = bound.key().identity.as_deref();
-    let auth_type = remote_user.and_then(|_| {
-        scope
-            .authorization
-            .auth_type
-            .as_deref()
-            .filter(|kind| kind.eq_ignore_ascii_case("basic"))
-            .map(|_| "Basic")
-    });
+    // The canonical target scope may not repeat the lexical URL's AuthType,
+    // but the request-owned identity still came exclusively from the Basic
+    // authenticator (the only implemented HTTP authentication mechanism).
+    let auth_type = remote_user.map(|_| "Basic");
     let ctx = CgiContext {
         cfg,
         vhost,
@@ -6855,14 +6860,7 @@ fn run_cgi(
             .contains(Options::SYMLINKS_IF_OWNER_MATCH);
     let docroot = cfg.documentation_root_for(vhost);
     let remote_user = bound.key().identity.as_deref();
-    let auth_type = remote_user.and_then(|_| {
-        scope
-            .authorization
-            .auth_type
-            .as_deref()
-            .filter(|kind| kind.eq_ignore_ascii_case("basic"))
-            .map(|_| "Basic")
-    });
+    let auth_type = remote_user.map(|_| "Basic");
     let ctx = CgiContext {
         cfg,
         vhost,
@@ -8576,6 +8574,7 @@ mod tests {
             dispatch_with_scheme_and_identity(&cfg, &req, cov_peer(), "127.0.0.1", 80, false);
         assert_eq!(response.status, 200);
         assert_eq!(remote_user.as_deref(), Some("alice"));
+        assert_eq!(req.authenticated_identity().as_deref(), Some("alice"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

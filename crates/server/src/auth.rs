@@ -12,7 +12,6 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
 use md5::Md5;
 use sha1::{Digest, Sha1};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -30,21 +29,6 @@ const AUTH_FAILURE_CACHE_TTL: Duration = Duration::from_millis(250);
 const CRYPT_ALPHABET: &[u8; 64] =
     b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-thread_local! {
-    /// The authenticated identity for the synchronous request dispatch that
-    /// is currently running on this worker. Dispatch never yields while this
-    /// value is live, including on HTTP/2 worker threads.
-    static REQUEST_IDENTITY: RefCell<Option<String>> = const { RefCell::new(None) };
-}
-
-pub(crate) fn reset_request_identity() {
-    REQUEST_IDENTITY.with(|identity| *identity.borrow_mut() = None);
-}
-
-pub(crate) fn take_request_identity() -> Option<String> {
-    REQUEST_IDENTITY.with(|identity| identity.borrow_mut().take())
-}
-
 /// Verify the request's Basic credentials against `AuthUserFile`.  Returns
 /// `None` for missing, malformed, unsupported or non-matching credentials.
 pub fn authenticate(scope: &Scope, req: &Request, mutable_auth_files: bool) -> Option<Identity> {
@@ -57,13 +41,7 @@ pub fn authenticate(scope: &Scope, req: &Request, mutable_auth_files: bool) -> O
     {
         return None;
     }
-    let header = req.header_str("authorization")?.trim();
-    let mut parts = header.splitn(2, char::is_whitespace);
-    let scheme = parts.next()?;
-    let token = parts.next()?.trim();
-    if !scheme.eq_ignore_ascii_case("basic") || token.is_empty() {
-        return None;
-    }
+    let token = basic_token(req.header("authorization")?)?;
     let decoded = STANDARD
         .decode(token)
         .or_else(|_| STANDARD_NO_PAD.decode(token))
@@ -83,16 +61,60 @@ pub fn authenticate(scope: &Scope, req: &Request, mutable_auth_files: bool) -> O
     if !verify_password(password, &stored) {
         return None;
     }
-    let groups = match scope.authorization.auth_group_file.as_ref() {
-        Some(path) => groups_for(path, user, mutable_auth_files)?,
-        None => Vec::new(),
-    };
+    // Group authorization is a separate provider. Preserve its unavailable
+    // state instead of treating a missing/unreadable database as an empty
+    // membership set: the latter can grant `Require not group ...`.
+    let groups = scope
+        .authorization
+        .auth_group_file
+        .as_ref()
+        .and_then(|path| groups_for(path, user, mutable_auth_files));
     let identity = Identity {
         user: user.to_string(),
         groups,
     };
-    REQUEST_IDENTITY.with(|current| *current.borrow_mut() = Some(identity.user.clone()));
+    if !req.record_authenticated_identity(&identity.user) {
+        return None;
+    }
     Some(identity)
+}
+
+/// Parse the byte-oriented Apache Basic scheme boundary. HTTP field values
+/// may contain UTF-8 obs-text, but Unicode whitespace is data rather than an
+/// authentication grammar separator.
+fn basic_token(header: &[u8]) -> Option<&[u8]> {
+    let mut start = 0usize;
+    while start < header.len() && matches!(header[start], b' ' | b'\t') {
+        start += 1;
+    }
+    let mut end = header.len();
+    while end > start && matches!(header[end - 1], b' ' | b'\t') {
+        end -= 1;
+    }
+    let scheme_basic =
+        end.saturating_sub(start) >= 5 && header[start..start + 5].eq_ignore_ascii_case(b"basic");
+    let separator = start
+        .checked_add(5)
+        .filter(|index| *index < end)
+        .is_some_and(|index| matches!(header[index], b' ' | b'\t'));
+    let mut token_start = start.saturating_add(5);
+    while token_start < end && matches!(header[token_start], b' ' | b'\t') {
+        token_start += 1;
+    }
+    let token_nonempty = token_start < end;
+    let token_has_no_ascii_whitespace = token_nonempty
+        && header[token_start..end]
+            .iter()
+            .all(|byte| !byte.is_ascii_whitespace());
+    if !vapache_verified::basic_authorization_shape_admit(
+        scheme_basic,
+        separator,
+        token_nonempty,
+        token_has_no_ascii_whitespace,
+    ) {
+        return None;
+    }
+    Some(&header[token_start..end])
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -246,7 +268,7 @@ fn path_names_key(path: &Path, key: &AuthFileKey) -> bool {
     let Ok(meta) = crate::fault::hit("auth.path.metadata").and_then(|()| file.metadata()) else {
         return false;
     };
-    meta.is_file() && meta.dev() == key.dev && meta.ino() == key.ino
+    vapache_verified::auth_cache_snapshot_admit(meta.is_file(), auth_key(path, &meta) == *key)
 }
 
 fn read_bounded(reader: impl Read) -> Option<String> {
@@ -290,8 +312,10 @@ fn parse_auth_file(data: &str) -> Option<(ParsedAuthFile, usize)> {
                 slot.insert(None);
             }
         }
-        let group = name.trim().to_string();
-        for member in value.split_whitespace() {
+        let group = name
+            .trim_matches(|character: char| character.is_ascii_whitespace())
+            .to_string();
+        for member in value.split_ascii_whitespace() {
             weight = weight
                 .checked_add(member.len())?
                 .checked_add(group.len())?
@@ -339,7 +363,6 @@ fn groups_for(path: &Path, user: &str, mutable: bool) -> Option<Vec<String>> {
 }
 
 fn verify_password(password: &[u8], stored: &str) -> bool {
-    let stored = stored.trim();
     if let Some(encoded) = stored.strip_prefix("{SHA}") {
         let Ok(expected) = STANDARD
             .decode(encoded)
@@ -567,12 +590,16 @@ mod tests {
 
         let identity = authenticate(&scope, &request(Some(basic(b"alice:secret"))), true).unwrap();
         assert_eq!(identity.user, "alice");
-        assert_eq!(identity.groups, ["admins"]);
+        assert_eq!(
+            identity.groups.as_deref(),
+            Some(["admins".to_string()].as_slice())
+        );
         assert!(authenticate(&scope, &request(Some(basic(b"alice:wrong"))), true).is_none());
         assert!(authenticate(&scope, &request(Some(basic(b"nobody:secret"))), true).is_none());
 
         std::fs::write(&groups, b"admins: alice\xff\n").unwrap();
-        assert!(authenticate(&scope, &request(Some(basic(b"alice:secret"))), true).is_none());
+        let identity = authenticate(&scope, &request(Some(basic(b"alice:secret"))), true).unwrap();
+        assert!(identity.groups.is_none());
         std::fs::write(&groups, "admins: alice bob\n").unwrap();
 
         std::fs::write(
@@ -583,6 +610,21 @@ mod tests {
         assert!(authenticate(&scope, &request(Some(basic(b"alice:secret"))), true).is_none());
         std::fs::remove_file(users).unwrap();
         std::fs::remove_file(groups).unwrap();
+    }
+
+    #[test]
+    fn group_provider_failure_does_not_erase_valid_user_authentication() {
+        let users = temp_path("valid-user-users");
+        std::fs::write(&users, "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n").unwrap();
+        let mut scope = Scope::default();
+        scope.authorization.auth_type = Some("Basic".into());
+        scope.authorization.auth_user_file = Some(users.clone());
+        scope.authorization.auth_group_file = Some(temp_path("missing-group-file"));
+
+        let identity = authenticate(&scope, &request(Some(basic(b"alice:test"))), true).unwrap();
+        assert_eq!(identity.user, "alice");
+        assert!(identity.groups.is_none());
+        std::fs::remove_file(users).unwrap();
     }
 
     #[test]
@@ -613,6 +655,10 @@ mod tests {
         assert!(!md5_crypt_matches(b"x", "$1$x$bad", "$apr1$"));
         assert!(!md5_crypt_matches(b"x", "$apr1$missing", "$apr1$"));
         assert!(!md5_crypt_matches(b"x", "$apr1$123456789$bad", "$apr1$"));
+        assert!(!verify_password(
+            b"secret",
+            "{SHA}5en6G6MezRroT3XKqkdPOmY/BfQ=\u{2003}"
+        ));
 
         let missing = temp_path("identity-missing");
         let missing_key = AuthFileKey {
@@ -626,6 +672,61 @@ mod tests {
             ctime_nsec: 0,
         };
         assert!(!path_names_key(&missing, &missing_key));
+    }
+
+    #[test]
+    fn basic_scheme_boundary_is_ascii_and_byte_exact() {
+        assert_eq!(
+            basic_token(b"Basic dXNlcjpwYXNz"),
+            Some(&b"dXNlcjpwYXNz"[..])
+        );
+        assert_eq!(
+            basic_token(b"\tBASIC\t\tdXNlcjpwYXNz \t"),
+            Some(&b"dXNlcjpwYXNz"[..])
+        );
+        for malformed in [
+            b"Basic\xe2\x80\x83dXNlcjpwYXNz".as_slice(),
+            b"\xe2\x80\x83Basic dXNlcjpwYXNz".as_slice(),
+            b"Basic dXNl dXNlcg==".as_slice(),
+            b"Basic".as_slice(),
+        ] {
+            assert!(basic_token(malformed).is_none());
+        }
+    }
+
+    #[test]
+    fn authenticated_identity_is_request_owned_and_monotonic() {
+        let first = request(None);
+        let internal = first.clone();
+        let unrelated = request(None);
+
+        assert!(first.record_authenticated_identity("alice"));
+        assert!(internal.record_authenticated_identity("alice"));
+        assert!(!internal.record_authenticated_identity("mallory"));
+        assert_eq!(first.authenticated_identity().as_deref(), Some("alice"));
+        assert!(unrelated.authenticated_identity().is_none());
+        // Taking an access-log snapshot must not shorten the identity's
+        // lifetime before a deferred handler or internal transition runs.
+        assert_eq!(internal.authenticated_identity().as_deref(), Some("alice"));
+        assert_eq!(first.authenticated_identity().as_deref(), Some("alice"));
+
+        assert!(unrelated.record_authenticated_identity("bob"));
+        unrelated.reset_authenticated_identity();
+        assert!(unrelated.authenticated_identity().is_none());
+    }
+
+    #[test]
+    fn cache_identity_includes_the_complete_metadata_snapshot() {
+        let path = temp_path("complete-cache-key");
+        std::fs::write(&path, "alice:old\n").unwrap();
+        let original = auth_key(&path, &std::fs::metadata(&path).unwrap());
+        assert!(path_names_key(&path, &original));
+
+        // Same path and inode, different contents/size: the old parsed
+        // snapshot must no longer be reusable.
+        std::fs::write(&path, "alice:replacement-value\n").unwrap();
+        assert!(!path_names_key(&path, &original));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[cfg(feature = "fault-injection")]

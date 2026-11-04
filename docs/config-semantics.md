@@ -66,7 +66,10 @@ treated as mutation authority even when the owner-write bit is currently
 clear. `MutableAuthFiles` is an explicit compatibility opt-in for deployments
 that intentionally let the service update these databases. Startup, reload,
 and every runtime read repeat the check, including files named by access-file
-configuration.
+configuration. Parsed-database cache hits revalidate the complete device,
+inode, size, mtime and ctime snapshot. An absent or unreadable group provider
+is distinct from a successful lookup with no memberships and denies both
+positive and negated group requirements.
 
 ## 1. Scope of the model
 
@@ -874,10 +877,13 @@ grant.identity = Some(user) -> CGI/FastCGI env contains REMOTE_USER=user
 authentication scheme          -> AUTH_TYPE=Basic (for Basic authentication)
 ```
 
-The identity recorded when `helper_access_response()` authenticates is carried
-through the target reauthorization and grant binding into `CgiContext`.  Both
-local CGI and FastCGI use the same `build_env()`, so an application cannot see
-an empty user for an authenticated request.  Configured/rewrite environment
+The first successful authenticator records a monotonic identity on the logical
+request. Internal request clones share that binding, unrelated requests do
+not, and a later provider cannot replace it with another user. The binding
+survives deferred execution, target reauthorization, proxy failover and grant
+binding into `CgiContext`; access logging receives a non-destructive snapshot.
+Both local CGI and FastCGI use the same `build_env()`, so an application cannot
+see an empty user for an authenticated request. Configured/rewrite environment
 entries still cannot override `REMOTE_USER`/`AUTH_TYPE`.
 
 ### I28 — Proxy serialization boundary
@@ -1794,7 +1800,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **686 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **694 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -2326,7 +2332,7 @@ The current ledger (2026-11-04) is:
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **686 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **694 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

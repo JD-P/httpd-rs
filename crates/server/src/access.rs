@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub user: String,
-    pub groups: Vec<String>,
+    /// `None` means the group provider was absent or unavailable. This must
+    /// remain distinct from a successful lookup with no memberships because
+    /// negated group rules cannot turn provider failure into a grant.
+    pub groups: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -782,10 +785,11 @@ fn eval_require(
             let Ok(names) = expanded_words(names, req, env, peer, url_path) else {
                 return PolicyResult::Denied;
             };
-            decide(
-                identity.groups.iter().any(|g| names.iter().any(|n| n == g)),
-                *negate,
-            )
+            let Some(groups) = identity.groups.as_ref() else {
+                return vapache_verified::group_provider_result(false, false, *negate);
+            };
+            let member = groups.iter().any(|g| names.iter().any(|n| n == g));
+            vapache_verified::group_provider_result(true, member, *negate)
         }
         Require::Env { negate, names } => {
             // mod_authz_core grants the provider when any listed variable is
@@ -1288,7 +1292,7 @@ mod tests {
         }]);
         let identity = Identity {
             user: "alice".into(),
-            groups: Vec::new(),
+            groups: Some(Vec::new()),
         };
         assert_eq!(
             check(
@@ -1411,7 +1415,7 @@ mod tests {
 
         let identity = Identity {
             user: "alice".into(),
-            groups: vec!["admins".into()],
+            groups: Some(vec!["admins".into()]),
         };
         for provider in [
             Require::Host {
@@ -1887,7 +1891,7 @@ mod tests {
         let docroot = Path::new("/");
         let identity = Identity {
             user: "alice".into(),
-            groups: Vec::new(),
+            groups: Some(Vec::new()),
         };
         assert_eq!(
             eval_require(
@@ -1927,6 +1931,34 @@ mod tests {
                 None,
             ),
             PolicyResult::Neutral
+        );
+    }
+
+    #[test]
+    fn unavailable_group_provider_cannot_satisfy_a_negated_rule() {
+        let request = req("GET");
+        let identity = Identity {
+            user: "alice".into(),
+            groups: None,
+        };
+        let mut scope = Scope::default();
+        scope.authorization.requires = nodes(vec![RequireNode::All(vec![
+            RequireNode::Provider(Require::AllGranted),
+            RequireNode::Provider(Require::Group {
+                negate: true,
+                names: vec!["banned".into()],
+            }),
+        ])]);
+        assert_eq!(
+            check(
+                &scope,
+                &request,
+                "127.0.0.1".parse().unwrap(),
+                Some(&identity),
+                "/x",
+                None,
+            ),
+            Access::Denied
         );
     }
 
@@ -2389,7 +2421,7 @@ mod tests {
         let peer_outside: IpAddr = "192.0.2.1".parse().unwrap();
         let alice = Identity {
             user: "alice".into(),
-            groups: Vec::new(),
+            groups: Some(Vec::new()),
         };
         let req = req("GET");
 
