@@ -8576,12 +8576,29 @@ impl Compile {
                 );
             }
             "sslciphersuite" | "sslciphersuitetls13" => {
-                self.directive_error(
-                    loc,
-                    format!(
-                        "{name} is not implemented by the Rustls backend; refusing to replace an explicit cipher policy with defaults"
-                    ),
-                );
+                // Debian and Ubuntu enable this OpenSSL policy in their stock
+                // mod_ssl configuration. Rustls' fixed TLS 1.2/1.3 suite set
+                // is a strict subset: every offered suite provides strong
+                // encryption and authenticated key exchange, and Rustls has
+                // no anonymous suites. Accept only that exact known superset;
+                // every policy that could remove a Rustls suite or request a
+                // different one remains a hard error.
+                if name == "sslciphersuite"
+                    && args.len() == 1
+                    && args[0].eq_ignore_ascii_case("HIGH:!aNULL")
+                {
+                    self.warn(format!(
+                        "{}:{}: SSLCipherSuite HIGH:!aNULL is satisfied by Rustls' smaller authenticated modern cipher set",
+                        loc.file, loc.line
+                    ));
+                } else {
+                    self.directive_error(
+                        loc,
+                        format!(
+                            "{name} is not implemented by the Rustls backend; refusing to replace an explicit cipher policy with defaults"
+                        ),
+                    );
+                }
             }
             "authtype" => {
                 debug_assert_eq!(payload.keyword(), Some(0));
@@ -15724,6 +15741,12 @@ Require all granted\n\
         err("SSLCARevocationCheck maybe\n");
         err("SSLProtocol\n");
         err("SSLCipherSuite HIGH\n");
+        let stock_cipher_policy =
+            load_text("Listen 127.0.0.1:0\nSSLCipherSuite HIGH:!aNULL\n", false).unwrap();
+        assert!(stock_cipher_policy
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("smaller authenticated modern cipher set")));
         err("LogLevel ssl:info\n");
         err("DeflateBufferSize 4096\n");
         err("AuthBasicProvider ldap\n");
