@@ -1,0 +1,130 @@
+# Shared fail-closed primitives for Vapache's privileged shell control plane.
+# This file is sourced from fixed /usr/lib/vapache paths by installed helpers.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+LC_ALL=C
+export LC_ALL
+IFS=$(printf ' \t\n_')
+IFS=${IFS%_}
+unset CDPATH ENV BASH_ENV
+umask 022
+
+vapache_path_is_plain() {
+    case "${1:-}" in
+        ""|*[!\ -~]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# Print an existing canonical path only when the supplied spelling contains no
+# symlink, dot-component, duplicate separator, or trailing separator.  Keeping
+# the checked spelling identical to the used spelling closes ancestor-swap
+# gaps in the shell wrappers.
+vapache_canonical_unsymlinked() {
+    vapache_cu_path=${1:-}
+    vapache_path_is_plain "$vapache_cu_path" || return 1
+    case "$vapache_cu_path" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    vapache_cu_canonical=$(readlink -e -- "$vapache_cu_path") || return 1
+    [ "$vapache_cu_canonical" = "$vapache_cu_path" ] || return 1
+    [ ! -L "$vapache_cu_path" ] || return 1
+    printf '%s\n' "$vapache_cu_canonical"
+}
+
+# Root-owned ancestors and ancestors owned by the invoking identity are trust
+# anchors. Writable sticky ancestors such as /tmp are safe only as ancestors:
+# a controlled child cannot be replaced there. The target itself must never be
+# writable by group or other users.
+vapache_path_is_controlled_by() (
+    vapache_pcb_path=$(vapache_canonical_unsymlinked "${1:-}") || exit 1
+    vapache_pcb_owner=${2:-}
+    case "$vapache_pcb_owner" in
+        ""|*[!0-9]*) exit 1 ;;
+    esac
+    vapache_pcb_current=$vapache_pcb_path
+    vapache_pcb_target=1
+    while :; do
+        vapache_pcb_actual_owner=$(stat -c '%u' -- "$vapache_pcb_current") || exit 1
+        [ "$vapache_pcb_actual_owner" = 0 ] \
+            || [ "$vapache_pcb_actual_owner" = "$vapache_pcb_owner" ] \
+            || exit 1
+        if [ -n "$(find "$vapache_pcb_current" -maxdepth 0 -perm /022 -print -quit)" ]; then
+            if [ "$vapache_pcb_target" -eq 1 ] \
+                || [ ! -d "$vapache_pcb_current" ] \
+                || [ -z "$(find "$vapache_pcb_current" -maxdepth 0 -perm -1000 -print -quit)" ]; then
+                exit 1
+            fi
+        fi
+        [ "$vapache_pcb_current" = / ] && exit 0
+        vapache_pcb_current=${vapache_pcb_current%/*}
+        [ -n "$vapache_pcb_current" ] || vapache_pcb_current=/
+        vapache_pcb_target=0
+    done
+)
+
+vapache_root_path_is_controlled() {
+    vapache_path_is_controlled_by "$1" 0
+}
+
+vapache_user_path_is_controlled() {
+    vapache_path_is_controlled_by "$1" "${2:-$(id -u)}"
+}
+
+vapache_path_is_controlled() {
+    if [ "$(id -u)" -eq 0 ]; then
+        vapache_root_path_is_controlled "$1"
+    else
+        vapache_user_path_is_controlled "$1"
+    fi
+}
+
+# Validate command overrides rather than trusting a privileged caller's PATH
+# or environment.  The permitted basenames prevent a root-owned general-
+# purpose interpreter from being substituted for a control command.
+vapache_validate_command() {
+    vapache_vc_path=${1:-}
+    vapache_vc_names=${2:-}
+    vapache_vc_canonical=$(vapache_canonical_unsymlinked "$vapache_vc_path") || return 1
+    [ -f "$vapache_vc_canonical" ] && [ -x "$vapache_vc_canonical" ] || return 1
+    case " $vapache_vc_names " in
+        *" ${vapache_vc_canonical##*/} "*) ;;
+        *) return 1 ;;
+    esac
+    vapache_path_is_controlled "$vapache_vc_canonical" || return 1
+    printf '%s\n' "$vapache_vc_canonical"
+}
+
+vapache_ensure_runtime_dir() {
+    vapache_erd_path=${1:-}
+    vapache_path_is_plain "$vapache_erd_path" || return 1
+    case "$vapache_erd_path" in
+        /|"") return 1 ;;
+        /*) ;;
+        *) return 1 ;;
+    esac
+
+    if [ -e "$vapache_erd_path" ] || [ -L "$vapache_erd_path" ]; then
+        [ -d "$vapache_erd_path" ] && [ ! -L "$vapache_erd_path" ] || return 1
+    else
+        vapache_erd_parent=${vapache_erd_path%/*}
+        [ -n "$vapache_erd_parent" ] || vapache_erd_parent=/
+        if [ "$(id -u)" -eq 0 ]; then
+            vapache_root_path_is_controlled "$vapache_erd_parent" || return 1
+            install -d -o root -g root -m 0755 -- "$vapache_erd_path" || return 1
+        else
+            install -d -m 0755 -- "$vapache_erd_path" || return 1
+        fi
+    fi
+    vapache_path_is_controlled "$vapache_erd_path"
+}
+
+vapache_lock_file_is_safe() {
+    vapache_lf_path=${1:-}
+    if [ -e "$vapache_lf_path" ] || [ -L "$vapache_lf_path" ]; then
+        [ -f "$vapache_lf_path" ] && [ ! -L "$vapache_lf_path" ] || return 1
+        vapache_path_is_controlled "$vapache_lf_path" || return 1
+    fi
+}

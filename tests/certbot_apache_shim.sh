@@ -93,13 +93,15 @@ if run_shim launch >/dev/null 2>&1; then
 fi
 
 : >"$log"
-PATH="$work:$PATH" SHIM_TEST_LOG=$log SHIM_TEST_VAPACHE_ACTIVE=0 \
+VAPACHE_SYSTEMCTL=$work/systemctl \
+    SHIM_TEST_LOG=$log SHIM_TEST_VAPACHE_ACTIVE=0 \
     "$deploy_hook"
 grep -qx 'systemctl:is-active --quiet vapache.service' "$log"
 [ "$(wc -l <"$log")" -eq 1 ]
 
 : >"$log"
-PATH="$work:$PATH" SHIM_TEST_LOG=$log SHIM_TEST_VAPACHE_ACTIVE=1 \
+VAPACHE_SYSTEMCTL=$work/systemctl \
+    SHIM_TEST_LOG=$log SHIM_TEST_VAPACHE_ACTIVE=1 \
     "$deploy_hook"
 grep -qx 'systemctl:is-active --quiet vapache.service' "$log"
 grep -qx 'systemctl:reload vapache.service' "$log"

@@ -1,5 +1,28 @@
-#!/bin/sh
+#!/bin/sh -p
 set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+case "$0" in
+    /usr/sbin/*)
+        vapache_switch_common=/usr/lib/vapache/control-common
+        if [ -L "$vapache_switch_common" ] || [ ! -f "$vapache_switch_common" ] \
+            || [ "$(stat -c '%u' -- "$vapache_switch_common")" != 0 ] \
+            || [ -n "$(find "$vapache_switch_common" -maxdepth 0 -perm /022 -print -quit)" ]; then
+            echo "vapache-switch: unsafe installed control library" >&2
+            exit 1
+        fi
+        ;;
+    *)
+    case "$0" in
+        */*) vapache_switch_script_dir=${0%/*} ;;
+        *) vapache_switch_script_dir=. ;;
+    esac
+        vapache_switch_common=$vapache_switch_script_dir/vapache-control-common
+        ;;
+esac
+. "$vapache_switch_common"
 
 assume_yes=false
 case "${1:-}" in
@@ -13,15 +36,46 @@ case "${1:-}" in
         exit 2
         ;;
 esac
+[ "$#" -eq 0 ] || {
+    echo "Usage: vapache-switch [--yes]" >&2
+    exit 2
+}
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "vapache-switch: run this command as root" >&2
     exit 1
 fi
-if ! command -v systemctl >/dev/null 2>&1; then
+if [ -n "${VAPACHE_SYSTEMCTL:-}" ]; then
+    systemctl_path=$VAPACHE_SYSTEMCTL
+elif ! systemctl_path=$(command -v systemctl 2>/dev/null); then
     echo "vapache-switch: systemd is required" >&2
     exit 1
 fi
+systemctl_command=$(vapache_validate_command "$systemctl_path" systemctl) || {
+    echo "vapache-switch: systemctl is not a controlled executable" >&2
+    exit 1
+}
+vapache_control=$(vapache_validate_command /usr/sbin/vapachectl vapachectl) || {
+    echo "vapache-switch: /usr/sbin/vapachectl is not a controlled executable" >&2
+    exit 1
+}
+
+vapache_ensure_runtime_dir /run/vapache || {
+    echo "vapache-switch: /run/vapache is not a controlled runtime directory" >&2
+    exit 1
+}
+switch_lock=/run/vapache/switch.lock
+vapache_lock_file_is_safe "$switch_lock" || {
+    echo "vapache-switch: unsafe switch lock: $switch_lock" >&2
+    exit 1
+}
+exec 8>"$switch_lock"
+chmod 0600 "$switch_lock"
+vapache_lock_file_is_safe "$switch_lock" || {
+    echo "vapache-switch: could not secure switch lock" >&2
+    exit 1
+}
+flock -x 8
 
 certbot_shim=/usr/lib/vapache/certbot-apachectl
 certbot_deploy_hook=/usr/lib/vapache/certbot-deploy-hook
@@ -31,6 +85,50 @@ certbot_cli_uses_shim=false
 certbot_renewals=0
 certbot_apache_renewals=0
 certbot_unshimmed_renewals=0
+temporary=
+transition_started=false
+transition_complete=false
+apache_service=
+apache_active=false
+apache_enabled=false
+
+restore_switch_state() {
+    vapache_switch_status=$?
+    if [ -n "$temporary" ]; then
+        rm -f -- "$temporary"
+    fi
+    if [ "$transition_started" = true ] && [ "$transition_complete" != true ]; then
+        echo "vapache-switch: restoring the previous web-server service state" >&2
+        "$systemctl_command" disable --now vapache.service >/dev/null 2>&1 || true
+        if [ -n "$apache_service" ]; then
+            if [ "$apache_enabled" = true ]; then
+                "$systemctl_command" enable "$apache_service" >/dev/null 2>&1 || true
+            fi
+            if [ "$apache_active" = true ]; then
+                "$systemctl_command" start "$apache_service" >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+    return "$vapache_switch_status"
+}
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap restore_switch_state EXIT
+
+controlled_certbot_directory() {
+    certbot_directory=$1
+    if [ -e "$certbot_directory" ] || [ -L "$certbot_directory" ]; then
+        [ -d "$certbot_directory" ] && [ ! -L "$certbot_directory" ] \
+            && vapache_root_path_is_controlled "$certbot_directory"
+        return
+    fi
+    certbot_parent=${certbot_directory%/*}
+    [ -n "$certbot_parent" ] || certbot_parent=/
+    vapache_root_path_is_controlled "$certbot_parent" || return 1
+    install -d -o root -g root -m 0755 -- "$certbot_directory"
+    vapache_root_path_is_controlled "$certbot_directory"
+}
 
 renewal_uses_apache() {
     grep -Eiq \
@@ -48,9 +146,15 @@ inspect_certbot() {
     if command -v certbot >/dev/null 2>&1 || [ -d /etc/letsencrypt ]; then
         certbot_present=true
     fi
+    if [ -e /etc/letsencrypt ] || [ -L /etc/letsencrypt ]; then
+        controlled_certbot_directory /etc/letsencrypt || {
+            echo "vapache-switch: unsafe Certbot configuration root: /etc/letsencrypt" >&2
+            exit 1
+        }
+    fi
     if [ -e "$certbot_cli_config" ] || [ -L "$certbot_cli_config" ]; then
         if [ -L "$certbot_cli_config" ] || [ ! -f "$certbot_cli_config" ] \
-            || [ -n "$(find "$certbot_cli_config" -maxdepth 0 \( ! -user root -o -perm /022 \) -print -quit)" ]; then
+            || ! vapache_root_path_is_controlled "$certbot_cli_config"; then
             echo "vapache-switch: unsafe Certbot configuration: $certbot_cli_config" >&2
             exit 1
         fi
@@ -69,10 +173,14 @@ inspect_certbot() {
         fi
     fi
     [ -d /etc/letsencrypt/renewal ] || return 0
+    controlled_certbot_directory /etc/letsencrypt/renewal || {
+        echo "vapache-switch: unsafe Certbot renewal directory" >&2
+        exit 1
+    }
     for renewal in /etc/letsencrypt/renewal/*.conf; do
         [ -e "$renewal" ] || continue
         if [ -L "$renewal" ] || [ ! -f "$renewal" ] \
-            || [ -n "$(find "$renewal" -maxdepth 0 \( ! -user root -o -perm /022 \) -print -quit)" ]; then
+            || ! vapache_root_path_is_controlled "$renewal"; then
             echo "vapache-switch: unsafe Certbot renewal configuration: $renewal" >&2
             exit 1
         fi
@@ -107,12 +215,17 @@ set_certbot_cli_apache_control() {
         chown --reference="$certbot_cli_config" "$temporary"
         chmod --reference="$certbot_cli_config" "$temporary"
         mv -f -- "$temporary" "$certbot_cli_config"
+        temporary=
     else
-        [ -d /etc/letsencrypt ] || install -d -m 0755 /etc/letsencrypt
+        controlled_certbot_directory /etc/letsencrypt || {
+            echo "vapache-switch: could not create a controlled Certbot configuration root" >&2
+            exit 1
+        }
         temporary=$(mktemp "$certbot_cli_config.vapache.XXXXXX")
         printf '%s\n' "apache-ctl = $certbot_shim" >"$temporary"
         chmod 0600 "$temporary"
         mv -f -- "$temporary" "$certbot_cli_config"
+        temporary=
     fi
     if command -v restorecon >/dev/null 2>&1; then
         restorecon "$certbot_cli_config" >/dev/null 2>&1 || true
@@ -164,6 +277,7 @@ set_renewal_apache_control() {
     chown --reference="$renewal" "$temporary"
     chmod --reference="$renewal" "$temporary"
     mv -f -- "$temporary" "$renewal"
+    temporary=
     if command -v restorecon >/dev/null 2>&1; then
         restorecon "$renewal" >/dev/null 2>&1 || true
     fi
@@ -171,11 +285,12 @@ set_renewal_apache_control() {
 
 configure_certbot() {
     [ "$certbot_present" = true ] || return 0
-    [ -x "$certbot_shim" ] || {
+    certbot_shim=$(vapache_validate_command "$certbot_shim" certbot-apachectl) || {
         echo "vapache-switch: missing Certbot Apache control shim: $certbot_shim" >&2
         exit 1
     }
-    [ -x "$certbot_deploy_hook" ] || {
+    certbot_deploy_hook=$(vapache_validate_command \
+        "$certbot_deploy_hook" certbot-deploy-hook) || {
         echo "vapache-switch: missing Certbot deploy hook: $certbot_deploy_hook" >&2
         exit 1
     }
@@ -188,7 +303,14 @@ configure_certbot() {
     fi
 
     set_certbot_cli_apache_control
-    install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+    controlled_certbot_directory /etc/letsencrypt/renewal-hooks || {
+        echo "vapache-switch: unsafe Certbot renewal-hooks directory" >&2
+        exit 1
+    }
+    controlled_certbot_directory /etc/letsencrypt/renewal-hooks/deploy || {
+        echo "vapache-switch: unsafe Certbot deploy-hook directory" >&2
+        exit 1
+    }
     if [ ! -L "$hook" ]; then
         ln -s "$certbot_deploy_hook" "$hook"
     else
@@ -206,16 +328,15 @@ configure_certbot() {
 
 inspect_certbot
 
-apache_service=
 for candidate in apache2.service httpd.service; do
-    if systemctl is-active --quiet "$candidate" 2>/dev/null; then
+    if "$systemctl_command" is-active --quiet "$candidate" 2>/dev/null; then
         apache_service=$candidate
         break
     fi
 done
 for candidate in apache2.service httpd.service; do
     [ -z "$apache_service" ] || break
-    if systemctl list-unit-files "$candidate" --no-legend 2>/dev/null \
+    if "$systemctl_command" list-unit-files "$candidate" --no-legend 2>/dev/null \
         | grep -q "^$candidate"; then
         apache_service=$candidate
         break
@@ -223,13 +344,11 @@ for candidate in apache2.service httpd.service; do
 done
 
 echo "Checking the existing Apache configuration with vapache..."
-/usr/sbin/vapachectl configtest
+"$vapache_control" configtest
 
-apache_active=false
-apache_enabled=false
 if [ -n "$apache_service" ]; then
-    systemctl is-active --quiet "$apache_service" && apache_active=true
-    systemctl is-enabled --quiet "$apache_service" && apache_enabled=true
+    "$systemctl_command" is-active --quiet "$apache_service" && apache_active=true
+    "$systemctl_command" is-enabled --quiet "$apache_service" && apache_enabled=true
     echo "Detected $apache_service (active=$apache_active, enabled=$apache_enabled)."
     echo "Its configuration files will not be modified."
     echo "The switch will disable and stop $apache_service, then enable and start vapache.service."
@@ -273,33 +392,20 @@ if [ "$assume_yes" != true ]; then
 fi
 
 configure_certbot
-systemctl daemon-reload
+"$systemctl_command" daemon-reload
+transition_started=true
 if [ -n "$apache_service" ]; then
-    if ! systemctl disable --now "$apache_service"; then
-        echo "vapache-switch: could not disable $apache_service; restoring its previous state" >&2
-        if [ "$apache_enabled" = true ]; then
-            systemctl enable "$apache_service" >/dev/null 2>&1 || true
-        fi
-        if [ "$apache_active" = true ]; then
-            systemctl start "$apache_service" >/dev/null 2>&1 || true
-        fi
+    if ! "$systemctl_command" disable --now "$apache_service"; then
+        echo "vapache-switch: could not disable $apache_service" >&2
         exit 1
     fi
 fi
 
-if systemctl enable --now vapache.service; then
+if "$systemctl_command" enable --now vapache.service; then
+    transition_complete=true
     echo "vapache.service is enabled and running; the Apache configuration was left unchanged."
     exit 0
 fi
 
-echo "vapache-switch: vapache failed to start; restoring the previous Apache service state" >&2
-systemctl disable --now vapache.service >/dev/null 2>&1 || true
-if [ -n "$apache_service" ]; then
-    if [ "$apache_enabled" = true ]; then
-        systemctl enable "$apache_service" >/dev/null 2>&1 || true
-    fi
-    if [ "$apache_active" = true ]; then
-        systemctl start "$apache_service" >/dev/null 2>&1 || true
-    fi
-fi
+echo "vapache-switch: vapache failed to start" >&2
 exit 1

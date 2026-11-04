@@ -183,6 +183,36 @@ jobs:
             test "$granted" -eq 1
           '
 
+      - name: Validate the RPM package on Rocky Linux 9
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/release:/release:ro" rockylinux:9 bash -c '
+            set -euo pipefail
+            mkdir -p /etc/httpd/conf /var/log/httpd /run/httpd \
+              /usr/lib64/httpd/modules /var/www/html
+            ln -s ../../var/log/httpd /etc/httpd/logs
+            ln -s ../../run/httpd /etc/httpd/run
+            ln -s ../../usr/lib64/httpd/modules /etc/httpd/modules
+            printf "%s\n" \
+              "ServerRoot /etc/httpd" \
+              "Listen 127.0.0.1:18080" \
+              "User nobody" \
+              "Group nobody" \
+              "DocumentRoot /var/www/html" \
+              "<Directory /var/www/html>" \
+              "Require all granted" \
+              "</Directory>" \
+              >/etc/httpd/conf/httpd.conf
+            rpm -i /release/vapache-*.x86_64.rpm
+            test "$(stat -c %U:%G:%a /usr/lib/vapache/control-common)" \
+              = root:root:644
+            /usr/sbin/vapachectl configtest
+            test ! -e /run/vapache/apache-config
+            grep -qx "PidFile /run/httpd/httpd.pid" \
+              /run/vapache/apache-capabilities.conf
+          '
+
       - name: Validate the stock Debian 13 SSL configuration
         shell: bash
         run: |

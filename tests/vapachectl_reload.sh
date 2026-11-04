@@ -3,6 +3,10 @@ set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 daemon=${VAPACHE_TEST_BINARY:-$repo_root/target/debug/vapached}
+case "$daemon" in
+    /*) ;;
+    *) daemon=$repo_root/$daemon ;;
+esac
 control=$repo_root/packaging/vapachectl
 work=$(mktemp -d)
 source_root=$work/apache2
@@ -19,6 +23,11 @@ cleanup() {
     rm -rf -- "$work"
 }
 trap cleanup EXIT
+
+if [[ $(id -u) -eq 0 && $(stat -c '%u' -- "$daemon") -ne 0 ]]; then
+    install -m 0755 -- "$daemon" "$work/vapached"
+    daemon=$work/vapached
+fi
 
 mkdir -p "$source_root/sites-available" "$source_root/sites-enabled" "$runtime_root" "$www"
 printf 'reload fixture\n' >"$www/index.txt"

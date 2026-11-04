@@ -1,8 +1,29 @@
-#!/bin/sh
+#!/bin/sh -p
 set -eu
 
-vapache_control=${VAPACHE_CONTROL:-/usr/sbin/vapachectl}
-systemctl_command=${VAPACHE_SYSTEMCTL:-systemctl}
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+case "$0" in
+    /usr/lib/vapache/*)
+        vapache_certbot_common=/usr/lib/vapache/control-common
+        if [ -L "$vapache_certbot_common" ] || [ ! -f "$vapache_certbot_common" ] \
+            || [ "$(stat -c '%u' -- "$vapache_certbot_common")" != 0 ] \
+            || [ -n "$(find "$vapache_certbot_common" -maxdepth 0 -perm /022 -print -quit)" ]; then
+            echo "vapache-certbot-apachectl: unsafe installed control library" >&2
+            exit 1
+        fi
+        ;;
+    *)
+    case "$0" in
+        */*) vapache_certbot_script_dir=${0%/*} ;;
+        *) vapache_certbot_script_dir=. ;;
+    esac
+        vapache_certbot_common=$vapache_certbot_script_dir/vapache-control-common
+        ;;
+esac
+. "$vapache_certbot_common"
+
 target=${VAPACHE_CERTBOT_TARGET:-auto}
 
 die() {
@@ -10,21 +31,39 @@ die() {
     exit 1
 }
 
+vapache_control=$(vapache_validate_command \
+    "${VAPACHE_CONTROL:-/usr/sbin/vapachectl}" vapachectl) \
+    || die "Vapache control must be an unsymlinked, controlled vapachectl executable"
+
+if [ -n "${VAPACHE_SYSTEMCTL:-}" ]; then
+    systemctl_command=$(vapache_validate_command "$VAPACHE_SYSTEMCTL" systemctl) \
+        || die "VAPACHE_SYSTEMCTL must be an unsymlinked, controlled systemctl executable"
+elif systemctl_path=$(command -v systemctl 2>/dev/null); then
+    systemctl_command=$(vapache_validate_command "$systemctl_path" systemctl) \
+        || die "systemctl is not a controlled executable"
+else
+    systemctl_command=
+fi
+
 find_apache_control() {
     if [ -n "${VAPACHE_APACHECTL_DISCOVERY:-}" ]; then
-        apache_control=$VAPACHE_APACHECTL_DISCOVERY
-    elif [ -x /usr/sbin/apache2ctl ]; then
-        apache_control=/usr/sbin/apache2ctl
-    elif [ -x /usr/sbin/apachectl ]; then
-        apache_control=/usr/sbin/apachectl
+        apache_control=$(vapache_validate_command \
+            "$VAPACHE_APACHECTL_DISCOVERY" 'apachectl apache2ctl') \
+            || die "Apache discovery control must be an unsymlinked, controlled apachectl executable"
     else
         apache_control=
+        for apache_candidate in /usr/sbin/apache2ctl /usr/sbin/apachectl; do
+            if apache_validated=$(vapache_validate_command \
+                "$apache_candidate" 'apachectl apache2ctl' 2>/dev/null); then
+                apache_control=$apache_validated
+                break
+            fi
+        done
     fi
-    if [ -n "$apache_control" ] && [ ! -x "$apache_control" ]; then
-        die "Apache discovery control is not executable: $apache_control"
-    fi
-    if [ -n "$apache_control" ] && [ "$apache_control" -ef "$0" ]; then
-        die "Apache discovery control resolves to this shim"
+    if [ -n "$apache_control" ]; then
+        if [ "$apache_control" -ef "$0" ]; then
+            die "Apache discovery control resolves to this shim"
+        fi
     fi
 }
 
@@ -34,7 +73,7 @@ require_apache_control() {
 }
 
 vapache_is_active() {
-    command -v "$systemctl_command" >/dev/null 2>&1 \
+    [ -n "$systemctl_command" ] \
         && "$systemctl_command" is-active --quiet vapache.service 2>/dev/null
 }
 

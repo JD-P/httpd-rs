@@ -1,5 +1,12 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 set -euo pipefail
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+LC_ALL=C
+export LC_ALL
+unset CDPATH ENV BASH_ENV
+umask 022
 
 usage() {
     echo "Usage: $0 --binary PATH --version VERSION --output DIR" >&2
@@ -81,6 +88,8 @@ install -Dm 0755 "$script_dir/vapache-certbot-deploy-hook" \
     "$archive_root/usr/lib/vapache/certbot-deploy-hook"
 install -Dm 0755 "$script_dir/vapache-certbot-cleanup" \
     "$archive_root/usr/lib/vapache/certbot-cleanup"
+install -Dm 0644 "$script_dir/vapache-control-common" \
+    "$archive_root/usr/lib/vapache/control-common"
 install -Dm 0644 "$script_dir/vapache.service" \
     "$archive_root/usr/lib/systemd/system/vapache.service"
 install -Dm 0644 "$repo_root/README.md" "$archive_root/usr/share/doc/vapache/README.md"
@@ -103,6 +112,8 @@ install -Dm 0755 "$script_dir/vapache-certbot-deploy-hook" \
     "$deb_root/usr/lib/vapache/certbot-deploy-hook"
 install -Dm 0755 "$script_dir/vapache-certbot-cleanup" \
     "$deb_root/usr/lib/vapache/certbot-cleanup"
+install -Dm 0644 "$script_dir/vapache-control-common" \
+    "$deb_root/usr/lib/vapache/control-common"
 install -Dm 0644 "$script_dir/vapache.service" \
     "$deb_root/usr/lib/systemd/system/vapache.service"
 install -Dm 0644 "$repo_root/README.md" "$deb_root/usr/share/doc/vapache/README.md"
@@ -124,8 +135,12 @@ Description: Apache-compatible web server with a security-focused core
  untouched until the administrator explicitly runs vapache-switch.
 EOF
 cat >"$deb_root/DEBIAN/postinst" <<'EOF'
-#!/bin/sh
+#!/bin/sh -p
 set -e
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+umask 022
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
@@ -138,8 +153,12 @@ fi
 exit 0
 EOF
 cat >"$deb_root/DEBIAN/prerm" <<'EOF'
-#!/bin/sh
+#!/bin/sh -p
 set -e
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+umask 022
 if [ "${1:-}" = remove ] && command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now vapache.service >/dev/null 2>&1 || true
 fi
@@ -150,8 +169,12 @@ fi
 exit 0
 EOF
 cat >"$deb_root/DEBIAN/postrm" <<'EOF'
-#!/bin/sh
+#!/bin/sh -p
 set -e
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+umask 022
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
@@ -171,6 +194,8 @@ install -m 0755 "$script_dir/vapache-certbot-deploy-hook" \
     "$rpm_top/SOURCES/vapache-certbot-deploy-hook"
 install -m 0755 "$script_dir/vapache-certbot-cleanup" \
     "$rpm_top/SOURCES/vapache-certbot-cleanup"
+install -m 0644 "$script_dir/vapache-control-common" \
+    "$rpm_top/SOURCES/vapache-control-common"
 install -m 0644 "$script_dir/vapache.service" "$rpm_top/SOURCES/vapache.service"
 install -m 0644 "$repo_root/README.md" "$rpm_top/SOURCES/README.md"
 install -m 0644 "$script_dir/README.md" "$rpm_top/SOURCES/PACKAGING.md"
@@ -188,10 +213,11 @@ Source2:        vapache-switch
 Source3:        vapache-certbot-apachectl
 Source4:        vapache-certbot-deploy-hook
 Source5:        vapache-certbot-cleanup
-Source6:        vapache.service
-Source7:        README.md
-Source8:        PACKAGING.md
-Source9:        LICENSE
+Source6:        vapache-control-common
+Source7:        vapache.service
+Source8:        README.md
+Source9:        PACKAGING.md
+Source10:       LICENSE
 BuildArch:      x86_64
 AutoReqProv:    no
 Suggests:       httpd
@@ -213,12 +239,17 @@ install -Dm 0755 %{SOURCE2} %{buildroot}/usr/sbin/vapache-switch
 install -Dm 0755 %{SOURCE3} %{buildroot}/usr/lib/vapache/certbot-apachectl
 install -Dm 0755 %{SOURCE4} %{buildroot}/usr/lib/vapache/certbot-deploy-hook
 install -Dm 0755 %{SOURCE5} %{buildroot}/usr/lib/vapache/certbot-cleanup
-install -Dm 0644 %{SOURCE6} %{buildroot}/usr/lib/systemd/system/vapache.service
-install -Dm 0644 %{SOURCE7} %{buildroot}/usr/share/doc/vapache/README.md
-install -Dm 0644 %{SOURCE8} %{buildroot}/usr/share/doc/vapache/PACKAGING.md
-install -Dm 0644 %{SOURCE9} %{buildroot}/usr/share/licenses/vapache/LICENSE
+install -Dm 0644 %{SOURCE6} %{buildroot}/usr/lib/vapache/control-common
+install -Dm 0644 %{SOURCE7} %{buildroot}/usr/lib/systemd/system/vapache.service
+install -Dm 0644 %{SOURCE8} %{buildroot}/usr/share/doc/vapache/README.md
+install -Dm 0644 %{SOURCE9} %{buildroot}/usr/share/doc/vapache/PACKAGING.md
+install -Dm 0644 %{SOURCE10} %{buildroot}/usr/share/licenses/vapache/LICENSE
 
 %post
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+umask 022
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || :
 fi
@@ -230,6 +261,10 @@ else
 fi
 
 %preun
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+umask 022
 if [ \$1 -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now vapache.service >/dev/null 2>&1 || :
 fi
@@ -239,6 +274,10 @@ if [ \$1 -eq 0 ] && [ -x /usr/lib/vapache/certbot-cleanup ]; then
 fi
 
 %postun
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+umask 022
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || :
 fi
@@ -250,6 +289,7 @@ fi
 %attr(0755,root,root) /usr/lib/vapache/certbot-apachectl
 %attr(0755,root,root) /usr/lib/vapache/certbot-deploy-hook
 %attr(0755,root,root) /usr/lib/vapache/certbot-cleanup
+%attr(0644,root,root) /usr/lib/vapache/control-common
 %attr(0644,root,root) /usr/lib/systemd/system/vapache.service
 %doc /usr/share/doc/vapache/README.md
 %doc /usr/share/doc/vapache/PACKAGING.md

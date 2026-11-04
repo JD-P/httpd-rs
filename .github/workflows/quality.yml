@@ -59,6 +59,8 @@ jobs:
           python3 tests/cross_server_cve_matrix.py --check
       - name: Certbot Apache control command routing
         run: tests/certbot_apache_shim.sh
+      - name: Privileged control-plane security invariants
+        run: tests/control_plane_security.sh
 
   production-coverage:
     runs-on: ubuntu-24.04

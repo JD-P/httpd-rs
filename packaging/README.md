@@ -8,6 +8,7 @@ The `vapache` packages install:
 - `/usr/lib/vapache/certbot-apachectl` — a Certbot Apache-plugin control shim;
 - `/usr/lib/vapache/certbot-deploy-hook` — a conditional Vapache reload hook;
 - `/usr/lib/vapache/certbot-cleanup` — the package-removal integration cleanup;
+- `/usr/lib/vapache/control-common` — shared privileged path/command validation;
 - `/usr/lib/systemd/system/vapache.service` — the systemd service unit; and
 - documentation below `/usr/share/doc/vapache`.
 
@@ -70,6 +71,13 @@ The release binary targets `x86_64-unknown-linux-musl` and is a static PIE. It
 therefore has no glibc version floor. Vapache still requires Linux 5.9 or newer
 for its fail-closed `openat2` path-resolution and `close_range`
 descriptor-isolation boundaries.
+
+All privileged helpers replace inherited command lookup with the fixed system
+path, reject shell startup environments, validate executable overrides and the
+complete ownership chain of every mutable path, and serialize snapshot/service
+transitions below `/run/vapache`. Configuration snapshots accept only regular
+files and directories. An interrupted `vapache-switch` disables a partial
+Vapache start and restores Apache's exact previous active/enabled state.
 
 The workflow also uploads the loose `vapached` executable. GitHub's artifact
 transport may clear its executable bit; run `chmod +x vapached-*` after a loose

@@ -1,9 +1,45 @@
-#!/bin/sh
+#!/bin/sh -p
 set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+case "$0" in
+    /usr/lib/vapache/*)
+        vapache_deploy_common=/usr/lib/vapache/control-common
+        if [ -L "$vapache_deploy_common" ] || [ ! -f "$vapache_deploy_common" ] \
+            || [ "$(stat -c '%u' -- "$vapache_deploy_common")" != 0 ] \
+            || [ -n "$(find "$vapache_deploy_common" -maxdepth 0 -perm /022 -print -quit)" ]; then
+            echo "vapache-certbot-deploy-hook: unsafe installed control library" >&2
+            exit 1
+        fi
+        ;;
+    *)
+    case "$0" in
+        */*) vapache_deploy_script_dir=${0%/*} ;;
+        *) vapache_deploy_script_dir=. ;;
+    esac
+        vapache_deploy_common=$vapache_deploy_script_dir/vapache-control-common
+        ;;
+esac
+. "$vapache_deploy_common"
+
+if [ -n "${VAPACHE_SYSTEMCTL:-}" ]; then
+    systemctl_command=$(vapache_validate_command "$VAPACHE_SYSTEMCTL" systemctl) || {
+        echo "vapache-certbot-deploy-hook: unsafe VAPACHE_SYSTEMCTL" >&2
+        exit 1
+    }
+elif systemctl_path=$(command -v systemctl 2>/dev/null); then
+    systemctl_command=$(vapache_validate_command "$systemctl_path" systemctl) || {
+        echo "vapache-certbot-deploy-hook: unsafe systemctl executable" >&2
+        exit 1
+    }
+else
+    exit 0
+fi
 
 # Certbot runs deploy hooks only after a lineage has actually changed. Do not
 # start Vapache or interfere with Apache when Vapache is not the active server.
-if command -v systemctl >/dev/null 2>&1 \
-    && systemctl is-active --quiet vapache.service 2>/dev/null; then
-    systemctl reload vapache.service
+if "$systemctl_command" is-active --quiet vapache.service 2>/dev/null; then
+    "$systemctl_command" reload vapache.service
 fi

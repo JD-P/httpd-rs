@@ -50,6 +50,14 @@ if [[ "$override" == 1 ]]; then
     install -m 0755 /current/vapached /usr/sbin/vapached
 fi
 
+chmod 0666 /usr/lib/vapache/control-common
+if /usr/sbin/vapachectl --help >/tmp/unsafe-common.log 2>&1; then
+    echo 'vapachectl sourced a writable privileged control library' >&2
+    exit 1
+fi
+grep -q 'unsafe installed control library' /tmp/unsafe-common.log
+chmod 0644 /usr/lib/vapache/control-common
+
 # A pre-provisioned TLS vhost may name its future Certbot lineage before the
 # first certificate exists. Keep that state fail-closed, but make the recovery
 # command concrete instead of leaving the administrator in a bootstrap loop.
@@ -128,15 +136,43 @@ rm -f /etc/letsencrypt/cli.ini
 install -d -m 0755 /tmp/switch-bin
 cat >/tmp/switch-bin/systemctl <<'EOF'
 #!/bin/sh
+printf '%s\n' "$*" >>/tmp/vapache-switch-systemctl.calls
+if [ -e /tmp/vapache-switch-interrupt ] \
+    && [ "$1" = disable ] && [ "${3:-}" = apache2.service ]; then
+    rm -f /tmp/vapache-switch-interrupt
+    kill -TERM "$PPID"
+    exit 1
+fi
 case "$1" in
-    is-active|is-enabled) exit 1 ;;
-    list-unit-files) exit 0 ;;
+    is-active|is-enabled)
+        [ "${3:-}" = apache2.service ]
+        ;;
+    list-unit-files)
+        [ "${2:-}" = apache2.service ] && echo 'apache2.service enabled'
+        exit 0
+        ;;
     daemon-reload|disable|enable|start|stop|restart) exit 0 ;;
     *) exit 0 ;;
 esac
 EOF
 chmod 0755 /tmp/switch-bin/systemctl
-PATH="/tmp/switch-bin:$PATH" /usr/sbin/vapache-switch --yes \
+
+# A signal in the service-transition window must restore Apache's exact prior
+# enabled/active state and stop any partial Vapache start.
+: >/tmp/vapache-switch-systemctl.calls
+touch /tmp/vapache-switch-interrupt
+if VAPACHE_SYSTEMCTL=/tmp/switch-bin/systemctl \
+    /usr/sbin/vapache-switch --yes >/tmp/switch-interrupted.log 2>&1; then
+    echo 'interrupted vapache-switch unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -qx 'disable --now apache2.service' /tmp/vapache-switch-systemctl.calls
+grep -qx 'disable --now vapache.service' /tmp/vapache-switch-systemctl.calls
+grep -qx 'enable apache2.service' /tmp/vapache-switch-systemctl.calls
+grep -qx 'start apache2.service' /tmp/vapache-switch-systemctl.calls
+
+: >/tmp/vapache-switch-systemctl.calls
+VAPACHE_SYSTEMCTL=/tmp/switch-bin/systemctl /usr/sbin/vapache-switch --yes \
     >/tmp/switch.log 2>&1
 grep -Eq '^apache_ctl[[:space:]]*=[[:space:]]*/usr/lib/vapache/certbot-apachectl$' \
     /etc/letsencrypt/renewal/example.test.conf
@@ -169,7 +205,7 @@ test "$ready" -eq 1
 # Model systemd's root-started replacement generation. The production shim
 # selects this path so the first certificate can introduce a privileged :443
 # listener; this container intentionally has no init system of its own.
-cat >/tmp/vapache-test-systemctl <<'EOF'
+cat >/tmp/systemctl <<'EOF'
 #!/bin/sh
 set -eu
 printf '%s\n' "$*" >>/tmp/vapache-systemctl.calls
@@ -201,11 +237,11 @@ case "$1" in
     *) exit 1 ;;
 esac
 EOF
-chmod 0755 /tmp/vapache-test-systemctl
+chmod 0755 /tmp/systemctl
 
 # No --apache-ctl argument is needed: vapache-switch made ordinary
 # `certbot --apache` invocations select the shim through Certbot's cli.ini.
-VAPACHE_SYSTEMCTL=/tmp/vapache-test-systemctl \
+VAPACHE_SYSTEMCTL=/tmp/systemctl \
     certbot install --cert-name example.test --apache \
         --non-interactive --no-redirect >/tmp/certbot.log 2>&1 || {
             cat /tmp/certbot.log >&2

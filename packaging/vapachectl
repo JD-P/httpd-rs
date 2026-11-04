@@ -1,5 +1,50 @@
-#!/bin/sh
+#!/bin/sh -p
 set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+case "$0" in
+    /usr/sbin/*)
+        vapachectl_common=/usr/lib/vapache/control-common
+        if [ -L "$vapachectl_common" ] || [ ! -f "$vapachectl_common" ] \
+            || [ "$(stat -c '%u' -- "$vapachectl_common")" != 0 ] \
+            || [ -n "$(find "$vapachectl_common" -maxdepth 0 -perm /022 -print -quit)" ]; then
+            echo "vapachectl: unsafe installed control library" >&2
+            exit 1
+        fi
+        ;;
+    *)
+    case "$0" in
+        */*) vapachectl_script_dir=${0%/*} ;;
+        *) vapachectl_script_dir=. ;;
+    esac
+        vapachectl_common=$vapachectl_script_dir/vapache-control-common
+        ;;
+esac
+. "$vapachectl_common"
+
+vapachectl_die() {
+    echo "vapachectl: $*" >&2
+    exit 1
+}
+
+staging=
+temporary=
+vapachectl_cleanup() {
+    vapachectl_cleanup_status=$?
+    if [ -n "$temporary" ]; then
+        rm -f -- "$temporary"
+    fi
+    if [ -n "$staging" ]; then
+        rm -rf --one-file-system -- "$staging"
+    fi
+    return "$vapachectl_cleanup_status"
+}
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap vapachectl_cleanup EXIT
 
 find_configuration() {
     if [ -n "${VAPACHE_CONFIG:-}" ]; then
@@ -54,94 +99,116 @@ EOF
 esac
 
 find_configuration
-daemon=${VAPACHED:-/usr/sbin/vapached}
+daemon=$(vapache_validate_command "${VAPACHED:-/usr/sbin/vapached}" vapached) \
+    || vapachectl_die "vapached must be an unsymlinked, controlled executable named vapached"
 snapshot_active=0
+snapshot_requested=0
 compatibility_directives=
+case "${VAPACHE_AUTO_CAPABILITIES:-1}" in
+    0|1) ;;
+    *) vapachectl_die "VAPACHE_AUTO_CAPABILITIES must be 0 or 1" ;;
+esac
 if [ "$server_root" = /etc/httpd ]; then
     # RHEL's httpd build supplies this as a compiled-in default rather than a
     # directive in httpd.conf. Vapache's raw default follows Debian instead.
     compatibility_directives='PidFile /run/httpd/httpd.pid'
 fi
 
-snapshot_configuration() {
-    snapshot_mode=${VAPACHE_SNAPSHOT_CONFIG:-auto}
-    case "$snapshot_mode" in
-        0) return 0 ;;
-        1) ;;
-        auto)
-            if [ ! -d "$server_root/mods-enabled" ] \
-                && [ ! -d "$server_root/conf-enabled" ] \
-                && [ ! -d "$server_root/sites-enabled" ]; then
-                return 0
-            fi
-            ;;
-        *)
-            echo "vapachectl: VAPACHE_SNAPSHOT_CONFIG must be auto, 0, or 1" >&2
-            exit 1
-            ;;
-    esac
-
+normalize_and_validate_configuration() {
     case "$server_root" in
         /*) ;;
-        *)
-            echo "vapachectl: VAPACHE_CONFDIR must be an absolute path" >&2
-            exit 1
-            ;;
+        *) vapachectl_die "VAPACHE_CONFDIR must be an absolute path" ;;
     esac
+    [ "$server_root" != / ] || vapachectl_die "refusing to use / as VAPACHE_CONFDIR"
+    server_root=$(vapache_canonical_unsymlinked "$server_root") \
+        || vapachectl_die "VAPACHE_CONFDIR must be an existing unsymlinked canonical directory"
+    [ -d "$server_root" ] || vapachectl_die "VAPACHE_CONFDIR is not a directory: $server_root"
+
     case "$config_file" in
         /*) ;;
         *) config_file=$server_root/$config_file ;;
     esac
+    config_file=$(vapache_canonical_unsymlinked "$config_file") \
+        || vapachectl_die "configuration must be an existing unsymlinked canonical file"
+    [ -f "$config_file" ] || vapachectl_die "configuration is not a regular file: $config_file"
     case "$config_file" in
         "$server_root"/*) relative_config=${config_file#"$server_root"/} ;;
-        *)
-            echo "vapachectl: configuration must be below VAPACHE_CONFDIR" >&2
-            exit 1
-            ;;
+        *) vapachectl_die "configuration must be below VAPACHE_CONFDIR" ;;
     esac
 
-    runtime_dir=${VAPACHE_RUNTIME_DIR:-/run/vapache}
-    case "$runtime_dir" in
-        /*) ;;
-        *)
-            echo "vapachectl: VAPACHE_RUNTIME_DIR must be an absolute path" >&2
-            exit 1
+    case "${VAPACHE_SNAPSHOT_CONFIG:-auto}" in
+        0) snapshot_requested=0 ;;
+        1) snapshot_requested=1 ;;
+        auto)
+            if [ -d "$server_root/mods-enabled" ] \
+                || [ -d "$server_root/conf-enabled" ] \
+                || [ -d "$server_root/sites-enabled" ]; then
+                snapshot_requested=1
+            fi
             ;;
+        *) vapachectl_die "VAPACHE_SNAPSHOT_CONFIG must be auto, 0, or 1" ;;
     esac
-    if [ "$runtime_dir" = / ]; then
-        echo "vapachectl: refusing to use / as VAPACHE_RUNTIME_DIR" >&2
+
+    configuration_owner=$(id -u)
+    vapache_path_is_controlled "$server_root" \
+        || vapachectl_die "configuration root or an ancestor is not caller-controlled: $server_root"
+    vapache_path_is_controlled "$config_file" \
+        || vapachectl_die "configuration file is not caller-controlled: $config_file"
+    [ "$snapshot_requested" -eq 1 ] || return 0
+
+    # Prove every link is contained before using find -L below; otherwise an
+    # administrative link to /proc or a large mount could expand the audit
+    # outside the selected tree before containment was checked.
+    if ! find "$server_root" -type l -exec sh -c '
+        root=$1
+        shift
+        for link do
+            target=$(readlink -e -- "$link") || exit 1
+            case "$target" in
+                "$root"/*) ;;
+                *)
+                    echo "vapachectl: configuration symlink escapes $root: $link" >&2
+                    exit 1
+                    ;;
+            esac
+        done
+    ' sh "$server_root" {} +; then
         exit 1
     fi
-    install -d -m 0755 "$runtime_dir"
-
-    if [ "$(id -u)" -eq 0 ]; then
-        unsafe=$(find -L "$server_root" \( -type d -o -type f \) \
-            \( ! -user root -o -perm /022 \) -print -quit)
-        if [ -n "$unsafe" ]; then
-            echo "vapachectl: Apache configuration is not root-controlled: $unsafe" >&2
-            exit 1
-        fi
-        if ! find "$server_root" -type l -exec sh -c '
-            root=$1
-            shift
-            for link do
-                target=$(readlink -f -- "$link") || exit 1
-                case "$target" in
-                    "$root"/*) ;;
-                    *)
-                        echo "vapachectl: configuration symlink escapes $root: $link" >&2
-                        exit 1
-                        ;;
-                esac
-            done
-        ' sh "$server_root" {} +; then
-            exit 1
-        fi
+    unsafe=$(find -L "$server_root" \( -type d -o -type f \) \
+        \( \( ! -uid "$configuration_owner" -a ! -uid 0 \) -o -perm /022 \) \
+        -print -quit)
+    if [ -n "$unsafe" ]; then
+        vapachectl_die "Apache configuration is not caller-controlled: $unsafe"
     fi
+    if ! special=$(find -L "$server_root" ! \( -type d -o -type f \) -print -quit); then
+        vapachectl_die "could not inspect the complete Apache configuration tree"
+    fi
+    if [ -n "$special" ]; then
+        vapachectl_die "Apache configuration contains a special or dangling file: $special"
+    fi
+}
+
+normalize_and_validate_configuration
+
+runtime_dir=${VAPACHE_RUNTIME_DIR:-/run/vapache}
+vapache_ensure_runtime_dir "$runtime_dir" \
+    || vapachectl_die "runtime directory must be canonical, controlled, and unsymlinked: $runtime_dir"
+runtime_dir=$(vapache_canonical_unsymlinked "$runtime_dir")
+control_lock=$runtime_dir/control.lock
+vapache_lock_file_is_safe "$control_lock" \
+    || vapachectl_die "unsafe control lock: $control_lock"
+exec 9>"$control_lock"
+chmod 0600 "$control_lock"
+vapache_lock_file_is_safe "$control_lock" \
+    || vapachectl_die "could not secure control lock: $control_lock"
+flock -x 9
+
+snapshot_configuration() {
+    [ "$snapshot_requested" -eq 1 ] || return 0
 
     staging=$(mktemp -d "$runtime_dir/.apache-config.XXXXXX")
     if ! cp -RL -- "$server_root/." "$staging/"; then
-        rm -rf -- "$staging"
         exit 1
     fi
     # The daemon loads this snapshot once as root, then must traverse it again
@@ -152,15 +219,17 @@ snapshot_configuration() {
     chmod -R go-w "$staging"
     if [ ! -f "$staging/$relative_config" ]; then
         echo "vapachectl: configuration snapshot is missing $relative_config" >&2
-        rm -rf -- "$staging"
         exit 1
     fi
 
     mirror=$runtime_dir/apache-config
     previous=$runtime_dir/.apache-config.previous
-    rm -rf -- "$previous"
+    rm -rf --one-file-system -- "$previous"
     had_previous=0
-    if [ -e "$mirror" ]; then
+    if [ -e "$mirror" ] || [ -L "$mirror" ]; then
+        if [ -L "$mirror" ] || [ ! -d "$mirror" ]; then
+            vapachectl_die "unsafe existing configuration snapshot: $mirror"
+        fi
         mv -- "$mirror" "$previous"
         had_previous=1
     fi
@@ -170,7 +239,8 @@ snapshot_configuration() {
         fi
         exit 1
     fi
-    rm -rf -- "$previous"
+    staging=
+    rm -rf --one-file-system -- "$previous"
 
     server_root=$mirror
     config_file=$mirror/$relative_config
@@ -194,8 +264,8 @@ prepare_runtime_configuration() {
     [ -n "$capabilities$compatibility_directives" ] || return 0
 
     case "$config_file" in
-        *\"*)
-            echo "vapachectl: Apache configuration path contains an unsupported quote" >&2
+        *\"*|*\\*)
+            echo "vapachectl: Apache configuration path contains an unsupported quote or backslash" >&2
             exit 1
             ;;
     esac
@@ -204,8 +274,6 @@ prepare_runtime_configuration() {
         generated=$server_root/.vapache-capabilities.conf
         temporary=$(mktemp "$server_root/.vapache-capabilities.XXXXXX")
     else
-        runtime_dir=${VAPACHE_RUNTIME_DIR:-/run/vapache}
-        install -d -m 0755 "$runtime_dir"
         generated=$runtime_dir/apache-capabilities.conf
         temporary=$(mktemp "$runtime_dir/.apache-capabilities.XXXXXX")
     fi
@@ -222,6 +290,7 @@ prepare_runtime_configuration() {
     fi
     chmod 0644 "$temporary"
     mv -f -- "$temporary" "$generated"
+    temporary=
     config_file=$generated
 
     if [ -n "$capabilities" ]; then
@@ -255,4 +324,16 @@ case "$command" in
         ;;
 esac
 
-exec "$daemon" -d "$server_root" -f "$config_file" "$@"
+if [ "$command" = foreground ]; then
+    flock -u 9
+    exec 9>&-
+    exec "$daemon" -d "$server_root" -f "$config_file" "$@"
+fi
+
+set +e
+"$daemon" -d "$server_root" -f "$config_file" "$@"
+vapachectl_status=$?
+set -e
+flock -u 9
+exec 9>&-
+exit "$vapachectl_status"
