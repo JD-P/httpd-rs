@@ -8,7 +8,7 @@ license.workspace = true
 regex-automata = "0.4"
 regex-syntax = "0.8"
 smallvec = "1.15"
-vapache-verified = { path = "../verified", version = "0.1.0" }
+vapache-verified = { path = "../verified", version = "0.1.2" }
 
 [dev-dependencies]
 # This is an oracle only. It is absent from vapached's normal dependency
