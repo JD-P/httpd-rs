@@ -9382,6 +9382,45 @@ pub fn config_rule_phase(
     }
 }
 
+/// Apache's URL-translation phase contains server/vhost policy plus matching
+/// Location rules. Filesystem Directory/Files rules and top-level condition
+/// carriers are not part of that phase; nested request-time conditions retain
+/// their Location provenance.
+pub open spec fn url_translation_rule_admit_spec(
+    kind: ConfigRuleKind,
+    conditional: bool,
+) -> bool {
+    match kind {
+        ConfigRuleKind::Location | ConfigRuleKind::LocationMatch => !conditional,
+        _ => false,
+    }
+}
+
+pub fn url_translation_rule_admit(
+    kind: ConfigRuleKind,
+    conditional: bool,
+) -> (ok: bool)
+    ensures ok == url_translation_rule_admit_spec(kind, conditional),
+{
+    match kind {
+        ConfigRuleKind::Location | ConfigRuleKind::LocationMatch => !conditional,
+        _ => false,
+    }
+}
+
+/// Once URL translation has completed, only rules carrying explicit
+/// filesystem-container provenance may execute in the fixup pass. Pattern
+/// shape (`per_dir`) is deliberately not used as phase provenance.
+pub open spec fn filesystem_rewrite_rule_admit_spec(filesystem_context: bool) -> bool {
+    filesystem_context
+}
+
+pub fn filesystem_rewrite_rule_admit(filesystem_context: bool) -> (ok: bool)
+    ensures ok == filesystem_rewrite_rule_admit_spec(filesystem_context),
+{
+    filesystem_context
+}
+
 pub open spec fn config_deferred_slot_spec(
     kind: ConfigRuleKind,
     conditional: bool,

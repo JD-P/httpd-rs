@@ -126,6 +126,16 @@ pub struct Target {
     pub path_info: String,
     pub route_order: usize,
     pub logical_url: Option<String>,
+    pub(crate) origin: RouteOrigin,
+}
+
+/// Authorization phase that selected a FastCGI target. `ProxyPass` and
+/// `ProxyPassMatch` are URL-space translations; `SetHandler proxy:fcgi` is a
+/// filesystem handler and retains Directory/Files/access-file policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteOrigin {
+    UrlTranslation,
+    FilesystemHandler,
 }
 
 impl Target {
@@ -486,6 +496,7 @@ fn match_proxy_inner(
                 rule.backend.trim_end_matches('/'),
                 suffix.trim_start_matches('/')
             )),
+            origin: RouteOrigin::UrlTranslation,
         };
         if best
             .as_ref()
@@ -544,6 +555,7 @@ fn match_proxy_inner(
             path_info,
             route_order: rule.route_order,
             logical_url: Some(logical_url),
+            origin: RouteOrigin::UrlTranslation,
         };
         if best
             .as_ref()
@@ -577,6 +589,7 @@ pub fn handler_target(scope: &Scope, root: &Path, rel: &Path, url_path: &str) ->
         path_info: String::new(),
         route_order: usize::MAX,
         logical_url: Some(handler.to_string()),
+        origin: RouteOrigin::FilesystemHandler,
     })
 }
 
@@ -625,6 +638,7 @@ pub(crate) fn handler_target_for_file(
         path_info: String::new(),
         route_order: usize::MAX,
         logical_url: Some(handler.to_string()),
+        origin: RouteOrigin::FilesystemHandler,
     })
 }
 
@@ -1956,6 +1970,7 @@ mod tests {
             script_name: "/index.php".into(),
             path_info: String::new(),
             route_order: 0,
+            origin: RouteOrigin::FilesystemHandler,
             logical_url: None,
         };
         let script_c = std::ffi::CString::new(script.as_os_str().as_bytes()).unwrap();
@@ -2142,6 +2157,7 @@ mod tests {
             script_name: "/index.php".into(),
             path_info: String::new(),
             route_order: 0,
+            origin: RouteOrigin::FilesystemHandler,
             logical_url: None,
         };
         let ctx = CgiContext {
@@ -2224,6 +2240,7 @@ mod tests {
             script_name: "/index.php".into(),
             path_info: "/info".into(),
             route_order: 0,
+            origin: RouteOrigin::FilesystemHandler,
             logical_url: None,
         };
         let ctx = CgiContext {
@@ -2289,6 +2306,7 @@ mod tests {
             script_name: "/index.php".into(),
             path_info: String::new(),
             route_order: 0,
+            origin: RouteOrigin::FilesystemHandler,
             logical_url: None,
         };
         let ctx = CgiContext {
@@ -2357,6 +2375,7 @@ mod tests {
             script_name: "/index.php".into(),
             path_info: String::new(),
             route_order: 0,
+            origin: RouteOrigin::FilesystemHandler,
             logical_url: None,
         };
         let key = unix_target.binding_key(Path::new("/srv/real/index.php"));
@@ -2368,6 +2387,7 @@ mod tests {
             script_name: "/index.php".into(),
             path_info: "/info".into(),
             route_order: 0,
+            origin: RouteOrigin::FilesystemHandler,
             logical_url: None,
         };
         assert!(tcp_target
@@ -3023,6 +3043,7 @@ mod tests {
             script_name: "/index.php".into(),
             path_info: String::new(),
             route_order: 0,
+            origin: RouteOrigin::FilesystemHandler,
             logical_url: None,
         };
         let mut ctx = CgiContext {
@@ -3058,6 +3079,7 @@ mod tests {
             script_name: "/index.php".into(),
             path_info: String::new(),
             route_order: 0,
+            origin: RouteOrigin::FilesystemHandler,
             logical_url: None,
         };
         assert_eq!(execute(&ctx, &cfg.global, &target).status, 200);
@@ -3154,6 +3176,7 @@ mod tests {
             script_name: "/index.php".into(),
             path_info: String::new(),
             route_order: 0,
+            origin: RouteOrigin::FilesystemHandler,
             logical_url: None,
         };
         let non_file_target = Target {

@@ -2851,6 +2851,7 @@ fn apply_directive(
                 .clone();
             rule.match_base = normalize_rewrite_base(match_base);
             rule.per_dir = true;
+            rule.filesystem_context = true;
             if let Some(handler) = rule.flags.handler.as_deref() {
                 require_handler_capability(cfg, handler, "RewriteRule")?;
             }

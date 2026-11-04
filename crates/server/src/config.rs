@@ -793,6 +793,11 @@ pub struct RewriteRule {
     /// the URL-mapping root and targets deeper than the URL mount (F58/I58).
     pub subject_dir: Option<PathBuf>,
     pub per_dir: bool,
+    /// The rule was declared in a filesystem configuration container
+    /// (Directory/DirectoryMatch/Files or an access file). Pattern semantics
+    /// may remain server-style for compatibility, so `per_dir` alone cannot
+    /// identify which request phase owns the rule.
+    pub filesystem_context: bool,
     /// True only for rules parsed from an access file.  Directory-context
     /// rules in the trusted main configuration are also `per_dir`, so phase
     /// alone is not a sufficient provenance boundary for FastCGI.
@@ -5678,6 +5683,14 @@ impl Compile {
                                 None,
                                 child_section,
                             );
+                            if matches!(
+                                child_section,
+                                SectionKind::Directory
+                                    | SectionKind::DirectoryMatch
+                                    | SectionKind::Files
+                            ) {
+                                mark_filesystem_rewrite_context(&mut delta, &mut nested);
+                            }
                             self.order += 1;
                             let order = self.order;
                             rules.push(ScopeRule {
@@ -8802,6 +8815,15 @@ fn transformed_rewrite_rules(
     Some(rules)
 }
 
+fn mark_filesystem_rewrite_context(scope: &mut Scope, nested: &mut [ScopeRule]) {
+    for rule in &mut scope.rewrite_policy.rewrite_rules {
+        rule.filesystem_context = true;
+    }
+    for rule in nested {
+        mark_filesystem_rewrite_context(&mut rule.delta, &mut rule.nested);
+    }
+}
+
 fn merge_rule_delta(s: &mut Scope, rule: &ScopeRule, fs_path: &Path, url_path: &str) {
     match transformed_rewrite_rules(rule, fs_path, url_path) {
         Some(rules) => s.merge_with_rewrite_rules(&rule.delta, &rules),
@@ -9818,6 +9840,7 @@ pub(crate) fn parse_rewrite_rule(
         match_base: normalize_rewrite_base(base),
         subject_dir: None,
         per_dir,
+        filesystem_context: per_dir,
         access_file: false,
     })
 }
@@ -12132,6 +12155,7 @@ SSLOptions +StrictRequire\n";
         let s = c.effective_scope(None, Path::new("/srv/www/sub/old"), "/sub/old");
         assert_eq!(s.rewrite_policy.rewrite_rules.len(), 1);
         assert!(s.rewrite_policy.rewrite_rules[0].per_dir);
+        assert!(s.rewrite_policy.rewrite_rules[0].filesystem_context);
         assert_eq!(s.rewrite_policy.rewrite_rules[0].match_base, "/sub/");
         assert_eq!(s.rewrite_policy.rewrite_rules[0].base, "/sub/");
         assert_eq!(
@@ -12157,6 +12181,7 @@ SSLOptions +StrictRequire\n";
         .unwrap();
         let s = wildcard.effective_scope(None, Path::new("/srv/www/sub/old"), "/sub/old");
         assert!(!s.rewrite_policy.rewrite_rules[0].per_dir);
+        assert!(s.rewrite_policy.rewrite_rules[0].filesystem_context);
         assert!(s.rewrite_policy.rewrite_rules[0].subject_dir.is_none());
     }
 
@@ -13108,6 +13133,67 @@ ServerName localhost\n\
                 "/other/42/x",
                 None
             ),
+            crate::access::Access::Allowed
+        );
+    }
+
+    #[test]
+    fn url_translation_scope_keeps_only_url_space_rules() {
+        fn url_scope(
+            cfg: &Config,
+            fs_path: &Path,
+            url_path: &str,
+            req: &crate::http::Request,
+            peer: std::net::IpAddr,
+        ) -> Scope {
+            let (mut scope, conditionals) =
+                cfg.url_translation_scope_req_deferred(None, fs_path, url_path, req, peer);
+            crate::policy_ref::apply_conditionals(
+                cfg,
+                None,
+                &mut scope,
+                &conditionals,
+                fs_path,
+                url_path,
+                req,
+                peer,
+            );
+            scope
+        }
+
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Directory />\nRequire all denied\n</Directory>\n",
+            "<Files \"*\">\nRequire all denied\n</Files>\n",
+            "<Location \"/private\">\nRequire all denied\n</Location>\n",
+            "<Location \"/conditional\">\n",
+            "Require all denied\n",
+            "<If \"%{HTTP:X-Allow} == 'yes'\">\nRequire all granted\n</If>\n",
+            "</Location>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let req = test_request("GET");
+        let peer = "127.0.0.1".parse().unwrap();
+        let open = url_scope(&c, Path::new("/srv/www/open"), "/open", &req, peer);
+        assert!(open.authorization.requires.is_none());
+
+        let private = url_scope(&c, Path::new("/srv/www/private"), "/private", &req, peer);
+        assert_eq!(
+            crate::access::check(&private, &req, peer, None, "/private", None),
+            crate::access::Access::Denied
+        );
+
+        let mut allowed_req = test_request("GET");
+        allowed_req.headers.insert("x-allow", b"yes".to_vec());
+        let conditional = url_scope(
+            &c,
+            Path::new("/srv/www/conditional"),
+            "/conditional",
+            &allowed_req,
+            peer,
+        );
+        assert_eq!(
+            crate::access::check(&conditional, &allowed_req, peer, None, "/conditional", None),
             crate::access::Access::Allowed
         );
     }
@@ -16636,6 +16722,94 @@ impl Config {
             &mut chain_state,
         );
         s
+    }
+
+    /// Build the URL-space scope used before filesystem translation. Apache
+    /// merges server/vhost and matching `<Location>` configuration here;
+    /// `<Directory>`, `<Files>` and access files do not exist until a request
+    /// proceeds to a local filesystem mapping.
+    pub(crate) fn url_translation_scope_req_deferred(
+        &self,
+        vhost: Option<&VHost>,
+        fs_path: &Path,
+        url_path: &str,
+        req: &crate::http::Request,
+        _peer: std::net::IpAddr,
+    ) -> (Scope, Vec<ScopeRule>) {
+        let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
+        let mut scope = base.clone();
+        let rules: &[ScopeRule] = vhost
+            .map(|v| v.rules.as_slice())
+            .unwrap_or(self.global_rules.as_slice());
+        let fname = fs_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut conditionals = Vec::new();
+        for rule in rules {
+            if !vapache_verified::url_translation_rule_admit(
+                verified_config_rule_kind(&rule.kind),
+                rule_is_conditional(rule),
+            ) {
+                continue;
+            }
+            let matched = match rule_kind_matches_req(&rule.kind, fs_path, url_path, &fname, req) {
+                Ok(matched) => matched,
+                Err(_) => {
+                    scope.conditional_error = true;
+                    break;
+                }
+            };
+            if !matched {
+                continue;
+            }
+            merge_rule_delta(&mut scope, rule, fs_path, url_path);
+            for nested in &rule.nested {
+                if nested.phase() == RulePhase::Condition {
+                    conditionals.push(nested.clone());
+                }
+            }
+        }
+        conditionals.sort_by_key(|rule| rule.order);
+        (scope, conditionals)
+    }
+
+    /// True when dispatch must perform URL translation before it is safe to
+    /// construct a filesystem/access-file plan. This deliberately answers a
+    /// configuration-shape question without evaluating request expressions;
+    /// the real URL phase performs the exact matching later.
+    pub(crate) fn url_translation_may_terminate(&self, vhost: Option<&VHost>) -> bool {
+        fn scope_may_terminate(scope: &Scope) -> bool {
+            !scope.rewrite_policy.rewrite_rules.is_empty()
+                || !scope.mapping_policy.redirects.is_empty()
+                || !scope.proxy_policy.proxy_passes.is_empty()
+                || !scope.proxy_policy.proxy_rules.is_empty()
+        }
+
+        fn rules_may_terminate(rules: &[ScopeRule]) -> bool {
+            fn nested_may_terminate(rules: &[ScopeRule]) -> bool {
+                rules.iter().any(|rule| {
+                    scope_may_terminate(&rule.delta) || nested_may_terminate(&rule.nested)
+                })
+            }
+
+            rules.iter().any(|rule| {
+                let location = matches!(
+                    &rule.kind,
+                    MatchKind::Location(_)
+                        | MatchKind::LocationGlob(_)
+                        | MatchKind::LocationMatch(_)
+                );
+                (location && scope_may_terminate(&rule.delta))
+                    || (location && nested_may_terminate(&rule.nested))
+            })
+        }
+
+        let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
+        let rules = vhost
+            .map(|v| v.rules.as_slice())
+            .unwrap_or(self.global_rules.as_slice());
+        scope_may_terminate(base) || rules_may_terminate(rules)
     }
 
     /// Start a request scope at the inherited base and collect only the

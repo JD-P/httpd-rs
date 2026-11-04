@@ -3355,7 +3355,7 @@ fn alternate_target(
 fn authorize_failover(
     cfg: &Config,
     vhost: Option<&VHost>,
-    scope: &Scope,
+    proxy_base_scope: &Scope,
     req: &Request,
     url_path: &str,
     target: &Target,
@@ -3366,7 +3366,11 @@ fn authorize_failover(
     crate::access::AccessGrant,
     crate::access::ResourceKey,
 )> {
-    let mut next_scope = scope.clone();
+    // Never merge a new member into the previous member's effective scope.
+    // In particular, AuthMerging Or would otherwise let member A's grant
+    // weaken member B's deny. Rebuild logical-balancer and concrete-member
+    // policy from the route's pristine pre-<Proxy> scope every time.
+    let mut next_scope = proxy_base_scope.clone();
     let mut proxy_urls = vec![target.proxy_url.as_str()];
     if let Some(logical) = target.logical_url.as_deref() {
         proxy_urls.push(logical);
@@ -3448,6 +3452,33 @@ fn authorize_failover(
 pub fn execute(
     cfg: &Config,
     vhost: Option<&VHost>,
+    scope: &Scope,
+    req: &Request,
+    url_path: &str,
+    target: &Target,
+    peer: SocketAddr,
+    local_port: u16,
+    https: bool,
+    host: &str,
+    local_ip: &str,
+    grant: &crate::access::AccessGrant,
+    resource: &crate::access::ResourceKey,
+) -> Response {
+    execute_with_proxy_base(
+        cfg, vhost, scope, scope, req, url_path, target, peer, local_port, https, host, local_ip,
+        grant, resource,
+    )
+}
+
+/// Execute a proxy route while retaining the policy scope that existed before
+/// the selected balancer member's `<Proxy>` containers were merged. Ordinary
+/// direct callers may use [`execute`]; the server dispatcher supplies this
+/// explicit base so failover cannot inherit policy from the failed member.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_with_proxy_base(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    proxy_base_scope: &Scope,
     scope: &Scope,
     req: &Request,
     url_path: &str,
@@ -3671,7 +3702,7 @@ pub fn execute(
                     let (next_scope, next_grant, next_resource) = match authorize_failover(
                         cfg,
                         vhost,
-                        &active_scope,
+                        proxy_base_scope,
                         req,
                         url_path,
                         &next,
@@ -3771,7 +3802,7 @@ pub fn execute(
                     let (next_scope, next_grant, next_resource) = match authorize_failover(
                         cfg,
                         vhost,
-                        &active_scope,
+                        proxy_base_scope,
                         req,
                         url_path,
                         &next,
@@ -6916,6 +6947,91 @@ mod coverage_tests {
             authorize_failover(&cfg, None, &scope, &authed, "/ws", &target, peer, &resource)
                 .is_some()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failover_rebuilds_member_policy_from_pristine_route_scope() {
+        let dir =
+            std::env::temp_dir().join(format!("vapache-proxy-member-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first_port = 19081;
+        let second_port = 19082;
+        let config_path = dir.join("httpd.conf");
+        std::fs::write(
+            &config_path,
+            format!(
+                "Listen 127.0.0.1:0\n\
+                 <Proxy http://127.0.0.1:{first_port}/>\n\
+                 Require all granted\n\
+                 </Proxy>\n\
+                 <Proxy http://127.0.0.1:{second_port}/>\n\
+                 AuthMerging Or\n\
+                 Require all denied\n\
+                 </Proxy>\n"
+            ),
+        )
+        .unwrap();
+        let cfg =
+            Config::load(&config_path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        let request = req("/route");
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let base = Scope::default();
+
+        // This is the old, contaminated construction: member B is merged into
+        // member A, so AuthMerging Or carries A's grant into B.
+        let mut contaminated = base.clone();
+        cfg.apply_proxy_access_urls(
+            None,
+            &mut contaminated,
+            &[&format!("http://127.0.0.1:{first_port}/")],
+            &request,
+            peer.ip(),
+            "/route",
+        );
+        cfg.apply_proxy_access_urls(
+            None,
+            &mut contaminated,
+            &[&format!("http://127.0.0.1:{second_port}/")],
+            &request,
+            peer.ip(),
+            "/route",
+        );
+        assert_eq!(
+            crate::access::check(&contaminated, &request, peer.ip(), None, "/route", None),
+            crate::access::Access::Allowed
+        );
+
+        let backend = HttpBackend {
+            host: "127.0.0.1".into(),
+            port: second_port,
+            base: "/".into(),
+            tls: false,
+        };
+        let path = "/route".to_string();
+        let target = Target {
+            proxy_url: canonical_proxy_url(&backend, &path),
+            backend,
+            path,
+            suffix: String::new(),
+            reverse: Vec::new(),
+            balancer: Some("test".into()),
+            fail_on_status: Vec::new(),
+            logical_url: None,
+            route_order: 0,
+        };
+        let resource = crate::access::ResourceKey::request(
+            None,
+            &request,
+            "/route",
+            None,
+            Some(target.proxy_url.as_str()),
+        );
+        assert!(authorize_failover(
+            &cfg, None, &base, &request, "/route", &target, peer, &resource,
+        )
+        .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
