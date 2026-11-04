@@ -4201,7 +4201,9 @@ fn dispatch_inner_request(
     // access-file work. Apart from matching Apache's phase order, this keeps
     // writable content configuration from influencing ProxyPass, Redirect,
     // or a server/Location RewriteRule [P] route.
-    let url_translation_first = cfg.url_translation_may_terminate(vhost);
+    let url_translation_first = CanonicalTarget::from_request(req, allow_encoded)
+        .map(|target| cfg.url_translation_may_terminate(vhost, &target.url_path))
+        .unwrap_or(true);
     // Cache planning is filesystem work and remains independently bounded.
     // A configuration that can terminate in URL space deliberately defers
     // this lease until dispatch has proved the request is local, so proxy and
@@ -4379,7 +4381,13 @@ fn project_internal_request(
     // canonicalization input for the newly selected resource.
     internal.raw_path = path.as_bytes().to_vec();
     if !projection.preserve_query {
-        internal.query = target_query.unwrap_or_default().to_vec();
+        // Apache carries the original query into a local ErrorDocument when
+        // the configured target has no `?`. An explicit target query replaces
+        // it. Treating absence as an empty replacement silently erased CGI
+        // and FastCGI request identity during error recovery.
+        if let Some(target_query) = target_query {
+            internal.query = target_query.to_vec();
+        }
     }
     if !projection.preserve_body {
         if !internal.prepare_error_document_transition() {
@@ -4992,6 +5000,38 @@ fn url_mapping_hint(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn authorize_url_phase_original(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    original: &(String, PathBuf, Scope),
+    req: &Request,
+    effects: &crate::rewrite::Effects,
+    peer: SocketAddr,
+    local_ip: &str,
+    local_port: u16,
+    server_name: &str,
+) -> Result<Scope, Response> {
+    let (url_path, fs_hint, captured_scope) = original;
+    let mut scope = captured_scope.clone();
+    apply_rewrite_effects(&mut scope, effects);
+    let mut resource = access::ResourceKey::request(vhost, req, url_path, None, None);
+    helper_access_response(
+        cfg,
+        vhost,
+        &scope,
+        req,
+        url_path,
+        fs_hint,
+        local_port,
+        server_name,
+        peer.ip(),
+        local_ip,
+        &mut resource,
+    )?;
+    Ok(scope)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn url_redirect_response(
     cfg: &Config,
     vhost: Option<&VHost>,
@@ -5369,6 +5409,29 @@ fn run_url_translation_phase(
                 } => {
                     let mut redirect_scope = scope;
                     apply_rewrite_effects(&mut redirect_scope, &rewrite_effects);
+                    let mut terminal_effects = effects.clone();
+                    terminal_effects.merge(rewrite_effects);
+                    if let Some(original) = original.as_ref().filter(|(url, _, _)| {
+                        url != &target.url_path
+                            || !terminal_effects.is_empty()
+                            || owned_req.is_some()
+                    }) {
+                        let original_scope = match authorize_url_phase_original(
+                            cfg,
+                            vhost,
+                            original,
+                            req,
+                            &terminal_effects,
+                            peer,
+                            local_ip,
+                            local_port,
+                            server_name,
+                        ) {
+                            Ok(scope) => scope,
+                            Err(response) => return UrlPhaseResult::Terminal(response),
+                        };
+                        redirect_scope.restrict_policy_with(&original_scope);
+                    }
                     return UrlPhaseResult::Terminal(url_redirect_response(
                         cfg,
                         vhost,
@@ -5474,14 +5537,21 @@ fn run_url_translation_phase(
                             local_ip,
                         ));
                     };
-                    if query != current_req.query {
+                    let same_target = canonical == target.url_path && query == current_req.query;
+                    if !same_target && query != current_req.query {
                         let mut rewritten = current_req.clone();
                         rewritten.query = query;
                         owned_req = Some(rewritten);
                     }
                     target =
                         CanonicalTarget::from_normalized(canonical.as_bytes().to_vec(), canonical);
-                    stop_rewriting = final_pass;
+                    // An effects-only rule (`RewriteRule ... - [E=...]`) must
+                    // make its environment visible to deferred conditionals
+                    // and authorization, but replaying the identical URL
+                    // rewrite would apply the same rule forever. Re-evaluate
+                    // the scope once with the accumulated effects while
+                    // suppressing another rewrite pass over the same target.
+                    stop_rewriting = final_pass || same_target;
                     if filesystem.is_some() {
                         break;
                     }
@@ -5491,15 +5561,36 @@ fn run_url_translation_phase(
         }
 
         let current_req = owned_req.as_ref().unwrap_or(req);
-        if let Some((redirect, location)) =
+        if let Some((redirect_status, location)) =
             match_redirect(&scope, &target.url_path, Some(current_req))
+                .map(|(redirect, location)| (redirect.status, location))
         {
+            let mut redirect_scope = scope;
+            if let Some(original) = original.as_ref().filter(|(url, _, _)| {
+                url != &target.url_path || !effects.is_empty() || owned_req.is_some()
+            }) {
+                let original_scope = match authorize_url_phase_original(
+                    cfg,
+                    vhost,
+                    original,
+                    req,
+                    &effects,
+                    peer,
+                    local_ip,
+                    local_port,
+                    server_name,
+                ) {
+                    Ok(scope) => scope,
+                    Err(response) => return UrlPhaseResult::Terminal(response),
+                };
+                redirect_scope.restrict_policy_with(&original_scope);
+            }
             return UrlPhaseResult::Terminal(url_redirect_response(
                 cfg,
                 vhost,
-                &scope,
+                &redirect_scope,
                 current_req,
-                redirect.status,
+                redirect_status,
                 &location,
                 &target.url_path,
                 server_name,
@@ -5597,6 +5688,7 @@ fn dispatch_inner(
     initial_plan: Option<RequestPlan>,
     filesystem_admitted: bool,
 ) -> Response {
+    let url_original_req = req;
     if cfg.capability_audit_only {
         return Response::new(500);
     }
@@ -6476,12 +6568,12 @@ fn dispatch_inner(
     if let Some((original_url, original_fs_hint, mut original_scope)) = url_original {
         apply_rewrite_effects(&mut original_scope, &rewrite_effects);
         let mut original_resource =
-            access::ResourceKey::request(vhost, req, &original_url, None, None);
+            access::ResourceKey::request(vhost, url_original_req, &original_url, None, None);
         if let Err(response) = helper_access_response(
             cfg,
             vhost,
             &original_scope,
-            req,
+            url_original_req,
             &original_url,
             &original_fs_hint,
             local_port,
@@ -7560,11 +7652,11 @@ fn run_fastcgi(
             local_ip,
         );
     }
-    // FastCGI routes have two distinct origins. A filesystem SetHandler route
-    // must re-evaluate Directory/Files/access-file policy for the script it
-    // opens. ProxyPass/ProxyPassMatch was selected in URL space and must not
-    // acquire that policy after the fact; it still binds its grant to the
-    // opened inode below so the backend identity cannot race.
+    // FastCGI route selection happens in URL space, but executing the selected
+    // local script is still a filesystem authority transition. Re-evaluate
+    // the canonical target for both SetHandler and ProxyPassMatch origins so a
+    // public symlink or route cannot launder a script out of a denied target
+    // directory or canonical <Location> scope.
     // Resolve the actual script through an opened descriptor first. The
     // canonical object is the authorization identity, but Apache forwards the
     // lexical split prefix as SCRIPT_FILENAME and lets PHP-FPM apply
@@ -7619,50 +7711,22 @@ fn run_fastcgi(
         target.script_filename().display(),
         authorized_path.display()
     );
-    let (target_grant, target_resource, target_scope) = match target.origin {
-        fastcgi::RouteOrigin::FilesystemHandler => match authorize_resolved_target(
-            cfg,
-            vhost,
-            req,
-            peer.ip(),
-            &authorized_path,
-            &script_url,
-            scope,
-            Some(&proxy_identity),
-            mapping_root,
-            local_port,
-            server_name,
-            local_ip,
-        ) {
-            Ok(v) => v,
-            Err(r) => return r,
-        },
-        fastcgi::RouteOrigin::UrlTranslation => {
-            let mut resource = access::ResourceKey::request(
-                vhost,
-                req,
-                url_path,
-                Some(&authorized_path),
-                Some(&proxy_identity),
-            );
-            let grant = match helper_access_response(
-                cfg,
-                vhost,
-                scope,
-                req,
-                url_path,
-                &authorized_path,
-                local_port,
-                server_name,
-                peer.ip(),
-                local_ip,
-                &mut resource,
-            ) {
-                Ok(grant) => grant,
-                Err(response) => return response,
-            };
-            (grant, resource, scope.clone())
-        }
+    let (target_grant, target_resource, target_scope) = match authorize_resolved_target(
+        cfg,
+        vhost,
+        req,
+        peer.ip(),
+        &authorized_path,
+        &script_url,
+        scope,
+        Some(&proxy_identity),
+        mapping_root,
+        local_port,
+        server_name,
+        local_ip,
+    ) {
+        Ok(v) => v,
+        Err(r) => return r,
     };
     let scope = &target_scope;
     let grant = &target_grant;
@@ -8372,6 +8436,13 @@ mod tests {
             assert!(error.header(stripped).is_none(), "{stripped}");
         }
         assert_eq!(error.error_document_depth(), 1);
+        let inherited_query = project_internal_request(
+            &outer,
+            "/errors/show.php",
+            vapache_verified::InternalRequestKind::ErrorDocument,
+        )
+        .unwrap();
+        assert_eq!(inherited_query.query, b"original=1");
         assert!(project_internal_request(
             &error,
             "/errors/again",
@@ -11057,6 +11128,60 @@ mod tests {
     }
 
     #[test]
+    fn effects_only_server_rewrite_is_applied_once_before_authorization() {
+        let dir = cov_dir("server-rewrite-env-authz");
+        std::fs::write(dir.join("www/file.txt"), "content\n").unwrap();
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "RewriteEngine On\n\
+                 RewriteRule ^/file\\.txt$ - [E=EARLY_ALLOW:yes]\n\
+                 <Directory \"{}/www\">\n\
+                 Require env EARLY_ALLOW\n\
+                 </Directory>\n",
+                dir.display(),
+            ),
+        );
+
+        assert_eq!(cov_dispatch(&cfg, "GET", "/file.txt").status, 200);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unrelated_url_routes_do_not_disable_local_cache_planning() {
+        let dir = cov_dir("url-route-local-cache");
+        std::fs::create_dir_all(dir.join("www/cache")).unwrap();
+        std::fs::write(dir.join("www/cache/file.txt"), "content\n").unwrap();
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "CacheRoot \"{}/cache-root\"\n\
+                 CacheEnable disk /cache/\n\
+                 CacheHeader On\n\
+                 RewriteEngine On\n\
+                 RewriteRule ^/terminal$ - [F]\n\
+                 ProxyPass /app/ http://127.0.0.1:9/\n",
+                dir.display(),
+            ),
+        );
+        crate::cache::prepare(&cfg);
+
+        let first = cov_dispatch(&cfg, "GET", "/cache/file.txt");
+        assert_eq!(first.status, 200);
+        assert!(first
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-cache") && value == b"MISS"));
+        let second = cov_dispatch(&cfg, "GET", "/cache/file.txt");
+        assert_eq!(second.status, 200);
+        assert!(second
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-cache") && value == b"HIT"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn proxy_route_skips_filesystem_acl_but_keeps_location_and_proxy_acl() {
         let dir = cov_dir("proxy-url-space-acl");
         let open = cov_config(
@@ -11213,8 +11338,9 @@ mod tests {
                 dir.display(),
             ),
         );
-        let status = cov_dispatch(&fastcgi, "GET", "/script.php").status;
-        assert!(matches!(status, 500 | 502 | 503), "unexpected {status}");
+        // Route selection remains in URL space, but a local FastCGI script is
+        // an execution target and must retain its canonical filesystem deny.
+        assert_eq!(cov_dispatch(&fastcgi, "GET", "/script.php").status, 403);
 
         std::fs::create_dir_all(dir.join("www/target")).unwrap();
         std::fs::write(dir.join("www/target/.htaccess"), "Header \"unterminated\n").unwrap();

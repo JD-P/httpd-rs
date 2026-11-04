@@ -3426,6 +3426,9 @@ impl Config {
         if self.listen_backlog != previous.listen_backlog {
             changed.push("ListenBacklog");
         }
+        if self.has_cgi() && !previous.has_cgi() {
+            changed.push("CGI execution policy");
+        }
         let listeners_changed = self.listeners.len() != previous.listeners.len()
             || self
                 .listeners
@@ -14861,6 +14864,7 @@ ServerName localhost\n\
         changed.pid_file = "/tmp/new.pid".into();
         changed.server_root = "/different".into();
         changed.listen_backlog += 1;
+        changed.cgi_path_info_possible = true;
         changed.listeners[0].port = 8081;
         let error = changed.validate_reload_from(&cfg).unwrap_err();
         for directive in [
@@ -14869,6 +14873,7 @@ ServerName localhost\n\
             "PidFile",
             "ServerRoot",
             "ListenBacklog",
+            "CGI execution policy",
             "Listen",
         ] {
             assert!(error.contains(directive), "{error}");
@@ -17378,22 +17383,52 @@ impl Config {
         (scope, conditionals)
     }
 
-    /// True when dispatch must perform URL translation before it is safe to
-    /// construct a filesystem/access-file plan. This deliberately answers a
-    /// configuration-shape question without evaluating request expressions;
-    /// the real URL phase performs the exact matching later.
-    pub(crate) fn url_translation_may_terminate(&self, vhost: Option<&VHost>) -> bool {
-        fn scope_may_terminate(scope: &Scope) -> bool {
-            !scope.rewrite_policy.rewrite_rules.is_empty()
-                || !scope.mapping_policy.redirects.is_empty()
-                || !scope.proxy_policy.proxy_passes.is_empty()
-                || !scope.proxy_policy.proxy_rules.is_empty()
+    /// True when this URL may terminate in URL translation before a
+    /// filesystem/access-file plan is safe. Request expressions remain
+    /// conservatively unevaluated, but unrelated route patterns no longer
+    /// disable local cache planning for the entire virtual host.
+    pub(crate) fn url_translation_may_terminate(
+        &self,
+        vhost: Option<&VHost>,
+        url_path: &str,
+    ) -> bool {
+        fn scope_may_terminate(scope: &Scope, url_path: &str) -> bool {
+            let rewrite_matches = scope.rewrite_policy.rewrite_rules.iter().any(|rule| {
+                if rule.per_dir || rule.filesystem_context {
+                    return true;
+                }
+                let matched = rule.pattern.is_match(url_path.as_bytes());
+                matched != rule.negated
+            });
+            let redirect_matches = scope.mapping_policy.redirects.iter().any(|redirect| {
+                if let Some(regex) = &redirect.regex {
+                    regex.is_match(url_path.as_bytes())
+                } else if redirect.from.ends_with('/') {
+                    url_path.starts_with(&redirect.from)
+                } else {
+                    url_path == redirect.from
+                        || (url_path.starts_with(&redirect.from)
+                            && url_path.as_bytes().get(redirect.from.len()) == Some(&b'/'))
+                }
+            });
+            let proxy_matches = scope
+                .proxy_policy
+                .proxy_passes
+                .iter()
+                .any(|rule| crate::util::route_prefix_suffix(&rule.prefix, url_path).is_some())
+                || scope
+                    .proxy_policy
+                    .proxy_rules
+                    .iter()
+                    .any(|rule| rule.pattern.is_match(url_path.as_bytes()));
+            rewrite_matches || redirect_matches || proxy_matches
         }
 
-        fn rules_may_terminate(rules: &[ScopeRule]) -> bool {
-            fn nested_may_terminate(rules: &[ScopeRule]) -> bool {
+        fn rules_may_terminate(rules: &[ScopeRule], url_path: &str) -> bool {
+            fn nested_may_terminate(rules: &[ScopeRule], url_path: &str) -> bool {
                 rules.iter().any(|rule| {
-                    scope_may_terminate(&rule.delta) || nested_may_terminate(&rule.nested)
+                    scope_may_terminate(&rule.delta, url_path)
+                        || nested_may_terminate(&rule.nested, url_path)
                 })
             }
 
@@ -17404,8 +17439,11 @@ impl Config {
                         | MatchKind::LocationGlob(_)
                         | MatchKind::LocationMatch(_)
                 );
-                (location && scope_may_terminate(&rule.delta))
-                    || (location && nested_may_terminate(&rule.nested))
+                let matches =
+                    location && rule_kind_matches(&rule.kind, Path::new(""), url_path, "");
+                matches
+                    && (scope_may_terminate(&rule.delta, url_path)
+                        || nested_may_terminate(&rule.nested, url_path))
             })
         }
 
@@ -17413,7 +17451,7 @@ impl Config {
         let rules = vhost
             .map(|v| v.rules.as_slice())
             .unwrap_or(self.global_rules.as_slice());
-        scope_may_terminate(base) || rules_may_terminate(rules)
+        scope_may_terminate(base, url_path) || rules_may_terminate(rules, url_path)
     }
 
     /// Start a request scope at the inherited base and collect only the

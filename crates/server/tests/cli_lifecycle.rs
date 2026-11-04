@@ -3,7 +3,9 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -101,6 +103,29 @@ fn spawn_foreground(root: &Path, config: &Path, args: &[&str]) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .unwrap()
+}
+
+fn spawn_foreground_with_inherited_fd(root: &Path, config: &Path, fd: i32) -> Child {
+    let sentinel = fs::File::open("/dev/null").unwrap();
+    let source = sentinel.as_raw_fd();
+    let mut command = command(root, config);
+    command
+        .arg("-X")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Install the descriptor in the child after std::process has prepared its
+    // own descriptor table. Vapache must close it before opening any server
+    // resource, regardless of the launcher's CLOEXEC discipline.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(source, fd) < 0 || libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn().unwrap()
 }
 
 fn wait_until(mut predicate: impl FnMut() -> bool) {
@@ -384,9 +409,14 @@ fn foreground_reload_reopen_bind_and_actions() {
     fs::write(alternate.join("index.txt"), "candidate\n").unwrap();
     let port = free_port();
     let config = write_config(&root, port, "");
-    let child = spawn_foreground(&root, &config, &[]);
+    const INHERITED_FD: i32 = 198;
+    let child = spawn_foreground_with_inherited_fd(&root, &config, INHERITED_FD);
     wait_running(&root, port);
     let pid = read_pid(&root);
+    assert!(
+        !PathBuf::from(format!("/proc/{pid}/fd/{INHERITED_FD}")).exists(),
+        "daemon retained a launcher-supplied descriptor"
+    );
 
     assert!(output(&root, &config, &["-k", "status"]).status.success());
     assert!(!output(&root, &config, &["-X"]).status.success());

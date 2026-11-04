@@ -1998,6 +1998,7 @@ fn isolated_dns_lookup(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        .env_clear()
         .spawn()?;
     loop {
         if let Some(status) = child.try_wait()? {

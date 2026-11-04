@@ -102,17 +102,23 @@ Implemented today:
   The broker closes every unrelated descriptor and standard stream, disables
   dumps and privilege acquisition, installs tight core/file/descriptor/CPU/
   address-space limits, and runs under a read-only seccomp syscall allowlist.
+  The parent accepts it only after a readiness handshake proves those controls
+  are active; an incomplete descriptor sweep or hardening step aborts startup.
 - HTTP/2 over TLS (ALPN `h2`, enabled by the default
   `Protocols h2 http/1.1`) with bounded header/stream limits, Apache
   request/body limits, content-length validation, CGI POST, ranges and HEAD.
   Request bodies retain at most a 64 KiB prefix per stream and then use the
   same process-wide spool budget as HTTP/1. Cleartext h2c is not implemented.
-- CGI/1.1 executed directly (never through a shell) with a minimal
-  environment, `PR_SET_NO_NEW_PRIVS`, rlimits, a new session, a watchdog and
-  bounded output. `PATH_INFO` is split against the actual script and policy is
-  re-evaluated for that script before execution. The worker control socket is
-  close-on-exec, and request bodies above the spool threshold stay on disk
-  through the CGI worker instead of being buffered in full. TLS requests set
+- CGI/1.1 executed directly (never through a shell) from a pre-created,
+  privilege-dropped worker pool, with a minimal environment,
+  `PR_SET_NO_NEW_PRIVS`, rlimits, a new session, a watchdog and bounded output.
+  Pool absence or saturation returns `503`; it never downgrades to a spawn from
+  the multithreaded daemon. `PATH_INFO` is split against the actual script and
+  policy is re-evaluated for that script before execution. Every child-side
+  descriptor is close-on-exec except stdio and the inode-bound script; the
+  worker control socket cannot reach a script. Request bodies above the spool
+  threshold stay on disk through the CGI worker instead of being buffered in
+  full. TLS requests set
   `REQUEST_SCHEME=https` and `HTTPS=on`, and authenticated requests export
   `REMOTE_USER`/`AUTH_TYPE`, for both CGI and FastCGI. The selected FastCGI
   target is authoritative for `SCRIPT_FILENAME`, `SCRIPT_NAME`, `PATH_INFO`
@@ -192,7 +198,9 @@ Implemented today:
   `MaxRequestWorkers`/`ListenBacklog`, graceful `SIGHUP` reload with listener
   reuse, `SIGUSR1` log reopen, `-k graceful`/`graceful-stop` with connection
   draining, pidfd-based control actions bound to the daemon's boot/start/exe
-  identity, pre-thread daemonization, transactional reload preparation for
+  identity, exact inherited-descriptor closure, pre-thread daemonization,
+  privileged helper creation before permanent uid/gid drop, background-worker
+  activation only after that drop, transactional reload preparation for
   logs, TLS and background workers, reload cache isolation, retained
   root-ownership/parent trust for every administrative input, and rejection
   of reload-only changes to process identity, listeners, pid file, server root
@@ -235,7 +243,9 @@ Implemented today:
   and 32 concurrent CPU-heavy regex/hash/compression/access-file operations.
   TLS handshakes are capped at 64 concurrent (4 per source), 128 per second
   process-wide and 64 per source per second. `RewriteMap prg:` is limited to
-  eight calls per request, eight concurrent helpers and 64 starts per second.
+  eight calls per request, eight concurrent helpers and 64 starts per second;
+  each helper gets an empty environment, one sealed program descriptor, tight
+  rlimits and an absolute nonblocking output deadline.
   Access/error lines stop at 128 KiB and log/stderr writers do not queue the
   worker population. Disk-cache administrative walks stop after depth 32 or
   32,768 records and invalidate fail closed by generation. DNS
@@ -333,8 +343,9 @@ uploads five x86-64 artifacts:
 - `SHA256SUMS` covering all four payloads.
 
 The release target is `x86_64-unknown-linux-musl`, producing a static PIE with
-no glibc version floor. Vapache remains Linux-specific and requires Linux 5.6
-or newer for its fail-closed `openat2` path-resolution boundary.
+no glibc version floor. Vapache remains Linux-specific and requires Linux 5.9
+or newer for its fail-closed `openat2` path-resolution and `close_range`
+descriptor-isolation boundaries.
 
 The packages install the server as `/usr/sbin/vapached` and service as
 `vapache.service`, but deliberately leave the existing Apache configuration

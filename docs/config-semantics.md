@@ -513,14 +513,23 @@ The per-finding closure matrix is in `docs/adversarial-closure.md`.
 ### I13 — Descriptor capability isolation
 
 ```text
+fds(daemon at entry) = {0,1,2}
+fds(cgi_worker) = {0,1,2,control_fd}
 fds(cgi_child) subseteq {0,1,2,script_fd}
-control_socket.cloexec == true
+fds(rewrite_helper) subseteq {0,1,2,sealed_program_fd}
+fds(tls_broker) = {protocol_fd}
 ```
 
-The worker control socket is marked close-on-exec by the worker after its own
-exec and before any script is spawned; the script descriptor is the only
-additional inheritable descriptor.  A CGI test inspects `/proc/self/fd` and
-fails if any socket other than stdio/script is visible.
+The main entrypoint atomically closes every launcher-supplied descriptor above
+stderr before it opens configuration, listeners, or logs. Child setup marks
+the complete descriptor range close-on-exec, then restores only the one
+capability named above. The CGI worker control socket is marked close-on-exec
+after the worker's own exec and before any script is spawned. The TLS broker
+reports readiness only after retaining fd 3 alone and installing all process
+restrictions. Vapache requires Linux `close_range`; it fails closed instead of
+guessing an upper descriptor number. Fork/exec tests deliberately inject
+non-CLOEXEC sentinels into each boundary and inspect `/proc/<pid>/fd` or the
+executed child.
 
 ### I14 — Ordered competing mappings
 
@@ -720,6 +729,7 @@ fingerprint then describe that selected file/script rather than the directory
 Reload(old, candidate) is admitted only if
     candidate.admin_input_trust == old.admin_input_trust
     && every discovered administrative parent is not service-writable
+    && !(candidate.has_cgi && !old.has_cgi)
     && candidate.{User, Group, PidFile, ServerRoot,
                   ListenBacklog, Listen}
        == old.{User, Group, PidFile, ServerRoot,
@@ -759,9 +769,10 @@ with an exact numeric allowlist of TLS paths compiled from the startup
 configuration. The helper accepts no pathname from the request process, closes
 unrelated inherited descriptors and standard streams, disables dumps and new
 privileges, applies tight rlimits, and installs a seccomp allowlist limited to
-bounded file reads, memory management and its existing socket. It rechecks
-root ownership, type, size and stable metadata on every read, and exits when
-its parent does. A reload may replace
+bounded file reads, memory management and its existing socket. The parent
+requires a bounded readiness handshake after all hardening; failure kills and
+reaps the broker before startup continues. It rechecks root ownership, type,
+size and stable metadata on every read, and exits when its parent does. A reload may replace
 the contents at an already-authorized path; adding a different TLS pathname
 requires a full restart.
 
@@ -1028,6 +1039,12 @@ and compared with the authorized `(dev, inode)`. `REMOTE_USER`/`AUTH_TYPE` come 
 authenticated grant, while configured or rewrite-set environment entries
 cannot override calculated names.  Request bodies stay on their spool file
 above the threshold; stdout/stderr, descriptors and deadlines are bounded.
+The isolated pool is created before request/background threads and signals
+readiness only after its irreversible uid/gid and supplementary-group drop,
+parent-death binding, descriptor limit, core limit and no-new-privileges state.
+uid/gid 0 and incomplete group setup fail startup. Production never falls back
+to direct daemon-side spawning: exhausted or unavailable pool capacity returns
+`503`, and enabling CGI on reload requires a full restart.
 
 The FastCGI protocol has no descriptor-passing primitive: PHP-FPM opens
 `SCRIPT_FILENAME` after this final comparison. Vapache therefore requires the

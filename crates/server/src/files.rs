@@ -1100,6 +1100,16 @@ pub fn mime_type(cfg: &Config, scope: &Scope, name: &[u8]) -> Option<String> {
 }
 
 fn mime_with_charset(cfg: &Config, scope: &Scope, name: &[u8], mut mime: String) -> String {
+    // Apache's AddDefaultCharset filter applies to textual media types.  In
+    // particular, a RewriteRule [T=application/...], ForceType application/...
+    // or binary AddType must not acquire a charset parameter merely because
+    // the server has a textual default configured.
+    if !mime
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/"))
+    {
+        return mime;
+    }
     let charset = cfg
         .mime
         .content_charset(name)
@@ -2548,6 +2558,14 @@ mod tests {
         assert_eq!(
             mime_type(&cfg, &scope, b"x.foo").as_deref(),
             Some("text/custom; charset=utf-8")
+        );
+        scope
+            .content_policy
+            .add_types
+            .push(("application/x-test".into(), "app".into()));
+        assert_eq!(
+            mime_type(&cfg, &scope, b"x.app").as_deref(),
+            Some("application/x-test")
         );
         scope.content_policy.remove_types.push("foo".into());
         assert!(mime_type(&cfg, &scope, b"x.foo").is_none());

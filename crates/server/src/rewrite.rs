@@ -32,8 +32,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PRG_MAP_TIMEOUT: Duration = Duration::from_secs(2);
 const PRG_MAP_MAX_OUTPUT: usize = 8 * 1024;
@@ -1431,22 +1430,31 @@ fn run_prg_map_timeout(program: &RewriteProgram, key: &str, timeout: Duration) -
         .args(&program.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    // A separate process group lets the timeout close stdout held by a
-    // helper's descendants as well as terminating the direct child. Clear
-    // CLOEXEC only in the forked child: script interpreters must be able to
-    // reopen /proc/self/fd/N, while unrelated parent-side spawns must never
-    // inherit the retained program descriptor.
+        .stderr(Stdio::null())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin");
+    // A separate session lets the timeout terminate ordinary descendants as
+    // well as the direct child. Clear CLOEXEC only in the forked child: script
+    // interpreters must be able to reopen /proc/self/fd/N, while unrelated
+    // parent-side spawns must never inherit the retained program descriptor.
+    // Mark every other descriptor CLOEXEC in the child so an accidental
+    // non-CLOEXEC daemon descriptor cannot cross this boundary.
+    let parent_pid = unsafe { libc::getpid() };
     // coverage:ignore-start - runs in the forked child before coverage can flush
     unsafe {
         command.pre_exec(move || {
-            let flags = libc::fcntl(exec_fd, libc::F_GETFD);
-            if flags < 0
-                || libc::fcntl(exec_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
-                || libc::setpgid(0, 0) != 0
-            {
+            crate::process::bind_to_parent(parent_pid)?;
+            crate::process::cloexec_unrelated_descriptors()?;
+            crate::process::set_cloexec(exec_fd, false)?;
+            if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            libc::umask(0o077);
+            crate::process::no_new_privileges()?;
+            crate::process::disable_dumping()?;
+            crate::process::set_limit(libc::RLIMIT_CPU, timeout.as_secs().max(1))?;
+            crate::process::set_limit(libc::RLIMIT_FSIZE, 1024 * 1024)?;
+            crate::process::set_limit(libc::RLIMIT_NOFILE, 64)?;
             Ok(())
         });
     }
@@ -1460,7 +1468,7 @@ fn run_prg_map_timeout(program: &RewriteProgram, key: &str, timeout: Duration) -
 }
 
 fn finish_prg_map(
-    mut child: std::process::Child,
+    child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     key: &str,
     timeout: Duration,
@@ -1486,33 +1494,28 @@ fn abort_prg_map(mut child: std::process::Child) -> String {
 }
 
 fn wait_prg_output(mut child: std::process::Child, timeout: Duration) -> String {
-    let Some(stdout) = child.stdout.take() else {
+    let Some(mut stdout) = child.stdout.take() else {
         return abort_prg_map(child);
     };
-    let (tx, rx) = mpsc::sync_channel(1);
-    let reader = std::thread::spawn(move || {
-        let _ = tx.send(read_prg_line(stdout));
-    });
-    let received = rx.recv_timeout(timeout);
-    let completed_before_deadline = received.is_ok();
-    let (line, complete) = received.unwrap_or_default();
+    let (line, complete, completed_before_deadline) =
+        read_prg_line_with_deadline(&mut stdout, Instant::now() + timeout);
     let admitted = vapache_verified::rewrite_map_result_admit(
         completed_before_deadline,
         complete,
         line.len() as u64,
         PRG_MAP_MAX_OUTPUT as u64,
     );
-    let running = child.try_wait().ok().flatten().is_none();
-    if running {
-        let pid = child.id() as i32;
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-        let _ = child.kill();
+    let pid = child.id() as i32;
+    // Always clear the helper's process group, even when the direct child has
+    // already produced a valid line. A successful lookup does not grant its
+    // background descendants daemon lifetime. Signal before wait/reap so the
+    // numeric PID cannot be recycled as an unrelated process-group id.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
     }
-    let status = child.wait().ok();
-    let _ = reader.join();
-    if !admitted || (status.is_some_and(|status| !status.success()) && !running) {
+    let _ = child.kill();
+    let _ = child.wait();
+    if !admitted {
         return String::new();
     }
     String::from_utf8_lossy(&line)
@@ -1520,6 +1523,42 @@ fn wait_prg_output(mut child: std::process::Child, timeout: Duration) -> String 
         .to_string()
 }
 
+fn read_prg_line_with_deadline(
+    input: &mut (impl Read + AsRawFd),
+    deadline: Instant,
+) -> (Vec<u8>, bool, bool) {
+    let flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(input.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return (Vec::new(), false, false);
+    }
+    let mut line = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    loop {
+        if Instant::now() >= deadline {
+            return (line, false, false);
+        }
+        if line.len() > PRG_MAP_MAX_OUTPUT {
+            return (line, false, true);
+        }
+        match input.read(&mut byte) {
+            Ok(0) => return (line, true, true),
+            Ok(_) if byte[0] == b'\n' => return (line, true, true),
+            Ok(_) => line.push(byte[0]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(
+                    Duration::from_millis(1)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(_) => return (line, false, true),
+        }
+    }
+}
+
+#[cfg(test)]
 fn read_prg_line(mut input: impl Read) -> (Vec<u8>, bool) {
     let mut line = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
@@ -3896,11 +3935,52 @@ mod tests {
             ""
         );
 
+        // Even if an unrelated daemon descriptor accidentally lacks CLOEXEC,
+        // the helper boundary applies a child-local close-on-exec sweep and
+        // restores only the sealed RewriteMap program descriptor.
+        let sentinel = std::fs::File::open("/dev/null").unwrap();
+        const SENTINEL_FD: libc::c_int = 198;
+        assert!(std::env::var_os("HOME").is_some());
+        let isolation_script = std::env::temp_dir().join(format!(
+            "vapache-prg-descriptor-isolation-{}",
+            std::process::id()
+        ));
+        fs::write(
+            &isolation_script,
+            "#!/bin/sh\nif [ -e \"/proc/self/fd/$1\" ] || [ -n \"${HOME+x}\" ]; then printf leaked; else printf isolated; fi\n",
+        )
+        .unwrap();
+        let mut isolation_mode = fs::metadata(&isolation_script).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        isolation_mode.set_mode(0o700);
+        fs::set_permissions(&isolation_script, isolation_mode).unwrap();
+        let isolation_program =
+            RewriteProgram::bind(isolation_script.clone(), vec![SENTINEL_FD.to_string()]).unwrap();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            // Use a high fixed number: after exec the shell may legitimately
+            // reuse a closed low descriptor for its own files, which is not
+            // evidence that the original capability crossed the boundary.
+            let ok = unsafe { libc::dup2(sentinel.as_raw_fd(), SENTINEL_FD) } == SENTINEL_FD
+                && crate::process::set_cloexec(SENTINEL_FD, false).is_ok()
+                && run_prg_map_timeout(&isolation_program, "x", Duration::from_secs(1))
+                    == "isolated";
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut isolation_status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(child, &mut isolation_status, 0) },
+            child
+        );
+        assert!(libc::WIFEXITED(isolation_status));
+        assert_eq!(libc::WEXITSTATUS(isolation_status), 0);
+        let _ = fs::remove_file(isolation_script);
+
         let timeout_script =
             std::env::temp_dir().join(format!("vapache-prg-timeout-{}", std::process::id()));
         fs::write(&timeout_script, "#!/bin/sh\nsleep 5\n").unwrap();
         let mut mode = fs::metadata(&timeout_script).unwrap().permissions();
-        use std::os::unix::fs::PermissionsExt;
         mode.set_mode(0o700);
         fs::set_permissions(&timeout_script, mode).unwrap();
         let timeout_program = RewriteProgram::bind(timeout_script.clone(), Vec::new()).unwrap();

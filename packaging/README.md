@@ -67,8 +67,9 @@ Package removal deletes only these exact Vapache settings and hook from
 Certbot's configuration, so it does not leave a dangling control path.
 
 The release binary targets `x86_64-unknown-linux-musl` and is a static PIE. It
-therefore has no glibc version floor. Vapache still requires Linux 5.6 or newer
-for its fail-closed `openat2` path-resolution boundary.
+therefore has no glibc version floor. Vapache still requires Linux 5.9 or newer
+for its fail-closed `openat2` path-resolution and `close_range`
+descriptor-isolation boundaries.
 
 The workflow also uploads the loose `vapached` executable. GitHub's artifact
 transport may clear its executable bit; run `chmod +x vapached-*` after a loose

@@ -199,6 +199,8 @@ pub fn install_privileged_file_broker(cfg: &Config, service_uid: u32) -> Result<
         ));
     }
     let parent_pid = unsafe { libc::getpid() };
+    // Do not allocate from Rust's inherited heap in the post-fork child.
+    let child_specs = specs.clone();
     let child = unsafe { libc::fork() };
     if child < 0 {
         unsafe {
@@ -214,13 +216,26 @@ pub fn install_privileged_file_broker(cfg: &Config, service_uid: u32) -> Result<
         unsafe {
             libc::close(sockets[0]);
         }
-        privileged_broker_child(sockets[1], parent_pid, specs.clone(), service_uid);
+        privileged_broker_child(sockets[1], parent_pid, child_specs, service_uid);
     }
 
     unsafe {
         libc::close(sockets[1]);
     }
-    let stream = unsafe { UnixStream::from_raw_fd(sockets[0]) };
+    let mut stream = unsafe { UnixStream::from_raw_fd(sockets[0]) };
+    if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(5))) {
+        terminate_failed_broker(&stream, child);
+        return Err(format!("cannot configure privileged TLS broker: {error}"));
+    }
+    let mut ready = [0u8; 1];
+    if stream.read_exact(&mut ready).is_err() || ready != [1] {
+        terminate_failed_broker(&stream, child);
+        return Err("privileged TLS broker failed its isolation setup".into());
+    }
+    if let Err(error) = stream.set_read_timeout(None) {
+        terminate_failed_broker(&stream, child);
+        return Err(format!("cannot configure privileged TLS broker: {error}"));
+    }
     let paths = specs
         .iter()
         .enumerate()
@@ -246,6 +261,14 @@ pub fn install_privileged_file_broker(cfg: &Config, service_uid: u32) -> Result<
     }
 }
 
+fn terminate_failed_broker(stream: &UnixStream, child: libc::pid_t) {
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    unsafe {
+        libc::kill(child, libc::SIGKILL);
+        libc::waitpid(child, std::ptr::null_mut(), 0);
+    }
+}
+
 fn privileged_broker_child(
     fd: libc::c_int,
     parent_pid: libc::pid_t,
@@ -265,9 +288,11 @@ fn privileged_broker_child(
             libc::close(fd);
         }
         if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) < 0 {
-            for inherited in 4..65_536 {
-                libc::close(inherited);
-            }
+            // A bounded close loop can miss a launcher-supplied descriptor
+            // above its guessed ceiling. The broker retains uid 0 and its
+            // seccomp profile permits reads, so incomplete isolation is not a
+            // safe compatibility fallback.
+            libc::_exit(1);
         }
         libc::close(0);
         libc::close(1);
@@ -276,6 +301,9 @@ fn privileged_broker_child(
             libc::_exit(1);
         }
         let mut stream = UnixStream::from_raw_fd(3);
+        if stream.write_all(&[1]).is_err() {
+            libc::_exit(1);
+        }
         privileged_broker_loop(&mut stream, &specs, service_uid);
         libc::_exit(0);
     }
@@ -1699,7 +1727,7 @@ mod tests {
     use rustls::pki_types::ServerName;
     use rustls::server::StoresServerSessions as _;
     use rustls::{ClientConfig, ClientConnection, HandshakeKind, ServerConnection};
-    use std::os::fd::IntoRawFd;
+    use std::os::fd::{AsRawFd, IntoRawFd};
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1774,6 +1802,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn privileged_broker_reports_ready_only_after_descriptor_isolation() {
+        // The broker is usable without uid 0 when its allowlist is empty, so
+        // this regression probe can exercise the real fork/seccomp boundary
+        // in ordinary developer and CI environments.
+        unsafe {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let sentinel = std::fs::File::open("/dev/null").unwrap();
+            let sentinel_fd = sentinel.as_raw_fd();
+            assert!(sentinel_fd >= 4);
+            let parent_pid = libc::getpid();
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                drop(client);
+                privileged_broker_child(server.into_raw_fd(), parent_pid, Vec::new(), u32::MAX);
+            }
+            drop(server);
+            let mut ready = [0u8; 1];
+            client.read_exact(&mut ready).unwrap();
+            assert_eq!(ready, [1]);
+            assert!(
+                !PathBuf::from(format!("/proc/{pid}/fd/{sentinel_fd}")).exists(),
+                "privileged broker retained an unrelated descriptor"
+            );
+            client.write_all(&BROKER_SHUTDOWN.to_ne_bytes()).unwrap();
+            drop(client);
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
+    }
+
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn privileged_broker_seccomp_kills_unlisted_syscalls() {
@@ -1821,6 +1883,9 @@ mod tests {
                 privileged_broker_child(server.into_raw_fd(), parent_pid, vec![(key, 64)], 65_534);
             }
             drop(server);
+            let mut ready = [0u8; 1];
+            client.read_exact(&mut ready).unwrap();
+            assert_eq!(ready, [1]);
             assert_eq!(
                 privileged_broker_read(&mut client, 0, 64).unwrap(),
                 b"first-secret"

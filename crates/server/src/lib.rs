@@ -49,6 +49,7 @@ pub mod http;
 pub mod log;
 pub mod ocsp;
 pub mod policy_ref;
+pub mod process;
 pub mod proxy;
 pub mod request_plan;
 pub mod resource;

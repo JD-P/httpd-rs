@@ -57,6 +57,7 @@ MODULES = [
     ("main", "crates/server/src/main.rs", 100.0),
     ("ocsp", "crates/server/src/ocsp.rs", 100.0),
     ("policy_ref", "crates/server/src/policy_ref.rs", 100.0),
+    ("process", "crates/server/src/process.rs", 100.0),
     ("proxy", "crates/server/src/proxy.rs", 100.0),
     ("request_plan", "crates/server/src/request_plan.rs", 100.0),
     ("resource", "crates/server/src/resource.rs", 100.0),

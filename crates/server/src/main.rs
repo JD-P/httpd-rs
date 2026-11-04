@@ -363,7 +363,14 @@ fn drop_privileges(user: &str, group: &str) -> Result<(), String> {
     }
     unsafe {
         // coverage:ignore-start - privileged syscall failure
-        if libc::initgroups(cuser.as_ptr(), gid as libc::gid_t) != 0 {
+        let groups_result = if user.parse::<u32>().is_ok() {
+            // A numeric User has no NSS name from which supplementary groups
+            // can be derived. Clear root's inherited groups explicitly.
+            libc::setgroups(0, std::ptr::null())
+        } else {
+            libc::initgroups(cuser.as_ptr(), gid as libc::gid_t)
+        };
+        if groups_result != 0 {
             // NSS/kernel failure after both configured identities resolved is
             // not deterministically injectable in the test environment.
             return Err(format!(
@@ -422,18 +429,36 @@ fn daemonize() -> Result<(), String> {
         if pid2 > 0 {
             std::process::exit(0);
         }
+        libc::umask(0o027);
         let devnull = CString::new("/dev/null").unwrap();
-        let fd = libc::open(devnull.as_ptr(), libc::O_RDWR);
-        if fd >= 0 {
-            libc::dup2(fd, 0);
-            libc::dup2(fd, 1);
-            libc::dup2(fd, 2);
-            if fd > 2 {
-                libc::close(fd);
+        let fd = libc::open(devnull.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+        if fd < 0 {
+            return Err(format!(
+                "cannot open /dev/null: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        for target in 0..=2 {
+            if libc::dup2(fd, target) < 0 {
+                if fd > 2 {
+                    libc::close(fd);
+                }
+                return Err(format!(
+                    "cannot redirect daemon standard streams: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
         }
+        if fd > 2 {
+            libc::close(fd);
+        }
         let root = CString::new("/").unwrap();
-        libc::chdir(root.as_ptr());
+        if libc::chdir(root.as_ptr()) != 0 {
+            return Err(format!(
+                "cannot enter daemon root directory: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
     }
     Ok(())
 }
@@ -911,6 +936,9 @@ fn main() {
     if raw_args.get(1).map(OsString::as_os_str)
         == Some(OsStr::new("--vapache-reverse-resolver-worker"))
     {
+        if vapached::process::close_inherited_descriptors().is_err() {
+            std::process::exit(1);
+        }
         let result = raw_args
             .get(2)
             .and_then(|ip| ip.to_str())
@@ -927,6 +955,9 @@ fn main() {
         return;
     }
     if raw_args.get(1).map(OsString::as_os_str) == Some(OsStr::new("--vapache-resolver-worker")) {
+        if vapached::process::close_inherited_descriptors().is_err() {
+            std::process::exit(1);
+        }
         let result = raw_args
             .get(2)
             .and_then(|host| host.to_str())
@@ -947,22 +978,35 @@ fn main() {
         return;
     }
     if raw_args.get(1).map(OsString::as_os_str) == Some(OsStr::new("--cgi-worker")) {
-        let uid = raw_args
+        let worker = raw_args
             .get(2)
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let gid = raw_args
-            .get(3)
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let user = raw_args
-            .get(4)
-            .and_then(|s| s.to_str())
-            .unwrap_or("www-data");
-        vapached::cgi::worker_main(3, uid, gid, user);
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.parse::<u32>().ok())
+            .zip(
+                raw_args
+                    .get(3)
+                    .and_then(|value| value.to_str())
+                    .and_then(|value| value.parse::<u32>().ok()),
+            )
+            .zip(raw_args.get(4).and_then(|value| value.to_str()))
+            .zip(
+                raw_args
+                    .get(5)
+                    .and_then(|value| value.to_str())
+                    .and_then(|value| value.parse::<libc::pid_t>().ok()),
+            )
+            .filter(|(((uid, gid), user), parent)| {
+                raw_args.len() == 6 && *uid != 0 && *gid != 0 && !user.is_empty() && *parent > 1
+            });
+        let Some((((uid, gid), user), parent_pid)) = worker else {
+            std::process::exit(1);
+        };
+        vapached::cgi::worker_main(3, uid, gid, user, parent_pid);
         return;
+    }
+    if let Err(error) = vapached::process::close_inherited_descriptors() {
+        eprintln!("vapached: cannot close inherited descriptors: {error}");
+        std::process::exit(1);
     }
     let args = parse_args();
     if args.show_version {
@@ -1231,32 +1275,46 @@ fn main() {
         eprintln!("vapached: cannot start privileged TLS broker: {e}");
         std::process::exit(1);
     }
-    if let Err(e) = server::activate_background(&cfg, &mut bound) {
-        eprintln!("vapached: cannot start background services: {e}");
-        std::process::exit(1);
+    // Finish every privileged, process-creating startup action before any
+    // background thread exists. Forking a multithreaded root process risks
+    // copied locks and gives the new thread a window to perform work as root.
+    vapached::cache::prepare(&cfg);
+    if cfg.has_cgi() {
+        if let Err(e) = vapached::cgi::init_pool(&cfg) {
+            eprintln!("vapached: cannot start isolated CGI worker pool: {e}");
+            vapached::tls::shutdown_privileged_file_broker();
+            std::process::exit(1);
+        }
     }
     let mut pid_guard = match write_pid(&cfg.pid_file, admin_service_uid) {
         Ok(guard) => guard,
         Err(e) => {
             eprintln!("vapached: {e}");
+            vapached::cgi::shutdown_pool();
+            vapached::tls::shutdown_privileged_file_broker();
             std::process::exit(1);
         }
     };
-    if cfg.has_cgi() {
-        if let Err(e) = vapached::cgi::init_pool(&cfg) {
-            // coverage:ignore-start - root-only configured identity failure
-            eprintln!("vapached: warning: CGI worker pool unavailable: {e}; using direct CGI");
-        } // coverage:ignore-stop
-    }
     logger.prepare_permissions(&cfg);
     if let Err(e) = drop_privileges(&cfg.user, &cfg.group) {
         eprintln!("vapached: {e}");
         pid_guard.clear();
+        vapached::cgi::shutdown_pool();
+        vapached::tls::shutdown_privileged_file_broker();
         std::process::exit(1);
     }
     if let Err(e) = pid_guard.refresh_identity() {
         eprintln!("vapached: {e}");
         pid_guard.clear();
+        vapached::cgi::shutdown_pool();
+        vapached::tls::shutdown_privileged_file_broker();
+        std::process::exit(1);
+    }
+    if let Err(e) = server::activate_background(&cfg, &mut bound) {
+        eprintln!("vapached: cannot start background services: {e}");
+        pid_guard.clear();
+        vapached::cgi::shutdown_pool();
+        vapached::tls::shutdown_privileged_file_broker();
         std::process::exit(1);
     }
     unsafe {

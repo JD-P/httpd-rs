@@ -836,7 +836,10 @@ AliasMatch "^/escape(.*)$" "$1"
             self.port, "/tenant/cacheme.cgi", headers
         )
         self.assertEqual(status, 200, body[:200])
-        self.assertEqual(response_headers.get("X-Cache"), "HIT")
+        # CGI observes REMOTE_PORT. Separate client connections therefore
+        # have distinct shared-cache transport identities even when their
+        # tenant header is identical.
+        self.assertEqual(response_headers.get("X-Cache"), "MISS")
         status, _, body = request(
             self.port, "/tenant/cacheme.cgi", {"X-Tenant": "beta"}
         )
@@ -2402,7 +2405,9 @@ CacheMaxExpire 3600
         self.assertEqual(headers.get("X-Cache"), "MISS")
         status, headers, body = request(self.port, "/index.php?normal")
         self.assertEqual(status, 200)
-        self.assertEqual(headers.get("X-Cache"), "HIT")
+        # FastCGI receives REMOTE_PORT, so a new connection must not reuse a
+        # representation produced under a different transport identity.
+        self.assertEqual(headers.get("X-Cache"), "MISS")
         self.assertIn(b"normal", body)
 
 

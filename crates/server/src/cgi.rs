@@ -373,19 +373,6 @@ pub fn execute(ctx: &CgiContext) -> Response {
         .parent()
         .unwrap_or(Path::new("/"))
         .to_path_buf();
-    // If the caller authorized an already-opened script, execute that exact
-    // inode rather than reopening a path that could have been swapped.
-    let mut script_fd = None;
-    let path = if let Some(file) = ctx.script_file {
-        let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 0) };
-        if fd < 0 {
-            return cgi_error(ctx);
-        }
-        script_fd = Some(unsafe { File::from_raw_fd(fd) });
-        PathBuf::from(format!("/proc/self/fd/{fd}"))
-    } else {
-        original_path.clone()
-    };
     let env = build_env(ctx);
     // Keep large bodies on their existing spool file.  Only the small
     // in-memory case is copied, so concurrent CGI POSTs no longer multiply
@@ -399,37 +386,58 @@ pub fn execute(ctx: &CgiContext) -> Response {
         _ => BodySource::Bytes(ctx.req.body.clone()),
     };
 
-    // The worker pool is created on the first CGI request.  Static-only
-    // deployments therefore pay nothing, and CGI no longer forks from the
-    // large, multi-threaded server process (which caused an expensive COW/TLB
-    // storm for every request).
-    // Execute bound scripts in the worker too.  The worker reopens the path
-    // and verifies the authorized dev/inode before exec, so the grant remains
-    // inode-bound without forking the large main process (and copying its page
-    // tables) for every CGI request.
-    let worker_identity = ctx
-        .script_file
-        .and_then(|file| file.metadata().ok().map(|meta| (meta.dev(), meta.ino())));
-    let worker_path = if script_fd.is_some() {
-        original_path.as_path()
-    } else {
-        path.as_path()
+    // Every production CGI request goes through the pre-forked worker pool.
+    // The worker reopens the path and verifies the authorized dev/inode
+    // immediately before exec. Never downgrade to spawning from the large,
+    // multithreaded daemon when the pool is absent or saturated: temporarily
+    // making the script descriptor inheritable there races every other spawn.
+    let worker_identity = match ctx.script_file {
+        Some(file) => match file.metadata() {
+            Ok(meta) => Some((meta.dev(), meta.ino())),
+            Err(_) => return cgi_error(ctx),
+        },
+        None => None,
     };
+
+    #[cfg(test)]
+    return execute_direct_for_test(
+        ctx,
+        &original_path,
+        &cwd,
+        &env,
+        &body,
+        worker_identity,
+        resource_context,
+    );
+
+    #[cfg(not(test))]
     if let Some(pool) = POOL.get() {
-        if let Some(resp) = execute_via_pool(
+        execute_via_pool(
             pool,
             ctx,
-            worker_path,
+            &original_path,
             &cwd,
             &env,
             &body,
             worker_identity,
             resource_context,
-        ) {
-            return resp;
-        }
+        )
+    } else {
+        eprintln!("vapached: CGI worker pool is unavailable");
+        cgi_status_error(ctx, 503)
     }
+}
 
+#[cfg(test)]
+fn execute_direct_for_test(
+    ctx: &CgiContext,
+    path: &Path,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    body: &BodySource,
+    expected: Option<(u64, u64)>,
+    resource_context: &crate::resource::ResourceContext,
+) -> Response {
     let mut response_lease = match ctx
         .cfg
         .resource_budget
@@ -444,8 +452,7 @@ pub fn execute(ctx: &CgiContext) -> Response {
         &env,
         &body,
         ctx.cfg.timeout,
-        false,
-        None,
+        expected,
         Some(&mut response_lease),
         ctx.req.request_scope(),
     ) {
@@ -486,7 +493,7 @@ fn execute_via_pool(
     body: &BodySource,
     expected: Option<(u64, u64)>,
     resource_context: &crate::resource::ResourceContext,
-) -> Option<Response> {
+) -> Response {
     let stream_body = matches!(body, BodySource::Stream { .. });
     let mut worker_spool_lease = match body {
         BodySource::File(_) | BodySource::Stream { .. } => {
@@ -498,20 +505,22 @@ fn execute_via_pool(
                 Ok(lease) => lease,
                 Err(e) => {
                     eprintln!("vapached: CGI worker spool admission failed: {e}");
-                    return Some(cgi_status_error(ctx, 503));
+                    return cgi_status_error(ctx, 503);
                 }
             };
             if !stream_body {
                 if let Err(e) = lease.reserve(body.len()) {
                     eprintln!("vapached: CGI worker spool admission failed: {e}");
-                    return Some(cgi_status_error(ctx, 503));
+                    return cgi_status_error(ctx, 503);
                 }
             }
             Some(lease)
         }
         BodySource::Bytes(_) => None,
     };
-    let mut worker = pool.take()?;
+    let Some(mut worker) = pool.take() else {
+        return cgi_status_error(ctx, 503);
+    };
     let mut response_lease = match ctx
         .cfg
         .resource_budget
@@ -520,7 +529,7 @@ fn execute_via_pool(
         Ok(lease) => lease,
         Err(_) => {
             worker.terminate();
-            return Some(cgi_status_error(ctx, 503));
+            return cgi_status_error(ctx, 503);
         }
     };
     let incremental_spool = stream_body.then(|| worker_spool_lease.as_mut()).flatten();
@@ -542,24 +551,24 @@ fn execute_via_pool(
                 eprintln!("CGI stderr: {}", stderr.trim());
             }
             if response_lease.reserve(out.len() as u64).is_err() {
-                return Some(cgi_status_error(ctx, 503));
+                return cgi_status_error(ctx, 503);
             }
             let parsed = parse_cgi_response(&out, ctx.req.version);
             drop(out);
-            Some(match parsed {
+            match parsed {
                 Ok(mut r) => {
                     response_lease.release(response_lease.bytes().saturating_sub(r.body_len()));
                     r.hold_resident(response_lease);
                     r
                 }
                 Err(()) => cgi_error(ctx),
-            })
+            }
         }
         Err(e) => {
             // Do not retry locally: the script may already have run.
             worker.terminate();
             eprintln!("vapached: CGI worker failed: {e}");
-            Some(cgi_error(ctx))
+            cgi_error(ctx)
         }
     }
 }
@@ -708,39 +717,42 @@ fn worker_ids_for(euid: u32, egid: u32, user: &str, group: &str) -> Result<(u32,
         }
         unsafe { (*gr).gr_gid }
     };
+    if uid == 0 || gid == 0 {
+        return Err("refusing to run CGI workers as root user/group".into());
+    }
     Ok((uid, gid))
 }
 
-fn clear_cloexec(fd: i32) -> std::io::Result<()> {
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn prepare_worker_fd(child_fd: i32, target: i32) -> std::io::Result<()> {
+fn prepare_worker_fd(child_fd: i32, target: i32, parent_pid: libc::pid_t) -> std::io::Result<()> {
+    crate::process::bind_to_parent(parent_pid)?;
+    crate::process::cloexec_unrelated_descriptors()?;
     if unsafe { libc::dup2(child_fd, target) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    clear_cloexec(target)
+    crate::process::set_cloexec(target, false)
 }
 
-fn child_process_setup(timeout: Duration) -> std::io::Result<()> {
-    unsafe {
-        libc::setsid();
-        libc::umask(0o022);
-        let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-        let lim = libc::rlimit {
-            rlim_cur: timeout.as_secs().max(1) as libc::rlim_t,
-            rlim_max: timeout.as_secs().max(1) as libc::rlim_t,
-        };
-        libc::setrlimit(libc::RLIMIT_CPU, &lim);
-        let fsize = libc::rlimit {
-            rlim_cur: MAX_OUTPUT as libc::rlim_t,
-            rlim_max: MAX_OUTPUT as libc::rlim_t,
-        };
-        libc::setrlimit(libc::RLIMIT_FSIZE, &fsize);
+fn child_process_setup(
+    timeout: Duration,
+    retained_fd: Option<i32>,
+    parent_pid: libc::pid_t,
+) -> std::io::Result<()> {
+    crate::process::bind_to_parent(parent_pid)?;
+    crate::process::cloexec_unrelated_descriptors()?;
+    if let Some(fd) = retained_fd {
+        crate::process::set_cloexec(fd, false)?;
     }
+    unsafe {
+        if libc::setsid() < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        libc::umask(0o022);
+    }
+    crate::process::no_new_privileges()?;
+    crate::process::disable_dumping()?;
+    crate::process::set_limit(libc::RLIMIT_CPU, timeout.as_secs().max(1))?;
+    crate::process::set_limit(libc::RLIMIT_FSIZE, MAX_OUTPUT as u64)?;
+    crate::process::set_limit(libc::RLIMIT_NOFILE, 128)?;
     Ok(())
 }
 
@@ -762,60 +774,84 @@ fn start_pool_with_exe(
     user: &str,
     count: usize,
 ) -> Result<CgiPool, String> {
+    let parent_pid = unsafe { libc::getpid() };
     let mut workers = Vec::with_capacity(count);
     for _ in 0..count {
-        let (mut parent, child) =
-            UnixStream::pair().map_err(|e| format!("cannot create CGI worker socket: {e}"))?;
-        parent
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .map_err(|e| e.to_string())?;
-        parent
-            .set_write_timeout(Some(Duration::from_secs(30)))
-            .map_err(|e| e.to_string())?;
-        let child_fd = child.as_raw_fd();
-        let mut cmd = Command::new(exe);
-        cmd.arg("--cgi-worker")
-            .arg(uid.to_string())
-            .arg(gid.to_string())
-            .arg(user)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .env_clear();
-        // Keep coverage collection working in the isolated worker.  This is
-        // the only environment variable inherited, and only when the operator
-        // explicitly set a profile path.
-        if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
-            cmd.env("LLVM_PROFILE_FILE", profile);
+        match start_pool_worker(exe, uid, gid, user, parent_pid) {
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                for worker in workers {
+                    worker.terminate();
+                }
+                return Err(error);
+            }
         }
-        // Keep the descriptor across this exec (the worker needs it).  The
-        // worker sets FD_CLOEXEC itself before spawning scripts.
-        unsafe {
-            cmd.pre_exec(move || prepare_worker_fd(child_fd, WORKER_FD));
-        }
-        let proc = cmd
-            .spawn()
-            .map_err(|e| format!("cannot spawn CGI worker: {e}"))?;
-        drop(child);
-        // The worker signals readiness after dropping privileges.  This also
-        // catches a bad configured user before the first request.
-        let mut ready = [0u8; 1];
-        parent
-            .read_exact(&mut ready)
-            .map_err(|e| format!("CGI worker did not start: {e}"))?;
-        if ready[0] != 1 {
-            return Err("CGI worker failed privilege drop".into());
-        }
-        workers.push(CgiWorker {
-            stream: parent,
-            child: proc,
-        });
     }
     Ok(CgiPool {
         workers: Mutex::new(workers),
         ready: Condvar::new(),
         closed: AtomicBool::new(false),
     })
+}
+
+fn start_pool_worker(
+    exe: &Path,
+    uid: u32,
+    gid: u32,
+    user: &str,
+    parent_pid: libc::pid_t,
+) -> Result<CgiWorker, String> {
+    let (parent, child) =
+        UnixStream::pair().map_err(|e| format!("cannot create CGI worker socket: {e}"))?;
+    parent
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| e.to_string())?;
+    parent
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| e.to_string())?;
+    let child_fd = child.as_raw_fd();
+    let mut cmd = Command::new(exe);
+    cmd.arg("--cgi-worker")
+        .arg(uid.to_string())
+        .arg(gid.to_string())
+        .arg(user)
+        .arg(parent_pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_clear();
+    // Keep coverage collection working in the isolated worker. This is the
+    // only environment variable inherited, and only when the operator
+    // explicitly set a profile path.
+    if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
+        cmd.env("LLVM_PROFILE_FILE", profile);
+    }
+    // Keep the descriptor across this exec (the worker needs it). The worker
+    // sets FD_CLOEXEC itself before spawning scripts.
+    unsafe {
+        cmd.pre_exec(move || prepare_worker_fd(child_fd, WORKER_FD, parent_pid));
+    }
+    let proc = cmd
+        .spawn()
+        .map_err(|e| format!("cannot spawn CGI worker: {e}"))?;
+    drop(child);
+    let mut worker = CgiWorker {
+        stream: parent,
+        child: proc,
+    };
+    // The worker signals readiness only after it has dropped privileges and
+    // installed its limits. This catches an incomplete isolation setup before
+    // any request can be handed to the process.
+    let mut ready = [0u8; 1];
+    if let Err(error) = worker.stream.read_exact(&mut ready) {
+        worker.terminate();
+        return Err(format!("CGI worker did not start: {error}"));
+    }
+    if ready != [1] {
+        worker.terminate();
+        return Err("CGI worker failed its isolation setup".into());
+    }
+    Ok(worker)
 }
 
 fn drop_worker_privileges(uid: u32, gid: u32, user: &str) -> bool {
@@ -829,55 +865,55 @@ fn drop_worker_privileges(uid: u32, gid: u32, user: &str) -> bool {
 }
 
 fn drop_worker_privileges_for(euid: u32, egid: u32, uid: u32, gid: u32, user: &str) -> bool {
+    if uid == 0 || gid == 0 {
+        return false;
+    }
     if euid != 0 {
         return euid == uid && egid == gid;
     }
-    init_worker_groups(user, gid);
+    if !init_worker_groups(user, gid) {
+        return false;
+    }
     unsafe {
-        if libc::setgid(gid as libc::gid_t) != 0 || libc::setuid(uid as libc::uid_t) != 0 {
+        if libc::setresgid(gid, gid, gid) != 0 || libc::setresuid(uid, uid, uid) != 0 {
             return false;
         }
     }
     true
 }
 
-fn init_worker_groups(user: &str, gid: u32) {
+fn init_worker_groups(user: &str, gid: u32) -> bool {
+    if user.parse::<u32>().is_ok() {
+        return unsafe { libc::setgroups(0, std::ptr::null()) == 0 };
+    }
     let Ok(cuser) = std::ffi::CString::new(user) else {
-        return;
+        return false;
     };
     let pw = unsafe { libc::getpwnam(cuser.as_ptr()) };
     if pw.is_null() {
-        return;
+        return false;
     }
-    unsafe {
-        libc::initgroups(cuser.as_ptr(), gid as libc::gid_t);
-    }
+    unsafe { libc::initgroups(cuser.as_ptr(), gid as libc::gid_t) == 0 }
 }
 
 /// CGI worker process entry point.  It is spawned once per pool slot and is
 /// deliberately tiny and single-threaded until it has completed a request, so
 /// fork/exec avoids copying the main server's address space and TLB entries.
-pub fn worker_main(fd: i32, uid: u32, gid: u32, user: &str) {
-    unsafe {
-        libc::setsid();
-        libc::umask(0o022);
+pub fn worker_main(fd: i32, uid: u32, gid: u32, user: &str, parent_pid: libc::pid_t) {
+    if crate::process::bind_to_parent(parent_pid).is_err() || unsafe { libc::setsid() } < 0 {
+        std::process::exit(1);
     }
+    unsafe { libc::umask(0o022) };
     if !drop_worker_privileges(uid, gid, user) {
         std::process::exit(1);
     }
-    unsafe {
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
-        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-        let cpu = libc::rlimit {
-            rlim_cur: 3600,
-            rlim_max: 3600,
-        };
-        libc::setrlimit(libc::RLIMIT_CPU, &cpu);
-        let fsize = libc::rlimit {
-            rlim_cur: MAX_OUTPUT as libc::rlim_t,
-            rlim_max: MAX_OUTPUT as libc::rlim_t,
-        };
-        libc::setrlimit(libc::RLIMIT_FSIZE, &fsize);
+    if crate::process::no_new_privileges().is_err()
+        || crate::process::disable_dumping().is_err()
+        || crate::process::set_limit(libc::RLIMIT_CPU, 3600).is_err()
+        || crate::process::set_limit(libc::RLIMIT_FSIZE, MAX_OUTPUT as u64).is_err()
+        || crate::process::set_limit(libc::RLIMIT_NOFILE, 128).is_err()
+    {
+        std::process::exit(1);
     }
     // The worker owns the control socket, but CGI scripts spawned by the
     // worker must not inherit it.  Marking it close-on-exec here (after the
@@ -953,9 +989,7 @@ fn worker_request(stream: &mut UnixStream) -> Result<bool, String> {
     };
     let timeout = Duration::from_secs(read_u64(stream)?.clamp(1, 3600));
 
-    let result = run_local(
-        &script, &cwd, &env, &body, timeout, true, expected, None, None,
-    );
+    let result = run_local(&script, &cwd, &env, &body, timeout, expected, None, None);
     match result {
         Ok((out, stderr)) => {
             write_u8(stream, 1)?;
@@ -1212,9 +1246,8 @@ fn read_bytes_budgeted(
 
 fn inheritable_fd_path(file: &File) -> Result<PathBuf, String> {
     let fd = file.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
-        return Err("cannot make CGI script descriptor inheritable".into());
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err("cannot inspect CGI script descriptor".into());
     }
     Ok(PathBuf::from(format!("/proc/self/fd/{fd}")))
 }
@@ -1311,26 +1344,12 @@ fn run_local(
     env: &[(OsString, OsString)],
     body: &BodySource,
     timeout: Duration,
-    worker_prepared: bool,
     expected: Option<(u64, u64)>,
     mut response_lease: Option<&mut crate::resource::ResidentLease>,
     request_scope: Option<&crate::resource::RequestScope>,
 ) -> Result<(Vec<u8>, String), String> {
-    // In the worker path, set the child's cwd in the worker before spawning
-    // instead of asking `Command` for a per-child chdir.  This keeps the spawn
-    // path free of `pre_exec`/`current_dir`, allowing the standard library to
-    // use posix_spawn (vfork-based) instead of copying the worker's page tables
-    // for every CGI request.  The worker handles one request at a time, so the
-    // cwd change is safely restored before it reads the response.
-    let previous_cwd = if worker_prepared {
-        let previous = std::env::current_dir().map_err(|e| format!("cannot read CGI cwd: {e}"))?;
-        std::env::set_current_dir(cwd)
-            .map_err(|e| format!("cannot enter CGI cwd {}: {e}", cwd.display()))?;
-        Some(previous)
-    } else {
-        None
-    };
     let mut verified_script: Option<File> = None;
+    let mut retained_fd = None;
     let exec_path: PathBuf = if let Some((dev, ino)) = expected {
         let file = File::open(path)
             .map_err(|e| format!("cannot reopen CGI script {}: {e}", path.display()))?;
@@ -1341,15 +1360,14 @@ fn run_local(
             return Err("CGI script inode changed after authorization".into());
         }
         let fd_path = inheritable_fd_path(&file)?;
+        retained_fd = Some(file.as_raw_fd());
         verified_script = Some(file);
         fd_path
     } else {
         path.to_path_buf()
     };
     let mut cmd = Command::new(&exec_path);
-    if !worker_prepared {
-        cmd.current_dir(cwd);
-    }
+    cmd.current_dir(cwd);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1357,10 +1375,9 @@ fn run_local(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    if !worker_prepared {
-        unsafe {
-            cmd.pre_exec(move || child_process_setup(timeout));
-        }
+    let parent_pid = unsafe { libc::getpid() };
+    unsafe {
+        cmd.pre_exec(move || child_process_setup(timeout, retained_fd, parent_pid));
     }
     let spawn_result = crate::fault::hit("cgi.spawn")
         .map_err(|e| format!("cannot execute {}: {e}", path.display()))
@@ -1368,10 +1385,8 @@ fn run_local(
             cmd.spawn()
                 .map_err(|e| format!("cannot execute {}: {e}", path.display()))
         });
-    if let Some(previous) = previous_cwd {
-        let _ = std::env::set_current_dir(previous);
-    }
     let mut child = spawn_result?;
+    drop(verified_script);
     let pid = child.id() as i32;
     let deadline = Instant::now() + timeout;
 
@@ -1447,7 +1462,7 @@ fn wait_with_deadline(
     deadline: Instant,
     request_scope: Option<&crate::resource::RequestScope>,
 ) -> Result<(), String> {
-    while matches!(child.try_wait(), Ok(None)) {
+    loop {
         if request_scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
             kill_group(pid);
             let _ = child.wait();
@@ -1458,9 +1473,27 @@ fn wait_with_deadline(
             let _ = child.wait();
             return Err("CGI timeout".into());
         }
+        let exited = match crate::process::child_exited_unreaped(pid) {
+            Ok(exited) => exited,
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                kill_group(pid);
+                let _ = child.wait();
+                return Err(format!("cannot observe CGI process: {error}"));
+            }
+        };
+        if exited {
+            // Keep the direct child unreaped until after the group signal.
+            // That prevents its numeric PID/PGID from being recycled for an
+            // unrelated process group between wait and cleanup.
+            kill_group(pid);
+            let _ = child.wait();
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
-    Ok(())
 }
 
 fn poll_result(rc: i32, error: std::io::Error) -> Result<bool, String> {
@@ -2095,7 +2128,6 @@ mod tests {
             &[],
             &BodySource::Bytes(Vec::new()),
             Duration::from_millis(50),
-            false,
             None,
             None,
             None,
@@ -2103,6 +2135,43 @@ mod tests {
         assert!(result.is_err());
         assert!(start.elapsed() < Duration::from_secs(2));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cgi_exec_closes_an_unrelated_inheritable_descriptor() {
+        let dir = tempdir("descriptor-isolation");
+        let path = script(
+            &dir,
+            "fds.sh",
+            "#!/bin/sh\nif [ -e \"/proc/self/fd/$LEAK_FD\" ]; then value=leaked; else value=isolated; fi\nprintf 'Content-Type: text/plain\\r\\n\\r\\n%s\\n' \"$value\"\n",
+        );
+        let sentinel = File::open("/dev/null").unwrap();
+        let sentinel_fd = sentinel.as_raw_fd();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let ok = crate::process::set_cloexec(sentinel_fd, false).is_ok()
+                && run_local(
+                    &path,
+                    &dir,
+                    &[(
+                        OsString::from("LEAK_FD"),
+                        OsString::from(sentinel_fd.to_string()),
+                    )],
+                    &BodySource::Bytes(Vec::new()),
+                    Duration::from_secs(1),
+                    None,
+                    None,
+                    None,
+                )
+                .is_ok_and(|(output, _)| output.ends_with(b"isolated\n"));
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2125,7 +2194,6 @@ mod tests {
             &[],
             &BodySource::Bytes(Vec::new()),
             Duration::from_secs(5),
-            false,
             None,
             None,
             Some(&scope),
@@ -2181,7 +2249,6 @@ mod tests {
             &[],
             &BodySource::Bytes(Vec::new()),
             Duration::from_secs(1),
-            false,
             None,
             None,
             None,
@@ -2603,23 +2670,26 @@ mod tests {
         assert_eq!(worker_ids_for(0, 0, "123", "456").unwrap(), (123, 456));
         assert!(worker_ids_for(0, 0, "bad\0user", "0").is_err());
         assert!(worker_ids_for(0, 0, "no-such-vapache-user-xyz", "0").is_err());
-        let root_ids = worker_ids_for(0, 0, "root", "root").unwrap();
-        assert_eq!(root_ids.0, 0);
-        assert_eq!(root_ids.1, 0);
+        assert!(worker_ids_for(0, 0, "root", "root").is_err());
         assert!(worker_ids_for(0, 0, "0", "bad\0group").is_err());
         assert!(worker_ids_for(0, 0, "0", "no-such-vapache-group-xyz").is_err());
-        init_worker_groups("bad\0user", 0);
-        init_worker_groups("no-such-vapache-user-xyz", 0);
+        assert!(!init_worker_groups("bad\0user", 0));
+        assert!(!init_worker_groups("no-such-vapache-user-xyz", 0));
 
         let (parent, child) = UnixStream::pair().unwrap();
-        assert!(prepare_worker_fd(child.as_raw_fd(), 99).is_ok());
-        unsafe {
-            libc::close(99);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let parent_pid = unsafe { libc::getppid() };
+            let ok = prepare_worker_fd(child.as_raw_fd(), 99, parent_pid).is_ok();
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
         }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(libc::WEXITSTATUS(status), 0);
         drop(parent);
         drop(child);
-        assert!(prepare_worker_fd(-1, 99).is_err());
-        assert!(clear_cloexec(-1).is_err());
+        assert!(crate::process::set_cloexec(-1, false).is_err());
 
         let empty = CgiPool {
             workers: Mutex::new(Vec::new()),
@@ -2634,6 +2704,27 @@ mod tests {
             closed: AtomicBool::new(false),
         };
         assert!(waiting.take().is_none());
+
+        let dir = tempdir("empty-pool");
+        let cfg = config(&dir);
+        let req = request("/missing.cgi", Vec::new());
+        let ctx = test_ctx(&cfg, &req, &dir, Path::new("missing.cgi"), None);
+        let resource_context = cfg.resource_budget.context("127.0.0.1".parse().unwrap());
+        assert_eq!(
+            execute_via_pool(
+                &waiting,
+                &ctx,
+                &dir.join("missing.cgi"),
+                &dir,
+                &[],
+                &BodySource::Bytes(Vec::new()),
+                None,
+                &resource_context,
+            )
+            .status,
+            503
+        );
+        let _ = fs::remove_dir_all(&dir);
 
         let closed = CgiPool {
             workers: Mutex::new(Vec::new()),
@@ -2710,8 +2801,7 @@ mod tests {
             &BodySource::Bytes(Vec::new()),
             None,
             &resource_context,
-        )
-        .unwrap();
+        );
         assert_eq!(resp.status, 200);
         let resp = execute_via_pool(
             &pool,
@@ -2722,8 +2812,7 @@ mod tests {
             &BodySource::Bytes(Vec::new()),
             None,
             &resource_context,
-        )
-        .unwrap();
+        );
         assert_eq!(resp.status, 500);
         fake.join().unwrap();
         shutdown_pool_inner(&pool);
@@ -2889,7 +2978,6 @@ mod tests {
             &[],
             &BodySource::Bytes(Vec::new()),
             Duration::from_secs(1),
-            false,
             Some((0, 0)),
             None,
             None,
@@ -2903,7 +2991,6 @@ mod tests {
             &[],
             &BodySource::Bytes(vec![b'x'; 32 * 1024]),
             Duration::from_secs(1),
-            false,
             None,
             None,
             None,
@@ -2921,7 +3008,6 @@ mod tests {
             &[],
             &BodySource::Bytes(Vec::new()),
             Duration::from_millis(50),
-            false,
             None,
             None,
             None,
@@ -2945,7 +3031,6 @@ mod tests {
             &[],
             &BodySource::Bytes(vec![b'x'; 32 * 1024]),
             Duration::from_millis(75),
-            false,
             None,
             None,
             None,
@@ -3015,10 +3100,17 @@ mod tests {
     fn child_process_and_worker_main_paths() {
         let pid = unsafe { libc::fork() };
         if pid == 0 {
-            let setup = child_process_setup(Duration::from_secs(1)).is_ok();
+            let setup =
+                child_process_setup(Duration::from_secs(1), None, unsafe { libc::getppid() })
+                    .is_ok();
             let euid = unsafe { libc::geteuid() };
             let egid = unsafe { libc::getegid() };
-            let dropped = drop_worker_privileges(euid, egid, "root");
+            let (uid, gid, user) = if euid == 0 {
+                (65_534, 65_534, "nobody")
+            } else {
+                (euid, egid, "ignored")
+            };
+            let dropped = drop_worker_privileges(uid, gid, user);
             let rejected = drop_worker_privileges(u32::MAX, u32::MAX, "no-such-user");
             std::process::exit(if setup && dropped && !rejected { 0 } else { 1 });
         }
@@ -3033,38 +3125,24 @@ mod tests {
         // children.  The first keeps the child's real ids; the second uses an
         // impossible gid so the syscall failure is observed without changing
         // the test runner's credentials.
-        let pid = unsafe { libc::fork() };
-        if pid == 0 {
-            let uid = unsafe { libc::geteuid() };
-            let gid = unsafe { libc::getegid() };
-            std::process::exit(if drop_worker_privileges_for(0, 0, uid, gid, "root") {
-                0
-            } else {
-                1
-            });
+        if unsafe { libc::geteuid() } == 0 {
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                std::process::exit(
+                    if drop_worker_privileges_for(0, 0, 65_534, 65_534, "nobody") {
+                        0
+                    } else {
+                        1
+                    },
+                );
+            }
+            let mut status = 0;
+            unsafe {
+                libc::waitpid(pid, &mut status, 0);
+            }
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
         }
-        let mut status = 0;
-        unsafe {
-            libc::waitpid(pid, &mut status, 0);
-        }
-        assert!(libc::WIFEXITED(status));
-        assert_eq!(libc::WEXITSTATUS(status), 0);
-
-        let pid = unsafe { libc::fork() };
-        if pid == 0 {
-            let uid = unsafe { libc::geteuid() };
-            std::process::exit(if drop_worker_privileges_for(0, 0, uid, u32::MAX, "root") {
-                1
-            } else {
-                0
-            });
-        }
-        let mut status = 0;
-        unsafe {
-            libc::waitpid(pid, &mut status, 0);
-        }
-        assert!(libc::WIFEXITED(status));
-        assert_eq!(libc::WEXITSTATUS(status), 0);
 
         assert_eq!(
             drop_worker_privileges_for(1000, 1001, 1000, 1001, "ignored"),
@@ -3081,10 +3159,22 @@ mod tests {
         let (parent, child) = UnixStream::pair().unwrap();
         let euid = unsafe { libc::geteuid() };
         let egid = unsafe { libc::getegid() };
+        let (worker_uid, worker_gid, worker_user) = if euid == 0 {
+            (65_534, 65_534, "nobody")
+        } else {
+            (euid, egid, "ignored")
+        };
+        let owner = unsafe { libc::getpid() };
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             drop(parent);
-            worker_main(child.as_raw_fd(), euid, egid, "root");
+            worker_main(
+                child.as_raw_fd(),
+                worker_uid,
+                worker_gid,
+                worker_user,
+                owner,
+            );
             std::process::exit(0);
         }
         drop(child);
@@ -3104,7 +3194,13 @@ mod tests {
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             drop(parent);
-            worker_main(child.as_raw_fd(), euid, egid, "root");
+            worker_main(
+                child.as_raw_fd(),
+                worker_uid,
+                worker_gid,
+                worker_user,
+                owner,
+            );
             std::process::exit(0);
         }
         drop(parent);
@@ -3118,7 +3214,7 @@ mod tests {
         // An invalid control fd returns cleanly after privilege setup.
         let pid = unsafe { libc::fork() };
         if pid == 0 {
-            worker_main(-1, euid, egid, "root");
+            worker_main(-1, worker_uid, worker_gid, worker_user, owner);
             std::process::exit(0);
         }
         let mut status = 0;
@@ -3130,7 +3226,7 @@ mod tests {
         // Privilege failure exits the worker process with status 1.
         let pid = unsafe { libc::fork() };
         if pid == 0 {
-            worker_main(-1, u32::MAX, u32::MAX, "no-such-user");
+            worker_main(-1, u32::MAX, u32::MAX, "no-such-user", owner);
             std::process::exit(0);
         }
         let mut status = 0;

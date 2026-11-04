@@ -901,6 +901,7 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
+            .env_clear()
             .spawn()
             .ok()?;
         loop {
