@@ -121,6 +121,62 @@ pub(crate) enum PayloadValueSchema {
     Validated(PayloadValidation),
 }
 
+impl PayloadValueSchema {
+    pub(crate) const fn semantic_kind(self) -> vapache_verified::ConfigSemanticKind {
+        use vapache_verified::ConfigSemanticKind as Kind;
+        match self {
+            Self::Tokens => Kind::Tokens,
+            Self::DirectoryIndex => Kind::DirectoryIndex,
+            Self::OnOff => Kind::OnOff,
+            Self::Unsigned { .. } => Kind::Unsigned,
+            Self::Keyword(_) => Kind::Keyword,
+            Self::Options => Kind::Options,
+            Self::Require => Kind::Require,
+            Self::LegacyHosts => Kind::LegacyHosts,
+            Self::FileEtag => Kind::FileEtag,
+            Self::ErrorDocument => Kind::ErrorDocument,
+            Self::Header => Kind::Header,
+            Self::Redirect { .. } => Kind::Redirect,
+            Self::RewriteCond => Kind::RewriteCond,
+            Self::RewriteRule => Kind::RewriteRule,
+            Self::RepeatedKeyword(_) => Kind::RepeatedKeyword,
+            Self::HttpProtocols => Kind::HttpProtocols,
+            Self::ExpiresDefault => Kind::ExpiresDefault,
+            Self::ExpiresByType => Kind::ExpiresByType,
+            Self::EnvironmentRule => Kind::EnvironmentRule,
+            Self::GlobPatterns => Kind::GlobPatterns,
+            Self::AllowMethods => Kind::AllowMethods,
+            Self::RequestReadTimeout => Kind::RequestReadTimeout,
+            Self::Listen => Kind::Listen,
+            Self::RemoteIpNetworks => Kind::RemoteIpNetworks,
+            Self::SslProtocol => Kind::SslProtocol,
+            Self::UnitFloat => Kind::UnitFloat,
+            Self::OcspResponderUrl => Kind::OcspResponderUrl,
+            Self::AliasRegex => Kind::AliasRegex,
+            Self::ProxyPass => Kind::ProxyPass,
+            Self::ProxyPassReverse => Kind::ProxyPassReverse,
+            Self::ProxyPassMatch => Kind::ProxyPassMatch,
+            Self::Validated(kind) => match kind {
+                PayloadValidation::Capability => Kind::Capability,
+                PayloadValidation::FastCgiStablePath => Kind::FastCgiStablePath,
+                PayloadValidation::ServerAliases => Kind::ServerAliases,
+                PayloadValidation::AllowOverride => Kind::AllowOverride,
+                PayloadValidation::AllowOverrideList => Kind::AllowOverrideList,
+                PayloadValidation::RewriteMap => Kind::RewriteMap,
+                PayloadValidation::LogLevel => Kind::LogLevel,
+                PayloadValidation::SslRandomSeed => Kind::SslRandomSeed,
+                PayloadValidation::SslPassphraseDialog => Kind::SslPassphraseDialog,
+                PayloadValidation::SslSessionCache => Kind::SslSessionCache,
+                PayloadValidation::SslStaplingCache => Kind::SslStaplingCache,
+                PayloadValidation::SslOptions => Kind::SslOptions,
+                PayloadValidation::BalancerMember => Kind::BalancerMember,
+                PayloadValidation::ProxySet => Kind::ProxySet,
+                PayloadValidation::ProxyHealthTemplate => Kind::ProxyHealthTemplate,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PayloadValidation {
     Capability,
@@ -183,6 +239,41 @@ pub(crate) struct SealedProxyMatch {
     pub(crate) fastcgi: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SealedProxySet {
+    pub(crate) health: crate::config::HealthTemplate,
+    pub(crate) sticky_cookie: Option<String>,
+    pub(crate) sticky_sep: Option<String>,
+    pub(crate) fail_on_status: Option<Vec<u16>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SealedAllowOverride {
+    pub(crate) mode: crate::config::OverrideMode,
+    pub(crate) nonfatal: crate::config::NonfatalMode,
+    pub(crate) enables_access_files: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SealedAllowOverrideList {
+    pub(crate) directives: Vec<String>,
+    pub(crate) enables_access_files: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SealedRewriteMap {
+    pub(crate) name: String,
+    pub(crate) source: SealedRewriteMapSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SealedRewriteMapSource {
+    Txt(String),
+    Rnd(String),
+    Prg { program: String, args: Vec<String> },
+    Int(String),
+}
+
 #[derive(Debug, Clone, Copy)]
 enum HeaderAction {
     Set,
@@ -213,7 +304,18 @@ impl SealedHeader {
 
 #[derive(Debug, Clone)]
 enum SealedValue {
-    Tokens,
+    TokenClass(vapache_verified::ConfigSemanticKind),
+    Capability(crate::config::Capability, bool),
+    FastCgiStablePath(Option<crate::config::FastCgiStablePathPolicy>),
+    ServerAliases(Vec<String>),
+    RewriteMap(SealedRewriteMap),
+    LogLevel(String),
+    SslSessionCache(bool),
+    BalancerMember(crate::config::BalancerMember),
+    ProxySet(SealedProxySet),
+    ProxyHealthTemplate(String, crate::config::HealthTemplate),
+    AllowOverride(SealedAllowOverride),
+    AllowOverrideList(SealedAllowOverrideList),
     OnOff(bool),
     Unsigned(u64),
     Keyword(usize),
@@ -249,6 +351,54 @@ enum SealedValue {
     ProxyPassMatch(SealedProxyMatch),
 }
 
+impl SealedValue {
+    fn semantic_kind(&self) -> vapache_verified::ConfigSemanticKind {
+        use vapache_verified::ConfigSemanticKind as Kind;
+        match self {
+            Self::TokenClass(kind) => *kind,
+            Self::Capability(_, _) => Kind::Capability,
+            Self::FastCgiStablePath(_) => Kind::FastCgiStablePath,
+            Self::ServerAliases(_) => Kind::ServerAliases,
+            Self::RewriteMap(_) => Kind::RewriteMap,
+            Self::LogLevel(_) => Kind::LogLevel,
+            Self::SslSessionCache(_) => Kind::SslSessionCache,
+            Self::BalancerMember(_) => Kind::BalancerMember,
+            Self::ProxySet(_) => Kind::ProxySet,
+            Self::ProxyHealthTemplate(_, _) => Kind::ProxyHealthTemplate,
+            Self::AllowOverride(_) => Kind::AllowOverride,
+            Self::AllowOverrideList(_) => Kind::AllowOverrideList,
+            Self::OnOff(_) => Kind::OnOff,
+            Self::Unsigned(_) => Kind::Unsigned,
+            Self::Keyword(_) => Kind::Keyword,
+            Self::Options(_) => Kind::Options,
+            Self::Require(_) => Kind::Require,
+            Self::LegacyHosts(_) => Kind::LegacyHosts,
+            Self::FileEtag(_) => Kind::FileEtag,
+            Self::ErrorDocument(_, _) => Kind::ErrorDocument,
+            Self::Header(_) => Kind::Header,
+            Self::Redirect(_) => Kind::Redirect,
+            Self::RewriteCond(_) => Kind::RewriteCond,
+            Self::RewriteRule(_) => Kind::RewriteRule,
+            Self::HttpProtocols(_) => Kind::HttpProtocols,
+            Self::ExpiresDefault(_) => Kind::ExpiresDefault,
+            Self::ExpiresByType(_, _) => Kind::ExpiresByType,
+            Self::EnvironmentRule(_) => Kind::EnvironmentRule,
+            Self::GlobPatterns(_) => Kind::GlobPatterns,
+            Self::AllowMethods(_) => Kind::AllowMethods,
+            Self::RequestReadTimeout { .. } => Kind::RequestReadTimeout,
+            Self::Listen(_) => Kind::Listen,
+            Self::RemoteIpNetworks(_) => Kind::RemoteIpNetworks,
+            Self::SslProtocol(_) => Kind::SslProtocol,
+            Self::UnitFloat(_) => Kind::UnitFloat,
+            Self::OcspResponderUrl(_) => Kind::OcspResponderUrl,
+            Self::AliasRegex(_) => Kind::AliasRegex,
+            Self::ProxyPass(_) => Kind::ProxyPass,
+            Self::ProxyPassReverse(_) => Kind::ProxyPassReverse,
+            Self::ProxyPassMatch(_) => Kind::ProxyPassMatch,
+        }
+    }
+}
+
 /// Immutable token payload carrying an executable schema certificate.
 ///
 /// Policy compilation consumes this object rather than reparsing an arbitrary
@@ -259,6 +409,7 @@ enum SealedValue {
 pub(crate) struct SealedPayload {
     args: Box<[String]>,
     value: SealedValue,
+    semantic_kind: vapache_verified::ConfigSemanticKind,
 }
 
 impl SealedPayload {
@@ -290,8 +441,10 @@ impl SealedPayload {
                 "directive '{directive}' does not permit an empty argument"
             ));
         }
+        let source_argument_count = args.len();
+        let schema_kind = schema.value.semantic_kind();
         let value = match schema.value {
-            PayloadValueSchema::Tokens => SealedValue::Tokens,
+            PayloadValueSchema::Tokens => SealedValue::TokenClass(schema_kind),
             PayloadValueSchema::DirectoryIndex => {
                 for name in &args {
                     let bytes = name.as_bytes();
@@ -309,11 +462,17 @@ impl SealedPayload {
                         );
                     }
                 }
-                SealedValue::Tokens
+                SealedValue::TokenClass(schema_kind)
             }
             PayloadValueSchema::OnOff => match args.as_slice() {
-                [value] if value.eq_ignore_ascii_case("on") => SealedValue::OnOff(true),
-                [value] if value.eq_ignore_ascii_case("off") => SealedValue::OnOff(false),
+                [value] => match vapache_verified::config_on_off(value.as_bytes()) {
+                    Some(value) => SealedValue::OnOff(value),
+                    None => {
+                        return Err(format!(
+                            "directive '{directive}' requires exactly On or Off"
+                        ))
+                    }
+                },
                 _ => {
                     return Err(format!(
                         "directive '{directive}' requires exactly On or Off"
@@ -322,10 +481,13 @@ impl SealedPayload {
             },
             PayloadValueSchema::Unsigned { min, max } => {
                 let value = match args.as_slice() {
-                    [value] => crate::util::parse_u64(value.as_bytes()),
+                    [value] => vapache_verified::config_bounded_unsigned(
+                        vapache_verified::parse_decimal_u64(value.as_bytes()),
+                        min,
+                        max,
+                    ),
                     _ => None,
                 }
-                .filter(|value| *value >= min && *value <= max)
                 .ok_or_else(|| {
                     format!(
                         "directive '{directive}' requires an unsigned integer from {min} through {max}"
@@ -335,9 +497,13 @@ impl SealedPayload {
             }
             PayloadValueSchema::Keyword(keywords) => {
                 let index = match args.as_slice() {
-                    [value] => keywords
-                        .iter()
-                        .position(|keyword| value.eq_ignore_ascii_case(keyword)),
+                    [value] => {
+                        let vocabulary = keywords
+                            .iter()
+                            .map(|keyword| keyword.as_bytes().to_vec())
+                            .collect::<Vec<_>>();
+                        vapache_verified::config_keyword_index(value.as_bytes(), &vocabulary)
+                    }
                     _ => None,
                 }
                 .ok_or_else(|| {
@@ -426,7 +592,7 @@ impl SealedPayload {
                         "unsupported {directive} flag '{invalid}'; expected {keyword}"
                     ));
                 }
-                SealedValue::Tokens
+                SealedValue::TokenClass(schema_kind)
             }
             PayloadValueSchema::HttpProtocols => {
                 SealedValue::HttpProtocols(crate::config::parse_http_protocols(&args)?)
@@ -599,22 +765,235 @@ impl SealedPayload {
                     backend: args[1].clone(),
                 })
             }
+            PayloadValueSchema::Validated(PayloadValidation::Capability) => {
+                let capability = crate::config::Capability::parse(&args[0])
+                    .ok_or_else(|| format!("unknown vapache capability '{}'", args[0]))?;
+                let enabled = vapache_verified::config_on_off(args[1].as_bytes())
+                    .ok_or_else(|| "VapacheCapability requires On or Off".to_string())?;
+                SealedValue::Capability(capability, enabled)
+            }
+            PayloadValueSchema::Validated(PayloadValidation::FastCgiStablePath) => {
+                if args.len() == 1 && args[0].eq_ignore_ascii_case("off") {
+                    SealedValue::FastCgiStablePath(None)
+                } else {
+                    if args.len() < 5 || !args[0].eq_ignore_ascii_case("on") {
+                        return Err("VapacheFastCGIStablePath requires 'Off' or 'On <unix-endpoint> <backend-uid> <endpoint-owner-uid> <trusted-owner-uid>...'".into());
+                    }
+                    let endpoint = crate::config::parse_fastcgi_policy_endpoint(&args[1])?;
+                    if matches!(endpoint, crate::config::FastCgiEndpoint::Tcp { .. }) {
+                        return Err("VapacheFastCGIStablePath requires a Unix socket; TCP cannot authenticate the backend process".into());
+                    }
+                    let parse_uid = |raw: &str, field: &str| {
+                        vapache_verified::parse_decimal_u64(raw.as_bytes())
+                            .and_then(|value| u32::try_from(value).ok())
+                            .ok_or_else(|| format!("invalid {field} uid '{raw}'"))
+                    };
+                    let backend_uid = parse_uid(&args[2], "FastCGI backend")?;
+                    if backend_uid == 0 {
+                        return Err("VapacheFastCGIStablePath rejects uid 0 backends".into());
+                    }
+                    let endpoint_owner_uid = parse_uid(&args[3], "Unix FastCGI endpoint-owner")?;
+                    let mut trusted_owner_uids = Vec::new();
+                    for raw in &args[4..] {
+                        let uid = parse_uid(raw, "trusted path-owner")?;
+                        if !trusted_owner_uids.contains(&uid) {
+                            trusted_owner_uids.push(uid);
+                        }
+                    }
+                    SealedValue::FastCgiStablePath(Some(crate::config::FastCgiStablePathPolicy {
+                        endpoint,
+                        backend_uid,
+                        endpoint_owner_uid: Some(endpoint_owner_uid),
+                        trusted_owner_uids,
+                    }))
+                }
+            }
+            PayloadValueSchema::Validated(PayloadValidation::ServerAliases) => {
+                for alias in &args {
+                    let wildcard = alias.contains('*') || alias.contains('?');
+                    let supported = alias == "*"
+                        || alias.strip_prefix("*.").is_some_and(|suffix| {
+                            !suffix.is_empty() && !suffix.contains('*') && !suffix.contains('?')
+                        });
+                    if wildcard && !supported {
+                        return Err(format!(
+                            "ServerAlias wildcard '{alias}' is not implemented; only '*' or a leading '*.suffix' wildcard is supported"
+                        ));
+                    }
+                }
+                SealedValue::ServerAliases(args.clone())
+            }
+            PayloadValueSchema::Validated(PayloadValidation::RewriteMap) => {
+                SealedValue::RewriteMap(compile_rewrite_map(&args)?)
+            }
+            PayloadValueSchema::Validated(PayloadValidation::LogLevel) => {
+                SealedValue::LogLevel(compile_log_level(&args)?)
+            }
+            PayloadValueSchema::Validated(PayloadValidation::SslSessionCache) => {
+                SealedValue::SslSessionCache(compile_ssl_session_cache(&args)?)
+            }
+            PayloadValueSchema::Validated(PayloadValidation::BalancerMember) => {
+                SealedValue::BalancerMember(compile_balancer_member(directive, &args)?)
+            }
+            PayloadValueSchema::Validated(PayloadValidation::ProxySet) => {
+                SealedValue::ProxySet(compile_proxy_set(directive, &args)?)
+            }
+            PayloadValueSchema::Validated(PayloadValidation::ProxyHealthTemplate) => {
+                let (name, template) = compile_proxy_health_template(directive, &args)?;
+                SealedValue::ProxyHealthTemplate(name, template)
+            }
+            PayloadValueSchema::Validated(PayloadValidation::AllowOverride) => {
+                SealedValue::AllowOverride(compile_allow_override(&args)?)
+            }
+            PayloadValueSchema::Validated(PayloadValidation::AllowOverrideList) => {
+                SealedValue::AllowOverrideList(compile_allow_override_list(&args)?)
+            }
             PayloadValueSchema::Validated(kind) => {
                 validate_compatibility_payload(directive, &args, kind)?;
-                SealedValue::Tokens
+                SealedValue::TokenClass(schema_kind)
             }
         };
+        if !vapache_verified::config_semantic_seal_admit(
+            schema_kind,
+            value.semantic_kind(),
+            source_argument_count,
+            args.len(),
+        ) {
+            return Err(format!(
+                "internal semantic schema mismatch while sealing directive '{directive}'"
+            ));
+        }
         Ok(Self {
             args: args.into_boxed_slice(),
             value,
+            semantic_kind: schema_kind,
         })
+    }
+
+    pub(crate) fn refines(&self, consumer: vapache_verified::ConfigSemanticKind) -> bool {
+        vapache_verified::config_semantic_projection_admit(self.semantic_kind, consumer)
     }
 
     pub(crate) fn as_slice(&self) -> &[String] {
         &self.args
     }
 
+    pub(crate) fn capability(&self) -> Option<(crate::config::Capability, bool)> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::Capability) {
+            return None;
+        }
+        match self.value {
+            SealedValue::Capability(capability, enabled) => Some((capability, enabled)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn fastcgi_stable_path(
+        &self,
+    ) -> Option<&Option<crate::config::FastCgiStablePathPolicy>> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::FastCgiStablePath) {
+            return None;
+        }
+        match &self.value {
+            SealedValue::FastCgiStablePath(policy) => Some(policy),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn server_aliases(&self) -> Option<&[String]> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::ServerAliases) {
+            return None;
+        }
+        match &self.value {
+            SealedValue::ServerAliases(aliases) => Some(aliases),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn rewrite_map(&self) -> Option<&SealedRewriteMap> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::RewriteMap) {
+            return None;
+        }
+        match &self.value {
+            SealedValue::RewriteMap(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn log_level(&self) -> Option<&str> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::LogLevel) {
+            return None;
+        }
+        match &self.value {
+            SealedValue::LogLevel(level) => Some(level),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn ssl_session_cache(&self) -> Option<bool> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::SslSessionCache) {
+            return None;
+        }
+        match self.value {
+            SealedValue::SslSessionCache(enabled) => Some(enabled),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn balancer_member(&self) -> Option<&crate::config::BalancerMember> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::BalancerMember) {
+            return None;
+        }
+        match &self.value {
+            SealedValue::BalancerMember(member) => Some(member),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn proxy_set(&self) -> Option<&SealedProxySet> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::ProxySet) {
+            return None;
+        }
+        match &self.value {
+            SealedValue::ProxySet(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn proxy_health_template(&self) -> Option<(&str, &crate::config::HealthTemplate)> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::ProxyHealthTemplate) {
+            return None;
+        }
+        match &self.value {
+            SealedValue::ProxyHealthTemplate(name, template) => Some((name, template)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn allow_override(&self) -> Option<&SealedAllowOverride> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::AllowOverride) {
+            return None;
+        }
+        match &self.value {
+            SealedValue::AllowOverride(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn allow_override_list(&self) -> Option<&SealedAllowOverrideList> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::AllowOverrideList) {
+            return None;
+        }
+        match &self.value {
+            SealedValue::AllowOverrideList(value) => Some(value),
+            _ => None,
+        }
+    }
+
     pub(crate) fn on_off(&self) -> Option<bool> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::OnOff) {
+            return None;
+        }
         match self.value {
             SealedValue::OnOff(value) => Some(value),
             _ => None,
@@ -622,6 +1001,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn unsigned(&self) -> Option<u64> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::Unsigned) {
+            return None;
+        }
         match self.value {
             SealedValue::Unsigned(value) => Some(value),
             _ => None,
@@ -629,6 +1011,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn keyword(&self) -> Option<usize> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::Keyword) {
+            return None;
+        }
         match self.value {
             SealedValue::Keyword(value) => Some(value),
             _ => None,
@@ -636,6 +1021,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn options(&self) -> Option<&SealedOptions> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::Options) {
+            return None;
+        }
         match &self.value {
             SealedValue::Options(value) => Some(value),
             _ => None,
@@ -643,6 +1031,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn require(&self) -> Option<&crate::config::Require> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::Require) {
+            return None;
+        }
         match &self.value {
             SealedValue::Require(value) => Some(value),
             _ => None,
@@ -650,6 +1041,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn legacy_hosts(&self) -> Option<&[crate::config::HostSpec]> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::LegacyHosts) {
+            return None;
+        }
         match &self.value {
             SealedValue::LegacyHosts(value) => Some(value),
             _ => None,
@@ -657,6 +1051,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn file_etag(&self) -> Option<u32> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::FileEtag) {
+            return None;
+        }
         match self.value {
             SealedValue::FileEtag(value) => Some(value),
             _ => None,
@@ -664,6 +1061,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn error_document(&self) -> Option<(u16, &crate::config::ErrorDoc)> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::ErrorDocument) {
+            return None;
+        }
         match &self.value {
             SealedValue::ErrorDocument(code, document) => Some((*code, document)),
             _ => None,
@@ -671,6 +1071,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn header(&self) -> Option<&SealedHeader> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::Header) {
+            return None;
+        }
         match &self.value {
             SealedValue::Header(value) => Some(value),
             _ => None,
@@ -678,6 +1081,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn redirect(&self) -> Option<&crate::config::Redirect> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::Redirect) {
+            return None;
+        }
         match &self.value {
             SealedValue::Redirect(value) => Some(value),
             _ => None,
@@ -685,6 +1091,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn rewrite_cond(&self) -> Option<&crate::config::RewriteCond> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::RewriteCond) {
+            return None;
+        }
         match &self.value {
             SealedValue::RewriteCond(value) => Some(value),
             _ => None,
@@ -692,6 +1101,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn rewrite_rule(&self) -> Option<&crate::config::RewriteRule> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::RewriteRule) {
+            return None;
+        }
         match &self.value {
             SealedValue::RewriteRule(value) => Some(value),
             _ => None,
@@ -699,6 +1111,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn http_protocols(&self) -> Option<&[crate::config::HttpProtocol]> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::HttpProtocols) {
+            return None;
+        }
         match &self.value {
             SealedValue::HttpProtocols(value) => Some(value),
             _ => None,
@@ -706,6 +1121,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn expires_default(&self) -> Option<&str> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::ExpiresDefault) {
+            return None;
+        }
         match &self.value {
             SealedValue::ExpiresDefault(value) => Some(value),
             _ => None,
@@ -713,6 +1131,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn expires_by_type(&self) -> Option<(&str, &str)> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::ExpiresByType) {
+            return None;
+        }
         match &self.value {
             SealedValue::ExpiresByType(content_type, value) => Some((content_type, value)),
             _ => None,
@@ -720,6 +1141,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn environment_rule(&self) -> Option<&crate::config::EnvRule> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::EnvironmentRule) {
+            return None;
+        }
         match &self.value {
             SealedValue::EnvironmentRule(value) => Some(value),
             _ => None,
@@ -727,6 +1151,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn glob_patterns(&self) -> Option<&[String]> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::GlobPatterns) {
+            return None;
+        }
         match &self.value {
             SealedValue::GlobPatterns(value) => Some(value),
             _ => None,
@@ -734,6 +1161,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn allow_methods(&self) -> Option<&crate::config::AllowMethods> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::AllowMethods) {
+            return None;
+        }
         match &self.value {
             SealedValue::AllowMethods(value) => Some(value),
             _ => None,
@@ -743,6 +1173,9 @@ impl SealedPayload {
     pub(crate) fn request_read_timeout(
         &self,
     ) -> Option<(Option<Duration>, Option<Duration>, Option<u64>, Option<u64>)> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::RequestReadTimeout) {
+            return None;
+        }
         match self.value {
             SealedValue::RequestReadTimeout {
                 header,
@@ -755,6 +1188,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn listen(&self) -> Option<&crate::config::ListenSpec> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::Listen) {
+            return None;
+        }
         match &self.value {
             SealedValue::Listen(value) => Some(value),
             _ => None,
@@ -762,6 +1198,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn remote_ip_networks(&self) -> Option<&[(IpAddr, u8)]> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::RemoteIpNetworks) {
+            return None;
+        }
         match &self.value {
             SealedValue::RemoteIpNetworks(value) => Some(value),
             _ => None,
@@ -769,6 +1208,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn ssl_protocol(&self) -> Option<&str> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::SslProtocol) {
+            return None;
+        }
         match &self.value {
             SealedValue::SslProtocol(value) => Some(value),
             _ => None,
@@ -776,6 +1218,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn unit_float(&self) -> Option<f64> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::UnitFloat) {
+            return None;
+        }
         match self.value {
             SealedValue::UnitFloat(value) => Some(value),
             _ => None,
@@ -783,6 +1228,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn ocsp_responder_url(&self) -> Option<&str> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::OcspResponderUrl) {
+            return None;
+        }
         match &self.value {
             SealedValue::OcspResponderUrl(value) => Some(value),
             _ => None,
@@ -790,6 +1238,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn alias_regex(&self) -> Option<&SealedAliasRegex> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::AliasRegex) {
+            return None;
+        }
         match &self.value {
             SealedValue::AliasRegex(value) => Some(value),
             _ => None,
@@ -797,6 +1248,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn proxy_pass(&self) -> Option<&SealedProxyPass> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::ProxyPass) {
+            return None;
+        }
         match &self.value {
             SealedValue::ProxyPass(value) => Some(value),
             _ => None,
@@ -804,6 +1258,9 @@ impl SealedPayload {
     }
 
     pub(crate) fn proxy_pass_reverse(&self) -> Option<&SealedProxyReverse> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::ProxyPassReverse) {
+            return None;
+        }
         match &self.value {
             SealedValue::ProxyPassReverse(value) => Some(value),
             _ => None,
@@ -811,10 +1268,89 @@ impl SealedPayload {
     }
 
     pub(crate) fn proxy_pass_match(&self) -> Option<&SealedProxyMatch> {
+        if !self.refines(vapache_verified::ConfigSemanticKind::ProxyPassMatch) {
+            return None;
+        }
         match &self.value {
             SealedValue::ProxyPassMatch(value) => Some(value),
             _ => None,
         }
+    }
+}
+
+fn compile_rewrite_map(args: &[String]) -> Result<SealedRewriteMap, String> {
+    let name = args[0].clone();
+    let (kind, source) = args[1].split_once(':').unwrap_or(("txt", &args[1]));
+    if source.is_empty() {
+        return Err("RewriteMap requires a non-empty map source".into());
+    }
+    let source = match kind.to_ascii_lowercase().as_str() {
+        "txt" => SealedRewriteMapSource::Txt(source.to_string()),
+        "rnd" => SealedRewriteMapSource::Rnd(source.to_string()),
+        "prg" => {
+            let (program, args) = match source.split_once(char::is_whitespace) {
+                Some((program, rest)) => (
+                    program.to_string(),
+                    rest.split_whitespace().map(str::to_string).collect(),
+                ),
+                None => (source.to_string(), Vec::new()),
+            };
+            SealedRewriteMapSource::Prg { program, args }
+        }
+        "int" => {
+            let function = source.to_ascii_lowercase();
+            if !matches!(function.as_str(), "tolower" | "toupper") {
+                return Err(format!(
+                    "unsupported RewriteMap int function '{source}' (expected tolower or toupper)"
+                ));
+            }
+            SealedRewriteMapSource::Int(function)
+        }
+        other => return Err(format!("unsupported RewriteMap type '{other}'")),
+    };
+    Ok(SealedRewriteMap { name, source })
+}
+
+fn compile_log_level(args: &[String]) -> Result<String, String> {
+    let value = &args[0];
+    if value.contains(':') {
+        return Err("module-specific LogLevel is not implemented; refusing to replace the configured audit policy with a global level".into());
+    }
+    if !matches!(
+        value.to_ascii_lowercase().as_str(),
+        "emerg"
+            | "alert"
+            | "crit"
+            | "error"
+            | "warn"
+            | "notice"
+            | "info"
+            | "debug"
+            | "trace1"
+            | "trace2"
+            | "trace3"
+            | "trace4"
+            | "trace5"
+            | "trace6"
+            | "trace7"
+            | "trace8"
+    ) {
+        return Err("LogLevel contains an invalid level".into());
+    }
+    Ok(value.clone())
+}
+
+fn compile_ssl_session_cache(args: &[String]) -> Result<bool, String> {
+    if args.len() != 1 {
+        return Err("SSLSessionCache requires exactly one value".into());
+    }
+    let value = &args[0];
+    if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("nonenotnull") {
+        Ok(false)
+    } else if valid_provider_target(value) {
+        Ok(true)
+    } else {
+        Err("SSLSessionCache requires none or a provider:target value".into())
     }
 }
 
@@ -824,101 +1360,19 @@ fn validate_compatibility_payload(
     kind: PayloadValidation,
 ) -> Result<(), String> {
     match kind {
-        PayloadValidation::Capability => {
-            crate::config::Capability::parse(&args[0])
-                .ok_or_else(|| format!("unknown vapache capability '{}'", args[0]))?;
-            if !matches!(args[1].to_ascii_lowercase().as_str(), "on" | "off") {
-                return Err("VapacheCapability requires On or Off".into());
-            }
+        PayloadValidation::Capability | PayloadValidation::FastCgiStablePath => {
+            return Err("internal typed payload routed through compatibility validation".into());
         }
-        PayloadValidation::FastCgiStablePath => {
-            if args.len() == 1 && args[0].eq_ignore_ascii_case("off") {
-                return Ok(());
-            }
-            if args.len() < 5 || !args[0].eq_ignore_ascii_case("on") {
-                return Err("VapacheFastCGIStablePath requires 'Off' or 'On <unix-endpoint> <backend-uid> <endpoint-owner-uid> <trusted-owner-uid>...'".into());
-            }
-            if matches!(
-                crate::config::parse_fastcgi_policy_endpoint(&args[1])?,
-                crate::config::FastCgiEndpoint::Tcp { .. }
-            ) {
-                return Err("VapacheFastCGIStablePath requires a Unix socket; TCP cannot authenticate the backend process".into());
-            }
-            let backend_uid = args[2]
-                .parse::<u32>()
-                .map_err(|_| format!("invalid FastCGI backend uid '{}'", args[2]))?;
-            if backend_uid == 0 {
-                return Err("VapacheFastCGIStablePath rejects uid 0 backends".into());
-            }
-            args[3]
-                .parse::<u32>()
-                .map_err(|_| format!("invalid Unix FastCGI endpoint-owner uid '{}'", args[3]))?;
-            for raw in &args[4..] {
-                raw.parse::<u32>()
-                    .map_err(|_| format!("invalid trusted path-owner uid '{raw}'"))?;
-            }
+        PayloadValidation::ServerAliases
+        | PayloadValidation::RewriteMap
+        | PayloadValidation::LogLevel
+        | PayloadValidation::SslSessionCache => {
+            return Err("internal typed payload routed through compatibility validation".into());
         }
-        PayloadValidation::ServerAliases => {
-            for alias in args {
-                let wildcard = alias.contains('*') || alias.contains('?');
-                let supported = alias == "*"
-                    || alias.strip_prefix("*.").is_some_and(|suffix| {
-                        !suffix.is_empty() && !suffix.contains('*') && !suffix.contains('?')
-                    });
-                if wildcard && !supported {
-                    return Err(format!(
-                        "ServerAlias wildcard '{alias}' is not implemented; only '*' or a leading '*.suffix' wildcard is supported"
-                    ));
-                }
-            }
-        }
-        PayloadValidation::AllowOverride => validate_allow_override(args)?,
-        PayloadValidation::AllowOverrideList => {
-            let none = args.iter().any(|arg| arg.eq_ignore_ascii_case("none"));
-            if none && args.len() != 1 {
-                return Err(
-                    "AllowOverrideList None cannot be combined with directive names".into(),
-                );
-            }
-        }
-        PayloadValidation::RewriteMap => {
-            let (map_kind, source) = args[1].split_once(':').unwrap_or(("txt", &args[1]));
-            if source.is_empty() {
-                return Err("RewriteMap requires a non-empty map source".into());
-            }
-            match map_kind.to_ascii_lowercase().as_str() {
-                "txt" | "rnd" | "prg" => {}
-                "int" if matches!(source.to_ascii_lowercase().as_str(), "tolower" | "toupper") => {}
-                "int" => return Err(format!("unsupported RewriteMap int function '{source}'")),
-                other => return Err(format!("unsupported RewriteMap type '{other}'")),
-            }
-        }
-        PayloadValidation::LogLevel => {
-            let value = &args[0];
-            if value.contains(':') {
-                return Err("module-specific LogLevel is not implemented; refusing to replace the configured audit policy with a global level".into());
-            }
-            if !matches!(
-                value.to_ascii_lowercase().as_str(),
-                "emerg"
-                    | "alert"
-                    | "crit"
-                    | "error"
-                    | "warn"
-                    | "notice"
-                    | "info"
-                    | "debug"
-                    | "trace1"
-                    | "trace2"
-                    | "trace3"
-                    | "trace4"
-                    | "trace5"
-                    | "trace6"
-                    | "trace7"
-                    | "trace8"
-            ) {
-                return Err("LogLevel contains an invalid level".into());
-            }
+        PayloadValidation::AllowOverride | PayloadValidation::AllowOverrideList => {
+            return Err(
+                "internal typed override payload routed through compatibility validation".into(),
+            );
         }
         PayloadValidation::SslRandomSeed => {
             if !(2..=3).contains(&args.len())
@@ -934,14 +1388,18 @@ fn validate_compatibility_payload(
             {
                 return Err("SSLRandomSeed requires startup|connect, a builtin/file:/exec:/egd: source, and optional byte count".into());
             }
-            if args
-                .get(2)
-                .is_some_and(|value| crate::util::parse_u64(value.as_bytes()).is_none())
-            {
+            if args.get(2).is_some_and(|value| {
+                vapache_verified::parse_decimal_u64(value.as_bytes()).is_none()
+            }) {
                 return Err("SSLRandomSeed requires startup|connect, a builtin/file:/exec:/egd: source, and optional byte count".into());
             }
         }
         PayloadValidation::SslPassphraseDialog => {
+            if args.len() != 1 {
+                return Err(
+                    "SSLPassPhraseDialog requires builtin or exec:/absolute/program".into(),
+                );
+            }
             let value = &args[0];
             if !value.eq_ignore_ascii_case("builtin")
                 && !value
@@ -951,15 +1409,6 @@ fn validate_compatibility_payload(
                 return Err(
                     "SSLPassPhraseDialog requires builtin or exec:/absolute/program".into(),
                 );
-            }
-        }
-        PayloadValidation::SslSessionCache => {
-            let value = &args[0];
-            if !value.eq_ignore_ascii_case("none")
-                && !value.eq_ignore_ascii_case("nonenotnull")
-                && !valid_provider_target(value)
-            {
-                return Err("SSLSessionCache requires none or a provider:target value".into());
             }
         }
         PayloadValidation::SslStaplingCache => {
@@ -975,9 +1424,13 @@ fn validate_compatibility_payload(
                 return Err("only SSLOptions +StrictRequire is supported".into());
             }
         }
-        PayloadValidation::BalancerMember => validate_proxy_parameters(directive, &args[1..])?,
-        PayloadValidation::ProxySet => validate_proxy_parameters(directive, args)?,
-        PayloadValidation::ProxyHealthTemplate => validate_proxy_parameters(directive, &args[1..])?,
+        PayloadValidation::BalancerMember
+        | PayloadValidation::ProxySet
+        | PayloadValidation::ProxyHealthTemplate => {
+            return Err(
+                "internal typed proxy payload routed through compatibility validation".into(),
+            );
+        }
     }
     Ok(())
 }
@@ -988,95 +1441,187 @@ fn valid_provider_target(value: &str) -> bool {
         .is_some_and(|(provider, target)| !provider.is_empty() && !target.is_empty())
 }
 
-fn validate_allow_override(args: &[String]) -> Result<(), String> {
+fn compile_allow_override(args: &[String]) -> Result<SealedAllowOverride, String> {
+    use crate::config::{NonfatalMode, OverrideCategories, OverrideMode};
+    let mut all = false;
+    let mut none = false;
+    let mut nonfatal = NonfatalMode::None;
+    let mut flags = OverrideCategories::empty();
     for argument in args {
         let lower = argument.to_ascii_lowercase();
         if let Some(mode) = lower.strip_prefix("nonfatal=") {
-            if !matches!(mode, "override" | "unknown" | "all") {
-                return Err(format!("invalid Nonfatal mode '{mode}'"));
-            }
+            nonfatal = match mode {
+                "override" => NonfatalMode::Override,
+                "unknown" => NonfatalMode::Unknown,
+                "all" => NonfatalMode::All,
+                _ => return Err(format!("invalid Nonfatal mode '{mode}'")),
+            };
             continue;
         }
         if let Some(options) = lower.strip_prefix("options=") {
-            if options.is_empty()
-                || options.split(',').any(|option| {
-                    !matches!(
-                        option,
-                        "all"
-                            | "none"
-                            | "execcgi"
-                            | "includes"
-                            | "includesnoexec"
-                            | "followsymlinks"
-                            | "indexes"
-                            | "multiviews"
-                            | "symlinksifownermatch"
-                    )
-                })
-            {
+            if options.is_empty() {
                 return Err(format!("invalid AllowOverride option '{argument}'"));
+            }
+            for option in options.split(',') {
+                flags.0 |= match option {
+                    "all" => OverrideCategories::OPTIONS,
+                    "none" => OverrideCategories::OPT_NONE,
+                    "execcgi" => OverrideCategories::EXEC_CGI,
+                    "includes" => OverrideCategories::INCLUDES,
+                    "includesnoexec" => OverrideCategories::INCLUDES_NOEXEC,
+                    "followsymlinks" => OverrideCategories::OPT_FOLLOW_SYMLINKS,
+                    "indexes" => OverrideCategories::OPT_INDEXES,
+                    "multiviews" => OverrideCategories::OPT_MULTIVIEWS,
+                    "symlinksifownermatch" => OverrideCategories::OPT_SYMLINKS_IF_OWNER_MATCH,
+                    _ => return Err(format!("invalid AllowOverride option '{argument}'")),
+                };
             }
             continue;
         }
-        if !matches!(
-            lower.as_str(),
-            "all"
-                | "none"
-                | "authconfig"
-                | "fileinfo"
-                | "indexes"
-                | "limit"
-                | "options"
-                | "execcgi"
-                | "includes"
-                | "includesnoexec"
-                | "languagepriority"
-        ) {
-            return Err(format!("unsupported AllowOverride category '{argument}'"));
+        match lower.as_str() {
+            "all" => all = true,
+            "none" => none = true,
+            "authconfig" => flags.0 |= OverrideCategories::AUTH_CONFIG,
+            "fileinfo" => flags.0 |= OverrideCategories::FILE_INFO,
+            "indexes" => flags.0 |= OverrideCategories::INDEXES,
+            "limit" => flags.0 |= OverrideCategories::LIMIT,
+            "options" => flags.0 |= OverrideCategories::OPTIONS,
+            "execcgi" => flags.0 |= OverrideCategories::EXEC_CGI,
+            "includes" => flags.0 |= OverrideCategories::INCLUDES,
+            "includesnoexec" => flags.0 |= OverrideCategories::INCLUDES_NOEXEC,
+            "languagepriority" => flags.0 |= OverrideCategories::LANGUAGE_PRIORITY,
+            _ => return Err(format!("unsupported AllowOverride category '{argument}'")),
         }
     }
-    Ok(())
+    if !all && !none && flags.0 == 0 {
+        return Err("AllowOverride has no supported categories".into());
+    }
+    let mode = if all {
+        OverrideMode::All
+    } else if none || flags.0 == 0 {
+        OverrideMode::None
+    } else {
+        OverrideMode::Categories(flags)
+    };
+    Ok(SealedAllowOverride {
+        mode,
+        nonfatal,
+        enables_access_files: all || (!none && flags.0 != 0),
+    })
 }
 
-fn validate_proxy_parameters(directive: &str, parameters: &[String]) -> Result<(), String> {
+fn compile_allow_override_list(args: &[String]) -> Result<SealedAllowOverrideList, String> {
+    let none = args.iter().any(|arg| arg.eq_ignore_ascii_case("none"));
+    if none && args.len() != 1 {
+        return Err("AllowOverrideList None cannot be combined with directive names".into());
+    }
+    Ok(SealedAllowOverrideList {
+        directives: if none { Vec::new() } else { args.to_vec() },
+        enables_access_files: !none,
+    })
+}
+
+#[derive(Default)]
+struct CompiledProxyParameters {
+    health: crate::config::HealthTemplate,
+    template: Option<String>,
+    route: Option<String>,
+    sticky_cookie: Option<String>,
+    sticky_sep: Option<String>,
+    fail_on_status: Option<Vec<u16>>,
+}
+
+fn compile_proxy_parameters(
+    directive: &str,
+    parameters: &[String],
+) -> Result<CompiledProxyParameters, String> {
+    let mut out = CompiledProxyParameters::default();
     for item in parameters {
         let (key, value) = item
             .split_once('=')
             .ok_or_else(|| format!("{directive} parameter '{item}' must use name=value syntax"))?;
         let key_lower = key.to_ascii_lowercase();
-        let recognized = matches!(key_lower.as_str(), "hcmethod" | "hcuri")
-            || (directive == "balancermember"
-                && matches!(key_lower.as_str(), "template" | "route"))
-            || (directive == "proxyset"
-                && matches!(
-                    key_lower.as_str(),
-                    "stickysession" | "stickysessionsep" | "failonstatus"
-                ));
-        if recognized {
-            if key.eq_ignore_ascii_case("failonstatus") {
-                let (_, bad) = crate::config::parse_status_list(value);
+        match key_lower.as_str() {
+            "hcmethod" => out.health.method = Some(value.to_string()),
+            "hcuri" => out.health.uri = Some(value.to_string()),
+            "hcinterval" => {
+                out.health.interval = Some(
+                    parse_duration(value)
+                        .ok_or_else(|| format!("invalid {directive} hcinterval '{value}'"))?,
+                );
+            }
+            "hcpasses" => {
+                out.health.passes = Some(parse_proxy_u32(directive, key, value)?);
+            }
+            "hcfails" => {
+                out.health.fails = Some(parse_proxy_u32(directive, key, value)?);
+            }
+            "template" if directive == "balancermember" => {
+                out.template = Some(value.to_string());
+            }
+            "route" if directive == "balancermember" => {
+                out.route = Some(value.to_string());
+            }
+            "stickysession" if directive == "proxyset" => {
+                out.sticky_cookie = Some(value.to_string());
+            }
+            "stickysessionsep" if directive == "proxyset" => {
+                out.sticky_sep = Some(value.to_string());
+            }
+            "failonstatus" if directive == "proxyset" => {
+                let (statuses, bad) = crate::config::parse_status_list(value);
                 if !bad.is_empty() {
                     return Err(format!(
                         "{directive} failonstatus contains non-numeric entries {bad:?}"
                     ));
                 }
-            }
-            continue;
-        }
-        match key_lower.as_str() {
-            "hcinterval" => {
-                parse_duration(value)
-                    .ok_or_else(|| format!("invalid {directive} hcinterval '{value}'"))?;
-            }
-            "hcpasses" | "hcfails" => {
-                value
-                    .parse::<u32>()
-                    .map_err(|_| format!("invalid {directive} {key} '{value}'"))?;
+                out.fail_on_status = Some(statuses);
             }
             _ => return Err(format!("unsupported {directive} parameter '{key}'")),
         }
     }
-    Ok(())
+    Ok(out)
+}
+
+fn parse_proxy_u32(directive: &str, key: &str, value: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid {directive} {key} '{value}'"))
+}
+
+fn compile_balancer_member(
+    directive: &str,
+    args: &[String],
+) -> Result<crate::config::BalancerMember, String> {
+    let compiled = compile_proxy_parameters(directive, &args[1..])?;
+    Ok(crate::config::BalancerMember {
+        url: args[0].clone(),
+        hcmethod: compiled.health.method,
+        hcuri: compiled.health.uri,
+        hcinterval: compiled.health.interval,
+        hcpasses: compiled.health.passes,
+        hcfails: compiled.health.fails,
+        template: compiled.template,
+        route: compiled.route,
+    })
+}
+
+fn compile_proxy_set(directive: &str, args: &[String]) -> Result<SealedProxySet, String> {
+    let compiled = compile_proxy_parameters(directive, args)?;
+    Ok(SealedProxySet {
+        health: compiled.health,
+        sticky_cookie: compiled.sticky_cookie,
+        sticky_sep: compiled.sticky_sep,
+        fail_on_status: compiled.fail_on_status,
+    })
+}
+
+fn compile_proxy_health_template(
+    directive: &str,
+    args: &[String],
+) -> Result<(String, crate::config::HealthTemplate), String> {
+    let compiled = compile_proxy_parameters(directive, &args[1..])?;
+    Ok((args[0].clone(), compiled.health))
 }
 
 fn parse_duration(value: &str) -> Option<Duration> {
@@ -1090,7 +1635,7 @@ fn parse_duration(value: &str) -> Option<Duration> {
     } else {
         (value, 1_000)
     };
-    let millis = crate::util::parse_u64(digits.as_bytes())?.checked_mul(multiplier)?;
+    let millis = vapache_verified::parse_decimal_u64(digits.as_bytes())?.checked_mul(multiplier)?;
     Some(Duration::from_millis(millis))
 }
 
@@ -1317,5 +1862,281 @@ mod tests {
             Some(9)
         );
         assert!(SealedPayload::seal("Level", vec!["10".into()], bounded).is_err());
+
+        let keyword = PayloadSchema::typed(
+            PayloadArity::ONE,
+            true,
+            PayloadValueSchema::Keyword(&["alpha", "beta"]),
+        );
+        assert_eq!(
+            SealedPayload::seal("Choice", vec!["BeTa".into()], keyword)
+                .unwrap()
+                .keyword(),
+            Some(1)
+        );
+
+        for invalid in ["", "+1", "-1", "10", "18446744073709551616"] {
+            assert!(
+                SealedPayload::seal("Level", vec![invalid.into()], bounded).is_err(),
+                "bounded unsigned payload accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_refinement_codes_are_complete_and_projections_fail_closed() {
+        use vapache_verified::ConfigSemanticKind as Kind;
+        let kinds = [
+            Kind::Tokens,
+            Kind::DirectoryIndex,
+            Kind::OnOff,
+            Kind::Unsigned,
+            Kind::Keyword,
+            Kind::Options,
+            Kind::Require,
+            Kind::LegacyHosts,
+            Kind::FileEtag,
+            Kind::ErrorDocument,
+            Kind::Header,
+            Kind::Redirect,
+            Kind::RewriteCond,
+            Kind::RewriteRule,
+            Kind::RepeatedKeyword,
+            Kind::HttpProtocols,
+            Kind::ExpiresDefault,
+            Kind::ExpiresByType,
+            Kind::EnvironmentRule,
+            Kind::GlobPatterns,
+            Kind::AllowMethods,
+            Kind::RequestReadTimeout,
+            Kind::Listen,
+            Kind::RemoteIpNetworks,
+            Kind::SslProtocol,
+            Kind::UnitFloat,
+            Kind::OcspResponderUrl,
+            Kind::AliasRegex,
+            Kind::ProxyPass,
+            Kind::ProxyPassReverse,
+            Kind::ProxyPassMatch,
+            Kind::Capability,
+            Kind::FastCgiStablePath,
+            Kind::ServerAliases,
+            Kind::AllowOverride,
+            Kind::AllowOverrideList,
+            Kind::RewriteMap,
+            Kind::LogLevel,
+            Kind::SslRandomSeed,
+            Kind::SslPassphraseDialog,
+            Kind::SslSessionCache,
+            Kind::SslStaplingCache,
+            Kind::SslOptions,
+            Kind::BalancerMember,
+            Kind::ProxySet,
+            Kind::ProxyHealthTemplate,
+        ];
+        let mut codes = kinds
+            .into_iter()
+            .map(vapache_verified::config_semantic_kind_code)
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        assert_eq!(codes, (0u8..46).collect::<Vec<_>>());
+
+        let toggle = SealedPayload::seal(
+            "Toggle",
+            vec!["On".into()],
+            PayloadSchema::typed(PayloadArity::ONE, true, PayloadValueSchema::OnOff),
+        )
+        .unwrap();
+        assert_eq!(toggle.on_off(), Some(true));
+        assert_eq!(toggle.unsigned(), None);
+        assert_eq!(toggle.keyword(), None);
+        assert!(toggle.refines(Kind::OnOff));
+        assert!(!toggle.refines(Kind::Tokens));
+        assert!(vapache_verified::config_semantic_seal_admit(
+            Kind::OnOff,
+            Kind::OnOff,
+            1,
+            1
+        ));
+        assert!(!vapache_verified::config_semantic_seal_admit(
+            Kind::OnOff,
+            Kind::Unsigned,
+            1,
+            1
+        ));
+        assert!(!vapache_verified::config_semantic_seal_admit(
+            Kind::OnOff,
+            Kind::OnOff,
+            1,
+            2
+        ));
+    }
+
+    #[test]
+    fn effectful_validated_payloads_are_compiled_once() {
+        let capability = SealedPayload::seal(
+            "vapachecapability",
+            vec!["FastCgi".into(), "oN".into()],
+            PayloadSchema::typed(
+                PayloadArity::TWO,
+                true,
+                PayloadValueSchema::Validated(PayloadValidation::Capability),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            capability.capability(),
+            Some((crate::config::Capability::FastCgi, true))
+        );
+        assert!(capability.fastcgi_stable_path().is_none());
+
+        let stable = SealedPayload::seal(
+            "vapachefastcgistablepath",
+            vec![
+                "On".into(),
+                "unix:/run/php.sock".into(),
+                "33".into(),
+                "0".into(),
+                "0".into(),
+                "33".into(),
+                "33".into(),
+            ],
+            PayloadSchema::typed(
+                PayloadArity::at_least(1),
+                true,
+                PayloadValueSchema::Validated(PayloadValidation::FastCgiStablePath),
+            ),
+        )
+        .unwrap();
+        let policy = stable.fastcgi_stable_path().unwrap().as_ref().unwrap();
+        assert_eq!(policy.backend_uid, 33);
+        assert_eq!(policy.endpoint_owner_uid, Some(0));
+        assert_eq!(policy.trusted_owner_uids, vec![0, 33]);
+
+        let set = SealedPayload::seal(
+            "proxyset",
+            vec![
+                "hcinterval=5ms".into(),
+                "hcpasses=2".into(),
+                "hcfails=3".into(),
+                "stickysession=ROUTE".into(),
+                "failonstatus=500,503".into(),
+            ],
+            PayloadSchema::typed(
+                PayloadArity::at_least(1),
+                true,
+                PayloadValueSchema::Validated(PayloadValidation::ProxySet),
+            ),
+        )
+        .unwrap();
+        let set = set.proxy_set().unwrap();
+        assert_eq!(set.health.interval, Some(Duration::from_millis(5)));
+        assert_eq!(set.health.passes, Some(2));
+        assert_eq!(set.health.fails, Some(3));
+        assert_eq!(set.sticky_cookie.as_deref(), Some("ROUTE"));
+        assert_eq!(set.fail_on_status, Some(vec![500, 503]));
+
+        let overflow = SealedPayload::seal(
+            "proxyset",
+            vec!["hcpasses=4294967296".into()],
+            PayloadSchema::typed(
+                PayloadArity::at_least(1),
+                true,
+                PayloadValueSchema::Validated(PayloadValidation::ProxySet),
+            ),
+        );
+        assert!(overflow.is_err());
+
+        let override_policy = SealedPayload::seal(
+            "allowoverride",
+            vec![
+                "AuthConfig".into(),
+                "Options=Indexes".into(),
+                "Nonfatal=Unknown".into(),
+            ],
+            PayloadSchema::typed(
+                PayloadArity::at_least(1),
+                true,
+                PayloadValueSchema::Validated(PayloadValidation::AllowOverride),
+            ),
+        )
+        .unwrap();
+        let override_policy = override_policy.allow_override().unwrap();
+        let crate::config::OverrideMode::Categories(categories) = override_policy.mode else {
+            panic!("expected category-scoped AllowOverride")
+        };
+        assert!(categories.contains(crate::config::OverrideCategories::AUTH_CONFIG));
+        assert!(categories.contains(crate::config::OverrideCategories::OPT_INDEXES));
+        assert_eq!(
+            override_policy.nonfatal,
+            crate::config::NonfatalMode::Unknown
+        );
+        assert!(override_policy.enables_access_files);
+
+        let override_list = SealedPayload::seal(
+            "allowoverridelist",
+            vec!["None".into()],
+            PayloadSchema::typed(
+                PayloadArity::at_least(1),
+                true,
+                PayloadValueSchema::Validated(PayloadValidation::AllowOverrideList),
+            ),
+        )
+        .unwrap();
+        assert!(override_list
+            .allow_override_list()
+            .unwrap()
+            .directives
+            .is_empty());
+        assert!(SealedPayload::seal(
+            "allowoverridelist",
+            vec!["None".into(), "Require".into()],
+            PayloadSchema::typed(
+                PayloadArity::at_least(1),
+                true,
+                PayloadValueSchema::Validated(PayloadValidation::AllowOverrideList),
+            ),
+        )
+        .is_err());
+
+        let rewrite_map = SealedPayload::seal(
+            "rewritemap",
+            vec!["case".into(), "prg:/usr/bin/helper --safe".into()],
+            PayloadSchema::typed(
+                PayloadArity::TWO,
+                true,
+                PayloadValueSchema::Validated(PayloadValidation::RewriteMap),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            rewrite_map.rewrite_map().unwrap().source,
+            SealedRewriteMapSource::Prg {
+                program: "/usr/bin/helper".into(),
+                args: vec!["--safe".into()],
+            }
+        );
+        assert!(SealedPayload::seal(
+            "rewritemap",
+            vec!["bad".into(), "int:escape".into()],
+            PayloadSchema::typed(
+                PayloadArity::TWO,
+                true,
+                PayloadValueSchema::Validated(PayloadValidation::RewriteMap),
+            ),
+        )
+        .is_err());
+
+        let session_cache = SealedPayload::seal(
+            "sslsessioncache",
+            vec!["shmcb:/run/cache".into()],
+            PayloadSchema::typed(
+                PayloadArity::ONE,
+                true,
+                PayloadValueSchema::Validated(PayloadValidation::SslSessionCache),
+            ),
+        )
+        .unwrap();
+        assert_eq!(session_cache.ssl_session_cache(), Some(true));
     }
 }

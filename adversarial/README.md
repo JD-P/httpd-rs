@@ -9,6 +9,7 @@ prevents re-deriving them from scratch.
 
 | Path | Contents |
 |---|---|
+| `configuration-semantic-refinement-review.md` | Configuration compiler campaign: closed schema/IR/consumer semantic domains, executable Verus refinement certificates, verified primitive normalizers, single-pass effectful payload compilation, and main/access schema-drift tests |
 | `dynamic-backend-identity-review.md` | Backend identity campaign: generation-pinned DNS shared by proxy/WebSocket/health/FastCGI/OCSP, exact connected-peer checks, and Linux `SO_PEERCRED` authentication for strict Unix FastCGI |
 | `privileged-control-plane-review.md` | Root tooling/package campaign: fixed execution environments, canonical trusted path chains, serialized configuration snapshots, special-file rejection, transactional service rollback, controlled Certbot edits, and real-package interruption tests |
 | `process-descriptor-isolation-review.md` | Process-boundary campaign: fail-closed main-daemon descriptor closure, privilege-safe CGI pool/scripts, sealed RewriteMap helpers, TLS-broker readiness, and fork/exec regression probes |

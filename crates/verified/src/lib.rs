@@ -7522,11 +7522,46 @@ fn lower_ascii(input: &[u8]) -> (out: Vec<u8>)
     out
 }
 
+pub open spec fn parse_decimal_u64_from_spec(
+    input: Seq<u8>,
+    index: int,
+    value: int,
+) -> Option<int>
+    recommends 0 <= index <= input.len(), 0 <= value <= u64::MAX,
+    decreases input.len() - index,
+{
+    if index >= input.len() {
+        Some(value)
+    } else if input[index] < b'0' || input[index] > b'9' {
+        None
+    } else {
+        let digit = (input[index] - b'0') as int;
+        if value > (u64::MAX as int - digit) / 10 {
+            None
+        } else {
+            parse_decimal_u64_from_spec(input, index + 1, value * 10 + digit)
+        }
+    }
+}
+
+pub open spec fn parse_decimal_u64_spec(input: Seq<u8>) -> Option<int> {
+    if input.len() == 0 {
+        None
+    } else {
+        parse_decimal_u64_from_spec(input, 0, 0)
+    }
+}
+
 /// Decimal parser shared by HTTP framing and configuration payload sealing.
-/// A successful result is non-empty, digit-only, and every multiplication and
-/// addition is proved to remain within `u64`.
+/// A successful result is non-empty, digit-only, and equals the mathematical
+/// base-10 value of every input digit; overflow is rejected rather than
+/// wrapped.
 pub fn parse_decimal_u64(input: &[u8]) -> (out: Option<u64>)
     ensures
+        match out {
+            Some(value) => parse_decimal_u64_spec(input@) == Some(value as int),
+            None => parse_decimal_u64_spec(input@).is_none(),
+        },
         match out {
             Some(_) => input@.len() > 0
                 && forall|i: int| 0 <= i < input@.len() ==> b'0' <= input@[i] && input@[i] <= b'9',
@@ -7541,6 +7576,10 @@ pub fn parse_decimal_u64(input: &[u8]) -> (out: Option<u64>)
     while i < input.len()
         invariant
             i <= input.len(),
+            input.len() > 0,
+            v <= u64::MAX,
+            parse_decimal_u64_from_spec(input@, i as int, v as int)
+                == parse_decimal_u64_spec(input@),
             forall|j: int| 0 <= j < i ==> b'0' <= input@[j] && input@[j] <= b'9',
         decreases input.len() - i,
     {
@@ -11520,6 +11559,345 @@ pub proof fn config_payload_schema_implies_arity_and_nonempty(
         match max { Some(bound) => count <= bound, None => true },
         reject_empty ==> !has_empty,
 {
+}
+
+/// Semantic domain selected by a directive's payload schema.  This is the
+/// common discriminant carried from the source/schema boundary, through the
+/// sealed payload, to the compiler projection which consumes it.  Payload
+/// data itself remains in the server crate's strongly typed Rust values; the
+/// purpose of this enum is to make a wrong-schema or wrong-getter transition
+/// an executable, verified rejection instead of an unchecked convention.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigSemanticKind {
+    Tokens,
+    DirectoryIndex,
+    OnOff,
+    Unsigned,
+    Keyword,
+    Options,
+    Require,
+    LegacyHosts,
+    FileEtag,
+    ErrorDocument,
+    Header,
+    Redirect,
+    RewriteCond,
+    RewriteRule,
+    RepeatedKeyword,
+    HttpProtocols,
+    ExpiresDefault,
+    ExpiresByType,
+    EnvironmentRule,
+    GlobPatterns,
+    AllowMethods,
+    RequestReadTimeout,
+    Listen,
+    RemoteIpNetworks,
+    SslProtocol,
+    UnitFloat,
+    OcspResponderUrl,
+    AliasRegex,
+    ProxyPass,
+    ProxyPassReverse,
+    ProxyPassMatch,
+    Capability,
+    FastCgiStablePath,
+    ServerAliases,
+    AllowOverride,
+    AllowOverrideList,
+    RewriteMap,
+    LogLevel,
+    SslRandomSeed,
+    SslPassphraseDialog,
+    SslSessionCache,
+    SslStaplingCache,
+    SslOptions,
+    BalancerMember,
+    ProxySet,
+    ProxyHealthTemplate,
+}
+
+pub open spec fn config_semantic_kind_code_spec(kind: ConfigSemanticKind) -> u8 {
+    match kind {
+        ConfigSemanticKind::Tokens => 0,
+        ConfigSemanticKind::DirectoryIndex => 1,
+        ConfigSemanticKind::OnOff => 2,
+        ConfigSemanticKind::Unsigned => 3,
+        ConfigSemanticKind::Keyword => 4,
+        ConfigSemanticKind::Options => 5,
+        ConfigSemanticKind::Require => 6,
+        ConfigSemanticKind::LegacyHosts => 7,
+        ConfigSemanticKind::FileEtag => 8,
+        ConfigSemanticKind::ErrorDocument => 9,
+        ConfigSemanticKind::Header => 10,
+        ConfigSemanticKind::Redirect => 11,
+        ConfigSemanticKind::RewriteCond => 12,
+        ConfigSemanticKind::RewriteRule => 13,
+        ConfigSemanticKind::RepeatedKeyword => 14,
+        ConfigSemanticKind::HttpProtocols => 15,
+        ConfigSemanticKind::ExpiresDefault => 16,
+        ConfigSemanticKind::ExpiresByType => 17,
+        ConfigSemanticKind::EnvironmentRule => 18,
+        ConfigSemanticKind::GlobPatterns => 19,
+        ConfigSemanticKind::AllowMethods => 20,
+        ConfigSemanticKind::RequestReadTimeout => 21,
+        ConfigSemanticKind::Listen => 22,
+        ConfigSemanticKind::RemoteIpNetworks => 23,
+        ConfigSemanticKind::SslProtocol => 24,
+        ConfigSemanticKind::UnitFloat => 25,
+        ConfigSemanticKind::OcspResponderUrl => 26,
+        ConfigSemanticKind::AliasRegex => 27,
+        ConfigSemanticKind::ProxyPass => 28,
+        ConfigSemanticKind::ProxyPassReverse => 29,
+        ConfigSemanticKind::ProxyPassMatch => 30,
+        ConfigSemanticKind::Capability => 31,
+        ConfigSemanticKind::FastCgiStablePath => 32,
+        ConfigSemanticKind::ServerAliases => 33,
+        ConfigSemanticKind::AllowOverride => 34,
+        ConfigSemanticKind::AllowOverrideList => 35,
+        ConfigSemanticKind::RewriteMap => 36,
+        ConfigSemanticKind::LogLevel => 37,
+        ConfigSemanticKind::SslRandomSeed => 38,
+        ConfigSemanticKind::SslPassphraseDialog => 39,
+        ConfigSemanticKind::SslSessionCache => 40,
+        ConfigSemanticKind::SslStaplingCache => 41,
+        ConfigSemanticKind::SslOptions => 42,
+        ConfigSemanticKind::BalancerMember => 43,
+        ConfigSemanticKind::ProxySet => 44,
+        ConfigSemanticKind::ProxyHealthTemplate => 45,
+    }
+}
+
+pub fn config_semantic_kind_code(kind: ConfigSemanticKind) -> (code: u8)
+    ensures code == config_semantic_kind_code_spec(kind),
+{
+    match kind {
+        ConfigSemanticKind::Tokens => 0,
+        ConfigSemanticKind::DirectoryIndex => 1,
+        ConfigSemanticKind::OnOff => 2,
+        ConfigSemanticKind::Unsigned => 3,
+        ConfigSemanticKind::Keyword => 4,
+        ConfigSemanticKind::Options => 5,
+        ConfigSemanticKind::Require => 6,
+        ConfigSemanticKind::LegacyHosts => 7,
+        ConfigSemanticKind::FileEtag => 8,
+        ConfigSemanticKind::ErrorDocument => 9,
+        ConfigSemanticKind::Header => 10,
+        ConfigSemanticKind::Redirect => 11,
+        ConfigSemanticKind::RewriteCond => 12,
+        ConfigSemanticKind::RewriteRule => 13,
+        ConfigSemanticKind::RepeatedKeyword => 14,
+        ConfigSemanticKind::HttpProtocols => 15,
+        ConfigSemanticKind::ExpiresDefault => 16,
+        ConfigSemanticKind::ExpiresByType => 17,
+        ConfigSemanticKind::EnvironmentRule => 18,
+        ConfigSemanticKind::GlobPatterns => 19,
+        ConfigSemanticKind::AllowMethods => 20,
+        ConfigSemanticKind::RequestReadTimeout => 21,
+        ConfigSemanticKind::Listen => 22,
+        ConfigSemanticKind::RemoteIpNetworks => 23,
+        ConfigSemanticKind::SslProtocol => 24,
+        ConfigSemanticKind::UnitFloat => 25,
+        ConfigSemanticKind::OcspResponderUrl => 26,
+        ConfigSemanticKind::AliasRegex => 27,
+        ConfigSemanticKind::ProxyPass => 28,
+        ConfigSemanticKind::ProxyPassReverse => 29,
+        ConfigSemanticKind::ProxyPassMatch => 30,
+        ConfigSemanticKind::Capability => 31,
+        ConfigSemanticKind::FastCgiStablePath => 32,
+        ConfigSemanticKind::ServerAliases => 33,
+        ConfigSemanticKind::AllowOverride => 34,
+        ConfigSemanticKind::AllowOverrideList => 35,
+        ConfigSemanticKind::RewriteMap => 36,
+        ConfigSemanticKind::LogLevel => 37,
+        ConfigSemanticKind::SslRandomSeed => 38,
+        ConfigSemanticKind::SslPassphraseDialog => 39,
+        ConfigSemanticKind::SslSessionCache => 40,
+        ConfigSemanticKind::SslStaplingCache => 41,
+        ConfigSemanticKind::SslOptions => 42,
+        ConfigSemanticKind::BalancerMember => 43,
+        ConfigSemanticKind::ProxySet => 44,
+        ConfigSemanticKind::ProxyHealthTemplate => 45,
+    }
+}
+
+/// The executable tag is a lossless encoding of the closed semantic domain.
+/// Consequently, equality admitted by the runtime certificate is equality of
+/// semantic kinds, rather than merely a hash or a conventionally unique ID.
+pub proof fn config_semantic_kind_code_is_injective(
+    left: ConfigSemanticKind,
+    right: ConfigSemanticKind,
+)
+    requires
+        config_semantic_kind_code_spec(left) == config_semantic_kind_code_spec(right),
+    ensures left == right,
+{
+}
+
+/// A seal is a refinement only when it preserves both the schema's semantic
+/// domain and the complete source argument cardinality.  The runtime moves
+/// the source vector into the sealed object, then consumes this decision
+/// before the object can enter a configuration program.
+pub open spec fn config_semantic_seal_spec(
+    schema: ConfigSemanticKind,
+    sealed: ConfigSemanticKind,
+    source_arguments: usize,
+    sealed_arguments: usize,
+) -> bool {
+    config_semantic_kind_code_spec(schema) == config_semantic_kind_code_spec(sealed)
+        && source_arguments == sealed_arguments
+}
+
+pub fn config_semantic_seal_admit(
+    schema: ConfigSemanticKind,
+    sealed: ConfigSemanticKind,
+    source_arguments: usize,
+    sealed_arguments: usize,
+) -> (ok: bool)
+    ensures ok == config_semantic_seal_spec(
+        schema,
+        sealed,
+        source_arguments,
+        sealed_arguments,
+    ),
+{
+    config_semantic_kind_code(schema) == config_semantic_kind_code(sealed)
+        && source_arguments == sealed_arguments
+}
+
+/// A compiler projection may observe a sealed payload only through the same
+/// semantic domain.  Typed payload getters call this executable gate.
+pub open spec fn config_semantic_projection_spec(
+    sealed: ConfigSemanticKind,
+    consumer: ConfigSemanticKind,
+) -> bool {
+    config_semantic_kind_code_spec(sealed) == config_semantic_kind_code_spec(consumer)
+}
+
+pub fn config_semantic_projection_admit(
+    sealed: ConfigSemanticKind,
+    consumer: ConfigSemanticKind,
+) -> (ok: bool)
+    ensures ok == config_semantic_projection_spec(sealed, consumer),
+{
+    config_semantic_kind_code(sealed) == config_semantic_kind_code(consumer)
+}
+
+/// End-to-end refinement: a successfully sealed payload projected by a
+/// compiler has one semantic kind and an unchanged argument count.
+pub proof fn config_semantic_refinement_is_transitive(
+    schema: ConfigSemanticKind,
+    sealed: ConfigSemanticKind,
+    consumer: ConfigSemanticKind,
+    source_arguments: usize,
+    sealed_arguments: usize,
+)
+    requires
+        config_semantic_seal_spec(
+            schema,
+            sealed,
+            source_arguments,
+            sealed_arguments,
+        ),
+        config_semantic_projection_spec(sealed, consumer),
+    ensures
+        schema == sealed,
+        sealed == consumer,
+        schema == consumer,
+        config_semantic_kind_code_spec(schema) == config_semantic_kind_code_spec(consumer),
+        source_arguments == sealed_arguments,
+{
+    config_semantic_kind_code_is_injective(schema, sealed);
+    config_semantic_kind_code_is_injective(sealed, consumer);
+}
+
+pub proof fn config_semantic_kind_substitution_is_rejected(
+    sealed: ConfigSemanticKind,
+    consumer: ConfigSemanticKind,
+)
+    requires config_semantic_kind_code_spec(sealed) != config_semantic_kind_code_spec(consumer),
+    ensures !config_semantic_projection_spec(sealed, consumer),
+{
+}
+
+/// Exact, case-insensitive On/Off normalizer used by configuration payload
+/// sealing.  Keeping the semantic constructor here makes the implementation
+/// itself the proved refinement of this small declarative specification.
+pub open spec fn config_on_off_spec(input: Seq<u8>) -> Option<bool> {
+    if eq_ignore_ascii_case_spec(input, b"on"@) {
+        Some(true)
+    } else if eq_ignore_ascii_case_spec(input, b"off"@) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+pub fn config_on_off(input: &[u8]) -> (out: Option<bool>)
+    ensures out == config_on_off_spec(input@),
+{
+    if eq_ignore_ascii_case(input, b"on") {
+        Some(true)
+    } else if eq_ignore_ascii_case(input, b"off") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Range refinement applied to the output of the verified decimal parser.
+pub open spec fn config_bounded_unsigned_spec(
+    parsed: Option<u64>,
+    min: u64,
+    max: u64,
+) -> Option<u64> {
+    match parsed {
+        Some(value) if min <= value && value <= max => Some(value),
+        _ => None,
+    }
+}
+
+pub fn config_bounded_unsigned(
+    parsed: Option<u64>,
+    min: u64,
+    max: u64,
+) -> (out: Option<u64>)
+    ensures out == config_bounded_unsigned_spec(parsed, min, max),
+{
+    match parsed {
+        Some(value) if min <= value && value <= max => Some(value),
+        _ => None,
+    }
+}
+
+/// Select the first matching keyword from a schema vocabulary.  The
+/// postcondition rules out both a skipped earlier match and an invented match;
+/// consumers may therefore use the returned index as a closed enum tag.
+pub fn config_keyword_index(value: &[u8], keywords: &[Vec<u8>]) -> (out: Option<usize>)
+    ensures
+        match out {
+            Some(index) => index < keywords@.len()
+                && eq_ignore_ascii_case_spec(value@, keywords@[index as int]@)
+                && forall|j: int| 0 <= j < index
+                    ==> !eq_ignore_ascii_case_spec(value@, keywords@[j]@),
+            None => forall|j: int| 0 <= j < keywords@.len()
+                ==> !eq_ignore_ascii_case_spec(value@, keywords@[j]@),
+        },
+{
+    let mut index: usize = 0;
+    while index < keywords.len()
+        invariant
+            index <= keywords.len(),
+            forall|j: int| 0 <= j < index
+                ==> !eq_ignore_ascii_case_spec(value@, keywords@[j]@),
+        decreases keywords.len() - index,
+    {
+        if eq_ignore_ascii_case(value, &keywords[index]) {
+            return Some(index);
+        }
+        index = index + 1;
+    }
+    None
 }
 
 /// The three pure line kinds produced by the configuration tokenizer. This is

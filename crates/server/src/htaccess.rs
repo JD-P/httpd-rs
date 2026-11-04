@@ -2557,6 +2557,11 @@ fn apply_directive(
     require_only: bool,
 ) -> Result<(), String> {
     let args = payload.as_slice();
+    if !payload.refines(access_directive_schema(name).value.semantic_kind()) {
+        return Err(format!(
+            "internal semantic payload mismatch for .htaccess directive '{name}'"
+        ));
+    }
     let Some(spec) = directive_spec(name) else {
         return Err(format!("unsupported .htaccess directive '{name}'"));
     };
@@ -5502,6 +5507,22 @@ mod tests {
             assert_eq!(result.is_ok(), ok, "{text}: {:?}", result.err());
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effectful_access_directives_share_main_semantic_domains() {
+        for (name, _, disposition) in DIRECTIVE_SPECS {
+            if *disposition != DirectiveDisposition::Effectful {
+                continue;
+            }
+            let access = access_directive_schema(name);
+            let main = crate::config::directive_payload_schema(name);
+            assert_eq!(
+                access.value.semantic_kind(),
+                main.value.semantic_kind(),
+                "main and .htaccess semantic schemas drifted for {name}"
+            );
+        }
     }
 }
 

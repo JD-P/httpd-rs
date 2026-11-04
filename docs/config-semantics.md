@@ -1839,7 +1839,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **706 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **711 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -2316,10 +2316,20 @@ compiled only for a new descriptor/version snapshot and the resulting parsed
 layer is cached; the sealed program is not retained on the request hot path.
 The token-to-semantic-IR boundary is now closed in production: no fallible
 payload parser is first invoked after `Scope` mutation begins. Apache
-compatibility of the safe-Rust semantic constructors is still a differential
+compatibility of complex safe-Rust constructors is still a differential
 oracle obligation, while regex matching semantics remain the separate engine
-assumption. AccessLayer slot and directive disposition boundaries are already
-verified.
+assumption. Internally, every schema, sealed value and compiler projection
+carries one of 46 closed semantic kinds. Executable Verus certificates prove
+argument-count preservation, kind-code injectivity and end-to-end kind
+identity; every compiler entry and typed getter consumes those certificates.
+On/Off normalization, exact overflow-safe decimal parsing/ranging and
+first-keyword selection are executable verified constructors. Capability,
+stable FastCGI policy, override policy, proxy/balancer health, server aliases,
+log level, TLS session-cache mode and RewriteMap source/program payloads are
+compiled once during sealing rather than validated and reparsed during
+effects. A cross-table test requires every effectful main/access directive to
+select the same semantic domain. AccessLayer slot and directive disposition
+boundaries are already verified.
 
 ### Remaining refinement boundary
 
@@ -2327,11 +2337,14 @@ The verified source/depth plan is consumed by the evaluator. Rule-kind phase
 classification, deferred-slot selection and the recursive ordering comparator
 are executable verified decisions. Configuration/access-file lexical
 transitions, argument bounds and sealed section structure are executable
-verified decisions too. Semantic payload construction is encapsulated by the
-sealed Rust IR, uses verified schema and decimal kernels, and completes before
-effects. Exact equivalence of those constructors to Apache and standard-library
-sort correctness remain outside mechanical proof; container/list field merging
-and the security disposition/layer-slot translation use verified helpers.
+verified decisions too. Schema-to-sealed-IR-to-consumer semantic-kind
+refinement, argument preservation, primitive normalization and kind
+substitution rejection are executable verified decisions. Semantic payload
+construction is encapsulated by the sealed Rust IR and completes before
+effects. Exact equivalence of complex constructors to Apache and
+standard-library sort correctness remain outside mechanical proof;
+container/list field merging and the security disposition/layer-slot
+translation use verified helpers.
 
 The authorization decision, access-phase interleaving, Options algebra,
 scalar overrides, `.htaccess` rule classification, expression truthiness,
@@ -2459,11 +2472,13 @@ profile with its exact executable build ID before export; this avoids the Rust
   source/depth plan consumed by the single production evaluator. Rule-kind
   phase classification, deferred-slot selection and the recursive ordering
   comparator also consume executable Verus decisions. Lexical transitions,
-  argument bounds and immutable section structure are verified and connected;
-  semantic payloads are sealed before effects, while their exact Apache
-  equivalence and concrete library sorting remain covered by the explicit
-  oracle/refinement assumption. Container/list field merging, directive
-  disposition and `.htaccess` layer-slot translation use verified helpers.
+  argument bounds and immutable section structure are verified and connected.
+  The closed schema/sealed-IR/compiler semantic domains, argument preservation,
+  primitive normalizers and wrong-domain rejection are mechanically connected;
+  complex constructor equivalence to Apache and concrete library sorting
+  remain covered by the explicit oracle/refinement assumption. Container/list
+  field merging, directive disposition and `.htaccess` layer-slot translation
+  use verified helpers.
 - Some module-specific merge rules are not modelled.  `AllowOverrideList`,
   `Nonfatal=...`, `Include`/`IncludeOptional` and the covered contexts are now
   implemented or covered by the differential/context matrices.
