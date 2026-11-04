@@ -413,6 +413,13 @@ impl Server {
         self.cfg.retire_generation();
     }
 
+    /// Last fallible reload checkpoint. It deliberately precedes candidate
+    /// background activation so an injected abort leaves no candidate worker
+    /// alive and the old generation's admission gate remains open.
+    pub fn prepare_generation_commit(&self) -> io::Result<()> {
+        crate::fault::hit("transition.reload.precommit")
+    }
+
     pub fn run(&self, bound: &[Bound]) -> io::Result<()> {
         self.run_with_poll(bound, |pollfds| {
             poll_listener_fds(pollfds, Duration::from_millis(100))
@@ -739,7 +746,7 @@ where
             format!("connection worker runtime unavailable: {error}"),
         )
     })?;
-    Ok(handle.spawn_blocking(work))
+    Ok(handle.spawn_blocking(crate::fault::inherited(work)))
 }
 
 async fn run_connection_work<F, T>(work: F) -> io::Result<T>
@@ -762,9 +769,9 @@ where
                 "connection worker queue is full",
             ));
         }
-        queue.push_back(Box::new(move || {
+        queue.push_back(Box::new(crate::fault::inherited(move || {
             let _ = reply.send(work());
-        }));
+        })));
     }
     pool.shared.ready.notify_one();
     result
@@ -2061,6 +2068,7 @@ fn process_h1_request_phase<C: Read + Write>(
             "connection closed before admitted request",
         )));
     };
+    crate::fault::hit("transition.h1.head").map_err(ReadError::Io)?;
     let scope_guard = head.request().request_scope().map(|scope| scope.guard());
     let dispatch_peer = cfg.client_addr(peer, head.request());
     let mut phase = RequestPhaseToken::head();
@@ -4101,6 +4109,9 @@ pub(crate) fn probe_prepared_handler(
     local_port: u16,
     tls: bool,
 ) -> PreparedRouteDecision {
+    if crate::fault::hit("transition.request.policy").is_err() {
+        return PreparedRouteDecision::Respond(Response::memory_overload(), None);
+    }
     req.set_handler_probe(true);
     let (mut response, remote_user) =
         dispatch_with_scheme_and_identity(cfg, req, peer, local_ip, local_port, tls);
@@ -4159,6 +4170,11 @@ pub(crate) fn execute_prepared_handler(
     debug_assert!(vapache_verified::prepared_handler_needs_dynamic_lease(
         handler.kind()
     ));
+    if crate::fault::hit("transition.backend.start").is_err() {
+        // Dropping the typed handler here also drops any route-owned descriptor or other
+        // leases. No backend side effect has happened yet.
+        return Response::memory_overload();
+    }
     let context = req
         .resource_context()
         .cloned()
@@ -9095,6 +9111,101 @@ mod tests {
             before
         );
         crate::fault::clear();
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn transition_failures_are_fail_closed_and_release_prepared_backends() {
+        let _test_guard = ADMISSION_TEST_LOCK.lock().unwrap();
+        let _fault_guard = crate::fault::test_guard();
+        let dir = cov_dir("transition-policy-backend");
+        let script = dir.join("www/upload.cgi");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\n'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "AddHandler cgi-script .cgi\n<Directory \"{}/www\">\nOptions +ExecCGI\nRequire all granted\n</Directory>\n",
+                dir.display()
+            ),
+        );
+        let peer = cov_peer();
+        let before = cfg.resource_budget.transition_snapshot();
+
+        let mut denied = cov_req("POST", "/upload.cgi");
+        denied.framing = crate::verified::BodyFraming::Length(4);
+        denied
+            .headers
+            .bind_request_scope(crate::resource::RequestScope::new(
+                cfg.resource_budget.context(peer.ip()),
+            ));
+        crate::fault::configure(
+            "transition.request.policy",
+            0,
+            io::ErrorKind::ConnectionAborted,
+        );
+        match probe_request_body(&cfg, &mut denied, peer, "127.0.0.1", 80, false) {
+            BodyRouteDecision::Respond(response, None) => assert_eq!(response.status, 503),
+            _ => panic!("injected policy transition did not fail closed"),
+        }
+        drop(denied);
+        assert_eq!(cfg.resource_budget.transition_snapshot(), before);
+
+        crate::fault::clear();
+        let mut request = cov_req("POST", "/upload.cgi");
+        request.framing = crate::verified::BodyFraming::Length(4);
+        request
+            .headers
+            .bind_request_scope(crate::resource::RequestScope::new(
+                cfg.resource_budget.context(peer.ip()),
+            ));
+        let handler = match probe_request_body(&cfg, &mut request, peer, "127.0.0.1", 80, false) {
+            BodyRouteDecision::Read { handler, .. } => handler,
+            _ => panic!("CGI route did not produce a prepared handler"),
+        };
+        assert_ne!(cfg.resource_budget.transition_snapshot(), before);
+        crate::fault::clear();
+        crate::fault::configure(
+            "transition.backend.start",
+            0,
+            io::ErrorKind::ConnectionAborted,
+        );
+        let response = execute_prepared_handler(&cfg, &mut request, peer, 80, false, handler);
+        assert_eq!(response.status, 503);
+        drop((response, request));
+        assert_eq!(cfg.resource_budget.transition_snapshot(), before);
+        assert_eq!(crate::fault::trace(), ["transition.backend.start"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn reload_precommit_failure_preserves_the_old_generation() {
+        let _fault_guard = crate::fault::test_guard();
+        let dir = cov_dir("transition-reload");
+        let cfg = Arc::new(cov_config(&dir, ""));
+        let server = Server::new(cfg.clone(), Arc::new(cov_logger(&cfg)));
+
+        crate::fault::configure(
+            "transition.reload.precommit",
+            0,
+            io::ErrorKind::ConnectionAborted,
+        );
+        assert!(server.prepare_generation_commit().is_err());
+        assert!(cfg.admit_generation_work(|| ()).is_some());
+
+        crate::fault::clear();
+        server.prepare_generation_commit().unwrap();
+        server.retire_generation();
+        assert!(cfg.admit_generation_work(|| ()).is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(flavor = "current_thread")]

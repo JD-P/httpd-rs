@@ -1078,6 +1078,7 @@ async fn send_streaming_body_chunk(
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))?;
+    crate::fault::hit("transition.h1.body.backend-await")?;
     tokio::time::timeout(remaining, sender.send(chunk))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))?
@@ -1101,6 +1102,7 @@ where
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))?;
+        crate::fault::hit("transition.h1.body.continue-await")?;
         tokio::time::timeout(remaining, async {
             tokio::io::AsyncWriteExt::write_all(stream, b"HTTP/1.1 100 Continue\r\n\r\n").await?;
             tokio::io::AsyncWriteExt::flush(stream).await
@@ -1409,6 +1411,7 @@ async fn async_read_with_deadline<S: tokio::io::AsyncRead + Unpin>(
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))?;
+    crate::fault::hit("transition.h1.body.read-await")?;
     tokio::time::timeout(remaining, tokio::io::AsyncReadExt::read(stream, bytes))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request body timeout"))?
@@ -3369,6 +3372,7 @@ where
             ));
         }
         let quantum = bytes.len().min(ASYNC_OUTPUT_QUANTUM);
+        crate::fault::hit("transition.h1.output.write-await")?;
         let written = if output.is_slow() {
             loop {
                 let now = Instant::now();
@@ -3430,6 +3434,7 @@ async fn async_flush_progress<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    crate::fault::hit("transition.h1.output.flush-await")?;
     if !output.is_slow() {
         let remaining = progress.remaining_classification_grace(H1_SLOW_CLASSIFY_GRACE);
         if !remaining.is_zero() {
@@ -3466,10 +3471,11 @@ async fn async_read_stream_chunk(
         None => None,
     };
     let ownership = ownership.begin_read();
-    tokio::task::spawn_blocking(move || {
+    crate::fault::spawn_blocking(move || {
         let _lease = lease;
         let mut reader = reader;
         let mut bytes = vec![0u8; want];
+        crate::fault::hit("transition.h1.output.stream-read")?;
         let read = reader.read(&mut bytes)?;
         bytes.truncate(read);
         Ok((reader, bytes, read, ownership.complete_read()))
@@ -3490,9 +3496,10 @@ async fn async_read_file_chunk(
         None => None,
     };
     let ownership = ownership.begin_read();
-    tokio::task::spawn_blocking(move || {
+    crate::fault::spawn_blocking(move || {
         let _lease = lease;
         let mut bytes = vec![0u8; want];
+        crate::fault::hit("transition.h1.output.file-read")?;
         let read = file.read_at(&mut bytes, offset)?;
         bytes.truncate(read);
         Ok((file, bytes, read, ownership.complete_read()))
@@ -3515,6 +3522,7 @@ pub(crate) async fn write_response_async<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    crate::fault::hit("transition.h1.output.start")?;
     let (head, no_body_status, _) = serialize_response_head(resp, opts)?;
     let mut progress =
         crate::resource::SlowOutputProgress::new(opts.write_timeout.max(H1_OUTPUT_FLOOR));
@@ -3619,6 +3627,7 @@ pub(crate) async fn write_response_async_plain(
     scope: Option<&crate::resource::RequestScope>,
     output: &mut crate::resource::SlowOutputAdmission,
 ) -> io::Result<u64> {
+    crate::fault::hit("transition.h1.output.plain-start")?;
     if !matches!(&resp.body, Body::File { .. }) {
         return write_response_async(stream, resp, opts, scope, output).await;
     }
@@ -3653,6 +3662,7 @@ pub(crate) async fn write_response_async_plain(
         }
         let count = len.min(ASYNC_OUTPUT_QUANTUM as u64) as usize;
         let transfer = loop {
+            crate::fault::hit("transition.h1.output.sendfile-await")?;
             let operation = async {
                 loop {
                     stream.writable().await?;
@@ -4599,6 +4609,49 @@ mod tests {
         assert_eq!(buffered, b"GET /next");
     }
 
+    #[cfg(feature = "fault-injection")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_body_await_failure_drops_the_complete_request_ledger() {
+        let _fault_guard = crate::fault::test_guard();
+        let budget = std::sync::Arc::new(ResourceBudget::default());
+        let before = budget.transition_snapshot();
+        let mut limits = Limits::default();
+        limits.resource_budget = budget.clone();
+        let context = budget.context("127.0.0.1".parse().unwrap());
+        let mut parser = std::io::Cursor::new(Vec::<u8>::new());
+        let mut buffered =
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\n".to_vec();
+        let head = read_request_head_with_reservation(
+            &mut parser,
+            &mut buffered,
+            &limits,
+            |_, _| Ok(Some(context)),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let (mut server, mut client) = tokio::io::duplex(1024);
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"body")
+            .await
+            .unwrap();
+        crate::fault::clear();
+        crate::fault::configure(
+            "transition.h1.body.read-await",
+            0,
+            io::ErrorKind::ConnectionReset,
+        );
+        assert!(
+            read_request_body_async(&mut server, &mut buffered, &limits, head)
+                .await
+                .is_err()
+        );
+        drop((server, client));
+        assert_eq!(budget.transition_snapshot(), before);
+        assert!(crate::fault::trace()
+            .iter()
+            .any(|name| name == "transition.h1.body.read-await"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn async_output_pump_transfers_large_bodies_in_bounded_quanta() {
         let (mut server, mut client) = tokio::io::duplex(8 * 1024);
@@ -4632,6 +4685,65 @@ mod tests {
             .unwrap()
             + 4;
         assert_eq!(&wire[split..], vec![b'x'; expected]);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn transition_campaign_releases_h1_output_ownership_at_every_checkpoint() {
+        async fn run(inject_after: Option<usize>) -> (io::Result<u64>, Vec<String>) {
+            crate::fault::clear();
+            if let Some(after) = inject_after {
+                crate::fault::configure_sequence(after, io::ErrorKind::ConnectionReset);
+            }
+
+            let budget = std::sync::Arc::new(ResourceBudget::default());
+            let before = budget.transition_snapshot();
+            let client = "192.0.2.91".parse().unwrap();
+            let context = budget.context(client);
+            let scope = crate::resource::RequestScope::new(context.clone());
+            let mut response = Response::new(200);
+            response.body = Body::Stream {
+                reader: Box::new(std::io::Cursor::new(vec![b'x'; 16 * 1024])),
+                len: 16 * 1024,
+            };
+            response.admit_resident_for(&budget, client).unwrap();
+            response.hold_dynamic(budget.try_dynamic_descriptors_in(&context, 1, 1).unwrap());
+            let mut output = crate::resource::SlowOutputAdmission::detached(context);
+            let (mut server, _client) = tokio::io::duplex(128 * 1024);
+            let result = write_response_async(
+                &mut server,
+                &mut response,
+                &response_options(),
+                Some(&scope),
+                &mut output,
+            )
+            .await;
+            drop((server, response, output, scope));
+            assert_eq!(budget.transition_snapshot(), before);
+            (result, crate::fault::trace())
+        }
+
+        let _fault_guard = crate::fault::test_guard();
+        let (result, trace) = run(None).await;
+        assert_eq!(result.unwrap(), 16 * 1024);
+        assert_eq!(
+            trace,
+            [
+                "transition.h1.output.start",
+                "transition.h1.output.write-await",
+                "transition.h1.output.stream-read",
+                "transition.h1.output.write-await",
+                "transition.h1.output.flush-await"
+            ]
+        );
+        for checkpoint in 0..trace.len() {
+            let (result, injected_trace) = run(Some(checkpoint)).await;
+            assert!(
+                result.is_err(),
+                "checkpoint {checkpoint} unexpectedly passed"
+            );
+            assert_eq!(injected_trace.len(), checkpoint + 1);
+        }
     }
 
     #[test]

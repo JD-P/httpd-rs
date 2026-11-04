@@ -176,6 +176,22 @@ pub struct ResourceBudget {
     next_scope: AtomicU64,
 }
 
+/// Complete process-ledger state used by deterministic transition campaigns.
+/// Comparing snapshots before and after an injected failure catches leaks in
+/// typed pools as well as their aggregate descriptor/task/memory parents.
+#[cfg(any(test, feature = "fault-injection"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitionResourceSnapshot {
+    slots: [u64; SlotKind::COUNT],
+    bytes: [u64; ByteKind::COUNT],
+    physical: [u64; PhysicalKind::COUNT],
+    disk_bytes: u64,
+    disk_files: u64,
+    filesystem_bytes: u64,
+    filesystem_files: u64,
+    transport_bytes: u64,
+}
+
 impl Default for ResourceBudget {
     fn default() -> Self {
         let physical_limits = detected_physical_limits();
@@ -2327,6 +2343,34 @@ impl ResourceBudget {
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn websocket_usage(&self) -> u64 {
         self.slot_usage(SlotKind::Websocket)
+    }
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn transition_snapshot(&self) -> TransitionResourceSnapshot {
+        let ledgers = self
+            .disk_ledgers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        TransitionResourceSnapshot {
+            slots: std::array::from_fn(|index| self.slot_process[index].load(Ordering::Acquire)),
+            bytes: std::array::from_fn(|index| self.byte_process[index].load(Ordering::Acquire)),
+            physical: std::array::from_fn(|index| {
+                self.physical_process[index].load(Ordering::Acquire)
+            }),
+            disk_bytes: self.disk_bytes.load(Ordering::Acquire),
+            disk_files: self.disk_files.load(Ordering::Acquire),
+            filesystem_bytes: ledgers
+                .devices
+                .values()
+                .map(|ledger| ledger.bytes.load(Ordering::Acquire))
+                .sum(),
+            filesystem_files: ledgers
+                .devices
+                .values()
+                .map(|ledger| ledger.files.load(Ordering::Acquire))
+                .sum(),
+            transport_bytes: self.transport_bytes.load(Ordering::Acquire),
+        }
     }
 }
 

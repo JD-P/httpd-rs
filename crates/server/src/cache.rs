@@ -2135,6 +2135,9 @@ pub fn store(
     if !vapache_verified::cache_generation_admit(request_epoch, cfg.cache_epoch()) {
         return;
     }
+    if crate::fault::hit("transition.cache.store.start").is_err() {
+        return;
+    }
     // A local ErrorDocument marks the response itself ineligible before this
     // boundary. Response-local provenance cannot bleed between async tasks.
     if !resp.shared_cache_eligible() || !crate::http::response_headers_valid(resp) {
@@ -2292,6 +2295,9 @@ pub fn store(
         .read()
         .unwrap_or_else(|error| error.into_inner());
     if !vapache_verified::cache_generation_admit(request_epoch, cfg.cache_epoch()) {
+        return;
+    }
+    if crate::fault::hit("transition.cache.store.commit").is_err() {
         return;
     }
     disk_store(cfg, &key, &entry);
@@ -5652,6 +5658,70 @@ CacheIgnoreQueryString On\n\
         assert!(!stem.with_extension("meta").exists());
 
         disk_usage().lock().unwrap().remove(&root);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn cache_transition_failures_never_publish_or_leak_an_entry() {
+        let _fault_guard = crate::fault::test_guard();
+        let (dir, mut cfg) = disk_test_config("transition-store");
+        cfg.cache.root = None;
+        cfg.cache.min_file_size = 0;
+        cfg.cache.max_file_size = 1_000_000;
+        cfg.cache.max_memory_size = 1_000_000;
+        cfg.cache.default_expire = 60;
+        cfg.cache.ignore_no_last_mod = true;
+        let request = test_request();
+        let scope = Scope::default();
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let target = Path::new("/tmp/cache-transition-target");
+        let grant = crate::access::test_grant();
+        let before = cfg.resource_budget.transition_snapshot();
+
+        for boundary in [
+            "transition.cache.store.start",
+            "transition.cache.store.commit",
+        ] {
+            let key = format!("{boundary}-{}", std::process::id());
+            entries()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .entries
+                .remove(&key);
+            crate::fault::clear();
+            crate::fault::configure(boundary, 0, io::ErrorKind::ConnectionAborted);
+            let mut response = Response::bytes(200, "text/plain", b"not published".to_vec());
+            store(
+                &cfg,
+                None,
+                &request,
+                "host",
+                "/x",
+                &scope,
+                peer,
+                &mut response,
+                &grant,
+                &key,
+                target,
+                false,
+                cfg.cache_epoch(),
+            );
+            assert!(
+                !entries()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .entries
+                    .contains_key(&key),
+                "{boundary} published a cache entry"
+            );
+            assert_eq!(
+                cfg.resource_budget.transition_snapshot(),
+                before,
+                "{boundary}"
+            );
+            assert!(crate::fault::trace().iter().any(|name| name == boundary));
+        }
         let _ = fs::remove_dir_all(dir);
     }
 

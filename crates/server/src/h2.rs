@@ -375,6 +375,12 @@ async fn read_body(
         // One deadline covers the complete body.  Restarting the timeout for
         // every DATA frame lets a slow peer keep a request alive forever.
         let remaining = timeout.saturating_sub(started.elapsed());
+        if crate::fault::hit("transition.h2.body.data-await").is_err() {
+            return Err(H2ReadFailure::Response(bad(
+                503,
+                "request-body transition aborted",
+            )));
+        }
         let next = match tokio::time::timeout(remaining, recv.data()).await {
             Ok(next) => next,
             Err(_) => return Err(H2ReadFailure::Response(bad(408, "request body timeout"))),
@@ -460,6 +466,12 @@ async fn stream_body(
     let started = Instant::now();
     loop {
         let remaining = timeout.saturating_sub(started.elapsed());
+        if crate::fault::hit("transition.h2.body.data-await").is_err() {
+            return Err(H2ReadFailure::Response(bad(
+                503,
+                "request-body transition aborted",
+            )));
+        }
         let next = match tokio::time::timeout(remaining, recv.data()).await {
             Ok(next) => next,
             Err(_) => return Err(H2ReadFailure::Response(bad(408, "request body timeout"))),
@@ -495,6 +507,12 @@ async fn stream_body(
         budget = next_budget;
         let chunk_len = chunk.len();
         let remaining = timeout.saturating_sub(started.elapsed());
+        if crate::fault::hit("transition.h2.body.backend-await").is_err() {
+            return Err(H2ReadFailure::Response(bad(
+                503,
+                "backend body transition aborted",
+            )));
+        }
         match tokio::time::timeout(remaining, sender.send(chunk.to_vec())).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return Err(H2ReadFailure::BackendClosed),
@@ -530,6 +548,12 @@ async fn read_trailers(
     allow_trailers: bool,
 ) -> Result<(), H2ReadFailure> {
     let remaining = timeout.saturating_sub(started.elapsed());
+    if crate::fault::hit("transition.h2.body.trailers-await").is_err() {
+        return Err(H2ReadFailure::Response(bad(
+            503,
+            "request-trailer transition aborted",
+        )));
+    }
     let trailers = match tokio::time::timeout(remaining, recv.trailers()).await {
         Err(_) => return Err(H2ReadFailure::Response(bad(408, "request body timeout"))),
         Ok(Err(error)) if error.is_reset() => return Err(H2ReadFailure::Reset),
@@ -609,6 +633,7 @@ async fn send_capacity(
     progress: &mut crate::resource::SlowOutputProgress,
     ownership: &mut crate::http::ResponseOwnership,
 ) -> io::Result<usize> {
+    crate::fault::hit("transition.h2.output.capacity-await")?;
     send.reserve_capacity(remaining);
     if !output.is_slow() {
         let remaining_grace = progress.remaining_classification_grace(H2_SLOW_CLASSIFY_GRACE);
@@ -675,6 +700,7 @@ async fn send_response_with_admission(
     head_only: bool,
     output: &mut crate::resource::SlowOutputAdmission,
 ) -> io::Result<u64> {
+    crate::fault::hit("transition.h2.output.start")?;
     let client = output.client();
     if !crate::http::response_headers_valid(&resp) {
         // Do not silently discard just the malformed fields and forward the
@@ -848,11 +874,12 @@ async fn send_response_with_admission(
                 let blocking_read = cfg.resource_budget.try_response_body_read_for(client)?;
                 let read_ownership = ownership.begin_read();
                 let (next_reader, mut buf, resident, result, next_ownership) =
-                    tokio::task::spawn_blocking(move || {
+                    crate::fault::spawn_blocking(move || {
                         let _blocking_read = blocking_read;
                         let mut buf = take_body_buffer(capacity);
                         buf.resize(capacity, 0);
-                        let result = reader.read(&mut buf[..capacity]);
+                        let result = crate::fault::hit("transition.h2.output.stream-read")
+                            .and_then(|()| reader.read(&mut buf[..capacity]));
                         (
                             reader,
                             buf,
@@ -911,9 +938,10 @@ async fn send_response_with_admission(
                     let blocking_read = cfg.resource_budget.try_response_body_read_for(client)?;
                     let read_ownership = ownership.begin_read();
                     let (next_file, data, next_ownership) =
-                        tokio::task::spawn_blocking(move || {
+                        crate::fault::spawn_blocking(move || {
                             let _blocking_read = blocking_read;
-                            let data = read_range(&file, pos, capacity, resident);
+                            let data = crate::fault::hit("transition.h2.output.file-read")
+                                .and_then(|()| read_range(&file, pos, capacity, resident));
                             (file, data, read_ownership.complete_read())
                         })
                         .await
@@ -922,6 +950,7 @@ async fn send_response_with_admission(
                     ownership = next_ownership;
                     data?
                 } else {
+                    crate::fault::hit("transition.h2.output.file-read")?;
                     read_range(&file, pos, capacity, resident)?
                 };
                 let filled = data.len();
@@ -1039,6 +1068,10 @@ async fn blocking_task_or_reset<T>(
     task: &mut tokio::task::JoinHandle<T>,
     scope: &crate::resource::RequestScope,
 ) -> Option<Result<T, tokio::task::JoinError>> {
+    if crate::fault::hit("transition.h2.blocking-await").is_err() {
+        scope.cancel();
+        return None;
+    }
     let reset = std::future::poll_fn(|cx| respond.poll_reset(cx));
     tokio::pin!(reset);
     tokio::select! {
@@ -1078,6 +1111,17 @@ async fn handle_stream(
     } = admission;
     let mut output_admission =
         crate::resource::SlowOutputAdmission::tracked_h2(resource_context.clone(), stream_quota);
+    if crate::fault::hit("transition.h2.head").is_err() {
+        return send_response_with_admission(
+            respond,
+            &cfg,
+            Response::memory_overload(),
+            false,
+            &mut output_admission,
+        )
+        .await
+        .is_err();
+    }
     if !quota_identity_valid {
         return send_response_with_admission(
             respond,
@@ -1391,7 +1435,7 @@ async fn handle_stream(
         let probe_cfg = cfg.clone();
         let probe_local_ip = local_ip.clone();
         let mut probe_req = req;
-        let mut probed = tokio::task::spawn_blocking(move || {
+        let mut probed = crate::fault::spawn_blocking(move || {
             let decision = crate::server::probe_request_body(
                 &probe_cfg,
                 &mut probe_req,
@@ -1461,7 +1505,7 @@ async fn handle_stream(
         let probe_cfg = cfg.clone();
         let probe_local_ip = local_ip.clone();
         let mut probe_req = req;
-        let mut probed = tokio::task::spawn_blocking(move || {
+        let mut probed = crate::fault::spawn_blocking(move || {
             let decision = crate::server::probe_prepared_handler(
                 &probe_cfg,
                 &mut probe_req,
@@ -1544,7 +1588,7 @@ async fn handle_stream(
                     .expect("streaming route retained its prepared handler");
                 let remote_user = body_remote_user.take();
                 let backend_req = req.clone();
-                let mut backend = tokio::task::spawn_blocking(move || {
+                let mut backend = crate::fault::spawn_blocking(move || {
                     let mut req = backend_req;
                     let response = crate::server::execute_prepared_handler(
                         &dispatch_cfg,
@@ -1748,7 +1792,7 @@ async fn handle_stream(
                 let dispatch_cfg = cfg.clone();
                 let dispatch_local_ip = local_ip.clone();
                 let runs_backend = prepared_handler.is_some();
-                let mut dispatched = tokio::task::spawn_blocking(move || {
+                let mut dispatched = crate::fault::spawn_blocking(move || {
                     let mut req = req;
                     let (resp, remote_user) = match prepared_handler {
                         Some(handler) => (
@@ -2195,7 +2239,7 @@ where
                 let tls_identity = tls_identity.clone();
                 let tx = events_tx.clone();
                 let request_scope = admission.request_scope.clone();
-                tasks.spawn(async move {
+                tasks.spawn(crate::fault::scope_future(async move {
                     let _cancel = H2RequestCancelGuard {
                         scope: request_scope,
                     };
@@ -2220,7 +2264,7 @@ where
                         admission,
                     )
                     .await;
-                });
+                }));
             }
         }
     };
@@ -2425,7 +2469,7 @@ mod tests {
         delay_before_first_chunk: Duration,
     ) -> StreamBodyOutcome {
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
-        let server = tokio::spawn(async move {
+        let server = tokio::spawn(crate::fault::scope_future(async move {
             let mut connection = h2::server::handshake(server_io).await.unwrap();
             let (request, _) = connection.accept().await.unwrap().unwrap();
             let (sender, mut receiver_channel) = tokio::sync::mpsc::channel(1);
@@ -2477,7 +2521,7 @@ mod tests {
                 drain.abort();
             }
             result
-        });
+        }));
         let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
         let driver = tokio::spawn(async move { connection.await });
         let request = http::Request::builder()
@@ -2519,6 +2563,52 @@ mod tests {
             Err(H2ReadFailure::Reset) => StreamBodyOutcome::Reset,
             Err(H2ReadFailure::BackendClosed) => StreamBodyOutcome::BackendClosed,
             Err(H2ReadFailure::Response(response)) => StreamBodyOutcome::Response(response.status),
+        }
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_body_transition_awaits_fail_closed() {
+        let _fault_guard = crate::fault::test_guard();
+        for (boundary, chunks, end, declared) in [
+            (
+                "transition.h2.body.data-await",
+                Vec::<&[u8]>::new(),
+                StreamBodyEnd::Open,
+                0,
+            ),
+            (
+                "transition.h2.body.backend-await",
+                vec![b"body".as_slice()],
+                StreamBodyEnd::Data,
+                4,
+            ),
+            (
+                "transition.h2.body.trailers-await",
+                vec![b"body".as_slice()],
+                StreamBodyEnd::Data,
+                4,
+            ),
+        ] {
+            crate::fault::clear();
+            crate::fault::configure(boundary, 0, io::ErrorKind::ConnectionReset);
+            assert_eq!(
+                stream_body_case(
+                    &chunks,
+                    end,
+                    StreamBodyReceiver::Drain,
+                    declared,
+                    1024,
+                    Duration::from_secs(1),
+                    0,
+                    false,
+                    Duration::ZERO,
+                )
+                .await,
+                StreamBodyOutcome::Response(503),
+                "{boundary}"
+            );
+            assert!(crate::fault::trace().iter().any(|name| name == boundary));
         }
     }
 
@@ -2680,7 +2770,7 @@ mod tests {
     ) -> (io::Result<u64>, u16, http::HeaderMap, Vec<u8>) {
         let (client_io, server_io) = tokio::io::duplex(32 * 1024 * 1024);
         let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
+        let server = tokio::spawn(crate::fault::scope_future(async move {
             let mut connection = h2::server::handshake(server_io).await.unwrap();
             let (_, respond) = connection.accept().await.unwrap().unwrap();
             let sender = send_response(
@@ -2712,7 +2802,7 @@ mod tests {
                 }
             }
             result
-        });
+        }));
         let mut builder = h2::client::Builder::new();
         if let Some(initial_window) = initial_window {
             builder.initial_window_size(initial_window);
@@ -4380,6 +4470,50 @@ mod tests {
         };
         assert!(response_round_trip(cfg, read_error, false).await.0.is_err());
 
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn inherited_h2_read_failure_releases_all_response_ownership() {
+        let _fault_guard = crate::fault::test_guard();
+        let (cfg, _logger, dir) = test_config("transition-h2-output");
+        let before = cfg.resource_budget.transition_snapshot();
+        let client = std::net::IpAddr::from([127, 0, 0, 1]);
+        let context = cfg.resource_budget.context(client);
+        let mut response = Response::new(200);
+        response.body = Body::Stream {
+            reader: Box::new(std::io::Cursor::new(vec![b'x'; 16 * 1024])),
+            len: 16 * 1024,
+        };
+        response
+            .admit_resident_for(&cfg.resource_budget, client)
+            .unwrap();
+        response.hold_dynamic(
+            cfg.resource_budget
+                .try_dynamic_descriptors_in(&context, 1, 1)
+                .unwrap(),
+        );
+        crate::fault::clear();
+        crate::fault::configure(
+            "transition.h2.output.stream-read",
+            0,
+            io::ErrorKind::ConnectionReset,
+        );
+
+        let (result, status, _, body) = response_round_trip(cfg.clone(), response, false).await;
+        assert!(result.is_err());
+        assert_eq!(status, 200, "headers must commit before the body read");
+        assert!(body.is_empty());
+        assert_eq!(cfg.resource_budget.transition_snapshot(), before);
+        assert_eq!(
+            crate::fault::trace(),
+            [
+                "transition.h2.output.start",
+                "transition.h2.output.capacity-await",
+                "transition.h2.output.stream-read"
+            ]
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

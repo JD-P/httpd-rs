@@ -1425,9 +1425,17 @@ fn main() {
                 continue;
             }
         };
-        // This is the commit boundary: every fallible candidate resource has
-        // been prepared, and activate_background validates the whole listener
-        // set before starting any candidate worker.
+        // This is the final fallible checkpoint. Keeping it before background
+        // activation guarantees that an aborted transition leaves neither a
+        // candidate worker nor a retired old-generation admission gate.
+        if let Err(e) = srv.prepare_generation_commit() {
+            logger.error(&format!("reload rejected before commit: {e}"));
+            logger.error("reload rejected; continuing with previous configuration");
+            continue;
+        }
+        // Every fallible candidate resource has now been prepared, and
+        // activate_background validates the listener set before starting the
+        // candidate worker. The remaining generation swap is infallible.
         if let Err(e) = server::activate_background(&new_cfg, &mut new_bound) {
             logger.error(&format!(
                 "reload rejected: background preparation failed: {e}"

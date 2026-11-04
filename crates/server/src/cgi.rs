@@ -831,6 +831,7 @@ fn start_pool_worker(
     unsafe {
         cmd.pre_exec(move || prepare_worker_fd(child_fd, WORKER_FD, parent_pid));
     }
+    crate::fault::hit("cgi.worker.spawn").map_err(|e| format!("cannot spawn CGI worker: {e}"))?;
     let proc = cmd
         .spawn()
         .map_err(|e| format!("cannot spawn CGI worker: {e}"))?;
@@ -1053,7 +1054,7 @@ impl Read for CgiExchangeStream<'_> {
             if let Some(error) = self.interrupted() {
                 return Err(error);
             }
-            match self.inner.read(buf) {
+            match crate::fault::hit("cgi.worker.read").and_then(|()| self.inner.read(buf)) {
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -1071,7 +1072,7 @@ impl Write for CgiExchangeStream<'_> {
             if let Some(error) = self.interrupted() {
                 return Err(error);
             }
-            match self.inner.write(buf) {
+            match crate::fault::hit("cgi.worker.write").and_then(|()| self.inner.write(buf)) {
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -1268,7 +1269,7 @@ fn feed_stdin(
             drop(stdin);
             return None;
         };
-        Some(std::thread::spawn(move || {
+        Some(crate::fault::spawn_thread(move || {
             let Ok(flags) = rustix::fs::fcntl_getfl(&stdin) else {
                 return;
             };
@@ -1289,7 +1290,8 @@ fn feed_stdin(
                     return;
                 }
                 if start == end {
-                    match reader.read(&mut chunk) {
+                    match crate::fault::hit("cgi.input.read").and_then(|()| reader.read(&mut chunk))
+                    {
                         Ok(0) => return,
                         Ok(read) => {
                             start = 0;
@@ -1323,7 +1325,9 @@ fn feed_stdin(
                 if result == 0 {
                     continue;
                 }
-                match stdin.write(&chunk[start..end]) {
+                match crate::fault::hit("cgi.input.write")
+                    .and_then(|()| stdin.write(&chunk[start..end]))
+                {
                     Ok(0) => return,
                     Ok(written) => start += written,
                     Err(error)
@@ -1399,7 +1403,7 @@ fn run_local(
         .and_then(|stdin| feed_stdin(stdin, body, body_len, deadline, request_scope.cloned()));
     let stderr_scope = request_scope.cloned();
     let stderr_thread = child.stderr.take().map(|e| {
-        std::thread::spawn(move || {
+        crate::fault::spawn_thread(move || {
             let mut buf = Vec::new();
             let _ = read_limited_with_deadline(
                 e,
@@ -1554,7 +1558,7 @@ fn read_limited_with_deadline(
         if !poll_result(rc, std::io::Error::last_os_error())? {
             continue;
         }
-        match reader.read(&mut chunk) {
+        match crate::fault::hit("cgi.output.read").and_then(|()| reader.read(&mut chunk)) {
             Ok(0) => return Ok(()),
             Ok(n) => {
                 if out.len().saturating_add(n) > limit {
@@ -2255,6 +2259,52 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("injected failure at cgi.spawn"));
+        crate::fault::clear();
+        crate::fault::configure("cgi.worker.spawn", 0, std::io::ErrorKind::PermissionDenied);
+        let error = start_pool_worker(
+            Path::new("/bin/true"),
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            "nobody",
+            unsafe { libc::getpid() },
+        )
+        .err()
+        .expect("worker spawn failpoint was ignored");
+        assert!(error.contains("injected failure at cgi.worker.spawn"));
+
+        let (mut client, _server) = UnixStream::pair().unwrap();
+        let mut exchange = CgiExchangeStream {
+            inner: &mut client,
+            deadline: Instant::now() + Duration::from_secs(1),
+            scope: None,
+        };
+        crate::fault::clear();
+        crate::fault::configure("cgi.worker.write", 0, std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            exchange.write(b"request").unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        crate::fault::clear();
+        crate::fault::configure("cgi.worker.read", 0, std::io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            exchange.read(&mut [0u8; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+
+        crate::fault::clear();
+        crate::fault::configure("cgi.output.read", 0, std::io::ErrorKind::ConnectionReset);
+        let mut out = Vec::new();
+        let error = read_limited_with_deadline(
+            File::open("/dev/null").unwrap(),
+            Instant::now() + Duration::from_secs(1),
+            &mut out,
+            1,
+            false,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("injected failure at cgi.output.read"));
         let _ = fs::remove_dir_all(dir);
     }
 

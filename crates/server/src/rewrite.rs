@@ -1401,7 +1401,9 @@ fn int_map(function: &str, key: &str) -> String {
 }
 
 fn write_prg_key(stdin: &mut impl Write, key: &str) -> bool {
-    stdin.write_all(key.as_bytes()).is_ok() && stdin.write_all(b"\n").is_ok()
+    crate::fault::hit("rewrite.program.write").is_ok()
+        && stdin.write_all(key.as_bytes()).is_ok()
+        && stdin.write_all(b"\n").is_ok()
 }
 
 fn run_prg_map(program: &RewriteProgram, key: &str) -> String {
@@ -1459,6 +1461,9 @@ fn run_prg_map_timeout(program: &RewriteProgram, key: &str, timeout: Duration) -
         });
     }
     // coverage:ignore-stop
+    if crate::fault::hit("rewrite.program.spawn").is_err() {
+        return String::new();
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return String::new(), // coverage:ignore-line -- fork/exec kernel failure
@@ -1527,6 +1532,9 @@ fn read_prg_line_with_deadline(
     input: &mut (impl Read + AsRawFd),
     deadline: Instant,
 ) -> (Vec<u8>, bool, bool) {
+    if crate::fault::hit("rewrite.program.read").is_err() {
+        return (Vec::new(), false, false);
+    }
     let flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFL) };
     if flags < 0
         || unsafe { libc::fcntl(input.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
@@ -4223,6 +4231,23 @@ mod tests {
         let program = RewriteProgram::bind(path.clone(), Vec::new()).unwrap();
         assert!(program.file.set_len(0).is_err(), "snapshot must be sealed");
         assert_eq!(run_prg_map(&program, "value"), "trusted:value");
+        #[cfg(feature = "fault-injection")]
+        {
+            let _fault_guard = crate::fault::test_guard();
+            crate::fault::configure(
+                "rewrite.program.spawn",
+                0,
+                std::io::ErrorKind::PermissionDenied,
+            );
+            assert_eq!(run_prg_map(&program, "value"), "");
+            assert_eq!(crate::fault::trace(), ["rewrite.program.spawn"]);
+            for boundary in ["rewrite.program.write", "rewrite.program.read"] {
+                crate::fault::clear();
+                crate::fault::configure(boundary, 0, std::io::ErrorKind::PermissionDenied);
+                assert_eq!(run_prg_map(&program, "value"), "");
+                assert!(crate::fault::trace().iter().any(|name| name == boundary));
+            }
+        }
 
         fs::rename(&path, &displaced).unwrap();
         assert!(!program.binding_intact());

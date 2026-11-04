@@ -201,6 +201,13 @@ pub fn install_privileged_file_broker(cfg: &Config, service_uid: u32) -> Result<
     let parent_pid = unsafe { libc::getpid() };
     // Do not allocate from Rust's inherited heap in the post-fork child.
     let child_specs = specs.clone();
+    if let Err(error) = crate::fault::hit("tls.broker.fork") {
+        unsafe {
+            libc::close(sockets[0]);
+            libc::close(sockets[1]);
+        }
+        return Err(format!("cannot fork privileged TLS broker: {error}"));
+    }
     let child = unsafe { libc::fork() };
     if child < 0 {
         unsafe {
@@ -515,12 +522,12 @@ fn privileged_broker_read(
     id: u32,
     max_bytes: u64,
 ) -> Result<Vec<u8>, String> {
-    stream
-        .write_all(&id.to_ne_bytes())
+    crate::fault::hit("tls.broker.write")
+        .and_then(|()| stream.write_all(&id.to_ne_bytes()))
         .map_err(|error| format!("privileged TLS broker request failed: {error}"))?;
     let mut header = [0u8; 9];
-    stream
-        .read_exact(&mut header)
+    crate::fault::hit("tls.broker.header-read")
+        .and_then(|()| stream.read_exact(&mut header))
         .map_err(|error| format!("privileged TLS broker response failed: {error}"))?;
     let len = u64::from_ne_bytes(header[1..].try_into().expect("fixed broker header"));
     let response_limit = if header[0] == 0 {
@@ -536,8 +543,8 @@ fn privileged_broker_read(
         return Err("privileged TLS broker returned an oversized response".into());
     }
     let mut data = vec![0; len as usize];
-    stream
-        .read_exact(&mut data)
+    crate::fault::hit("tls.broker.body-read")
+        .and_then(|()| stream.read_exact(&mut data))
         .map_err(|error| format!("privileged TLS broker response failed: {error}"))?;
     if len > response_limit {
         return Err("privileged TLS broker returned an oversized response".into());
@@ -1078,7 +1085,10 @@ where
 }
 
 fn spawn_ocsp_refresh(refresh: OcspRefresh) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+    crate::fault::spawn_thread(move || {
+        if crate::fault::hit("transition.ocsp.refresh.start").is_err() {
+            return;
+        }
         ocsp_refresh_loop(
             refresh,
             |refresh| {
@@ -2079,6 +2089,33 @@ mod tests {
             .unwrap_err()
             .contains("injected failure at tls.key.read"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn privileged_broker_transport_failures_are_deterministic() {
+        let _fault_guard = crate::fault::test_guard();
+        for boundary in ["tls.broker.write", "tls.broker.header-read"] {
+            let (mut client, _server) = UnixStream::pair().unwrap();
+            crate::fault::clear();
+            crate::fault::configure(boundary, 0, std::io::ErrorKind::ConnectionReset);
+            assert!(privileged_broker_read(&mut client, 7, 16)
+                .unwrap_err()
+                .contains("injected failure"));
+        }
+
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let header = [0u8; 9];
+        server.write_all(&header).unwrap();
+        crate::fault::clear();
+        crate::fault::configure(
+            "tls.broker.body-read",
+            0,
+            std::io::ErrorKind::ConnectionReset,
+        );
+        assert!(privileged_broker_read(&mut client, 7, 16)
+            .unwrap_err()
+            .contains("injected failure at tls.broker.body-read"));
     }
 
     #[test]
