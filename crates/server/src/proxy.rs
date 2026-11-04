@@ -33,8 +33,34 @@ const MAX_WEBSOCKET_EXTENSION_PARAMS: usize = 32;
 const MAX_PROXY_CA_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PROXY_ADDRESSES: usize = 32;
 const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const BACKEND_DNS_TTL: Duration = Duration::from_secs(30);
-const MAX_BACKEND_DNS_CACHE: usize = 256;
+/// A backend name is resolved once for each immutable configuration
+/// generation. DNS remains an input to configuration, not a mutable routing
+/// authority which can retarget an already-authorized request. TLS adds a
+/// second, cryptographic identity check but consumes the same bound transport.
+const MAX_BACKEND_IDENTITIES: usize = 1024;
+
+/// Resolver authority owned by exactly one immutable configuration. Clones of
+/// that configuration share this object; background health/OCSP work may keep
+/// only this bounded transport state alive, never another generation's map.
+#[derive(Debug)]
+pub(crate) struct BackendIdentityRegistry {
+    generation: u64,
+    identities: Mutex<HashMap<(String, u16), Vec<SocketAddr>>>,
+}
+
+impl BackendIdentityRegistry {
+    pub(crate) fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            identities: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_backend_identities() -> BackendIdentityRegistry {
+    BackendIdentityRegistry::new(0)
+}
 
 struct ProxyBodyCollector {
     memory: Vec<u8>,
@@ -428,6 +454,7 @@ struct MemberHealth {
 
 #[derive(Clone)]
 struct HealthSpec {
+    backend_identities: Arc<BackendIdentityRegistry>,
     key: String,
     url: String,
     method: String,
@@ -551,6 +578,7 @@ fn balancer_specs(cfg: &Config, balancer: &Balancer) -> Vec<HealthSpec> {
         let passes = member.hcpasses.or(health.passes).unwrap_or(1);
         let fails = member.hcfails.or(health.fails).unwrap_or(1);
         out.push(HealthSpec {
+            backend_identities: Arc::clone(&cfg.backend_identities),
             key: health_key(cfg.generation, &balancer.name, &member.url),
             url: member.url.clone(),
             method,
@@ -663,7 +691,14 @@ fn check_health(spec: &HealthSpec) -> bool {
     scope.proxy_policy.proxy_ca_trust = spec.ca_trust;
     let timeout = Duration::from_secs(5);
     let deadline = Instant::now() + timeout;
-    let Ok(stream) = connect(&backend, &scope, timeout, deadline, None) else {
+    let Ok(stream) = connect(
+        &backend,
+        &scope,
+        &spec.backend_identities,
+        timeout,
+        deadline,
+        None,
+    ) else {
         return false;
     };
     check_health_stream(stream, spec, &backend)
@@ -2120,21 +2155,78 @@ fn submit_dns(
     Ok(rx)
 }
 
-fn dns_cache() -> &'static Mutex<HashMap<(String, u16), (Instant, Vec<SocketAddr>)>> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, u16), (Instant, Vec<SocketAddr>)>>> =
-        OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn backend_identity_key(host: &str, port: u16) -> (String, u16) {
+    (host.to_ascii_lowercase(), port)
+}
+
+fn bound_backend_identity(
+    registry: &BackendIdentityRegistry,
+    host: &str,
+    port: u16,
+) -> Option<Vec<SocketAddr>> {
+    registry
+        .identities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&backend_identity_key(host, port))
+        .cloned()
+}
+
+/// Atomically establish the DNS result which belongs to this configuration
+/// generation. Concurrent first lookups may complete with different answers;
+/// only the first result becomes authoritative and every caller receives it.
+fn bind_backend_identity(
+    registry: &BackendIdentityRegistry,
+    host: &str,
+    port: u16,
+    addresses: Vec<SocketAddr>,
+) -> std::io::Result<Vec<SocketAddr>> {
+    let key = backend_identity_key(host, port);
+    let mut identities = registry
+        .identities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(bound) = identities.get(&key) {
+        return Ok(bound.clone());
+    }
+    if identities.len() >= MAX_BACKEND_IDENTITIES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "backend identity table is full",
+        ));
+    }
+    let resolver_result_valid = !addresses.is_empty()
+        && addresses.len() <= MAX_PROXY_ADDRESSES
+        && addresses.iter().all(|address| address.port() == port);
+    if !vapache_verified::backend_resolution_binding_admit(
+        registry.generation,
+        registry.generation,
+        resolver_result_valid,
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "resolver returned an invalid backend identity",
+        ));
+    }
+    identities.insert(key, addresses.clone());
+    Ok(addresses)
+}
+
+fn connected_endpoint_admitted(actual: SocketAddr, selected: SocketAddr) -> bool {
+    vapache_verified::backend_connected_endpoint_admit(actual == selected, true)
 }
 
 pub(crate) fn resolve_backend_addrs(
+    registry: &BackendIdentityRegistry,
     host: &str,
     port: u16,
     timeout: Duration,
 ) -> std::io::Result<Vec<SocketAddr>> {
-    resolve_backend_addrs_cancellable(host, port, timeout, None)
+    resolve_backend_addrs_cancellable(registry, host, port, timeout, None)
 }
 
 pub(crate) fn resolve_backend_addrs_cancellable(
+    registry: &BackendIdentityRegistry,
     host: &str,
     port: u16,
     timeout: Duration,
@@ -2149,15 +2241,7 @@ pub(crate) fn resolve_backend_addrs_cancellable(
     if let Some(addresses) = literal_backend_addrs(host, port) {
         return Ok(addresses);
     }
-    let key = (host.to_ascii_lowercase(), port);
-    let now = Instant::now();
-    if let Some(addresses) = dns_cache()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(&key)
-        .filter(|(expires, _)| *expires > now)
-        .map(|(_, addresses)| addresses.clone())
-    {
+    if let Some(addresses) = bound_backend_identity(registry, host, port) {
         return Ok(addresses);
     }
     let rx = submit_dns(host, port, timeout)?;
@@ -2187,20 +2271,11 @@ pub(crate) fn resolve_backend_addrs_cancellable(
             }
         }
     };
-    let mut cache = dns_cache()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    cache.retain(|_, (expires, _)| *expires > now);
-    if cache.len() >= MAX_BACKEND_DNS_CACHE {
-        if let Some(victim) = cache.keys().next().cloned() {
-            cache.remove(&victim);
-        }
-    }
-    cache.insert(key, (now + BACKEND_DNS_TTL, addresses.clone()));
-    Ok(addresses)
+    bind_backend_identity(registry, host, port, addresses)
 }
 
 async fn resolve_backend_addrs_async(
+    registry: &BackendIdentityRegistry,
     host: &str,
     port: u16,
     timeout: Duration,
@@ -2208,15 +2283,7 @@ async fn resolve_backend_addrs_async(
     if let Some(addresses) = literal_backend_addrs(host, port) {
         return Ok(addresses);
     }
-    let key = (host.to_ascii_lowercase(), port);
-    let now = Instant::now();
-    if let Some(addresses) = dns_cache()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(&key)
-        .filter(|(expires, _)| *expires > now)
-        .map(|(_, addresses)| addresses.clone())
-    {
+    if let Some(addresses) = bound_backend_identity(registry, host, port) {
         return Ok(addresses);
     }
     let rx = submit_dns(host, port, timeout)?;
@@ -2225,17 +2292,7 @@ async fn resolve_backend_addrs_async(
         match rx.try_recv() {
             Ok(result) => {
                 let addresses = result?;
-                let mut cache = dns_cache()
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                cache.retain(|_, (expires, _)| *expires > now);
-                if cache.len() >= MAX_BACKEND_DNS_CACHE {
-                    if let Some(victim) = cache.keys().next().cloned() {
-                        cache.remove(&victim);
-                    }
-                }
-                cache.insert(key, (now + BACKEND_DNS_TTL, addresses.clone()));
-                return Ok(addresses);
+                return bind_backend_identity(registry, host, port, addresses);
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 return Err(std::io::Error::new(
@@ -2287,17 +2344,21 @@ pub fn resolver_worker_main(host: &str, port: u16) -> std::io::Result<()> {
 async fn connect_async(
     backend: &HttpBackend,
     scope: &Scope,
+    backend_identities: &BackendIdentityRegistry,
     timeout: Duration,
 ) -> std::io::Result<Box<dyn AsyncReadWrite>> {
     let deadline = Instant::now() + timeout;
     let mut stream = None;
-    for addr in resolve_backend_addrs_async(&backend.host, backend.port, timeout).await? {
+    for addr in
+        resolve_backend_addrs_async(backend_identities, &backend.host, backend.port, timeout)
+            .await?
+    {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
         match tokio::time::timeout(remaining, tokio::net::TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => {
+            Ok(Ok(s)) if connected_endpoint_admitted(s.peer_addr()?, addr) => {
                 stream = Some(s);
                 break;
             }
@@ -2495,7 +2556,8 @@ where
     let _websocket_lease = cfg.resource_budget.try_websocket_for(client_ip)?;
     drop(general_connection);
     let timeout = cfg.timeout.max(Duration::from_secs(5));
-    let mut upstream = connect_async(&target.backend, scope, timeout).await?;
+    let mut upstream =
+        connect_async(&target.backend, scope, &cfg.backend_identities, timeout).await?;
     // `Target::path` is the decoded authorization identity. Re-encode bytes
     // that could be interpreted as delimiters or a second escape by the
     // upstream, exactly as the ordinary reverse-proxy path does.
@@ -2687,6 +2749,7 @@ fn client_config(scope: &Scope) -> std::io::Result<Arc<rustls::ClientConfig>> {
 
 fn connect_tcp(
     backend: &HttpBackend,
+    backend_identities: &BackendIdentityRegistry,
     timeout: Duration,
     scope: Option<&crate::resource::RequestScope>,
 ) -> std::io::Result<TcpStream> {
@@ -2700,7 +2763,13 @@ fn connect_tcp(
     let deadline = Instant::now() + timeout;
     let mut tcp = None;
     let mut last = None;
-    for addr in resolve_backend_addrs_cancellable(&backend.host, backend.port, timeout, scope)? {
+    for addr in resolve_backend_addrs_cancellable(
+        backend_identities,
+        &backend.host,
+        backend.port,
+        timeout,
+        scope,
+    )? {
         loop {
             if scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
                 return Err(std::io::Error::new(
@@ -2713,8 +2782,15 @@ fn connect_tcp(
                 break;
             }
             match TcpStream::connect_timeout(&addr, remaining.min(Duration::from_secs(1))) {
-                Ok(stream) => {
+                Ok(stream) if connected_endpoint_admitted(stream.peer_addr()?, addr) => {
                     tcp = Some(stream);
+                    break;
+                }
+                Ok(_) => {
+                    last = Some(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "connected proxy peer differs from bound backend identity",
+                    ));
                     break;
                 }
                 Err(error)
@@ -2753,11 +2829,12 @@ fn connect_tcp(
 fn connect(
     backend: &HttpBackend,
     scope: &Scope,
+    backend_identities: &BackendIdentityRegistry,
     timeout: Duration,
     deadline: Instant,
     request_scope: Option<&crate::resource::RequestScope>,
 ) -> std::io::Result<Box<dyn ReadWrite>> {
-    let tcp = connect_tcp(backend, timeout, request_scope)?;
+    let tcp = connect_tcp(backend, backend_identities, timeout, request_scope)?;
     let inner: Box<dyn ReadWrite> = if !backend.tls {
         Box::new(tcp)
     } else {
@@ -3639,6 +3716,7 @@ pub(crate) fn execute_with_proxy_base(
         let (result, request_may_have_started) = match connect(
             &current.backend,
             &active_scope,
+            &cfg.backend_identities,
             remaining,
             exchange_deadline,
             req.request_scope(),
@@ -3927,13 +4005,19 @@ mod tests {
             tls: false,
         };
         assert_eq!(
-            connect_tcp(&backend, Duration::from_secs(1), Some(&scope))
-                .unwrap_err()
-                .kind(),
+            connect_tcp(
+                &backend,
+                &test_backend_identities(),
+                Duration::from_secs(1),
+                Some(&scope),
+            )
+            .unwrap_err()
+            .kind(),
             std::io::ErrorKind::ConnectionAborted
         );
         assert_eq!(
             resolve_backend_addrs_cancellable(
+                &test_backend_identities(),
                 "cancelled.invalid",
                 80,
                 Duration::from_secs(1),
@@ -4283,7 +4367,13 @@ mod more_tests {
             tls: false,
         };
         crate::fault::configure("proxy.connect", 0, std::io::ErrorKind::PermissionDenied);
-        let error = connect_tcp(&backend, Duration::from_secs(1), None).unwrap_err();
+        let error = connect_tcp(
+            &backend,
+            &test_backend_identities(),
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
@@ -5673,6 +5763,7 @@ mod coverage_tests {
     #[test]
     fn health_check_invalid_and_eof() {
         let spec = HealthSpec {
+            backend_identities: Arc::new(test_backend_identities()),
             key: "k".into(),
             url: "ftp://invalid".into(),
             method: "GET".into(),
@@ -5754,6 +5845,7 @@ mod coverage_tests {
             let _ = stream.read(&mut request);
         });
         let spec = HealthSpec {
+            backend_identities: Arc::new(test_backend_identities()),
             key: "tls-name".into(),
             url: format!("https://127.0.0.1:{port}/health"),
             method: "GET".into(),
@@ -6172,6 +6264,7 @@ mod coverage_tests {
 
     fn health_spec() -> HealthSpec {
         HealthSpec {
+            backend_identities: Arc::new(test_backend_identities()),
             key: "k".into(),
             url: "http://127.0.0.1:1/health".into(),
             method: "HEAD".into(),
@@ -6292,7 +6385,13 @@ mod coverage_tests {
             base: "/".into(),
             tls: false,
         };
-        let err = match connect_async(&backend, &Scope::default(), Duration::from_millis(100)).await
+        let err = match connect_async(
+            &backend,
+            &Scope::default(),
+            &test_backend_identities(),
+            Duration::from_millis(100),
+        )
+        .await
         {
             Ok(_) => panic!("expected connection failure"),
             Err(e) => e,
@@ -6314,7 +6413,13 @@ mod coverage_tests {
             base: "/".into(),
             tls: true,
         };
-        let err = match connect_async(&backend, &Scope::default(), Duration::from_millis(50)).await
+        let err = match connect_async(
+            &backend,
+            &Scope::default(),
+            &test_backend_identities(),
+            Duration::from_millis(50),
+        )
+        .await
         {
             Ok(_) => panic!("expected TLS timeout"),
             Err(e) => e,
@@ -7314,18 +7419,73 @@ mod coverage_tests {
     #[test]
     fn literal_proxy_resolution_is_bounded_without_dns() {
         assert_eq!(
-            resolve_backend_addrs("127.0.0.1", 8080, Duration::ZERO).unwrap(),
+            resolve_backend_addrs(
+                &test_backend_identities(),
+                "127.0.0.1",
+                8080,
+                Duration::ZERO,
+            )
+            .unwrap(),
             vec!["127.0.0.1:8080".parse().unwrap()]
         );
         assert_eq!(
-            resolve_backend_addrs("[::1]", 8080, Duration::ZERO).unwrap(),
+            resolve_backend_addrs(&test_backend_identities(), "[::1]", 8080, Duration::ZERO,)
+                .unwrap(),
             vec!["[::1]:8080".parse().unwrap()]
         );
     }
 
     #[test]
+    fn backend_identity_is_atomic_and_generation_scoped() {
+        let generation = u64::MAX - 100;
+        let next_generation = generation + 1;
+        let identities = Arc::new(BackendIdentityRegistry::new(generation));
+        let next_identities = BackendIdentityRegistry::new(next_generation);
+        let lifetime = Arc::downgrade(&identities);
+        let first: SocketAddr = "192.0.2.10:8080".parse().unwrap();
+        let rebound: SocketAddr = "198.51.100.20:8080".parse().unwrap();
+
+        assert_eq!(
+            bind_backend_identity(&identities, "Backend.Example", 8080, vec![first]).unwrap(),
+            vec![first]
+        );
+        assert_eq!(
+            bind_backend_identity(&identities, "backend.example", 8080, vec![rebound]).unwrap(),
+            vec![first],
+            "a later DNS answer must not retarget an active configuration"
+        );
+        assert_eq!(
+            bind_backend_identity(&next_identities, "backend.example", 8080, vec![rebound])
+                .unwrap(),
+            vec![rebound],
+            "reload is the explicit backend identity transition"
+        );
+        assert!(connected_endpoint_admitted(first, first));
+        assert!(!connected_endpoint_admitted(rebound, first));
+        assert!(bind_backend_identity(
+            &identities,
+            "wrong-port.example",
+            8080,
+            vec!["192.0.2.10:8081".parse().unwrap()],
+        )
+        .is_err());
+
+        assert_eq!(
+            bound_backend_identity(&next_identities, "backend.example", 8080),
+            Some(vec![rebound])
+        );
+        drop(identities);
+        assert!(
+            lifetime.upgrade().is_none(),
+            "generation cleanup is structural"
+        );
+    }
+
+    #[test]
     fn proxy_dns_isolated_worker_and_expired_jobs_are_bounded() {
-        let addresses = resolve_backend_addrs("localhost", 8080, Duration::from_secs(2)).unwrap();
+        let identities = test_backend_identities();
+        let addresses =
+            resolve_backend_addrs(&identities, "localhost", 8080, Duration::from_secs(2)).unwrap();
         assert!(!addresses.is_empty());
         assert!(addresses.len() <= MAX_PROXY_ADDRESSES);
         assert!(addresses.iter().all(|address| address.port() == 8080));
@@ -7361,10 +7521,14 @@ mod coverage_tests {
         assert!(!resolved.is_empty());
         assert!(resolved.iter().all(|address| address.port() == 8081));
 
-        let cached = resolve_backend_addrs("ip6-localhost", 8082, Duration::from_secs(2)).unwrap();
+        let identities = BackendIdentityRegistry::new(91);
+        let cached =
+            resolve_backend_addrs(&identities, "ip6-localhost", 8082, Duration::from_secs(2))
+                .unwrap();
         assert!(!cached.is_empty());
         assert_eq!(
-            resolve_backend_addrs("IP6-LOCALHOST", 8082, Duration::from_secs(2)).unwrap(),
+            resolve_backend_addrs(&identities, "IP6-LOCALHOST", 8082, Duration::from_secs(2),)
+                .unwrap(),
             cached
         );
     }
@@ -7374,13 +7538,20 @@ mod coverage_tests {
         if !resolver_daemon_is_built() {
             return;
         }
-        let first = resolve_backend_addrs_async("ip6-localhost", 8083, Duration::from_secs(2))
-            .await
-            .unwrap();
+        let identities = BackendIdentityRegistry::new(92);
+        let first =
+            resolve_backend_addrs_async(&identities, "ip6-localhost", 8083, Duration::from_secs(2))
+                .await
+                .unwrap();
         assert!(!first.is_empty());
         assert!(first.iter().all(|address| address.port() == 8083));
         assert_eq!(
-            resolve_backend_addrs_async("IP6-LOCALHOST", 8083, Duration::from_secs(2))
+            resolve_backend_addrs_async(
+                &identities,
+                "IP6-LOCALHOST",
+                8083,
+                Duration::from_secs(2),
+            )
                 .await
                 .unwrap(),
             first

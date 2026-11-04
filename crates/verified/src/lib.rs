@@ -71,6 +71,98 @@ pub proof fn stale_cache_generation_rejects_work(request_epoch: u64, current_epo
 {
 }
 
+/// A dynamic backend resolution is policy state, not a per-request hint.  A
+/// resolver result can authorize a transport endpoint only for the immutable
+/// configuration generation which established it, and only after the result
+/// has passed the runtime's bounded address validation.
+pub open spec fn backend_resolution_binding_spec(
+    request_generation: u64,
+    bound_generation: u64,
+    resolver_result_valid: bool,
+) -> bool {
+    request_generation == bound_generation && resolver_result_valid
+}
+
+pub fn backend_resolution_binding_admit(
+    request_generation: u64,
+    bound_generation: u64,
+    resolver_result_valid: bool,
+) -> (admit: bool)
+    ensures admit == backend_resolution_binding_spec(
+        request_generation,
+        bound_generation,
+        resolver_result_valid,
+    ),
+{
+    request_generation == bound_generation && resolver_result_valid
+}
+
+/// The socket used by a backend exchange must be the exact endpoint selected
+/// from the generation-bound resolution. Merely authorizing the configured
+/// hostname is insufficient.
+pub open spec fn backend_connected_endpoint_spec(
+    actual_matches_selected: bool,
+    selected_from_bound_generation: bool,
+) -> bool {
+    actual_matches_selected && selected_from_bound_generation
+}
+
+pub fn backend_connected_endpoint_admit(
+    actual_matches_selected: bool,
+    selected_from_bound_generation: bool,
+) -> (admit: bool)
+    ensures admit == backend_connected_endpoint_spec(
+        actual_matches_selected,
+        selected_from_bound_generation,
+    ),
+{
+    actual_matches_selected && selected_from_bound_generation
+}
+
+pub proof fn unbound_or_substituted_backend_endpoint_is_rejected(bound: bool, matches: bool)
+    requires !bound || !matches,
+    ensures !backend_connected_endpoint_spec(matches, bound),
+{
+}
+
+/// Linux authenticates the process which created a listening Unix socket via
+/// SO_PEERCRED. A strict FastCGI policy accepts only the configured worker,
+/// the configured socket owner (for an unprivileged pool manager), or uid 0,
+/// which is already the operating-system trust root.
+pub open spec fn fastcgi_peer_identity_spec(
+    backend_uid: u32,
+    endpoint_owner_uid: u32,
+    peer_uid: u32,
+) -> bool {
+    backend_uid != 0
+        && (peer_uid == backend_uid || peer_uid == endpoint_owner_uid || peer_uid == 0)
+}
+
+pub fn fastcgi_peer_identity_admit(
+    backend_uid: u32,
+    endpoint_owner_uid: u32,
+    peer_uid: u32,
+) -> (admit: bool)
+    ensures admit == fastcgi_peer_identity_spec(backend_uid, endpoint_owner_uid, peer_uid),
+{
+    backend_uid != 0
+        && (peer_uid == backend_uid || peer_uid == endpoint_owner_uid || peer_uid == 0)
+}
+
+pub proof fn unrelated_fastcgi_peer_is_rejected(
+    backend_uid: u32,
+    endpoint_owner_uid: u32,
+    peer_uid: u32,
+)
+    requires
+        backend_uid != 0,
+        peer_uid != 0,
+        peer_uid != backend_uid,
+        peer_uid != endpoint_owner_uid,
+    ensures !fastcgi_peer_identity_spec(backend_uid, endpoint_owner_uid, peer_uid),
+{
+}
+
 /// Bytes that may appear in a decoded URI path before UTF-8 validation:
 /// visible ASCII except `\`, plus non-ASCII bytes. A space is permitted after
 /// percent-decoding (`%20`), matching Apache, and cannot appear literally in

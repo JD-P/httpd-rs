@@ -143,7 +143,12 @@ Implemented today:
   request is retried after an ambiguous send or `failonstatus` response only
   for an idempotent method; connection failures before a send may still move
   any method to another member. Proxy DNS uses a bounded worker queue and one
-  absolute connect deadline, and custom CA bundles are parsed once per policy
+  absolute connect deadline. The first bounded DNS answer for a backend is an
+  immutable transport identity shared by ordinary proxy requests, health
+  checks, WebSockets, TCP FastCGI and OCSP for that configuration generation;
+  a reload is required to admit a changed address set. Every connected peer is
+  checked against the selected address, while HTTPS/WSS additionally verifies
+  the configured DNS name. Custom CA bundles are parsed once per policy
   generation.
 - TLS client-certificate authentication (`SSLVerifyClient`,
   `SSLCACertificateFile`) with bounded PEM CRL enforcement through
@@ -533,7 +538,11 @@ VapacheFastCGIStablePath On unix:/run/php/php8.4-fpm.sock 33 0 0 1001
 The directive is repeatable, once per backend. A FastCGI request whose exact
 Unix socket is not registered is denied. The socket is checked before and
 after `connect()` for type, owner and inode
-stability independently of the configured PHP worker UID. TCP is rejected in
+stability independently of the configured PHP worker UID. On Linux, the
+connected listener's kernel `SO_PEERCRED` uid must be either the configured
+backend uid, the configured endpoint-owner uid (for a rootless pool manager),
+or uid 0 (the usual privileged PHP-FPM master); socket pathname ownership is
+not substituted for this independent kernel credential. TCP is rejected in
 strict mode because a loopback address does not authenticate the process that
 owns it; use a protected Unix socket for the verified backend-identity
 boundary.

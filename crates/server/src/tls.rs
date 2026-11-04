@@ -585,6 +585,7 @@ fn current_key(key: &SharedKey) -> Arc<CertifiedKey> {
 }
 
 struct OcspRefresh {
+    backend_identities: Arc<crate::proxy::BackendIdentityRegistry>,
     chain: Vec<CertificateDer<'static>>,
     force_url: Option<String>,
     timeout: Duration,
@@ -848,7 +849,14 @@ fn load_key_with_ocsp(
     cache_dir: Option<&Path>,
     enable_ocsp: bool,
 ) -> Result<(Arc<CertifiedKey>, Option<OcspRefresh>), String> {
-    load_key_with_ocsp_accounted(ssl, provider, cache_dir, enable_ocsp, None)
+    load_key_with_ocsp_accounted(
+        ssl,
+        provider,
+        cache_dir,
+        enable_ocsp,
+        None,
+        Arc::new(crate::proxy::BackendIdentityRegistry::new(0)),
+    )
 }
 
 fn load_key_with_ocsp_accounted(
@@ -857,6 +865,7 @@ fn load_key_with_ocsp_accounted(
     cache_dir: Option<&Path>,
     enable_ocsp: bool,
     resource_budget: Option<&Arc<crate::resource::ResourceBudget>>,
+    backend_identities: Arc<crate::proxy::BackendIdentityRegistry>,
 ) -> Result<(Arc<CertifiedKey>, Option<OcspRefresh>), String> {
     let cert_file = ssl
         .cert_file
@@ -888,8 +897,12 @@ fn load_key_with_ocsp_accounted(
                 cached = None;
             }
         }
-        let fetched =
-            crate::ocsp::staple_response(&chain, ssl.stapling_force_url.as_deref(), timeout);
+        let fetched = crate::ocsp::staple_response(
+            &backend_identities,
+            &chain,
+            ssl.stapling_force_url.as_deref(),
+            timeout,
+        );
         let response = if let Some(fresh) = fetched {
             if let Some(budget) = resource_budget {
                 crate::ocsp::save_cached_accounted(&cache_path, &chain, &fresh, budget);
@@ -934,6 +947,7 @@ fn load_key_with_ocsp_accounted(
     let refresh =
         refresh.map(
             |(chain, cache_path, interval, timeout, staple_expires)| OcspRefresh {
+                backend_identities: Arc::clone(&backend_identities),
                 chain,
                 force_url: ssl.stapling_force_url.clone(),
                 timeout,
@@ -1069,6 +1083,7 @@ fn spawn_ocsp_refresh(refresh: OcspRefresh) -> std::thread::JoinHandle<()> {
             refresh,
             |refresh| {
                 crate::ocsp::fetch_fresh(
+                    &refresh.backend_identities,
                     &refresh.chain,
                     refresh.force_url.as_deref(),
                     refresh.timeout,
@@ -1575,6 +1590,7 @@ pub(crate) fn prepare_server_config(
         Some(&ocsp_cache_dir),
         true,
         Some(&cfg.resource_budget),
+        Arc::clone(&cfg.backend_identities),
     )
     .map_err(|error| certbot_first_issuance_error(error, default_ssl, default_server_name))?;
     let default_key: SharedKey = Arc::new(RwLock::new(default_cert));
@@ -1602,6 +1618,7 @@ pub(crate) fn prepare_server_config(
                     Some(&ocsp_cache_dir),
                     true,
                     Some(&cfg.resource_budget),
+                    Arc::clone(&cfg.backend_identities),
                 )
                 .map_err(|error| {
                     certbot_first_issuance_error(error, &v.ssl, v.server_name.as_deref())

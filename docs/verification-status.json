@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-04",
   "verus": {
-    "verified_functions": 706,
+    "verified_functions": 711,
     "errors": 0
   },
   "obligations": [
@@ -481,6 +481,13 @@
       "status": "partial",
       "weight": 1.0,
       "evidence": "service_identity_admit is consumed before binding/startup and again by drop_privileges; its proofs reject uid/gid zero and require an already-unprivileged process to match both configured effective IDs. pid_control_admit is consumed after pidfd_open and proves that special/non-positive PIDs, UID changes or any recorded identity mismatch cannot reach pidfd_send_signal. Runtime binds the sidecar to boot ID, process start time and executable device/inode, validates root-owned PID artifacts and refreshes the recorded UID after setresuid. Root-owned administrative-input trust is captured before privilege drop and retained across reload; every discovered include/TLS/types/map/proxy-CA parent is checked against the service uid, including empty optional includes, and privileged RewriteMap programs require a root-controlled canonical source before sealing. Reload rejects changes to startup-only identity, pid, root, backlog and listener fields and prepares logs, TLS/OCSP and background generations before one commit point. configuration_generation_admit proves retired generations reject new work; runtime shares one retirement identity across listener loops for the same Config and linearizes H1/H2 admission under a read gate against commit's write gate. It retires only after candidate preparation, closes H1 keep-alive and WebSockets, sends H2 GOAWAY while draining admitted streams, and namespaces access-file IR plus proxy health/failure state until the last old Config drops. A pre-thread root TLS broker accepts only numeric IDs from an exact startup allowlist, closes inherited descriptors and standard streams, disables dumps/new privileges, installs tight rlimits plus a seccomp read-only syscall profile, enforces root-owned stable bounded reads and exits with its parent. Root-capable lifecycle tests cover same-path rotation and mutable replacement rejection; reload integration covers rejected-candidate continuity and successful old-connection retirement. Kernel pidfd/procfs identity semantics, daemon fork orchestration and filesystem ownership enforcement remain outside Verus and are covered by lifecycle/integration tests."
+    },
+    {
+      "id": "dynamic_backend_identity",
+      "title": "Dynamic backend endpoints remain bound to one configuration identity",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "backend_resolution_binding_admit requires a validated resolver result to belong to the consuming immutable generation, backend_connected_endpoint_admit requires the kernel peer to equal the selected bound endpoint, and fastcgi_peer_identity_admit rejects a Unix listener outside the configured worker/endpoint-owner or uid-0 trust set. Runtime stores the first bounded DNS answer in an Arc-owned per-Config registry shared by proxy, WebSocket, health, TCP FastCGI and OCSP paths; concurrent first answers converge on one map entry, the map has no in-generation expiry, reload creates a distinct registry, and structural Arc lifetime prevents retirement cleanup from racing an in-flight background insertion. Linux strict Unix FastCGI additionally consumes SO_PEERCRED independently of before/after socket pathname metadata. Unit tests cover rebinding, generation separation, structural cleanup, invalid resolver ports, endpoint mismatch and peer uid mismatch; complete workspace tests cover every integrated consumer."
     }
   ],
   "minimum_weighted_score": 3.5,

@@ -21,7 +21,7 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 #[cfg(test)]
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
@@ -840,8 +840,77 @@ fn connect_unix_timeout(
     Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
+#[cfg(target_os = "linux")]
+fn unix_peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: credentials and length are live output buffers of exactly the
+    // shape required by SO_PEERCRED, and stream owns a connected Unix fd.
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize != std::mem::size_of::<libc::ucred>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FastCGI peer returned malformed credentials",
+        ));
+    }
+    Ok(credentials.uid)
+}
+
+#[cfg(target_os = "linux")]
+fn authenticate_unix_peer(stream: &UnixStream, policy: &FastCgiStablePathPolicy) -> io::Result<()> {
+    let peer_uid = unix_peer_uid(stream)?;
+    let endpoint_owner_uid = policy.endpoint_owner_uid.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "strict FastCGI Unix policy has no endpoint owner uid",
+        )
+    })?;
+    if vapache_verified::fastcgi_peer_identity_admit(
+        policy.backend_uid,
+        endpoint_owner_uid,
+        peer_uid,
+    ) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "FastCGI listener uid {peer_uid} is not root, backend uid {}, or endpoint-owner uid {endpoint_owner_uid}",
+                policy.backend_uid,
+            ),
+        ))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn authenticate_unix_peer(
+    _stream: &UnixStream,
+    _policy: &FastCgiStablePathPolicy,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "strict FastCGI peer authentication requires Linux SO_PEERCRED",
+    ))
+}
+
 fn connect(
     backend: &Backend,
+    backend_identities: &crate::proxy::BackendIdentityRegistry,
     timeout: Duration,
     policy: Option<&FastCgiStablePathPolicy>,
     request_scope: Option<&crate::resource::RequestScope>,
@@ -854,6 +923,7 @@ fn connect(
                 .transpose()?;
             let s = connect_unix_timeout(path, deadline, request_scope)?;
             if let (Some(policy), Some(before)) = (policy, before) {
+                authenticate_unix_peer(&s, policy)?;
                 let after = validate_unix_endpoint(policy, path)?;
                 if before.dev() != after.dev()
                     || before.ino() != after.ino()
@@ -893,6 +963,7 @@ fn connect(
             let mut last = None;
             let remaining = deadline.saturating_duration_since(Instant::now());
             let addrs = crate::proxy::resolve_backend_addrs_cancellable(
+                backend_identities,
                 host,
                 *port,
                 remaining,
@@ -1633,7 +1704,13 @@ fn execute_inner(
     let result = (|| -> io::Result<Response> {
         let timeout = base.cfg.timeout.max(Duration::from_secs(5));
         let policy = stable_policy_for(base.cfg, &target.backend)?;
-        let mut stream = connect(&target.backend, timeout, policy, base.req.request_scope())?;
+        let mut stream = connect(
+            &target.backend,
+            &base.cfg.backend_identities,
+            timeout,
+            policy,
+            base.req.request_scope(),
+        )?;
         let params = build_params(&env);
         if let Some(policy) = policy {
             enforce_stable_fastcgi_path(policy, target.script_filename())?;
@@ -1743,10 +1820,16 @@ mod tests {
             prefix: String::new(),
         };
         assert_eq!(
-            connect(&backend, Duration::from_secs(1), None, Some(&scope),)
-                .err()
-                .unwrap()
-                .kind(),
+            connect(
+                &backend,
+                &crate::proxy::BackendIdentityRegistry::new(0),
+                Duration::from_secs(1),
+                None,
+                Some(&scope),
+            )
+            .err()
+            .unwrap()
+            .kind(),
             io::ErrorKind::ConnectionAborted
         );
     }
@@ -1847,6 +1930,7 @@ mod tests {
         };
         let err = connect(
             &tcp_backend,
+            &crate::proxy::BackendIdentityRegistry::new(0),
             Duration::from_millis(1),
             Some(&tcp_policy),
             None,
@@ -1905,8 +1989,42 @@ mod tests {
         assert!(stable_policy_for(&cfg, &unregistered).is_err());
 
         let accept = std::thread::spawn(move || listener.accept().unwrap());
-        connect(&backend, Duration::from_secs(2), Some(&policy), None).unwrap();
+        let connected = connect(
+            &backend,
+            &cfg.backend_identities,
+            Duration::from_secs(2),
+            Some(&policy),
+            None,
+        );
+        connected.expect("configured endpoint owner must authenticate the FastCGI listener");
         drop(accept.join().unwrap());
+
+        let (client, _server) = UnixStream::pair().unwrap();
+        let peer_policy = FastCgiStablePathPolicy {
+            backend_uid: if euid == 0 { 33 } else { euid },
+            ..policy.clone()
+        };
+        authenticate_unix_peer(&client, &peer_policy).unwrap();
+        if euid != 0 {
+            let unrelated_backend_uid = if euid == 33 { 34 } else { 33 };
+            let unrelated_owner_uid = if euid == 34 { 35 } else { 34 };
+            let unrelated_policy = FastCgiStablePathPolicy {
+                backend_uid: unrelated_backend_uid,
+                endpoint_owner_uid: Some(unrelated_owner_uid),
+                ..policy.clone()
+            };
+            assert_eq!(
+                authenticate_unix_peer(&client, &unrelated_policy)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied,
+                "an unexpected non-root listener uid must not inherit pathname trust"
+            );
+        }
+        assert!(vapache_verified::fastcgi_peer_identity_admit(33, 100, 0));
+        assert!(vapache_verified::fastcgi_peer_identity_admit(33, 100, 33));
+        assert!(vapache_verified::fastcgi_peer_identity_admit(33, 100, 100));
+        assert!(!vapache_verified::fastcgi_peer_identity_admit(33, 100, 34));
 
         let file = dir.join("script.php");
         fs::write(&file, "<?php\n").unwrap();
@@ -2741,14 +2859,28 @@ mod tests {
             transport: Transport::Tcp("127.0.0.1".into(), port),
             prefix: String::new(),
         };
-        assert!(connect(&backend, Duration::from_secs(2), None, None).is_ok());
+        assert!(connect(
+            &backend,
+            &crate::proxy::BackendIdentityRegistry::new(0),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .is_ok());
         handle.join().unwrap();
 
         let dead = Backend {
             transport: Transport::Tcp("127.0.0.1".into(), 1),
             prefix: String::new(),
         };
-        assert!(connect(&dead, Duration::from_millis(100), None, None).is_err());
+        assert!(connect(
+            &dead,
+            &crate::proxy::BackendIdentityRegistry::new(0),
+            Duration::from_millis(100),
+            None,
+            None,
+        )
+        .is_err());
     }
 
     #[test]

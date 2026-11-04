@@ -607,7 +607,7 @@ CGI/FastCGI body                : spool above threshold; do not materialize Limi
 CGI output/stderr               : capped
 proxy response head/body/chunk/trailer: decoded-byte, chunk-count, framing-byte and trailer caps
 proxy chunk arithmetic          : checked_add and MAX_PROXY_BODY
-proxy DNS / TLS CA              : bounded queue/deadline; CA parsed once per generation
+proxy DNS / TLS CA              : bounded queue/deadline; first address set and CA parsed state are generation-bound
 pre-request sockets              : async bounded pool; header/TLS/H2-preface deadline and per-transport cap
 client/upstream transport buffers: 128 KiB requested send/receive queues; 512 KiB accounting lease under a shared 256 MiB process parent
 TLS handshakes                   : 64 concurrent, 4/source, 128/second and 64/source/second
@@ -1057,7 +1057,10 @@ VapacheFastCGIStablePath On <unix-endpoint> <backend-uid> <endpoint-owner-uid> <
 `endpoint` is an exact `unix:/path` transport identity. Every backend must
 have an exact entry; an unregistered backend is rejected. Unix socket type,
 owner and inode are validated before and after connect separately from the
-PHP worker UID. TCP
+PHP worker UID. Linux `SO_PEERCRED` also binds the connected listener to the
+configured backend uid, configured endpoint-owner uid (for a rootless pool
+manager), or the operating-system trust root (uid 0); the socket file's uid is
+never substituted for that independent process credential. TCP
 entries are rejected because a loopback address cannot authenticate the
 process that owns it. The lexical and canonical script paths are walked
 immediately before parameters are sent.
@@ -1138,6 +1141,7 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | Compression/PCRE/password hashing | fixed input/cost bounds and a shared 32-operation CPU-work admission gate; optional compression falls back to identity under pressure |
 | Autoindex | at most 4096 examined directory records (including filtered names), 4096 rendered entries and 4 MiB of generated HTML |
 | DNS authorization | eight resolver workers, queue length 64, two-second caller deadline and bounded copied host operands |
+| Dynamic backend DNS | the first bounded address set is atomically pinned to one immutable configuration generation and shared by proxy, WebSocket, health, TCP FastCGI and OCSP paths; exact connected peer addresses are rechecked and reload is the only identity transition |
 | Expression filesystem functions | `-f`/`-d`/`-e`/`-s`/`-F`/`-U`, `file()` and `filesize()` resolve relative to the retained document/alias-root descriptor with `RESOLVE_BENEATH`; `file()` uses `O_NONBLOCK`/`O_NOFOLLOW`, a stable before/after descriptor snapshot and a 64 KiB read ceiling |
 | Administrative inputs | regular descriptors with stable before/after metadata; symlinks are forbidden except for a root-owned final TLS-material link between root-owned non-writable trees (the Certbot `live` → `archive` shape), and a root-controlled RewriteMap program spelling whose canonical executable is separately validated and snapshotted; retained root trust and service-nonwritable parents across reload; proxy CA files consume the same retained trust; authentication databases additionally require strict UTF-8 and service-immutable parents/files unless `MutableAuthFiles` is enabled; 4 MiB per configuration/certificate/TypesConfig/auth file, 1 MiB per key/envvars file, existing RewriteMap limit, and 16 MiB aggregate configuration text |
 

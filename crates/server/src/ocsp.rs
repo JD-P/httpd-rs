@@ -346,19 +346,28 @@ fn read_http_line(reader: &mut impl BufRead) -> Option<String> {
     String::from_utf8(line).ok()
 }
 
-fn fetch_response(url: &str, request: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+fn fetch_response(
+    backend_identities: &crate::proxy::BackendIdentityRegistry,
+    url: &str,
+    request: &[u8],
+    timeout: Duration,
+) -> Option<Vec<u8>> {
     let (host, port, path) = parse_http_url(url)?;
     let deadline = Instant::now() + timeout;
     let mut stream = None;
-    let addresses = crate::proxy::resolve_backend_addrs(&host, port, timeout).ok()?;
+    let addresses =
+        crate::proxy::resolve_backend_addrs(backend_identities, &host, port, timeout).ok()?;
     for candidate in addresses {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
         if let Ok(s) = TcpStream::connect_timeout(&candidate, remaining) {
-            stream = Some(s);
-            break;
+            let actual = s.peer_addr().ok()?;
+            if vapache_verified::backend_connected_endpoint_admit(actual == candidate, true) {
+                stream = Some(s);
+                break;
+            }
         }
     }
     let stream = stream?;
@@ -1291,7 +1300,8 @@ fn save_cached_inner(
 /// Fetch a fresh response, bypassing the in-memory cache.  Used by the
 /// periodic refresher so a valid startup staple is replaced with current
 /// revocation information.
-pub fn fetch_fresh(
+pub(crate) fn fetch_fresh(
+    backend_identities: &crate::proxy::BackendIdentityRegistry,
     chain: &[CertificateDer<'static>],
     force_url: Option<&str>,
     timeout: Duration,
@@ -1303,7 +1313,7 @@ pub fn fetch_fresh(
     let issuer = parse_cert(chain[1].as_ref())?;
     let url = force_url.map(str::to_string).or(leaf.ocsp_url.clone())?;
     let request = build_request(&leaf, &issuer)?;
-    let response = fetch_response(&url, &request, timeout)?;
+    let response = fetch_response(backend_identities, &url, &request, timeout)?;
     if valid_response(chain, &response) {
         Some(response)
     } else {
@@ -1314,7 +1324,8 @@ pub fn fetch_fresh(
 /// Fetch and return a DER-encoded OCSPResponse to staple for `chain[0]`.
 /// `chain[1]` must be the issuer certificate.  `force_url` overrides the AIA
 /// URL when `SSLStaplingForceURL` is configured.
-pub fn staple_response(
+pub(crate) fn staple_response(
+    backend_identities: &crate::proxy::BackendIdentityRegistry,
     chain: &[CertificateDer<'static>],
     force_url: Option<&str>,
     timeout: Duration,
@@ -1342,7 +1353,7 @@ pub fn staple_response(
             .unwrap_or_else(|e| e.into_inner())
             .remove(&key);
     }
-    let response = fetch_response(&url, &request, timeout)?;
+    let response = fetch_response(backend_identities, &url, &request, timeout)?;
     if !valid_response(chain, &response) {
         return None;
     }
@@ -1409,6 +1420,7 @@ mod tests {
             let _ = stream.write_all(&response);
         });
         let result = fetch_response(
+            &crate::proxy::BackendIdentityRegistry::new(0),
             &format!("http://{addr}/ocsp"),
             b"request",
             Duration::from_secs(2),
@@ -1562,8 +1574,20 @@ mod tests {
         assert!(!successful_response(&[]));
         assert!(!successful_response(&der(0x04, b"bad")));
         assert!(!successful_response(&der(0x30, &[])));
-        assert!(fetch_fresh(&[], None, Duration::ZERO).is_none());
-        assert!(staple_response(&[], None, Duration::ZERO).is_none());
+        assert!(fetch_fresh(
+            &crate::proxy::BackendIdentityRegistry::new(0),
+            &[],
+            None,
+            Duration::ZERO,
+        )
+        .is_none());
+        assert!(staple_response(
+            &crate::proxy::BackendIdentityRegistry::new(0),
+            &[],
+            None,
+            Duration::ZERO,
+        )
+        .is_none());
         let chain = [
             CertificateDer::from(cert),
             CertificateDer::from(minimal_cert(None)),
@@ -1663,7 +1687,13 @@ mod tests {
 
         let mut eof = &b""[..];
         assert!(read_http_line(&mut eof).is_none());
-        assert!(fetch_response("not-a-url", b"x", Duration::ZERO).is_none());
+        assert!(fetch_response(
+            &crate::proxy::BackendIdentityRegistry::new(0),
+            "not-a-url",
+            b"x",
+            Duration::ZERO,
+        )
+        .is_none());
     }
 
     #[test]
@@ -1688,19 +1718,43 @@ mod tests {
             CertificateDer::from(cert),
         ];
         let (bad_url, bad_thread) = responder(der(0x30, &der(0x0a, &[1])));
-        assert!(fetch_fresh(&chain, Some(&bad_url), Duration::from_secs(2)).is_none());
+        assert!(fetch_fresh(
+            &crate::proxy::BackendIdentityRegistry::new(0),
+            &chain,
+            Some(&bad_url),
+            Duration::from_secs(2),
+        )
+        .is_none());
         bad_thread.join().unwrap();
 
         let (bad_staple_url, bad_staple_thread) = responder(der(0x30, &der(0x0a, &[1])));
-        assert!(staple_response(&chain, Some(&bad_staple_url), Duration::from_secs(2)).is_none());
+        assert!(staple_response(
+            &crate::proxy::BackendIdentityRegistry::new(0),
+            &chain,
+            Some(&bad_staple_url),
+            Duration::from_secs(2),
+        )
+        .is_none());
         bad_staple_thread.join().unwrap();
 
         let structural_only = test_successful_response();
         let (fresh_url, fresh_thread) = responder(structural_only.clone());
-        assert!(fetch_fresh(&chain, Some(&fresh_url), Duration::from_secs(2)).is_none());
+        assert!(fetch_fresh(
+            &crate::proxy::BackendIdentityRegistry::new(0),
+            &chain,
+            Some(&fresh_url),
+            Duration::from_secs(2),
+        )
+        .is_none());
         fresh_thread.join().unwrap();
         let (staple_url, staple_thread) = responder(structural_only);
-        assert!(staple_response(&chain, Some(&staple_url), Duration::from_secs(2)).is_none());
+        assert!(staple_response(
+            &crate::proxy::BackendIdentityRegistry::new(0),
+            &chain,
+            Some(&staple_url),
+            Duration::from_secs(2),
+        )
+        .is_none());
         staple_thread.join().unwrap();
     }
 }

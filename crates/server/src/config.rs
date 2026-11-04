@@ -3183,6 +3183,10 @@ pub struct Config {
     /// a generation boundary (for example active backend health state).
     pub(crate) generation: u64,
     _generation_guard: Arc<ConfigGenerationGuard>,
+    /// Dynamic network identities are policy state owned by this exact
+    /// immutable generation. Background health and OCSP work may retain the
+    /// bounded registry without keeping the complete Config alive.
+    pub(crate) backend_identities: Arc<crate::proxy::BackendIdentityRegistry>,
     /// Linearizes policy-bearing request/stream admission against retirement.
     /// The read side is held only for the admission decision; commit takes the
     /// write side before broadcasting retirement.
@@ -5348,6 +5352,7 @@ impl Compile {
         let cfg = Config {
             generation,
             _generation_guard: Arc::new(ConfigGenerationGuard(generation)),
+            backend_identities: Arc::new(crate::proxy::BackendIdentityRegistry::new(generation)),
             generation_admission: Arc::new(RwLock::new(())),
             generation_retired: tokio::sync::watch::channel(false).0,
             cache_epoch: Arc::new(AtomicU64::new(crate::cache::active_epoch())),

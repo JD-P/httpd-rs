@@ -1773,6 +1773,7 @@ fn is_external_url(s: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::{normalize_rewrite_base, parse_rewrite_cond, parse_rewrite_rule};
+    use std::os::unix::fs::PermissionsExt;
 
     fn req() -> Request {
         Request {
@@ -3935,47 +3936,18 @@ mod tests {
             ""
         );
 
-        // Even if an unrelated daemon descriptor accidentally lacks CLOEXEC,
-        // the helper boundary applies a child-local close-on-exec sweep and
-        // restores only the sealed RewriteMap program descriptor.
-        let sentinel = std::fs::File::open("/dev/null").unwrap();
-        const SENTINEL_FD: libc::c_int = 198;
-        assert!(std::env::var_os("HOME").is_some());
-        let isolation_script = std::env::temp_dir().join(format!(
-            "vapache-prg-descriptor-isolation-{}",
-            std::process::id()
-        ));
-        fs::write(
-            &isolation_script,
-            "#!/bin/sh\nif [ -e \"/proc/self/fd/$1\" ] || [ -n \"${HOME+x}\" ]; then printf leaked; else printf isolated; fi\n",
-        )
-        .unwrap();
-        let mut isolation_mode = fs::metadata(&isolation_script).unwrap().permissions();
-        use std::os::unix::fs::PermissionsExt;
-        isolation_mode.set_mode(0o700);
-        fs::set_permissions(&isolation_script, isolation_mode).unwrap();
-        let isolation_program =
-            RewriteProgram::bind(isolation_script.clone(), vec![SENTINEL_FD.to_string()]).unwrap();
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0);
-        if child == 0 {
-            // Use a high fixed number: after exec the shell may legitimately
-            // reuse a closed low descriptor for its own files, which is not
-            // evidence that the original capability crossed the boundary.
-            let ok = unsafe { libc::dup2(sentinel.as_raw_fd(), SENTINEL_FD) } == SENTINEL_FD
-                && crate::process::set_cloexec(SENTINEL_FD, false).is_ok()
-                && run_prg_map_timeout(&isolation_program, "x", Duration::from_secs(1))
-                    == "isolated";
-            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
-        }
-        let mut isolation_status = 0;
-        assert_eq!(
-            unsafe { libc::waitpid(child, &mut isolation_status, 0) },
-            child
-        );
-        assert!(libc::WIFEXITED(isolation_status));
-        assert_eq!(libc::WEXITSTATUS(isolation_status), 0);
-        let _ = fs::remove_file(isolation_script);
+        // Run descriptor mutation in a fresh single-test process. Calling
+        // Rust's Command machinery after raw fork() from this multithreaded
+        // test runner inherits allocator/stdio locks and is itself undefined
+        // harness behaviour.
+        let isolation_status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("rewrite::tests::prg_descriptor_isolation_subprocess")
+            .arg("--test-threads=1")
+            .env("VAPACHE_PRG_ISOLATION_SUBPROCESS", "1")
+            .status()
+            .unwrap();
+        assert!(isolation_status.success());
 
         let timeout_script =
             std::env::temp_dir().join(format!("vapache-prg-timeout-{}", std::process::id()));
@@ -4123,6 +4095,47 @@ mod tests {
         assert!(same_host_internal(&c, &host_req, "http://other.test/x").is_none());
         let no_host = req();
         assert!(same_host_internal(&c, &no_host, "http://localhost:80/x").is_some());
+    }
+
+    #[test]
+    fn prg_descriptor_isolation_subprocess() {
+        if std::env::var_os("VAPACHE_PRG_ISOLATION_SUBPROCESS").is_none() {
+            return;
+        }
+        // Even if an unrelated daemon descriptor accidentally lacks CLOEXEC,
+        // the helper boundary applies a child-local close-on-exec sweep and
+        // restores only the sealed RewriteMap program descriptor.
+        let sentinel = std::fs::File::open("/dev/null").unwrap();
+        const SENTINEL_FD: libc::c_int = 198;
+        assert!(std::env::var_os("HOME").is_some());
+        let isolation_script = std::env::temp_dir().join(format!(
+            "vapache-prg-descriptor-isolation-{}",
+            std::process::id()
+        ));
+        fs::write(
+            &isolation_script,
+            "#!/bin/sh\nif [ -e \"/proc/self/fd/$1\" ] || [ -n \"${HOME+x}\" ]; then printf leaked; else printf isolated; fi\n",
+        )
+        .unwrap();
+        let mut isolation_mode = fs::metadata(&isolation_script).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        isolation_mode.set_mode(0o700);
+        fs::set_permissions(&isolation_script, isolation_mode).unwrap();
+        let isolation_program =
+            RewriteProgram::bind(isolation_script.clone(), vec![SENTINEL_FD.to_string()]).unwrap();
+        // Use a high fixed number: after exec the shell may legitimately reuse
+        // a closed low descriptor for its own files, which is not evidence
+        // that the original capability crossed the boundary.
+        assert_eq!(
+            unsafe { libc::dup2(sentinel.as_raw_fd(), SENTINEL_FD) },
+            SENTINEL_FD
+        );
+        crate::process::set_cloexec(SENTINEL_FD, false).unwrap();
+        assert_eq!(
+            run_prg_map_timeout(&isolation_program, "x", Duration::from_secs(1)),
+            "isolated"
+        );
+        let _ = fs::remove_file(isolation_script);
     }
 
     #[test]
