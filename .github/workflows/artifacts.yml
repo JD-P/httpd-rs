@@ -106,7 +106,10 @@ jobs:
             dpkg -i /release/vapache_*.deb
             test "$before" = "$(config_digest)"
             test ! -e /etc/systemd/system/multi-user.target.wants/vapache.service
-            /usr/sbin/vapachectl configtest >/tmp/configtest.log 2>&1
+            if ! /usr/sbin/vapachectl configtest >/tmp/configtest.log 2>&1; then
+              cat /tmp/configtest.log >&2
+              exit 1
+            fi
             test "$before" = "$(config_digest)"
             test -z "$(find /run/vapache/apache-config -type l -print -quit)"
             grep -qx "VapacheCapability AutoIndex On" \

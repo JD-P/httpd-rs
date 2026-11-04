@@ -6662,7 +6662,7 @@ fn dispatch_inner(
             );
         }
         let auto = req.query.eq_ignore_ascii_case(b"auto");
-        return crate::status::response(auto, &cfg.resource_budget);
+        return crate::status::response(auto, cfg.extended_status, &cfg.resource_budget);
     }
 
     if fastcgi_wins {

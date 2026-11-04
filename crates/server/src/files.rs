@@ -9,10 +9,12 @@
 
 use crate::config::{Config, ErrorDoc, Scope, ServerSignature, VHost, ETAG_ALL};
 use crate::http::{reason_phrase, Body, Request, Response};
+use crate::scope_policy::{AutoIndexIcon, AutoIndexIconMatch};
 use crate::util::{html_escape, http_date, parse_http_date, url_encode_query};
 use crate::verified::{parse_byte_range, RangeDecision};
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsString};
 use std::fmt::Write as _;
@@ -1059,20 +1061,14 @@ fn open_at_with_symlink_policy(
 
 pub fn mime_type(cfg: &Config, scope: &Scope, name: &[u8]) -> Option<String> {
     if let Some(ft) = &scope.content_policy.force_type {
-        return Some(ft.clone());
+        return Some(mime_with_charset(cfg, scope, name, ft.clone()));
     }
     // The overwhelmingly common case is a plain TypesConfig lookup with no
     // per-directory AddType/RemoveType overrides.  Avoid scanning and
     // lowercasing the extension when both override lists are empty.
     if scope.content_policy.remove_types.is_empty() && scope.content_policy.add_types.is_empty() {
-        let mut t = cfg.mime.content_type(name)?;
-        if let Some(cs) = &scope.content_policy.default_charset {
-            if t.starts_with("text/") && !t.contains("charset") {
-                t.push_str("; charset=");
-                t.push_str(cs);
-            }
-        }
-        return Some(t);
+        let t = cfg.mime.content_type(name)?;
+        return Some(mime_with_charset(cfg, scope, name, t));
     }
     let extensions = crate::config::filename_extension_tokens(name);
     let removed = extensions.iter().any(|ext| {
@@ -1095,25 +1091,26 @@ pub fn mime_type(cfg: &Config, scope: &Scope, name: &[u8]) -> Option<String> {
                     .unwrap_or(configured)
                     .eq_ignore_ascii_case(ext)
             }) {
-                let mut t = ty.clone();
-                if let Some(cs) = &scope.content_policy.default_charset {
-                    if t.starts_with("text/") && !t.contains("charset") {
-                        t.push_str("; charset=");
-                        t.push_str(cs);
-                    }
-                }
-                return Some(t);
+                return Some(mime_with_charset(cfg, scope, name, ty.clone()));
             }
         }
     }
-    let mut t = cfg.mime.content_type(name)?;
-    if let Some(cs) = &scope.content_policy.default_charset {
-        if t.starts_with("text/") && !t.contains("charset") {
-            t.push_str("; charset=");
-            t.push_str(cs);
+    let t = cfg.mime.content_type(name)?;
+    Some(mime_with_charset(cfg, scope, name, t))
+}
+
+fn mime_with_charset(cfg: &Config, scope: &Scope, name: &[u8], mut mime: String) -> String {
+    let charset = cfg
+        .mime
+        .content_charset(name)
+        .or(scope.content_policy.default_charset.as_deref());
+    if let Some(charset) = charset {
+        if !mime.to_ascii_lowercase().contains("charset=") {
+            mime.push_str("; charset=");
+            mime.push_str(charset);
         }
     }
-    Some(t)
+    mime
 }
 
 fn etag(meta: &Metadata, bits: u32) -> String {
@@ -1170,12 +1167,20 @@ fn current_etag_matches(value: &[u8], etag: Option<&str>, weak: bool) -> bool {
 
 fn representation_headers(
     mime: Option<&str>,
+    encoding: Option<&str>,
+    language: Option<&str>,
     last_mod: &str,
     tag: Option<&str>,
 ) -> Vec<(Cow<'static, str>, Vec<u8>)> {
     let mut headers = Vec::new();
     if let Some(mime) = mime {
         headers.push(("Content-Type".into(), mime.as_bytes().to_vec()));
+    }
+    if let Some(encoding) = encoding {
+        headers.push(("Content-Encoding".into(), encoding.as_bytes().to_vec()));
+    }
+    if let Some(language) = language {
+        headers.push(("Content-Language".into(), language.as_bytes().to_vec()));
     }
     headers.push(("Last-Modified".into(), last_mod.as_bytes().to_vec()));
     if let Some(tag) = tag {
@@ -1188,6 +1193,8 @@ fn representation_headers(
 fn not_modified_response(
     scope: &Scope,
     mime: Option<&str>,
+    encoding: Option<&str>,
+    language: Option<&str>,
     last_mod: &str,
     tag: Option<&str>,
 ) -> Response {
@@ -1196,6 +1203,16 @@ fn not_modified_response(
         response
             .headers
             .push(("Content-Type".into(), mime.as_bytes().to_vec()));
+    }
+    if let Some(encoding) = encoding {
+        response
+            .headers
+            .push(("Content-Encoding".into(), encoding.as_bytes().to_vec()));
+    }
+    if let Some(language) = language {
+        response
+            .headers
+            .push(("Content-Language".into(), language.as_bytes().to_vec()));
     }
     response
         .headers
@@ -1250,7 +1267,15 @@ fn serve_file_inner(
     let tag = vapache_verified::file_etag_emit_admit(etag_bits).then(|| etag(meta, etag_bits));
     let last_mod = http_date(mtime);
     let mime = mime_type(cfg, scope, mime_name);
-    let headers = representation_headers(mime.as_deref(), &last_mod, tag.as_deref());
+    let encoding = cfg.mime.content_encoding(mime_name);
+    let language = cfg.mime.content_language(mime_name);
+    let headers = representation_headers(
+        mime.as_deref(),
+        encoding,
+        language,
+        &last_mod,
+        tag.as_deref(),
+    );
     let mut representation = Response::new(200);
     representation.headers = headers.clone();
     if scope
@@ -1281,7 +1306,14 @@ fn serve_file_inner(
     if let Some(v) = req.header("if-none-match") {
         if current_etag_matches(v, validator_tag.as_deref(), true) {
             if is_get || is_head {
-                return not_modified_response(scope, mime.as_deref(), &last_mod, tag.as_deref());
+                return not_modified_response(
+                    scope,
+                    mime.as_deref(),
+                    encoding,
+                    language,
+                    &last_mod,
+                    tag.as_deref(),
+                );
             }
             return error_response(cfg, None, scope, 412, req, "", 0, "", peer, local_ip);
         }
@@ -1292,6 +1324,8 @@ fn serve_file_inner(
                     return not_modified_response(
                         scope,
                         mime.as_deref(),
+                        encoding,
+                        language,
                         &last_mod,
                         tag.as_deref(),
                     );
@@ -1397,6 +1431,51 @@ enum DirAction {
 
 const MAX_AUTOINDEX_ENTRIES: usize = 4096;
 const MAX_AUTOINDEX_BYTES: usize = 4 * 1024 * 1024;
+
+fn version_name_cmp(left: &[u8], right: &[u8]) -> CmpOrdering {
+    let (mut li, mut ri) = (0usize, 0usize);
+    while li < left.len() && ri < right.len() {
+        if left[li].is_ascii_digit() && right[ri].is_ascii_digit() {
+            let (left_start, right_start) = (li, ri);
+            while li < left.len() && left[li].is_ascii_digit() {
+                li += 1;
+            }
+            while ri < right.len() && right[ri].is_ascii_digit() {
+                ri += 1;
+            }
+            let left_digits = &left[left_start..li];
+            let right_digits = &right[right_start..ri];
+            let left_value = left_digits
+                .iter()
+                .position(|byte| *byte != b'0')
+                .map(|index| &left_digits[index..])
+                .unwrap_or(&left_digits[left_digits.len()..]);
+            let right_value = right_digits
+                .iter()
+                .position(|byte| *byte != b'0')
+                .map(|index| &right_digits[index..])
+                .unwrap_or(&right_digits[right_digits.len()..]);
+            let order = left_value
+                .len()
+                .cmp(&right_value.len())
+                .then_with(|| left_value.cmp(right_value))
+                .then_with(|| left_digits.len().cmp(&right_digits.len()));
+            if order != CmpOrdering::Equal {
+                return order;
+            }
+            continue;
+        }
+        let order = left[li]
+            .to_ascii_lowercase()
+            .cmp(&right[ri].to_ascii_lowercase());
+        if order != CmpOrdering::Equal {
+            return order;
+        }
+        li += 1;
+        ri += 1;
+    }
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
 
 fn directory_action(
     cfg: &Config,
@@ -1515,9 +1594,15 @@ fn directory_action(
                 entries.push((name, is_dir, size));
             }
         }
+        let version_sort = scope.content_policy.autoindex.version_sort.unwrap_or(false);
         entries.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()))
+            b.1.cmp(&a.1).then_with(|| {
+                if version_sort {
+                    version_name_cmp(&a.0, &b.0)
+                } else {
+                    a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase())
+                }
+            })
         });
         return DirAction::List(entries);
     }
@@ -1745,7 +1830,23 @@ fn autoindex(
     // optional signature fit in the margin.
     let estimated = entries.iter().try_fold(
         (64 * 1024usize).saturating_add(url_path.len().saturating_mul(6)),
-        |total, (name, _, _)| total.checked_add(name.len().saturating_mul(9).saturating_add(128)),
+        |total, (name, is_dir, _)| {
+            let icon = autoindex_icon(cfg, scope, name, *is_dir);
+            let icon_bytes = icon
+                .map(|icon| {
+                    icon.url
+                        .len()
+                        .saturating_mul(5)
+                        .saturating_add(icon.alt.len().saturating_mul(5))
+                })
+                .unwrap_or(0);
+            total.checked_add(
+                name.len()
+                    .saturating_mul(9)
+                    .saturating_add(icon_bytes)
+                    .saturating_add(192),
+            )
+        },
     );
     let Some(estimated) =
         estimated.filter(|size| *size <= MAX_AUTOINDEX_BYTES.saturating_add(64 * 1024))
@@ -1798,9 +1899,18 @@ fn autoindex(
     body.push_str(&title);
     body.push_str("</title>\n </head>\n <body>\n<h1>");
     body.push_str(&title);
-    body.push_str("</h1>\n  <table>\n");
+    body.push_str("</h1>\n");
+    append_autoindex_named_link(
+        &mut body,
+        entries,
+        scope.content_policy.autoindex.header_name.as_deref(),
+        "Header",
+    );
+    body.push_str("  <table>\n");
     if url_path != "/" {
-        body.push_str("   <tr><td><a href=\"../\">Parent Directory</a></td></tr>\n");
+        body.push_str("   <tr>");
+        append_autoindex_icon(&mut body, autoindex_icon(cfg, scope, b"..", true));
+        body.push_str("<td><a href=\"../\">Parent Directory</a></td></tr>\n");
     }
     for (name, is_dir, size) in entries {
         let mut href = crate::util::safe_relative_href(name);
@@ -1808,7 +1918,9 @@ fn autoindex(
             href.push('/');
         }
         let mut row = String::new();
-        row.push_str("   <tr><td><a href=\"");
+        row.push_str("   <tr>");
+        append_autoindex_icon(&mut row, autoindex_icon(cfg, scope, name, *is_dir));
+        row.push_str("<td><a href=\"");
         row.push_str(&href);
         row.push_str("\">");
         row.push_str(&html_escape(name));
@@ -1836,12 +1948,101 @@ fn autoindex(
         body.push_str(&row);
     }
     body.push_str("  </table>\n");
+    append_autoindex_named_link(
+        &mut body,
+        entries,
+        scope.content_policy.autoindex.readme_name.as_deref(),
+        "Readme",
+    );
     add_signature(&mut body, cfg, host, port);
     body.push_str(" </body>\n</html>\n");
     let mut response = Response::bytes(200, "text/html; charset=UTF-8", body.into_bytes());
     resident.release(resident.bytes().saturating_sub(response.body_len()));
     response.hold_resident(resident);
     response
+}
+
+fn autoindex_icon<'a>(
+    cfg: &Config,
+    scope: &'a Scope,
+    name: &[u8],
+    is_dir: bool,
+) -> Option<&'a AutoIndexIcon> {
+    let media_type = mime_type(cfg, scope, name);
+    let media_type = media_type
+        .as_deref()
+        .and_then(|value| value.split(';').next());
+    let encoding = cfg.mime.content_encoding(name);
+    for rule in &scope.content_policy.autoindex.icon_rules {
+        let matched = rule.patterns.iter().any(|pattern| match rule.kind {
+            AutoIndexIconMatch::Name => {
+                (pattern == "^^DIRECTORY^^" && is_dir)
+                    || (pattern != "^^DIRECTORY^^"
+                        && pattern != "^^BLANKICON^^"
+                        && if pattern.starts_with('.') {
+                            name.len() >= pattern.len()
+                                && name[name.len() - pattern.len()..]
+                                    .eq_ignore_ascii_case(pattern.as_bytes())
+                        } else {
+                            name.eq_ignore_ascii_case(pattern.as_bytes())
+                        })
+            }
+            AutoIndexIconMatch::MediaType => media_type.is_some_and(|media_type| {
+                if let Some(prefix) = pattern.strip_suffix("/*") {
+                    media_type
+                        .get(..prefix.len())
+                        .is_some_and(|major| major.eq_ignore_ascii_case(prefix))
+                        && media_type.as_bytes().get(prefix.len()) == Some(&b'/')
+                } else {
+                    media_type.eq_ignore_ascii_case(pattern)
+                }
+            }),
+            AutoIndexIconMatch::Encoding => {
+                encoding.is_some_and(|encoding| encoding.eq_ignore_ascii_case(pattern))
+            }
+        });
+        if matched {
+            return Some(&rule.icon);
+        }
+    }
+    scope.content_policy.autoindex.default_icon.as_ref()
+}
+
+fn append_autoindex_icon(body: &mut String, icon: Option<&AutoIndexIcon>) {
+    body.push_str("<td>");
+    if let Some(icon) = icon {
+        body.push_str("<img src=\"");
+        body.push_str(&html_escape(icon.url.as_bytes()));
+        body.push_str("\" alt=\"[");
+        body.push_str(&html_escape(icon.alt.as_bytes()));
+        body.push_str("]\"></td>");
+    } else {
+        body.push_str("</td>");
+    }
+}
+
+fn append_autoindex_named_link(
+    body: &mut String,
+    entries: &[(Vec<u8>, bool, u64)],
+    configured: Option<&str>,
+    label: &str,
+) {
+    let Some(name) = configured else {
+        return;
+    };
+    if !entries
+        .iter()
+        .any(|(entry, is_dir, _)| !is_dir && entry.eq_ignore_ascii_case(name.as_bytes()))
+    {
+        return;
+    }
+    body.push_str("<p>");
+    body.push_str(label);
+    body.push_str(": <a href=\"");
+    body.push_str(&crate::util::safe_relative_href(name.as_bytes()));
+    body.push_str("\">");
+    body.push_str(&html_escape(name.as_bytes()));
+    body.push_str("</a></p>\n");
 }
 
 fn add_signature(body: &mut String, cfg: &Config, host: &str, port: u16) {
@@ -2359,8 +2560,82 @@ mod tests {
             mime_type(&cfg, &scope, b"x.cgi.\xff").as_deref(),
             Some("text/cgi-token; charset=utf-8")
         );
+        cfg.mime.charsets.insert("utf8".into(), "UTF-8".into());
+        assert_eq!(
+            mime_type(&cfg, &scope, b"plain.txt.utf8").as_deref(),
+            Some("text/plain; charset=UTF-8")
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn static_metadata_and_autoindex_presentation_are_effectful() {
+        let (root, mut cfg) = config("metadata-autoindex");
+        let path = root.join("file.txt.en.gz");
+        std::fs::write(&path, b"compressed-ish").unwrap();
+        cfg.mime.types.insert("txt".into(), "text/plain".into());
+        cfg.mime.encodings.insert("gz".into(), "gzip".into());
+        cfg.mime.languages.insert("en".into(), "en".into());
+        let file = File::open(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        let response = serve_file_inner(
+            &cfg,
+            &Scope::default(),
+            &request("GET", b"/file.txt.en.gz"),
+            file,
+            &meta,
+            b"file.txt.en.gz",
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "127.0.0.1",
+        );
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-encoding") && value == b"gzip"
+        }));
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-language") && value == b"en"
+        }));
+
+        let mut scope = Scope::default();
+        scope.content_policy.autoindex.version_sort = Some(true);
+        scope
+            .content_policy
+            .autoindex
+            .icon_rules
+            .push(crate::scope_policy::AutoIndexIconRule {
+                icon: crate::scope_policy::AutoIndexIcon {
+                    alt: "TXT".into(),
+                    url: "/icons/text.gif".into(),
+                },
+                kind: crate::scope_policy::AutoIndexIconMatch::MediaType,
+                patterns: vec!["text/*".into()],
+            });
+        scope.content_policy.autoindex.header_name = Some("HEADER.html".into());
+        scope.content_policy.autoindex.readme_name = Some("README.html".into());
+        let entries = vec![
+            (b"file10.txt".to_vec(), false, 10),
+            (b"file2.txt".to_vec(), false, 2),
+            (b"HEADER.html".to_vec(), false, 1),
+            (b"README.html".to_vec(), false, 1),
+        ];
+        let response = autoindex(
+            &cfg,
+            &scope,
+            &request("GET", b"/listing/"),
+            "/listing/",
+            &entries,
+            "example.test",
+            80,
+        );
+        let Body::Bytes(body) = response.body else {
+            panic!("autoindex response was not resident")
+        };
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains("src=\"/icons/text.gif\""));
+        assert!(body.contains("Header: <a href=\"./HEADER.html\""));
+        assert!(body.contains("Readme: <a href=\"./README.html\""));
+        assert_eq!(version_name_cmp(b"file2", b"file10"), CmpOrdering::Less);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -769,11 +769,64 @@ mod environment_tests {
 }
 
 /// Content/MIME and directory-response policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoIndexIconMatch {
+    Name,
+    MediaType,
+    Encoding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoIndexIcon {
+    pub alt: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoIndexIconRule {
+    pub icon: AutoIndexIcon,
+    pub kind: AutoIndexIconMatch,
+    pub patterns: Vec<String>,
+}
+
+/// The supported, security-preserving subset of mod_autoindex presentation
+/// policy.  Fixed layout choices are validated by the compiler; values whose
+/// effects vary per directory are retained here and inherited with the scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutoIndexPolicy {
+    pub version_sort: Option<bool>,
+    pub icon_rules: Vec<AutoIndexIconRule>,
+    pub default_icon: Option<AutoIndexIcon>,
+    pub header_name: Option<String>,
+    pub readme_name: Option<String>,
+}
+
+impl AutoIndexPolicy {
+    fn merge_child(&mut self, child: &AutoIndexPolicy) {
+        if child.version_sort.is_some() {
+            self.version_sort = child.version_sort;
+        }
+        crate::verified::append_vec(&mut self.icon_rules, &child.icon_rules);
+        if child.default_icon.is_some() {
+            self.default_icon = child.default_icon.clone();
+        }
+        if child.header_name.is_some() {
+            self.header_name = child.header_name.clone();
+        }
+        if child.readme_name.is_some() {
+            self.readme_name = child.readme_name.clone();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContentPolicy {
     pub document_root: Option<std::path::PathBuf>,
     pub directory_index: Option<Vec<String>>,
     pub index_ignore: Vec<String>,
+    pub autoindex: AutoIndexPolicy,
+    pub language_priority: Option<Vec<String>>,
+    pub force_language_priority: Option<(bool, bool)>,
     pub default_charset: Option<String>,
     pub file_etag: Option<u32>,
     pub enable_sendfile: Option<bool>,
@@ -793,6 +846,13 @@ impl ContentPolicy {
             self.directory_index = child.directory_index.clone();
         }
         crate::verified::append_vec(&mut self.index_ignore, &child.index_ignore);
+        self.autoindex.merge_child(&child.autoindex);
+        if child.language_priority.is_some() {
+            self.language_priority = child.language_priority.clone();
+        }
+        if child.force_language_priority.is_some() {
+            self.force_language_priority = child.force_language_priority;
+        }
         if child.default_charset.is_some() {
             self.default_charset = child.default_charset.clone();
         }

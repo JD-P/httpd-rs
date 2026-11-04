@@ -14,9 +14,9 @@ use crate::config_payload::{
     PayloadArity, PayloadSchema, PayloadValidation, PayloadValueSchema, SealedPayload,
 };
 use crate::scope_policy::{
-    AuthorizationPolicy, CompressionPolicy, ContentPolicy, EnvironmentPolicy, ErrorDocumentPolicy,
-    HeaderPolicy, MappingPolicy, OptionsPolicy, Originated, OverridePolicy, ProxyPolicy,
-    RewriteCachePolicy,
+    AuthorizationPolicy, AutoIndexIcon, AutoIndexIconMatch, AutoIndexIconRule, AutoIndexPolicy,
+    CompressionPolicy, ContentPolicy, EnvironmentPolicy, ErrorDocumentPolicy, HeaderPolicy,
+    MappingPolicy, OptionsPolicy, Originated, OverridePolicy, ProxyPolicy, RewriteCachePolicy,
 };
 // Apache's directive regexes operate on request bytes and use ASCII character
 // classes unless UTF mode was explicitly requested.  Keeping one byte-regex
@@ -75,6 +75,16 @@ impl Drop for ConfigGenerationGuard {
 /// Apache `ServerLimit` would otherwise turn a configuration value into an
 /// effectively unbounded thread/HTTP2-connection ceiling.
 pub const MAX_IMPLEMENTED_REQUEST_WORKERS: usize = 512;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApacheMpmTuning {
+    pub start_servers: Option<u32>,
+    pub min_spare_threads: Option<u32>,
+    pub max_spare_threads: Option<u32>,
+    pub thread_limit: Option<u32>,
+    pub threads_per_child: Option<u32>,
+    pub max_connections_per_child: Option<u64>,
+}
 
 const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CONFIG_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
@@ -886,6 +896,142 @@ pub(crate) fn filename_extension_tokens(name: &[u8]) -> Vec<&[u8]> {
         .split(|b| *b == b'.')
         .filter(|part| !part.is_empty())
         .collect()
+}
+
+fn autoindex_icon(raw: &str) -> Result<AutoIndexIcon, String> {
+    let (alt, url) = if raw.starts_with('(') && raw.ends_with(')') {
+        let inner = &raw[1..raw.len() - 1];
+        let Some((alt, url)) = inner.split_once(',') else {
+            return Err("autoindex icon '(alt,url)' value is missing its comma".into());
+        };
+        (alt, url)
+    } else {
+        ("", raw)
+    };
+    if url.is_empty() || url.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err("autoindex icon URL must be a non-empty printable value".into());
+    }
+    if alt.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err("autoindex icon alternate text must be printable".into());
+    }
+    Ok(AutoIndexIcon {
+        alt: alt.to_string(),
+        url: url.to_string(),
+    })
+}
+
+fn autoindex_component(raw: &str, directive: &str) -> Result<String, String> {
+    if raw.is_empty()
+        || raw == "."
+        || raw == ".."
+        || raw.contains('/')
+        || raw.as_bytes().contains(&0)
+    {
+        return Err(format!(
+            "{directive} must name one file in the indexed directory"
+        ));
+    }
+    Ok(raw.to_string())
+}
+
+pub(crate) fn apply_autoindex_options(
+    policy: &mut AutoIndexPolicy,
+    args: &[String],
+) -> Result<(), String> {
+    for raw in args {
+        let (enabled, option) = match raw.as_bytes().first() {
+            Some(b'+') => (true, &raw[1..]),
+            Some(b'-') => (false, &raw[1..]),
+            _ => (true, raw.as_str()),
+        };
+        if option.eq_ignore_ascii_case("VersionSort") {
+            policy.version_sort = Some(enabled);
+        } else if option.eq_ignore_ascii_case("FancyIndexing")
+            || option.eq_ignore_ascii_case("HTMLTable")
+        {
+            if !enabled {
+                return Err(format!(
+                    "IndexOptions -{option} is not implemented by Vapache's table renderer"
+                ));
+            }
+        } else if option.eq_ignore_ascii_case("NameWidth=*")
+            || option.eq_ignore_ascii_case("DescriptionWidth=*")
+            || option.eq_ignore_ascii_case("Charset=UTF-8")
+        {
+            if !enabled {
+                return Err(format!("IndexOptions -{option} is not meaningful"));
+            }
+            // These are exact declarations of Vapache's bounded table layout:
+            // names are not truncated, no description column is configured,
+            // and generated indexes are UTF-8.
+        } else {
+            return Err(format!(
+                "IndexOptions value '{raw}' is not implemented; refusing to change directory-listing presentation"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn add_autoindex_icon_rule(
+    policy: &mut AutoIndexPolicy,
+    args: &[String],
+    kind: AutoIndexIconMatch,
+) -> Result<(), String> {
+    let icon = autoindex_icon(&args[0])?;
+    let patterns = args[1..].to_vec();
+    for pattern in &patterns {
+        if pattern.is_empty() || pattern.as_bytes().contains(&0) {
+            return Err("autoindex icon match must not be empty".into());
+        }
+        match kind {
+            AutoIndexIconMatch::Name => {
+                if pattern
+                    .bytes()
+                    .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']'))
+                {
+                    return Err(format!(
+                        "AddIcon wildcard '{pattern}' is not implemented; use a literal name or extension"
+                    ));
+                }
+            }
+            AutoIndexIconMatch::MediaType => {
+                let valid = pattern.split_once('/').is_some_and(|(major, minor)| {
+                    !major.is_empty()
+                        && !minor.is_empty()
+                        && !major.contains('*')
+                        && (minor == "*" || !minor.contains('*'))
+                });
+                if !valid {
+                    return Err(format!("invalid AddIconByType match '{pattern}'"));
+                }
+            }
+            AutoIndexIconMatch::Encoding => {}
+        }
+    }
+    policy.icon_rules.push(AutoIndexIconRule {
+        icon,
+        kind,
+        patterns,
+    });
+    Ok(())
+}
+
+pub(crate) fn set_autoindex_default_icon(
+    policy: &mut AutoIndexPolicy,
+    raw: &str,
+) -> Result<(), String> {
+    policy.default_icon = Some(autoindex_icon(raw)?);
+    Ok(())
+}
+
+pub(crate) fn set_autoindex_named_fragment(
+    slot: &mut Option<String>,
+    raw: &str,
+    directive: &str,
+) -> Result<(), String> {
+    *slot = Some(autoindex_component(raw, directive)?);
+    Ok(())
 }
 
 /// Resolve the effective handler for one literal extension token.
@@ -2480,6 +2626,8 @@ impl VHostIndex {
 pub struct MimeMap {
     pub types: HashMap<String, String>,
     pub encodings: HashMap<String, String>,
+    pub languages: HashMap<String, String>,
+    pub charsets: HashMap<String, String>,
 }
 
 impl MimeMap {
@@ -2487,6 +2635,8 @@ impl MimeMap {
         MimeMap {
             types: HashMap::new(),
             encodings: HashMap::new(),
+            languages: HashMap::new(),
+            charsets: HashMap::new(),
         }
     }
 
@@ -2575,6 +2725,35 @@ impl MimeMap {
         // Apache does not invent a media type for unknown extensions or for
         // extensionless files; the response simply has no Content-Type.
         best.map(|(_, t)| t.to_string())
+    }
+
+    pub fn content_encoding(&self, name: &[u8]) -> Option<&str> {
+        self.extension_metadata(name, &self.encodings)
+    }
+
+    pub fn content_language(&self, name: &[u8]) -> Option<&str> {
+        self.extension_metadata(name, &self.languages)
+    }
+
+    pub fn content_charset(&self, name: &[u8]) -> Option<&str> {
+        self.extension_metadata(name, &self.charsets)
+    }
+
+    fn extension_metadata<'a>(
+        &'a self,
+        name: &[u8],
+        values: &'a HashMap<String, String>,
+    ) -> Option<&'a str> {
+        let mut selected = None;
+        for extension in filename_extension_tokens(name) {
+            let Ok(extension) = std::str::from_utf8(extension) else {
+                continue;
+            };
+            if let Some(value) = values.get(&extension.to_ascii_lowercase()) {
+                selected = Some(value.as_str());
+            }
+        }
+        selected
     }
 }
 
@@ -3022,6 +3201,7 @@ pub struct Config {
     pub max_keep_alive_requests: usize,
     pub server_tokens: ServerTokens,
     pub server_signature: ServerSignature,
+    pub extended_status: bool,
     pub protocols: Vec<HttpProtocol>,
     pub trace_enable: bool,
     pub capabilities: Capabilities,
@@ -3038,6 +3218,10 @@ pub struct Config {
     pub limit_request_field_size: usize,
     pub limit_request_body: u64,
     pub max_request_workers: usize,
+    /// Parsed Apache MPM topology. Vapache has one process-wide worker/admission
+    /// hierarchy, so these values are retained for validation while
+    /// MaxRequestWorkers remains the effective concurrency ceiling.
+    pub apache_mpm_tuning: ApacheMpmTuning,
     pub listen_backlog: i32,
     pub graceful_shutdown_timeout: Duration,
     pub request_header_timeout: Duration,
@@ -3534,6 +3718,8 @@ fn directive_arity(name: &str) -> PayloadArity {
         | "serveralias"
         | "directoryindex"
         | "indexignore"
+        | "indexoptions"
+        | "languagepriority"
         | "fileetag"
         | "accessfilename"
         | "options"
@@ -3600,12 +3786,19 @@ fn directive_arity(name: &str) -> PayloadArity {
         | "usecanonicalname"
         | "servertokens"
         | "serversignature"
+        | "extendedstatus"
         | "traceenable"
         | "limitrequestline"
         | "limitrequestfields"
         | "limitrequestfieldsize"
         | "maxrequestworkers"
         | "serverlimit"
+        | "startservers"
+        | "minsparethreads"
+        | "maxsparethreads"
+        | "threadlimit"
+        | "threadsperchild"
+        | "maxconnectionsperchild"
         | "listenbacklog"
         | "gracefulshutdowntimeout"
         | "limitrequestbody"
@@ -3651,14 +3844,16 @@ fn directive_arity(name: &str) -> PayloadArity {
         | "vapachemaxdynamicrequests"
         | "vapachemaxfastcgioutput"
         | "loglevel" => PayloadArity::ONE,
+        "defaulticon" | "headername" | "readmename" => PayloadArity::ONE,
         "loadmodule" => PayloadArity::TWO,
-        "define" => PayloadArity::between(1, 2),
+        "define" | "forcelanguagepriority" => PayloadArity::between(1, 2),
         "setenv" => PayloadArity::between(1, 2),
         "listen" => PayloadArity::between(1, 2),
         "allow" | "deny" | "rewritecond" | "rewriterule" | "addtype" | "addhandler"
         | "addinputfilter" | "header" | "expiresbytype" | "browsermatch" | "browsermatchnocase" => {
             PayloadArity::at_least(2)
         }
+        "addicon" | "addiconbyencoding" | "addiconbytype" => PayloadArity::at_least(2),
         "setenvif" | "setenvifnocase" => PayloadArity::at_least(3),
         "addcharset"
         | "addencoding"
@@ -3808,6 +4003,7 @@ fn directive_payload_schema(name: &str) -> PayloadSchema {
         | "cacheheader"
         | "cachedetailheader"
         | "keepalive"
+        | "extendedstatus"
         | "sslengine"
         | "sslusestapling"
         | "sslstaplingreturnrespondererrors"
@@ -3820,13 +4016,18 @@ fn directive_payload_schema(name: &str) -> PayloadSchema {
             min: 1,
             max: u64::MAX,
         },
-        "cachedefaultexpire" | "cachemaxexpire" | "cacheminexpire" | "cachemaxfilesize"
-        | "cachemaxdisksize" | "cachemaxmemorysize" | "cacheminsize" | "limitrequestbody" => {
-            PayloadValueSchema::Unsigned {
-                min: 0,
-                max: u64::MAX,
-            }
-        }
+        "cachedefaultexpire"
+        | "cachemaxexpire"
+        | "cacheminexpire"
+        | "cachemaxfilesize"
+        | "cachemaxdisksize"
+        | "cachemaxmemorysize"
+        | "cacheminsize"
+        | "limitrequestbody"
+        | "maxconnectionsperchild" => PayloadValueSchema::Unsigned {
+            min: 0,
+            max: u64::MAX,
+        },
         "deflatecompressionlevel" => PayloadValueSchema::Unsigned { min: 0, max: 9 },
         "brotlicompressionquality" => PayloadValueSchema::Unsigned { min: 0, max: 11 },
         "timeout"
@@ -3839,7 +4040,8 @@ fn directive_payload_schema(name: &str) -> PayloadSchema {
             min: 0,
             max: u32::MAX as u64,
         },
-        "maxrequestworkers" | "serverlimit" => PayloadValueSchema::Unsigned {
+        "maxrequestworkers" | "serverlimit" | "startservers" | "minsparethreads"
+        | "maxsparethreads" | "threadlimit" | "threadsperchild" => PayloadValueSchema::Unsigned {
             min: 1,
             max: MAX_IMPLEMENTED_REQUEST_WORKERS as u64,
         },
@@ -4380,7 +4582,10 @@ fn directive_owner(name: &str) -> Option<&'static str> {
         "addoutputfilterbytype" | "filterchain" | "filterdeclare" | "filterprovider" => "filter",
         "deflatecompressionlevel" | "deflatefilternote" => "deflate",
         "brotlicompressionquality" => "brotli",
-        "indexignore" | "indexoptions" | "readmename" | "headername" => "autoindex",
+        "addicon" | "addiconbyencoding" | "addiconbytype" | "defaulticon" | "indexignore"
+        | "indexoptions" | "readmename" | "headername" => "autoindex",
+        "forcelanguagepriority" | "languagepriority" => "negotiation",
+        "extendedstatus" => "status",
         "sslengine"
         | "sslprotocol"
         | "sslciphersuite"
@@ -5132,6 +5337,7 @@ impl Compile {
             max_keep_alive_requests: 100,
             server_tokens: ServerTokens::Full,
             server_signature: ServerSignature::On,
+            extended_status: false,
             protocols: vec![HttpProtocol::Http2, HttpProtocol::Http11],
             trace_enable: false,
             capabilities: Capabilities::default(),
@@ -5142,6 +5348,7 @@ impl Compile {
             limit_request_field_size: 8190,
             limit_request_body: 1_073_741_824,
             max_request_workers: 512,
+            apache_mpm_tuning: ApacheMpmTuning::default(),
             listen_backlog: 511,
             graceful_shutdown_timeout: Duration::from_secs(30),
             request_header_timeout: Duration::from_secs(20),
@@ -6005,19 +6212,28 @@ impl Compile {
                 | "usecanonicalname"
                 | "servertokens"
                 | "serversignature"
+                | "extendedstatus"
                 | "traceenable"
                 | "limitrequestline"
                 | "limitrequestfields"
                 | "limitrequestfieldsize"
                 | "maxrequestworkers"
                 | "serverlimit"
+                | "startservers"
+                | "minsparethreads"
+                | "maxsparethreads"
+                | "threadlimit"
+                | "threadsperchild"
+                | "maxconnectionsperchild"
                 | "listenbacklog"
                 | "gracefulshutdowntimeout"
                 | "requestreadtimeout"
                 | "limitrequestbody"
                 | "allowencodedslashes"
                 | "typesconfig"
+                | "addcharset"
                 | "addencoding"
+                | "addlanguage"
                 | "cacheroot"
                 | "cachedefaultexpire"
                 | "cachemaxexpire"
@@ -6395,6 +6611,72 @@ impl Compile {
                         .cloned(),
                 );
             }
+            "indexoptions" => {
+                if let Err(error) = apply_autoindex_options(&mut scope.content_policy.autoindex, args)
+                {
+                    self.directive_error(loc, error);
+                }
+            }
+            "addicon" | "addiconbyencoding" | "addiconbytype" => {
+                let kind = match name {
+                    "addicon" => AutoIndexIconMatch::Name,
+                    "addiconbyencoding" => AutoIndexIconMatch::Encoding,
+                    "addiconbytype" => AutoIndexIconMatch::MediaType,
+                    _ => unreachable!(),
+                };
+                if let Err(error) =
+                    add_autoindex_icon_rule(&mut scope.content_policy.autoindex, args, kind)
+                {
+                    self.directive_error(loc, error);
+                }
+            }
+            "defaulticon" => {
+                if let Err(error) = set_autoindex_default_icon(
+                    &mut scope.content_policy.autoindex,
+                    &args[0],
+                ) {
+                    self.directive_error(loc, error);
+                }
+            }
+            "headername" => {
+                if let Err(error) = set_autoindex_named_fragment(
+                    &mut scope.content_policy.autoindex.header_name,
+                    &args[0],
+                    "HeaderName",
+                ) {
+                    self.directive_error(loc, error);
+                }
+            }
+            "readmename" => {
+                if let Err(error) = set_autoindex_named_fragment(
+                    &mut scope.content_policy.autoindex.readme_name,
+                    &args[0],
+                    "ReadmeName",
+                ) {
+                    self.directive_error(loc, error);
+                }
+            }
+            "languagepriority" => {
+                scope.content_policy.language_priority = Some(args.to_vec());
+            }
+            "forcelanguagepriority" => {
+                let mut prefer = false;
+                let mut fallback = false;
+                for value in args {
+                    if value.eq_ignore_ascii_case("Prefer") {
+                        prefer = true;
+                    } else if value.eq_ignore_ascii_case("Fallback") {
+                        fallback = true;
+                    } else {
+                        self.directive_error(
+                            loc,
+                            format!("invalid ForceLanguagePriority value '{value}'"),
+                        );
+                        return;
+                    }
+                }
+                scope.content_policy.force_language_priority = Some((prefer, fallback));
+            }
             "options" => {
                 let options = payload
                     .options()
@@ -6406,6 +6688,12 @@ impl Compile {
                     self.require_capability(Capability::Cgi, loc, "Options ExecCGI/All");
                 }
                 scope.options.merge_child(&options.policy);
+                if scope.effective_options().contains(Options::MULTIVIEWS) {
+                    self.directive_error(
+                        loc,
+                        "Options MultiViews is not implemented; refusing to enable implicit content negotiation",
+                    );
+                }
             }
             "allowoverride" => {
                 if section != SectionKind::Directory {
@@ -7327,20 +7615,20 @@ impl Compile {
                     _ => unreachable!("sealed AlterETag keyword index"),
                 });
             }
-            "addencoding" => {
-                for e in &args[1..] {
-                    self.cfg.mime.encodings.insert(
-                        e.trim_start_matches('.').to_ascii_lowercase(),
+            "addcharset" | "addencoding" | "addlanguage" => {
+                let table = match name {
+                    "addcharset" => &mut self.cfg.mime.charsets,
+                    "addencoding" => &mut self.cfg.mime.encodings,
+                    "addlanguage" => &mut self.cfg.mime.languages,
+                    _ => unreachable!(),
+                };
+                for extension in &args[1..] {
+                    table.insert(
+                        extension.trim_start_matches('.').to_ascii_lowercase(),
                         args[0].clone(),
                     );
                 }
             }
-            "addcharset" | "addlanguage" => self.directive_error(
-                loc,
-                format!(
-                    "{name} is not implemented; refusing to ignore a content metadata directive"
-                ),
-            ),
             "listen" => {
                 self.cfg.listeners.push(
                     payload
@@ -7538,6 +7826,11 @@ impl Compile {
                 2 => self.cfg.server_signature = ServerSignature::Email,
                 _ => unreachable!("sealed ServerSignature keyword index"),
             },
+            "extendedstatus" => {
+                self.cfg.extended_status = payload
+                    .on_off()
+                    .expect("ExtendedStatus is typed while sealing");
+            }
             "traceenable" => {
                 self.cfg.trace_enable = payload
                     .keyword()
@@ -7545,6 +7838,57 @@ impl Compile {
                     .expect("TraceEnable is typed while sealing");
                 if self.cfg.trace_enable {
                     self.require_capability(Capability::Trace, loc, "enabled TraceEnable");
+                }
+            }
+            "startservers" | "minsparethreads" | "maxsparethreads" | "threadlimit"
+            | "threadsperchild" => {
+                let value = payload
+                    .unsigned()
+                    .expect("MPM tuning is typed while sealing")
+                    as u32;
+                match name {
+                    "startservers" => self.cfg.apache_mpm_tuning.start_servers = Some(value),
+                    "minsparethreads" => {
+                        self.cfg.apache_mpm_tuning.min_spare_threads = Some(value)
+                    }
+                    "maxsparethreads" => {
+                        self.cfg.apache_mpm_tuning.max_spare_threads = Some(value)
+                    }
+                    "threadlimit" => self.cfg.apache_mpm_tuning.thread_limit = Some(value),
+                    "threadsperchild" => {
+                        self.cfg.apache_mpm_tuning.threads_per_child = Some(value)
+                    }
+                    _ => unreachable!(),
+                }
+                if self
+                    .cfg
+                    .apache_mpm_tuning
+                    .min_spare_threads
+                    .zip(self.cfg.apache_mpm_tuning.max_spare_threads)
+                    .is_some_and(|(minimum, maximum)| minimum > maximum)
+                {
+                    self.directive_error(loc, "MinSpareThreads exceeds MaxSpareThreads");
+                }
+                if self
+                    .cfg
+                    .apache_mpm_tuning
+                    .threads_per_child
+                    .zip(self.cfg.apache_mpm_tuning.thread_limit)
+                    .is_some_and(|(threads, limit)| threads > limit)
+                {
+                    self.directive_error(loc, "ThreadsPerChild exceeds ThreadLimit");
+                }
+            }
+            "maxconnectionsperchild" => {
+                let value = payload
+                    .unsigned()
+                    .expect("MaxConnectionsPerChild is typed while sealing");
+                self.cfg.apache_mpm_tuning.max_connections_per_child = Some(value);
+                if value != 0 {
+                    self.directive_error(
+                        loc,
+                        "nonzero MaxConnectionsPerChild is not implemented for Vapache's single-process runtime",
+                    );
                 }
             }
             "limitrequestline" => {
@@ -11675,6 +12019,72 @@ SSLOptions +StrictRequire\n";
     }
 
     #[test]
+    fn stock_debian_autoindex_mime_mpm_and_status_policy_is_compiled() {
+        let cfg = load_text(
+            concat!(
+                "Listen 127.0.0.1:0\n",
+                "IndexOptions FancyIndexing VersionSort HTMLTable NameWidth=* DescriptionWidth=* Charset=UTF-8\n",
+                "AddIconByEncoding (CMP,/icons/compressed.gif) x-gzip\n",
+                "AddIconByType (TXT,/icons/text.gif) text/*\n",
+                "AddIcon /icons/folder.gif ^^DIRECTORY^^\n",
+                "DefaultIcon /icons/unknown.gif\n",
+                "HeaderName HEADER.html\n",
+                "ReadmeName README.html\n",
+                "AddEncoding x-gzip .gz\n",
+                "AddLanguage en .en\n",
+                "AddCharset UTF-8 .utf8\n",
+                "LanguagePriority en fr\n",
+                "ForceLanguagePriority Prefer Fallback\n",
+                "StartServers 2\n",
+                "MinSpareThreads 25\n",
+                "MaxSpareThreads 75\n",
+                "ThreadLimit 64\n",
+                "ThreadsPerChild 25\n",
+                "MaxConnectionsPerChild 0\n",
+                "ExtendedStatus On\n",
+            ),
+            false,
+        )
+        .unwrap();
+        let autoindex = &cfg.global.content_policy.autoindex;
+        assert_eq!(autoindex.version_sort, Some(true));
+        assert_eq!(autoindex.icon_rules.len(), 3);
+        assert_eq!(
+            autoindex
+                .default_icon
+                .as_ref()
+                .map(|icon| icon.url.as_str()),
+            Some("/icons/unknown.gif")
+        );
+        assert_eq!(autoindex.header_name.as_deref(), Some("HEADER.html"));
+        assert_eq!(autoindex.readme_name.as_deref(), Some("README.html"));
+        assert_eq!(cfg.mime.content_encoding(b"page.html.gz"), Some("x-gzip"));
+        assert_eq!(cfg.mime.content_language(b"page.html.en"), Some("en"));
+        assert_eq!(cfg.mime.content_charset(b"page.html.utf8"), Some("UTF-8"));
+        assert_eq!(
+            cfg.global.content_policy.language_priority.as_deref(),
+            Some(["en".to_string(), "fr".to_string()].as_slice())
+        );
+        assert_eq!(
+            cfg.global.content_policy.force_language_priority,
+            Some((true, true))
+        );
+        assert_eq!(cfg.apache_mpm_tuning.threads_per_child, Some(25));
+        assert!(cfg.extended_status);
+
+        for directive in [
+            "IndexOptions -FancyIndexing",
+            "MaxConnectionsPerChild 1",
+            "Options MultiViews",
+        ] {
+            assert!(
+                load_text(&format!("Listen 127.0.0.1:0\n{directive}\n"), false).is_err(),
+                "unsupported behavior was accepted: {directive}"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_ssl_session_and_seed_directives_fail_closed() {
         let invalid = [
             "SSLRandomSeed later builtin",
@@ -15062,7 +15472,7 @@ ServerName plain.test\n\
 Define TEMP 1\n\
 Undefine TEMP\n\
 DocumentRoot rel/www\n\
-Options All\n\
+Options All -MultiViews\n\
 FileETag MTime\n\
 TypesConfig {relative}/mime.types\n\
 CacheRoot rel/cache\n\
@@ -15073,7 +15483,7 @@ RedirectMatch ^/rm/(.*)$ /new/$1\n\
 RewriteMap reltxt txt:{relative}/types.txt\n\
 RewriteMap relrnd rnd:{relative}/rnd.txt\n\
 <Directory /srv/edge>\n\
-Options All\n\
+Options All -MultiViews\n\
 AllowOverride All Nonfatal=Override\n\
 AllowOverride AuthConfig Nonfatal=Unknown\n\
 AllowOverride FileInfo Nonfatal=All\n\
@@ -15133,7 +15543,10 @@ Require all granted\n\
         assert_eq!(b.fail_on_status, vec![500, 502]);
         assert!(c.health_templates.contains_key("edge"));
         let s = c.effective_scope(None, Path::new("/srv/edge/file"), "/file");
-        assert_eq!(s.options.effective_bits(0), Options::all().0);
+        assert_eq!(
+            s.options.effective_bits(0),
+            Options::all().0 & !Options::MULTIVIEWS
+        );
         assert!(s.override_policy.raw_mode().is_some());
         assert_eq!(
             s.authorization.auth_user_file.as_deref(),
