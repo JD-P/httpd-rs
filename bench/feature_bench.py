@@ -145,6 +145,10 @@ def make_fixture(conf):
 def write_configs(conf):
     acfg = conf.common(AP_PORT, RUN / "apache", True, AP_TLS_PORT)
     vcfg = conf.common(VP_PORT, RUN, False, VP_TLS_PORT)
+    # Do not force either server to churn TLS connections during a serving
+    # benchmark. Connection/handshake admission has its own dedicated tests.
+    acfg = acfg.replace("MaxKeepAliveRequests 100\n", "MaxKeepAliveRequests 10000\n")
+    vcfg = vcfg.replace("MaxKeepAliveRequests 100\n", "MaxKeepAliveRequests 10000\n")
     # Request logging is not part of what we are comparing; a shared /dev/null
     # is what bench.py uses and keeps the comparison focused on request handling.
     acfg = re.sub(r"^CustomLog .* common$", "CustomLog /dev/null common", acfg, flags=re.M)
@@ -330,6 +334,18 @@ def url_for(port, path, tls=False, host=None):
     return f"{scheme}://{h}:{port}{path}"
 
 
+def benchmark_concurrency(sc):
+    """Keep one-host cohorts inside Vapache's source-keyed admission limits."""
+    requested = sc["conc"]
+    if sc["proto"] == "tls-h2":
+        # A single loopback identity may own 64 active H2 streams. Opening a
+        # larger cohort measures intentional overload rejection, not serving.
+        streams = max(1, sc.get("streams", 1))
+        return min(requested, 8, max(1, 64 // streams))
+    # Pending HTTP/1/TLS connection admission is capped at eight per source.
+    return min(requested, 8)
+
+
 def curl_probe(port, sc, tls=False, h2=False):
     path = sc["path"]
     host = sc.get("host")
@@ -368,23 +384,24 @@ def http_probe(port, sc):
 
 def measure(port, sc, duration):
     proto = sc["proto"]
+    conc = benchmark_concurrency(sc)
     headers = list(sc.get("headers", []))
     host = sc.get("host")
     if proto == "http":
         url = url_for(port, sc["path"])
-        return run_wrk(url, headers, sc["conc"], duration)
+        return run_wrk(url, headers, conc, duration)
     if proto == "ab-head":
         url = url_for(port, sc["path"])
-        return run_ab(url, sc["conc"], sc.get("requests", 20000), head=True)
+        return run_ab(url, conc, sc.get("requests", 20000), head=True)
     if proto == "ab-post":
         url = url_for(port, sc["path"])
-        return run_ab(url, sc["conc"], sc.get("requests", 5000), data_file=RUN / "post-body.txt")
+        return run_ab(url, conc, sc.get("requests", 5000), data_file=RUN / "post-body.txt")
     if proto in ("tls-h1", "tls-h2"):
         tls = True
         h1 = proto == "tls-h1"
         url = url_for(port, sc["path"], tls=True, host=host)
         return run_h2load(
-            url, headers, sc["conc"], sc.get("streams", 1), duration,
+            url, headers, conc, sc.get("streams", 1), duration,
             tls=tls, h1=h1, host=host, port=port,
             data_file=(RUN / "post-body.txt") if sc.get("data") else None,
         )
@@ -528,8 +545,12 @@ def main():
                 row["servers"][server] = best
                 if best["raw"]:
                     print(f"  !! {server} {sc['name']} output:\n{best['raw'][-2000:]}")
-                if best["failed"]:
-                    print(f"  !! {server} {sc['name']} failed={best['failed']} non2xx={best['non2xx']}")
+                socket_errors = sum(best.get("socket_errors") or [])
+                if best["failed"] or best["non2xx"] or socket_errors:
+                    print(
+                        f"  !! {server} {sc['name']} failed={best['failed']} "
+                        f"non2xx={best['non2xx']} socket-errors={socket_errors}"
+                    )
             a = row["servers"]["apache"]["rps"] or 0
             v = row["servers"]["vapache"]["rps"] or 0
             row["ratio"] = v / a if a else None
@@ -562,7 +583,9 @@ def main():
             f"Generated: {results['timestamp']}\n",
             f"Method: {samples} x {duration:g}s samples per server after warm-up; access logs to /dev/null. "
             "`wrk` for cleartext HTTP/1.1, `ab` for HEAD/POST, `h2load` for TLS/HTTP/2 with four load-generator threads. "
-            "HTTP/2 uses 64 clients x 16 streams; the 1 MB case uses 16 x 4 and CGI uses 16-32 clients.\n",
+            "Loopback concurrency is capped at eight connections and HTTP/2 cohorts stay within "
+            "the 64-stream per-client admission budget, so the run measures serving rather than "
+            "intentional overload rejection.\n",
             "| feature | apache req/s | vapache req/s | ratio | apache mean ms | vapache mean ms |",
             "|---|---:|---:|---:|---:|---:|",
         ]

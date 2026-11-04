@@ -333,6 +333,7 @@ fn ensure_disk_usage(
 /// cache keys behind the accounting lock. A fixed set of stripes bounds the
 /// lock table itself, while making the body-then-metadata rename sequence
 /// atomic from the point of view of `disk_load`.
+#[cfg(not(test))]
 fn disk_io_locks() -> &'static [Mutex<()>] {
     const STRIPES: usize = 64;
     static LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
@@ -341,10 +342,28 @@ fn disk_io_locks() -> &'static [Mutex<()>] {
         .as_slice()
 }
 
+#[cfg(not(test))]
 fn disk_io_lock(stem: &Path) -> &Mutex<()> {
     let mut hasher = DefaultHasher::new();
     stem.hash(&mut hasher);
     &disk_io_locks()[hasher.finish() as usize % disk_io_locks().len()]
+}
+
+#[cfg(test)]
+fn disk_io_lock(stem: &Path) -> &'static Mutex<()> {
+    // Production deliberately maps distinct cache keys onto a bounded set of
+    // nonblocking stripes. Unit tests use an exact-key table so fixtures for
+    // unrelated roots cannot spuriously skip stores merely because Rust runs
+    // them in parallel. The same-key contention test still exercises the
+    // production miss/store-skip behavior.
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, &'static Mutex<()>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *locks
+        .entry(stem.to_path_buf())
+        .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
 }
 
 fn disk_stem(path: &Path) -> Option<PathBuf> {
@@ -2620,20 +2639,9 @@ mod tests {
 
     #[test]
     fn disk_entries_round_trip_for_warm_start() {
-        let dir = std::env::temp_dir().join(format!("vapache-cache-meta-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let conf = dir.join("httpd.conf");
-        fs::write(&conf, "Listen 127.0.0.1:0\n").unwrap();
-        let mut cfg = crate::config::Config::load(
-            &conf,
-            &dir,
-            &Default::default(),
-            &Default::default(),
-            false,
-        )
-        .unwrap();
-        cfg.cache.root = Some(dir.join("cache"));
+        // Use the isolated disk fixture so an unrelated parallel cold-cache
+        // scan cannot make this test's optional first store skip.
+        let (dir, mut cfg) = disk_test_config("meta");
         let entry = Entry {
             status: 200,
             headers: vec![("content-type".into(), b"text/plain".to_vec())],

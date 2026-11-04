@@ -284,6 +284,18 @@ fn sockaddr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_
 
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static ADMISSION_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+type ConnectionJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct ConnectionWorkPool {
+    shared: Arc<ConnectionWorkState>,
+}
+
+struct ConnectionWorkState {
+    queue: std::sync::Mutex<std::collections::VecDeque<ConnectionJob>>,
+    ready: std::sync::Condvar,
+}
+
+static CONNECTION_WORK_POOL: OnceLock<io::Result<ConnectionWorkPool>> = OnceLock::new();
 const MAX_CONNECTIONS_PER_CLIENT: usize = 32;
 const MAX_PENDING_CONNECTIONS: usize = 2_048;
 const MAX_PENDING_PER_CLIENT: usize = 8;
@@ -292,8 +304,11 @@ const ACCEPT_BATCH: usize = 64;
 const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 64;
 const MAX_TLS_HANDSHAKES_PER_SECOND: usize = 128;
 const MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND: usize = 64;
+const CONNECTION_WORK_THREADS: usize = 64;
+const CONNECTION_WORK_QUEUE: usize = 1024;
 fn configure_accepted_transport(stream: &TcpStream) -> io::Result<()> {
-    crate::resource::configure_transport_fd(stream)
+    crate::resource::configure_transport_fd(stream)?;
+    stream.set_nodelay(true)
 }
 
 fn listener_index(first: usize, offset: usize, count: usize) -> usize {
@@ -319,10 +334,8 @@ fn admission_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
     let threads = admission_thread_count();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
-        // HTTP/1 connections and HTTP/2 filesystem dispatch use Tokio's
-        // reusable blocking pool. Admission counters bound queued work; this
-        // implementation ceiling prevents configuration from making the pool
-        // unbounded while leaving room for the separately capped H2 reads.
+        // TLS, dynamic backends and HTTP/2 retain Tokio's blocking pool. The
+        // ordinary HTTP/1 filesystem phase uses its smaller fixed pool below.
         .max_blocking_threads(MAX_IMPLEMENTED_REQUEST_WORKERS + 64)
         .thread_name("vapache-io")
         .enable_io()
@@ -332,6 +345,48 @@ fn admission_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
     Ok(ADMISSION_RUNTIME
         .get()
         .expect("admission runtime was initialized"))
+}
+
+fn connection_work_pool() -> io::Result<&'static ConnectionWorkPool> {
+    let pool = CONNECTION_WORK_POOL.get_or_init(|| {
+        let shared = Arc::new(ConnectionWorkState {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                CONNECTION_WORK_QUEUE,
+            )),
+            ready: std::sync::Condvar::new(),
+        });
+        for index in 0..CONNECTION_WORK_THREADS {
+            let shared = shared.clone();
+            std::thread::Builder::new()
+                .name(format!("vapache-request-{index}"))
+                .spawn(move || loop {
+                    let job = {
+                        let mut queue = shared
+                            .queue
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        while queue.is_empty() {
+                            queue = shared
+                                .ready
+                                .wait(queue)
+                                .unwrap_or_else(|error| error.into_inner());
+                        }
+                        queue.pop_front().expect("non-empty worker queue")
+                    };
+                    // Keep a panicking request from permanently shrinking the
+                    // bounded worker pool. The awaiting task observes the
+                    // dropped reply and closes that request.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                })?;
+        }
+        Ok(ConnectionWorkPool { shared })
+    });
+    pool.as_ref().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("connection worker pool unavailable: {error}"),
+        )
+    })
 }
 
 pub struct Server {
@@ -378,6 +433,9 @@ impl Server {
             b.listener.set_nonblocking(true)?;
         }
         let runtime = admission_runtime()?;
+        // Allocate the fixed blocking workers during generation startup so
+        // the first client does not pay thread-creation latency.
+        let _ = connection_work_pool()?;
         let mut pollfds: Vec<_> = bound
             .iter()
             .map(|bound| rustix::event::PollFd::new(&bound.listener, rustix::event::PollFlags::IN))
@@ -682,6 +740,36 @@ where
         )
     })?;
     Ok(handle.spawn_blocking(work))
+}
+
+async fn run_connection_work<F, T>(work: F) -> io::Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    crate::fault::hit("server.connection.spawn")?;
+    let pool = connection_work_pool()?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    {
+        let mut queue = pool
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if queue.len() >= CONNECTION_WORK_QUEUE {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "connection worker queue is full",
+            ));
+        }
+        queue.push_back(Box::new(move || {
+            let _ = reply.send(work());
+        }));
+    }
+    pool.shared.ready.notify_one();
+    result
+        .await
+        .map_err(|_| io::Error::other("connection worker stopped without a result"))
 }
 
 fn poll_listener_fds(
@@ -1528,10 +1616,6 @@ impl TlsH1 {
                 )
             })
     }
-
-    fn into_inner(self) -> Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
-        self.stream
-    }
 }
 
 impl Read for TlsH1 {
@@ -1949,7 +2033,7 @@ fn finish_h1_response(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_h1_request_phase<C: Conn + ResponseWrite>(
+fn process_h1_request_phase<C: Read + Write>(
     cfg: &Config,
     stream: &mut C,
     peer: SocketAddr,
@@ -2601,11 +2685,7 @@ async fn admit_plain_connection(
             reject_h1_async(&mut stream, &cfg, 503).await;
             return Ok(());
         };
-        let blocking = stream.into_std()?;
-        blocking.set_nonblocking(false)?;
-        blocking.set_nodelay(true).ok();
         let cfg_worker = cfg.clone();
-        let logger_worker = logger.clone();
         let local_ip_worker = local_ip.clone();
         let mut request_buf = initial;
         let websocket_connection_guard = admission
@@ -2613,8 +2693,11 @@ async fn admit_plain_connection(
             .then(|| established_guard.take())
             .flatten();
         let retired_worker = retired.clone();
-        let result = if admission.websocket {
-            spawn_connection_worker(move || {
+        if admission.websocket {
+            let blocking = stream.into_std()?;
+            blocking.set_nonblocking(false)?;
+            let logger_worker = logger.clone();
+            let (_, _, result) = spawn_connection_worker(move || {
                 let mut blocking = blocking;
                 let result = handle_connection_inner(
                     &cfg_worker,
@@ -2634,40 +2717,38 @@ async fn admit_plain_connection(
                     &mut served,
                     true,
                 );
-                (blocking, request_buf, None, result.map(|_| ()))
+                (blocking, request_buf, result.map(|_| ()))
             })?
             .await
-            .map_err(|error| io::Error::other(format!("HTTP/1 worker failed: {error}")))?
-        } else {
-            spawn_connection_worker(move || {
-                let _worker_guard = worker_guard;
-                let mut blocking = blocking;
-                let phase = process_h1_request_phase(
-                    &cfg_worker,
-                    &mut blocking,
-                    peer,
-                    &local_ip_worker,
-                    local_port,
-                    false,
-                    &mut request_buf,
-                    resident,
-                    body_guard,
-                    admission.context,
-                    served,
-                );
-                (blocking, request_buf, Some(phase), Ok(()))
-            })?
-            .await
-            .map_err(|error| io::Error::other(format!("HTTP/1 worker failed: {error}")))?
-        };
-        let (blocking, mut buffered, phase, legacy) = result;
-        legacy?;
-        if phase.is_none() {
+            .map_err(|error| io::Error::other(format!("HTTP/1 worker failed: {error}")))?;
+            result?;
             return Ok(());
         }
-        blocking.set_nonblocking(true)?;
-        stream = tokio::net::TcpStream::from_std(blocking)?;
-        let mut deferred = match phase.expect("non-WebSocket worker returned a phase") {
+        let (mut buffered, phase) = run_connection_work(move || {
+            let _worker_guard = worker_guard;
+            // Admission retained the complete request head.  This phase
+            // parses those owned bytes and performs policy/filesystem work,
+            // but never needs transport I/O; keeping the Tokio socket in the
+            // async task avoids three mode/option syscalls and two ownership
+            // transfers on every ordinary request.
+            let mut no_transport = std::io::Cursor::new(Vec::new());
+            let phase = process_h1_request_phase(
+                &cfg_worker,
+                &mut no_transport,
+                peer,
+                &local_ip_worker,
+                local_port,
+                false,
+                &mut request_buf,
+                resident,
+                body_guard,
+                admission.context,
+                served,
+            );
+            (request_buf, phase)
+        })
+        .await?;
+        let mut deferred = match phase {
             Ok(H1WorkerPhase::Response(deferred)) => deferred,
             Ok(H1WorkerPhase::Backend {
                 request,
@@ -2918,7 +2999,6 @@ async fn admit_tls_connection(
         .alpn_protocols
         .iter()
         .any(|protocol| protocol == b"http/1.1");
-    stream.set_nodelay(true).ok();
     stream.set_nonblocking(true)?;
     let tcp = tokio::net::TcpStream::from_std(stream)?;
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
@@ -3014,7 +3094,6 @@ async fn admit_tls_connection(
     let mut established_guard = Some(established_guard);
     drop(pending_guard);
     let _lifetime_guard = lifetime_guard;
-    let runtime_handle = tokio::runtime::Handle::current();
     let mut served = 0usize;
     let mut next_admission = Some(first_admission);
     loop {
@@ -3057,9 +3136,7 @@ async fn admit_tls_connection(
             reject_h1_async(&mut tls, &cfg, 503).await;
             return Ok(());
         };
-        let bridge = TlsH1::new(tls, runtime_handle.clone());
         let cfg_worker = cfg.clone();
-        let logger_worker = logger.clone();
         let local_ip_worker = local_ip.clone();
         let mut request_buf = initial;
         let websocket_connection_guard = admission
@@ -3067,8 +3144,10 @@ async fn admit_tls_connection(
             .then(|| established_guard.take())
             .flatten();
         let retired_worker = retired.clone();
-        let result = if admission.websocket {
-            spawn_connection_worker(move || {
+        if admission.websocket {
+            let bridge = TlsH1::new(tls, tokio::runtime::Handle::current());
+            let logger_worker = logger.clone();
+            let (_, _, result) = spawn_connection_worker(move || {
                 let mut bridge = bridge;
                 let result = handle_connection_inner(
                     &cfg_worker,
@@ -3088,42 +3167,33 @@ async fn admit_tls_connection(
                     &mut served,
                     true,
                 );
-                (bridge, request_buf, None, result.map(|_| ()))
+                (bridge, request_buf, result.map(|_| ()))
             })?
             .await
-            .map_err(|error| io::Error::other(format!("TLS HTTP/1 worker failed: {error}")))?
-        } else {
-            spawn_connection_worker(move || {
-                let _worker_guard = worker_guard;
-                let mut bridge = bridge;
-                let phase = process_h1_request_phase(
-                    &cfg_worker,
-                    &mut bridge,
-                    peer,
-                    &local_ip_worker,
-                    local_port,
-                    true,
-                    &mut request_buf,
-                    resident,
-                    body_guard,
-                    admission.context,
-                    served,
-                );
-                (bridge, request_buf, Some(phase), Ok(()))
-            })?
-            .await
-            .map_err(|error| io::Error::other(format!("TLS HTTP/1 worker failed: {error}")))?
-        };
-        let (bridge, mut buffered, phase, legacy) = result;
-        legacy?;
-        if phase.is_none() {
+            .map_err(|error| io::Error::other(format!("TLS HTTP/1 worker failed: {error}")))?;
+            result?;
             return Ok(());
         }
-        let Some(next_tls) = bridge.into_inner() else {
-            return Ok(());
-        };
-        tls = next_tls;
-        let mut deferred = match phase.expect("non-WebSocket worker returned a phase") {
+        let (mut buffered, phase) = run_connection_work(move || {
+            let _worker_guard = worker_guard;
+            let mut no_transport = std::io::Cursor::new(Vec::new());
+            let phase = process_h1_request_phase(
+                &cfg_worker,
+                &mut no_transport,
+                peer,
+                &local_ip_worker,
+                local_port,
+                true,
+                &mut request_buf,
+                resident,
+                body_guard,
+                admission.context,
+                served,
+            );
+            (request_buf, phase)
+        })
+        .await?;
+        let mut deferred = match phase {
             Ok(H1WorkerPhase::Response(deferred)) => deferred,
             Ok(H1WorkerPhase::Backend {
                 request,
@@ -8954,6 +9024,16 @@ mod tests {
         crate::fault::clear();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_connection_pool_runs_outside_the_async_runtime() {
+        let caller = std::thread::current().id();
+        let (worker, value) = run_connection_work(move || (std::thread::current().id(), 41 + 1))
+            .await
+            .unwrap();
+        assert_ne!(worker, caller);
+        assert_eq!(value, 42);
+    }
+
     #[test]
     fn per_client_connection_limit_is_enforced_and_released() {
         let _test_guard = ADMISSION_TEST_LOCK.lock().unwrap();
@@ -9053,6 +9133,7 @@ mod tests {
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
         configure_accepted_transport(&server).unwrap();
+        assert!(server.nodelay().unwrap());
         for value in [
             rustix::net::sockopt::socket_send_buffer_size(&server).unwrap(),
             rustix::net::sockopt::socket_recv_buffer_size(&server).unwrap(),

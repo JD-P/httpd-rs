@@ -15,7 +15,7 @@ def main():
     parser.add_argument(
         "--minimum-ratio",
         type=float,
-        default=float(os.environ.get("MIN_VAPACHE_APACHE_RATIO", "0.75")),
+        default=float(os.environ.get("MIN_VAPACHE_APACHE_RATIO", "0.85")),
         help="minimum vapache/Apache requests-per-second ratio per scenario",
     )
     args = parser.parse_args()
