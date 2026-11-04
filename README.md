@@ -820,24 +820,26 @@ python3 bench/bench.py           # 3s samples
 
 `wrk` is used when available (HTTP/1.1, reliable keep-alive under load) with
 `ab` as a fallback. Both servers use identical configurations and access logs
-are written to `/dev/null` so the harness does not fill `/tmp`. Results are
-appended to `bench/RESULTS.md`. Latest full run (2026-10-27, 3s samples, median of three,
-100 connections for small files and 20 for the 1 MB case):
+are written to `/dev/null` so the harness does not fill `/tmp`. The default
+uses eight connections because `wrk` opens its cohort simultaneously from one
+loopback client identity and Vapache deliberately limits each client to eight
+pending connections. Higher concurrency measures connection-admission overload
+rejection rather than successful static serving. Results are appended to
+`bench/RESULTS.md`. Latest full run (2026-11-04, 3s samples, median of three,
+eight connections, zero failed/non-2xx responses or socket errors):
 
 | scenario | Apache req/s | vapache req/s | ratio |
 |---|---:|---:|---:|
-| index.html | 92,792 | 205,324 | 2.21x |
-| hello.txt (1.1 KB) | 96,773 | 188,648 | 1.95x |
-| 10 KB file | 89,396 | 154,126 | 1.72x |
-| 1 MB file | 8,850 | 12,388 | 1.40x |
+| index.html | 39,356 | 34,067 | 0.87x |
+| hello.txt (1.1 KB) | 39,762 | 33,448 | 0.84x |
+| 10 KB file | 38,223 | 32,142 | 0.84x |
+| 1 MB file | 6,599 | 11,656 | 1.77x |
 
-The run recorded 13–22 Apache-side keep-alive read errors (out of ~20,000
-requests), which lower Apache's measured rate and make these ratios
-conservative. This run was taken during elevated host load, so absolute rates
-are lower than the earlier snapshot while the server-to-server ratios remain
-in the usual range. Recent full runs put the index/hello ratio around
-1.95–2.21x, the 10 KB case around 1.72–1.96x and the 1 MB scenario around
-1.34–1.40x.
+On that five-vCPU host, Vapache trails Apache by 13–16% for small static files
+and leads it by 77% for the 1 MB file. Older runs used more simultaneous
+connections from one identity and the old `wrk` parser did not record its
+non-2xx counter. They remain in `bench/RESULTS.md` as historical measurements,
+but are not comparable with the strict run above.
 Recent hot-path work caches the `Date` header and document-root descriptors,
 coalesces small response bodies, and reduces per-request allocation in MIME
 and access-log formatting. The latest policy migration also caches

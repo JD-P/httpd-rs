@@ -2,13 +2,19 @@
 
 Methodology: each run starts real Apache and vapached with equivalent configs,
 warms up, then takes the median of three samples. Runs from
-`2026-10-22T10:46` onward use `wrk` (HTTP/1.1, full runs use 3s samples,
-100 connections, access logs sent to `/dev/null`). Quick `--quick` runs use 1s
-samples and are useful for trend checks, not precise comparisons. Earlier runs used `ab`; those Apache numbers
-include client-side keep-alive length failures and are kept only as history.
-Each run's JSON also records `socket_errors`; a handful of Apache-side
-keep-alive read errors (seen on the shared host from 20:07 onward) makes the
-Apache rate look slightly better and therefore the reported ratio conservative.
+`2026-10-22T10:46` onward use `wrk` (HTTP/1.1, full runs use 3s samples and
+access logs go to `/dev/null`). Quick `--quick` runs use 1s samples and are
+useful for trend checks, not precise comparisons. Earlier runs used `ab`; those
+Apache numbers include client-side keep-alive length failures and are kept only
+as history.
+
+Runs through 2026-10-28 used 100 connections for small files, and the old
+`wrk` parser did not record its non-2xx counter. After per-client connection
+admission was introduced, that workload could benchmark overload rejection
+rather than successful responses. Runs from 2026-11-04 use eight connections,
+the pending-connection ceiling for this single-loopback-client harness, and
+strictly record non-2xx and socket errors. Pre-2026-11-04 ratios remain as
+history but are not comparable with strict runs.
 
 ## 2026-10-22T10:05:47.899796+00:00
 
@@ -315,3 +321,12 @@ Apache rate look slightly better and therefore the reported ratio conservative.
 | hello.txt (1.1KB, keepalive) | 88745 | 175953 | 1.98x | 0.46 | 2 |
 | 10k.bin (10KB, keepalive) | 83626 | 161785 | 1.93x | 0.55 | 4 |
 | 1m.bin (1MB, keepalive) | 9299 | 11616 | 1.25x | 1.02 | 2 |
+
+## 2026-11-04T08:06:33.743651+00:00
+
+| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+|---|---:|---:|---:|---:|---:|
+| index.html (small, keepalive) | 39356 | 34067 | 0.87x | 0.23 | 1 |
+| hello.txt (1.1KB, keepalive) | 39762 | 33448 | 0.84x | 0.24 | 1 |
+| 10k.bin (10KB, keepalive) | 38223 | 32142 | 0.84x | 0.25 | 1 |
+| 1m.bin (1MB, keepalive) | 6599 | 11656 | 1.77x | 0.63 | 2 |

@@ -64,7 +64,7 @@ LogLevel warn
 ServerName bench.local
 Timeout 60
 KeepAlive On
-MaxKeepAliveRequests 1000
+MaxKeepAliveRequests 10000
 KeepAliveTimeout 5
 DocumentRoot "{RUN}/www"
 <Directory />
@@ -105,7 +105,7 @@ LogLevel warn
 ServerName bench.local
 Timeout 60
 KeepAlive On
-MaxKeepAliveRequests 1000
+MaxKeepAliveRequests 10000
 KeepAliveTimeout 5
 DocumentRoot "{RUN}/www"
 <Directory />
@@ -198,7 +198,7 @@ def run_wrk(url, duration, concurrency):
         "p99_ms": p99_ms,
         "transferred_kbps": transferred_kbps,
         "failed": 0,
-        "non2xx": 0,
+        "non2xx": grab(r"Non-2xx or 3xx responses:\s+(\d+)", int) or 0,
         "socket_errors": errors,
         "raw": text if out.returncode != 0 else "",
     }
@@ -269,11 +269,23 @@ def main():
             ("1m.bin (1MB, keepalive)", "/large/1m.bin"),
         ]
         if args.quick:
-            tests = [(n, p, 3000, 50) for n, p in scenarios[:3]] + [(scenarios[3][0], scenarios[3][1], 300, 10)]
+            # wrk opens its cohort simultaneously from one loopback identity.
+            # Stay within vapache's per-client pending-connection ceiling so
+            # this measures serving rather than overload rejection.
+            tests = [(n, p, 3000, 8) for n, p in scenarios[:3]] + [
+                (scenarios[3][0], scenarios[3][1], 300, 8)
+            ]
         else:
             req = args.requests or 20000
-            conc = args.concurrency or 100
-            tests = [(n, p, req, conc) for n, p in scenarios[:3]] + [(scenarios[3][0], scenarios[3][1], max(500, req // 10), max(10, conc // 5))]
+            conc = args.concurrency or 8
+            tests = [(n, p, req, conc) for n, p in scenarios[:3]] + [
+                (
+                    scenarios[3][0],
+                    scenarios[3][1],
+                    max(500, req // 10),
+                    max(1, min(8, conc)),
+                )
+            ]
         results = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "tool": "wrk" if WRK else "ab",
@@ -287,7 +299,17 @@ def main():
                 if WRK:
                     duration = args.duration or (1.0 if args.quick else 3.0)
                     run_wrk(url, 1, conc)
-                    samples = [run_wrk(url, duration, conc) for _ in range(3)]
+                    # Let the server observe EOF and retire the previous
+                    # process's keep-alive sockets before opening the next
+                    # sample.  Otherwise a loopback run can momentarily count
+                    # two complete client populations against the per-client
+                    # connection quota.
+                    time.sleep(0.25)
+                    samples = []
+                    for sample in range(3):
+                        samples.append(run_wrk(url, duration, conc))
+                        if sample != 2:
+                            time.sleep(0.25)
                 else:
                     run_ab(url, max(200, req // 20), conc)
                     samples = [run_ab(url, req, conc) for _ in range(3)]
