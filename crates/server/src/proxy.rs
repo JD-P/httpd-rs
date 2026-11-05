@@ -4759,6 +4759,56 @@ mod more_tests {
     }
 
     #[test]
+    fn proxy_session_is_generation_scoped_bounded_and_expires_idle_entries() {
+        fn idle(
+            budget: &Arc<crate::resource::ResourceBudget>,
+            idle_since: Instant,
+        ) -> IdleProxyConnection {
+            let context = budget.context("127.0.0.1".parse().unwrap());
+            let mut lease = budget.try_dynamic_in(&context, 64).unwrap();
+            lease.release_general_slot();
+            IdleProxyConnection {
+                stream: Box::new(std::io::Cursor::new(Vec::new())),
+                lease,
+                idle_since,
+            }
+        }
+
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let session = ProxySession::new(7);
+        assert!(format!("{session:?}").contains("generation: 7"));
+
+        session.put(
+            6,
+            b"wrong-generation".to_vec(),
+            idle(&budget, Instant::now()),
+        );
+        assert!(session.idle.lock().unwrap().is_empty());
+        for index in 0..MAX_PROXY_SESSION_BACKENDS + 1 {
+            session.put(7, vec![index as u8], idle(&budget, Instant::now()));
+        }
+        assert_eq!(
+            session.idle.lock().unwrap().len(),
+            MAX_PROXY_SESSION_BACKENDS
+        );
+        assert!(session.take(6, &[0]).is_none());
+        assert!(session.take(7, &[0]).is_some());
+
+        // Replacing an existing key remains admissible even at capacity.
+        session.put(7, vec![1], idle(&budget, Instant::now()));
+        assert!(session.take(7, &[1]).is_some());
+        session.put(
+            7,
+            b"expired".to_vec(),
+            idle(
+                &budget,
+                Instant::now() - PROXY_SESSION_IDLE_TIMEOUT - Duration::from_secs(1),
+            ),
+        );
+        assert!(session.take(7, b"expired").is_none());
+    }
+
+    #[test]
     fn proxy_drops_connection_with_surplus_response_bytes() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
