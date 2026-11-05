@@ -881,7 +881,14 @@ def start_vapache(context: CaseContext, config_text: str, pid_file: Path, port: 
     )
     context.add_cleanup(process.stop)
     process.start()
-    wait_http(port)
+    try:
+        wait_http(port)
+    except Exception:
+        # If startup exited, replace a generic readiness timeout with the
+        # captured daemon tail. A still-running but unreachable process keeps
+        # the original network diagnostic.
+        process.assert_running()
+        raise
     process.assert_running()
     return process
 
