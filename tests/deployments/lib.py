@@ -267,6 +267,8 @@ class VapacheProcess:
             # privileged parser to enforce its root-owned trust boundary.
             command([*prefix, "chown", "0:0", os.fspath(self.config)], timeout=30)
             command([*prefix, "chmod", "0644", os.fspath(self.config)], timeout=30)
+            command([*prefix, "chown", "0:0", os.fspath(self.pid_file.parent)], timeout=30)
+            command([*prefix, "chmod", "0755", os.fspath(self.pid_file.parent)], timeout=30)
         check = [*prefix, os.fspath(self.binary), "-f", os.fspath(self.config), "-t", "--strict-config"]
         command(check, timeout=timeout)
         self.log.parent.mkdir(parents=True, exist_ok=True)
@@ -305,6 +307,19 @@ class VapacheProcess:
         if self._log_handle is not None:
             self._log_handle.close()
             self._log_handle = None
+        prefix = privilege_prefix()
+        if prefix and self.pid_file.parent.exists():
+            command(
+                [
+                    *prefix,
+                    "chown",
+                    "-R",
+                    f"{os.getuid()}:{os.getgid()}",
+                    os.fspath(self.pid_file.parent),
+                ],
+                timeout=30,
+                check=False,
+            )
 
     def assert_running(self) -> None:
         if self.process is None or self.process.poll() is not None:
@@ -717,7 +732,7 @@ def common_apache_config(
     server_root = run_dir / f"apache-{port}"
     logs = server_root / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    os.chmod(logs, 0o777)
+    os.chmod(logs, 0o755)
     user, group = service_identity()
     return f"""ServerRoot "{server_root}"
 {apache_modules(modules)}
