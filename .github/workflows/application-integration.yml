@@ -56,7 +56,10 @@ jobs:
           sudo apt-get install -y libcgi-pm-perl perl
           # The runner image may carry a newer Git PPA build whose version is
           # intentionally incompatible with Ubuntu's matching gitweb package.
-          sudo apt-get install -y --allow-downgrades -t noble-updates git git-man gitweb
+          gitweb_version=$(apt-cache show gitweb | awk '$1 == "Version:" { print $2; exit }')
+          test -n "$gitweb_version"
+          sudo apt-get install -y --allow-downgrades \
+            "git=$gitweb_version" "git-man=$gitweb_version" "gitweb=$gitweb_version"
       - name: Install differential benchmark tools
         if: ${{ inputs.benchmark == true }}
         env:
