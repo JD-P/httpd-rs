@@ -147,6 +147,10 @@ pub struct Headers {
     // internal redirects share this monotonic binding; unrelated requests do
     // not, even when a worker thread is reused or HTTP/2 tasks interleave.
     authenticated_identity: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    // Requests parsed from one downstream transport share a narrowly scoped
+    // reverse-proxy session. Internal rewrites retain it; unrelated client
+    // connections and configuration generations never do.
+    proxy_session: Option<std::sync::Arc<crate::proxy::ProxySession>>,
 }
 
 #[derive(Debug)]
@@ -219,6 +223,17 @@ impl Headers {
     pub(crate) fn bind_request_scope(&mut self, scope: crate::resource::RequestScope) {
         self.policy_budget.bind_context(scope.context().clone());
         self.request_scope = Some(scope);
+    }
+
+    pub(crate) fn bind_proxy_session(
+        &mut self,
+        session: std::sync::Arc<crate::proxy::ProxySession>,
+    ) {
+        self.proxy_session = Some(session);
+    }
+
+    pub(crate) fn proxy_session(&self) -> Option<&std::sync::Arc<crate::proxy::ProxySession>> {
+        self.proxy_session.as_ref()
     }
 
     pub(crate) fn resource_context(&self) -> Option<&crate::resource::ResourceContext> {
@@ -2052,6 +2067,7 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
             wire_identity: None,
             public_uri: Default::default(),
             authenticated_identity: Default::default(),
+            proxy_session: None,
         },
         body: Vec::new(),
         body_spool: None,

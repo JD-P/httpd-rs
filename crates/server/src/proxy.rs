@@ -2,8 +2,9 @@
 //!
 //! Covers HTTP and HTTPS upstreams, prefix/regex routing, chunked or
 //! fixed-length bodies, `Location` rewriting, round-robin `balancer://`
-//! members, compression and WebSocket tunneling over TCP/TLS.  Health checks,
-//! failover and connection pooling are follow-ups.
+//! members, compression and WebSocket tunneling over TCP/TLS. Plain HTTP
+//! upstream connections may be reused only by the same downstream connection,
+//! configuration generation and exact request identity.
 
 use crate::config::{
     Balancer, BalancerMember, Config, HealthTemplate, ProxyReverseRule, Scope, VHost,
@@ -38,6 +39,62 @@ const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// authority which can retarget an already-authorized request. TLS adds a
 /// second, cryptographic identity check but consumes the same bound transport.
 const MAX_BACKEND_IDENTITIES: usize = 1024;
+const MAX_PROXY_SESSION_BACKENDS: usize = 4;
+const PROXY_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct IdleProxyConnection {
+    stream: Box<dyn ReadWrite>,
+    lease: crate::resource::DynamicLease,
+    idle_since: Instant,
+}
+
+/// A deliberately connection-local upstream cache. Apache's process-wide
+/// worker pools are fast, but also let a malicious backend's surplus response
+/// bytes cross a client boundary. Vapache carries this object in request
+/// metadata shared only by requests parsed from one downstream transport.
+pub(crate) struct ProxySession {
+    generation: u64,
+    idle: Mutex<HashMap<Vec<u8>, IdleProxyConnection>>,
+}
+
+impl std::fmt::Debug for ProxySession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProxySession")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProxySession {
+    pub(crate) fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            idle: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn take(&self, generation: u64, key: &[u8]) -> Option<IdleProxyConnection> {
+        if generation != self.generation {
+            return None;
+        }
+        let mut idle = self.idle.lock().unwrap_or_else(|error| error.into_inner());
+        idle.retain(|_, connection| connection.idle_since.elapsed() <= PROXY_SESSION_IDLE_TIMEOUT);
+        idle.remove(key)
+    }
+
+    fn put(&self, generation: u64, key: Vec<u8>, connection: IdleProxyConnection) {
+        if generation != self.generation {
+            return;
+        }
+        let mut idle = self.idle.lock().unwrap_or_else(|error| error.into_inner());
+        idle.retain(|_, connection| connection.idle_since.elapsed() <= PROXY_SESSION_IDLE_TIMEOUT);
+        if !idle.contains_key(&key) && idle.len() >= MAX_PROXY_SESSION_BACKENDS {
+            return;
+        }
+        idle.insert(key, connection);
+    }
+}
 
 /// Resolver authority owned by exactly one immutable configuration. Clones of
 /// that configuration share this object; background health/OCSP work may keep
@@ -230,6 +287,10 @@ impl DeadlineStream {
                     "proxy request scope cancelled",
                 )
             })
+    }
+
+    fn into_inner(self) -> Box<dyn ReadWrite> {
+        self.inner
     }
 }
 
@@ -697,15 +758,7 @@ fn check_health(spec: &HealthSpec) -> bool {
     scope.proxy_policy.proxy_ca_file = spec.ca_file.clone();
     scope.proxy_policy.proxy_ca_trust = spec.ca_trust;
     let timeout = Duration::from_secs(5);
-    let deadline = Instant::now() + timeout;
-    let Ok(stream) = connect(
-        &backend,
-        &scope,
-        &spec.backend_identities,
-        timeout,
-        deadline,
-        None,
-    ) else {
+    let Ok(stream) = connect(&backend, &scope, &spec.backend_identities, timeout, None) else {
         return false;
     };
     check_health_stream(stream, spec, &backend)
@@ -2830,6 +2883,7 @@ fn connect_tcp(
         last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address"))
     })?;
     crate::resource::configure_transport_fd(&tcp)?;
+    tcp.set_nodelay(true)?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(std::io::Error::new(
@@ -2848,7 +2902,6 @@ fn connect(
     scope: &Scope,
     backend_identities: &BackendIdentityRegistry,
     timeout: Duration,
-    deadline: Instant,
     request_scope: Option<&crate::resource::RequestScope>,
 ) -> std::io::Result<Box<dyn ReadWrite>> {
     let tcp = connect_tcp(backend, backend_identities, timeout, request_scope)?;
@@ -2861,11 +2914,7 @@ fn connect(
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Box::new(StreamOwned::new(conn, tcp))
     };
-    Ok(Box::new(DeadlineStream {
-        inner,
-        deadline,
-        scope: request_scope.cloned(),
-    }))
+    Ok(inner)
 }
 
 fn backend_key(backend: &HttpBackend) -> String {
@@ -2877,6 +2926,27 @@ fn backend_key(backend: &HttpBackend) -> String {
     )
 }
 
+fn proxy_session_key(target: &Target, req: &Request, host: &str) -> Vec<u8> {
+    fn update(context: &mut ring::digest::Context, bytes: &[u8]) {
+        context.update(&(bytes.len() as u64).to_be_bytes());
+        context.update(bytes);
+    }
+
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    update(&mut context, target.binding_key().as_bytes());
+    update(&mut context, req.method.as_bytes());
+    update(&mut context, &req.query);
+    update(&mut context, host.as_bytes());
+    // Hash the complete admitted client header view. This keeps credentials
+    // and cookies out of the pool key while ensuring a connection carrying
+    // one request identity is never reused for another.
+    for (name, value) in req.headers.iter() {
+        update(&mut context, name.as_bytes());
+        update(&mut context, value);
+    }
+    context.finish().as_ref().to_vec()
+}
+
 fn proxy_method_is_idempotent(method: &str) -> bool {
     matches!(
         method,
@@ -2885,7 +2955,7 @@ fn proxy_method_is_idempotent(method: &str) -> bool {
 }
 
 struct PoolBodyReader {
-    inner: Option<BufReader<Box<dyn ReadWrite>>>,
+    inner: Option<BufReader<DeadlineStream>>,
     remaining: u64,
 }
 
@@ -2943,7 +3013,11 @@ fn proxy_once(
     static TEST_BUDGET: OnceLock<Arc<crate::resource::ResourceBudget>> = OnceLock::new();
     let budget = TEST_BUDGET.get_or_init(|| Arc::new(crate::resource::ResourceBudget::default()));
     proxy_once_budgeted(
-        stream,
+        DeadlineStream {
+            inner: stream,
+            deadline: Instant::now() + Duration::from_secs(60),
+            scope: None,
+        },
         budget,
         (MAX_PROXY_BODY as u64 + 1).saturating_mul(4),
         32,
@@ -2959,7 +3033,7 @@ fn proxy_once(
 
 #[allow(clippy::too_many_arguments)]
 fn proxy_once_budgeted(
-    mut stream: Box<dyn ReadWrite>,
+    mut stream: DeadlineStream,
     resource_budget: &Arc<crate::resource::ResourceBudget>,
     max_spool_bytes: u64,
     max_spool_files: u64,
@@ -3023,9 +3097,7 @@ fn proxy_once_budgeted(
     head.extend_from_slice(req.method.as_bytes());
     head.push(b' ');
     head.extend_from_slice(&path);
-    head.extend_from_slice(
-        format!(" HTTP/1.1\r\nHost: {upstream_host}\r\nConnection: close\r\n").as_bytes(),
-    );
+    head.extend_from_slice(format!(" HTTP/1.1\r\nHost: {upstream_host}\r\n").as_bytes());
     let body_len = req.body_len();
     if body_len > 0 {
         append_proxy_header(
@@ -3080,6 +3152,7 @@ fn proxy_once_budgeted(
 
     let mut reader = BufReader::new(stream);
     let status_line = read_line(&mut reader)?;
+    let response_http11 = status_line.starts_with(b"HTTP/1.1 ");
     let status = parse_proxy_status_line(&status_line)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad status"))?;
     // A normal proxy response cannot be an interim/upgrade response.  The
@@ -3097,6 +3170,7 @@ fn proxy_once_budgeted(
     let mut header_sanitizer = crate::http::ResponseHeaderSanitizer::new();
     let mut header_count = 0usize;
     let mut head_bytes = status_line.len();
+    let mut backend_closes = false;
     loop {
         let line = read_line(&mut reader)?;
         if line.is_empty() {
@@ -3147,6 +3221,9 @@ fn proxy_once_budgeted(
             continue;
         }
         if name == "connection" {
+            backend_closes |= connection_tokens(value)
+                .iter()
+                .any(|token| token == "close");
             header_sanitizer.add_connection_value(value)?;
             continue;
         }
@@ -3191,6 +3268,7 @@ fn proxy_once_budgeted(
                     "ambiguous proxy response framing",
                 )
             })?;
+    let reusable_framing = !matches!(framing, crate::verified::ProxyResponseFraming::Eof);
     let (no_body, content_length, chunked) = match framing {
         crate::verified::ProxyResponseFraming::NoBody => (true, None, false),
         crate::verified::ProxyResponseFraming::Length(length) => {
@@ -3332,7 +3410,10 @@ fn proxy_once_budgeted(
         url_path.as_bytes(),
         resource_budget,
     );
-    Ok((response, None))
+    let reusable =
+        response_http11 && !backend_closes && reusable_framing && reader.buffer().is_empty();
+    let stream = reusable.then(|| reader.into_inner().into_inner());
+    Ok((response, stream))
 }
 
 /// Drive the complete upstream response parser without opening a socket.
@@ -3742,35 +3823,49 @@ pub(crate) fn execute_with_proxy_base(
             );
         }
         tried.insert(backend_key(&current.backend));
-        let (result, request_may_have_started) = match connect(
-            &current.backend,
-            &active_scope,
-            &cfg.backend_identities,
-            remaining,
-            exchange_deadline,
-            req.request_scope(),
-        ) {
-            Ok(stream) => (
-                proxy_once_budgeted(
-                    stream,
-                    &cfg.resource_budget,
-                    cfg.max_spool_bytes,
-                    cfg.max_spool_files,
-                    &current,
-                    req,
-                    &active_scope,
-                    url_path,
-                    peer,
-                    https,
-                    host,
-                )
-                .map(|(response, _)| response),
-                true,
+        let pool_key = (!current.backend.tls).then(|| proxy_session_key(&current, req, host));
+        let pooled = pool_key.as_deref().and_then(|key| {
+            req.headers
+                .proxy_session()
+                .and_then(|session| session.take(cfg.generation, key))
+        });
+        let (stream, mut pooled_lease, request_may_have_started, connect_error) = match pooled {
+            Some(connection) => (Some(connection.stream), Some(connection.lease), true, None),
+            None => match connect(
+                &current.backend,
+                &active_scope,
+                &cfg.backend_identities,
+                remaining,
+                req.request_scope(),
+            ) {
+                Ok(stream) => (Some(stream), None, true, None),
+                Err(error) => (None, None, false, Some(error)),
+            },
+        };
+        let result = match stream {
+            Some(stream) => proxy_once_budgeted(
+                DeadlineStream {
+                    inner: stream,
+                    deadline: exchange_deadline,
+                    scope: req.request_scope().cloned(),
+                },
+                &cfg.resource_budget,
+                cfg.max_spool_bytes,
+                cfg.max_spool_files,
+                &current,
+                req,
+                &active_scope,
+                url_path,
+                peer,
+                https,
+                host,
             ),
-            Err(e) => (Err(e), false),
+            None => Err(connect_error.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "cannot connect upstream")
+            })),
         };
         match result {
-            Ok(mut response) => {
+            Ok((mut response, reusable_stream)) => {
                 let failed_status =
                     current.balancer.is_some() && current.fail_on_status.contains(&response.status);
                 if failed_status {
@@ -3838,6 +3933,28 @@ pub(crate) fn execute_with_proxy_base(
                     active_resource = next_resource;
                     current = next;
                     continue;
+                }
+                if let (Some(session), Some(key), Some(stream)) =
+                    (req.headers.proxy_session(), pool_key, reusable_stream)
+                {
+                    let lease = match pooled_lease.take() {
+                        Some(lease) => Some(lease),
+                        None => dynamic_lease.take().map(|mut lease| {
+                            lease.release_general_slot();
+                            lease
+                        }),
+                    };
+                    if let Some(lease) = lease {
+                        session.put(
+                            cfg.generation,
+                            key,
+                            IdleProxyConnection {
+                                stream,
+                                lease,
+                                idle_since: Instant::now(),
+                            },
+                        );
+                    }
                 }
                 if matches!(response.body, Body::Stream { .. }) {
                     response.hold_dynamic(
@@ -4447,7 +4564,7 @@ mod more_tests {
     }
 
     #[test]
-    fn proxy_does_not_reuse_keepalive_connection() {
+    fn proxy_reuses_only_connection_local_exact_identity() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -4503,7 +4620,10 @@ mod more_tests {
                 fail_on_status: Vec::new(),
                 route_order: 0,
             });
-        let request = req("/pool/x");
+        let mut request = req("/pool/x");
+        request
+            .headers
+            .bind_proxy_session(Arc::new(ProxySession::new(cfg.generation)));
         let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
         for _ in 0..3 {
             let target = match_target(&cfg, &scope, "/pool/x").unwrap();
@@ -4522,11 +4642,121 @@ mod more_tests {
             );
             assert_eq!(response.status, 200);
         }
-        // Pooling is deliberately disabled: a backend must not be able to
-        // leave bytes that are consumed as the next response.
-        assert_eq!(accepts.load(Ordering::Relaxed), 3);
+        assert_eq!(accepts.load(Ordering::Relaxed), 1);
+        let mut authenticated = request.clone();
+        authenticated
+            .headers
+            .insert("authorization", "Bearer distinct");
+        let target = match_target(&cfg, &scope, "/pool/x").unwrap();
+        assert_eq!(
+            execute(
+                &cfg,
+                None,
+                &scope,
+                &authenticated,
+                "/pool/x",
+                &target,
+                peer,
+                80,
+                false,
+                "localhost",
+                "127.0.0.1",
+            )
+            .status,
+            200
+        );
+        assert_eq!(accepts.load(Ordering::Relaxed), 2);
+        let target = match_target(&cfg, &scope, "/pool/x").unwrap();
+        assert_eq!(
+            execute(
+                &cfg,
+                None,
+                &scope,
+                &request,
+                "/pool/x",
+                &target,
+                peer,
+                80,
+                false,
+                "localhost",
+                "127.0.0.1",
+            )
+            .status,
+            200
+        );
+        assert_eq!(accepts.load(Ordering::Relaxed), 2);
         stop.store(true, Ordering::Relaxed);
         let _ = handle.join();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxy_drops_connection_with_surplus_response_bytes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_thread = Arc::clone(&accepts);
+        let handle = std::thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                accepts_thread.fetch_add(1, Ordering::Relaxed);
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    if stream.read(&mut byte).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    request.push(byte[0]);
+                }
+                let response = if index == 0 {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nevil".as_slice()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".as_slice()
+                };
+                stream.write_all(response).unwrap();
+            }
+        });
+        let dir =
+            std::env::temp_dir().join(format!("vapache-proxy-surplus-pool-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = config(&dir);
+        let mut scope = Scope::default();
+        scope
+            .proxy_policy
+            .proxy_passes
+            .push(crate::config::ProxyPassRule {
+                prefix: "/surplus".into(),
+                backend: format!("http://127.0.0.1:{port}/"),
+                sticky_cookie: None,
+                fail_on_status: Vec::new(),
+                route_order: 0,
+            });
+        let mut request = req("/surplus/x");
+        request
+            .headers
+            .bind_proxy_session(Arc::new(ProxySession::new(cfg.generation)));
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        for _ in 0..2 {
+            let target = match_target(&cfg, &scope, "/surplus/x").unwrap();
+            let response = execute(
+                &cfg,
+                None,
+                &scope,
+                &request,
+                "/surplus/x",
+                &target,
+                peer,
+                80,
+                false,
+                "localhost",
+                "127.0.0.1",
+            );
+            assert_eq!(response.status, 200);
+        }
+        handle.join().unwrap();
+        assert_eq!(accepts.load(Ordering::Relaxed), 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -6043,7 +6273,7 @@ mod coverage_tests {
             run("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok")
                 .unwrap();
         assert_eq!(resp.status, 200);
-        assert!(returned.is_none());
+        assert!(returned.is_some());
         match resp.body {
             Body::Bytes(body) => assert_eq!(body, b"ok"),
             _ => panic!("expected bytes"),
@@ -6078,9 +6308,13 @@ mod coverage_tests {
             .headers
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("x-private")));
-        let (ordinary_connection, _) =
+        let (ordinary_connection, returned) =
             run("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").unwrap();
         assert!(ordinary_connection.shared_cache_eligible());
+        assert!(returned.is_none());
+
+        let (_, returned) = run("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+        assert!(returned.is_none());
 
         let (resp, _) = run("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
         assert_eq!(resp.status, 204);
@@ -6193,9 +6427,11 @@ mod coverage_tests {
         assert_eq!(none.read(&mut buf).unwrap(), 0);
 
         let mut eof = PoolBodyReader {
-            inner: Some(BufReader::new(
-                Box::new(MockStream::new(Vec::new())) as Box<dyn ReadWrite>
-            )),
+            inner: Some(BufReader::new(DeadlineStream {
+                inner: Box::new(MockStream::new(Vec::new())),
+                deadline: Instant::now() + Duration::from_secs(1),
+                scope: None,
+            })),
             remaining: 3,
         };
         assert_eq!(eof.read(&mut buf).unwrap(), 0);

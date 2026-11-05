@@ -976,6 +976,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
     single_request: bool,
 ) -> io::Result<bool> {
     let limits = request_limits(cfg, tls);
+    let proxy_session = Arc::new(crate::proxy::ProxySession::new(cfg.generation));
     // Configure the transport once rather than paying a setsockopt on every
     // keep-alive response. The explicit write deadline remains the fallback
     // on kernels and transports without the progress-wakeup option.
@@ -1027,7 +1028,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
         };
         let pre_identity_context = cfg.resource_budget.context(peer.ip());
         let _pre_identity_guard = crate::resource::enter_resource_context(pre_identity_context);
-        let req = match read_request_with_reservation(
+        let mut req = match read_request_with_reservation(
             stream,
             buf,
             &limits,
@@ -1140,6 +1141,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                 return Ok(false);
             }
         };
+        req.headers.bind_proxy_session(Arc::clone(&proxy_session));
         drop(_pre_identity_guard);
         let _request_scope_guard = req.request_scope().map(|scope| scope.guard());
         // This lease protects only the slow body-read phase. The parsed body
@@ -2092,6 +2094,7 @@ fn process_h1_request_phase<C: Read + Write>(
     body_guard: Option<BodyWorkerGuard>,
     resource_context: crate::resource::ResourceContext,
     served: usize,
+    proxy_session: &Arc<crate::proxy::ProxySession>,
 ) -> Result<H1WorkerPhase, ReadError> {
     let started = Instant::now();
     let limits = request_limits(cfg, tls);
@@ -2108,6 +2111,9 @@ fn process_h1_request_phase<C: Read + Write>(
             "connection closed before admitted request",
         )));
     };
+    head.request_mut()
+        .headers
+        .bind_proxy_session(Arc::clone(proxy_session));
     crate::fault::hit("transition.h1.head").map_err(ReadError::Io)?;
     let scope_guard = head.request().request_scope().map(|scope| scope.guard());
     let dispatch_peer = cfg.client_addr(peer, head.request());
@@ -2751,6 +2757,7 @@ async fn admit_plain_connection(
     drop(pending_guard);
     let mut served = 0usize;
     let mut next_admission = Some(first_admission);
+    let proxy_session = Arc::new(crate::proxy::ProxySession::new(cfg.generation));
     loop {
         let admission = match next_admission.take() {
             Some(admission) => admission,
@@ -2786,6 +2793,7 @@ async fn admit_plain_connection(
         };
         let cfg_worker = cfg.clone();
         let local_ip_worker = local_ip.clone();
+        let proxy_session_worker = Arc::clone(&proxy_session);
         let mut request_buf = initial;
         let websocket_connection_guard = admission
             .websocket
@@ -2843,6 +2851,7 @@ async fn admit_plain_connection(
                 body_guard,
                 admission.context,
                 served,
+                &proxy_session_worker,
             );
             // Request-worker capacity protects policy work, not backend wait
             // time. Release it before either dynamic execution path. A small,
@@ -3210,6 +3219,7 @@ async fn admit_tls_connection(
     let _lifetime_guard = lifetime_guard;
     let mut served = 0usize;
     let mut next_admission = Some(first_admission);
+    let proxy_session = Arc::new(crate::proxy::ProxySession::new(cfg.generation));
     loop {
         let admission = match next_admission.take() {
             Some(admission) => admission,
@@ -3252,6 +3262,7 @@ async fn admit_tls_connection(
         };
         let cfg_worker = cfg.clone();
         let local_ip_worker = local_ip.clone();
+        let proxy_session_worker = Arc::clone(&proxy_session);
         let mut request_buf = initial;
         let websocket_connection_guard = admission
             .websocket
@@ -3303,6 +3314,7 @@ async fn admit_tls_connection(
                 body_guard,
                 admission.context,
                 served,
+                &proxy_session_worker,
             );
             drop(worker_guard);
             let phase = continue_bodyless_backend_inline(
