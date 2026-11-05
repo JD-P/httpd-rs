@@ -46,6 +46,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 tests/release_version.py
           version=$(cargo metadata --locked --no-deps --format-version 1 \
             | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "vapached"))')
           SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
