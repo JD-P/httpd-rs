@@ -47,12 +47,16 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install application and workload prerequisites
+      - name: Install Git CGI prerequisites
+        if: ${{ inputs.scenario == '' || inputs.scenario == 'git-cgi' }}
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y git gitweb libcgi-pm-perl perl
+          sudo apt-get install -y libcgi-pm-perl perl
+          # The runner image may carry a newer Git PPA build whose version is
+          # intentionally incompatible with Ubuntu's matching gitweb package.
+          sudo apt-get install -y --allow-downgrades -t noble-updates git git-man gitweb
       - name: Install differential benchmark tools
         if: ${{ inputs.benchmark == true }}
         env:
