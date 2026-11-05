@@ -1,0 +1,50 @@
+# P32 retained live runs against target/release/vapached, HEAD e1251ec.
+# Setup: 8 loopback source addresses (127.0.0.2 through 127.0.0.9), one TLS/h2
+# connection each, 32 partial POST /hold bodies each, no DATA; victim source
+# 127.0.0.1. Apache oracle: Apache/2.4.69 mpm_event + mod_http2 + mod_ssl,
+# equivalent 256 blocked CGI request bodies.
+
+# 1) Rolling full pool, 90-second measurement.
+#    python3 adversarial/p32/rolling.py --measure-seconds 90 --probe-interval 0.2
+baseline: status=b'200' reset=None terminated=None body=10
+pool filled: active=255 opened=256 victim=status=b'200' reset=None terminated=None body=10
+rolling: probes=180 refused=180 served=0 other=0 refusal_ratio=1.000 max_served_gap=0.00s active=256 opened=513 408s=256 resets=257
+after release: status=b'200' reset=None terminated=None body=10
+
+# 2) Rolling full pool, 150-second measurement.
+#    python3 adversarial/p32/rolling.py --measure-seconds 150 --probe-interval 0.2
+baseline: status=b'200' reset=None terminated=None body=10
+pool filled: active=256 opened=256 victim=status=None reset=7 terminated=None body=0
+rolling: probes=750 refused=750 served=0 other=0 refusal_ratio=1.000 max_served_gap=0.00s active=256 opened=768 408s=512 resets=512
+after release: status=b'200' reset=None terminated=None body=10
+
+# 3) Stock default body timeout (30 s), rolling full pool for 75 s.  Two full
+#    timeout cycles occurred (512 timeouts) and the pool was refilled each time.
+#    python3 adversarial/p32/rolling.py --timeout 30 --measure-seconds 75 --probe-interval 0.2
+baseline: status=b'200' reset=None terminated=None body=10
+pool filled: active=255 opened=256 victim=status=b'200' reset=None terminated=None body=10
+rolling: probes=375 refused=373 served=2 other=0 refusal_ratio=0.995 max_served_gap=0.20s active=256 opened=770 408s=512 resets=514
+after release: status=b'200' reset=None terminated=None body=10
+
+# 4) Threshold control: 7 sources x 1 connection x 32 = 224 streams, below the
+#    256-slot process pool.  Same rolling harness and measurement.
+#    python3 adversarial/p32/rolling.py --sources 7 --per-source 32 --measure-seconds 35 --probe-interval 0.2
+baseline: status=b'200' reset=None terminated=None body=10
+pool filled: active=221 opened=224 victim=status=b'200' reset=None terminated=None body=10
+rolling: probes=175 refused=0 served=175 other=0 refusal_ratio=0.000 max_served_gap=0.00s active=224 opened=227 408s=0 resets=3
+after release: status=b'200' reset=None terminated=None body=10
+
+# 5) Apache 2.4.69 oracle: same 8 x 32 = 256 blocked request bodies, CGI
+#    handler reads stdin without DATA.  A fresh source still gets 200.
+#    python3 adversarial/p32/oracle_apache.py
+baseline: status=b'200' reset=None terminated=None body=10
+held: sent=256 active=256 ended=0 statuses=[{}, {}, {}, {}, {}, {}, {}, {}]
+t=0s victim=status=b'200' reset=None terminated=None body=10
+t=5s victim=status=b'200' reset=None terminated=None body=10
+t=10s victim=status=b'200' reset=None terminated=None body=10
+t=15s victim=status=b'200' reset=None terminated=None body=10
+t=20s victim=status=b'200' reset=None terminated=None body=10
+t=25s victim=status=b'200' reset=None terminated=None body=10
+t=30s victim=status=b'200' reset=None terminated=None body=10
+t=35s victim=status=b'200' reset=None terminated=None body=10
+after release: status=b'200' reset=None terminated=None body=10
