@@ -13,6 +13,7 @@ SYSROOT="$(rustc --print sysroot)"
 HOST="$(rustc -vV | awk '/^host:/ {print $2}')"
 LLVM_BIN="$SYSROOT/lib/rustlib/$HOST/bin"
 PROFILE_DIR="${PROFILE_DIR:-/tmp/vapcov}"
+export COVERAGE_TARGET_DIR="${COVERAGE_TARGET_DIR:-target/cov}"
 
 if [ ! -x "$LLVM_BIN/llvm-profdata" ] || [ ! -x "$LLVM_BIN/llvm-cov" ]; then
     echo "coverage: missing llvm-tools-preview for $(rustc --version)" >&2
@@ -24,7 +25,7 @@ if ! command -v apache2 >/dev/null 2>&1; then
     exit 1
 fi
 
-rm -rf target/cov "$PROFILE_DIR"
+rm -rf "$COVERAGE_TARGET_DIR" "$PROFILE_DIR"
 mkdir -p "$PROFILE_DIR"
 chmod 777 "$PROFILE_DIR"
 
@@ -37,40 +38,40 @@ COVERAGE_RUSTFLAGS="-C instrument-coverage -C llvm-args=-runtime-counter-relocat
 export CARGO_PROFILE_RELEASE_LTO=false
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 
-CARGO_TARGET_DIR=target/cov RUSTFLAGS="$COVERAGE_RUSTFLAGS" \
+CARGO_TARGET_DIR="$COVERAGE_TARGET_DIR" RUSTFLAGS="$COVERAGE_RUSTFLAGS" \
     cargo build --release -p vapached
 
-CARGO_TARGET_DIR=target/cov RUSTFLAGS="$COVERAGE_RUSTFLAGS" \
+CARGO_TARGET_DIR="$COVERAGE_TARGET_DIR" RUSTFLAGS="$COVERAGE_RUSTFLAGS" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/unit-%p-%m%c.profraw" \
     cargo test -p vapached --features fault-injection -- --test-threads=1
 
-VAPACHED="$PWD/target/cov/release/vapached" \
+VAPACHED="$COVERAGE_TARGET_DIR/release/vapached" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/config_grammar.py
 
-VAPACHED="$PWD/target/cov/release/vapached" \
+VAPACHED="$COVERAGE_TARGET_DIR/release/vapached" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/config_validity.py
 
-VAPACHED="$PWD/target/cov/release/vapached" \
+VAPACHED="$COVERAGE_TARGET_DIR/release/vapached" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/config_semantics.py --random 128 --seed 2469 \
         --stateful 128 --stateful-seed 1818
 
-VAPACHED="$PWD/target/cov/release/vapached" \
+VAPACHED="$COVERAGE_TARGET_DIR/release/vapached" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/vhost_semantics.py
 
-VAPACHED="$PWD/target/cov/release/vapached" \
+VAPACHED="$COVERAGE_TARGET_DIR/release/vapached" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/conformance.py
 
-VAPACHED="$PWD/target/cov/release/vapached" \
+VAPACHED="$COVERAGE_TARGET_DIR/release/vapached" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/adversarial_regressions.py

@@ -1537,7 +1537,7 @@ pub type RequestEnvironment = Vec<(String, Vec<u8>)>;
 /// action changes the result of `Require env`/`Require expr`.
 pub(crate) fn parse_env_rule(name: &str, args: &[String]) -> Result<EnvRule, String> {
     let nocase = name.ends_with("nocase");
-    let (attribute, pattern_idx, actions_idx) = if name.starts_with("browsermatch") {
+    let (mut attribute, pattern_idx, actions_idx) = if name.starts_with("browsermatch") {
         ("User-Agent".to_string(), 0, 1)
     } else {
         (args.first().cloned().unwrap_or_default(), 1, 2)
@@ -1545,6 +1545,22 @@ pub(crate) fn parse_env_rule(name: &str, args: &[String]) -> Result<EnvRule, Str
     let Some(pattern) = args.get(pattern_idx) else {
         return Err(format!("{name} requires an attribute, pattern and action"));
     };
+    // Apache permits a regex over header names here. Keep rejecting that
+    // broad mode, but recognize an anchored literal header name as the exact
+    // header lookup it denotes. Debian's stock PHP-FPM configuration uses
+    // `^Authorization$` to forward credentials to the FastCGI application.
+    if let Some(literal) = attribute
+        .strip_prefix('^')
+        .and_then(|value| value.strip_suffix('$'))
+        .filter(|value| {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        })
+    {
+        attribute = literal.to_string();
+    }
     let attr_l = attribute.to_ascii_lowercase();
     if matches!(attr_l.as_str(), "remote_host" | "server_addr") {
         return Err(format!(
@@ -1592,6 +1608,12 @@ pub(crate) fn parse_env_rule(name: &str, args: &[String]) -> Result<EnvRule, Str
         nocase,
         actions,
     })
+}
+
+fn env_rule_enables_cgi_pass_auth(rule: &EnvRule) -> bool {
+    rule.attribute.eq_ignore_ascii_case("authorization")
+        && matches!(rule.pattern.as_str(), "(.+)" | "(?i:(.+))")
+        && rule.actions.as_slice() == [("HTTP_AUTHORIZATION".to_string(), Some("$1".to_string()))]
 }
 
 #[derive(Debug, Clone)]
@@ -3878,6 +3900,7 @@ fn directive_arity(name: &str) -> PayloadArity {
         | "vapachemaxdynamicrequests"
         | "vapachemaxfastcgioutput"
         | "proxypreservehost"
+        | "proxystatus"
         | "cgipassauth"
         | "loglevel" => PayloadArity::ONE,
         "defaulticon" | "headername" | "readmename" => PayloadArity::ONE,
@@ -4046,6 +4069,7 @@ pub(crate) fn directive_payload_schema(name: &str) -> PayloadSchema {
         | "sslsessiontickets"
         | "sslhonorcipherorder"
         | "proxypreservehost"
+        | "proxystatus"
         | "cgipassauth" => PayloadValueSchema::OnOff,
         "vapachemaxspoolbytes"
         | "vapachemaxspoolfiles"
@@ -4611,7 +4635,7 @@ fn directive_owner(name: &str) -> Option<&'static str> {
         "remoteipheader" | "remoteipinternalproxy" | "remoteiptrustedproxy" => "remoteip",
         "proxybadheader" | "proxyblock" | "proxyerroroverride" | "proxypass" | "proxypassmatch"
         | "proxypassreverse" | "proxypreservehost" | "proxyrequests" | "proxyset"
-        | "proxytimeout" => "proxy",
+        | "proxystatus" | "proxytimeout" => "proxy",
         "cachedefaultexpire" | "cachedisable" | "cacheenable" | "cacheignoreheaders"
         | "cachelock" | "cachemaxexpire" | "cachemaxfilesize" | "cachequickhandler"
         | "cachestorenostore" | "cachestoreprivate" => "cache",
@@ -6348,6 +6372,7 @@ impl Compile {
                 | "proxypassreverse"
                 | "proxypassmatch"
                 | "proxypreservehost"
+                | "proxystatus"
                 | "customlog"
                 | "sslengine"
                 | "sslcertificatefile"
@@ -6645,12 +6670,6 @@ impl Compile {
                     self.require_capability(Capability::Cgi, loc, "Options ExecCGI/All");
                 }
                 scope.options.merge_child(&options.policy);
-                if scope.effective_options().contains(Options::MULTIVIEWS) {
-                    self.directive_error(
-                        loc,
-                        "Options MultiViews is not implemented; refusing to enable implicit content negotiation",
-                    );
-                }
             }
             "allowoverride" => {
                 if section != SectionKind::Directory {
@@ -7522,12 +7541,17 @@ impl Compile {
                 .pass_env
                 .extend(args.iter().cloned().map(Originated::main)),
             "setenvif" | "setenvifnocase" | "browsermatch" | "browsermatchnocase" => {
-                scope.environment_policy.set_env_if.push(Originated::main(
-                    payload
-                        .environment_rule()
-                        .expect("environment rule is compiled while sealing")
-                        .clone(),
-                ));
+                let rule = payload
+                    .environment_rule()
+                    .expect("environment rule is compiled while sealing")
+                    .clone();
+                if env_rule_enables_cgi_pass_auth(&rule) {
+                    scope.environment_policy.cgi_pass_auth = Some(true);
+                }
+                scope
+                    .environment_policy
+                    .set_env_if
+                    .push(Originated::main(rule));
             }
             "remoteipheader" => {
                 self.cfg.remoteip_header = Some(first());
@@ -7627,6 +7651,17 @@ impl Compile {
                 self.cfg.extended_status = payload
                     .on_off()
                     .expect("ExtendedStatus is typed while sealing");
+            }
+            "proxystatus" => {
+                if payload
+                    .on_off()
+                    .expect("ProxyStatus is typed while sealing")
+                {
+                    self.warn(format!(
+                        "{}:{}: ProxyStatus is accepted for Debian mod_status compatibility; Vapache's bounded status page omits proxy-worker details",
+                        loc.file, loc.line,
+                    ));
+                }
             }
             "traceenable" => {
                 self.cfg.trace_enable = payload
@@ -11794,16 +11829,54 @@ SSLOptions +StrictRequire\n";
         assert_eq!(cfg.apache_mpm_tuning.threads_per_child, Some(25));
         assert!(cfg.extended_status);
 
-        for directive in [
-            "IndexOptions -FancyIndexing",
-            "MaxConnectionsPerChild 1",
-            "Options MultiViews",
-        ] {
+        for directive in ["IndexOptions -FancyIndexing", "MaxConnectionsPerChild 1"] {
             assert!(
                 load_text(&format!("Listen 127.0.0.1:0\n{directive}\n"), false).is_err(),
                 "unsupported behavior was accepted: {directive}"
             );
         }
+        let multiviews = load_text(
+            "Listen 127.0.0.1:0\n\
+             Alias /javascript /usr/share/javascript/\n\
+             <Directory \"/usr/share/javascript/\">\n\
+             Options FollowSymLinks MultiViews\n\
+             </Directory>\n",
+            false,
+        )
+        .unwrap();
+        assert!(multiviews
+            .effective_scope(
+                None,
+                Path::new("/usr/share/javascript/app.js"),
+                "/javascript/app",
+            )
+            .effective_options()
+            .contains(Options::MULTIVIEWS));
+
+        let php_fpm = load_text(
+            "Listen 127.0.0.1:0\n\
+             <FilesMatch \".+\\.ph(?:ar|p|tml)$\">\n\
+             SetEnvIfNoCase ^Authorization$ \"(.+)\" HTTP_AUTHORIZATION=$1\n\
+             SetHandler \"proxy:unix:/run/php/php8.4-fpm.sock|fcgi://localhost\"\n\
+             </FilesMatch>\n\
+             ProxyStatus On\n",
+            false,
+        )
+        .unwrap();
+        let php_scope =
+            php_fpm.effective_scope(None, Path::new("/var/www/html/index.php"), "/index.php");
+        assert_eq!(php_scope.environment_policy.cgi_pass_auth, Some(true));
+        assert_eq!(php_scope.environment_policy.set_env_if.len(), 1);
+        assert_eq!(
+            php_scope.environment_policy.set_env_if[0].value.attribute,
+            "Authorization"
+        );
+        assert!(php_fpm
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("omits proxy-worker details")));
+        assert!(load_text("Listen 127.0.0.1:0\nProxyStatus Maybe\n", false).is_err());
+        assert_eq!(directive_owner("setenvif"), Some("setenvif"));
     }
 
     #[test]

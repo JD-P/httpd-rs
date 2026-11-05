@@ -89,8 +89,11 @@ jobs:
             set -euo pipefail
             export DEBIAN_FRONTEND=noninteractive
             apt-get update >/dev/null
-            apt-get install -y --no-install-recommends apache2 curl >/dev/null
-            a2enmod ssl >/dev/null
+            apt-get install -y --no-install-recommends \
+              apache2 curl javascript-common php-fpm >/dev/null
+            a2enmod ssl proxy_fcgi setenvif >/dev/null
+            set -- /etc/apache2/conf-available/php*-fpm.conf
+            a2enconf "$(basename "$1" .conf)" >/dev/null
             config_digest() {
               {
                 find /etc/apache2 -xdev -printf "%P %y %m %u:%g %l\n" | sort

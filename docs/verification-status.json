@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "updated": "2026-11-04",
+  "updated": "2026-11-05",
   "verus": {
-    "verified_functions": 711,
+    "verified_functions": 714,
     "errors": 0
   },
   "obligations": [
@@ -109,7 +109,7 @@
       "title": "Every positive terminal outcome enforces original-URL and current-target grants",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "TransformCapability plus AccessGrant::require_sink mechanize the final exact-resource and sink-binding gate for static/directory, CGI/FastCGI, proxy, WebSocket and cache outcomes. Original-URL and current-target scopes are both enforced and F23 covers rewrite-then-proxy/redirect. Redirect and error-response orchestration remain runtime projections outside the protected body/tunnel/cache sink state machine, so the broader all-positive-outcomes obligation remains partial."
+      "evidence": "TransformCapability plus AccessGrant::require_sink mechanize the final exact-resource and sink-binding gate for static/directory, CGI/FastCGI, proxy, WebSocket and cache outcomes. MultiViews candidate admission additionally requires a missing public target, same-directory basename match, regular typed representation, static handler, acceptable negotiation result and bounded scan; the selected descriptor is reauthorized against both the public URL and candidate policy and inode-bound before the static sink. Original-URL and current-target scopes are both enforced and F23 covers rewrite-then-proxy/redirect. Redirect and error-response orchestration remain runtime projections outside the protected body/tunnel/cache sink state machine, so the broader all-positive-outcomes obligation remains partial."
     },
     {
       "id": "internal_request_projection",
@@ -542,6 +542,7 @@
     "max_cve_not_covered_high_critical": 0
   },
   "verified_subcomponents": [
+    "Bounded static-only MultiViews candidate admission and selected-inode reauthorization",
     "virtual-host exact/wildcard host matching (host_pattern_matches)",
     "virtual-host first-match selection (first_true_index)",
     "IPv4/IPv6 network membership (ipv4_in_net/ipv6_in_net)",

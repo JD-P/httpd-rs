@@ -7,8 +7,8 @@ use crate::config::{
 };
 use crate::fastcgi;
 use crate::files::{
-    directory_index_target, error_response, mime_type, resolve_target_checked, serve_directory,
-    serve_file, simple_html, Target,
+    directory_index_target, error_response, mime_type, multiviews_target, resolve_target_checked,
+    serve_directory, serve_file, simple_html, MultiViewsResult, Target,
 };
 use crate::http::{
     preflight_request_head, prepare_streaming_request_body, pump_streaming_request_body,
@@ -4850,6 +4850,168 @@ fn bind_target_grant(
     }
 }
 
+/// Bind an implicitly negotiated static representation to both the public
+/// extensionless URL policy and the selected filename/inode policy. Unlike an
+/// internal redirect, MultiViews does not change the public URL identity.
+#[allow(clippy::too_many_arguments)]
+fn bind_multiview_grant(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    base_scope: &Scope,
+    candidate_fs: &Path,
+    actual_path: &Path,
+    mapping_root: &Path,
+    meta: &std::fs::Metadata,
+    url_path: &str,
+    req: &Request,
+    peer: IpAddr,
+    local_port: u16,
+    server_name: &str,
+    local_ip: &str,
+    rewrite_effects: &crate::rewrite::Effects,
+) -> Result<(access::AccessGrant, access::ResourceKey, Scope), Response> {
+    let lexical = evaluate_scope_identities_for_path(
+        cfg,
+        vhost,
+        candidate_fs,
+        None,
+        url_path,
+        req,
+        peer,
+        mapping_root,
+    )
+    .map_err(|error| {
+        eprintln!("vapached: negotiated target scope error: {error}");
+        error_response(
+            cfg,
+            vhost,
+            base_scope,
+            500,
+            req,
+            url_path,
+            local_port,
+            server_name,
+            peer,
+            local_ip,
+        )
+    })?;
+    let mut lexical_scope = lexical.scope;
+    apply_rewrite_effects(&mut lexical_scope, rewrite_effects);
+    apply_scope_conditionals(
+        cfg,
+        vhost,
+        &mut lexical_scope,
+        &lexical.config_conditionals,
+        &lexical.htaccess_conditionals,
+        candidate_fs,
+        url_path,
+        req,
+        peer,
+    );
+
+    let mut target_scope = if actual_path == candidate_fs {
+        lexical_scope.clone()
+    } else {
+        let evaluated = evaluate_scope_identities_for_path(
+            cfg,
+            vhost,
+            actual_path,
+            Some(candidate_fs),
+            url_path,
+            req,
+            peer,
+            mapping_root,
+        )
+        .map_err(|error| {
+            eprintln!("vapached: negotiated resolved-target scope error: {error}");
+            error_response(
+                cfg,
+                vhost,
+                base_scope,
+                500,
+                req,
+                url_path,
+                local_port,
+                server_name,
+                peer,
+                local_ip,
+            )
+        })?;
+        let mut resolved = evaluated.scope;
+        apply_rewrite_effects(&mut resolved, rewrite_effects);
+        apply_scope_conditionals(
+            cfg,
+            vhost,
+            &mut resolved,
+            &evaluated.config_conditionals,
+            &evaluated.htaccess_conditionals,
+            actual_path,
+            url_path,
+            req,
+            peer,
+        );
+        if let Some(mut handler_scope) = evaluated.handler_scope {
+            apply_rewrite_effects(&mut handler_scope.scope, rewrite_effects);
+            let lexical_name = candidate_fs
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            crate::request_plan::apply_conditionals_with_file_name(
+                cfg,
+                vhost,
+                &mut handler_scope.scope,
+                &handler_scope.config_conditionals,
+                &handler_scope.access_conditionals,
+                actual_path,
+                url_path,
+                req,
+                peer,
+                &lexical_name,
+            );
+            replace_handler_policy(&mut resolved, &handler_scope.scope);
+        }
+        resolved.restrict_with(&lexical_scope);
+        resolved
+    };
+    // The missing public spelling was already authorized before negotiation.
+    // A variant may only add restrictions; it cannot replace that policy.
+    target_scope.restrict_with(base_scope);
+    let mut key = access::ResourceKey::request(vhost, req, url_path, Some(actual_path), None);
+    let grant = helper_access_response(
+        cfg,
+        vhost,
+        &target_scope,
+        req,
+        url_path,
+        actual_path,
+        local_port,
+        server_name,
+        peer,
+        local_ip,
+        &mut key,
+    )?;
+    // helper_access_response returns a grant for `key`; failure here would be
+    // an internal grant-construction invariant violation.
+    // coverage:ignore-start
+    let Some(bound) = grant.bind_file(&key, meta) else {
+        return Err(error_response(
+            cfg,
+            vhost,
+            &target_scope,
+            500,
+            req,
+            url_path,
+            local_port,
+            server_name,
+            peer,
+            local_ip,
+        ));
+    };
+    // coverage:ignore-stop
+    let key = bound.key().clone();
+    Ok((bound, key, target_scope))
+}
+
 /// Re-evaluate policy for a target selected by a transform (PATH_INFO split,
 /// FastCGI script resolution, alias target).  The returned grant is bound to
 /// the target path and, for CGIs, to the opened inode by the caller.
@@ -7516,6 +7678,186 @@ fn dispatch_inner(
             if req.method == "OPTIONS" {
                 return options_response(cfg, &scope, None);
             }
+            if !script_alias && matches!(req.method.as_str(), "GET" | "HEAD") {
+                match multiviews_target(
+                    cfg,
+                    &scope,
+                    req,
+                    &root,
+                    &rel,
+                    follow_symlinks,
+                    owner_match_only,
+                ) {
+                    MultiViewsResult::Selected(view) => {
+                        let candidate_fs = fs_path
+                            .parent()
+                            .unwrap_or(root.as_path())
+                            .join(std::ffi::OsStr::from_bytes(&view.name));
+                        let Some(actual_path) =
+                            crate::files::fd_path_cow(&view.file, &candidate_fs)
+                        else {
+                            // coverage:ignore-start - procfs/readlink platform failure after a successful descriptor-relative open
+                            return error_response(
+                                cfg,
+                                vhost,
+                                &scope,
+                                500,
+                                req,
+                                &url_path,
+                                local_port,
+                                &server_name,
+                                peer.ip(),
+                                local_ip,
+                            );
+                            // coverage:ignore-stop
+                        };
+                        let (target_grant, target_resource, target_scope) =
+                            match bind_multiview_grant(
+                                cfg,
+                                vhost,
+                                &scope,
+                                &candidate_fs,
+                                actual_path.as_ref(),
+                                &root,
+                                &view.meta,
+                                &url_path,
+                                req,
+                                peer.ip(),
+                                local_port,
+                                &server_name,
+                                local_ip,
+                                &rewrite_effects,
+                            ) {
+                                Ok(bound) => bound,
+                                Err(response) => return response,
+                            };
+                        let handler = crate::config::effective_handler(&target_scope, &view.name)
+                            .map(str::trim)
+                            .filter(|handler| {
+                                !handler.is_empty()
+                                    && !handler.eq_ignore_ascii_case("default-handler")
+                                    && !handler.eq_ignore_ascii_case("none")
+                            });
+                        // MultiViewsMatch defaults to NegotiatedOnly. Refuse
+                        // to turn an extensionless URL into any dynamic sink,
+                        // even if a leaf-sensitive Files rule adds a handler
+                        // after the bounded candidate scan selected the name.
+                        if handler.is_some()
+                            || cgi::is_cgi(cfg, &target_scope, &view.name, false)
+                            || fastcgi::handler_target_for_file(
+                                &target_scope,
+                                &root,
+                                &url_path,
+                                &candidate_fs,
+                                actual_path.as_ref(),
+                                &view.name,
+                            )
+                            .is_some()
+                        {
+                            return error_response(
+                                cfg,
+                                vhost,
+                                &target_scope,
+                                404,
+                                req,
+                                &url_path,
+                                local_port,
+                                &server_name,
+                                peer.ip(),
+                                local_ip,
+                            );
+                        }
+                        let media_type = mime_type(cfg, &target_scope, &view.name);
+                        let mut unsupported_filters =
+                            target_scope.mapping_policy.unsupported_filters.clone();
+                        for filter in crate::compression::unsupported_filters(
+                            &target_scope,
+                            media_type.as_deref(),
+                            &view.name,
+                        ) {
+                            if !unsupported_filters
+                                .iter()
+                                .any(|known| known.eq_ignore_ascii_case(&filter))
+                            {
+                                unsupported_filters.push(filter);
+                            }
+                        }
+                        if !unsupported_filters.is_empty() {
+                            return error_response(
+                                cfg,
+                                vhost,
+                                &target_scope,
+                                500,
+                                req,
+                                &url_path,
+                                local_port,
+                                &server_name,
+                                peer.ip(),
+                                local_ip,
+                            );
+                        }
+                        let mut response = serve_file(
+                            cfg,
+                            &target_scope,
+                            req,
+                            view.file,
+                            &view.meta,
+                            actual_path.as_ref(),
+                            &view.name,
+                            peer.ip(),
+                            local_ip,
+                            &target_grant,
+                            &target_resource,
+                        );
+                        response.headers.push((
+                            "Content-Location".into(),
+                            crate::util::url_encode_path(&view.name).into_bytes(),
+                        ));
+                        response.headers.push((
+                            "Vary".into(),
+                            b"Accept, Accept-Language, Accept-Encoding".to_vec(),
+                        ));
+                        response.headers.push(("TCN".into(), b"choice".to_vec()));
+                        return response;
+                    }
+                    MultiViewsResult::NotAcceptable => {
+                        return error_response(
+                            cfg,
+                            vhost,
+                            &scope,
+                            406,
+                            req,
+                            &url_path,
+                            local_port,
+                            &server_name,
+                            peer.ip(),
+                            local_ip,
+                        );
+                    }
+                    MultiViewsResult::MultipleChoices => {
+                        return error_response(
+                            cfg,
+                            vhost,
+                            &scope,
+                            300,
+                            req,
+                            &url_path,
+                            local_port,
+                            &server_name,
+                            peer.ip(),
+                            local_ip,
+                        );
+                    }
+                    MultiViewsResult::Overloaded => {
+                        return Response::bytes(
+                            503,
+                            "text/plain; charset=utf-8",
+                            b"Service Unavailable\n".to_vec(),
+                        );
+                    }
+                    MultiViewsResult::NotFound => {}
+                }
+            }
             // CGI PATH_INFO: try progressively shorter script names.  The
             // requested suffix must not select the handler: `/protected.sh/x.cgi`
             // is only executable when `protected.sh` itself is configured as a
@@ -9663,6 +10005,142 @@ mod tests {
     }
 
     #[test]
+    fn multiviews_reauthorizes_the_variant_and_never_executes_it() {
+        let dir = cov_dir("multiview-policy");
+        std::fs::write(dir.join("www/app.js"), "static variant\n").unwrap();
+        std::fs::write(dir.join("www/secret.js"), "secret\n").unwrap();
+        std::fs::write(dir.join("www/page.html"), "html\n").unwrap();
+        std::fs::write(dir.join("www/page.txt"), "text\n").unwrap();
+        std::fs::write(dir.join("www/filter.js"), "filter\n").unwrap();
+        std::fs::write(dir.join("www/filter-rule.flt"), "filter rule\n").unwrap();
+        std::fs::create_dir(dir.join("www/assets")).unwrap();
+        std::fs::write(dir.join("www/assets/linked.js"), "linked variant\n").unwrap();
+        std::os::unix::fs::symlink("assets/linked.js", dir.join("www/linked.js")).unwrap();
+        std::fs::create_dir(dir.join("www/bad-assets")).unwrap();
+        std::fs::write(
+            dir.join("www/bad-assets/broken-target.js"),
+            "must not be served\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("www/bad-assets/.htaccess"),
+            "Header \"unterminated\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("bad-assets/broken-target.js", dir.join("www/broken.js"))
+            .unwrap();
+        for index in 0..=crate::files::MAX_MULTIVIEW_CANDIDATES {
+            std::fs::write(
+                dir.join("www").join(format!("many.{index}.txt")),
+                "candidate\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.join("www/tool.cgi"),
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nEXECUTED\\n'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(dir.join("www/tool.cgi"))
+            .unwrap()
+            .permissions();
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(dir.join("www/tool.cgi"), permissions).unwrap();
+
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "AddType application/javascript .js\n\
+                 AddType application/x-cgi .cgi\n\
+                 AddType text/html .html\n\
+                 AddType text/plain .txt\n\
+                 AddType application/x-filtered .flt\n\
+                 AddOutputFilterByType INCLUDES application/x-filtered\n\
+                 <Directory \"{}/www\">\n\
+                 Options MultiViews +ExecCGI +FollowSymLinks\n\
+                 Require all granted\n\
+                 <Files \"secret.js\">\nRequire all denied\n</Files>\n\
+                 <Files \"tool.cgi\">\nSetHandler cgi-script\n</Files>\n\
+                 <Files \"filter.js\">\nSetOutputFilter INCLUDES\n</Files>\n\
+                 <Files \"filter.js\">\nAddOutputFilter INCLUDES .js\n</Files>\n\
+                 </Directory>\n\
+                 <Directory \"{}/www/bad-assets\">\nAllowOverride All\n</Directory>\n",
+                dir.display(),
+                dir.display(),
+            ),
+        );
+
+        let (selected, result) = cov_run_conn(
+            &cfg,
+            "GET /app HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            80,
+        );
+        result.unwrap();
+        assert_eq!(cov_status(&selected), 200, "{selected}");
+        assert!(selected.contains("static variant"), "{selected}");
+        assert!(selected
+            .to_ascii_lowercase()
+            .contains("content-location: app.js"));
+        assert!(selected.to_ascii_lowercase().contains("vary: accept"));
+
+        let (linked, result) = cov_run_conn(
+            &cfg,
+            "GET /linked HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            80,
+        );
+        result.unwrap();
+        assert_eq!(cov_status(&linked), 200, "{linked}");
+        assert!(linked.contains("linked variant"), "{linked}");
+
+        let (broken, result) = cov_run_conn(
+            &cfg,
+            "GET /broken HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            80,
+        );
+        result.unwrap();
+        assert_eq!(cov_status(&broken), 500, "{broken}");
+        assert!(!broken.contains("must not be served"), "{broken}");
+
+        let (denied, result) = cov_run_conn(
+            &cfg,
+            "GET /secret HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            80,
+        );
+        result.unwrap();
+        assert_eq!(cov_status(&denied), 403, "{denied}");
+        assert!(!denied.contains("secret\n"), "{denied}");
+
+        let (handler, result) = cov_run_conn(
+            &cfg,
+            "GET /tool HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            80,
+        );
+        result.unwrap();
+        assert_eq!(cov_status(&handler), 404, "{handler}");
+        assert!(!handler.contains("EXECUTED"), "{handler}");
+
+        for (path, header, expected) in [
+            ("/app", "Accept: text/plain\r\n", 406),
+            ("/page", "", 300),
+            ("/many", "", 503),
+            ("/filter", "", 500),
+            ("/filter-rule", "", 500),
+        ] {
+            let (response, result) = cov_run_conn(
+                &cfg,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: localhost\r\n{header}Connection: close\r\n\r\n"
+                ),
+                80,
+            );
+            result.unwrap();
+            assert_eq!(cov_status(&response), expected, "{path}: {response}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn keep_alive_request_bodies_reenter_the_slow_body_admission_gate() {
         let _test_guard = ADMISSION_TEST_LOCK.lock().unwrap();
         let dir = cov_dir("keepalive-body-admission");
@@ -10367,6 +10845,26 @@ mod tests {
 
         let target = dir.join("www/bad/file.txt");
         let target_meta = std::fs::metadata(&target).unwrap();
+        let multiview_lexical_error = bind_multiview_grant(
+            &cfg,
+            None,
+            &scope,
+            &target,
+            &target,
+            &map_root,
+            &target_meta,
+            "/bad/file",
+            &req,
+            peer,
+            80,
+            "localhost",
+            "127.0.0.1",
+            &effects,
+        )
+        .err()
+        .expect("negotiated lexical target scope error");
+        assert_eq!(multiview_lexical_error.status, 500);
+
         let wildcard = access::test_grant();
         let err = bind_target_grant(
             &cfg,

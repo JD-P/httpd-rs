@@ -2650,6 +2650,102 @@ pub proof fn rejected_websocket_negotiation_is_not_admitted(
 {
 }
 
+/// A filesystem variant discovered by `Options MultiViews` may participate in
+/// negotiation only when every identity and resource boundary agrees.  In
+/// particular, the default Apache `NegotiatedOnly` behavior never promotes a
+/// handler-only suffix (CGI/FastCGI/etc.) into an executable request.
+pub open spec fn multiview_candidate_spec(
+    enabled: bool,
+    target_missing: bool,
+    same_directory: bool,
+    basename_matches: bool,
+    regular_file: bool,
+    typed_representation: bool,
+    static_handler: bool,
+    acceptable: bool,
+    within_scan_budget: bool,
+) -> bool {
+    enabled
+        && target_missing
+        && same_directory
+        && basename_matches
+        && regular_file
+        && typed_representation
+        && static_handler
+        && acceptable
+        && within_scan_budget
+}
+
+pub fn multiview_candidate_admit(
+    enabled: bool,
+    target_missing: bool,
+    same_directory: bool,
+    basename_matches: bool,
+    regular_file: bool,
+    typed_representation: bool,
+    static_handler: bool,
+    acceptable: bool,
+    within_scan_budget: bool,
+) -> (ok: bool)
+    ensures
+        ok == multiview_candidate_spec(
+            enabled,
+            target_missing,
+            same_directory,
+            basename_matches,
+            regular_file,
+            typed_representation,
+            static_handler,
+            acceptable,
+            within_scan_budget,
+        ),
+{
+    enabled
+        && target_missing
+        && same_directory
+        && basename_matches
+        && regular_file
+        && typed_representation
+        && static_handler
+        && acceptable
+        && within_scan_budget
+}
+
+pub proof fn admitted_multiview_candidate_is_static_and_bounded(
+    enabled: bool,
+    target_missing: bool,
+    same_directory: bool,
+    basename_matches: bool,
+    regular_file: bool,
+    typed_representation: bool,
+    static_handler: bool,
+    acceptable: bool,
+    within_scan_budget: bool,
+)
+    requires multiview_candidate_spec(
+        enabled,
+        target_missing,
+        same_directory,
+        basename_matches,
+        regular_file,
+        typed_representation,
+        static_handler,
+        acceptable,
+        within_scan_budget,
+    ),
+    ensures
+        enabled,
+        target_missing,
+        same_directory,
+        basename_matches,
+        regular_file,
+        typed_representation,
+        static_handler,
+        acceptable,
+        within_scan_budget,
+{
+}
+
 /// Admission for the breadth of the access-file program participating in one
 /// request.  `next_instructions` is checked by subtraction so the concrete
 /// accumulator cannot overflow while walking ancestor layers.

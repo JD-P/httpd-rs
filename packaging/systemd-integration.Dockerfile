@@ -5,8 +5,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        apache2 curl systemd systemd-sysv \
+        apache2 curl javascript-common php-fpm systemd systemd-sysv \
     && rm -rf /var/lib/apt/lists/*
+
+RUN a2enmod proxy_fcgi setenvif \
+    && set -- /etc/apache2/conf-available/php*-fpm.conf \
+    && a2enconf "$(basename "$1" .conf)"
 
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]

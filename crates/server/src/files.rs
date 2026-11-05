@@ -480,6 +480,320 @@ pub enum Target {
     Forbidden,
 }
 
+/// A descriptor-bound representation selected by Apache-style MultiViews.
+/// The URL remains the extensionless public request; `name` is used for
+/// Files/MIME policy and Content-Location only.
+pub struct MultiView {
+    pub name: Vec<u8>,
+    pub file: File,
+    pub meta: Metadata,
+}
+
+pub enum MultiViewsResult {
+    Selected(MultiView),
+    NotFound,
+    NotAcceptable,
+    MultipleChoices,
+    Overloaded,
+}
+
+const MAX_MULTIVIEW_DIRECTORY_ENTRIES: usize = 1024;
+pub(crate) const MAX_MULTIVIEW_CANDIDATES: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct VariantScore {
+    quality: u64,
+    media_specificity: u8,
+    language_priority: usize,
+}
+
+fn quality_value(raw: &str) -> Option<u16> {
+    let raw = raw.trim();
+    let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+    if fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    match whole {
+        "0" => {
+            let mut value = 0u16;
+            for (index, byte) in fraction.bytes().enumerate() {
+                value += u16::from(byte - b'0') * [100, 10, 1][index];
+            }
+            Some(value)
+        }
+        "1" if fraction.bytes().all(|byte| byte == b'0') => Some(1000),
+        _ => None,
+    }
+}
+
+fn item_quality<'a>(parts: impl Iterator<Item = &'a str>) -> u16 {
+    for parameter in parts {
+        let Some((name, value)) = parameter.trim().split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("q") {
+            return quality_value(value).unwrap_or(0);
+        }
+    }
+    1000
+}
+
+fn media_quality(header: Option<&[u8]>, media_type: &str) -> (u16, u8) {
+    let Some(header) = header else {
+        return (1000, 0);
+    };
+    let Ok(header) = std::str::from_utf8(header) else {
+        return (0, 0);
+    };
+    let media_type = media_type.split(';').next().unwrap_or("").trim();
+    let Some((candidate_type, candidate_subtype)) = media_type.split_once('/') else {
+        return (0, 0);
+    };
+    let mut selected: Option<(u8, u16)> = None;
+    for item in header.split(',') {
+        let mut parts = item.split(';');
+        let range = parts.next().unwrap_or("").trim();
+        let Some((kind, subtype)) = range.split_once('/') else {
+            continue;
+        };
+        let specificity = if kind == "*" && subtype == "*" {
+            Some(0)
+        } else if kind.eq_ignore_ascii_case(candidate_type) && subtype == "*" {
+            Some(1)
+        } else if kind.eq_ignore_ascii_case(candidate_type)
+            && subtype.eq_ignore_ascii_case(candidate_subtype)
+        {
+            Some(2)
+        } else {
+            None
+        };
+        let Some(specificity) = specificity else {
+            continue;
+        };
+        let quality = item_quality(parts);
+        if selected
+            .map(|(current, _)| specificity >= current)
+            .unwrap_or(true)
+        {
+            selected = Some((specificity, quality));
+        }
+    }
+    selected
+        .map(|(specificity, quality)| (quality, specificity))
+        .unwrap_or((0, 0))
+}
+
+fn language_quality(header: Option<&[u8]>, language: Option<&str>) -> u16 {
+    let Some(header) = header else {
+        return 1000;
+    };
+    // A representation with no language metadata is language-independent.
+    let Some(language) = language else {
+        return 1000;
+    };
+    let Ok(header) = std::str::from_utf8(header) else {
+        return 0;
+    };
+    let mut best = 0u16;
+    for item in header.split(',') {
+        let mut parts = item.split(';');
+        let range = parts.next().unwrap_or("").trim();
+        let matches = range == "*"
+            || language.eq_ignore_ascii_case(range)
+            || language
+                .get(..range.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(range))
+                && language.as_bytes().get(range.len()) == Some(&b'-');
+        if matches {
+            best = best.max(item_quality(parts));
+        }
+    }
+    best
+}
+
+fn encoding_quality(header: Option<&[u8]>, encoding: Option<&str>) -> u16 {
+    let Some(header) = header else {
+        // Do not select a pre-encoded sibling without an explicit client
+        // offer. The identity representation remains universally eligible.
+        return if encoding.is_none() { 1000 } else { 0 };
+    };
+    let Ok(header) = std::str::from_utf8(header) else {
+        return 0;
+    };
+    let candidate = encoding.unwrap_or("identity");
+    let mut explicit = None;
+    let mut wildcard = None;
+    for item in header.split(',') {
+        let mut parts = item.split(';');
+        let name = parts.next().unwrap_or("").trim();
+        let quality = item_quality(parts);
+        if name.eq_ignore_ascii_case(candidate)
+            || (candidate.eq_ignore_ascii_case("x-gzip") && name.eq_ignore_ascii_case("gzip"))
+            || (candidate.eq_ignore_ascii_case("gzip") && name.eq_ignore_ascii_case("x-gzip"))
+        {
+            explicit = Some(quality);
+        } else if name == "*" {
+            wildcard = Some(quality);
+        }
+    }
+    explicit.unwrap_or_else(|| {
+        if encoding.is_none() {
+            wildcard.unwrap_or(1000)
+        } else {
+            wildcard.unwrap_or(0)
+        }
+    })
+}
+
+fn static_negotiation_handler(scope: &Scope, name: &[u8]) -> bool {
+    crate::config::effective_handler(scope, name).is_none_or(|handler| {
+        handler.trim().is_empty()
+            || handler.eq_ignore_ascii_case("default-handler")
+            || handler.eq_ignore_ascii_case("none")
+    })
+}
+
+/// Resolve the default Apache `MultiViewsMatch NegotiatedOnly` shape. The
+/// directory scan and candidate set are hard-capped and charged to the
+/// request's shared policy-work budget. Every candidate is opened relative to
+/// the already-pinned parent descriptor under the active symlink policy.
+pub fn multiviews_target(
+    cfg: &Config,
+    scope: &Scope,
+    req: &Request,
+    root: &Path,
+    rel: &Path,
+    follow_symlinks: bool,
+    owner_match_only: bool,
+) -> MultiViewsResult {
+    if !scope
+        .effective_options()
+        .contains(crate::config::Options::MULTIVIEWS)
+    {
+        return MultiViewsResult::NotFound;
+    }
+    let Some(requested_name) = rel.file_name().map(|name| name.as_bytes()) else {
+        return MultiViewsResult::NotFound;
+    };
+    if requested_name.is_empty() || requested_name == b"." || requested_name == b".." {
+        return MultiViewsResult::NotFound; // coverage:ignore-line - Path::file_name excludes these terminal components
+    }
+    let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
+    let Target::Directory { file: parent, .. } =
+        resolve_target_checked(root, parent_rel, follow_symlinks, owner_match_only)
+    else {
+        return MultiViewsResult::NotFound;
+    };
+    let Some(_expensive) = crate::resource::try_expensive() else {
+        return MultiViewsResult::Overloaded;
+    };
+    let path = format!("/proc/self/fd/{}", parent.as_raw_fd());
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return MultiViewsResult::NotFound; // coverage:ignore-line - procfs disappeared after the parent fd was opened
+    };
+    let mut prefix = requested_name.to_vec();
+    prefix.push(b'.');
+    let mut scanned = 0usize;
+    let mut candidates = 0usize;
+    let mut saw_typed_variant = false;
+    let mut best: Option<(VariantScore, MultiView)> = None;
+    let mut ambiguous = false;
+    for entry in entries {
+        scanned += 1;
+        if scanned > MAX_MULTIVIEW_DIRECTORY_ENTRIES {
+            return MultiViewsResult::Overloaded;
+        }
+        let Ok(entry) = entry else {
+            continue; // coverage:ignore-line - filesystem readdir I/O failure
+        };
+        let name = entry.file_name().as_encoded_bytes().to_vec();
+        if req
+            .charge_policy_work((name.len() as u64).saturating_add(1))
+            .is_err()
+        {
+            return MultiViewsResult::Overloaded;
+        }
+        if !name.starts_with(&prefix) || name.len() == prefix.len() {
+            continue;
+        }
+        candidates += 1;
+        if candidates > MAX_MULTIVIEW_CANDIDATES {
+            return MultiViewsResult::Overloaded;
+        }
+        let Some(media_type) = mime_type(cfg, scope, &name) else {
+            continue;
+        };
+        if !static_negotiation_handler(scope, &name) {
+            continue;
+        }
+        saw_typed_variant = true;
+        let (media, media_specificity) = media_quality(req.header("accept"), &media_type);
+        let language = cfg.mime.content_language(&name);
+        let language_quality = language_quality(req.header("accept-language"), language);
+        let encoding_quality = encoding_quality(
+            req.header("accept-encoding"),
+            cfg.mime.content_encoding(&name),
+        );
+        let quality = u64::from(media)
+            .saturating_mul(u64::from(language_quality))
+            .saturating_mul(u64::from(encoding_quality));
+        let acceptable = quality > 0;
+        let opened = open_at_with_symlink_policy(&parent, &name, follow_symlinks, owner_match_only);
+        let Ok(file) = opened else {
+            continue;
+        };
+        let Ok(meta) = file.metadata() else {
+            continue; // coverage:ignore-line - metadata failure on an already-open regular candidate
+        };
+        if !vapache_verified::multiview_candidate_admit(
+            true,
+            true,
+            true,
+            true,
+            meta.is_file(),
+            true,
+            true,
+            acceptable,
+            scanned <= MAX_MULTIVIEW_DIRECTORY_ENTRIES && candidates <= MAX_MULTIVIEW_CANDIDATES,
+        ) {
+            continue;
+        }
+        let language_priority = language
+            .and_then(|language| {
+                scope
+                    .content_policy
+                    .language_priority
+                    .as_ref()?
+                    .iter()
+                    .position(|configured| configured.eq_ignore_ascii_case(language))
+            })
+            .map(|position| usize::MAX - position)
+            .unwrap_or(0);
+        let score = VariantScore {
+            quality,
+            media_specificity,
+            language_priority,
+        };
+        match best.as_ref().map(|(best, _)| score.cmp(best)) {
+            None | Some(CmpOrdering::Greater) => {
+                best = Some((score, MultiView { name, file, meta }));
+                ambiguous = false;
+            }
+            Some(CmpOrdering::Equal) => ambiguous = true,
+            Some(CmpOrdering::Less) => {}
+        }
+    }
+    if ambiguous {
+        MultiViewsResult::MultipleChoices
+    } else if let Some((_, selected)) = best {
+        MultiViewsResult::Selected(selected)
+    } else if saw_typed_variant {
+        MultiViewsResult::NotAcceptable
+    } else {
+        MultiViewsResult::NotFound
+    }
+}
+
 /// Directory descriptor for `/proc/self/fd`, opened once.  `readlinkat` on a
 /// bare descriptor number avoids re-walking the `/proc/self/fd` prefix for
 /// every target.  If procfs is unavailable we fall back to `read_link`.
@@ -2203,11 +2517,13 @@ pub fn error_response(
 fn error_message(status: u16, url: &str) -> String {
     let url = html_escape(url.as_bytes());
     match status {
+        300 => "The requested resource has multiple available representations.".into(),
         400 => "Your browser sent a request that this server could not understand.".into(),
         401 => "This server could not verify that you are authorized to access the document requested.".into(),
         403 => format!("You don't have permission to access this resource."),
         404 => format!("The requested URL {url} was not found on this server."),
         405 => "The requested method is not allowed for this URL.".into(),
+        406 => "No representation of the requested resource is acceptable to this client.".into(),
         408 => "The server closed the network connection because the browser didn't finish the request within the specified time.".into(),
         412 => "The precondition on the request for the URL failed positive evaluation.".into(),
         413 => "The requested resource does not allow request data with the requested method.".into(),
@@ -2354,6 +2670,269 @@ mod tests {
         .unwrap();
         let cfg = Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
         (dir, cfg)
+    }
+
+    #[test]
+    fn multiviews_selects_only_acceptable_typed_static_variants() {
+        let (root, mut cfg) = config("multiview-static");
+        std::fs::write(root.join("app.js"), b"selected").unwrap();
+        cfg.mime
+            .add_type("application/javascript", &["js".to_string()]);
+        let mut scope = cfg.global.clone();
+        scope.options.push_add(crate::config::Options::MULTIVIEWS);
+
+        let req = request("GET", b"/app");
+        let MultiViewsResult::Selected(mut selected) =
+            multiviews_target(&cfg, &scope, &req, &root, Path::new("app"), false, false)
+        else {
+            panic!("typed static representation was not selected");
+        };
+        assert_eq!(selected.name, b"app.js");
+        let mut body = String::new();
+        selected.file.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "selected");
+
+        let mut unacceptable = request("GET", b"/app");
+        unacceptable
+            .headers
+            .insert("accept", b"text/plain".to_vec());
+        assert!(matches!(
+            multiviews_target(
+                &cfg,
+                &scope,
+                &unacceptable,
+                &root,
+                Path::new("app"),
+                false,
+                false,
+            ),
+            MultiViewsResult::NotAcceptable
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn multiviews_never_promotes_a_handler_candidate() {
+        let (root, mut cfg) = config("multiview-handler");
+        std::fs::write(root.join("tool.cgi"), b"not executed").unwrap();
+        cfg.mime.add_type("application/x-cgi", &["cgi".to_string()]);
+        let mut scope = cfg.global.clone();
+        scope.options.push_add(crate::config::Options::MULTIVIEWS);
+        scope
+            .mapping_policy
+            .handlers
+            .push(crate::config::Handler::add(
+                "cgi".into(),
+                "cgi-script".into(),
+            ));
+
+        assert!(matches!(
+            multiviews_target(
+                &cfg,
+                &scope,
+                &request("GET", b"/tool"),
+                &root,
+                Path::new("tool"),
+                false,
+                false,
+            ),
+            MultiViewsResult::NotFound
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn multiviews_reports_ambiguous_and_bounded_candidate_sets() {
+        let (root, mut cfg) = config("multiview-bounds");
+        cfg.mime.add_type("text/html", &["html".to_string()]);
+        cfg.mime.add_type("text/plain", &["txt".to_string()]);
+        let mut scope = cfg.global.clone();
+        scope.options.push_add(crate::config::Options::MULTIVIEWS);
+        std::fs::write(root.join("page.html"), b"html").unwrap();
+        std::fs::write(root.join("page.txt"), b"text").unwrap();
+        assert!(matches!(
+            multiviews_target(
+                &cfg,
+                &scope,
+                &request("GET", b"/page"),
+                &root,
+                Path::new("page"),
+                false,
+                false,
+            ),
+            MultiViewsResult::MultipleChoices
+        ));
+
+        for index in 0..=MAX_MULTIVIEW_CANDIDATES {
+            std::fs::write(root.join(format!("many.{index}.txt")), b"candidate").unwrap();
+        }
+        assert!(matches!(
+            multiviews_target(
+                &cfg,
+                &scope,
+                &request("GET", b"/many"),
+                &root,
+                Path::new("many"),
+                false,
+                false,
+            ),
+            MultiViewsResult::Overloaded
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn multiview_quality_parsers_fail_closed() {
+        assert_eq!(quality_value("0"), Some(0));
+        assert_eq!(quality_value("0.125"), Some(125));
+        assert_eq!(quality_value("1.000"), Some(1000));
+        assert_eq!(quality_value("1.001"), None);
+        assert_eq!(quality_value("0.0000"), None);
+        assert_eq!(item_quality(["level=1"].into_iter()), 1000);
+        assert_eq!(item_quality(["q=bad"].into_iter()), 0);
+        assert_eq!(media_quality(None, "text/html"), (1000, 0));
+        assert_eq!(media_quality(Some(b"\xff"), "text/html"), (0, 0));
+        assert_eq!(media_quality(Some(b"text/html"), "invalid"), (0, 0));
+        assert_eq!(
+            media_quality(Some(b"invalid, text/*"), "text/html"),
+            (1000, 1)
+        );
+        assert_eq!(
+            media_quality(Some(b"text/*;q=0.4, text/html;q=0.8"), "text/html"),
+            (800, 2)
+        );
+        assert_eq!(language_quality(None, Some("en")), 1000);
+        assert_eq!(language_quality(Some(b"en"), None), 1000);
+        assert_eq!(language_quality(Some(b"\xff"), Some("en")), 0);
+        assert_eq!(encoding_quality(Some(b"*;q=0, gzip;q=1"), None), 0);
+        assert_eq!(
+            encoding_quality(Some(b"*;q=0, gzip;q=1"), Some("gzip")),
+            1000
+        );
+        assert_eq!(encoding_quality(Some(b"gzip"), Some("br")), 0);
+        assert_eq!(encoding_quality(Some(b"\xff"), Some("br")), 0);
+        assert_eq!(
+            language_quality(Some(b"en;q=0.7, *;q=0.1"), Some("en-US")),
+            700
+        );
+    }
+
+    #[test]
+    fn multiviews_admission_edges_are_bounded() {
+        let (root, mut cfg) = config("multiview-admission");
+        cfg.mime.add_type("text/html", &["html".to_string()]);
+        cfg.mime.languages.insert("en".into(), "en".into());
+        cfg.mime.languages.insert("fr".into(), "fr".into());
+        let mut scope = cfg.global.clone();
+        let req = request("GET", b"/page");
+
+        assert!(matches!(
+            multiviews_target(&cfg, &scope, &req, &root, Path::new("page"), false, false),
+            MultiViewsResult::NotFound
+        ));
+        scope.options.push_add(crate::config::Options::MULTIVIEWS);
+        assert!(matches!(
+            multiviews_target(&cfg, &scope, &req, &root, Path::new(""), false, false),
+            MultiViewsResult::NotFound
+        ));
+        assert!(matches!(
+            multiviews_target(
+                &cfg,
+                &scope,
+                &req,
+                &root,
+                Path::new("missing/page"),
+                false,
+                false,
+            ),
+            MultiViewsResult::NotFound
+        ));
+
+        std::fs::write(root.join("plain.unknown-vapache-type"), b"plain").unwrap();
+        assert!(matches!(
+            multiviews_target(&cfg, &scope, &req, &root, Path::new("plain"), false, false),
+            MultiViewsResult::NotFound
+        ));
+        std::os::unix::fs::symlink("absent.html", root.join("dangling.html")).unwrap();
+        assert!(matches!(
+            multiviews_target(
+                &cfg,
+                &scope,
+                &req,
+                &root,
+                Path::new("dangling"),
+                false,
+                false,
+            ),
+            MultiViewsResult::NotAcceptable
+        ));
+
+        std::fs::write(root.join("budget.html"), b"budget").unwrap();
+        let budgeted = request("GET", b"/budget");
+        budgeted
+            .charge_policy_work(crate::resource::MAX_POLICY_WORK_UNITS)
+            .unwrap();
+        assert!(matches!(
+            multiviews_target(
+                &cfg,
+                &scope,
+                &budgeted,
+                &root,
+                Path::new("budget"),
+                false,
+                false,
+            ),
+            MultiViewsResult::Overloaded
+        ));
+
+        let overloaded =
+            crate::resource::with_expensive_client("192.0.2.201".parse().unwrap(), || {
+                let leases: Vec<_> = (0..crate::resource::MAX_EXPENSIVE_OPS_PER_CLIENT)
+                    .map(|_| crate::resource::try_expensive().unwrap())
+                    .collect();
+                let result =
+                    multiviews_target(&cfg, &scope, &req, &root, Path::new("budget"), false, false);
+                drop(leases);
+                result
+            });
+        assert!(matches!(overloaded, MultiViewsResult::Overloaded));
+
+        std::fs::write(root.join("choice.html.en"), b"english").unwrap();
+        std::fs::write(root.join("choice.html.fr"), b"french").unwrap();
+        scope.content_policy.language_priority = Some(vec!["fr".into(), "en".into()]);
+        let mut language = request("GET", b"/choice");
+        language
+            .headers
+            .insert("accept-language", b"en, fr".to_vec());
+        let MultiViewsResult::Selected(selected) = multiviews_target(
+            &cfg,
+            &scope,
+            &language,
+            &root,
+            Path::new("choice"),
+            false,
+            false,
+        ) else {
+            panic!("language priority did not select a representation");
+        };
+        assert_eq!(selected.name, b"choice.html.fr");
+
+        for index in 0..=MAX_MULTIVIEW_DIRECTORY_ENTRIES {
+            std::fs::write(root.join(format!("unrelated-{index}")), b"x").unwrap();
+        }
+        assert!(matches!(
+            multiviews_target(
+                &cfg,
+                &scope,
+                &request("GET", b"/absent"),
+                &root,
+                Path::new("absent"),
+                false,
+                false,
+            ),
+            MultiViewsResult::Overloaded
+        ));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

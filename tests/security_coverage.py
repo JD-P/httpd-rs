@@ -29,7 +29,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PROFILE = Path(os.environ.get("SECURITY_COVERAGE_PROFILE", "/tmp/vapcov/all.profdata"))
-COV_TARGET = ROOT / "target" / "cov"
+COV_TARGET = Path(os.environ.get("COVERAGE_TARGET_DIR", ROOT / "target" / "cov"))
+if not COV_TARGET.is_absolute():
+    COV_TARGET = ROOT / COV_TARGET
 BASELINE = Path(
     os.environ.get(
         "SECURITY_COVERAGE_BASELINE",
