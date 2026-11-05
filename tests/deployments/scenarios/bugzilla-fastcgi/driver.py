@@ -243,11 +243,18 @@ ProxyPassMatch ^/(.*\\.cgi(/.*)?)$ "unix:{socket_path}|fcgi://localhost{bugzilla
             extra=common,
         )
         start_apache(context, apache_config, apache_port)
-        require_response(apache_port, "/index.cgi", contains=b"Bugzilla")
+        public_host = f"127.0.0.1:{port}"
+        require_response(
+            apache_port,
+            "/index.cgi",
+            contains=b"Bugzilla",
+            headers={"Host": public_host},
+        )
         differential_benchmark(
             port,
             apache_port,
             "/index.cgi",
             context.artifact_dir / "apache-vapache-benchmark.json",
+            headers=(f"Host: {public_host}",),
             connections=2,
         )

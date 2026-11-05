@@ -237,7 +237,10 @@ def require_response(
 ) -> tuple[dict[str, str], bytes]:
     actual, response_headers, body = request(port, path, headers=headers, tls=tls)
     if actual != status:
-        raise DeploymentError(f"{path}: expected HTTP {status}, received {actual}: {body[:500]!r}")
+        raise DeploymentError(
+            f"{path}: expected HTTP {status}, received {actual}; "
+            f"headers={response_headers!r}: {body[:500]!r}"
+        )
     if contains is not None and contains not in body:
         raise DeploymentError(f"{path}: response did not contain {contains!r}: {body[:500]!r}")
     return response_headers, body
