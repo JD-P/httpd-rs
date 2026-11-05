@@ -1,9 +1,9 @@
 {
   "crates/server/src/access.rs": 5,
   "crates/server/src/cache.rs": 4,
-  "crates/server/src/cgi.rs": 53,
-  "crates/server/src/config.rs": 6,
-  "crates/server/src/fastcgi.rs": 15,
+  "crates/server/src/cgi.rs": 56,
+  "crates/server/src/config.rs": 7,
+  "crates/server/src/fastcgi.rs": 16,
   "crates/server/src/files.rs": 6,
   "crates/server/src/h2.rs": 0,
   "crates/server/src/htaccess.rs": 1,
@@ -14,5 +14,5 @@
   "crates/server/src/proxy.rs": 7,
   "crates/server/src/rewrite.rs": 10,
   "crates/server/src/server.rs": 10,
-  "crates/server/src/tls.rs": 22
+  "crates/server/src/tls.rs": 23
 }
