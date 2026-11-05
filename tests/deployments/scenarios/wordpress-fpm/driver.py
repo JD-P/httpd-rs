@@ -153,14 +153,18 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
     # root-owned and leave only the upload directory writable by PHP-FPM.
     compose.exec("wordpress", ["chown", "-R", f"{os.getuid()}:{os.getgid()}", "/var/www/html"], user="0")
     htaccess = wordpress_root / ".htaccess"
+    # WordPress's stock authorization rule matches every request, including
+    # static assets.  Vapache deliberately will not let a cache hit bypass a
+    # rewrite with environment side effects.  Attach the same forwarding
+    # effect only to the two rules that actually select index.php, leaving
+    # static representations safely cacheable.
     htaccess.write_text(
         "RewriteEngine On\n"
-        "RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]\n"
         "RewriteBase /\n"
-        "RewriteRule ^index\\.php$ - [L]\n"
+        "RewriteRule ^index\\.php$ - [L,E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]\n"
         "RewriteCond %{REQUEST_FILENAME} !-f\n"
         "RewriteCond %{REQUEST_FILENAME} !-d\n"
-        "RewriteRule . /index.php [L]\n"
+        "RewriteRule . /index.php [L,E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]\n"
     )
     os.chmod(htaccess, 0o644)
     uploads = wordpress_root / "wp-content/uploads"
