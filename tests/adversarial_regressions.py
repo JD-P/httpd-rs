@@ -43,6 +43,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
+# Use the platform temporary directory by default.  Environments whose system
+# temp mount is noexec can select an executable scratch mount explicitly.
+TEST_TMPDIR = os.environ.get("VAPACHE_TEST_TMPDIR")
 
 SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
 SERVICE_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
@@ -339,7 +342,7 @@ class F23ToF38Tests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-adversarial-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-adversarial-", dir=TEST_TMPDIR))
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
         cls.cache = cls.base / "cache"
@@ -475,7 +478,7 @@ class F23ToF38Tests(unittest.TestCase):
         # F31: an absolute target outside ServerRoot.  The capture-only alias
         # must fail instead of re-rooting at the file's parent directory.
         cls.alias_dir = Path(
-            tempfile.mkdtemp(prefix="vapache-alias-escape-", dir="/tmp/opencode")
+            tempfile.mkdtemp(prefix="vapache-alias-escape-", dir=TEST_TMPDIR)
         )
         cls.alias_secret = cls.alias_dir / "secret.txt"
         cls.alias_secret.write_text("WALLET-ALIAS-SECRET\n")
@@ -938,7 +941,7 @@ class F48AddressBoundVhostTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-vhost-ip-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-vhost-ip-", dir=TEST_TMPDIR))
         cls.public = cls.base / "public"
         cls.admin = cls.base / "admin"
         cls.logs = cls.base / "logs"
@@ -1038,7 +1041,7 @@ class F49IPv4MappedPeerTests(unittest.TestCase):
             raise unittest.SkipTest(f"missing {VAPACHED}")
         if not socket.has_ipv6:
             raise unittest.SkipTest("IPv6 unavailable")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-ipmapped-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-ipmapped-", dir=TEST_TMPDIR))
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
         cls.base.chmod(0o755)
@@ -1142,7 +1145,7 @@ class F50AncestorAccessFileTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f50-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f50-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.app = cls.base / "app"
         cls.www = cls.app / "public"
@@ -1265,7 +1268,7 @@ class F51OverlappingAliasAccessRootTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f51-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f51-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.site = cls.base / "site"
@@ -1359,7 +1362,7 @@ class F52DirectoryIndexCacheTargetTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f52-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f52-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.cache = cls.base / "cache"
@@ -1450,7 +1453,7 @@ class F53AliasRewriteBaseTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f53-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f53-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.site = cls.base / "site"
@@ -1572,7 +1575,7 @@ class F57RequestUriIdentityTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f57-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f57-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
@@ -1692,7 +1695,7 @@ class F58ParentRewriteSubjectTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f58-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f58-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.ancestor = cls.base / "ancestor"
         cls.www = cls.ancestor / "public"
@@ -1847,7 +1850,7 @@ class F59ExplicitTargetAccessLayerTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f59-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f59-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.real = cls.base / "real" / "public"
         cls.root = cls.base / "www" / "html"
@@ -1967,7 +1970,7 @@ class F60ResolvedTargetScopeTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f60-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f60-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.real = cls.base / "real" / "public"
         cls.root = cls.base / "www" / "html"
@@ -2196,7 +2199,7 @@ class F60AllowOverrideDenyTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f60-override-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f60-override-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.real = cls.base / "real" / "public"
         cls.root = cls.base / "www" / "html"
@@ -2269,7 +2272,7 @@ class F54SetHandlerCacheTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f54-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f54-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.cache = cls.base / "cache"
@@ -2341,7 +2344,7 @@ class F55CacheKeyBytesTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f55-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f55-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.cache = cls.base / "cache"
@@ -2418,7 +2421,7 @@ class F56ErrorDocumentCacheTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f56-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f56-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.cache = cls.base / "cache"
@@ -2479,7 +2482,7 @@ class F67PassthroughTargetTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f67-pt-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f67-pt-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
@@ -2539,7 +2542,7 @@ class F68StickyFilesystemOverrideTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f68-sticky-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f68-sticky-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
@@ -2623,7 +2626,7 @@ class UnsafePrefixStatWarningTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f32-warn-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f32-warn-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
@@ -2688,7 +2691,7 @@ class F61ToF69Pass11Tests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-pass11-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-pass11-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
@@ -2911,7 +2914,7 @@ class P13LexicalHandlerIdentityTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p13-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p13-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
@@ -3022,7 +3025,7 @@ class P14ConfigRewriteHardeningTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p14-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p14-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "htdocs"  # Exercise the implicit DocumentRoot.
         cls.logs = cls.base / "logs"
@@ -3243,7 +3246,7 @@ class P15ApacheParityHardeningTests(unittest.TestCase):
     def setUpClass(cls):
         if not VAPACHED.exists():
             raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p15-", dir="/tmp/opencode"))
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p15-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
