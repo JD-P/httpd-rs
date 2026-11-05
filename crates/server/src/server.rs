@@ -3984,6 +3984,7 @@ pub(crate) enum PreparedHandler {
         local_ip: String,
         grant: access::AccessGrant,
         resource: access::ResourceKey,
+        request_uri: String,
         url_path: String,
         mapping_root: PathBuf,
     },
@@ -3998,6 +3999,7 @@ pub(crate) enum PreparedHandler {
         resource: access::ResourceKey,
         root: PathBuf,
         script_rel: PathBuf,
+        request_uri: String,
         url_path: String,
         path_info: String,
         script_name: String,
@@ -4151,6 +4153,7 @@ impl PreparedHandler {
                 local_ip,
                 grant,
                 resource,
+                request_uri,
                 url_path,
                 mapping_root,
             } => {
@@ -4159,6 +4162,7 @@ impl PreparedHandler {
                     cfg,
                     vhost,
                     req,
+                    &request_uri,
                     &url_path,
                     &server_name,
                     peer,
@@ -4182,6 +4186,7 @@ impl PreparedHandler {
                 resource,
                 root,
                 script_rel,
+                request_uri,
                 url_path,
                 path_info,
                 script_name,
@@ -4196,6 +4201,7 @@ impl PreparedHandler {
                     req,
                     &root,
                     &script_rel,
+                    &request_uri,
                     &url_path,
                     &path_info,
                     &script_name,
@@ -5094,6 +5100,8 @@ fn authorize_original_request(
 }
 
 struct UrlPhaseLocal {
+    /// Canonical public path before internal URL or filesystem rewrites.
+    request_uri: String,
     target: CanonicalTarget,
     owned_req: Option<Request>,
     rewrite_effects: crate::rewrite::Effects,
@@ -5107,6 +5115,7 @@ enum UrlPhaseResult {
 }
 
 struct UrlPhaseStart<'a> {
+    request_uri: &'a str,
     effects: crate::rewrite::Effects,
     stop_rewriting: bool,
     prior_scope: (&'a str, &'a Path, &'a Scope),
@@ -5228,6 +5237,7 @@ fn dispatch_url_proxy(
     mut scope: Scope,
     prior_scope: Option<(&str, &Path, &Scope)>,
     req: &Request,
+    request_uri: &str,
     front_url_path: &str,
     fs_hint: &Path,
     mapping_root: &Path,
@@ -5383,6 +5393,7 @@ fn dispatch_url_proxy(
                     local_ip: local_ip.to_string(),
                     grant,
                     resource,
+                    request_uri: request_uri.to_string(),
                     url_path: front_url_path.to_string(),
                     mapping_root: mapping_root.to_path_buf(),
                 });
@@ -5391,6 +5402,7 @@ fn dispatch_url_proxy(
                 cfg,
                 vhost,
                 req,
+                request_uri,
                 front_url_path,
                 server_name,
                 peer,
@@ -5436,6 +5448,12 @@ fn run_url_translation_phase(
             ));
         }
     };
+    // Capture this before rewrites.  A filesystem rewrite re-entering this
+    // phase supplies the original value explicitly through `UrlPhaseStart`.
+    let request_uri = start
+        .as_ref()
+        .map(|start| start.request_uri.to_string())
+        .unwrap_or_else(|| target.url_path.clone());
     let mut owned_req = None;
     let mut effects = start
         .as_ref()
@@ -5616,6 +5634,7 @@ fn run_url_translation_phase(
                         proxy_scope,
                         prior,
                         current_req,
+                        &request_uri,
                         &target.url_path,
                         &fs_hint,
                         &mapping_root,
@@ -5769,6 +5788,7 @@ fn run_url_translation_phase(
                 scope,
                 prior,
                 current_req,
+                &request_uri,
                 &target.url_path,
                 &fs_hint,
                 &mapping_root,
@@ -5801,6 +5821,7 @@ fn run_url_translation_phase(
         url != &target.url_path || !effects.is_empty() || owned_req.is_some()
     });
     UrlPhaseResult::Local(UrlPhaseLocal {
+        request_uri,
         target,
         owned_req,
         rewrite_effects: effects,
@@ -5936,6 +5957,7 @@ fn dispatch_inner(
         UrlPhaseResult::Local(local) => local,
     };
     let UrlPhaseLocal {
+        request_uri,
         target: url_target,
         owned_req: url_owned_req,
         rewrite_effects: url_rewrite_effects,
@@ -6500,6 +6522,7 @@ fn dispatch_inner(
                         https,
                         server_name,
                         Some(UrlPhaseStart {
+                            request_uri: &request_uri,
                             effects: rewrite_effects.clone(),
                             stop_rewriting: final_pass,
                             prior_scope: (
@@ -6899,6 +6922,7 @@ fn dispatch_inner(
                     local_ip: local_ip.to_string(),
                     grant,
                     resource,
+                    request_uri: request_uri.clone(),
                     url_path: url_path.clone(),
                     mapping_root: root,
                 });
@@ -6907,6 +6931,7 @@ fn dispatch_inner(
                 cfg,
                 vhost,
                 req,
+                &request_uri,
                 &url_path,
                 &server_name,
                 peer,
@@ -7101,6 +7126,7 @@ fn dispatch_inner(
                         local_ip: local_ip.to_string(),
                         grant: target_grant,
                         resource: target_resource,
+                        request_uri: request_uri.clone(),
                         url_path: url_path.clone(),
                         mapping_root: root,
                     });
@@ -7109,6 +7135,7 @@ fn dispatch_inner(
                     cfg,
                     vhost,
                     req,
+                    &request_uri,
                     &url_path,
                     &server_name,
                     peer,
@@ -7138,6 +7165,7 @@ fn dispatch_inner(
                         resource: target_resource,
                         root: script_root,
                         script_rel,
+                        request_uri: request_uri.clone(),
                         url_path: url_path.clone(),
                         path_info: String::new(),
                         script_name: url_path.clone(),
@@ -7152,6 +7180,7 @@ fn dispatch_inner(
                     req,
                     &script_root,
                     &script_rel,
+                    &request_uri,
                     &url_path,
                     "",
                     &url_path,
@@ -7516,6 +7545,7 @@ fn dispatch_inner(
                                 resource: target_resource,
                                 root: script_root,
                                 script_rel,
+                                request_uri: request_uri.clone(),
                                 url_path: url_path.clone(),
                                 path_info: st.path_info,
                                 script_name,
@@ -7530,6 +7560,7 @@ fn dispatch_inner(
                             req,
                             &script_root,
                             &script_rel,
+                            &request_uri,
                             &url_path,
                             &st.path_info,
                             &script_name,
@@ -7756,6 +7787,7 @@ fn run_fastcgi(
     cfg: &Config,
     vhost: Option<&VHost>,
     req: &Request,
+    request_uri: &str,
     url_path: &str,
     server_name: &str,
     peer: SocketAddr,
@@ -7938,6 +7970,7 @@ fn run_fastcgi(
         req,
         root: &docroot,
         script_rel: Path::new(""),
+        request_uri,
         script_name: url_path,
         path_info: &target.path_info,
         docroot: &docroot,
@@ -7973,6 +8006,7 @@ fn run_cgi(
     req: &Request,
     root: &Path,
     script_rel: &Path,
+    request_uri: &str,
     url_path: &str,
     path_info: &str,
     script_name: &str,
@@ -8063,6 +8097,7 @@ fn run_cgi(
         req,
         root,
         script_rel,
+        request_uri,
         script_name,
         path_info,
         docroot: &docroot,
@@ -10350,6 +10385,7 @@ mod tests {
             &dir.join("www"),
             Path::new("script.cgi"),
             "/script.cgi",
+            "/script.cgi",
             "",
             "/script.cgi",
             "localhost",
@@ -10385,6 +10421,7 @@ mod tests {
             &script_req,
             &dir.join("www"),
             Path::new("script.cgi"),
+            "/script.cgi",
             "/script.cgi",
             "",
             "/script.cgi",
@@ -10426,6 +10463,7 @@ mod tests {
             &dir.join("www"),
             Path::new("script.cgi"),
             "/script.cgi",
+            "/script.cgi",
             "",
             "/script.cgi",
             "localhost",
@@ -10448,6 +10486,7 @@ mod tests {
             &script_req,
             &dir.join("www"),
             Path::new("script.cgi"),
+            "/script.cgi",
             "/script.cgi",
             "",
             "/script.cgi",
@@ -11330,6 +11369,7 @@ mod tests {
             None,
             &req,
             "/script.php/info",
+            "/script.php/info",
             "localhost",
             cov_peer(),
             "127.0.0.1",
@@ -11349,6 +11389,7 @@ mod tests {
             None,
             &req,
             "/missing.php",
+            "/missing.php",
             "localhost",
             cov_peer(),
             "127.0.0.1",
@@ -11366,6 +11407,7 @@ mod tests {
             &cfg,
             None,
             &unauthorized,
+            "/script.php/info",
             "/script.php/info",
             "localhost",
             cov_peer(),

@@ -2369,6 +2369,7 @@ mod tests {
             req: &req,
             root: &dir,
             script_rel: Path::new(""),
+            request_uri: "/hello-world/",
             script_name: "/index.php",
             path_info: "",
             docroot: &dir,
@@ -2395,6 +2396,10 @@ mod tests {
         let params = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
         assert!(params.contains("SCRIPT_FILENAME"));
         assert!(params.contains("/var/www/html/index.php"));
+        assert!(params.contains("REQUEST_URI"));
+        assert!(params.contains("/hello-world/"));
+        assert!(params.contains("SCRIPT_NAME"));
+        assert!(params.contains("/index.php"));
         assert!(params.contains("REMOTE_USER"));
         assert!(params.contains("alice"));
         assert!(params.contains("AUTH_TYPE"));
@@ -2453,6 +2458,7 @@ mod tests {
             req: &req,
             root: &dir,
             script_rel: Path::new(""),
+            request_uri: "/index.php/info",
             script_name: "/index.php/info",
             path_info: "/info",
             docroot: &dir,
@@ -2520,6 +2526,7 @@ mod tests {
             req: &req,
             root: &dir,
             script_rel: Path::new(""),
+            request_uri: "/index.php",
             script_name: "/index.php",
             path_info: "",
             docroot: &dir,
@@ -3289,6 +3296,7 @@ mod tests {
             req: &req,
             root: &dir,
             script_rel: Path::new(""),
+            request_uri: "/index.php",
             script_name: "/index.php",
             path_info: "",
             docroot: &dir,

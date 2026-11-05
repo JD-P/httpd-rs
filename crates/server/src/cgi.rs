@@ -162,6 +162,10 @@ pub struct CgiContext<'a> {
     pub req: &'a Request,
     pub root: &'a Path,
     pub script_rel: &'a Path,
+    /// Canonical public URL path before any internal rewrite.  This remains
+    /// distinct from `script_name`, which identifies the selected CGI/FastCGI
+    /// program after routing.
+    pub request_uri: &'a str,
     pub script_name: &'a str,
     pub path_info: &'a str,
     pub docroot: &'a Path,
@@ -253,15 +257,11 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
     );
     put("DOCUMENT_ROOT", ctx.docroot.to_string_lossy().into_owned());
     put("REQUEST_METHOD", ctx.req.method.clone());
-    // Apache's CGI REQUEST_URI is the canonical URL path, without the query
-    // string.  Never export the raw request-line target (F57).  The script
-    // name has already had PATH_INFO removed when it is nonempty.
-    let request_uri = if !ctx.path_info.is_empty() && !ctx.script_name.ends_with(ctx.path_info) {
-        format!("{}{}", ctx.script_name, ctx.path_info)
-    } else {
-        ctx.script_name.to_string()
-    };
-    put("REQUEST_URI", request_uri);
+    // Apache's CGI REQUEST_URI is the canonical public URL path, without the
+    // query string.  It must survive an internal rewrite to a different
+    // script (for example WordPress `/hello-world/` -> `/index.php`).  Never
+    // export the raw request-line target here (F57).
+    put("REQUEST_URI", ctx.request_uri.to_string());
     put("SCRIPT_NAME", ctx.script_name.to_string());
     put(
         "SCRIPT_FILENAME",
@@ -1877,6 +1877,7 @@ mod tests {
             req: &req,
             root: &dir,
             script_rel: Path::new("hello.sh"),
+            request_uri: "/hello.sh",
             script_name: "/hello.sh",
             path_info: "",
             docroot: &dir,
@@ -1920,6 +1921,7 @@ mod tests {
             req: &req,
             root: &dir,
             script_rel: Path::new("opened.sh"),
+            request_uri: "/opened.sh",
             script_name: "/opened.sh",
             path_info: "",
             docroot: &dir,
@@ -1964,6 +1966,7 @@ mod tests {
             req: &req,
             root: &dir,
             script_rel: Path::new("cgi-bin/env.sh"),
+            request_uri: "/hello-world/",
             script_name: "/cgi-bin/env.sh",
             path_info: "",
             docroot: &dir,
@@ -1989,7 +1992,8 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(get("REQUEST_METHOD"), "GET");
-        assert_eq!(get("REQUEST_URI"), "/cgi-bin/env.sh");
+        assert_eq!(get("REQUEST_URI"), "/hello-world/");
+        assert_eq!(get("SCRIPT_NAME"), "/cgi-bin/env.sh");
         assert_eq!(
             get("SCRIPT_FILENAME"),
             dir.join("cgi-bin/env.sh").to_string_lossy()
@@ -2051,6 +2055,7 @@ mod tests {
             req: &req,
             root: &dir,
             script_rel: Path::new("cgi-bin/who.sh"),
+            request_uri: "/cgi-bin/who.sh",
             script_name: "/cgi-bin/who.sh",
             path_info: "",
             docroot: &dir,
@@ -2103,6 +2108,7 @@ mod tests {
             req: &req,
             root: &dir,
             script_rel: Path::new("bad.sh"),
+            request_uri: "/bad.sh",
             script_name: "/bad.sh",
             path_info: "",
             docroot: &dir,
@@ -2502,6 +2508,7 @@ mod tests {
             req,
             root,
             script_rel,
+            request_uri: "/test",
             script_name: "/test",
             path_info: "",
             docroot: root,
