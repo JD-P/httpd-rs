@@ -137,6 +137,11 @@ pub struct Headers {
     // identity separately from the mutable synthetic-request fields and
     // share it across clones without copying the bounded request target.
     wire_identity: Option<std::sync::Arc<WireRequestIdentity>>,
+    // CGI/FastCGI REQUEST_URI is the first canonical public path, not the
+    // synthetic target selected by a rewrite, DirectoryIndex, or local error
+    // document.  OnceLock makes that identity monotonic and Arc keeps it
+    // shared by every internal Request clone.
+    public_uri: std::sync::Arc<std::sync::OnceLock<String>>,
     // HTTP authentication belongs to the logical request, not the executor
     // thread that happens to evaluate one of its transitions. Clones used by
     // internal redirects share this monotonic binding; unrelated requests do
@@ -603,6 +608,14 @@ impl Request {
             .authenticated_identity
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    pub(crate) fn bind_public_uri(&self, uri: &str) {
+        let _ = self.headers.public_uri.set(uri.to_string());
+    }
+
+    pub(crate) fn public_uri(&self) -> Option<&str> {
+        self.headers.public_uri.get().map(String::as_str)
     }
 
     pub(crate) fn record_authenticated_identity(&self, user: &str) -> bool {
@@ -2037,6 +2050,7 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
             discarded_body_len: 0,
             error_document_depth: 0,
             wire_identity: None,
+            public_uri: Default::default(),
             authenticated_identity: Default::default(),
         },
         body: Vec::new(),

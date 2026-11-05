@@ -5453,6 +5453,7 @@ fn run_url_translation_phase(
     let request_uri = start
         .as_ref()
         .map(|start| start.request_uri.to_string())
+        .or_else(|| req.public_uri().map(str::to_string))
         .unwrap_or_else(|| target.url_path.clone());
     let mut owned_req = None;
     let mut effects = start
@@ -5849,22 +5850,28 @@ fn dispatch_inner(
     // means the outer request deliberately skipped filesystem planning. This
     // preserves the parser invariant that an invalid target is never treated
     // as a request for an unknown method (or handed to a backend).
-    if let Err(error) =
-        CanonicalTarget::from_request(req, cfg.encoded_slashes == EncodedSlashes::On)
-    {
-        return error_response(
-            cfg,
-            vhost,
-            vhost.map(|v| &v.scope).unwrap_or(&cfg.global),
-            error.status(),
-            req,
-            &String::from_utf8_lossy(&req.raw_path),
-            local_port,
-            server_name,
-            peer.ip(),
-            local_ip,
-        );
-    }
+    let public_target =
+        match CanonicalTarget::from_request(req, cfg.encoded_slashes == EncodedSlashes::On) {
+            Ok(target) => target,
+            Err(error) => {
+                return error_response(
+                    cfg,
+                    vhost,
+                    vhost.map(|v| &v.scope).unwrap_or(&cfg.global),
+                    error.status(),
+                    req,
+                    &String::from_utf8_lossy(&req.raw_path),
+                    local_port,
+                    server_name,
+                    peer.ip(),
+                    local_ip,
+                );
+            }
+        };
+    // Bind once, before any internal transition clones this request.  A
+    // DirectoryIndex or ErrorDocument then retains the public application
+    // URI while its own canonical path remains the routing identity.
+    req.bind_public_uri(&public_target.url_path);
     // Methods we do not implement at all are 501, matching Apache.  Known
     // methods that are invalid for a particular resource (for example POST
     // to a static file) are handled below with 405.
@@ -8561,6 +8568,7 @@ mod tests {
             .headers
             .insert("connection", b"Upgrade, X-Hop".to_vec());
         outer.headers.insert("x-hop", b"secret".to_vec());
+        outer.bind_public_uri("/missing");
 
         let index = project_internal_request(
             &outer,
@@ -8575,6 +8583,7 @@ mod tests {
         assert_eq!(index.body, b"payload");
         assert_eq!(index.framing, crate::verified::BodyFraming::Length(7));
         assert_eq!(index.header("x-hop"), Some(b"secret".as_slice()));
+        assert_eq!(index.public_uri(), Some("/missing"));
 
         let error = project_internal_request(
             &outer,
@@ -8612,6 +8621,7 @@ mod tests {
             assert!(error.header(stripped).is_none(), "{stripped}");
         }
         assert_eq!(error.error_document_depth(), 1);
+        assert_eq!(error.public_uri(), Some("/missing"));
         let inherited_query = project_internal_request(
             &outer,
             "/errors/show.php",
