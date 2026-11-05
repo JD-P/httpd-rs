@@ -8,6 +8,9 @@ updates:
     groups:
       rust-patch-updates:
         update-types: [patch]
+        exclude-patterns:
+          - vstd
+          - webpki-roots
   - package-ecosystem: github-actions
     directory: /
     schedule:

@@ -24,3 +24,9 @@ who = "Vapache project dependency review <noreply@github.com>"
 criteria = "safe-to-deploy"
 delta = "1.15.2 -> 1.16.4"
 notes = "Reviewed the delta and unsafe storage/drop paths used by vapache-pcre2; no build script or external execution, with upstream tests covering inline/heap transitions."
+
+[[audits.webpki-roots]]
+who = "Vapache project dependency review <noreply@github.com>"
+criteria = "safe-to-deploy"
+version = "1.0.11"
+notes = "Reviewed the published crate matching SHA-256 f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171: the 1.0.10 -> 1.0.11 delta only removes the emSign Root CA - C1 and emSign ECC Root CA - C3 trust anchors, adds no executable code or trust roots, has no build script, and forbids unsafe code."

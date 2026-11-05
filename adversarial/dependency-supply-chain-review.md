@@ -1,20 +1,20 @@
 # Dependency and build-supply-chain review
 
-Date: 2026-11-04
+Date: 2026-11-05
 
 ## Result
 
 Vapache's dependency policy now distinguishes audit evidence from temporary
 trust explicitly. The initial `cargo vet init` state contained 146 blanket
 exemptions and no imported or project-authored audit evidence. Trusted audit
-ledgers from nine established Rust projects reduce that to 106 exemptions;
-four additional crates have project-authored reviews. At the current lockfile,
-`cargo vet` reports 40 fully audited dependency versions and 106 exempted
+ledgers from nine established Rust projects reduce that to 105 exemptions;
+five additional crates have project-authored reviews. At the current lockfile,
+`cargo vet` reports 41 fully audited dependency versions and 105 exempted
 versions.
 
 An exemption means only that the dependency is currently allowed so the build
 can proceed. It is not evidence that Vapache reviewed that code. The CI policy
-therefore caps exemptions at 106 and fails if local audit evidence or trusted
+therefore caps exemptions at 105 and fails if local audit evidence or trusted
 imports disappear. Removing an exemption remains monotonic progress; adding
 one requires an explicit policy change and review.
 
@@ -32,13 +32,15 @@ The Vapache project additionally reviewed:
 - `smallvec 1.15.2 -> 1.16.4`, including the unsafe inline/heap storage and
   drop paths exercised by `vapache-pcre2`;
 - `bitflags 2.11.1 -> 2.13.2`, including its generated flag API and changes to
-  unsafe implementations.
+  unsafe implementations;
+- `webpki-roots 1.0.11`, whose published-crate delta removes two distrusted
+  eMudhra trust anchors without adding code or roots.
 
 The exact scope and reviewer notes live in `supply-chain/audits.toml`.
 
 ## Important residual trust
 
-The 106 exemptions are a concrete audit backlog, not a claim of completion.
+The 105 exemptions are a concrete audit backlog, not a claim of completion.
 The highest-impact remaining items include:
 
 - `ring`, because it implements cryptography and contains assembly and unsafe
