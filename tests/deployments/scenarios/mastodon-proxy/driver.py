@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import struct
 import time
 import urllib.parse
@@ -18,10 +19,12 @@ from lib import (
     DeploymentError,
     common_apache_config,
     common_vapache_config,
+    command,
     differential_benchmark,
     free_port,
     request,
     require_response,
+    secure_admin_file,
     start_apache,
     start_vapache,
     wait_http,
@@ -74,7 +77,11 @@ def read_frame(stream: socket.socket) -> tuple[int, bytes]:
 
 
 def open_stream(port: int, token: str, stream_name: str) -> socket.socket:
-    connection = socket.create_connection(("127.0.0.1", port), timeout=20)
+    raw = socket.create_connection(("127.0.0.1", port), timeout=20)
+    tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    tls_context.check_hostname = False
+    tls_context.verify_mode = ssl.CERT_NONE
+    connection = tls_context.wrap_socket(raw, server_hostname=PUBLIC_HOST)
     connection.settimeout(35)
     key = base64.b64encode(b"vapache-mastodon").decode()
     handshake = (
@@ -84,7 +91,7 @@ def open_stream(port: int, token: str, stream_name: str) -> socket.socket:
         "Upgrade: websocket\r\n"
         "Sec-WebSocket-Version: 13\r\n"
         f"Sec-WebSocket-Key: {key}\r\n"
-        f"Origin: http://{PUBLIC_HOST}\r\n"
+        f"Origin: https://{PUBLIC_HOST}\r\n"
         f"Authorization: Bearer {token}\r\n\r\n"
     ).encode()
     connection.sendall(handshake)
@@ -171,6 +178,37 @@ def create_access_token(compose) -> str:
     return candidates[-1]
 
 
+def create_test_certificate(context: CaseContext) -> tuple[Path, Path]:
+    tls_dir = context.run_dir / "tls"
+    tls_dir.mkdir()
+    certificate = tls_dir / "certificate.pem"
+    private_key = tls_dir / "private-key.pem"
+    command(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            f"/CN={PUBLIC_HOST}",
+            "-addext",
+            f"subjectAltName=DNS:{PUBLIC_HOST}",
+            "-keyout",
+            private_key,
+            "-out",
+            certificate,
+        ],
+        timeout=30,
+    )
+    secure_admin_file(certificate, 0o644)
+    secure_admin_file(private_key, 0o600)
+    return certificate, private_key
+
+
 def run(context: CaseContext, variant: dict[str, str]) -> None:
     media = context.run_dir / "media"
     media.mkdir()
@@ -201,25 +239,40 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
 
     document_root = context.run_dir / "empty"
     document_root.mkdir()
+    certificate, private_key = create_test_certificate(context)
     port = free_port()
     extra = f"""
+<VirtualHost *:{port}>
+ServerName {PUBLIC_HOST}
+SSLEngine On
+SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
+SSLCertificateFile "{certificate}"
+SSLCertificateKeyFile "{private_key}"
 ProxyPreserveHost On
 ProxyPass /api/v1/streaming http://{streaming_host}:4000/api/v1/streaming
 ProxyPassReverse /api/v1/streaming http://{streaming_host}:4000/api/v1/streaming
 ProxyPass / http://{web_host}:3000/
 ProxyPassReverse / http://{web_host}:3000/
+</VirtualHost>
 """
     config, pid_file = common_vapache_config(context.run_dir, port, document_root, extra=extra)
-    server = start_vapache(context, config, pid_file, port)
+    server = start_vapache(context, config, pid_file, port, tls=True)
     host = {"Host": PUBLIC_HOST}
-    require_response(port, "/health", contains=b"OK", headers=host)
-    require_response(port, "/api/v2/instance", contains=b'"domain":"deployment.test"', headers=host)
+    require_response(port, "/health", contains=b"OK", headers=host, tls=True)
+    require_response(
+        port,
+        "/api/v2/instance",
+        contains=b'"domain":"deployment.test"',
+        headers=host,
+        tls=True,
+    )
     auth = {"Host": PUBLIC_HOST, "Authorization": f"Bearer {token}"}
     require_response(
         port,
         "/api/v1/accounts/verify_credentials",
         contains=b'"username":"integration"',
         headers=auth,
+        tls=True,
     )
 
     stream_name = "user" if variant["stream"] == "user" else "public:local"
@@ -245,6 +298,7 @@ ProxyPassReverse / http://{web_host}:3000/
             },
             body=body,
             timeout=30,
+            tls=True,
         )
         if status != 200:
             raise DeploymentError(f"Mastodon status creation failed: {status} {response[:1000]!r}")
@@ -265,12 +319,14 @@ ProxyPassReverse / http://{web_host}:3000/
             f"/api/v1/statuses/{status_id}",
             contains=marker.encode(),
             headers=host,
+            tls=True,
         )
         deleted, _, delete_body = request(
             port,
             f"/api/v1/statuses/{status_id}",
             method="DELETE",
             headers=auth,
+            tls=True,
         )
         if deleted != 200:
             raise DeploymentError(
@@ -282,6 +338,20 @@ ProxyPassReverse / http://{web_host}:3000/
 
     if context.benchmark:
         apache_port = free_port()
+        apache_extra = f"""
+<VirtualHost *:{apache_port}>
+ServerName {PUBLIC_HOST}
+SSLEngine On
+SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
+SSLCertificateFile "{certificate}"
+SSLCertificateKeyFile "{private_key}"
+ProxyPreserveHost On
+ProxyPass /api/v1/streaming http://{streaming_host}:4000/api/v1/streaming
+ProxyPassReverse /api/v1/streaming http://{streaming_host}:4000/api/v1/streaming
+ProxyPass / http://{web_host}:3000/
+ProxyPassReverse / http://{web_host}:3000/
+</VirtualHost>
+"""
         apache_config = common_apache_config(
             context.run_dir,
             apache_port,
@@ -290,18 +360,21 @@ ProxyPassReverse / http://{web_host}:3000/
                 "mpm_event",
                 "authz_core",
                 "authz_host",
+                "socache_shmcb",
+                "ssl",
                 "proxy",
                 "proxy_http",
                 "proxy_wstunnel",
             ),
-            extra=extra,
+            extra=apache_extra,
         )
-        start_apache(context, apache_config, apache_port)
+        start_apache(context, apache_config, apache_port, tls=True)
         require_response(
             apache_port,
             "/api/v2/instance",
             contains=b'"domain":"deployment.test"',
             headers=host,
+            tls=True,
         )
         differential_benchmark(
             port,
@@ -309,4 +382,5 @@ ProxyPassReverse / http://{web_host}:3000/
             "/api/v2/instance",
             context.artifact_dir / "apache-vapache-benchmark.json",
             headers=(f"Host: {PUBLIC_HOST}",),
+            tls=True,
         )

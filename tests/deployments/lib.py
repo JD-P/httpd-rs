@@ -19,6 +19,7 @@ import re
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import tarfile
 import time
@@ -180,8 +181,15 @@ def request(
     body: bytes | None = None,
     timeout: float = 15,
     host: str = "127.0.0.1",
+    tls: bool = False,
 ) -> tuple[int, dict[str, str], bytes]:
-    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    if tls:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        connection = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
+    else:
+        connection = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
         connection.request(method, path, body=body, headers=headers or {})
         response = connection.getresponse()
@@ -198,8 +206,9 @@ def require_response(
     status: int = 200,
     contains: bytes | None = None,
     headers: dict[str, str] | None = None,
+    tls: bool = False,
 ) -> tuple[dict[str, str], bytes]:
-    actual, response_headers, body = request(port, path, headers=headers)
+    actual, response_headers, body = request(port, path, headers=headers, tls=tls)
     if actual != status:
         raise DeploymentError(f"{path}: expected HTTP {status}, received {actual}: {body[:500]!r}")
     if contains is not None and contains not in body:
@@ -214,10 +223,11 @@ def wait_http(
     timeout: float = 30,
     host: str = "127.0.0.1",
     statuses: tuple[int, ...] | None = None,
+    tls: bool = False,
 ) -> None:
     def ready() -> bool:
         try:
-            status, _, _ = request(port, path, timeout=1, host=host)
+            status, _, _ = request(port, path, timeout=1, host=host, tls=tls)
             return status in statuses if statuses is not None else 100 <= status < 600
         except (OSError, http.client.HTTPException):
             return False
@@ -247,6 +257,16 @@ def privilege_prefix() -> list[str]:
         [sudo, "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
     )
     return [sudo, "-n"] if probe.returncode == 0 else []
+
+
+def secure_admin_file(path: Path, mode: int) -> None:
+    """Give a generated privileged input the ownership Vapache requires."""
+    prefix = privilege_prefix()
+    if prefix:
+        command([*prefix, "chown", "0:0", os.fspath(path)], timeout=30)
+        command([*prefix, "chmod", f"{mode:04o}", os.fspath(path)], timeout=30)
+    else:
+        os.chmod(path, mode)
 
 
 @dataclass
@@ -761,14 +781,16 @@ DocumentRoot "{document_root}"
 """
 
 
-def start_apache(context: CaseContext, config_text: str, port: int) -> ApacheProcess:
+def start_apache(
+    context: CaseContext, config_text: str, port: int, *, tls: bool = False
+) -> ApacheProcess:
     config = context.run_dir / f"apache-{port}.conf"
     config.write_text(config_text)
     shutil.copy2(config, context.artifact_dir / "apache.conf")
     process = ApacheProcess(config=config, log=context.artifact_dir / "apache.log")
     context.add_cleanup(process.stop)
     process.start()
-    wait_http(port)
+    wait_http(port, tls=tls)
     return process
 
 
@@ -779,6 +801,7 @@ def differential_benchmark(
     artifact: Path,
     *,
     headers: tuple[str, ...] = (),
+    tls: bool = False,
 ) -> None:
     wrk = shutil.which("wrk")
     if not wrk:
@@ -788,7 +811,8 @@ def differential_benchmark(
         argv = [wrk, "-t2", f"-c{connections}", f"-d{duration}", "--latency"]
         for header in headers:
             argv.extend(["-H", header])
-        argv.append(f"http://127.0.0.1:{port}{path}")
+        scheme = "https" if tls else "http"
+        argv.append(f"{scheme}://127.0.0.1:{port}{path}")
         return argv
 
     for port in (vapache_port, apache_port):
@@ -884,7 +908,14 @@ TypesConfig /etc/mime.types
     return config, pid_file
 
 
-def start_vapache(context: CaseContext, config_text: str, pid_file: Path, port: int) -> VapacheProcess:
+def start_vapache(
+    context: CaseContext,
+    config_text: str,
+    pid_file: Path,
+    port: int,
+    *,
+    tls: bool = False,
+) -> VapacheProcess:
     config = context.run_dir / "vapache.conf"
     config.write_text(config_text)
     shutil.copy2(config, context.artifact_dir / "vapache.conf")
@@ -897,7 +928,7 @@ def start_vapache(context: CaseContext, config_text: str, pid_file: Path, port: 
     context.add_cleanup(process.stop)
     process.start()
     try:
-        wait_http(port)
+        wait_http(port, tls=tls)
     except Exception:
         # If startup exited, replace a generic readiness timeout with the
         # captured daemon tail. A still-running but unreachable process keeps

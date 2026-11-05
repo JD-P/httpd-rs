@@ -23,7 +23,7 @@ The feature-to-application rationale is maintained in the
 | Nextcloud (manual sample) | FastCGI + WebDAV | database install, Basic auth forwarding, DAV verbs, large upload, move and download |
 | Wagtail Bakery Demo (manual sample) | reverse proxy | Gunicorn worker variants, public API, CSRF-bound admin login and session survival across reload |
 | Bugzilla (manual sample) | FastCGI | large Perl application setup, stable worker identity, REST `PATH_INFO`, CSRF-bound login and administrative policy |
-| Mastodon (manual sample) | reverse proxy + WebSocket | PostgreSQL/Redis/Puma/Sidekiq composition, bearer API, status fan-out and authenticated streaming across reload |
+| Mastodon (manual sample) | TLS reverse proxy + WebSocket | PostgreSQL/Redis/Puma/Sidekiq composition, bearer API, status fan-out and authenticated streaming across reload |
 
 ## Hugo
 
@@ -229,15 +229,23 @@ backends require ordered routes, with the streaming prefix before the general
 web route:
 
 ```apache
-ProxyPreserveHost On
-ProxyPass /api/v1/streaming http://STREAMING:4000/api/v1/streaming
-ProxyPassReverse /api/v1/streaming http://STREAMING:4000/api/v1/streaming
-ProxyPass / http://WEB:3000/
-ProxyPassReverse / http://WEB:3000/
+<VirtualHost *:443>
+    SSLEngine On
+    SSLCertificateFile /etc/letsencrypt/live/example.com/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/example.com/privkey.pem
+    ProxyPreserveHost On
+    ProxyPass /api/v1/streaming http://STREAMING:4000/api/v1/streaming
+    ProxyPassReverse /api/v1/streaming http://STREAMING:4000/api/v1/streaming
+    ProxyPass / http://WEB:3000/
+    ProxyPassReverse / http://WEB:3000/
+</VirtualHost>
 ```
 
 `LOCAL_DOMAIN` and the preserved public `Host` must agree; do not substitute
-an ephemeral private backend address. The checked-in cryptographic values and
+an ephemeral private backend address. Mastodon production mode requires HTTPS;
+terminate TLS at Vapache so its non-spoofable connection state generates the
+correct `X-Forwarded-Proto: https`. Do not accept a client-supplied forwarded
+scheme on a plaintext listener. The checked-in cryptographic values and
 database password are isolated test fixtures, not deployment defaults. A real
 installation must generate independent Rails encryption, OTP, VAPID and
 database secrets and retain them across upgrades.

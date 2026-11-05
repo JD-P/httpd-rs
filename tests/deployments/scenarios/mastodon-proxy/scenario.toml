@@ -3,7 +3,7 @@ title = "Mastodon multi-service HTTP and streaming deployment"
 nightly = false
 timeout_seconds = 1200
 disk_mb = 4096
-modes = ["reverse-proxy", "websocket", "api", "database", "background-jobs"]
+modes = ["reverse-proxy", "websocket", "tls-termination", "api", "database", "background-jobs"]
 upstreams = [
   "Mastodon 4.7.5",
   "PostgreSQL 17.7",
@@ -15,7 +15,7 @@ images = [
   "postgres@sha256:a6d31f853205ce20d399df4e33a0b4c715672f232f4ee7440499747e6e02c126",
   "redis@sha256:b9f6cf0cab55fdd102fd2182deeae150457943d33439d18c6e2fc5666d3228c1",
 ]
-prerequisites = ["docker"]
+prerequisites = ["docker", "openssl"]
 
 [dimensions]
 workers = ["one", "two"]

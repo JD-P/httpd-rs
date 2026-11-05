@@ -23,6 +23,7 @@ routing and backend lifetime do.
 | Proxy request and response streaming | Gitea smart HTTP; Jenkins form body; MinIO signed object transfer | Slow-peer resource accounting remains soak/fault testing |
 | Preserved public authority | MinIO SigV4 with `ProxyPreserveHost On` | Invalid/ambiguous authority matrices remain protocol tests |
 | WebSocket handshake and bidirectional traffic | Grafana Live; Jupyter kernel execution; authenticated Mastodon status streaming | Malformed frames and slow tunnels remain protocol/soak tests |
+| Application-required TLS termination | Mastodon production HTTPS and WSS through a short-lived test certificate | SNI/mTLS/OCSP and protocol matrices remain focused TLS tests |
 | Graceful reload with active ownership | Every nightly scenario; Grafana reloads an open WebSocket | Generation race schedules remain deterministic fault tests |
 | Multi-service job and event fan-out | Mastodon API through Puma to Sidekiq/Redis and its separate streaming service | Broker failure schedules remain focused fault tests |
 | Apache-relative application performance | Optional alternating Apache/Vapache workloads | Microbenchmarks continue isolating front-end overhead |
