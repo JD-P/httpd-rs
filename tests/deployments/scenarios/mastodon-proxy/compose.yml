@@ -11,6 +11,9 @@ x-mastodon-environment: &mastodon-environment
   ES_ENABLED: "false"
   S3_ENABLED: "false"
   SMTP_SERVER: ""
+  # The isolated test network has no public DNS/MX path. This is the reserved
+  # domain used by the one confirmed fixture account, not a production policy.
+  EMAIL_DOMAIN_ALLOWLIST: deployment.test
   SECRET_KEY_BASE: "1798a2ee79a7dc5fe9649043caf46a08e655aae610113aef9094654218b416ac"
   OTP_SECRET: "8d26787bdb6ba04f0ee3684e747a10788a950705829735b230e12f748de9627f"
   ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY: "6676399f224f16330355da4859957d94f03a00f3bd76155643c6155306524a85"
