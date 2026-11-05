@@ -105,7 +105,11 @@ impl From<HttpVersion> for Version {
 
 #[derive(Clone, Debug, Default)]
 pub struct Headers {
-    entries: Vec<(String, Vec<u8>)>,
+    // Internal rewrites and DirectoryIndex transitions read the same header
+    // view. Share those bounded bytes until a recovery transition actually
+    // mutates them; this also makes the shared resident lease below describe
+    // the real allocation rather than a deep-cloned, uncharged copy.
+    entries: std::sync::Arc<Vec<(String, Vec<u8>)>>,
     // Clones of a request's headers share the same reservation.  This keeps
     // the charge alive through dispatch without adding a lease field to every
     // synthetic Request initializer in tests and modules.
@@ -185,17 +189,18 @@ impl Headers {
 
     pub fn insert(&mut self, name: &str, value: impl Into<Vec<u8>>) {
         let lname = name.to_ascii_lowercase();
-        self.entries.retain(|(n, _)| *n != lname);
-        self.entries.push((lname, value.into()));
+        let entries = std::sync::Arc::make_mut(&mut self.entries);
+        entries.retain(|(n, _)| *n != lname);
+        entries.push((lname, value.into()));
     }
 
     pub fn remove(&mut self, name: &str) {
         let lname = name.to_ascii_lowercase();
-        self.entries.retain(|(n, _)| *n != lname);
+        std::sync::Arc::make_mut(&mut self.entries).retain(|(n, _)| *n != lname);
     }
 
     pub fn push(&mut self, name: &str, value: impl Into<Vec<u8>>) {
-        self.entries.push((name.to_ascii_lowercase(), value.into()));
+        std::sync::Arc::make_mut(&mut self.entries).push((name.to_ascii_lowercase(), value.into()));
     }
 
     /// Append a field line to the canonical request-header view.  HTTP/2's
@@ -204,11 +209,12 @@ impl Headers {
     /// authorization consumer see a different value than CGI/proxy sinks.
     pub(crate) fn push_merged(&mut self, name: &str, value: &[u8]) {
         let lname = name.to_ascii_lowercase();
-        if let Some((_, current)) = self.entries.iter_mut().find(|(n, _)| *n == lname) {
+        let entries = std::sync::Arc::make_mut(&mut self.entries);
+        if let Some((_, current)) = entries.iter_mut().find(|(n, _)| *n == lname) {
             current.extend_from_slice(header_merge_separator(lname.as_bytes()));
             current.extend_from_slice(value);
         } else {
-            self.entries.push((lname, value.to_vec()));
+            entries.push((lname, value.to_vec()));
         }
     }
 
@@ -286,7 +292,7 @@ impl Headers {
                     .map(str::to_ascii_lowercase)
             })
             .collect();
-        self.entries.retain(|(name, _)| {
+        std::sync::Arc::make_mut(&mut self.entries).retain(|(name, _)| {
             !nominated.contains(name)
                 && !name.starts_with("content-")
                 && !name.starts_with("if-")
@@ -2056,7 +2062,7 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
         query,
         version: version.into(),
         headers: Headers {
-            entries,
+            entries: entries.into(),
             resident_lease: None,
             policy_budget: std::sync::Arc::new(crate::resource::RequestPolicyBudget::default()),
             request_scope: None,
@@ -3817,6 +3823,29 @@ mod tests {
         assert!(clone.charge_policy_work(2).is_err());
         assert!(req.policy_budget_failed());
         assert!(clone.policy_budget_failed());
+    }
+
+    #[test]
+    fn header_clones_share_storage_until_one_is_mutated() {
+        let req = parse_head(
+            b"GET / HTTP/1.1\r\nHost: x\r\nX-Shared: original\r\n\r\n",
+            &limits(),
+        )
+        .unwrap();
+        let mut clone = req.clone();
+
+        assert!(std::sync::Arc::ptr_eq(
+            &req.headers.entries,
+            &clone.headers.entries
+        ));
+        clone.headers.insert("x-shared", b"changed".to_vec());
+
+        assert_eq!(req.header("x-shared"), Some(&b"original"[..]));
+        assert_eq!(clone.header("x-shared"), Some(&b"changed"[..]));
+        assert!(!std::sync::Arc::ptr_eq(
+            &req.headers.entries,
+            &clone.headers.entries
+        ));
     }
 
     #[test]

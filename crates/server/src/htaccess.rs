@@ -18,7 +18,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 const MAX_HTACCESS: u64 = 1024 * 1024;
 const MAX_HTACCESS_LINE: usize = 8190;
@@ -719,6 +719,55 @@ struct CacheKey {
     identity: crate::request_plan::LayerIdentity,
 }
 
+struct CacheProbe<'a> {
+    config_generation: u64,
+    path: &'a Path,
+    server_root: &'a Path,
+    meta: &'a fs::Metadata,
+    mode: u32,
+    allow_list: &'a [String],
+    nonfatal: u8,
+    identity: &'a crate::request_plan::LayerIdentity,
+}
+
+impl CacheProbe<'_> {
+    fn matches(&self, key: &CacheKey) -> bool {
+        key.config_generation == self.config_generation
+            && key.path == self.path
+            && key.server_root == self.server_root
+            && key.dev == self.meta.dev()
+            && key.ino == self.meta.ino()
+            && key.mtime == self.meta.mtime()
+            && key.mtime_nsec == self.meta.mtime_nsec()
+            && key.ctime == self.meta.ctime()
+            && key.ctime_nsec == self.meta.ctime_nsec()
+            && key.size == self.meta.len()
+            && key.mode == self.mode
+            && key.allow_list == self.allow_list
+            && key.nonfatal == self.nonfatal
+            && key.identity == *self.identity
+    }
+
+    fn to_owned(&self) -> CacheKey {
+        CacheKey {
+            config_generation: self.config_generation,
+            path: self.path.to_path_buf(),
+            server_root: self.server_root.to_path_buf(),
+            dev: self.meta.dev(),
+            ino: self.meta.ino(),
+            mtime: self.meta.mtime(),
+            mtime_nsec: self.meta.mtime_nsec(),
+            ctime: self.meta.ctime(),
+            ctime_nsec: self.meta.ctime_nsec(),
+            size: self.meta.len(),
+            mode: self.mode,
+            allow_list: self.allow_list.to_vec(),
+            nonfatal: self.nonfatal,
+            identity: self.identity.clone(),
+        }
+    }
+}
+
 fn mode_key(mode: OverrideMode) -> u32 {
     match mode {
         OverrideMode::None => 0,
@@ -734,6 +783,11 @@ const MAX_ACCESS_CACHE_BYTES: usize = 32 * 1024 * 1024;
 struct AccessFileCache {
     entries: HashMap<CacheKey, (Arc<Parsed>, usize)>,
     bytes: usize,
+    // The common static-site case repeatedly uses one access file. Keep one
+    // exact key/Arc pair so a hit can be proved from borrowed request data
+    // without allocating another owned CacheKey. The Arc is the same bounded
+    // entry retained by `entries`, not a duplicate parsed program.
+    last: Option<(CacheKey, Arc<Parsed>)>,
 }
 
 impl AccessFileCache {
@@ -754,6 +808,8 @@ impl AccessFileCache {
         if weight > MAX_ACCESS_CACHE_BYTES {
             return;
         }
+        // Do not let `last` retain an entry selected for eviction below.
+        self.last = None;
         if let Some((_, old_weight)) = self.entries.remove(&key) {
             self.bytes = self.bytes.saturating_sub(old_weight);
         }
@@ -768,17 +824,18 @@ impl AccessFileCache {
             }
         }
         self.bytes = self.bytes.saturating_add(weight);
+        self.last = Some((key.clone(), Arc::clone(&parsed)));
         self.entries.insert(key, (parsed, weight));
     }
 }
 
-fn cache() -> &'static Mutex<AccessFileCache> {
-    static CACHE: OnceLock<Mutex<AccessFileCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(AccessFileCache::default()))
+fn cache() -> &'static RwLock<AccessFileCache> {
+    static CACHE: OnceLock<RwLock<AccessFileCache>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(AccessFileCache::default()))
 }
 
 pub(crate) fn drop_generation_state(generation: u64) {
-    let mut cache = cache().lock().unwrap_or_else(|error| error.into_inner());
+    let mut cache = cache().write().unwrap_or_else(|error| error.into_inner());
     cache
         .entries
         .retain(|key, _| key.config_generation != generation);
@@ -786,6 +843,13 @@ pub(crate) fn drop_generation_state(generation: u64) {
         .entries
         .values()
         .fold(0usize, |total, (_, weight)| total.saturating_add(*weight));
+    if cache
+        .last
+        .as_ref()
+        .is_some_and(|(key, _)| key.config_generation == generation)
+    {
+        cache.last = None;
+    }
 }
 
 struct OpenedAccessFile {
@@ -888,49 +952,65 @@ fn parse_cached(
     opened: OpenedAccessFile,
 ) -> Result<Arc<Parsed>, String> {
     let meta = &opened.meta;
-    let key = CacheKey {
+    let nonfatal_key = match nonfatal {
+        NonfatalMode::None => 0,
+        NonfatalMode::Override => 1,
+        NonfatalMode::Unknown => 2,
+        NonfatalMode::All => 3,
+    };
+    let probe = CacheProbe {
         config_generation: cfg.generation,
-        path: path.to_path_buf(),
-        server_root: cfg.server_root.clone(),
-        dev: meta.dev(),
-        ino: meta.ino(),
-        mtime: meta.mtime(),
-        mtime_nsec: meta.mtime_nsec(),
-        ctime: meta.ctime(),
-        ctime_nsec: meta.ctime_nsec(),
-        size: meta.len(),
+        path,
+        server_root: &cfg.server_root,
+        meta,
         mode: mode_key(mode),
-        allow_list: allow_list.to_vec(),
-        nonfatal: match nonfatal {
-            NonfatalMode::None => 0,
-            NonfatalMode::Override => 1,
-            NonfatalMode::Unknown => 2,
-            NonfatalMode::All => 3,
-        },
-        identity: identity.clone(),
+        allow_list,
+        nonfatal: nonfatal_key,
+        identity,
+    };
+    let validate_hit = |parsed: Arc<Parsed>| -> Result<Arc<Parsed>, String> {
+        // Validate that the already-open descriptor did not change while the
+        // cache lookup ran. The key and parse always describe the same
+        // inode/version, never a pathname reopened later.
+        let after = opened
+            .file
+            .metadata()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if vapache_verified::descriptor_snapshot_admit(
+            meta.is_file() && after.is_file(),
+            meta.dev() == after.dev() && meta.ino() == after.ino(),
+            same_access_file_version(meta, &after),
+            meta.len() <= MAX_HTACCESS,
+        ) {
+            return Ok(parsed);
+        }
+        Err(format!(
+            "{}: access file changed while it was being evaluated",
+            path.display()
+        ))
     };
     {
-        let guard = cache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(parsed) = guard.get(&key) {
-            // Validate that the already-open descriptor did not change while
-            // the cache lookup ran.  The key and parse always describe the
-            // same inode/version, never a pathname reopened later.
-            let after = opened
-                .file
-                .metadata()
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-            if vapache_verified::descriptor_snapshot_admit(
-                meta.is_file() && after.is_file(),
-                meta.dev() == after.dev() && meta.ino() == after.ino(),
-                same_access_file_version(meta, &after),
-                meta.len() <= MAX_HTACCESS,
-            ) {
-                return Ok(Arc::clone(parsed));
-            }
-            return Err(format!(
-                "{}: access file changed while it was being evaluated",
-                path.display()
-            ));
+        // Cache hits dominate static workloads. Readers may validate distinct
+        // requests concurrently; reload eviction and a genuinely new access
+        // file take the exclusive side only on the cold path.
+        let guard = cache().read().unwrap_or_else(|e| e.into_inner());
+        if let Some(parsed) = guard
+            .last
+            .as_ref()
+            .filter(|(key, _)| probe.matches(key))
+            .map(|(_, parsed)| Arc::clone(parsed))
+        {
+            drop(guard);
+            return validate_hit(parsed);
+        }
+    }
+    let key = probe.to_owned();
+    {
+        let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
+        if let Some(parsed) = guard.get(&key).cloned() {
+            guard.last = Some((key.clone(), Arc::clone(&parsed)));
+            drop(guard);
+            return validate_hit(parsed);
         }
     }
     // Parse outside the lock: a slow filesystem read must not serialize
@@ -943,7 +1023,7 @@ fn parse_cached(
     let parsed = Arc::new(parse_access_bytes(
         cfg, path, &data, mode, allow_list, nonfatal, identity,
     )?);
-    let mut guard = cache().lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
     guard.insert(key, Arc::clone(&parsed));
     Ok(parsed)
 }
@@ -5140,7 +5220,7 @@ mod tests {
         }
         let parsed = parsed.unwrap();
         {
-            let mut guard = cache().lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
             for n in 0..512 {
                 guard.insert(
                     CacheKey {

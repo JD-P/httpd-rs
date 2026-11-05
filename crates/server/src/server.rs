@@ -7,7 +7,7 @@ use crate::config::{
 };
 use crate::fastcgi;
 use crate::files::{
-    directory_index_name, error_response, mime_type, resolve_target_checked, serve_directory,
+    directory_index_target, error_response, mime_type, resolve_target_checked, serve_directory,
     serve_file, simple_html, Target,
 };
 use crate::http::{
@@ -4562,6 +4562,9 @@ pub(crate) fn internal_dispatch(
     req: &Request,
     url: &str,
     kind: vapache_verified::InternalRequestKind,
+    initial_plan: Option<RequestPlan>,
+    vhost: Option<&VHost>,
+    server_name: &str,
     peer: SocketAddr,
     local_ip: &str,
     local_port: u16,
@@ -4573,13 +4576,10 @@ pub(crate) fn internal_dispatch(
             b"Invalid or recursive internal request\n".to_vec(),
         );
     };
-    let host = host_header(&internal).unwrap_or("");
-    let vhost = cfg.select_vhost(
-        local_ip.parse().ok(),
-        local_port,
-        if host.is_empty() { None } else { Some(host) },
-    );
-    let server_name = server_name_for(cfg, &internal, local_ip, local_port);
+    // Internal requests preserve the Host field and run synchronously inside
+    // one immutable configuration generation. The caller's already selected
+    // vhost/server identity is therefore authoritative; selecting and parsing
+    // it again can neither change policy nor improve isolation.
     dispatch_inner(
         cfg,
         &internal,
@@ -4587,8 +4587,8 @@ pub(crate) fn internal_dispatch(
         local_ip,
         local_port,
         vhost,
-        &server_name,
-        None,
+        server_name,
+        initial_plan,
         // Internal redirects are synchronous children of a dispatch that
         // already owns the filesystem-phase lease. Reacquiring the request's
         // one-slot child quota would reject DirectoryIndex/ErrorDocument
@@ -5862,7 +5862,12 @@ fn dispatch_inner(
     // means the outer request deliberately skipped filesystem planning. This
     // preserves the parser invariant that an invalid target is never treated
     // as a request for an unknown method (or handed to a backend).
-    let public_target =
+    let public_target = if let Some(plan) = initial_plan.as_ref() {
+        // A typed plan can only be constructed from a successfully
+        // canonicalized request/transition target. Reusing it avoids decoding
+        // and allocating the same DirectoryIndex path a second time.
+        plan.target().clone()
+    } else {
         match CanonicalTarget::from_request(req, cfg.encoded_slashes == EncodedSlashes::On) {
             Ok(target) => target,
             Err(error) => {
@@ -5879,7 +5884,8 @@ fn dispatch_inner(
                     local_ip,
                 );
             }
-        };
+        }
+    };
     // Bind once, before any internal transition clones this request.  A
     // DirectoryIndex or ErrorDocument then retains the public application
     // URI while its own canonical path remains the routing identity.
@@ -5961,19 +5967,41 @@ fn dispatch_inner(
     }
 
     let https = crate::expr::request_is_https();
-    let url_phase = match run_url_translation_phase(
-        cfg,
-        vhost,
-        req,
-        peer,
-        local_ip,
-        local_port,
-        https,
-        server_name,
-        None,
-    ) {
-        UrlPhaseResult::Terminal(response) => return response,
-        UrlPhaseResult::Local(local) => local,
+    let url_phase = if initial_plan
+        .as_ref()
+        .is_some_and(RequestPlan::skips_url_translation)
+    {
+        let target = initial_plan
+            .as_ref()
+            .expect("checked typed internal plan")
+            .target()
+            .clone();
+        UrlPhaseLocal {
+            request_uri: req
+                .public_uri()
+                .map(str::to_string)
+                .unwrap_or_else(|| target.url_path.clone()),
+            target,
+            owned_req: None,
+            rewrite_effects: Default::default(),
+            filesystem: None,
+            original: None,
+        }
+    } else {
+        match run_url_translation_phase(
+            cfg,
+            vhost,
+            req,
+            peer,
+            local_ip,
+            local_port,
+            https,
+            server_name,
+            None,
+        ) {
+            UrlPhaseResult::Terminal(response) => return response,
+            UrlPhaseResult::Local(local) => local,
+        }
     };
     let UrlPhaseLocal {
         request_uri,
@@ -6105,7 +6133,7 @@ fn dispatch_inner(
         // evaluated with the rewritten request context.  The original URL is
         // still reauthorized separately with `original_req`.
         let current_req = owned_req.as_ref().unwrap_or(req);
-        let mut evaluated = plan.evaluate_scope(cfg, vhost, current_req, peer.ip());
+        let mut evaluated = plan.take_evaluate_scope(cfg, vhost, current_req, peer.ip());
         apply_rewrite_effects(&mut evaluated.scope, &rewrite_effects);
         evaluated.apply_conditionals(cfg, vhost, &fs_path, &url_path, current_req, peer.ip());
         // Server/vhost and Location rewrite rules have already run in the URL
@@ -7025,7 +7053,11 @@ fn dispatch_inner(
             .contains(Options::SYMLINKS_IF_OWNER_MATCH);
     let follow = follow_symlinks || owner_match_only;
 
-    match resolve_target_checked(&root, &rel, follow, owner_match_only) {
+    let selected_target = plan
+        .take_preopened_target(follow_symlinks, owner_match_only)
+        .map(|(file, meta)| Target::File { file, meta })
+        .unwrap_or_else(|| resolve_target_checked(&root, &rel, follow, owner_match_only));
+    match selected_target {
         Target::File { file, meta } => {
             // Re-authorize and bind the actual opened target before selecting
             // any handler.  A symlink must not inherit the lexical URL's
@@ -7364,19 +7396,36 @@ fn dispatch_inner(
                     Err(r) => return r,
                 }
             }
-            if let Some(name) =
-                directory_index_name(cfg, &scope, req, &file, &auth_url, &req.raw_path)
+            if let Some(index) =
+                directory_index_target(cfg, &scope, req, &file, &auth_url, &req.raw_path)
             {
+                let crate::files::DirectoryIndex { name, file, meta } = index;
                 let index_url = format!(
                     "{}/{}",
                     auth_url.trim_end_matches('/'),
                     String::from_utf8_lossy(&name)
                 );
+                let index_plan = CanonicalTarget::from_url_path(&index_url).and_then(|target| {
+                    plan.retarget_directory_index(
+                        cfg,
+                        vhost,
+                        target,
+                        Some((file, meta, follow_symlinks, owner_match_only)),
+                        (rewrite_rounds == 0
+                            && rewrite_effects.is_empty()
+                            && original_url_path == url_path
+                            && original_fs_path == fs_path)
+                            .then_some(scope),
+                    )
+                });
                 return internal_dispatch(
                     cfg,
                     req,
                     &index_url,
                     vapache_verified::InternalRequestKind::DirectoryIndex,
+                    index_plan,
+                    vhost,
+                    &server_name,
                     peer,
                     local_ip,
                     local_port,

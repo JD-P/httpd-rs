@@ -1757,6 +1757,9 @@ fn serve_directory_inner(
                 req,
                 &index_url,
                 vapache_verified::InternalRequestKind::DirectoryIndex,
+                None,
+                vhost,
+                host,
                 std::net::SocketAddr::new(peer, 0),
                 local_ip,
                 port,
@@ -2111,7 +2114,7 @@ fn error_response_inner(
             }
             ErrorDoc::Local(path) => {
                 if let Some(r) =
-                    serve_error_document(cfg, vhost, req, path, status, peer, local_ip, port)
+                    serve_error_document(cfg, vhost, req, path, status, peer, local_ip, port, host)
                 {
                     return r;
                 }
@@ -2258,13 +2261,14 @@ pub(crate) fn finalize_prepared_error_document(
 
 fn serve_error_document(
     cfg: &Config,
-    _vhost: Option<&VHost>,
+    vhost: Option<&VHost>,
     req: &Request,
     path: &str,
     status: u16,
     peer: std::net::IpAddr,
     local_ip: &str,
     local_port: u16,
+    server_name: &str,
 ) -> Option<Response> {
     // Avoid recursion when an error document itself fails. The depth follows
     // the request, so unrelated async tasks cannot affect this decision.
@@ -2276,6 +2280,9 @@ fn serve_error_document(
         req,
         path,
         vapache_verified::InternalRequestKind::ErrorDocument,
+        None,
+        vhost,
+        server_name,
         std::net::SocketAddr::new(peer, 0),
         local_ip,
         local_port,
@@ -3188,7 +3195,8 @@ mod tests {
             500,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "127.0.0.1",
-            80
+            80,
+            "h",
         )
         .is_none());
         let local = serve_error_document(
@@ -3200,6 +3208,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "127.0.0.1",
             80,
+            "h",
         )
         .expect("existing local error document");
         assert_eq!(local.status, 404);

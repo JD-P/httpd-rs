@@ -11,6 +11,7 @@ use crate::config::{Config, Scope, ScopeRule, VHost};
 use crate::http::Request;
 use crate::policy_ref::AccessLayer;
 use crate::verified::{normalize_uri_path, percent_decode_path};
+use std::fs::{File, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -198,6 +199,17 @@ pub struct RequestPlan {
     script_alias: bool,
     layers: Vec<AccessLayer>,
     access_may_apply: bool,
+    preopened_target: Option<PreopenedTarget>,
+    precomputed_scope: Option<EvaluatedScope>,
+    skip_url_translation: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PreopenedTarget {
+    file: Arc<File>,
+    meta: Metadata,
+    follow_symlinks: bool,
+    owner_match_only: bool,
 }
 
 impl RequestPlan {
@@ -387,6 +399,9 @@ impl RequestPlan {
             script_alias,
             layers,
             access_may_apply,
+            preopened_target: None,
+            precomputed_scope: None,
+            skip_url_translation: false,
         })
     }
 
@@ -418,6 +433,156 @@ impl RequestPlan {
         &self.layers
     }
 
+    /// Retarget a directory plan to the `DirectoryIndex` selected in that
+    /// exact directory without reopening and reparsing the same access files.
+    ///
+    /// `AllowOverride` is valid only in `<Directory>` context, and both the
+    /// directory URL and its index file start their access-file walk at the
+    /// same directory.  The layer identity equality below additionally proves
+    /// that every rewrite subject base is unchanged.  If either invariant is
+    /// not true, the caller falls back to constructing a fresh plan.
+    pub fn retarget_directory_index(
+        &self,
+        cfg: &Config,
+        vhost: Option<&VHost>,
+        target: CanonicalTarget,
+        preopened_target: Option<(File, Metadata, bool, bool)>,
+        reusable_scope: Option<Scope>,
+    ) -> Option<Self> {
+        let parent_url = self.target.url_path.trim_end_matches('/');
+        let child_url = target.url_path.as_str();
+        let child_name = child_url.strip_prefix(parent_url)?.strip_prefix('/')?;
+        if child_name.is_empty() || child_name.contains('/') {
+            return None;
+        }
+        let mut rel = self.rel.clone();
+        rel.push(child_name);
+        let fs_path = self.root.join(&rel);
+        if fs_path.parent() != Some(self.fs_path.as_path()) {
+            return None;
+        }
+        // A child URL may cross an Alias/ScriptAlias boundary even though it
+        // is lexically below the directory URL. Reuse is valid only when the
+        // normal URL mapper selects the exact same root, relative target and
+        // execution class as the descriptor selected by mod_dir semantics.
+        let (mapped_root, mapped_rel, mapped_script_alias) =
+            crate::server::map_path(cfg, vhost, &target.norm)?;
+        if mapped_root != self.root || mapped_rel != rel || mapped_script_alias != self.script_alias
+        {
+            return None;
+        }
+        let identities_match = self.layers.iter().all(|layer| {
+            LayerIdentity::new(&self.root, &layer.identity.dir, &fs_path, child_url)
+                == layer.identity
+        });
+        if !identities_match {
+            return None;
+        }
+        let precomputed_scope = reusable_scope
+            .filter(|_| self.directory_index_scope_reusable(cfg, vhost, &fs_path))
+            .map(|scope| EvaluatedScope {
+                scope,
+                config_conditionals: Arc::new(Vec::new()),
+                access_conditionals: Arc::new(Vec::new()),
+            });
+        let skip_url_translation =
+            precomputed_scope.is_some() && !cfg.url_translation_may_terminate(vhost, child_url);
+        Some(Self {
+            target,
+            root: self.root.clone(),
+            rel,
+            fs_path,
+            script_alias: self.script_alias,
+            // One request must observe one access-file snapshot. Reusing the
+            // already descriptor-bound parsed layers is both cheaper and more
+            // internally consistent than reopening a mutable pathname during
+            // the synchronous index transition.
+            layers: self.layers.clone(),
+            access_may_apply: self.access_may_apply,
+            preopened_target: preopened_target.map(
+                |(file, meta, follow_symlinks, owner_match_only)| PreopenedTarget {
+                    file: Arc::new(file),
+                    meta,
+                    follow_symlinks,
+                    owner_match_only,
+                },
+            ),
+            precomputed_scope,
+            skip_url_translation,
+        })
+    }
+
+    /// A typed DirectoryIndex transition can reuse its already mapped target
+    /// only when the configuration compiler proved that URL translation has
+    /// no matching terminal rule for the child URL.
+    pub(crate) fn skips_url_translation(&self) -> bool {
+        self.skip_url_translation
+    }
+
+    /// Whether the directory and its direct index child are guaranteed to
+    /// receive the same merged policy. This deliberately recognizes only the
+    /// simple, common shape: literal ancestor `<Directory>` sections plus
+    /// access-file directives that do not contain a leaf-sensitive section.
+    /// Any rule whose result could depend on the child basename, URL or full
+    /// filesystem path falls back to a complete evaluation.
+    fn directory_index_scope_reusable(
+        &self,
+        cfg: &Config,
+        vhost: Option<&VHost>,
+        child_fs_path: &Path,
+    ) -> bool {
+        if self
+            .layers
+            .iter()
+            .any(|layer| !layer.files.is_empty() || !layer.conditionals.is_empty())
+        {
+            return false;
+        }
+        let rules = vhost
+            .map(|vhost| vhost.rules.as_slice())
+            .unwrap_or(cfg.global_rules.as_slice());
+        rules.iter().all(|rule| {
+            if rule.condition.is_some()
+                || rule.branch != crate::config::ConditionBranch::Normal
+                || !rule.nested.is_empty()
+            {
+                return false;
+            }
+            let crate::config::MatchKind::Directory(pattern) = &rule.kind else {
+                return false;
+            };
+            let pattern_bytes = pattern.as_os_str().as_encoded_bytes();
+            !pattern_bytes
+                .iter()
+                .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+                && pattern != child_fs_path
+        })
+    }
+
+    /// Clone the already selected index descriptor only when the index's
+    /// effective symlink policy is identical to the directory policy that
+    /// selected it. A `<Files>` rule that changes `Options` therefore forces a
+    /// fresh descriptor-relative resolution.
+    pub(crate) fn take_preopened_target(
+        &mut self,
+        follow_symlinks: bool,
+        owner_match_only: bool,
+    ) -> Option<(File, Metadata)> {
+        let opened = self.preopened_target.take()?;
+        if opened.follow_symlinks != follow_symlinks || opened.owner_match_only != owner_match_only
+        {
+            return None;
+        }
+        // The ordinary DirectoryIndex path moves its typed plan directly into
+        // the child dispatch, so the selected descriptor has one owner and
+        // can be moved without an fcntl/dup round trip. A cloned diagnostic
+        // plan remains correct and merely pays the old fallback cost.
+        let file = std::sync::Arc::try_unwrap(opened.file)
+            .or_else(|file| file.try_clone().map_err(|_| file))
+            .ok()?;
+        Some((file, opened.meta))
+    }
+
     /// Evaluate the complete configuration/access-file scope for this plan.
     /// The returned conditionals are not yet applied so dispatch can insert
     /// rewrite `[E=...]` effects first.
@@ -428,6 +593,9 @@ impl RequestPlan {
         req: &Request,
         peer: std::net::IpAddr,
     ) -> EvaluatedScope {
+        if let Some(scope) = &self.precomputed_scope {
+            return scope.clone();
+        }
         // A nonempty layer set already proves that access files apply.  Never
         // fall back to the configuration-only path merely because the target
         // path is outside the lexical `AllowOverride` prefix (F59/I60).
@@ -465,6 +633,21 @@ impl RequestPlan {
                 access_conditionals: Arc::new(Vec::new()),
             }
         }
+    }
+
+    /// Dispatch owns its plan, so a request-local precomputed scope can be
+    /// moved into the child request instead of deep-cloning every policy
+    /// vector. Ordinary plans continue through the shared evaluator.
+    pub(crate) fn take_evaluate_scope(
+        &mut self,
+        cfg: &Config,
+        vhost: Option<&VHost>,
+        req: &Request,
+        peer: std::net::IpAddr,
+    ) -> EvaluatedScope {
+        self.precomputed_scope
+            .take()
+            .unwrap_or_else(|| self.evaluate_scope(cfg, vhost, req, peer))
     }
 
     /// Re-evaluate the same canonical directory and access-file layers while
@@ -513,7 +696,7 @@ impl RequestPlan {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EvaluatedScope {
     pub scope: Scope,
     pub config_conditionals: Arc<Vec<ScopeRule>>,
@@ -667,6 +850,193 @@ mod tests {
             identity.subject(Path::new("/srv/www/dir/file"), "/dir/file"),
             Some("dir/file".into())
         );
+    }
+
+    #[test]
+    fn directory_index_retargets_same_directory_access_snapshot() {
+        let root = PathBuf::from("/srv/www");
+        let layer = AccessLayer {
+            identity: LayerIdentity::new(&root, &root, &root, "/"),
+            scope: Arc::new(Scope::default()),
+            files: Vec::new(),
+            conditionals: Vec::new(),
+        };
+        let plan = RequestPlan {
+            target: CanonicalTarget::from_url_path("/").unwrap(),
+            root: root.clone(),
+            rel: PathBuf::new(),
+            fs_path: root.clone(),
+            script_alias: false,
+            layers: vec![layer],
+            access_may_apply: true,
+            preopened_target: None,
+            precomputed_scope: None,
+            skip_url_translation: false,
+        };
+        let cfg = load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n");
+        let reusable = Scope::default();
+        let index = plan
+            .retarget_directory_index(
+                &cfg,
+                None,
+                CanonicalTarget::from_url_path("/index.html").unwrap(),
+                None,
+                Some(reusable),
+            )
+            .unwrap();
+        assert_eq!(index.rel(), Path::new("index.html"));
+        assert_eq!(index.fs_path(), Path::new("/srv/www/index.html"));
+        assert_eq!(index.url_path(), "/index.html");
+        assert!(Arc::ptr_eq(&plan.layers[0].scope, &index.layers[0].scope));
+        assert!(index.precomputed_scope.is_some());
+        assert!(index.skips_url_translation());
+
+        assert!(plan
+            .retarget_directory_index(
+                &cfg,
+                None,
+                CanonicalTarget::from_url_path("/nested/index.html").unwrap(),
+                None,
+                None,
+            )
+            .is_none());
+
+        let alias_cfg = load_config(
+            "Listen 127.0.0.1:0\nDocumentRoot /srv/www\nAlias /index.html /srv/other.html\n",
+        );
+        assert!(plan
+            .retarget_directory_index(
+                &alias_cfg,
+                None,
+                CanonicalTarget::from_url_path("/index.html").unwrap(),
+                None,
+                None,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn directory_index_scope_reuse_rejects_leaf_sensitive_policy() {
+        let root = PathBuf::from("/srv/www");
+        let base_plan = || RequestPlan {
+            target: CanonicalTarget::from_url_path("/").unwrap(),
+            root: root.clone(),
+            rel: PathBuf::new(),
+            fs_path: root.clone(),
+            script_alias: false,
+            layers: vec![AccessLayer {
+                identity: LayerIdentity::new(&root, &root, &root, "/"),
+                scope: Arc::new(Scope::default()),
+                files: Vec::new(),
+                conditionals: Vec::new(),
+            }],
+            access_may_apply: true,
+            preopened_target: None,
+            precomputed_scope: None,
+            skip_url_translation: false,
+        };
+        let reusable = Scope::default();
+        for policy in [
+            "<Files \"index.html\">\nRequire all denied\n</Files>\n",
+            "<Location \"/index.html\">\nRequire all denied\n</Location>\n",
+            "<DirectoryMatch \"index[.]html$\">\nRequire all denied\n</DirectoryMatch>\n",
+            "<Directory \"/srv/www/*\">\nRequire all denied\n</Directory>\n",
+            "<Directory \"/srv/www/index.html\">\nRequire all denied\n</Directory>\n",
+        ] {
+            let cfg = load_config(&format!(
+                "Listen 127.0.0.1:0\nDocumentRoot /srv/www\n{policy}"
+            ));
+            let child = base_plan()
+                .retarget_directory_index(
+                    &cfg,
+                    None,
+                    CanonicalTarget::from_url_path("/index.html").unwrap(),
+                    None,
+                    Some(reusable.clone()),
+                )
+                .unwrap();
+            assert!(
+                child.precomputed_scope.is_none(),
+                "leaf-sensitive policy reused the directory scope: {policy}"
+            );
+        }
+
+        let files_cfg = load_config(
+            "Listen 127.0.0.1:0\n<Files \"index.html\">\nRequire all denied\n</Files>\n",
+        );
+        let mut access_sensitive = base_plan();
+        access_sensitive.layers[0].files = files_cfg.global_rules.clone();
+        let child = access_sensitive
+            .retarget_directory_index(
+                &load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n"),
+                None,
+                CanonicalTarget::from_url_path("/index.html").unwrap(),
+                None,
+                Some(reusable),
+            )
+            .unwrap();
+        assert!(child.precomputed_scope.is_none());
+
+        let redirect_cfg =
+            load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\nRedirect /index.html /next\n");
+        let child = base_plan()
+            .retarget_directory_index(
+                &redirect_cfg,
+                None,
+                CanonicalTarget::from_url_path("/index.html").unwrap(),
+                None,
+                Some(Scope::default()),
+            )
+            .unwrap();
+        assert!(child.precomputed_scope.is_some());
+        assert!(!child.skips_url_translation());
+    }
+
+    #[test]
+    fn directory_index_preopened_target_requires_identical_symlink_policy() {
+        let root = PathBuf::from("/srv/www");
+        let plan = RequestPlan {
+            target: CanonicalTarget::from_url_path("/").unwrap(),
+            root: root.clone(),
+            rel: PathBuf::new(),
+            fs_path: root,
+            script_alias: false,
+            layers: Vec::new(),
+            access_may_apply: false,
+            preopened_target: None,
+            precomputed_scope: None,
+            skip_url_translation: false,
+        };
+        let fixture =
+            std::env::temp_dir().join(format!("vapache-plan-index-fd-{}", std::process::id()));
+        std::fs::write(&fixture, b"index").unwrap();
+        let file = File::open(&fixture).unwrap();
+        let meta = file.metadata().unwrap();
+        let child = plan
+            .retarget_directory_index(
+                &load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n"),
+                None,
+                CanonicalTarget::from_url_path("/index.html").unwrap(),
+                Some((file, meta, true, false)),
+                None,
+            )
+            .unwrap();
+        let mut child = child;
+        assert!(child.take_preopened_target(false, true).is_none());
+
+        let file = File::open(&fixture).unwrap();
+        let meta = file.metadata().unwrap();
+        let mut matching = plan
+            .retarget_directory_index(
+                &load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n"),
+                None,
+                CanonicalTarget::from_url_path("/index.html").unwrap(),
+                Some((file, meta, true, false)),
+                None,
+            )
+            .unwrap();
+        assert!(matching.take_preopened_target(true, false).is_some());
+        let _ = std::fs::remove_file(fixture);
     }
 
     #[test]
