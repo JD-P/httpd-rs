@@ -2964,18 +2964,18 @@ class CacheTests(Base):
         self.assertEqual(st, 403)
 
 class ConfigTests(unittest.TestCase):
-    def test_stock_debian_config_parses(self):
+    def test_stock_debian_config_audits_for_packaged_wrapper(self):
         cfg = Path("/etc/apache2/apache2.conf")
         if not cfg.exists():
             self.skipTest("no Debian apache2 config")
         r = subprocess.run(
-            [str(VAPACHED), "-f", str(cfg), "-t"],
+            [str(VAPACHED), "-f", str(cfg), "--audit-capabilities"],
             capture_output=True,
             text=True,
             timeout=30,
         )
         self.assertEqual(r.returncode, 0, r.stderr[-3000:])
-        self.assertIn("Syntax OK", r.stdout)
+        self.assertIn("VapacheCapability AutoIndex On", r.stdout)
 
     def test_strict_unknown_directive(self):
         p = BASE / "strict.conf"
