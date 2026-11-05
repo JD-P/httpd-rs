@@ -240,7 +240,10 @@ ProxyPassMatch ^/(.*\\.cgi(/.*)?)$ "unix:{socket_path}|fcgi://localhost{bugzilla
                 "proxy",
                 "proxy_fcgi",
             ),
-            extra=common,
+            # mod_proxy_fcgi defaults to PHP-FPM-specific SCRIPT_FILENAME
+            # semantics. fcgiwrap is a generic FastCGI backend and otherwise
+            # rejects Apache's script identity with 403.
+            extra="ProxyFCGIBackendType GENERIC\n" + common,
         )
         start_apache(context, apache_config, apache_port)
         public_host = f"127.0.0.1:{port}"
