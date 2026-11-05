@@ -13233,6 +13233,88 @@ pub proof fn closed_slow_output_is_absorbing(event: SlowOutputEvent)
 {
 }
 
+/// HTTP/2 request input ownership leaves general dispatch capacity only while
+/// the adapter is awaiting DATA. Completion must reacquire general ownership
+/// before backend/policy execution or response output resumes. `GeneralAfterBody`
+/// deliberately cannot re-enter the slow-input pool: one wire request has one
+/// body phase.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2InputPhase {
+    GeneralBeforeBody,
+    SlowInput,
+    GeneralAfterBody,
+    Closed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2InputEvent {
+    BodyWait,
+    BodyComplete,
+    Finish,
+}
+
+pub open spec fn h2_input_phase_step_spec(
+    phase: H2InputPhase,
+    event: H2InputEvent,
+) -> Option<H2InputPhase> {
+    match (phase, event) {
+        (H2InputPhase::GeneralBeforeBody, H2InputEvent::BodyWait) => {
+            Some(H2InputPhase::SlowInput)
+        },
+        (H2InputPhase::SlowInput, H2InputEvent::BodyComplete) => {
+            Some(H2InputPhase::GeneralAfterBody)
+        },
+        (H2InputPhase::GeneralBeforeBody, H2InputEvent::Finish)
+        | (H2InputPhase::SlowInput, H2InputEvent::Finish)
+        | (H2InputPhase::GeneralAfterBody, H2InputEvent::Finish) => {
+            Some(H2InputPhase::Closed)
+        },
+        _ => None,
+    }
+}
+
+pub fn h2_input_phase_step(
+    phase: H2InputPhase,
+    event: H2InputEvent,
+) -> (next: Option<H2InputPhase>)
+    ensures next == h2_input_phase_step_spec(phase, event),
+{
+    match (phase, event) {
+        (H2InputPhase::GeneralBeforeBody, H2InputEvent::BodyWait) => {
+            Some(H2InputPhase::SlowInput)
+        },
+        (H2InputPhase::SlowInput, H2InputEvent::BodyComplete) => {
+            Some(H2InputPhase::GeneralAfterBody)
+        },
+        (H2InputPhase::GeneralBeforeBody, H2InputEvent::Finish)
+        | (H2InputPhase::SlowInput, H2InputEvent::Finish)
+        | (H2InputPhase::GeneralAfterBody, H2InputEvent::Finish) => {
+            Some(H2InputPhase::Closed)
+        },
+        _ => None,
+    }
+}
+
+pub proof fn h2_slow_input_returns_only_to_general_after_body()
+    ensures
+        h2_input_phase_step_spec(H2InputPhase::SlowInput, H2InputEvent::BodyComplete)
+            == Some(H2InputPhase::GeneralAfterBody),
+        h2_input_phase_step_spec(H2InputPhase::SlowInput, H2InputEvent::BodyWait).is_none(),
+{
+}
+
+pub proof fn h2_completed_input_cannot_wait_again(event: H2InputEvent)
+    ensures
+        h2_input_phase_step_spec(H2InputPhase::GeneralAfterBody, event)
+            != Some(H2InputPhase::SlowInput),
+{
+}
+
+pub proof fn closed_h2_input_is_absorbing(event: H2InputEvent)
+    ensures h2_input_phase_step_spec(H2InputPhase::Closed, event).is_none(),
+{
+}
+
 pub fn h2_budget_step(b: H2Budget, event: H2BudgetEvent) -> (out: Option<H2Budget>)
     requires h2_budget_inv(b),
     ensures

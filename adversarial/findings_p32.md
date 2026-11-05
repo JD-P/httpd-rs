@@ -13,9 +13,11 @@
 - **Method:** source audit of HTTP/2 stream admission and the request-body read
   path, then live Apache-versus-vapached differentials using Python `h2` and
   the project's TLS/h2 configuration shape. All traffic is loopback.
-- **Remediation status:** open at HEAD. A stream waiting for request-body DATA
-  still owns one of the 256 general HTTP/2 stream leases. The P31 slow-output
-  transfer covers only downstream response stalls, not slow request input.
+- **Remediation status:** fixed in the 2026-11-05 working tree. A stream waiting
+  for request-body DATA now transfers into a separate 128-process/32-source
+  slow-input pool and must reacquire general ownership before execution or
+  output resumes. The transfer is represented by an executable Verus state
+  machine and protected by source/process fairness and live P32 regressions.
 
 ---
 
@@ -371,7 +373,63 @@ response-read permit.
 
 ---
 
-## 6. Remediation direction
+## 6. Implemented remediation
+
+The HTTP/2 adapter now performs the input-side ownership transfer after the
+route probe has established that DATA must be read or drained and before its
+first body wait. `SlowOutputAdmission` retains the complete protocol ownership
+state and acquires the new `SlowInput` lease before releasing `H2Stream`.
+Completion performs the inverse acquire-before-release operation. If general
+capacity cannot be reacquired, the stream is reset while the slow-input lease
+remains held until unwind; it is never temporarily unaccounted.
+
+The pool is independently capped at 128 process-wide and 32 per canonical
+source identity. Saturating it therefore leaves all 256 general H2 stream
+slots available to bodiless requests from unrelated clients. A full
+slow-input pool returns a bounded 503 to additional body waiters without
+parking them in general capacity.
+
+`H2InputPhase` mechanizes the only permitted lifecycle:
+
+```text
+GeneralBeforeBody -> SlowInput -> GeneralAfterBody -> Closed
+```
+
+The proofs make `Closed` absorbing, prohibit a completed body from waiting a
+second time, and require slow input to return only to the post-body general
+phase. Unit regressions cover process/source fairness, acquire-before-release
+atomicity in both directions, reacquisition overload, idempotence, and the
+original 256-holder cross-client capacity shape. The retained live rolling
+harness is also used as the end-to-end replay.
+
+The 2026-11-05 optimized-binary replay used the stock harness with a five-
+second body deadline and eight seconds of aggressive replacement. The server
+admitted 128 of the initial 256 heads into the bounded slow-input pool; an
+unrelated source was served on all 40 probes while holders recycled 1,854
+streams:
+
+```text
+pool filled: active=128 opened=256 victim=status=b'200' reset=None terminated=None body=10
+rolling: probes=40 refused=0 served=40 other=0 refusal_ratio=0.000 max_served_gap=0.00s active=256 opened=1854 408s=162 resets=1598
+after release: status=b'200' reset=None terminated=None body=10
+```
+
+The final `active=256` includes recently rejected streams that the client had
+not yet drained; it is not 256 retained server leases. The victim result and
+the initial 128 admission threshold demonstrate the ownership separation.
+
+Performance validation used three alternating samples per server and rejected
+every sample containing a failed or non-2xx request. The ordinary HTTP/1
+static suite measured Vapache/Apache throughput ratios of 0.96x (small), 0.95x
+(1.1 KiB), 1.03x (10 KiB), and 1.38x (1 MiB); Vapache p99 was 1, 1, 1, and
+2 ms respectively. A targeted HTTP/2 run used two connections with four
+streams each, staying within every single-source useful-work pool. It measured
+0.99x for the tiny static response, 1.10x for 10 KiB, and 2.21x for CGI POST.
+CGI POST exercises the new request-body ownership transfer; all 3,456 selected
+Vapache responses were 2xx. The transfer therefore did not introduce an
+observable throughput regression in the affected path.
+
+The implementation follows the original remediation requirements:
 
 1. **Transfer body-waiting streams out of the general dispatch pool.** After
    the route probe decides that the body must be read or drained, move the

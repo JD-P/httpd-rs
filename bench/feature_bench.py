@@ -304,7 +304,7 @@ def run_ab(url, conc, requests, head=False, data_file=None):
 def run_h2load(url, headers, conc, streams, duration, tls=True, h1=False, host=None, port=None, data_file=None):
     # Four load-generator threads keep h2load from becoming the bottleneck on
     # the low-connection-count scenarios; both servers get the same client.
-    threads = 4
+    threads = min(4, max(1, conc))
     cmd = [
         H2LOAD,
         "-D", f"{duration:g}s",
@@ -338,12 +338,19 @@ def benchmark_concurrency(sc):
     """Keep one-host cohorts inside Vapache's source-keyed admission limits."""
     requested = sc["conc"]
     if sc["proto"] == "tls-h2":
-        # A single loopback identity may own 64 active H2 streams. Opening a
-        # larger cohort measures intentional overload rejection, not serving.
-        streams = max(1, sc.get("streams", 1))
-        return min(requested, 8, max(1, 64 // streams))
+        # The narrowest useful-work pool exercised by this feature-rich
+        # configuration is eight per source (filesystem and dynamic backend).
+        # Keep the complete H2 cohort within it instead of timing intentional
+        # 503 overload responses from one loopback identity.
+        return min(requested, 8, max(1, 8 // benchmark_streams(sc)))
     # Pending HTTP/1/TLS connection admission is capped at eight per source.
     return min(requested, 8)
+
+
+def benchmark_streams(sc):
+    """Use multiplexing without letting one connection exceed the cohort."""
+    streams = max(1, sc.get("streams", 1))
+    return min(streams, 4) if sc["proto"] == "tls-h2" else streams
 
 
 def curl_probe(port, sc, tls=False, h2=False):
@@ -401,7 +408,7 @@ def measure(port, sc, duration):
         h1 = proto == "tls-h1"
         url = url_for(port, sc["path"], tls=True, host=host)
         return run_h2load(
-            url, headers, conc, sc.get("streams", 1), duration,
+            url, headers, conc, benchmark_streams(sc), duration,
             tls=tls, h1=h1, host=host, port=port,
             data_file=(RUN / "post-body.txt") if sc.get("data") else None,
         )

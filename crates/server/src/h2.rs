@@ -1562,6 +1562,25 @@ async fn handle_stream(
         }
     }
 
+    if has_body && early.is_none() {
+        // Waiting for peer-controlled DATA must not retain the general H2
+        // dispatch pool. Acquire the source-fair slow-input class first; a
+        // rejected transfer keeps general ownership long enough to send this
+        // bounded overload response.
+        if output_admission.enter_slow_input().is_err() {
+            phase = vapache_verified::request_phase_step(
+                phase,
+                vapache_verified::RequestPhaseEvent::BodyErrorResponse,
+            )
+            .expect("HTTP/2 slow-input admission failure transition");
+            early = Some(bad(503, "slow request-body capacity exhausted"));
+            early_remote_user = body_remote_user.take();
+            drop(prepared_handler.take());
+            drop(drain_after_body.take());
+            drop(recv.take());
+        }
+    }
+
     let mut streamed = None;
     if has_body
         && early.is_none()
@@ -1628,12 +1647,21 @@ async fn handle_stream(
                     result = &mut body_future => {
                         match result {
                             Ok(()) | Err(H2ReadFailure::BackendClosed) => {
-                                blocking_task_or_reset(
+                                if output_admission.leave_slow_input().is_err() {
+                                    request_scope.cancel();
+                                    drop(backend);
+                                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                                    return true;
+                                }
+                                let Some(result) = blocking_task_or_reset(
                                     &mut respond,
                                     &mut backend,
                                     &request_scope,
                                 )
-                                .await
+                                .await else {
+                                    return true;
+                                };
+                                Some(result)
                             }
                             Err(H2ReadFailure::Reset) => {
                                 if let Some(scope) = rejected_req.request_scope() {
@@ -1673,6 +1701,14 @@ async fn handle_stream(
                     .expect("HTTP/2 streaming backend completion transition");
                     streamed = Some((req, response, remote_user));
                 }
+                if output_admission.is_slow_input()
+                    && (streamed.is_some() || early.is_some())
+                    && output_admission.leave_slow_input().is_err()
+                {
+                    request_scope.cancel();
+                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    return true;
+                }
             }
             Err(_) => {
                 phase = vapache_verified::request_phase_step(
@@ -1684,6 +1720,14 @@ async fn handle_stream(
                 early_remote_user = body_remote_user.take();
                 drop(recv.take());
             }
+        }
+        if output_admission.is_slow_input()
+            && early.is_some()
+            && output_admission.leave_slow_input().is_err()
+        {
+            request_scope.cancel();
+            respond.send_reset(h2::Reason::REFUSED_STREAM);
+            return true;
         }
     }
 
@@ -1722,6 +1766,11 @@ async fn handle_stream(
         };
         match body_result {
             Ok(body) => {
+                if output_admission.leave_slow_input().is_err() {
+                    request_scope.cancel();
+                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    return true;
+                }
                 if declared.is_some_and(|declared| declared != body.len) {
                     // h2 enforces this before clean end-of-stream; retain the
                     // adapter check as a fail-closed dependency boundary.
@@ -1765,6 +1814,11 @@ async fn handle_stream(
                 return true;
             }
             Err(H2ReadFailure::Response(response)) => {
+                if output_admission.leave_slow_input().is_err() {
+                    request_scope.cancel();
+                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    return true;
+                }
                 phase = vapache_verified::request_phase_step(
                     phase,
                     vapache_verified::RequestPhaseEvent::BodyErrorResponse,
@@ -4110,6 +4164,42 @@ mod tests {
         drop(victim_stream);
         drop(retained);
         assert_eq!(budget.h2_output_usage(), (0, 0));
+    }
+
+    #[test]
+    fn slow_input_handoff_preserves_capacity_for_an_unrelated_client() {
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let mut inputs = Vec::new();
+        for source in 1..=8 {
+            for _ in 0..32 {
+                let context = budget.context(std::net::IpAddr::from([192, 0, 2, source]));
+                let general = budget.try_h2_stream_in(&context).unwrap();
+                inputs.push(crate::resource::SlowOutputAdmission::tracked_h2(
+                    context, general,
+                ));
+            }
+        }
+        assert_eq!(budget.h2_input_usage(), (256, 0));
+
+        let mut retained = Vec::new();
+        for mut input in inputs {
+            if input.enter_slow_input().is_ok() {
+                input.enter_slow_input().unwrap();
+                retained.push(input);
+            }
+            // Rejected waiters retain their general lease only until this
+            // bounded error path unwinds and drops the admission value.
+        }
+        assert_eq!(budget.h2_input_usage(), (0, 128));
+
+        let victim = budget.context(std::net::IpAddr::from([198, 51, 100, 7]));
+        let victim_stream = budget
+            .try_h2_stream_in(&victim)
+            .expect("slow request bodies consumed unrelated dispatch capacity");
+        assert_eq!(budget.h2_input_usage(), (1, 128));
+        drop(victim_stream);
+        drop(retained);
+        assert_eq!(budget.h2_input_usage(), (0, 0));
     }
 
     #[test]

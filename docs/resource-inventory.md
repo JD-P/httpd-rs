@@ -24,7 +24,7 @@ response construction.
 
 The slot ledger covers pending connections, HTTP/1 workers, slow-body workers,
 TLS handshakes, HTTP/2 connections, ordinary streams and a shared source-fair
-slow-output class, dynamic backend requests, blocking response reads,
+slow-input and slow-output class, dynamic backend requests, blocking response reads,
 WebSocket tunnels, expensive CPU operations, `RewriteMap prg` helpers, and
 general/slow spool files. Filesystem lookup/cache work has a separate
 64-process/8-source phase, so a stalled mount cannot occupy every request
@@ -46,6 +46,15 @@ An HTTP/1 connection that entered the slow class closes after its response
 instead of returning to keep-alive capacity. WebSocket upgrades similarly
 acquire their dedicated tunnel lease before releasing the general HTTP/1
 connection lease.
+
+HTTP/2 uploads use the verified
+`GeneralBeforeBody -> SlowInput -> GeneralAfterBody -> Closed` ownership
+transition. The adapter acquires a source-fair slow-input lease before
+releasing its general stream lease while awaiting DATA, and reacquires general
+capacity before releasing slow-input ownership when the body finishes. A full
+slow-input pool therefore leaves all ordinary stream capacity available to
+unrelated clients; an overloaded completion remains accounted as slow input
+until its stream is reset.
 
 All downstream-bound output is measured from the original response start.
 Partial writes and HTTP/2 capacity grants cannot renew the minimum average

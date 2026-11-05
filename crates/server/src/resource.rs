@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 pub(crate) enum SlotKind {
     DynamicBackend,
     H2Stream,
+    SlowInput,
     SlowOutput,
     ResponseBodyRead,
     Websocket,
@@ -41,7 +42,7 @@ pub(crate) enum SlotKind {
 }
 
 impl SlotKind {
-    const COUNT: usize = 16;
+    const COUNT: usize = 17;
 
     const fn index(self) -> usize {
         self as usize
@@ -226,6 +227,13 @@ pub const MAX_RESPONSE_BODY_READS: u64 = 32;
 pub const MAX_RESPONSE_BODY_READS_PER_CLIENT: u64 = 8;
 pub const MAX_H2_STREAMS: u64 = 256;
 pub const MAX_H2_STREAMS_PER_CLIENT: u64 = 64;
+/// Request-body-blocked HTTP/2 streams leave the general dispatch pool and
+/// enter this smaller source-fair pool. A peer that withholds DATA can retain
+/// only this reserve, rather than every stream needed by unrelated clients.
+pub const MAX_SLOW_INPUTS: u64 = 128;
+/// Allow one complete advertised 32-stream connection per source while
+/// preventing a small set of addresses from owning the entire reserve.
+pub const MAX_SLOW_INPUTS_PER_CLIENT: u64 = 32;
 /// Flow-control-blocked outputs leave the general stream pool and enter this
 /// smaller source-fair pool. A handful of slow peers can therefore retain
 /// their responses without denying dispatch capacity to unrelated clients.
@@ -391,7 +399,7 @@ const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
         H1Connection => [0, 1, 64 * 1024],
         RequestWorker => [0, 1, 512 * 1024],
         H2Connection => [0, 1, 256 * 1024],
-        H2Stream | SlowOutput => [0, 1, 128 * 1024],
+        H2Stream | SlowInput | SlowOutput => [0, 1, 128 * 1024],
         ResponseBodyRead => [0, 1, 64 * 1024],
         // A dynamic request may own an upstream socket or the CGI stdin/stdout/
         // stderr pipes, plus bounded helper work.
@@ -2073,6 +2081,21 @@ impl ResourceBudget {
         })
     }
 
+    pub(crate) fn try_slow_input_in(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+    ) -> io::Result<SlowInputLease> {
+        Ok(SlowInputLease {
+            _slot: context.slot(
+                SlotKind::SlowInput,
+                MAX_SLOW_INPUTS,
+                Some(MAX_SLOW_INPUTS_PER_CLIENT),
+                Some(1),
+                "slow-input limit reached",
+            )?,
+        })
+    }
+
     pub fn try_request_bytes(self: &Arc<Self>) -> io::Result<ResidentLease> {
         let context = self.current_context_for()?;
         Ok(ResidentLease::new(
@@ -2330,6 +2353,14 @@ impl ResourceBudget {
         )
     }
 
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn h2_input_usage(&self) -> (u64, u64) {
+        (
+            self.slot_usage(SlotKind::H2Stream),
+            self.slot_usage(SlotKind::SlowInput),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn slow_output_resource_usage(&self) -> (u64, u64, u64, u64) {
         (
@@ -2473,6 +2504,11 @@ impl ResidentLease {
 
 #[derive(Debug)]
 pub struct CombinedH2Lease {
+    _slot: SlotLease,
+}
+
+#[derive(Debug)]
+pub(crate) struct SlowInputLease {
     _slot: SlotLease,
 }
 
@@ -2640,7 +2676,9 @@ enum GeneralOutputLease {
 pub(crate) struct SlowOutputAdmission {
     context: ResourceContext,
     general: Option<GeneralOutputLease>,
+    slow_input: Option<SlowInputLease>,
     slow: Option<SlowOutputLease>,
+    input_phase: Option<vapache_verified::H2InputPhase>,
     phase: vapache_verified::SlowOutputPhase,
 }
 
@@ -2649,7 +2687,9 @@ impl SlowOutputAdmission {
         Self {
             context,
             general: Some(GeneralOutputLease::H1(general)),
+            slow_input: None,
             slow: None,
+            input_phase: None,
             phase: vapache_verified::SlowOutputPhase::General,
         }
     }
@@ -2658,7 +2698,9 @@ impl SlowOutputAdmission {
         Self {
             context,
             general: Some(GeneralOutputLease::H2 { _lease: general }),
+            slow_input: None,
             slow: None,
+            input_phase: Some(vapache_verified::H2InputPhase::GeneralBeforeBody),
             phase: vapache_verified::SlowOutputPhase::General,
         }
     }
@@ -2667,7 +2709,9 @@ impl SlowOutputAdmission {
         Self {
             context,
             general: None,
+            slow_input: None,
             slow: None,
+            input_phase: None,
             phase: vapache_verified::SlowOutputPhase::General,
         }
     }
@@ -2680,6 +2724,69 @@ impl SlowOutputAdmission {
         self.context
             .client()
             .expect("slow output admission requires a client identity")
+    }
+
+    pub(crate) fn is_slow_input(&self) -> bool {
+        self.input_phase == Some(vapache_verified::H2InputPhase::SlowInput)
+    }
+
+    /// Transfer an HTTP/2 stream that is about to wait for request DATA from
+    /// general dispatch capacity into the source-fair slow-input reserve. The
+    /// slow lease is acquired first, so rejection leaves the general lease
+    /// intact for the bounded error response.
+    pub(crate) fn enter_slow_input(&mut self) -> io::Result<()> {
+        if self.is_slow_input() {
+            return Ok(());
+        }
+        let phase = self
+            .input_phase
+            .ok_or_else(|| io::Error::other("slow input requires HTTP/2 ownership"))?;
+        let next =
+            vapache_verified::h2_input_phase_step(phase, vapache_verified::H2InputEvent::BodyWait)
+                .ok_or_else(|| io::Error::other("HTTP/2 input ownership cannot enter body wait"))?;
+        if !matches!(self.general, Some(GeneralOutputLease::H2 { .. })) {
+            return Err(io::Error::other("HTTP/2 input lost general ownership"));
+        }
+        let slow = self
+            .context
+            .budget()
+            .try_slow_input_in(&self.context)
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "slow-input capacity exhausted")
+            })?;
+        self.input_phase = Some(next);
+        self.slow_input = Some(slow);
+        drop(self.general.take());
+        Ok(())
+    }
+
+    /// A completed/abandoned upload must reacquire normal stream ownership
+    /// before policy/backend execution or response output resumes. Acquire the
+    /// general lease first; on overload the slow-input lease remains owned
+    /// until the stream is reset and this value is dropped.
+    pub(crate) fn leave_slow_input(&mut self) -> io::Result<()> {
+        if !self.is_slow_input() {
+            return Ok(());
+        }
+        let next = vapache_verified::h2_input_phase_step(
+            vapache_verified::H2InputPhase::SlowInput,
+            vapache_verified::H2InputEvent::BodyComplete,
+        )
+        .expect("verified slow-input completion transition");
+        let general = self
+            .context
+            .budget()
+            .try_h2_stream_in(&self.context)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "HTTP/2 stream capacity exhausted after request body",
+                )
+            })?;
+        self.general = Some(GeneralOutputLease::H2 { _lease: general });
+        self.input_phase = Some(next);
+        drop(self.slow_input.take());
+        Ok(())
     }
 
     pub(crate) fn enter_slow(&mut self) -> io::Result<()> {
@@ -2696,6 +2803,11 @@ impl SlowOutputAdmission {
     ) -> io::Result<()> {
         if self.is_slow() {
             return Ok(());
+        }
+        if self.is_slow_input() {
+            return Err(io::Error::other(
+                "output cannot start while HTTP/2 request input is pending",
+            ));
         }
         let next = vapache_verified::slow_output_phase_step(
             self.phase,
@@ -2717,6 +2829,13 @@ impl SlowOutputAdmission {
     }
 
     fn finish(&mut self) {
+        if let Some(phase) = self.input_phase {
+            if let Some(next) =
+                vapache_verified::h2_input_phase_step(phase, vapache_verified::H2InputEvent::Finish)
+            {
+                self.input_phase = Some(next);
+            }
+        }
         if let Some(next) = vapache_verified::slow_output_phase_step(
             self.phase,
             vapache_verified::SlowOutputEvent::Finish,
@@ -2724,6 +2843,7 @@ impl SlowOutputAdmission {
             self.phase = next;
         }
         drop(self.general.take());
+        drop(self.slow_input.take());
         drop(self.slow.take());
     }
 
@@ -3095,6 +3215,41 @@ mod tests {
     }
 
     #[test]
+    fn h2_slow_input_handoff_is_atomic_in_both_directions() {
+        let budget = Arc::new(ResourceBudget::default());
+        let context = budget.context(IpAddr::from([192, 0, 2, 44]));
+        let general = budget.try_h2_stream_in(&context).unwrap();
+        let mut output = SlowOutputAdmission::tracked_h2(context, general);
+
+        assert_eq!(budget.h2_input_usage(), (1, 0));
+        output.enter_slow_input().unwrap();
+        output.enter_slow_input().unwrap();
+        assert_eq!(budget.h2_input_usage(), (0, 1));
+
+        let general: Vec<_> = (0..MAX_H2_STREAMS)
+            .map(|index| {
+                budget
+                    .try_h2_stream_for(IpAddr::from([
+                        198,
+                        51,
+                        (index / MAX_H2_STREAMS_PER_CLIENT) as u8,
+                        (index % MAX_H2_STREAMS_PER_CLIENT) as u8,
+                    ]))
+                    .unwrap()
+            })
+            .collect();
+        assert!(output.leave_slow_input().is_err());
+        assert_eq!(budget.h2_input_usage(), (MAX_H2_STREAMS, 1));
+
+        drop(general);
+        output.leave_slow_input().unwrap();
+        output.leave_slow_input().unwrap();
+        assert_eq!(budget.h2_input_usage(), (1, 0));
+        output.finish_response();
+        assert_eq!(budget.h2_input_usage(), (0, 0));
+    }
+
+    #[test]
     fn one_request_context_cannot_multiply_dynamic_backend_slots() {
         let budget = Arc::new(ResourceBudget::default());
         let context = budget.context(IpAddr::from([192, 0, 2, 2]));
@@ -3325,6 +3480,34 @@ mod tests {
         assert_eq!(budget.h2_output_usage(), (0, MAX_SLOW_OUTPUTS));
         drop(all);
         assert_eq!(budget.h2_output_usage(), (0, 0));
+    }
+
+    #[test]
+    fn slow_h2_inputs_have_source_and_process_fairness() {
+        let budget = Arc::new(ResourceBudget::default());
+        let first_leases: Vec<_> = (0..MAX_SLOW_INPUTS_PER_CLIENT)
+            .map(|_| {
+                let context = budget.context(IpAddr::from([192, 0, 2, 1]));
+                budget.try_slow_input_in(&context).unwrap()
+            })
+            .collect();
+        let first_overflow = budget.context(IpAddr::from([192, 0, 2, 1]));
+        assert!(budget.try_slow_input_in(&first_overflow).is_err());
+
+        let mut all = first_leases;
+        for source in 2..=4 {
+            all.extend((0..MAX_SLOW_INPUTS_PER_CLIENT).map(|_| {
+                let context = budget.context(IpAddr::from([192, 0, 2, source]));
+                budget.try_slow_input_in(&context).unwrap()
+            }));
+        }
+        assert_eq!(all.len() as u64, MAX_SLOW_INPUTS);
+        assert!(budget
+            .try_slow_input_in(&budget.context(IpAddr::from([198, 51, 100, 1])))
+            .is_err());
+        assert_eq!(budget.h2_input_usage(), (0, MAX_SLOW_INPUTS));
+        drop(all);
+        assert_eq!(budget.h2_input_usage(), (0, 0));
     }
 
     #[test]
