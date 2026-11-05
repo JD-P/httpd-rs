@@ -54,7 +54,7 @@ struct IdleProxyConnection {
 /// metadata shared only by requests parsed from one downstream transport.
 pub(crate) struct ProxySession {
     generation: u64,
-    idle: Mutex<HashMap<Vec<u8>, IdleProxyConnection>>,
+    idle: Mutex<HashMap<[u8; 32], IdleProxyConnection>>,
 }
 
 impl std::fmt::Debug for ProxySession {
@@ -74,7 +74,7 @@ impl ProxySession {
         }
     }
 
-    fn take(&self, generation: u64, key: &[u8]) -> Option<IdleProxyConnection> {
+    fn take(&self, generation: u64, key: &[u8; 32]) -> Option<IdleProxyConnection> {
         if generation != self.generation {
             return None;
         }
@@ -83,7 +83,7 @@ impl ProxySession {
         idle.remove(key)
     }
 
-    fn put(&self, generation: u64, key: Vec<u8>, connection: IdleProxyConnection) {
+    fn put(&self, generation: u64, key: [u8; 32], connection: IdleProxyConnection) {
         if generation != self.generation {
             return;
         }
@@ -2926,14 +2926,17 @@ fn backend_key(backend: &HttpBackend) -> String {
     )
 }
 
-fn proxy_session_key(target: &Target, req: &Request, host: &str) -> Option<Vec<u8>> {
+fn proxy_session_key(binding: &str, req: &Request, host: &str) -> Option<[u8; 32]> {
     fn update(context: &mut ring::digest::Context, bytes: &[u8]) {
         context.update(&(bytes.len() as u64).to_be_bytes());
         context.update(bytes);
     }
 
     let mut context = ring::digest::Context::new(&ring::digest::SHA256);
-    update(&mut context, target.binding_key().as_bytes());
+    // The authorization check immediately before pool lookup has already
+    // materialized this exact backend binding. Reuse it rather than formatting
+    // and allocating the same security identity a second time.
+    update(&mut context, binding.as_bytes());
     update(&mut context, req.method.as_bytes());
     update(&mut context, &req.query);
     update(&mut context, host.as_bytes());
@@ -2952,7 +2955,13 @@ fn proxy_session_key(target: &Target, req: &Request, host: &str) -> Option<Vec<u
         return None;
     }
     update(&mut context, &req.body);
-    Some(context.finish().as_ref().to_vec())
+    Some(
+        context
+            .finish()
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 has a 32-byte output"),
+    )
 }
 
 fn proxy_method_is_idempotent(method: &str) -> bool {
@@ -3830,13 +3839,17 @@ pub(crate) fn execute_with_proxy_base(
                 local_ip,
             );
         }
-        tried.insert(backend_key(&current.backend));
+        // Direct ProxyPass routes have no alternate member, so they do not
+        // need a per-request allocation for the failover exclusion set.
+        if current.balancer.is_some() {
+            tried.insert(backend_key(&current.backend));
+        }
         let pool_key = if current.backend.tls {
             None
         } else {
-            proxy_session_key(&current, req, host)
+            proxy_session_key(&binding, req, host)
         };
-        let pooled = pool_key.as_deref().and_then(|key| {
+        let pooled = pool_key.as_ref().and_then(|key| {
             req.headers
                 .proxy_session()
                 .and_then(|session| session.take(cfg.generation, key))
@@ -4805,37 +4818,29 @@ mod more_tests {
         let session = ProxySession::new(7);
         assert!(format!("{session:?}").contains("generation: 7"));
 
-        session.put(
-            6,
-            b"wrong-generation".to_vec(),
-            idle(&budget, Instant::now()),
-        );
+        session.put(6, [255; 32], idle(&budget, Instant::now()));
         assert!(session.idle.lock().unwrap().is_empty());
         for index in 0..MAX_PROXY_SESSION_BACKENDS + 1 {
-            session.put(7, vec![index as u8], idle(&budget, Instant::now()));
+            session.put(7, [index as u8; 32], idle(&budget, Instant::now()));
         }
         assert_eq!(
             session.idle.lock().unwrap().len(),
             MAX_PROXY_SESSION_BACKENDS
         );
-        assert!(session.take(6, &[0]).is_none());
+        assert!(session.take(6, &[0; 32]).is_none());
 
         // Replacing an existing key remains admissible even at capacity.
-        session.put(7, vec![1], idle(&budget, Instant::now()));
-        assert!(session.take(7, &[0]).is_some());
-        assert!(session.take(7, &[1]).is_some());
+        session.put(7, [1; 32], idle(&budget, Instant::now()));
+        assert!(session.take(7, &[0; 32]).is_some());
+        assert!(session.take(7, &[1; 32]).is_some());
         let expired = idle(
             &budget,
             Instant::now() - PROXY_SESSION_IDLE_TIMEOUT - Duration::from_secs(1),
         );
-        session
-            .idle
-            .lock()
-            .unwrap()
-            .insert(b"expired".to_vec(), expired);
-        session.put(7, b"fresh".to_vec(), idle(&budget, Instant::now()));
-        assert!(session.take(7, b"expired").is_none());
-        assert!(session.take(7, b"fresh").is_some());
+        session.idle.lock().unwrap().insert([2; 32], expired);
+        session.put(7, [3; 32], idle(&budget, Instant::now()));
+        assert!(session.take(7, &[2; 32]).is_none());
+        assert!(session.take(7, &[3; 32]).is_some());
     }
 
     #[test]
