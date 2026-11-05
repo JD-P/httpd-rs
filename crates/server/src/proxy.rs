@@ -4753,6 +4753,33 @@ mod more_tests {
             );
         }
         assert_eq!(accepts.load(Ordering::Relaxed), 4);
+        let mut spooled = request.clone();
+        spooled.method = "POST".into();
+        spooled.body_spool = Some(Arc::new(crate::http::SpooledBody::from_bytes(
+            b"spooled body",
+        )));
+        spooled.framing = crate::verified::BodyFraming::Length(spooled.body_len());
+        for _ in 0..2 {
+            let target = match_target(&cfg, &scope, "/pool/x").unwrap();
+            assert_eq!(
+                execute(
+                    &cfg,
+                    None,
+                    &scope,
+                    &spooled,
+                    "/pool/x",
+                    &target,
+                    peer,
+                    80,
+                    false,
+                    "localhost",
+                    "127.0.0.1",
+                )
+                .status,
+                200
+            );
+        }
+        assert_eq!(accepts.load(Ordering::Relaxed), 6);
         stop.store(true, Ordering::Relaxed);
         let _ = handle.join();
         let _ = fs::remove_dir_all(&dir);
@@ -4792,20 +4819,23 @@ mod more_tests {
             MAX_PROXY_SESSION_BACKENDS
         );
         assert!(session.take(6, &[0]).is_none());
-        assert!(session.take(7, &[0]).is_some());
 
         // Replacing an existing key remains admissible even at capacity.
         session.put(7, vec![1], idle(&budget, Instant::now()));
+        assert!(session.take(7, &[0]).is_some());
         assert!(session.take(7, &[1]).is_some());
-        session.put(
-            7,
-            b"expired".to_vec(),
-            idle(
-                &budget,
-                Instant::now() - PROXY_SESSION_IDLE_TIMEOUT - Duration::from_secs(1),
-            ),
+        let expired = idle(
+            &budget,
+            Instant::now() - PROXY_SESSION_IDLE_TIMEOUT - Duration::from_secs(1),
         );
+        session
+            .idle
+            .lock()
+            .unwrap()
+            .insert(b"expired".to_vec(), expired);
+        session.put(7, b"fresh".to_vec(), idle(&budget, Instant::now()));
         assert!(session.take(7, b"expired").is_none());
+        assert!(session.take(7, b"fresh").is_some());
     }
 
     #[test]
