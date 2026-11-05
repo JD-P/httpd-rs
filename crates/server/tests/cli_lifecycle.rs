@@ -145,6 +145,19 @@ fn wait_running(root: &Path, port: u16) {
     });
 }
 
+fn connect_when_ready(port: u16) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => return stream,
+            Err(_) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("timed out connecting to vapached: {error}"),
+        }
+    }
+}
+
 fn read_pid(root: &Path) -> i32 {
     fs::read_to_string(root.join("vapached.pid"))
         .unwrap()
@@ -158,7 +171,7 @@ fn signal(pid: i32, sig: i32) {
 }
 
 fn http_body(port: u16, path: &str) -> Vec<u8> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut stream = connect_when_ready(port);
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -425,7 +438,7 @@ fn foreground_reload_reopen_bind_and_actions() {
     assert!(output(&root, &config, &["-k", "graceful"]).status.success());
     thread::sleep(Duration::from_millis(150));
 
-    let mut old_generation = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut old_generation = connect_when_ready(port);
     old_generation
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -546,7 +559,7 @@ fn daemon_and_active_graceful_drain() {
     // The listener is bound before CGI pool setup and signal-handler
     // installation complete.  Do not send SIGTERM in that narrow window.
     thread::sleep(Duration::from_secs(2));
-    let mut request = TcpStream::connect(("127.0.0.1", drain_port)).unwrap();
+    let mut request = connect_when_ready(drain_port);
     request
         .write_all(b"GET /slow.cgi HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .unwrap();
