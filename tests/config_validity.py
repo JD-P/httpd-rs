@@ -364,6 +364,10 @@ MALFORMED_CASES = [
 # policy and rejects it in every mode.
 HARDENED_CASES = [
     ("Options requires an operand", f'<Directory "{DOCROOT}">\nOptions\n</Directory>\n'),
+    (
+        "AllowOverride rejects an unknown Options member",
+        f'<Directory "{DOCROOT}/x">\nAllowOverride Options=NotAnOption\n</Directory>\n',
+    ),
     ("ExpiresDefault invalid duration", "ExpiresDefault nonsense\n"),
     ("ErrorDocument rejects a non-error status", "ErrorDocument 200 /error.html\n"),
     ("Timeout invalid integer", "Timeout nope\n"),

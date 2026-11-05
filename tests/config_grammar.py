@@ -89,7 +89,6 @@ DIRECTIVES = [
 
 INVALID = [
     ("bad-allowoverride", "AllowOverride NotACategory\n"),
-    ("bad-allowoverride-options", f'<Directory "{DOCROOT}/x">\nAllowOverride Options=NotAnOption\n</Directory>\n'),
     ("bad-allowoverridelist-none", f'<Directory "{DOCROOT}/x">\nAllowOverride None\nAllowOverrideList None Require\n</Directory>\n'),
     ("bad-require-ip", f'<Directory "{DOCROOT}/x">\nRequire ip not-an-ip\n</Directory>\n'),
     ("bad-require-method", f'<Directory "{DOCROOT}/x">\nRequire method BOGUS\n</Directory>\n'),
