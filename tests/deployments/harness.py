@@ -368,7 +368,10 @@ def main() -> int:
     for index, case in enumerate(cases, 1):
         started = time.monotonic()
         print(f"[{index}/{len(cases)}] {case.identifier}: {case.scenario.title}", flush=True)
-        run_dir = run_root / case.identifier
+        # Unix-domain sockets have a 108-byte sockaddr limit (and Apache's
+        # proxy worker representation is stricter), so keep disposable staging
+        # paths compact while retaining descriptive artifact directories.
+        run_dir = run_root / f"c{index:02d}"
         artifact_dir = artifact_root / case.identifier
         run_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(run_dir, 0o755)

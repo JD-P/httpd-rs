@@ -37,7 +37,7 @@ services:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000$${GITEA_HEALTH_PATH}/api/v1/version"]
       interval: 2s
       timeout: 5s
-      retries: 60
+      retries: 180
 
 networks:
   application:

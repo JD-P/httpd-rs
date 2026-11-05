@@ -31,6 +31,7 @@ from typing import Callable, Iterable
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCKER_SOCKET = Path("/var/run/docker.sock")
+_PORT_CURSOR: int | None = None
 
 
 class DeploymentError(RuntimeError):
@@ -67,9 +68,35 @@ def command(
 
 
 def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
+    """Choose an unused port that the kernel will not claim as an ephemeral source port."""
+    global _PORT_CURSOR
+    ephemeral_low, ephemeral_high = 32768, 60999
+    try:
+        fields = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()
+        ephemeral_low, ephemeral_high = int(fields[0]), int(fields[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    ranges = [
+        (10_000, min(29_999, ephemeral_low - 1)),
+        (max(61_000, ephemeral_high + 1), 65_535),
+    ]
+    ranges = [(low, high) for low, high in ranges if low <= high]
+    if not ranges:
+        ranges = [(10_000, 29_999)]
+    low, high = max(ranges, key=lambda bounds: bounds[1] - bounds[0])
+    size = high - low + 1
+    if _PORT_CURSOR is None or not low <= _PORT_CURSOR <= high:
+        _PORT_CURSOR = low + (os.getpid() * 7919) % size
+    for _ in range(size):
+        candidate = _PORT_CURSOR
+        _PORT_CURSOR = low + ((_PORT_CURSOR - low + 1) % size)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            try:
+                listener.bind(("127.0.0.1", candidate))
+            except OSError:
+                continue
+            return candidate
+    raise DeploymentError("could not find a free non-ephemeral loopback port")
 
 
 def wait_for(
@@ -386,6 +413,11 @@ class ApacheProcess:
             self._log_handle.close()
             self._log_handle = None
 
+    def assert_running(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            tail = self.log.read_text(errors="replace")[-4000:] if self.log.exists() else ""
+            raise DeploymentError(f"Apache exited unexpectedly\n{tail}")
+
 
 def paths_overlap(first: Path, second: Path) -> bool:
     first = first.resolve()
@@ -507,19 +539,31 @@ class ComposeProject:
         if wait_timeout < 1:
             raise DeploymentError("Compose wait timeout must be positive")
         self.validate()
-        command(
-            [
-                *self._base(),
-                "up",
-                "--detach",
-                "--wait",
-                "--wait-timeout",
-                str(wait_timeout),
-            ],
-            env=self._environment(),
-            timeout=wait_timeout + 60,
-            capture=False,
-        )
+        try:
+            command(
+                [
+                    *self._base(),
+                    "up",
+                    "--detach",
+                    "--wait",
+                    "--wait-timeout",
+                    str(wait_timeout),
+                ],
+                env=self._environment(),
+                timeout=wait_timeout + 60,
+                capture=False,
+            )
+        except Exception as error:
+            diagnostics = command(
+                [*self._base(), "logs", "--no-color", "--tail", "200"],
+                env=self._environment(),
+                timeout=60,
+                check=False,
+            ).stdout
+            diagnostic_path = self.artifact_dir / "compose-startup.log"
+            diagnostic_path.write_text(diagnostics or "")
+            tail = (diagnostics or "")[-8000:]
+            raise DeploymentError(f"{error}\ncontainer startup log:\n{tail}") from error
         self.validate_live_mounts()
 
     def validate_live_mounts(self) -> None:
@@ -760,7 +804,7 @@ Listen {port}
 User {user}
 Group {group}
 PidFile "{logs / 'apache.pid'}"
-ErrorLog "{logs / 'error.log'}"
+ErrorLog /dev/stderr
 LogLevel warn
 ServerName deployment.test
 Timeout 30
@@ -790,7 +834,12 @@ def start_apache(
     process = ApacheProcess(config=config, log=context.artifact_dir / "apache.log")
     context.add_cleanup(process.stop)
     process.start()
-    wait_http(port, tls=tls)
+    try:
+        wait_http(port, tls=tls)
+    except Exception:
+        process.assert_running()
+        raise
+    process.assert_running()
     return process
 
 

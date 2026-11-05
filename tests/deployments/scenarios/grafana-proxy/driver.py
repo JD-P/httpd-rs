@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import socket
 import struct
 import time
@@ -121,6 +122,16 @@ def expect_pong(stream: socket.socket) -> None:
     raise DeploymentError("Grafana did not return the WebSocket ping payload")
 
 
+def require_healthy(port: int, path: str, *, headers: dict[str, str] | None = None) -> None:
+    _, body = require_response(port, path, headers=headers)
+    try:
+        health = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise DeploymentError(f"Grafana health response was not JSON: {body[:1000]!r}") from error
+    if health.get("database") != "ok":
+        raise DeploymentError(f"Grafana database was not healthy: {health!r}")
+
+
 def run(context: CaseContext, variant: dict[str, str]) -> None:
     backend_port = free_port()
     frontend_port = free_port()
@@ -151,7 +162,7 @@ ProxyPassReverse {route} {backend_route}
         context.run_dir, frontend_port, empty_docroot, extra=extra
     )
     server = start_vapache(context, config, pid_file, frontend_port)
-    require_response(frontend_port, f"{prefix}/api/health", contains=b'"database":"ok"')
+    require_healthy(frontend_port, f"{prefix}/api/health")
     root_status, root_headers, root_body = request(frontend_port, f"{prefix}/")
     if root_status in (301, 302, 303, 307, 308):
         location = root_headers.get("location", "")
@@ -174,7 +185,7 @@ ProxyPassReverse {route} {backend_route}
     finally:
         websocket.close()
 
-    require_response(frontend_port, f"{prefix}/api/health", contains=b'"database":"ok"')
+    require_healthy(frontend_port, f"{prefix}/api/health")
     if context.benchmark:
         apache_port = free_port()
         websocket_route = f"{prefix}/api/live/" if prefix else "/api/live/"
@@ -201,10 +212,9 @@ ProxyPassReverse {route} {backend_route}
         )
         start_apache(context, apache_config, apache_port)
         host = f"127.0.0.1:{frontend_port}"
-        require_response(
+        require_healthy(
             apache_port,
             f"{prefix}/api/health",
-            contains=b'"database":"ok"',
             headers={"Host": host},
         )
         apache_websocket = open_websocket(

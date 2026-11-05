@@ -14,6 +14,7 @@ from lib import (
     ComposeProject,
     DeploymentError,
     ROOT,
+    free_port,
     validate_bind_source,
     validate_build_context,
 )
@@ -181,6 +182,16 @@ class DeploymentHarnessTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(DeploymentError, "timeout must be positive"):
             project.up(wait_timeout=0)
+
+    def test_frontend_ports_avoid_the_kernel_ephemeral_range(self) -> None:
+        port = free_port()
+        try:
+            low, high = map(
+                int, Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()
+            )
+        except (OSError, ValueError):
+            low, high = 32768, 60999
+        self.assertFalse(low <= port <= high)
 
     def test_compose_models_enforce_container_isolation(self) -> None:
         by_id = {scenario.identifier: scenario for scenario in self.scenarios}

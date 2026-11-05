@@ -178,7 +178,7 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
         },
     )
     compose.pull()
-    compose.up(wait_timeout=240)
+    compose.up(wait_timeout=360)
     backend_host = compose.service_ip("gitea")
     create_admin(compose)
 

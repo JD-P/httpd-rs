@@ -49,7 +49,7 @@ def install_wordpress(port: int) -> urllib.request.OpenerDirector:
             "language": "",
         }
     ).encode()
-    request_object = urllib.request.Request(install_url, data=form, method="POST")
+    request_object = urllib.request.Request(f"{install_url}?step=2", data=form, method="POST")
     with opener.open(request_object, timeout=60) as response:
         installed = response.read()
     if b"Success" not in installed and b"Log In" not in installed:

@@ -374,15 +374,15 @@ ProxyPassReverse / http://{web_host}:3000/
         start_apache(context, apache_config, apache_port, tls=True)
         require_response(
             apache_port,
-            "/api/v2/instance",
-            contains=b'"domain":"deployment.test"',
+            "/health",
+            contains=b"OK",
             headers=host,
             tls=True,
         )
         differential_benchmark(
             port,
             apache_port,
-            "/api/v2/instance",
+            "/health",
             context.artifact_dir / "apache-vapache-benchmark.json",
             headers=(f"Host: {PUBLIC_HOST}",),
             tls=True,

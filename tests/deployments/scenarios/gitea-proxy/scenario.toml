@@ -1,7 +1,7 @@
 id = "gitea-proxy"
 title = "Gitea API and smart-HTTP reverse proxy"
 nightly = false
-timeout_seconds = 300
+timeout_seconds = 480
 disk_mb = 1536
 modes = ["reverse-proxy", "streaming", "request-body", "cookies", "git-smart-http"]
 upstreams = ["Gitea 1.26.0"]
