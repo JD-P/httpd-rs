@@ -260,6 +260,13 @@ class VapacheProcess:
 
     def start(self, *, timeout: float = 30) -> None:
         prefix = privilege_prefix()
+        if prefix:
+            # CI creates the per-case configuration as the unprivileged runner
+            # and then starts Vapache through passwordless sudo so it can drop
+            # to www-data. Mirror a real /etc/apache2 input before asking the
+            # privileged parser to enforce its root-owned trust boundary.
+            command([*prefix, "chown", "0:0", os.fspath(self.config)], timeout=30)
+            command([*prefix, "chmod", "0644", os.fspath(self.config)], timeout=30)
         check = [*prefix, os.fspath(self.binary), "-f", os.fspath(self.config), "-t", "--strict-config"]
         command(check, timeout=timeout)
         self.log.parent.mkdir(parents=True, exist_ok=True)
