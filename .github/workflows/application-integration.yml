@@ -94,6 +94,11 @@ jobs:
             args+=(--benchmark)
           fi
           python3 tests/deployments/harness.py "${args[@]}"
+      - name: Show differential benchmark summary
+        if: always()
+        run: |
+          find deployment-results -name benchmark-summary.md -type f -print \
+            -exec cat {} \;
       - name: Show reclaimed container storage
         if: always()
         run: docker system df

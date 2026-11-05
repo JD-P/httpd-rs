@@ -347,6 +347,7 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
 SSLCertificateFile "{certificate}"
 SSLCertificateKeyFile "{private_key}"
 ProxyPreserveHost On
+RequestHeader set X-Forwarded-Proto "https"
 ProxyPass /api/v1/streaming http://{streaming_host}:4000/api/v1/streaming
 ProxyPassReverse /api/v1/streaming http://{streaming_host}:4000/api/v1/streaming
 ProxyPass / http://{web_host}:3000/
@@ -361,6 +362,7 @@ ProxyPassReverse / http://{web_host}:3000/
                 "mpm_event",
                 "authz_core",
                 "authz_host",
+                "headers",
                 "socache_shmcb",
                 "ssl",
                 "proxy",
@@ -384,4 +386,5 @@ ProxyPassReverse / http://{web_host}:3000/
             context.artifact_dir / "apache-vapache-benchmark.json",
             headers=(f"Host: {PUBLIC_HOST}",),
             tls=True,
+            connections=4,
         )

@@ -242,4 +242,5 @@ ProxyPassMatch ^/(.*\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{document_
             apache_port,
             path,
             context.artifact_dir / "apache-vapache-benchmark.json",
+            connections=4,
         )

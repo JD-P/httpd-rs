@@ -174,7 +174,10 @@ ErrorDocument 404 /404.html
     if headers.get("x-vapache-deployment") != "hugo":
         raise DeploymentError(".htaccess Header policy was not applied")
     status, redirect_headers, _ = request(port, "/legacy")
-    if status != 302 or redirect_headers.get("location") != "/posts/hello/":
+    redirect = urllib.parse.urlsplit(redirect_headers.get("location", ""))
+    if status != 302 or redirect.path != "/posts/hello/" or (
+        redirect.port is not None and redirect.port != port
+    ):
         raise DeploymentError(f"unexpected Hugo legacy redirect: {status} {redirect_headers}")
     require_response(port, "/missing", status=404, contains=b"hugo-custom-404")
 
@@ -246,7 +249,9 @@ ErrorDocument 404 /404.html
                 "authz_core",
                 "authz_host",
                 "auth_basic",
+                "authn_core",
                 "authn_file",
+                "authz_user",
                 "alias",
                 "dir",
                 "mime",

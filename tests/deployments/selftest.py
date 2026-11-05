@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 import tempfile
 import unittest
@@ -100,6 +101,31 @@ class DeploymentHarnessTests(unittest.TestCase):
     def test_every_driver_imports(self) -> None:
         for scenario in self.scenarios:
             self.assertTrue(callable(harness.import_driver(scenario).run))
+
+    def test_benchmark_summary_aggregates_medians(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vapache-summary-selftest-") as temporary:
+            artifact_root = Path(temporary)
+            case = artifact_root / "case-id"
+            case.mkdir()
+            (case / "apache-vapache-benchmark.json").write_text(
+                json.dumps(
+                    {
+                        "path": "/health",
+                        "median_requests_per_second": {"apache": 100.0, "vapache": 90.0},
+                        "vapache_to_apache_ratio": 0.9,
+                        "samples": {
+                            "apache": [{"p99_latency_ms": 2.0}, {"p99_latency_ms": 4.0}],
+                            "vapache": [{"p99_latency_ms": 3.0}, {"p99_latency_ms": 5.0}],
+                        },
+                    }
+                )
+            )
+            harness.write_benchmark_summary(
+                artifact_root, [{"case": "case-id", "scenario": "example"}]
+            )
+            summary = json.loads((artifact_root / "benchmark-summary.json").read_text())
+            self.assertEqual(summary["benchmarks"][0]["apache_p99_latency_ms"], 3.0)
+            self.assertEqual(summary["benchmarks"][0]["vapache_p99_latency_ms"], 4.0)
 
     def test_bind_mounts_are_confined_to_run_directory(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vapache-deployment-selftest-") as temporary:

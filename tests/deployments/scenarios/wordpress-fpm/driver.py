@@ -310,5 +310,6 @@ ProxyPassMatch ^/(.*\\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{wordpres
             "/",
             context.artifact_dir / "apache-vapache-benchmark.json",
             headers=(f"Host: {host}",),
+            connections=4,
         )
 

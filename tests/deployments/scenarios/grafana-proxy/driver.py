@@ -137,11 +137,12 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
     )
     compose.pull()
     compose.up()
+    backend_host = compose.service_ip("grafana")
 
     empty_docroot = context.run_dir / "empty"
     empty_docroot.mkdir()
     route = f"{prefix}/" if prefix else "/"
-    backend_route = f"http://127.0.0.1:{backend_port}{route}"
+    backend_route = f"http://{backend_host}:3000{route}"
     extra = f"""
 ProxyPass {route} {backend_route}
 ProxyPassReverse {route} {backend_route}
@@ -177,7 +178,7 @@ ProxyPassReverse {route} {backend_route}
     if context.benchmark:
         apache_port = free_port()
         websocket_route = f"{prefix}/api/live/" if prefix else "/api/live/"
-        websocket_backend = f"ws://127.0.0.1:{backend_port}{websocket_route}"
+        websocket_backend = f"ws://{backend_host}:3000{websocket_route}"
         apache_extra = f"""
 ProxyPass {websocket_route} {websocket_backend}
 ProxyPassReverse {websocket_route} {websocket_backend}
@@ -222,5 +223,6 @@ ProxyPassReverse {route} {backend_route}
             f"{prefix}/api/health",
             context.artifact_dir / "apache-vapache-benchmark.json",
             headers=(f"Host: {host}",),
+            connections=4,
         )
 

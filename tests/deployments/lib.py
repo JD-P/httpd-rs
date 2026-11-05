@@ -802,6 +802,7 @@ def differential_benchmark(
     *,
     headers: tuple[str, ...] = (),
     tls: bool = False,
+    connections: int = 8,
 ) -> None:
     wrk = shutil.which("wrk")
     if not wrk:
@@ -815,13 +816,15 @@ def differential_benchmark(
         argv.append(f"{scheme}://127.0.0.1:{port}{path}")
         return argv
 
+    if connections < 1:
+        raise DeploymentError("differential benchmark connections must be positive")
     for port in (vapache_port, apache_port):
-        command(wrk_command(port, "2s", 4), timeout=20)
+        command(wrk_command(port, "2s", min(4, connections)), timeout=20)
 
     samples: dict[str, list[dict[str, object]]] = {"vapache": [], "apache": []}
     order = (("vapache", vapache_port), ("apache", apache_port), ("apache", apache_port), ("vapache", vapache_port), ("vapache", vapache_port), ("apache", apache_port))
     for server, port in order:
-        output = command(wrk_command(port, "5s", 8), timeout=30).stdout
+        output = command(wrk_command(port, "5s", connections), timeout=30).stdout
         match = re.search(r"Requests/sec:\s+([0-9.]+)", output)
         if match is None:
             raise DeploymentError(f"wrk did not report throughput for {server}: {output}")

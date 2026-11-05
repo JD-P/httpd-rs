@@ -178,14 +178,15 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
         },
     )
     compose.pull()
-    compose.up()
+    compose.up(wait_timeout=240)
+    backend_host = compose.service_ip("gitea")
     create_admin(compose)
 
     empty_docroot = context.run_dir / "empty"
     empty_docroot.mkdir()
     os.chmod(empty_docroot, 0o755)
     route = f"{prefix}/" if prefix else "/"
-    backend_route = f"http://127.0.0.1:{backend_port}{route}"
+    backend_route = f"http://{backend_host}:3000{route}"
     extra = f"""
 ProxyPass {route} {backend_route}
 ProxyPassReverse {route} {backend_route}
@@ -250,5 +251,6 @@ ProxyPassReverse {route} {backend_route}
             benchmark_path,
             context.artifact_dir / "apache-vapache-benchmark.json",
             headers=(f"Host: {host}", f"Authorization: {authorization}"),
+            connections=4,
         )
 

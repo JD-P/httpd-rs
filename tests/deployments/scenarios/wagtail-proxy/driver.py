@@ -158,4 +158,5 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
             apache_port,
             "/",
             context.artifact_dir / "apache-vapache-benchmark.json",
+            connections=2,
         )

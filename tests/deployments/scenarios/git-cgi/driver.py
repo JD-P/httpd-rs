@@ -194,7 +194,9 @@ Alias /gitweb-static/ "{gitweb_static}/"
                 "authz_core",
                 "authz_host",
                 "auth_basic",
+                "authn_core",
                 "authn_file",
+                "authz_user",
                 "alias",
                 "cgid",
                 "env",
@@ -213,5 +215,6 @@ Alias /gitweb-static/ "{gitweb_static}/"
             path,
             context.artifact_dir / "apache-vapache-benchmark.json",
             headers=benchmark_headers,
+            connections=2,
         )
 

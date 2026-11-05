@@ -165,4 +165,5 @@ ProxyPassReverse {route} {backend_route}
             benchmark_path,
             context.artifact_dir / "apache-vapache-benchmark.json",
             headers=(f"Authorization: {AUTHORIZATION}",) if benchmark_headers else (),
+            connections=2,
         )

@@ -272,4 +272,5 @@ ProxyPassReverse / {backend_route}
             apache_port,
             "/minio/health/live",
             context.artifact_dir / "apache-vapache-benchmark.json",
+            connections=4,
         )

@@ -278,4 +278,5 @@ ProxyPassMatch ^/(.*\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{nextcloud
             apache_port,
             "/status.php",
             context.artifact_dir / "apache-vapache-benchmark.json",
+            connections=4,
         )

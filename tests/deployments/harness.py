@@ -19,6 +19,7 @@ import os
 import random
 import secrets
 import shutil
+import statistics
 import subprocess
 import time
 import tomllib
@@ -214,7 +215,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-count", type=int, default=10)
     parser.add_argument("--seed", type=lambda value: int(value, 0))
     parser.add_argument("--vapached", type=Path, default=ROOT / "target/release/vapached")
-    default_run_root = Path("/run/vapache-deployments") if os.geteuid() == 0 else Path("/tmp/vapache-deployments")
+    default_run_root = (
+        Path("/run/vapache-deployments")
+        if os.geteuid() == 0 or privilege_prefix()
+        else Path("/tmp/vapache-deployments")
+    )
     parser.add_argument("--run-root", type=Path, default=default_run_root)
     parser.add_argument("--artifacts", type=Path, default=Path("/tmp/vapache-deployment-results"))
     parser.add_argument("--plan-only", action="store_true")
@@ -226,6 +231,88 @@ def parse_args() -> argparse.Namespace:
         help="developer-only: skip the distinct host service-identity prerequisite",
     )
     return parser.parse_args()
+
+
+def prepare_run_root(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        prefix = privilege_prefix()
+        if not prefix:
+            raise
+        command(
+            [
+                *prefix,
+                "install",
+                "-d",
+                "-m",
+                "0755",
+                "-o",
+                str(os.getuid()),
+                "-g",
+                str(os.getgid()),
+                os.fspath(path),
+            ],
+            timeout=30,
+        )
+    os.chmod(path, 0o755)
+
+
+def write_benchmark_summary(artifact_root: Path, results: list[dict[str, Any]]) -> None:
+    rows: list[dict[str, Any]] = []
+    results_by_case = {str(result["case"]): result for result in results}
+    for benchmark in sorted(artifact_root.glob("*/apache-vapache-benchmark.json")):
+        data = json.loads(benchmark.read_text())
+        case = benchmark.parent.name
+        result = results_by_case.get(case, {})
+        samples = data.get("samples", {})
+
+        def median_metric(server: str, metric: str) -> float | None:
+            values = [
+                float(sample[metric])
+                for sample in samples.get(server, [])
+                if sample.get(metric) is not None
+            ]
+            return statistics.median(values) if values else None
+
+        rows.append(
+            {
+                "case": case,
+                "scenario": result.get("scenario"),
+                "path": data.get("path"),
+                "apache_requests_per_second": data["median_requests_per_second"]["apache"],
+                "vapache_requests_per_second": data["median_requests_per_second"]["vapache"],
+                "vapache_to_apache_ratio": data.get("vapache_to_apache_ratio"),
+                "apache_p99_latency_ms": median_metric("apache", "p99_latency_ms"),
+                "vapache_p99_latency_ms": median_metric("vapache", "p99_latency_ms"),
+            }
+        )
+    output = {"version": 1, "benchmarks": rows}
+    (artifact_root / "benchmark-summary.json").write_text(
+        json.dumps(output, indent=2, sort_keys=True) + "\n"
+    )
+    lines = [
+        "# Canonical application benchmark summary",
+        "",
+        "| scenario | path | Apache req/s | Vapache req/s | ratio | Apache p99 ms | Vapache p99 ms |",
+        "|---|---|---:|---:|---:|---:|---:|",
+    ]
+    def metric(value: float | None, digits: int) -> str:
+        return f"{value:.{digits}f}" if value is not None else "n/a"
+
+    for row in rows:
+        ratio = row["vapache_to_apache_ratio"]
+        apache_p99 = row["apache_p99_latency_ms"]
+        vapache_p99 = row["vapache_p99_latency_ms"]
+        ratio_text = f"{ratio:.3f}x" if ratio is not None else "n/a"
+        lines.append(
+            f"| {row['scenario']} | `{row['path']}` | "
+            f"{row['apache_requests_per_second']:.2f} | {row['vapache_requests_per_second']:.2f} | "
+            f"{ratio_text} | {metric(apache_p99, 3)} | {metric(vapache_p99, 3)} |"
+        )
+    if not rows:
+        lines.append("| _no completed differential benchmarks_ | | | | | | |")
+    (artifact_root / "benchmark-summary.md").write_text("\n".join(lines) + "\n")
 
 
 def main() -> int:
@@ -244,8 +331,7 @@ def main() -> int:
     run_id = f"{int(time.time())}-{seed:016x}"
     artifact_root = args.artifacts.resolve() / run_id
     run_root = args.run_root.resolve() / run_id
-    args.run_root.resolve().mkdir(parents=True, exist_ok=True)
-    os.chmod(args.run_root.resolve(), 0o755)
+    prepare_run_root(args.run_root.resolve())
     run_root.mkdir(parents=True, exist_ok=True)
     os.chmod(run_root, 0o755)
     artifact_root.mkdir(parents=True, exist_ok=True)
@@ -327,6 +413,7 @@ def main() -> int:
 
     summary = {**plan, "results": results, "status": "failed" if failed else "passed"}
     (artifact_root / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    write_benchmark_summary(artifact_root, results)
     with contextlib.suppress(OSError):
         run_root.rmdir()
     print(f"deployment integration: {summary['status']} (seed={seed}, artifacts={artifact_root})")

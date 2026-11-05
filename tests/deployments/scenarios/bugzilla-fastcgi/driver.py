@@ -249,4 +249,5 @@ ProxyPassMatch ^/(.*\\.cgi(/.*)?)$ "unix:{socket_path}|fcgi://localhost{bugzilla
             apache_port,
             "/index.cgi",
             context.artifact_dir / "apache-vapache-benchmark.json",
+            connections=2,
         )

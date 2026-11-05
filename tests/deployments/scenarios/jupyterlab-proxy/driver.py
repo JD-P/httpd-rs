@@ -255,4 +255,5 @@ ProxyPassReverse {route} {backend_route}
             f"{prefix}/api/status",
             context.artifact_dir / "apache-vapache-benchmark.json",
             headers=(f"Authorization: token {TOKEN}",),
+            connections=4,
         )
