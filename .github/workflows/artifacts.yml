@@ -205,7 +205,11 @@ jobs:
             esac
           done
           test "$ready" -eq 1
-          docker exec "$container" dpkg -i /release/vapache_*.deb
+          deb_path=(release/vapache_*.deb)
+          test "${#deb_path[@]}" -eq 1
+          test -f "${deb_path[0]}"
+          deb_name=${deb_path[0]##*/}
+          docker exec "$container" dpkg -i "/release/$deb_name"
           if docker exec "$container" systemctl is-enabled --quiet vapache.service; then
             echo "package unexpectedly enabled vapache.service" >&2
             exit 1
