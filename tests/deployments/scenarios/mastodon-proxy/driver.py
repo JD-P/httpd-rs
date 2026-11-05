@@ -161,6 +161,7 @@ def create_access_token(compose) -> str:
             "--email",
             ACCOUNT_EMAIL,
             "--confirmed",
+            "--approve",
         ],
     )
     script = (
