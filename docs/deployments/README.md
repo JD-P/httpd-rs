@@ -1,7 +1,7 @@
 # Tested application deployments
 
-The real-application harness verifies ten deployment patterns: four fixed
-nightly cases and six applications in the stochastic manual population. The
+The real-application harness verifies twelve deployment patterns: four fixed
+nightly cases and eight applications in the stochastic manual population. The
 exact generated configuration and logs are retained with every run; these
 guides explain the security-relevant differences from a typical Apache or
 Nginx installation.
@@ -21,6 +21,8 @@ The feature-to-application rationale is maintained in the
 | JupyterLab (manual sample) | reverse proxy + WebSocket | token auth, root/subpath mounts, kernel creation and code execution across reload |
 | MinIO (manual sample) | reverse proxy | SigV4 authority binding, signed streaming upload, ranges and object listing |
 | Nextcloud (manual sample) | FastCGI + WebDAV | database install, Basic auth forwarding, DAV verbs, large upload, move and download |
+| Wagtail Bakery Demo (manual sample) | reverse proxy | Gunicorn worker variants, public API, CSRF-bound admin login and session survival across reload |
+| Bugzilla (manual sample) | FastCGI | large Perl application setup, stable worker identity, REST `PATH_INFO`, CSRF-bound login and administrative policy |
 
 ## Hugo
 
@@ -191,10 +193,36 @@ the data directory writable by PHP-FPM, and denies direct access to `config/`,
 authenticated `MKCOL`, upload, `PROPFIND`, `MOVE`, reload, exact download and
 delete against MariaDB-backed Nextcloud.
 
+## Wagtail Bakery Demo with Gunicorn
+
+The Bakery Demo is built from a digest-verified source commit with exact Python
+package versions, then runs unprivileged with an immutable root and only its
+media directory writable. PostgreSQL is confined to the internal application
+network. Django validates the public authority, so the proxy intentionally
+uses `ProxyPreserveHost On`; the private container address is never accepted
+as an application host. The test reads fixture content through Wagtail's API,
+performs a real CSRF-bound admin login, exercises both one- and two-worker
+Gunicorn configurations, and proves the authenticated session remains valid
+after Vapache reload.
+
+## Bugzilla through generic FastCGI
+
+Bugzilla is built from a digest-verified 5.2 source commit and served by
+`fcgiwrap` as `www-data`. The executable application tree is root-owned and
+immutable after `checksetup.pl`; only Bugzilla's generated data is writable by
+the worker. Vapache's FastCGI stable-path policy binds the Unix socket to UID
+33 and permits only the release owner and root along the script path. The
+socket is mode `0660`, owned by the backend UID and Vapache's service group;
+unrelated local users cannot bypass the front end. Direct reads of Perl
+modules, templates and `localconfig` are denied. The test uses the real
+two-pass installer, MariaDB, the REST version endpoint through `PATH_INFO`,
+Bugzilla's login-request cookie and CSRF token, query/admin pages, and an
+authenticated reload.
+
 ## Planned manual expansion
 
-The remaining high-value additions are Bugzilla (large legacy CGI), a current
-reproducible Wagtail/Gunicorn application, and Zulip or Mastodon (large
-multi-service composition). They should enter the stochastic manual
-population before any are promoted into the fixed nightly quota.
+The remaining high-value addition is Zulip or Mastodon for a large
+multi-service operational/configuration composition. It should enter the
+stochastic manual population before any manual case is promoted into the fixed
+nightly quota.
 

@@ -1,0 +1,26 @@
+id = "bugzilla-fastcgi"
+title = "Bugzilla through a generic FastCGI runner"
+nightly = false
+timeout_seconds = 1200
+disk_mb = 2048
+modes = ["fastcgi", "perl", "cookies", "csrf", "path-info", "database"]
+upstreams = [
+  "Bugzilla 5.2 at commit 852cd06ef751cb5a5f87e100466e71e46e3cfc0e",
+  "fcgiwrap from Ubuntu 24.04",
+  "MariaDB 11.8.3",
+]
+images = [
+  "ubuntu@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852",
+  "mariadb@sha256:ae6119716edac6998ae85508431b3d2e666530ddf4e94c61a10710caec9b0f71",
+]
+prerequisites = ["docker"]
+
+[dimensions]
+workflow = ["query", "admin"]
+session = ["anonymous", "authenticated"]
+reload = ["none", "after-login"]
+
+[canonical]
+workflow = "admin"
+session = "authenticated"
+reload = "after-login"

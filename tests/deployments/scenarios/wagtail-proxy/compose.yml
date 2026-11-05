@@ -1,0 +1,85 @@
+services:
+  database:
+    image: postgres@sha256:1090bc3a8ccfb0b55f78a494d76f8d603434f7e4553543d6e807bc7bd6bbd17f
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    environment:
+      POSTGRES_DB: bakerydemo
+      POSTGRES_USER: bakerydemo
+      POSTGRES_PASSWORD: vapache-wagtail-db
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+      - /run/postgresql:rw,nosuid,nodev,size=32m
+    volumes:
+      - database:/var/lib/postgresql
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bakerydemo -d bakerydemo"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+
+  wagtail:
+    image: ${WAGTAIL_IMAGE:?}
+    pull_policy: never
+    user: "1000:1000"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+      ADMIN_PASSWORD: vapache-wagtail-password-42
+      DATABASE_URL: postgres://bakerydemo:vapache-wagtail-db@database/bakerydemo
+      DJANGO_ALLOWED_HOSTS: 127.0.0.1,deployment.test
+      DJANGO_SECRET_KEY: vapache-wagtail-integration-secret
+      REDIS_URL: ""
+      SECURE_HSTS_SECONDS: "0"
+      SECURE_SSL_REDIRECT: "False"
+      NO_PROXY: "*"
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        python manage.py migrate --noinput;
+        python manage.py load_initial_data;
+        python manage.py reset_admin_password;
+        exec gunicorn --bind=0.0.0.0:8000 --workers=${WAGTAIL_WORKERS:?}
+        --threads=2 --access-logfile=- bakerydemo.wsgi:application
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=1000
+    volumes:
+      - type: bind
+        source: ${WAGTAIL_MEDIA:?}
+        target: /code/bakerydemo/media
+    networks:
+      - application
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=3).read(1)"
+      interval: 2s
+      timeout: 5s
+      retries: 120
+
+networks:
+  application:
+    internal: true
+
+volumes:
+  database:

@@ -19,7 +19,7 @@ failure can be replayed exactly:
 
 ```sh
 python3 tests/deployments/harness.py \
-  --profile sample --sample-count 10 --seed 4660
+  --profile sample --sample-count 12 --seed 4660
 ```
 
 Run one application while developing:
@@ -40,18 +40,20 @@ security test, not merely a port-binding convenience.
 
 ## Container isolation
 
-Applications use upstream OCI images directly as `repository@sha256:digest`.
-There is no Dockerfile per application: Compose supplies configuration,
-temporary volumes and a private network to the immutable upstream image. A
-Dockerfile should be introduced only when a real adapter is unavoidable, and
-its build context must be an independently staged directory rather than the
-repository.
+Applications use upstream OCI images directly as `repository@sha256:digest`
+where possible. Compose supplies configuration, temporary volumes and a
+private network to each immutable upstream image. Wagtail and Bugzilla need a
+runtime assembled from upstream source; their source archives and extra build
+inputs are digest-verified, their base image and Dockerfile frontend are
+digest-pinned, and their build context is an independently staged directory
+rather than the repository. The harness rejects unpinned build frontends and
+build-context symlinks that escape staging.
 
-Gitweb is the deliberate exception: CGI must execute as a local process, so
-the scenario uses Ubuntu 24.04's maintained Git/Gitweb packages and records
-the exact `git --version` with the result. This gives the nightly test useful
-distro-integration drift rather than pretending a containerized CGI process
-has the same ownership boundary.
+Gitweb is a separate deliberate exception: CGI must execute as a local
+process, so the scenario uses Ubuntu 24.04's maintained Git/Gitweb packages
+and records the exact `git --version` with the result. This gives the nightly
+test useful distro-integration drift rather than pretending a containerized
+CGI process has the same ownership boundary.
 
 The harness enforces these rules twice: once against the rendered Compose
 model and again against the live container inspection.

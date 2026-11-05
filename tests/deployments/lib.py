@@ -1,8 +1,8 @@
 """Shared primitives for real-application deployment scenarios.
 
 The application containers are deliberately treated as untrusted.  They may
-only see a per-run staging directory outside the checkout; the repository, Docker socket
-and arbitrary host paths are never mounted into them.
+only see a per-run staging directory outside the checkout; the repository,
+Docker socket and arbitrary host paths are never mounted into them.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import grp
+import hashlib
 import http.client
 import json
 import os
@@ -19,7 +20,9 @@ import shutil
 import signal
 import socket
 import subprocess
+import tarfile
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -103,6 +106,69 @@ def make_readable_tree(root: Path) -> None:
         elif path.is_file():
             executable = path.stat().st_mode & 0o111
             os.chmod(path, 0o755 if executable else 0o644)
+
+
+def stage_verified_tarball(
+    url: str,
+    expected_sha256: str,
+    destination: Path,
+    *,
+    max_bytes: int = 64 * 1024 * 1024,
+) -> None:
+    """Download a pinned source archive and extract its single top-level tree."""
+    if destination.exists():
+        raise DeploymentError(f"source destination already exists: {destination}")
+    archive = destination.parent / f".{destination.name}.tar.gz"
+    download_verified_file(url, expected_sha256, archive, max_bytes=max_bytes)
+    try:
+        extraction = destination.parent / f".{destination.name}.extracted"
+        extraction.mkdir()
+        try:
+            with tarfile.open(archive, mode="r:gz") as tar:
+                tar.extractall(extraction, filter="data")
+            roots = list(extraction.iterdir())
+            if len(roots) != 1 or not roots[0].is_dir():
+                raise DeploymentError(f"source archive does not contain one top-level directory: {url}")
+            roots[0].rename(destination)
+            # `tarfile` deliberately applies the caller's restrictive umask
+            # during hardened extraction. Build as root and run as non-root is
+            # otherwise a trap: the image builds but its application package
+            # remains hidden behind 0700 source directories.
+            make_readable_tree(destination)
+        finally:
+            shutil.rmtree(extraction, ignore_errors=True)
+    finally:
+        archive.unlink(missing_ok=True)
+
+
+def download_verified_file(
+    url: str,
+    expected_sha256: str,
+    destination: Path,
+    *,
+    max_bytes: int = 64 * 1024 * 1024,
+) -> None:
+    """Stream a remote build input to staging and require its exact digest."""
+    if destination.exists():
+        raise DeploymentError(f"download destination already exists: {destination}")
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response, destination.open("wb") as output:
+            while chunk := response.read(1024 * 1024):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise DeploymentError(f"source archive exceeds {max_bytes} bytes: {url}")
+                digest.update(chunk)
+                output.write(chunk)
+        actual = digest.hexdigest()
+        if actual != expected_sha256:
+            raise DeploymentError(
+                f"source archive digest mismatch for {url}: expected {expected_sha256}, got {actual}"
+            )
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
 
 
 def request(
@@ -299,6 +365,40 @@ def validate_bind_source(source: Path, run_dir: Path) -> None:
         ) from error
 
 
+def validate_build_context(context: Path, dockerfile: Path, run_dir: Path) -> None:
+    """Confine a generated application build to its scenario staging tree."""
+    validate_bind_source(context, run_dir)
+    resolved_context = context.resolve()
+    resolved_dockerfile = dockerfile.resolve()
+    if resolved_context not in resolved_dockerfile.parents:
+        raise DeploymentError(f"Dockerfile is outside the staged build context: {resolved_dockerfile}")
+    for path in context.rglob("*"):
+        if not path.is_symlink():
+            continue
+        target = path.resolve()
+        if target != resolved_context and resolved_context not in target.parents:
+            raise DeploymentError(f"staged build symlink escapes its context: {path} -> {target}")
+
+    pinned_frontend = False
+    for line in dockerfile.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("# syntax="):
+            frontend = stripped.split("=", 1)[1].strip()
+            if "@sha256:" not in frontend:
+                raise DeploymentError(
+                    f"staged build Dockerfile frontend is not pinned by digest: {frontend}"
+                )
+            pinned_frontend = True
+        fields = line.strip().split()
+        if not fields or fields[0].lower() != "from":
+            continue
+        base = fields[1]
+        if base.lower() != "scratch" and "@sha256:" not in base:
+            raise DeploymentError(f"staged build base image is not pinned by digest: {base}")
+    if not pinned_frontend:
+        raise DeploymentError("staged build Dockerfile must pin its syntax frontend by digest")
+
+
 @dataclass
 class ComposeProject:
     compose_file: Path
@@ -308,6 +408,7 @@ class ComposeProject:
     images: tuple[str, ...]
     artifact_dir: Path
     remove_images: bool = False
+    pull_images: tuple[str, ...] | None = None
 
     def _base(self) -> list[str]:
         return ["docker", "compose", "-f", os.fspath(self.compose_file), "-p", self.project]
@@ -357,7 +458,8 @@ class ComposeProject:
 
     def pull(self) -> None:
         self.validate()
-        command([*self._base(), "pull"], env=self._environment(), timeout=600, capture=False)
+        for image in self.pull_images if self.pull_images is not None else self.images:
+            command(["docker", "pull", image], timeout=600, capture=False)
 
     def up(self) -> None:
         self.validate()
@@ -395,12 +497,52 @@ class ComposeProject:
                 if mount.get("Type") == "bind":
                     validate_bind_source(Path(mount["Source"]), self.run_dir)
 
-    def exec(self, service: str, args: list[str], *, user: str | None = None) -> str:
+    def exec(
+        self,
+        service: str,
+        args: list[str],
+        *,
+        user: str | None = None,
+        check: bool = True,
+    ) -> str:
         command_line = [*self._base(), "exec", "--no-TTY"]
         if user:
             command_line.extend(["--user", user])
         command_line.extend([service, *args])
-        return command(command_line, env=self._environment(), timeout=120).stdout
+        return command(
+            command_line,
+            env=self._environment(),
+            timeout=120,
+            check=check,
+        ).stdout
+
+    def run_once(
+        self,
+        service: str,
+        args: list[str],
+        *,
+        entrypoint: str,
+        user: str | None = None,
+        check: bool = True,
+    ) -> str:
+        """Run a disposable service command even if its main container exited."""
+        command_line = [
+            *self._base(),
+            "run",
+            "--rm",
+            "--no-deps",
+            "--entrypoint",
+            entrypoint,
+        ]
+        if user:
+            command_line.extend(["--user", user])
+        command_line.extend([service, *args])
+        return command(
+            command_line,
+            env=self._environment(),
+            timeout=120,
+            check=check,
+        ).stdout
 
     def service_ip(self, service: str) -> str:
         """Return a service's IPv4 address on its isolated application network."""
@@ -479,7 +621,41 @@ class CaseContext:
         if failures:
             raise DeploymentError("cleanup failures: " + "; ".join(failures))
 
-    def compose(self, compose_file: Path, env: dict[str, str]) -> ComposeProject:
+    def build_staged_image(self, context: Path, dockerfile: Path, *, label: str) -> str:
+        validate_build_context(context, dockerfile, self.run_dir)
+        safe_label = re.sub(r"[^a-z0-9_.-]+", "-", label.lower()).strip("-.")
+        safe_case = re.sub(r"[^a-z0-9_.-]+", "-", self.case_id.lower()).strip("-.")
+        if not safe_label or not safe_case:
+            raise DeploymentError("staged image label is empty after normalization")
+        image = f"vapache-deployment-{safe_case}-{safe_label}:local"
+        build = [
+            "docker",
+            "build",
+            "--file",
+            os.fspath(dockerfile),
+            "--label",
+            f"org.vapache.deployment.case={self.case_id}",
+            "--tag",
+            image,
+        ]
+        proxy_ca = os.environ.get("CODEX_PROXY_CERT")
+        if proxy_ca and Path(proxy_ca).is_file():
+            build.extend(["--secret", f"id=proxy_ca,src={proxy_ca}"])
+        system_ca = Path("/etc/ssl/certs/ca-certificates.crt")
+        if system_ca.is_file():
+            build.extend(["--secret", f"id=system_ca,src={system_ca}"])
+        build.append(os.fspath(context))
+        command(build, timeout=1200, capture=False)
+        self.add_cleanup(lambda: command(["docker", "image", "rm", image], timeout=120, check=False))
+        return image
+
+    def compose(
+        self,
+        compose_file: Path,
+        env: dict[str, str],
+        *,
+        local_images: tuple[str, ...] = (),
+    ) -> ComposeProject:
         project = "vap_" + "".join(ch if ch.isalnum() else "_" for ch in self.case_id.lower())[-48:]
         project += f"_{os.getpid()}"
         instance = ComposeProject(
@@ -487,9 +663,10 @@ class CaseContext:
             project=project,
             run_dir=self.run_dir,
             env=env,
-            images=self.images,
+            images=self.images + local_images,
             artifact_dir=self.artifact_dir,
             remove_images=self.remove_images,
+            pull_images=self.images,
         )
         self.add_cleanup(instance.down)
         return instance

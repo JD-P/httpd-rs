@@ -9,7 +9,13 @@ import unittest
 from pathlib import Path
 
 import harness
-from lib import ComposeProject, DeploymentError, ROOT, validate_bind_source
+from lib import (
+    ComposeProject,
+    DeploymentError,
+    ROOT,
+    validate_bind_source,
+    validate_build_context,
+)
 
 
 class DeploymentHarnessTests(unittest.TestCase):
@@ -93,6 +99,36 @@ class DeploymentHarnessTests(unittest.TestCase):
                 validate_bind_source(ROOT.parent, run_dir)
             with self.assertRaises(DeploymentError):
                 validate_bind_source(Path("/tmp"), run_dir)
+
+    def test_staged_builds_are_confined_and_digest_pinned(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vapache-build-selftest-") as temporary:
+            run_dir = Path(temporary)
+            context = run_dir / "build"
+            context.mkdir()
+            dockerfile = context / "Dockerfile"
+            dockerfile.write_text(
+                "# syntax=docker/dockerfile:1@sha256:"
+                + "b" * 64
+                + "\nFROM example.invalid/app@sha256:"
+                + "a" * 64
+                + "\n"
+            )
+            validate_build_context(context, dockerfile, run_dir)
+            dockerfile.write_text(
+                "# syntax=docker/dockerfile:1\n"
+                "FROM example.invalid/app@sha256:" + "a" * 64 + "\n"
+            )
+            with self.assertRaises(DeploymentError):
+                validate_build_context(context, dockerfile, run_dir)
+            dockerfile.write_text("FROM example.invalid/app:latest\n")
+            with self.assertRaises(DeploymentError):
+                validate_build_context(context, dockerfile, run_dir)
+            dockerfile.write_text(
+                "# syntax=docker/dockerfile:1@sha256:" + "b" * 64 + "\nFROM scratch\n"
+            )
+            (context / "escape").symlink_to(ROOT)
+            with self.assertRaises(DeploymentError):
+                validate_build_context(context, dockerfile, run_dir)
 
     def test_compose_models_enforce_container_isolation(self) -> None:
         by_id = {scenario.identifier: scenario for scenario in self.scenarios}
@@ -201,6 +237,44 @@ class DeploymentHarnessTests(unittest.TestCase):
                     images=scenario.images,
                     artifact_dir=run_dir / "artifacts",
                 ).validate()
+
+            wagtail_media = run_dir / "wagtail-media"
+            wagtail_media.mkdir()
+            wagtail = by_id["wagtail-proxy"]
+            local_wagtail = "vapache-deployment-selftest-wagtail:local"
+            ComposeProject(
+                compose_file=wagtail.path / "compose.yml",
+                project="selftest_wagtail",
+                run_dir=run_dir,
+                env={
+                    "WAGTAIL_IMAGE": local_wagtail,
+                    "WAGTAIL_MEDIA": str(wagtail_media),
+                    "WAGTAIL_WORKERS": "2",
+                },
+                images=wagtail.images + (local_wagtail,),
+                artifact_dir=run_dir / "artifacts",
+            ).validate()
+
+            bugzilla_root = run_dir / "bugzilla"
+            bugzilla_run = run_dir / "bugzilla-run"
+            bugzilla_root.mkdir()
+            bugzilla_run.mkdir()
+            bugzilla = by_id["bugzilla-fastcgi"]
+            local_bugzilla = "vapache-deployment-selftest-bugzilla:local"
+            ComposeProject(
+                compose_file=bugzilla.path / "compose.yml",
+                project="selftest_bugzilla",
+                run_dir=run_dir,
+                env={
+                    "BUGZILLA_IMAGE": local_bugzilla,
+                    "BUGZILLA_ROOT": str(bugzilla_root),
+                    "BZ_URLBASE": "http://127.0.0.1:30996/",
+                    "FCGI_RUN": str(bugzilla_run),
+                    "VAPACHE_SOCKET_GID": "1000",
+                },
+                images=bugzilla.images + (local_bugzilla,),
+                artifact_dir=run_dir / "artifacts",
+            ).validate()
 
 
 if __name__ == "__main__":

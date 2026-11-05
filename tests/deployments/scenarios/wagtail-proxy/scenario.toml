@@ -1,0 +1,26 @@
+id = "wagtail-proxy"
+title = "Wagtail Bakery Demo through Gunicorn"
+nightly = false
+timeout_seconds = 900
+disk_mb = 3072
+modes = ["reverse-proxy", "python", "cookies", "csrf", "api", "database"]
+upstreams = [
+  "Wagtail Bakery Demo 8.1 at commit 890285b95dcf980215ab9e9942d64ed2b47c48c3",
+  "Gunicorn 23.0.0",
+  "PostgreSQL 18.1",
+]
+images = [
+  "python@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30",
+  "postgres@sha256:1090bc3a8ccfb0b55f78a494d76f8d603434f7e4553543d6e807bc7bd6bbd17f",
+]
+prerequisites = ["docker"]
+
+[dimensions]
+workers = ["one", "two"]
+workflow = ["api", "admin"]
+reload = ["none", "after-login"]
+
+[canonical]
+workers = "two"
+workflow = "admin"
+reload = "after-login"

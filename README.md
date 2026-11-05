@@ -831,13 +831,14 @@ measured by that gate rather than runtime line coverage.
 Real-application integration lives under [`tests/deployments`](tests/deployments/README.md).
 The fixed nightly profile deploys Hugo, Gitweb/smart Git CGI, WordPress with
 PHP-FPM, and Grafana with a live WebSocket. Manual runs reproducibly sample
-88 application/topology combinations by recorded seed across ten applications,
-including Gitea, Drupal, Jenkins, JupyterLab, MinIO and Nextcloud, or can
-explicitly request the full Cartesian set.
-Application containers use digest-pinned upstream images, private networks,
-read-only roots and staging-only mounts; a dedicated harness gate rejects any
-mount overlapping the source checkout. Optional workloads compare the same
-application through Apache and Vapache with alternating samples.
+104 application/topology combinations by recorded seed across twelve
+applications, including Gitea, Drupal, Jenkins, JupyterLab, MinIO, Nextcloud,
+Wagtail and Bugzilla, or can explicitly request the full Cartesian set.
+Application containers use digest-pinned upstream images or staged builds from
+pinned source, private networks, read-only roots and staging-only mounts; a
+dedicated harness gate rejects any mount overlapping the source checkout.
+Optional workloads compare the same application through Apache and Vapache
+with alternating samples.
 
 Known, deliberate divergences from Apache (reported by the differential run):
 

@@ -17,7 +17,7 @@ on:
       sample_count:
         description: Cases selected by the stochastic sample profile
         type: number
-        default: 10
+        default: 12
       seed:
         description: Optional integer seed (blank chooses and records a random seed)
         type: string
@@ -69,7 +69,7 @@ jobs:
           INPUT_BENCHMARK: ${{ inputs.benchmark }}
         run: |
           profile=${INPUT_PROFILE:-nightly}
-          sample_count=${INPUT_SAMPLE_COUNT:-10}
+          sample_count=${INPUT_SAMPLE_COUNT:-12}
           args=(
             --profile "$profile"
             --sample-count "$sample_count"
