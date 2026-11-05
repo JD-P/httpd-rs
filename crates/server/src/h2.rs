@@ -1588,7 +1588,10 @@ async fn handle_stream(
         && prepared_handler.is_some()
     {
         let length = declared.expect("checked fixed HTTP/2 body length");
-        match crate::http::install_streaming_request_body(&mut req, length, &cfg.resource_budget) {
+        let install = crate::fault::hit("transition.h2.streaming-body-install").and_then(|()| {
+            crate::http::install_streaming_request_body(&mut req, length, &cfg.resource_budget)
+        });
+        match install {
             Ok(sender) => {
                 req.headers.hold_resident(
                     request_resident
@@ -2349,8 +2352,9 @@ mod tests {
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
-    fn test_config_with_extra(
+    fn test_config_with_upstream(
         name: &str,
+        upstream: &str,
         extra: &str,
     ) -> (Arc<Config>, Arc<Logger>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("vapache-h2-{name}-{}", std::process::id()));
@@ -2366,11 +2370,12 @@ mod tests {
                  ServerName localhost\n\
                  DocumentRoot \"{}/www\"\n\
                  ErrorLog \"{}/error.log\"\n\
-                 ProxyPass /__body_test http://127.0.0.1:9/\n\
+                 ProxyPass /__body_test {}\n\
                  {}\n",
                 dir.display(),
                 dir.display(),
                 dir.display(),
+                upstream,
                 extra
             ),
         )
@@ -2379,6 +2384,13 @@ mod tests {
         let cfg = Arc::new(cfg);
         let logger = Arc::new(Logger::new(&cfg).unwrap());
         (cfg, logger, dir)
+    }
+
+    fn test_config_with_extra(
+        name: &str,
+        extra: &str,
+    ) -> (Arc<Config>, Arc<Logger>, std::path::PathBuf) {
+        test_config_with_upstream(name, "http://127.0.0.1:9/", extra)
     }
 
     fn test_config(name: &str) -> (Arc<Config>, Arc<Logger>, std::path::PathBuf) {
@@ -2711,7 +2723,7 @@ mod tests {
             443,
             sni,
         );
-        let server = tokio::spawn(async move {
+        let server = tokio::spawn(crate::fault::scope_future(async move {
             let mut connection = h2::server::handshake(server_io).await.unwrap();
             let (request, respond) = connection.accept().await.unwrap().unwrap();
             let admission =
@@ -2750,7 +2762,7 @@ mod tests {
                 }
             }
             reset
-        });
+        }));
         let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
         let driver = tokio::spawn(async move { connection.await.unwrap() });
         let request_label = format!("{} {}", request.method(), request.uri());
@@ -2806,6 +2818,236 @@ mod tests {
             .expect("HTTP/2 server task timed out")
             .unwrap();
         (status, response_body, reset)
+    }
+
+    #[cfg(feature = "fault-injection")]
+    async fn round_trip_expecting_reset(
+        cfg: Arc<Config>,
+        logger: Arc<Logger>,
+        request: http::Request<()>,
+        body: &[u8],
+        finish_body: bool,
+    ) -> h2::Reason {
+        let (client_io, server_io) = tokio::io::duplex(4 * 1024 * 1024);
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let tls_identity = test_tls_identity(&cfg);
+        let server = tokio::spawn(crate::fault::scope_future(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (request, respond) = connection.accept().await.unwrap().unwrap();
+            let admission =
+                admit_stream_before_spawn(&cfg, "127.0.0.1:12345".parse().unwrap(), &request)
+                    .unwrap();
+            let handler = handle_stream(
+                cfg,
+                logger,
+                "127.0.0.1:12345".parse().unwrap(),
+                "127.0.0.1".into(),
+                443,
+                tls_identity,
+                request,
+                respond,
+                admission,
+            );
+            tokio::pin!(handler);
+            let reset = loop {
+                tokio::select! {
+                    reset = &mut handler => break reset,
+                    accepted = connection.accept() => {
+                        if accepted.is_none() {
+                            break true;
+                        }
+                    }
+                }
+            };
+            loop {
+                tokio::select! {
+                    _ = &mut done_rx => break,
+                    accepted = connection.accept() => {
+                        if accepted.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+            reset
+        }));
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+        let (response, mut send) = client
+            .send_request(request, body.is_empty() && finish_body)
+            .unwrap();
+        if !body.is_empty() {
+            let mut offset = 0usize;
+            while offset < body.len() {
+                send.reserve_capacity(body.len() - offset);
+                let capacity = std::future::poll_fn(|cx| send.poll_capacity(cx))
+                    .await
+                    .expect("reset arrived before request DATA was admitted")
+                    .expect("request DATA capacity failed");
+                let take = capacity.min(body.len() - offset);
+                let last = finish_body && offset + take == body.len();
+                send.send_data(Bytes::copy_from_slice(&body[offset..offset + take]), last)
+                    .unwrap();
+                offset += take;
+            }
+        }
+        let error = tokio::time::timeout(Duration::from_secs(2), response)
+            .await
+            .expect("faulted HTTP/2 request did not reset")
+            .expect_err("faulted slow-input reacquisition returned a response");
+        let reason = error.reason().expect("HTTP/2 reset omitted its reason");
+        let _ = done_tx.send(());
+        drop((send, client));
+        driver.abort();
+        let _ = driver.await;
+        assert!(server.await.unwrap());
+        reason
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_input_saturation_returns_a_bounded_overload_response() {
+        let (cfg, logger, dir) = test_config("slow-input-overload");
+        let mut occupied = Vec::new();
+        for source in 1..=4 {
+            for _ in 0..crate::resource::MAX_SLOW_INPUTS_PER_CLIENT {
+                let context = cfg
+                    .resource_budget
+                    .context(std::net::IpAddr::from([192, 0, 2, source]));
+                occupied.push(cfg.resource_budget.try_slow_input_in(&context).unwrap());
+            }
+        }
+        assert_eq!(
+            cfg.resource_budget.h2_input_usage(),
+            (0, crate::resource::MAX_SLOW_INPUTS)
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/__body_test")
+            .body(())
+            .unwrap();
+        assert_eq!(round_trip(cfg.clone(), logger, request, b"x").await.0, 503);
+        drop(occupied);
+        assert_eq!(cfg.resource_budget.h2_input_usage(), (0, 0));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_input_reacquisition_faults_reset_every_body_path() {
+        let _fault_guard = crate::fault::test_guard();
+
+        let (cfg, logger, dir) = test_config("slow-input-buffered-reacquire");
+        crate::fault::configure(
+            "transition.h2.slow-input-reacquire",
+            0,
+            io::ErrorKind::WouldBlock,
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/__body_test")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            round_trip_expecting_reset(cfg, logger, request, b"x", true).await,
+            h2::Reason::REFUSED_STREAM
+        );
+        fs::remove_dir_all(dir).unwrap();
+
+        let (cfg, logger, dir) = test_config("slow-input-error-reacquire");
+        let mut limited = (*cfg).clone();
+        limited.limit_request_body = 2;
+        crate::fault::configure(
+            "transition.h2.slow-input-reacquire",
+            0,
+            io::ErrorKind::WouldBlock,
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/__body_test")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            round_trip_expecting_reset(Arc::new(limited), logger, request, b"too large", true,)
+                .await,
+            h2::Reason::REFUSED_STREAM
+        );
+        fs::remove_dir_all(dir).unwrap();
+
+        let (cfg, logger, dir) = test_config("slow-input-stream-install-reacquire");
+        crate::fault::configure(
+            "transition.h2.streaming-body-install",
+            0,
+            io::ErrorKind::OutOfMemory,
+        );
+        crate::fault::configure(
+            "transition.h2.slow-input-reacquire",
+            0,
+            io::ErrorKind::WouldBlock,
+        );
+        let length = crate::http::MAX_REQUEST_BODY_IN_MEMORY + 1;
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/__body_test")
+            .header("content-length", length.to_string())
+            .body(())
+            .unwrap();
+        assert_eq!(
+            round_trip_expecting_reset(cfg, logger, request, &[], false).await,
+            h2::Reason::REFUSED_STREAM
+        );
+        fs::remove_dir_all(dir).unwrap();
+
+        let (port, accepted, closed, upstream) = stalling_upstream();
+        let upstream_url = format!("http://127.0.0.1:{port}/");
+        let (cfg, logger, dir) =
+            test_config_with_upstream("slow-input-stream-complete-reacquire", &upstream_url, "");
+        crate::fault::configure(
+            "transition.h2.slow-input-reacquire",
+            0,
+            io::ErrorKind::WouldBlock,
+        );
+        let length = crate::http::MAX_REQUEST_BODY_IN_MEMORY + 1;
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/__body_test")
+            .header("content-length", length.to_string())
+            .body(())
+            .unwrap();
+        let body = vec![b'x'; length as usize];
+        assert_eq!(
+            round_trip_expecting_reset(cfg, logger, request, &body, true).await,
+            h2::Reason::REFUSED_STREAM
+        );
+        accepted.await.unwrap();
+        closed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reset did not close the streaming upstream");
+        upstream.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+
+        let (cfg, logger, dir) = test_config("slow-input-stream-read-reacquire");
+        crate::fault::configure(
+            "transition.h2.body.data-await",
+            0,
+            io::ErrorKind::ConnectionReset,
+        );
+        crate::fault::configure(
+            "transition.h2.slow-input-reacquire",
+            0,
+            io::ErrorKind::WouldBlock,
+        );
+        let length = crate::http::MAX_REQUEST_BODY_IN_MEMORY + 1;
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/__body_test")
+            .header("content-length", length.to_string())
+            .body(())
+            .unwrap();
+        assert_eq!(
+            round_trip_expecting_reset(cfg, logger, request, &[], false).await,
+            h2::Reason::REFUSED_STREAM
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     async fn response_round_trip(

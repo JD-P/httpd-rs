@@ -2768,6 +2768,7 @@ impl SlowOutputAdmission {
         if !self.is_slow_input() {
             return Ok(());
         }
+        crate::fault::hit("transition.h2.slow-input-reacquire")?;
         let next = vapache_verified::h2_input_phase_step(
             vapache_verified::H2InputPhase::SlowInput,
             vapache_verified::H2InputEvent::BodyComplete,
@@ -3247,6 +3248,33 @@ mod tests {
         assert_eq!(budget.h2_input_usage(), (1, 0));
         output.finish_response();
         assert_eq!(budget.h2_input_usage(), (0, 0));
+    }
+
+    #[test]
+    fn slow_input_rejects_invalid_ownership_states() {
+        let budget = Arc::new(ResourceBudget::default());
+        let context = budget.context(IpAddr::from([192, 0, 2, 45]));
+
+        let mut detached = SlowOutputAdmission::detached(context.clone());
+        assert!(detached.enter_slow_input().is_err());
+
+        let general = budget.try_h2_stream_in(&context).unwrap();
+        let mut completed = SlowOutputAdmission::tracked_h2(context.clone(), general);
+        completed.enter_slow_input().unwrap();
+        completed.leave_slow_input().unwrap();
+        assert!(completed.enter_slow_input().is_err());
+        drop(completed);
+
+        let general = budget.try_h2_stream_in(&context).unwrap();
+        let mut unowned = SlowOutputAdmission::tracked_h2(context.clone(), general);
+        drop(unowned.general.take());
+        assert!(unowned.enter_slow_input().is_err());
+        drop(unowned);
+
+        let general = budget.try_h2_stream_in(&context).unwrap();
+        let mut pending = SlowOutputAdmission::tracked_h2(context, general);
+        pending.enter_slow_input().unwrap();
+        assert!(pending.enter_slow().is_err());
     }
 
     #[test]
