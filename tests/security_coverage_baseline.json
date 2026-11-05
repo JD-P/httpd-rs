@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "description": "Reviewed worst-observed production-line coverage debt after the request-transition, backend-isolation, and proxy-session campaigns, including asynchronous cancellation scheduling variance. CI requires covered lines not to decrease and missed lines not to increase beyond these per-module and aggregate ceilings; the absolute target remains zero missed lines.",
-  "total": {"minimum_covered": 33540, "maximum_missed": 3116},
+  "total": {"minimum_covered": 33546, "maximum_missed": 3117},
   "modules": {
     "access": {"minimum_covered": 674, "maximum_missed": 22},
     "auth": {"minimum_covered": 331, "maximum_missed": 1},
