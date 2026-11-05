@@ -416,7 +416,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **711 verified functions, 0 errors** (percent-decoding,
+Current result: **725 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
@@ -863,22 +863,25 @@ are written to `/dev/null` so the harness does not fill `/tmp`. The default
 uses eight connections because `wrk` opens its cohort simultaneously from one
 loopback client identity and Vapache deliberately limits each client to eight
 pending connections. Higher concurrency measures connection-admission overload
-rejection rather than successful static serving. Results are appended to
-`bench/RESULTS.md`. Latest full run (2026-11-04, 3s samples, median of three,
-eight connections, zero failed/non-2xx responses or socket errors):
+rejection rather than successful static serving. Each round alternates which
+server runs first so shared-host drift cannot systematically favor one side.
+Results are appended to `bench/RESULTS.md`. Latest full run (2026-11-05, 3s
+samples, median of three, eight connections, zero failed/non-2xx responses or
+socket errors):
 
 | scenario | Apache req/s | vapache req/s | ratio |
 |---|---:|---:|---:|
-| index.html | 39,356 | 34,067 | 0.87x |
-| hello.txt (1.1 KB) | 39,762 | 33,448 | 0.84x |
-| 10 KB file | 38,223 | 32,142 | 0.84x |
-| 1 MB file | 6,599 | 11,656 | 1.77x |
+| index.html | 41,663 | 44,075 | 1.06x |
+| hello.txt (1.1 KB) | 35,602 | 44,413 | 1.25x |
+| 10 KB file | 42,811 | 41,789 | 0.98x |
+| 1 MB file | 8,310 | 12,250 | 1.47x |
 
-On that five-vCPU host, Vapache trails Apache by 13–16% for small static files
-and leads it by 77% for the 1 MB file. Older runs used more simultaneous
-connections from one identity and the old `wrk` parser did not record its
-non-2xx counter. They remain in `bench/RESULTS.md` as historical measurements,
-but are not comparable with the strict run above.
+On that five-vCPU host, Vapache is at parity or ahead for the three small-file
+cases and leads by 47% for the 1 MB file. Older runs used more simultaneous
+connections from one identity, sampled the servers in a fixed order, and the
+old `wrk` parser did not record its non-2xx counter. They remain in
+`bench/RESULTS.md` as historical measurements, but are not comparable with the
+strict run above.
 Recent hot-path work caches the `Date` header and document-root descriptors,
 coalesces small response bodies, and reduces per-request allocation in MIME
 and access-log formatting. The latest policy migration also caches
@@ -933,25 +936,28 @@ copying a heap buffer. Results are appended to `bench/CACHE_RESULTS.md`.
 same upstreams:
 
 ```sh
-python3 bench/app_bench.py --quick
-python3 bench/app_bench.py --only php
+sudo python3 bench/app_bench.py --quick
+sudo python3 bench/app_bench.py --only php
 python3 bench/app_bench.py --only gunicorn
 ```
 
 The fixture starts a private PHP-FPM pool over a Unix socket and eight Gunicorn
 sync workers, then benchmarks `/index.php` through FastCGI and `/app/hello`
-through the HTTP proxy against both front ends. Latest five-sample run:
+through the HTTP proxy against both front ends. The secure PHP fixture runs
+under root-owned `/run` so the same stable-path policy used in production can
+remain enabled. Latest five-sample PHP run:
 
 | scenario | Apache req/s | vapache req/s | ratio |
 |---|---:|---:|---:|
-| PHP-FPM `/index.php` | 42,866 | 55,373 | 1.29x |
-| Gunicorn `/app/hello` | 22,332 | 24,624 | 1.10x |
+| PHP-FPM `/index.php` | 17,424 | 11,258 | 0.65x |
 
 The handlers are intentionally trivial; these numbers isolate the front-end
-and upstream hop. Real PHP/WSGI application time will usually dominate. The
-Gunicorn sync workers close each upstream connection, and vapache deliberately
-does not pool backend connections without strict response-framing checks.
-See `bench/APP_RESULTS.md` for details.
+and upstream hop. Vapache's PHP result includes per-request stable-path
+ownership/writeability/ACL checks, endpoint inode validation and peer-credential
+authentication; Apache does not make an equivalent proof. Real PHP/WSGI
+application time will usually dominate. The Gunicorn sync workers close each
+upstream connection, and vapache deliberately does not pool backend connections
+without strict response-framing checks. See `bench/APP_RESULTS.md` for details.
 
 These are static-file microbenchmark numbers with a minimal Apache module set,
 not a general claim about Apache. TLS, HTTP/2, `.htaccess`, CGI/modules and

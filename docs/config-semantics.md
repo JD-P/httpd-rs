@@ -1839,7 +1839,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **711 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **725 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -2152,10 +2152,12 @@ construction: there is no second production interleaver.
   `X-Forwarded-Host`, and the fully serialized upstream request head pass the
   verified token/header predicates before `write_all`.  Backend response
   `Location` values also pass the verified header sanitizer.
-- FastCGI script containment.  `script_from_prefix()` and
-  `split_path_info()` clean and canonicalize the target inside the configured
-  FastCGI prefix or document/alias root; the `PATH_INFO` ancestor walk cannot
-  select a file above that base.
+- FastCGI script containment.  `script_from_prefix()` cleans the target inside
+  the configured FastCGI prefix or document/alias root, while
+  `split_path_info()` binds regular-file and symlink containment to one
+  `openat2(RESOLVE_BENEATH)` descriptor check. The `PATH_INFO` ancestor walk
+  cannot select a file above that base, and execution repeats the
+  descriptor-bound check before handoff.
 - CGI/FastCGI authentication context.  The grant identity is passed into
   `CgiContext`; `build_env()` emits `REMOTE_USER` and `AUTH_TYPE` for both
   local CGI and FastCGI while keeping configured environment entries unable to

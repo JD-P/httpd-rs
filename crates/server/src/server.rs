@@ -296,6 +296,7 @@ struct ConnectionWorkState {
 }
 
 static CONNECTION_WORK_POOL: OnceLock<io::Result<ConnectionWorkPool>> = OnceLock::new();
+static INLINE_DYNAMIC_WORKERS: AtomicUsize = AtomicUsize::new(0);
 const MAX_CONNECTIONS_PER_CLIENT: usize = 32;
 const MAX_PENDING_CONNECTIONS: usize = 2_048;
 const MAX_PENDING_PER_CLIENT: usize = 8;
@@ -306,6 +307,45 @@ const MAX_TLS_HANDSHAKES_PER_SECOND: usize = 128;
 const MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND: usize = 64;
 const CONNECTION_WORK_THREADS: usize = 64;
 const CONNECTION_WORK_QUEUE: usize = 1024;
+/// Let ordinary bodyless dynamic requests keep their current policy worker
+/// instead of paying a second cross-pool handoff. The hard reserve guarantees
+/// that a slow backend can occupy at most one eighth of the filesystem/policy
+/// pool, so static dispatch retains 56 workers independently of dynamic
+/// admission and backend timeouts.
+const MAX_INLINE_DYNAMIC_WORKERS: usize = 8;
+
+struct InlineDynamicWorker<'a> {
+    count: &'a AtomicUsize,
+}
+
+impl Drop for InlineDynamicWorker<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_borrow_inline_dynamic_worker(
+    count: &AtomicUsize,
+    limit: usize,
+    pool_threads: usize,
+) -> Option<InlineDynamicWorker<'_>> {
+    count
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            vapache_verified::inline_dynamic_worker_admit(current, limit, pool_threads)
+                .then_some(current + 1)
+        })
+        .ok()
+        .map(|_| InlineDynamicWorker { count })
+}
+
+fn try_inline_dynamic_worker() -> Option<InlineDynamicWorker<'static>> {
+    try_borrow_inline_dynamic_worker(
+        &INLINE_DYNAMIC_WORKERS,
+        MAX_INLINE_DYNAMIC_WORKERS,
+        CONNECTION_WORK_THREADS,
+    )
+}
+
 fn configure_accepted_transport(stream: &TcpStream) -> io::Result<()> {
     crate::resource::configure_transport_fd(stream)?;
     stream.set_nodelay(true)
@@ -2210,6 +2250,57 @@ fn dispatch_h1_backend_phase(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn continue_bodyless_backend_inline(
+    cfg: &Config,
+    peer: SocketAddr,
+    local_ip: &str,
+    local_port: u16,
+    tls: bool,
+    served: usize,
+    phase: Result<H1WorkerPhase, ReadError>,
+) -> Result<H1WorkerPhase, ReadError> {
+    let (request, handler, remote_user, scope_guard, started, request_phase) = match phase {
+        Ok(H1WorkerPhase::Backend {
+            request,
+            handler,
+            remote_user,
+            scope_guard,
+            started,
+            phase,
+        }) => (request, handler, remote_user, scope_guard, started, phase),
+        other => return other,
+    };
+    let Some(_inline) = try_inline_dynamic_worker() else {
+        return Ok(H1WorkerPhase::Backend {
+            request,
+            handler,
+            remote_user,
+            scope_guard,
+            started,
+            phase: request_phase,
+        });
+    };
+    // Preserve the same deterministic fault boundary as the ordinary second
+    // blocking-pool handoff. A failure drops the typed handler and all of its
+    // grants/leases before any backend side effect begins.
+    crate::fault::hit("server.connection.spawn").map_err(ReadError::Io)?;
+    Ok(H1WorkerPhase::Response(dispatch_h1_backend_phase(
+        cfg,
+        request,
+        peer,
+        local_ip,
+        local_port,
+        tls,
+        started,
+        served,
+        handler,
+        remote_user,
+        scope_guard,
+        request_phase,
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn finish_h1_drained_body(
     cfg: &Config,
     mut request: Request,
@@ -2733,7 +2824,7 @@ async fn admit_plain_connection(
             return Ok(());
         }
         let (mut buffered, phase) = run_connection_work(move || {
-            let _worker_guard = worker_guard;
+            let worker_guard = worker_guard;
             // Admission retained the complete request head.  This phase
             // parses those owned bytes and performs policy/filesystem work,
             // but never needs transport I/O; keeping the Tokio socket in the
@@ -2752,6 +2843,21 @@ async fn admit_plain_connection(
                 body_guard,
                 admission.context,
                 served,
+            );
+            // Request-worker capacity protects policy work, not backend wait
+            // time. Release it before either dynamic execution path. A small,
+            // separately bounded slice of this physical pool may continue the
+            // prepared bodyless handler in place, avoiding a second scheduler
+            // and blocking-pool handoff while preserving 56 static workers.
+            drop(worker_guard);
+            let phase = continue_bodyless_backend_inline(
+                &cfg_worker,
+                peer,
+                &local_ip_worker,
+                local_port,
+                false,
+                served,
+                phase,
             );
             (request_buf, phase)
         })
@@ -3183,7 +3289,7 @@ async fn admit_tls_connection(
             return Ok(());
         }
         let (mut buffered, phase) = run_connection_work(move || {
-            let _worker_guard = worker_guard;
+            let worker_guard = worker_guard;
             let mut no_transport = std::io::Cursor::new(Vec::new());
             let phase = process_h1_request_phase(
                 &cfg_worker,
@@ -3197,6 +3303,16 @@ async fn admit_tls_connection(
                 body_guard,
                 admission.context,
                 served,
+            );
+            drop(worker_guard);
+            let phase = continue_bodyless_backend_inline(
+                &cfg_worker,
+                peer,
+                &local_ip_worker,
+                local_port,
+                true,
+                served,
+                phase,
             );
             (request_buf, phase)
         })
@@ -7713,13 +7829,23 @@ fn run_fastcgi(
     };
     let authorized_path = script_binding.actual_path.clone();
     let docroot = cfg.documentation_root_for(vhost);
-    let canonical_docroot = std::fs::canonicalize(&docroot).unwrap_or(docroot.clone());
+    // Most document roots are already lexical/canonical matches. Only pay for
+    // a realpath walk when a symlinked DocumentRoot makes that fast path fail.
+    let render_script_url = |relative: &Path| {
+        let relative = relative.to_string_lossy();
+        format!("/{}", relative.trim_start_matches('/'))
+    };
     let script_url = authorized_path
-        .strip_prefix(&canonical_docroot)
+        .strip_prefix(&docroot)
         .ok()
-        .map(|relative| {
-            let relative = relative.to_string_lossy();
-            format!("/{}", relative.trim_start_matches('/'))
+        .map(|relative| render_script_url(relative))
+        .or_else(|| {
+            std::fs::canonicalize(&docroot).ok().and_then(|canonical| {
+                authorized_path
+                    .strip_prefix(canonical)
+                    .ok()
+                    .map(render_script_url)
+            })
         })
         .unwrap_or(lexical_script_url);
     let proxy_identity = format!(
@@ -9216,6 +9342,21 @@ mod tests {
             .unwrap();
         assert_ne!(worker, caller);
         assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn inline_dynamic_worker_lending_is_bounded_and_released() {
+        assert!(MAX_INLINE_DYNAMIC_WORKERS < CONNECTION_WORK_THREADS);
+        assert_eq!(CONNECTION_WORK_THREADS - MAX_INLINE_DYNAMIC_WORKERS, 56);
+        let count = AtomicUsize::new(0);
+        let first = try_borrow_inline_dynamic_worker(&count, 2, 3).unwrap();
+        let second = try_borrow_inline_dynamic_worker(&count, 2, 3).unwrap();
+        assert!(try_borrow_inline_dynamic_worker(&count, 2, 3).is_none());
+        assert_eq!(count.load(Ordering::Acquire), 2);
+        drop(first);
+        let replacement = try_borrow_inline_dynamic_worker(&count, 2, 3).unwrap();
+        drop((second, replacement));
+        assert_eq!(count.load(Ordering::Acquire), 0);
     }
 
     #[test]

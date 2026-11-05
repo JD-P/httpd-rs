@@ -16,12 +16,15 @@ Usage:
     python3 bench/app_bench.py --only php
     python3 bench/app_bench.py --only gunicorn --keep
 
-Requires: apache2, target/release/vapached, wrk, php-fpm, gunicorn.
+Requires: apache2, target/release/vapached, wrk and php-fpm. Gunicorn is
+required only when its scenario is selected.
 """
 
 import argparse
+import grp
 import json
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -34,22 +37,30 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench"
-RUN = Path("/tmp/vapache-app-bench")
-APACHE = shutil.which("apache2") or "/usr/sbin/apache2"
-VAPACHED = ROOT / "target" / "release" / "vapached"
-WRK = shutil.which("wrk")
-GUNICORN = shutil.which("gunicorn")
-PHP_FPM = shutil.which("php-fpm")
+DEFAULT_RUN = "/run/vapache-app-bench" if os.geteuid() == 0 else "/tmp/vapache-app-bench"
+RUN = Path(os.environ.get("VAPACHE_APP_BENCH_RUN", DEFAULT_RUN))
+APACHE = os.environ.get("APACHE") or shutil.which("apache2") or "/usr/sbin/apache2"
+VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
+WRK = os.environ.get("WRK") or shutil.which("wrk")
+GUNICORN = os.environ.get("GUNICORN") or shutil.which("gunicorn")
+PHP_FPM = os.environ.get("PHP_FPM") or shutil.which("php-fpm")
 if PHP_FPM is None:
     candidates = sorted(Path("/usr/sbin").glob("php-fpm*"))
     PHP_FPM = str(candidates[0]) if candidates else None
+APACHE_MODDIR = Path(os.environ.get("APACHE_MODDIR", "/usr/lib/apache2/modules"))
+BENCH_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
+BENCH_GROUP = "www-data" if os.geteuid() == 0 else grp.getgrgid(os.getegid()).gr_name
+BACKEND_UID = 33 if os.geteuid() == 0 else os.geteuid()
 
 AP_PORT, VP_PORT = 19080, 19081
 GUNICORN_PORT = 19090
 
 SCENARIOS = [
-    dict(name="PHP-FPM /index.php", path="/index.php", marker=b"php-fpm", conc=32),
-    dict(name="Gunicorn /app/hello", path="/app/hello", marker=b"gunicorn", conc=32),
+    # Vapache admits at most eight concurrent dynamic requests from one client.
+    # Loopback is one identity, so a higher benchmark concurrency measures the
+    # deliberate overload response rather than backend throughput.
+    dict(name="PHP-FPM /index.php", path="/index.php", marker=b"php-fpm", conc=8),
+    dict(name="Gunicorn /app/hello", path="/app/hello", marker=b"gunicorn", conc=8),
 ]
 
 
@@ -58,7 +69,7 @@ def die(msg):
     raise SystemExit(2)
 
 
-def check_tools():
+def check_tools(needs_gunicorn):
     missing = []
     if not Path(APACHE).exists() and shutil.which(APACHE) is None:
         missing.append("apache2")
@@ -68,7 +79,7 @@ def check_tools():
         missing.append("wrk")
     if not PHP_FPM:
         missing.append("php-fpm")
-    if not GUNICORN:
+    if needs_gunicorn and not GUNICORN:
         missing.append("gunicorn")
     if missing:
         die("missing required tool(s): " + ", ".join(missing))
@@ -162,7 +173,7 @@ def stop(p, f=None):
 def common_config_lines(port, docroot, php_socket, apache):
     modules = []
     if apache:
-        moddir = "/usr/lib/apache2/modules"
+        moddir = APACHE_MODDIR
         modules = [
             f"LoadModule mpm_event_module {moddir}/mod_mpm_event.so",
             f"LoadModule authz_core_module {moddir}/mod_authz_core.so",
@@ -172,8 +183,13 @@ def common_config_lines(port, docroot, php_socket, apache):
             f"LoadModule proxy_http_module {moddir}/mod_proxy_http.so",
             f"LoadModule dir_module {moddir}/mod_dir.so",
         ]
+    vapache_security = [] if apache else [
+        "VapacheCapability FastCgi On",
+        f"VapacheFastCGIStablePath On unix:{php_socket} {BACKEND_UID} {BACKEND_UID} 0",
+    ]
     return "\n".join(
         modules
+        + vapache_security
         + [
             f"Listen {port}",
             "ServerName app-bench.local",
@@ -208,8 +224,8 @@ def write_server_configs():
 PidFile "{RUN}/apache/logs/httpd.pid"
 ErrorLog "{RUN}/apache/logs/error.log"
 LogLevel warn
-User www-data
-Group www-data
+User {BENCH_USER}
+Group {BENCH_GROUP}
 """
         + common_config_lines(AP_PORT, docroot, php_socket, True)
     )
@@ -218,8 +234,8 @@ Group www-data
 PidFile "{RUN}/vapache/logs/httpd.pid"
 ErrorLog "{RUN}/vapache/logs/error.log"
 LogLevel warn
-User www-data
-Group www-data
+User {BENCH_USER}
+Group {BENCH_GROUP}
 """
         + common_config_lines(VP_PORT, docroot, php_socket, False)
     )
@@ -252,7 +268,18 @@ def parse_wrk(text):
     if m:
         v = float(m.group(1))
         p99 = v / 1000 if m.group(2) == "us" else v * 1000 if m.group(2) == "s" else v
-    return dict(rps=num(r"Requests/sec:\s+([0-9.]+)"), mean_ms=ms, p99_ms=p99, raw=text)
+    errors = re.search(
+        r"Socket errors: connect (\d+), read (\d+), write (\d+), timeout (\d+)", text
+    )
+    socket_errors = tuple(map(int, errors.groups())) if errors else (0, 0, 0, 0)
+    return dict(
+        rps=num(r"Requests/sec:\s+([0-9.]+)"),
+        mean_ms=ms,
+        p99_ms=p99,
+        non2xx=num(r"Non-2xx or 3xx responses:\s+(\d+)", int) or 0,
+        socket_errors=socket_errors,
+        raw=text,
+    )
 
 
 def measure(port, path, duration, conc):
@@ -270,13 +297,24 @@ def main():
     ap.add_argument("--duration", type=float, default=None)
     ap.add_argument("--samples", type=int, default=3)
     args = ap.parse_args()
-    check_tools()
-
     duration = args.duration or (1.0 if args.quick else 3.0)
     samples = 1 if args.quick else args.samples
     selected = [s for s in SCENARIOS if not args.only or re.search(args.only, s["name"], re.I)]
     if not selected:
         die("no scenarios matched --only")
+    needs_gunicorn = any(s["marker"] == b"gunicorn" for s in selected)
+    needs_php = any(s["marker"] == b"php-fpm" for s in selected)
+    if (
+        needs_php
+        and os.geteuid() != 0
+        and os.environ.get("VAPACHE_APP_BENCH_PREPARED_STABLE_PATH") != "1"
+    ):
+        die(
+            "the secure PHP benchmark must run as root so its fixture can live "
+            "under root-owned /run; alternatively pre-provision a stable path and "
+            "set VAPACHE_APP_BENCH_RUN plus VAPACHE_APP_BENCH_PREPARED_STABLE_PATH=1"
+        )
+    check_tools(needs_gunicorn)
 
     make_fixture()
     fpm_cfg = write_fpm_config()
@@ -289,25 +327,26 @@ def main():
         if not wait_unix(RUN / "fpm" / "php.sock"):
             die("PHP-FPM did not create its socket")
 
-        gunicorn, gunicorn_log = start(
-            [
-                GUNICORN,
-                "--workers",
-                "8",
-                "--bind",
-                f"127.0.0.1:{GUNICORN_PORT}",
-                "--chdir",
-                str(RUN / "wsgi"),
-                "--access-logfile",
-                "/dev/null",
-                "--error-logfile",
-                str(RUN / "wsgi" / "error.log"),
-                "app:app",
-            ],
-            RUN / "wsgi" / "stdout.log",
-        )
-        if not wait_tcp(GUNICORN_PORT):
-            die("Gunicorn did not bind its port")
+        if needs_gunicorn:
+            gunicorn, gunicorn_log = start(
+                [
+                    GUNICORN,
+                    "--workers",
+                    "8",
+                    "--bind",
+                    f"127.0.0.1:{GUNICORN_PORT}",
+                    "--chdir",
+                    str(RUN / "wsgi"),
+                    "--access-logfile",
+                    "/dev/null",
+                    "--error-logfile",
+                    str(RUN / "wsgi" / "error.log"),
+                    "app:app",
+                ],
+                RUN / "wsgi" / "stdout.log",
+            )
+            if not wait_tcp(GUNICORN_PORT):
+                die("Gunicorn did not bind its port")
 
         apache, apache_log = start(
             [APACHE, "-f", str(apache_cfg), "-DFOREGROUND"], RUN / "apache" / "stdout.log"
@@ -330,9 +369,22 @@ def main():
         print(f"\n{'scenario':30} {'apache rps':>12} {'vapache rps':>12} {'ratio':>7} {'a mean':>8} {'v mean':>8}")
         for sc in selected:
             row = dict(name=sc["name"], path=sc["path"], servers={})
-            for server, port in (("apache", AP_PORT), ("vapache", VP_PORT)):
+            endpoints = (("apache", AP_PORT), ("vapache", VP_PORT))
+            for _, port in endpoints:
                 measure(port, sc["path"], max(0.5, duration / 2), sc["conc"])
-                vals = [measure(port, sc["path"], duration, sc["conc"]) for _ in range(samples)]
+            collected = {server: [] for server, _ in endpoints}
+            for sample in range(samples):
+                order = endpoints if sample % 2 == 0 else tuple(reversed(endpoints))
+                for server, port in order:
+                    value = measure(port, sc["path"], duration, sc["conc"])
+                    if value["non2xx"] or any(value["socket_errors"]):
+                        die(
+                            f"invalid {server} sample for {sc['name']}: "
+                            f"non2xx={value['non2xx']} socket_errors={value['socket_errors']}"
+                        )
+                    collected[server].append(value)
+            for server, _ in endpoints:
+                vals = collected[server]
                 vals.sort(key=lambda x: x["rps"] or 0)
                 row["servers"][server] = vals[len(vals) // 2]
             a = row["servers"]["apache"]["rps"] or 0
@@ -376,6 +428,7 @@ def main():
             "\n## Reading the numbers\n",
             "- Both handlers are deliberately trivial; this isolates the front-end/FastCGI/proxy hop rather than application work.",
             "- PHP-FPM uses a Unix socket and is the production-shaped PHP path. Native `php-cgi` is not used here.",
+            "- Vapache's PHP result keeps its stable-path ownership, writeability, ACL, endpoint-inode and peer-credential checks enabled; Apache does not perform an equivalent per-request proof.",
             "- Gunicorn uses eight default sync workers; vapache intentionally does not pool backend connections without strict response-framing checks. A real WSGI request with application latency will spend most of its time in the app, not this hop.",
             "- Run-to-run variance is material on a shared host; the ratios are more useful than absolute req/s.",
         ]

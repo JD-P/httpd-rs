@@ -97,7 +97,10 @@ Some mutable state is intentionally process-owned rather than request-owned:
   prove exact descriptor sets, privilege state, parent binding and rlimits
   before they can receive work;
 - the process-owned HTTP/1 connection work pool, fixed at 64 threads with a
-  fail-closed 1,024-job queue;
+  fail-closed 1,024-job queue. Bodyless prepared dynamic handlers may retain
+  at most eight of those workers after releasing request-worker admission;
+  the executable Verus lending predicate therefore preserves at least 56
+  workers for filesystem/policy/static work even if every backend stalls;
 - configuration-generation state (including the monotonic process-local ID
   allocator and cache-publication barrier), signal flags, logging
   serialization, and privileged TLS file-broker state;

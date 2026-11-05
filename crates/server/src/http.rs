@@ -3420,7 +3420,13 @@ where
         }
         progress.record(written);
         bytes = &bytes[written..];
-        tokio::task::yield_now().await;
+        // Yield between bounded quanta, not after the final bytes. Returning
+        // from this pump is itself a scheduling boundary; forcing an extra
+        // round trip after every tiny header/body only adds latency and does
+        // not improve fairness or slow-client accounting.
+        if !bytes.is_empty() {
+            tokio::task::yield_now().await;
+        }
     }
     Ok(())
 }
@@ -3715,7 +3721,9 @@ pub(crate) async fn write_response_async_plain(
                 progress.record(written);
                 sent += written as u64;
                 len -= written as u64;
-                tokio::task::yield_now().await;
+                if len > 0 {
+                    tokio::task::yield_now().await;
+                }
             }
             // Pipes, synthetic descriptors and some filesystems cannot be
             // sendfile sources. Resume at the explicit offset through the

@@ -179,7 +179,7 @@
       "title": "FastCGI script and PATH_INFO targets are bounded by the configured base",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "script_from_prefix and split_path_info clean/canonicalize the script inside the FastCGI prefix or document/alias root and consume the verified component-aware path_under_base kernel; the ancestor walk cannot select an ancestor file such as /bin/sh or a sibling with a shared byte prefix such as www2; unit cases cover dot segments, $1 templates, sibling-prefix targets and outside targets"
+      "evidence": "script_from_prefix cleans the script inside the FastCGI prefix or document/alias root and consumes the verified component-aware path_under_base kernel; split_path_info binds regular-file and symlink containment to one openat2 RESOLVE_BENEATH descriptor check, and execution repeats that descriptor-bound check before handoff. The ancestor walk cannot select an ancestor file such as /bin/sh or a sibling with a shared byte prefix such as www2; unit cases cover dot segments, $1 templates, sibling-prefix targets and outside targets"
     },
     {
       "id": "cache_authorization_inputs",

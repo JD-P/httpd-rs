@@ -339,3 +339,12 @@ history but are not comparable with strict runs.
 | hello.txt (1.1KB, keepalive) | 46437 | 41187 | 0.89x | 0.19 | 1 |
 | 10k.bin (10KB, keepalive) | 38427 | 36104 | 0.94x | 0.23 | 1 |
 | 1m.bin (1MB, keepalive) | 4741 | 11023 | 2.33x | 0.68 | 2 |
+
+## 2026-11-05T00:21:29.849764+00:00
+
+| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+|---|---:|---:|---:|---:|---:|
+| index.html (small, keepalive) | 41663 | 44075 | 1.06x | 0.18 | 1 |
+| hello.txt (1.1KB, keepalive) | 35602 | 44413 | 1.25x | 0.18 | 1 |
+| 10k.bin (10KB, keepalive) | 42811 | 41789 | 0.98x | 0.19 | 0 |
+| 1m.bin (1MB, keepalive) | 8310 | 12250 | 1.47x | 0.61 | 2 |

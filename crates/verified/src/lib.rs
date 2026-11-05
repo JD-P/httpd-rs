@@ -3710,6 +3710,40 @@ pub proof fn every_prepared_handler_has_bounded_dynamic_admission(kind: Prepared
 {
 }
 
+/// A policy worker may continue into a prepared dynamic handler only from a
+/// strict sub-pool. This preserves a non-empty policy/static reserve even when
+/// every lent worker is blocked in an external backend.
+pub open spec fn inline_dynamic_worker_admit_spec(
+    current: usize,
+    lend_limit: usize,
+    pool_threads: usize,
+) -> bool {
+    current < lend_limit && lend_limit < pool_threads
+}
+
+pub fn inline_dynamic_worker_admit(
+    current: usize,
+    lend_limit: usize,
+    pool_threads: usize,
+) -> (ok: bool)
+    ensures ok == inline_dynamic_worker_admit_spec(current, lend_limit, pool_threads),
+{
+    current < lend_limit && lend_limit < pool_threads
+}
+
+pub proof fn inline_dynamic_worker_preserves_static_reserve(
+    current: usize,
+    lend_limit: usize,
+    pool_threads: usize,
+)
+    requires inline_dynamic_worker_admit_spec(current, lend_limit, pool_threads),
+    ensures
+        (current as int) + 1 <= lend_limit as int,
+        (pool_threads as int) - ((current as int) + 1)
+            >= (pool_threads as int) - (lend_limit as int),
+{
+}
+
 /// Protocol-independent request lifecycle used by the HTTP/1 and HTTP/2
 /// adapters.  In particular, body acquisition is reachable only after the
 /// policy route selects a body-consuming handler, while an early denial can

@@ -13,8 +13,10 @@ fallback.
 """
 
 import argparse
+import grp
 import json
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -27,10 +29,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench"
 RUN = Path("/tmp/vapache-bench")
-APACHE = shutil.which("apache2") or "/usr/sbin/apache2"
-VAPACHED = ROOT / "target" / "release" / "vapached"
-AB = shutil.which("ab")
-WRK = shutil.which("wrk")
+APACHE = os.environ.get("APACHE") or shutil.which("apache2") or "/usr/sbin/apache2"
+VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
+AB = os.environ.get("AB") or shutil.which("ab")
+WRK = os.environ.get("WRK") or shutil.which("wrk")
+APACHE_MODDIR = Path(os.environ.get("APACHE_MODDIR", "/usr/lib/apache2/modules"))
+BENCH_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
+BENCH_GROUP = "www-data" if os.geteuid() == 0 else grp.getgrgid(os.getegid()).gr_name
 
 
 def make_tree():
@@ -56,8 +61,8 @@ def apache_config(port):
     cfg.write_text(
         f"""ServerRoot "{d}"
 Listen {port}
-User www-data
-Group www-data
+User {BENCH_USER}
+Group {BENCH_GROUP}
 PidFile {d}/logs/httpd.pid
 ErrorLog {d}/logs/error.log
 LogLevel warn
@@ -75,12 +80,12 @@ DocumentRoot "{RUN}/www"
     AllowOverride None
     Require all granted
 </Directory>
-LoadModule mpm_event_module /usr/lib/apache2/modules/mod_mpm_event.so
-LoadModule mime_module /usr/lib/apache2/modules/mod_mime.so
-LoadModule dir_module /usr/lib/apache2/modules/mod_dir.so
-LoadModule alias_module /usr/lib/apache2/modules/mod_alias.so
-LoadModule authz_core_module /usr/lib/apache2/modules/mod_authz_core.so
-LoadModule authz_host_module /usr/lib/apache2/modules/mod_authz_host.so
+LoadModule mpm_event_module {APACHE_MODDIR}/mod_mpm_event.so
+LoadModule mime_module {APACHE_MODDIR}/mod_mime.so
+LoadModule dir_module {APACHE_MODDIR}/mod_dir.so
+LoadModule alias_module {APACHE_MODDIR}/mod_alias.so
+LoadModule authz_core_module {APACHE_MODDIR}/mod_authz_core.so
+LoadModule authz_host_module {APACHE_MODDIR}/mod_authz_host.so
 TypesConfig /etc/mime.types
 DirectoryIndex index.html
 LogFormat "%h %l %u %t \\"%r\\" %>s %O" common
@@ -97,8 +102,8 @@ def vapache_config(port):
     cfg.write_text(
         f"""ServerRoot "{d}"
 Listen {port}
-User www-data
-Group www-data
+User {BENCH_USER}
+Group {BENCH_GROUP}
 PidFile {d}/logs/httpd.pid
 ErrorLog {d}/logs/error.log
 LogLevel warn
@@ -294,25 +299,28 @@ def main():
         print(f"{'scenario':38} {'server':10} {'req/s':>10} {'mean ms':>9} {'p99 ms':>8} {'MB/s':>8}")
         for name, path, req, conc in tests:
             row = {"name": name, "path": path, "requests": req, "concurrency": conc, "servers": {}}
-            for server, port in (("apache", apache_port), ("vapache", vapache_port)):
+            endpoints = (("apache", apache_port), ("vapache", vapache_port))
+            collected = {server: [] for server, _ in endpoints}
+            duration = args.duration or (1.0 if args.quick else 3.0)
+            for _, port in endpoints:
                 url = f"http://127.0.0.1:{port}{path}"
                 if WRK:
-                    duration = args.duration or (1.0 if args.quick else 3.0)
                     run_wrk(url, 1, conc)
-                    # Let the server observe EOF and retire the previous
-                    # process's keep-alive sockets before opening the next
-                    # sample.  Otherwise a loopback run can momentarily count
-                    # two complete client populations against the per-client
-                    # connection quota.
-                    time.sleep(0.25)
-                    samples = []
-                    for sample in range(3):
-                        samples.append(run_wrk(url, duration, conc))
-                        if sample != 2:
-                            time.sleep(0.25)
                 else:
                     run_ab(url, max(200, req // 20), conc)
-                    samples = [run_ab(url, req, conc) for _ in range(3)]
+                # Let the server observe EOF and retire the warm-up cohort.
+                time.sleep(0.25)
+            # Alternate server order so shared-host drift cannot systematically
+            # favor whichever implementation happens to run first.
+            for sample in range(3):
+                order = endpoints if sample % 2 == 0 else tuple(reversed(endpoints))
+                for server, port in order:
+                    url = f"http://127.0.0.1:{port}{path}"
+                    value = run_wrk(url, duration, conc) if WRK else run_ab(url, req, conc)
+                    collected[server].append(value)
+                    time.sleep(0.25)
+            for server, _ in endpoints:
+                samples = collected[server]
                 samples.sort(key=lambda r: r["rps"] or 0)
                 best = samples[len(samples) // 2]
                 row["servers"][server] = best

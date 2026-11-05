@@ -15,6 +15,7 @@
 use crate::cgi::{self, CgiContext};
 use crate::config::{Config, FastCgiEndpoint, FastCgiStablePathPolicy, Scope};
 use crate::http::{Body, Request, Response};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
@@ -192,10 +193,10 @@ pub(crate) fn open_script(
         return None;
     };
     let actual_path = crate::files::fd_path(&file)?;
-    let actual_base = std::fs::canonicalize(&base).ok()?;
-    if !script_under_base(&actual_path, &actual_base) {
-        return None; // coverage:ignore-line -- resolve_target_checked enforces beneath base
-    }
+    // `resolve_target_checked` opened this descriptor with openat2
+    // RESOLVE_BENEATH against `base`. Re-canonicalizing both pathnames here
+    // repeated the filesystem walk without strengthening that kernel-bound
+    // containment proof.
     Some(ScriptBinding {
         file,
         meta,
@@ -342,14 +343,27 @@ fn script_from_prefix(backend: &Backend, root: &Path, rel: &Path) -> Option<(Pat
     Some((script, base))
 }
 
-fn contained_after_resolving_symlinks(candidate: &Path, base: &Path) -> bool {
-    let Ok(base) = std::fs::canonicalize(base) else {
-        return false;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BeneathFile {
+    File,
+    NotFile,
+    Forbidden,
+}
+
+fn regular_file_beneath(candidate: &Path, base: &Path) -> BeneathFile {
+    let Ok(relative) = candidate.strip_prefix(base) else {
+        return BeneathFile::Forbidden;
     };
-    let Ok(candidate) = std::fs::canonicalize(candidate) else {
-        return false;
-    };
-    script_under_base(&candidate, &base)
+    // Bind containment and object type to one opened descriptor. Besides
+    // avoiding two realpath walks, openat2 RESOLVE_BENEATH cannot race a
+    // pathname check against a later open when a component is renamed.
+    match crate::files::resolve_target_checked(base, relative, true, false) {
+        crate::files::Target::File { .. } => BeneathFile::File,
+        crate::files::Target::Forbidden => BeneathFile::Forbidden,
+        crate::files::Target::Directory { .. } | crate::files::Target::NotFound => {
+            BeneathFile::NotFile
+        }
+    }
 }
 
 /// Split `PATH_INFO` from a FastCGI script target by finding the longest
@@ -398,11 +412,12 @@ fn split_path_info_with_request(
     if !charge_probe(&script_filename) {
         return None;
     }
-    if script_filename.is_file() {
-        if !contained_after_resolving_symlinks(&script_filename, base) {
-            return None;
+    match regular_file_beneath(&script_filename, base) {
+        BeneathFile::File => {
+            return Some((script_filename, url_path.to_string(), String::new()));
         }
-        return Some((script_filename, url_path.to_string(), String::new()));
+        BeneathFile::Forbidden => return None,
+        BeneathFile::NotFile => {}
     }
     let original = script_filename.clone();
     let mut candidate = script_filename;
@@ -419,14 +434,15 @@ fn split_path_info_with_request(
         if !charge_probe(&candidate) {
             return None;
         }
-        if candidate.is_file() {
-            if !contained_after_resolving_symlinks(&candidate, base) {
-                return None;
+        match regular_file_beneath(&candidate, base) {
+            BeneathFile::File => {
+                suffix.reverse();
+                let info = format!("/{}", suffix.join("/"));
+                let name = url_path.strip_suffix(&info).unwrap_or(url_path).to_string();
+                return Some((candidate, name, info));
             }
-            suffix.reverse();
-            let info = format!("/{}", suffix.join("/"));
-            let name = url_path.strip_suffix(&info).unwrap_or(url_path).to_string();
-            return Some((candidate, name, info));
+            BeneathFile::Forbidden => return None,
+            BeneathFile::NotFile => {}
         }
     }
     script_under_base(&original, base).then_some((original, url_path.to_string(), String::new()))
@@ -577,9 +593,7 @@ pub fn handler_target(scope: &Scope, root: &Path, rel: &Path, url_path: &str) ->
     }
     let backend = parse_backend(handler)?;
     let (script_filename, base) = LexicalScriptPath::from_mapping(&backend, root, rel)?;
-    if script_filename.as_path().is_file()
-        && !contained_after_resolving_symlinks(script_filename.as_path(), &base)
-    {
+    if regular_file_beneath(script_filename.as_path(), &base) == BeneathFile::Forbidden {
         return None;
     }
     Some(Target {
@@ -626,9 +640,7 @@ pub(crate) fn handler_target_for_file(
     ) {
         return None;
     }
-    if script_filename.as_path().is_file()
-        && !contained_after_resolving_symlinks(script_filename.as_path(), &base)
-    {
+    if regular_file_beneath(script_filename.as_path(), &base) == BeneathFile::Forbidden {
         return None;
     }
     Some(Target {
@@ -674,6 +686,7 @@ fn stable_policy_for<'a>(
 fn validate_unix_endpoint(
     policy: &FastCgiStablePathPolicy,
     path: &Path,
+    stable_path: &mut StableFastCgiPathProof,
 ) -> io::Result<std::fs::Metadata> {
     let Some(parent) = path.parent() else {
         return Err(io::Error::new(
@@ -681,7 +694,7 @@ fn validate_unix_endpoint(
             "FastCGI Unix endpoint has no parent directory",
         ));
     };
-    enforce_stable_fastcgi_path(policy, parent)?;
+    enforce_stable_fastcgi_path_with_proof(policy, parent, stable_path)?;
     let meta = std::fs::symlink_metadata(path)?;
     if !meta.file_type().is_socket() || Some(meta.uid()) != policy.endpoint_owner_uid {
         return Err(io::Error::new(
@@ -908,23 +921,24 @@ fn authenticate_unix_peer(
     ))
 }
 
-fn connect(
+fn connect_with_proof(
     backend: &Backend,
     backend_identities: &crate::proxy::BackendIdentityRegistry,
     timeout: Duration,
     policy: Option<&FastCgiStablePathPolicy>,
+    stable_path: &mut StableFastCgiPathProof,
     request_scope: Option<&crate::resource::RequestScope>,
 ) -> io::Result<Box<dyn ReadWrite>> {
     let deadline = Instant::now() + timeout;
     match &backend.transport {
         Transport::Unix(path) => {
             let before = policy
-                .map(|policy| validate_unix_endpoint(policy, path))
+                .map(|policy| validate_unix_endpoint(policy, path, stable_path))
                 .transpose()?;
             let s = connect_unix_timeout(path, deadline, request_scope)?;
             if let (Some(policy), Some(before)) = (policy, before) {
                 authenticate_unix_peer(&s, policy)?;
-                let after = validate_unix_endpoint(policy, path)?;
+                let after = validate_unix_endpoint(policy, path, stable_path)?;
                 if before.dev() != after.dev()
                     || before.ino() != after.ino()
                     || before.uid() != after.uid()
@@ -1017,6 +1031,25 @@ fn connect(
             Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address")))
         }
     }
+}
+
+#[cfg(test)]
+fn connect(
+    backend: &Backend,
+    backend_identities: &crate::proxy::BackendIdentityRegistry,
+    timeout: Duration,
+    policy: Option<&FastCgiStablePathPolicy>,
+    request_scope: Option<&crate::resource::RequestScope>,
+) -> io::Result<Box<dyn ReadWrite>> {
+    let mut stable_path = StableFastCgiPathProof::default();
+    connect_with_proof(
+        backend,
+        backend_identities,
+        timeout,
+        policy,
+        &mut stable_path,
+        request_scope,
+    )
 }
 
 trait ReadWrite: Read + Write {}
@@ -1153,7 +1186,12 @@ fn build_params(env: &[(OsString, OsString)]) -> Vec<u8> {
     params
 }
 
-fn send_request(stream: &mut dyn ReadWrite, params: &[u8], body: &mut dyn Read) -> io::Result<()> {
+fn send_request(
+    stream: &mut dyn ReadWrite,
+    params: &[u8],
+    body: &mut dyn Read,
+    body_is_empty: bool,
+) -> io::Result<()> {
     let mut out = Vec::new();
     let mut begin = vec![0u8; 8];
     begin[0..2].copy_from_slice(&FCGI_RESPONDER.to_be_bytes());
@@ -1162,6 +1200,13 @@ fn send_request(stream: &mut dyn ReadWrite, params: &[u8], body: &mut dyn Read) 
         record(&mut out, FCGI_PARAMS, 1, chunk);
     }
     record(&mut out, FCGI_PARAMS, 1, &[]);
+    if body_is_empty {
+        // GET/HEAD and most application requests have no body. Coalesce the
+        // terminating STDIN record with BEGIN/PARAMS so they need one backend
+        // write and no otherwise-unused 60 KiB body buffer.
+        record(&mut out, FCGI_STDIN, 1, &[]);
+        return stream.write_all(&out);
+    }
     stream.write_all(&out)?;
     let mut chunk = vec![0u8; 60_000];
     loop {
@@ -1581,10 +1626,21 @@ fn stable_fastcgi_component(
     }
 }
 
+#[derive(Default)]
+struct StableFastCgiPathProof {
+    components: HashSet<PathBuf>,
+}
+
 /// Check every lexical/canonical pathname component. A symlink's own mode is
 /// ignored (Unix reports meaningless 0777 bits), but its owner and containing
 /// directory are checked, and the canonical target is checked separately.
-fn enforce_stable_fastcgi_path(policy: &FastCgiStablePathPolicy, path: &Path) -> io::Result<()> {
+/// Components already proved during this request may be reused: the proof
+/// establishes that the configured backend cannot replace or mutate them.
+fn enforce_stable_fastcgi_path_with_proof(
+    policy: &FastCgiStablePathPolicy,
+    path: &Path,
+    proof: &mut StableFastCgiPathProof,
+) -> io::Result<()> {
     use std::path::Component;
 
     if !path.is_absolute() {
@@ -1594,7 +1650,10 @@ fn enforce_stable_fastcgi_path(policy: &FastCgiStablePathPolicy, path: &Path) ->
         ));
     }
     let mut current = PathBuf::from("/");
-    stable_fastcgi_component(policy, &current, &std::fs::symlink_metadata(&current)?)?;
+    if !proof.components.contains(&current) {
+        stable_fastcgi_component(policy, &current, &std::fs::symlink_metadata(&current)?)?;
+        proof.components.insert(current.clone());
+    }
     for component in path.components() {
         match component {
             Component::RootDir => continue,
@@ -1606,10 +1665,18 @@ fn enforce_stable_fastcgi_path(policy: &FastCgiStablePathPolicy, path: &Path) ->
                 ));
             }
         }
+        if proof.components.contains(&current) {
+            continue;
+        }
         let meta = std::fs::symlink_metadata(&current)?;
         stable_fastcgi_component(policy, &current, &meta)?;
+        proof.components.insert(current.clone());
     }
     Ok(())
+}
+
+fn enforce_stable_fastcgi_path(policy: &FastCgiStablePathPolicy, path: &Path) -> io::Result<()> {
+    enforce_stable_fastcgi_path_with_proof(policy, path, &mut StableFastCgiPathProof::default())
 }
 
 fn fastcgi_error_response(
@@ -1704,18 +1771,28 @@ fn execute_inner(
     let result = (|| -> io::Result<Response> {
         let timeout = base.cfg.timeout.max(Duration::from_secs(5));
         let policy = stable_policy_for(base.cfg, &target.backend)?;
-        let mut stream = connect(
+        let mut stable_path = StableFastCgiPathProof::default();
+        let mut stream = connect_with_proof(
             &target.backend,
             &base.cfg.backend_identities,
             timeout,
             policy,
+            &mut stable_path,
             base.req.request_scope(),
         )?;
         let params = build_params(&env);
         if let Some(policy) = policy {
-            enforce_stable_fastcgi_path(policy, target.script_filename())?;
+            enforce_stable_fastcgi_path_with_proof(
+                policy,
+                target.script_filename(),
+                &mut stable_path,
+            )?;
             if let Some(binding) = binding {
-                enforce_stable_fastcgi_path(policy, &binding.actual_path)?;
+                enforce_stable_fastcgi_path_with_proof(
+                    policy,
+                    &binding.actual_path,
+                    &mut stable_path,
+                )?;
             }
         }
         // Connect first, then keep both the originally selected descriptor and
@@ -1731,10 +1808,10 @@ fn execute_inner(
         };
         if let Some(reader) = base.req.body_reader() {
             let mut reader = reader?;
-            send_request(&mut stream, &params, &mut reader)?;
+            send_request(&mut stream, &params, &mut reader, base.req.body_len() == 0)?;
         } else {
             let mut reader = Cursor::new(base.req.body.as_slice());
-            send_request(&mut stream, &params, &mut reader)?;
+            send_request(&mut stream, &params, &mut reader, base.req.body_len() == 0)?;
         }
         let (spool, stderr) = read_response_with_budget(
             &mut stream,
@@ -1899,6 +1976,12 @@ mod tests {
         };
         enforce_stable_fastcgi_path(&policy, Path::new("/etc/passwd"))
             .expect("root-owned system path should be stable for uid 33");
+        let mut proof = StableFastCgiPathProof::default();
+        enforce_stable_fastcgi_path_with_proof(&policy, Path::new("/etc/passwd"), &mut proof)
+            .unwrap();
+        let proved = proof.components.len();
+        enforce_stable_fastcgi_path_with_proof(&policy, Path::new("/etc"), &mut proof).unwrap();
+        assert_eq!(proof.components.len(), proved);
         assert!(enforce_stable_fastcgi_path(&policy, Path::new("/tmp")).is_err());
         assert!(enforce_stable_fastcgi_path(&policy, Path::new("relative.php")).is_err());
 
@@ -2564,14 +2647,14 @@ mod tests {
         fs::write(base.join("index.php"), "<?php\n").unwrap();
         fs::write(base.join("dir").join("script.php"), "<?php\n").unwrap();
 
-        assert!(!contained_after_resolving_symlinks(
-            &base.join("missing"),
-            &base
-        ));
-        assert!(!contained_after_resolving_symlinks(
-            &base,
-            &base.join("missing")
-        ));
+        assert_eq!(
+            regular_file_beneath(&base.join("missing"), &base),
+            BeneathFile::NotFile
+        );
+        assert_eq!(
+            regular_file_beneath(&base, &base.join("missing")),
+            BeneathFile::Forbidden
+        );
 
         let (script, name, info) =
             split_path_info(base.join("index.php"), "/index.php", &base).unwrap();
@@ -2906,11 +2989,19 @@ mod tests {
             &mut sink,
             &vec![b'p'; 130_000],
             &mut Cursor::new(body.clone()),
+            false,
         )
         .unwrap();
         assert!(sink.0.len() > body.len());
         assert_eq!(sink.0[0], FCGI_VERSION);
         assert!(sink.0.windows(2).any(|w| w == [FCGI_VERSION, FCGI_PARAMS]));
+
+        let mut empty_sink = Sink(Vec::new());
+        send_request(&mut empty_sink, b"p", &mut Cursor::new(Vec::new()), true).unwrap();
+        assert!(empty_sink
+            .0
+            .windows(8)
+            .any(|record| record[0] == FCGI_VERSION && record[1] == FCGI_STDIN));
 
         let mut empty_records = Vec::new();
         for _ in 0..=MAX_FASTCGI_RECORDS {
