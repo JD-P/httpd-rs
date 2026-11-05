@@ -460,10 +460,6 @@ fn collect_layers_with_root_inner(
         if !policy_applicable {
             continue;
         }
-        let is_dir = crate::files::is_dir_cached(&dir);
-        if !is_dir {
-            continue;
-        }
         let dir_scope = match req {
             Some(req) => cfg
                 .effective_scope_cached_req(vhost, &dir, url_path, req)
@@ -489,10 +485,7 @@ fn collect_layers_with_root_inner(
         let mode = override_policy.mode();
         let allow_list = override_policy.allow_list();
         let nonfatal = override_policy.nonfatal();
-        if !crate::verified::access_walk_dir_admit(
-            is_dir,
-            mode.is_enabled() || !allow_list.is_empty(),
-        ) {
+        if !mode.is_enabled() && allow_list.is_empty() {
             continue;
         }
         let identity = crate::request_plan::LayerIdentity::new(&root, &dir, fs_path, url_path);
@@ -521,6 +514,13 @@ fn collect_layers_with_root_inner(
                 }
                 Ok(Some(opened)) => opened,
             };
+            // A successful `dir/access-file` open proves that every prefix,
+            // including `dir`, was a directory at the kernel lookup boundary.
+            // Let that same lookup establish directory existence instead of
+            // preceding it with a redundant pathname `statx` on every
+            // request. `ENOTDIR` is treated like an absent candidate below,
+            // preserving PATH_INFO/non-directory ancestor semantics.
+            debug_assert!(crate::verified::access_walk_dir_admit(true, true));
             let parsed = parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, opened)?;
             if !vapache_verified::access_program_budget_admit(
                 layers.len() as u64,
@@ -803,7 +803,14 @@ fn open_access_file(path: &Path) -> std::io::Result<Option<OpenedAccessFile>> {
         .open(path)
     {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None)
+        }
         Err(error) => return Err(error),
     };
     let meta = file.metadata()?;

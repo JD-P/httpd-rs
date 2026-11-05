@@ -2926,7 +2926,7 @@ fn backend_key(backend: &HttpBackend) -> String {
     )
 }
 
-fn proxy_session_key(target: &Target, req: &Request, host: &str) -> Vec<u8> {
+fn proxy_session_key(target: &Target, req: &Request, host: &str) -> Option<Vec<u8>> {
     fn update(context: &mut ring::digest::Context, bytes: &[u8]) {
         context.update(&(bytes.len() as u64).to_be_bytes());
         context.update(bytes);
@@ -2944,7 +2944,15 @@ fn proxy_session_key(target: &Target, req: &Request, host: &str) -> Vec<u8> {
         update(&mut context, name.as_bytes());
         update(&mut context, value);
     }
-    context.finish().as_ref().to_vec()
+    // A streamed or file-spooled body cannot be hashed without consuming or
+    // rereading attacker-sized input before dispatch. Keep those requests on
+    // single-use transports. Empty and bounded in-memory bodies participate
+    // in the identity so two different POSTs can never share a pooled socket.
+    if req.body_spool.is_some() || req.body_len() != req.body.len() as u64 {
+        return None;
+    }
+    update(&mut context, &req.body);
+    Some(context.finish().as_ref().to_vec())
 }
 
 fn proxy_method_is_idempotent(method: &str) -> bool {
@@ -3823,7 +3831,11 @@ pub(crate) fn execute_with_proxy_base(
             );
         }
         tried.insert(backend_key(&current.backend));
-        let pool_key = (!current.backend.tls).then(|| proxy_session_key(&current, req, host));
+        let pool_key = if current.backend.tls {
+            None
+        } else {
+            proxy_session_key(&current, req, host)
+        };
         let pooled = pool_key.as_deref().and_then(|key| {
             req.headers
                 .proxy_session()
@@ -3966,7 +3978,6 @@ pub(crate) fn execute_with_proxy_base(
                 return response;
             }
             Err(e) => {
-                eprintln!("vapache proxy error: {e}");
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::StorageFull
@@ -4000,6 +4011,22 @@ pub(crate) fn execute_with_proxy_base(
                         local_ip,
                     );
                 }
+                // A backend may close an otherwise reusable keep-alive
+                // connection while it sits in the connection-local cache.
+                // Retry that backend once on a fresh transport only when the
+                // method is idempotent. The pooled lease is discarded here;
+                // the request's ordinary dynamic lease accounts for the new
+                // connection. Non-idempotent requests retain the strict
+                // no-replay behavior below.
+                if pooled_lease.take().is_some()
+                    && vapache_verified::proxy_retry_admit(
+                        true,
+                        proxy_method_is_idempotent(&req.method),
+                    )
+                {
+                    continue;
+                }
+                eprintln!("vapache proxy error: {e}");
                 if let Some(name) = &current.balancer {
                     mark_dead(
                         cfg.generation,
@@ -4589,6 +4616,19 @@ mod more_tests {
                                         Ok(_) => buf.push(byte[0]),
                                     }
                                 }
+                                let body_len = String::from_utf8_lossy(&buf)
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (name, value) = line.split_once(':')?;
+                                        name.eq_ignore_ascii_case("content-length")
+                                            .then(|| value.trim().parse::<usize>().ok())
+                                            .flatten()
+                                    })
+                                    .unwrap_or(0);
+                                let mut body = vec![0u8; body_len];
+                                if stream.read_exact(&mut body).is_err() {
+                                    return;
+                                }
                                 if stream
                                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                                     .is_err()
@@ -4685,6 +4725,34 @@ mod more_tests {
             200
         );
         assert_eq!(accepts.load(Ordering::Relaxed), 2);
+        let mut first_post = request.clone();
+        first_post.method = "POST".into();
+        first_post.body = b"first body".to_vec();
+        first_post.framing = crate::verified::BodyFraming::Length(first_post.body.len() as u64);
+        let mut second_post = first_post.clone();
+        second_post.body = b"second body".to_vec();
+        second_post.framing = crate::verified::BodyFraming::Length(second_post.body.len() as u64);
+        for post in [&first_post, &second_post, &first_post] {
+            let target = match_target(&cfg, &scope, "/pool/x").unwrap();
+            assert_eq!(
+                execute(
+                    &cfg,
+                    None,
+                    &scope,
+                    post,
+                    "/pool/x",
+                    &target,
+                    peer,
+                    80,
+                    false,
+                    "localhost",
+                    "127.0.0.1",
+                )
+                .status,
+                200
+            );
+        }
+        assert_eq!(accepts.load(Ordering::Relaxed), 4);
         stop.store(true, Ordering::Relaxed);
         let _ = handle.join();
         let _ = fs::remove_dir_all(&dir);
@@ -4754,6 +4822,92 @@ mod more_tests {
                 "127.0.0.1",
             );
             assert_eq!(response.status, 200);
+        }
+        handle.join().unwrap();
+        assert_eq!(accepts.load(Ordering::Relaxed), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idempotent_request_reconnects_after_backend_closes_idle_transport() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn read_head(stream: &mut TcpStream) {
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                assert_eq!(stream.read(&mut byte).unwrap(), 1);
+                request.push(byte[0]);
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_thread = Arc::clone(&accepts);
+        let handle = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            accepts_thread.fetch_add(1, Ordering::Relaxed);
+            read_head(&mut first);
+            first
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            // Consume the next idempotent request, then simulate an upstream
+            // idle timeout/reset before any response bytes are returned.
+            read_head(&mut first);
+            drop(first);
+
+            let (mut fresh, _) = listener.accept().unwrap();
+            accepts_thread.fetch_add(1, Ordering::Relaxed);
+            read_head(&mut fresh);
+            fresh
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok",
+                )
+                .unwrap();
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-proxy-stale-pool-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = config(&dir);
+        let mut scope = Scope::default();
+        scope
+            .proxy_policy
+            .proxy_passes
+            .push(crate::config::ProxyPassRule {
+                prefix: "/stale".into(),
+                backend: format!("http://127.0.0.1:{port}/"),
+                sticky_cookie: None,
+                fail_on_status: Vec::new(),
+                route_order: 0,
+            });
+        let mut request = req("/stale/x");
+        request
+            .headers
+            .bind_proxy_session(Arc::new(ProxySession::new(cfg.generation)));
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        for _ in 0..2 {
+            let target = match_target(&cfg, &scope, "/stale/x").unwrap();
+            assert_eq!(
+                execute(
+                    &cfg,
+                    None,
+                    &scope,
+                    &request,
+                    "/stale/x",
+                    &target,
+                    peer,
+                    80,
+                    false,
+                    "localhost",
+                    "127.0.0.1",
+                )
+                .status,
+                200
+            );
         }
         handle.join().unwrap();
         assert_eq!(accepts.load(Ordering::Relaxed), 2);
