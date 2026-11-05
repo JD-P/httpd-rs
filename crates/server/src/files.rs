@@ -3059,6 +3059,10 @@ mod tests {
         assert!(
             directory_index_target(&cfg, &scope, &request("GET", b"/"), &dir, "/", b"/").is_some()
         );
+        assert_eq!(
+            directory_index_name(&cfg, &scope, &request("GET", b"/"), &dir, "/", b"/"),
+            Some(b"index.html".to_vec())
+        );
         cfg.directory_index.clear();
         scope.options.push_add(crate::config::Options::INDEXES);
         scope.content_policy.index_ignore.push("visible".into());

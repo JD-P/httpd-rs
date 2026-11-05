@@ -593,9 +593,6 @@ impl RequestPlan {
         req: &Request,
         peer: std::net::IpAddr,
     ) -> EvaluatedScope {
-        if let Some(scope) = &self.precomputed_scope {
-            return scope.clone();
-        }
         // A nonempty layer set already proves that access files apply.  Never
         // fall back to the configuration-only path merely because the target
         // path is outside the lexical `AllowOverride` prefix (F59/I60).
@@ -896,6 +893,31 @@ mod tests {
                 &cfg,
                 None,
                 CanonicalTarget::from_url_path("/nested/index.html").unwrap(),
+                None,
+                None,
+            )
+            .is_none());
+
+        let mut inconsistent_path = plan.clone();
+        inconsistent_path.fs_path = PathBuf::from("/srv/other");
+        assert!(inconsistent_path
+            .retarget_directory_index(
+                &cfg,
+                None,
+                CanonicalTarget::from_url_path("/index.html").unwrap(),
+                None,
+                None,
+            )
+            .is_none());
+
+        let mut inconsistent_layer = plan.clone();
+        inconsistent_layer.layers[0].identity =
+            LayerIdentity::with_url_mount(&root, &root, "/different/");
+        assert!(inconsistent_layer
+            .retarget_directory_index(
+                &cfg,
+                None,
+                CanonicalTarget::from_url_path("/index.html").unwrap(),
                 None,
                 None,
             )
