@@ -3145,6 +3145,20 @@ mod tests {
             .status,
             503
         );
+        let oversized_name = vec![(vec![b'x'; MAX_AUTOINDEX_BYTES / 8], false, 1)];
+        assert_eq!(
+            autoindex(
+                &cfg,
+                &scope,
+                &request("GET", b"/"),
+                "/",
+                &oversized_name,
+                "example.test",
+                80,
+            )
+            .status,
+            503
+        );
 
         let mut text_scope = Scope::default();
         text_scope
@@ -3322,6 +3336,20 @@ mod tests {
             ),
             DirAction::Overloaded
         ));
+        let response = serve_directory_inner(
+            &cfg,
+            None,
+            &scope,
+            &request("GET", b"/"),
+            File::open(&root).unwrap(),
+            "/",
+            b"/",
+            "example.test",
+            80,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "127.0.0.1",
+        );
+        assert_eq!(response.status, 503);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
