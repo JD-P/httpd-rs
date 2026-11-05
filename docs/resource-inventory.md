@@ -105,7 +105,9 @@ Some mutable state is intentionally process-owned rather than request-owned:
   allocator and cache-publication barrier), signal flags, logging
   serialization, and privileged TLS file-broker state;
 - telemetry counters, thread-local formatting buffers, request-local metadata
-  memoization, and collision-resistant temporary-name counters.
+  memoization, collision-resistant temporary-name counters, and the
+  deterministic task/thread fault plans compiled only for fault-injection
+  testing.
 
 These objects have bounds or constant cardinality at their definitions and do
 not grant request execution capacity. `tests/resource_inventory.py` makes the
