@@ -4861,15 +4861,11 @@ mod more_tests {
             accepts_thread.fetch_add(1, Ordering::Relaxed);
             read_head(&mut fresh);
             fresh
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok",
-                )
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok")
                 .unwrap();
         });
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-proxy-stale-pool-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vapache-proxy-stale-pool-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cfg = config(&dir);

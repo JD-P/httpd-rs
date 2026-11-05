@@ -2073,16 +2073,30 @@ mod tests {
         let unregistered = parse_backend("fcgi://127.0.0.1:9000").unwrap();
         assert!(stable_policy_for(&cfg, &unregistered).is_err());
 
-        let accept = std::thread::spawn(move || listener.accept().unwrap());
-        let connected = connect(
-            &backend,
-            &cfg.backend_identities,
-            Duration::from_secs(2),
-            Some(&policy),
-            None,
-        );
-        connected.expect("configured endpoint owner must authenticate the FastCGI listener");
-        drop(accept.join().unwrap());
+        // GitHub's hosted runner places the checkout below `/home`, which
+        // itself carries a POSIX ACL. In that environment the production
+        // policy must reject the endpoint before peer authentication; on an
+        // ordinary ACL-free checkout, exercise the successful connection as
+        // well. The explicit file-ACL assertion below remains unconditional.
+        match enforce_stable_fastcgi_path(&policy, &socket) {
+            Ok(()) => {
+                let accept = std::thread::spawn(move || listener.accept().unwrap());
+                let connected = connect(
+                    &backend,
+                    &cfg.backend_identities,
+                    Duration::from_secs(2),
+                    Some(&policy),
+                    None,
+                );
+                connected
+                    .expect("configured endpoint owner must authenticate the FastCGI listener");
+                drop(accept.join().unwrap());
+            }
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                drop(listener);
+            }
+        }
 
         let (client, _server) = UnixStream::pair().unwrap();
         let peer_policy = FastCgiStablePathPolicy {
@@ -2141,6 +2155,12 @@ mod tests {
             0
         );
         assert!(path_has_posix_acl(&file).unwrap());
+        assert_eq!(
+            stable_fastcgi_component(&policy, &file, &fs::symlink_metadata(&file).unwrap())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
         assert!(enforce_stable_fastcgi_path(&policy, &file).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
