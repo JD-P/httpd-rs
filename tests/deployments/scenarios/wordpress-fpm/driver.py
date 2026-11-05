@@ -238,8 +238,12 @@ ProxyPassMatch ^/(.*\\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{wordpres
         require_response(port, "/?p=1", contains=b"Hello world")
     require_response(port, "/", contains=b"Vapache WordPress Integration")
     require_response(port, "/wp-json/wp/v2/posts", contains=b"hello-world")
-    source_status, _, source_body = request(port, "/index.php")
-    if source_status != 200 or b"<?php" in source_body:
+    source_status, source_headers, source_body = request(port, "/index.php")
+    source_redirect = source_headers.get("location", "")
+    safe_canonical_redirect = source_status in {301, 302, 307, 308} and source_redirect == (
+        f"http://127.0.0.1:{port}/"
+    )
+    if (source_status != 200 and not safe_canonical_redirect) or b"<?php" in source_body:
         raise DeploymentError("WordPress PHP source was exposed or index.php failed")
     require_response(port, "/wp-content/uploads/must-not-execute.php", status=403)
 
