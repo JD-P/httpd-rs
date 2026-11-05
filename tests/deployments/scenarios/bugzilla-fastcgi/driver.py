@@ -243,7 +243,7 @@ ProxyPassMatch ^/(.*\\.cgi(/.*)?)$ "unix:{socket_path}|fcgi://localhost{bugzilla
             extra=common,
         )
         start_apache(context, apache_config, apache_port)
-        require_response(apache_port, "/", contains=b"Bugzilla")
+        require_response(apache_port, "/index.cgi", contains=b"Bugzilla")
         differential_benchmark(
             port,
             apache_port,

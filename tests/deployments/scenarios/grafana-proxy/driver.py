@@ -179,6 +179,11 @@ ProxyPassReverse {route} {backend_route}
             server.reload()
             time.sleep(0.5)
             server.assert_running()
+            # Generation retirement deliberately terminates long-lived
+            # tunnels so old routing/authorization policy cannot survive a
+            # reload. Exercise the replacement generation with a new tunnel.
+            websocket.close()
+            websocket = open_websocket(frontend_port, f"{prefix}/api/live/ws")
         if variant["websocket"] == "message":
             expect_pong(websocket)
         send_masked_frame(websocket, 0x8, b"\x03\xe8")

@@ -252,7 +252,6 @@ class DeploymentHarnessTests(unittest.TestCase):
                         "GITEA_PASSWD": str(gitea_passwd),
                         "GITEA_GROUP": str(gitea_group),
                         "GITEA_PORT": "30997",
-                        "GITEA_HEALTH_PATH": "",
                     },
                 ),
                 (

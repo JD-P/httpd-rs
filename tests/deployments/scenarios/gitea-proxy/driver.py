@@ -174,11 +174,10 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
             "GITEA_PASSWD": os.fspath(passwd),
             "GITEA_GROUP": os.fspath(group),
             "GITEA_PORT": str(backend_port),
-            "GITEA_HEALTH_PATH": prefix,
         },
     )
     compose.pull()
-    compose.up(wait_timeout=360)
+    compose.up(wait_timeout=240)
     backend_host = compose.service_ip("gitea")
     create_admin(compose)
 
@@ -186,7 +185,9 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
     empty_docroot.mkdir()
     os.chmod(empty_docroot, 0o755)
     route = f"{prefix}/" if prefix else "/"
-    backend_route = f"http://{backend_host}:3000{route}"
+    # Gitea's ROOT_URL contains the public subpath, but its internal router is
+    # rooted at /. Strip the public prefix at the reverse-proxy boundary.
+    backend_route = f"http://{backend_host}:3000/"
     extra = f"""
 ProxyPass {route} {backend_route}
 ProxyPassReverse {route} {backend_route}

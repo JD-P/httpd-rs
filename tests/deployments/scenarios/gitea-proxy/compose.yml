@@ -14,7 +14,6 @@ services:
       USER: runner
       GITEA_WORK_DIR: /data/gitea
       GITEA_CUSTOM: /data/gitea
-      GITEA_HEALTH_PATH: ${GITEA_HEALTH_PATH-}
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=128m,uid=${HOST_UID:?},gid=${HOST_GID:?}
     volumes:
@@ -34,10 +33,12 @@ services:
     networks:
       - application
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000$${GITEA_HEALTH_PATH}/api/v1/version"]
+      # BusyBox wget does not honor NO_PROXY; -Y off keeps this loopback probe
+      # inside the otherwise network-isolated application container.
+      test: ["CMD", "wget", "-Y", "off", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/v1/version"]
       interval: 2s
       timeout: 5s
-      retries: 180
+      retries: 60
 
 networks:
   application:

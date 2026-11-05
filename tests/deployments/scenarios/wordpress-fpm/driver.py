@@ -223,14 +223,15 @@ ProxyPassMatch ^/(.*\\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{wordpres
 
     if variant["permalinks"] == "pretty":
         compose.exec(
-            "database",
+            "wordpress",
             [
-                "mariadb",
-                "--user=wordpress",
-                "--password=vapache-integration-db",
-                "--database=wordpress",
-                "--execute=UPDATE wp_options SET option_value='/%postname%/' WHERE option_name='permalink_structure'",
+                "php",
+                "-r",
+                "require '/var/www/html/wp-load.php'; "
+                "update_option('permalink_structure', '/%postname%/'); "
+                "flush_rewrite_rules(false);",
             ],
+            user="33",
         )
         require_response(port, "/hello-world/", contains=b"Hello world")
     else:

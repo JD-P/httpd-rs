@@ -164,6 +164,7 @@ Alias /gitweb-static/ "{gitweb_static}/"
         path = "/gitweb/?p=demo.git;a=summary" if variant["application"] == "gitweb" else "/git/demo.git/info/refs?service=git-upload-pack"
         apache_port = free_port()
         apache_extra = f"""
+TypesConfig /etc/mime.types
 ScriptSock "{context.run_dir / 'apache-cgid.sock'}"
 SetEnv GITWEB_CONFIG "{gitweb_config}"
 SetEnv GIT_PROJECT_ROOT "{projects}"
