@@ -8,6 +8,9 @@ protocol, differential, fuzz or unit suites.
 
 - `nightly` runs one fixed representative case for Hugo static content, Git
   CGI, WordPress/PHP-FPM and Grafana HTTP/WebSockets.
+- `canonical` runs the declared representative case for every application. It
+  is the reproducible baseline for cross-application compatibility and
+  differential performance campaigns.
 - `sample` uses a recorded random seed. It first selects one random combination
   for every application (when the requested sample is large enough), then
   samples the remaining combinations without replacement.

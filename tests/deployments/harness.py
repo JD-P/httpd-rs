@@ -134,6 +134,8 @@ def choose_cases(
             raise DeploymentError(f"unknown scenario {only!r}")
     if profile == "nightly":
         return [Case(scenario, scenario.canonical) for scenario in scenarios if scenario.nightly]
+    if profile == "canonical":
+        return [Case(scenario, scenario.canonical) for scenario in scenarios]
     all_cases = [case for scenario in scenarios for case in cases_for_scenario(scenario)]
     if profile == "full":
         return all_cases
@@ -205,7 +207,9 @@ def check_disk(scenario: Scenario) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--profile", choices=("nightly", "sample", "full"), default="nightly")
+    parser.add_argument(
+        "--profile", choices=("nightly", "canonical", "sample", "full"), default="nightly"
+    )
     parser.add_argument("--scenario", help="restrict the run to one scenario")
     parser.add_argument("--sample-count", type=int, default=10)
     parser.add_argument("--seed", type=lambda value: int(value, 0))

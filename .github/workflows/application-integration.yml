@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: Fixed nightly set, stochastic sample, or exhaustive Cartesian set
+        description: Fixed nightly set, all canonical cases, stochastic sample, or exhaustive Cartesian set
         type: choice
-        options: [nightly, sample, full]
+        options: [nightly, canonical, sample, full]
         default: sample
       scenario:
         description: Optional single scenario id
