@@ -139,9 +139,14 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
     panic!("timed out waiting for vapached lifecycle transition");
 }
 
-fn wait_running(root: &Path, port: u16) {
+fn wait_running(root: &Path, config: &Path, port: u16) {
     wait_until(|| {
-        root.join("vapached.pid").exists() && TcpStream::connect(("127.0.0.1", port)).is_ok()
+        // A bound listener can complete the TCP handshake while startup is
+        // still publishing its authenticated PID identity and before the
+        // accept loop begins.  Use the control-plane status contract as the
+        // readiness marker so lifecycle assertions cannot race that window.
+        output(root, config, &["-k", "status"]).status.success()
+            && TcpStream::connect(("127.0.0.1", port)).is_ok()
     });
 }
 
@@ -424,7 +429,7 @@ fn foreground_reload_reopen_bind_and_actions() {
     let config = write_config(&root, port, "");
     const INHERITED_FD: i32 = 198;
     let child = spawn_foreground_with_inherited_fd(&root, &config, INHERITED_FD);
-    wait_running(&root, port);
+    wait_running(&root, &config, port);
     let pid = read_pid(&root);
     assert!(
         !PathBuf::from(format!("/proc/{pid}/fd/{INHERITED_FD}")).exists(),
@@ -514,7 +519,7 @@ fn foreground_reload_reopen_bind_and_actions() {
     wait_success(child);
 
     let child = spawn_foreground(&root, &config, &["-k", "start"]);
-    wait_running(&root, port);
+    wait_running(&root, &config, port);
     assert!(output(&root, &config, &["-k", "graceful-stop"])
         .status
         .success());
@@ -530,7 +535,7 @@ fn daemon_and_active_graceful_drain() {
     let daemon_port = free_port();
     let daemon_config = write_config(&daemon_root, daemon_port, "");
     assert!(output(&daemon_root, &daemon_config, &[]).status.success());
-    wait_running(&daemon_root, daemon_port);
+    wait_running(&daemon_root, &daemon_config, daemon_port);
     assert!(output(&daemon_root, &daemon_config, &["-k", "status"])
         .status
         .success());
@@ -555,7 +560,7 @@ fn daemon_and_active_graceful_drain() {
         "Timeout 60\nGracefulShutdownTimeout 1\nAddHandler cgi-script .cgi\n<Directory /tmp>\nOptions +ExecCGI\n</Directory>",
     );
     let child = spawn_foreground(&drain_root, &drain_config, &[]);
-    wait_running(&drain_root, drain_port);
+    wait_running(&drain_root, &drain_config, drain_port);
     // The listener is bound before CGI pool setup and signal-handler
     // installation complete.  Do not send SIGTERM in that narrow window.
     thread::sleep(Duration::from_secs(2));
