@@ -18,12 +18,13 @@ routing and backend lifetime do.
 | FastCGI rewrites, cookies and auth state | WordPress install/login/REST; Drupal install/clean URLs; Nextcloud WebDAV auth; Bugzilla login/admin | Parameter-level matrices remain conformance tests |
 | Writable dynamic content | WordPress media, Drupal files and Nextcloud data with PHP denied or code immutable around them | Spool exhaustion remains resource testing |
 | WebDAV verbs and large request bodies | Nextcloud `MKCOL`/`PROPFIND`/`MOVE`, upload and exact download | Full CalDAV/CardDAV method matrices remain focused compatibility work |
-| Ordinary HTTP reverse proxy | Grafana, Gitea, Jenkins, JupyterLab, MinIO and Wagtail/Gunicorn | Malicious backend framing remains adversarial/fuzz testing |
+| Ordinary HTTP reverse proxy | Grafana, Gitea, Jenkins, JupyterLab, MinIO, Wagtail/Gunicorn and Mastodon/Puma | Malicious backend framing remains adversarial/fuzz testing |
 | Proxy subpath and redirect rewriting | Grafana `/grafana/`; Gitea `/gitea/`; Jenkins and Jupyter root/subpath pairs | Regex/capture route order remains differential |
 | Proxy request and response streaming | Gitea smart HTTP; Jenkins form body; MinIO signed object transfer | Slow-peer resource accounting remains soak/fault testing |
 | Preserved public authority | MinIO SigV4 with `ProxyPreserveHost On` | Invalid/ambiguous authority matrices remain protocol tests |
-| WebSocket handshake and bidirectional traffic | Grafana Live; Jupyter kernel execution | Malformed frames and slow tunnels remain protocol/soak tests |
+| WebSocket handshake and bidirectional traffic | Grafana Live; Jupyter kernel execution; authenticated Mastodon status streaming | Malformed frames and slow tunnels remain protocol/soak tests |
 | Graceful reload with active ownership | Every nightly scenario; Grafana reloads an open WebSocket | Generation race schedules remain deterministic fault tests |
+| Multi-service job and event fan-out | Mastodon API through Puma to Sidekiq/Redis and its separate streaming service | Broker failure schedules remain focused fault tests |
 | Apache-relative application performance | Optional alternating Apache/Vapache workloads | Microbenchmarks continue isolating front-end overhead |
 
 Several surfaces should not be forced into an application merely to claim
@@ -33,7 +34,6 @@ precise existing harnesses. Application topology overlays can later add
 HTTPS upstreams and replicated backends once they provide a distinct workflow
 rather than duplicating those tests.
 
-The next manual application is prioritized by operational complexity: a
-multi-service Zulip or Mastodon deployment. CalDAV/CardDAV extensions can
-deepen the existing Nextcloud case without adding another application.
+The representative application slots are complete. CalDAV/CardDAV extensions
+can deepen the existing Nextcloud case without adding another application.
 

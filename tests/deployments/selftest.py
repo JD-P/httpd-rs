@@ -130,6 +130,18 @@ class DeploymentHarnessTests(unittest.TestCase):
             with self.assertRaises(DeploymentError):
                 validate_build_context(context, dockerfile, run_dir)
 
+    def test_compose_wait_timeout_must_be_positive(self) -> None:
+        project = ComposeProject(
+            compose_file=Path("unused-compose.yml"),
+            project="unused",
+            run_dir=ROOT.parent,
+            env={},
+            images=(),
+            artifact_dir=ROOT.parent,
+        )
+        with self.assertRaisesRegex(DeploymentError, "timeout must be positive"):
+            project.up(wait_timeout=0)
+
     def test_compose_models_enforce_container_isolation(self) -> None:
         by_id = {scenario.identifier: scenario for scenario in self.scenarios}
         with tempfile.TemporaryDirectory(prefix="vapache-compose-selftest-") as temporary:
@@ -160,6 +172,8 @@ class DeploymentHarnessTests(unittest.TestCase):
             nextcloud_fpm.write_text("[www]\n")
             jenkins_init = run_dir / "jenkins-security.groovy"
             jenkins_init.write_text("// self-test fixture\n")
+            mastodon_media = run_dir / "mastodon-media"
+            mastodon_media.mkdir()
             cases = (
                 (
                     by_id["wordpress-fpm"],
@@ -225,6 +239,13 @@ class DeploymentHarnessTests(unittest.TestCase):
                     {
                         "MINIO_ROOT_USER": "selftest-admin",
                         "MINIO_ROOT_PASSWORD": "selftest-password-42",
+                    },
+                ),
+                (
+                    by_id["mastodon-proxy"],
+                    {
+                        "MASTODON_MEDIA": str(mastodon_media),
+                        "MASTODON_WORKERS": "2",
                     },
                 ),
             )

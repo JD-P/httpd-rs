@@ -19,7 +19,7 @@ failure can be replayed exactly:
 
 ```sh
 python3 tests/deployments/harness.py \
-  --profile sample --sample-count 12 --seed 4660
+  --profile sample --sample-count 13 --seed 4660
 ```
 
 Run one application while developing:

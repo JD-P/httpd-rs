@@ -1,0 +1,28 @@
+id = "mastodon-proxy"
+title = "Mastodon multi-service HTTP and streaming deployment"
+nightly = false
+timeout_seconds = 1200
+disk_mb = 4096
+modes = ["reverse-proxy", "websocket", "api", "database", "background-jobs"]
+upstreams = [
+  "Mastodon 4.7.5",
+  "PostgreSQL 17.7",
+  "Redis 7.4.7",
+]
+images = [
+  "ghcr.io/mastodon/mastodon@sha256:0ad6672712739abdf084e1b5f9707e4cb2b2bd256b6579a67102bc9db92844e3",
+  "ghcr.io/mastodon/mastodon-streaming@sha256:53b9696ef281b6c6e6e340c4ac705f8204fa54f5308ca30c4f901da398d527ee",
+  "postgres@sha256:a6d31f853205ce20d399df4e33a0b4c715672f232f4ee7440499747e6e02c126",
+  "redis@sha256:b9f6cf0cab55fdd102fd2182deeae150457943d33439d18c6e2fc5666d3228c1",
+]
+prerequisites = ["docker"]
+
+[dimensions]
+workers = ["one", "two"]
+stream = ["user", "public-local"]
+reload = ["none", "before-publish"]
+
+[canonical]
+workers = "two"
+stream = "user"
+reload = "before-publish"

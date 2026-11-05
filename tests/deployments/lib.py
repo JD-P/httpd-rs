@@ -461,12 +461,21 @@ class ComposeProject:
         for image in self.pull_images if self.pull_images is not None else self.images:
             command(["docker", "pull", image], timeout=600, capture=False)
 
-    def up(self) -> None:
+    def up(self, *, wait_timeout: int = 120) -> None:
+        if wait_timeout < 1:
+            raise DeploymentError("Compose wait timeout must be positive")
         self.validate()
         command(
-            [*self._base(), "up", "--detach", "--wait", "--wait-timeout", "120"],
+            [
+                *self._base(),
+                "up",
+                "--detach",
+                "--wait",
+                "--wait-timeout",
+                str(wait_timeout),
+            ],
             env=self._environment(),
-            timeout=180,
+            timeout=wait_timeout + 60,
             capture=False,
         )
         self.validate_live_mounts()

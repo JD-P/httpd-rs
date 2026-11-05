@@ -1,0 +1,178 @@
+x-mastodon-environment: &mastodon-environment
+  LOCAL_DOMAIN: deployment.test
+  WEB_DOMAIN: deployment.test
+  DB_HOST: database
+  DB_PORT: "5432"
+  DB_NAME: mastodon
+  DB_USER: mastodon
+  DB_PASS: vapache-mastodon-db
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  ES_ENABLED: "false"
+  S3_ENABLED: "false"
+  SMTP_SERVER: ""
+  SECRET_KEY_BASE: "1798a2ee79a7dc5fe9649043caf46a08e655aae610113aef9094654218b416ac"
+  OTP_SECRET: "8d26787bdb6ba04f0ee3684e747a10788a950705829735b230e12f748de9627f"
+  ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY: "6676399f224f16330355da4859957d94f03a00f3bd76155643c6155306524a85"
+  ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY: "d639f86d4548cc5d3f87e50c73a572ef234b3b6e73bca41edda08a0004cc03b7"
+  ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT: "716b70ffe0c3c767745112184d1496a91df1a8f82c1c8c32cd5c9f8e90f7b6b1"
+  VAPID_PRIVATE_KEY: "L30H-2NXR1jjjZioURPG-y0FLESXXCbCedDtlwPXRjE"
+  VAPID_PUBLIC_KEY: "BP5J2IfAKsgeDoi1u1R4epcxbtLMIRKxYwmE-37G0mvlD3oGu_vLaiv8LrReFzkufuNLbcWEocoEABUemq3rMrc"
+  RAILS_ENV: production
+  NODE_ENV: production
+  RAILS_LOG_LEVEL: warn
+  BIND: 0.0.0.0
+  NO_PROXY: "*"
+
+services:
+  database:
+    image: postgres@sha256:a6d31f853205ce20d399df4e33a0b4c715672f232f4ee7440499747e6e02c126
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    environment:
+      POSTGRES_DB: mastodon
+      POSTGRES_USER: mastodon
+      POSTGRES_PASSWORD: vapache-mastodon-db
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+      - /run/postgresql:rw,nosuid,nodev,size=32m
+    volumes:
+      - database:/var/lib/postgresql/data
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mastodon -d mastodon"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+
+  redis:
+    image: redis@sha256:b9f6cf0cab55fdd102fd2182deeae150457943d33439d18c6e2fc5666d3228c1
+    user: "999:1000"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=999,gid=1000
+    volumes:
+      - redis:/data
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  web:
+    image: ghcr.io/mastodon/mastodon@sha256:0ad6672712739abdf084e1b5f9707e4cb2b2bd256b6579a67102bc9db92844e3
+    user: "991:991"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *mastodon-environment
+      WEB_CONCURRENCY: ${MASTODON_WORKERS:?}
+    command:
+      - /bin/bash
+      - -ec
+      - >-
+        bundle exec rails db:prepare;
+        exec bundle exec puma -C config/puma.rb
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,uid=991,gid=991
+      - /opt/mastodon/tmp:rw,noexec,nosuid,nodev,size=256m,uid=991,gid=991
+      - /opt/mastodon/log:rw,noexec,nosuid,nodev,size=64m,uid=991,gid=991
+    volumes:
+      - type: bind
+        source: ${MASTODON_MEDIA:?}
+        target: /opt/mastodon/public/system
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --noproxy '*' http://127.0.0.1:3000/health | grep -q OK"]
+      interval: 2s
+      timeout: 5s
+      retries: 120
+
+  sidekiq:
+    image: ghcr.io/mastodon/mastodon@sha256:0ad6672712739abdf084e1b5f9707e4cb2b2bd256b6579a67102bc9db92844e3
+    user: "991:991"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      <<: *mastodon-environment
+      MASTODON_SIDEKIQ_READY_FILENAME: vapache-sidekiq-ready
+    command: ["bundle", "exec", "sidekiq", "-c", "5"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,uid=991,gid=991
+      - /opt/mastodon/tmp:rw,noexec,nosuid,nodev,size=256m,uid=991,gid=991
+      - /opt/mastodon/log:rw,noexec,nosuid,nodev,size=64m,uid=991,gid=991
+    volumes:
+      - type: bind
+        source: ${MASTODON_MEDIA:?}
+        target: /opt/mastodon/public/system
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD", "test", "-f", "/opt/mastodon/tmp/vapache-sidekiq-ready"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+
+  streaming:
+    image: ghcr.io/mastodon/mastodon-streaming@sha256:53b9696ef281b6c6e6e340c4ac705f8204fa54f5308ca30c4f901da398d527ee
+    user: "991:991"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      <<: *mastodon-environment
+      PORT: "4000"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=991,gid=991
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --noproxy '*' http://127.0.0.1:4000/api/v1/streaming/health | grep -q OK"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+
+networks:
+  application:
+    internal: true
+
+volumes:
+  database:
+  redis:

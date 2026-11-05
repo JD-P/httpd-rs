@@ -1,7 +1,7 @@
 # Tested application deployments
 
-The real-application harness verifies twelve deployment patterns: four fixed
-nightly cases and eight applications in the stochastic manual population. The
+The real-application harness verifies thirteen deployment patterns: four fixed
+nightly cases and nine applications in the stochastic manual population. The
 exact generated configuration and logs are retained with every run; these
 guides explain the security-relevant differences from a typical Apache or
 Nginx installation.
@@ -23,6 +23,7 @@ The feature-to-application rationale is maintained in the
 | Nextcloud (manual sample) | FastCGI + WebDAV | database install, Basic auth forwarding, DAV verbs, large upload, move and download |
 | Wagtail Bakery Demo (manual sample) | reverse proxy | Gunicorn worker variants, public API, CSRF-bound admin login and session survival across reload |
 | Bugzilla (manual sample) | FastCGI | large Perl application setup, stable worker identity, REST `PATH_INFO`, CSRF-bound login and administrative policy |
+| Mastodon (manual sample) | reverse proxy + WebSocket | PostgreSQL/Redis/Puma/Sidekiq composition, bearer API, status fan-out and authenticated streaming across reload |
 
 ## Hugo
 
@@ -219,10 +220,40 @@ two-pass installer, MariaDB, the REST version endpoint through `PATH_INFO`,
 Bugzilla's login-request cookie and CSRF token, query/admin pages, and an
 authenticated reload.
 
-## Planned manual expansion
+## Mastodon
 
-The remaining high-value addition is Zulip or Mastodon for a large
-multi-service operational/configuration composition. It should enter the
-stochastic manual population before any manual case is promoted into the fixed
-nightly quota.
+Mastodon is the deliberately large operational-composition case. PostgreSQL,
+Redis, Puma, Sidekiq and Mastodon's dedicated Node streaming service share an
+internal-only container network. Vapache is the only public HTTP path. The two
+backends require ordered routes, with the streaming prefix before the general
+web route:
+
+```apache
+ProxyPreserveHost On
+ProxyPass /api/v1/streaming http://STREAMING:4000/api/v1/streaming
+ProxyPassReverse /api/v1/streaming http://STREAMING:4000/api/v1/streaming
+ProxyPass / http://WEB:3000/
+ProxyPassReverse / http://WEB:3000/
+```
+
+`LOCAL_DOMAIN` and the preserved public `Host` must agree; do not substitute
+an ephemeral private backend address. The checked-in cryptographic values and
+database password are isolated test fixtures, not deployment defaults. A real
+installation must generate independent Rails encryption, OTP, VAPID and
+database secrets and retain them across upgrades.
+
+The workflow creates a confirmed local account and scoped bearer token, opens
+an authenticated stream, reloads Vapache, reconnects under the new policy
+generation, publishes a real status through Puma, and waits for Sidekiq and
+Redis to deliver that exact status through the streaming WebSocket. One- and
+two-worker Puma layouts plus user and public-local streams are stochastically
+sampled. Only the media directory is writable by the application; no
+container can see the source checkout.
+
+## Future expansion
+
+The representative application inventory is complete. Add another application
+only when it exposes a distinct Vapache boundary rather than duplicating an
+implementation language behind ordinary HTTP. CalDAV/CardDAV can deepen the
+existing Nextcloud case without another deployment.
 
