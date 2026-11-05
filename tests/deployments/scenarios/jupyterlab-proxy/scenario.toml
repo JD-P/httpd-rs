@@ -1,0 +1,19 @@
+id = "jupyterlab-proxy"
+title = "JupyterLab HTTP and kernel WebSocket proxy"
+nightly = false
+timeout_seconds = 420
+disk_mb = 3072
+modes = ["reverse-proxy", "websocket", "subpath", "cookies"]
+upstreams = ["Jupyter Docker Stacks base-notebook 2025-10-27"]
+images = ["quay.io/jupyter/base-notebook@sha256:929c9adc94c4ad2b729e5b0dbddd3677c36c4ab6391d6e58b6e666c39aa65673"]
+prerequisites = ["docker"]
+
+[dimensions]
+mount = ["root", "subpath"]
+websocket = ["handshake", "execute"]
+reload = ["none", "while-open"]
+
+[canonical]
+mount = "subpath"
+websocket = "execute"
+reload = "while-open"

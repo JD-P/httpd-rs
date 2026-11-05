@@ -5847,10 +5847,7 @@ fn dispatch_inner(
     // Methods we do not implement at all are 501, matching Apache.  Known
     // methods that are invalid for a particular resource (for example POST
     // to a static file) are handled below with 405.
-    const KNOWN_METHODS: &[&str] = &[
-        "GET", "HEAD", "POST", "OPTIONS", "TRACE", "PUT", "DELETE", "CONNECT", "PATCH",
-    ];
-    if !KNOWN_METHODS.contains(&req.method.as_str()) {
+    if !crate::config::known_http_method(&req.method) {
         let mut r = error_response(
             cfg,
             vhost,
@@ -7955,6 +7952,7 @@ fn run_fastcgi(
         env: &scope.fastcgi_env(req, url_path, peer.ip()),
         remote_user,
         auth_type,
+        pass_authorization: scope.environment_policy.cgi_pass_auth.unwrap_or(false),
         script_file: None,
     };
     let mut r = fastcgi::execute_bound(&ctx, scope, &target, &script_binding);
@@ -8079,6 +8077,7 @@ fn run_cgi(
         env: &scope.request_env(req, url_path, peer.ip()),
         remote_user,
         auth_type,
+        pass_authorization: scope.environment_policy.cgi_pass_auth.unwrap_or(false),
         script_file: Some(script_file),
     };
     let mut r = cgi::execute(&ctx);
@@ -10051,6 +10050,31 @@ mod tests {
         assert_eq!(cov_dispatch(&cfg_no_trace, "TRACE", "/").status, 405);
         cfg_no_trace.trace_enable = false;
         assert_eq!(cov_dispatch(&cfg, "BREW", "/").status, 501);
+        for method in [
+            "PROPFIND",
+            "PROPPATCH",
+            "MKCOL",
+            "COPY",
+            "MOVE",
+            "LOCK",
+            "UNLOCK",
+            "ACL",
+            "REPORT",
+            "VERSION-CONTROL",
+            "CHECKOUT",
+            "UNCHECKOUT",
+            "CHECKIN",
+            "UPDATE",
+            "LABEL",
+            "MERGE",
+            "BASELINE-CONTROL",
+            "MKWORKSPACE",
+            "MKACTIVITY",
+            "ORDERPATCH",
+            "SEARCH",
+        ] {
+            assert_eq!(cov_dispatch(&cfg, method, "/file.txt").status, 405);
+        }
         assert_eq!(cov_dispatch(&cfg, "OPTIONS", "*").status, 200);
         let mut star = cov_req("GET", "/");
         star.raw_path = b"*".to_vec();
@@ -11068,6 +11092,10 @@ mod tests {
         assert!(matches!(status, 500 | 502 | 503), "{status}");
         let status = cov_dispatch(&fastcgi_cfg, "GET", "/script.php/info").status;
         assert!(matches!(status, 500 | 502 | 503 | 404), "{status}");
+        for method in ["REPORT", "ACL", "SEARCH"] {
+            let status = cov_dispatch(&fastcgi_cfg, method, "/script.php").status;
+            assert!(matches!(status, 500 | 502 | 503), "{method}: {status}");
+        }
 
         let mixed_cfg = cov_config(
             &dir,

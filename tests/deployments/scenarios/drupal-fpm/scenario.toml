@@ -1,0 +1,19 @@
+id = "drupal-fpm"
+title = "Drupal through PHP-FPM"
+nightly = false
+timeout_seconds = 420
+disk_mb = 1536
+modes = ["fastcgi", "htaccess", "rewrite", "cookies"]
+upstreams = ["Drupal 11.2.5 with PHP 8.4 FPM (Alpine)"]
+images = ["drupal@sha256:0b87bb364bd2185631dcaa7c935f2dda0698497dae3dd20a058671283fa49477"]
+prerequisites = ["docker"]
+
+[dimensions]
+profile = ["standard", "demo_umami"]
+reload = ["none", "after-start"]
+benchmark = ["front", "clean-url"]
+
+[canonical]
+profile = "demo_umami"
+reload = "after-start"
+benchmark = "clean-url"

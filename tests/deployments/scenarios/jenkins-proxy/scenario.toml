@@ -1,0 +1,19 @@
+id = "jenkins-proxy"
+title = "Jenkins LTS reverse proxy"
+nightly = false
+timeout_seconds = 360
+disk_mb = 2048
+modes = ["reverse-proxy", "java", "authentication", "forms", "redirects"]
+upstreams = ["Jenkins 2.580.2 LTS with JDK 21"]
+images = ["jenkins/jenkins@sha256:19db581de85e7ce6a1ad89e55a0318d1114e4f103d2dc25493a235ff2b26d044"]
+prerequisites = ["docker"]
+
+[dimensions]
+mount = ["root", "subpath"]
+reload = ["none", "after-start"]
+benchmark = ["login", "job"]
+
+[canonical]
+mount = "subpath"
+reload = "after-start"
+benchmark = "job"

@@ -3139,6 +3139,9 @@ AddHandler cgi-script .cgi\n\
                             "1".into(),
                         )))
                 }),
+                ("environment.cgi_pass_auth", |s| {
+                    s.environment_policy.cgi_pass_auth = Some(true)
+                }),
                 ("environment.rewrite_env", |s| {
                     s.environment_policy
                         .rewrite_env
@@ -3315,6 +3318,9 @@ AddHandler cgi-script .cgi\n\
                             front: "/x".into(),
                             backend: "http://127.0.0.1:9000/".into(),
                         })
+                }),
+                ("proxy.preserve_host", |s| {
+                    s.proxy_policy.preserve_host = Some(true)
                 }),
                 ("proxy.ca_file", |s| {
                     s.proxy_policy.proxy_ca_file = Some("/tmp/ca.pem".into())

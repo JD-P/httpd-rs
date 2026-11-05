@@ -9,18 +9,20 @@ routing and backend lifetime do.
 |---|---|---|
 | Static path resolution and directory indexes | Hugo generated pages and assets | Alias/symlink edge matrices remain in conformance tests |
 | Custom errors, ranges and validators | Hugo 404 and binary range workflow | Full conditional/range combinations remain differential |
-| `.htaccess`, rewrite and headers | Hugo policy; WordPress permalinks | Malformed and nested scope semantics remain fuzz/differential |
+| `.htaccess`, rewrite and headers | Hugo policy; WordPress permalinks; Drupal's adapted upstream policy | Malformed and nested scope semantics remain fuzz/differential |
 | Basic authentication | Hugo private tree; Git CGI routes | Provider/hash and merge matrices remain focused tests |
 | Compression and static cache | Hugo assets; optional WordPress assets | Encoding/range/cache-key matrices remain focused tests |
 | CGI environment, query and `PATH_INFO` | Gitweb | Injection and descriptor invariants remain adversarial tests |
 | CGI request/response body framing | Real smart-HTTP clone through `git-http-backend` | Malformed CGI output remains parser fuzzing |
-| FastCGI identity and Unix transport | WordPress/PHP-FPM with stable-path policy | Record corruption and race injection remain focused tests |
-| FastCGI rewrites, cookies and auth state | WordPress install/login/REST/permalinks | Parameter-level matrices remain conformance tests |
-| Writable dynamic content | WordPress media upload with PHP denied in uploads | Large spool and exhaustion behavior remains resource testing |
-| Ordinary HTTP reverse proxy | Grafana and Gitea | Malicious backend framing remains adversarial/fuzz testing |
-| Proxy subpath and redirect rewriting | Grafana `/grafana/`; Gitea `/gitea/` | Regex/capture route order remains differential |
-| Proxy request and response streaming | Gitea API, authenticated Git push and clone | Slow-peer resource accounting remains soak/fault testing |
-| WebSocket handshake and bidirectional traffic | Grafana Live handshake and ping/pong | Malformed frames and slow tunnels remain protocol/soak tests |
+| FastCGI identity and Unix transport | WordPress, Drupal and Nextcloud/PHP-FPM with stable-path policy | Record corruption and race injection remain focused tests |
+| FastCGI rewrites, cookies and auth state | WordPress install/login/REST; Drupal install/clean URLs; Nextcloud WebDAV auth | Parameter-level matrices remain conformance tests |
+| Writable dynamic content | WordPress media, Drupal files and Nextcloud data with PHP denied or code immutable around them | Spool exhaustion remains resource testing |
+| WebDAV verbs and large request bodies | Nextcloud `MKCOL`/`PROPFIND`/`MOVE`, upload and exact download | Full CalDAV/CardDAV method matrices remain focused compatibility work |
+| Ordinary HTTP reverse proxy | Grafana, Gitea, Jenkins, JupyterLab and MinIO | Malicious backend framing remains adversarial/fuzz testing |
+| Proxy subpath and redirect rewriting | Grafana `/grafana/`; Gitea `/gitea/`; Jenkins and Jupyter root/subpath pairs | Regex/capture route order remains differential |
+| Proxy request and response streaming | Gitea smart HTTP; Jenkins form body; MinIO signed object transfer | Slow-peer resource accounting remains soak/fault testing |
+| Preserved public authority | MinIO SigV4 with `ProxyPreserveHost On` | Invalid/ambiguous authority matrices remain protocol tests |
+| WebSocket handshake and bidirectional traffic | Grafana Live; Jupyter kernel execution | Malformed frames and slow tunnels remain protocol/soak tests |
 | Graceful reload with active ownership | Every nightly scenario; Grafana reloads an open WebSocket | Generation race schedules remain deterministic fault tests |
 | Apache-relative application performance | Optional alternating Apache/Vapache workloads | Microbenchmarks continue isolating front-end overhead |
 
@@ -31,9 +33,9 @@ precise existing harnesses. Application topology overlays can later add
 HTTPS upstreams and replicated backends once they provide a distinct workflow
 rather than duplicating those tests.
 
-The next manual applications are prioritized by missing behavior: Nextcloud
-for DAV and large/chunked uploads, Bugzilla for a larger CGI codebase,
-JupyterLab for subpath WebSockets, MinIO for signed streaming requests, and a
-multi-service Zulip or Mastodon deployment for operational/configuration
-composition.
+The next manual applications are prioritized by missing behavior: Bugzilla for
+a larger CGI codebase, a reproducible current Wagtail/Gunicorn application,
+and a multi-service Zulip or Mastodon deployment for operational/configuration
+composition. CalDAV/CardDAV extensions can deepen the existing Nextcloud case
+without adding another application.
 

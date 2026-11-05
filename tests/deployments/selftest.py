@@ -34,14 +34,14 @@ class DeploymentHarnessTests(unittest.TestCase):
             self.scenarios,
             profile="sample",
             rng=random.Random(8675309),
-            sample_count=8,
+            sample_count=len(self.scenarios),
             only=None,
         )
         second = harness.choose_cases(
             self.scenarios,
             profile="sample",
             rng=random.Random(8675309),
-            sample_count=8,
+            sample_count=len(self.scenarios),
             only=None,
         )
         self.assertEqual(first, second)
@@ -110,6 +110,20 @@ class DeploymentHarnessTests(unittest.TestCase):
             gitea_group = run_dir / "gitea.group"
             gitea_passwd.write_text("runner:x:1000:1000::/data/gitea:/sbin/nologin\n")
             gitea_group.write_text("runner:x:1000:\n")
+            drupal_root = run_dir / "drupal"
+            drupal_php_run = run_dir / "drupal-php-run"
+            drupal_root.mkdir()
+            drupal_php_run.mkdir()
+            drupal_fpm = run_dir / "drupal-fpm.conf"
+            drupal_fpm.write_text("[www]\n")
+            nextcloud_root = run_dir / "nextcloud"
+            nextcloud_php_run = run_dir / "nextcloud-php-run"
+            nextcloud_root.mkdir()
+            nextcloud_php_run.mkdir()
+            nextcloud_fpm = run_dir / "nextcloud-fpm.conf"
+            nextcloud_fpm.write_text("[www]\n")
+            jenkins_init = run_dir / "jenkins-security.groovy"
+            jenkins_init.write_text("// self-test fixture\n")
             cases = (
                 (
                     by_id["wordpress-fpm"],
@@ -138,6 +152,43 @@ class DeploymentHarnessTests(unittest.TestCase):
                         "GITEA_GROUP": str(gitea_group),
                         "GITEA_PORT": "30997",
                         "GITEA_HEALTH_PATH": "",
+                    },
+                ),
+                (
+                    by_id["drupal-fpm"],
+                    {
+                        "DRUPAL_ROOT": str(drupal_root),
+                        "PHP_RUN": str(drupal_php_run),
+                        "FPM_CONFIG": str(drupal_fpm),
+                    },
+                ),
+                (
+                    by_id["nextcloud-fpm"],
+                    {
+                        "NEXTCLOUD_ROOT": str(nextcloud_root),
+                        "PHP_RUN": str(nextcloud_php_run),
+                        "FPM_CONFIG": str(nextcloud_fpm),
+                    },
+                ),
+                (
+                    by_id["jenkins-proxy"],
+                    {
+                        "JENKINS_PREFIX": "/jenkins",
+                        "JENKINS_INIT": str(jenkins_init),
+                    },
+                ),
+                (
+                    by_id["jupyterlab-proxy"],
+                    {
+                        "JUPYTER_BASE_URL": "/jupyter/",
+                        "JUPYTER_TOKEN": "selftest-token",
+                    },
+                ),
+                (
+                    by_id["minio-proxy"],
+                    {
+                        "MINIO_ROOT_USER": "selftest-admin",
+                        "MINIO_ROOT_PASSWORD": "selftest-password-42",
                     },
                 ),
             )

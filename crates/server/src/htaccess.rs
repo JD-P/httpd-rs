@@ -2100,6 +2100,11 @@ const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
         DirectiveDisposition::Effectful,
     ),
     (
+        "cgipassauth",
+        OverrideCategory::AuthConfig,
+        DirectiveDisposition::Effectful,
+    ),
+    (
         "deflatealteretag",
         OverrideCategory::FileInfo,
         DirectiveDisposition::Effectful,
@@ -2455,7 +2460,8 @@ fn access_directive_schema(name: &str) -> PayloadSchema {
         | "deflatememlevel"
         | "deflatewindowssize"
         | "headername"
-        | "readmefile" => (1, Some(1)),
+        | "readmefile"
+        | "cgipassauth" => (1, Some(1)),
         "errordocument" | "redirectpermanent" | "redirecttemp" => (2, Some(2)),
         "redirect" | "redirectmatch" | "rewritecond" | "rewriterule" => (2, Some(3)),
         "setenv" => (1, Some(2)),
@@ -2530,7 +2536,7 @@ fn access_directive_schema(name: &str) -> PayloadSchema {
             PayloadValueSchema::EnvironmentRule
         }
         "indexignore" => PayloadValueSchema::GlobPatterns,
-        "rewriteengine" | "enablesendfile" | "directoryslash" | "expiresactive" => {
+        "rewriteengine" | "enablesendfile" | "directoryslash" | "expiresactive" | "cgipassauth" => {
             PayloadValueSchema::OnOff
         }
         "deflatecompressionlevel" => PayloadValueSchema::Unsigned { min: 0, max: 9 },
@@ -2908,6 +2914,13 @@ fn apply_directive(
                 payload
                     .on_off()
                     .expect("ExpiresActive is typed while sealing"),
+            )
+        }
+        "cgipassauth" => {
+            scope.environment_policy.cgi_pass_auth = Some(
+                payload
+                    .on_off()
+                    .expect("CGIPassAuth is typed while sealing"),
             )
         }
         "expiresdefault" => {
@@ -3626,6 +3639,11 @@ mod tests {
         DirectiveCase {
             name: "brotlicompressionquality",
             args: &["5"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "cgipassauth",
+            args: &["On"],
             effect: ExpectedEffect::Changed,
         },
         DirectiveCase {

@@ -1,7 +1,7 @@
 """Shared primitives for real-application deployment scenarios.
 
 The application containers are deliberately treated as untrusted.  They may
-only see a per-run staging directory under /tmp; the repository, Docker socket
+only see a per-run staging directory outside the checkout; the repository, Docker socket
 and arbitrary host paths are never mounted into them.
 """
 
@@ -113,8 +113,9 @@ def request(
     headers: dict[str, str] | None = None,
     body: bytes | None = None,
     timeout: float = 15,
+    host: str = "127.0.0.1",
 ) -> tuple[int, dict[str, str], bytes]:
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
         connection.request(method, path, body=body, headers=headers or {})
         response = connection.getresponse()
@@ -140,15 +141,22 @@ def require_response(
     return response_headers, body
 
 
-def wait_http(port: int, path: str = "/", *, timeout: float = 30) -> None:
+def wait_http(
+    port: int,
+    path: str = "/",
+    *,
+    timeout: float = 30,
+    host: str = "127.0.0.1",
+    statuses: tuple[int, ...] | None = None,
+) -> None:
     def ready() -> bool:
         try:
-            status, _, _ = request(port, path, timeout=1)
-            return 100 <= status < 600
+            status, _, _ = request(port, path, timeout=1, host=host)
+            return status in statuses if statuses is not None else 100 <= status < 600
         except (OSError, http.client.HTTPException):
             return False
 
-    wait_for(ready, timeout=timeout, description=f"HTTP service on 127.0.0.1:{port}{path}")
+    wait_for(ready, timeout=timeout, description=f"HTTP service on {host}:{port}{path}")
 
 
 def service_identity() -> tuple[str, str]:
@@ -393,6 +401,34 @@ class ComposeProject:
             command_line.extend(["--user", user])
         command_line.extend([service, *args])
         return command(command_line, env=self._environment(), timeout=120).stdout
+
+    def service_ip(self, service: str) -> str:
+        """Return a service's IPv4 address on its isolated application network."""
+        container_id = command(
+            [*self._base(), "ps", "--quiet", service],
+            env=self._environment(),
+            timeout=30,
+        ).stdout.strip()
+        if not container_id:
+            raise DeploymentError(f"Compose service {service!r} has no running container")
+        inspection = json.loads(command(["docker", "inspect", container_id], timeout=30).stdout)[0]
+        addresses = {
+            network.get("IPAddress", "")
+            for network in inspection.get("NetworkSettings", {}).get("Networks", {}).values()
+            if network.get("IPAddress")
+        }
+        if len(addresses) != 1:
+            raise DeploymentError(
+                f"Compose service {service!r} must have exactly one isolated IPv4 address: {sorted(addresses)}"
+            )
+        address = addresses.pop()
+        try:
+            socket.inet_pton(socket.AF_INET, address)
+        except OSError as error:
+            raise DeploymentError(
+                f"Compose service {service!r} returned an invalid IPv4 address: {address!r}"
+            ) from error
+        return address
 
     def collect_logs(self) -> None:
         self.artifact_dir.mkdir(parents=True, exist_ok=True)

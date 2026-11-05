@@ -1473,10 +1473,12 @@ fn read_response_with_budget(
                 stderr.extend_from_slice(&content[..take]);
             }
             FCGI_END_REQUEST => {
-                if content.len() != 8
-                    || content[4] != FCGI_REQUEST_COMPLETE
-                    || content[5..].iter().any(|byte| *byte != 0)
-                {
+                // FastCGI defines the final three bytes as reserved.  They do
+                // not carry protocol semantics and receivers must not rely on
+                // their contents.  In particular, PHP-FPM 8.4 leaves them
+                // nonzero, so requiring zero rejects an otherwise valid
+                // response from a widely deployed conforming backend.
+                if content.len() != 8 || content[4] != FCGI_REQUEST_COMPLETE {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "invalid FastCGI END_REQUEST record",
@@ -2381,6 +2383,7 @@ mod tests {
             env: &[],
             remote_user: Some("alice"),
             auth_type: Some("Basic"),
+            pass_authorization: false,
             script_file: None,
         };
         let resp = execute(&ctx, &cfg.global, &target);
@@ -2464,6 +2467,7 @@ mod tests {
             env: &[],
             remote_user: None,
             auth_type: None,
+            pass_authorization: false,
             script_file: None,
         };
         let resp = execute(&ctx, &cfg.global, &target);
@@ -2530,6 +2534,7 @@ mod tests {
             env: &[],
             remote_user: None,
             auth_type: None,
+            pass_authorization: false,
             script_file: None,
         };
         let resp = execute(&ctx, &cfg.global, &target);
@@ -3180,6 +3185,15 @@ mod tests {
             assert!(read_response(&mut Cursor::new(std::mem::take(&mut input))).is_err());
         }
 
+        // Reserved END_REQUEST bytes have no receiver-visible meaning.  PHP-
+        // FPM 8.4 emits nonzero values here, and the FastCGI parser must ignore
+        // them while still validating the record length and protocol status.
+        let mut input = Vec::new();
+        let mut end = [0u8; 8];
+        end[5..].copy_from_slice(b".14");
+        record(&mut input, FCGI_END_REQUEST, 1, &end);
+        assert!(read_response(&mut Cursor::new(input)).is_ok());
+
         let mut input = Vec::new();
         record(&mut input, FCGI_STDOUT, 1, b"12345678");
         record(&mut input, FCGI_END_REQUEST, 1, &[0u8; 8]);
@@ -3289,6 +3303,7 @@ mod tests {
             env: &[],
             remote_user: None,
             auth_type: None,
+            pass_authorization: false,
             script_file: None,
         };
         assert_eq!(execute(&ctx, &cfg.global, &missing).status, 502);

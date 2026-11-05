@@ -1,0 +1,26 @@
+services:
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:3c60a2a8c4d33409a9bc7a623a7fcbfb4605adc3d89422d2f53b3f673a6e5597
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["server", "/data", "--address", ":9000"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?}
+      MINIO_BROWSER: "off"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    volumes:
+      - data:/data
+    networks:
+      - application
+
+networks:
+  application:
+    internal: true
+
+volumes:
+  data:

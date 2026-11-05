@@ -3877,6 +3877,8 @@ fn directive_arity(name: &str) -> PayloadArity {
         | "vapachemaxspoolfiles"
         | "vapachemaxdynamicrequests"
         | "vapachemaxfastcgioutput"
+        | "proxypreservehost"
+        | "cgipassauth"
         | "loglevel" => PayloadArity::ONE,
         "defaulticon" | "headername" | "readmename" => PayloadArity::ONE,
         "loadmodule" => PayloadArity::TWO,
@@ -4042,7 +4044,9 @@ pub(crate) fn directive_payload_schema(name: &str) -> PayloadSchema {
         | "sslusestapling"
         | "sslstaplingreturnrespondererrors"
         | "sslsessiontickets"
-        | "sslhonorcipherorder" => PayloadValueSchema::OnOff,
+        | "sslhonorcipherorder"
+        | "proxypreservehost"
+        | "cgipassauth" => PayloadValueSchema::OnOff,
         "vapachemaxspoolbytes"
         | "vapachemaxspoolfiles"
         | "vapachemaxdynamicrequests"
@@ -6343,6 +6347,7 @@ impl Compile {
                 | "proxypass"
                 | "proxypassreverse"
                 | "proxypassmatch"
+                | "proxypreservehost"
                 | "customlog"
                 | "sslengine"
                 | "sslcertificatefile"
@@ -7300,6 +7305,13 @@ impl Compile {
                 });
                 self.next_route += 1;
             }
+            "proxypreservehost" => {
+                scope.proxy_policy.preserve_host = Some(
+                    payload
+                        .on_off()
+                        .expect("ProxyPreserveHost is typed while sealing"),
+                );
+            }
             "addoutputfilterbytype" => {
                 if args.len() < 2 {
                     return;
@@ -7790,6 +7802,21 @@ impl Compile {
                         .allow_methods()
                         .expect("AllowMethods is compiled while sealing")
                         .clone(),
+                );
+            }
+            "cgipassauth" => {
+                if !in_directory {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "CGIPassAuth is only allowed in directory context".into(),
+                    });
+                    return;
+                }
+                scope.environment_policy.cgi_pass_auth = Some(
+                    payload
+                        .on_off()
+                        .expect("CGIPassAuth is typed while sealing"),
                 );
             }
             "authmerging" => {
@@ -9411,7 +9438,7 @@ fn valid_method_token(method: &str) -> bool {
         })
 }
 
-fn known_http_method(method: &str) -> bool {
+pub(crate) fn known_http_method(method: &str) -> bool {
     matches!(
         method,
         "GET"
@@ -9430,6 +9457,20 @@ fn known_http_method(method: &str) -> bool {
             | "MOVE"
             | "LOCK"
             | "UNLOCK"
+            | "ACL"
+            | "REPORT"
+            | "VERSION-CONTROL"
+            | "CHECKOUT"
+            | "UNCHECKOUT"
+            | "CHECKIN"
+            | "UPDATE"
+            | "LABEL"
+            | "MERGE"
+            | "BASELINE-CONTROL"
+            | "MKWORKSPACE"
+            | "MKACTIVITY"
+            | "ORDERPATCH"
+            | "SEARCH"
     )
 }
 
@@ -10130,6 +10171,7 @@ fn known_directives() -> HashSet<&'static str> {
         "cachestoreprivate",
         "cachestoresession",
         "cachettl",
+        "cgipassauth",
         "cgidscripttimeout",
         "charsetdefault",
         "charsetoptions",
@@ -12765,6 +12807,24 @@ SSLOptions +StrictRequire\n";
     }
 
     #[test]
+    fn cgi_pass_auth_is_typed_scoped_and_defaults_closed() {
+        let cfg = load_text(
+            "Listen 127.0.0.1:0\n<Directory /srv/app>\nCGIPassAuth On\n</Directory>\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(cfg.global.environment_policy.cgi_pass_auth, None);
+        let scope = cfg.effective_scope(None, Path::new("/srv/app/index.php"), "/index.php");
+        assert_eq!(scope.environment_policy.cgi_pass_auth, Some(true));
+        assert!(load_text("Listen 127.0.0.1:0\nCGIPassAuth On\n", false).is_err());
+        assert!(load_text(
+            "Listen 127.0.0.1:0\n<Directory /srv/app>\nCGIPassAuth Maybe\n</Directory>\n",
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn scope_merge_applies_each_policy_once() {
         let mut parent = Scope::default();
         parent
@@ -12878,15 +12938,30 @@ SSLOptions +StrictRequire\n";
             "ProxyPass /app http://127.0.0.1:9000/\n",
             "ProxyPassReverse /app http://127.0.0.1:9000/\n",
             "ProxyPassMatch ^/(.*\\.php)$ unix:/run/php.sock|fcgi://localhost/var/www/\n",
+            "ProxyPreserveHost On\n",
             "<VirtualHost *:8080>\n",
             "ServerName localhost\n",
+            "ProxyPreserveHost Off\n",
             "</VirtualHost>\n",
         );
         let c = load_text(cfg, false).unwrap();
+        let global = c.effective_scope(None, Path::new("/srv/app/x"), "/app/x");
+        assert_eq!(global.proxy_policy.preserve_host, Some(true));
         let s = c.effective_scope(c.vhosts.first(), Path::new("/srv/app/x"), "/app/x");
         assert_eq!(s.proxy_policy.proxy_passes.len(), 1);
         assert_eq!(s.proxy_policy.proxy_reverses.len(), 1);
         assert_eq!(s.proxy_policy.proxy_rules.len(), 1);
+        assert_eq!(s.proxy_policy.preserve_host, Some(false));
+        for invalid in [
+            "ProxyPreserveHost Maybe",
+            "ProxyPreserveHost On Off",
+            "<Directory /srv>\nProxyPreserveHost On\n</Directory>",
+        ] {
+            assert!(
+                load_text(&format!("Listen 127.0.0.1:0\n{invalid}\n"), false).is_err(),
+                "malformed or unsafe ProxyPreserveHost was accepted: {invalid}"
+            );
+        }
     }
 
     #[test]

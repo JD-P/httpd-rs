@@ -1,0 +1,43 @@
+services:
+  drupal:
+    image: drupal@sha256:0b87bb364bd2185631dcaa7c935f2dda0698497dae3dd20a058671283fa49477
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+    volumes:
+      - type: bind
+        source: ${DRUPAL_ROOT:?}
+        target: /opt/drupal
+      # ProxyPassMatch passes the host's canonical script pathname to FPM.
+      # Mount the same tree at that exact pathname so the two namespaces agree.
+      - type: bind
+        source: ${DRUPAL_ROOT:?}
+        target: ${DRUPAL_ROOT:?}
+      - type: bind
+        source: ${PHP_RUN:?}
+        target: /run/vapache-php
+      - type: bind
+        source: ${FPM_CONFIG:?}
+        target: /usr/local/etc/php-fpm.d/zz-vapache-integration.conf
+        read_only: true
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/vapache-php/php-fpm.sock"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+networks:
+  application:
+    internal: true

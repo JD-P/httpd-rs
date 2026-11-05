@@ -408,6 +408,13 @@ fn valid_forwarded_host(host: &str) -> bool {
         && crate::verified::sanitize_header_value(host.as_bytes()).is_some()
 }
 
+fn request_authority<'a>(req: &'a Request, fallback: &'a str) -> &'a str {
+    req.header_str("host")
+        .map(|host| host.trim_matches([' ', '\t']))
+        .filter(|host| !host.is_empty())
+        .unwrap_or(fallback)
+}
+
 fn tls_server_name(
     host: &str,
 ) -> Result<ServerName<'static>, rustls::pki_types::InvalidDnsNameError> {
@@ -2566,12 +2573,28 @@ where
         path.push(b'?');
         path.extend_from_slice(&req.query);
     }
+    if !host.is_empty() && !valid_forwarded_host(host) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsafe X-Forwarded-Host",
+        ));
+    }
+    let upstream_host = if scope.proxy_policy.preserve_host == Some(true) {
+        if host.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ProxyPreserveHost requires a request authority",
+            ));
+        }
+        host.to_string()
+    } else {
+        format!("{}:{}", target.backend.host, target.backend.port)
+    };
     let mut head = b"GET ".to_vec();
     head.extend_from_slice(&path);
     head.extend_from_slice(
         format!(
-            " HTTP/1.1\r\nHost: {}:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n",
-            target.backend.host, target.backend.port
+            " HTTP/1.1\r\nHost: {upstream_host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
         )
         .as_bytes(),
     );
@@ -2598,12 +2621,6 @@ where
         b"X-Forwarded-Proto",
         if https { b"https" } else { b"http" },
     );
-    if !host.is_empty() && !valid_forwarded_host(host) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "unsafe X-Forwarded-Host",
-        ));
-    }
     if !host.is_empty() {
         append_proxy_header(&mut head, b"X-Forwarded-Host", host.as_bytes());
     }
@@ -2984,16 +3001,30 @@ fn proxy_once_budgeted(
         path.push(b'?');
         path.extend_from_slice(&req.query);
     }
+    let forwarded_host = request_authority(req, host);
+    if !forwarded_host.is_empty() && !valid_forwarded_host(forwarded_host) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsafe X-Forwarded-Host",
+        ));
+    }
+    let upstream_host = if scope.proxy_policy.preserve_host == Some(true) {
+        if forwarded_host.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ProxyPreserveHost requires a request authority",
+            ));
+        }
+        forwarded_host.to_string()
+    } else {
+        format!("{}:{}", target.backend.host, target.backend.port)
+    };
     let mut head = Vec::new();
     head.extend_from_slice(req.method.as_bytes());
     head.push(b' ');
     head.extend_from_slice(&path);
     head.extend_from_slice(
-        format!(
-            " HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n",
-            target.backend.host, target.backend.port
-        )
-        .as_bytes(),
+        format!(" HTTP/1.1\r\nHost: {upstream_host}\r\nConnection: close\r\n").as_bytes(),
     );
     let body_len = req.body_len();
     if body_len > 0 {
@@ -3026,20 +3057,18 @@ fn proxy_once_budgeted(
         b"X-Forwarded-Proto",
         if https { b"https" } else { b"http" },
     );
-    if !host.is_empty() && !valid_forwarded_host(host) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "unsafe X-Forwarded-Host",
-        ));
-    }
-    if !host.is_empty() {
-        append_proxy_header(&mut head, b"X-Forwarded-Host", host.as_bytes());
+    if !forwarded_host.is_empty() {
+        append_proxy_header(&mut head, b"X-Forwarded-Host", forwarded_host.as_bytes());
     }
     head.extend_from_slice(b"\r\n");
     let head = ValidatedProxyHead::new(
         head,
         &target.backend,
-        if host.is_empty() { None } else { Some(host) },
+        if forwarded_host.is_empty() {
+            None
+        } else {
+            Some(forwarded_host)
+        },
     )?;
     stream.write_all(head.as_bytes())?;
     if let Some(reader) = req.body_reader() {
@@ -5246,6 +5275,28 @@ mod coverage_tests {
         input: Cursor<Vec<u8>>,
     }
 
+    struct CapturingStream {
+        input: Cursor<Vec<u8>>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Read for CapturingStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            Read::read(&mut self.input, buf)
+        }
+    }
+
+    impl Write for CapturingStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     impl MockStream {
         fn new(input: impl Into<Vec<u8>>) -> Self {
             Self {
@@ -6151,6 +6202,40 @@ mod coverage_tests {
     }
 
     #[test]
+    fn proxy_preserve_host_forwards_only_the_validated_request_authority() {
+        let response = b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+        for (preserve, expected_host) in [(false, "127.0.0.1:9000"), (true, "signed.example:8443")]
+        {
+            let written = Arc::new(Mutex::new(Vec::new()));
+            let stream = CapturingStream {
+                input: Cursor::new(response.to_vec()),
+                written: Arc::clone(&written),
+            };
+            let mut request = req("/x");
+            request.headers.push("Host", "signed.example:8443");
+            let mut scope = Scope::default();
+            scope.proxy_policy.preserve_host = Some(preserve);
+            proxy_once(
+                Box::new(stream),
+                &target(),
+                &request,
+                &scope,
+                "/x",
+                "127.0.0.1:1".parse().unwrap(),
+                false,
+                "canonical.example",
+            )
+            .unwrap();
+            let request_head = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+            assert!(
+                request_head.contains(&format!("\r\nHost: {expected_host}\r\n")),
+                "{request_head}"
+            );
+            assert!(request_head.contains("\r\nX-Forwarded-Host: signed.example:8443\r\n"));
+        }
+    }
+
+    #[test]
     fn unavailable_backends_are_skipped_in_matching() {
         let dir = std::env::temp_dir().join(format!("vapache-proxy-skip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6565,8 +6650,9 @@ mod coverage_tests {
         let mut r = ws_request(key);
         r.query = b"x=\xff".to_vec();
         r.headers.insert("x-raw", b"a\xffb".to_vec());
-        let (cfg, scope, r, target, grant, resource) =
+        let (cfg, mut scope, r, target, grant, resource) =
             ws_context_with_path(port, &r, "/ws/%2e?x#y z");
+        Arc::get_mut(&mut scope).unwrap().proxy_policy.preserve_host = Some(true);
         let initial = b"hello".to_vec();
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let task = tokio::spawn(async move {
@@ -6612,6 +6698,9 @@ mod coverage_tests {
         assert!(request
             .windows(b"x-raw: a\xffb\r\n".len())
             .any(|window| window == b"x-raw: a\xffb\r\n"));
+        assert!(request
+            .windows(b"Host: client.example\r\n".len())
+            .any(|window| window == b"Host: client.example\r\n"));
         assert!(request.ends_with(b"hello"));
     }
 

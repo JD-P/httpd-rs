@@ -10,6 +10,7 @@ sys.dont_write_bytecode = True
 
 import argparse
 import collections
+import contextlib
 import hashlib
 import importlib.util
 import itertools
@@ -206,14 +207,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", choices=("nightly", "sample", "full"), default="nightly")
     parser.add_argument("--scenario", help="restrict the run to one scenario")
-    parser.add_argument("--sample-count", type=int, default=8)
+    parser.add_argument("--sample-count", type=int, default=10)
     parser.add_argument("--seed", type=lambda value: int(value, 0))
     parser.add_argument("--vapached", type=Path, default=ROOT / "target/release/vapached")
-    parser.add_argument("--run-root", type=Path, default=Path("/tmp/vapache-deployments"))
+    default_run_root = Path("/run/vapache-deployments") if os.geteuid() == 0 else Path("/tmp/vapache-deployments")
+    parser.add_argument("--run-root", type=Path, default=default_run_root)
     parser.add_argument("--artifacts", type=Path, default=Path("/tmp/vapache-deployment-results"))
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--remove-images", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument(
+        "--allow-same-identity",
+        action="store_true",
+        help="developer-only: skip the distinct host service-identity prerequisite",
+    )
     return parser.parse_args()
 
 
@@ -248,12 +255,21 @@ def main() -> int:
     (artifact_root / "plan.json").write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n")
     print(json.dumps(plan, indent=2, sort_keys=True), flush=True)
     if args.plan_only:
+        with contextlib.suppress(OSError):
+            run_root.rmdir()
         return 0
     if not args.vapached.is_file():
         raise DeploymentError(f"Vapache binary not found: {args.vapached}")
-    if os.geteuid() != 0 and not privilege_prefix():
+    if os.geteuid() != 0 and not privilege_prefix() and not args.allow_same_identity:
         raise DeploymentError(
             "deployment scenarios require root or passwordless sudo so Vapache can use a distinct service identity"
+        )
+    if args.allow_same_identity and os.geteuid() != 0 and not privilege_prefix():
+        print(
+            "WARNING: local compatibility run uses the invoking identity for Vapache; "
+            "CI must run without --allow-same-identity",
+            file=sys.stderr,
+            flush=True,
         )
 
     results: list[dict[str, Any]] = []
@@ -307,6 +323,8 @@ def main() -> int:
 
     summary = {**plan, "results": results, "status": "failed" if failed else "passed"}
     (artifact_root / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    with contextlib.suppress(OSError):
+        run_root.rmdir()
     print(f"deployment integration: {summary['status']} (seed={seed}, artifacts={artifact_root})")
     return 1 if failed else 0
 

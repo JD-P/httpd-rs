@@ -179,6 +179,9 @@ pub struct CgiContext<'a> {
     pub remote_user: Option<&'a str>,
     /// Authentication scheme (for example `Basic`) exported as `AUTH_TYPE`.
     pub auth_type: Option<&'a str>,
+    /// Explicit Apache-compatible permission to expose raw credentials to the
+    /// selected local application as HTTP_AUTHORIZATION.
+    pub pass_authorization: bool,
     /// Opened script descriptor, when the caller already authorized a
     /// specific inode.  Execution uses `/proc/self/fd` so the path cannot be
     /// swapped between authorization and exec.
@@ -305,7 +308,8 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
         if matches!(
             name,
             "content-type" | "content-length" | "connection" | "proxy"
-        ) {
+        ) || (name == "authorization" && !ctx.pass_authorization)
+        {
             continue;
         }
         // httpoxy: a request header named Proxy must never become HTTP_PROXY.
@@ -313,12 +317,6 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
         if valid_token(env_name.as_bytes()) {
             put(&env_name, sanitize_env_value(value));
         }
-    }
-    if let Some(auth) = ctx.req.header("authorization") {
-        // Never expose credentials as HTTP_AUTHORIZATION to CGI; Apache uses
-        // AUTH_TYPE/REMOTE_USER after authentication.
-        env.retain(|(k, _)| k != "HTTP_AUTHORIZATION");
-        let _ = auth;
     }
     for (k, v) in ctx.env {
         // Do not let a configured/rewrite environment entry shadow values
@@ -1893,6 +1891,7 @@ mod tests {
             env: &[],
             remote_user: None,
             auth_type: None,
+            pass_authorization: false,
             script_file: None,
         };
         let resp = execute(&ctx);
@@ -1935,6 +1934,7 @@ mod tests {
             env: &[],
             remote_user: None,
             auth_type: None,
+            pass_authorization: false,
             script_file: Some(&file),
         };
         let resp = execute(&ctx);
@@ -1978,6 +1978,7 @@ mod tests {
             env: &extra,
             remote_user: None,
             auth_type: None,
+            pass_authorization: false,
             script_file: None,
         };
         let env = build_env(&ctx);
@@ -2064,6 +2065,7 @@ mod tests {
             env: &extra,
             remote_user: Some("alice"),
             auth_type: Some("Basic"),
+            pass_authorization: false,
             script_file: None,
         };
         let env = build_env(&ctx);
@@ -2115,6 +2117,7 @@ mod tests {
             env: &[],
             remote_user: None,
             auth_type: None,
+            pass_authorization: false,
             script_file: None,
         };
         assert_eq!(execute(&ctx).status, 500);
@@ -2513,6 +2516,7 @@ mod tests {
             env: &[],
             remote_user: None,
             auth_type: None,
+            pass_authorization: false,
             script_file,
         }
     }
@@ -2546,7 +2550,7 @@ mod tests {
         req.headers.push("Authorization", "Basic c2VjcmV0");
         req.headers.push("Content-Type", "text/plain");
         req.headers.push("Content-Length", "4");
-        let ctx = test_ctx(&cfg, &req, &dir, Path::new("hello.sh"), None);
+        let mut ctx = test_ctx(&cfg, &req, &dir, Path::new("hello.sh"), None);
         let env = build_env(&ctx);
         assert!(!env.iter().any(|(name, _)| name == "HTTP_AUTHORIZATION"));
         assert!(
@@ -2554,6 +2558,11 @@ mod tests {
                 .any(|(name, value)| name == "CONTENT_TYPE"
                     && value.to_string_lossy() == "text/plain")
         );
+        ctx.pass_authorization = true;
+        let env = build_env(&ctx);
+        assert!(env.iter().any(|(name, value)| {
+            name == "HTTP_AUTHORIZATION" && value.to_string_lossy() == "Basic c2VjcmV0"
+        }));
         let _ = fs::remove_dir_all(&dir);
     }
 

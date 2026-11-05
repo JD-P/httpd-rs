@@ -1,0 +1,22 @@
+id = "nextcloud-fpm"
+title = "Nextcloud WebDAV through PHP-FPM"
+nightly = false
+timeout_seconds = 600
+disk_mb = 3072
+modes = ["fastcgi", "webdav", "streaming", "request-body", "database"]
+upstreams = ["Nextcloud 32.0.1 with PHP-FPM (Alpine)", "MariaDB 11.8.3"]
+images = [
+  "nextcloud@sha256:44d07694f45594f6d02d2b2a5724b9467c72915092c577a5f3cd47d3972972ad",
+  "mariadb@sha256:ae6119716edac6998ae85508431b3d2e666530ddf4e94c61a10710caec9b0f71",
+]
+prerequisites = ["docker"]
+
+[dimensions]
+upload = ["small", "large"]
+dav = ["propfind", "move"]
+reload = ["none", "before-download"]
+
+[canonical]
+upload = "large"
+dav = "move"
+reload = "before-download"

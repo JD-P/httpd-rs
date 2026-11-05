@@ -1,9 +1,10 @@
 # Tested application deployments
 
-The real-application harness continuously verifies four deployment patterns.
-The exact generated configuration and logs are retained with every CI run;
-these guides explain the security-relevant differences from a typical Apache
-or Nginx installation.
+The real-application harness verifies ten deployment patterns: four fixed
+nightly cases and six applications in the stochastic manual population. The
+exact generated configuration and logs are retained with every run; these
+guides explain the security-relevant differences from a typical Apache or
+Nginx installation.
 
 The feature-to-application rationale is maintained in the
 [application coverage inventory](coverage.md).
@@ -15,6 +16,11 @@ The feature-to-application rationale is maintained in the
 | WordPress | FastCGI | PHP-FPM Unix socket, install/login, REST, media upload, permalinks, rewrites and static cache |
 | Grafana | reverse proxy + WebSocket | subpath redirects, forwarded authority, health API, upgrade and bidirectional frames across reload |
 | Gitea (manual sample) | reverse proxy | API state creation followed by authenticated smart-HTTP push and clone |
+| Drupal (manual sample) | FastCGI | real installer, shipped `.htaccess`, clean URLs, protected files and immutable PHP source |
+| Jenkins (manual sample) | reverse proxy | root/subpath mounts, Basic auth, CSRF crumb/session binding, form POST and job API |
+| JupyterLab (manual sample) | reverse proxy + WebSocket | token auth, root/subpath mounts, kernel creation and code execution across reload |
+| MinIO (manual sample) | reverse proxy | SigV4 authority binding, signed streaming upload, ranges and object listing |
+| Nextcloud (manual sample) | FastCGI + WebDAV | database install, Basic auth forwarding, DAV verbs, large upload, move and download |
 
 ## Hugo
 
@@ -103,13 +109,92 @@ repository through the API, pushes a commit through Vapache's HTTP proxy, then
 clones it and checks the resulting content. This covers request bodies and
 streaming behavior that a simple health endpoint would miss.
 
+## Drupal with PHP-FPM
+
+Drupal uses the protected Unix-socket and immutable-code model described for
+WordPress, with `web/sites/default/files` as its only PHP-writable subtree.
+Its upstream `.htaccess` is executed rather than replaced, with four bounded
+compatibility adaptations:
+
+- two PCRE negative lookaheads become ordered, bounded rewrite rules;
+- `Header append` becomes the equivalent supported `Header add` form;
+- `RequestHeader unset Proxy` is removed because Vapache never creates
+  `HTTP_PROXY` from the request `Proxy` field;
+- `AddEncoding` moves to main configuration, where Vapache supports it.
+
+The adapter fails if those exact upstream lines drift, so a future Drupal
+change cannot silently discard policy. The test installs a real profile,
+loads a clean URL, rejects `composer.json`, rejects direct `.htaccess` access,
+and reloads the server. The FastCGI `SCRIPT_FILENAME` path must exist
+identically in Vapache's and PHP-FPM's mount namespaces.
+
+## Jenkins
+
+Jenkins 2.580.2 LTS with JDK 21 is an ordinary HTTP backend on an
+internal-only network. Root and `/jenkins/` deployments use matching public
+and backend prefixes:
+
+```apache
+ProxyPass /jenkins/ http://BACKEND:8080/jenkins/
+ProxyPassReverse /jenkins/ http://BACKEND:8080/jenkins/
+```
+
+The test authenticates, obtains a CSRF crumb and its bound session cookie,
+creates a job by POSTing XML, and reads the authenticated job API after a
+reload. Jenkins was selected for the Java slot because its maintained LTS
+image has a current immutable amd64 manifest.
+
+## JupyterLab
+
+JupyterLab is configured with the same `base_url` used in both proxy rules.
+The workflow creates a kernel through the HTTP API and performs a real Jupyter
+wire-protocol execution over WebSocket. A graceful reload deliberately closes
+the tunnel owned by the old configuration generation; the test reconnects
+under the new grant and proves the existing kernel still executes code. This
+is the safe expected behavior, not transparent tunnel migration.
+
+## MinIO
+
+S3 Signature V4 covers the public authority, so this deployment explicitly
+uses:
+
+```apache
+ProxyPreserveHost On
+ProxyPass / http://BACKEND:9000/
+ProxyPassReverse / http://BACKEND:9000/
+```
+
+Vapache validates the request authority before reconstructing the upstream
+header and preserves its non-default port. The test creates a bucket, uploads
+an approximately 1 MiB object using AWS's per-chunk signature chain, reloads,
+checks a byte range and listing, then removes the object and bucket. Do not
+enable `ProxyPreserveHost` for unrelated backends that expect their private
+authority.
+
+## Nextcloud with PHP-FPM
+
+Nextcloud requires raw HTTP authentication at its WebDAV front controller.
+Apache-compatible forwarding is explicit and directory scoped:
+
+```apache
+<Directory "/srv/nextcloud">
+    CGIPassAuth On
+    Require all granted
+</Directory>
+```
+
+`CGIPassAuth` defaults off; scope inheritance can turn it off again below this
+directory. The hardened layout sets Nextcloud's documented
+`config_is_read_only=true`, makes code and `config.php` immutable, leaves only
+the data directory writable by PHP-FPM, and denies direct access to `config/`,
+`data/`, `lib/`, dot files and command-line entry points. The test performs an
+authenticated `MKCOL`, upload, `PROPFIND`, `MOVE`, reload, exact download and
+delete against MariaDB-backed Nextcloud.
+
 ## Planned manual expansion
 
-The next applications should be added for distinct semantics: Bugzilla
-(large CGI), Drupal (rich `.htaccess`), Nextcloud (DAV and large uploads),
-Wagtail (Python/Gunicorn), Spring PetClinic (Java), JupyterLab (subpaths and
-WebSockets), MinIO (signed streaming), and
-Zulip or Mastodon (large multi-service deployment). They should join the
-stochastic manual population before any are promoted into the fixed nightly
-set.
+The remaining high-value additions are Bugzilla (large legacy CGI), a current
+reproducible Wagtail/Gunicorn application, and Zulip or Mastodon (large
+multi-service composition). They should enter the stochastic manual
+population before any are promoted into the fixed nightly quota.
 

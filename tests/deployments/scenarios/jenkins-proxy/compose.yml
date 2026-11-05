@@ -1,0 +1,28 @@
+services:
+  jenkins:
+    image: jenkins/jenkins@sha256:19db581de85e7ce6a1ad89e55a0318d1114e4f103d2dc25493a235ff2b26d044
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      JAVA_OPTS: -Djenkins.install.runSetupWizard=false
+      JENKINS_OPTS: --httpPort=8080 --prefix=${JENKINS_PREFIX-}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
+    volumes:
+      - home:/var/jenkins_home
+      - type: bind
+        source: ${JENKINS_INIT:?}
+        target: /usr/share/jenkins/ref/init.groovy.d/vapache-security.groovy
+        read_only: true
+    networks:
+      - application
+
+networks:
+  application:
+    internal: true
+
+volumes:
+  home:

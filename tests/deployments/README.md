@@ -19,7 +19,7 @@ failure can be replayed exactly:
 
 ```sh
 python3 tests/deployments/harness.py \
-  --profile sample --sample-count 8 --seed 4660
+  --profile sample --sample-count 10 --seed 4660
 ```
 
 Run one application while developing:
@@ -56,8 +56,10 @@ has the same ownership boundary.
 The harness enforces these rules twice: once against the rendered Compose
 model and again against the live container inspection.
 
-- A bind source must be under the unique `/tmp/vapache-deployments/...` run
-  directory.
+- A bind source must be under the unique scenario run directory. Privileged
+  runs default to `/run/vapache-deployments/...`, whose non-writable ancestry
+  also satisfies the FastCGI stable-path policy; unprivileged developer runs
+  must select an equivalently stable repository-external path explicitly.
 - A bind source that contains or is contained by the repository is rejected.
 - The Docker socket and privileged containers are rejected.
 - Published application ports bind only to loopback; databases publish no
@@ -74,8 +76,8 @@ model and again against the live container inspection.
   images are removed. The harness never invokes a global Docker prune.
 
 The source checkout is therefore not writable—or even visible—to application
-containers. Generated content, WordPress files, database state and Grafana
-state exist only in the staging directory or scenario volume.
+containers. Application code, generated content, databases and other mutable
+state exist only in the staging directory or scenario-owned volumes.
 
 ## Result artifacts
 

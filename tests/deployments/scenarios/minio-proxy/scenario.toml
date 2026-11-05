@@ -1,0 +1,19 @@
+id = "minio-proxy"
+title = "MinIO signed object-storage reverse proxy"
+nightly = false
+timeout_seconds = 300
+disk_mb = 1024
+modes = ["reverse-proxy", "streaming", "signed-requests", "ranges"]
+upstreams = ["Chainguard MinIO image pinned by manifest digest"]
+images = ["cgr.dev/chainguard/minio@sha256:3c60a2a8c4d33409a9bc7a623a7fcbfb4605adc3d89422d2f53b3f673a6e5597"]
+prerequisites = ["docker"]
+
+[dimensions]
+payload = ["fixed", "streaming"]
+operation = ["object", "listing"]
+reload = ["none", "before-read"]
+
+[canonical]
+payload = "streaming"
+operation = "listing"
+reload = "before-read"

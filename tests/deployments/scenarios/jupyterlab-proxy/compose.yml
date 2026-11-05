@@ -1,0 +1,32 @@
+services:
+  jupyter:
+    image: quay.io/jupyter/base-notebook@sha256:929c9adc94c4ad2b729e5b0dbddd3677c36c4ab6391d6e58b6e666c39aa65673
+    user: "1000:100"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command:
+      - start-notebook.py
+      - --ServerApp.ip=0.0.0.0
+      - --ServerApp.port=8888
+      - --ServerApp.open_browser=False
+      - --IdentityProvider.token=${JUPYTER_TOKEN:?}
+      - --ServerApp.base_url=${JUPYTER_BASE_URL:?}
+      - --ServerApp.allow_remote_access=True
+    environment:
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN:?}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m,uid=1000,gid=100
+    volumes:
+      - home:/home/jovyan
+    networks:
+      - application
+
+networks:
+  application:
+    internal: true
+
+volumes:
+  home:

@@ -693,6 +693,9 @@ impl<T> Originated<T> {
 
 #[derive(Debug, Clone, Default)]
 pub struct EnvironmentPolicy {
+    /// Whether the raw request Authorization field may become
+    /// HTTP_AUTHORIZATION for CGI/FastCGI. Apache defaults CGIPassAuth off.
+    pub cgi_pass_auth: Option<bool>,
     /// Early environment effects produced by completed rewrite rounds.
     pub rewrite_env: Vec<Originated<(String, Vec<u8>)>>,
     pub rewrite_unset_env: Vec<Originated<String>>,
@@ -709,6 +712,9 @@ pub struct EnvironmentPolicy {
 
 impl EnvironmentPolicy {
     pub fn merge_child(&mut self, child: &EnvironmentPolicy) {
+        if child.cgi_pass_auth.is_some() {
+            self.cgi_pass_auth = child.cgi_pass_auth;
+        }
         crate::verified::append_vec(&mut self.rewrite_env, &child.rewrite_env);
         crate::verified::append_vec(&mut self.rewrite_unset_env, &child.rewrite_unset_env);
         crate::verified::append_vec(&mut self.rewrite_late_env, &child.rewrite_late_env);
@@ -730,6 +736,7 @@ mod environment_tests {
     #[test]
     fn environment_lists_append_in_order() {
         let mut parent = EnvironmentPolicy::default();
+        parent.cgi_pass_auth = Some(false);
         parent
             .rewrite_env
             .push(Originated::main(("EARLY".into(), b"1".to_vec())));
@@ -737,6 +744,7 @@ mod environment_tests {
             .set_env
             .push(Originated::main(("A".into(), "1".into())));
         let mut child = EnvironmentPolicy::default();
+        child.cgi_pass_auth = Some(true);
         child
             .rewrite_unset_env
             .push(Originated::main("OLD_EARLY".into()));
@@ -751,6 +759,7 @@ mod environment_tests {
             .push(Originated::main(("B".into(), "2".into())));
         child.unset_env.push(Originated::main("OLD".into()));
         parent.merge_child(&child);
+        assert_eq!(parent.cgi_pass_auth, Some(true));
         assert_eq!(parent.set_env[0].value, ("A".into(), "1".into()));
         assert_eq!(parent.set_env[1].value, ("ACCESS".into(), "3".into()));
         assert_eq!(parent.set_env[2].value, ("B".into(), "2".into()));
@@ -1175,6 +1184,9 @@ pub struct ProxyPolicy {
     pub proxy_rules: Vec<crate::config::ProxyRule>,
     pub proxy_passes: Vec<crate::config::ProxyPassRule>,
     pub proxy_reverses: Vec<crate::config::ProxyReverseRule>,
+    /// Preserve the validated client authority in the upstream Host field.
+    /// `None` inherits; Apache's effective default is `Off`.
+    pub preserve_host: Option<bool>,
     pub proxy_ca_file: Option<std::path::PathBuf>,
     pub(crate) proxy_ca_trust: crate::files::AdminFileTrust,
     pub(crate) tls_config_cache: std::sync::Arc<ProxyTlsConfigCache>,
@@ -1185,6 +1197,9 @@ impl ProxyPolicy {
         crate::verified::append_vec(&mut self.proxy_rules, &child.proxy_rules);
         crate::verified::append_vec(&mut self.proxy_passes, &child.proxy_passes);
         crate::verified::append_vec(&mut self.proxy_reverses, &child.proxy_reverses);
+        if child.preserve_host.is_some() {
+            self.preserve_host = child.preserve_host;
+        }
         if child.proxy_ca_file.is_some() {
             self.proxy_ca_file = child.proxy_ca_file.clone();
             self.proxy_ca_trust = child.proxy_ca_trust;
@@ -1289,6 +1304,7 @@ mod final_policy_tests {
         let mut proxy = ProxyPolicy::default();
         proxy.proxy_ca_file = Some("/old-ca.pem".into());
         let child = ProxyPolicy {
+            preserve_host: Some(true),
             proxy_ca_file: Some("/new-ca.pem".into()),
             ..ProxyPolicy::default()
         };
@@ -1297,6 +1313,7 @@ mod final_policy_tests {
             proxy.proxy_ca_file.as_deref(),
             Some(std::path::Path::new("/new-ca.pem"))
         );
+        assert_eq!(proxy.preserve_host, Some(true));
     }
 
     #[test]

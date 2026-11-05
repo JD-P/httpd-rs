@@ -135,6 +135,17 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
     )
     compose.pull()
     compose.up()
+    context.add_cleanup(
+        lambda: compose.exec(
+            "wordpress",
+            [
+                "/bin/sh",
+                "-c",
+                f"chmod -R u+rwX /var/www/html && chown -R {os.getuid()}:{os.getgid()} /var/www/html",
+            ],
+            user="0",
+        )
+    )
     socket_path = php_run / "php-fpm.sock"
     wait_for_path(socket_path, timeout=60)
 

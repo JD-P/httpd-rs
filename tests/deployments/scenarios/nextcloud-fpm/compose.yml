@@ -1,0 +1,88 @@
+services:
+  database:
+    image: mariadb@sha256:ae6119716edac6998ae85508431b3d2e666530ddf4e94c61a10710caec9b0f71
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    environment:
+      MARIADB_DATABASE: nextcloud
+      MARIADB_USER: nextcloud
+      MARIADB_PASSWORD: vapache-nextcloud-db
+      MARIADB_ROOT_PASSWORD: vapache-nextcloud-root
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+      - /run/mysqld:rw,nosuid,nodev,size=32m
+    volumes:
+      - database:/var/lib/mysql
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+
+  nextcloud:
+    image: nextcloud@sha256:44d07694f45594f6d02d2b2a5724b9467c72915092c577a5f3cd47d3972972ad
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    environment:
+      MYSQL_HOST: database
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: vapache-nextcloud-db
+      NEXTCLOUD_ADMIN_USER: admin
+      NEXTCLOUD_ADMIN_PASSWORD: vapache-nextcloud-password-42
+      NEXTCLOUD_TRUSTED_DOMAINS: 127.0.0.1 deployment.test
+      OVERWRITEPROTOCOL: http
+    depends_on:
+      database:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
+    volumes:
+      - type: bind
+        source: ${NEXTCLOUD_ROOT:?}
+        target: /var/www/html
+      # Keep SCRIPT_FILENAME identical in Vapache's and PHP-FPM's namespaces.
+      - type: bind
+        source: ${NEXTCLOUD_ROOT:?}
+        target: ${NEXTCLOUD_ROOT:?}
+      - type: bind
+        source: ${PHP_RUN:?}
+        target: /run/vapache-php
+      - type: bind
+        source: ${FPM_CONFIG:?}
+        target: /usr/local/etc/php-fpm.d/zz-vapache-integration.conf
+        read_only: true
+    networks:
+      - application
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/vapache-php/php-fpm.sock && test -f /var/www/html/config/config.php"]
+      interval: 2s
+      timeout: 5s
+      retries: 120
+
+networks:
+  application:
+    internal: true
+
+volumes:
+  database:

@@ -59,6 +59,10 @@ services:
       - type: bind
         source: ${WORDPRESS_ROOT:?}
         target: /var/www/html
+      # Keep SCRIPT_FILENAME identical in Vapache's and PHP-FPM's namespaces.
+      - type: bind
+        source: ${WORDPRESS_ROOT:?}
+        target: ${WORDPRESS_ROOT:?}
       - type: bind
         source: ${PHP_RUN:?}
         target: /run/vapache-php
