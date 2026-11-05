@@ -97,8 +97,10 @@ jobs:
       - name: Show differential benchmark summary
         if: always()
         run: |
-          find deployment-results -name benchmark-summary.md -type f -print \
-            -exec cat {} \;
+          if [ -d deployment-results ]; then
+            find deployment-results -name benchmark-summary.md -type f -print \
+              -exec cat {} \;
+          fi
       - name: Show reclaimed container storage
         if: always()
         run: docker system df

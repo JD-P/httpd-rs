@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from lib import CaseContext, DeploymentError, ROOT, privilege_prefix
+from lib import CaseContext, DeploymentError, ROOT, command, privilege_prefix
 
 
 HERE = Path(__file__).resolve().parent
