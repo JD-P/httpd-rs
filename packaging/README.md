@@ -37,6 +37,13 @@ shows which Apache service it found, asks for confirmation, and only then
 disables/stops Apache and enables/starts vapache. If vapache fails to start,
 the helper restores Apache's previous active/enabled state.
 
+The service retains systemd's namespace, privilege, kernel, and filesystem
+hardening, but deliberately does not set `RestrictSUIDSGID=true`: systemd
+implements that option by returning `ENOSYS` from `openat2`, which Vapache
+requires for descriptor-contained configuration and content resolution. The
+package workflow boots Debian 13 under systemd and serves a real request so
+the unit's syscall policy is tested rather than merely syntax-checked.
+
 When a Certbot installation or configuration exists, `vapache-switch` installs
 a deploy hook that reloads Vapache only while `vapache.service` is active.
 Renewal configurations using `authenticator = apache` or `installer = apache`

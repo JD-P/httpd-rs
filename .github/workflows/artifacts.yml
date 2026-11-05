@@ -179,6 +179,55 @@ jobs:
             test "$granted" -eq 1
           '
 
+      - name: Validate the service under Debian 13 systemd
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=vapache-systemd-integration
+          container="vapache-systemd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            docker rm --force "$container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker build \
+            --file packaging/systemd-integration.Dockerfile \
+            --tag "$image" .
+          docker run --detach --privileged --cgroupns=private \
+            --tmpfs /run --tmpfs /run/lock \
+            --volume "$PWD/release:/release:ro" \
+            --name "$container" "$image" >/dev/null
+          ready=0
+          for attempt in $(seq 1 100); do
+            state=$(docker exec "$container" systemctl is-system-running 2>/dev/null || true)
+            case "$state" in
+              starting|initializing|'') sleep 0.1 ;;
+              *) ready=1; break ;;
+            esac
+          done
+          test "$ready" -eq 1
+          docker exec "$container" dpkg -i /release/vapache_*.deb
+          if docker exec "$container" systemctl is-enabled --quiet vapache.service; then
+            echo "package unexpectedly enabled vapache.service" >&2
+            exit 1
+          fi
+          docker exec "$container" systemctl daemon-reload
+          docker exec "$container" systemctl stop apache2.service
+          docker exec "$container" systemctl start vapache.service
+          docker exec "$container" systemctl is-active --quiet vapache.service
+          served=0
+          for attempt in $(seq 1 100); do
+            if docker exec "$container" \
+                curl --noproxy '*' --fail --silent --show-error \
+                  http://127.0.0.1/ -o /tmp/served.html; then
+              served=1
+              break
+            fi
+            sleep 0.1
+          done
+          test "$served" -eq 1
+          docker exec "$container" \
+            cmp /tmp/served.html /var/www/html/index.html
+
       - name: Validate the RPM package on Rocky Linux 9
         shell: bash
         run: |

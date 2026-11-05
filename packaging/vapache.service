@@ -26,7 +26,8 @@ ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectSystem=full
 RestrictRealtime=true
-RestrictSUIDSGID=true
+# RestrictSUIDSGID's seccomp policy makes openat2 return ENOSYS. Vapache needs
+# openat2 for descriptor-contained configuration and content path resolution.
 SystemCallArchitectures=native
 Restart=on-abort
 OOMPolicy=continue

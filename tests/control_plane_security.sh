@@ -4,8 +4,20 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 control=$repo_root/packaging/vapachectl
 deploy_hook=$repo_root/packaging/vapache-certbot-deploy-hook
+service_unit=$repo_root/packaging/vapache.service
 work=$(mktemp -d)
 trap 'rm -rf --one-file-system -- "$work"' EXIT
+
+# systemd implements RestrictSUIDSGID by making openat2 return ENOSYS. That
+# breaks Vapache's mandatory descriptor-contained resolver before configtest.
+# Keep the compatible service hardening explicit and reject the known-bad
+# combination without waiting for the slower package/systemd integration job.
+if grep -qx 'RestrictSUIDSGID=true' "$service_unit"; then
+    echo 'vapache.service blocks its own mandatory openat2 resolver' >&2
+    exit 1
+fi
+grep -qx 'NoNewPrivileges=true' "$service_unit"
+grep -qx 'SystemCallArchitectures=native' "$service_unit"
 
 fake_daemon=$work/vapached
 cat >"$fake_daemon" <<'EOF'
