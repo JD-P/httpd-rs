@@ -77,12 +77,6 @@ and WebSocket route together.
 
 Delete the test status when the check succeeds.
 
-## Roll back
-
-Restore the previous Vapache routes and Mastodon domain settings. Restart the
-Mastodon services and reload Vapache. Keep the production secrets and database
-unchanged.
-
 <!--
 Deployment contract only; not operator instructions.
 --scenario mastodon-proxy

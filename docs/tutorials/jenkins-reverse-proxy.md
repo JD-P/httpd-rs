@@ -71,11 +71,6 @@ Reload Vapache. Open the job again and request its JSON API through the public
 URL. Confirm that the session remains valid and that no redirect exposes port
 `8080`.
 
-## Roll back
-
-Restore the previous Vapache route, Jenkins URL, and context-path setting.
-Restart Jenkins and reload Vapache.
-
 <!--
 Deployment contract only; not operator instructions.
 --scenario jenkins-proxy

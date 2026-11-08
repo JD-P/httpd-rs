@@ -79,11 +79,6 @@ The REST request must return Bugzilla version data, and the `localconfig`
 request must be denied. Sign in to Bugzilla, open an administration page, reload
 Vapache, and confirm that the same session can still open the page.
 
-## Roll back
-
-Restore the previous virtual host and reload Vapache. Stop the dedicated
-`fcgiwrap` instance only if no other verified route uses it.
-
 <!--
 Deployment contract only; not operator instructions.
 --scenario bugzilla-fastcgi

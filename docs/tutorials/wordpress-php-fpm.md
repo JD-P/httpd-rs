@@ -90,12 +90,6 @@ the test.
 
 Reload Vapache and repeat the REST and permalink requests.
 
-## Roll back
-
-Restore the previous virtual host and `wp-config.php` values, run the
-configuration test, and reload Vapache. Do not restore PHP-FPM write access to
-the WordPress code as a rollback method.
-
 <!--
 Deployment contract only; not operator instructions.
 --scenario wordpress-fpm

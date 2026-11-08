@@ -101,11 +101,6 @@ $ cmp /tmp/vapache-nextcloud.bin /tmp/vapache-nextcloud-check.bin
 
 Delete the test object and collection after `cmp` succeeds.
 
-## Roll back
-
-Restore the previous virtual host and Nextcloud public-URL settings, then reload
-Vapache. Keep the data directory intact.
-
 <!--
 Deployment contract only; not operator instructions.
 --scenario nextcloud-fpm

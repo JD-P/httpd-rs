@@ -106,10 +106,7 @@ Enter Alice's password when Git asks for it. A successful Gitweb page alone
 does not test smart-HTTP request bodies. The push and second clone test the
 write and read paths across a reload.
 
-## Roll back
-
-Restore the previous virtual host and reload Vapache. Remove the test clones.
-Do not remove the repository until you have another verified access path.
+Remove `/tmp/example-clone` and `/tmp/example-check` after the test succeeds.
 
 <!--
 Deployment contract only; not operator instructions.

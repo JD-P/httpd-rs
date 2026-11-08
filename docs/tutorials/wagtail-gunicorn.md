@@ -78,11 +78,6 @@ port `8000`.
 Keep uploaded media in a separate writable directory. The Gunicorn identity
 must not modify Python code or its parent directories.
 
-## Roll back
-
-Restore the previous Vapache route and Django public-host settings, restart
-Gunicorn, and reload Vapache.
-
 <!--
 Deployment contract only; not operator instructions.
 --scenario wagtail-proxy

@@ -84,11 +84,7 @@ $ git clone https://git.example.test/gitea/alice/example.git /tmp/gitea-check
 ```
 
 Confirm that `/tmp/gitea-check/vapache-test.txt` contains the expected text.
-
-## Roll back
-
-Restore the previous Vapache route and Gitea `ROOT_URL`, then restart Gitea and
-reload Vapache. Remove the two temporary clones.
+Remove `/tmp/gitea-example` and `/tmp/gitea-check` after the test succeeds.
 
 <!--
 Deployment contract only; not operator instructions.

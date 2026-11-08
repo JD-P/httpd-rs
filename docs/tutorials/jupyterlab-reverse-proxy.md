@@ -72,10 +72,7 @@ second cell in the same kernel. A successful `101 Switching Protocols` response
 does not prove that the kernel protocol works; confirm that both cells return
 their output.
 
-## Roll back
-
-Restore the previous Vapache route and Jupyter `base_url`, restart JupyterLab,
-and reload Vapache. Shut down the test kernel.
+Shut down the test kernel after the check succeeds.
 
 <!--
 Deployment contract only; not operator instructions.

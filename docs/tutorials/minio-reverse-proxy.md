@@ -83,11 +83,6 @@ $ mc rm vapache-test/vapache-check/object.bin
 $ mc rb vapache-test/vapache-check
 ```
 
-## Roll back
-
-Restore the previous Vapache route and MinIO public URL, restart MinIO, and
-reload Vapache.
-
 <!--
 Deployment contract only; not operator instructions.
 --scenario minio-proxy

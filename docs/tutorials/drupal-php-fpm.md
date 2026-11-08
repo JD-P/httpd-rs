@@ -85,11 +85,6 @@ $ curl -I https://drupal.example.test/.htaccess
 The access-file request must be denied. Also test one clean URL and one path
 that the Drupal rules protect. Reload Vapache and repeat the login-page request.
 
-## Roll back
-
-Restore the previous virtual host and reload Vapache. Restore the previous
-Drupal configuration only if the trusted-host change was part of this test.
-
 <!--
 Deployment contract only; not operator instructions.
 --scenario drupal-fpm

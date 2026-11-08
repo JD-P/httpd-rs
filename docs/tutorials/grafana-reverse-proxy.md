@@ -73,11 +73,6 @@ Reload Vapache while Grafana Live is open. The existing WebSocket can close
 during reload. Confirm that the browser reconnects and resumes receiving
 updates.
 
-## Roll back
-
-Restore the previous proxy route and Grafana `root_url`, restart Grafana, and
-reload Vapache.
-
 <!--
 Deployment contract only; not operator instructions.
 --scenario grafana-proxy
