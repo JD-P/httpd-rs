@@ -7,110 +7,167 @@ contracts: DOC-HOWTO-TLS-001
 
 # Migrate TLS and Certbot
 
-Use this procedure to retain an existing Certbot lineage or to issue a new
-certificate after you switch from Apache to Vapache. Contract
-`DOC-HOWTO-TLS-001` binds this guide to the packaged Certbot tests.
+Vapache can use certificates that Certbot already manages. The service switch
+also configures Certbot to reload Vapache after a successful renewal. You do not
+need to request replacement certificates only because you switch web servers.
+
+This guide has separate instructions for an existing certificate and a new
+certificate.
 
 ## Prerequisites
 
-Install the Vapache package. Keep the Apache configuration and
-`/etc/letsencrypt` unchanged. Complete the
-[configuration assessment](assess-apache-configuration.md) before you switch
-services.
+Install the Vapache package and complete the [configuration
+assessment](assess-apache-configuration.md). Keep the current Apache service
+available for rollback.
 
-## 1. Record the certificate state
+For an existing certificate, Certbot and `/etc/letsencrypt` must remain on the
+host. To issue a new certificate with `certbot --apache`, install Certbot and
+its Apache plugin.
 
-Run:
+## 1. Can Vapache use the existing certificates?
+
+List the certificates that Certbot currently manages:
 
 ```console
 $ sudo certbot certificates
-$ sudo apache2ctl -t -D DUMP_VHOSTS
+```
+
+Save this output. You will use it after the switch to confirm that the
+certificate names and domain names did not change.
+
+Confirm that Apache accepts its current configuration. On a Debian-family
+system, run:
+
+```console
 $ sudo apache2ctl configtest
 Syntax OK
 ```
 
-Record each certificate name, domain name, and TLS virtual host. Do not copy
-files out of `/etc/letsencrypt/live`. Certbot maintains those paths.
+On an RPM-family system, run:
 
-## 2. Test the Vapache configuration
+```console
+$ sudo httpd -t
+Syntax OK
+```
 
-Run:
+Then confirm that Vapache can read the same configuration and certificates:
 
 ```console
 $ sudo vapachectl configtest
 Syntax OK
 ```
 
-Vapache accepts an existing Certbot lineage when the final certificate and key
-links resolve through a root-controlled tree. Correct an ownership or
-writability error before you continue.
+`Syntax OK` means that Vapache can use the configured certificate and private
+key. Vapache reads the existing certificate links below
+`/etc/letsencrypt/live`. You do not need to copy the certificate files. If the
+check reports an ownership or permission error, correct the path named in the
+error before you switch services.
 
-## 3. Switch the service
+## 2. What changes during the service switch?
 
-Run the packaged switch from a local administrative session:
+Run:
 
 ```console
 $ sudo vapache-switch
 ```
 
-Review the reported Apache service, Certbot renewal configurations, and
-planned changes. The switch installs a Certbot Apache-control shim and a
-conditional deploy hook. The shim controls Vapache while `vapache.service` is
-active. It controls Apache while Vapache is inactive.
+The command shows the Apache service that it found, the number of Certbot
+renewal configurations, and the changes that it will make. Review the plan and
+confirm the switch.
 
-If Vapache does not start, the switch restores the previous active and enabled
-Apache state. See [Roll back to Apache](roll-back-to-apache.md) for a later
+The switch makes two Certbot changes:
+
+- Certbot's Apache commands control Vapache while Vapache is active. They
+  control Apache again after a rollback.
+- A successful certificate renewal reloads Vapache. A failed renewal does not
+  reload the service.
+
+The switch does not change the certificate paths or the Apache configuration.
+If Vapache does not start, the command restores the previous Apache service
+state. The [Apache rollback procedure](roll-back-to-apache.md) covers a later
 manual rollback.
 
-## 4. Verify an existing lineage
+## 3. How do I verify an existing certificate?
 
-Run a dry renewal and inspect the served certificate:
+Choose one domain name from the `certbot certificates` output. The following
+command uses `www.example.test`; replace it with your domain name in both
+places.
 
 ```console
-$ sudo certbot renew --dry-run
 $ openssl s_client -connect www.example.test:443 \
-    -servername www.example.test </dev/null
+    -servername www.example.test </dev/null 2>/dev/null \
+    | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
 ```
 
-Confirm the certificate subject, issuer, domain names, and expiry. Confirm that
-the HTTP challenge path is reachable if the lineage uses HTTP-01.
+Confirm that the subject alternative names contain the expected domains and
+that the expiry date is current.
 
-## 5. Issue a new certificate
+## 4. How do I issue a new certificate?
 
-Create and enable an HTTP-only virtual host for the domain. Then run:
+Skip this section when Certbot already manages every certificate that the site
+needs.
+
+The examples in this section use `www.example.test`. Replace it with the new
+domain name before you run any command.
+
+First, add an HTTP virtual host for the domain:
+
+```apache
+<VirtualHost *:80>
+    ServerName www.example.test
+    DocumentRoot /var/www/html
+</VirtualHost>
+```
+
+On a Debian-family system, place the virtual host in
+`/etc/apache2/sites-available`, enable it with `a2ensite`, and run
+`vapachectl configtest`. On an RPM-family system, place it in
+`/etc/httpd/conf.d` and run `vapachectl configtest`. Reload Vapache after the
+configuration test succeeds.
+
+Then ask Certbot to issue the certificate and add the TLS configuration:
 
 ```console
 $ sudo certbot --apache -d www.example.test
 ```
 
-The Vapache shim lets the Apache plugin test configuration and reload the
-active server. It does not permit Certbot to start Apache while Vapache owns
-the listener.
+Certbot tests the resulting configuration and reloads Vapache.
 
-If the configuration already names a lineage that does not exist, the
-configuration test prints a `certbot certonly --standalone` command. Stop the
-service that owns port 80, run the printed command, and start the service
-again. Re-run `vapachectl configtest` before you enable the TLS virtual host.
+### If the configuration already refers to a missing certificate
 
-## 6. Verify renewal control
+`vapachectl configtest` prints a `certbot certonly --standalone` command when
+the configuration refers to certificate files that do not exist. The
+standalone Certbot server needs port 80, so this procedure causes a brief
+service interruption.
 
-Run:
+Replace the example domain in the printed command, then run:
 
 ```console
-$ sudo systemctl status vapache.service
+$ sudo systemctl stop vapache.service
+$ sudo certbot certonly --standalone -d www.example.test
+$ sudo vapachectl configtest
+Syntax OK
+$ sudo systemctl start vapache.service
+```
+
+## 5. How do I verify future renewals?
+
+Run one renewal test after the switch or after you issue a new certificate:
+
+```console
 $ sudo certbot renew --dry-run
+$ sudo systemctl is-active vapache.service
+active
 $ sudo journalctl -u vapache.service --since today
 ```
 
-Confirm that Vapache remains active after the dry run. The deploy hook reloads
-Vapache only after a successful renewal and only while the Vapache service is
-active.
+The renewal test must succeed, and Vapache must remain active. After a real
+successful renewal, Certbot reloads Vapache so that it begins serving the new
+certificate.
 
-## Evidence
-
-The [Certbot Apache integration test](../../tests/certbot_apache_integration.sh)
-checks service selection, renewal edits, interruption recovery, and service
-restoration. The [Certbot shim test](../../tests/certbot_apache_shim.sh) checks
-the permitted Apache-plugin control commands. The
-[packaging workflow](../../.github/workflows/artifacts.yml) runs these tests in
-the package boundary.
+<!--
+Behavior contract evidence:
+[Certbot package integration](../../tests/certbot_apache_integration.sh)
+[Certbot service control](../../tests/certbot_apache_shim.sh)
+[Package workflow](../../.github/workflows/artifacts.yml)
+-->
