@@ -19,7 +19,7 @@ configuration.
 
 | Tutorial | What the tutorial covers | Tested workflow | Similar software and starting points |
 |---|---|---|---|
-| [Hugo static site](hugo-static-site.md) | Static files, authentication, compression, byte ranges, caching, and reload <!-- test modes: `static`, `access`, `compression`, `cache` --> | Generate a site; test authentication, compression, ranges, cache, and reload | Jekyll, Eleventy, MkDocs, Docusaurus, Zola |
+| [Hugo static site](hugo-static-site.md) | Static files, HTTPS, custom errors, compression, byte ranges, and reload <!-- test modes: `static`, `access`, `compression`, `cache` --> | Build a release; test the home page, custom `404`, Brotli, a byte range, and reload | Jekyll, Eleventy, MkDocs, Docusaurus, Zola |
 | [Gitweb and smart Git HTTP](git-cgi.md) | CGI, path information, and request bodies <!-- test modes: `cgi`, `path-info`, `request-body` --> | Browse Gitweb and clone a repository through CGI | cgit, ViewVC, other bounded CGI programs |
 | [WordPress with PHP-FPM](wordpress-php-fpm.md) | PHP-FPM, rewrites, cookies, uploads, and a database <!-- test modes: `fastcgi`, `rewrite`, `cookies`, `database` --> | Install, upload media, use pretty URLs and REST, cache assets, and reload | ClassicPress, Joomla, TYPO3, other PHP-FPM content systems |
 | [Grafana reverse proxy](grafana-reverse-proxy.md) | Reverse proxying, WebSocket, redirects, and cookies <!-- test modes: `reverse-proxy`, `websocket`, `redirects`, `cookies` --> | Use a subpath, follow public redirects, exchange WebSocket frames, and reload | OpenSearch Dashboards, Kibana, Netdata, other live dashboards |
