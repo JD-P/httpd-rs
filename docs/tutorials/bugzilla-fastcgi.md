@@ -30,19 +30,26 @@ TCP ports 80 and 443 in the provider firewall. This Debian 13 example uses
 ```console
 $ sudo apt install build-essential fcgiwrap git libmariadb-dev mariadb-server \
     perl spawn-fcgi
+$ sudo adduser --system --group --home /var/lib/bugzilla-deploy \
+    bugzilla-deploy
 $ id -u www-data
 33
-$ sudo git clone https://github.com/bugzilla/bugzilla.git \
+$ sudo install -d -o root -g root -m 0755 /srv/bugzilla
+$ sudo install -d -o bugzilla-deploy -g bugzilla-deploy -m 0755 \
     /srv/bugzilla/current
-$ sudo git -C /srv/bugzilla/current checkout \
+$ sudo -H -u bugzilla-deploy git clone https://github.com/bugzilla/bugzilla.git \
+    /srv/bugzilla/current
+$ sudo -H -u bugzilla-deploy git -C /srv/bugzilla/current checkout \
     852cd06ef751cb5a5f87e100466e71e46e3cfc0e
 $ cd /srv/bugzilla/current
-$ sudo perl install-module.pl --all
-$ sudo perl checksetup.pl
+$ sudo -H -u bugzilla-deploy perl install-module.pl --all
+$ sudo -H -u bugzilla-deploy perl checksetup.pl
 ```
 
 The first `checksetup.pl` run creates `localconfig` and reports the remaining
-setup work. Do not continue if `id -u` reports a value other than `33`.
+setup work. `install-module.pl` installs CPAN modules inside the Bugzilla tree;
+it does not install them globally. Do not continue if `id -u` reports a value
+other than `33`.
 
 Create the database and replace both password examples with one new database
 password:
@@ -71,12 +78,16 @@ Run setup again. Enter the administrator email, name, and password when
 
 ```console
 $ cd /srv/bugzilla/current
-$ sudo perl checksetup.pl
+$ sudo -H -u bugzilla-deploy perl checksetup.pl
 $ sudo chown -R root:root /srv/bugzilla/current
 $ sudo chown -R www-data:www-data /srv/bugzilla/current/data
 $ sudo chown root:www-data /srv/bugzilla/current/localconfig
 $ sudo chmod 0640 /srv/bugzilla/current/localconfig
 ```
+
+The deployment identity runs Bugzilla and CPAN setup code. The completed
+application becomes root-owned. The FastCGI identity can write only Bugzilla's
+data directory.
 
 ## 2. Create the FastCGI socket
 
@@ -112,6 +123,8 @@ ExecStart=/usr/sbin/fcgiwrap -f
 StandardInput=socket
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/srv/bugzilla/current/data
 ```
 
 Enable the socket and verify its identity:

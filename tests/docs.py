@@ -203,6 +203,37 @@ def check_deployment_tutorial_security() -> None:
         if required not in wordpress:
             raise DocsError(f"WordPress privilege boundary is missing {required!r}")
 
+    bugzilla = (tutorials / "bugzilla-fastcgi.md").read_text(encoding="utf-8")
+    for forbidden in ("sudo perl install-module.pl", "sudo perl checksetup.pl"):
+        if forbidden in bugzilla:
+            raise DocsError(f"Bugzilla tutorial runs application setup as root: {forbidden!r}")
+    for required in (
+        "adduser --system --group --home /var/lib/bugzilla-deploy",
+        "sudo -H -u bugzilla-deploy perl install-module.pl --all",
+        "sudo -H -u bugzilla-deploy perl checksetup.pl",
+        "sudo chown -R root:root /srv/bugzilla/current",
+        "User=www-data",
+        "ProtectSystem=strict",
+        "ReadWritePaths=/srv/bugzilla/current/data",
+    ):
+        if required not in bugzilla:
+            raise DocsError(f"Bugzilla privilege boundary is missing {required!r}")
+
+    jupyter = (tutorials / "jupyterlab-reverse-proxy.md").read_text(encoding="utf-8")
+    for forbidden in ("sudo python3 -m venv", "sudo /opt/jupyterlab/bin/pip"):
+        if forbidden in jupyter:
+            raise DocsError(f"JupyterLab tutorial builds its environment as root: {forbidden!r}")
+    for required in (
+        "adduser --system --group --home /var/lib/jupyter-deploy",
+        "sudo -H -u jupyter-deploy python3 -m venv",
+        "sudo -H -u jupyter-deploy /opt/jupyterlab/bin/pip install",
+        "sudo chown -R root:root /opt/jupyterlab",
+        "User=jupyter",
+        "ReadWritePaths=/srv/jupyter",
+    ):
+        if required not in jupyter:
+            raise DocsError(f"JupyterLab privilege boundary is missing {required!r}")
+
     verified_artifacts = {
         "gitea-reverse-proxy.md": (
             "7C9E68152594688862D62AF62D9AE806EC1592E2",

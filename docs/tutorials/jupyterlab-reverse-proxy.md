@@ -28,15 +28,23 @@ TCP ports 80 and 443 in the provider firewall.
 
 ```console
 $ sudo apt install python3-venv
+$ sudo adduser --system --group --home /var/lib/jupyter-deploy jupyter-deploy
 $ sudo adduser --system --group --home /srv/jupyter jupyter
-$ sudo python3 -m venv /opt/jupyterlab
-$ sudo /opt/jupyterlab/bin/pip install --upgrade pip jupyterlab
-$ sudo -u jupyter /opt/jupyterlab/bin/jupyter server password
+$ sudo install -d -o jupyter-deploy -g jupyter-deploy -m 0755 \
+    /opt/jupyterlab
+$ sudo -H -u jupyter-deploy python3 -m venv /opt/jupyterlab
+$ sudo -H -u jupyter-deploy /opt/jupyterlab/bin/pip install \
+    'jupyterlab==4.4.10'
+$ sudo chown -R root:root /opt/jupyterlab
+$ sudo chmod -R a-w /opt/jupyterlab
+$ sudo -H -u jupyter /opt/jupyterlab/bin/jupyter server password
 ```
 
 Enter the password that administrators will use at the public JupyterLab login
 page. The password command stores a hash below `/srv/jupyter`; it does not store
-the entered password as plain text.
+the entered password as plain text. The deployment identity installs Python
+packages, the root-owned environment is read-only at runtime, and the Jupyter
+service can write only its workspace.
 
 ## 2. Configure the JupyterLab service
 
@@ -67,10 +75,14 @@ After=network.target
 User=jupyter
 Group=jupyter
 WorkingDirectory=/srv/jupyter
+Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/jupyterlab/bin/jupyter lab --config=/etc/jupyter/jupyter_server_config.py
 Restart=on-failure
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/srv/jupyter
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
