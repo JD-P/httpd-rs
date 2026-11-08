@@ -191,6 +191,18 @@ def check_deployment_tutorial_security() -> None:
     if "http://git.example.test" in git_cgi:
         raise DocsError("Git CGI tutorial must not send Basic authentication over HTTP")
 
+    wordpress = (tutorials / "wordpress-php-fpm.md").read_text(encoding="utf-8")
+    if "--allow-root" in wordpress:
+        raise DocsError("WordPress tutorial must not run WP-CLI as root")
+    for required in (
+        "adduser --system --group --home /var/lib/wordpress-deploy",
+        "sudo -u wordpress-deploy wp",
+        "sudo chown -R root:root /srv/wordpress/current",
+        "user = www-data",
+    ):
+        if required not in wordpress:
+            raise DocsError(f"WordPress privilege boundary is missing {required!r}")
+
     verified_artifacts = {
         "gitea-reverse-proxy.md": (
             "7C9E68152594688862D62AF62D9AE806EC1592E2",

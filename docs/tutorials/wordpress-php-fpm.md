@@ -45,6 +45,8 @@ $ test "$(gpg --show-keys --with-colons /tmp/wp-cli.pgp \
 $ gpg --batch --import /tmp/wp-cli.pgp
 $ gpg --batch --verify /tmp/wp-cli.phar.asc /tmp/wp-cli.phar
 $ sudo install -m 0755 /tmp/wp-cli.phar /usr/local/bin/wp
+$ sudo adduser --system --group --home /var/lib/wordpress-deploy \
+    wordpress-deploy
 $ id -u www-data
 33
 ```
@@ -65,16 +67,18 @@ EXIT;
 ## 2. Install WordPress and separate uploads
 
 ```console
-$ sudo install -d -o root -g root -m 0755 /srv/wordpress/current
-$ sudo wp core download --allow-root --version=6.8.3 \
+$ sudo install -d -o root -g root -m 0755 /srv/wordpress
+$ sudo install -d -o wordpress-deploy -g wordpress-deploy -m 0755 \
+    /srv/wordpress/current
+$ sudo -u wordpress-deploy wp core download --version=6.8.3 \
     --path=/srv/wordpress/current
-$ sudo wp config create --allow-root --path=/srv/wordpress/current \
+$ sudo -u wordpress-deploy wp config create --path=/srv/wordpress/current \
     --dbname=wordpress --dbuser=wordpress --prompt=dbpass
-$ sudo wp core install --allow-root --path=/srv/wordpress/current \
+$ sudo -u wordpress-deploy wp core install --path=/srv/wordpress/current \
     --url=https://www.example.test --title='Vapache WordPress tutorial' \
     --admin_user=admin --admin_email=admin@example.test \
     --prompt=admin_password
-$ sudo wp rewrite structure '/%postname%/' --hard --allow-root \
+$ sudo -u wordpress-deploy wp rewrite structure '/%postname%/' --hard \
     --path=/srv/wordpress/current
 $ sudo install -d -o www-data -g www-data -m 0750 \
     /srv/wordpress/shared/uploads
@@ -90,8 +94,10 @@ $ echo '/srv/wordpress/shared/uploads /srv/wordpress/current/wp-content/uploads 
     | sudo tee -a /etc/fstab >/dev/null
 ```
 
-The bind mount keeps uploaded data writable without making the WordPress PHP
-files writable.
+WP-CLI runs as the non-login `wordpress-deploy` identity. PHP-FPM does not run
+as that identity and cannot change the finished application tree. The bind
+mount keeps uploaded data writable by `www-data` without making the WordPress
+PHP files writable.
 
 ## 3. Configure the PHP-FPM pool
 
