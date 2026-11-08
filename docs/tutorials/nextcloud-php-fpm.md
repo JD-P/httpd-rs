@@ -36,12 +36,14 @@ $ id -u www-data
 $ curl --fail --show-error --location \
     --output /tmp/nextcloud.tar.bz2 \
     https://download.nextcloud.com/server/releases/nextcloud-32.0.1.tar.bz2
+$ printf '%s  %s\n' \
+    5810b06e75678384973d8d86387ee39f4c086d79dfa92f15fcb743aaba36eaa9 \
+    /tmp/nextcloud.tar.bz2 | sha256sum --check --strict
 $ sudo install -d -o root -g root -m 0755 /srv/nextcloud/current
 $ sudo tar --extract --bzip2 --file /tmp/nextcloud.tar.bz2 \
     --strip-components=1 --directory /srv/nextcloud/current
 $ sudo install -d -o www-data -g www-data -m 0750 /srv/nextcloud/data
 $ sudo chown -R www-data:www-data /srv/nextcloud/current/config
-$ sudo certbot certonly --standalone --domain cloud.example.test
 ```
 
 Do not continue if `id -u` reports a value other than `33`.
@@ -57,14 +59,19 @@ GRANT ALL PRIVILEGES ON nextcloud.* TO 'nextcloud'@'localhost';
 EXIT;
 ```
 
-Install Nextcloud and replace the example administrator password:
+Read the administrator password without saving it in shell history, pass it
+through the environment, install Nextcloud, and then remove the variable:
 
 ```console
-$ sudo -u www-data php /srv/nextcloud/current/occ maintenance:install \
+$ read -rsp 'Nextcloud administrator password: ' OC_PASS; echo
+$ export OC_PASS
+$ sudo --preserve-env=OC_PASS -u www-data \
+    php /srv/nextcloud/current/occ maintenance:install \
     --database=mysql --database-name=nextcloud --database-user=nextcloud \
     --database-pass='replace-database-password' \
-    --admin-user=admin --admin-pass='replace-admin-password' \
+    --admin-user=admin --admin-pass-from-env \
     --data-dir=/srv/nextcloud/data
+$ unset OC_PASS
 ```
 
 ## 2. Configure Nextcloud
@@ -117,11 +124,32 @@ socket 0:33 660 /run/php/nextcloud-fpm.sock
 
 ## 4. Configure Vapache
 
-Create `/etc/apache2/sites-available/nextcloud.conf`:
+Create `/etc/apache2/sites-available/nextcloud.conf` with a temporary HTTP-only
+host, enable it, and obtain the certificate:
+
+```apache
+<VirtualHost *:80>
+    ServerName cloud.example.test
+</VirtualHost>
+```
+
+```console
+$ sudo a2ensite nextcloud.conf
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ sudo certbot certonly --apache --domain cloud.example.test
+```
+
+Replace it with the final configuration:
 
 ```apache
 VapacheCapability FastCgi On
 VapacheFastCGIStablePath On unix:/run/php/nextcloud-fpm.sock 33 0 0
+
+<VirtualHost *:80>
+    ServerName cloud.example.test
+    Redirect permanent / https://cloud.example.test/
+</VirtualHost>
 
 <VirtualHost *:443>
     ServerName cloud.example.test
@@ -151,37 +179,37 @@ VapacheFastCGIStablePath On unix:/run/php/nextcloud-fpm.sock 33 0 0
 </VirtualHost>
 ```
 
-Enable the virtual host, test the configuration, and start Vapache:
+Test the configuration, reload Vapache, and verify renewal:
 
 ```console
-$ sudo a2ensite nextcloud.conf
 $ sudo vapachectl configtest
-$ sudo systemctl enable --now vapache.service
+$ sudo systemctl reload vapache.service
+$ sudo certbot renew --dry-run
 ```
 
 ## 5. Test a WebDAV workflow
 
-Replace `replace-admin-password` with the administrator password that you set
-in step 1:
+Each `curl --user admin` command prompts for the administrator password. The
+password does not appear in the command or shell history.
 
 ```console
 $ dd if=/dev/urandom of=/tmp/vapache-nextcloud.bin bs=1M count=2
-$ curl --fail --user admin:replace-admin-password -X MKCOL \
+$ curl --fail --user admin -X MKCOL \
     https://cloud.example.test/remote.php/dav/files/admin/vapache-test
-$ curl --fail --user admin:replace-admin-password -T /tmp/vapache-nextcloud.bin \
+$ curl --fail --user admin -T /tmp/vapache-nextcloud.bin \
     https://cloud.example.test/remote.php/dav/files/admin/vapache-test/original.bin
-$ curl --fail --user admin:replace-admin-password -X PROPFIND -H 'Depth: 1' \
+$ curl --fail --user admin -X PROPFIND -H 'Depth: 1' \
     https://cloud.example.test/remote.php/dav/files/admin/vapache-test/
-$ curl --fail --user admin:replace-admin-password -X MOVE \
+$ curl --fail --user admin -X MOVE \
     -H 'Destination: https://cloud.example.test/remote.php/dav/files/admin/vapache-test/moved.bin' \
     https://cloud.example.test/remote.php/dav/files/admin/vapache-test/original.bin
 $ sudo systemctl reload vapache.service
-$ curl --fail --user admin:replace-admin-password -o /tmp/vapache-nextcloud-check.bin \
+$ curl --fail --user admin -o /tmp/vapache-nextcloud-check.bin \
     https://cloud.example.test/remote.php/dav/files/admin/vapache-test/moved.bin
 $ cmp /tmp/vapache-nextcloud.bin /tmp/vapache-nextcloud-check.bin
-$ curl --fail --user admin:replace-admin-password -X DELETE \
+$ curl --fail --user admin -X DELETE \
     https://cloud.example.test/remote.php/dav/files/admin/vapache-test/moved.bin
-$ curl --fail --user admin:replace-admin-password -X DELETE \
+$ curl --fail --user admin -X DELETE \
     https://cloud.example.test/remote.php/dav/files/admin/vapache-test
 ```
 

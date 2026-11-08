@@ -76,9 +76,16 @@ def documented_routes(
 ) -> str:
     """Render the exact operator-facing virtual host with disposable test paths."""
     template = (ROOT / "docs/examples/tutorials/git-cgi-vhost.conf").read_text()
-    rendered = template.replace("VapacheCapability Cgi On\n\n", "", 1)
-    rendered = rendered.replace("<VirtualHost *:80>\n", "", 1)
-    rendered = rendered.rsplit("</VirtualHost>", 1)[0]
+    marker = "<VirtualHost *:443>\n"
+    start = template.index(marker) + len(marker)
+    rendered = template[start : template.index("</VirtualHost>", start)]
+    rendered = "\n".join(
+        line
+        for line in rendered.splitlines()
+        if not line.strip().startswith(
+            ("ServerName ", "SSLEngine ", "SSLCertificateFile ", "SSLCertificateKeyFile ")
+        )
+    )
     replacements = {
         "/etc/gitweb.conf": os.fspath(gitweb_config),
         "/srv/git": os.fspath(projects),

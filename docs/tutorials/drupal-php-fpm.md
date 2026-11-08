@@ -32,7 +32,7 @@ $ sudo apt install composer mariadb-server php8.4-cli php8.4-curl php8.4-fpm \
     php8.4-gd php8.4-mbstring php8.4-mysql php8.4-xml php8.4-zip unzip
 $ id -u www-data
 33
-$ sudo certbot certonly --standalone --domain drupal.example.test
+$ sudo adduser --system --group --home /srv/drupal drupal-deploy
 ```
 
 Do not continue if `id -u` reports a value other than `33`.
@@ -51,10 +51,12 @@ EXIT;
 Install Drupal and Drush, then run the standard-profile installer:
 
 ```console
-$ sudo install -d -o root -g root -m 0755 /srv/drupal
-$ sudo composer create-project drupal/recommended-project:11.2.5 \
+$ sudo install -d -o drupal-deploy -g drupal-deploy -m 0750 /srv/drupal
+$ sudo -u drupal-deploy composer create-project \
+    drupal/recommended-project:11.2.5 \
     /srv/drupal/current
-$ sudo composer --working-dir=/srv/drupal/current require drush/drush
+$ sudo -u drupal-deploy composer --working-dir=/srv/drupal/current \
+    require drush/drush
 $ sudo /srv/drupal/current/vendor/bin/drush site:install standard -y \
     --root=/srv/drupal/current/web \
     --db-url='mysql://drupal:replace-database-password@localhost/drupal' \
@@ -116,12 +118,33 @@ socket 0:33 660 /run/php/drupal-fpm.sock
 
 ## 4. Configure Vapache
 
-Create `/etc/apache2/sites-available/drupal.conf`:
+Create `/etc/apache2/sites-available/drupal.conf` with a temporary HTTP-only
+host, enable it, and obtain the certificate:
+
+```apache
+<VirtualHost *:80>
+    ServerName drupal.example.test
+</VirtualHost>
+```
+
+```console
+$ sudo a2ensite drupal.conf
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ sudo certbot certonly --apache --domain drupal.example.test
+```
+
+Replace it with the final configuration:
 
 ```apache
 VapacheCapability AccessFiles On
 VapacheCapability FastCgi On
 VapacheFastCGIStablePath On unix:/run/php/drupal-fpm.sock 33 0 0
+
+<VirtualHost *:80>
+    ServerName drupal.example.test
+    Redirect permanent / https://drupal.example.test/
+</VirtualHost>
 
 <VirtualHost *:443>
     ServerName drupal.example.test
@@ -149,12 +172,12 @@ access file. Ask it to preserve each rejected rule in the main configuration
 and to provide a request that proves the replacement. Do not accept a change
 that only deletes the rule.
 
-Enable the virtual host, test the configuration, and start Vapache:
+Test the configuration, reload Vapache, and verify renewal:
 
 ```console
-$ sudo a2ensite drupal.conf
 $ sudo vapachectl configtest
-$ sudo systemctl enable --now vapache.service
+$ sudo systemctl reload vapache.service
+$ sudo certbot renew --dry-run
 ```
 
 ## 6. Test Drupal

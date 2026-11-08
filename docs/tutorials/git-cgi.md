@@ -13,29 +13,24 @@ through Vapache CGI. The example domain is `git.example.test`.
 
 ## What you will do
 
-You will install Gitweb and Vapache on a fresh Debian VPS, verify the installed
-CGI paths, create one bare repository, configure bounded CGI routes, protect
-the routes with Basic authentication, push a commit, and test a reload.
+You will install Gitweb on a prepared Debian VPS, verify the installed CGI
+paths, create one bare repository, obtain a certificate, configure bounded CGI
+routes, protect the routes with HTTPS and Basic authentication, push a commit,
+and test a reload.
 
 ## Before you start
 
-This tutorial starts with a fresh Debian 13 VPS. Point `git.example.test` at
-the VPS and open TCP port 80 in the provider firewall. Download the current
-Vapache Debian package from the [release
-page](https://github.com/JD-P/vapache/releases) to `/tmp/vapache.deb`.
+Complete [Prepare a Debian VPS for a Vapache
+tutorial](prepare-debian-vps.md). Point `git.example.test` at the VPS and open
+TCP ports 80 and 443 in the provider firewall.
 
-## 1. Install Vapache and Gitweb
+## 1. Install Gitweb
 
-Install the Vapache package and the Debian packages used by this deployment:
+Install the Debian packages used by this deployment:
 
 ```console
-$ sudo apt update
-$ sudo apt install /tmp/vapache.deb apache2 apache2-utils git gitweb libcgi-pm-perl
-$ sudo systemctl disable --now apache2.service
+$ sudo apt install apache2-utils git gitweb libcgi-pm-perl
 ```
-
-The Apache package supplies the configuration tree that Vapache reads. It does
-not need to run.
 
 Verify the three paths used later in the virtual host:
 
@@ -63,14 +58,16 @@ $ sudo -u git git init --bare --shared=group /srv/git/example.git
 $ sudo -u git git -C /srv/git/example.git symbolic-ref HEAD refs/heads/main
 $ sudo -u git git -C /srv/git/example.git config http.receivepack true
 $ sudo install -d -o root -g www-data -m 0750 /etc/vapache/auth
-$ sudo htpasswd -c /etc/vapache/auth/git.htpasswd alice
+$ sudo htpasswd -B -C 12 -c /etc/vapache/auth/git.htpasswd alice
 $ sudo chown root:www-data /etc/vapache/auth/git.htpasswd
 $ sudo chmod 0640 /etc/vapache/auth/git.htpasswd
 ```
 
 The `www-data` identity executes both CGI programs. Membership in `gitwriters`
-lets smart HTTP update this repository. Do not add unrelated services or users
-to that group.
+lets every authenticated user update every repository in `/srv/git`; this
+tutorial therefore implements one shared authorization tier. Use Gitea or
+another forge when you need per-user or per-repository authorization. Do not
+add unrelated services or users to `gitwriters`.
 
 ## 3. Configure Gitweb
 
@@ -91,7 +88,26 @@ $ sudo install -d -o www-data -g www-data -m 0750 /var/cache/gitweb
 
 ## 4. Configure Vapache
 
-Create `/etc/apache2/sites-available/git.conf` with this virtual host. If
+First create `/etc/apache2/sites-available/git.conf` with an HTTP-only virtual
+host that Certbot can use:
+
+```apache
+<VirtualHost *:80>
+    ServerName git.example.test
+</VirtualHost>
+```
+
+Enable it, reload Vapache, and obtain the certificate through Vapache's
+Certbot control shim:
+
+```console
+$ sudo a2ensite git.conf
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ sudo certbot certonly --apache --domain git.example.test
+```
+
+Replace the temporary virtual host with the following configuration. If
 `git --exec-path` printed another directory in step 1, replace both
 `/usr/lib/git-core` paths with that directory.
 
@@ -101,6 +117,15 @@ VapacheCapability Cgi On
 
 <VirtualHost *:80>
     ServerName git.example.test
+    Redirect permanent / https://git.example.test/
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName git.example.test
+
+    SSLEngine On
+    SSLCertificateFile /etc/letsencrypt/live/git.example.test/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/git.example.test/privkey.pem
 
     SetEnv GITWEB_CONFIG /etc/gitweb.conf
     SetEnv GIT_PROJECT_ROOT /srv/git
@@ -128,19 +153,19 @@ VapacheCapability Cgi On
 </VirtualHost>
 ```
 
-Enable the virtual host, test the configuration, and start Vapache:
+Test the final configuration, reload Vapache, and test certificate renewal:
 
 ```console
-$ sudo a2ensite git.conf
 $ sudo vapachectl configtest
-$ sudo systemctl enable --now vapache.service
+$ sudo systemctl reload vapache.service
+$ sudo certbot renew --dry-run
 ```
 
 ## 5. Test browsing, cloning, and pushing
 
 ```console
-$ curl --fail --user alice http://git.example.test/gitweb
-$ git clone http://alice@git.example.test/git/example.git /tmp/example-clone
+$ curl --fail --user alice https://git.example.test/gitweb
+$ git clone https://alice@git.example.test/git/example.git /tmp/example-clone
 $ cd /tmp/example-clone
 $ printf '%s\n' 'Vapache smart HTTP test' > README.md
 $ git add README.md
@@ -148,7 +173,7 @@ $ git -c user.name='Vapache test' -c user.email='test@example.test' \
     commit -m 'Test smart HTTP'
 $ git push -u origin HEAD:main
 $ sudo systemctl reload vapache.service
-$ git clone http://alice@git.example.test/git/example.git /tmp/example-check
+$ git clone https://alice@git.example.test/git/example.git /tmp/example-check
 $ cat /tmp/example-check/README.md
 Vapache smart HTTP test
 ```

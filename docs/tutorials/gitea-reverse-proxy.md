@@ -30,12 +30,22 @@ $ sudo apt install git
 $ curl --fail --show-error --location \
     --output /tmp/gitea \
     https://dl.gitea.com/gitea/1.26.0/gitea-1.26.0-linux-amd64
+$ curl --fail --show-error --location \
+    --output /tmp/gitea.asc \
+    https://dl.gitea.com/gitea/1.26.0/gitea-1.26.0-linux-amd64.asc
+$ curl --fail --show-error --location \
+    'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x7C9E68152594688862D62AF62D9AE806EC1592E2' \
+    --output /tmp/gitea-signing-key.asc
+$ test "$(gpg --show-keys --with-colons /tmp/gitea-signing-key.asc \
+    | awk -F: '$1 == "fpr" { print $10; exit }')" \
+    = 7C9E68152594688862D62AF62D9AE806EC1592E2
+$ gpg --batch --import /tmp/gitea-signing-key.asc
+$ gpg --batch --verify /tmp/gitea.asc /tmp/gitea
 $ sudo install -m 0755 /tmp/gitea /usr/local/bin/gitea
 $ sudo adduser --system --group --home /var/lib/gitea git
 $ sudo install -d -o git -g git -m 0750 /var/lib/gitea/data \
     /var/lib/gitea/log /var/lib/gitea/custom
 $ sudo install -d -o root -g git -m 0750 /etc/gitea
-$ sudo certbot certonly --standalone --domain git.example.test
 ```
 
 Create `/etc/gitea/app.ini`:
@@ -96,12 +106,53 @@ $ sudo systemctl enable --now gitea.service
 $ curl -I http://127.0.0.1:3000/gitea/
 ```
 
-## 2. Configure Vapache
+## 2. Complete the Gitea installation on the private listener
 
-Create `/etc/apache2/sites-available/gitea.conf`. The trailing slashes are
-significant:
+From your workstation, replace `your-user` and `VPS-IP` in this command and
+forward the loopback listener through SSH:
+
+```console
+$ ssh -L 3000:127.0.0.1:3000 your-user@VPS-IP
+```
+
+Open `http://127.0.0.1:3000/gitea/`. Keep SQLite and the repository paths from
+step 1, create the administrator account, and complete the installer. Close the
+SSH tunnel after setup.
+
+Prevent the Gitea process from rewriting its configuration and restart it:
+
+```console
+$ sudo chown root:git /etc/gitea/app.ini
+$ sudo chmod 0640 /etc/gitea/app.ini
+$ sudo systemctl restart gitea.service
+```
+
+## 3. Configure Vapache
+
+Create `/etc/apache2/sites-available/gitea.conf` with a temporary HTTP-only
+host, enable it, and obtain the certificate:
 
 ```apache
+<VirtualHost *:80>
+    ServerName git.example.test
+</VirtualHost>
+```
+
+```console
+$ sudo a2ensite gitea.conf
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ sudo certbot certonly --apache --domain git.example.test
+```
+
+Replace it with the final configuration. The trailing slashes are significant:
+
+```apache
+<VirtualHost *:80>
+    ServerName git.example.test
+    Redirect permanent / https://git.example.test/gitea/
+</VirtualHost>
+
 <VirtualHost *:443>
     ServerName git.example.test
     SSLEngine On
@@ -113,25 +164,17 @@ significant:
 </VirtualHost>
 ```
 
-Enable the virtual host, test the configuration, and start Vapache:
+Test the configuration, reload Vapache, and verify renewal:
 
 ```console
-$ sudo a2ensite gitea.conf
 $ sudo vapachectl configtest
-$ sudo systemctl enable --now vapache.service
+$ sudo systemctl reload vapache.service
+$ sudo certbot renew --dry-run
 ```
 
-## 3. Complete the Gitea installation
-
-Open `https://git.example.test/gitea/`. Keep SQLite and the repository paths
-from step 1, create the administrator account, and complete the installer.
-After the installer succeeds, prevent the Gitea process from rewriting its
-configuration and check the public API:
+Check the public API:
 
 ```console
-$ sudo chown root:git /etc/gitea/app.ini
-$ sudo chmod 0640 /etc/gitea/app.ini
-$ sudo systemctl restart gitea.service
 $ curl --fail https://git.example.test/gitea/api/v1/version
 ```
 

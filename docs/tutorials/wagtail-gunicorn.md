@@ -27,13 +27,15 @@ TCP ports 80 and 443 in the provider firewall.
 
 ```console
 $ sudo apt install postgresql python3-venv
-$ sudo adduser --system --group --home /srv/wagtail wagtail
+$ sudo adduser --system --group --home /var/lib/wagtail wagtail
 $ sudo -u postgres createuser wagtail
 $ sudo -u postgres createdb --owner=wagtail wagtail
 $ sudo python3 -m venv /opt/wagtail
-$ sudo /opt/wagtail/bin/pip install --upgrade pip wagtail gunicorn 'psycopg[binary]'
+$ sudo /opt/wagtail/bin/pip install \
+    'wagtail==8.1' 'gunicorn==23.0.0' 'psycopg[binary]==3.3.8'
+$ sudo install -d -o root -g root -m 0755 /srv/wagtail
+$ sudo install -d -o wagtail -g wagtail -m 0750 /srv/wagtail/current
 $ sudo -u wagtail /opt/wagtail/bin/wagtail start mysite /srv/wagtail/current
-$ sudo certbot certonly --standalone --domain cms.example.test
 ```
 
 In `/srv/wagtail/current/mysite/settings/base.py`, replace the generated
@@ -57,6 +59,7 @@ Add these values to `/srv/wagtail/current/mysite/settings/production.py`:
 ALLOWED_HOSTS = ['cms.example.test']
 CSRF_TRUSTED_ORIGINS = ['https://cms.example.test']
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+MEDIA_ROOT = BASE_DIR / 'media'
 ```
 
 Initialize the database and create the administrator used in the final test:
@@ -68,7 +71,15 @@ $ sudo -u wagtail env DJANGO_SETTINGS_MODULE=mysite.settings.production \
     /opt/wagtail/bin/python /srv/wagtail/current/manage.py createsuperuser
 $ sudo -u wagtail env DJANGO_SETTINGS_MODULE=mysite.settings.production \
     /opt/wagtail/bin/python /srv/wagtail/current/manage.py collectstatic --noinput
+$ sudo install -d -o wagtail -g wagtail -m 0750 /srv/wagtail/current/media
+$ sudo chown -R root:root /srv/wagtail/current
+$ sudo chmod -R a-w /srv/wagtail/current
+$ sudo chown -R wagtail:wagtail /srv/wagtail/current/media
+$ sudo chmod -R u+rwX /srv/wagtail/current/media
 ```
+
+Gunicorn can write uploaded media, but it cannot change the application source
+or static files.
 
 Create `/etc/systemd/system/wagtail-gunicorn.service`:
 
@@ -82,10 +93,13 @@ User=wagtail
 Group=wagtail
 WorkingDirectory=/srv/wagtail/current
 Environment=DJANGO_SETTINGS_MODULE=mysite.settings.production
+Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/wagtail/bin/gunicorn --bind 127.0.0.1:8000 mysite.wsgi:application
 Restart=on-failure
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/srv/wagtail/current/media
 
 [Install]
 WantedBy=multi-user.target
@@ -101,9 +115,30 @@ $ curl -I -H 'Host: cms.example.test' http://127.0.0.1:8000/
 
 ## 3. Configure Vapache
 
-Create `/etc/apache2/sites-available/wagtail.conf`:
+Create `/etc/apache2/sites-available/wagtail.conf` with a temporary HTTP-only
+host, enable it, and obtain the certificate:
 
 ```apache
+<VirtualHost *:80>
+    ServerName cms.example.test
+</VirtualHost>
+```
+
+```console
+$ sudo a2ensite wagtail.conf
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ sudo certbot certonly --apache --domain cms.example.test
+```
+
+Replace it with the final configuration:
+
+```apache
+<VirtualHost *:80>
+    ServerName cms.example.test
+    Redirect permanent / https://cms.example.test/
+</VirtualHost>
+
 <VirtualHost *:443>
     ServerName cms.example.test
     SSLEngine On
@@ -121,12 +156,12 @@ Create `/etc/apache2/sites-available/wagtail.conf`:
 </VirtualHost>
 ```
 
-Enable the virtual host, test the configuration, and start Vapache:
+Test the configuration, reload Vapache, and verify renewal:
 
 ```console
-$ sudo a2ensite wagtail.conf
 $ sudo vapachectl configtest
-$ sudo systemctl enable --now vapache.service
+$ sudo systemctl reload vapache.service
+$ sudo certbot renew --dry-run
 ```
 
 ## 4. Test the site and admin session

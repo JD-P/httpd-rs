@@ -29,12 +29,16 @@ TCP ports 80 and 443 in the provider firewall.
 $ sudo apt install fontconfig gnupg openjdk-21-jre
 $ curl --fail --show-error --location \
     https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key \
-    | sudo tee /usr/share/keyrings/jenkins-keyring.asc >/dev/null
+    --output /tmp/jenkins-keyring.asc
+$ test "$(gpg --show-keys --with-colons /tmp/jenkins-keyring.asc \
+    | awk -F: '$1 == "fpr" { print $10; exit }')" \
+    = 63667EE74BBA1F0A08A698725BA31D57EF5975CA
+$ sudo install -o root -g root -m 0644 /tmp/jenkins-keyring.asc \
+    /usr/share/keyrings/jenkins-keyring.asc
 $ echo 'deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/' \
     | sudo tee /etc/apt/sources.list.d/jenkins.list >/dev/null
 $ sudo apt update
 $ sudo apt install jenkins
-$ sudo certbot certonly --standalone --domain ci.example.test
 ```
 
 ## 2. Configure the Jenkins listener and prefix
@@ -62,11 +66,51 @@ $ curl -I http://127.0.0.1:8080/jenkins/login
 The explicit restart applies the loopback listener and `/jenkins` prefix even
 if the package started Jenkins during installation.
 
-## 3. Configure Vapache
+## 3. Complete Jenkins setup on the private listener
 
-Create `/etc/apache2/sites-available/jenkins.conf`:
+Read the initial administrator password:
+
+```console
+$ sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+```
+
+From your workstation, replace `your-user` and `VPS-IP` in this command and
+forward the loopback listener through SSH:
+
+```console
+$ ssh -L 8080:127.0.0.1:8080 your-user@VPS-IP
+```
+
+Open `http://127.0.0.1:8080/jenkins/`, enter the initial password, install the
+suggested plugins, and create the first administrator. Set the Jenkins URL to
+`https://ci.example.test/jenkins/`. Close the SSH tunnel after setup.
+
+## 4. Configure Vapache
+
+Create `/etc/apache2/sites-available/jenkins.conf` with a temporary HTTP-only
+host, enable it, and obtain the certificate:
 
 ```apache
+<VirtualHost *:80>
+    ServerName ci.example.test
+</VirtualHost>
+```
+
+```console
+$ sudo a2ensite jenkins.conf
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ sudo certbot certonly --apache --domain ci.example.test
+```
+
+Replace it with the final configuration:
+
+```apache
+<VirtualHost *:80>
+    ServerName ci.example.test
+    Redirect permanent / https://ci.example.test/jenkins/
+</VirtualHost>
+
 <VirtualHost *:443>
     ServerName ci.example.test
     SSLEngine On
@@ -78,25 +122,13 @@ Create `/etc/apache2/sites-available/jenkins.conf`:
 </VirtualHost>
 ```
 
-Enable the virtual host, test the configuration, and start Vapache:
+Test the configuration, reload Vapache, and verify renewal:
 
 ```console
-$ sudo a2ensite jenkins.conf
 $ sudo vapachectl configtest
-$ sudo systemctl enable --now vapache.service
+$ sudo systemctl reload vapache.service
+$ sudo certbot renew --dry-run
 ```
-
-## 4. Complete Jenkins setup
-
-Read the initial administrator password:
-
-```console
-$ sudo cat /var/lib/jenkins/secrets/initialAdminPassword
-```
-
-Open `https://ci.example.test/jenkins/`, enter that password, install the
-suggested plugins, and create the first administrator. In **Manage Jenkins →
-System → Jenkins URL**, set `https://ci.example.test/jenkins/`.
 
 ## 5. Test an authenticated state change
 

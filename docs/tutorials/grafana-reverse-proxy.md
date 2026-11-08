@@ -24,7 +24,7 @@ Complete [Prepare a Debian VPS for a Vapache
 tutorial](prepare-debian-vps.md). Point `monitor.example.test` at the VPS and
 open TCP ports 80 and 443 in the provider firewall.
 
-## 1. Install Grafana and the certificate
+## 1. Install Grafana
 
 Install Grafana from its Debian repository:
 
@@ -32,13 +32,16 @@ Install Grafana from its Debian repository:
 $ sudo apt install gnupg
 $ sudo install -d -m 0755 /etc/apt/keyrings
 $ curl --fail --show-error --location https://apt.grafana.com/gpg.key \
-    | gpg --dearmor \
+    --output /tmp/grafana-signing-key.asc
+$ test "$(gpg --show-keys --with-colons /tmp/grafana-signing-key.asc \
+    | awk -F: '$1 == "fpr" { print $10; exit }')" \
+    = B53AE77BADB630A683046005963FA27710458545
+$ gpg --dearmor < /tmp/grafana-signing-key.asc \
     | sudo tee /etc/apt/keyrings/grafana.gpg >/dev/null
 $ echo 'deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main' \
     | sudo tee /etc/apt/sources.list.d/grafana.list >/dev/null
 $ sudo apt update
 $ sudo apt install grafana
-$ sudo certbot certonly --standalone --domain monitor.example.test
 ```
 
 ## 2. Configure Grafana
@@ -62,11 +65,43 @@ $ sudo systemctl restart grafana-server.service
 $ curl --fail http://127.0.0.1:3000/api/health
 ```
 
+Before publishing Grafana, forward its loopback port through SSH from your
+workstation:
+
+```console
+$ ssh -L 3000:127.0.0.1:3000 your-user@VPS-IP
+```
+
+Replace `your-user` and `VPS-IP` with your administrative SSH login. Open
+`http://127.0.0.1:3000/grafana/`, sign in with Grafana's initial credentials,
+and replace the initial administrator password.
+
 ## 3. Configure Vapache
 
-Create `/etc/apache2/sites-available/grafana.conf`:
+Create `/etc/apache2/sites-available/grafana.conf` with a temporary HTTP-only
+host, enable it, and obtain the certificate:
 
 ```apache
+<VirtualHost *:80>
+    ServerName monitor.example.test
+</VirtualHost>
+```
+
+```console
+$ sudo a2ensite grafana.conf
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ sudo certbot certonly --apache --domain monitor.example.test
+```
+
+Replace it with the final configuration:
+
+```apache
+<VirtualHost *:80>
+    ServerName monitor.example.test
+    Redirect permanent / https://monitor.example.test/grafana/
+</VirtualHost>
+
 <VirtualHost *:443>
     ServerName monitor.example.test
     SSLEngine On
@@ -78,12 +113,12 @@ Create `/etc/apache2/sites-available/grafana.conf`:
 </VirtualHost>
 ```
 
-Enable the virtual host, test the configuration, and start Vapache:
+Test the configuration, reload Vapache, and verify renewal:
 
 ```console
-$ sudo a2ensite grafana.conf
 $ sudo vapachectl configtest
-$ sudo systemctl enable --now vapache.service
+$ sudo systemctl reload vapache.service
+$ sudo certbot renew --dry-run
 ```
 
 ## 4. Test HTTP and WebSocket behavior

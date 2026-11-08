@@ -42,10 +42,7 @@ $ printf '%s\n' '<!doctype html><title>Not found</title><h1>Not found</h1>' \
     | sudo -u deploy tee /srv/hugo/source/layouts/404.html >/dev/null
 $ printf '%s\n' "console.log('Vapache Hugo tutorial');" \
     | sudo -u deploy tee /srv/hugo/source/static/assets/app.js >/dev/null
-$ sudo certbot certonly --standalone --domain docs.example.test
 ```
-
-Certbot must report that it created the certificate before you continue.
 
 ## 2. Build an immutable release
 
@@ -70,9 +67,32 @@ $ test -f /srv/www/hugo/releases/2026-11-08/public/assets/app.js
 
 ## 3. Configure Vapache
 
-Create `/etc/apache2/sites-available/hugo.conf` with this virtual host:
+Create `/etc/apache2/sites-available/hugo.conf` with this temporary HTTP-only
+virtual host:
 
 ```apache
+<VirtualHost *:80>
+    ServerName docs.example.test
+</VirtualHost>
+```
+
+Enable it, reload Vapache, and obtain the certificate:
+
+```console
+$ sudo a2ensite hugo.conf
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ sudo certbot certonly --apache --domain docs.example.test
+```
+
+Replace the temporary host with the final HTTP redirect and HTTPS host:
+
+```apache
+<VirtualHost *:80>
+    ServerName docs.example.test
+    Redirect permanent / https://docs.example.test/
+</VirtualHost>
+
 <VirtualHost *:443>
     ServerName docs.example.test
     DocumentRoot /srv/www/hugo/releases/2026-11-08/public
@@ -93,12 +113,12 @@ Create `/etc/apache2/sites-available/hugo.conf` with this virtual host:
 </VirtualHost>
 ```
 
-Enable the site, test the configuration, and start Vapache:
+Test the configuration, reload Vapache, and verify renewal:
 
 ```console
-$ sudo a2ensite hugo.conf
 $ sudo vapachectl configtest
-$ sudo systemctl enable --now vapache.service
+$ sudo systemctl reload vapache.service
+$ sudo certbot renew --dry-run
 ```
 
 ## 4. Test the site

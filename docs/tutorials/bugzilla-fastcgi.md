@@ -39,7 +39,6 @@ $ sudo git -C /srv/bugzilla/current checkout \
 $ cd /srv/bugzilla/current
 $ sudo perl install-module.pl --all
 $ sudo perl checksetup.pl
-$ sudo certbot certonly --standalone --domain bugs.example.test
 ```
 
 The first `checksetup.pl` run creates `localconfig` and reports the remaining
@@ -126,11 +125,32 @@ socket 33:33 660 /run/fcgiwrap/bugzilla.sock
 
 ## 3. Configure Vapache
 
-Create `/etc/apache2/sites-available/bugzilla.conf`:
+Create `/etc/apache2/sites-available/bugzilla.conf` with a temporary HTTP-only
+host, enable it, and obtain the certificate:
+
+```apache
+<VirtualHost *:80>
+    ServerName bugs.example.test
+</VirtualHost>
+```
+
+```console
+$ sudo a2ensite bugzilla.conf
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ sudo certbot certonly --apache --domain bugs.example.test
+```
+
+Replace it with the final configuration:
 
 ```apache
 VapacheCapability FastCgi On
 VapacheFastCGIStablePath On unix:/run/fcgiwrap/bugzilla.sock 33 33 0
+
+<VirtualHost *:80>
+    ServerName bugs.example.test
+    Redirect permanent / https://bugs.example.test/
+</VirtualHost>
 
 <VirtualHost *:443>
     ServerName bugs.example.test
@@ -154,12 +174,12 @@ VapacheFastCGIStablePath On unix:/run/fcgiwrap/bugzilla.sock 33 33 0
 </VirtualHost>
 ```
 
-Enable the virtual host, test the configuration, and start Vapache:
+Test the configuration, reload Vapache, and verify renewal:
 
 ```console
-$ sudo a2ensite bugzilla.conf
 $ sudo vapachectl configtest
-$ sudo systemctl enable --now vapache.service
+$ sudo systemctl reload vapache.service
+$ sudo certbot renew --dry-run
 ```
 
 ## 4. Test Bugzilla

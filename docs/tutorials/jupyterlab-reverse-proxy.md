@@ -32,7 +32,6 @@ $ sudo adduser --system --group --home /srv/jupyter jupyter
 $ sudo python3 -m venv /opt/jupyterlab
 $ sudo /opt/jupyterlab/bin/pip install --upgrade pip jupyterlab
 $ sudo -u jupyter /opt/jupyterlab/bin/jupyter server password
-$ sudo certbot certonly --standalone --domain lab.example.test
 ```
 
 Enter the password that administrators will use at the public JupyterLab login
@@ -87,9 +86,30 @@ $ curl -I http://127.0.0.1:8888/jupyter/
 
 ## 3. Configure Vapache
 
-Create `/etc/apache2/sites-available/jupyterlab.conf`:
+Create `/etc/apache2/sites-available/jupyterlab.conf` with a temporary
+HTTP-only host, enable it, and obtain the certificate:
 
 ```apache
+<VirtualHost *:80>
+    ServerName lab.example.test
+</VirtualHost>
+```
+
+```console
+$ sudo a2ensite jupyterlab.conf
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ sudo certbot certonly --apache --domain lab.example.test
+```
+
+Replace it with the final configuration:
+
+```apache
+<VirtualHost *:80>
+    ServerName lab.example.test
+    Redirect permanent / https://lab.example.test/jupyter/
+</VirtualHost>
+
 <VirtualHost *:443>
     ServerName lab.example.test
     SSLEngine On
@@ -101,12 +121,12 @@ Create `/etc/apache2/sites-available/jupyterlab.conf`:
 </VirtualHost>
 ```
 
-Enable the virtual host, test the configuration, and start Vapache:
+Test the configuration, reload Vapache, and verify renewal:
 
 ```console
-$ sudo a2ensite jupyterlab.conf
 $ sudo vapachectl configtest
-$ sudo systemctl enable --now vapache.service
+$ sudo systemctl reload vapache.service
+$ sudo certbot renew --dry-run
 ```
 
 ## 4. Test a kernel and reload

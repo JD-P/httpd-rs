@@ -33,10 +33,20 @@ $ sudo apt install mariadb-server php8.4-cli php8.4-curl php8.4-fpm \
 $ curl --fail --show-error --location \
     --output /tmp/wp-cli.phar \
     https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+$ curl --fail --show-error --location \
+    --output /tmp/wp-cli.phar.asc \
+    https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar.asc
+$ curl --fail --show-error --location \
+    --output /tmp/wp-cli.pgp \
+    https://raw.githubusercontent.com/wp-cli/builds/gh-pages/wp-cli.pgp
+$ test "$(gpg --show-keys --with-colons /tmp/wp-cli.pgp \
+    | awk -F: '$1 == "fpr" { print $10; exit }')" \
+    = 63AF7AA15067C05616FDDD88A3A2E8F226F0BC06
+$ gpg --batch --import /tmp/wp-cli.pgp
+$ gpg --batch --verify /tmp/wp-cli.phar.asc /tmp/wp-cli.phar
 $ sudo install -m 0755 /tmp/wp-cli.phar /usr/local/bin/wp
 $ id -u www-data
 33
-$ sudo certbot certonly --standalone --domain www.example.test
 ```
 
 Do not continue if `id -u` reports a value other than `33`.
@@ -59,12 +69,11 @@ $ sudo install -d -o root -g root -m 0755 /srv/wordpress/current
 $ sudo wp core download --allow-root --version=6.8.3 \
     --path=/srv/wordpress/current
 $ sudo wp config create --allow-root --path=/srv/wordpress/current \
-    --dbname=wordpress --dbuser=wordpress \
-    --dbpass='replace-database-password'
+    --dbname=wordpress --dbuser=wordpress --prompt=dbpass
 $ sudo wp core install --allow-root --path=/srv/wordpress/current \
     --url=https://www.example.test --title='Vapache WordPress tutorial' \
-    --admin_user=admin --admin_password='replace-admin-password' \
-    --admin_email=admin@example.test
+    --admin_user=admin --admin_email=admin@example.test \
+    --prompt=admin_password
 $ sudo wp rewrite structure '/%postname%/' --hard --allow-root \
     --path=/srv/wordpress/current
 $ sudo install -d -o www-data -g www-data -m 0750 \
@@ -128,12 +137,33 @@ writable data path through the deployment process.
 
 ## 5. Configure Vapache
 
-Create `/etc/apache2/sites-available/wordpress.conf`:
+Create `/etc/apache2/sites-available/wordpress.conf` with a temporary HTTP-only
+host, enable it, and obtain the certificate:
+
+```apache
+<VirtualHost *:80>
+    ServerName www.example.test
+</VirtualHost>
+```
+
+```console
+$ sudo a2ensite wordpress.conf
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ sudo certbot certonly --apache --domain www.example.test
+```
+
+Replace it with the final configuration:
 
 ```apache
 VapacheCapability AccessFiles On
 VapacheCapability FastCgi On
 VapacheFastCGIStablePath On unix:/run/php/wordpress-fpm.sock 33 0 0
+
+<VirtualHost *:80>
+    ServerName www.example.test
+    Redirect permanent / https://www.example.test/
+</VirtualHost>
 
 <VirtualHost *:443>
     ServerName www.example.test
@@ -159,12 +189,12 @@ VapacheFastCGIStablePath On unix:/run/php/wordpress-fpm.sock 33 0 0
 </VirtualHost>
 ```
 
-Enable the virtual host, test the configuration, and start Vapache:
+Test the configuration, reload Vapache, and verify renewal:
 
 ```console
-$ sudo a2ensite wordpress.conf
 $ sudo vapachectl configtest
-$ sudo systemctl enable --now vapache.service
+$ sudo systemctl reload vapache.service
+$ sudo certbot renew --dry-run
 ```
 
 ## 6. Test WordPress

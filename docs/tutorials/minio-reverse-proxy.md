@@ -24,18 +24,49 @@ Complete [Prepare a Debian VPS for a Vapache
 tutorial](prepare-debian-vps.md). Point `s3.example.test` at the VPS and open
 TCP ports 80 and 443 in the provider firewall.
 
-## 1. Install MinIO and create its service
+## 1. Install verified MinIO and `mc` releases
 
 ```console
+$ sudo apt install golang-go git
 $ curl --fail --show-error --location \
-    --output /tmp/minio https://dl.min.io/server/minio/release/linux-amd64/minio
-$ curl --fail --show-error --location \
-    --output /tmp/mc https://dl.min.io/client/mc/release/linux-amd64/mc
+    'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x4405F3F0DDBA1B9E68A31D2512C74390F9AAC728' \
+    --output /tmp/minio-signing-key.asc
+$ test "$(gpg --show-keys --with-colons /tmp/minio-signing-key.asc \
+    | awk -F: '$1 == "fpr" { print $10; exit }')" \
+    = 4405F3F0DDBA1B9E68A31D2512C74390F9AAC728
+$ gpg --batch --import /tmp/minio-signing-key.asc
+$ git clone --filter=blob:none --no-checkout \
+    https://github.com/minio/minio.git /tmp/minio-source
+$ git -C /tmp/minio-source fetch --depth=1 origin \
+    tag RELEASE.2025-09-07T16-13-09Z
+$ git -C /tmp/minio-source verify-tag RELEASE.2025-09-07T16-13-09Z
+$ git -C /tmp/minio-source checkout --detach \
+    07c3a429bfed433e49018cb0f78a52145d4bedeb
+$ test "$(git -C /tmp/minio-source rev-parse HEAD)" \
+    = 07c3a429bfed433e49018cb0f78a52145d4bedeb
+$ git clone --filter=blob:none --no-checkout \
+    https://github.com/minio/mc.git /tmp/mc-source
+$ git -C /tmp/mc-source fetch --depth=1 origin \
+    tag RELEASE.2025-08-13T08-35-41Z
+$ git -C /tmp/mc-source verify-tag RELEASE.2025-08-13T08-35-41Z
+$ git -C /tmp/mc-source checkout --detach \
+    7394ce0dd2a80935aded936b09fa12cbb3cb8096
+$ test "$(git -C /tmp/mc-source rev-parse HEAD)" \
+    = 7394ce0dd2a80935aded936b09fa12cbb3cb8096
+$ cd /tmp/minio-source && go build -trimpath -o /tmp/minio .
+$ cd /tmp/mc-source && go build -trimpath -o /tmp/mc .
 $ sudo install -m 0755 /tmp/minio /usr/local/bin/minio
 $ sudo install -m 0755 /tmp/mc /usr/local/bin/mc
+```
+
+The pinned signing-key fingerprint and commit IDs make both source checkouts
+reviewable. Go verifies downloaded modules against each checkout's `go.sum`.
+
+## 2. Create the MinIO service
+
+```console
 $ sudo adduser --system --group --home /var/lib/minio minio
 $ sudo install -d -o minio -g minio -m 0750 /srv/minio/data
-$ sudo certbot certonly --standalone --domain s3.example.test
 ```
 
 Create `/etc/default/minio` and replace both example credentials with new
@@ -85,11 +116,47 @@ $ sudo systemctl enable --now minio.service
 $ curl --fail http://127.0.0.1:9000/minio/health/live
 ```
 
-## 2. Configure Vapache
+Create a limited account for the public test. These `read` commands do not put
+either password in shell history:
 
-Create `/etc/apache2/sites-available/minio.conf`:
+```console
+$ read -rsp 'MinIO root password: ' MINIO_ROOT_PASSWORD; echo
+$ read -rsp 'New test-account password: ' MINIO_TEST_PASSWORD; echo
+$ mc alias set minio-local http://127.0.0.1:9000 \
+    minio-admin "$MINIO_ROOT_PASSWORD"
+$ mc admin user add minio-local vapache-test "$MINIO_TEST_PASSWORD"
+$ mc admin policy attach minio-local readwrite --user vapache-test
+$ unset MINIO_ROOT_PASSWORD
+```
+
+Keep `MINIO_TEST_PASSWORD` in this shell until the final test finishes.
+
+## 3. Configure Vapache
+
+Create `/etc/apache2/sites-available/minio.conf` with a temporary HTTP-only
+host, enable it, and obtain the certificate:
 
 ```apache
+<VirtualHost *:80>
+    ServerName s3.example.test
+</VirtualHost>
+```
+
+```console
+$ sudo a2ensite minio.conf
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ sudo certbot certonly --apache --domain s3.example.test
+```
+
+Replace it with the final configuration:
+
+```apache
+<VirtualHost *:80>
+    ServerName s3.example.test
+    Redirect permanent / https://s3.example.test/
+</VirtualHost>
+
 <VirtualHost *:443>
     ServerName s3.example.test
     SSLEngine On
@@ -102,21 +169,21 @@ Create `/etc/apache2/sites-available/minio.conf`:
 </VirtualHost>
 ```
 
-Enable the virtual host, test the configuration, and start Vapache:
+Test the configuration, reload Vapache, and verify renewal:
 
 ```console
-$ sudo a2ensite minio.conf
 $ sudo vapachectl configtest
-$ sudo systemctl enable --now vapache.service
+$ sudo systemctl reload vapache.service
+$ sudo certbot renew --dry-run
 ```
 
-## 3. Test signed object operations
+## 4. Test signed object operations
 
-Replace `ACCESS_KEY` and `SECRET_KEY` with the `MINIO_ROOT_USER` and
-`MINIO_ROOT_PASSWORD` values that you set in step 1, then run:
+Use the limited test account and the password retained in the shell:
 
 ```console
-$ mc alias set vapache-test https://s3.example.test ACCESS_KEY SECRET_KEY
+$ mc alias set vapache-test https://s3.example.test \
+    vapache-test "$MINIO_TEST_PASSWORD"
 $ mc mb vapache-test/vapache-check
 $ dd if=/dev/urandom of=/tmp/vapache-minio.bin bs=1M count=2
 $ mc cp /tmp/vapache-minio.bin vapache-test/vapache-check/object.bin
@@ -132,6 +199,10 @@ streaming, and listing. Remove the object and bucket after `cmp` succeeds:
 ```console
 $ mc rm vapache-test/vapache-check/object.bin
 $ mc rb vapache-test/vapache-check
+$ mc admin user remove minio-local vapache-test
+$ mc alias remove vapache-test
+$ mc alias remove minio-local
+$ unset MINIO_TEST_PASSWORD
 ```
 
 <!--

@@ -30,13 +30,28 @@ firewall.
 
 ```console
 $ sudo apt install autoconf bison build-essential curl ffmpeg file g++ gcc git \
-    imagemagick libffi-dev libgdbm-dev libicu-dev libidn-dev libjemalloc-dev \
+    gnupg imagemagick libffi-dev libgdbm-dev libicu-dev libidn-dev libjemalloc-dev \
     libncurses-dev libpq-dev libprotobuf-dev libreadline-dev libssl-dev \
     libxml2-dev libxslt1-dev libyaml-dev pkg-config postgresql \
     postgresql-contrib protobuf-compiler redis-server ruby-dev ruby-full zlib1g-dev
-$ curl --fail --show-error --location https://deb.nodesource.com/setup_22.x \
-    --output /tmp/nodesource-setup.sh
-$ sudo bash /tmp/nodesource-setup.sh
+$ curl --fail --show-error --location \
+    https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    --output /tmp/nodesource.asc
+$ gpg --show-keys --with-colons /tmp/nodesource.asc | \
+    awk -F: '$1 == "fpr" { print $10; exit }' | \
+    grep -Fx 6F71F525282841EEDAF851B42F59B5F99B1BE0B4
+$ sudo install -d -m 0755 /etc/apt/keyrings
+$ gpg --dearmor --output /tmp/nodesource.gpg /tmp/nodesource.asc
+$ sudo install -o root -g root -m 0644 /tmp/nodesource.gpg \
+    /etc/apt/keyrings/nodesource.gpg
+$ printf '%s\n' \
+    'Types: deb' \
+    'URIs: https://deb.nodesource.com/node_22.x' \
+    'Suites: nodistro' \
+    'Components: main' \
+    'Signed-By: /etc/apt/keyrings/nodesource.gpg' | \
+    sudo tee /etc/apt/sources.list.d/nodesource.sources >/dev/null
+$ sudo apt update
 $ sudo apt install nodejs
 $ sudo corepack enable
 $ sudo gem install bundler --no-document
@@ -45,9 +60,14 @@ $ sudo adduser --disabled-login --gecos '' mastodon
 
 ## 2. Install Mastodon and run its setup
 
+The commit below is the exact source for Mastodon v4.7.5.
+
 ```console
 $ sudo -iu mastodon git clone https://github.com/mastodon/mastodon.git live
-$ sudo -iu mastodon git -C /home/mastodon/live checkout v4.7.5
+$ sudo -iu mastodon git -C /home/mastodon/live checkout \
+    24cd1c875a1ac393e587421726394d5692ff5496
+$ sudo -iu mastodon bash -lc \
+    'test "$(git -C ~/live rev-parse HEAD)" = 24cd1c875a1ac393e587421726394d5692ff5496'
 $ sudo -iu mastodon bash -lc \
     'cd ~/live && bundle config deployment true && bundle config without development test'
 $ sudo -iu mastodon bash -lc 'cd ~/live && bundle install -j2'
@@ -95,7 +115,6 @@ $ sudo systemctl daemon-reload
 $ sudo systemctl enable --now mastodon-web mastodon-sidekiq mastodon-streaming
 $ curl --fail http://127.0.0.1:3000/health
 $ curl --fail http://127.0.0.1:4000/api/v1/streaming/health
-$ sudo certbot certonly --standalone --domain social.example.test
 ```
 
 ## 3. Confirm Mastodon's public domain
@@ -111,10 +130,31 @@ it does not need a separate `WEB_DOMAIN` value.
 
 ## 4. Configure Vapache
 
-Create `/etc/apache2/sites-available/mastodon.conf`. The streaming route must
-appear before the catch-all web route:
+Create `/etc/apache2/sites-available/mastodon.conf` with a temporary HTTP-only
+host, enable it, and obtain the certificate:
 
 ```apache
+<VirtualHost *:80>
+    ServerName social.example.test
+</VirtualHost>
+```
+
+```console
+$ sudo a2ensite mastodon.conf
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ sudo certbot certonly --apache --domain social.example.test
+```
+
+Replace it with the final configuration. The streaming route must appear
+before the catch-all web route:
+
+```apache
+<VirtualHost *:80>
+    ServerName social.example.test
+    Redirect permanent / https://social.example.test/
+</VirtualHost>
+
 <VirtualHost *:443>
     ServerName social.example.test
     SSLEngine On
@@ -129,12 +169,12 @@ appear before the catch-all web route:
 </VirtualHost>
 ```
 
-Enable the virtual host, test the configuration, and start Vapache:
+Test the configuration, reload Vapache, and verify renewal:
 
 ```console
-$ sudo a2ensite mastodon.conf
 $ sudo vapachectl configtest
-$ sudo systemctl enable --now vapache.service
+$ sudo systemctl reload vapache.service
+$ sudo certbot renew --dry-run
 ```
 
 ## 5. Test the web and streaming paths

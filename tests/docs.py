@@ -149,6 +149,86 @@ def check_style_and_structure() -> None:
             raise DocsError(f"{path.relative_to(ROOT)}: how-to is missing prerequisites")
 
 
+def check_deployment_tutorial_security() -> None:
+    tutorials = DOCS / "tutorials"
+    for path in sorted(tutorials.glob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        data = metadata(path, text)
+        if "certbot certonly --standalone" in text:
+            raise DocsError(
+                f"{path.relative_to(ROOT)}: deployment tutorials must not use standalone Certbot"
+            )
+        if "nodesource-setup" in text or "setup_22.x" in text:
+            raise DocsError(
+                f"{path.relative_to(ROOT)}: downloaded repository setup scripts are not allowed"
+            )
+        if data.get("scenario") and "SSLEngine On" in text:
+            for required in (
+                "certbot certonly --apache --domain",
+                "<VirtualHost *:80>",
+                "Redirect permanent / https://",
+                "certbot renew --dry-run",
+            ):
+                if required not in text:
+                    raise DocsError(
+                        f"{path.relative_to(ROOT)}: TLS tutorial is missing {required!r}"
+                    )
+
+    shared = (tutorials / "prepare-debian-vps.md").read_text(encoding="utf-8")
+    for required in (
+        "SHA256SUMS",
+        "sha256sum --check --strict",
+        "python3-certbot-apache",
+        "a2dissite 000-default.conf",
+        "vapache-switch --yes",
+    ):
+        if required not in shared:
+            raise DocsError(f"shared VPS setup is missing {required!r}")
+
+    git_cgi = (tutorials / "git-cgi.md").read_text(encoding="utf-8")
+    if "htpasswd -B -C 12" not in git_cgi:
+        raise DocsError("Git CGI tutorial must use bcrypt password hashes")
+    if "http://git.example.test" in git_cgi:
+        raise DocsError("Git CGI tutorial must not send Basic authentication over HTTP")
+
+    verified_artifacts = {
+        "gitea-reverse-proxy.md": (
+            "7C9E68152594688862D62AF62D9AE806EC1592E2",
+            "gpg --batch --verify /tmp/gitea.asc /tmp/gitea",
+        ),
+        "grafana-reverse-proxy.md": (
+            "B53AE77BADB630A683046005963FA27710458545",
+            "signed-by=/etc/apt/keyrings/grafana.gpg",
+        ),
+        "jenkins-reverse-proxy.md": (
+            "63667EE74BBA1F0A08A698725BA31D57EF5975CA",
+            "signed-by=/usr/share/keyrings/jenkins-keyring.asc",
+        ),
+        "mastodon-tls-streaming.md": (
+            "6F71F525282841EEDAF851B42F59B5F99B1BE0B4",
+            "Signed-By: /etc/apt/keyrings/nodesource.gpg",
+        ),
+        "minio-reverse-proxy.md": (
+            "4405F3F0DDBA1B9E68A31D2512C74390F9AAC728",
+            "git -C /tmp/minio-source verify-tag",
+            "git -C /tmp/mc-source verify-tag",
+        ),
+        "nextcloud-php-fpm.md": (
+            "5810b06e75678384973d8d86387ee39f4c086d79dfa92f15fcb743aaba36eaa9",
+            "sha256sum --check --strict",
+        ),
+        "wordpress-php-fpm.md": (
+            "63AF7AA15067C05616FDDD88A3A2E8F226F0BC06",
+            "gpg --batch --verify /tmp/wp-cli.phar.asc /tmp/wp-cli.phar",
+        ),
+    }
+    for name, required_values in verified_artifacts.items():
+        text = (tutorials / name).read_text(encoding="utf-8")
+        for required in required_values:
+            if required not in text:
+                raise DocsError(f"docs/tutorials/{name}: download verification lost {required!r}")
+
+
 def check_safe_rust_claim() -> None:
     source_files = sorted((ROOT / "crates" / "server" / "src").glob("*.rs"))
     source_lines = 0
@@ -663,6 +743,7 @@ def execute_contracts(contracts: list[dict], capabilities: list[str]) -> None:
 def main() -> int:
     try:
         check_style_and_structure()
+        check_deployment_tutorial_security()
         check_safe_rust_claim()
         check_links()
         check_how_to_catalog()
