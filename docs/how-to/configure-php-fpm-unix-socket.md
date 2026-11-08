@@ -7,9 +7,9 @@ contracts: DOC-HOWTO-FCGI-SOCKET-001
 
 # Configure a protected PHP-FPM Unix socket
 
-Use this procedure to let Vapache authenticate one PHP-FPM pool. Do not use a
-TCP FastCGI endpoint for this connection. Four automated application deployment
-tests exercise this procedure.
+Use this procedure to connect Vapache to one PHP-FPM pool through a protected
+Unix socket. The socket settings let Vapache reject a replaced endpoint or an
+unexpected backend process.
 
 ## Prerequisites
 
@@ -93,20 +93,20 @@ Vapache checks the Unix-socket type, owner, inode, and peer credentials. It
 also checks the script path and its ancestors. A writable executable path,
 unexpected socket replacement, or unexpected peer identity fails closed.
 
-## 5. Keep the policy active
+## 5. Resolve a failed identity check
 
-Do not set `VapacheFastCGIStablePath Off` to resolve an ownership error. Do not
-enable the unstable FastCGI path capability unless the deployment has a
-separate trust analysis for unauthenticated backends.
+If Vapache reports an unexpected owner or peer, compare the error with the
+`id` and `stat` output from steps 1 and 2. Correct the PHP-FPM pool or socket
+ownership. Turning off `VapacheFastCGIStablePath` removes the endpoint identity
+check rather than fixing the mismatch.
 
 Use [Replace an unsafe writable PHP layout](replace-writable-php-layout.md) if
 the PHP process can update application code.
 
-## Evidence
-
-The canonical [WordPress](../tutorials/wordpress-php-fpm.md),
-[Drupal](../tutorials/drupal-php-fpm.md), and
-[Nextcloud](../tutorials/nextcloud-php-fpm.md) deployments use protected
-PHP-FPM Unix sockets. The canonical
-[Bugzilla](../tutorials/bugzilla-fastcgi.md) deployment tests the same stable
-FastCGI boundary with a non-PHP application.
+<!--
+Behavior contract deployment evidence:
+[WordPress](../tutorials/wordpress-php-fpm.md)
+[Drupal](../tutorials/drupal-php-fpm.md)
+[Nextcloud](../tutorials/nextcloud-php-fpm.md)
+[Bugzilla](../tutorials/bugzilla-fastcgi.md)
+-->

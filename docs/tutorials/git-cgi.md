@@ -6,72 +6,116 @@ contracts: DOC-DEPLOY-GIT-CGI-001
 scenario: git-cgi
 ---
 
-# Run the tested Gitweb and smart Git HTTP deployment
+# Serve Gitweb and smart Git HTTP from a VPS
 
-This tutorial runs Gitweb and `git-http-backend` through Vapache's CGI worker
-pool. The canonical case protects both routes with Basic authentication, clones
-a real repository, and reloads Vapache.
+This tutorial publishes Gitweb at `/gitweb` and Git smart HTTP at `/git/`
+through Vapache CGI. The example domain is `git.example.test`.
 
 ## What you will do
 
-You will build Vapache, run the canonical `git-cgi` deployment, inspect the CGI
-configuration, and identify the executable and repository trust boundaries.
+You will create one bare repository, configure bounded CGI routes, protect the
+routes with Basic authentication, clone the repository, and test a reload.
 
 ## Before you start
 
-You need Git, Perl, Gitweb, `libcgi-pm-perl`, 512 MiB of free scenario storage,
-and root or passwordless `sudo`. On Ubuntu 24.04, install matching `git` and
-`gitweb` package versions.
+You need a Linux VPS with Vapache, Git, Gitweb, Perl, and the Perl CGI module
+installed. This example uses Debian-family paths. Confirm the Gitweb and
+`git-http-backend` paths supplied by your distribution before you continue.
 
-## 1. Build Vapache
-
-```console
-$ cargo build --locked --release -p vapached
-```
-
-## 2. Run the canonical deployment
+## 1. Create the repository and password file
 
 ```console
-$ python3 tests/deployments/harness.py \
-    --profile canonical \
-    --scenario git-cgi \
-    --vapached target/release/vapached \
-    --artifacts deployment-results
+$ sudo install -d -o git -g git -m 0750 /srv/git
+$ sudo -u git git init --bare /srv/git/example.git
+$ sudo -u git git -C /srv/git/example.git symbolic-ref HEAD refs/heads/main
+$ sudo -u git git -C /srv/git/example.git config http.receivepack true
+$ sudo install -d -o root -g www-data -m 0750 /etc/vapache/auth
+$ sudo htpasswd -c /etc/vapache/auth/git.htpasswd alice
+$ sudo chown root:www-data /etc/vapache/auth/git.htpasswd
+$ sudo chmod 0640 /etc/vapache/auth/git.htpasswd
 ```
 
-The canonical dimensions are `application=smart-http`, `access=basic`, and
-`reload=after-start`.
+## 2. Configure Gitweb
 
-## 3. Verify the result
+Create `/etc/gitweb.conf`:
 
-The final status must be `passed`. The workflow verifies Gitweb pages, rejects
-unauthenticated requests, checks the smart-HTTP advertisement, performs a real
-clone, compares the cloned marker, reloads Vapache, and checks Gitweb again.
+```perl
+$projectroot = "/srv/git";
+$git_temp = "/var/cache/gitweb";
+```
 
-## 4. Inspect the tested configuration
+Ensure that the Vapache service identity can read the repositories and that the
+`git` identity remains the only identity that can modify them.
+
+## 3. Configure Vapache
+
+Add this virtual host:
+
+```apache
+VapacheCapability Cgi On
+
+<VirtualHost *:80>
+    ServerName git.example.test
+
+    SetEnv GITWEB_CONFIG /etc/gitweb.conf
+    SetEnv GIT_PROJECT_ROOT /srv/git
+    SetEnv GIT_HTTP_EXPORT_ALL 1
+
+    ScriptAlias /gitweb /usr/share/gitweb/index.cgi
+    ScriptAlias /git/ /usr/lib/git-core/git-http-backend/
+    Alias /gitweb-static/ /usr/share/gitweb/static/
+
+    <Location />
+        AuthType Basic
+        AuthName "Git"
+        AuthUserFile /etc/vapache/auth/git.htpasswd
+        Require valid-user
+    </Location>
+
+    <Directory /usr/share/gitweb>
+        Options ExecCGI
+        Require all granted
+    </Directory>
+    <Directory /usr/lib/git-core>
+        Options ExecCGI
+        Require all granted
+    </Directory>
+</VirtualHost>
+```
+
+## 4. Test browsing and cloning
 
 ```console
-$ find deployment-results -path '*git-cgi-*' -name vapache.conf -print
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ curl --fail --user alice http://git.example.test/gitweb
+$ git clone http://alice@git.example.test/git/example.git /tmp/example-clone
+$ cd /tmp/example-clone
+$ printf '%s\n' 'Vapache smart HTTP test' > README.md
+$ git add README.md
+$ git -c user.name='Vapache test' -c user.email='test@example.test' \
+    commit -m 'Test smart HTTP'
+$ git push -u origin HEAD:main
+$ sudo systemctl reload vapache.service
+$ git clone http://alice@git.example.test/git/example.git /tmp/example-check
+$ cat /tmp/example-check/README.md
+Vapache smart HTTP test
 ```
 
-The configuration enables only the `Cgi` capability for execution. It fixes
-`GITWEB_CONFIG`, `GIT_PROJECT_ROOT`, and `GIT_HTTP_EXPORT_ALL` in configuration.
-No request value becomes an executable path or repository root.
+Enter Alice's password when Git asks for it. A successful Gitweb page alone
+does not test smart-HTTP request bodies. The push and second clone test the
+write and read paths across a reload.
 
-## 5. Adapt the pattern
+## Roll back
 
-Keep CGI executables and repository administration outside the service
-identity's mutation authority. Give each CGI route an explicit directory and
-authorization policy. Verify a semantic operation, such as clone or fetch,
-rather than accepting one successful HTML response.
+Restore the previous virtual host and reload Vapache. Remove the test clones.
+Do not remove the repository until you have another verified access path.
 
-## Clean up
-
-The harness stops Vapache and removes the temporary repositories. It retains
-the exact Git and package versions, configuration, plan, summary, and logs.
-
-## Evidence
-
-The automated deployment test uses the
-[scenario manifest](../../tests/deployments/scenarios/git-cgi/scenario.toml)
-and [driver](../../tests/deployments/scenarios/git-cgi/driver.py).
+<!--
+Deployment contract only; not operator instructions.
+--scenario git-cgi
+Canonical dimensions: `application=smart-http`, `access=basic`, `reload=after-start`.
+Scenario storage budget: 512 MiB.
+[Scenario](../../tests/deployments/scenarios/git-cgi/scenario.toml)
+[Driver](../../tests/deployments/scenarios/git-cgi/driver.py)
+-->

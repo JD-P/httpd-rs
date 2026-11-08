@@ -7,9 +7,8 @@ contracts: DOC-HOWTO-HTACCESS-001
 
 # Move `.htaccess` policy into the main configuration
 
-Use this procedure to remove access-file evaluation from a document tree.
-Configuration tests and automated application deployment tests exercise the
-migration.
+Use this procedure to move `.htaccess` rules into the main configuration and
+then stop Vapache from reading access files in that document tree.
 
 ## Prerequisites
 
@@ -24,7 +23,7 @@ Find every configured access-file name and every file in the served trees:
 ```console
 $ sudo apache2ctl -t -D DUMP_INCLUDES
 $ find /srv/www -name .htaccess -type f -print
-$ rg '^[[:space:]]*(AccessFileName|AllowOverride|AllowOverrideList)' /etc/apache2
+$ grep -R -E '^[[:space:]]*(AccessFileName|AllowOverride|AllowOverrideList)' /etc/apache2
 ```
 
 Repeat the search for a non-default `AccessFileName`. Record the effective
@@ -87,11 +86,10 @@ $ sudo systemctl reload vapache.service
 Keep the old access files until the deployment is accepted. Their presence has
 no effect when the effective override policy is `None`.
 
-## Evidence
-
-The [configuration semantics test](../../tests/config_semantics.py) generates
-`AllowOverride`, `AllowOverrideList`, ordering, context, and `Nonfatal`
-combinations. The canonical [Hugo](../tutorials/hugo-static-site.md),
-[WordPress](../tutorials/wordpress-php-fpm.md), and
-[Drupal](../tutorials/drupal-php-fpm.md) deployments cover representative
-static and front-controller layouts.
+<!--
+Behavior contract evidence:
+[Configuration semantics](../../tests/config_semantics.py)
+[Hugo](../tutorials/hugo-static-site.md)
+[WordPress](../tutorials/wordpress-php-fpm.md)
+[Drupal](../tutorials/drupal-php-fpm.md)
+-->

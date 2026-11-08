@@ -6,70 +6,88 @@ contracts: DOC-DEPLOY-MASTODON-001
 scenario: mastodon-proxy
 ---
 
-# Run the tested Mastodon TLS and streaming deployment
+# Put Mastodon web and streaming services behind Vapache
 
-This tutorial runs Mastodon web, streaming, background-job, PostgreSQL, and
-Redis services behind one Vapache TLS virtual host. It routes the streaming
-prefix before the general web route.
+This tutorial publishes Mastodon at `https://social.example.test/`. Vapache
+sends the streaming route to Mastodon's streaming service and all other
+requests to the web service.
 
 ## What you will do
 
-You will run the canonical `mastodon-proxy` deployment, authenticate to the API,
-open a user stream, reload Vapache, publish a status, receive the exact event
-through WebSocket, and remove the status.
+You will configure Mastodon's public domain, bind its web and streaming
+services to loopback, order the Vapache routes, publish one status, reload
+Vapache, reconnect the user stream, and receive the status event.
 
 ## Before you start
 
-You need Docker, OpenSSL, 4096 MiB for the scenario, the Docker safety reserve,
-and root or passwordless `sudo`. The complete cold run can take 20 minutes.
+You need a Linux VPS with Vapache and a working Mastodon installation with
+PostgreSQL, Redis, the web service, the streaming service, and background jobs.
+You also need a certificate for `social.example.test` and a Mastodon test
+account.
 
-## 1. Build and run the deployment
+## 1. Configure Mastodon's public authority
 
-```console
-$ cargo build --locked --release -p vapached
-$ python3 tests/deployments/harness.py \
-    --profile canonical \
-    --scenario mastodon-proxy \
-    --vapached target/release/vapached \
-    --artifacts deployment-results
+Set these values in the production environment:
+
+```text
+LOCAL_DOMAIN=social.example.test
+WEB_DOMAIN=social.example.test
+WEB_CONCURRENCY=2
 ```
 
-The canonical dimensions are `workers=two`, `stream=user`, and
-`reload=before-publish`.
+Bind the web service to `127.0.0.1:3000` and the streaming service to
+`127.0.0.1:4000`. Keep the existing database, Redis, secrets, and media
+settings unchanged.
 
-## 2. Verify the result
+Restart the Mastodon services and verify both private listeners before you
+change Vapache.
 
-The final status must be `passed`. The workflow checks TLS health and instance
-identity, verifies bearer credentials, opens an authenticated stream, reloads
-and reconnects, creates a status through Puma, waits for Sidekiq and Redis to
-deliver the same status through the streaming service, reads it, and deletes it.
+## 2. Configure Vapache
 
-## 3. Inspect the tested configuration
+The streaming route must appear before the catch-all web route:
 
-```console
-$ find deployment-results -path '*mastodon-proxy-*' -name vapache.conf -print
+```apache
+<VirtualHost *:443>
+    ServerName social.example.test
+    SSLEngine On
+    SSLCertificateFile /etc/letsencrypt/live/social.example.test/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/social.example.test/privkey.pem
+
+    ProxyPreserveHost On
+    ProxyPass /api/v1/streaming http://127.0.0.1:4000/api/v1/streaming
+    ProxyPassReverse /api/v1/streaming http://127.0.0.1:4000/api/v1/streaming
+    ProxyPass / http://127.0.0.1:3000/
+    ProxyPassReverse / http://127.0.0.1:3000/
+</VirtualHost>
 ```
 
-The TLS connection state supplies the public HTTPS scheme. The configuration
-preserves the validated public `Host`, routes `/api/v1/streaming` to the
-streaming service before routing `/` to the web service, and reconnects the
-stream after a configuration-generation change.
+## 3. Test the web and streaming paths
 
-## 4. Adapt the pattern
+```console
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ curl --fail https://social.example.test/api/v2/instance
+```
 
-Replace every fixture secret and test certificate. Keep Rails encryption, OTP,
-VAPID, database, and object-storage secrets stable across upgrades. Make the
-Mastodon local domain equal the public Vapache authority. Do not accept a
-client-supplied forwarded scheme on a plaintext listener.
+Sign in with the test account and open its user stream. Reload Vapache and
+confirm that the streaming client reconnects. Publish a status through the web
+application and confirm that the same status arrives on the reconnected stream.
+This tests the web service, background job, Redis delivery, streaming service,
+and WebSocket route together.
 
-## Clean up
+Delete the test status when the check succeeds.
 
-The workflow deletes the created status. The harness removes all Mastodon
-services, state volumes, media staging, and the private network. It retains the
-configuration and event-delivery evidence.
+## Roll back
 
-## Evidence
+Restore the previous Vapache routes and Mastodon domain settings. Restart the
+Mastodon services and reload Vapache. Keep the production secrets and database
+unchanged.
 
-The automated deployment test uses the
-[scenario manifest](../../tests/deployments/scenarios/mastodon-proxy/scenario.toml)
-and [driver](../../tests/deployments/scenarios/mastodon-proxy/driver.py).
+<!--
+Deployment contract only; not operator instructions.
+--scenario mastodon-proxy
+Canonical dimensions: `workers=two`, `stream=user`, `reload=before-publish`.
+Scenario storage budget: 4096 MiB.
+[Scenario](../../tests/deployments/scenarios/mastodon-proxy/scenario.toml)
+[Driver](../../tests/deployments/scenarios/mastodon-proxy/driver.py)
+-->

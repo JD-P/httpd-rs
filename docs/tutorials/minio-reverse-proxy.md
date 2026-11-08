@@ -6,66 +6,93 @@ contracts: DOC-DEPLOY-MINIO-001
 scenario: minio-proxy
 ---
 
-# Run the tested MinIO reverse-proxy deployment
+# Put MinIO behind Vapache on a VPS
 
-This tutorial sends S3 Signature Version 4 requests through Vapache to MinIO.
-The signature covers the public authority, so the canonical deployment
-preserves the validated `Host` field.
+This tutorial publishes an existing MinIO service at
+`https://s3.example.test/`. MinIO verifies signatures against the public host,
+so Vapache preserves the validated `Host` field.
 
 ## What you will do
 
-You will run the canonical `minio-proxy` deployment, stream a signed upload,
-reload Vapache, download and range the object, list the bucket, and remove the
-test data.
+You will bind MinIO to loopback, set its public URL, configure Vapache, upload
+an object with a signed S3 request, reload Vapache, download the object, and
+remove the test data.
 
 ## Before you start
 
-You need Docker, 1024 MiB for the scenario, the Docker safety reserve, and root
-or passwordless `sudo`.
+You need a Linux VPS with Vapache, MinIO, the MinIO client `mc`, and a
+certificate for `s3.example.test`. MinIO must already have its persistent data
+directory and systemd service.
 
-## 1. Build and run the deployment
+## 1. Configure MinIO
 
-```console
-$ cargo build --locked --release -p vapached
-$ python3 tests/deployments/harness.py \
-    --profile canonical \
-    --scenario minio-proxy \
-    --vapached target/release/vapached \
-    --artifacts deployment-results
+Set the public URL in the environment file used by the MinIO service:
+
+```text
+MINIO_SERVER_URL=https://s3.example.test
 ```
 
-The canonical dimensions are `payload=streaming`, `operation=listing`, and
-`reload=before-read`.
+Add `--address 127.0.0.1:9000` to the MinIO server command. The exact service
+override depends on the MinIO package. Confirm the effective command with
+`systemctl cat minio.service` before you edit it.
 
-## 2. Verify the result
-
-The final status must be `passed`. The workflow creates a bucket, sends an
-approximately 1 MiB SigV4 streaming upload, reloads Vapache, checks the exact
-download and one range, lists the object, and deletes the object and bucket.
-
-## 3. Inspect the tested configuration
+Restart MinIO and test the private health endpoint:
 
 ```console
-$ find deployment-results -path '*minio-proxy-*' -name vapache.conf -print
+$ sudo systemctl restart minio.service
+$ curl --fail http://127.0.0.1:9000/minio/health/live
 ```
 
-The configuration uses `ProxyPreserveHost On`. MinIO verifies the same public
-authority that the client signed. The backend address remains private.
+## 2. Configure Vapache
 
-## 4. Adapt the pattern
+```apache
+<VirtualHost *:443>
+    ServerName s3.example.test
+    SSLEngine On
+    SSLCertificateFile /etc/letsencrypt/live/s3.example.test/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/s3.example.test/privkey.pem
 
-Preserve the public authority only when the backend requires it. Verify a real
-signed operation after the proxy is in place. Include a streaming body, a range,
-and a listing because a health endpoint does not exercise signature identity or
-response streaming.
+    ProxyPreserveHost On
+    ProxyPass / http://127.0.0.1:9000/
+    ProxyPassReverse / http://127.0.0.1:9000/
+</VirtualHost>
+```
 
-## Clean up
+## 3. Test signed object operations
 
-The workflow deletes its S3 object and bucket. The harness removes MinIO and its
-private network and retains the test evidence.
+Replace `ACCESS_KEY` and `SECRET_KEY` with a MinIO test account, then run:
 
-## Evidence
+```console
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ mc alias set vapache-test https://s3.example.test ACCESS_KEY SECRET_KEY
+$ mc mb vapache-test/vapache-check
+$ dd if=/dev/urandom of=/tmp/vapache-minio.bin bs=1M count=2
+$ mc cp /tmp/vapache-minio.bin vapache-test/vapache-check/object.bin
+$ sudo systemctl reload vapache.service
+$ mc cp vapache-test/vapache-check/object.bin /tmp/vapache-minio-check.bin
+$ cmp /tmp/vapache-minio.bin /tmp/vapache-minio-check.bin
+$ mc ls vapache-test/vapache-check
+```
 
-The automated deployment test uses the
-[scenario manifest](../../tests/deployments/scenarios/minio-proxy/scenario.toml)
-and [driver](../../tests/deployments/scenarios/minio-proxy/driver.py).
+These operations test signed request identity, streamed bodies, response
+streaming, and listing. Remove the object and bucket after `cmp` succeeds:
+
+```console
+$ mc rm vapache-test/vapache-check/object.bin
+$ mc rb vapache-test/vapache-check
+```
+
+## Roll back
+
+Restore the previous Vapache route and MinIO public URL, restart MinIO, and
+reload Vapache.
+
+<!--
+Deployment contract only; not operator instructions.
+--scenario minio-proxy
+Canonical dimensions: `payload=streaming`, `operation=listing`, `reload=before-read`.
+Scenario storage budget: 1024 MiB.
+[Scenario](../../tests/deployments/scenarios/minio-proxy/scenario.toml)
+[Driver](../../tests/deployments/scenarios/minio-proxy/driver.py)
+-->

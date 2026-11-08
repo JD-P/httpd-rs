@@ -7,14 +7,13 @@ contracts: DOC-HOWTO-ROLLBACK-001
 
 # Roll back to Apache
 
-Use this procedure to return listener ownership to the Apache service after a
-completed Vapache switch. Packaged tests exercise the interruption and
-restoration steps.
+Use this procedure to return HTTP and HTTPS traffic to Apache after a completed
+Vapache switch.
 
 ## Prerequisites
 
-Keep an administrative session that does not depend on the affected web
-service. Confirm the Apache unit name. Debian-family systems normally use
+Keep a second SSH session or the hosting provider's console open during the
+rollback. Confirm the Apache unit name. Debian-family systems normally use
 `apache2.service`; RPM-family systems normally use `httpd.service`.
 
 The original Apache configuration remains in place after `vapache-switch`.
@@ -29,8 +28,7 @@ $ sudo apache2ctl configtest
 Syntax OK
 ```
 
-On an RPM-family system, use `sudo apachectl configtest`. Stop if the test
-fails.
+On an RPM-family system, use `sudo httpd -t`. Stop if the test fails.
 
 ## 2. Stop Vapache
 
@@ -75,9 +73,7 @@ $ sudo certbot renew --dry-run
 Use the RPM-family unit name where applicable. Test login, state changes,
 uploads, proxy routes, and WebSockets that the site uses.
 
-The installed Certbot control shim selects Apache while Vapache is inactive.
-Package removal removes the integration entries only when they still match the
-Vapache-installed values.
+Certbot's Apache commands control Apache again while Vapache is inactive.
 
 ## 5. Diagnose a failed rollback
 
@@ -95,10 +91,8 @@ If `vapache-switch` failed before it reported success, it already attempts to
 restore the prior active and enabled Apache state. Inspect both service units
 before you repeat the transition.
 
-## Evidence
-
-The [Certbot Apache integration test](../../tests/certbot_apache_integration.sh)
-interrupts switch operations and checks restoration of Apache's active and
-enabled state. The [switch implementation](../../packaging/vapache-switch)
-keeps the Apache configuration unchanged and restores the prior service state
-when Vapache startup fails.
+<!--
+Behavior contract evidence:
+[Switch interruption](../../tests/certbot_apache_integration.sh)
+[Switch implementation](../../packaging/vapache-switch)
+-->

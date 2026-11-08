@@ -6,64 +6,81 @@ contracts: DOC-DEPLOY-JENKINS-001
 scenario: jenkins-proxy
 ---
 
-# Run the tested Jenkins reverse-proxy deployment
+# Put Jenkins behind Vapache on a VPS
 
-This tutorial runs Jenkins below `/jenkins/` and exercises authentication, a
-CSRF-protected form operation, redirects, and session state through Vapache.
+This tutorial publishes Jenkins below `/jenkins/` at
+`https://ci.example.test/jenkins/`.
 
 ## What you will do
 
-You will run the canonical `jenkins-proxy` deployment, create a Jenkins job,
-reload Vapache, read the authenticated job API, and inspect the matching public
-and backend prefixes.
+You will bind Jenkins to loopback, set its context path, configure the Vapache
+route, create a job through Jenkins's authenticated form flow, reload Vapache,
+and verify the job through the API.
 
 ## Before you start
 
-You need Docker, 2048 MiB for the scenario, the Docker safety reserve, and root
-or passwordless `sudo`.
+You need a Linux VPS with Vapache, Jenkins LTS, and a certificate for
+`ci.example.test`. Jenkins must already run as a systemd service.
 
-## 1. Build and run the deployment
+## 1. Configure the Jenkins listener and prefix
 
-```console
-$ cargo build --locked --release -p vapached
-$ python3 tests/deployments/harness.py \
-    --profile canonical \
-    --scenario jenkins-proxy \
-    --vapached target/release/vapached \
-    --artifacts deployment-results
+Set the Jenkins startup options for your distribution so that they include:
+
+```text
+--httpListenAddress=127.0.0.1
+--httpPort=8080
+--prefix=/jenkins
 ```
 
-The canonical dimensions are `mount=subpath`, `reload=after-start`, and
-`benchmark=job`.
-
-## 2. Verify the result
-
-The final status must be `passed`. The workflow opens the login page,
-authenticates, obtains a CSRF crumb and its session cookie, creates a job by
-posting XML, reloads Vapache, and reads the protected job API.
-
-## 3. Inspect the tested configuration
+Restart Jenkins and confirm that the private endpoint responds:
 
 ```console
-$ find deployment-results -path '*jenkins-proxy-*' -name vapache.conf -print
+$ sudo systemctl restart jenkins.service
+$ curl -I http://127.0.0.1:8080/jenkins/login
 ```
 
-The public `/jenkins/` route and the Jenkins backend context path match. This
-prevents redirects and form targets from escaping the public mount.
+In **Manage Jenkins → System → Jenkins URL**, set
+`https://ci.example.test/jenkins/`.
 
-## 4. Adapt the pattern
+## 2. Configure Vapache
 
-Configure the backend context path before you add the Vapache route. Verify a
-state-changing request with its real authentication, cookie, and CSRF flow.
-After reload, verify an authenticated object instead of the public login page.
+```apache
+<VirtualHost *:443>
+    ServerName ci.example.test
+    SSLEngine On
+    SSLCertificateFile /etc/letsencrypt/live/ci.example.test/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/ci.example.test/privkey.pem
 
-## Clean up
+    ProxyPass /jenkins/ http://127.0.0.1:8080/jenkins/
+    ProxyPassReverse /jenkins/ http://127.0.0.1:8080/jenkins/
+</VirtualHost>
+```
 
-The harness removes Jenkins, its state, and its private network. It retains the
-configuration and semantic workflow result.
+## 3. Test an authenticated state change
 
-## Evidence
+```console
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ curl -I https://ci.example.test/jenkins/login
+```
 
-The automated deployment test uses the
-[scenario manifest](../../tests/deployments/scenarios/jenkins-proxy/scenario.toml)
-and [driver](../../tests/deployments/scenarios/jenkins-proxy/driver.py).
+Sign in through the public URL, create a small freestyle job, and save it. This
+tests the session cookie, CSRF token, form body, and public redirects together.
+
+Reload Vapache. Open the job again and request its JSON API through the public
+URL. Confirm that the session remains valid and that no redirect exposes port
+`8080`.
+
+## Roll back
+
+Restore the previous Vapache route, Jenkins URL, and context-path setting.
+Restart Jenkins and reload Vapache.
+
+<!--
+Deployment contract only; not operator instructions.
+--scenario jenkins-proxy
+Canonical dimensions: `mount=subpath`, `reload=after-start`, `benchmark=job`.
+Scenario storage budget: 2048 MiB.
+[Scenario](../../tests/deployments/scenarios/jenkins-proxy/scenario.toml)
+[Driver](../../tests/deployments/scenarios/jenkins-proxy/driver.py)
+-->

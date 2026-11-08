@@ -6,71 +6,95 @@ contracts: DOC-DEPLOY-DRUPAL-001
 scenario: drupal-fpm
 ---
 
-# Run the tested Drupal and PHP-FPM deployment
+# Run Drupal with PHP-FPM on a VPS
 
-This tutorial installs Drupal through PHP-FPM and executes Drupal's adapted
-`.htaccess` policy. The canonical case uses the Umami profile, a clean URL, and
-a reload after startup.
+This tutorial serves a Composer-installed Drupal site from
+`/srv/drupal/current/web` through `/run/php/drupal-fpm.sock`. The example domain
+is `drupal.example.test`.
 
 ## What you will do
 
-You will run the canonical `drupal-fpm` deployment, verify public and protected
-files, inspect the bounded access-file adaptations, and review the stable
-FastCGI path.
+You will configure Drupal's trusted host, connect Vapache to PHP-FPM, check the
+release's access-file rules, protect private files, and test a reload.
 
 ## Before you start
 
-You need Docker, 1536 MiB for the scenario, the Docker safety reserve, and root
-or passwordless `sudo`.
+You need a Linux VPS with Vapache, PHP-FPM, Drupal, and its database already
+installed. Keep the Drupal release read-only to PHP-FPM. Give PHP-FPM write
+access only to the configured files directory.
 
-## 1. Build and run the deployment
+The socket example uses backend ID `33`, socket owner ID `0`, and release owner
+ID `1001`. Replace these values with the IDs from the VPS.
 
-```console
-$ cargo build --locked --release -p vapached
-$ python3 tests/deployments/harness.py \
-    --profile canonical \
-    --scenario drupal-fpm \
-    --vapached target/release/vapached \
-    --artifacts deployment-results
+## 1. Configure Drupal's public host
+
+Add the public host pattern to `web/sites/default/settings.php`:
+
+```php
+$settings['trusted_host_patterns'] = [
+  '^drupal\.example\.test$',
+];
 ```
 
-The canonical dimensions are `profile=demo_umami`, `reload=after-start`, and
-`benchmark=clean-url`.
+Confirm that the files directory is writable and that `settings.php`, the
+Composer files, modules, themes, and PHP code are read-only to PHP-FPM.
 
-## 2. Verify the result
+## 2. Configure Vapache
 
-The final status must be `passed`. The workflow completes the Drupal installer,
-opens the site and login page, denies `composer.json`, prevents direct access to
-`.htaccess`, reloads Vapache, and opens the login page again.
+```apache
+VapacheCapability AccessFiles On
+VapacheCapability FastCgi On
+VapacheFastCGIStablePath On unix:/run/php/drupal-fpm.sock 33 0 0 1001
 
-## 3. Inspect the tested configuration
+<VirtualHost *:443>
+    ServerName drupal.example.test
+    DocumentRoot /srv/drupal/current/web
+    DirectoryIndex index.php
 
-```console
-$ find deployment-results -path '*drupal-fpm-*' -name vapache.conf -print
+    SSLEngine On
+    SSLCertificateFile /etc/letsencrypt/live/drupal.example.test/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/drupal.example.test/privkey.pem
+
+    ProxyPassMatch ^/(.*\.php(/.*)?)$ "unix:/run/php/drupal-fpm.sock|fcgi://localhost/srv/drupal/current/web/"
+
+    <Directory /srv/drupal/current/web>
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>
 ```
 
-The configuration enables `AccessFiles` and `FastCgi`, registers the PHP-FPM
-Unix socket, and allows Drupal's access file. The scenario changes four bounded
-upstream constructs. Its adapter fails when those exact source lines drift.
+## 3. Check the Drupal access file
 
-## 4. Adapt the pattern
+Run `vapachectl configtest`. If it rejects a directive in Drupal's `.htaccess`,
+give your coding agent the exact Drupal release, the complete error, and the
+access file. Ask it to preserve each rejected rule in the main configuration
+and to provide a request that proves the replacement. Do not accept a change
+that only deletes the rule.
 
-Give your coding agent the `.htaccess` file from the exact Drupal release, the
-Vapache configuration-test output, and the tested configuration from step 3.
-Ask it to list each adapted rule, the behavior that the rule preserves, and a
-request that tests the behavior. Do not accept an adaptation that only deletes
-an unsupported directive.
+## 4. Test Drupal
 
-Keep Drupal code immutable to PHP-FPM. Leave only the documented files
-directory writable and deny executable handlers there.
+```console
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ curl --fail https://drupal.example.test/
+$ curl --fail https://drupal.example.test/user/login
+$ curl -I https://drupal.example.test/.htaccess
+```
 
-## Clean up
+The access-file request must be denied. Also test one clean URL and one path
+that the Drupal rules protect. Reload Vapache and repeat the login-page request.
 
-The harness removes Drupal and its private resources. It retains the tested
-configuration, adapted source evidence, plan, summary, and logs.
+## Roll back
 
-## Evidence
+Restore the previous virtual host and reload Vapache. Restore the previous
+Drupal configuration only if the trusted-host change was part of this test.
 
-The automated deployment test uses the
-[scenario manifest](../../tests/deployments/scenarios/drupal-fpm/scenario.toml)
-and [driver](../../tests/deployments/scenarios/drupal-fpm/driver.py).
+<!--
+Deployment contract only; not operator instructions.
+--scenario drupal-fpm
+Canonical dimensions: `profile=demo_umami`, `reload=after-start`, `benchmark=clean-url`.
+Scenario storage budget: 1536 MiB.
+[Scenario](../../tests/deployments/scenarios/drupal-fpm/scenario.toml)
+[Driver](../../tests/deployments/scenarios/drupal-fpm/driver.py)
+-->

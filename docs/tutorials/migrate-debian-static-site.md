@@ -11,10 +11,8 @@ In this tutorial, you migrate one Apache virtual host to Vapache. The host is
 `www.example.test`. It serves an immutable static release from
 `/srv/www/example/releases/2026-11-07/public`.
 
-The tutorial keeps the existing Apache configuration. The Vapache package
-creates a runtime snapshot when the Debian configuration uses enabled-file
-symlinks. The switch tool can restore the previous Apache service state if the
-Vapache start fails.
+The tutorial keeps the existing Apache configuration. The switch tool restores
+the previous Apache service state if Vapache does not start.
 
 Use a non-production host when possible. If you test on the current host, keep
 a second SSH session or the hosting provider's console open during the switch.
@@ -40,8 +38,7 @@ You need:
 - a second SSH session or hosting-provider console for recovery;
 - the name or address of the evaluation host.
 
-The example site uses this virtual host. The documentation test starts the real
-`vapached` binary with this configuration and verifies its HTTP behavior.
+The example site uses this virtual host:
 
 <!-- tested-example: migrate-debian-static-site/vhost.conf -->
 
@@ -108,10 +105,9 @@ $ sudo vapachectl configtest
 Syntax OK
 ```
 
-On Debian, `vapachectl` materializes the selected Apache configuration below
-`/run/vapache`. It does not edit `/etc/apache2`. If the configuration requests a
-default-off capability, `vapachectl` prints each capability that it adds to the
-runtime snapshot.
+The command reads the complete Apache configuration without editing
+`/etc/apache2`. If the site needs a default-off capability, the command prints
+the `VapacheCapability` line that enables it.
 
 Do not continue if the command reports an unsupported directive, unsafe input,
 missing file, or invalid certificate.
@@ -215,13 +211,3 @@ Vapache documentation example
 
 The Vapache package does not remove or edit the Apache configuration during the
 switch.
-
-## How this tutorial is tested
-
-The automated documentation test starts the built Vapache server with the
-example virtual host. It checks the home page, custom `404` response, and static
-`POST` response through HTTP.
-
-The package test checks that an interrupted switch restores the previous Apache
-service state. The package build also installs and starts the service in the
-supported distribution test environments.

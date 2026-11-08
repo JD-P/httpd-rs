@@ -6,69 +6,89 @@ contracts: DOC-DEPLOY-BUGZILLA-001
 scenario: bugzilla-fastcgi
 ---
 
-# Run the tested Bugzilla and generic FastCGI deployment
+# Run Bugzilla through FastCGI on a VPS
 
-This tutorial runs Bugzilla through `fcgiwrap`. It demonstrates a generic
-FastCGI application whose script identity, `PATH_INFO`, cookies, and protected
-source files differ from a PHP-FPM deployment.
+This tutorial serves Bugzilla from `/srv/bugzilla/current` through the
+`fcgiwrap` Unix socket at `/run/fcgiwrap/bugzilla.sock`.
 
 ## What you will do
 
-You will run the canonical `bugzilla-fastcgi` deployment, use the REST path-info
-endpoint, complete Bugzilla's authenticated admin flow, reload Vapache, and
-inspect the Unix-socket identity policy.
+You will protect the FastCGI socket, map Bugzilla CGI programs and path
+information, deny direct access to source and configuration files, test the
+REST endpoint, and keep an authenticated session across reload.
 
 ## Before you start
 
-You need Docker, 2048 MiB for the scenario, the Docker safety reserve, and root
-or passwordless `sudo`. The complete cold run can take 20 minutes.
+You need a Linux VPS with Vapache, Bugzilla, Perl, `fcgiwrap`, and Bugzilla's
+database already installed. Complete Bugzilla's `checksetup.pl` procedure
+before you configure Vapache. The example domain is `bugs.example.test`.
 
-## 1. Build and run the deployment
+This example uses worker ID `33`, socket owner ID `33`, and release owner ID
+`1001`. Replace them with the IDs reported on the VPS.
 
-```console
-$ cargo build --locked --release -p vapached
-$ python3 tests/deployments/harness.py \
-    --profile canonical \
-    --scenario bugzilla-fastcgi \
-    --vapached target/release/vapached \
-    --artifacts deployment-results
-```
+## 1. Protect the Bugzilla release and socket
 
-The canonical dimensions are `workflow=admin`, `session=authenticated`, and
-`reload=after-login`.
-
-## 2. Verify the result
-
-The final status must be `passed`. The workflow completes the two-pass Bugzilla
-setup, opens the application, denies Perl modules and `localconfig`, reads the
-REST version endpoint through `PATH_INFO`, performs the login-request and CSRF
-flow, opens administration policy, reloads Vapache, and confirms the session.
-
-## 3. Inspect the tested configuration
+Keep Bugzilla CGI and Perl files read-only to the `fcgiwrap` worker. Configure
+`fcgiwrap` to create `/run/fcgiwrap/bugzilla.sock` with mode `0660`, then run:
 
 ```console
-$ find deployment-results -path '*bugzilla-fastcgi-*' -name vapache.conf -print
+$ sudo stat -Lc '%F %u:%g %a %n' /run/fcgiwrap/bugzilla.sock
 ```
 
-The configuration enables `FastCgi`, registers the `fcgiwrap` Unix socket and
-worker identity, maps `.cgi` plus path info, and denies direct reads of Perl
-modules, templates, and local configuration. The socket is not a loopback TCP
-endpoint.
+Confirm that the result is a socket and that the reported IDs match the Vapache
+configuration below.
 
-## 4. Adapt the pattern
+## 2. Configure Vapache
 
-Identify the generic FastCGI runner separately from the application. Protect
-the socket directory and authenticate the connected process. Keep executable
-CGI and every ancestor immutable to the worker. Test an endpoint that requires
-`PATH_INFO` and an authenticated state change.
+```apache
+VapacheCapability FastCgi On
+VapacheFastCGIStablePath On unix:/run/fcgiwrap/bugzilla.sock 33 33 0 1001
 
-## Clean up
+<VirtualHost *:443>
+    ServerName bugs.example.test
+    DocumentRoot /srv/bugzilla/current
+    DirectoryIndex index.cgi
 
-The harness removes Bugzilla, `fcgiwrap`, MariaDB, staged images, volumes, and
-the private network. It retains the tested configuration and setup logs.
+    SSLEngine On
+    SSLCertificateFile /etc/letsencrypt/live/bugs.example.test/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/bugs.example.test/privkey.pem
 
-## Evidence
+    ProxyFCGIBackendType GENERIC
+    ProxyPassMatch ^/(.*\.cgi(/.*)?)$ "unix:/run/fcgiwrap/bugzilla.sock|fcgi://localhost/srv/bugzilla/current/"
 
-The automated deployment test uses the
-[scenario manifest](../../tests/deployments/scenarios/bugzilla-fastcgi/scenario.toml)
-and [driver](../../tests/deployments/scenarios/bugzilla-fastcgi/driver.py).
+    <Directory /srv/bugzilla/current>
+        AllowOverride None
+        Require all granted
+    </Directory>
+    <FilesMatch "(\.pm|\.pl|\.tmpl|^localconfig.*)$">
+        Require all denied
+    </FilesMatch>
+</VirtualHost>
+```
+
+## 3. Test Bugzilla
+
+```console
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ curl --fail https://bugs.example.test/rest/version
+$ curl -I https://bugs.example.test/localconfig
+```
+
+The REST request must return Bugzilla version data, and the `localconfig`
+request must be denied. Sign in to Bugzilla, open an administration page, reload
+Vapache, and confirm that the same session can still open the page.
+
+## Roll back
+
+Restore the previous virtual host and reload Vapache. Stop the dedicated
+`fcgiwrap` instance only if no other verified route uses it.
+
+<!--
+Deployment contract only; not operator instructions.
+--scenario bugzilla-fastcgi
+Canonical dimensions: `workflow=admin`, `session=authenticated`, `reload=after-login`.
+Scenario storage budget: 2048 MiB.
+[Scenario](../../tests/deployments/scenarios/bugzilla-fastcgi/scenario.toml)
+[Driver](../../tests/deployments/scenarios/bugzilla-fastcgi/driver.py)
+-->

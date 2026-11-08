@@ -6,68 +6,87 @@ contracts: DOC-DEPLOY-WAGTAIL-001
 scenario: wagtail-proxy
 ---
 
-# Run the tested Wagtail and Gunicorn deployment
+# Put Wagtail and Gunicorn behind Vapache on a VPS
 
-This tutorial runs the Wagtail Bakery Demo through Gunicorn and Vapache. The
-canonical case uses two Gunicorn workers and verifies an authenticated Wagtail
-admin session across reload.
+This tutorial publishes a Wagtail site from Gunicorn at
+`https://cms.example.test/`.
 
 ## What you will do
 
-You will run the canonical `wagtail-proxy` deployment, read the Wagtail API,
-complete a CSRF-bound admin login, reload Vapache, and reuse the authenticated
-session.
+You will bind Gunicorn to loopback, configure Django's public authority, add
+the Vapache route, test the Wagtail API and admin login, reload Vapache, and
+reuse the session.
 
 ## Before you start
 
-You need Docker, 3072 MiB for the scenario, the Docker safety reserve, and root
-or passwordless `sudo`. The harness downloads a digest-verified Bakery Demo
-source revision and builds it from locked Python requirements.
+You need a Linux VPS with Vapache, a deployed Wagtail project, Gunicorn, its
+database, and a certificate for `cms.example.test`. The Gunicorn systemd
+service must already start the correct Python environment.
 
-## 1. Build and run the deployment
+## 1. Configure Django and Gunicorn
 
-```console
-$ cargo build --locked --release -p vapached
-$ python3 tests/deployments/harness.py \
-    --profile canonical \
-    --scenario wagtail-proxy \
-    --vapached target/release/vapached \
-    --artifacts deployment-results
+Set these Django values:
+
+```python
+ALLOWED_HOSTS = ['cms.example.test']
+CSRF_TRUSTED_ORIGINS = ['https://cms.example.test']
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 ```
 
-The canonical dimensions are `workers=two`, `workflow=admin`, and
-`reload=after-login`.
+Bind Gunicorn to loopback with two workers:
 
-## 2. Verify the result
-
-The final status must be `passed`. The workflow opens the Bakery home page,
-checks fixture content through the page API, completes an admin login with its
-CSRF token and cookie, opens the page administration view, reloads Vapache, and
-opens the dashboard with the existing session.
-
-## 3. Inspect the tested configuration
-
-```console
-$ find deployment-results -path '*wagtail-proxy-*' -name vapache.conf -print
+```text
+--bind 127.0.0.1:8000 --workers 2
 ```
 
-The configuration uses `ProxyPreserveHost On` because Django validates the
-public authority. The private container address is not an accepted application
-host. Only the media directory is writable.
+Restart the service and test the private endpoint:
 
-## 4. Adapt the pattern
+```console
+$ sudo systemctl restart wagtail-gunicorn.service
+$ curl -I -H 'Host: cms.example.test' http://127.0.0.1:8000/
+```
 
-Configure Django `ALLOWED_HOSTS`, CSRF trusted origins, and the public scheme for
-the Vapache authority. Preserve `Host` only after Vapache validates it. Keep the
-application image immutable and mount a separate media directory.
+## 2. Configure Vapache
 
-## Clean up
+```apache
+<VirtualHost *:443>
+    ServerName cms.example.test
+    SSLEngine On
+    SSLCertificateFile /etc/letsencrypt/live/cms.example.test/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/cms.example.test/privkey.pem
 
-The harness removes Wagtail, PostgreSQL, the staged image, volumes, and private
-network. It retains the tested configuration and workflow evidence.
+    ProxyPreserveHost On
+    ProxyPass / http://127.0.0.1:8000/
+    ProxyPassReverse / http://127.0.0.1:8000/
+</VirtualHost>
+```
 
-## Evidence
+## 3. Test the API and admin session
 
-The automated deployment test uses the
-[scenario manifest](../../tests/deployments/scenarios/wagtail-proxy/scenario.toml)
-and [driver](../../tests/deployments/scenarios/wagtail-proxy/driver.py).
+```console
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ curl --fail https://cms.example.test/api/v2/pages/
+```
+
+Sign in to Wagtail administration through the public URL and open a page-edit
+screen. Reload Vapache and open the dashboard with the same session. Confirm
+that redirects and form targets use `https://cms.example.test` and never expose
+port `8000`.
+
+Keep uploaded media in a separate writable directory. The Gunicorn identity
+must not modify Python code or its parent directories.
+
+## Roll back
+
+Restore the previous Vapache route and Django public-host settings, restart
+Gunicorn, and reload Vapache.
+
+<!--
+Deployment contract only; not operator instructions.
+--scenario wagtail-proxy
+Canonical dimensions: `workers=two`, `workflow=admin`, `reload=after-login`.
+Scenario storage budget: 3072 MiB.
+[Scenario](../../tests/deployments/scenarios/wagtail-proxy/scenario.toml)
+[Driver](../../tests/deployments/scenarios/wagtail-proxy/driver.py)
+-->

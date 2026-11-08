@@ -8,8 +8,7 @@ contracts: DOC-HOWTO-PROXY-AUTHORITY-001
 # Configure the public URL and forwarded headers for a reverse proxy
 
 Use this procedure when a backend generates public URLs, validates the `Host`
-header, verifies signed requests, or accepts WebSocket upgrades. Automated
-proxy tests and application deployment tests exercise this procedure.
+header, verifies signed requests, or accepts WebSocket upgrades.
 
 ## Prerequisites
 
@@ -17,9 +16,9 @@ Bind the backend to a private address or protected Unix socket. Record the
 application's configured public URL and trusted-proxy settings. Keep a direct
 backend health check that does not depend on the public proxy route.
 
-## 1. Record the public URL and backend endpoint
+## 1. Identify the public URL and backend endpoint
 
-Record the public URL and the backend endpoint. For example:
+Write down the two addresses before you edit either service. For example:
 
 ```text
 Public URL:       https://app.example.test/
@@ -108,11 +107,10 @@ If the verification fails, restore the previous proxy directives and reload
 Vapache. Keep the backend on its private endpoint while you correct its public
 URL or trusted-proxy configuration.
 
-## Evidence
-
-The [conformance suite](../../tests/conformance.py) checks proxy framing,
-header filtering, authority, redirects, TLS, and WebSocket behavior. The
-canonical [Wagtail](../tutorials/wagtail-gunicorn.md),
-[MinIO](../tutorials/minio-reverse-proxy.md), and
-[Mastodon](../tutorials/mastodon-tls-streaming.md) deployments exercise public
-authority, signed requests, TLS termination, and streaming connections.
+<!--
+Behavior contract evidence:
+[Proxy conformance](../../tests/conformance.py)
+[Wagtail](../tutorials/wagtail-gunicorn.md)
+[MinIO](../tutorials/minio-reverse-proxy.md)
+[Mastodon](../tutorials/mastodon-tls-streaming.md)
+-->

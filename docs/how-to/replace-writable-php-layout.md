@@ -8,8 +8,7 @@ contracts: DOC-HOWTO-PHP-LAYOUT-001
 # Replace an unsafe writable PHP layout
 
 Use this procedure when PHP-FPM can modify PHP code, a plugin directory, or an
-ancestor of the document root. Automated WordPress, Drupal, and Nextcloud
-deployment tests exercise this layout.
+ancestor of the document root.
 
 ## Prerequisites
 
@@ -110,9 +109,9 @@ Build plugins, themes, modules, and application upgrades outside the running
 PHP process. Deploy a new immutable release and change the configured release
 path after validation.
 
-An application dashboard that writes executable code is outside this model.
-Disable that function or continue to use a server and isolation boundary that
-matches the accepted risk.
+This layout does not support installing executable plugins, themes, or updates
+from the application dashboard. Disable that function or use a separate
+deployment process.
 
 ## Roll back the release change
 
@@ -120,10 +119,9 @@ Restore the previous versioned release path in the virtual host. Run the
 configuration test and reload Vapache. Do not restore write access to
 executable code as a rollback method.
 
-## Evidence
-
-The canonical [WordPress](../tutorials/wordpress-php-fpm.md),
-[Drupal](../tutorials/drupal-php-fpm.md), and
-[Nextcloud](../tutorials/nextcloud-php-fpm.md) scenarios exercise uploads and
-application workflows while the application code remains immutable to the
-backend.
+<!--
+Behavior contract deployment evidence:
+[WordPress](../tutorials/wordpress-php-fpm.md)
+[Drupal](../tutorials/drupal-php-fpm.md)
+[Nextcloud](../tutorials/nextcloud-php-fpm.md)
+-->

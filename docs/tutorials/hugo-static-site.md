@@ -6,85 +6,137 @@ contracts: DOC-DEPLOY-HUGO-001
 scenario: hugo-static
 ---
 
-# Run the tested Hugo static-site deployment
+# Serve a Hugo site from a VPS
 
-This tutorial builds a Hugo site and serves the generated files directly from
-Vapache. The canonical case adds Basic authentication, Brotli compression, a
-disk cache, an access-file rule, and a graceful reload.
+This tutorial builds one Hugo site into an immutable release directory and
+serves it directly with Vapache. The example domain is `docs.example.test`.
 
 ## What you will do
 
-You will:
-
-1. build Vapache;
-2. run the canonical `hugo-static` deployment;
-3. inspect the exact generated configuration;
-4. identify the controls to retain in another static-site deployment.
+You will build the site, configure a custom error page, protect one directory
+with Basic authentication, compress text responses, cache static assets, and
+test a Vapache reload.
 
 ## Before you start
 
-You need Docker, 768 MiB for the image and scenario, the Docker safety reserve,
-and root or passwordless `sudo`. The harness pulls a digest-pinned Hugo image.
+You need a Linux VPS with Vapache, Hugo, and `htpasswd` installed. Point
+`docs.example.test` at the VPS. Replace the example domain and paths with your
+own values before you run the commands.
 
-## 1. Build Vapache
+This tutorial uses `/srv/hugo/source` for the Hugo project and
+`/srv/www/hugo/releases/2026-11-08/public` for the generated release.
 
-```console
-$ cargo build --locked --release -p vapached
-```
+## 1. Build an immutable release
 
-## 2. Run the canonical deployment
-
-```console
-$ python3 tests/deployments/harness.py \
-    --profile canonical \
-    --scenario hugo-static \
-    --vapached target/release/vapached \
-    --artifacts deployment-results
-```
-
-The canonical dimensions are `access=basic`, `cache=disk`, `encoding=brotli`,
-and `reload=after-start`.
-
-## 3. Verify the result
-
-The final harness status must be `passed`. The workflow verifies:
-
-- the generated home page and post;
-- an access-file redirect and response header;
-- the custom `404` page;
-- rejection and acceptance for the protected directory;
-- Brotli output and a byte range;
-- a disk-cache hit;
-- the generated site after reload.
-
-## 4. Inspect the tested configuration
-
-Find the saved configuration:
+Run Hugo as the identity that deploys the site:
 
 ```console
-$ find deployment-results -path '*hugo-static-*' -name vapache.conf -print
+$ sudo -u deploy hugo \
+    --source /srv/hugo/source \
+    --destination /srv/www/hugo/releases/2026-11-08/public
+$ sudo tee /srv/www/hugo/releases/2026-11-08/public/.htaccess >/dev/null <<'EOF'
+RewriteEngine On
+RewriteRule ^legacy$ /posts/hello/ [R=302,L]
+Header set X-Vapache-Deployment hugo
+EOF
+$ sudo chown -R deploy:deploy /srv/www/hugo/releases/2026-11-08
+$ sudo chmod -R a-w /srv/www/hugo/releases/2026-11-08
 ```
 
-The configuration enables `AccessFiles` because this lab tests `.htaccess`.
-Keep that capability off when all policy is in the main configuration. Limit
-cache policy to generated static assets. Keep private paths outside public
-cache policy.
+Create `/srv/www/hugo/releases/2026-11-08/public/404.html` if the Hugo project
+does not generate one.
 
-## 5. Adapt the pattern
+## 2. Create the password and cache paths
 
-Build the site separately from Vapache. Deploy the generated output as an
-immutable release tree. Point `DocumentRoot` at the current release and retain
-the explicit authorization, compression, cache, range, and error-page checks
-that your site needs.
+Create one test user and a cache directory that the Vapache service identity
+can write:
 
-## Clean up
+```console
+$ sudo install -d -o root -g www-data -m 0750 /etc/vapache/auth
+$ sudo htpasswd -c /etc/vapache/auth/hugo.htpasswd alice
+$ sudo chown root:www-data /etc/vapache/auth/hugo.htpasswd
+$ sudo chmod 0640 /etc/vapache/auth/hugo.htpasswd
+$ sudo install -d -o www-data -g www-data -m 0750 /var/cache/vapache/hugo
+```
 
-The harness removes its containers, network, volumes, and selected image. It
-retains `plan.json`, `summary.json`, the Vapache configuration, and logs below
-`deployment-results`.
+Use the service user from the Apache `User` directive when it is not
+`www-data`.
 
-## Evidence
+## 3. Configure Vapache
 
-The automated deployment test uses the
-[scenario manifest](../../tests/deployments/scenarios/hugo-static/scenario.toml)
-and [driver](../../tests/deployments/scenarios/hugo-static/driver.py).
+Add this virtual host to the main configuration:
+
+```apache
+VapacheCapability AccessFiles On
+
+<VirtualHost *:80>
+    ServerName docs.example.test
+    DocumentRoot /srv/www/hugo/releases/2026-11-08/public
+    DirectoryIndex index.html
+    ErrorDocument 404 /404.html
+
+    AddOutputFilterByType BROTLI_COMPRESS text/html text/css application/javascript
+    BrotliCompressionQuality 4
+
+    CacheRoot /var/cache/vapache/hugo
+    CacheEnable disk /assets/
+    CacheHeader On
+    CacheIgnoreNoLastMod On
+    CacheDefaultExpire 300
+    CacheMaxExpire 300
+
+    <Directory /srv/www/hugo/releases/2026-11-08/public>
+        AllowOverride FileInfo
+        Require all granted
+    </Directory>
+
+    <Directory /srv/www/hugo/releases/2026-11-08/public/private>
+        AuthType Basic
+        AuthName "Private documentation"
+        AuthUserFile /etc/vapache/auth/hugo.htpasswd
+        Require valid-user
+    </Directory>
+</VirtualHost>
+```
+
+## 4. Test the site
+
+Run:
+
+```console
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ curl --fail http://docs.example.test/
+$ curl --silent --show-error --output /tmp/hugo-404.html \
+    --write-out '%{http_code}\n' http://docs.example.test/missing
+$ curl -I http://docs.example.test/legacy
+$ curl -I http://docs.example.test/assets/app.js
+$ curl -I http://docs.example.test/assets/app.js
+$ curl -I -H 'Accept-Encoding: br' http://docs.example.test/
+$ curl -I -H 'Range: bytes=0-31' http://docs.example.test/assets/app.js
+$ curl -I http://docs.example.test/private/
+$ curl --fail --user alice http://docs.example.test/private/
+```
+
+The missing page must return `404`. The legacy path must redirect to
+`/posts/hello/`. The asset response must contain `X-Vapache-Deployment: hugo`,
+and the second asset request must report an `X-Cache` hit. The compressed
+response must name `br`, the range must return `206`, and the unauthenticated
+private request must return `401`.
+
+Reload Vapache once more and repeat the home-page and authenticated requests.
+
+## Roll back
+
+Restore the previous virtual host, run `vapachectl configtest`, and reload
+Vapache. Keep the generated release until the replacement deployment is
+accepted.
+
+<!--
+Deployment contract only; not operator instructions.
+--scenario hugo-static
+Canonical dimensions: `access=basic`, `cache=disk`, `encoding=brotli`, `reload=after-start`.
+Scenario storage budget: 768 MiB.
+[Scenario](../../tests/deployments/scenarios/hugo-static/scenario.toml)
+[Driver](../../tests/deployments/scenarios/hugo-static/driver.py)
+-->

@@ -4,15 +4,14 @@ audience: application-operator
 status: draft
 ---
 
-# Tutorial catalog
+# Choose a deployment tutorial
 
-Each application tutorial uses a specific application. The automated deployment
-test installs the application, starts Vapache, completes the operations named in
-the tutorial, saves the Vapache configuration, and removes the test resources.
+Choose the tutorial for your application. If the application is not listed,
+choose one that connects to the web server in the same way.
 
-Use the generated configuration as a tested starting point. Replace its
-temporary paths, ports, identities, certificates, and credentials before you
-use the pattern outside the lab.
+Each tutorial assumes that the application is installed on a Linux VPS. It
+shows the application settings, Vapache configuration, checks, and rollback for
+one concrete deployment.
 
 The “similar software” column lists applications that connect to the web server
 in a similar way. It does not mean that the listed software accepts the same
@@ -53,20 +52,4 @@ Ask it to return:
 
 The [Debian static-site migration tutorial](migrate-debian-static-site.md)
 starts with an existing Apache virtual host. It covers the service switch and
-rollback rather than the application harness.
-
-## Run all automated deployment tests
-
-The weekly application workflow runs the documented case for every application.
-You can run the same profile locally:
-
-```console
-$ cargo build --locked --release -p vapached
-$ python3 tests/deployments/harness.py \
-    --profile canonical \
-    --vapached target/release/vapached \
-    --artifacts deployment-results
-```
-
-The complete run needs the sum of the scenario time and storage budgets. Run
-one tutorial when you need only one operating mode.
+rollback for a site that is already in production.

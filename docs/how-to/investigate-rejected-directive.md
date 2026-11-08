@@ -8,8 +8,7 @@ contracts: DOC-HOWTO-REJECTION-001, DOC-UNSUPPORTED-POLICY-001
 # Investigate a rejected directive
 
 Use this procedure when `vapachectl configtest` rejects an Apache directive or
-value. Configuration tests check the procedure and include a case that confirms
-an unsupported directive stops configuration loading.
+value.
 
 ## Prerequisites
 
@@ -36,6 +35,8 @@ Run the matching Apache test:
 $ sudo apache2ctl configtest
 $ sudo apache2ctl -t -D DUMP_INCLUDES
 ```
+
+On an RPM-family system, use `httpd -t` and `httpd -t -D DUMP_INCLUDES`.
 
 If Apache also rejects the configuration, correct the Apache configuration
 first. If Apache accepts it, continue with the Vapache classification.
@@ -95,9 +96,7 @@ Then test the workflow that the directive controlled. Include a negative test.
 For an authorization rule, test both permitted and denied requests. For a
 rewrite, test the original target and a target that must not match.
 
-## Evidence
-
-The [configuration validity test](../../tests/config_validity.py) checks the
-directive registry, contexts, values, and strict rejection behavior. The
-[unsupported-policy example](../examples/compatibility/unsupported-policy.conf)
-is executed by the documentation test through `vapached -t`.
+<!--
+Behavior contract evidence:
+[Configuration validity](../../tests/config_validity.py)
+-->

@@ -6,65 +6,82 @@ contracts: DOC-DEPLOY-JUPYTERLAB-001
 scenario: jupyterlab-proxy
 ---
 
-# Run the tested JupyterLab reverse-proxy deployment
+# Put JupyterLab behind Vapache on a VPS
 
-This tutorial runs JupyterLab below `/jupyter/`. It sends the HTTP API and the
-kernel WebSocket protocol through Vapache.
+This tutorial publishes JupyterLab below `/jupyter/` at
+`https://lab.example.test/jupyter/`. The same Vapache route carries the HTTP API
+and kernel WebSocket protocol.
 
 ## What you will do
 
-You will run the canonical `jupyterlab-proxy` deployment, create a kernel,
-execute code over WebSocket, reload Vapache while the tunnel is open, reconnect,
-and execute through the same kernel again.
+You will bind JupyterLab to loopback, set its base URL, add the Vapache route,
+execute code in a kernel, reload Vapache, reconnect, and use the same kernel.
 
 ## Before you start
 
-You need Docker, 3072 MiB for the scenario, the Docker safety reserve, and root
-or passwordless `sudo`.
+You need a Linux VPS with Vapache, JupyterLab, and a certificate for
+`lab.example.test`. Run JupyterLab from a dedicated systemd service and keep its
+token or configured authentication enabled.
 
-## 1. Build and run the deployment
+## 1. Configure JupyterLab
 
-```console
-$ cargo build --locked --release -p vapached
-$ python3 tests/deployments/harness.py \
-    --profile canonical \
-    --scenario jupyterlab-proxy \
-    --vapached target/release/vapached \
-    --artifacts deployment-results
+Set these values in the Jupyter Server configuration used by the service:
+
+```python
+c.ServerApp.ip = '127.0.0.1'
+c.ServerApp.port = 8888
+c.ServerApp.base_url = '/jupyter/'
+c.ServerApp.open_browser = False
+c.ServerApp.trust_xheaders = True
 ```
 
-The canonical dimensions are `mount=subpath`, `websocket=execute`, and
-`reload=while-open`.
-
-## 2. Verify the result
-
-The final status must be `passed`. The workflow authenticates to the status API,
-opens JupyterLab, creates a kernel, executes a marker over the Jupyter wire
-protocol, reloads Vapache, reconnects, executes again, and deletes the kernel.
-
-## 3. Inspect the tested configuration
+Restart JupyterLab and test its private endpoint:
 
 ```console
-$ find deployment-results -path '*jupyterlab-proxy-*' -name vapache.conf -print
+$ sudo systemctl restart jupyterlab.service
+$ curl -I http://127.0.0.1:8888/jupyter/
 ```
 
-JupyterLab and both proxy directives use the same base URL. Reload retires the
-old WebSocket grant and closes that tunnel. The kernel remains in the backend,
-so the client can reconnect under the new configuration generation.
+## 2. Configure Vapache
 
-## 4. Adapt the pattern
+```apache
+<VirtualHost *:443>
+    ServerName lab.example.test
+    SSLEngine On
+    SSLCertificateFile /etc/letsencrypt/live/lab.example.test/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/lab.example.test/privkey.pem
 
-Set the Jupyter base URL before startup. Route the same prefix for HTTP and
-WebSocket traffic. Verify a real kernel execution, not only a WebSocket `101`
-response. Make the client reconnect after a Vapache reload.
+    ProxyPass /jupyter/ http://127.0.0.1:8888/jupyter/
+    ProxyPassReverse /jupyter/ http://127.0.0.1:8888/jupyter/
+</VirtualHost>
+```
 
-## Clean up
+## 3. Test a kernel and reload
 
-The harness deletes the kernel and removes JupyterLab and its private network.
-It retains the tested configuration and logs.
+```console
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+```
 
-## Evidence
+Open `https://lab.example.test/jupyter/`, authenticate, create a kernel, and run
+a cell that prints `Vapache Jupyter test`. Keep the kernel open and reload
+Vapache again.
 
-The automated deployment test uses the
-[scenario manifest](../../tests/deployments/scenarios/jupyterlab-proxy/scenario.toml)
-and [driver](../../tests/deployments/scenarios/jupyterlab-proxy/driver.py).
+The current WebSocket can close during reload. Reconnect the browser and run a
+second cell in the same kernel. A successful `101 Switching Protocols` response
+does not prove that the kernel protocol works; confirm that both cells return
+their output.
+
+## Roll back
+
+Restore the previous Vapache route and Jupyter `base_url`, restart JupyterLab,
+and reload Vapache. Shut down the test kernel.
+
+<!--
+Deployment contract only; not operator instructions.
+--scenario jupyterlab-proxy
+Canonical dimensions: `mount=subpath`, `websocket=execute`, `reload=while-open`.
+Scenario storage budget: 3072 MiB.
+[Scenario](../../tests/deployments/scenarios/jupyterlab-proxy/scenario.toml)
+[Driver](../../tests/deployments/scenarios/jupyterlab-proxy/driver.py)
+-->

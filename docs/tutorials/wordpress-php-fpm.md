@@ -6,70 +6,118 @@ contracts: DOC-DEPLOY-WORDPRESS-001
 scenario: wordpress-fpm
 ---
 
-# Run the tested WordPress and PHP-FPM deployment
+# Run WordPress with PHP-FPM on a VPS
 
-This tutorial installs WordPress behind Vapache and PHP-FPM. The canonical case
-uses pretty permalinks, a disk cache for static assets, an immutable PHP release
-tree, a writable upload directory, and a graceful reload.
+This tutorial serves WordPress from `/srv/wordpress/current` through the PHP-FPM
+socket at `/run/php/wordpress-fpm.sock`. The example domain is
+`www.example.test`.
 
 ## What you will do
 
-You will run the canonical `wordpress-fpm` deployment, verify a real WordPress
-workflow, inspect the stable FastCGI path policy, and identify which directories
-can be writable.
+You will separate WordPress code from writable uploads, configure the PHP-FPM
+socket, enable pretty permalinks, test an upload and REST request, and reload
+Vapache.
 
 ## Before you start
 
-You need Docker, 2048 MiB for the scenario, the Docker safety reserve, and root
-or passwordless `sudo`. The scenario pulls digest-pinned WordPress and MariaDB
-images.
+You need a Linux VPS with Vapache, PHP-FPM, WordPress, and its database already
+installed. Complete [Configure a protected PHP-FPM Unix
+socket](../how-to/configure-php-fpm-unix-socket.md) and [Replace an unsafe
+writable PHP layout](../how-to/replace-writable-php-layout.md) first.
 
-## 1. Build and run the deployment
+The examples use PHP-FPM user ID `33`, socket owner ID `0`, and release owner ID
+`1001`. Replace them with the values returned by `id -u` and `stat` on the VPS.
 
-```console
-$ cargo build --locked --release -p vapached
-$ python3 tests/deployments/harness.py \
-    --profile canonical \
-    --scenario wordpress-fpm \
-    --vapached target/release/vapached \
-    --artifacts deployment-results
+## 1. Set the WordPress public URL
+
+Set the public HTTPS URL in `wp-config.php`:
+
+```php
+define('WP_HOME', 'https://www.example.test');
+define('WP_SITEURL', 'https://www.example.test');
+define('DISALLOW_FILE_EDIT', true);
+define('DISALLOW_FILE_MODS', true);
 ```
 
-The canonical dimensions are `permalinks=pretty`, `asset_cache=disk`, and
-`reload=after-start`.
+Keep `/srv/wordpress/current` read-only to PHP-FPM. Give PHP-FPM write access to
+`/srv/wordpress/shared/uploads`, and make `wp-content/uploads` refer to that
+writable data path through the deployment process.
 
-## 2. Verify the result
-
-The final status must be `passed`. The workflow installs WordPress, uploads and
-retrieves a PNG, opens a pretty permalink, reads the REST API, checks that PHP
-source is not exposed, denies PHP in the upload tree, confirms a static cache
-hit, reloads Vapache, and reads the REST root again.
-
-## 3. Inspect the tested configuration
+Create the asset-cache directory:
 
 ```console
-$ find deployment-results -path '*wordpress-fpm-*' -name vapache.conf -print
+$ sudo install -d -o www-data -g www-data -m 0750 /var/cache/vapache/wordpress
 ```
 
-The configuration enables `AccessFiles` and `FastCgi`. It registers an exact
-Unix socket with `VapacheFastCGIStablePath`. The release tree is immutable to
-PHP-FPM. Only `wp-content/uploads` is writable, and a `FilesMatch` rule denies
-PHP execution in that directory.
+Use the Vapache service identity in place of `www-data` when they differ.
 
-## 4. Adapt the pattern
+## 2. Configure Vapache
 
-Give PHP-FPM a protected Unix socket. Keep every PHP file and ancestor directory
-outside the backend's mutation authority. Put media in a separate writable
-tree. Perform core, plugin, and theme updates by creating and activating a new
-immutable release instead of editing the live tree from the dashboard.
+```apache
+VapacheCapability AccessFiles On
+VapacheCapability FastCgi On
+VapacheFastCGIStablePath On unix:/run/php/wordpress-fpm.sock 33 0 0 1001
 
-## Clean up
+<VirtualHost *:443>
+    ServerName www.example.test
+    DocumentRoot /srv/wordpress/current
+    DirectoryIndex index.php
 
-The harness removes WordPress, MariaDB, their network, volumes, and selected
-images. It retains the tested Vapache configuration and workflow evidence.
+    SSLEngine On
+    SSLCertificateFile /etc/letsencrypt/live/www.example.test/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/www.example.test/privkey.pem
 
-## Evidence
+    ProxyPassMatch ^/(.*\.php(/.*)?)$ "unix:/run/php/wordpress-fpm.sock|fcgi://localhost/srv/wordpress/current/"
 
-The automated deployment test uses the
-[scenario manifest](../../tests/deployments/scenarios/wordpress-fpm/scenario.toml)
-and [driver](../../tests/deployments/scenarios/wordpress-fpm/driver.py).
+    <Directory /srv/wordpress/current>
+        AllowOverride FileInfo
+        Require all granted
+    </Directory>
+
+    <Directory /srv/wordpress/current/wp-content/uploads>
+        <FilesMatch "\.php$">
+            Require all denied
+        </FilesMatch>
+    </Directory>
+
+    CacheRoot /var/cache/vapache/wordpress
+    CacheEnable disk /wp-includes/css/
+    CacheHeader On
+    CacheIgnoreNoLastMod On
+    CacheDefaultExpire 300
+</VirtualHost>
+```
+
+## 3. Test WordPress
+
+```console
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ curl --fail https://www.example.test/wp-json/
+$ curl -I https://www.example.test/wp-includes/css/dashicons.min.css
+$ curl -I https://www.example.test/wp-includes/css/dashicons.min.css
+```
+
+In the WordPress dashboard, select a non-plain permalink format and upload one
+PNG file. Open the resulting post and media URL. Place a harmless file named
+`vapache-test.php` in the upload directory and confirm that an HTTP request for
+it is denied rather than executed or returned as source. Remove the file after
+the test. Confirm that the second `dashicons.min.css` request reports an
+`X-Cache` hit.
+
+Reload Vapache and repeat the REST and permalink requests.
+
+## Roll back
+
+Restore the previous virtual host and `wp-config.php` values, run the
+configuration test, and reload Vapache. Do not restore PHP-FPM write access to
+the WordPress code as a rollback method.
+
+<!--
+Deployment contract only; not operator instructions.
+--scenario wordpress-fpm
+Canonical dimensions: `permalinks=pretty`, `asset_cache=disk`, `reload=after-start`.
+Scenario storage budget: 2048 MiB.
+[Scenario](../../tests/deployments/scenarios/wordpress-fpm/scenario.toml)
+[Driver](../../tests/deployments/scenarios/wordpress-fpm/driver.py)
+-->

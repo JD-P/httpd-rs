@@ -7,9 +7,7 @@ contracts: DOC-HOWTO-SERVICE-001
 
 # Reload, reopen logs, stop, and diagnose Vapache
 
-Use this procedure for the packaged systemd service. Contract
-`DOC-HOWTO-SERVICE-001` binds these commands to the packaged service definition
-and reload tests.
+Use this procedure for the packaged systemd service.
 
 ## Prerequisites
 
@@ -42,8 +40,8 @@ $ sudo vapachectl configtest
 $ sudo systemctl reload vapache.service
 ```
 
-The packaged `ExecReload` uses `vapachectl graceful`. Existing accepted
-connections can complete against their current generation.
+Existing accepted connections can complete with the configuration that
+accepted them. New connections use the reloaded configuration.
 
 Vapache rejects reload-only changes to the process identity, listeners, PID
 file, server root, listen backlog, and CGI execution policy. When the
@@ -98,14 +96,11 @@ If the diagnostic names an unsupported directive, use
 names a missing capability or unsafe input, use
 [Assess an Apache configuration](assess-apache-configuration.md).
 
-## Evidence
-
-The [reload test](../../tests/vapachectl_reload.sh) checks wrapper configuration
-selection and graceful reload behavior. The
-[control-plane security test](../../tests/control_plane_security.sh) checks
-privileged path and command selection. The packaged
-[systemd unit](../../packaging/vapache.service) defines the start, preflight,
-reload, and stop boundary. The [CLI lifecycle test](../../crates/server/tests/cli_lifecycle.rs)
-checks reload and `SIGUSR1` log reopening. The
-[configuration reload tests](../../crates/server/src/config.rs) check the
-restart-only field comparison.
+<!--
+Behavior contract evidence:
+[Reload behavior](../../tests/vapachectl_reload.sh)
+[Control path checks](../../tests/control_plane_security.sh)
+[Packaged service](../../packaging/vapache.service)
+[CLI lifecycle](../../crates/server/tests/cli_lifecycle.rs)
+[Reload validation](../../crates/server/src/config.rs)
+-->

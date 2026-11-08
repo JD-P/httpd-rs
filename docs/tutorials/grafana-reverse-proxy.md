@@ -6,67 +6,83 @@ contracts: DOC-DEPLOY-GRAFANA-001
 scenario: grafana-proxy
 ---
 
-# Run the tested Grafana reverse-proxy deployment
+# Put Grafana behind Vapache on a VPS
 
-This tutorial runs Grafana below `/grafana/` and sends HTTP and WebSocket
-traffic through Vapache. Grafana generates public redirects for the Vapache
-authority, not for its private backend address.
+This tutorial publishes Grafana below `/grafana/` at
+`https://monitor.example.test/grafana/`. The same route carries Grafana's HTTP
+and WebSocket traffic.
 
 ## What you will do
 
-You will run the canonical `grafana-proxy` deployment, verify the health and
-redirect behavior, exchange a WebSocket message, reload Vapache, and reconnect
-under the new configuration generation.
+You will bind Grafana to loopback, configure its public URL, add the Vapache
+route, check redirects, use Grafana Live, and reconnect after a reload.
 
 ## Before you start
 
-You need Docker, 1024 MiB for the scenario, the Docker safety reserve, and root
-or passwordless `sudo`.
+You need a Linux VPS with Vapache, Grafana, and a certificate for
+`monitor.example.test`. Grafana must already run as a systemd service.
 
-## 1. Build and run the deployment
+## 1. Configure Grafana
 
-```console
-$ cargo build --locked --release -p vapached
-$ python3 tests/deployments/harness.py \
-    --profile canonical \
-    --scenario grafana-proxy \
-    --vapached target/release/vapached \
-    --artifacts deployment-results
+Set these values in `/etc/grafana/grafana.ini`:
+
+```ini
+[server]
+protocol = http
+http_addr = 127.0.0.1
+http_port = 3000
+domain = monitor.example.test
+root_url = https://monitor.example.test/grafana/
+serve_from_sub_path = true
 ```
 
-The canonical dimensions are `mount=subpath`, `reload=after-start`, and
-`websocket=message`.
-
-## 2. Verify the result
-
-The final status must be `passed`. The workflow checks `/grafana/api/health`,
-follows any public redirect without exposing the backend port, opens Grafana
-Live, reloads Vapache, reconnects the tunnel, exchanges a ping and pong, and
-checks health again.
-
-## 3. Inspect the tested configuration
+Restart Grafana and test its private health endpoint:
 
 ```console
-$ find deployment-results -path '*grafana-proxy-*' -name vapache.conf -print
+$ sudo systemctl restart grafana-server.service
+$ curl --fail http://127.0.0.1:3000/api/health
 ```
 
-The Vapache route and Grafana `root_url` use the same `/grafana/` prefix. The
-same route carries the `/api/live/ws` upgrade. Vapache closes a tunnel that
-belongs to the retired configuration generation; the client reconnects.
+## 2. Configure Vapache
 
-## 4. Adapt the pattern
+```apache
+<VirtualHost *:443>
+    ServerName monitor.example.test
+    SSLEngine On
+    SSLCertificateFile /etc/letsencrypt/live/monitor.example.test/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/monitor.example.test/privkey.pem
 
-Set the application's public URL before you configure `ProxyPass`. Match the
-public and backend prefix rules. Verify redirects and one bidirectional
-WebSocket exchange. Do not use a health response as the only WebSocket test.
+    ProxyPass /grafana/ http://127.0.0.1:3000/grafana/
+    ProxyPassReverse /grafana/ http://127.0.0.1:3000/grafana/
+</VirtualHost>
+```
 
-## Clean up
+## 3. Test HTTP and WebSocket behavior
 
-The harness removes Grafana and its private network. It retains the exact
-configuration, plan, summary, and logs.
+```console
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+$ curl --fail https://monitor.example.test/grafana/api/health
+$ curl -I https://monitor.example.test/grafana/
+```
 
-## Evidence
+Confirm that every redirect uses the public HTTPS URL and retains `/grafana/`.
+Open Grafana Live in a browser and confirm that it receives updates.
 
-The automated deployment test uses the
-[scenario manifest](../../tests/deployments/scenarios/grafana-proxy/scenario.toml)
-and [driver](../../tests/deployments/scenarios/grafana-proxy/driver.py).
+Reload Vapache while Grafana Live is open. The existing WebSocket can close
+during reload. Confirm that the browser reconnects and resumes receiving
+updates.
+
+## Roll back
+
+Restore the previous proxy route and Grafana `root_url`, restart Grafana, and
+reload Vapache.
+
+<!--
+Deployment contract only; not operator instructions.
+--scenario grafana-proxy
+Canonical dimensions: `mount=subpath`, `reload=after-start`, `websocket=message`.
+Scenario storage budget: 1024 MiB.
+[Scenario](../../tests/deployments/scenarios/grafana-proxy/scenario.toml)
+[Driver](../../tests/deployments/scenarios/grafana-proxy/driver.py)
+-->
