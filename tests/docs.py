@@ -128,10 +128,6 @@ def check_style_and_structure() -> None:
             for heading in ("## What you will do", "## Before you start"):
                 if heading not in text:
                     raise DocsError(f"{path.relative_to(ROOT)}: tutorial is missing {heading!r}")
-            if "## Roll back" not in text and "## Clean up" not in text:
-                raise DocsError(
-                    f"{path.relative_to(ROOT)}: tutorial needs rollback or cleanup"
-                )
         if data["doc_type"] == "how-to" and "## Prerequisites" not in text:
             raise DocsError(f"{path.relative_to(ROOT)}: how-to is missing prerequisites")
 

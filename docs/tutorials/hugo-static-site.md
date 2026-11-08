@@ -91,12 +91,6 @@ name the `br` content encoding, and the range file must contain 32 bytes.
 
 Reload Vapache once more and repeat the home-page and range requests.
 
-## Roll back
-
-Restore the previous virtual host, run `vapachectl configtest`, and reload
-Vapache. Keep the generated release until the replacement deployment is
-accepted.
-
 <!--
 Deployment contract only; not operator instructions.
 --scenario hugo-static
