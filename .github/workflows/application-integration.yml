@@ -1,15 +1,23 @@
 name: real-application-integration
 
 on:
+  pull_request:
+    paths:
+      - "docs/examples/tutorials/**"
+      - "docs/tutorials/**"
+      - "tests/deployments/**"
+      - "tests/docs.py"
+      - ".github/workflows/application-integration.yml"
   schedule:
     - cron: "53 4 * * 1-6"
     - cron: "17 5 * * 0"
+    - cron: "31 5 * * 3"
   workflow_dispatch:
     inputs:
       profile:
-        description: Fixed nightly set, all canonical cases, stochastic sample, or exhaustive Cartesian set
+        description: Fixed nightly set, tutorial cases, all canonical cases, stochastic sample, or exhaustive Cartesian set
         type: choice
-        options: [nightly, canonical, sample, full]
+        options: [nightly, documentation, canonical, sample, full]
         default: sample
       scenario:
         description: Optional single scenario id
@@ -79,8 +87,14 @@ jobs:
           EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
           profile=${INPUT_PROFILE:-nightly}
+          if [ "$EVENT_NAME" = pull_request ]; then
+            profile=documentation
+          fi
           if [ "$EVENT_NAME" = schedule ] && [ "$EVENT_SCHEDULE" = "17 5 * * 0" ]; then
             profile=canonical
+          fi
+          if [ "$EVENT_NAME" = schedule ] && [ "$EVENT_SCHEDULE" = "31 5 * * 3" ]; then
+            profile=documentation
           fi
           sample_count=${INPUT_SAMPLE_COUNT:-13}
           args=(

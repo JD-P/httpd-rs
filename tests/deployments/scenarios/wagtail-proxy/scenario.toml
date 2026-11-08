@@ -24,3 +24,8 @@ reload = ["none", "after-login"]
 workers = "two"
 workflow = "admin"
 reload = "after-login"
+
+[documentation]
+workers = "one"
+workflow = "admin"
+reload = "after-login"

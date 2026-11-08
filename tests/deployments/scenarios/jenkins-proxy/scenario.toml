@@ -17,3 +17,8 @@ benchmark = ["login", "job"]
 mount = "subpath"
 reload = "after-start"
 benchmark = "job"
+
+[documentation]
+mount = "subpath"
+reload = "after-start"
+benchmark = "job"

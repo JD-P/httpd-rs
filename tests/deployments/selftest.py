@@ -72,6 +72,20 @@ class DeploymentHarnessTests(unittest.TestCase):
             [(scenario.identifier, scenario.canonical) for scenario in self.scenarios],
         )
 
+    def test_documentation_has_declared_case_for_every_scenario(self) -> None:
+        cases = harness.choose_cases(
+            self.scenarios,
+            profile="documentation",
+            rng=random.Random(1),
+            sample_count=1,
+            only=None,
+        )
+        self.assertEqual(len(cases), len(self.scenarios))
+        self.assertEqual(
+            [(case.scenario.identifier, case.variant) for case in cases],
+            [(scenario.identifier, scenario.documentation) for scenario in self.scenarios],
+        )
+
     def test_every_combination_is_reachable_by_sampling(self) -> None:
         expected = {
             case.identifier

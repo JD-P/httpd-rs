@@ -14,18 +14,40 @@ and kernel WebSocket protocol.
 
 ## What you will do
 
-You will bind JupyterLab to loopback, set its base URL, add the Vapache route,
-execute code in a kernel, reload Vapache, reconnect, and use the same kernel.
+You will install JupyterLab in a dedicated Python environment, create its
+systemd service, bind it to loopback, add the Vapache route, execute code in a
+kernel, reload Vapache, reconnect, and use the same kernel.
 
 ## Before you start
 
-You need a Linux VPS with Vapache, JupyterLab, and a certificate for
-`lab.example.test`. Run JupyterLab from a dedicated systemd service and keep its
-token or configured authentication enabled.
+Complete [Prepare a Debian VPS for a Vapache
+tutorial](prepare-debian-vps.md). Point `lab.example.test` at the VPS and open
+TCP ports 80 and 443 in the provider firewall.
 
-## 1. Configure JupyterLab
+## 1. Install JupyterLab
 
-Set these values in the Jupyter Server configuration used by the service:
+```console
+$ sudo apt install python3-venv
+$ sudo adduser --system --group --home /srv/jupyter jupyter
+$ sudo python3 -m venv /opt/jupyterlab
+$ sudo /opt/jupyterlab/bin/pip install --upgrade pip jupyterlab
+$ sudo -u jupyter /opt/jupyterlab/bin/jupyter server password
+$ sudo certbot certonly --standalone --domain lab.example.test
+```
+
+Enter the password that administrators will use at the public JupyterLab login
+page. The password command stores a hash below `/srv/jupyter`; it does not store
+the entered password as plain text.
+
+## 2. Configure the JupyterLab service
+
+Create the system configuration directory:
+
+```console
+$ sudo install -d -o root -g root -m 0755 /etc/jupyter
+```
+
+Create `/etc/jupyter/jupyter_server_config.py`:
 
 ```python
 c.ServerApp.ip = '127.0.0.1'
@@ -35,14 +57,37 @@ c.ServerApp.open_browser = False
 c.ServerApp.trust_xheaders = True
 ```
 
-Restart JupyterLab and test its private endpoint:
+Create `/etc/systemd/system/jupyterlab.service`:
+
+```systemd
+[Unit]
+Description=JupyterLab
+After=network.target
+
+[Service]
+User=jupyter
+Group=jupyter
+WorkingDirectory=/srv/jupyter
+ExecStart=/opt/jupyterlab/bin/jupyter lab --config=/etc/jupyter/jupyter_server_config.py
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Start JupyterLab and test its private endpoint:
 
 ```console
-$ sudo systemctl restart jupyterlab.service
+$ sudo systemctl daemon-reload
+$ sudo systemctl enable --now jupyterlab.service
 $ curl -I http://127.0.0.1:8888/jupyter/
 ```
 
-## 2. Configure Vapache
+## 3. Configure Vapache
+
+Create `/etc/apache2/sites-available/jupyterlab.conf`:
 
 ```apache
 <VirtualHost *:443>
@@ -56,12 +101,15 @@ $ curl -I http://127.0.0.1:8888/jupyter/
 </VirtualHost>
 ```
 
-## 3. Test a kernel and reload
+Enable the virtual host, test the configuration, and start Vapache:
 
 ```console
+$ sudo a2ensite jupyterlab.conf
 $ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo systemctl enable --now vapache.service
 ```
+
+## 4. Test a kernel and reload
 
 Open `https://lab.example.test/jupyter/`, authenticate, create a kernel, and run
 a cell that prints `Vapache Jupyter test`. Keep the kernel open and reload
@@ -77,7 +125,7 @@ Shut down the test kernel after the check succeeds.
 <!--
 Deployment contract only; not operator instructions.
 --scenario jupyterlab-proxy
-Canonical dimensions: `mount=subpath`, `websocket=execute`, `reload=while-open`.
+Documentation case: `mount=subpath`, `websocket=execute`, `reload=while-open`.
 Scenario storage budget: 3072 MiB.
 [Scenario](../../tests/deployments/scenarios/jupyterlab-proxy/scenario.toml)
 [Driver](../../tests/deployments/scenarios/jupyterlab-proxy/driver.py)

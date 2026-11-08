@@ -26,3 +26,8 @@ reload = ["none", "before-publish"]
 workers = "two"
 stream = "user"
 reload = "before-publish"
+
+[documentation]
+workers = "one"
+stream = "user"
+reload = "before-publish"

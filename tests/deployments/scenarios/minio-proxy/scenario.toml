@@ -17,3 +17,8 @@ reload = ["none", "before-read"]
 payload = "streaming"
 operation = "listing"
 reload = "before-read"
+
+[documentation]
+payload = "streaming"
+operation = "listing"
+reload = "before-read"

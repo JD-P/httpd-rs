@@ -11,14 +11,20 @@ protocol, differential, fuzz or unit suites.
 - `canonical` runs the declared representative case for every application. It
   is the reproducible baseline for cross-application compatibility and
   differential performance campaigns.
+- `documentation` runs the fixed case described by each operator tutorial. It
+  never runs differential benchmarks. This profile can differ from the
+  canonical performance case when the tutorial uses a smaller or safer setup.
 - `sample` uses a recorded random seed. It first selects one random combination
   for every application (when the requested sample is large enough), then
   samples the remaining combinations without replacement.
 - `full` is the explicit, expensive Cartesian escape hatch.
 
 The application-integration workflow runs `nightly` from Monday through
-Saturday. It runs `canonical` on Sunday so every application tutorial retains a
-scheduled end-to-end behavior check.
+Saturday and `canonical` on Sunday. It also runs `documentation` on Wednesday
+so every application tutorial retains a scheduled end-to-end behavior check
+that is independent of the performance case. A pull request that changes a
+tutorial, its checked examples, or the deployment harness also runs the
+documentation profile before merge.
 
 Every combination has a nonzero chance of selection by `sample`. The emitted
 `plan.json` records the exact seed, application versions and dimensions, so a

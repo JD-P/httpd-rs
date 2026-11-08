@@ -698,6 +698,7 @@ class ComposeProject:
 class CaseContext:
     scenario_id: str
     case_id: str
+    profile: str
     run_dir: Path
     artifact_dir: Path
     vapached: Path

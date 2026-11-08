@@ -24,3 +24,8 @@ reload = ["none", "after-login"]
 workflow = "admin"
 session = "authenticated"
 reload = "after-login"
+
+[documentation]
+workflow = "admin"
+session = "authenticated"
+reload = "after-login"

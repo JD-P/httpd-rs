@@ -6,12 +6,15 @@ status: draft
 
 # Choose a deployment tutorial
 
+Start with [Prepare a Debian VPS for a Vapache
+tutorial](prepare-debian-vps.md) when the host does not have Vapache and an
+Apache configuration layout.
+
 Choose the tutorial for your application. If the application is not listed,
 choose one that connects to the web server in the same way.
 
-Each tutorial assumes that the application is installed on a Linux VPS. It
-shows the application settings, Vapache configuration, checks, and rollback for
-one concrete deployment.
+Each application tutorial starts with a fresh Debian VPS. It installs one
+application, configures Vapache, and verifies one concrete deployment.
 
 The “similar software” column lists applications that connect to the web server
 in a similar way. It does not mean that the listed software accepts the same

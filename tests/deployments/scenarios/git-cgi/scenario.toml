@@ -18,3 +18,8 @@ application = "smart-http"
 access = "basic"
 reload = "after-start"
 
+[documentation]
+application = "smart-http"
+access = "basic"
+reload = "after-start"
+

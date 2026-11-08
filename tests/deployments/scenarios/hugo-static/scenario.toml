@@ -20,3 +20,9 @@ cache = "disk"
 encoding = "brotli"
 reload = "after-start"
 
+[documentation]
+access = "open"
+cache = "off"
+encoding = "brotli"
+reload = "after-start"
+

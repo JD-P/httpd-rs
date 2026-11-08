@@ -17,3 +17,8 @@ reload = ["none", "while-open"]
 mount = "subpath"
 websocket = "execute"
 reload = "while-open"
+
+[documentation]
+mount = "subpath"
+websocket = "execute"
+reload = "while-open"

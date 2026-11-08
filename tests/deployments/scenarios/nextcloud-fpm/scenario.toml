@@ -20,3 +20,8 @@ reload = ["none", "before-download"]
 upload = "large"
 dav = "move"
 reload = "before-download"
+
+[documentation]
+upload = "large"
+dav = "move"
+reload = "before-download"

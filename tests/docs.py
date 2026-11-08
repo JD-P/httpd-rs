@@ -128,6 +128,23 @@ def check_style_and_structure() -> None:
             for heading in ("## What you will do", "## Before you start"):
                 if heading not in text:
                     raise DocsError(f"{path.relative_to(ROOT)}: tutorial is missing {heading!r}")
+            if data.get("scenario") and path.name != "migrate-debian-static-site.md":
+                if not re.search(r"^## 1\. Install", text, re.MULTILINE):
+                    raise DocsError(
+                        f"{path.relative_to(ROOT)}: deployment tutorial must start with installation"
+                    )
+                has_shared_setup = "(prepare-debian-vps.md)" in text
+                has_inline_setup = "sudo apt install /tmp/vapache.deb" in text
+                if not has_shared_setup and not has_inline_setup:
+                    raise DocsError(
+                        f"{path.relative_to(ROOT)}: deployment tutorial omits the fresh-VPS setup"
+                    )
+                for phrase in ("already installed", "must already run", "working installation"):
+                    if phrase in text.lower():
+                        raise DocsError(
+                            f"{path.relative_to(ROOT)}: deployment tutorial starts after setup: "
+                            f"{phrase!r}"
+                        )
         if data["doc_type"] == "how-to" and "## Prerequisites" not in text:
             raise DocsError(f"{path.relative_to(ROOT)}: how-to is missing prerequisites")
 
@@ -276,10 +293,10 @@ def check_contract_inventory(contracts: list[dict], embedded_examples: set[str])
             if f"--scenario {scenario}" not in page:
                 raise DocsError(f"{contract_id}: tutorial does not run its scenario")
             manifest_data = tomllib.loads(manifest.read_text(encoding="utf-8"))
-            for name, value in manifest_data["canonical"].items():
+            for name, value in manifest_data["documentation"].items():
                 if f"`{name}={value}`" not in page:
                     raise DocsError(
-                        f"{contract_id}: tutorial omits canonical dimension {name}={value}"
+                        f"{contract_id}: tutorial omits documentation dimension {name}={value}"
                     )
             if str(manifest_data["disk_mb"]) not in page:
                 raise DocsError(f"{contract_id}: tutorial omits its scenario storage budget")
@@ -380,7 +397,9 @@ def check_contract_inventory(contracts: list[dict], embedded_examples: set[str])
         ROOT / ".github" / "workflows" / "application-integration.yml"
     ).read_text(encoding="utf-8")
     if 'cron: "17 5 * * 0"' not in workflow or "profile=canonical" not in workflow:
-        raise DocsError("deployment tutorials require a scheduled canonical application workflow")
+        raise DocsError("deployment scenarios require a scheduled canonical application workflow")
+    if 'cron: "31 5 * * 3"' not in workflow or "profile=documentation" not in workflow:
+        raise DocsError("deployment tutorials require a scheduled documentation workflow")
 
 
 def check_reference_evidence() -> list[str]:

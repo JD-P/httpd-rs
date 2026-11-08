@@ -17,3 +17,8 @@ benchmark = ["front", "clean-url"]
 profile = "demo_umami"
 reload = "after-start"
 benchmark = "clean-url"
+
+[documentation]
+profile = "standard"
+reload = "after-start"
+benchmark = "clean-url"

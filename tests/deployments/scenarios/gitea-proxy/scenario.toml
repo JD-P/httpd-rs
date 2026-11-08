@@ -18,3 +18,8 @@ mount = "subpath"
 reload = "before-transfer"
 benchmark = "repository"
 
+[documentation]
+mount = "subpath"
+reload = "before-transfer"
+benchmark = "repository"
+

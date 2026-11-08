@@ -9,6 +9,7 @@ from pathlib import Path
 from lib import (
     CaseContext,
     DeploymentError,
+    ROOT,
     basic_authorization,
     command,
     common_apache_config,
@@ -63,6 +64,33 @@ def locate_git_apps() -> tuple[Path, Path, Path]:
     if missing:
         raise DeploymentError("missing Git CGI application files: " + ", ".join(map(str, missing)))
     return gitweb, gitweb_static, backend
+
+
+def documented_routes(
+    projects: Path,
+    gitweb_config: Path,
+    auth_file: Path,
+    gitweb: Path,
+    gitweb_static: Path,
+    backend: Path,
+) -> str:
+    """Render the exact operator-facing virtual host with disposable test paths."""
+    template = (ROOT / "docs/examples/tutorials/git-cgi-vhost.conf").read_text()
+    rendered = template.replace("VapacheCapability Cgi On\n\n", "", 1)
+    rendered = rendered.replace("<VirtualHost *:80>\n", "", 1)
+    rendered = rendered.rsplit("</VirtualHost>", 1)[0]
+    replacements = {
+        "/etc/gitweb.conf": os.fspath(gitweb_config),
+        "/srv/git": os.fspath(projects),
+        "/etc/vapache/auth/git.htpasswd": os.fspath(auth_file),
+        "/usr/share/gitweb/gitweb.cgi": os.fspath(gitweb),
+        "/usr/share/gitweb/static": os.fspath(gitweb_static),
+        "/usr/lib/git-core/git-http-backend": os.fspath(backend),
+        "/usr/lib/git-core": os.fspath(backend.parent),
+    }
+    for source, destination in replacements.items():
+        rendered = rendered.replace(source, destination)
+    return rendered
 
 
 def run(context: CaseContext, variant: dict[str, str]) -> None:
@@ -122,6 +150,15 @@ Alias /gitweb-static/ "{gitweb_static}/"
 </Directory>
 {authorization}
 """
+    if context.profile == "documentation":
+        extra = documented_routes(
+            projects,
+            gitweb_config,
+            auth_file,
+            gitweb,
+            gitweb_static,
+            backend,
+        )
     config, pid_file = common_vapache_config(
         context.run_dir,
         port,

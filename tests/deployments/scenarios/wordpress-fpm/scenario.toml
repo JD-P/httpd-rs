@@ -21,3 +21,8 @@ permalinks = "pretty"
 asset_cache = "disk"
 reload = "after-start"
 
+[documentation]
+permalinks = "pretty"
+asset_cache = "off"
+reload = "after-start"
+

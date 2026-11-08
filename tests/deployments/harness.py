@@ -48,6 +48,7 @@ class Scenario:
     prerequisites: tuple[str, ...]
     dimensions: dict[str, tuple[str, ...]]
     canonical: dict[str, str]
+    documentation: dict[str, str]
 
     def variants(self) -> list[dict[str, str]]:
         names = sorted(self.dimensions)
@@ -100,12 +101,22 @@ def load_scenarios() -> list[Scenario]:
             prerequisites=tuple(data.get("prerequisites", [])),
             dimensions=dimensions,
             canonical=canonical,
+            documentation=dict(data["documentation"]),
         )
         if set(canonical) != set(dimensions):
             raise DeploymentError(f"{manifest}: canonical dimensions do not match dimensions table")
         for name, value in canonical.items():
             if value not in dimensions[name]:
                 raise DeploymentError(f"{manifest}: canonical {name}={value!r} is not selectable")
+        if set(scenario.documentation) != set(dimensions):
+            raise DeploymentError(
+                f"{manifest}: documentation dimensions do not match dimensions table"
+            )
+        for name, value in scenario.documentation.items():
+            if value not in dimensions[name]:
+                raise DeploymentError(
+                    f"{manifest}: documentation {name}={value!r} is not selectable"
+                )
         for image in scenario.images:
             if "@sha256:" not in image:
                 raise DeploymentError(f"{manifest}: image is not pinned by digest: {image}")
@@ -137,6 +148,8 @@ def choose_cases(
         return [Case(scenario, scenario.canonical) for scenario in scenarios if scenario.nightly]
     if profile == "canonical":
         return [Case(scenario, scenario.canonical) for scenario in scenarios]
+    if profile == "documentation":
+        return [Case(scenario, scenario.documentation) for scenario in scenarios]
     all_cases = [case for scenario in scenarios for case in cases_for_scenario(scenario)]
     if profile == "full":
         return all_cases
@@ -209,7 +222,9 @@ def check_disk(scenario: Scenario) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--profile", choices=("nightly", "canonical", "sample", "full"), default="nightly"
+        "--profile",
+        choices=("nightly", "canonical", "documentation", "sample", "full"),
+        default="nightly",
     )
     parser.add_argument("--scenario", help="restrict the run to one scenario")
     parser.add_argument("--sample-count", type=int, default=10)
@@ -317,6 +332,8 @@ def write_benchmark_summary(artifact_root: Path, results: list[dict[str, Any]]) 
 
 def main() -> int:
     args = parse_args()
+    if args.profile == "documentation" and args.benchmark:
+        raise DeploymentError("the documentation profile does not run differential benchmarks")
     seed = args.seed if args.seed is not None else secrets.randbits(64)
     rng = random.Random(seed)
     scenarios = load_scenarios()
@@ -379,6 +396,7 @@ def main() -> int:
         context = CaseContext(
             scenario_id=case.scenario.identifier,
             case_id=case.identifier,
+            profile=args.profile,
             run_dir=run_dir,
             artifact_dir=artifact_dir,
             vapached=args.vapached.resolve(),

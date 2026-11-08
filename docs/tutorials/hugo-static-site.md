@@ -18,18 +18,41 @@ a custom error page and Brotli compression, and test byte ranges and reload.
 
 ## Before you start
 
-You need a Linux VPS with Vapache, Hugo, and a certificate for
-`docs.example.test`. Point the domain at the VPS. Replace the example domain and
+Complete [Prepare a Debian VPS for a Vapache
+tutorial](prepare-debian-vps.md). Point `docs.example.test` at the VPS and open
+TCP ports 80 and 443 in the provider firewall. Replace the example domain and
 paths with your own values before you run the commands.
 
 This tutorial uses `/srv/hugo/source` for the Hugo project and
 `/srv/www/hugo/releases/2026-11-08/public` for the generated release.
 
-## 1. Build an immutable release
+## 1. Install Hugo and create the example site
+
+```console
+$ sudo apt install hugo
+$ sudo adduser --system --group --home /srv/hugo deploy
+$ sudo -u deploy hugo new site /srv/hugo/source
+$ sudo -u deploy mkdir -p /srv/hugo/source/content /srv/hugo/source/layouts \
+    /srv/hugo/source/static/assets
+$ printf '%s\n' '---' 'title: Home' '---' 'Vapache Hugo tutorial.' \
+    | sudo -u deploy tee /srv/hugo/source/content/_index.md >/dev/null
+$ printf '%s\n' '<!doctype html><title>{{ .Title }}</title><main>{{ .Content }}</main>' \
+    | sudo -u deploy tee /srv/hugo/source/layouts/home.html >/dev/null
+$ printf '%s\n' '<!doctype html><title>Not found</title><h1>Not found</h1>' \
+    | sudo -u deploy tee /srv/hugo/source/layouts/404.html >/dev/null
+$ printf '%s\n' "console.log('Vapache Hugo tutorial');" \
+    | sudo -u deploy tee /srv/hugo/source/static/assets/app.js >/dev/null
+$ sudo certbot certonly --standalone --domain docs.example.test
+```
+
+Certbot must report that it created the certificate before you continue.
+
+## 2. Build an immutable release
 
 Run Hugo as the identity that deploys the site:
 
 ```console
+$ sudo install -d -o deploy -g deploy -m 0755 /srv/www/hugo/releases
 $ sudo -u deploy hugo \
     --source /srv/hugo/source \
     --destination /srv/www/hugo/releases/2026-11-08/public
@@ -37,12 +60,17 @@ $ sudo chown -R deploy:deploy /srv/www/hugo/releases/2026-11-08
 $ sudo chmod -R a-w /srv/www/hugo/releases/2026-11-08
 ```
 
-Create `/srv/www/hugo/releases/2026-11-08/public/404.html` if the Hugo project
-does not generate one.
+Confirm that Hugo generated the files used by the checks:
 
-## 2. Configure Vapache
+```console
+$ test -f /srv/www/hugo/releases/2026-11-08/public/index.html
+$ test -f /srv/www/hugo/releases/2026-11-08/public/404.html
+$ test -f /srv/www/hugo/releases/2026-11-08/public/assets/app.js
+```
 
-Add this virtual host to the main configuration:
+## 3. Configure Vapache
+
+Create `/etc/apache2/sites-available/hugo.conf` with this virtual host:
 
 ```apache
 <VirtualHost *:443>
@@ -65,13 +93,19 @@ Add this virtual host to the main configuration:
 </VirtualHost>
 ```
 
-## 3. Test the site
+Enable the site, test the configuration, and start Vapache:
+
+```console
+$ sudo a2ensite hugo.conf
+$ sudo vapachectl configtest
+$ sudo systemctl enable --now vapache.service
+```
+
+## 4. Test the site
 
 Run:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
 $ curl --fail https://docs.example.test/
 $ curl --silent --show-error --output /tmp/hugo-404.html \
     --write-out '%{http_code}\n' https://docs.example.test/missing
@@ -94,7 +128,7 @@ Reload Vapache once more and repeat the home-page and range requests.
 <!--
 Deployment contract only; not operator instructions.
 --scenario hugo-static
-Canonical dimensions: `access=basic`, `cache=disk`, `encoding=brotli`, `reload=after-start`.
+Documentation case: `access=open`, `cache=off`, `encoding=brotli`, `reload=after-start`.
 Scenario storage budget: 768 MiB.
 [Scenario](../../tests/deployments/scenarios/hugo-static/scenario.toml)
 [Driver](../../tests/deployments/scenarios/hugo-static/driver.py)

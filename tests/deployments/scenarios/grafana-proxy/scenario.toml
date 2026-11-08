@@ -18,3 +18,8 @@ mount = "subpath"
 reload = "after-start"
 websocket = "message"
 
+[documentation]
+mount = "subpath"
+reload = "after-start"
+websocket = "message"
+
