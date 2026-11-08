@@ -320,6 +320,33 @@ def check_links() -> None:
                 raise DocsError(f"{path.relative_to(ROOT)}: broken local link: {target}")
 
 
+def check_apache_reference_links() -> None:
+    required = {
+        "reference/apache-compatibility.md": (
+            "https://httpd.apache.org/docs/2.4/mod/quickreference.html",
+            "https://httpd.apache.org/docs/2.4/mod/",
+        ),
+        "how-to/assess-apache-configuration.md": (
+            "https://httpd.apache.org/docs/2.4/mod/quickreference.html",
+            "https://httpd.apache.org/docs/2.4/mod/",
+        ),
+        "how-to/investigate-rejected-directive.md": (
+            "https://httpd.apache.org/docs/2.4/mod/quickreference.html",
+            "https://httpd.apache.org/docs/2.4/sections.html",
+        ),
+        "how-to/move-htaccess-to-main-config.md": (
+            "https://httpd.apache.org/docs/2.4/howto/htaccess.html",
+            "https://httpd.apache.org/docs/2.4/mod/core.html#allowoverride",
+            "https://httpd.apache.org/docs/2.4/mod/core.html#allowoverridelist",
+        ),
+    }
+    for relative, urls in required.items():
+        text = (DOCS / relative).read_text(encoding="utf-8")
+        for url in urls:
+            if url not in text:
+                raise DocsError(f"docs/{relative}: missing Apache reference {url}")
+
+
 def local_link_targets(path: Path, text: str) -> set[Path]:
     targets: set[Path] = set()
     for match in MARKDOWN_LINK.finditer(text):
@@ -789,6 +816,7 @@ def main() -> int:
         check_deployment_tutorial_security()
         check_safe_rust_claim()
         check_links()
+        check_apache_reference_links()
         check_how_to_catalog()
         check_explanation_catalog()
         embedded_examples = check_tested_examples()

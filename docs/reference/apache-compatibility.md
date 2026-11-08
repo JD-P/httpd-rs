@@ -23,6 +23,13 @@ before a switch.
 Vapache reads Apache HTTP Server 2.4 configuration for the features that it
 supports. It is not a drop-in replacement for every Apache module.
 
+Use Apache's [directive quick
+reference](https://httpd.apache.org/docs/2.4/mod/quickreference.html) to find a
+directive's syntax, permitted context, override class, and supplying module.
+Use the [module index](https://httpd.apache.org/docs/2.4/mod/) for the behavior
+that Apache assigns to the directive. Those pages describe Apache. This page
+and `vapachectl configtest` describe whether Vapache preserves that behavior.
+
 ## What a successful configuration test means
 
 A successful test means that Vapache recognizes the selected configuration and

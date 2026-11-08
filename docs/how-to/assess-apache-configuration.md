@@ -39,6 +39,13 @@ Save this output. You will use it to compare Apache with Vapache. The
 loaded-module list can reveal Apache features that are compiled into the server
 or enabled outside the site's virtual-host file.
 
+Use Apache's [directive quick
+reference](https://httpd.apache.org/docs/2.4/mod/quickreference.html) to identify
+the module, context, and override class for an unfamiliar directive. Use the
+[module index](https://httpd.apache.org/docs/2.4/mod/) to read the Apache
+behavior that the configuration currently requests. These references do not
+state whether Vapache implements that behavior.
+
 ## 3. Run the packaged Vapache check
 
 Run:

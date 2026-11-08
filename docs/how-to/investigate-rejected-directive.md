@@ -43,6 +43,14 @@ first. If Apache accepts it, continue with the Vapache classification.
 
 ## 3. Classify the rejection
 
+Look up an unfamiliar directive in Apache's [directive quick
+reference](https://httpd.apache.org/docs/2.4/mod/quickreference.html). Then read
+the documentation for its supplying module in the [Apache module
+index](https://httpd.apache.org/docs/2.4/mod/). If the rejection concerns where
+the directive appears, use Apache's [configuration-section
+guide](https://httpd.apache.org/docs/2.4/sections.html) to determine which
+requests and files the enclosing block controls.
+
 | Diagnostic class | Meaning | Response |
 |---|---|---|
 | Missing `VapacheCapability` | The feature is supported but default-off | Check what the capability enables and add it only if the deployment needs that feature |

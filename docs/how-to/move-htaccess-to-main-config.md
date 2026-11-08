@@ -29,6 +29,15 @@ $ grep -R -E '^[[:space:]]*(AccessFileName|AllowOverride|AllowOverrideList)' /et
 Repeat the search for a non-default `AccessFileName`. Record the effective
 `AllowOverride` and `AllowOverrideList` for each directory.
 
+Apache's [access-file
+guide](https://httpd.apache.org/docs/2.4/howto/htaccess.html) explains when
+Apache reads `.htaccess` files. The directive references define
+[`AccessFileName`](https://httpd.apache.org/docs/2.4/mod/core.html#accessfilename),
+[`AllowOverride`](https://httpd.apache.org/docs/2.4/mod/core.html#allowoverride),
+and
+[`AllowOverrideList`](https://httpd.apache.org/docs/2.4/mod/core.html#allowoverridelist).
+Use those definitions to record the Apache baseline before you move a rule.
+
 ## 2. Classify each directive
 
 For each access file, record:
@@ -45,6 +54,10 @@ access-control or authentication rule to make the configuration load.
 
 Copy the directives, in the same order, into the matching `<Directory>` block
 in the main configuration. Then set `AllowOverride None` for that tree.
+
+Use Apache's [`<Directory>`
+reference](https://httpd.apache.org/docs/2.4/mod/core.html#directory) to preserve
+the original filesystem scope.
 
 ```apache
 <Directory /srv/www/example/public>
