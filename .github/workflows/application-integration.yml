@@ -2,7 +2,8 @@ name: real-application-integration
 
 on:
   schedule:
-    - cron: "53 4 * * *"
+    - cron: "53 4 * * 1-6"
+    - cron: "17 5 * * 0"
   workflow_dispatch:
     inputs:
       profile:
@@ -44,7 +45,7 @@ jobs:
     # Actions usage and peak Docker storage; the harness removes each pinned
     # application image before proceeding.
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Git CGI prerequisites
@@ -74,8 +75,13 @@ jobs:
           INPUT_SAMPLE_COUNT: ${{ inputs.sample_count }}
           INPUT_SEED: ${{ inputs.seed }}
           INPUT_BENCHMARK: ${{ inputs.benchmark }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
           profile=${INPUT_PROFILE:-nightly}
+          if [ "$EVENT_NAME" = schedule ] && [ "$EVENT_SCHEDULE" = "17 5 * * 0" ]; then
+            profile=canonical
+          fi
           sample_count=${INPUT_SAMPLE_COUNT:-13}
           args=(
             --profile "$profile"
@@ -111,4 +117,3 @@ jobs:
           path: deployment-results
           if-no-files-found: warn
           retention-days: 30
-

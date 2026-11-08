@@ -55,8 +55,8 @@ implemented-but-unmodelled protocol surfaces.
 Status meanings:
 
 - **prevented** — Rust memory safety, verified parsing, `openat2`
-  containment, Rustls, or another construction/verification primitive
-  removes the vulnerability primitive.
+  containment, Rustls, or another implementation or verification property
+  prevents the root cause described by the advisory.
 - **fail_closed / not_applicable** — the module, platform, directive or
   feature is absent or rejected.
 - **partial** — a relevant layer is verified, but the complete CVE class is
@@ -65,7 +65,7 @@ Status meanings:
 - **not_covered** — the production behavior is implemented but outside the
   formal model.
 - **needs_review** — the public source record is internally inconsistent or
-  does not disclose enough of the primitive to compare honestly.
+  does not describe the cause in enough detail for a reliable comparison.
 
 Classification is static and intentionally conservative. It uses NVD
 descriptions plus explicit human overrides for ambiguous historical cases.

@@ -1,9 +1,11 @@
 # vapache
 
-**WARNING: THIS ISN'T DONE YET AND HAS NOT UNDERGONE AN ADVERSARIAL PASS YET, THERE ARE PROBABLY STILL CRITICAL BUGS IN THIS DON'T USE IT**
-
 A memory-safe, formally verified, drop-in-compatible Apache HTTP Server
 replacement written in Rust.
+
+The [Vapache documentation](docs/README.md) covers migration, intentional
+Apache differences, security expectations, and executable documentation
+contracts.
 
 `vapached` reads ordinary Apache 2.4 configuration files, serves static files,
 runs CGI programs, and keeps the security-critical parsing kernels in
@@ -830,10 +832,12 @@ measured by that gate rather than runtime line coverage.
 
 Real-application integration lives under [`tests/deployments`](tests/deployments/README.md).
 The fixed nightly profile deploys Hugo, Gitweb/smart Git CGI, WordPress with
-PHP-FPM, and Grafana with a live WebSocket. Manual runs reproducibly sample
-104 application/topology combinations by recorded seed across twelve
+PHP-FPM, and Grafana with a live WebSocket. The Sunday workflow runs the
+canonical case for all thirteen applications. Manual runs reproducibly sample
+112 application/topology combinations by recorded seed across thirteen
 applications, including Gitea, Drupal, Jenkins, JupyterLab, MinIO, Nextcloud,
-Wagtail and Bugzilla, or can explicitly request the full Cartesian set.
+Wagtail, Bugzilla and Mastodon, or can explicitly request the full Cartesian
+set.
 Application containers use digest-pinned upstream images or staged builds from
 pinned source, private networks, read-only roots and staging-only mounts; a
 dedicated harness gate rejects any mount overlapping the source checkout.

@@ -84,6 +84,9 @@ export PYTHONDONTWRITEBYTECODE=1
 step "release build"
 cargo build --release -p vapached
 
+step "executable documentation"
+python3 tests/docs.py
+
 step "Rust workspace tests"
 cargo test --workspace -- --test-threads=1
 

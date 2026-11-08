@@ -1,0 +1,248 @@
+schema = 1
+
+[[contract]]
+id = "DOC-MIGRATE-STATIC-001"
+kind = "runtime"
+document = "docs/tutorials/migrate-debian-static-site.md"
+example = "docs/examples/migrate-debian-static-site/vhost.conf"
+evidence = "Vapache runtime test and existing Apache differential test"
+apache_test = "tests/conformance.py:Conformance.test_post_static"
+
+[[contract.request]]
+method = "GET"
+path = "/"
+status = 200
+body = "Vapache documentation example\n"
+
+[[contract.request]]
+method = "GET"
+path = "/missing"
+status = 404
+body = "The requested example page does not exist.\n"
+
+[[contract.request]]
+method = "POST"
+path = "/"
+status = 405
+header = "Allow"
+
+[[contract]]
+id = "DOC-CAPABILITY-AUDIT-001"
+kind = "capability-audit"
+document = "docs/how-to/assess-apache-configuration.md"
+example = "docs/examples/compatibility/capability-cgi.conf"
+evidence = "Vapache command-line behavior"
+output = "VapacheCapability Cgi On"
+
+[[contract]]
+id = "DOC-UNSUPPORTED-POLICY-001"
+kind = "config-reject"
+document = "docs/how-to/assess-apache-configuration.md"
+example = "docs/examples/compatibility/unsupported-policy.conf"
+evidence = "Fail-closed configuration rejection"
+error = "SSLRequireSSL is not implemented; refusing to weaken TLS policy"
+
+[[contract]]
+id = "DOC-HOWTO-TLS-001"
+kind = "evidence"
+document = "docs/how-to/migrate-tls-and-certbot.md"
+evidence = "Packaged Certbot service-selection and renewal behavior"
+evidence_paths = [
+    "tests/certbot_apache_integration.sh",
+    "tests/certbot_apache_shim.sh",
+    ".github/workflows/artifacts.yml",
+]
+evidence_markers = [
+    "tests/certbot_apache_integration.sh::sudo certbot certonly --standalone -d example.test",
+    "tests/certbot_apache_shim.sh::SHIM_TEST_VAPACHE_ACTIVE=1 VAPACHE_CERTBOT_TARGET=auto run_shim graceful",
+    ".github/workflows/artifacts.yml::tests/certbot_apache_integration.sh release/vapache_*.deb",
+]
+
+[[contract]]
+id = "DOC-HOWTO-FCGI-SOCKET-001"
+kind = "evidence"
+document = "docs/how-to/configure-php-fpm-unix-socket.md"
+evidence = "Scheduled canonical stable FastCGI deployments"
+scenarios = ["wordpress-fpm", "drupal-fpm", "nextcloud-fpm", "bugzilla-fastcgi"]
+
+[[contract]]
+id = "DOC-HOWTO-PHP-LAYOUT-001"
+kind = "evidence"
+document = "docs/how-to/replace-writable-php-layout.md"
+evidence = "Scheduled canonical immutable-code PHP deployments"
+scenarios = ["wordpress-fpm", "drupal-fpm", "nextcloud-fpm"]
+
+[[contract]]
+id = "DOC-HOWTO-HTACCESS-001"
+kind = "evidence"
+document = "docs/how-to/move-htaccess-to-main-config.md"
+evidence = "Generated access-file semantics and canonical application layouts"
+evidence_paths = ["tests/config_semantics.py"]
+evidence_markers = [
+    "tests/config_semantics.py::AllowOverride category x .htaccess directive",
+]
+scenarios = ["hugo-static", "wordpress-fpm", "drupal-fpm"]
+
+[[contract]]
+id = "DOC-HOWTO-PROXY-AUTHORITY-001"
+kind = "evidence"
+document = "docs/how-to/configure-proxy-authority.md"
+evidence = "Proxy conformance and canonical public-authority deployments"
+evidence_paths = ["tests/conformance.py"]
+evidence_markers = [
+    "tests/conformance.py::def test_proxy_strips_client_forwarded_addresses(self):",
+    "tests/conformance.py::def test_websocket_requires_valid_handshake(self):",
+]
+scenarios = ["wagtail-proxy", "minio-proxy", "mastodon-proxy"]
+
+[[contract]]
+id = "DOC-HOWTO-SERVICE-001"
+kind = "evidence"
+document = "docs/how-to/operate-vapache-service.md"
+evidence = "Packaged systemd control and reload behavior"
+evidence_paths = [
+    "tests/vapachectl_reload.sh",
+    "tests/control_plane_security.sh",
+    "packaging/vapache.service",
+    "crates/server/tests/cli_lifecycle.rs",
+    "crates/server/src/config.rs",
+]
+evidence_markers = [
+    "tests/vapachectl_reload.sh::run_control graceful",
+    "tests/control_plane_security.sh::deploy hook accepted a command below an untrusted ancestor",
+    "packaging/vapache.service::ExecReload=/usr/sbin/vapachectl graceful",
+    "crates/server/tests/cli_lifecycle.rs::fn foreground_reload_reopen_bind_and_actions()",
+    "crates/server/src/config.rs::pub fn validate_reload_from(&self, previous: &Config)",
+]
+
+[[contract]]
+id = "DOC-HOWTO-REJECTION-001"
+kind = "evidence"
+document = "docs/how-to/investigate-rejected-directive.md"
+evidence = "Configuration registry and validity checks"
+evidence_paths = ["tests/config_validity.py"]
+evidence_markers = [
+    "tests/config_validity.py::HARDENED_CASES = [",
+    "tests/config_validity.py::MALFORMED_CASES = [",
+]
+
+[[contract]]
+id = "DOC-HOWTO-CVE-001"
+kind = "evidence"
+document = "docs/how-to/evaluate-apache-cve.md"
+evidence = "Reproducible Apache and cross-server CVE classifications"
+evidence_paths = [
+    "tests/cve_matrix.py",
+    "tests/cross_server_cve_matrix.py",
+    "docs/cve/README.md",
+]
+evidence_markers = [
+    "tests/cve_matrix.py::CVE-2021-41773",
+    "tests/cross_server_cve_matrix.py::--check",
+    "docs/cve/README.md::not a claim that every CVE has a working replay test",
+]
+
+[[contract]]
+id = "DOC-HOWTO-ROLLBACK-001"
+kind = "evidence"
+document = "docs/how-to/roll-back-to-apache.md"
+evidence = "Packaged switch interruption and service restoration behavior"
+evidence_paths = [
+    "tests/certbot_apache_integration.sh",
+    "packaging/vapache-switch",
+]
+evidence_markers = [
+    "tests/certbot_apache_integration.sh::restore Apache's exact prior",
+    "packaging/vapache-switch::restore_switch_state()",
+]
+
+[[contract]]
+id = "DOC-DEPLOY-HUGO-001"
+kind = "deployment"
+document = "docs/tutorials/hugo-static-site.md"
+scenario = "hugo-static"
+evidence = "Scheduled canonical real-application deployment"
+
+[[contract]]
+id = "DOC-DEPLOY-GIT-CGI-001"
+kind = "deployment"
+document = "docs/tutorials/git-cgi.md"
+scenario = "git-cgi"
+evidence = "Scheduled canonical real-application deployment"
+
+[[contract]]
+id = "DOC-DEPLOY-WORDPRESS-001"
+kind = "deployment"
+document = "docs/tutorials/wordpress-php-fpm.md"
+scenario = "wordpress-fpm"
+evidence = "Scheduled canonical real-application deployment"
+
+[[contract]]
+id = "DOC-DEPLOY-GRAFANA-001"
+kind = "deployment"
+document = "docs/tutorials/grafana-reverse-proxy.md"
+scenario = "grafana-proxy"
+evidence = "Scheduled canonical real-application deployment"
+
+[[contract]]
+id = "DOC-DEPLOY-GITEA-001"
+kind = "deployment"
+document = "docs/tutorials/gitea-reverse-proxy.md"
+scenario = "gitea-proxy"
+evidence = "Scheduled canonical real-application deployment"
+
+[[contract]]
+id = "DOC-DEPLOY-DRUPAL-001"
+kind = "deployment"
+document = "docs/tutorials/drupal-php-fpm.md"
+scenario = "drupal-fpm"
+evidence = "Scheduled canonical real-application deployment"
+
+[[contract]]
+id = "DOC-DEPLOY-JENKINS-001"
+kind = "deployment"
+document = "docs/tutorials/jenkins-reverse-proxy.md"
+scenario = "jenkins-proxy"
+evidence = "Scheduled canonical real-application deployment"
+
+[[contract]]
+id = "DOC-DEPLOY-JUPYTERLAB-001"
+kind = "deployment"
+document = "docs/tutorials/jupyterlab-reverse-proxy.md"
+scenario = "jupyterlab-proxy"
+evidence = "Scheduled canonical real-application deployment"
+
+[[contract]]
+id = "DOC-DEPLOY-MINIO-001"
+kind = "deployment"
+document = "docs/tutorials/minio-reverse-proxy.md"
+scenario = "minio-proxy"
+evidence = "Scheduled canonical real-application deployment"
+
+[[contract]]
+id = "DOC-DEPLOY-NEXTCLOUD-001"
+kind = "deployment"
+document = "docs/tutorials/nextcloud-php-fpm.md"
+scenario = "nextcloud-fpm"
+evidence = "Scheduled canonical real-application deployment"
+
+[[contract]]
+id = "DOC-DEPLOY-WAGTAIL-001"
+kind = "deployment"
+document = "docs/tutorials/wagtail-gunicorn.md"
+scenario = "wagtail-proxy"
+evidence = "Scheduled canonical real-application deployment"
+
+[[contract]]
+id = "DOC-DEPLOY-BUGZILLA-001"
+kind = "deployment"
+document = "docs/tutorials/bugzilla-fastcgi.md"
+scenario = "bugzilla-fastcgi"
+evidence = "Scheduled canonical real-application deployment"
+
+[[contract]]
+id = "DOC-DEPLOY-MASTODON-001"
+kind = "deployment"
+document = "docs/tutorials/mastodon-tls-streaming.md"
+scenario = "mastodon-proxy"
+evidence = "Scheduled canonical real-application deployment"

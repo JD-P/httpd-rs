@@ -15,6 +15,8 @@ cargo clippy -p vapached --lib --bins --no-deps -- \
   -D clippy::correctness -D clippy::suspicious \
   -D unused_must_use -A unsafe_code
 cargo test --workspace --all-targets --all-features -- --test-threads=1
+cargo build --locked -p vapached
+python3 tests/docs.py
 python3 tests/unsafe_inventory.py
 python3 tests/resource_inventory.py
 python3 tests/verification_status.py

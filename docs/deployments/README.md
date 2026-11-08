@@ -6,6 +6,10 @@ exact generated configuration and logs are retained with every run; these
 guides explain the security-relevant differences from a typical Apache or
 Nginx installation.
 
+For executable, application-specific learning paths, use the
+[tutorial catalog](../tutorials/README.md). This page remains the cross-application
+evidence summary.
+
 The feature-to-application rationale is maintained in the
 [application coverage inventory](coverage.md).
 
@@ -264,4 +268,3 @@ The representative application inventory is complete. Add another application
 only when it exposes a distinct Vapache boundary rather than duplicating an
 implementation language behind ordinary HTTP. CalDAV/CardDAV can deepen the
 existing Nextcloud case without another deployment.
-

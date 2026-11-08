@@ -16,6 +16,10 @@ protocol, differential, fuzz or unit suites.
   samples the remaining combinations without replacement.
 - `full` is the explicit, expensive Cartesian escape hatch.
 
+The application-integration workflow runs `nightly` from Monday through
+Saturday. It runs `canonical` on Sunday so every application tutorial retains a
+scheduled end-to-end behavior check.
+
 Every combination has a nonzero chance of selection by `sample`. The emitted
 `plan.json` records the exact seed, application versions and dimensions, so a
 failure can be replayed exactly:
@@ -109,4 +113,3 @@ Choose applications for distinct observable behavior rather than language
 labels. Python, Java and Go look alike after becoming ordinary HTTP, while
 WebDAV uploads, subpath redirects, smart Git HTTP and WebSocket lifetimes
 exercise materially different server boundaries.
-

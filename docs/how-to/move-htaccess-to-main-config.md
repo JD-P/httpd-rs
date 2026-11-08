@@ -1,0 +1,97 @@
+---
+doc_type: how-to
+audience: apache-operator
+status: draft
+contracts: DOC-HOWTO-HTACCESS-001
+---
+
+# Move `.htaccess` policy into the main configuration
+
+Use this procedure to remove access-file evaluation from a document tree.
+Configuration tests and automated application deployment tests exercise the
+migration.
+
+## Prerequisites
+
+Obtain the complete main configuration, all included files, and all served
+trees. Record representative permitted and denied requests before you change
+the policy.
+
+## 1. Record the active policy
+
+Find every configured access-file name and every file in the served trees:
+
+```console
+$ sudo apache2ctl -t -D DUMP_INCLUDES
+$ find /srv/www -name .htaccess -type f -print
+$ rg '^[[:space:]]*(AccessFileName|AllowOverride|AllowOverrideList)' /etc/apache2
+```
+
+Repeat the search for a non-default `AccessFileName`. Record the effective
+`AllowOverride` and `AllowOverrideList` for each directory.
+
+## 2. Classify each directive
+
+For each access file, record:
+
+- the directory where Apache reads the file;
+- the directive order;
+- the permitted override category;
+- the requests that the rule permits, denies, redirects, or rewrites.
+
+Stop if the file contains a directive that Vapache rejects. Do not delete an
+access-control or authentication rule to make the configuration load.
+
+## 3. Move the policy into its directory context
+
+Copy the directives, in the same order, into the matching `<Directory>` block
+in the main configuration. Then set `AllowOverride None` for that tree.
+
+```apache
+<Directory /srv/www/example/public>
+    AllowOverride None
+    Require all granted
+
+    RewriteEngine On
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteRule ^ index.php [L]
+</Directory>
+```
+
+Do not add a leading slash to a per-directory rewrite pattern. Confirm the
+substitution base and inherited directory context. These details can change
+the target even when the regular expression is equal.
+
+## 4. Test a staged configuration
+
+Test the complete configuration before you change the live service:
+
+```console
+$ sudo vapachectl configtest
+```
+
+Start the staged configuration on an evaluation host. Test positive and
+negative cases for authentication, authorization, redirects, rewrites,
+indexes, error documents, and content handlers.
+
+## 5. Disable access-file capability
+
+After all served trees use `AllowOverride None`, remove the `AccessFiles`
+capability declaration. Run:
+
+```console
+$ sudo vapachectl configtest
+$ sudo systemctl reload vapache.service
+```
+
+Keep the old access files until the deployment is accepted. Their presence has
+no effect when the effective override policy is `None`.
+
+## Evidence
+
+The [configuration semantics test](../../tests/config_semantics.py) generates
+`AllowOverride`, `AllowOverrideList`, ordering, context, and `Nonfatal`
+combinations. The canonical [Hugo](../tutorials/hugo-static-site.md),
+[WordPress](../tutorials/wordpress-php-fpm.md), and
+[Drupal](../tutorials/drupal-php-fpm.md) deployments cover representative
+static and front-controller layouts.
