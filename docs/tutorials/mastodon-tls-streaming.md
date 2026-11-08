@@ -32,12 +32,12 @@ Set these values in the production environment:
 ```text
 LOCAL_DOMAIN=social.example.test
 WEB_DOMAIN=social.example.test
-WEB_CONCURRENCY=2
 ```
 
 Bind the web service to `127.0.0.1:3000` and the streaming service to
 `127.0.0.1:4000`. Keep the existing database, Redis, secrets, and media
-settings unchanged.
+settings unchanged. Keep the worker count selected for the host's available
+memory and CPU.
 
 Restart the Mastodon services and verify both private listeners before you
 change Vapache.

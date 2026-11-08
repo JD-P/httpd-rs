@@ -43,14 +43,6 @@ Keep `/srv/wordpress/current` read-only to PHP-FPM. Give PHP-FPM write access to
 `/srv/wordpress/shared/uploads`, and make `wp-content/uploads` refer to that
 writable data path through the deployment process.
 
-Create the asset-cache directory:
-
-```console
-$ sudo install -d -o www-data -g www-data -m 0750 /var/cache/vapache/wordpress
-```
-
-Use the Vapache service identity in place of `www-data` when they differ.
-
 ## 2. Configure Vapache
 
 ```apache
@@ -79,12 +71,6 @@ VapacheFastCGIStablePath On unix:/run/php/wordpress-fpm.sock 33 0 0 1001
             Require all denied
         </FilesMatch>
     </Directory>
-
-    CacheRoot /var/cache/vapache/wordpress
-    CacheEnable disk /wp-includes/css/
-    CacheHeader On
-    CacheIgnoreNoLastMod On
-    CacheDefaultExpire 300
 </VirtualHost>
 ```
 
@@ -94,16 +80,13 @@ VapacheFastCGIStablePath On unix:/run/php/wordpress-fpm.sock 33 0 0 1001
 $ sudo vapachectl configtest
 $ sudo systemctl reload vapache.service
 $ curl --fail https://www.example.test/wp-json/
-$ curl -I https://www.example.test/wp-includes/css/dashicons.min.css
-$ curl -I https://www.example.test/wp-includes/css/dashicons.min.css
 ```
 
 In the WordPress dashboard, select a non-plain permalink format and upload one
 PNG file. Open the resulting post and media URL. Place a harmless file named
 `vapache-test.php` in the upload directory and confirm that an HTTP request for
 it is denied rather than executed or returned as source. Remove the file after
-the test. Confirm that the second `dashicons.min.css` request reports an
-`X-Cache` hit.
+the test.
 
 Reload Vapache and repeat the REST and permalink requests.
 

@@ -14,7 +14,7 @@ This tutorial publishes a Wagtail site from Gunicorn at
 ## What you will do
 
 You will bind Gunicorn to loopback, configure Django's public authority, add
-the Vapache route, test the Wagtail API and admin login, reload Vapache, and
+the Vapache route, test the public site and admin login, reload Vapache, and
 reuse the session.
 
 ## Before you start
@@ -33,10 +33,11 @@ CSRF_TRUSTED_ORIGINS = ['https://cms.example.test']
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 ```
 
-Bind Gunicorn to loopback with two workers:
+Bind Gunicorn to loopback. Keep the worker count selected for the host's
+available memory and CPU. For example:
 
 ```text
---bind 127.0.0.1:8000 --workers 2
+--bind 127.0.0.1:8000
 ```
 
 Restart the service and test the private endpoint:
@@ -61,12 +62,12 @@ $ curl -I -H 'Host: cms.example.test' http://127.0.0.1:8000/
 </VirtualHost>
 ```
 
-## 3. Test the API and admin session
+## 3. Test the site and admin session
 
 ```console
 $ sudo vapachectl configtest
 $ sudo systemctl reload vapache.service
-$ curl --fail https://cms.example.test/api/v2/pages/
+$ curl --fail https://cms.example.test/
 ```
 
 Sign in to Wagtail administration through the public URL and open a page-edit
