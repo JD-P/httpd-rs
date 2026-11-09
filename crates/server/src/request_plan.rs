@@ -91,6 +91,28 @@ impl CanonicalTarget {
         }
         Some(Self { url_path, norm })
     }
+
+    /// Build the decoded URL identity for a filesystem child selected by an
+    /// internal transform. Policy always consumes decoded canonical paths;
+    /// percent encoding belongs only at later wire-serialization boundaries.
+    pub fn from_selected_child(parent_url: &str, name: &[u8], directory: bool) -> Option<Self> {
+        let parent = Self::from_url_path(parent_url)?;
+        if parent.url_path != parent_url {
+            return None;
+        }
+        let name = std::str::from_utf8(name).ok()?;
+        if name.is_empty() || name.contains('/') {
+            return None;
+        }
+        let mut candidate = parent.url_path.trim_end_matches('/').to_string();
+        candidate.push('/');
+        candidate.push_str(name);
+        if directory {
+            candidate.push('/');
+        }
+        let target = Self::from_url_path(&candidate)?;
+        (target.url_path == candidate).then_some(target)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -803,6 +825,31 @@ pub enum CanonicalErrorOrPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_children_keep_decoded_policy_identity() {
+        for (name, expected) in [
+            (
+                b"name with space.txt".as_slice(),
+                "/docs/name with space.txt",
+            ),
+            ("café.txt".as_bytes(), "/docs/café.txt"),
+            (b"pct%20literal.txt".as_slice(), "/docs/pct%20literal.txt"),
+        ] {
+            let target = CanonicalTarget::from_selected_child("/docs/", name, false).unwrap();
+            assert_eq!(target.url_path, expected);
+        }
+        assert_eq!(
+            CanonicalTarget::from_selected_child("/docs", b"child", true)
+                .unwrap()
+                .url_path,
+            "/docs/child/"
+        );
+        assert!(CanonicalTarget::from_selected_child("/docs", b"bad/name", false).is_none());
+        assert!(CanonicalTarget::from_selected_child("/docs", b"..", false).is_none());
+        assert!(CanonicalTarget::from_selected_child("/docs", b"bad\xff", false).is_none());
+        assert!(CanonicalTarget::from_selected_child("/docs//", b"child", false).is_none());
+    }
 
     #[test]
     fn canonical_target_is_query_free_decoded_and_normalized() {

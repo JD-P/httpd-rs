@@ -851,7 +851,7 @@ pub fn request_scope_with_plan(
                 ) {
                     crate::files::MultiViewsResult::Selected(view) => {
                         let selected_url =
-                            crate::server::multiview_selected_url(&url_path, &view.name);
+                            crate::server::multiview_selected_url(&url_path, &view.name)?;
                         let candidate_fs = fs_path
                             .parent()
                             .unwrap_or(root.as_path())
@@ -4251,7 +4251,7 @@ DirectoryIndex index.html\n\
         let _ = fs::remove_dir_all(&dir);
         let www = dir.join("www");
         fs::create_dir_all(&www).unwrap();
-        fs::write(www.join("secret.txt"), "selected\n").unwrap();
+        fs::write(www.join("secret file.txt"), "selected\n").unwrap();
         fs::write(www.join(".htaccess"), "# no deny\n").unwrap();
         let conf = dir.join("httpd.conf");
         fs::write(
@@ -4284,8 +4284,8 @@ AddType text/plain .txt\n\
         .unwrap();
         let request = crate::http::Request {
             method: "GET".into(),
-            target: b"/secret?allowed=1".to_vec(),
-            raw_path: b"/secret".to_vec(),
+            target: b"/secret%20file?allowed=1".to_vec(),
+            raw_path: b"/secret%20file".to_vec(),
             query: b"allowed=1".to_vec(),
             version: crate::http::Version::Http11,
             headers: crate::http::Headers::default(),
@@ -4300,7 +4300,7 @@ AddType text/plain .txt\n\
             None,
             &request,
             "127.0.0.1:12345".parse().unwrap(),
-            "/secret",
+            "/secret file",
             80,
             false,
             "localhost",
@@ -4308,19 +4308,19 @@ AddType text/plain .txt\n\
             "127.0.0.1",
         )
         .expect("selected representation cache scope");
-        assert_eq!(context.path(), "/secret.txt");
-        assert_eq!(context.target(), www.join("secret.txt"));
+        assert_eq!(context.path(), "/secret file.txt");
+        assert_eq!(context.target(), www.join("secret file.txt"));
         assert_eq!(
             context.authorization().identity().public_url_path(),
-            "/secret"
+            "/secret file"
         );
         assert_eq!(
             context.authorization().identity().selected_url_path(),
-            "/secret.txt"
+            "/secret file.txt"
         );
         assert_eq!(
             context.authorization().identity().lexical_fs_path(),
-            Some(www.join("secret.txt").as_path())
+            Some(www.join("secret file.txt").as_path())
         );
         assert!(context
             .authorization()
@@ -4328,7 +4328,7 @@ AddType text/plain .txt\n\
 
         fs::write(
             www.join(".htaccess"),
-            "<Files \"secret.txt\">\n    Require all denied\n</Files>\n",
+            "<Files \"secret file.txt\">\n    Require all denied\n</Files>\n",
         )
         .unwrap();
         assert!(request_scope(
@@ -4336,7 +4336,7 @@ AddType text/plain .txt\n\
             None,
             &request,
             "127.0.0.1:12345".parse().unwrap(),
-            "/secret",
+            "/secret file",
             80,
             false,
             "localhost",
@@ -4357,7 +4357,7 @@ RewriteRule \\.txt$ - [F]\n",
             None,
             &request,
             "127.0.0.1:12345".parse().unwrap(),
-            "/secret",
+            "/secret file",
             80,
             false,
             "localhost",
@@ -4366,14 +4366,14 @@ RewriteRule \\.txt$ - [F]\n",
         )
         .is_some());
         let mut blocked = request;
-        blocked.target = b"/secret?blocked=1".to_vec();
+        blocked.target = b"/secret%20file?blocked=1".to_vec();
         blocked.query = b"blocked=1".to_vec();
         assert!(request_scope(
             &cfg,
             None,
             &blocked,
             "127.0.0.1:12345".parse().unwrap(),
-            "/secret",
+            "/secret file",
             80,
             false,
             "localhost",

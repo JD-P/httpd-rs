@@ -2186,14 +2186,14 @@ fn authorized_autoindex_entries(
         let Some(actual_path) = fd_path(&file) else {
             return Err(Response::policy_error());
         };
-        let mut target_url = format!(
-            "{}/{}",
-            url_path.trim_end_matches('/'),
-            crate::util::url_encode_path(&name)
-        );
-        if meta.is_dir() {
-            target_url.push('/');
-        }
+        let Some(target_url) = crate::request_plan::CanonicalTarget::from_selected_child(
+            url_path,
+            &name,
+            meta.is_dir(),
+        )
+        .map(|target| target.url_path) else {
+            continue;
+        };
         if crate::server::autoindex_entry_visible(
             cfg,
             vhost,

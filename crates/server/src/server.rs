@@ -5234,15 +5234,16 @@ fn bind_multiview_grant(
     })
 }
 
-pub(crate) fn multiview_selected_url(public_url_path: &str, selected_name: &[u8]) -> String {
+pub(crate) fn multiview_selected_url(
+    public_url_path: &str,
+    selected_name: &[u8],
+) -> Option<String> {
     let parent_end = public_url_path
         .rfind('/')
         .map(|index| index + 1)
         .unwrap_or(0);
-    let mut selected = String::with_capacity(public_url_path.len() + selected_name.len() + 8);
-    selected.push_str(&public_url_path[..parent_end]);
-    selected.push_str(&crate::util::url_encode_path(selected_name));
-    selected
+    CanonicalTarget::from_selected_child(&public_url_path[..parent_end], selected_name, false)
+        .map(|target| target.url_path)
 }
 
 /// Re-evaluate policy for a target selected by a transform (PATH_INFO split,
@@ -8115,7 +8116,21 @@ fn dispatch_inner(
                     owner_match_only,
                 ) {
                     MultiViewsResult::Selected(view) => {
-                        let selected_url_path = multiview_selected_url(&url_path, &view.name);
+                        let Some(selected_url_path) = multiview_selected_url(&url_path, &view.name)
+                        else {
+                            return error_response(
+                                cfg,
+                                vhost,
+                                &scope,
+                                404,
+                                req,
+                                &url_path,
+                                local_port,
+                                &server_name,
+                                peer.ip(),
+                                local_ip,
+                            );
+                        };
                         let candidate_fs = fs_path
                             .parent()
                             .unwrap_or(root.as_path())
@@ -10877,12 +10892,21 @@ mod tests {
         }
         assert_eq!(
             multiview_selected_url("/nested/name", b"name.en.txt"),
-            "/nested/name.en.txt"
+            Some("/nested/name.en.txt".into())
         );
         assert_eq!(
             multiview_selected_url("/name", b"name with space.txt"),
-            "/name%20with%20space.txt"
+            Some("/name with space.txt".into())
         );
+        assert_eq!(
+            multiview_selected_url("/café", "café.txt".as_bytes()),
+            Some("/café.txt".into())
+        );
+        assert_eq!(
+            multiview_selected_url("/pct%20literal", b"pct%20literal.txt"),
+            Some("/pct%20literal.txt".into())
+        );
+        assert_eq!(multiview_selected_url("/bad", b"bad\xff.txt"), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -11332,18 +11356,18 @@ mod tests {
     #[test]
     fn autoindex_hides_entries_denied_by_file_policy() {
         let dir = cov_dir("autoindex-file-policy");
-        for child in ["files", "access-file"] {
+        for (child, secret) in [
+            ("files", "secret-record.txt"),
+            ("access-file", "secret-record.txt"),
+            ("location", "secret record.txt"),
+        ] {
             std::fs::create_dir_all(dir.join("www").join(child)).unwrap();
             std::fs::write(
                 dir.join("www").join(child).join("public-record.txt"),
                 "public\n",
             )
             .unwrap();
-            std::fs::write(
-                dir.join("www").join(child).join("secret-record.txt"),
-                "secret\n",
-            )
-            .unwrap();
+            std::fs::write(dir.join("www").join(child).join(secret), "secret\n").unwrap();
         }
         std::fs::write(
             dir.join("www/access-file/.htaccess"),
@@ -11363,13 +11387,25 @@ mod tests {
                  Options +Indexes\n\
                  AllowOverride AuthConfig\n\
                  Require all granted\n\
-                 </Directory>\n",
+                 </Directory>\n\
+                 <Directory \"{}/www/location\">\n\
+                 Options +Indexes\n\
+                 Require all granted\n\
+                 </Directory>\n\
+                 <LocationMatch \"^/location/secret record\\.txt$\">\n\
+                 Require all denied\n\
+                 </LocationMatch>\n",
+                dir.display(),
                 dir.display(),
                 dir.display(),
             ),
         );
 
-        for child in ["files", "access-file"] {
+        for (child, secret, wire_secret) in [
+            ("files", "secret-record.txt", "secret-record.txt"),
+            ("access-file", "secret-record.txt", "secret-record.txt"),
+            ("location", "secret record.txt", "secret%20record.txt"),
+        ] {
             let response = cov_dispatch(&cfg, "GET", &format!("/{child}/"));
             assert_eq!(response.status, 200, "{child}");
             let Body::Bytes(body) = response.body else {
@@ -11377,9 +11413,9 @@ mod tests {
             };
             let body = String::from_utf8(body).unwrap();
             assert!(body.contains("public-record.txt"), "{child}: {body}");
-            assert!(!body.contains("secret-record.txt"), "{child}: {body}");
+            assert!(!body.contains(secret), "{child}: {body}");
             assert_eq!(
-                cov_dispatch(&cfg, "GET", &format!("/{child}/secret-record.txt")).status,
+                cov_dispatch(&cfg, "GET", &format!("/{child}/{wire_secret}")).status,
                 403,
                 "{child}"
             );

@@ -115,6 +115,10 @@ python3 tests/conformance.py --differential
 step "generated transform and sink differential"
 python3 tests/transform_differential.py
 
+step "P34 decoded synthesized-identity differential"
+P34_APACHE="$APACHE" P34_APACHE_MODULES="$APACHE_MODDIR" \
+    python3 adversarial/p34/exploit_p34.py
+
 step "attacker-view information-disclosure noninterference"
 python3 tests/information_disclosure.py --all-probes
 
