@@ -1399,6 +1399,10 @@ pub mod bytes {
         crlf: bool,
     ) -> Result<(), Error> {
         let bytes = pattern.as_bytes();
+        // A scoped `x` option can hide semantic adjacency inside a group. A
+        // conservative whole-pattern scan is preferable to accepting one
+        // unrepresentable ACL regex when option scope is ambiguous here.
+        let extended_may_apply = extended || inline_option_may_enable(pattern, b'x');
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
@@ -1428,6 +1432,16 @@ pub mod bytes {
                     return Err(Error::unsupported(
                         i,
                         "CRLF start-offset non-boundary assertion",
+                    ));
+                }
+                b'\\'
+                    if matches!(bytes.get(i + 1), Some(b'S') | Some(b'N'))
+                        && matches!(bytes.get(i + 2), Some(b'*') | Some(b'+'))
+                        && auto_possessified_line_atom(bytes, i + 3, extended_may_apply) =>
+                {
+                    return Err(Error::unsupported(
+                        i,
+                        "PCRE2 auto-possessified line sequence",
                     ));
                 }
                 b'\\'
@@ -1466,6 +1480,34 @@ pub mod bytes {
             }
         }
         Ok(())
+    }
+
+    /// Recognize the next semantic atom after syntax PCRE discards before its
+    /// auto-possessification pass.
+    fn auto_possessified_line_atom(bytes: &[u8], mut i: usize, extended: bool) -> bool {
+        loop {
+            if extended {
+                while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+                    i += 1;
+                }
+                if bytes.get(i) == Some(&b'#') {
+                    i = bytes[i..]
+                        .iter()
+                        .position(|&byte| byte == b'\n')
+                        .map_or(bytes.len(), |relative| i + relative + 1);
+                    continue;
+                }
+            }
+            if bytes.get(i..i + 3) == Some(b"(?#") {
+                let Some(relative_end) = bytes[i + 3..].iter().position(|&byte| byte == b')')
+                else {
+                    return false;
+                };
+                i += relative_end + 4;
+                continue;
+            }
+            return matches!(bytes.get(i..i + 2), Some(b"\\R" | b"\\v" | b"\\h"));
+        }
     }
 
     fn anchor_is_terminal(bytes: &[u8], mut i: usize, extended: bool) -> bool {

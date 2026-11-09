@@ -50,29 +50,14 @@ pub fn logical_lines_with_numbers(text: &str) -> Vec<(usize, String)> {
 /// lines are dropped here because the access-file parser has no source-line
 /// diagnostics for skipped lines.
 pub fn logical_lines(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    for raw in text.lines() {
-        let line = raw.trim_end_matches('\r');
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('#') {
-            continue;
-        }
-        if cur.is_empty() && trimmed.is_empty() {
-            continue;
-        }
-        let continuation = line.ends_with('\\');
-        if continuation {
-            cur.push_str(&line[..line.len() - 1]);
-        } else {
-            cur.push_str(line);
-            out.push(std::mem::take(&mut cur));
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur);
-    }
-    out
+    logical_lines_with_numbers(text)
+        .into_iter()
+        .map(|(_, line)| line)
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .collect()
 }
 
 /// Split one logical line into Apache-style arguments.  Quoted arguments may
@@ -336,5 +321,19 @@ mod tests {
     fn logical_lines_skip_htaccess_comments() {
         let lines = logical_lines("# hi\nRequire all \\\n denied\n\nOptions -Indexes\n");
         assert_eq!(lines, vec!["Require all  denied", "Options -Indexes"]);
+    }
+
+    #[test]
+    fn p35_htaccess_comments_swallow_continued_physical_lines() {
+        assert!(logical_lines("#\\\nRequire all granted\n").is_empty());
+        assert!(logical_lines("#\\\n#\\\nRequire all granted\n").is_empty());
+        assert_eq!(
+            logical_lines("# comment\nRequire all granted\n"),
+            vec!["Require all granted"]
+        );
+        assert_eq!(
+            logical_lines("#\\\n<Files run.txt>\nSetHandler cgi-script\n</Files>\n"),
+            vec!["SetHandler cgi-script", "</Files>"]
+        );
     }
 }

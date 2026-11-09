@@ -2318,11 +2318,14 @@ abstract model/projection proof over these policy objects.
 
 `crates/server/src/config_frontend.rs` isolates the pure front-end pieces:
 
-- logical-line accumulation with source line numbers;
+- continuation-first logical-line accumulation with source line numbers;
 - Apache-style quoted/escaped tokenization;
 - a small `ConfigLine` IR for directives, section starts and section ends.
 
-Both the main configuration parser and `.htaccess` use the shared tokenizer.
+Both the main configuration parser and `.htaccess` use the shared logical-line
+assembler and tokenizer. A physical trailing backslash is resolved before the
+complete logical line is classified as a comment, so `#\` swallows the next
+physical line exactly as it does in Apache.
 Quote, escape, whitespace, section-tag delimiter, EOF, argument-count,
 argument-arity/nonempty and structural-depth decisions are executable Verus
 kernels used by production. After includes and execute-on-read conditions are

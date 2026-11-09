@@ -4401,6 +4401,24 @@ mod tests {
     }
 
     #[test]
+    fn p35_comment_continuation_is_sealed_before_access_file_parsing() {
+        let hidden_grant = crate::config_frontend::logical_lines("#\\\nRequire all granted\n");
+        assert!(AccessProgram::seal(&hidden_grant)
+            .unwrap()
+            .instructions
+            .is_empty());
+
+        let hidden_section = crate::config_frontend::logical_lines(
+            "#\\\n<Files run.txt>\nSetHandler cgi-script\n</Files>\n",
+        );
+        let error = match AccessProgram::seal(&hidden_section) {
+            Err(error) => error,
+            Ok(_) => panic!("comment continuation activated a hidden section"),
+        };
+        assert!(error.contains("unexpected closing </files>"), "{error}");
+    }
+
+    #[test]
     fn access_program_seals_nested_sections_before_skipping() {
         let lines = crate::config_frontend::logical_lines(
             "<Unknown>\n<Files secret>\nRequire all denied\n</Files>\n</Unknown>\nRequire all granted\n",

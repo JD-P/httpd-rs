@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Pass-35-B: PCRE2 auto-possessification differential on an ACL guard.
+"""Pass-35-B regression: PCRE2 auto-possessification in ACL guards.
 
 Vapache compiles PCRE2 patterns with a non-backtracking automata engine and
-translates `\\S*`, `.*` and `\\N*` into ordinary repetitions. PCRE2 (Apache)
+translates `\\S*` and `\\N*` into ordinary repetitions. PCRE2 (Apache)
 auto-possessifies those repetitions when the next atom is `\\R`, `\\v` or
 `\\h`, so for certain subjects Apache finds no match while Vapache does.
 
-A negated guard (`!~`) that denies values which do *not* match the pattern is
-therefore fail-open on Vapache for a header value containing the NEL byte
-0x85. The harness starts Apache and vapached on loopback ports, sends the
-same request, and retains the differential.
+A negated guard (`!~`) used to fail open on Vapache for a header value
+containing the NEL byte 0x85. The compatibility layer cannot exactly model
+these PCRE2 optimizer semantics, so Vapache now rejects the unsafe four
+patterns at configuration load. The harness verifies that Apache accepts
+them, Vapache fails closed, and the simple `\v` control still agrees live.
 
 Usage:
     python3 adversarial/p35/pcre2_guard_p35.py
@@ -19,7 +20,9 @@ Usage:
 from __future__ import annotations
 
 import http.client
+import grp
 import os
+import pwd
 import shutil
 import signal
 import socket
@@ -34,6 +37,13 @@ APACHE = os.environ.get("P35_APACHE", "/usr/sbin/apache2")
 APACHE_MODULES = Path(os.environ.get("P35_APACHE_MODULES", "/usr/lib/apache2/modules"))
 HARNESS = Path("/tmp/opencode/p35-pcre2-harness")
 
+if os.geteuid() == 0:
+    SERVICE_USER = "www-data"
+    SERVICE_GROUP = "www-data"
+else:
+    SERVICE_USER = pwd.getpwuid(os.geteuid()).pw_name
+    SERVICE_GROUP = grp.getgrgid(os.getegid()).gr_name
+
 PATTERNS = [
     ("S-star-v", r"\S*\v"),
     ("S-star-R", r"\S*\R"),
@@ -41,6 +51,7 @@ PATTERNS = [
     ("S-plus-R", r"\S+\R"),
     ("plain-v-control", r"\v"),
 ]
+FAIL_CLOSED = {"S-star-v", "S-star-R", "N-plus-R", "S-plus-R"}
 
 
 def free_port(start: int) -> int:
@@ -109,8 +120,8 @@ LoadModule authz_core_module {APACHE_MODULES / 'mod_authz_core.so'}
 LoadModule authz_host_module {APACHE_MODULES / 'mod_authz_host.so'}
 TypesConfig /etc/mime.types
 Listen {port_a}
-User www-data
-Group www-data
+User {SERVICE_USER}
+Group {SERVICE_GROUP}
 PidFile "{case / 'apache' / 'logs' / 'apache.pid'}"
 ErrorLog "{case / 'apache' / 'logs' / 'error.log'}"
 ServerName p35b.test
@@ -126,8 +137,8 @@ DocumentRoot "{www}"
         vapache_conf.write_text(
             f"""ServerRoot "{case / 'vapache'}"
 Listen {port_v}
-User www-data
-Group www-data
+User {SERVICE_USER}
+Group {SERVICE_GROUP}
 PidFile "{case / 'vapache' / 'logs' / 'vapached.pid'}"
 ErrorLog "{case / 'vapache' / 'logs' / 'error.log'}"
 ServerName p35b.test
@@ -143,6 +154,21 @@ TypesConfig /etc/mime.types
         built = subprocess.run(
             [str(VAPACHED), "-f", str(vapache_conf), "-t"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        apache_test = subprocess.run(
+            [APACHE, "-t", "-f", str(apache_conf)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if apache_test.returncode != 0:
+            print(f"## {name}: Apache rejected the guard: {apache_test.stdout.strip()[-160:]}")
+            failures += 1
+            continue
+        if name in FAIL_CLOSED:
+            if built.returncode == 0:
+                print(f"## {name}: Vapache accepted an unrepresentable guard")
+                failures += 1
+            else:
+                print(f"## {name}  pattern={pattern}")
+                print("   apache=accepted vapache=rejected (fail closed)")
+            continue
         if built.returncode != 0:
             print(f"## {name}: vapache rejected the guard: {built.stdout.strip()[-160:]}")
             failures += 1
@@ -173,10 +199,6 @@ TypesConfig /etc/mime.types
                 if label == "plain" and (a_status, v_status) != (403, 403):
                     print("   -> UNEXPECTED plain control")
                     failures += 1
-                if name != "plain-v-control" and label == "nel":
-                    if a_status != 403 or v_status != 200:
-                        print("   -> UNEXPECTED NEL divergence")
-                        failures += 1
                 if name == "plain-v-control" and label == "nel":
                     if (a_status, v_status) != (200, 200):
                         print("   -> UNEXPECTED simple-pattern control")
@@ -193,7 +215,7 @@ TypesConfig /etc/mime.types
     if failures:
         print(f"P35-B REGRESSION: {failures} unexpected verdict(s)")
         return 1
-    print("P35-B LIVE: PCRE2 auto-possessification over-matches on vapache")
+    print("P35-B REMEDIATED: unrepresentable guards fail closed")
     return 0
 
 
