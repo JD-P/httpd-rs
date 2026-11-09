@@ -5399,6 +5399,84 @@ fn authorize_resolved_target(
     })
 }
 
+/// Hide whether an authorization-rejected target was discovered by an
+/// implicit transform. A public spelling that names no target and the same
+/// spelling with a denied MultiViews or PATH_INFO candidate must have one
+/// attacker-visible outcome. Internal failures and positive terminal outcomes
+/// retain their original semantics.
+#[allow(clippy::too_many_arguments)]
+fn conceal_implicit_target_rejection(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    base_scope: &Scope,
+    response: Response,
+    req: &Request,
+    public_url: &str,
+    local_port: u16,
+    server_name: &str,
+    peer: IpAddr,
+    local_ip: &str,
+) -> Response {
+    if matches!(response.status, 401 | 403 | 404) {
+        error_response(
+            cfg,
+            vhost,
+            base_scope,
+            404,
+            req,
+            public_url,
+            local_port,
+            server_name,
+            peer,
+            local_ip,
+        )
+    } else {
+        response
+    }
+}
+
+/// Decide whether one descriptor-opened directory entry may be named by an
+/// autoindex response. Listing is a metadata sink: `<Files>`, access-file and
+/// canonical-target policy must be evaluated before the entry name, type or
+/// size becomes attacker-visible, even though the file itself is not served.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn autoindex_entry_visible(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
+    peer: IpAddr,
+    target_fs: &Path,
+    target_url: &str,
+    base_scope: &Scope,
+    local_port: u16,
+    server_name: &str,
+    local_ip: &str,
+) -> Result<bool, Response> {
+    let mapping_root = CanonicalTarget::from_url_path(target_url)
+        .and_then(|target| RequestPlan::resolve_for_request(cfg, vhost, target, req).ok())
+        .map(|plan| plan.root().to_path_buf())
+        .ok_or_else(Response::policy_error)?;
+    match authorize_resolved_target(
+        cfg,
+        vhost,
+        req,
+        peer,
+        target_fs,
+        target_url,
+        target_url,
+        base_scope,
+        None,
+        &mapping_root,
+        local_port,
+        server_name,
+        local_ip,
+    ) {
+        Ok(_) => Ok(true),
+        Err(response) if matches!(response.status, 401 | 403 | 404) => Ok(false),
+        Err(response) => Err(response),
+    }
+}
+
 fn apply_scope_conditionals(
     cfg: &Config,
     vhost: Option<&VHost>,
@@ -7642,10 +7720,59 @@ fn dispatch_inner(
                 );
             }
             if cgi::is_cgi(cfg, scope, name, script_alias) {
+                let (path_info, env_script_name) = direct_cgi_identity(req, &url_path);
+                let authorization_url = if path_info == "/" {
+                    env_script_name.clone()
+                } else {
+                    url_path.clone()
+                };
+                // Mapping `/script.cgi/` opens the script inode directly and
+                // represents the trailing slash as empty PATH_INFO. Recheck
+                // the script's slashless URL identity before execution: exact
+                // Location/query policy on `/script.cgi` must not be bypassed
+                // by the alternate spelling. Conceal a rejected implicit
+                // target so the result also matches a missing script.
+                let target_authorization = if path_info == "/" {
+                    match authorize_resolved_target(
+                        cfg,
+                        vhost,
+                        req,
+                        peer.ip(),
+                        actual_path.as_ref(),
+                        &authorization_url,
+                        &url_path,
+                        scope,
+                        None,
+                        &root,
+                        local_port,
+                        &server_name,
+                        local_ip,
+                    ) {
+                        Ok(plan) => match plan.bind_file(&meta) {
+                            Some(bound) => bound,
+                            None => return Response::policy_error(),
+                        },
+                        Err(response) => {
+                            return conceal_implicit_target_rejection(
+                                cfg,
+                                vhost,
+                                scope,
+                                response,
+                                req,
+                                &url_path,
+                                local_port,
+                                &server_name,
+                                peer.ip(),
+                                local_ip,
+                            );
+                        }
+                    }
+                } else {
+                    target_authorization
+                };
                 let authorization = target_authorization
                     .into_outcome(vapache_verified::TransformSink::LocalCgi)
                     .expect("CGI target retained its inode-bound authorization");
-                let (path_info, env_script_name) = direct_cgi_identity(req, &url_path);
                 if req.handler_probe() {
                     let descriptor_lease = match cfg.resource_budget.try_descriptor() {
                         Ok(lease) => lease,
@@ -7663,7 +7790,7 @@ fn dispatch_inner(
                         request_uri: request_uri.clone(),
                         url_path: url_path.clone(),
                         path_info,
-                        script_name: url_path.clone(),
+                        script_name: authorization_url,
                         env_script_name,
                         script_file: file,
                         script_meta: meta,
@@ -7679,7 +7806,7 @@ fn dispatch_inner(
                     &request_uri,
                     &url_path,
                     &path_info,
-                    &url_path,
+                    &authorization_url,
                     &env_script_name,
                     &server_name,
                     peer,
@@ -8031,7 +8158,20 @@ fn dispatch_inner(
                             &rewrite_effects,
                         ) {
                             Ok(bound) => bound,
-                            Err(response) => return response,
+                            Err(response) => {
+                                return conceal_implicit_target_rejection(
+                                    cfg,
+                                    vhost,
+                                    &scope,
+                                    response,
+                                    req,
+                                    &url_path,
+                                    local_port,
+                                    &server_name,
+                                    peer.ip(),
+                                    local_ip,
+                                );
+                            }
                         };
                         let target_scope = target_authorization.scope();
                         let handler = crate::config::effective_handler(target_scope, &view.name)
@@ -8235,7 +8375,20 @@ fn dispatch_inner(
                         local_ip,
                     ) {
                         Ok(v) => v,
-                        Err(r) => return r,
+                        Err(response) => {
+                            return conceal_implicit_target_rejection(
+                                cfg,
+                                vhost,
+                                &scope,
+                                response,
+                                req,
+                                &url_path,
+                                local_port,
+                                &server_name,
+                                peer.ip(),
+                                local_ip,
+                            );
+                        }
                     };
                     let script_root = actual_path.parent().unwrap_or(root.as_path()).to_path_buf();
                     let script_rel = actual_path
@@ -10599,7 +10752,7 @@ mod tests {
             80,
         );
         result.unwrap();
-        assert_eq!(cov_status(&denied), 403, "{denied}");
+        assert_eq!(cov_status(&denied), 404, "{denied}");
         assert!(!denied.contains("secret\n"), "{denied}");
 
         let (handler, result) = cov_run_conn(
@@ -10704,10 +10857,10 @@ mod tests {
         for (path, expected) in [
             ("/plain/secret", 200),
             ("/plain/secret/", 404),
-            ("/location/secret", 403),
-            ("/rewrite/secret", 403),
+            ("/location/secret", 404),
+            ("/rewrite/secret", 404),
             ("/redirect/secret", 302),
-            ("/redirect-denied/secret", 403),
+            ("/redirect-denied/secret", 404),
             ("/js/secret", 403),
             ("/js/secret/", 404),
         ] {
@@ -11173,6 +11326,132 @@ mod tests {
         let mut disabled = cfg;
         disabled.capabilities.set(Capability::FastCgi, false);
         assert_eq!(cov_dispatch(&disabled, "GET", "/script.php").status, 403);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autoindex_hides_entries_denied_by_file_policy() {
+        let dir = cov_dir("autoindex-file-policy");
+        for child in ["files", "access-file"] {
+            std::fs::create_dir_all(dir.join("www").join(child)).unwrap();
+            std::fs::write(
+                dir.join("www").join(child).join("public-record.txt"),
+                "public\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("www").join(child).join("secret-record.txt"),
+                "secret\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.join("www/access-file/.htaccess"),
+            "<Files \"secret-record.txt\">\nRequire all denied\n</Files>\n",
+        )
+        .unwrap();
+
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "<Directory \"{}/www/files\">\n\
+                 Options +Indexes\n\
+                 Require all granted\n\
+                 <Files \"secret-record.txt\">\nRequire all denied\n</Files>\n\
+                 </Directory>\n\
+                 <Directory \"{}/www/access-file\">\n\
+                 Options +Indexes\n\
+                 AllowOverride AuthConfig\n\
+                 Require all granted\n\
+                 </Directory>\n",
+                dir.display(),
+                dir.display(),
+            ),
+        );
+
+        for child in ["files", "access-file"] {
+            let response = cov_dispatch(&cfg, "GET", &format!("/{child}/"));
+            assert_eq!(response.status, 200, "{child}");
+            let Body::Bytes(body) = response.body else {
+                panic!("{child}: autoindex response was not resident");
+            };
+            let body = String::from_utf8(body).unwrap();
+            assert!(body.contains("public-record.txt"), "{child}: {body}");
+            assert!(!body.contains("secret-record.txt"), "{child}: {body}");
+            assert_eq!(
+                cov_dispatch(&cfg, "GET", &format!("/{child}/secret-record.txt")).status,
+                403,
+                "{child}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn denied_path_info_target_is_indistinguishable_from_missing() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = cov_dir("path-info-existence");
+        std::fs::create_dir_all(dir.join("www/cgi")).unwrap();
+        let script = dir.join("www/cgi/secret.cgi");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nsecret\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let location_script = dir.join("www/cgi/location.cgi");
+        std::fs::write(
+            &location_script,
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nlocation-secret\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&location_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "AddHandler cgi-script .cgi\n\
+                 <Directory \"{}/www/cgi\">\n\
+                 Options +ExecCGI\n\
+                 Require all granted\n\
+                 <Files \"secret.cgi\">\nRequire all denied\n</Files>\n\
+                 </Directory>\n\
+                 <LocationMatch \"^/cgi/location\\.cgi$\">\n\
+                 Require all denied\n\
+                 </LocationMatch>\n",
+                dir.display(),
+            ),
+        );
+
+        assert_eq!(cov_dispatch(&cfg, "GET", "/cgi/secret.cgi").status, 403);
+        let present = cov_dispatch(&cfg, "GET", "/cgi/secret.cgi/info");
+        assert_eq!(present.status, 404);
+        std::fs::remove_file(&script).unwrap();
+        let missing = cov_dispatch(&cfg, "GET", "/cgi/secret.cgi/info");
+        assert_eq!(missing.status, 404);
+        assert_eq!(present.headers, missing.headers);
+        let Body::Bytes(present_body) = present.body else {
+            panic!("present denial response was not resident");
+        };
+        let Body::Bytes(missing_body) = missing.body else {
+            panic!("missing response was not resident");
+        };
+        assert_eq!(present_body, missing_body);
+
+        assert_eq!(cov_dispatch(&cfg, "GET", "/cgi/location.cgi").status, 403);
+        let present = cov_dispatch(&cfg, "GET", "/cgi/location.cgi/");
+        assert_eq!(present.status, 404);
+        std::fs::remove_file(&location_script).unwrap();
+        let missing = cov_dispatch(&cfg, "GET", "/cgi/location.cgi/");
+        assert_eq!(missing.status, 404);
+        assert_eq!(present.headers, missing.headers);
+        let Body::Bytes(present_body) = present.body else {
+            panic!("present slash denial response was not resident");
+        };
+        let Body::Bytes(missing_body) = missing.body else {
+            panic!("missing slash response was not resident");
+        };
+        assert_eq!(present_body, missing_body);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

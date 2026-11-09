@@ -952,16 +952,20 @@ def printable_observation(observation: dict) -> dict:
 def compare_step(case: Case, step: RequestStep, apache: dict, vapache: dict) -> list[str]:
     problems: list[str] = []
     if apache["status"] != vapache["status"]:
-        # Apache hides a forbidden negotiated representation as 404 while
-        # Vapache reports the selected representation's 403.  Both exclude
-        # the terminal sink; retain this explicit narrow hardening equivalence
-        # instead of weakening status comparison globally.
-        multiview_deny = (
-            case.transform == "multiviews"
+        # Apache exposes discovery of a denied implicit target as 403. Vapache
+        # deliberately collapses it into the same 404 as failed discovery.
+        # Admit only that one-way hardening difference, and only when neither
+        # response contains the selected fixture marker.
+        expected = f"MATRIX:{case.id}:".encode()
+        concealed_implicit_deny = (
+            case.transform in {"multiviews", "cgi_path_info"}
             and case.policy_phase in {"files", "htaccess"}
-            and {apache["status"], vapache["status"]} == {403, 404}
+            and apache["status"] == 403
+            and vapache["status"] == 404
+            and expected not in apache["body"]
+            and expected not in vapache["body"]
         )
-        if multiview_deny:
+        if concealed_implicit_deny:
             return problems
         problems.append(
             f"{step.label}: status apache={apache['status']} vapache={vapache['status']}"

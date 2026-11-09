@@ -39,6 +39,32 @@ reservations to the request/client/process hierarchy. It also inventories
 bounded process-owned caches, queues, telemetry, and lifecycle state, so a new
 mutable static cannot silently become a second resource ledger.
 
+### Generated transform and secrecy campaigns
+
+`tests/transform_differential.py` generates 147 Apache/Vapache comparisons
+across 21 transform/sink pairs, seven authorization phases, seven URL
+spellings and six terminal sinks. It targets early returns and fallback paths
+through rewrites, aliases, MultiViews, DirectoryIndex, CGI/PATH_INFO,
+ErrorDocument, proxying and cache planning. Failures retain the generated case
+and exact replay command as JSON under `artifacts/transform-differential/`.
+The comparator has one narrow security equivalence: Apache's 403 for a denied
+implicit MultiViews/CGI-PATH_INFO target may be Vapache's 404, provided neither
+response contains the selected fixture. This intentionally suppresses the
+target-existence oracle and does not relax any other status comparison.
+
+`tests/information_disclosure.py` is the complementary noninterference oracle.
+Its 105 cases run Vapache in paired worlds that differ only in protected
+existence, contents/metadata, directory state or denied backend output. It
+compares 416 complete attacker-visible observations: status, body and every
+header except `Date`, including validators, ranges, compression, redirects,
+cache disposition and challenges. It also rejects secret markers, temporary
+filesystem paths and any contact with a denied backend. Failures are replayable
+from JSON under `artifacts/information-disclosure/`.
+
+Pull-request CI checks deterministic generation and matrix completeness without
+requiring Apache modules. The fail-closed pre-adversarial/nightly gate runs both
+live campaigns against the release daemon.
+
 Thirteen libFuzzer targets cover:
 
 - HTTP request parsing and whole fragmented/pipelined connections;

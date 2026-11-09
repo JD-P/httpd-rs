@@ -2124,7 +2124,24 @@ fn serve_directory_inner(
                 port,
             )
         }
-        DirAction::List(entries) => autoindex(cfg, scope, req, url_path, &entries, host, port),
+        DirAction::List(entries) => match authorized_autoindex_entries(
+            cfg,
+            vhost,
+            scope,
+            req,
+            &dir,
+            url_path,
+            entries,
+            follow_symlinks,
+            owner_match_only,
+            host,
+            port,
+            peer,
+            local_ip,
+        ) {
+            Ok(entries) => autoindex(cfg, scope, req, url_path, &entries, host, port),
+            Err(response) => response,
+        },
         DirAction::Overloaded => Response::bytes(
             503,
             "text/html; charset=UTF-8",
@@ -2134,6 +2151,65 @@ fn serve_directory_inner(
             cfg, vhost, scope, 403, req, url_path, port, host, peer, local_ip,
         ),
     }
+}
+
+/// Re-open each bounded directory entry and authorize its exact URL and
+/// descriptor-resolved filesystem identity before exposing name/type/size.
+/// The initial scan intentionally does no policy work so DirectoryIndex probes
+/// and capacity accounting remain bounded; this second pass is the autoindex
+/// metadata sink gate.
+#[allow(clippy::too_many_arguments)]
+fn authorized_autoindex_entries(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    scope: &Scope,
+    req: &Request,
+    dir: &File,
+    url_path: &str,
+    entries: Vec<(Vec<u8>, bool, u64)>,
+    follow_symlinks: bool,
+    owner_match_only: bool,
+    host: &str,
+    port: u16,
+    peer: std::net::IpAddr,
+    local_ip: &str,
+) -> Result<Vec<(Vec<u8>, bool, u64)>, Response> {
+    let mut visible = Vec::with_capacity(entries.len());
+    for (name, _, _) in entries {
+        let Ok(file) = open_at_with_symlink_policy(dir, &name, follow_symlinks, owner_match_only)
+        else {
+            continue;
+        };
+        let Ok(meta) = file.metadata() else {
+            continue;
+        };
+        let Some(actual_path) = fd_path(&file) else {
+            return Err(Response::policy_error());
+        };
+        let mut target_url = format!(
+            "{}/{}",
+            url_path.trim_end_matches('/'),
+            crate::util::url_encode_path(&name)
+        );
+        if meta.is_dir() {
+            target_url.push('/');
+        }
+        if crate::server::autoindex_entry_visible(
+            cfg,
+            vhost,
+            req,
+            peer,
+            &actual_path,
+            &target_url,
+            scope,
+            port,
+            host,
+            local_ip,
+        )? {
+            visible.push((name, meta.is_dir(), meta.size()));
+        }
+    }
+    Ok(visible)
 }
 
 pub fn serve_directory(

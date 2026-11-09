@@ -19,3 +19,4 @@ __pycache__/
 /bench/results/
 /bench/FEATURE_RESULTS-*.md
 /tests/differential_report.md
+/artifacts/

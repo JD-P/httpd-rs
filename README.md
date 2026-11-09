@@ -859,6 +859,7 @@ Known, deliberate divergences from Apache (reported by the differential run):
 | Unsatisfiable range | omits `Content-Range` | `Content-Range: bytes */N` | RFC 9110 requires it |
 | `TraceEnable Off` response | empty `Allow` | populated `Allow` | RFC 9110 requires `Allow` on 405 |
 | Proxy auth on `RewriteRule [P]` | not enforced on the rewrite-proxy path | enforced | Prevents bypassing `<Proxy>` authorization via `[P]` |
+| Denied implicit MultiViews/CGI target | `403`, revealing candidate discovery | `404`, matching no candidate | Suppresses protected-target existence oracles |
 | Unsupported handler/filter | may serve source if the module is absent | `500` | Fail closed instead of exposing source |
 | Unimplemented security directive | may enforce a policy we do not implement | refuses to start | Fail closed instead of silently ignoring an access/auth/proxy/filter control |
 

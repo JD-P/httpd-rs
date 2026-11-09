@@ -112,6 +112,12 @@ python3 tests/vhost_semantics.py
 step "end-to-end Apache differential conformance"
 python3 tests/conformance.py --differential
 
+step "generated transform and sink differential"
+python3 tests/transform_differential.py
+
+step "attacker-view information-disclosure noninterference"
+python3 tests/information_disclosure.py
+
 step "portable adversarial regressions"
 python3 tests/adversarial_regressions.py
 
