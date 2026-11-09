@@ -331,6 +331,28 @@ confidence. The ones worth a human look:
    1–14) to RCE (9–18) to DoS (19–32). Comparing raw yields across those
    scopes without a scope normalizer will mostly measure the prompt.
 
+## Pass 33 extension (appended after the initial recovery)
+
+This index was extended on 2026-11-09 with the Pass 33 logical search
+`S40` (`eng-ses_e4253e249ffet2sc5faL9luct2`) and its claims, appended without
+modifying any earlier row:
+
+- **S40 / Pass 33** — reviewed clean HEAD `dc2d5e5cb9a00a650ebe8ca4e2506784659f6cbe`;
+  multi-family yield review that confirmed
+  **P33-A** (MultiViews negotiated representation bypasses the P25-A
+  trailing-slash rejection and URL-scoped authorization; primary
+  `information_disclosure`, secondary `authority_bypass`, high, two
+  unintended behaviors) and preserved two negative observations
+  (`P33-O1`, `P33-O2`).
+- Updated aggregate counts after the append: 30 engagements, 40 logical
+  searches (51 segments), 189 claims — 131 confirmed, 11 duplicate, 1 invalid,
+  46 unresolved. Confirmed `information_disclosure` findings: 24.
+
+The recovery report's earlier Passes 1–32 counts above remain a description of
+the initial reconstruction. The yield CSV/report were **not** recomputed in
+this extension; run `compute_yield.py` to regenerate them from the extended
+JSONL index.
+
 ## Validation
 
 Run:

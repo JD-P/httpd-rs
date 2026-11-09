@@ -78,6 +78,9 @@ prevents re-deriving them from scratch.
 | `findings_p31.md` | Pass-31 write-up (**P31-A**, now remediated): flow-control-progress send-deadline renewal made the 256-stream global lease hold permanent; slow outputs now transfer into a smaller source-fair pool governed by anchored minimum-rate and absolute-lifetime bounds |
 | `dos-resource-budget-followup.md` | Post-P28 DoS review: CVE-2011-4415-style `SetEnvIf` amplification, request-wide matcher/policy work and expansion budgets, access-program breadth limits, and generated-response-header admission |
 | `dos-connection-admission-followup.md` | Post-P28 connection DoS follow-up: asynchronous first-head admission, H2 preface deadline, worker/source reserves, fair listener batches, and complete control-frame charging |
+| `findings_p33.md` | Pass-33 write-up (**P33-A**): `Options MultiViews` selects a sibling representation before the trailing-slash rejection and serves it under the pre-negotiation URL identity, bypassing exact/extension `Location` and `.htaccess` rewrite guards (stock-Debian `Alias /javascript` shape included); controls cover MultiViews-off and candidate-bound `<Files>` |
+| `p33/exploit_p33.py` | Pass-33 differential harness (six verdicts): exact-`Location` slash bypass, extension-`Location` and `.htaccess` rewrite guard bypass, stock-Debian alias shape, MultiViews-off and `<Files>` controls; Apache 2.4.69 oracle with `mod_negotiation`/`mod_rewrite`; fixtures under `/tmp/opencode/p33-harness` |
+| `p33/results_p33.txt` | Pass-33 retained Apache-versus-vapached run output (P33-A reproduces: Apache `404`, vapache `200` + protected body) |
 
 ## Pre-adversarial gate
 
