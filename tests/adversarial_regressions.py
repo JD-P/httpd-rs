@@ -719,9 +719,14 @@ AliasMatch "^/escape(.*)$" "$1"
         self.assertEqual(status, 200, body[:200])
         self.assertIn(b"WALLET-RELOAD-SECRET", body)
         type(self).reload_with_wallet_deny()
-        for path in ("/cgi/wallet.cgi", "/cgi/wallet.cgi/foo"):
+        for path, expected in (
+            ("/cgi/wallet.cgi", 403),
+            # PATH_INFO discovers the denied script implicitly. Match a
+            # missing candidate rather than exposing its existence.
+            ("/cgi/wallet.cgi/foo", 404),
+        ):
             status, _, body = request(self.port, path)
-            self.assertEqual(status, 403, f"{path}: {body[:200]}")
+            self.assertEqual(status, expected, f"{path}: {body[:200]}")
             self.assertNotIn(b"WALLET-RELOAD-SECRET", body)
 
     def test_f25_relative_regex_alias_reads_target_htaccess(self):
@@ -885,15 +890,16 @@ AliasMatch "^/escape(.*)$" "$1"
         self.assertNotIn(b"WALLET-LIMIT-EXECCGI-BYPASS", body)
 
     def test_f41_symlinked_cgi_and_fastcgi_use_actual_target_policy(self):
-        for path in (
-            "/private-cgi/admin.cgi",
-            "/public-cgi/link.cgi",
-            "/public-cgi/link.cgi/anything",
-            "/private-cgi/secret.php",
-            "/public-cgi/link.php",
+        for path, expected in (
+            ("/private-cgi/admin.cgi", 403),
+            ("/public-cgi/link.cgi", 403),
+            # Conceal the denied script selected through PATH_INFO.
+            ("/public-cgi/link.cgi/anything", 404),
+            ("/private-cgi/secret.php", 403),
+            ("/public-cgi/link.php", 403),
         ):
             status, _, body = request(self.port, path)
-            self.assertEqual(status, 403, f"{path}: {body[:200]}")
+            self.assertEqual(status, expected, f"{path}: {body[:200]}")
             self.assertNotIn(b"WALLET-PRIVATE-CGI-SECRET", body)
             self.assertNotIn(b"WALLET-PRIVATE-PHP-SECRET", body)
 
@@ -2467,7 +2473,11 @@ ErrorDocument 404 /err.php
 
     def test_error_document_query_does_not_poison_missing_url(self):
         status, headers, body = request(self.port, "/missing?attack=POISON")
-        self.assertIn(b"SECRET-FOR-attack=POISON", body)
+        # Apache internal redirects replace the original query with the
+        # ErrorDocument target's query. This target has none, so the handler
+        # must not observe or cache the missing URL's attacker-controlled query.
+        self.assertIn(b"SECRET-FOR-\n", body)
+        self.assertNotIn(b"POISON", body)
         self.assertNotEqual(headers.get("X-Cache"), "HIT")
 
         status, headers, body = request(self.port, "/missing")

@@ -53,13 +53,19 @@ response contains the selected fixture. This intentionally suppresses the
 target-existence oracle and does not relax any other status comparison.
 
 `tests/information_disclosure.py` is the complementary noninterference oracle.
-Its 105 cases run Vapache in paired worlds that differ only in protected
-existence, contents/metadata, directory state or denied backend output. It
-compares 416 complete attacker-visible observations: status, body and every
-header except `Date`, including validators, ranges, compression, redirects,
-cache disposition and challenges. It also rejects secret markers, temporary
-filesystem paths and any contact with a denied backend. Failures are replayable
-from JSON under `artifacts/information-disclosure/`.
+One rotation has 105 cases that run Vapache in paired worlds differing only in
+protected existence, contents/metadata, directory state or denied backend
+output. The pre-adversarial gate runs all ten deterministic probe rotations:
+1,050 cases and 4,190 cold-state observations cover every generated
+transform/policy/state/probe intersection. Four additional stateful sequences
+compare 30 attacker observations after credentialed cache exclusion and a
+principal switch, a grant-to-deny reload for static and CGI/PATH_INFO targets,
+and live mutation of denied autoindex metadata, for 4,220 total attacker
+observations. The oracle compares HTTP version, status, reason,
+ordered headers except `Date`, and body; it also rejects secret markers,
+temporary filesystem paths, denied autoindex names and any contact with a
+denied backend. Failures are replayable from JSON under
+`artifacts/information-disclosure/`.
 
 Pull-request CI checks deterministic generation and matrix completeness without
 requiring Apache modules. The fail-closed pre-adversarial/nightly gate runs both

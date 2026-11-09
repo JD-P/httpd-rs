@@ -116,7 +116,7 @@ step "generated transform and sink differential"
 python3 tests/transform_differential.py
 
 step "attacker-view information-disclosure noninterference"
-python3 tests/information_disclosure.py
+python3 tests/information_disclosure.py --all-probes
 
 step "portable adversarial regressions"
 python3 tests/adversarial_regressions.py

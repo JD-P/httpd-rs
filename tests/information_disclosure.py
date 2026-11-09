@@ -8,10 +8,14 @@ server worlds that differ only in state it is not allowed to observe?
 Each generated case is run twice on the same port, with the same configuration
 and temporary root.  The worlds differ in one hidden fact: a protected target
 exists or not, protected contents and metadata differ, a directory is populated
-or empty, or a denied upstream would return a different payload.  The campaign
-compares the complete attacker-visible response after removing only the Date
-header.  Status, body, length, validators, ranges, redirects, challenges, cache
-disposition, compression and every other header remain part of the oracle.
+or empty, or a denied upstream would return a different payload.  Four stateful
+sequences additionally preserve one live server across credentialed cache
+exclusion and a principal switch, a grant-to-deny reload, or hidden autoindex
+metadata mutation.  The
+campaign compares the complete attacker-visible response after removing only
+the Date header.  Status, body, length, validators, ranges, redirects,
+challenges, cache disposition, compression and every other header remain part
+of the oracle.
 
 The matrix covers direct files, rewrites, aliases, MultiViews, DirectoryIndex,
 CGI and PATH_INFO, autoindex, ErrorDocument, cache, directory-slash fallback and
@@ -25,6 +29,8 @@ Failures produce replayable JSON under artifacts/information-disclosure.
 Usage:
     python3 tests/information_disclosure.py --check
     python3 tests/information_disclosure.py
+    python3 tests/information_disclosure.py --all-probes
+    python3 tests/information_disclosure.py --stateful-only
     python3 tests/information_disclosure.py --only 'cache.*content-metadata'
     python3 tests/information_disclosure.py --list
 """
@@ -60,6 +66,12 @@ VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapach
 PORT = int(os.environ.get("VAPACHE_DISCLOSURE_PORT", "18320"))
 ARTIFACT_DIR = "artifacts/information-disclosure"
 WORLD_TIMES = {"a": 1_700_000_000, "b": 1_600_000_000}
+STATEFUL_SEQUENCES = (
+    "credentialed-cache-exclusion-principal-switch",
+    "reload-static-cache",
+    "reload-cgi-path-info",
+    "live-autoindex-metadata-mutation",
+)
 
 
 @dataclass(frozen=True)
@@ -278,11 +290,11 @@ def apply_policy(case: Case) -> None:
     policy = case.policy
     guard_pattern = re.escape(case.guard_url)
     query_guard_pattern = re.escape(case.query_guard_url)
-    # DirectorySlash treats the slashless and slash forms as two spellings of
-    # one directory identity. Protect both; an exact rule for only one form
-    # would intentionally leave the other URL public rather than define a
-    # hidden-state noninterference case.
-    if case.template == "directory-slash":
+    # DirectorySlash and the proxy slash-boundary probe treat the slashless
+    # and slash forms as two spellings of one protected route. Protect both;
+    # an exact rule for only one form would intentionally leave the other URL
+    # public rather than define a hidden-state noninterference case.
+    if case.template in {"directory-slash", "proxy-http"}:
         guard_pattern += "/?"
         query_guard_pattern += "/?"
     if policy == "directory":
@@ -639,6 +651,37 @@ def generation_errors(cases: list[Case]) -> list[str]:
         )
         if not configured_deny and not access_file_deny:
             errors.append(f"{case.id}: no denial policy")
+    return errors
+
+
+def probe_rotation_errors(seed: int) -> list[str]:
+    errors: list[str] = []
+    rotations = [generate_cases(seed + offset) for offset in range(len(PROBES))]
+    rows = [case for rotation in rotations for case in rotation]
+    expected_count = len(rotations[0]) * len(PROBES)
+    if len(rows) != expected_count:
+        errors.append(f"probe rotations generated {len(rows)} cases, expected {expected_count}")
+
+    expected_probes = {probe.id for probe in PROBES}
+    base_rows = {
+        (case.template, case.policy, case.state) for case in rotations[0]
+    }
+    for template, policy, state in sorted(base_rows):
+        actual = {
+            case.probe
+            for case in rows
+            if (case.template, case.policy, case.state) == (template, policy, state)
+        }
+        if actual != expected_probes:
+            errors.append(
+                f"{template}/{policy}/{state}: incomplete rotated probes {sorted(actual)}"
+            )
+    identities = {(case.template, case.policy, case.state, case.probe) for case in rows}
+    if len(identities) != expected_count:
+        errors.append(
+            f"probe rotations have {len(identities)} unique intersections, "
+            f"expected {expected_count}"
+        )
     return errors
 
 
@@ -1109,6 +1152,394 @@ def run_live(cases: list[Case], args: argparse.Namespace) -> int:
         stop_runtime(runtime, args.keep_tree)
 
 
+def stateful_config(runtime: Runtime, deny_reloaded_targets: bool) -> str:
+    lines = transform.module_lines()
+    lines.extend(
+        [
+            "VapacheCapability AccessFiles On",
+            "VapacheCapability AutoIndex On",
+            "VapacheCapability Cgi On",
+            "VapacheCapability MutableAuthFiles On",
+            f'ServerRoot "{runtime.base}"',
+            f"Listen {PORT}",
+            f"User {transform.SERVICE_USER}",
+            f"Group {transform.SERVICE_GROUP}",
+            f'PidFile "{runtime.base}/logs/vapache.pid"',
+            f'ErrorLog "{runtime.base}/logs/error.log"',
+            "LogLevel warn",
+            "ServerName localhost",
+            "Timeout 10",
+            f'DocumentRoot "{runtime.docroot}"',
+            "TypesConfig /etc/mime.types",
+            "AddType text/plain .txt",
+            "AddHandler cgi-script .cgi",
+            f'CacheRoot "{runtime.cache_root}"',
+            "CacheEnable disk /",
+            "CacheHeader On",
+            "CacheDefaultExpire 3600",
+            "<Directory />",
+            "    AllowOverride None",
+            "    Require all denied",
+            "</Directory>",
+            f'<Directory "{runtime.docroot}">',
+            "    Options FollowSymLinks",
+            "    AllowOverride None",
+            "    Require all granted",
+            "</Directory>",
+            f'<Directory "{runtime.docroot}/state-auth">',
+            "    AuthType Basic",
+            '    AuthName "stateful cache"',
+            f'    AuthUserFile "{runtime.base}/stateful.htpasswd"',
+            "    Require valid-user",
+            "</Directory>",
+            f'<Directory "{runtime.docroot}/state-cgi">',
+            "    Options +ExecCGI",
+            "    Require all granted",
+            "</Directory>",
+            f'<Directory "{runtime.docroot}/state-list">',
+            "    Options +Indexes",
+            "    Require all granted",
+            '    <Files "secret-record.txt">',
+            "        Require all denied",
+            "    </Files>",
+            "</Directory>",
+            '<LocationMatch "^/state-(auth|reload|cgi)/">',
+            '    Header set Cache-Control "max-age=3600"',
+            "</LocationMatch>",
+        ]
+    )
+    if deny_reloaded_targets:
+        lines.extend(
+            [
+                f'<Directory "{runtime.docroot}/state-reload">',
+                '    <Files "secret.txt">',
+                "        Require all denied",
+                "    </Files>",
+                "</Directory>",
+                f'<Directory "{runtime.docroot}/state-cgi">',
+                '    <Files "secret.cgi">',
+                "        Require all denied",
+                "    </Files>",
+                "</Directory>",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def stateful_fixture(runtime: Runtime, world: str) -> None:
+    for relative in ("state-auth", "state-reload", "state-cgi", "state-list"):
+        chmod_dir(runtime.docroot / relative)
+
+    hidden = confidential(f"stateful-{world}", world)
+    for relative in ("state-auth/secret.txt", "state-reload/secret.txt"):
+        path = runtime.docroot / relative
+        path.write_bytes(hidden)
+        os.chmod(path, 0o644)
+        os.utime(path, (WORLD_TIMES[world], WORLD_TIMES[world]))
+
+    script = runtime.docroot / "state-cgi/secret.cgi"
+    script.write_bytes(cgi_secret("stateful-cgi", world))
+    os.chmod(script, 0o755)
+    os.utime(script, (WORLD_TIMES[world], WORLD_TIMES[world]))
+
+    listing_secret = runtime.docroot / "state-list/secret-record.txt"
+    listing_secret.write_bytes(hidden)
+    os.chmod(listing_secret, 0o644)
+    os.utime(listing_secret, (WORLD_TIMES[world], WORLD_TIMES[world]))
+    public = runtime.docroot / "state-list/public-record.txt"
+    public.write_bytes(b"public\n")
+    os.chmod(public, 0o644)
+    os.utime(public, (1_500_000_000, 1_500_000_000))
+    os.utime(runtime.docroot / "state-list", (1_500_000_000, 1_500_000_000))
+
+    # SHA-1 is used only as an Apache-compatible fixture format. The campaign
+    # authenticates once to populate the cache, then evaluates the anonymous
+    # attacker's view.
+    password_digest = base64.b64encode(hashlib.sha1(b"secret").digest()).decode(
+        "ascii"
+    )
+    htpasswd = runtime.base / "stateful.htpasswd"
+    htpasswd.write_text(f"alice:{{SHA}}{password_digest}\n")
+    os.chmod(htpasswd, 0o644)
+
+
+def checked_stateful_request(step: RequestStep) -> dict:
+    observation = send_request(step)
+    return observation
+
+
+def warm_stateful_target(
+    step: RequestStep, label: str, cache_expectation: str = "hit"
+) -> None:
+    last: dict | None = None
+    for _attempt in range(2):
+        last = checked_stateful_request(step)
+        if last["status"] != 200 or b"CONFIDENTIAL:" not in last["body"]:
+            raise RuntimeError(
+                f"{label} did not warm protected content: "
+                f"status={last['status']} body={last['body'][:200]!r}"
+            )
+    cache_state = None if last is None else last["headers"].get("x-cache")
+    if cache_expectation == "hit" and cache_state != ["HIT"]:
+        raise RuntimeError(f"{label} did not produce a cache hit; X-Cache={cache_state}")
+    if cache_expectation == "excluded" and cache_state == ["HIT"]:
+        raise RuntimeError(f"{label} persisted a credentialed response in shared cache")
+
+
+def wait_for_reloaded_denial(timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    last: dict | None = None
+    step = RequestStep("reload-probe", "GET", "/state-reload/secret.txt")
+    while time.monotonic() < deadline:
+        try:
+            last = send_request(step)
+            if last["status"] == 403:
+                return
+        except OSError:
+            pass
+        time.sleep(0.05)
+    status = None if last is None else last["status"]
+    raise RuntimeError(f"stateful grant-to-deny reload did not commit; last status={status}")
+
+
+def collect_steps(steps: list[RequestStep]) -> list[dict]:
+    return [checked_stateful_request(step) for step in steps]
+
+
+def run_stateful_world(world: str, verbose: bool) -> tuple[Runtime, dict[str, list[dict]]]:
+    runtime = prepare_runtime([])
+    try:
+        stateful_fixture(runtime, world)
+        config = runtime.base / "vapache-stateful.conf"
+        config.write_text(stateful_config(runtime, False))
+        run_checked([str(VAPACHED), "-t", "-f", str(config)], "stateful configtest")
+        start_server(runtime, f"stateful-{world}", config)
+    except Exception:
+        stop_runtime(runtime, True)
+        raise
+
+    auth = base64.b64encode(b"alice:secret").decode("ascii")
+    auth_headers = {"Authorization": f"Basic {auth}"}
+    groups: dict[str, list[dict]] = {}
+    try:
+        warm_stateful_target(
+            RequestStep(
+                "authenticated-warm",
+                "GET",
+                "/state-auth/secret.txt",
+                auth_headers,
+            ),
+            "credentialed cache exclusion",
+            cache_expectation="excluded",
+        )
+        groups["credentialed-cache-exclusion-principal-switch"] = collect_steps(
+            [
+                RequestStep("anonymous-get", "GET", "/state-auth/secret.txt"),
+                RequestStep("anonymous-head", "HEAD", "/state-auth/secret.txt"),
+                RequestStep(
+                    "anonymous-range",
+                    "GET",
+                    "/state-auth/secret.txt",
+                    {"Range": "bytes=0-3", "Accept-Encoding": "gzip"},
+                ),
+                RequestStep(
+                    "anonymous-validator",
+                    "GET",
+                    "/state-auth/secret.txt",
+                    {"If-None-Match": "*"},
+                ),
+            ]
+        )
+
+        warm_stateful_target(
+            RequestStep("static-warm", "GET", "/state-reload/secret.txt"),
+            "reload static cache",
+        )
+        warm_stateful_target(
+            RequestStep("cgi-warm", "GET", "/state-cgi/secret.cgi/info"),
+            "reload CGI cache",
+            cache_expectation="unchecked",
+        )
+
+        list_step = RequestStep("autoindex", "GET", "/state-list/")
+        direct_step = RequestStep(
+            "autoindex-direct-denial", "GET", "/state-list/secret-record.txt"
+        )
+        before = collect_steps([list_step, direct_step])
+        listing_secret = runtime.docroot / "state-list/secret-record.txt"
+        listing_secret.write_bytes(
+            b"CONFIDENTIAL:STATEFUL-MUTATION:" + (b"X" * 4093) + b"\n"
+        )
+        os.chmod(listing_secret, 0o644)
+        os.utime(listing_secret, (1_800_000_000, 1_800_000_000))
+        after = collect_steps([list_step, direct_step])
+        groups["live-autoindex-metadata-mutation-before"] = before
+        groups["live-autoindex-metadata-mutation-after"] = after
+
+        config.write_text(stateful_config(runtime, True))
+        process = runtime.process
+        if process is None or process.poll() is not None:
+            raise RuntimeError("stateful server exited before reload")
+        os.kill(process.pid, signal.SIGHUP)
+        wait_for_reloaded_denial()
+        groups["reload-static-cache"] = collect_steps(
+            [
+                RequestStep("denied-get", "GET", "/state-reload/secret.txt"),
+                RequestStep("denied-head", "HEAD", "/state-reload/secret.txt"),
+                RequestStep(
+                    "denied-range",
+                    "GET",
+                    "/state-reload/secret.txt",
+                    {"Range": "bytes=0-3", "Accept-Encoding": "gzip"},
+                ),
+                RequestStep(
+                    "denied-validator",
+                    "GET",
+                    "/state-reload/secret.txt",
+                    {"If-None-Match": "*"},
+                ),
+            ]
+        )
+        groups["reload-cgi-path-info"] = collect_steps(
+            [
+                RequestStep("denied-script", "GET", "/state-cgi/secret.cgi"),
+                RequestStep("denied-path-info", "GET", "/state-cgi/secret.cgi/info"),
+                RequestStep("denied-path-info-head", "HEAD", "/state-cgi/secret.cgi/info"),
+            ]
+        )
+        if verbose:
+            for group, rows in groups.items():
+                print(
+                    f"    stateful world-{world} {group}: "
+                    + ", ".join(str(row["status"]) for row in rows)
+                )
+        return runtime, groups
+    except Exception:
+        stop_runtime(runtime, True)
+        raise
+    finally:
+        stop_server(runtime)
+
+
+def write_stateful_artifact(
+    artifact_dir: Path,
+    sequence: str,
+    problems: list[str],
+    world_a: list[dict],
+    world_b: list[dict],
+) -> Path:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    path = artifact_dir / f"stateful-{safe_id(sequence)}.json"
+    payload = {
+        "schema": 1,
+        "sequence": sequence,
+        "problems": problems,
+        "world_a": [printable_observation(row) for row in world_a],
+        "world_b": [printable_observation(row) for row in world_b],
+        "replay": "python3 tests/information_disclosure.py --stateful-only -v",
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def compare_stateful_sequence(
+    sequence: str,
+    runtime_a: Runtime,
+    runtime_b: Runtime,
+    rows_a: list[dict],
+    rows_b: list[dict],
+) -> list[str]:
+    problems: list[str] = []
+    if len(rows_a) != len(rows_b):
+        return [f"observation count world-a={len(rows_a)} world-b={len(rows_b)}"]
+    for index, (row_a, row_b) in enumerate(zip(rows_a, rows_b, strict=True)):
+        for problem in describe_difference(attacker_view(row_a), attacker_view(row_b)):
+            problems.append(f"observation-{index}: {problem}")
+        for world, runtime, row in (
+            ("a", runtime_a, row_a),
+            ("b", runtime_b, row_b),
+        ):
+            for disclosure in forbidden_disclosures(runtime, row):
+                problems.append(f"observation-{index}: world-{world} leaked {disclosure}")
+
+    expected_statuses = {
+        "credentialed-cache-exclusion-principal-switch": [401, 401, 401, 401],
+        "reload-static-cache": [403, 403, 403, 403],
+        "reload-cgi-path-info": [403, 404, 404],
+        "live-autoindex-metadata-mutation": [200, 403, 200, 403],
+    }[sequence]
+    for world, rows in (("a", rows_a), ("b", rows_b)):
+        actual_statuses = [row["status"] for row in rows]
+        if actual_statuses != expected_statuses:
+            problems.append(
+                f"world-{world} statuses={actual_statuses}, expected={expected_statuses}"
+            )
+        if sequence == "live-autoindex-metadata-mutation":
+            for index in (0, 2):
+                if b"secret-record.txt" in rows[index]["body"]:
+                    problems.append(
+                        f"world-{world} observation-{index} exposed denied entry name"
+                    )
+    return problems
+
+
+def run_stateful(args: argparse.Namespace) -> tuple[int, int]:
+    if not VAPACHED.is_file():
+        raise RuntimeError(f"missing {VAPACHED}; build the release daemon first")
+    runtime_a: Runtime | None = None
+    runtime_b: Runtime | None = None
+    try:
+        runtime_a, groups_a = run_stateful_world("a", args.verbose)
+        runtime_b, groups_b = run_stateful_world("b", args.verbose)
+        failures = 0
+        observations = 0
+        for sequence in STATEFUL_SEQUENCES:
+            if sequence == "live-autoindex-metadata-mutation":
+                rows_a = groups_a[f"{sequence}-before"] + groups_a[f"{sequence}-after"]
+                rows_b = groups_b[f"{sequence}-before"] + groups_b[f"{sequence}-after"]
+            else:
+                rows_a = groups_a[sequence]
+                rows_b = groups_b[sequence]
+            observations += len(rows_a) + len(rows_b)
+            problems = compare_stateful_sequence(
+                sequence, runtime_a, runtime_b, rows_a, rows_b
+            )
+            if sequence == "live-autoindex-metadata-mutation":
+                for world, groups in (("a", groups_a), ("b", groups_b)):
+                    before = groups[f"{sequence}-before"]
+                    after = groups[f"{sequence}-after"]
+                    for index, (first, second) in enumerate(
+                        zip(before, after, strict=True)
+                    ):
+                        for problem in describe_difference(
+                            attacker_view(first), attacker_view(second)
+                        ):
+                            problems.append(
+                                f"world-{world} live-mutation-{index}: {problem}"
+                            )
+            if problems:
+                failures += 1
+                artifact = write_stateful_artifact(
+                    Path(args.artifact_dir), sequence, problems, rows_a, rows_b
+                )
+                print(f"FAIL stateful--{sequence}")
+                for problem in problems:
+                    print(f"     {problem}")
+                print(f"     artifact: {artifact}")
+            else:
+                print(f"ok   stateful--{sequence}")
+        print(
+            f"\n{len(STATEFUL_SEQUENCES)} stateful sequences, "
+            f"{observations} attacker observations, {failures} disclosure divergence(s)"
+        )
+        return (1 if failures else 0), observations
+    finally:
+        if runtime_a is not None:
+            stop_runtime(runtime_a, args.keep_tree)
+        if runtime_b is not None:
+            stop_runtime(runtime_b, args.keep_tree)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="validate generation and exit")
@@ -1116,13 +1547,28 @@ def main() -> int:
     parser.add_argument("--only", default="", help="run case IDs matching this regular expression")
     parser.add_argument("--sample", type=int, default=0, help="run a deterministic sample")
     parser.add_argument("--seed", type=int, default=9049)
+    parser.add_argument(
+        "--all-probes",
+        action="store_true",
+        help="run all ten probe rotations (the full case/probe cross-product)",
+    )
+    parser.add_argument(
+        "--stateful-only",
+        action="store_true",
+        help="run only authenticated-warm, reload and live-mutation sequences",
+    )
+    parser.add_argument(
+        "--skip-stateful",
+        action="store_true",
+        help="omit the stateful sequences from a full single-rotation run",
+    )
     parser.add_argument("--artifact-dir", default=ARTIFACT_DIR)
     parser.add_argument("--keep-tree", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
     cases = generate_cases(args.seed)
-    errors = generation_errors(cases)
+    errors = generation_errors(cases) + probe_rotation_errors(args.seed)
     if errors:
         for error in errors:
             print(f"generation error: {error}", file=sys.stderr)
@@ -1135,19 +1581,75 @@ def main() -> int:
             f"information-disclosure generation: {len(cases)} cases, "
             f"{len(TEMPLATES)} transforms, {len(PROBES)} probes, "
             f"{len({case.policy for case in cases})} policy phases, "
-            f"{len({case.state for case in cases})} hidden-state relations"
+            f"{len({case.state for case in cases})} hidden-state relations, "
+            f"{len(STATEFUL_SEQUENCES)} stateful sequences; "
+            f"{len(cases) * len(PROBES)} full-rotation intersections"
         )
         return 0
+    if args.stateful_only and (
+        args.only or args.sample or args.all_probes or args.skip_stateful
+    ):
+        print(
+            "selection error: --stateful-only cannot be combined with case selection, "
+            "--all-probes or --skip-stateful",
+            file=sys.stderr,
+        )
+        return 2
+    if args.all_probes and (args.only or args.sample):
+        print(
+            "selection error: --all-probes cannot be combined with --only or --sample",
+            file=sys.stderr,
+        )
+        return 2
     try:
-        selected = filter_cases(cases, args.only, args.sample, args.seed)
+        if args.stateful_only:
+            status, _observations = run_stateful(args)
+            return status
+
+        seeds = (
+            [args.seed + offset for offset in range(len(PROBES))]
+            if args.all_probes
+            else [args.seed]
+        )
+        failed = False
+        total_cases = 0
+        total_observations = 0
+        for rotation, seed in enumerate(seeds, start=1):
+            rotation_cases = generate_cases(seed)
+            errors = generation_errors(rotation_cases)
+            if errors:
+                raise RuntimeError(
+                    f"probe rotation {rotation} generation failed: {'; '.join(errors)}"
+                )
+            selected = filter_cases(rotation_cases, args.only, args.sample, seed)
+            if not selected:
+                raise RuntimeError("no generated cases selected")
+            rotation_args = argparse.Namespace(**vars(args))
+            rotation_args.seed = seed
+            if args.all_probes:
+                print(
+                    f"\nprobe rotation {rotation}/{len(seeds)} "
+                    f"(seed={seed}, offset={seed % len(PROBES)})"
+                )
+            failed |= run_live(selected, rotation_args) != 0
+            total_cases += len(selected)
+            total_observations += sum(len(case.requests) for case in selected) * 2
+
+        run_stateful_after = not args.skip_stateful and not (args.only or args.sample)
+        if run_stateful_after:
+            stateful_status, stateful_observations = run_stateful(args)
+            failed |= stateful_status != 0
+            total_observations += stateful_observations
+        if args.all_probes:
+            print(
+                f"\nall {len(seeds)} probe rotations: {total_cases} generated cases, "
+                f"{total_observations} attacker observations, "
+                f"{'failure' if failed else 'PASS'}"
+            )
+        return 1 if failed else 0
     except (ValueError, re.error) as error:
         print(f"selection error: {error}", file=sys.stderr)
         return 2
-    if not selected:
-        print("no generated cases selected", file=sys.stderr)
-        return 2
-    try:
-        return run_live(selected, args)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         print(f"information disclosure campaign: {error}", file=sys.stderr)
         return 2
