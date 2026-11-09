@@ -562,10 +562,16 @@ assumption.
 P34-A is closed by separating decoded authorization identity from wire
 serialization. `CanonicalTarget::from_selected_child` constructs the exact
 decoded canonical path for every implicitly selected filesystem child. Both
-MultiViews (including cache planning) and autoindex entry authorization now
-use that typed path; invalid UTF-8, separators and non-canonical names are not
-implicitly selected. `url_encode_path` remains at the `Content-Location` and
-autoindex `href` output boundaries only.
+MultiViews and `DirectoryIndex` (including cache planning), plus autoindex
+entry authorization, now use that typed path; invalid UTF-8, separators and
+non-canonical names are not implicitly selected. `url_encode_path` remains at
+the `Content-Location` and autoindex `href` output boundaries only. The
+`DirectoryIndex` conversion is preventive hardening: configuration validation
+already restricted index names to valid single components, but dispatch no
+longer depends on duplicate string construction or lossy conversion. The
+main-config variable expansion pass also advances on UTF-8 character
+boundaries, so non-ASCII directive arguments retain their exact decoded
+identity instead of being double-encoded before policy compilation.
 
 The retained Apache differential is now a fail-closed regression in the
 regular pre-adversarial gate. Its 12 cases cover spaces, non-ASCII and literal

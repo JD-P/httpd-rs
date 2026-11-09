@@ -7975,24 +7975,23 @@ fn dispatch_inner(
                 directory_index_target(cfg, &scope, req, &file, &auth_url, &req.raw_path)
             {
                 let crate::files::DirectoryIndex { name, file, meta } = index;
-                let index_url = format!(
-                    "{}/{}",
-                    auth_url.trim_end_matches('/'),
-                    String::from_utf8_lossy(&name)
+                let Some(index_target) =
+                    CanonicalTarget::from_selected_child(&auth_url, &name, false)
+                else {
+                    return Response::policy_error();
+                };
+                let index_url = index_target.url_path.clone();
+                let index_plan = plan.retarget_directory_index(
+                    cfg,
+                    vhost,
+                    index_target,
+                    Some((file, meta, follow_symlinks, owner_match_only)),
+                    (rewrite_rounds == 0
+                        && rewrite_effects.is_empty()
+                        && original_url_path == url_path
+                        && original_fs_path == fs_path)
+                        .then_some(scope),
                 );
-                let index_plan = CanonicalTarget::from_url_path(&index_url).and_then(|target| {
-                    plan.retarget_directory_index(
-                        cfg,
-                        vhost,
-                        target,
-                        Some((file, meta, follow_symlinks, owner_match_only)),
-                        (rewrite_rounds == 0
-                            && rewrite_effects.is_empty()
-                            && original_url_path == url_path
-                            && original_fs_path == fs_path)
-                            .then_some(scope),
-                    )
-                });
                 return internal_dispatch(
                     cfg,
                     req,
@@ -11420,6 +11419,41 @@ mod tests {
                 "{child}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_index_uses_decoded_selected_child_policy_identity() {
+        let dir = cov_dir("directory-index-decoded-child");
+        for child in ["allowed", "denied"] {
+            std::fs::create_dir_all(dir.join("www").join(child)).unwrap();
+            std::fs::write(
+                dir.join("www").join(child).join("café.html"),
+                format!("{child}\n"),
+            )
+            .unwrap();
+        }
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "<Directory \"{}/www\">\n\
+                 DirectoryIndex café.html\n\
+                 Require all granted\n\
+                 </Directory>\n\
+                 <LocationMatch \"^/denied/café\\.html$\">\n\
+                 Require all denied\n\
+                 </LocationMatch>\n",
+                dir.display(),
+            ),
+        );
+
+        let allowed = cov_dispatch(&cfg, "GET", "/allowed/");
+        assert_eq!(allowed.status, 200);
+        assert_eq!(cov_dispatch(&cfg, "GET", "/denied/").status, 403);
+        assert_eq!(
+            cov_dispatch(&cfg, "GET", "/denied/caf%C3%A9.html").status,
+            403
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

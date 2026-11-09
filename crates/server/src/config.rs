@@ -4791,8 +4791,12 @@ impl ParserState {
                     }
                     i = end + 1;
                 } else {
-                    s.push(bytes[i] as char);
-                    i += 1;
+                    let ch = a[i..]
+                        .chars()
+                        .next()
+                        .expect("cursor remains on a UTF-8 character boundary");
+                    s.push(ch);
+                    i += ch.len_utf8();
                 }
             }
             out.push(s);
@@ -14399,6 +14403,10 @@ ServerName localhost\n\
         assert_eq!(
             p.expand_vars(&["$plain".into()], &loc),
             Some(vec!["$plain".into()])
+        );
+        assert_eq!(
+            p.expand_vars(&["pré-${A}-café".into()], &loc),
+            Some(vec!["pré-one-café".into()])
         );
         assert!(p.expand_vars(&["${MISSING}".into()], &loc).is_none());
         p.warnings.clear();

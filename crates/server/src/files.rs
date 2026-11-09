@@ -2106,11 +2106,12 @@ fn serve_directory_inner(
             r
         }
         DirAction::Index(_, _, name) => {
-            let index_url = format!(
-                "{}/{}",
-                url_path.trim_end_matches('/'),
-                String::from_utf8_lossy(&name)
-            );
+            let Some(index_url) =
+                crate::request_plan::CanonicalTarget::from_selected_child(url_path, &name, false)
+                    .map(|target| target.url_path)
+            else {
+                return Response::policy_error();
+            };
             crate::server::internal_dispatch(
                 cfg,
                 req,

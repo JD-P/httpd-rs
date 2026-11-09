@@ -795,17 +795,21 @@ pub fn request_scope_with_plan(
                 &url_path,
                 &req.raw_path,
             ) {
-                // The cache identity must preserve the exact index name bytes.
-                // Reject a non-UTF-8 index name rather than sharing a lossy key.
-                let index_name = std::str::from_utf8(&index.name).ok()?;
-                let index_url = format!("{}/{}", url_path.trim_end_matches('/'), index_name);
+                // The cache and live paths must consume the same typed decoded
+                // child identity. Reject anything that cannot be represented
+                // exactly as a canonical policy URL.
+                let index_target = crate::request_plan::CanonicalTarget::from_selected_child(
+                    &url_path,
+                    &index.name,
+                    false,
+                )?;
+                let index_url = index_target.url_path.clone();
                 lexical_fs_path = fs_path.join(std::ffi::OsStr::from_bytes(&index.name));
                 let index_fs = crate::files::fd_path(&index.file)?;
-                let target = crate::request_plan::CanonicalTarget::from_url_path(&index_url)?;
                 let index_plan = crate::request_plan::RequestPlan::from_fs_target_for_request(
                     cfg,
                     vhost,
-                    target,
+                    index_target.clone(),
                     root.clone(),
                     index_fs.clone(),
                     script_alias,
@@ -815,10 +819,13 @@ pub fn request_scope_with_plan(
                 let mut index_scope = index_plan.effective_scope(cfg, vhost, req, peer.ip());
                 // The selected index has its own URL identity; conjoin that
                 // lexical scope and the directory URL's non-handler policy.
-                let lexical = crate::request_plan::CanonicalTarget::from_url_path(&index_url)?;
-                let lexical_plan =
-                    crate::request_plan::RequestPlan::resolve_for_request(cfg, vhost, lexical, req)
-                        .ok()?;
+                let lexical_plan = crate::request_plan::RequestPlan::resolve_for_request(
+                    cfg,
+                    vhost,
+                    index_target,
+                    req,
+                )
+                .ok()?;
                 let lexical_scope = lexical_plan.effective_scope(cfg, vhost, req, peer.ip());
                 index_scope.restrict_with(&lexical_scope);
                 index_scope.restrict_policy_with(&scope);
@@ -4165,7 +4172,7 @@ ErrorDocument 404 /404.html\n\
         let _ = fs::remove_dir_all(&dir);
         let www = dir.join("www");
         fs::create_dir_all(www.join("dir")).unwrap();
-        fs::write(www.join("dir/index.html"), "index\n").unwrap();
+        fs::write(www.join("dir/café.html"), "index\n").unwrap();
         fs::write(www.join("dir/.htaccess"), "# no deny\n").unwrap();
         let conf = dir.join("httpd.conf");
         fs::write(
@@ -4175,8 +4182,8 @@ ErrorDocument 404 /404.html\n\
 DocumentRoot \"{www}\"\n\
 CacheRoot \"{cache}\"\n\
 CacheEnable disk /\n\
-DirectoryIndex index.html\n\
 <Directory \"{www}\">\n\
+    DirectoryIndex café.html\n\
     AllowOverride All\n\
     Require all granted\n\
 </Directory>\n",
@@ -4220,12 +4227,12 @@ DirectoryIndex index.html\n\
             "127.0.0.1",
         )
         .expect("directory index cache scope");
-        assert_eq!(ctx.target(), www.join("dir/index.html"));
-        assert_eq!(ctx.path(), "/dir/index.html");
+        assert_eq!(ctx.target(), www.join("dir/café.html"));
+        assert_eq!(ctx.path(), "/dir/café.html");
 
         fs::write(
             www.join("dir/.htaccess"),
-            "<Files \"index.html\">\n    Require all denied\n</Files>\n",
+            "<Files \"café.html\">\n    Require all denied\n</Files>\n",
         )
         .unwrap();
         assert!(request_scope(
