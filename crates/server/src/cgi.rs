@@ -139,12 +139,21 @@ fn find_script_checked_inner(
                 .map(|c| c.to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
+            // A trailing slash belongs to PATH_INFO, not to the script name.
+            // The mapping plan strips it from `rel`, so consult the request
+            // target as well; preserving it keeps SCRIPT_NAME/PATH_INFO
+            // aligned with Apache for `/script.cgi/info/` (and lets the
+            // caller strip the path info from the canonical URL identity).
+            let trailing_slash = req.is_some_and(|req| req.raw_path.ends_with(b"/"))
+                || rel.as_os_str().as_encoded_bytes().ends_with(b"/");
             return Some(ScriptTarget {
                 rel_script: prefix,
                 file,
                 meta,
                 path_info: if info.is_empty() {
                     String::new()
+                } else if trailing_slash {
+                    format!("/{info}/")
                 } else {
                     format!("/{info}")
                 },

@@ -768,7 +768,9 @@ def prepare_runtime(cases: list[Case]) -> Runtime:
     for path in (base, docroot, aliasroot, base / "logs", base / "apache", base / "cache-apache", base / "cache-vapache"):
         path.mkdir(parents=True, exist_ok=True)
         os.chmod(path, 0o755)
-    os.chmod(base / "logs", 0o777)
+    # Vapache refuses an administrative path whose parent the service
+    # account can mutate; both servers open their logs before dropping
+    # privileges, so 0755 is sufficient and keeps the startup guard intact.
     os.chmod(base / "cache-apache", 0o777)
     os.chmod(base / "cache-vapache", 0o777)
 

@@ -4007,6 +4007,12 @@ pub(crate) enum PreparedHandler {
         url_path: String,
         path_info: String,
         script_name: String,
+        /// Client-visible SCRIPT_NAME. A rewrite can select a different
+        /// script without changing the URI Apache reports, while an internal
+        /// DirectoryIndex/ErrorDocument transition renames it. Capture the
+        /// answer during the routing probe, when the transition's raw target
+        /// is still attached to the request.
+        env_script_name: String,
         script_file: std::fs::File,
         script_meta: std::fs::Metadata,
         _descriptor_lease: crate::resource::DescriptorLease,
@@ -4178,6 +4184,7 @@ impl PreparedHandler {
                 url_path,
                 path_info,
                 script_name,
+                env_script_name,
                 script_file,
                 script_meta,
                 _descriptor_lease,
@@ -4193,6 +4200,7 @@ impl PreparedHandler {
                     &url_path,
                     &path_info,
                     &script_name,
+                    &env_script_name,
                     &server_name,
                     peer,
                     &local_ip,
@@ -4479,13 +4487,12 @@ fn project_internal_request(
     // canonicalization input for the newly selected resource.
     internal.raw_path = path.as_bytes().to_vec();
     if !projection.preserve_query {
-        // Apache carries the original query into a local ErrorDocument when
-        // the configured target has no `?`. An explicit target query replaces
-        // it. Treating absence as an empty replacement silently erased CGI
-        // and FastCGI request identity during error recovery.
-        if let Some(target_query) = target_query {
-            internal.query = target_query.to_vec();
-        }
+        // A local ErrorDocument replaces the failing request's query with the
+        // query configured on its target (none when the target has no `?`).
+        // Apache does not carry the original query into the error document,
+        // and treating absence as inheritance exposed the failed request's
+        // query to CGI/FastCGI error handlers.
+        internal.query = target_query.unwrap_or(&[]).to_vec();
     }
     if !projection.preserve_body {
         if !internal.prepare_error_document_transition() {
@@ -5592,6 +5599,23 @@ fn authorize_url_phase_original(
     Ok(scope)
 }
 
+/// Apache's URL redirects append the client's query string when the configured
+/// destination does not supply one. An explicitly empty query (`/path?`) is
+/// still a query and must survive as a trailing `?` in `Location`.
+fn append_redirect_query(location: String, req: &Request) -> String {
+    if location.contains('?') {
+        return location;
+    }
+    let query_present = req.target.contains(&b'?') || !req.query.is_empty();
+    if !query_present {
+        return location;
+    }
+    let Ok(query) = std::str::from_utf8(&req.query) else {
+        return location;
+    };
+    format!("{location}?{query}")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn url_redirect_response(
     cfg: &Config,
@@ -6061,7 +6085,7 @@ fn run_url_translation_phase(
                         &mapping_root,
                         UrlProxySelection::Http {
                             target: proxy_target,
-                            execute_path,
+                            execute_path: target.url_path.clone(),
                             query_override: Some(query),
                         },
                         peer,
@@ -6137,6 +6161,7 @@ fn run_url_translation_phase(
             match_redirect(&scope, &target.url_path, Some(current_req))
                 .map(|(redirect, location)| (redirect.status, location))
         {
+            let location = append_redirect_query(location, current_req);
             let mut redirect_scope = scope;
             if let Some(original) = original.as_ref().filter(|(url, _, _)| {
                 url != &target.url_path || !effects.is_empty() || owned_req.is_some()
@@ -6745,7 +6770,7 @@ fn dispatch_inner(
                         https,
                         server_name: server_name.to_string(),
                         local_ip: local_ip.to_string(),
-                        url_path: url_path_part.to_string(),
+                        url_path: url_path.clone(),
                         query_override: Some(query.as_bytes().to_vec()),
                     });
                 }
@@ -6758,7 +6783,7 @@ fn dispatch_inner(
                     vhost,
                     &proxy_base_scope,
                     &proxy_req,
-                    url_path_part,
+                    &url_path,
                     &target,
                     peer,
                     local_port,
@@ -7088,8 +7113,16 @@ fn dispatch_inner(
                 // A rewrite-selected filesystem target has the same two
                 // identities as a symlink target: the rewritten URL scope and
                 // the canonical file scope.  Meet them instead of replacing
-                // the URL policy (F60/I61).
+                // the URL policy (F60/I61).  The URL-translation scope does
+                // not contain `<Directory>` policy, so its Options are only
+                // the server/vhost defaults; conjoining those here strips
+                // `ExecCGI`/`Indexes` from a target directory that grants
+                // them.  The original URL's filesystem scope is conjoined
+                // below, so execution options stay bound to a real
+                // `<Directory>` identity instead of the pre-mapping base.
+                let target_options = target_scope.options.clone();
                 target_scope.restrict_with(&scope);
+                target_scope.options = target_options;
                 scope = target_scope;
             }
             Err(e) => {
@@ -7191,12 +7224,18 @@ fn dispatch_inner(
         ) {
             return response;
         }
+        // The captured scope is URL-only and therefore has no `<Directory>`
+        // policy. Conjoining its server/vhost-default Options would strip
+        // `ExecCGI` or `Indexes` granted by the selected target's directory.
+        let target_options = scope.options.clone();
         scope.restrict_policy_with(&original_scope);
+        scope.options = target_options;
     }
 
     // Redirects are evaluated after rewrites but before access control and
     // filesystem mapping, matching Apache's URL translation order.
     if let Some((red, loc)) = match_redirect(&scope, &url_path, Some(req)) {
+        let loc = append_redirect_query(loc, req);
         let loc = if loc.is_empty() {
             String::new()
         } else if loc.starts_with('/') {
@@ -7624,6 +7663,7 @@ fn dispatch_inner(
                         url_path: url_path.clone(),
                         path_info: String::new(),
                         script_name: url_path.clone(),
+                        env_script_name: cgi_script_name(req, &url_path),
                         script_file: file,
                         script_meta: meta,
                         _descriptor_lease: descriptor_lease,
@@ -7639,6 +7679,7 @@ fn dispatch_inner(
                     &url_path,
                     "",
                     &url_path,
+                    &cgi_script_name(req, &url_path),
                     &server_name,
                     peer,
                     local_ip,
@@ -8224,7 +8265,8 @@ fn dispatch_inner(
                                 request_uri: request_uri.clone(),
                                 url_path: url_path.clone(),
                                 path_info: st.path_info,
-                                script_name,
+                                script_name: script_name.clone(),
+                                env_script_name: script_name,
                                 script_file: st.file,
                                 script_meta: st.meta,
                                 _descriptor_lease: descriptor_lease,
@@ -8239,6 +8281,7 @@ fn dispatch_inner(
                             &request_uri,
                             &url_path,
                             &st.path_info,
+                            &script_name,
                             &script_name,
                             &server_name,
                             peer,
@@ -8745,6 +8788,23 @@ fn run_fastcgi_with_public_url(
     r
 }
 
+/// SCRIPT_NAME for a CGI selected by the current dispatch target.
+///
+/// A server/Location or per-directory rewrite can change the filesystem
+/// target without changing the request URI Apache reports to the script.  An
+/// internal DirectoryIndex/ErrorDocument transition, by contrast, projects a
+/// new raw target at the selected script.  Compare the canonical raw path with
+/// the selected target to distinguish them.
+fn cgi_script_name(req: &Request, url_path: &str) -> String {
+    let raw_matches_target =
+        CanonicalTarget::from_request(req, false).is_ok_and(|target| target.url_path == url_path);
+    if raw_matches_target {
+        url_path.to_string()
+    } else {
+        req.public_uri().unwrap_or(url_path).to_string()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_authorized_cgi(
     cfg: &Config,
@@ -8756,6 +8816,7 @@ fn run_authorized_cgi(
     url_path: &str,
     path_info: &str,
     script_name: &str,
+    env_script_name: &str,
     server_name: &str,
     peer: SocketAddr,
     local_ip: &str,
@@ -8800,6 +8861,9 @@ fn run_authorized_cgi(
     {
         return invalid();
     }
+    // SCRIPT_NAME is captured by the caller while the transition identity is
+    // still attached: a rewrite keeps the client-visible URI while an internal
+    // DirectoryIndex/ErrorDocument transition names the selected script.
     run_cgi(
         cfg,
         vhost,
@@ -8809,7 +8873,7 @@ fn run_authorized_cgi(
         request_uri,
         url_path,
         path_info,
-        script_name,
+        env_script_name,
         server_name,
         peer,
         local_ip,
@@ -9444,7 +9508,7 @@ mod tests {
             vapache_verified::InternalRequestKind::ErrorDocument,
         )
         .unwrap();
-        assert_eq!(inherited_query.query, b"original=1");
+        assert_eq!(inherited_query.query, b"");
         assert!(project_internal_request(
             &error,
             "/errors/again",

@@ -833,6 +833,14 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                     };
                     location.push(if location.contains('?') { '&' } else { '?' });
                     location.push_str(new_query);
+                } else if !has_target_query
+                    && !rule.flags.qsa
+                    && !rule.flags.qsd
+                    && req.target.contains(&b'?')
+                {
+                    // `Preserve` keeps an explicitly empty query as a trailing
+                    // `?`; Apache exposes that distinction in Location.
+                    location.push('?');
                 }
                 if !rule.flags.noescape {
                     location = escape_redirect_location(&location);

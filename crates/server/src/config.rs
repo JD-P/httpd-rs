@@ -16988,7 +16988,18 @@ impl Config {
             if !matched {
                 continue;
             }
-            scope.merge(&container.delta);
+            // `<Proxy>` is an additional authorization identity, not a
+            // replacement for URL policy.  Apache still enforces a matching
+            // `<Location>`/`<If>` deny when a proxy section grants access, so
+            // meet the two requirement sets by default.  An explicit
+            // `AuthMerging` inside the proxy section keeps its declared
+            // relationship.
+            let mut delta = container.delta.clone();
+            if delta.authorization.requires.is_some() && delta.authorization.auth_merging.is_none()
+            {
+                delta.authorization.auth_merging = Some(crate::config::AuthMerging::And);
+            }
+            scope.merge(&delta);
             let mut chain_state: HashMap<usize, bool> = HashMap::new();
             apply_rules_req(
                 &container.rules,

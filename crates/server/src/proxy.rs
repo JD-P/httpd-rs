@@ -3182,6 +3182,10 @@ fn proxy_once_budgeted(
     if !req.query.is_empty() {
         path.push(b'?');
         path.extend_from_slice(&req.query);
+    } else if req.target.contains(&b'?') {
+        // An explicitly empty query (`/path?`) is distinct from an absent
+        // query and Apache forwards the trailing `?` to the backend.
+        path.push(b'?');
     }
     let forwarded_host = request_authority(req, host);
     if !forwarded_host.is_empty() && !valid_forwarded_host(forwarded_host) {
