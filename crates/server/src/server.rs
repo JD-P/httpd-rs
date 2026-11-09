@@ -9488,6 +9488,10 @@ mod tests {
     }
 
     fn cov_config(root: &Path, body: &str) -> Config {
+        cov_config_with_env(root, body, &HashMap::new())
+    }
+
+    fn cov_config_with_env(root: &Path, body: &str, env: &HashMap<String, String>) -> Config {
         let conf = root.join("httpd.conf");
         std::fs::write(
             &conf,
@@ -9509,7 +9513,7 @@ mod tests {
             ),
         )
         .unwrap();
-        Config::load(&conf, root, &Default::default(), &Default::default(), false).unwrap()
+        Config::load(&conf, root, env, &Default::default(), false).unwrap()
     }
 
     fn cov_capability_audit_config(root: &Path, body: &str) -> Config {
@@ -11453,6 +11457,65 @@ mod tests {
         assert_eq!(
             cov_dispatch(&cfg, "GET", "/denied/caf%C3%A9.html").status,
             403
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utf8_identity_is_exact_across_config_sources_and_policy_phases() {
+        let dir = cov_dir("utf8-config-policy-identity");
+        let www = dir.join("www");
+        let environment_directory = www.join("directory-café");
+        std::fs::create_dir_all(&environment_directory).unwrap();
+        for path in [
+            environment_directory.join("index.txt"),
+            www.join("files-café.txt"),
+            www.join("location-café.txt"),
+            www.join("rewrite-café.txt"),
+            www.join("public-café.txt"),
+        ] {
+            std::fs::write(path, "identity\n").unwrap();
+        }
+
+        let mut env = HashMap::new();
+        env.insert(
+            "ENV_DIRECTORY".to_string(),
+            environment_directory.to_str().unwrap().to_string(),
+        );
+        let cfg = cov_config_with_env(
+            &dir,
+            &format!(
+                "Define UTF8_FILE files-café.txt\n\
+                 <Directory \"{}/www\">\n\
+                 Require all granted\n\
+                 </Directory>\n\
+                 <Directory \"${{ENV_DIRECTORY}}\">\n\
+                 Require all denied\n\
+                 </Directory>\n\
+                 <Files \"${{UTF8_FILE}}\">\n\
+                 Require all denied\n\
+                 </Files>\n\
+                 <Location \"/location-café.txt\">\n\
+                 Require all denied\n\
+                 </Location>\n\
+                 RewriteEngine On\n\
+                 RewriteRule ^/rewrite-café\\.txt$ - [F]\n",
+                dir.display(),
+            ),
+            &env,
+        );
+
+        for denied in [
+            "/directory-caf%C3%A9/index.txt",
+            "/files-caf%C3%A9.txt",
+            "/location-caf%C3%A9.txt",
+            "/rewrite-caf%C3%A9.txt",
+        ] {
+            assert_eq!(cov_dispatch(&cfg, "GET", denied).status, 403, "{denied}");
+        }
+        assert_eq!(
+            cov_dispatch(&cfg, "GET", "/public-caf%C3%A9.txt").status,
+            200
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

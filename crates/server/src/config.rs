@@ -4913,7 +4913,18 @@ impl ParserState {
                     }
                     continue;
                 }
-                crate::config_frontend::ConfigLine::SectionStart { name, args } => {
+                crate::config_frontend::ConfigLine::SectionStart {
+                    name,
+                    args: raw_args,
+                } => {
+                    // Section match identities consume the same variable
+                    // expansion as directive arguments. Leaving `${...}`
+                    // literal here can silently detach a Directory/Files/
+                    // Location policy from the resource it was meant to
+                    // protect.
+                    let expanded_args = self.expand_vars(&raw_args, &loc);
+                    let expansion_ok = expanded_args.is_some();
+                    let args = expanded_args.unwrap_or(raw_args);
                     if name == "ifmodule" {
                         for a in &args {
                             if a.contains('>') {
@@ -4927,7 +4938,7 @@ impl ParserState {
                             self.error(&loc, error);
                         }
                     }
-                    let active = if parent_active {
+                    let active = if parent_active && expansion_ok {
                         self.eval_condition(&name, &args, &loc)
                     } else {
                         false
@@ -13006,6 +13017,32 @@ SSLOptions +StrictRequire\n";
             vec!["a \"b\""]
         );
         assert!(crate::config_frontend::tokenize("\"unterminated").is_err());
+    }
+
+    #[test]
+    fn section_arguments_expand_exact_utf8_identity_and_reject_missing_variables() {
+        let cfg = load_text(
+            "Define ROOT /srv/café\n\
+             <Directory \"${ROOT}\">\n\
+             Require all denied\n\
+             </Directory>\n",
+            false,
+        )
+        .unwrap();
+        let scope = cfg.effective_scope(None, Path::new("/srv/café/file.txt"), "/file.txt");
+        assert!(matches!(
+            scope.authorization.requires,
+            Some(AuthPolicy::List(ref entries))
+                if entries.iter().any(|entry| matches!(
+                    entry.node,
+                    RequireNode::Provider(Require::AllDenied)
+                ))
+        ));
+        assert!(load_text(
+            "<Location \"${MISSING}\">\nRequire all denied\n</Location>\n",
+            false,
+        )
+        .is_err());
     }
 
     #[test]

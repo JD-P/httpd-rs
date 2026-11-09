@@ -948,7 +948,11 @@ fn strftime_secs_into(out: &mut String, fmt: &str, secs: i64) {
     while i < b.len() {
         if b[i] == b'%' && i + 1 < b.len() {
             i += 1;
-            match b[i] as char {
+            let conversion = fmt[i..]
+                .chars()
+                .next()
+                .expect("cursor remains on a UTF-8 character boundary");
+            match conversion {
                 'Y' => {
                     let _ = write!(out, "{y:04}");
                 }
@@ -980,10 +984,14 @@ fn strftime_secs_into(out: &mut String, fmt: &str, secs: i64) {
                     out.push(c);
                 }
             }
-            i += 1;
+            i += conversion.len_utf8();
         } else {
-            out.push(b[i] as char);
-            i += 1;
+            let ch = fmt[i..]
+                .chars()
+                .next()
+                .expect("cursor remains on a UTF-8 character boundary");
+            out.push(ch);
+            i += ch.len_utf8();
         }
     }
 }
@@ -1213,6 +1221,8 @@ mod tests {
         assert!(t.len() > 20);
         assert!(t.contains("+0000 GMT"));
         assert!(t.ends_with("%Q"));
+        assert_eq!(strftime_secs("pré-%Y-café", 0), "pré-1970-café");
+        assert_eq!(strftime_secs("%é", 0), "%é");
     }
 
     #[test]

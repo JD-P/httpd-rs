@@ -256,8 +256,12 @@ fn expand_env(value: &str, vars: &HashMap<String, String>) -> String {
                 }
             }
         }
-        out.push(b[i] as char);
-        i += 1;
+        let ch = value[i..]
+            .chars()
+            .next()
+            .expect("cursor remains on a UTF-8 character boundary");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -1476,9 +1480,11 @@ mod tests {
         let mut vars = HashMap::new();
         vars.insert("FOO".to_string(), "bar".to_string());
         vars.insert("EMPTY".to_string(), String::new());
+        vars.insert("UNICODE".to_string(), "café".to_string());
         assert_eq!(expand_env("$FOO", &vars), "bar");
         assert_eq!(expand_env("x/${FOO}/y", &vars), "x/bar/y");
         assert_eq!(expand_env("${FOO##prefix}", &vars), "bar");
+        assert_eq!(expand_env("pré-$UNICODE-après", &vars), "pré-café-après");
         assert_eq!(expand_env("$EMPTY!$MISSING", &vars), "!");
         assert_eq!(expand_env("cost $5 and $", &vars), "cost  and $");
         assert_eq!(expand_env("${UNCLOSED", &vars), "${UNCLOSED");
@@ -1488,20 +1494,46 @@ mod tests {
     #[test]
     fn envvars_file() {
         let path = temp("envvars");
+        let policy_path = path.parent().unwrap().join("café-policy");
         std::fs::write(
             &path,
-            "# comment\nexport A=one\nB=\"two words\"\nC='$A-${B}'\ninvalid-name=x\nunset PATH\nEMPTY=\nNOEQUALS\n=bad\n",
+            format!(
+                "# comment\nexport A=one\nB=\"two words\"\nC='$A-${{B}}'\nUTF8={}\ninvalid-name=x\nunset PATH\nEMPTY=\nNOEQUALS\n=bad\n",
+                policy_path.display()
+            ),
         )
         .unwrap();
         let vars = load_envvars(&path);
         assert_eq!(vars.get("A").map(String::as_str), Some("one"));
         assert_eq!(vars.get("B").map(String::as_str), Some("two words"));
         assert_eq!(vars.get("C").map(String::as_str), Some("one-two words"));
+        assert_eq!(vars.get("UTF8").map(String::as_str), policy_path.to_str());
         assert!(!vars.contains_key("PATH"));
         assert_eq!(vars.get("EMPTY").map(String::as_str), Some(""));
         assert!(!vars.contains_key("invalid-name"));
         assert!(load_envvars(&temp("missing-envvars")).contains_key("PATH"));
+
+        let conf = temp("envvars-policy.conf");
+        std::fs::write(
+            &conf,
+            "Listen 127.0.0.1:0\n<Directory \"${UTF8}\">\nRequire all denied\n</Directory>\n",
+        )
+        .unwrap();
+        let cfg =
+            Config::load(&conf, conf.parent().unwrap(), &vars, &HashMap::new(), false).unwrap();
+        let scope = cfg.effective_scope(None, &policy_path.join("file.txt"), "/file.txt");
+        assert!(matches!(
+            scope.authorization.requires,
+            Some(vapached::config::AuthPolicy::List(ref entries))
+                if entries.iter().any(|entry| matches!(
+                    entry.node,
+                    vapached::config::RequireNode::Provider(
+                        vapached::config::Require::AllDenied
+                    )
+                ))
+        ));
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(conf);
     }
 
     #[test]

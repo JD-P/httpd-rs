@@ -571,7 +571,15 @@ already restricted index names to valid single components, but dispatch no
 longer depends on duplicate string construction or lossy conversion. The
 main-config variable expansion pass also advances on UTF-8 character
 boundaries, so non-ASCII directive arguments retain their exact decoded
-identity instead of being double-encoded before policy compilation.
+identity instead of being double-encoded before policy compilation. Section
+arguments now consume that same expansion; an undefined variable makes the
+section inactive and configuration loading fails instead of silently detaching
+its policy. The startup `envvars` expander preserves the identity before values
+enter configuration expansion, and custom log time-format literals advance by
+UTF-8 characters rather than corrupting audit text. A live matrix binds
+literal, `${Define}` and environment-backed Unicode through Directory, Files,
+Location and rewrite policy against percent-encoded requests and Unicode
+filesystem names.
 
 The retained Apache differential is now a fail-closed regression in the
 regular pre-adversarial gate. Its 12 cases cover spaces, non-ASCII and literal
