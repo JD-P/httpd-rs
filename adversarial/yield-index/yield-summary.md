@@ -35,11 +35,11 @@ number but not the trend.
 
 | Search hours | Searches | Confirmed findings | Findings/hour | Raw impact points | Composition-adjusted points | Adversarial yield |
 |---:|---:|---:|---:|---:|---:|---:|
-| 15.467 | 41 | 132 | 8.53 | 57444.0 | 15909.5 | **1028.64** |
+| 16.219 | 42 | 134 | 8.26 | 57554.0 | 15969.5 | **984.62** |
 
-Impact tiers: critical 52, high 52, medium 24, low 4.
+Impact tiers: critical 52, high 53, medium 25, low 4.
 
-Recovered unintended-behavior counts: 2 behaviors: 72 findings, 3 behaviors: 37 findings, 4 behaviors: 23 findings.
+Recovered unintended-behavior counts: 1 behaviors: 1 findings, 2 behaviors: 73 findings, 3 behaviors: 37 findings, 4 behaviors: 23 findings.
 
 ### Contribution by primary family
 
@@ -48,14 +48,14 @@ convergence because the time was not allocated uniformly across families.
 
 | Primary family | Confirmed findings | Adjusted points | Share of points | Points per whole-history hour |
 |---|---:|---:|---:|---:|
-| `authority_bypass` | 19 | 652.5 | 4.1% | 42.19 |
-| `code_execution` | 41 | 8062.5 | 50.7% | 521.29 |
-| `denial_of_service` | 28 | 4360.0 | 27.4% | 281.90 |
-| `information_disclosure` | 25 | 2643.5 | 16.6% | 170.92 |
-| `integrity_violation` | 10 | 70.0 | 0.4% | 4.53 |
-| `protocol_confusion` | 1 | 5.0 | 0.0% | 0.32 |
-| `server_request_abuse` | 3 | 100.0 | 0.6% | 6.47 |
-| `unclassified` | 5 | 16.0 | 0.1% | 1.03 |
+| `authority_bypass` | 20 | 662.5 | 4.1% | 40.85 |
+| `code_execution` | 42 | 8112.5 | 50.8% | 500.19 |
+| `denial_of_service` | 28 | 4360.0 | 27.3% | 268.82 |
+| `information_disclosure` | 25 | 2643.5 | 16.6% | 162.99 |
+| `integrity_violation` | 10 | 70.0 | 0.4% | 4.32 |
+| `protocol_confusion` | 1 | 5.0 | 0.0% | 0.31 |
+| `server_request_abuse` | 3 | 100.0 | 0.6% | 6.17 |
+| `unclassified` | 5 | 16.0 | 0.1% | 0.99 |
 
 ## Within-family result
 
@@ -117,7 +117,7 @@ because the campaign changed families.
 | S11–S20 | 4.038 | 42 | 10.40 | 29 | 9 | 4 | 0 | 6570.0 | 1627.05 |
 | S21–S30 | 3.743 | 26 | 6.95 | 6 | 13 | 5 | 2 | 1976.0 | 527.95 |
 | S31–S40 | 5.116 | 19 | 3.71 | 8 | 9 | 2 | 0 | 4135.0 | 808.22 |
-| S41–S41 | 0.855 | 1 | 1.17 | 0 | 1 | 0 | 0 | 50.0 | 58.46 |
+| S41–S42 | 1.608 | 3 | 1.87 | 0 | 2 | 1 | 0 | 110.0 | 68.42 |
 
 ## Interpretation and limits
 

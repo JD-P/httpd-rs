@@ -1,0 +1,17 @@
+## A-hidden-grant
+   /sub/file.txt  apache=403 vapache=200 apache_leak=False vapache_leak=True
+## A-control-plain-grant
+   /sub/file.txt  apache=200 vapache=200 apache_leak=True vapache_leak=True
+## A-control-comment-no-continuation
+   /sub/file.txt  apache=200 vapache=200 apache_leak=True vapache_leak=True
+## A-chained-hidden-grant
+   /sub/file.txt  apache=403 vapache=200 apache_leak=False vapache_leak=True
+## B-hidden-cgi
+   /sub/file.txt  apache=500 vapache=200 apache_leak=False vapache_leak=True
+   /sub/run.txt   apache=500 vapache=200 apache_exec=False vapache_exec=True
+## B-control-plain-cgi
+   /sub/file.txt  apache=200 vapache=200 apache_leak=True vapache_leak=True
+   /sub/run.txt   apache=200 vapache=200 apache_exec=True vapache_exec=True
+## C-hidden-grant-in-main-config
+   /sub/file.txt  apache=403 vapache=403 apache_leak=False vapache_leak=False
+P35-A LIVE: `.htaccess` comment continuation diverges from Apache

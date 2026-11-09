@@ -84,6 +84,11 @@ prevents re-deriving them from scratch.
 | `findings_p34.md` | Pass-34 write-up (**P34-A**, open at HEAD `755e81a`): the synthesized policy identities for the MultiViews negotiated representation and for autoindex entries use `url_encode_path` (wire percent-encoding) instead of the decoded path identity used by request authorization and Apache, so decoded-spelling `<Location>`/`<LocationMatch>` guards fail open for names containing a space, a non-ASCII character or a literal `%`; controls pin the defect to the encoding |
 | `p34/exploit_p34.py` | Pass-34 Apache 2.4.69 differential reproducer (eleven cases, exits non-zero once fixed): decoded-spelling `Location`/`LocationMatch` body and autoindex cases for space and non-ASCII names, encoded-spelling mirror, stock-Debian alias, `Files`/extension controls, direct-URL controls and a per-directory rewrite negative control; fixtures under `/tmp/opencode/p34-harness` when `--keep` is given |
 | `p34/results_p34.txt` | Pass-34 retained HEAD run output: every former divergence reproduces and all controls agree |
+| `findings_p35.md` | Pass-35 write-ups (**P35-A/P35-B**, open at HEAD `3310fe3`): the `.htaccess` front end drops comment lines before backslash continuation, so `#\` activates a directive Apache comments out and can make an Apache-invalid handler section execute; the PCRE2 translation also keeps `\S*`/`\S+`/`\N+` backtrackable before `\R`/`\v`, so a negated ACL guard fails open on the NEL byte `0x85` |
+| `p35/exploit_p35.py` | Pass-35 access-file differential (seven verdicts): hidden grant under `Require all denied`, chained comments, hidden CGI handler where Apache returns 500, plain/no-continuation controls and a main-config control; exits non-zero once fixed |
+| `p35/results_p35.txt` | Pass-35 retained HEAD run output: every P35-A divergence reproduces and all controls agree |
+| `p35/pcre2_guard_p35.py` | Pass-35 guarded-regex differential (five verdicts): four confirmed greedy-class/`\R`/`\v` guard bypasses on NEL plus the plain-value and simple-`\v` controls |
+| `p35/results_p35_pcre2.txt` | Pass-35 retained HEAD run output: Apache denies and vapache allows the four confirmed guards |
 
 ## Pre-adversarial gate
 
