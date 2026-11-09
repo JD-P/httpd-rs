@@ -418,7 +418,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **737 verified functions, 0 errors** (percent-decoding,
+Current result: **739 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
@@ -455,7 +455,12 @@ plus the executable rewrite expansion-token/match-action/program-counter state
 machine and recursive configuration kind/phase/deferred-slot/order decisions).
 The latest kernels also model the universal transform capability carried from
 authorization to each protected sink, prove its inode/backend/cache-policy
-requirements, validate descriptor snapshots used for access-file parsing, and
+requirements, and prove that construction of a typed authorized plan retains
+one public URL, selected URL, lexical/resolved filesystem pair and exact
+grant. Production static, directory, CGI, FastCGI, proxy, WebSocket and cache
+entry points consume that move-only plan/outcome artifact; local-file sinks
+also compare the descriptor's device/inode at the boundary. The kernels
+validate descriptor snapshots used for access-file parsing, and
 pin P15's fail-closed expression result, Apache-compatible RemoteIP proxy-class
 transition, and dual lexical/canonical FastCGI script identity. P16 adds
 executable proofs that directive regexes are byte-oriented with default and

@@ -425,6 +425,18 @@ endpoint binding alone is insufficient: the representation capability is
 minted only after both the authorized front path and serialized upstream path
 pass the verified ambiguity gate.
 
+The runtime packages those facts in one move-only pipeline. `OutcomeIdentity`
+retains the public URL, selected URL and lexical/resolved filesystem identities;
+`AuthorizedPlan` adds the effective scope, exact `ResourceKey` and grant; and
+`AuthorizedOutcome` adds the admitted terminal sink. Its constructor consumes
+the executable `authorized_plan_identity_admit` predicate, so a selected-URL,
+resolved-target or grant mismatch cannot produce a plan. Production static,
+directory, CGI, FastCGI, HTTP proxy, WebSocket and cache entry points accept
+this artifact instead of independently supplied identity/grant fields. The
+local-file adapters additionally compare the opened descriptor's device and
+inode with the outcome immediately before use, while balancer failover replaces
+the whole outcome atomically.
+
 ### I11 — Reauthorize every target-changing transform
 
 ```text
@@ -1839,7 +1851,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **737 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **739 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1938,6 +1950,12 @@ construction: there is no second production interleaver.
   retargeting cannot sink without reauthorization and that every file,
   backend, proxy representation or cache sink has its required concrete
   binding.
+- `authorized_plan_identity_spec`, `authorized_plan_identity_admit` and
+  `admitted_authorized_plan_retains_every_identity`. The executable constructor
+  requires a nonempty public URL, exact selected URL, a complete or absent
+  lexical/resolved filesystem pair, a resolved target matching the resource
+  key when present, and the exact grant before the runtime can construct an
+  `AuthorizedPlan`.
 - `parse_chunk_size_hex`, `chunk_extension_admit`,
   `chunk_framing_budget_step` and `http_trailer_field_admit`. Request bodies
   and proxy responses share the exact checked hexadecimal/extension/trailer

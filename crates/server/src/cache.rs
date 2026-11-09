@@ -17,6 +17,7 @@ use sha1::{Digest, Sha1};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
+#[cfg(not(test))]
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
@@ -561,20 +562,36 @@ fn prefix_matches(path: &str, prefix: &str) -> bool {
 pub struct CacheContext {
     /// Epoch captured when this request's policy/cache plan was compiled.
     /// It must never be replaced with the process-global epoch at completion.
-    pub epoch: u64,
-    pub scope: Scope,
-    pub grant: AccessGrant,
+    epoch: u64,
+    authorization: crate::access::AuthorizedOutcome,
     /// Fully qualified cache key binding listener, vhost, URL, mapped target
     /// and policy.  Lookup and store must use this exact key.
-    pub key: String,
-    pub target: std::path::PathBuf,
+    key: String,
     /// CGI/FastCGI/custom handlers can observe SERVER_PROTOCOL and
     /// REMOTE_PORT. Static representations cannot, and retaining this bit
     /// keeps their cache entries reusable across client connections.
-    pub backend_transport_visible: bool,
-    /// Effective cache URL.  For a directory request this is the selected
-    /// `DirectoryIndex` URL, so lookup and store authorize the same resource.
-    pub path: String,
+    backend_transport_visible: bool,
+}
+
+impl CacheContext {
+    pub fn authorization(&self) -> &crate::access::AuthorizedOutcome {
+        &self.authorization
+    }
+
+    pub fn scope(&self) -> &Scope {
+        self.authorization.scope()
+    }
+
+    pub fn path(&self) -> &str {
+        self.authorization.identity().selected_url_path()
+    }
+
+    pub fn target(&self) -> &std::path::Path {
+        self.authorization
+            .identity()
+            .resolved_fs_path()
+            .expect("a cache authorization always retains its resolved target")
+    }
 }
 
 /// Return the cache type selected for this request, if caching is enabled and
@@ -695,6 +712,7 @@ pub fn request_scope_with_plan(
     // nonexistent full path.  Bind cache policy and the cache target to that
     // script so a later `<Files "script.cgi">` deny is part of the scope and
     // fingerprint rather than being bypassed by `/script.cgi/<info>`.
+    let mut lexical_fs_path = mapped_fs_path.clone();
     let mut fs_path = mapped_fs_path;
     let mut cache_url_path = url_path.clone();
     let follow_symlinks = scope
@@ -722,7 +740,8 @@ pub fn request_scope_with_plan(
                     .strip_suffix(&st.path_info)
                     .unwrap_or(&url_path)
                     .to_string();
-                fs_path = root.join(&st.rel_script);
+                lexical_fs_path = root.join(&st.rel_script);
+                fs_path = lexical_fs_path.clone();
                 cache_url_path = script_url.clone();
                 let target = crate::request_plan::CanonicalTarget::from_url_path(&script_url)?;
                 let script_plan = crate::request_plan::RequestPlan::from_fs_target_for_request(
@@ -780,6 +799,7 @@ pub fn request_scope_with_plan(
                 // Reject a non-UTF-8 index name rather than sharing a lossy key.
                 let index_name = std::str::from_utf8(&index.name).ok()?;
                 let index_url = format!("{}/{}", url_path.trim_end_matches('/'), index_name);
+                lexical_fs_path = fs_path.join(std::ffi::OsStr::from_bytes(&index.name));
                 let index_fs = crate::files::fd_path(&index.file)?;
                 let target = crate::request_plan::CanonicalTarget::from_url_path(&index_url)?;
                 let index_plan = crate::request_plan::RequestPlan::from_fs_target_for_request(
@@ -875,6 +895,7 @@ pub fn request_scope_with_plan(
                             Some((selected_url.clone(), actual_path.as_ref().to_path_buf()));
                         selected_name = Some(view.name);
                         scope = selected_scope;
+                        lexical_fs_path = candidate_fs.clone();
                         fs_path = actual_path.into_owned();
                         cache_url_path = selected_url;
                     }
@@ -1002,6 +1023,7 @@ pub fn request_scope_with_plan(
         Ok(grant) => grant,
         Err(_) => return None,
     };
+    let resource = grant.key().clone();
     if let Some((selected_url, selected_target)) = &multiview_binding {
         let authorization_meet = vapache_verified::multiview_authorization_meet_admit(
             true,
@@ -1039,14 +1061,19 @@ pub fn request_scope_with_plan(
         &fs_path,
         fingerprint,
     );
+    let identity = crate::access::OutcomeIdentity::selected(
+        &url_path,
+        &cache_url_path,
+        Some(&lexical_fs_path),
+        Some(&fs_path),
+    );
+    let authorization = crate::access::AuthorizedPlan::new(identity, scope, grant, resource)
+        .and_then(|plan| plan.into_outcome(vapache_verified::TransformSink::Cache))?;
     Some(CacheContext {
         epoch: cfg.cache_epoch(),
-        scope,
-        grant,
+        authorization,
         key,
-        target: fs_path,
         backend_transport_visible,
-        path: cache_url_path,
     })
 }
 
@@ -1365,6 +1392,35 @@ fn conditional_hit(req: &Request, entry: &Entry, response: &mut Response) -> boo
         response.body = Body::Empty;
     }
     hit
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn lookup_authorized(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
+    host: &str,
+    peer: SocketAddr,
+    context: &CacheContext,
+) -> Option<Response> {
+    let authorization = context.authorization();
+    if !authorization.require_sink(vapache_verified::TransformSink::Cache) {
+        return None;
+    }
+    lookup(
+        cfg,
+        vhost,
+        req,
+        host,
+        context.path(),
+        authorization.scope(),
+        peer,
+        authorization.grant(),
+        &context.key,
+        context.target(),
+        context.backend_transport_visible,
+        context.epoch,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2210,6 +2266,37 @@ fn disk_load(cfg: &Config, key: &str) -> Option<Entry> {
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn store_authorized(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
+    host: &str,
+    peer: SocketAddr,
+    resp: &mut Response,
+    context: &CacheContext,
+) {
+    let authorization = context.authorization();
+    if !authorization.require_sink(vapache_verified::TransformSink::Cache) {
+        return;
+    }
+    store(
+        cfg,
+        vhost,
+        req,
+        host,
+        context.path(),
+        authorization.scope(),
+        peer,
+        resp,
+        authorization.grant(),
+        &context.key,
+        context.target(),
+        context.backend_transport_visible,
+        context.epoch,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn store(
     cfg: &Config,
     vhost: Option<&VHost>,
@@ -2976,7 +3063,7 @@ AddHandler cgi-script .cgi\n\
             "127.0.0.1",
         )
         .expect("path-info cache scope");
-        assert_eq!(ctx.target, cgi.join("wallet.cgi"));
+        assert_eq!(ctx.target(), cgi.join("wallet.cgi"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4133,8 +4220,8 @@ DirectoryIndex index.html\n\
             "127.0.0.1",
         )
         .expect("directory index cache scope");
-        assert_eq!(ctx.target, www.join("dir/index.html"));
-        assert_eq!(ctx.path, "/dir/index.html");
+        assert_eq!(ctx.target(), www.join("dir/index.html"));
+        assert_eq!(ctx.path(), "/dir/index.html");
 
         fs::write(
             www.join("dir/.htaccess"),
@@ -4221,8 +4308,23 @@ AddType text/plain .txt\n\
             "127.0.0.1",
         )
         .expect("selected representation cache scope");
-        assert_eq!(context.path, "/secret.txt");
-        assert_eq!(context.target, www.join("secret.txt"));
+        assert_eq!(context.path(), "/secret.txt");
+        assert_eq!(context.target(), www.join("secret.txt"));
+        assert_eq!(
+            context.authorization().identity().public_url_path(),
+            "/secret"
+        );
+        assert_eq!(
+            context.authorization().identity().selected_url_path(),
+            "/secret.txt"
+        );
+        assert_eq!(
+            context.authorization().identity().lexical_fs_path(),
+            Some(www.join("secret.txt").as_path())
+        );
+        assert!(context
+            .authorization()
+            .require_sink(vapache_verified::TransformSink::Cache));
 
         fs::write(
             www.join(".htaccess"),
@@ -4337,7 +4439,7 @@ CacheDisable /disabled\n\
         };
         let symlink = call("/alias.txt").expect("same-owner symlink is cacheable");
         assert_eq!(
-            symlink.target,
+            symlink.target(),
             fs::canonicalize(www.join("real.txt")).unwrap()
         );
         // Cache admission must consume the same owner-match policy as live

@@ -2554,6 +2554,47 @@ pub(crate) async fn websocket_async_with_connection<S>(
     target: &Target,
     grant: &crate::access::AccessGrant,
     resource: &crate::access::ResourceKey,
+    client: S,
+    peer: SocketAddr,
+    https: bool,
+    host: &str,
+    initial: &[u8],
+    general_connection: Option<crate::resource::SlotLease>,
+    generation_retired: Option<tokio::sync::watch::Receiver<bool>>,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let identity =
+        crate::access::OutcomeIdentity::direct(&resource.url_path, resource.fs_path.as_deref());
+    websocket_with_identity(
+        cfg,
+        scope,
+        req,
+        target,
+        grant,
+        resource,
+        identity,
+        client,
+        peer,
+        https,
+        host,
+        initial,
+        general_connection,
+        generation_retired,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn websocket_with_identity<S>(
+    cfg: &Config,
+    scope: &Scope,
+    req: &Request,
+    target: &Target,
+    grant: &crate::access::AccessGrant,
+    resource: &crate::access::ResourceKey,
+    identity: crate::access::OutcomeIdentity,
     mut client: S,
     peer: SocketAddr,
     https: bool,
@@ -2612,6 +2653,16 @@ where
             "access grant does not cover websocket target",
         ));
     }
+    let Some(authorization) =
+        crate::access::AuthorizedPlan::new(identity, scope.clone(), bound, expected)
+            .and_then(|plan| plan.into_outcome(vapache_verified::TransformSink::Proxy))
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "websocket authorization identities disagree",
+        ));
+    };
+    let scope = authorization.scope();
     let client_ip = crate::access::canonical_ip(peer.ip());
     let _websocket_lease = cfg.resource_budget.try_websocket_for(client_ip)?;
     drop(general_connection);
@@ -2771,6 +2822,46 @@ where
     )
     .await;
     Ok(())
+}
+
+/// Production WebSocket entry point.  Route policy, grant, concrete resource
+/// identity and URL/filesystem representation arrive as one typed plan; the
+/// tunnel performs its endpoint/representation binding immediately before
+/// connecting upstream.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn websocket_authorized_async_with_connection<S>(
+    cfg: &Config,
+    req: &Request,
+    target: &Target,
+    authorization: &crate::access::AuthorizedPlan,
+    client: S,
+    peer: SocketAddr,
+    https: bool,
+    host: &str,
+    initial: &[u8],
+    general_connection: Option<crate::resource::SlotLease>,
+    generation_retired: Option<tokio::sync::watch::Receiver<bool>>,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    websocket_with_identity(
+        cfg,
+        authorization.scope(),
+        req,
+        target,
+        authorization.grant(),
+        authorization.resource(),
+        authorization.identity().clone(),
+        client,
+        peer,
+        https,
+        host,
+        initial,
+        general_connection,
+        generation_retired,
+    )
+    .await
 }
 
 fn build_client_config(scope: &Scope) -> Result<Arc<rustls::ClientConfig>, String> {
@@ -3562,15 +3653,12 @@ fn authorize_failover(
     vhost: Option<&VHost>,
     proxy_base_scope: &Scope,
     req: &Request,
+    public_url_path: &str,
     url_path: &str,
     target: &Target,
     peer: SocketAddr,
     resource: &crate::access::ResourceKey,
-) -> Option<(
-    Scope,
-    crate::access::AccessGrant,
-    crate::access::ResourceKey,
-)> {
+) -> Option<crate::access::AuthorizedOutcome> {
     // Never merge a new member into the previous member's effective scope.
     // In particular, AuthMerging Or would otherwise let member A's grant
     // weaken member B's deny. Rebuild logical-balancer and concrete-member
@@ -3651,7 +3739,14 @@ fn authorize_failover(
         ),
         "failover grant does not cover bound backend"
     );
-    Some((next_scope, bound, expected))
+    let identity = crate::access::OutcomeIdentity::selected(
+        public_url_path,
+        url_path,
+        next_resource.fs_path.as_deref(),
+        next_resource.fs_path.as_deref(),
+    );
+    crate::access::AuthorizedPlan::new(identity, next_scope, bound, expected)?
+        .into_outcome(vapache_verified::TransformSink::Proxy)
 }
 
 pub fn execute(
@@ -3680,6 +3775,53 @@ pub fn execute(
 /// direct callers may use [`execute`]; the server dispatcher supplies this
 /// explicit base so failover cannot inherit policy from the failed member.
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_authorized_with_proxy_base(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    proxy_base_scope: &Scope,
+    req: &Request,
+    url_path: &str,
+    target: &Target,
+    peer: SocketAddr,
+    local_port: u16,
+    https: bool,
+    host: &str,
+    local_ip: &str,
+    authorization: &crate::access::AuthorizedPlan,
+) -> Response {
+    if authorization.identity().selected_url_path() != url_path {
+        return error(
+            cfg,
+            vhost,
+            authorization.scope(),
+            req,
+            authorization.identity().public_url_path(),
+            local_port,
+            host,
+            peer.ip(),
+            local_ip,
+        );
+    }
+    execute_with_proxy_identity(
+        cfg,
+        vhost,
+        proxy_base_scope,
+        authorization.scope(),
+        req,
+        url_path,
+        target,
+        peer,
+        local_port,
+        https,
+        host,
+        local_ip,
+        authorization.grant(),
+        authorization.resource(),
+        authorization.identity().clone(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_with_proxy_base(
     cfg: &Config,
     vhost: Option<&VHost>,
@@ -3695,6 +3837,44 @@ pub(crate) fn execute_with_proxy_base(
     local_ip: &str,
     grant: &crate::access::AccessGrant,
     resource: &crate::access::ResourceKey,
+) -> Response {
+    let identity = crate::access::OutcomeIdentity::direct(url_path, resource.fs_path.as_deref());
+    execute_with_proxy_identity(
+        cfg,
+        vhost,
+        proxy_base_scope,
+        scope,
+        req,
+        url_path,
+        target,
+        peer,
+        local_port,
+        https,
+        host,
+        local_ip,
+        grant,
+        resource,
+        identity,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_with_proxy_identity(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    proxy_base_scope: &Scope,
+    scope: &Scope,
+    req: &Request,
+    url_path: &str,
+    target: &Target,
+    peer: SocketAddr,
+    local_port: u16,
+    https: bool,
+    host: &str,
+    local_ip: &str,
+    grant: &crate::access::AccessGrant,
+    resource: &crate::access::ResourceKey,
+    identity: crate::access::OutcomeIdentity,
 ) -> Response {
     if !proxy_path_identity_safe(url_path, &target.path) {
         return crate::files::error_response(
@@ -3773,7 +3953,7 @@ pub(crate) fn execute_with_proxy_base(
             local_ip,
         );
     };
-    let mut active_resource = bound.key().clone();
+    let active_resource = bound.key().clone();
     if !bound.require_proxy_sink(
         &active_resource,
         &target.backend.host,
@@ -3794,11 +3974,25 @@ pub(crate) fn execute_with_proxy_base(
             local_ip,
         );
     }
+    let Some(mut active_authorization) =
+        crate::access::AuthorizedPlan::new(identity, scope.clone(), bound, active_resource)
+            .and_then(|plan| plan.into_outcome(vapache_verified::TransformSink::Proxy))
+    else {
+        return error(
+            cfg,
+            vhost,
+            scope,
+            req,
+            url_path,
+            local_port,
+            host,
+            peer.ip(),
+            local_ip,
+        );
+    };
     let timeout = cfg.timeout.max(Duration::from_secs(5));
     let exchange_deadline = Instant::now() + timeout;
     let mut current = target.clone();
-    let mut active_scope = scope.clone();
-    let mut active_grant = bound;
     let mut tried: HashSet<String> = HashSet::new();
     loop {
         let remaining = exchange_deadline.saturating_duration_since(Instant::now());
@@ -3806,7 +4000,7 @@ pub(crate) fn execute_with_proxy_base(
             return error(
                 cfg,
                 vhost,
-                &active_scope,
+                active_authorization.scope(),
                 req,
                 url_path,
                 local_port,
@@ -3818,19 +4012,20 @@ pub(crate) fn execute_with_proxy_base(
         // The grant used by the sink must name the exact member currently
         // selected.  A balancer failover replaces both together.
         let binding = current.binding_key();
-        if !active_grant.require_proxy_sink(
-            &active_resource,
+        if !active_authorization.grant().require_proxy_sink(
+            active_authorization.resource(),
             &current.backend.host,
             current.backend.port,
             current.backend.tls,
             &current.path,
-        ) || active_resource.proxy_url.as_deref() != Some(current.proxy_url.as_str())
-            || active_resource.backend_target.as_deref() != Some(binding.as_str())
+        ) || active_authorization.resource().proxy_url.as_deref()
+            != Some(current.proxy_url.as_str())
+            || active_authorization.resource().backend_target.as_deref() != Some(binding.as_str())
         {
             return error(
                 cfg,
                 vhost,
-                &active_scope,
+                active_authorization.scope(),
                 req,
                 url_path,
                 local_port,
@@ -3858,7 +4053,7 @@ pub(crate) fn execute_with_proxy_base(
             Some(connection) => (Some(connection.stream), Some(connection.lease), true, None),
             None => match connect(
                 &current.backend,
-                &active_scope,
+                active_authorization.scope(),
                 &cfg.backend_identities,
                 remaining,
                 req.request_scope(),
@@ -3879,7 +4074,7 @@ pub(crate) fn execute_with_proxy_base(
                 cfg.max_spool_files,
                 &current,
                 req,
-                &active_scope,
+                active_authorization.scope(),
                 url_path,
                 peer,
                 https,
@@ -3927,11 +4122,12 @@ pub(crate) fn execute_with_proxy_base(
                         }
                         return response;
                     };
-                    let (next_scope, next_grant, next_resource) = match authorize_failover(
+                    let next_authorization = match authorize_failover(
                         cfg,
                         vhost,
                         proxy_base_scope,
                         req,
+                        active_authorization.identity().public_url_path(),
                         url_path,
                         &next,
                         peer,
@@ -3942,7 +4138,7 @@ pub(crate) fn execute_with_proxy_base(
                             return crate::files::error_response(
                                 cfg,
                                 vhost,
-                                &active_scope,
+                                active_authorization.scope(),
                                 403,
                                 req,
                                 url_path,
@@ -3953,9 +4149,7 @@ pub(crate) fn execute_with_proxy_base(
                             )
                         }
                     };
-                    active_scope = next_scope;
-                    active_grant = next_grant;
-                    active_resource = next_resource;
+                    active_authorization = next_authorization;
                     current = next;
                     continue;
                 }
@@ -4000,7 +4194,7 @@ pub(crate) fn execute_with_proxy_base(
                     return crate::files::error_response(
                         cfg,
                         vhost,
-                        &active_scope,
+                        active_authorization.scope(),
                         503,
                         req,
                         url_path,
@@ -4014,7 +4208,7 @@ pub(crate) fn execute_with_proxy_base(
                     return crate::files::error_response(
                         cfg,
                         vhost,
-                        &active_scope,
+                        active_authorization.scope(),
                         502,
                         req,
                         url_path,
@@ -4054,7 +4248,7 @@ pub(crate) fn execute_with_proxy_base(
                     return error(
                         cfg,
                         vhost,
-                        &active_scope,
+                        active_authorization.scope(),
                         req,
                         url_path,
                         local_port,
@@ -4064,11 +4258,12 @@ pub(crate) fn execute_with_proxy_base(
                     );
                 }
                 if let Some(next) = alternate_target(cfg, &current, &tried, req) {
-                    let (next_scope, next_grant, next_resource) = match authorize_failover(
+                    let next_authorization = match authorize_failover(
                         cfg,
                         vhost,
                         proxy_base_scope,
                         req,
+                        active_authorization.identity().public_url_path(),
                         url_path,
                         &next,
                         peer,
@@ -4079,7 +4274,7 @@ pub(crate) fn execute_with_proxy_base(
                             return crate::files::error_response(
                                 cfg,
                                 vhost,
-                                &active_scope,
+                                active_authorization.scope(),
                                 403,
                                 req,
                                 url_path,
@@ -4090,16 +4285,14 @@ pub(crate) fn execute_with_proxy_base(
                             )
                         }
                     };
-                    active_scope = next_scope;
-                    active_grant = next_grant;
-                    active_resource = next_resource;
+                    active_authorization = next_authorization;
                     current = next;
                     continue;
                 }
                 return error(
                     cfg,
                     vhost,
-                    scope,
+                    active_authorization.scope(),
                     req,
                     url_path,
                     local_port,
@@ -7593,9 +7786,10 @@ mod coverage_tests {
             None,
             Some(target.proxy_url.as_str()),
         );
-        assert!(
-            authorize_failover(&cfg, None, &scope, &r, "/ws", &target, peer, &resource).is_none()
-        );
+        assert!(authorize_failover(
+            &cfg, None, &scope, &r, "/ws", "/ws", &target, peer, &resource,
+        )
+        .is_none());
 
         let mut authed = req("/ws");
         authed.headers.push(
@@ -7609,10 +7803,13 @@ mod coverage_tests {
             None,
             Some(target.proxy_url.as_str()),
         );
-        assert!(
-            authorize_failover(&cfg, None, &scope, &authed, "/ws", &target, peer, &resource)
-                .is_some()
-        );
+        let authorization = authorize_failover(
+            &cfg, None, &scope, &authed, "/public", "/ws", &target, peer, &resource,
+        )
+        .expect("authorized failover outcome");
+        assert_eq!(authorization.identity().public_url_path(), "/public");
+        assert_eq!(authorization.identity().selected_url_path(), "/ws");
+        assert!(authorization.require_sink(vapache_verified::TransformSink::Proxy));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7695,7 +7892,7 @@ mod coverage_tests {
             Some(target.proxy_url.as_str()),
         );
         assert!(authorize_failover(
-            &cfg, None, &base, &request, "/route", &target, peer, &resource,
+            &cfg, None, &base, &request, "/route", "/route", &target, peer, &resource,
         )
         .is_none());
         let _ = std::fs::remove_dir_all(&dir);

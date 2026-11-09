@@ -8,7 +8,7 @@ use crate::config::{
 use crate::fastcgi;
 use crate::files::{
     directory_index_target, error_response, mime_type, multiviews_target, resolve_target_checked,
-    serve_directory, serve_file, simple_html, MultiViewsResult, Target,
+    simple_html, MultiViewsResult, Target,
 };
 use crate::http::{
     preflight_request_head, prepare_streaming_request_body, pump_streaming_request_body,
@@ -1424,6 +1424,8 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                         return Ok(false);
                     }
                 };
+                let authorization = access::AuthorizedPlan::direct(scope, _grant, resource)
+                    .expect("WebSocket route retained one authorized identity");
                 if let Some((tls, handle)) = stream.take_tls_stream() {
                     // The TLS stream has been consumed by the tunnel; there is
                     // no safe way to inject a response here.
@@ -1432,13 +1434,11 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                     // WebSocket lease protects the long-lived tunnel, so do
                     // not pin a scarce request worker for the tunnel lifetime.
                     drop(request_worker.take());
-                    let _ = handle.block_on(proxy::websocket_async_with_connection(
+                    let _ = handle.block_on(proxy::websocket_authorized_async_with_connection(
                         &cfg,
-                        &scope,
                         &req,
                         &target,
-                        &_grant,
-                        &resource,
+                        &authorization,
                         tls,
                         peer,
                         true,
@@ -1457,19 +1457,17 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                         .enable_time()
                         .build()?;
                     let cfg_ref = cfg;
-                    let scope_ref = &scope;
                     let req_ref = &req;
                     let target_ref = &target;
+                    let authorization_ref = &authorization;
                     let buf_ref = &buf;
                     let result = rt.block_on(async move {
                         let tcp = tokio::net::TcpStream::from_std(client)?;
-                        proxy::websocket_async_with_connection(
+                        proxy::websocket_authorized_async_with_connection(
                             cfg_ref,
-                            scope_ref,
                             req_ref,
                             target_ref,
-                            &_grant,
-                            &resource,
+                            authorization_ref,
                             tcp,
                             peer,
                             false,
@@ -3974,41 +3972,35 @@ pub(crate) enum PreparedHandler {
         /// URL/filesystem policy before the selected `<Proxy>` member is
         /// merged. Balancer failover rebuilds from this pristine scope.
         proxy_base_scope: Scope,
-        scope: Scope,
+        authorization: access::AuthorizedPlan,
         target: proxy::Target,
         peer: SocketAddr,
         local_port: u16,
         https: bool,
         server_name: String,
         local_ip: String,
-        grant: access::AccessGrant,
-        resource: access::ResourceKey,
         url_path: String,
         query_override: Option<Vec<u8>>,
     },
     FastCgi {
         vhost_index: Option<usize>,
-        scope: Scope,
+        authorization: access::AuthorizedPlan,
         target: fastcgi::Target,
         peer: SocketAddr,
         local_port: u16,
         server_name: String,
         local_ip: String,
-        grant: access::AccessGrant,
-        resource: access::ResourceKey,
         request_uri: String,
         url_path: String,
         mapping_root: PathBuf,
     },
     Cgi {
         vhost_index: Option<usize>,
-        scope: Scope,
+        authorization: access::AuthorizedOutcome,
         peer: SocketAddr,
         local_port: u16,
         server_name: String,
         local_ip: String,
-        grant: access::AccessGrant,
-        resource: access::ResourceKey,
         root: PathBuf,
         script_rel: PathBuf,
         request_uri: String,
@@ -4058,20 +4050,14 @@ impl PreparedHandler {
                     .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
                 if let Ok(_filesystem_work) = cfg.resource_budget.try_filesystem_work_in(&context) {
                     if let Some(cache) = cache {
-                        crate::cache::store(
+                        crate::cache::store_authorized(
                             cfg,
                             vhost,
                             req,
                             &host,
-                            &cache.path,
-                            &cache.scope,
                             peer,
                             &mut response,
-                            &cache.grant,
-                            &cache.key,
-                            &cache.target,
-                            cache.backend_transport_visible,
-                            cache.epoch,
+                            &cache,
                         );
                     }
                     if must_invalidate {
@@ -4119,26 +4105,23 @@ impl PreparedHandler {
             PreparedHandler::Proxy {
                 vhost_index,
                 proxy_base_scope,
-                scope,
+                authorization,
                 target,
                 peer,
                 local_port,
                 https,
                 server_name,
                 local_ip,
-                grant,
-                resource,
                 url_path,
                 query_override,
             } => {
                 let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
                 let original_query =
                     query_override.map(|query| std::mem::replace(&mut req.query, query));
-                let response = proxy::execute_with_proxy_base(
+                let response = proxy::execute_authorized_with_proxy_base(
                     cfg,
                     vhost,
                     &proxy_base_scope,
-                    &scope,
                     req,
                     &url_path,
                     &target,
@@ -4147,8 +4130,7 @@ impl PreparedHandler {
                     https,
                     &server_name,
                     &local_ip,
-                    &grant,
-                    &resource,
+                    &authorization,
                 );
                 if let Some(original_query) = original_query {
                     req.query = original_query;
@@ -4157,20 +4139,18 @@ impl PreparedHandler {
             }
             PreparedHandler::FastCgi {
                 vhost_index,
-                scope,
+                authorization,
                 target,
                 peer,
                 local_port,
                 server_name,
                 local_ip,
-                grant,
-                resource,
                 request_uri,
                 url_path,
                 mapping_root,
             } => {
                 let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
-                run_fastcgi(
+                run_authorized_fastcgi(
                     cfg,
                     vhost,
                     req,
@@ -4180,22 +4160,18 @@ impl PreparedHandler {
                     peer,
                     &local_ip,
                     local_port,
-                    &scope,
                     &target,
-                    &grant,
-                    &resource,
+                    &authorization,
                     &mapping_root,
                 )
             }
             PreparedHandler::Cgi {
                 vhost_index,
-                scope,
+                authorization,
                 peer,
                 local_port,
                 server_name,
                 local_ip,
-                grant,
-                resource,
                 root,
                 script_rel,
                 request_uri,
@@ -4207,7 +4183,7 @@ impl PreparedHandler {
                 _descriptor_lease,
             } => {
                 let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
-                run_cgi(
+                run_authorized_cgi(
                     cfg,
                     vhost,
                     req,
@@ -4221,9 +4197,7 @@ impl PreparedHandler {
                     peer,
                     &local_ip,
                     local_port,
-                    &scope,
-                    &grant,
-                    &resource,
+                    &authorization,
                     Some(&script_file),
                     Some(&script_meta),
                 )
@@ -4423,8 +4397,8 @@ fn dispatch_inner_request(
         });
     if let (Some(plan), Some(cache_ctx)) = (&initial_plan, &cache_scope) {
         let trailing_slash = plan.url_path().len() > 1 && plan.url_path().ends_with('/');
-        let same_representation_path = cache_ctx.path == plan.url_path();
-        let regular_file = cache_ctx.target.is_file();
+        let same_representation_path = cache_ctx.path() == plan.url_path();
+        let regular_file = cache_ctx.target().is_file();
         if !vapache_verified::cache_trailing_slash_target_admit(
             trailing_slash,
             same_representation_path,
@@ -4438,20 +4412,8 @@ fn dispatch_inner_request(
         }
     }
     if let Some(cache_ctx) = &cache_scope {
-        if let Some(resp) = crate::cache::lookup(
-            cfg,
-            vhost,
-            req,
-            host,
-            &cache_ctx.path,
-            &cache_ctx.scope,
-            peer,
-            &cache_ctx.grant,
-            &cache_ctx.key,
-            &cache_ctx.target,
-            cache_ctx.backend_transport_visible,
-            cache_ctx.epoch,
-        ) {
+        if let Some(resp) = crate::cache::lookup_authorized(cfg, vhost, req, host, peer, cache_ctx)
+        {
             return resp;
         }
     }
@@ -4483,21 +4445,7 @@ fn dispatch_inner_request(
         resp = Response::prepared_handler(finalizer);
     } else {
         if let Some(cache_ctx) = cache_scope {
-            crate::cache::store(
-                cfg,
-                vhost,
-                req,
-                host,
-                &cache_ctx.path,
-                &cache_ctx.scope,
-                peer,
-                &mut resp,
-                &cache_ctx.grant,
-                &cache_ctx.key,
-                &cache_ctx.target,
-                cache_ctx.backend_transport_visible,
-                cache_ctx.epoch,
-            );
+            crate::cache::store_authorized(cfg, vhost, req, host, peer, &mut resp, &cache_ctx);
         }
         let unsafe_method = !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
         if vapache_verified::cache_invalidation_status_admit(unsafe_method, resp.status) {
@@ -4707,21 +4655,42 @@ fn bind_target_grant(
     actual_path: &Path,
     mapping_root: &Path,
     meta: &std::fs::Metadata,
-    url_path: &str,
+    public_url_path: &str,
+    selected_url_path: &str,
     req: &Request,
     peer: IpAddr,
     local_port: u16,
     server_name: &str,
     local_ip: &str,
     rewrite_effects: &crate::rewrite::Effects,
-) -> Result<(access::AccessGrant, access::ResourceKey, Scope), Response> {
+) -> Result<access::AuthorizedPlan, Response> {
     if actual_path == fs_path {
-        let mut key = access::ResourceKey::request(vhost, req, url_path, Some(actual_path), None);
+        let mut key =
+            access::ResourceKey::request(vhost, req, selected_url_path, Some(actual_path), None);
         key.identity = grant.key().identity.clone();
         return match grant.bind_file(&key, meta) {
             Some(bound) => {
                 let key = bound.key().clone();
-                Ok((bound, key, scope.clone()))
+                let identity = access::OutcomeIdentity::selected(
+                    public_url_path,
+                    selected_url_path,
+                    Some(fs_path),
+                    Some(actual_path),
+                );
+                access::AuthorizedPlan::new(identity, scope.clone(), bound, key).ok_or_else(|| {
+                    error_response(
+                        cfg,
+                        vhost,
+                        scope,
+                        500,
+                        req,
+                        public_url_path,
+                        local_port,
+                        server_name,
+                        peer,
+                        local_ip,
+                    )
+                })
             }
             None => Err(error_response(
                 cfg,
@@ -4729,7 +4698,7 @@ fn bind_target_grant(
                 scope,
                 500,
                 req,
-                url_path,
+                public_url_path,
                 local_port,
                 server_name,
                 peer,
@@ -4743,7 +4712,7 @@ fn bind_target_grant(
         vhost,
         actual_path,
         Some(fs_path),
-        url_path,
+        selected_url_path,
         req,
         peer,
         mapping_root,
@@ -4757,7 +4726,7 @@ fn bind_target_grant(
                 scope,
                 500,
                 req,
-                url_path,
+                public_url_path,
                 local_port,
                 server_name,
                 peer,
@@ -4776,7 +4745,7 @@ fn bind_target_grant(
         &config_conditionals,
         &htaccess_conditionals,
         actual_path,
-        url_path,
+        selected_url_path,
         req,
         peer,
     );
@@ -4795,7 +4764,7 @@ fn bind_target_grant(
         &handler_scope.config_conditionals,
         &handler_scope.access_conditionals,
         actual_path,
-        url_path,
+        selected_url_path,
         req,
         peer,
         &lexical_name,
@@ -4811,13 +4780,14 @@ fn bind_target_grant(
     // the scope here let `Options -ExecCGI`, `-Indexes`, `RemoveHandler` and
     // `AllowOverride None` disappear (F60/I61).
     target_scope.restrict_with(scope);
-    let mut key = access::ResourceKey::request(vhost, req, url_path, Some(actual_path), None);
+    let mut key =
+        access::ResourceKey::request(vhost, req, selected_url_path, Some(actual_path), None);
     let target_grant = match helper_access_response(
         cfg,
         vhost,
         &target_scope,
         req,
-        url_path,
+        selected_url_path,
         &actual_path,
         local_port,
         server_name,
@@ -4831,7 +4801,26 @@ fn bind_target_grant(
     match target_grant.bind_file(&key, meta) {
         Some(bound) => {
             let key = bound.key().clone();
-            Ok((bound, key, target_scope))
+            let identity = access::OutcomeIdentity::selected(
+                public_url_path,
+                selected_url_path,
+                Some(fs_path),
+                Some(actual_path),
+            );
+            access::AuthorizedPlan::new(identity, target_scope, bound, key).ok_or_else(|| {
+                error_response(
+                    cfg,
+                    vhost,
+                    scope,
+                    500,
+                    req,
+                    public_url_path,
+                    local_port,
+                    server_name,
+                    peer,
+                    local_ip,
+                )
+            })
         }
         // coverage:ignore-start
         None => Err(error_response(
@@ -4840,7 +4829,7 @@ fn bind_target_grant(
             scope,
             500,
             req,
-            url_path,
+            public_url_path,
             local_port,
             server_name,
             peer,
@@ -4998,7 +4987,7 @@ fn bind_multiview_grant(
     server_name: &str,
     local_ip: &str,
     rewrite_effects: &crate::rewrite::Effects,
-) -> Result<(access::AccessGrant, access::ResourceKey, Scope), Response> {
+) -> Result<access::AuthorizedPlan, Response> {
     let mut target_scope = multiview_target_scope(
         cfg,
         vhost,
@@ -5216,7 +5205,26 @@ fn bind_multiview_grant(
             local_ip,
         ));
     }
-    Ok((bound, key, target_scope))
+    let identity = access::OutcomeIdentity::selected(
+        public_url_path,
+        selected_url_path,
+        Some(candidate_fs),
+        Some(actual_path),
+    );
+    access::AuthorizedPlan::new(identity, target_scope, bound, key).ok_or_else(|| {
+        error_response(
+            cfg,
+            vhost,
+            base_scope,
+            500,
+            req,
+            public_url_path,
+            local_port,
+            server_name,
+            peer,
+            local_ip,
+        )
+    })
 }
 
 pub(crate) fn multiview_selected_url(public_url_path: &str, selected_name: &[u8]) -> String {
@@ -5241,13 +5249,14 @@ fn authorize_resolved_target(
     peer: IpAddr,
     target_fs: &Path,
     target_url: &str,
+    public_url: &str,
     base_scope: &Scope,
     proxy_url: Option<&str>,
     mapping_root: &Path,
     local_port: u16,
     server_name: &str,
     local_ip: &str,
-) -> Result<(access::AccessGrant, access::ResourceKey, Scope), Response> {
+) -> Result<access::AuthorizedPlan, Response> {
     let lexical_target_plan = match CanonicalTarget::from_url_path(target_url)
         .ok_or_else(|| format!("invalid canonical target URL '{target_url}'"))
         .and_then(|target| {
@@ -5361,7 +5370,26 @@ fn authorize_resolved_target(
         local_ip,
         &mut key,
     )?;
-    Ok((grant, key, target_scope))
+    let identity = access::OutcomeIdentity::selected(
+        public_url,
+        target_url,
+        Some(lexical_target_plan.fs_path()),
+        Some(target_fs),
+    );
+    access::AuthorizedPlan::new(identity, target_scope, grant, key).ok_or_else(|| {
+        error_response(
+            cfg,
+            vhost,
+            base_scope,
+            500,
+            req,
+            public_url,
+            local_port,
+            server_name,
+            peer,
+            local_ip,
+        )
+    })
 }
 
 fn apply_scope_conditionals(
@@ -5732,18 +5760,18 @@ fn dispatch_url_proxy(
             query_override,
         } => {
             if req.handler_probe() {
+                let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
+                    .expect("URL proxy route retained one authorized identity");
                 return Response::prepared_handler(PreparedHandler::Proxy {
                     vhost_index: selected_vhost_index(cfg, vhost),
                     proxy_base_scope,
-                    scope,
+                    authorization,
                     target,
                     peer,
                     local_port,
                     https,
                     server_name: server_name.to_string(),
                     local_ip: local_ip.to_string(),
-                    grant,
-                    resource,
                     url_path: execute_path,
                     query_override,
                 });
@@ -5756,11 +5784,12 @@ fn dispatch_url_proxy(
             } else {
                 req
             };
-            proxy::execute_with_proxy_base(
+            let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
+                .expect("URL proxy route retained one authorized identity");
+            proxy::execute_authorized_with_proxy_base(
                 cfg,
                 vhost,
                 &proxy_base_scope,
-                &scope,
                 execute_req,
                 &execute_path,
                 &target,
@@ -5769,28 +5798,29 @@ fn dispatch_url_proxy(
                 https,
                 server_name,
                 local_ip,
-                &grant,
-                &resource,
+                &authorization,
             )
         }
         UrlProxySelection::FastCgi(target) => {
             if req.handler_probe() {
+                let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
+                    .expect("URL FastCGI route retained one authorized identity");
                 return Response::prepared_handler(PreparedHandler::FastCgi {
                     vhost_index: selected_vhost_index(cfg, vhost),
-                    scope,
+                    authorization,
                     target,
                     peer,
                     local_port,
                     server_name: server_name.to_string(),
                     local_ip: local_ip.to_string(),
-                    grant,
-                    resource,
                     request_uri: request_uri.to_string(),
                     url_path: front_url_path.to_string(),
                     mapping_root: mapping_root.to_path_buf(),
                 });
             }
-            run_fastcgi(
+            let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
+                .expect("URL FastCGI route retained one authorized identity");
+            run_authorized_fastcgi(
                 cfg,
                 vhost,
                 req,
@@ -5800,10 +5830,8 @@ fn dispatch_url_proxy(
                 peer,
                 local_ip,
                 local_port,
-                &scope,
                 &target,
-                &grant,
-                &resource,
+                &authorization,
                 mapping_root,
             )
         }
@@ -6705,29 +6733,30 @@ fn dispatch_inner(
                     }
                 }
                 if current_req.handler_probe() {
+                    let authorization = access::AuthorizedPlan::direct(scope, _grant, resource)
+                        .expect("rewrite proxy route retained one authorized identity");
                     return Response::prepared_handler(PreparedHandler::Proxy {
                         vhost_index: selected_vhost_index(cfg, vhost),
                         proxy_base_scope,
-                        scope,
+                        authorization,
                         target,
                         peer,
                         local_port,
                         https,
                         server_name: server_name.to_string(),
                         local_ip: local_ip.to_string(),
-                        grant: _grant,
-                        resource,
                         url_path: url_path_part.to_string(),
                         query_override: Some(query.as_bytes().to_vec()),
                     });
                 }
                 let mut proxy_req = current_req.clone();
                 proxy_req.query = query.as_bytes().to_vec();
-                return proxy::execute_with_proxy_base(
+                let authorization = access::AuthorizedPlan::direct(scope, _grant, resource)
+                    .expect("rewrite proxy route retained one authorized identity");
+                return proxy::execute_authorized_with_proxy_base(
                     cfg,
                     vhost,
                     &proxy_base_scope,
-                    &scope,
                     &proxy_req,
                     url_path_part,
                     &target,
@@ -6736,8 +6765,7 @@ fn dispatch_inner(
                     https,
                     &server_name,
                     local_ip,
-                    &_grant,
-                    &resource,
+                    &authorization,
                 );
             }
             crate::rewrite::Outcome::Redirect {
@@ -7279,7 +7307,7 @@ fn dispatch_inner(
         Some(&fs_path),
         selected_proxy_urls.first().map(String::as_str),
     );
-    let mut grant = match helper_access_response(
+    let grant = match helper_access_response(
         cfg,
         vhost,
         &scope,
@@ -7339,22 +7367,24 @@ fn dispatch_inner(
     if fastcgi_wins {
         if let Some(target) = fastcgi_target {
             if req.handler_probe() {
+                let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
+                    .expect("FastCGI route retained one authorized identity");
                 return Response::prepared_handler(PreparedHandler::FastCgi {
                     vhost_index: selected_vhost_index(cfg, vhost),
-                    scope,
+                    authorization,
                     target,
                     peer,
                     local_port,
                     server_name: server_name.to_string(),
                     local_ip: local_ip.to_string(),
-                    grant,
-                    resource,
                     request_uri: request_uri.clone(),
                     url_path: url_path.clone(),
                     mapping_root: root,
                 });
             }
-            return run_fastcgi(
+            let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
+                .expect("FastCGI route retained one authorized identity");
+            return run_authorized_fastcgi(
                 cfg,
                 vhost,
                 req,
@@ -7364,10 +7394,8 @@ fn dispatch_inner(
                 peer,
                 local_ip,
                 local_port,
-                &scope,
                 &target,
-                &grant,
-                &resource,
+                &authorization,
                 &root,
             );
         }
@@ -7375,27 +7403,28 @@ fn dispatch_inner(
 
     if let Some(target) = proxy_target {
         if req.handler_probe() {
+            let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
+                .expect("proxy route retained one authorized identity");
             return Response::prepared_handler(PreparedHandler::Proxy {
                 vhost_index: selected_vhost_index(cfg, vhost),
                 proxy_base_scope,
-                scope,
+                authorization,
                 target,
                 peer,
                 local_port,
                 https,
                 server_name: server_name.to_string(),
                 local_ip: local_ip.to_string(),
-                grant,
-                resource,
                 url_path: url_path.clone(),
                 query_override: None,
             });
         }
-        return proxy::execute_with_proxy_base(
+        let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
+            .expect("proxy route retained one authorized identity");
+        return proxy::execute_authorized_with_proxy_base(
             cfg,
             vhost,
             &proxy_base_scope,
-            &scope,
             req,
             &url_path,
             &target,
@@ -7404,8 +7433,7 @@ fn dispatch_inner(
             https,
             &server_name,
             local_ip,
-            &grant,
-            &resource,
+            &authorization,
         );
     }
     if !fastcgi_wins
@@ -7456,7 +7484,7 @@ fn dispatch_inner(
                     local_ip,
                 );
             };
-            let (target_grant, target_resource, target_scope) = match bind_target_grant(
+            let target_authorization = match bind_target_grant(
                 cfg,
                 vhost,
                 &scope,
@@ -7465,6 +7493,7 @@ fn dispatch_inner(
                 actual_path.as_ref(),
                 &root,
                 &meta,
+                &url_path,
                 &url_path,
                 req,
                 peer.ip(),
@@ -7476,9 +7505,7 @@ fn dispatch_inner(
                 Ok(v) => v,
                 Err(r) => return r,
             };
-            let scope = &target_scope;
-            let grant = &target_grant;
-            let resource = &target_resource;
+            let scope = target_authorization.scope();
             // Handler, MIME and dispatch decisions bind to the lexical
             // request-mapped filename (F69/I70): an in-root symlink whose
             // canonical target has a different basename (for example
@@ -7549,20 +7576,18 @@ fn dispatch_inner(
                 if req.handler_probe() {
                     return Response::prepared_handler(PreparedHandler::FastCgi {
                         vhost_index: selected_vhost_index(cfg, vhost),
-                        scope: target_scope,
+                        authorization: target_authorization,
                         target,
                         peer,
                         local_port,
                         server_name: server_name.to_string(),
                         local_ip: local_ip.to_string(),
-                        grant: target_grant,
-                        resource: target_resource,
                         request_uri: request_uri.clone(),
                         url_path: url_path.clone(),
                         mapping_root: root,
                     });
                 }
-                return run_fastcgi(
+                return run_authorized_fastcgi(
                     cfg,
                     vhost,
                     req,
@@ -7572,14 +7597,15 @@ fn dispatch_inner(
                     peer,
                     local_ip,
                     local_port,
-                    scope,
                     &target,
-                    grant,
-                    resource,
+                    &target_authorization,
                     &root,
                 );
             }
             if cgi::is_cgi(cfg, scope, name, script_alias) {
+                let authorization = target_authorization
+                    .into_outcome(vapache_verified::TransformSink::LocalCgi)
+                    .expect("CGI target retained its inode-bound authorization");
                 if req.handler_probe() {
                     let descriptor_lease = match cfg.resource_budget.try_descriptor() {
                         Ok(lease) => lease,
@@ -7587,13 +7613,11 @@ fn dispatch_inner(
                     };
                     return Response::prepared_handler(PreparedHandler::Cgi {
                         vhost_index: selected_vhost_index(cfg, vhost),
-                        scope: target_scope,
+                        authorization,
                         peer,
                         local_port,
                         server_name: server_name.to_string(),
                         local_ip: local_ip.to_string(),
-                        grant: target_grant,
-                        resource: target_resource,
                         root: script_root,
                         script_rel,
                         request_uri: request_uri.clone(),
@@ -7605,7 +7629,7 @@ fn dispatch_inner(
                         _descriptor_lease: descriptor_lease,
                     });
                 }
-                return run_cgi(
+                return run_authorized_cgi(
                     cfg,
                     vhost,
                     req,
@@ -7619,9 +7643,7 @@ fn dispatch_inner(
                     peer,
                     local_ip,
                     local_port,
-                    scope,
-                    grant,
-                    resource,
+                    &authorization,
                     Some(&file),
                     Some(&meta),
                 );
@@ -7703,9 +7725,11 @@ fn dispatch_inner(
                     .push(("Allow".into(), b"GET, HEAD, OPTIONS".to_vec()));
                 return r;
             }
-            serve_file(
+            let authorization = target_authorization
+                .into_outcome(vapache_verified::TransformSink::StaticFile)
+                .expect("static target retained its inode-bound authorization");
+            crate::files::serve_authorized_file(
                 cfg,
-                scope,
                 req,
                 file,
                 &meta,
@@ -7713,8 +7737,7 @@ fn dispatch_inner(
                 name,
                 peer.ip(),
                 local_ip,
-                &target_grant,
-                &target_resource,
+                &authorization,
             )
         }
         Target::Directory { file, meta } => {
@@ -7752,6 +7775,7 @@ fn dispatch_inner(
             // URL, otherwise `<Location "/dir/">` is skipped and an autoindex
             // listing for the protected directory leaks its entries.
             let mut auth_url = url_path.clone();
+            let mut canonical_authorization = None;
             if !url_path.ends_with('/') && !scope.content_policy.directory_slash.unwrap_or(true) {
                 let canonical = format!("{}/", url_path.trim_end_matches('/'));
                 match authorize_resolved_target(
@@ -7761,6 +7785,7 @@ fn dispatch_inner(
                     peer.ip(),
                     &fs_path,
                     &canonical,
+                    &url_path,
                     &scope,
                     None,
                     &root,
@@ -7768,10 +7793,10 @@ fn dispatch_inner(
                     &server_name,
                     local_ip,
                 ) {
-                    Ok((target_grant, _target_resource, target_scope)) => {
-                        scope = target_scope;
-                        grant = target_grant;
+                    Ok(authorization) => {
+                        scope = authorization.scope().clone();
                         auth_url = canonical;
+                        canonical_authorization = Some(authorization);
                     }
                     Err(r) => return r,
                 }
@@ -7842,15 +7867,20 @@ fn dispatch_inner(
                     local_ip,
                 );
             };
-            let (target_grant, target_resource, target_scope) = match bind_target_grant(
+            let base_grant = canonical_authorization
+                .as_ref()
+                .map(access::AuthorizedPlan::grant)
+                .unwrap_or(&grant);
+            let target_authorization = match bind_target_grant(
                 cfg,
                 vhost,
                 &scope,
-                &grant,
+                base_grant,
                 &fs_path,
                 actual_path.as_ref(),
                 &root,
                 &meta,
+                &url_path,
                 &auth_url,
                 req,
                 peer.ip(),
@@ -7862,10 +7892,12 @@ fn dispatch_inner(
                 Ok(v) => v,
                 Err(r) => return r, // coverage:ignore-line
             };
-            serve_directory(
+            let authorization = target_authorization
+                .into_outcome(vapache_verified::TransformSink::Directory)
+                .expect("directory target retained its inode-bound authorization");
+            crate::files::serve_authorized_directory(
                 cfg,
                 vhost,
-                &target_scope,
                 req,
                 file,
                 &meta,
@@ -7876,8 +7908,7 @@ fn dispatch_inner(
                 local_port,
                 peer.ip(),
                 local_ip,
-                &target_grant,
-                &target_resource,
+                &authorization,
             )
         }
         Target::Forbidden => error_response(
@@ -7938,30 +7969,30 @@ fn dispatch_inner(
                             );
                             // coverage:ignore-stop
                         };
-                        let (target_grant, target_resource, target_scope) =
-                            match bind_multiview_grant(
-                                cfg,
-                                vhost,
-                                &scope,
-                                &grant,
-                                &candidate_fs,
-                                actual_path.as_ref(),
-                                &root,
-                                &view.meta,
-                                &url_path,
-                                &selected_url_path,
-                                req,
-                                peer.ip(),
-                                local_port,
-                                https,
-                                &server_name,
-                                local_ip,
-                                &rewrite_effects,
-                            ) {
-                                Ok(bound) => bound,
-                                Err(response) => return response,
-                            };
-                        let handler = crate::config::effective_handler(&target_scope, &view.name)
+                        let target_authorization = match bind_multiview_grant(
+                            cfg,
+                            vhost,
+                            &scope,
+                            &grant,
+                            &candidate_fs,
+                            actual_path.as_ref(),
+                            &root,
+                            &view.meta,
+                            &url_path,
+                            &selected_url_path,
+                            req,
+                            peer.ip(),
+                            local_port,
+                            https,
+                            &server_name,
+                            local_ip,
+                            &rewrite_effects,
+                        ) {
+                            Ok(bound) => bound,
+                            Err(response) => return response,
+                        };
+                        let target_scope = target_authorization.scope();
+                        let handler = crate::config::effective_handler(target_scope, &view.name)
                             .map(str::trim)
                             .filter(|handler| {
                                 !handler.is_empty()
@@ -7973,9 +8004,9 @@ fn dispatch_inner(
                         // even if a leaf-sensitive Files rule adds a handler
                         // after the bounded candidate scan selected the name.
                         if handler.is_some()
-                            || cgi::is_cgi(cfg, &target_scope, &view.name, false)
+                            || cgi::is_cgi(cfg, target_scope, &view.name, false)
                             || fastcgi::handler_target_for_file(
-                                &target_scope,
+                                target_scope,
                                 &root,
                                 &url_path,
                                 &candidate_fs,
@@ -7987,7 +8018,7 @@ fn dispatch_inner(
                             return error_response(
                                 cfg,
                                 vhost,
-                                &target_scope,
+                                target_scope,
                                 404,
                                 req,
                                 &url_path,
@@ -7997,11 +8028,11 @@ fn dispatch_inner(
                                 local_ip,
                             );
                         }
-                        let media_type = mime_type(cfg, &target_scope, &view.name);
+                        let media_type = mime_type(cfg, target_scope, &view.name);
                         let mut unsupported_filters =
                             target_scope.mapping_policy.unsupported_filters.clone();
                         for filter in crate::compression::unsupported_filters(
-                            &target_scope,
+                            target_scope,
                             media_type.as_deref(),
                             &view.name,
                         ) {
@@ -8016,7 +8047,7 @@ fn dispatch_inner(
                             return error_response(
                                 cfg,
                                 vhost,
-                                &target_scope,
+                                target_scope,
                                 500,
                                 req,
                                 &url_path,
@@ -8026,9 +8057,11 @@ fn dispatch_inner(
                                 local_ip,
                             );
                         }
-                        let mut response = serve_file(
+                        let authorization = target_authorization
+                            .into_outcome(vapache_verified::TransformSink::StaticFile)
+                            .expect("MultiViews target retained its inode-bound authorization");
+                        let mut response = crate::files::serve_authorized_file(
                             cfg,
-                            &target_scope,
                             req,
                             view.file,
                             &view.meta,
@@ -8036,8 +8069,7 @@ fn dispatch_inner(
                             &view.name,
                             peer.ip(),
                             local_ip,
-                            &target_grant,
-                            &target_resource,
+                            &authorization,
                         );
                         response.headers.push((
                             "Content-Location".into(),
@@ -8145,30 +8177,36 @@ fn dispatch_inner(
                     // `st.rel_script`: a public symlink to a denied script
                     // must not execute with the public directory's policy
                     // (F41/I39), including with PATH_INFO.
-                    let (target_grant, target_resource, target_scope) =
-                        match authorize_resolved_target(
-                            cfg,
-                            vhost,
-                            req,
-                            peer.ip(),
-                            actual_path.as_ref(),
-                            &script_name,
-                            &scope,
-                            None,
-                            &root,
-                            local_port,
-                            &server_name,
-                            local_ip,
-                        ) {
-                            Ok(v) => v,
-                            Err(r) => return r,
-                        };
+                    let target_authorization = match authorize_resolved_target(
+                        cfg,
+                        vhost,
+                        req,
+                        peer.ip(),
+                        actual_path.as_ref(),
+                        &script_name,
+                        &url_path,
+                        &scope,
+                        None,
+                        &root,
+                        local_port,
+                        &server_name,
+                        local_ip,
+                    ) {
+                        Ok(v) => v,
+                        Err(r) => return r,
+                    };
                     let script_root = actual_path.parent().unwrap_or(root.as_path()).to_path_buf();
                     let script_rel = actual_path
                         .file_name()
                         .map(PathBuf::from)
                         .unwrap_or_else(|| st.rel_script.clone());
-                    if cgi::is_cgi(cfg, &target_scope, actual_name, script_alias) {
+                    if cgi::is_cgi(cfg, target_authorization.scope(), actual_name, script_alias) {
+                        let authorization = target_authorization
+                            .bind_file(&st.meta)
+                            .and_then(|plan| {
+                                plan.into_outcome(vapache_verified::TransformSink::LocalCgi)
+                            })
+                            .expect("PATH_INFO CGI retained one inode-bound authorization");
                         if req.handler_probe() {
                             let descriptor_lease = match cfg.resource_budget.try_descriptor() {
                                 Ok(lease) => lease,
@@ -8176,13 +8214,11 @@ fn dispatch_inner(
                             };
                             return Response::prepared_handler(PreparedHandler::Cgi {
                                 vhost_index: selected_vhost_index(cfg, vhost),
-                                scope: target_scope,
+                                authorization,
                                 peer,
                                 local_port,
                                 server_name: server_name.to_string(),
                                 local_ip: local_ip.to_string(),
-                                grant: target_grant,
-                                resource: target_resource,
                                 root: script_root,
                                 script_rel,
                                 request_uri: request_uri.clone(),
@@ -8194,7 +8230,7 @@ fn dispatch_inner(
                                 _descriptor_lease: descriptor_lease,
                             });
                         }
-                        return run_cgi(
+                        return run_authorized_cgi(
                             cfg,
                             vhost,
                             req,
@@ -8208,9 +8244,7 @@ fn dispatch_inner(
                             peer,
                             local_ip,
                             local_port,
-                            &target_scope,
-                            &target_grant,
-                            &target_resource,
+                            &authorization,
                             Some(&st.file),
                             Some(&st.meta),
                         );
@@ -8423,12 +8457,98 @@ fn match_redirect<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_authorized_fastcgi(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
+    request_uri: &str,
+    url_path: &str,
+    server_name: &str,
+    peer: SocketAddr,
+    local_ip: &str,
+    local_port: u16,
+    target: &fastcgi::Target,
+    authorization: &access::AuthorizedPlan,
+    mapping_root: &Path,
+) -> Response {
+    if authorization.identity().selected_url_path() != url_path {
+        return error_response(
+            cfg,
+            vhost,
+            authorization.scope(),
+            500,
+            req,
+            authorization.identity().public_url_path(),
+            local_port,
+            server_name,
+            peer.ip(),
+            local_ip,
+        );
+    }
+    run_fastcgi_with_public_url(
+        cfg,
+        vhost,
+        req,
+        request_uri,
+        url_path,
+        authorization.identity().public_url_path(),
+        server_name,
+        peer,
+        local_ip,
+        local_port,
+        authorization.scope(),
+        target,
+        authorization.grant(),
+        authorization.resource(),
+        mapping_root,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn run_fastcgi(
     cfg: &Config,
     vhost: Option<&VHost>,
     req: &Request,
     request_uri: &str,
     url_path: &str,
+    server_name: &str,
+    peer: SocketAddr,
+    local_ip: &str,
+    local_port: u16,
+    scope: &Scope,
+    target: &fastcgi::Target,
+    _grant: &crate::access::AccessGrant,
+    _resource: &crate::access::ResourceKey,
+    mapping_root: &Path,
+) -> Response {
+    run_fastcgi_with_public_url(
+        cfg,
+        vhost,
+        req,
+        request_uri,
+        url_path,
+        url_path,
+        server_name,
+        peer,
+        local_ip,
+        local_port,
+        scope,
+        target,
+        _grant,
+        _resource,
+        mapping_root,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_fastcgi_with_public_url(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
+    request_uri: &str,
+    url_path: &str,
+    public_url_path: &str,
     server_name: &str,
     peer: SocketAddr,
     local_ip: &str,
@@ -8522,13 +8642,14 @@ fn run_fastcgi(
         target.script_filename().display(),
         authorized_path.display()
     );
-    let (target_grant, target_resource, target_scope) = match authorize_resolved_target(
+    let target_authorization = match authorize_resolved_target(
         cfg,
         vhost,
         req,
         peer.ip(),
         &authorized_path,
         &script_url,
+        public_url_path,
         scope,
         Some(&proxy_identity),
         mapping_root,
@@ -8539,18 +8660,20 @@ fn run_fastcgi(
         Ok(v) => v,
         Err(r) => return r,
     };
-    let scope = &target_scope;
-    let grant = &target_grant;
-    let resource = &target_resource;
+    let target_scope = target_authorization.scope().clone();
     let backend_binding = target.binding_key(&authorized_path);
     let backend_binds_both =
         backend_binding.contains("|lexical=") && backend_binding.contains("|authorized=");
     // coverage:ignore-start
-    let Some(file_bound) = grant.bind_file(resource, &script_binding.meta) else {
+    let Some(authorization) = target_authorization
+        .bind_file(&script_binding.meta)
+        .and_then(|plan| plan.bind_backend(backend_binding))
+        .and_then(|plan| plan.into_outcome(vapache_verified::TransformSink::FastCgi))
+    else {
         return error_response(
             cfg,
             vhost,
-            scope,
+            &target_scope,
             500,
             req,
             url_path,
@@ -8560,35 +8683,17 @@ fn run_fastcgi(
             local_ip,
         );
     };
-    let file_resource = file_bound.key().clone();
-    let Some(bound) = file_bound.bind_backend(&file_resource, backend_binding) else {
+    if !vapache_verified::fastcgi_script_identity_admit(
+        authorization.resource().fs_path.as_deref() == Some(authorized_path.as_path()),
+        script_binding.meta.dev() == authorization.resource().file_dev.unwrap_or_default()
+            && script_binding.meta.ino() == authorization.resource().file_ino.unwrap_or_default(),
+        true,
+        backend_binds_both,
+    ) {
         return error_response(
             cfg,
             vhost,
-            scope,
-            500,
-            req,
-            url_path,
-            local_port,
-            server_name,
-            peer.ip(),
-            local_ip,
-        );
-    };
-    let expected = bound.key().clone();
-    if !bound.require_sink(&expected, vapache_verified::TransformSink::FastCgi)
-        || !vapache_verified::fastcgi_script_identity_admit(
-            expected.fs_path.as_deref() == Some(authorized_path.as_path()),
-            script_binding.meta.dev() == expected.file_dev.unwrap_or_default()
-                && script_binding.meta.ino() == expected.file_ino.unwrap_or_default(),
-            true,
-            backend_binds_both,
-        )
-    {
-        return error_response(
-            cfg,
-            vhost,
-            scope,
+            &target_scope,
             500,
             req,
             url_path,
@@ -8599,7 +8704,8 @@ fn run_fastcgi(
         );
     }
     // coverage:ignore-stop
-    let remote_user = bound.key().identity.as_deref();
+    let scope = authorization.scope();
+    let remote_user = authorization.resource().identity.as_deref();
     // The canonical target scope may not repeat the lexical URL's AuthType,
     // but the request-owned identity still came exclusively from the Basic
     // authenticator (the only implemented HTTP authentication mechanism).
@@ -8637,6 +8743,83 @@ fn run_fastcgi(
         return Response::policy_error();
     }
     r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_authorized_cgi(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
+    root: &Path,
+    script_rel: &Path,
+    request_uri: &str,
+    url_path: &str,
+    path_info: &str,
+    script_name: &str,
+    server_name: &str,
+    peer: SocketAddr,
+    local_ip: &str,
+    local_port: u16,
+    authorization: &access::AuthorizedOutcome,
+    script_file: Option<&std::fs::File>,
+    script_meta: Option<&std::fs::Metadata>,
+) -> Response {
+    let invalid = || {
+        error_response(
+            cfg,
+            vhost,
+            authorization.scope(),
+            500,
+            req,
+            authorization.identity().public_url_path(),
+            local_port,
+            server_name,
+            peer.ip(),
+            local_ip,
+        )
+    };
+    let (Some(script_file), Some(script_meta)) = (script_file, script_meta) else {
+        return invalid();
+    };
+    let Ok(opened_meta) = script_file.metadata() else {
+        return invalid();
+    };
+    if opened_meta.dev() != script_meta.dev() || opened_meta.ino() != script_meta.ino() {
+        return invalid();
+    }
+    let Some(resolved_path) = authorization.identity().resolved_fs_path() else {
+        return invalid();
+    };
+    if crate::files::fd_path(script_file).as_deref() != Some(resolved_path)
+        || authorization.identity().selected_url_path() != script_name
+        || !authorization.require_file_sink(
+            vapache_verified::TransformSink::LocalCgi,
+            resolved_path,
+            &opened_meta,
+        )
+    {
+        return invalid();
+    }
+    run_cgi(
+        cfg,
+        vhost,
+        req,
+        root,
+        script_rel,
+        request_uri,
+        url_path,
+        path_info,
+        script_name,
+        server_name,
+        peer,
+        local_ip,
+        local_port,
+        authorization.scope(),
+        authorization.grant(),
+        authorization.resource(),
+        Some(script_file),
+        Some(&opened_meta),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11164,6 +11347,7 @@ mod tests {
             &map_root,
             &meta,
             "/a.txt",
+            "/a.txt",
             &req,
             peer,
             80,
@@ -11211,6 +11395,7 @@ mod tests {
             &map_root,
             &target_meta,
             "/a.txt",
+            "/a.txt",
             &req,
             peer,
             80,
@@ -11228,6 +11413,7 @@ mod tests {
             &req,
             peer,
             &target,
+            "/bad/file.txt",
             "/bad/file.txt",
             &scope,
             None,

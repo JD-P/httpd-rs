@@ -181,6 +181,212 @@ pub struct AccessGrant {
     wildcard: bool,
 }
 
+/// Every spelling that participates in selection or authorization for one
+/// terminal representation.  URL-only proxy outcomes carry no filesystem
+/// paths; local and cache outcomes carry both lexical and resolved paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutcomeIdentity {
+    public_url_path: String,
+    selected_url_path: String,
+    lexical_fs_path: Option<PathBuf>,
+    resolved_fs_path: Option<PathBuf>,
+}
+
+impl OutcomeIdentity {
+    pub fn direct(url_path: &str, fs_path: Option<&Path>) -> Self {
+        Self::selected(url_path, url_path, fs_path, fs_path)
+    }
+
+    pub fn selected(
+        public_url_path: &str,
+        selected_url_path: &str,
+        lexical_fs_path: Option<&Path>,
+        resolved_fs_path: Option<&Path>,
+    ) -> Self {
+        Self {
+            public_url_path: public_url_path.to_string(),
+            selected_url_path: selected_url_path.to_string(),
+            lexical_fs_path: lexical_fs_path.map(Path::to_path_buf),
+            resolved_fs_path: resolved_fs_path.map(Path::to_path_buf),
+        }
+    }
+
+    pub fn public_url_path(&self) -> &str {
+        &self.public_url_path
+    }
+
+    pub fn selected_url_path(&self) -> &str {
+        &self.selected_url_path
+    }
+
+    pub fn lexical_fs_path(&self) -> Option<&Path> {
+        self.lexical_fs_path.as_deref()
+    }
+
+    pub fn resolved_fs_path(&self) -> Option<&Path> {
+        self.resolved_fs_path.as_deref()
+    }
+}
+
+/// Policy-authorized representation before the final sink-specific binding.
+/// Keeping scope, grant, resource key and every representation identity in
+/// one move-only value prevents cache/dispatch/backend code from mixing
+/// fields produced by different request-plan transitions.
+#[derive(Debug)]
+pub struct AuthorizedPlan {
+    identity: OutcomeIdentity,
+    scope: Scope,
+    grant: AccessGrant,
+    resource: ResourceKey,
+}
+
+impl AuthorizedPlan {
+    pub fn new(
+        identity: OutcomeIdentity,
+        scope: Scope,
+        grant: AccessGrant,
+        resource: ResourceKey,
+    ) -> Option<Self> {
+        let filesystem_identity_well_formed =
+            identity.lexical_fs_path.is_some() == identity.resolved_fs_path.is_some();
+        // A cache policy key deliberately binds the target through its policy
+        // fingerprint rather than ResourceKey::fs_path.  Whenever the key
+        // does name a filesystem path, it must be the resolved identity.
+        let resolved_target_bound = resource
+            .fs_path
+            .as_deref()
+            .is_none_or(|path| identity.resolved_fs_path() == Some(path));
+        if !vapache_verified::authorized_plan_identity_admit(
+            !identity.public_url_path.is_empty(),
+            identity.selected_url_path == resource.url_path,
+            filesystem_identity_well_formed,
+            resolved_target_bound,
+            grant.require(&resource),
+        ) {
+            return None;
+        }
+        Some(Self {
+            identity,
+            scope,
+            grant,
+            resource,
+        })
+    }
+
+    pub fn direct(scope: Scope, grant: AccessGrant, resource: ResourceKey) -> Option<Self> {
+        let identity = OutcomeIdentity::direct(&resource.url_path, resource.fs_path.as_deref());
+        Self::new(identity, scope, grant, resource)
+    }
+
+    pub fn identity(&self) -> &OutcomeIdentity {
+        &self.identity
+    }
+
+    pub fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    pub fn grant(&self) -> &AccessGrant {
+        &self.grant
+    }
+
+    pub fn resource(&self) -> &ResourceKey {
+        &self.resource
+    }
+
+    pub fn bind_file(self, meta: &std::fs::Metadata) -> Option<Self> {
+        let grant = self.grant.bind_file(&self.resource, meta)?;
+        let resource = grant.key().clone();
+        Self::new(self.identity, self.scope, grant, resource)
+    }
+
+    pub fn bind_backend(self, backend_target: String) -> Option<Self> {
+        let grant = self.grant.bind_backend(&self.resource, backend_target)?;
+        let resource = grant.key().clone();
+        Self::new(self.identity, self.scope, grant, resource)
+    }
+
+    pub fn bind_proxy(
+        self,
+        host: &str,
+        port: u16,
+        tls: bool,
+        upstream_path: &str,
+    ) -> Option<AuthorizedOutcome> {
+        let grant = self
+            .grant
+            .bind_proxy(&self.resource, host, port, tls, upstream_path)?;
+        let resource = grant.key().clone();
+        let plan = Self::new(self.identity, self.scope, grant, resource)?;
+        if !plan
+            .grant
+            .require_proxy_sink(&plan.resource, host, port, tls, upstream_path)
+        {
+            return None;
+        }
+        plan.into_outcome(vapache_verified::TransformSink::Proxy)
+    }
+
+    pub fn into_outcome(self, sink: vapache_verified::TransformSink) -> Option<AuthorizedOutcome> {
+        if !self.grant.require_sink(&self.resource, sink) {
+            return None;
+        }
+        Some(AuthorizedOutcome { plan: self, sink })
+    }
+}
+
+/// Sink-bound terminal authorization.  Production body/tunnel/cache entry
+/// points consume this type instead of accepting independently supplied
+/// scope, grant, key, URL and target values.
+#[derive(Debug)]
+pub struct AuthorizedOutcome {
+    plan: AuthorizedPlan,
+    sink: vapache_verified::TransformSink,
+}
+
+impl AuthorizedOutcome {
+    pub fn identity(&self) -> &OutcomeIdentity {
+        self.plan.identity()
+    }
+
+    pub fn scope(&self) -> &Scope {
+        self.plan.scope()
+    }
+
+    pub fn grant(&self) -> &AccessGrant {
+        self.plan.grant()
+    }
+
+    pub fn resource(&self) -> &ResourceKey {
+        self.plan.resource()
+    }
+
+    pub fn sink(&self) -> vapache_verified::TransformSink {
+        self.sink
+    }
+
+    pub fn require_sink(&self, sink: vapache_verified::TransformSink) -> bool {
+        self.sink == sink && self.plan.grant.require_sink(&self.plan.resource, sink)
+    }
+
+    /// A local-file sink must retain both the resolved pathname and the
+    /// inode captured from the descriptor that will actually be consumed.
+    /// Checking this at the typed boundary prevents a caller from pairing an
+    /// authorized outcome with a different descriptor/metadata tuple.
+    pub fn require_file_sink(
+        &self,
+        sink: vapache_verified::TransformSink,
+        path: &Path,
+        meta: &std::fs::Metadata,
+    ) -> bool {
+        self.require_sink(sink)
+            && self.identity().resolved_fs_path() == Some(path)
+            && self.resource().fs_path.as_deref() == Some(path)
+            && self.resource().file_dev == Some(meta.dev())
+            && self.resource().file_ino == Some(meta.ino())
+    }
+}
+
 impl AccessGrant {
     pub fn require(&self, key: &ResourceKey) -> bool {
         self.wildcard || &self.key == key
@@ -1883,6 +2089,110 @@ mod tests {
         )
         .unwrap();
         assert!(policy_grant.require_sink(&policy, vapache_verified::TransformSink::Cache));
+    }
+
+    #[test]
+    fn authorized_plan_is_one_move_only_identity_and_sink_transition() {
+        let request = req("GET");
+        let peer = "127.0.0.1".parse().unwrap();
+        let scope = Scope::default();
+        let executable = Path::new("/proc/self/exe");
+        let meta = std::fs::metadata(executable).expect("self metadata");
+        let key = ResourceKey::request(None, &request, "/selected", Some(executable), None);
+
+        let mismatched_url = check_grant(
+            &scope,
+            &request,
+            peer,
+            None,
+            "/selected",
+            Some(executable),
+            key.clone(),
+        )
+        .unwrap();
+        assert!(AuthorizedPlan::new(
+            OutcomeIdentity::selected("/public", "/other", Some(executable), Some(executable),),
+            scope.clone(),
+            mismatched_url,
+            key.clone(),
+        )
+        .is_none());
+
+        let mismatched_target = check_grant(
+            &scope,
+            &request,
+            peer,
+            None,
+            "/selected",
+            Some(executable),
+            key.clone(),
+        )
+        .unwrap();
+        assert!(AuthorizedPlan::new(
+            OutcomeIdentity::selected(
+                "/public",
+                "/selected",
+                Some(executable),
+                Some(Path::new("/proc/self/status")),
+            ),
+            scope.clone(),
+            mismatched_target,
+            key.clone(),
+        )
+        .is_none());
+
+        let unbound = check_grant(
+            &scope,
+            &request,
+            peer,
+            None,
+            "/selected",
+            Some(executable),
+            key.clone(),
+        )
+        .unwrap();
+        let plan = AuthorizedPlan::new(
+            OutcomeIdentity::selected("/public", "/selected", Some(executable), Some(executable)),
+            scope.clone(),
+            unbound,
+            key.clone(),
+        )
+        .unwrap();
+        assert!(plan
+            .into_outcome(vapache_verified::TransformSink::StaticFile)
+            .is_none());
+
+        let file_grant = check_grant(
+            &scope,
+            &request,
+            peer,
+            None,
+            "/selected",
+            Some(executable),
+            key.clone(),
+        )
+        .unwrap();
+        let outcome = AuthorizedPlan::new(
+            OutcomeIdentity::selected("/public", "/selected", Some(executable), Some(executable)),
+            scope,
+            file_grant,
+            key,
+        )
+        .and_then(|plan| plan.bind_file(&meta))
+        .and_then(|plan| plan.into_outcome(vapache_verified::TransformSink::StaticFile))
+        .expect("file binding completes the static outcome");
+        assert_eq!(outcome.identity().public_url_path(), "/public");
+        assert_eq!(outcome.identity().selected_url_path(), "/selected");
+        assert_eq!(outcome.identity().lexical_fs_path(), Some(executable));
+        assert_eq!(outcome.identity().resolved_fs_path(), Some(executable));
+        assert!(outcome.require_sink(vapache_verified::TransformSink::StaticFile));
+        assert!(!outcome.require_sink(vapache_verified::TransformSink::LocalCgi));
+        let other_meta = std::fs::metadata("/proc/self/status").expect("other metadata");
+        assert!(!outcome.require_file_sink(
+            vapache_verified::TransformSink::StaticFile,
+            executable,
+            &other_meta,
+        ));
     }
 
     #[test]

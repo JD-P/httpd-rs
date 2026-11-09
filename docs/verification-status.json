@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-09",
   "verus": {
-    "verified_functions": 737,
+    "verified_functions": 739,
     "errors": 0
   },
   "obligations": [
@@ -67,7 +67,7 @@
       "title": "ACL reachability and resource binding",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "I1a exact ResourceKey grants and I1b inode/backend/policy binding feed the executable TransformCapability state. Every protected file, directory, CGI, FastCGI, proxy, WebSocket and cache sink calls AccessGrant::require_sink, which combines exact resource equality with the verified sink-specific admission predicate. I31 opens and reauthorizes CGI and FastCGI scripts before binding the selected inode; P15 FastCGI binds transport, lexical SCRIPT_FILENAME, authorized canonical path and PATH_INFO, with fastcgi_script_identity_admit proving that neither script identity can be omitted. P17 adds fastcgi_resolved_target_admit at the SetHandler constructor so its lexical classification/wire path cannot be replaced by the canonical authorization path. P18-B2 rebuilds a configuration-only scope for every selected ProxyPass/ProxyPassMatch or FastCGI route and consumes proxy_operator_acl_admit before the access-file-restricted scope, so access files may narrow but never supply the operator grant. Authorization providers and request-plan refinement remain outside this obligation."
+      "evidence": "I1a exact ResourceKey grants and I1b inode/backend/policy binding feed the executable TransformCapability state. authorized_plan_identity_admit gates construction of the move-only AuthorizedPlan over one public URL, selected URL, lexical/resolved filesystem pair, scope, exact grant and resource; AuthorizedOutcome adds the admitted sink. Production file, directory, CGI, FastCGI, proxy, WebSocket and cache entry points consume this artifact rather than independently supplied fields, and local-file boundaries compare the descriptor device/inode with it. Every protected sink calls AccessGrant::require_sink, which combines exact resource equality with the verified sink-specific admission predicate. I31 opens and reauthorizes CGI and FastCGI scripts before binding the selected inode; P15 FastCGI binds transport, lexical SCRIPT_FILENAME, authorized canonical path and PATH_INFO, with fastcgi_script_identity_admit proving that neither script identity can be omitted. P17 adds fastcgi_resolved_target_admit at the SetHandler constructor so its lexical classification/wire path cannot be replaced by the canonical authorization path. P18-B2 rebuilds a configuration-only scope for every selected ProxyPass/ProxyPassMatch or FastCGI route and consumes proxy_operator_acl_admit before the access-file-restricted scope, so access files may narrow but never supply the operator grant. Authorization providers and request-plan refinement remain outside this obligation."
     },
     {
       "id": "mapping_order",
@@ -109,7 +109,7 @@
       "title": "Every positive terminal outcome enforces original-URL and current-target grants",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "TransformCapability plus AccessGrant::require_sink mechanize the final exact-resource and sink-binding gate for static/directory, CGI/FastCGI, proxy, WebSocket and cache outcomes. MultiViews candidate admission additionally requires a missing public target, same-directory basename match, regular typed representation, static handler, acceptable negotiation result and bounded scan. multiview_authorization_meet_spec requires the public URL, selected URL, resolved inode and selected-name rewrite result together; dispatch consumes that admission after exact URL/path/dev/inode binding. multiview_cache_binding_spec requires cache lookup/store to use the selected URL and resolved target, and the cache planner consumes the same selected scope/rewrite transition as dispatch. Original-URL and current-target scopes are both enforced and F23 covers rewrite-then-proxy/redirect. Redirect and error-response orchestration remain runtime projections outside the protected body/tunnel/cache sink state machine, so the broader all-positive-outcomes obligation remains partial."
+      "evidence": "TransformCapability plus AccessGrant::require_sink mechanize the final exact-resource and sink-binding gate for static/directory, CGI/FastCGI, proxy, WebSocket and cache outcomes. authorized_plan_identity_spec additionally requires one coherent public URL, selected URL, lexical/resolved identity and exact grant; production sink adapters consume the resulting move-only AuthorizedPlan/AuthorizedOutcome, cache lookup/store own it through CacheContext, failover replaces it atomically, and local-file adapters reject descriptor/inode substitution. MultiViews candidate admission additionally requires a missing public target, same-directory basename match, regular typed representation, static handler, acceptable negotiation result and bounded scan. multiview_authorization_meet_spec requires the public URL, selected URL, resolved inode and selected-name rewrite result together; dispatch consumes that admission after exact URL/path/dev/inode binding. multiview_cache_binding_spec requires cache lookup/store to use the selected URL and resolved target, and the cache planner consumes the same selected scope/rewrite transition as dispatch. Original-URL and current-target scopes are both enforced and F23 covers rewrite-then-proxy/redirect. Redirect and error-response orchestration remain runtime projections outside the protected body/tunnel/cache sink state machine, so the broader all-positive-outcomes obligation remains partial."
     },
     {
       "id": "internal_request_projection",
@@ -659,6 +659,7 @@
     "Byte-oriented Basic authentication scheme and ASCII-separator admission",
     "Complete authentication-file cache snapshot reuse admission",
     "Monotonic request-owned authenticated-identity transition",
-    "Fail-closed unavailable group-provider result under positive and negated rules"
+    "Fail-closed unavailable group-provider result under positive and negated rules",
+    "Move-only authorized plan/outcome identity from public and selected URLs through exact local/backend/cache sink binding"
   ]
 }

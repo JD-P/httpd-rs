@@ -1745,6 +1745,51 @@ pub fn serve_file(
     r
 }
 
+/// Production static-file entry point.  The caller cannot supply a scope,
+/// grant, resource key, selected URL and resolved target independently: all
+/// of them come from the same sink-bound authorization artifact.
+pub fn serve_authorized_file(
+    cfg: &Config,
+    req: &Request,
+    file: File,
+    meta: &Metadata,
+    fs_path: &std::path::Path,
+    mime_name: &[u8],
+    peer: std::net::IpAddr,
+    local_ip: &str,
+    authorization: &crate::access::AuthorizedOutcome,
+) -> Response {
+    if !authorization.require_file_sink(vapache_verified::TransformSink::StaticFile, fs_path, meta)
+        || fd_path(&file).as_deref() != Some(fs_path)
+    {
+        return error_response(
+            cfg,
+            None,
+            authorization.scope(),
+            500,
+            req,
+            authorization.identity().public_url_path(),
+            0,
+            "",
+            peer,
+            local_ip,
+        );
+    }
+    serve_file(
+        cfg,
+        authorization.scope(),
+        req,
+        file,
+        meta,
+        fs_path,
+        mime_name,
+        peer,
+        local_ip,
+        authorization.grant(),
+        authorization.resource(),
+    )
+}
+
 enum DirAction {
     Redirect(Vec<u8>),
     Index(File, Metadata, Vec<u8>),
@@ -2133,6 +2178,58 @@ pub fn serve_directory(
         &cfg.resource_budget,
     );
     r
+}
+
+/// Production directory entry point paired with [`serve_authorized_file`].
+#[allow(clippy::too_many_arguments)]
+pub fn serve_authorized_directory(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
+    dir: File,
+    meta: &Metadata,
+    fs_path: &std::path::Path,
+    url_path: &str,
+    raw_path: &[u8],
+    host: &str,
+    port: u16,
+    peer: std::net::IpAddr,
+    local_ip: &str,
+    authorization: &crate::access::AuthorizedOutcome,
+) -> Response {
+    if !authorization.require_file_sink(vapache_verified::TransformSink::Directory, fs_path, meta)
+        || fd_path(&dir).as_deref() != Some(fs_path)
+    {
+        return error_response(
+            cfg,
+            vhost,
+            authorization.scope(),
+            500,
+            req,
+            authorization.identity().public_url_path(),
+            port,
+            host,
+            peer,
+            local_ip,
+        );
+    }
+    serve_directory(
+        cfg,
+        vhost,
+        authorization.scope(),
+        req,
+        dir,
+        meta,
+        fs_path,
+        url_path,
+        raw_path,
+        host,
+        port,
+        peer,
+        local_ip,
+        authorization.grant(),
+        authorization.resource(),
+    )
 }
 
 fn autoindex(

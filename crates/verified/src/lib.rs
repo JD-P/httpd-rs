@@ -1699,6 +1699,71 @@ pub enum TransformSink {
     Cache,
 }
 
+/// Runtime `AuthorizedPlan` construction must retain one coherent identity:
+/// a nonempty public URL, the exact selected URL named by the grant, a
+/// lexical/resolved filesystem pair (or neither for URL-only backends), and
+/// an exact grant for the selected resource.  Sink-specific inode, backend or
+/// cache-policy bindings are checked separately by `transform_sink_admit`.
+pub open spec fn authorized_plan_identity_spec(
+    public_url_present: bool,
+    selected_url_bound: bool,
+    filesystem_identity_well_formed: bool,
+    resolved_target_bound: bool,
+    exact_grant: bool,
+) -> bool {
+    public_url_present
+        && selected_url_bound
+        && filesystem_identity_well_formed
+        && resolved_target_bound
+        && exact_grant
+}
+
+pub fn authorized_plan_identity_admit(
+    public_url_present: bool,
+    selected_url_bound: bool,
+    filesystem_identity_well_formed: bool,
+    resolved_target_bound: bool,
+    exact_grant: bool,
+) -> (ok: bool)
+    ensures
+        ok == authorized_plan_identity_spec(
+            public_url_present,
+            selected_url_bound,
+            filesystem_identity_well_formed,
+            resolved_target_bound,
+            exact_grant,
+        ),
+{
+    public_url_present
+        && selected_url_bound
+        && filesystem_identity_well_formed
+        && resolved_target_bound
+        && exact_grant
+}
+
+pub proof fn admitted_authorized_plan_retains_every_identity(
+    public_url_present: bool,
+    selected_url_bound: bool,
+    filesystem_identity_well_formed: bool,
+    resolved_target_bound: bool,
+    exact_grant: bool,
+)
+    requires authorized_plan_identity_spec(
+        public_url_present,
+        selected_url_bound,
+        filesystem_identity_well_formed,
+        resolved_target_bound,
+        exact_grant,
+    ),
+    ensures
+        public_url_present,
+        selected_url_bound,
+        filesystem_identity_well_formed,
+        resolved_target_bound,
+        exact_grant,
+{
+}
+
 /// P15-A: a FastCGI request has two deliberately separate path identities.
 /// The canonical descriptor target is the authorization object, while the
 /// lexical split prefix is the Apache-compatible `SCRIPT_FILENAME` presented
