@@ -10,6 +10,7 @@ prevents re-deriving them from scratch.
 | Path | Contents |
 |---|---|
 | `adversarial-yield-recovery-handoff.md` | Agent handoff for reconstructing logical vulnerability searches and confirmed findings from the retained OpenCode logs, including commit provenance, the fixed vulnerability-family ontology and composition measures |
+| `vulnerability-families.md` | Reference definitions and classification boundaries for the nine vulnerability families used by adversarial findings and yield reports |
 | `yield-index/` | Recovered logical searches and findings, validation tooling, and the reproducible adversarial-yield calculation and report |
 | `configuration-semantic-refinement-review.md` | Configuration compiler campaign: closed schema/IR/consumer semantic domains, executable Verus refinement certificates, verified primitive normalizers, single-pass effectful payload compilation, and main/access schema-drift tests |
 | `dynamic-backend-identity-review.md` | Backend identity campaign: generation-pinned DNS shared by proxy/WebSocket/health/FastCGI/OCSP, exact connected-peer checks, and Linux `SO_PEERCRED` authentication for strict Unix FastCGI |

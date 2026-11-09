@@ -214,7 +214,9 @@ measuring false-positive rates and review quality.
 ## Classify vulnerability families
 
 Classify by the attacker-visible result, not the implementation surface or
-root cause. Use the following fixed ontology:
+root cause. The detailed classification reference is
+[`vulnerability-families.md`](vulnerability-families.md). Use the following
+fixed ontology:
 
 | ID | Vulnerability family | Includes |
 |---|---|---|
