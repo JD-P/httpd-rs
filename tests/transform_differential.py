@@ -778,6 +778,15 @@ def prepare_runtime(cases: list[Case]) -> Runtime:
     threading.Thread(target=backend.serve_forever, daemon=True).start()
     runtime = Runtime(base, docroot, aliasroot, backend)
     for case in cases:
+        # Materialize the directory named by the policy axis even for
+        # URL-space proxy and redirect cases that have no local files. Apache
+        # skips a <Directory> section whose path does not exist, which would
+        # otherwise turn a rewrite miss into a fixture-dependent 404/403
+        # difference instead of testing the configured policy phase.
+        selected_root = docroot if case.selected_area == "doc" else aliasroot
+        selected_dir = selected_root / case.selected_rel_dir
+        selected_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(selected_dir, 0o755)
         for key, data in case.files.items():
             path = runtime.resolve_file(key)
             path.parent.mkdir(parents=True, exist_ok=True)

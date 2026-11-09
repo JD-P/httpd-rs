@@ -7645,6 +7645,7 @@ fn dispatch_inner(
                 let authorization = target_authorization
                     .into_outcome(vapache_verified::TransformSink::LocalCgi)
                     .expect("CGI target retained its inode-bound authorization");
+                let (path_info, env_script_name) = direct_cgi_identity(req, &url_path);
                 if req.handler_probe() {
                     let descriptor_lease = match cfg.resource_budget.try_descriptor() {
                         Ok(lease) => lease,
@@ -7661,9 +7662,9 @@ fn dispatch_inner(
                         script_rel,
                         request_uri: request_uri.clone(),
                         url_path: url_path.clone(),
-                        path_info: String::new(),
+                        path_info,
                         script_name: url_path.clone(),
-                        env_script_name: cgi_script_name(req, &url_path),
+                        env_script_name,
                         script_file: file,
                         script_meta: meta,
                         _descriptor_lease: descriptor_lease,
@@ -7677,9 +7678,9 @@ fn dispatch_inner(
                     &script_rel,
                     &request_uri,
                     &url_path,
-                    "",
+                    &path_info,
                     &url_path,
-                    &cgi_script_name(req, &url_path),
+                    &env_script_name,
                     &server_name,
                     peer,
                     local_ip,
@@ -8802,6 +8803,19 @@ fn cgi_script_name(req: &Request, url_path: &str) -> String {
         url_path.to_string()
     } else {
         req.public_uri().unwrap_or(url_path).to_string()
+    }
+}
+
+/// Split the special empty PATH_INFO suffix on a directly selected CGI.
+/// Mapping intentionally removes a terminal slash before opening a file, but
+/// Apache exposes `/script.cgi/` as SCRIPT_NAME=/script.cgi and PATH_INFO=/.
+fn direct_cgi_identity(req: &Request, url_path: &str) -> (String, String) {
+    let mut script_name = cgi_script_name(req, url_path);
+    if url_path.len() > 1 && url_path.ends_with('/') && script_name.ends_with('/') {
+        script_name.pop();
+        ("/".to_string(), script_name)
+    } else {
+        (String::new(), script_name)
     }
 }
 
@@ -12367,7 +12381,7 @@ mod tests {
         std::fs::write(dir.join("www/bad/.htaccess"), "Header \"unterminated\n").unwrap();
         std::fs::write(
             dir.join("www/script.cgi"),
-            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nok\\n'\n",
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\n%s|%s\\n' \"$SCRIPT_NAME\" \"$PATH_INFO\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -12430,6 +12444,9 @@ mod tests {
         assert_eq!(cov_dispatch(&cfg, "GET", "/badcanon").status, 400);
         assert_eq!(cov_dispatch(&cfg, "GET", "/tofs").status, 500);
         assert_eq!(cov_dispatch(&cfg, "GET", "/script.cgi/info").status, 200);
+        let trailing = cov_dispatch(&cfg, "GET", "/script.cgi/");
+        assert_eq!(trailing.status, 200);
+        assert!(matches!(trailing.body, Body::Bytes(ref body) if body == b"/script.cgi|/\n"));
         assert_eq!(cov_dispatch(&cfg, "GET", "/link.cgi/info").status, 500);
         // A hidden, dot-only final path component is not an extension and
         // cannot classify the preceding script for CGI execution.

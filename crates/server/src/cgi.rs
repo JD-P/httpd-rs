@@ -151,7 +151,11 @@ fn find_script_checked_inner(
                 file,
                 meta,
                 path_info: if info.is_empty() {
-                    String::new()
+                    if trailing_slash {
+                        "/".to_string()
+                    } else {
+                        String::new()
+                    }
                 } else if trailing_slash {
                     format!("/{info}/")
                 } else {
@@ -2549,6 +2553,13 @@ mod tests {
         let found = find_script(&dir, Path::new("hello.sh"), false).unwrap();
         assert_eq!(found.rel_script, Path::new("hello.sh"));
         assert!(found.path_info.is_empty());
+
+        let trailing = request("/hello.sh/", Vec::new());
+        let found =
+            find_script_checked_for_request(&dir, Path::new("hello.sh"), false, false, &trailing)
+                .unwrap();
+        assert_eq!(found.rel_script, Path::new("hello.sh"));
+        assert_eq!(found.path_info, "/");
 
         let bytes = BodySource::Bytes(b"abc".to_vec());
         assert_eq!(bytes.len(), 3);
