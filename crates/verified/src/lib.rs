@@ -2746,6 +2746,109 @@ pub proof fn admitted_multiview_candidate_is_static_and_bounded(
 {
 }
 
+/// A negotiated representation is authorized only by the meet of every
+/// identity that selected or names it.  The public extensionless URL remains
+/// a policy floor; the selected URL and resolved inode may only add
+/// restrictions, and selected-name rewrite fixups must complete before a sink
+/// (including the shared cache) is admitted.
+pub open spec fn multiview_authorization_meet_spec(
+    public_url_authorized: bool,
+    selected_url_authorized: bool,
+    selected_inode_authorized: bool,
+    selected_rewrite_admitted: bool,
+) -> bool {
+    public_url_authorized
+        && selected_url_authorized
+        && selected_inode_authorized
+        && selected_rewrite_admitted
+}
+
+pub fn multiview_authorization_meet_admit(
+    public_url_authorized: bool,
+    selected_url_authorized: bool,
+    selected_inode_authorized: bool,
+    selected_rewrite_admitted: bool,
+) -> (ok: bool)
+    ensures
+        ok == multiview_authorization_meet_spec(
+            public_url_authorized,
+            selected_url_authorized,
+            selected_inode_authorized,
+            selected_rewrite_admitted,
+        ),
+{
+    public_url_authorized
+        && selected_url_authorized
+        && selected_inode_authorized
+        && selected_rewrite_admitted
+}
+
+pub proof fn admitted_multiview_authorization_retains_every_identity(
+    public_url_authorized: bool,
+    selected_url_authorized: bool,
+    selected_inode_authorized: bool,
+    selected_rewrite_admitted: bool,
+)
+    requires multiview_authorization_meet_spec(
+        public_url_authorized,
+        selected_url_authorized,
+        selected_inode_authorized,
+        selected_rewrite_admitted,
+    ),
+    ensures
+        public_url_authorized,
+        selected_url_authorized,
+        selected_inode_authorized,
+        selected_rewrite_admitted,
+{
+}
+
+/// Cache lookup/store for a negotiated response must use the selected URL and
+/// resolved target.  Retaining the missing public spelling for either field
+/// would let a cache hit skip the authorization meet above.
+pub open spec fn multiview_cache_binding_spec(
+    representation_selected: bool,
+    authorization_meet: bool,
+    selected_url_bound: bool,
+    selected_target_bound: bool,
+) -> bool {
+    !representation_selected
+        || (authorization_meet && selected_url_bound && selected_target_bound)
+}
+
+pub fn multiview_cache_binding_admit(
+    representation_selected: bool,
+    authorization_meet: bool,
+    selected_url_bound: bool,
+    selected_target_bound: bool,
+) -> (ok: bool)
+    ensures
+        ok == multiview_cache_binding_spec(
+            representation_selected,
+            authorization_meet,
+            selected_url_bound,
+            selected_target_bound,
+        ),
+{
+    !representation_selected
+        || (authorization_meet && selected_url_bound && selected_target_bound)
+}
+
+pub proof fn selected_multiview_cache_requires_authorized_target_binding(
+    authorization_meet: bool,
+    selected_url_bound: bool,
+    selected_target_bound: bool,
+)
+    requires multiview_cache_binding_spec(
+        true,
+        authorization_meet,
+        selected_url_bound,
+        selected_target_bound,
+    ),
+    ensures authorization_meet, selected_url_bound, selected_target_bound,
+{
+}
+
 /// Admission for the breadth of the access-file program participating in one
 /// request.  `next_instructions` is checked by subtraction so the concrete
 /// accumulator cannot overflow while walking ancestor layers.

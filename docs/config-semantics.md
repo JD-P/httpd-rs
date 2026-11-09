@@ -1839,7 +1839,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **725 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **737 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1863,6 +1863,11 @@ construction: there is no second production interleaver.
   wire method/target/version and client identity. Concrete header mutation
   remains covered by runtime refinement tests. `directory_index_name_admit`
   additionally binds the literal filename probe to the internal URL component.
+- `multiview_candidate_spec`, `multiview_authorization_meet_spec` and
+  `multiview_cache_binding_spec`, consumed by negotiation, final inode binding
+  and cache planning. A selected representation retains the public URL policy,
+  authorizes its selected URL and resolved inode, completes selected-name
+  rewrite fixups, and cannot enter cache under the missing public identity.
 - `ipv4_mapped_to_v4`, consumed by `access::canonical_ip` at the connection
   and RemoteIP boundaries; `vhost_address_admit` and
   `vhost_address_precedence`, consumed by `Config::select_vhost` and the TLS

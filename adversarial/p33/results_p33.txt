@@ -1,16 +1,16 @@
 ## A exact Location + trailing slash
    /secret        apache=403 vapache=403 leaked=False
-   /secret/       apache=404 vapache=200 leaked=True
+   /secret/       apache=404 vapache=404 leaked=False
 
 ## B extension Location guard
-   /secret        apache=404 vapache=200 leaked=True
+   /secret        apache=404 vapache=403 leaked=False
 
 ## C .htaccess rewrite extension guard
-   /secret        apache=404 vapache=200 leaked=True
+   /secret        apache=404 vapache=403 leaked=False
 
 ## D stock-Debian alias shape
    /js/secret     apache=403 vapache=403 leaked=False
-   /js/secret/    apache=404 vapache=200 leaked=True
+   /js/secret/    apache=404 vapache=404 leaked=False
 
 ## E control: MultiViews off
    /secret        apache=403 vapache=403 leaked=False
@@ -19,4 +19,4 @@
 ## F control: Files deny is candidate-bound
    /secret        apache=404 vapache=403 leaked=False
 
-PASS-33 HARNESS COMPLETE: expected divergences above are the P33-A reproducer
+PASS-33 REMEDIATION COMPLETE: all P33-A disclosures stayed closed

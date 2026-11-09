@@ -481,8 +481,8 @@ pub enum Target {
 }
 
 /// A descriptor-bound representation selected by Apache-style MultiViews.
-/// The URL remains the extensionless public request; `name` is used for
-/// Files/MIME policy and Content-Location only.
+/// The public URL remains extensionless for request metadata, while `name`
+/// supplies the selected URL, Files/MIME policy and Content-Location identity.
 pub struct MultiView {
     pub name: Vec<u8>,
     pub file: File,

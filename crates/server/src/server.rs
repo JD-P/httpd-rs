@@ -4850,51 +4850,29 @@ fn bind_target_grant(
     }
 }
 
-/// Bind an implicitly negotiated static representation to both the public
-/// extensionless URL policy and the selected filename/inode policy. Unlike an
-/// internal redirect, MultiViews does not change the public URL identity.
 #[allow(clippy::too_many_arguments)]
-fn bind_multiview_grant(
+pub(crate) fn multiview_target_scope(
     cfg: &Config,
     vhost: Option<&VHost>,
     base_scope: &Scope,
     candidate_fs: &Path,
     actual_path: &Path,
     mapping_root: &Path,
-    meta: &std::fs::Metadata,
-    url_path: &str,
+    selected_url_path: &str,
     req: &Request,
     peer: IpAddr,
-    local_port: u16,
-    server_name: &str,
-    local_ip: &str,
     rewrite_effects: &crate::rewrite::Effects,
-) -> Result<(access::AccessGrant, access::ResourceKey, Scope), Response> {
+) -> Result<Scope, String> {
     let lexical = evaluate_scope_identities_for_path(
         cfg,
         vhost,
         candidate_fs,
         None,
-        url_path,
+        selected_url_path,
         req,
         peer,
         mapping_root,
-    )
-    .map_err(|error| {
-        eprintln!("vapached: negotiated target scope error: {error}");
-        error_response(
-            cfg,
-            vhost,
-            base_scope,
-            500,
-            req,
-            url_path,
-            local_port,
-            server_name,
-            peer,
-            local_ip,
-        )
-    })?;
+    )?;
     let mut lexical_scope = lexical.scope;
     apply_rewrite_effects(&mut lexical_scope, rewrite_effects);
     apply_scope_conditionals(
@@ -4904,7 +4882,7 @@ fn bind_multiview_grant(
         &lexical.config_conditionals,
         &lexical.htaccess_conditionals,
         candidate_fs,
-        url_path,
+        selected_url_path,
         req,
         peer,
     );
@@ -4917,26 +4895,11 @@ fn bind_multiview_grant(
             vhost,
             actual_path,
             Some(candidate_fs),
-            url_path,
+            selected_url_path,
             req,
             peer,
             mapping_root,
-        )
-        .map_err(|error| {
-            eprintln!("vapached: negotiated resolved-target scope error: {error}");
-            error_response(
-                cfg,
-                vhost,
-                base_scope,
-                500,
-                req,
-                url_path,
-                local_port,
-                server_name,
-                peer,
-                local_ip,
-            )
-        })?;
+        )?;
         let mut resolved = evaluated.scope;
         apply_rewrite_effects(&mut resolved, rewrite_effects);
         apply_scope_conditionals(
@@ -4946,7 +4909,7 @@ fn bind_multiview_grant(
             &evaluated.config_conditionals,
             &evaluated.htaccess_conditionals,
             actual_path,
-            url_path,
+            selected_url_path,
             req,
             peer,
         );
@@ -4963,7 +4926,7 @@ fn bind_multiview_grant(
                 &handler_scope.config_conditionals,
                 &handler_scope.access_conditionals,
                 actual_path,
-                url_path,
+                selected_url_path,
                 req,
                 peer,
                 &lexical_name,
@@ -4976,13 +4939,236 @@ fn bind_multiview_grant(
     // The missing public spelling was already authorized before negotiation.
     // A variant may only add restrictions; it cannot replace that policy.
     target_scope.restrict_with(base_scope);
-    let mut key = access::ResourceKey::request(vhost, req, url_path, Some(actual_path), None);
+    Ok(target_scope)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn multiview_rewrite_outcome(
+    cfg: &Config,
+    scope: &Scope,
+    candidate_fs: &Path,
+    mapping_root: &Path,
+    selected_url_path: &str,
+    req: &Request,
+    peer: IpAddr,
+    local_port: u16,
+    https: bool,
+    server_name: &str,
+) -> crate::rewrite::Outcome {
+    let mut selected_rewrite_scope = scope.clone();
+    selected_rewrite_scope
+        .rewrite_policy
+        .rewrite_rules
+        .retain(|rule| vapache_verified::filesystem_rewrite_rule_admit(rule.filesystem_context));
+    let selected_rewrite_ctx = crate::rewrite::Context {
+        url_path: selected_url_path,
+        fs_path: candidate_fs,
+        docroot: mapping_root,
+        server_root: &cfg.server_root,
+        query: &req.query,
+        peer,
+        port: local_port,
+        https,
+        server_name,
+    };
+    crate::rewrite::process(&selected_rewrite_scope, req, &selected_rewrite_ctx)
+}
+
+/// Bind an implicitly negotiated static representation to the public
+/// extensionless URL policy, the selected URL representation and the selected
+/// filename/inode policy.  Apache keeps the public request target for request
+/// metadata, but URL authorization and per-directory rewrite fixups see the
+/// negotiated representation (P33-A).
+#[allow(clippy::too_many_arguments)]
+fn bind_multiview_grant(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    base_scope: &Scope,
+    public_grant: &access::AccessGrant,
+    candidate_fs: &Path,
+    actual_path: &Path,
+    mapping_root: &Path,
+    meta: &std::fs::Metadata,
+    public_url_path: &str,
+    selected_url_path: &str,
+    req: &Request,
+    peer: IpAddr,
+    local_port: u16,
+    https: bool,
+    server_name: &str,
+    local_ip: &str,
+    rewrite_effects: &crate::rewrite::Effects,
+) -> Result<(access::AccessGrant, access::ResourceKey, Scope), Response> {
+    let mut target_scope = multiview_target_scope(
+        cfg,
+        vhost,
+        base_scope,
+        candidate_fs,
+        actual_path,
+        mapping_root,
+        selected_url_path,
+        req,
+        peer,
+        rewrite_effects,
+    )
+    .map_err(|error| {
+        eprintln!("vapached: negotiated target scope error: {error}");
+        error_response(
+            cfg,
+            vhost,
+            base_scope,
+            500,
+            req,
+            public_url_path,
+            local_port,
+            server_name,
+            peer,
+            local_ip,
+        )
+    })?;
+
+    // URL translation has already run for the public spelling.  MultiViews
+    // inserts the selected filename between translation and filesystem
+    // fixups, so replay only Directory/access-file rewrite rules with the
+    // selected URL and filesystem subjects.  A terminal redirect is safe to
+    // honor; every sink-changing rewrite remains fail-closed because a
+    // negotiated representation must stay a static-file choice.
+    match multiview_rewrite_outcome(
+        cfg,
+        &target_scope,
+        candidate_fs,
+        mapping_root,
+        selected_url_path,
+        req,
+        peer,
+        local_port,
+        https,
+        server_name,
+    ) {
+        crate::rewrite::Outcome::None => {}
+        crate::rewrite::Outcome::Forbidden => {
+            return Err(error_response(
+                cfg,
+                vhost,
+                &target_scope,
+                403,
+                req,
+                public_url_path,
+                local_port,
+                server_name,
+                peer,
+                local_ip,
+            ));
+        }
+        crate::rewrite::Outcome::Gone => {
+            return Err(error_response(
+                cfg,
+                vhost,
+                &target_scope,
+                410,
+                req,
+                public_url_path,
+                local_port,
+                server_name,
+                peer,
+                local_ip,
+            ));
+        }
+        crate::rewrite::Outcome::Error(error) => {
+            eprintln!("vapached: negotiated representation rewrite error: {error}");
+            return Err(error_response(
+                cfg,
+                vhost,
+                &target_scope,
+                500,
+                req,
+                public_url_path,
+                local_port,
+                server_name,
+                peer,
+                local_ip,
+            ));
+        }
+        crate::rewrite::Outcome::Redirect {
+            status,
+            location,
+            effects,
+        } => {
+            let mut redirect_scope = target_scope;
+            apply_rewrite_effects(&mut redirect_scope, &effects);
+            // A positive rewrite redirect is a terminal result, so the
+            // ordinary post-rewrite authorization below will not run.  Bind
+            // the conjoined public/selected policy before returning it.
+            if status < 400 {
+                let mut redirect_key = access::ResourceKey::request(
+                    vhost,
+                    req,
+                    selected_url_path,
+                    Some(actual_path),
+                    None,
+                );
+                if let Err(response) = helper_access_response(
+                    cfg,
+                    vhost,
+                    &redirect_scope,
+                    req,
+                    selected_url_path,
+                    actual_path,
+                    local_port,
+                    server_name,
+                    peer,
+                    local_ip,
+                    &mut redirect_key,
+                ) {
+                    return Err(response);
+                }
+            }
+            return Err(url_redirect_response(
+                cfg,
+                vhost,
+                &redirect_scope,
+                req,
+                status,
+                &location,
+                public_url_path,
+                server_name,
+                local_port,
+                https,
+            ));
+        }
+        crate::rewrite::Outcome::Internal {
+            path,
+            query,
+            effects,
+            filesystem,
+            ..
+        } if path == selected_url_path && query == req.query && filesystem.is_none() => {
+            apply_rewrite_effects(&mut target_scope, &effects);
+        }
+        crate::rewrite::Outcome::Internal { .. } | crate::rewrite::Outcome::Proxy { .. } => {
+            return Err(error_response(
+                cfg,
+                vhost,
+                &target_scope,
+                404,
+                req,
+                public_url_path,
+                local_port,
+                server_name,
+                peer,
+                local_ip,
+            ));
+        }
+    }
+
+    let mut key =
+        access::ResourceKey::request(vhost, req, selected_url_path, Some(actual_path), None);
     let grant = helper_access_response(
         cfg,
         vhost,
         &target_scope,
         req,
-        url_path,
+        selected_url_path,
         actual_path,
         local_port,
         server_name,
@@ -5000,7 +5186,7 @@ fn bind_multiview_grant(
             &target_scope,
             500,
             req,
-            url_path,
+            public_url_path,
             local_port,
             server_name,
             peer,
@@ -5009,7 +5195,39 @@ fn bind_multiview_grant(
     };
     // coverage:ignore-stop
     let key = bound.key().clone();
+    if !vapache_verified::multiview_authorization_meet_admit(
+        public_grant.key().url_path == public_url_path,
+        key.url_path == selected_url_path,
+        key.fs_path.as_deref() == Some(actual_path)
+            && key.file_dev == Some(meta.dev())
+            && key.file_ino == Some(meta.ino()),
+        true,
+    ) {
+        return Err(error_response(
+            cfg,
+            vhost,
+            &target_scope,
+            500,
+            req,
+            public_url_path,
+            local_port,
+            server_name,
+            peer,
+            local_ip,
+        ));
+    }
     Ok((bound, key, target_scope))
+}
+
+pub(crate) fn multiview_selected_url(public_url_path: &str, selected_name: &[u8]) -> String {
+    let parent_end = public_url_path
+        .rfind('/')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let mut selected = String::with_capacity(public_url_path.len() + selected_name.len() + 8);
+    selected.push_str(&public_url_path[..parent_end]);
+    selected.push_str(&crate::util::url_encode_path(selected_name));
+    selected
 }
 
 /// Re-evaluate policy for a target selected by a transform (PATH_INFO split,
@@ -7678,7 +7896,15 @@ fn dispatch_inner(
             if req.method == "OPTIONS" {
                 return options_response(cfg, &scope, None);
             }
-            if !script_alias && matches!(req.method.as_str(), "GET" | "HEAD") {
+            // A trailing slash asserts a directory-like target.  Keep it out
+            // of MultiViews before the sibling scan; otherwise `/name/` can
+            // negotiate the regular file `name.ext` and bypass the P25-A
+            // file-branch check.  It must still fall through to CGI PATH_INFO,
+            // where a real script is allowed to consume that slash.
+            if !script_alias
+                && matches!(req.method.as_str(), "GET" | "HEAD")
+                && !(url_path.len() > 1 && url_path.ends_with('/'))
+            {
                 match multiviews_target(
                     cfg,
                     &scope,
@@ -7689,6 +7915,7 @@ fn dispatch_inner(
                     owner_match_only,
                 ) {
                     MultiViewsResult::Selected(view) => {
+                        let selected_url_path = multiview_selected_url(&url_path, &view.name);
                         let candidate_fs = fs_path
                             .parent()
                             .unwrap_or(root.as_path())
@@ -7716,14 +7943,17 @@ fn dispatch_inner(
                                 cfg,
                                 vhost,
                                 &scope,
+                                &grant,
                                 &candidate_fs,
                                 actual_path.as_ref(),
                                 &root,
                                 &view.meta,
                                 &url_path,
+                                &selected_url_path,
                                 req,
                                 peer.ip(),
                                 local_port,
+                                https,
                                 &server_name,
                                 local_ip,
                                 &rewrite_effects,
@@ -10141,6 +10371,108 @@ mod tests {
     }
 
     #[test]
+    fn multiviews_rejects_slashes_and_replays_selected_url_policy() {
+        let dir = cov_dir("p33-multiview-url-policy");
+        for child in [
+            "plain",
+            "location",
+            "rewrite",
+            "redirect",
+            "redirect-denied",
+        ] {
+            std::fs::create_dir_all(dir.join("www").join(child)).unwrap();
+            std::fs::write(
+                dir.join("www").join(child).join("secret.txt"),
+                format!("{child} secret\n"),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(dir.join("jsroot")).unwrap();
+        std::fs::write(dir.join("jsroot/secret.txt"), "alias secret\n").unwrap();
+        std::fs::write(
+            dir.join("www/rewrite/.htaccess"),
+            "RewriteEngine On\nRewriteRule \\.txt$ - [F]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("www/redirect/.htaccess"),
+            "RewriteEngine On\nRewriteRule \\.txt$ /replacement [R=302]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("www/redirect-denied/.htaccess"),
+            "RewriteEngine On\nRewriteRule \\.txt$ /replacement [R=302]\n",
+        )
+        .unwrap();
+
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "AddType text/plain .txt\n\
+                 <Directory \"{}/www\">\n\
+                 Options FollowSymLinks MultiViews\n\
+                 AllowOverride None\n\
+                 Require all granted\n\
+                 </Directory>\n\
+                 <Directory \"{}/www/rewrite\">\nAllowOverride FileInfo\n</Directory>\n\
+                 <Directory \"{}/www/redirect\">\nAllowOverride FileInfo\n</Directory>\n\
+                 <Directory \"{}/www/redirect-denied\">\nAllowOverride FileInfo\n</Directory>\n\
+                 <LocationMatch \"^/location/secret\\.txt$\">\n\
+                 Require all denied\n\
+                 </LocationMatch>\n\
+                 <LocationMatch \"^/redirect-denied/secret\\.txt$\">\n\
+                 Require all denied\n\
+                 </LocationMatch>\n\
+                 Alias /js \"{}/jsroot\"\n\
+                 <Directory \"{}/jsroot\">\n\
+                 Options FollowSymLinks MultiViews\n\
+                 Require all granted\n\
+                 </Directory>\n\
+                 <LocationMatch \"^/js/secret$\">\n\
+                 Require all denied\n\
+                 </LocationMatch>\n",
+                dir.display(),
+                dir.display(),
+                dir.display(),
+                dir.display(),
+                dir.display(),
+                dir.display(),
+            ),
+        );
+
+        for (path, expected) in [
+            ("/plain/secret", 200),
+            ("/plain/secret/", 404),
+            ("/location/secret", 403),
+            ("/rewrite/secret", 403),
+            ("/redirect/secret", 302),
+            ("/redirect-denied/secret", 403),
+            ("/js/secret", 403),
+            ("/js/secret/", 404),
+        ] {
+            let (response, result) = cov_run_conn(
+                &cfg,
+                &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+                80,
+            );
+            result.unwrap();
+            assert_eq!(cov_status(&response), expected, "{path}: {response}");
+            if expected != 200 {
+                assert!(!response.contains(" secret\n"), "{path}: {response}");
+            }
+        }
+        assert_eq!(
+            multiview_selected_url("/nested/name", b"name.en.txt"),
+            "/nested/name.en.txt"
+        );
+        assert_eq!(
+            multiview_selected_url("/name", b"name with space.txt"),
+            "/name%20with%20space.txt"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn keep_alive_request_bodies_reenter_the_slow_body_admission_gate() {
         let _test_guard = ADMISSION_TEST_LOCK.lock().unwrap();
         let dir = cov_dir("keepalive-body-admission");
@@ -10849,14 +11181,17 @@ mod tests {
             &cfg,
             None,
             &scope,
+            &grant,
             &target,
             &target,
             &map_root,
             &target_meta,
             "/bad/file",
+            "/bad/file.txt",
             &req,
             peer,
             80,
+            false,
             "localhost",
             "127.0.0.1",
             &effects,

@@ -760,6 +760,8 @@ pub fn request_scope_with_plan(
     let mut directory_target = false;
     let mut index_selected = false;
     let mut opened_actual = None;
+    let mut multiview_binding: Option<(String, PathBuf)> = None;
+    let mut selected_name: Option<Vec<u8>> = None;
     match crate::files::resolve_target_checked(&root, current_rel, follow, owner_match_only) {
         crate::files::Target::File { file, .. } => {
             opened_actual = Some(crate::files::fd_path(&file)?);
@@ -809,7 +811,80 @@ pub fn request_scope_with_plan(
             }
         }
         crate::files::Target::Forbidden => return None,
-        crate::files::Target::NotFound => {}
+        crate::files::Target::NotFound => {
+            // MultiViews selects a representation after ordinary URL mapping.
+            // Resolve it before cache authorization so lookup/store use the
+            // selected URL, selected Files/Location/access-file policy and
+            // resolved filesystem target rather than the missing public name.
+            if !script_alias
+                && matches!(req.method.as_str(), "GET" | "HEAD")
+                && !(url_path.len() > 1 && url_path.ends_with('/'))
+            {
+                match crate::files::multiviews_target(
+                    cfg,
+                    &scope,
+                    req,
+                    &root,
+                    &rel,
+                    follow_symlinks,
+                    owner_match_only,
+                ) {
+                    crate::files::MultiViewsResult::Selected(view) => {
+                        let selected_url =
+                            crate::server::multiview_selected_url(&url_path, &view.name);
+                        let candidate_fs = fs_path
+                            .parent()
+                            .unwrap_or(root.as_path())
+                            .join(std::ffi::OsStr::from_bytes(&view.name));
+                        let actual_path = crate::files::fd_path_cow(&view.file, &candidate_fs)?;
+                        let selected_scope = crate::server::multiview_target_scope(
+                            cfg,
+                            vhost,
+                            &scope,
+                            &candidate_fs,
+                            actual_path.as_ref(),
+                            &root,
+                            &selected_url,
+                            req,
+                            peer.ip(),
+                            &crate::rewrite::Effects::default(),
+                        )
+                        .ok()?;
+                        // A selected-name rewrite has its own terminal result
+                        // or effects. Let normal dispatch execute it instead
+                        // of reusing a representation cached before that
+                        // transition.
+                        if !matches!(
+                            crate::server::multiview_rewrite_outcome(
+                                cfg,
+                                &selected_scope,
+                                &candidate_fs,
+                                &root,
+                                &selected_url,
+                                req,
+                                peer.ip(),
+                                local_port,
+                                https,
+                                server_name,
+                            ),
+                            crate::rewrite::Outcome::None
+                        ) {
+                            return None;
+                        }
+                        multiview_binding =
+                            Some((selected_url.clone(), actual_path.as_ref().to_path_buf()));
+                        selected_name = Some(view.name);
+                        scope = selected_scope;
+                        fs_path = actual_path.into_owned();
+                        cache_url_path = selected_url;
+                    }
+                    crate::files::MultiViewsResult::NotFound => {}
+                    crate::files::MultiViewsResult::NotAcceptable
+                    | crate::files::MultiViewsResult::MultipleChoices
+                    | crate::files::MultiViewsResult::Overloaded => return None,
+                }
+            }
+        }
     }
     // The opened/canonical target may differ from the URL-mapped path when a
     // document root, alias target or in-root component is a symlink.  The
@@ -866,10 +941,12 @@ pub fn request_scope_with_plan(
     // identity. CGI/FastCGI/custom handlers can observe connection metadata;
     // a static response cannot, so binding its key to the ephemeral peer port
     // would turn every new connection into a cache miss.
-    let name = fs_path
-        .file_name()
-        .map(|n| n.as_encoded_bytes())
-        .unwrap_or(b"");
+    let name = selected_name.as_deref().unwrap_or_else(|| {
+        fs_path
+            .file_name()
+            .map(|n| n.as_encoded_bytes())
+            .unwrap_or(b"")
+    });
     let handler = crate::config::effective_handler(&scope, name)
         .map(str::trim)
         .filter(|h| {
@@ -925,6 +1002,22 @@ pub fn request_scope_with_plan(
         Ok(grant) => grant,
         Err(_) => return None,
     };
+    if let Some((selected_url, selected_target)) = &multiview_binding {
+        let authorization_meet = vapache_verified::multiview_authorization_meet_admit(
+            true,
+            grant.key().url_path == *selected_url,
+            true,
+            true,
+        );
+        if !vapache_verified::multiview_cache_binding_admit(
+            true,
+            authorization_meet,
+            cache_url_path == *selected_url,
+            fs_path == *selected_target,
+        ) {
+            return None; // coverage:ignore-line - exact bindings assigned above
+        }
+    }
     // AllowMethods and <Proxy> authorization are enforced by the normal
     // dispatcher; do not satisfy the request from cache first.
     if !scope.method_allowed(&req.method) {
@@ -4054,6 +4147,131 @@ DirectoryIndex index.html\n\
             &request,
             "127.0.0.1:12345".parse().unwrap(),
             "/dir/",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multiviews_binds_cache_to_selected_url_target_and_live_policy() {
+        let dir =
+            std::env::temp_dir().join(format!("vapache-cache-multiviews-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let www = dir.join("www");
+        fs::create_dir_all(&www).unwrap();
+        fs::write(www.join("secret.txt"), "selected\n").unwrap();
+        fs::write(www.join(".htaccess"), "# no deny\n").unwrap();
+        let conf = dir.join("httpd.conf");
+        fs::write(
+            &conf,
+            format!(
+                "{}Listen 127.0.0.1:0\n\
+DocumentRoot \"{www}\"\n\
+CacheRoot \"{cache}\"\n\
+CacheEnable disk /\n\
+CacheIgnoreQueryString On\n\
+AddType text/plain .txt\n\
+<Directory \"{www}\">\n\
+    Options FollowSymLinks MultiViews\n\
+    AllowOverride All\n\
+    Require all granted\n\
+</Directory>\n",
+                crate::config::TEST_CAPABILITIES,
+                www = www.display(),
+                cache = dir.join("cache").display(),
+            ),
+        )
+        .unwrap();
+        let cfg = crate::config::Config::load(
+            &conf,
+            &dir,
+            &Default::default(),
+            &Default::default(),
+            false,
+        )
+        .unwrap();
+        let request = crate::http::Request {
+            method: "GET".into(),
+            target: b"/secret?allowed=1".to_vec(),
+            raw_path: b"/secret".to_vec(),
+            query: b"allowed=1".to_vec(),
+            version: crate::http::Version::Http11,
+            headers: crate::http::Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        };
+        let context = request_scope(
+            &cfg,
+            None,
+            &request,
+            "127.0.0.1:12345".parse().unwrap(),
+            "/secret",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .expect("selected representation cache scope");
+        assert_eq!(context.path, "/secret.txt");
+        assert_eq!(context.target, www.join("secret.txt"));
+
+        fs::write(
+            www.join(".htaccess"),
+            "<Files \"secret.txt\">\n    Require all denied\n</Files>\n",
+        )
+        .unwrap();
+        assert!(request_scope(
+            &cfg,
+            None,
+            &request,
+            "127.0.0.1:12345".parse().unwrap(),
+            "/secret",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .is_none());
+
+        fs::write(
+            www.join(".htaccess"),
+            "RewriteEngine On\n\
+RewriteCond %{QUERY_STRING} blocked=1\n\
+RewriteRule \\.txt$ - [F]\n",
+        )
+        .unwrap();
+        assert!(request_scope(
+            &cfg,
+            None,
+            &request,
+            "127.0.0.1:12345".parse().unwrap(),
+            "/secret",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .is_some());
+        let mut blocked = request;
+        blocked.target = b"/secret?blocked=1".to_vec();
+        blocked.query = b"blocked=1".to_vec();
+        assert!(request_scope(
+            &cfg,
+            None,
+            &blocked,
+            "127.0.0.1:12345".parse().unwrap(),
+            "/secret",
             80,
             false,
             "localhost",

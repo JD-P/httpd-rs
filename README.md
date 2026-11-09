@@ -418,7 +418,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **725 verified functions, 0 errors** (percent-decoding,
+Current result: **737 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
@@ -440,8 +440,9 @@ authorization-merge, Options-merge and `.htaccess` rule-classification kernels
 used by the dispatcher, plus route-prefix matching, handler-extension/removal
 selection and authorization-configuration admission, the pass-6 ancestor
 access-walk, URL-selected
-alias mapping-root and `DirectoryIndex` cache-target/query-isolation
-predicates, and the pass-10 I61 Options/handler/`AllowOverride` meet and
+alias mapping-root, `DirectoryIndex` cache-target/query-isolation predicates,
+and the MultiViews public/selected-URL/resolved-inode authorization meet plus
+selected cache binding, and the pass-10 I61 Options/handler/`AllowOverride` meet and
 rewrite-scope-retention kernels, plus pass-12 admission proofs for exact
 `Require method`/`Require env` operands, HTTP/2 pseudo-header identity, CGI
 status/header framing, first-existing `AccessFileName`, `FileETag None`,

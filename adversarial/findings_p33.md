@@ -15,15 +15,18 @@
   Apache-versus-vapached differential across exact-`Location`,
   extension-`Location`, `.htaccess` rewrite, stock-Debian alias and control
   shapes.
-- **Disposition:** confirmed, live, reproducible; not yet remediated.
+- **Disposition:** confirmed and remediated on 2026-11-09. The selected
+  representation now has its own URL-policy identity, filesystem rewrite
+  fixup pass, inode-bound grant and shared-cache identity; trailing-slash
+  spellings are rejected before negotiation.
 
 ---
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
-|---|---------|---------------|--------------|-------|
-| **P33-A** | `Options MultiViews` content negotiation runs in the `Target::NotFound` branch and maps a missing/extensionless URL to a sibling `name.ext` representation. Two independent identities stay behind: (1) the trailing-slash static-file rejection lives only in the `Target::File` branch, so `/secret/` negotiates and serves `secret.txt`; (2) URL-scoped authorization ( `<Location>`/`<LocationMatch>` and per-directory `RewriteRule` subjects) is still evaluated against the pre-negotiation URL `/secret`, while Apache evaluates it against the negotiated representation `/secret.txt`. | `/secret` under `RewriteRule \.txt$ - [F]` or `<LocationMatch "\.txt$"> Require all denied` → `404`; `/secret/` under `<LocationMatch "^/secret$">` → `404`; stock alias `/js/secret/` → `404`. | `/secret` → `200` with the protected body; `/secret/` → `200` with the protected body; `/js/secret/` → `200` with the protected body. | protected static-file read; authority bypass |
+| # | Finding | Apache 2.4.69 | vapache before fix | Remediated vapache | Class |
+|---|---------|---------------|--------------------|-------------------|-------|
+| **P33-A** | `Options MultiViews` content negotiation runs in the `Target::NotFound` branch and maps a missing/extensionless URL to a sibling `name.ext` representation. Two independent identities stayed behind: (1) the trailing-slash static-file rejection lived only in the `Target::File` branch, so `/secret/` negotiated and served `secret.txt`; (2) URL-scoped authorization (`<Location>`/`<LocationMatch>` and per-directory `RewriteRule` subjects) was still evaluated against the pre-negotiation URL `/secret`, while Apache evaluates it against the negotiated representation `/secret.txt`. | `/secret` under `RewriteRule \.txt$ - [F]` or `<LocationMatch "\.txt$"> Require all denied` → `404`; `/secret/` under `<LocationMatch "^/secret$">` → `404`; stock alias `/js/secret/` → `404`. | `/secret` → `200` with the protected body; `/secret/` → `200` with the protected body; `/js/secret/` → `200` with the protected body. | Selected-name guards deny (`403`); trailing-slash and stock-alias spellings return `404`; no protected body is served. | protected static-file read; authority bypass |
 
 The controls agree on both servers: the same guard with `MultiViews` off
 returns `403`/`404`, and a candidate-bound `<Files "secret.txt"> Require all
@@ -101,10 +104,10 @@ precisely to keep the representation from being downloaded is skipped.
 
 ---
 
-## 3. Live evidence
+## 3. Original live evidence
 
-`python3 adversarial/p33/exploit_p33.py` (retained output
-`adversarial/p33/results_p33.txt`):
+The original `3ba0545` run produced the following historical output (the
+retained results file now records the post-fix replay):
 
 ```text
 ## A exact Location + trailing slash
@@ -130,6 +133,11 @@ precisely to keep the representation from being downloaded is skipped.
 
 PASS-33 HARNESS COMPLETE: expected divergences above are the P33-A reproducer
 ```
+
+After remediation, the same six-case battery reports no leak: the three
+selected-name guards return `403`, both affected trailing-slash spellings
+return `404`, and the controls retain their prior non-200 results. The retained
+output in `adversarial/p33/results_p33.txt` records that post-fix run.
 
 Case details:
 
@@ -229,28 +237,33 @@ fail-closed when this fix lands.
 
 ---
 
-## 6. Recommended remediation
+## 6. Remediation
 
-1. **Reject regular-file negotiation for trailing-slash requests before
-   selecting a candidate.** Move/duplicate the P25-A trailing-slash check so
-   it applies to the `Target::NotFound` path before `multiviews_target()` can
-   select a file. This closes cases A and D-slash and matches Apache's
-   directory assertion.
-2. **Make the negotiated representation a URL-policy identity.** After a
-   candidate is selected, re-run the URL-scoped authorization and
-   per-directory rewrite phases with the negotiated URL (`/name.ext`) as the
-   subject — or, equivalently, evaluate the candidate against a synthesized
-   internal-request identity the way Apache's negotiation phase does — and
-   require both the pre-negotiation URL policy and the negotiated-name policy
-   to allow it. This closes cases B and C. `bind_multiview_grant()` should keep
-   the existing candidate `Files`/`Directory`/resolved-target conjoin and must
-   not weaken the handler-refusal check.
-3. **Regression coverage:** add the six P33 harness cases (exact-Location
-   slash, extension-Location, `.htaccess` rewrite extension, stock alias,
-   MultiViews-off control, `<Files>` control) plus a candidate-handler
-   refusal control to the conformance/adversarial regression suites, and
-   require both the selected-file and selected-URL policy decisions in the
-   request plan rather than a post-selection patch.
+1. **Trailing slash:** the `Target::NotFound` branch now rejects a trailing
+   slash before `multiviews_target()` scans sibling representations, closing
+   the direct and stock-alias slash cases.
+2. **Selected URL identity:** `multiview_selected_url()` synthesizes the
+   negotiated `/name.ext` identity. `bind_multiview_grant()` evaluates the
+   candidate's `Location`, `Files`, `Directory`, access-file and resolved
+   inode policy against that identity, then conjoins it with the already
+   authorized public URL scope.
+3. **Rewrite and handler boundary:** Directory/access-file rewrite rules run
+   again with the selected URL and filesystem subjects. Deny/gone/redirect
+   outcomes are honored; sink-changing internal/proxy outcomes fail closed.
+   The existing post-bind handler check still refuses CGI/FastCGI or any other
+   dynamic handler selected for a negotiated candidate.
+4. **Shared cache:** cache planning resolves the same selected representation
+   and policy transition as dispatch. Lookup/store bind the selected URL and
+   resolved target; any selected-name rewrite outcome bypasses cache so normal
+   dispatch applies it.
+5. **Regression coverage:** the release differential covers all six original
+   cases, and `multiviews_rejects_slashes_and_replays_selected_url_policy`
+   covers selected-name `Location`, access-file deny and redirect rules,
+   direct/alias slash rejection, URL encoding and a successful static control.
+   The cache regression additionally pins selected URL/target identity, live
+   `<Files>` policy and query-dependent selected-name rewrite refusal. The
+   pre-existing MultiViews regression retains the candidate `<Files>` and
+   dynamic-handler refusal controls.
 
 ---
 
@@ -259,7 +272,7 @@ fail-closed when this fix lands.
 ```sh
 cd /root/vapache
 cargo build --release -p vapached
-python3 adversarial/p33/exploit_p33.py            # six differential cases
+python3 adversarial/p33/exploit_p33.py            # six remediation cases
 python3 adversarial/p33/exploit_p33.py --keep     # retain fixtures and logs
 ```
 
@@ -271,8 +284,8 @@ the real `/usr/sbin/apache2` 2.4.69 oracle with `mod_negotiation`,
 
 ## 8. Retained files
 
-- `adversarial/p33/exploit_p33.py` — six-case Apache/vapached differential
-  harness; asserts the vulnerable `LEAK` rows so a remediation flips it.
-- `adversarial/p33/results_p33.txt` — retained run output.
+- `adversarial/p33/exploit_p33.py` — six-case Apache/vapached remediation
+  harness; fails on any former disclosure or status regression.
+- `adversarial/p33/results_p33.txt` — retained post-fix run output.
 - `/tmp/opencode/p33-harness/` — per-case configs, fixture trees and server
   logs when `--keep` is used.
