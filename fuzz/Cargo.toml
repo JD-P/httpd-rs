@@ -126,6 +126,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "resource_transitions"
+path = "fuzz_targets/resource_transitions.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
 

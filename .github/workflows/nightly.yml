@@ -35,12 +35,14 @@ jobs:
           - cgi_response
           - fastcgi_records
           - proxy_response
+          - websocket_negotiation
           - h2_frames
           - cache_metadata
           - tls_policy
           - ocsp_der
           - pcre2_differential
           - pcre2_resource
+          - resource_transitions
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Restore cumulative coverage corpus

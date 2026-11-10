@@ -71,17 +71,21 @@ Pull-request CI checks deterministic generation and matrix completeness without
 requiring Apache modules. The fail-closed pre-adversarial/nightly gate runs both
 live campaigns against the release daemon.
 
-Fifteen libFuzzer targets cover:
+Seventeen libFuzzer targets cover:
 
 - HTTP request parsing and whole fragmented/pipelined connections;
 - configuration sections, full configuration compilation and `.htaccess`
   discovery/compilation;
 - rewrite expressions;
-- CGI, FastCGI and reverse-proxy response framing;
+- CGI, FastCGI and reverse-proxy response framing, plus WebSocket negotiation;
 - HTTP/2 frames, cache metadata, TLS policy and OCSP DER;
 - PCRE2 compile metadata and every public match/capture API, differentially
   checked against the pinned PCRE2 10.46 C oracle across byte, CRLF, UTF and
-  UCP modes, plus production resource-limit monotonicity and cost boundaries.
+  UCP modes, plus production resource-limit monotonicity and cost boundaries;
+- hierarchical resource leases as a state machine, including boundary
+  reservation/release, source and request attribution, physical/disk/transport
+  parent exhaustion, H1/H2 slow-input/output ownership transfer, mixed-ledger
+  rejection and complete RAII teardown.
 
 Each target has a seed corpus and, where useful, a protocol dictionary.
 `tests/fuzz_smoke.sh` is bounded; `tests/fuzz_campaign.sh` is the scheduled,
@@ -90,7 +94,7 @@ merge new coverage, minimize the result and cache that next generation in
 addition to uploading the corpus and crash artifacts for inspection.
 The expression-parser and both PCRE2 targets receive 16,384 smoke executions by
 default because their adversarial boundary failures required sustained mutation
-to discover.
+to discover; the resource state machine receives 1,024.
 
 ## Failure and memory models
 

@@ -180,7 +180,7 @@ pub struct ResourceBudget {
 /// Complete process-ledger state used by deterministic transition campaigns.
 /// Comparing snapshots before and after an injected failure catches leaks in
 /// typed pools as well as their aggregate descriptor/task/memory parents.
-#[cfg(any(test, feature = "fault-injection"))]
+#[cfg(any(test, feature = "fault-injection", feature = "fuzzing"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransitionResourceSnapshot {
     slots: [u64; SlotKind::COUNT],
@@ -1419,6 +1419,17 @@ impl Drop for ByteLease {
 }
 
 impl ResourceBudget {
+    fn validate_context(&self, context: &ResourceContext) -> io::Result<()> {
+        if std::ptr::eq(self, Arc::as_ptr(&context.budget)) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resource context belongs to another process ledger",
+            ))
+        }
+    }
+
     fn disk_ledger_for_path(&self, path: &Path) -> io::Result<Arc<DiskLedger>> {
         {
             let ledgers = self
@@ -1931,6 +1942,7 @@ impl ResourceBudget {
         self: &Arc<Self>,
         context: &ResourceContext,
     ) -> io::Result<SlotLease> {
+        self.validate_context(context)?;
         context.slot(
             SlotKind::FilesystemWork,
             64,
@@ -1970,6 +1982,7 @@ impl ResourceBudget {
         max_files: u64,
         context: &ResourceContext,
     ) -> io::Result<SpoolLease> {
+        self.validate_context(context)?;
         let descriptor = self.try_descriptor()?;
         let share_files = max_files.saturating_add(3) / 4;
         let file_slot = context.slot(
@@ -2023,6 +2036,7 @@ impl ResourceBudget {
         limit: u64,
         descriptors: u64,
     ) -> io::Result<DynamicLease> {
+        self.validate_context(context)?;
         let slot = context.slot(
             SlotKind::DynamicBackend,
             limit,
@@ -2055,6 +2069,7 @@ impl ResourceBudget {
         self: &Arc<Self>,
         context: &ResourceContext,
     ) -> io::Result<CombinedH2Lease> {
+        self.validate_context(context)?;
         Ok(CombinedH2Lease {
             _slot: context.slot(
                 SlotKind::H2Stream,
@@ -2070,6 +2085,7 @@ impl ResourceBudget {
         self: &Arc<Self>,
         context: &ResourceContext,
     ) -> io::Result<SlowOutputLease> {
+        self.validate_context(context)?;
         Ok(SlowOutputLease {
             _slot: context.slot(
                 SlotKind::SlowOutput,
@@ -2085,6 +2101,7 @@ impl ResourceBudget {
         self: &Arc<Self>,
         context: &ResourceContext,
     ) -> io::Result<SlowInputLease> {
+        self.validate_context(context)?;
         Ok(SlowInputLease {
             _slot: context.slot(
                 SlotKind::SlowInput,
@@ -2198,6 +2215,7 @@ impl ResourceBudget {
         self: &Arc<Self>,
         context: &ResourceContext,
     ) -> io::Result<ResponseBodyReadLease> {
+        self.validate_context(context)?;
         debug_assert!(vapache_verified::response_body_read_lease_admit(
             vapache_verified::ResponseWorkPhase::DescriptorRead,
         ));
@@ -2232,6 +2250,7 @@ impl ResourceBudget {
         process_rate_limit: u64,
         client_rate_limit: u64,
     ) -> io::Result<SlotLease> {
+        self.validate_context(context)?;
         let slot = context.slot(
             SlotKind::TlsHandshake,
             concurrency_limit,
@@ -2264,6 +2283,7 @@ impl ResourceBudget {
         process_rate_limit: u64,
         client_rate_limit: u64,
     ) -> io::Result<SlotLease> {
+        self.validate_context(context)?;
         let slot = context.slot(
             SlotKind::RewriteProgram,
             concurrency_limit,
@@ -2376,7 +2396,7 @@ impl ResourceBudget {
         self.slot_usage(SlotKind::Websocket)
     }
 
-    #[cfg(any(test, feature = "fault-injection"))]
+    #[cfg(any(test, feature = "fault-injection", feature = "fuzzing"))]
     pub fn transition_snapshot(&self) -> TransitionResourceSnapshot {
         let ledgers = self
             .disk_ledgers
@@ -2956,6 +2976,20 @@ impl SlowOutputProgress {
     pub(crate) fn next_deadline(&self) -> Instant {
         self.checkpoint.min(self.absolute_deadline)
     }
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+#[path = "resource_fuzz.rs"]
+mod resource_fuzz;
+
+/// Exercise hierarchical resource ownership as a bounded state machine.
+///
+/// The driver checks conservation across every successful, rejected and
+/// cross-ledger transition, then requires all process/client/request and
+/// physical-parent charges to return to zero at teardown.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_resource_transitions(data: &[u8]) {
+    resource_fuzz::run(data);
 }
 
 #[cfg(test)]
