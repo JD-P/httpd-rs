@@ -771,6 +771,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "pcre2",
+ "pcre2-sys",
  "vapache-pcre2",
  "vapached",
 ]

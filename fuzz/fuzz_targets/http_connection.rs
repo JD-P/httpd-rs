@@ -91,5 +91,8 @@ fuzz_target!(|data: &[u8]| {
     let wire = &data[3..];
     let whole = parse_sequence(wire, wire.len().max(1), spool_bytes, spool_files);
     let fragmented = parse_sequence(wire, chunk, spool_bytes, spool_files);
-    assert_eq!(whole, fragmented, "HTTP parsing changed with read fragmentation");
+    assert_eq!(
+        whole, fragmented,
+        "HTTP parsing changed with read fragmentation"
+    );
 });

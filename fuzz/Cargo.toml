@@ -11,7 +11,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 vapached = { path = "../crates/server", features = ["fuzzing"] }
 vapache-pcre2 = { path = "../crates/pcre2" }
-pcre2-c-oracle = { package = "pcre2", version = "0.2.11" }
+pcre2-c-oracle = { package = "pcre2", version = "=0.2.11" }
+pcre2-c-oracle-sys = { package = "pcre2-sys", version = "=0.2.10" }
 
 [[bin]]
 name = "http_request"
@@ -114,6 +115,13 @@ bench = false
 [[bin]]
 name = "pcre2_differential"
 path = "fuzz_targets/pcre2_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pcre2_resource"
+path = "fuzz_targets/pcre2_resource.rs"
 test = false
 doc = false
 bench = false

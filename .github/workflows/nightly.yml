@@ -14,6 +14,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  PCRE2_SYS_STATIC: 1
   RUST_BACKTRACE: 1
   VAPACHE_NIGHTLY_TOOLCHAIN: nightly-2026-10-29
 
@@ -38,8 +39,17 @@ jobs:
           - cache_metadata
           - tls_policy
           - ocsp_der
+          - pcre2_differential
+          - pcre2_resource
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Restore cumulative coverage corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ runner.os }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fuzz-corpus-${{ runner.os }}-${{ matrix.target }}-
       - run: |
           rustup toolchain install "$VAPACHE_NIGHTLY_TOOLCHAIN" --profile minimal
           cargo install cargo-fuzz --version 0.13.2 --locked
@@ -47,6 +57,7 @@ jobs:
         env:
           FUZZ_TARGETS: ${{ matrix.target }}
           FUZZ_SECONDS_PER_TARGET: ${{ inputs.fuzz_seconds || '900' }}
+          FUZZ_MINIMIZE_CORPUS: 1
         run: tests/fuzz_campaign.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
@@ -81,6 +92,17 @@ jobs:
           rustup toolchain install "$VAPACHE_NIGHTLY_TOOLCHAIN" --profile minimal
           cargo install cargo-fuzz --version 0.13.2 --locked
           tests/ci/install_verus.sh .tools/verus
+          PCRE2_ARCHIVE="$RUNNER_TEMP/pcre2-10.46.tar.gz"
+          PCRE2_ROOT="$RUNNER_TEMP/pcre2-10.46"
+          curl --fail --location --retry 3 \
+            https://github.com/PCRE2Project/pcre2/archive/refs/tags/pcre2-10.46.tar.gz \
+            -o "$PCRE2_ARCHIVE"
+          printf '%s  %s\n' \
+            ffde0c6ead457c4f8edcd8f9ce490bbabd30adabdfd179ecaddd320946cf3872 \
+            "$PCRE2_ARCHIVE" | sha256sum --check -
+          mkdir -p "$PCRE2_ROOT"
+          tar -xzf "$PCRE2_ARCHIVE" --strip-components=1 -C "$PCRE2_ROOT"
+          echo "PCRE2_TESTDATA=$PCRE2_ROOT/testdata" >> "$GITHUB_ENV"
       - name: Fail-closed pre-adversarial gate
         run: tests/pre_adversarial.sh
 

@@ -685,14 +685,20 @@ tests/fuzz_smoke.sh                         # bounded run of every target
 FUZZ_SECONDS_PER_TARGET=900 tests/fuzz_campaign.sh
 ```
 
-The 14 targets cover individual HTTP requests, fragmented/pipelined
+The 15 targets cover individual HTTP requests, fragmented/pipelined
 connections, configuration tokenization and full compilation, `.htaccess`
 walks, rewrite expressions, CGI/FastCGI/proxy responses, HTTP/2 frames, cache
-metadata, TLS policy, OCSP DER and the adversarial PCRE2 differential. The
-PCRE2 fuzzer implementation is retained with the P23 artifacts and included by
-the ordinary cargo-fuzz entry point. The P24 expression-parser crash is a
-permanent `rewrite_expr` seed, and that target receives 16,384 executions in
-the default smoke gate. Dictionaries and seed corpora live beside the targets.
+metadata, TLS policy, OCSP DER, the adversarial PCRE2 differential and PCRE2
+resource-policy monotonicity. The original PCRE2 fuzzer implementation is
+retained with the P23 artifacts; the
+ordinary cargo-fuzz entry point now extends it across compile metadata, all
+public matching APIs, start offsets, engine tiers, CRLF, malformed UTF and
+Unicode modes. An admitted-subset grammar makes unexpected compile rejection a
+fuzz failure, while the resource target keeps production limits active. The P24
+expression-parser crash and non-ASCII PCRE2 byte-boundary cases are permanent
+seeds. The expression and both PCRE2 targets receive 16,384 executions in the
+default smoke gate. Nightly coverage corpora are minimized and carried into the
+next run; dictionaries and committed bootstrap seeds live beside the targets.
 Property tests, Loom interleaving exploration, deterministic
 failure injection, Miri, sanitizers, mutation testing, protocol suites,
 supply-chain checks and scheduled soak/performance jobs are described in

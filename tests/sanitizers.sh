@@ -36,5 +36,8 @@ case "$sanitizer" in
         cargo +"$NIGHTLY" test -Zbuild-std -p vapached --lib \
             resource::tests::concurrent_dynamic_admission_never_exceeds_the_limit \
             --target x86_64-unknown-linux-gnu -- --exact --test-threads=1
+        cargo +"$NIGHTLY" test -Zbuild-std -p vapache-pcre2 \
+            --test concurrency --target x86_64-unknown-linux-gnu -- \
+            --test-threads=1
         ;;
 esac

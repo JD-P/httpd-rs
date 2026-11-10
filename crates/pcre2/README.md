@@ -26,6 +26,14 @@ histories whose preference differs between engines are rejected at compile
 time. There is a `RegexBuilder::backtracking` compatibility knob so callers
 cannot accidentally assume that enabling it worked; requesting it returns a
 compile error because no fallback engine ships in production.
+UTF/UCP class and escape forms whose semantics would be narrowed by the
+byte-class lowering (including Unicode-sensitive POSIX classes, raw
+non-ASCII classes, `\C`, `\R`, `\h` and `\v`) likewise fail closed.
+Malformed UTF and UCP subjects fail closed in full. PCRE2's strict validation
+window varies with offsets, anchors and word boundaries, while
+`MATCH_INVALID_UTF` treats invalid sequences as barriers between valid
+fragments. Rejecting the complete malformed subject is deliberately stronger
+than those context-dependent behaviors and avoids a false-positive match.
 
 Resource policy is part of the API, not a timeout:
 
@@ -60,13 +68,24 @@ PCRE2_TESTDATA=/path/to/pcre2-10.46/testdata \
   cargo test -p vapache-pcre2 --test upstream_testdata -- --nocapture
 ```
 
-The current importer checks 1,002 supported subject/capture records from
+The current importer checks 1,005 supported subject/capture records from
 `testinput1`; records using the deliberately unsupported dialect or complex
-`pcre2test` control commands are skipped.
+`pcre2test` control commands are skipped. Nightly CI downloads that corpus from
+the checksummed 10.46 tag and requires the importer to complete. Cargo forces
+the oracle C binding to build its bundled 10.46 source rather than selecting
+a runner-dependent system library through `pkg-config`.
 
 The unbounded complement is covered by `cargo fuzz run pcre2_differential` in
-the repository's `fuzz` package. It feeds the same pattern, flags, and raw byte
-subject to this crate and the C oracle and compares every capture span. The C
+the repository's `fuzz` package and by the default smoke and nightly campaigns.
+It feeds the same pattern, seven builder flags, raw byte subject, and several
+start offsets to this crate and the C oracle. It compares compile metadata,
+single-shot matches/captures, reusable capture locations, iterators, and cold
+versus hot engine tiers. Raw syntax mutation is paired with a generated grammar
+of the admitted subset, so an unexpected Rust rejection is itself a failure.
+Valid UTF behavior is differential; malformed UTF/UCP subjects exercise the
+documented whole-subject fail-closed boundary. `pcre2_resource` independently
+keeps production limits active and checks compile/match limit monotonicity. The
+nightly coverage corpus is minimized and carried forward between runs. The C
 crate is a dev/fuzz dependency only and is absent from vapached's normal Cargo
 graph and release binary.
 

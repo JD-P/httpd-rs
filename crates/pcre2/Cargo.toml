@@ -13,7 +13,11 @@ vapache-verified = { path = "../verified", version = "0.2.0" }
 [dev-dependencies]
 # This is an oracle only. It is absent from vapached's normal dependency
 # graph and from the release binary.
-pcre2-c-oracle = { package = "pcre2", version = "0.2.11" }
+pcre2-c-oracle = { package = "pcre2", version = "=0.2.11" }
+# Keep the oracle on the pcre2-sys release whose bundled C source is 10.46.
+# The high-level crate's generated version constants are stale (10.45), so the
+# Cargo.lock checksum and this exact dependency are the reproducible pin.
+pcre2-c-oracle-sys = { package = "pcre2-sys", version = "=0.2.10" }
 
 [lints.rust]
 unsafe_code = "forbid"

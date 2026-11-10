@@ -1,0 +1,5 @@
+# The C PCRE2 dependency is a test/fuzz oracle only. Force its bundled 10.46
+# source so differential results cannot silently depend on a runner's
+# pkg-config-selected system version.
+[env]
+PCRE2_SYS_STATIC = { value = "1", force = true }

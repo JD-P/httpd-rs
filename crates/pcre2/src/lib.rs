@@ -208,6 +208,8 @@ pub mod bytes {
                 self.config.multi_line,
                 self.config.crlf,
                 self.config.extended,
+                self.config.utf || self.config.ucp,
+                self.config.ucp,
             )?;
             if translation.pattern.len() > self.config.pattern_limit.saturating_mul(16) {
                 return Err(Error::resource(
@@ -462,11 +464,29 @@ pub mod bytes {
             RegexBuilder::new().build(pattern)
         }
 
-        fn check_subject(&self, subject_len: usize, start: usize) -> Result<(), Error> {
-            assert!(start <= subject_len, "start must be <= subject.len()");
+        fn check_subject(&self, subject: &[u8], start: usize) -> Result<(), Error> {
+            assert!(start <= subject.len(), "start must be <= subject.len()");
+            if (self.config.utf || self.config.ucp) && std::str::from_utf8(subject).is_err() {
+                // PCRE2's strict validation window depends on the starting
+                // offset and on constructs that can inspect earlier text
+                // (anchors and word boundaries), while MATCH_INVALID_UTF uses
+                // unmatchable fragment barriers. Rejecting the complete
+                // malformed subject is a conservative compatibility boundary
+                // that cannot turn an authorization miss into a match.
+                return Err(Error::syntax(if self.config.ucp {
+                    "invalid UTF-8 subject in UCP mode"
+                } else {
+                    "invalid UTF-8 subject in UTF mode"
+                }));
+            }
+            if self.config.utf && !self.config.ucp {
+                if subject.get(start).is_some_and(|byte| byte & 0xC0 == 0x80) {
+                    return Err(Error::syntax("invalid UTF-8 start offset in UTF mode"));
+                }
+            }
             if !vapache_verified::regex_match_resource_admit(
                 self.complexity,
-                subject_len.saturating_sub(start) as u64,
+                subject.len().saturating_sub(start) as u64,
                 self.config.subject_limit as u64,
                 self.config.work_limit,
             ) {
@@ -475,6 +495,18 @@ pub mod bytes {
                 ));
             }
             Ok(())
+        }
+
+        fn normalized_search_start(&self, subject: &[u8], mut start: usize) -> usize {
+            if self.config.ucp {
+                // The upstream Rust PCRE2 builder combines UCP with UTF and
+                // PCRE2_MATCH_INVALID_UTF. PCRE2 advances an explicit offset
+                // past UTF-8 continuation bytes before it starts matching.
+                while subject.get(start).is_some_and(|byte| byte & 0xC0 == 0x80) {
+                    start += 1;
+                }
+            }
+            start
         }
 
         pub fn is_match(&self, subject: &[u8]) -> Result<bool, Error> {
@@ -526,10 +558,19 @@ pub mod bytes {
             subject: &[u8],
             start: usize,
         ) -> Result<Option<CaptureSpans>, Error> {
-            self.check_subject(subject.len(), start)?;
+            self.check_subject(subject, start)?;
+            let start = self.normalized_search_start(subject, start);
             let engine = self.inner.for_search();
             if self.public_to_inner.len() == 1 && self.keep_groups.is_empty() {
-                return Ok(self.group_zero_spans(engine, subject, start));
+                let mut spans = self.group_zero_spans(engine, subject, start);
+                if spans.as_ref().is_some_and(|spans| {
+                    spans[0].is_some_and(|(match_start, match_end)| {
+                        self.suppress_terminal_multiline_anchor(subject, match_start, match_end)
+                    })
+                }) {
+                    spans = None;
+                }
+                return Ok(spans);
             }
             let full = Self::engine_captures_at(engine, subject, start);
             let mut trimmed = None;
@@ -585,6 +626,11 @@ pub mod bytes {
                 if let Some(keep_start) = keep_start {
                     spans[0] = Some((keep_start, end));
                 }
+            }
+            if spans[0].is_some_and(|(match_start, match_end)| {
+                self.suppress_terminal_multiline_anchor(subject, match_start, match_end)
+            }) {
+                return Ok(None);
             }
             Ok(Some(spans))
         }
@@ -990,6 +1036,8 @@ pub mod bytes {
         multi_line: bool,
         crlf: bool,
         extended: bool,
+        unicode_pattern: bool,
+        ucp: bool,
     ) -> Result<Translation, Error> {
         let quantifier_extended = extended || inline_option_may_enable(pattern, b'x');
         let invalid_quantifier = invalid_quantifier_placement(pattern, false, crlf).or_else(|| {
@@ -1009,38 +1057,84 @@ pub mod bytes {
                 "quantified capture with ambiguous capture history",
             ));
         }
-        let effective_multiline = leading_global_flag(pattern, b'm').unwrap_or(multi_line);
-        let effective_extended = leading_global_flag(pattern, b'x').unwrap_or(extended);
+        let mut effective_multiline = leading_global_flag(pattern, b'm').unwrap_or(multi_line);
+        let mut effective_extended = leading_global_flag(pattern, b'x').unwrap_or(extended);
         validate_line_constructs(pattern, effective_extended, effective_multiline, crlf)?;
 
         let bytes = pattern.as_bytes();
-        let captures = capture_count(pattern, crlf);
+        let captures = capture_count(pattern, crlf, effective_extended);
         let keep_prefix = choose_keep_prefix(pattern);
-        let absolute_end = contains_escape(pattern, b'z', crlf);
+        let absolute_end = contains_escape(pattern, b'z', crlf, effective_extended);
         let mut out = Vec::with_capacity(bytes.len());
         let mut i = 0;
         let mut keep_count = 0;
         let mut final_newline_fallback = false;
-        let mut saw_line_start = false;
+        let mut saw_multiline_start = false;
         let mut alternation_offset = None;
         let mut effective_caseless = caseless;
-        let mut caseless_scopes = Vec::new();
+        let mut option_scopes = Vec::new();
         while i < bytes.len() {
+            if effective_extended && bytes[i].is_ascii_whitespace() {
+                out.push(bytes[i]);
+                i += 1;
+                continue;
+            }
+            if effective_extended && bytes[i] == b'#' {
+                let end = bytes[i..]
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .map_or(bytes.len(), |relative| i + relative + 1);
+                out.extend_from_slice(&bytes[i..end]);
+                i = end;
+                continue;
+            }
             if bytes[i] >= 0x80 {
                 let ch = pattern[i..].chars().next().expect("valid UTF-8 pattern");
-                out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                if unicode_pattern {
+                    out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                } else {
+                    // PCRE2's 8-bit, non-UTF mode applies quantifiers to the
+                    // immediately preceding code unit, not to a complete
+                    // UTF-8 scalar. Keep every source byte as a separate
+                    // regex atom so, for example, `é*` means
+                    // `\xC3\xA9*` rather than `(?:\xC3\xA9)*`.
+                    for &byte in &bytes[i..i + ch.len_utf8()] {
+                        push_hex(&mut out, byte);
+                    }
+                }
                 i += ch.len_utf8();
                 continue;
             }
             match bytes[i] {
                 b'[' => {
+                    // PCRE2 reserves `[:name:]` for a POSIX class nested
+                    // inside an outer bracket class (`[[:name:]]`). The Rust
+                    // parser otherwise accepts the malformed outer-less form
+                    // as an ordinary character class.
+                    if bytes.get(i + 1) == Some(&b':')
+                        && bytes[i + 2..].windows(2).any(|pair| pair == b":]")
+                    {
+                        return Err(Error::syntax_at(
+                            i,
+                            "POSIX named class must be nested in a character class",
+                        ));
+                    }
+                    let class_end = byte_class_end(pattern, i, crlf)?;
+                    if unicode_pattern && unicode_class_requires_fallback(bytes, i, class_end, ucp)
+                    {
+                        return Err(Error::unsupported(i, "Unicode-sensitive character class"));
+                    }
                     let (class, end) =
                         translate_byte_class_caseless(pattern, i, crlf, effective_caseless)?;
                     out.extend_from_slice(class.as_bytes());
                     i = end;
                 }
                 b'(' if bytes.get(i + 1) != Some(&b'?') && bytes.get(i + 1) != Some(&b'*') => {
-                    caseless_scopes.push(effective_caseless);
+                    option_scopes.push((
+                        effective_caseless,
+                        effective_extended,
+                        effective_multiline,
+                    ));
                     out.push(b'(');
                     i += 1;
                 }
@@ -1059,13 +1153,30 @@ pub mod bytes {
                     if bytes[i..].starts_with(b"(?J)") {
                         return Err(Error::unsupported(i, "duplicate capture names"));
                     }
-                    if let Some((end, scoped, updated)) =
-                        inline_caseless_option(bytes, i, effective_caseless)
+                    if bytes[i..].starts_with(b"(?P<") {
+                        validate_capture_name(bytes, i + 4, b'>', i)?;
+                    } else if bytes[i..].starts_with(b"(?<")
+                        && !matches!(bytes.get(i + 3), Some(b'=') | Some(b'!'))
                     {
+                        validate_capture_name(bytes, i + 3, b'>', i)?;
+                    }
+                    if let Some((end, scoped, caseless, extended, multiline)) = inline_options(
+                        bytes,
+                        i,
+                        effective_caseless,
+                        effective_extended,
+                        effective_multiline,
+                    ) {
                         if scoped {
-                            caseless_scopes.push(effective_caseless);
+                            option_scopes.push((
+                                effective_caseless,
+                                effective_extended,
+                                effective_multiline,
+                            ));
                         }
-                        effective_caseless = updated;
+                        effective_caseless = caseless;
+                        effective_extended = extended;
+                        effective_multiline = multiline;
                         out.extend_from_slice(&bytes[i..end]);
                         i = end;
                         continue;
@@ -1087,35 +1198,38 @@ pub mod bytes {
                             return Err(Error::unsupported(i, "named backreference or recursion"));
                         }
                         Some(b'\'') => {
-                            caseless_scopes.push(effective_caseless);
+                            option_scopes.push((
+                                effective_caseless,
+                                effective_extended,
+                                effective_multiline,
+                            ));
                             let name_start = i + 3;
-                            let Some(relative_end) =
-                                bytes[name_start..].iter().position(|&b| b == b'\'')
-                            else {
-                                return Err(Error::syntax("unterminated named capture"));
-                            };
-                            let name_end = name_start + relative_end;
+                            let name_end = validate_capture_name(bytes, name_start, b'\'', i)?;
                             out.extend_from_slice(b"(?P<");
                             out.extend_from_slice(&bytes[name_start..name_end]);
                             out.push(b'>');
                             i = name_end + 1;
                         }
                         _ => {
-                            caseless_scopes.push(effective_caseless);
+                            option_scopes.push((
+                                effective_caseless,
+                                effective_extended,
+                                effective_multiline,
+                            ));
                             out.push(b'(');
                             i += 1;
                         }
                     }
                 }
                 b')' => {
-                    effective_caseless = caseless_scopes
+                    (effective_caseless, effective_extended, effective_multiline) = option_scopes
                         .pop()
                         .ok_or_else(|| Error::syntax_at(i, "unmatched closing parenthesis"))?;
                     out.push(b')');
                     i += 1;
                 }
                 b'^' => {
-                    saw_line_start = true;
+                    saw_multiline_start |= effective_multiline;
                     out.push(b'^');
                     i += 1;
                 }
@@ -1143,6 +1257,9 @@ pub mod bytes {
                         return Err(Error::unsupported(i, "non-ASCII escape"));
                     }
                     match escaped {
+                        b'C' | b'R' | b'h' | b'H' | b'v' | b'V' if unicode_pattern => {
+                            return Err(Error::unsupported(i, "Unicode-sensitive PCRE escape"));
+                        }
                         b'Q' => {
                             let start = i + 2;
                             let end = bytes[start..]
@@ -1150,7 +1267,7 @@ pub mod bytes {
                                 .position(|pair| pair == b"\\E")
                                 .map(|relative| start + relative)
                                 .unwrap_or(bytes.len());
-                            append_quoted_literal(&mut out, &pattern[start..end]);
+                            append_quoted_literal(&mut out, &pattern[start..end], unicode_pattern);
                             i = if end < bytes.len() { end + 2 } else { end };
                         }
                         b'K' => {
@@ -1267,7 +1384,7 @@ pub mod bytes {
                 }
             }
         }
-        if effective_multiline && saw_line_start {
+        if saw_multiline_start {
             if let Some(offset) = alternation_offset {
                 return Err(Error::unsupported(
                     offset,
@@ -1279,50 +1396,70 @@ pub mod bytes {
         Ok(Translation {
             pattern,
             final_newline_fallback,
-            multiline_start_anchor: effective_multiline && saw_line_start,
+            multiline_start_anchor: saw_multiline_start,
             keep_prefix,
         })
     }
 
     /// Return the byte just after an inline option header, whether it opens a
-    /// scoped group, and the effective caseless state inside/after it.
-    fn inline_caseless_option(
+    /// scoped group, and the effective translation-sensitive options.
+    fn inline_options(
         bytes: &[u8],
         start: usize,
-        initial: bool,
-    ) -> Option<(usize, bool, bool)> {
+        initial_caseless: bool,
+        initial_extended: bool,
+        initial_multiline: bool,
+    ) -> Option<(usize, bool, bool, bool, bool)> {
         let mut i = start + 2;
         let mut enabled = true;
-        let mut caseless = initial;
+        let mut caseless = initial_caseless;
+        let mut extended = initial_extended;
+        let mut multiline = initial_multiline;
         while let Some(&byte) = bytes.get(i) {
             match byte {
                 b'i' => {
                     caseless = enabled;
                     i += 1;
                 }
-                b'm' | b's' | b'x' => i += 1,
+                b'm' => {
+                    multiline = enabled;
+                    i += 1;
+                }
+                b'x' => {
+                    extended = enabled;
+                    i += 1;
+                }
+                b's' => i += 1,
                 b'-' => {
                     enabled = false;
                     i += 1;
                 }
-                b':' => return Some((i + 1, true, caseless)),
-                b')' if i > start + 2 => return Some((i + 1, false, caseless)),
+                b':' => return Some((i + 1, true, caseless, extended, multiline)),
+                b')' if i > start + 2 => {
+                    return Some((i + 1, false, caseless, extended, multiline));
+                }
                 _ => return None,
             }
         }
         None
     }
 
-    fn append_quoted_literal(out: &mut Vec<u8>, literal: &str) {
-        for byte in literal.as_bytes() {
-            if byte.is_ascii_whitespace() || *byte == b'#' || *byte >= 0x80 {
-                push_hex(out, *byte);
-            } else {
-                let ch = *byte as char;
-                if regex_syntax::is_meta_character(ch) {
-                    out.push(b'\\');
+    fn append_quoted_literal(out: &mut Vec<u8>, literal: &str, unicode_pattern: bool) {
+        for ch in literal.chars() {
+            if !ch.is_ascii() && unicode_pattern {
+                out.extend_from_slice(format!(r"\x{{{:X}}}", ch as u32).as_bytes());
+                continue;
+            }
+            for byte in ch.to_string().as_bytes() {
+                if byte.is_ascii_whitespace() || *byte == b'#' || *byte >= 0x80 {
+                    push_hex(out, *byte);
+                } else {
+                    let ch = *byte as char;
+                    if regex_syntax::is_meta_character(ch) {
+                        out.push(b'\\');
+                    }
+                    out.push(*byte);
                 }
-                out.push(*byte);
             }
         }
     }
@@ -1362,6 +1499,31 @@ pub mod bytes {
             i = close + 1;
         }
         result
+    }
+
+    fn validate_capture_name(
+        bytes: &[u8],
+        name_start: usize,
+        terminator: u8,
+        group_start: usize,
+    ) -> Result<usize, Error> {
+        let name_end = bytes[name_start..]
+            .iter()
+            .position(|&byte| byte == terminator)
+            .map(|relative| name_start + relative)
+            .ok_or_else(|| Error::syntax_at(group_start, "unterminated named capture"))?;
+        let name = &bytes[name_start..name_end];
+        let valid_first = name
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_');
+        if !valid_first
+            || !name
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            return Err(Error::syntax_at(name_start, "invalid capture name"));
+        }
+        Ok(name_end)
     }
 
     fn inline_option_may_enable(pattern: &str, flag: u8) -> bool {
@@ -1406,6 +1568,13 @@ pub mod bytes {
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
+                byte if extended && byte.is_ascii_whitespace() => i += 1,
+                b'#' if extended => {
+                    i = bytes[i..]
+                        .iter()
+                        .position(|&byte| byte == b'\n')
+                        .map_or(bytes.len(), |relative| i + relative + 1);
+                }
                 b'[' => {
                     let end = byte_class_end(pattern, i, false)?;
                     i = end;
@@ -1526,10 +1695,21 @@ pub mod bytes {
         }
     }
 
-    fn contains_escape(pattern: &str, wanted: u8, crlf: bool) -> bool {
+    fn contains_escape(pattern: &str, wanted: u8, crlf: bool, extended: bool) -> bool {
         let bytes = pattern.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
+            if extended && bytes[i].is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            if extended && bytes[i] == b'#' {
+                i = bytes[i..]
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .map_or(bytes.len(), |relative| i + relative + 1);
+                continue;
+            }
             if bytes[i] == b'[' {
                 if let Ok(end) = byte_class_end(pattern, i, crlf) {
                     i = end;
@@ -1548,11 +1728,22 @@ pub mod bytes {
         false
     }
 
-    fn capture_count(pattern: &str, crlf: bool) -> usize {
+    fn capture_count(pattern: &str, crlf: bool, extended: bool) -> usize {
         let bytes = pattern.as_bytes();
         let mut count = 0;
         let mut i = 0;
         while i < bytes.len() {
+            if extended && bytes[i].is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            if extended && bytes[i] == b'#' {
+                i = bytes[i..]
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .map_or(bytes.len(), |relative| i + relative + 1);
+                continue;
+            }
             if bytes[i] == b'[' {
                 if let Ok(end) = byte_class_end(pattern, i, crlf) {
                     i = end;
@@ -1707,6 +1898,34 @@ pub mod bytes {
         parse_byte_class(pattern, start, crlf, false).map(|(_, end)| end)
     }
 
+    fn unicode_class_requires_fallback(bytes: &[u8], start: usize, end: usize, ucp: bool) -> bool {
+        let mut i = start + 1;
+        while i < end.saturating_sub(1) {
+            if bytes[i] >= 0x80 {
+                return true;
+            }
+            if ucp && bytes.get(i..i + 2) == Some(b"[:") {
+                return true;
+            }
+            if bytes[i] == b'\\' {
+                if bytes.get(i + 1).is_some_and(|escaped| *escaped >= 0x80)
+                    || (ucp
+                        && matches!(
+                            bytes.get(i + 1),
+                            Some(b'd' | b'D' | b's' | b'S' | b'w' | b'W')
+                        ))
+                    || matches!(bytes.get(i + 1), Some(b'h' | b'H' | b'v' | b'V'))
+                {
+                    return true;
+                }
+                i = escape_atom_end(bytes, i);
+            } else {
+                i += 1;
+            }
+        }
+        false
+    }
+
     fn parse_byte_class(
         pattern: &str,
         start: usize,
@@ -1800,7 +2019,7 @@ pub mod bytes {
     fn class_escape(
         bytes: &[u8],
         i: usize,
-        crlf: bool,
+        _crlf: bool,
     ) -> Result<(ByteSet, Option<u8>, usize), Error> {
         let escaped = *bytes
             .get(i + 1)
@@ -1839,8 +2058,12 @@ pub mod bytes {
                 let (value, end) = parse_octal_escape(bytes, i + 1)?;
                 (singleton_set(value), Some(value), end)
             }
-            b'N' if crlf => (complement(bytes_set(b"\r\n")), None, i + 2),
-            b'N' => (complement(singleton_set(b'\n')), None, i + 2),
+            b'N' => {
+                return Err(Error::syntax_at(
+                    i,
+                    "\\N is not supported in a character class",
+                ));
+            }
             byte if !byte.is_ascii_alphanumeric() => (singleton_set(byte), Some(byte), i + 2),
             _ => return Err(Error::syntax_at(i, "unsupported escape in character class")),
         };

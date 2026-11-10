@@ -9,10 +9,8 @@ use vapached::config::Config;
 fn root() -> &'static std::path::Path {
     static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let root = std::env::temp_dir().join(format!(
-            "vapache-htaccess-fuzz-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("vapache-htaccess-fuzz-{}", std::process::id()));
         fs::create_dir_all(root.join("a/b/c")).expect("create access-file fuzz root");
         fs::write(root.join("a/b/c/target.txt"), b"target").expect("write fuzz target");
         root
@@ -24,7 +22,12 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let depth = usize::from(data[0] % 4);
-    let dirs = [root().to_path_buf(), root().join("a"), root().join("a/b"), root().join("a/b/c")];
+    let dirs = [
+        root().to_path_buf(),
+        root().join("a"),
+        root().join("a/b"),
+        root().join("a/b/c"),
+    ];
     for dir in &dirs {
         let _ = fs::remove_file(dir.join(".htaccess"));
     }
