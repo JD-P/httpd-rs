@@ -2641,6 +2641,7 @@ where
     };
     let expected = bound.key().clone();
     if !bound.require_proxy_sink(
+        cfg.authorization_generation(),
         &expected,
         &target.backend.host,
         target.backend.port,
@@ -2653,10 +2654,19 @@ where
             "access grant does not cover websocket target",
         ));
     }
-    let Some(authorization) =
-        crate::access::AuthorizedPlan::new(identity, scope.clone(), bound, expected)
-            .and_then(|plan| plan.into_outcome(vapache_verified::TransformSink::Proxy))
-    else {
+    let Some(authorization) = crate::access::AuthorizedPlan::new(
+        cfg.authorization_generation(),
+        identity,
+        scope.clone(),
+        bound,
+        expected,
+    )
+    .and_then(|plan| {
+        plan.into_outcome(
+            cfg.authorization_generation(),
+            vapache_verified::TransformSink::Proxy,
+        )
+    }) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "websocket authorization identities disagree",
@@ -3713,10 +3723,12 @@ fn authorize_failover(
     if access != crate::access::Access::Allowed {
         return None;
     }
+    let url_identity = crate::request_plan::CanonicalTarget::from_url_path(url_path)?;
+    let public_identity = crate::request_plan::CanonicalTarget::from_url_path(public_url_path)?;
     let mut next_resource = crate::access::ResourceKey::request(
         vhost,
         req,
-        url_path,
+        &url_identity.url_path,
         resource.fs_path.as_deref(),
         Some(target.proxy_url.as_str()),
     );
@@ -3724,7 +3736,11 @@ fn authorize_failover(
         .map(|i| i.user)
         .or_else(|| resource.identity.clone())
         .or_else(|| req.authenticated_identity());
-    let grant = crate::access::grant_if_allowed(access, next_resource.clone())?;
+    let grant = crate::access::grant_if_allowed(
+        access,
+        next_resource.clone(),
+        cfg.authorization_generation(),
+    )?;
     let bound = grant.bind_proxy(
         &next_resource,
         &target.backend.host,
@@ -3735,6 +3751,7 @@ fn authorize_failover(
     let expected = bound.key().clone();
     debug_assert!(
         bound.require_proxy_sink(
+            cfg.authorization_generation(),
             &expected,
             &target.backend.host,
             target.backend.port,
@@ -3744,13 +3761,22 @@ fn authorize_failover(
         "failover grant does not cover bound backend"
     );
     let identity = crate::access::OutcomeIdentity::selected(
-        public_url_path,
-        url_path,
+        &public_identity.url_path,
+        &url_identity.url_path,
         next_resource.fs_path.as_deref(),
         next_resource.fs_path.as_deref(),
     );
-    crate::access::AuthorizedPlan::new(identity, next_scope, bound, expected)?
-        .into_outcome(vapache_verified::TransformSink::Proxy)
+    crate::access::AuthorizedPlan::new(
+        cfg.authorization_generation(),
+        identity,
+        next_scope,
+        bound,
+        expected,
+    )?
+    .into_outcome(
+        cfg.authorization_generation(),
+        vapache_verified::TransformSink::Proxy,
+    )
 }
 
 pub fn execute(
@@ -3842,7 +3868,8 @@ pub(crate) fn execute_with_proxy_base(
     grant: &crate::access::AccessGrant,
     resource: &crate::access::ResourceKey,
 ) -> Response {
-    let identity = crate::access::OutcomeIdentity::direct(url_path, resource.fs_path.as_deref());
+    let identity =
+        crate::access::OutcomeIdentity::direct(&resource.url_path, resource.fs_path.as_deref());
     execute_with_proxy_identity(
         cfg,
         vhost,
@@ -3959,6 +3986,7 @@ fn execute_with_proxy_identity(
     };
     let active_resource = bound.key().clone();
     if !bound.require_proxy_sink(
+        cfg.authorization_generation(),
         &active_resource,
         &target.backend.host,
         target.backend.port,
@@ -3978,10 +4006,19 @@ fn execute_with_proxy_identity(
             local_ip,
         );
     }
-    let Some(mut active_authorization) =
-        crate::access::AuthorizedPlan::new(identity, scope.clone(), bound, active_resource)
-            .and_then(|plan| plan.into_outcome(vapache_verified::TransformSink::Proxy))
-    else {
+    let Some(mut active_authorization) = crate::access::AuthorizedPlan::new(
+        cfg.authorization_generation(),
+        identity,
+        scope.clone(),
+        bound,
+        active_resource,
+    )
+    .and_then(|plan| {
+        plan.into_outcome(
+            cfg.authorization_generation(),
+            vapache_verified::TransformSink::Proxy,
+        )
+    }) else {
         return error(
             cfg,
             vhost,
@@ -4017,6 +4054,7 @@ fn execute_with_proxy_identity(
         // selected.  A balancer failover replaces both together.
         let binding = current.binding_key();
         if !active_authorization.grant().require_proxy_sink(
+            cfg.authorization_generation(),
             active_authorization.resource(),
             &current.backend.host,
             current.backend.port,
@@ -4315,6 +4353,11 @@ mod tests {
     use crate::http::{Headers, Version};
     use std::path::Path;
 
+    fn policy_path(value: &str) -> crate::request_plan::DecodedUrlPath {
+        crate::request_plan::DecodedUrlPath::from_canonical(value)
+            .expect("test proxy path is canonical")
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute(
         cfg: &Config,
@@ -4332,7 +4375,7 @@ mod tests {
         let resource = crate::access::ResourceKey::request(
             vhost,
             req,
-            url_path,
+            &policy_path(url_path),
             None,
             Some(target.proxy_url.as_str()),
         );
@@ -4341,7 +4384,7 @@ mod tests {
             vhost,
             scope,
             req,
-            url_path,
+            &policy_path(url_path),
             target,
             peer,
             local_port,
@@ -4569,6 +4612,11 @@ mod more_tests {
     use std::io::Cursor;
     use std::path::Path;
 
+    fn policy_path(value: &str) -> crate::request_plan::DecodedUrlPath {
+        crate::request_plan::DecodedUrlPath::from_canonical(value)
+            .expect("test proxy path is canonical")
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute(
         cfg: &Config,
@@ -4586,7 +4634,7 @@ mod more_tests {
         let resource = crate::access::ResourceKey::request(
             vhost,
             req,
-            url_path,
+            &policy_path(url_path),
             None,
             Some(target.proxy_url.as_str()),
         );
@@ -5933,6 +5981,11 @@ mod coverage_tests {
     use std::io::Cursor;
     use std::net::TcpListener;
 
+    fn policy_path(value: &str) -> crate::request_plan::DecodedUrlPath {
+        crate::request_plan::DecodedUrlPath::from_canonical(value)
+            .expect("test proxy path is canonical")
+    }
+
     struct MockStream {
         input: Cursor<Vec<u8>>,
     }
@@ -6947,16 +7000,26 @@ mod coverage_tests {
         let t = target();
         let scope = Scope::default();
         let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-        let resource =
-            crate::access::ResourceKey::request(None, &r, "/x", None, Some(t.proxy_url.as_str()));
-        let wrong = crate::access::ResourceKey::request(
+        let resource = crate::access::ResourceKey::request(
             None,
             &r,
-            "/other",
+            &policy_path("/x"),
             None,
             Some(t.proxy_url.as_str()),
         );
-        let grant = crate::access::grant_if_allowed(crate::access::Access::Allowed, wrong).unwrap();
+        let wrong = crate::access::ResourceKey::request(
+            None,
+            &r,
+            &policy_path("/other"),
+            None,
+            Some(t.proxy_url.as_str()),
+        );
+        let grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            wrong,
+            cfg.authorization_generation(),
+        )
+        .unwrap();
         let resp = super::execute(
             &cfg,
             None,
@@ -6974,11 +7037,19 @@ mod coverage_tests {
         );
         assert_eq!(resp.status, 502);
 
-        let mismatched =
-            crate::access::ResourceKey::request(None, &r, "/x", None, Some("http://other/x"));
-        let grant =
-            crate::access::grant_if_allowed(crate::access::Access::Allowed, mismatched.clone())
-                .unwrap();
+        let mismatched = crate::access::ResourceKey::request(
+            None,
+            &r,
+            &policy_path("/x"),
+            None,
+            Some("http://other/x"),
+        );
+        let grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            mismatched.clone(),
+            cfg.authorization_generation(),
+        )
+        .unwrap();
         let resp = super::execute(
             &cfg,
             None,
@@ -7186,7 +7257,7 @@ mod coverage_tests {
     }
 
     fn resource(req: &Request, proxy_url: &str) -> crate::access::ResourceKey {
-        crate::access::ResourceKey::request(None, req, "/ws", None, Some(proxy_url))
+        crate::access::ResourceKey::request(None, req, &policy_path("/ws"), None, Some(proxy_url))
     }
 
     async fn spawn_upstream(
@@ -7277,13 +7348,16 @@ mod coverage_tests {
         let resource = crate::access::ResourceKey::request(
             None,
             r,
-            "/ws",
+            &policy_path("/ws"),
             None,
             Some(target.proxy_url.as_str()),
         );
-        let grant =
-            crate::access::grant_if_allowed(crate::access::Access::Allowed, resource.clone())
-                .unwrap();
+        let grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            resource.clone(),
+            cfg.authorization_generation(),
+        )
+        .unwrap();
         (
             Arc::new(cfg),
             Arc::new(Scope::default()),
@@ -7602,9 +7676,12 @@ mod coverage_tests {
         let (client, _server) = tokio::io::duplex(1024);
 
         let granted = resource(&r, "http://one.example/ws");
-        let grant =
-            crate::access::grant_if_allowed(crate::access::Access::Allowed, granted.clone())
-                .unwrap();
+        let grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            granted.clone(),
+            cfg.authorization_generation(),
+        )
+        .unwrap();
         let mismatched = resource(&r, "http://two.example/ws");
         let err = websocket_async(
             &cfg,
@@ -7625,9 +7702,12 @@ mod coverage_tests {
 
         let (client, _server) = tokio::io::duplex(1024);
         let matching = resource(&r, "http://two.example/ws");
-        let grant =
-            crate::access::grant_if_allowed(crate::access::Access::Allowed, matching.clone())
-                .unwrap();
+        let grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            matching.clone(),
+            cfg.authorization_generation(),
+        )
+        .unwrap();
         let err = websocket_async(
             &cfg,
             &scope,
@@ -7786,7 +7866,7 @@ mod coverage_tests {
         let resource = crate::access::ResourceKey::request(
             None,
             &r,
-            "/ws",
+            &policy_path("/ws"),
             None,
             Some(target.proxy_url.as_str()),
         );
@@ -7803,7 +7883,7 @@ mod coverage_tests {
         let resource = crate::access::ResourceKey::request(
             None,
             &authed,
-            "/ws",
+            &policy_path("/ws"),
             None,
             Some(target.proxy_url.as_str()),
         );
@@ -7813,7 +7893,10 @@ mod coverage_tests {
         .expect("authorized failover outcome");
         assert_eq!(authorization.identity().public_url_path(), "/public");
         assert_eq!(authorization.identity().selected_url_path(), "/ws");
-        assert!(authorization.require_sink(vapache_verified::TransformSink::Proxy));
+        assert!(authorization.require_sink(
+            cfg.authorization_generation(),
+            vapache_verified::TransformSink::Proxy,
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7891,7 +7974,7 @@ mod coverage_tests {
         let resource = crate::access::ResourceKey::request(
             None,
             &request,
-            "/route",
+            &policy_path("/route"),
             None,
             Some(target.proxy_url.as_str()),
         );
@@ -7948,13 +8031,16 @@ mod coverage_tests {
         let resource = crate::access::ResourceKey::request(
             None,
             &r,
-            "/fo/x",
+            &policy_path("/fo/x"),
             None,
             Some(target.proxy_url.as_str()),
         );
-        let grant =
-            crate::access::grant_if_allowed(crate::access::Access::Allowed, resource.clone())
-                .unwrap();
+        let grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            resource.clone(),
+            cfg.authorization_generation(),
+        )
+        .unwrap();
         let resp = super::execute(
             &cfg,
             None,
@@ -8017,13 +8103,16 @@ mod coverage_tests {
         let resource = crate::access::ResourceKey::request(
             None,
             &r,
-            "/fs/x",
+            &policy_path("/fs/x"),
             None,
             Some(target.proxy_url.as_str()),
         );
-        let grant =
-            crate::access::grant_if_allowed(crate::access::Access::Allowed, resource.clone())
-                .unwrap();
+        let grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            resource.clone(),
+            cfg.authorization_generation(),
+        )
+        .unwrap();
         let resp = super::execute(
             &cfg,
             None,
@@ -8079,13 +8168,16 @@ mod coverage_tests {
         let resource = crate::access::ResourceKey::request(
             None,
             &r,
-            "/ws",
+            &policy_path("/ws"),
             None,
             Some(target.proxy_url.as_str()),
         );
-        let grant =
-            crate::access::grant_if_allowed(crate::access::Access::Allowed, resource.clone())
-                .unwrap();
+        let grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            resource.clone(),
+            cfg.authorization_generation(),
+        )
+        .unwrap();
         let scope = Arc::new(Scope::default());
         let r = Arc::new(r);
         let grant = Arc::new(grant);

@@ -11,9 +11,125 @@ use crate::config::{Config, Scope, ScopeRule, VHost};
 use crate::http::Request;
 use crate::policy_ref::AccessLayer;
 use crate::verified::{normalize_uri_path, percent_decode_path};
+use std::fmt;
 use std::fs::{File, Metadata};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// A request-target path exactly as it appeared on the wire.
+///
+/// This type is deliberately distinct from [`DecodedUrlPath`].  A wire path
+/// may contain percent escapes and must pass through `CanonicalTarget` before
+/// any policy or resource-key API can consume it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WireUrlPath<'a>(&'a [u8]);
+
+impl<'a> WireUrlPath<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(self) -> &'a [u8] {
+        self.0
+    }
+}
+
+/// A decoded, normalized, query-free URL path suitable for policy decisions.
+///
+/// The inner string is private so wire serialization cannot be passed to an
+/// authorization boundary accidentally.  Instances are minted only by the
+/// canonical request/rewrite pipeline or by descriptor-selected child
+/// construction below.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DecodedUrlPath(String);
+
+impl DecodedUrlPath {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    /// Validate an internal path before it crosses into policy/resource
+    /// identity. Callers must make this conversion explicitly; wire paths use
+    /// `WireUrlPath` and descriptor children use `FilesystemName` instead.
+    pub(crate) fn from_canonical(path: &str) -> Option<Self> {
+        let target = CanonicalTarget::from_url_path(path)?;
+        (target.url_path.as_str() == path).then_some(target.url_path)
+    }
+}
+
+impl Deref for DecodedUrlPath {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for DecodedUrlPath {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for DecodedUrlPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<str> for DecodedUrlPath {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for DecodedUrlPath {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for DecodedUrlPath {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<DecodedUrlPath> for String {
+    fn eq(&self, other: &DecodedUrlPath) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<DecodedUrlPath> for str {
+    fn eq(&self, other: &DecodedUrlPath) -> bool {
+        self == other.as_str()
+    }
+}
+
+/// One descriptor-enumerated filesystem child name.
+///
+/// It is neither a URL path nor a wire target.  Converting it to a policy
+/// identity requires UTF-8 validation and decoded-path construction in
+/// `CanonicalTarget::from_selected_child`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FilesystemName<'a>(&'a [u8]);
+
+impl<'a> FilesystemName<'a> {
+    pub fn new(bytes: &'a [u8]) -> Option<Self> {
+        (!bytes.is_empty() && bytes != b"." && bytes != b".." && !bytes.contains(&b'/'))
+            .then_some(Self(bytes))
+    }
+
+    pub fn as_bytes(self) -> &'a [u8] {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalError {
@@ -39,7 +155,7 @@ impl CanonicalError {
 /// and query-free; `norm` is the mapping form used by `map_path()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalTarget {
-    pub url_path: String,
+    pub url_path: DecodedUrlPath,
     pub norm: Vec<u8>,
 }
 
@@ -50,11 +166,15 @@ impl CanonicalTarget {
         } else {
             &req.raw_path
         };
-        Self::from_raw_path(raw_path, allow_encoded)
+        Self::from_raw_path(WireUrlPath::new(raw_path), allow_encoded)
     }
 
-    pub fn from_raw_path(raw_path: &[u8], allow_encoded: bool) -> Result<Self, CanonicalError> {
-        let decoded = percent_decode_path(raw_path, allow_encoded).ok_or(CanonicalError::Decode)?;
+    pub fn from_raw_path(
+        raw_path: WireUrlPath<'_>,
+        allow_encoded: bool,
+    ) -> Result<Self, CanonicalError> {
+        let decoded = percent_decode_path(raw_path.as_bytes(), allow_encoded)
+            .ok_or(CanonicalError::Decode)?;
         let trailing_slash = decoded.len() > 1 && decoded.ends_with(b"/");
         let norm = normalize_uri_path(&decoded).ok_or(CanonicalError::Normalize)?;
         let canonical = crate::util::is_canonical_path(&norm);
@@ -73,13 +193,28 @@ impl CanonicalTarget {
         if trailing_slash && url_path != "/" {
             url_path.push('/');
         }
-        Ok(Self { url_path, norm })
+        Ok(Self {
+            url_path: DecodedUrlPath(url_path),
+            norm,
+        })
     }
 
     /// Build a target from an internal rewrite result.  `norm` is retained as
     /// the mapping form because rewrite canonicalization already ran.
-    pub fn from_normalized(norm: Vec<u8>, url_path: String) -> Self {
-        Self { url_path, norm }
+    pub fn from_normalized(norm: Vec<u8>, url_path: String) -> Option<Self> {
+        let trailing_slash = url_path.len() > 1 && url_path.ends_with('/');
+        let checked = normalize_uri_path(url_path.as_bytes())?;
+        if checked != norm {
+            return None;
+        }
+        let mut canonical = String::from_utf8(checked).ok()?;
+        if trailing_slash && canonical != "/" {
+            canonical.push('/');
+        }
+        (canonical == url_path).then_some(Self {
+            url_path: DecodedUrlPath(url_path),
+            norm,
+        })
     }
 
     pub fn from_url_path(path: &str) -> Option<Self> {
@@ -89,22 +224,22 @@ impl CanonicalTarget {
         if trailing_slash && url_path != "/" {
             url_path.push('/');
         }
-        Some(Self { url_path, norm })
+        Some(Self {
+            url_path: DecodedUrlPath(url_path),
+            norm,
+        })
     }
 
     /// Build the decoded URL identity for a filesystem child selected by an
     /// internal transform. Policy always consumes decoded canonical paths;
     /// percent encoding belongs only at later wire-serialization boundaries.
-    pub fn from_selected_child(parent_url: &str, name: &[u8], directory: bool) -> Option<Self> {
-        let parent = Self::from_url_path(parent_url)?;
-        if parent.url_path != parent_url {
-            return None;
-        }
-        let name = std::str::from_utf8(name).ok()?;
-        if name.is_empty() || name.contains('/') {
-            return None;
-        }
-        let mut candidate = parent.url_path.trim_end_matches('/').to_string();
+    pub fn from_selected_child(
+        parent_url: &DecodedUrlPath,
+        name: FilesystemName<'_>,
+        directory: bool,
+    ) -> Option<Self> {
+        let name = std::str::from_utf8(name.as_bytes()).ok()?;
+        let mut candidate = parent_url.trim_end_matches('/').to_string();
         candidate.push('/');
         candidate.push_str(name);
         if directory {
@@ -431,7 +566,7 @@ impl RequestPlan {
         &self.target
     }
 
-    pub fn url_path(&self) -> &str {
+    pub fn url_path(&self) -> &DecodedUrlPath {
         &self.target.url_path
     }
 
@@ -828,6 +963,7 @@ mod tests {
 
     #[test]
     fn selected_children_keep_decoded_policy_identity() {
+        let docs = CanonicalTarget::from_url_path("/docs/").unwrap().url_path;
         for (name, expected) in [
             (
                 b"name with space.txt".as_slice(),
@@ -836,37 +972,55 @@ mod tests {
             ("café.txt".as_bytes(), "/docs/café.txt"),
             (b"pct%20literal.txt".as_slice(), "/docs/pct%20literal.txt"),
         ] {
-            let target = CanonicalTarget::from_selected_child("/docs/", name, false).unwrap();
+            let target = CanonicalTarget::from_selected_child(
+                &docs,
+                FilesystemName::new(name).unwrap(),
+                false,
+            )
+            .unwrap();
             assert_eq!(target.url_path, expected);
         }
+        let docs = CanonicalTarget::from_url_path("/docs").unwrap().url_path;
         assert_eq!(
-            CanonicalTarget::from_selected_child("/docs", b"child", true)
-                .unwrap()
-                .url_path,
+            CanonicalTarget::from_selected_child(
+                &docs,
+                FilesystemName::new(b"child").unwrap(),
+                true,
+            )
+            .unwrap()
+            .url_path,
             "/docs/child/"
         );
-        assert!(CanonicalTarget::from_selected_child("/docs", b"bad/name", false).is_none());
-        assert!(CanonicalTarget::from_selected_child("/docs", b"..", false).is_none());
-        assert!(CanonicalTarget::from_selected_child("/docs", b"bad\xff", false).is_none());
-        assert!(CanonicalTarget::from_selected_child("/docs//", b"child", false).is_none());
+        assert!(FilesystemName::new(b"bad/name").is_none());
+        assert!(FilesystemName::new(b"..").is_none());
+        assert!(CanonicalTarget::from_selected_child(
+            &docs,
+            FilesystemName::new(b"bad\xff").unwrap(),
+            false,
+        )
+        .is_none());
+        assert!(DecodedUrlPath::from_canonical("/docs//").is_none());
     }
 
     #[test]
     fn canonical_target_is_query_free_decoded_and_normalized() {
-        let target = CanonicalTarget::from_raw_path(b"/%2eenv", false).unwrap();
+        let target = CanonicalTarget::from_raw_path(WireUrlPath::new(b"/%2eenv"), false).unwrap();
         assert_eq!(target.url_path, "/.env");
 
-        let target = CanonicalTarget::from_raw_path(b"/api/%2e%2e/secret", false).unwrap();
+        let target =
+            CanonicalTarget::from_raw_path(WireUrlPath::new(b"/api/%2e%2e/secret"), false).unwrap();
         assert_eq!(target.url_path, "/secret");
         assert_eq!(target.norm, b"/secret");
 
-        let target = CanonicalTarget::from_raw_path(b"/dir/", false).unwrap();
+        let target = CanonicalTarget::from_raw_path(WireUrlPath::new(b"/dir/"), false).unwrap();
         assert_eq!(target.url_path, "/dir/");
         assert_eq!(target.norm, b"/dir");
 
-        let target = CanonicalTarget::from_raw_path("/café".as_bytes(), false).unwrap();
+        let target =
+            CanonicalTarget::from_raw_path(WireUrlPath::new("/café".as_bytes()), false).unwrap();
         assert_eq!(target.url_path, "/café");
-        let target = CanonicalTarget::from_raw_path(b"/caf%c3%a9", false).unwrap();
+        let target =
+            CanonicalTarget::from_raw_path(WireUrlPath::new(b"/caf%c3%a9"), false).unwrap();
         assert_eq!(target.url_path, "/café");
     }
 
@@ -875,14 +1029,14 @@ mod tests {
         assert_eq!(CanonicalError::Decode.status(), 404);
         assert_eq!(CanonicalError::Normalize.status(), 400);
         assert_eq!(CanonicalError::Utf8.status(), 400);
-        assert!(CanonicalTarget::from_raw_path(b"relative", false).is_err());
-        assert!(CanonicalTarget::from_raw_path(b"/%zz", false).is_err());
+        assert!(CanonicalTarget::from_raw_path(WireUrlPath::new(b"relative"), false).is_err());
+        assert!(CanonicalTarget::from_raw_path(WireUrlPath::new(b"/%zz"), false).is_err());
         assert_eq!(
-            CanonicalTarget::from_raw_path(b"/\xff", false),
+            CanonicalTarget::from_raw_path(WireUrlPath::new(b"/\xff"), false),
             Err(CanonicalError::Utf8)
         );
         assert_eq!(
-            CanonicalTarget::from_raw_path(b"/%ff", false),
+            CanonicalTarget::from_raw_path(WireUrlPath::new(b"/%ff"), false),
             Err(CanonicalError::Utf8)
         );
         assert!(CanonicalTarget::from_url_path("relative").is_none());

@@ -1735,8 +1735,11 @@ pub fn serve_file(
     grant: &crate::access::AccessGrant,
     resource: &crate::access::ResourceKey,
 ) -> Response {
-    if !grant.require_sink(resource, vapache_verified::TransformSink::StaticFile)
-        || resource.fs_path.as_deref() != Some(fs_path)
+    if !grant.require_sink(
+        cfg.authorization_generation(),
+        resource,
+        vapache_verified::TransformSink::StaticFile,
+    ) || resource.fs_path.as_deref() != Some(fs_path)
     {
         return error_response(cfg, None, scope, 500, req, "", 0, "", peer, local_ip);
     }
@@ -1759,8 +1762,12 @@ pub fn serve_authorized_file(
     local_ip: &str,
     authorization: &crate::access::AuthorizedOutcome,
 ) -> Response {
-    if !authorization.require_file_sink(vapache_verified::TransformSink::StaticFile, fs_path, meta)
-        || fd_path(&file).as_deref() != Some(fs_path)
+    if !authorization.require_file_sink(
+        cfg.authorization_generation(),
+        vapache_verified::TransformSink::StaticFile,
+        fs_path,
+        meta,
+    ) || fd_path(&file).as_deref() != Some(fs_path)
     {
         return error_response(
             cfg,
@@ -2106,9 +2113,19 @@ fn serve_directory_inner(
             r
         }
         DirAction::Index(_, _, name) => {
-            let Some(index_url) =
-                crate::request_plan::CanonicalTarget::from_selected_child(url_path, &name, false)
-                    .map(|target| target.url_path)
+            let parent = crate::request_plan::CanonicalTarget::from_url_path(url_path);
+            let child = crate::request_plan::FilesystemName::new(&name);
+            let Some(index_url) = parent
+                .as_ref()
+                .zip(child)
+                .and_then(|(parent, child)| {
+                    crate::request_plan::CanonicalTarget::from_selected_child(
+                        &parent.url_path,
+                        child,
+                        false,
+                    )
+                })
+                .map(|target| target.url_path.into_string())
             else {
                 return Response::policy_error();
             };
@@ -2187,12 +2204,18 @@ fn authorized_autoindex_entries(
         let Some(actual_path) = fd_path(&file) else {
             return Err(Response::policy_error());
         };
+        let Some(parent) = crate::request_plan::CanonicalTarget::from_url_path(url_path) else {
+            return Err(Response::policy_error());
+        };
+        let Some(name_identity) = crate::request_plan::FilesystemName::new(&name) else {
+            continue;
+        };
         let Some(target_url) = crate::request_plan::CanonicalTarget::from_selected_child(
-            url_path,
-            &name,
+            &parent.url_path,
+            name_identity,
             meta.is_dir(),
         )
-        .map(|target| target.url_path) else {
+        .map(|target| target.url_path.into_string()) else {
             continue;
         };
         if crate::server::autoindex_entry_visible(
@@ -2230,8 +2253,11 @@ pub fn serve_directory(
     grant: &crate::access::AccessGrant,
     resource: &crate::access::ResourceKey,
 ) -> Response {
-    if !grant.require_sink(resource, vapache_verified::TransformSink::Directory)
-        || resource.fs_path.as_deref() != Some(fs_path)
+    if !grant.require_sink(
+        cfg.authorization_generation(),
+        resource,
+        vapache_verified::TransformSink::Directory,
+    ) || resource.fs_path.as_deref() != Some(fs_path)
     {
         return error_response(
             cfg, vhost, scope, 500, req, url_path, port, host, peer, local_ip,
@@ -2274,8 +2300,12 @@ pub fn serve_authorized_directory(
     local_ip: &str,
     authorization: &crate::access::AuthorizedOutcome,
 ) -> Response {
-    if !authorization.require_file_sink(vapache_verified::TransformSink::Directory, fs_path, meta)
-        || fd_path(&dir).as_deref() != Some(fs_path)
+    if !authorization.require_file_sink(
+        cfg.authorization_generation(),
+        vapache_verified::TransformSink::Directory,
+        fs_path,
+        meta,
+    ) || fd_path(&dir).as_deref() != Some(fs_path)
     {
         return error_response(
             cfg,
@@ -2806,6 +2836,11 @@ pub fn simple_html(status: u16, message: &str, location: Option<&str>) -> Respon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn policy_path(value: &str) -> crate::request_plan::DecodedUrlPath {
+        crate::request_plan::DecodedUrlPath::from_canonical(value)
+            .expect("test file path is canonical")
+    }
     use crate::http::{Headers, Version};
     use std::collections::HashMap;
     use std::io::Read;
@@ -3781,7 +3816,7 @@ mod tests {
             &crate::access::ResourceKey::request(
                 None,
                 &req,
-                "/file.txt",
+                &policy_path("/file.txt"),
                 Some(Path::new("/wrong")),
                 None,
             ),
@@ -4044,7 +4079,13 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "127.0.0.1",
             &crate::access::test_grant(),
-            &crate::access::ResourceKey::request(None, &req, "/", Some(Path::new("/wrong")), None),
+            &crate::access::ResourceKey::request(
+                None,
+                &req,
+                &policy_path("/"),
+                Some(Path::new("/wrong")),
+                None,
+            ),
         );
         assert_eq!(invalid.status, 500);
 

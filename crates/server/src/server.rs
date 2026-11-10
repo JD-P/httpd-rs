@@ -1213,7 +1213,8 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
             if trailing_slash && url_path != "/" {
                 url_path.push('/');
             }
-            let canonical = CanonicalTarget::from_normalized(norm.clone(), url_path.clone());
+            let canonical = CanonicalTarget::from_normalized(norm.clone(), url_path.clone())
+                .expect("validated websocket request path is canonical");
             let (url_root, url_fs_hint) = url_mapping_hint(&cfg, vhost, &canonical);
             let (mut url_scope, url_conditionals) = cfg.url_translation_scope_req_deferred(
                 vhost,
@@ -1401,7 +1402,9 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                 let mut resource = access::ResourceKey::request(
                     vhost,
                     &req,
-                    &url_path,
+                    &CanonicalTarget::from_url_path(&url_path)
+                        .expect("websocket route path was canonicalized")
+                        .url_path,
                     filesystem_route.then_some(fs_path.as_path()),
                     Some(target.proxy_url.as_str()),
                 );
@@ -1424,8 +1427,13 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                         return Ok(false);
                     }
                 };
-                let authorization = access::AuthorizedPlan::direct(scope, _grant, resource)
-                    .expect("WebSocket route retained one authorized identity");
+                let authorization = access::AuthorizedPlan::direct(
+                    cfg.authorization_generation(),
+                    scope,
+                    _grant,
+                    resource,
+                )
+                .expect("WebSocket route retained one authorized identity");
                 if let Some((tls, handle)) = stream.take_tls_stream() {
                     // The TLS stream has been consumed by the tunnel; there is
                     // no safe way to inject a response here.
@@ -3725,7 +3733,10 @@ fn helper_access_response(
             if resource.identity.is_none() {
                 resource.identity = inherited_identity;
             }
-            Ok(access::grant_if_allowed(access, resource.clone()).expect("allowed grant"))
+            Ok(
+                access::grant_if_allowed(access, resource.clone(), cfg.authorization_generation())
+                    .expect("allowed grant"),
+            )
         }
         Access::Denied => Err(error_response(
             cfg,
@@ -4672,19 +4683,35 @@ fn bind_target_grant(
     rewrite_effects: &crate::rewrite::Effects,
 ) -> Result<access::AuthorizedPlan, Response> {
     if actual_path == fs_path {
-        let mut key =
-            access::ResourceKey::request(vhost, req, selected_url_path, Some(actual_path), None);
+        let selected_identity = CanonicalTarget::from_url_path(selected_url_path)
+            .expect("selected target URL was canonicalized");
+        let public_identity = CanonicalTarget::from_url_path(public_url_path)
+            .expect("public target URL was canonicalized");
+        let mut key = access::ResourceKey::request(
+            vhost,
+            req,
+            &selected_identity.url_path,
+            Some(actual_path),
+            None,
+        );
         key.identity = grant.key().identity.clone();
         return match grant.bind_file(&key, meta) {
             Some(bound) => {
                 let key = bound.key().clone();
                 let identity = access::OutcomeIdentity::selected(
-                    public_url_path,
-                    selected_url_path,
+                    &public_identity.url_path,
+                    &selected_identity.url_path,
                     Some(fs_path),
                     Some(actual_path),
                 );
-                access::AuthorizedPlan::new(identity, scope.clone(), bound, key).ok_or_else(|| {
+                access::AuthorizedPlan::new(
+                    cfg.authorization_generation(),
+                    identity,
+                    scope.clone(),
+                    bound,
+                    key,
+                )
+                .ok_or_else(|| {
                     error_response(
                         cfg,
                         vhost,
@@ -4787,8 +4814,17 @@ fn bind_target_grant(
     // the scope here let `Options -ExecCGI`, `-Indexes`, `RemoveHandler` and
     // `AllowOverride None` disappear (F60/I61).
     target_scope.restrict_with(scope);
-    let mut key =
-        access::ResourceKey::request(vhost, req, selected_url_path, Some(actual_path), None);
+    let selected_identity = CanonicalTarget::from_url_path(selected_url_path)
+        .expect("selected target URL was canonicalized");
+    let public_identity = CanonicalTarget::from_url_path(public_url_path)
+        .expect("public target URL was canonicalized");
+    let mut key = access::ResourceKey::request(
+        vhost,
+        req,
+        &selected_identity.url_path,
+        Some(actual_path),
+        None,
+    );
     let target_grant = match helper_access_response(
         cfg,
         vhost,
@@ -4809,12 +4845,19 @@ fn bind_target_grant(
         Some(bound) => {
             let key = bound.key().clone();
             let identity = access::OutcomeIdentity::selected(
-                public_url_path,
-                selected_url_path,
+                &public_identity.url_path,
+                &selected_identity.url_path,
                 Some(fs_path),
                 Some(actual_path),
             );
-            access::AuthorizedPlan::new(identity, target_scope, bound, key).ok_or_else(|| {
+            access::AuthorizedPlan::new(
+                cfg.authorization_generation(),
+                identity,
+                target_scope,
+                bound,
+                key,
+            )
+            .ok_or_else(|| {
                 error_response(
                     cfg,
                     vhost,
@@ -4995,6 +5038,10 @@ fn bind_multiview_grant(
     local_ip: &str,
     rewrite_effects: &crate::rewrite::Effects,
 ) -> Result<access::AuthorizedPlan, Response> {
+    let public_identity = CanonicalTarget::from_url_path(public_url_path)
+        .expect("public negotiated URL was canonicalized");
+    let selected_identity = CanonicalTarget::from_url_path(selected_url_path)
+        .expect("selected negotiated URL was canonicalized");
     let mut target_scope = multiview_target_scope(
         cfg,
         vhost,
@@ -5099,7 +5146,7 @@ fn bind_multiview_grant(
                 let mut redirect_key = access::ResourceKey::request(
                     vhost,
                     req,
-                    selected_url_path,
+                    &selected_identity.url_path,
                     Some(actual_path),
                     None,
                 );
@@ -5157,8 +5204,13 @@ fn bind_multiview_grant(
         }
     }
 
-    let mut key =
-        access::ResourceKey::request(vhost, req, selected_url_path, Some(actual_path), None);
+    let mut key = access::ResourceKey::request(
+        vhost,
+        req,
+        &selected_identity.url_path,
+        Some(actual_path),
+        None,
+    );
     let grant = helper_access_response(
         cfg,
         vhost,
@@ -5213,12 +5265,19 @@ fn bind_multiview_grant(
         ));
     }
     let identity = access::OutcomeIdentity::selected(
-        public_url_path,
-        selected_url_path,
+        &public_identity.url_path,
+        &selected_identity.url_path,
         Some(candidate_fs),
         Some(actual_path),
     );
-    access::AuthorizedPlan::new(identity, target_scope, bound, key).ok_or_else(|| {
+    access::AuthorizedPlan::new(
+        cfg.authorization_generation(),
+        identity,
+        target_scope,
+        bound,
+        key,
+    )
+    .ok_or_else(|| {
         error_response(
             cfg,
             vhost,
@@ -5237,12 +5296,14 @@ fn bind_multiview_grant(
 pub(crate) fn multiview_selected_url(
     public_url_path: &str,
     selected_name: &[u8],
-) -> Option<String> {
+) -> Option<crate::request_plan::DecodedUrlPath> {
     let parent_end = public_url_path
         .rfind('/')
         .map(|index| index + 1)
         .unwrap_or(0);
-    CanonicalTarget::from_selected_child(&public_url_path[..parent_end], selected_name, false)
+    let parent = CanonicalTarget::from_url_path(&public_url_path[..parent_end])?;
+    let name = crate::request_plan::FilesystemName::new(selected_name)?;
+    CanonicalTarget::from_selected_child(&parent.url_path, name, false)
         .map(|target| target.url_path)
 }
 
@@ -5364,7 +5425,11 @@ fn authorize_resolved_target(
     let lexical_target_scope = lexical_target_plan.effective_scope(cfg, vhost, req, peer);
     target_scope.restrict_with(&lexical_target_scope);
     target_scope.restrict_policy_with(base_scope);
-    let mut key = access::ResourceKey::request(vhost, req, target_url, Some(target_fs), proxy_url);
+    let target_identity = lexical_target_plan.target().url_path.clone();
+    let public_identity =
+        CanonicalTarget::from_url_path(public_url).expect("public transform URL was canonicalized");
+    let mut key =
+        access::ResourceKey::request(vhost, req, &target_identity, Some(target_fs), proxy_url);
     let grant = helper_access_response(
         cfg,
         vhost,
@@ -5379,12 +5444,19 @@ fn authorize_resolved_target(
         &mut key,
     )?;
     let identity = access::OutcomeIdentity::selected(
-        public_url,
-        target_url,
+        &public_identity.url_path,
+        &target_identity,
         Some(lexical_target_plan.fs_path()),
         Some(target_fs),
     );
-    access::AuthorizedPlan::new(identity, target_scope, grant, key).ok_or_else(|| {
+    access::AuthorizedPlan::new(
+        cfg.authorization_generation(),
+        identity,
+        target_scope,
+        grant,
+        key,
+    )
+    .ok_or_else(|| {
         error_response(
             cfg,
             vhost,
@@ -5519,8 +5591,10 @@ fn authorize_original_scope(
     local_ip: &str,
     scope: &Scope,
 ) -> Result<(), Response> {
+    let identity = CanonicalTarget::from_url_path(url_path)
+        .expect("original authorization URL was canonicalized");
     let mut original_resource =
-        access::ResourceKey::request(vhost, req, url_path, Some(fs_path), None);
+        access::ResourceKey::request(vhost, req, &identity.url_path, Some(fs_path), None);
     helper_access_response(
         cfg,
         vhost,
@@ -5661,7 +5735,9 @@ fn authorize_url_phase_original(
     let (url_path, fs_hint, captured_scope) = original;
     let mut scope = captured_scope.clone();
     apply_rewrite_effects(&mut scope, effects);
-    let mut resource = access::ResourceKey::request(vhost, req, url_path, None, None);
+    let identity = CanonicalTarget::from_url_path(url_path)
+        .expect("URL-phase authorization path was canonicalized");
+    let mut resource = access::ResourceKey::request(vhost, req, &identity.url_path, None, None);
     helper_access_response(
         cfg,
         vhost,
@@ -5795,10 +5871,12 @@ fn dispatch_url_proxy(
         front_url_path,
     );
     if let Some((prior_url, prior_fs, prior)) = prior_scope {
+        let prior_identity =
+            CanonicalTarget::from_url_path(prior_url).expect("prior proxy URL was canonicalized");
         let mut prior_resource = access::ResourceKey::request(
             vhost,
             req,
-            prior_url,
+            &prior_identity.url_path,
             None,
             proxy_identities.first().copied(),
         );
@@ -5832,10 +5910,12 @@ fn dispatch_url_proxy(
     ) {
         return response;
     }
+    let front_identity =
+        CanonicalTarget::from_url_path(front_url_path).expect("front proxy URL was canonicalized");
     let mut resource = access::ResourceKey::request(
         vhost,
         req,
-        front_url_path,
+        &front_identity.url_path,
         None,
         proxy_identities.first().copied(),
     );
@@ -5863,8 +5943,13 @@ fn dispatch_url_proxy(
             query_override,
         } => {
             if req.handler_probe() {
-                let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
-                    .expect("URL proxy route retained one authorized identity");
+                let authorization = access::AuthorizedPlan::direct(
+                    cfg.authorization_generation(),
+                    scope,
+                    grant,
+                    resource,
+                )
+                .expect("URL proxy route retained one authorized identity");
                 return Response::prepared_handler(PreparedHandler::Proxy {
                     vhost_index: selected_vhost_index(cfg, vhost),
                     proxy_base_scope,
@@ -5887,8 +5972,13 @@ fn dispatch_url_proxy(
             } else {
                 req
             };
-            let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
-                .expect("URL proxy route retained one authorized identity");
+            let authorization = access::AuthorizedPlan::direct(
+                cfg.authorization_generation(),
+                scope,
+                grant,
+                resource,
+            )
+            .expect("URL proxy route retained one authorized identity");
             proxy::execute_authorized_with_proxy_base(
                 cfg,
                 vhost,
@@ -5906,8 +5996,13 @@ fn dispatch_url_proxy(
         }
         UrlProxySelection::FastCgi(target) => {
             if req.handler_probe() {
-                let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
-                    .expect("URL FastCGI route retained one authorized identity");
+                let authorization = access::AuthorizedPlan::direct(
+                    cfg.authorization_generation(),
+                    scope,
+                    grant,
+                    resource,
+                )
+                .expect("URL FastCGI route retained one authorized identity");
                 return Response::prepared_handler(PreparedHandler::FastCgi {
                     vhost_index: selected_vhost_index(cfg, vhost),
                     authorization,
@@ -5921,8 +6016,13 @@ fn dispatch_url_proxy(
                     mapping_root: mapping_root.to_path_buf(),
                 });
             }
-            let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
-                .expect("URL FastCGI route retained one authorized identity");
+            let authorization = access::AuthorizedPlan::direct(
+                cfg.authorization_generation(),
+                scope,
+                grant,
+                resource,
+            )
+            .expect("URL FastCGI route retained one authorized identity");
             run_authorized_fastcgi(
                 cfg,
                 vhost,
@@ -5977,7 +6077,7 @@ fn run_url_translation_phase(
         .as_ref()
         .map(|start| start.request_uri.to_string())
         .or_else(|| req.public_uri().map(str::to_string))
-        .unwrap_or_else(|| target.url_path.clone());
+        .unwrap_or_else(|| target.url_path.to_string());
     let mut owned_req = None;
     let mut effects = start
         .as_ref()
@@ -6016,7 +6116,7 @@ fn run_url_translation_phase(
             peer.ip(),
         );
         if original.is_none() {
-            original = Some((target.url_path.clone(), fs_hint.clone(), scope.clone()));
+            original = Some((target.url_path.to_string(), fs_hint.clone(), scope.clone()));
         }
 
         if !stop_rewriting {
@@ -6164,7 +6264,7 @@ fn run_url_translation_phase(
                         &mapping_root,
                         UrlProxySelection::Http {
                             target: proxy_target,
-                            execute_path: target.url_path.clone(),
+                            execute_path: target.url_path.to_string(),
                             query_override: Some(query),
                         },
                         peer,
@@ -6219,7 +6319,8 @@ fn run_url_translation_phase(
                         owned_req = Some(rewritten);
                     }
                     target =
-                        CanonicalTarget::from_normalized(canonical.as_bytes().to_vec(), canonical);
+                        CanonicalTarget::from_normalized(canonical.as_bytes().to_vec(), canonical)
+                            .expect("canonicalized rewrite path remains canonical");
                     // An effects-only rule (`RewriteRule ... - [E=...]`) must
                     // make its environment visible to deferred conditionals
                     // and authorization, but replaying the identical URL
@@ -6293,7 +6394,7 @@ fn run_url_translation_phase(
             }
             (Some(http), _) => Some(UrlProxySelection::Http {
                 target: http,
-                execute_path: target.url_path.clone(),
+                execute_path: target.url_path.to_string(),
                 query_override: None,
             }),
             (None, Some(fastcgi)) => Some(UrlProxySelection::FastCgi(fastcgi)),
@@ -6492,7 +6593,7 @@ fn dispatch_inner(
             request_uri: req
                 .public_uri()
                 .map(str::to_string)
-                .unwrap_or_else(|| target.url_path.clone()),
+                .unwrap_or_else(|| target.url_path.to_string()),
             target,
             owned_req: None,
             rewrite_effects: Default::default(),
@@ -6768,7 +6869,9 @@ fn dispatch_inner(
                 let mut resource = access::ResourceKey::request(
                     vhost,
                     current_req,
-                    &url_path,
+                    &CanonicalTarget::from_url_path(&url_path)
+                        .expect("rewritten proxy URL was canonicalized")
+                        .url_path,
                     None,
                     Some(target.proxy_url.as_str()),
                 );
@@ -6837,8 +6940,13 @@ fn dispatch_inner(
                     }
                 }
                 if current_req.handler_probe() {
-                    let authorization = access::AuthorizedPlan::direct(scope, _grant, resource)
-                        .expect("rewrite proxy route retained one authorized identity");
+                    let authorization = access::AuthorizedPlan::direct(
+                        cfg.authorization_generation(),
+                        scope,
+                        _grant,
+                        resource,
+                    )
+                    .expect("rewrite proxy route retained one authorized identity");
                     return Response::prepared_handler(PreparedHandler::Proxy {
                         vhost_index: selected_vhost_index(cfg, vhost),
                         proxy_base_scope,
@@ -6855,8 +6963,13 @@ fn dispatch_inner(
                 }
                 let mut proxy_req = current_req.clone();
                 proxy_req.query = query.as_bytes().to_vec();
-                let authorization = access::AuthorizedPlan::direct(scope, _grant, resource)
-                    .expect("rewrite proxy route retained one authorized identity");
+                let authorization = access::AuthorizedPlan::direct(
+                    cfg.authorization_generation(),
+                    scope,
+                    _grant,
+                    resource,
+                )
+                .expect("rewrite proxy route retained one authorized identity");
                 return proxy::execute_authorized_with_proxy_base(
                     cfg,
                     vhost,
@@ -7034,7 +7147,8 @@ fn dispatch_inner(
                 }
                 url_path = canonical;
                 norm = url_path.as_bytes().to_vec();
-                let mut target = CanonicalTarget::from_normalized(norm.clone(), url_path.clone());
+                let mut target = CanonicalTarget::from_normalized(norm.clone(), url_path.clone())
+                    .expect("canonicalized per-directory rewrite path remains canonical");
 
                 if rewrite_filesystem.is_none() {
                     // A per-directory internal rewrite starts a fresh URL
@@ -7095,7 +7209,7 @@ fn dispatch_inner(
                         UrlPhaseResult::Terminal(response) => return response,
                         UrlPhaseResult::Local(local) => {
                             target = local.target;
-                            url_path = target.url_path.clone();
+                            url_path = target.url_path.to_string();
                             norm = target.norm.clone();
                             rewrite_effects = local.rewrite_effects;
                             rewrite_filesystem = local.filesystem;
@@ -7286,8 +7400,15 @@ fn dispatch_inner(
     // through Directory/Files/.htaccess would cross the phase boundary again.
     if let Some((original_url, original_fs_hint, mut original_scope)) = url_original {
         apply_rewrite_effects(&mut original_scope, &rewrite_effects);
-        let mut original_resource =
-            access::ResourceKey::request(vhost, url_original_req, &original_url, None, None);
+        let original_identity = CanonicalTarget::from_url_path(&original_url)
+            .expect("original request URL was canonicalized");
+        let mut original_resource = access::ResourceKey::request(
+            vhost,
+            url_original_req,
+            &original_identity.url_path,
+            None,
+            None,
+        );
         if let Err(response) = helper_access_response(
             cfg,
             vhost,
@@ -7418,10 +7539,12 @@ fn dispatch_inner(
     ) {
         return r;
     }
+    let dispatch_identity =
+        CanonicalTarget::from_url_path(&url_path).expect("dispatch URL was canonicalized");
     let mut resource = access::ResourceKey::request(
         vhost,
         req,
-        &url_path,
+        &dispatch_identity.url_path,
         Some(&fs_path),
         selected_proxy_urls.first().map(String::as_str),
     );
@@ -7485,8 +7608,13 @@ fn dispatch_inner(
     if fastcgi_wins {
         if let Some(target) = fastcgi_target {
             if req.handler_probe() {
-                let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
-                    .expect("FastCGI route retained one authorized identity");
+                let authorization = access::AuthorizedPlan::direct(
+                    cfg.authorization_generation(),
+                    scope,
+                    grant,
+                    resource,
+                )
+                .expect("FastCGI route retained one authorized identity");
                 return Response::prepared_handler(PreparedHandler::FastCgi {
                     vhost_index: selected_vhost_index(cfg, vhost),
                     authorization,
@@ -7500,8 +7628,13 @@ fn dispatch_inner(
                     mapping_root: root,
                 });
             }
-            let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
-                .expect("FastCGI route retained one authorized identity");
+            let authorization = access::AuthorizedPlan::direct(
+                cfg.authorization_generation(),
+                scope,
+                grant,
+                resource,
+            )
+            .expect("FastCGI route retained one authorized identity");
             return run_authorized_fastcgi(
                 cfg,
                 vhost,
@@ -7521,8 +7654,13 @@ fn dispatch_inner(
 
     if let Some(target) = proxy_target {
         if req.handler_probe() {
-            let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
-                .expect("proxy route retained one authorized identity");
+            let authorization = access::AuthorizedPlan::direct(
+                cfg.authorization_generation(),
+                scope,
+                grant,
+                resource,
+            )
+            .expect("proxy route retained one authorized identity");
             return Response::prepared_handler(PreparedHandler::Proxy {
                 vhost_index: selected_vhost_index(cfg, vhost),
                 proxy_base_scope,
@@ -7537,8 +7675,9 @@ fn dispatch_inner(
                 query_override: None,
             });
         }
-        let authorization = access::AuthorizedPlan::direct(scope, grant, resource)
-            .expect("proxy route retained one authorized identity");
+        let authorization =
+            access::AuthorizedPlan::direct(cfg.authorization_generation(), scope, grant, resource)
+                .expect("proxy route retained one authorized identity");
         return proxy::execute_authorized_with_proxy_base(
             cfg,
             vhost,
@@ -7772,7 +7911,10 @@ fn dispatch_inner(
                     target_authorization
                 };
                 let authorization = target_authorization
-                    .into_outcome(vapache_verified::TransformSink::LocalCgi)
+                    .into_outcome(
+                        cfg.authorization_generation(),
+                        vapache_verified::TransformSink::LocalCgi,
+                    )
                     .expect("CGI target retained its inode-bound authorization");
                 if req.handler_probe() {
                     let descriptor_lease = match cfg.resource_budget.try_descriptor() {
@@ -7896,7 +8038,10 @@ fn dispatch_inner(
                 return r;
             }
             let authorization = target_authorization
-                .into_outcome(vapache_verified::TransformSink::StaticFile)
+                .into_outcome(
+                    cfg.authorization_generation(),
+                    vapache_verified::TransformSink::StaticFile,
+                )
                 .expect("static target retained its inode-bound authorization");
             crate::files::serve_authorized_file(
                 cfg,
@@ -7975,12 +8120,19 @@ fn dispatch_inner(
                 directory_index_target(cfg, &scope, req, &file, &auth_url, &req.raw_path)
             {
                 let crate::files::DirectoryIndex { name, file, meta } = index;
+                let auth_parent = CanonicalTarget::from_url_path(&auth_url);
+                let index_name = crate::request_plan::FilesystemName::new(&name);
                 let Some(index_target) =
-                    CanonicalTarget::from_selected_child(&auth_url, &name, false)
+                    auth_parent
+                        .as_ref()
+                        .zip(index_name)
+                        .and_then(|(parent, name)| {
+                            CanonicalTarget::from_selected_child(&parent.url_path, name, false)
+                        })
                 else {
                     return Response::policy_error();
                 };
-                let index_url = index_target.url_path.clone();
+                let index_url = index_target.url_path.to_string();
                 let index_plan = plan.retarget_directory_index(
                     cfg,
                     vhost,
@@ -8062,7 +8214,10 @@ fn dispatch_inner(
                 Err(r) => return r, // coverage:ignore-line
             };
             let authorization = target_authorization
-                .into_outcome(vapache_verified::TransformSink::Directory)
+                .into_outcome(
+                    cfg.authorization_generation(),
+                    vapache_verified::TransformSink::Directory,
+                )
                 .expect("directory target retained its inode-bound authorization");
             crate::files::serve_authorized_directory(
                 cfg,
@@ -8254,7 +8409,10 @@ fn dispatch_inner(
                             );
                         }
                         let authorization = target_authorization
-                            .into_outcome(vapache_verified::TransformSink::StaticFile)
+                            .into_outcome(
+                                cfg.authorization_generation(),
+                                vapache_verified::TransformSink::StaticFile,
+                            )
                             .expect("MultiViews target retained its inode-bound authorization");
                         let mut response = crate::files::serve_authorized_file(
                             cfg,
@@ -8413,7 +8571,10 @@ fn dispatch_inner(
                         let authorization = target_authorization
                             .bind_file(&st.meta)
                             .and_then(|plan| {
-                                plan.into_outcome(vapache_verified::TransformSink::LocalCgi)
+                                plan.into_outcome(
+                                    cfg.authorization_generation(),
+                                    vapache_verified::TransformSink::LocalCgi,
+                                )
                             })
                             .expect("PATH_INFO CGI retained one inode-bound authorization");
                         if req.handler_probe() {
@@ -8879,7 +9040,12 @@ fn run_fastcgi_with_public_url(
     let Some(authorization) = target_authorization
         .bind_file(&script_binding.meta)
         .and_then(|plan| plan.bind_backend(backend_binding))
-        .and_then(|plan| plan.into_outcome(vapache_verified::TransformSink::FastCgi))
+        .and_then(|plan| {
+            plan.into_outcome(
+                cfg.authorization_generation(),
+                vapache_verified::TransformSink::FastCgi,
+            )
+        })
     else {
         return error_response(
             cfg,
@@ -9035,6 +9201,7 @@ fn run_authorized_cgi(
     if crate::files::fd_path(script_file).as_deref() != Some(resolved_path)
         || authorization.identity().selected_url_path() != script_name
         || !authorization.require_file_sink(
+            cfg.authorization_generation(),
             vapache_verified::TransformSink::LocalCgi,
             resolved_path,
             &opened_meta,
@@ -9137,7 +9304,11 @@ fn run_cgi(
     let mut expected = resource.clone();
     expected.file_dev = Some(meta.dev());
     expected.file_ino = Some(meta.ino());
-    if !bound.require_sink(&expected, vapache_verified::TransformSink::LocalCgi) {
+    if !bound.require_sink(
+        cfg.authorization_generation(),
+        &expected,
+        vapache_verified::TransformSink::LocalCgi,
+    ) {
         return error_response(
             cfg,
             vhost,
@@ -9284,6 +9455,11 @@ fn apply_rewrite_effects(scope: &mut crate::config::Scope, effects: &crate::rewr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn policy_path(value: &str) -> crate::request_plan::DecodedUrlPath {
+        crate::request_plan::DecodedUrlPath::from_canonical(value)
+            .expect("test server path is canonical")
+    }
     use std::os::fd::AsRawFd as _;
 
     // Admission counters are intentionally process-wide.  Serialize the few
@@ -10894,20 +11070,28 @@ mod tests {
             }
         }
         assert_eq!(
-            multiview_selected_url("/nested/name", b"name.en.txt"),
-            Some("/nested/name.en.txt".into())
+            multiview_selected_url("/nested/name", b"name.en.txt")
+                .as_ref()
+                .map(crate::request_plan::DecodedUrlPath::as_str),
+            Some("/nested/name.en.txt")
         );
         assert_eq!(
-            multiview_selected_url("/name", b"name with space.txt"),
-            Some("/name with space.txt".into())
+            multiview_selected_url("/name", b"name with space.txt")
+                .as_ref()
+                .map(crate::request_plan::DecodedUrlPath::as_str),
+            Some("/name with space.txt")
         );
         assert_eq!(
-            multiview_selected_url("/café", "café.txt".as_bytes()),
-            Some("/café.txt".into())
+            multiview_selected_url("/café", "café.txt".as_bytes())
+                .as_ref()
+                .map(crate::request_plan::DecodedUrlPath::as_str),
+            Some("/café.txt")
         );
         assert_eq!(
-            multiview_selected_url("/pct%20literal", b"pct%20literal.txt"),
-            Some("/pct%20literal.txt".into())
+            multiview_selected_url("/pct%20literal", b"pct%20literal.txt")
+                .as_ref()
+                .map(crate::request_plan::DecodedUrlPath::as_str),
+            Some("/pct%20literal.txt")
         );
         assert_eq!(multiview_selected_url("/bad", b"bad\xff.txt"), None);
         let _ = std::fs::remove_dir_all(dir);
@@ -11823,8 +12007,18 @@ mod tests {
         let fs_path = dir.join("www/a.txt");
         let meta = std::fs::metadata(&fs_path).unwrap();
         let scope = Scope::default();
-        let other = access::ResourceKey::request(None, &req, "/other", None, None);
-        let grant = access::check_grant(&scope, &req, peer, None, "/x", None, other).unwrap();
+        let other = access::ResourceKey::request(None, &req, &policy_path("/other"), None, None);
+        let grant = access::check_grant(
+            &scope,
+            &req,
+            peer,
+            None,
+            "/x",
+            None,
+            other,
+            cfg.authorization_generation(),
+        )
+        .unwrap();
         let effects = crate::rewrite::Effects::default();
         let (_, _, _) = (grant.key(), &scope, &effects);
         let err = bind_target_grant(
@@ -11946,8 +12140,13 @@ mod tests {
         let script_file = std::fs::File::open(&script).unwrap();
         let script_meta = script_file.metadata().unwrap();
         let script_req = cov_req("GET", "/script.cgi");
-        let script_resource =
-            access::ResourceKey::request(None, &script_req, "/script.cgi", Some(&script), None);
+        let script_resource = access::ResourceKey::request(
+            None,
+            &script_req,
+            &policy_path("/script.cgi"),
+            Some(&script),
+            None,
+        );
         let script_grant = access::check_grant(
             &scope,
             &script_req,
@@ -11956,6 +12155,7 @@ mod tests {
             "/script.cgi",
             None,
             script_resource.clone(),
+            cfg.authorization_generation(),
         )
         .unwrap();
         let err = run_cgi(
@@ -11993,6 +12193,7 @@ mod tests {
             "/script.cgi",
             None,
             script_resource.clone(),
+            cfg.authorization_generation(),
         )
         .unwrap();
         let resp = run_cgi(
@@ -12023,8 +12224,13 @@ mod tests {
             crate::config::RequireNode::Provider(crate::config::Require::AllGranted),
             None,
         );
-        let mut auth_resource =
-            access::ResourceKey::request(None, &script_req, "/script.cgi", Some(&script), None);
+        let mut auth_resource = access::ResourceKey::request(
+            None,
+            &script_req,
+            &policy_path("/script.cgi"),
+            Some(&script),
+            None,
+        );
         auth_resource.identity = Some("alice".into());
         let auth_grant = access::check_grant(
             &auth_scope,
@@ -12034,6 +12240,7 @@ mod tests {
             "/script.cgi",
             None,
             auth_resource.clone(),
+            cfg.authorization_generation(),
         )
         .unwrap();
         let resp = run_cgi(
@@ -12943,7 +13150,7 @@ mod tests {
         let resource = access::ResourceKey::request(
             None,
             &req,
-            "/script.php/info",
+            &policy_path("/script.php/info"),
             Some(&script),
             Some("fcgi"),
         );

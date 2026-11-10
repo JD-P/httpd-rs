@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::request_plan::DecodedUrlPath;
+
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub user: String,
@@ -42,7 +44,7 @@ pub enum Access {
 pub struct ResourceKey {
     pub vhost: usize,
     pub method: String,
-    pub url_path: String,
+    pub url_path: DecodedUrlPath,
     pub fs_path: Option<PathBuf>,
     pub proxy_url: Option<String>,
     pub cache_host: Option<String>,
@@ -109,14 +111,14 @@ impl ResourceKey {
     pub fn request(
         vhost: Option<&crate::config::VHost>,
         req: &Request,
-        url_path: &str,
+        url_path: &DecodedUrlPath,
         fs_path: Option<&Path>,
         proxy_url: Option<&str>,
     ) -> Self {
         Self {
             vhost: vhost_id(vhost),
             method: req.method.clone(),
-            url_path: url_path.to_string(),
+            url_path: url_path.clone(),
             fs_path: fs_path.map(Path::to_path_buf),
             proxy_url: proxy_url.map(str::to_string),
             cache_host: None,
@@ -134,12 +136,12 @@ impl ResourceKey {
         vhost: Option<&crate::config::VHost>,
         req: &Request,
         host: &str,
-        path: &str,
+        path: &DecodedUrlPath,
     ) -> Self {
         Self {
             vhost: vhost_id(vhost),
             method: req.method.clone(),
-            url_path: path.to_string(),
+            url_path: path.clone(),
             fs_path: None,
             proxy_url: None,
             cache_host: Some(host.to_string()),
@@ -157,7 +159,7 @@ impl ResourceKey {
         vhost: Option<&crate::config::VHost>,
         req: &Request,
         host: &str,
-        path: &str,
+        path: &DecodedUrlPath,
         policy_fingerprint: [u8; 32],
     ) -> Self {
         let mut key = Self::cache(vhost, req, host, path);
@@ -171,6 +173,7 @@ impl ResourceKey {
 #[derive(Debug)]
 pub struct AccessGrant {
     key: ResourceKey,
+    generation: crate::config::ConfigurationGeneration,
     pipeline: vapache_verified::TransformCapability,
     /// Exact front-end/upstream path pair witnessed when a proxy target is
     /// bound. A boolean pipeline bit alone cannot prevent reuse after a
@@ -186,37 +189,37 @@ pub struct AccessGrant {
 /// paths; local and cache outcomes carry both lexical and resolved paths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutcomeIdentity {
-    public_url_path: String,
-    selected_url_path: String,
+    public_url_path: DecodedUrlPath,
+    selected_url_path: DecodedUrlPath,
     lexical_fs_path: Option<PathBuf>,
     resolved_fs_path: Option<PathBuf>,
 }
 
 impl OutcomeIdentity {
-    pub fn direct(url_path: &str, fs_path: Option<&Path>) -> Self {
+    pub fn direct(url_path: &DecodedUrlPath, fs_path: Option<&Path>) -> Self {
         Self::selected(url_path, url_path, fs_path, fs_path)
     }
 
     pub fn selected(
-        public_url_path: &str,
-        selected_url_path: &str,
+        public_url_path: &DecodedUrlPath,
+        selected_url_path: &DecodedUrlPath,
         lexical_fs_path: Option<&Path>,
         resolved_fs_path: Option<&Path>,
     ) -> Self {
         Self {
-            public_url_path: public_url_path.to_string(),
-            selected_url_path: selected_url_path.to_string(),
+            public_url_path: public_url_path.clone(),
+            selected_url_path: selected_url_path.clone(),
             lexical_fs_path: lexical_fs_path.map(Path::to_path_buf),
             resolved_fs_path: resolved_fs_path.map(Path::to_path_buf),
         }
     }
 
     pub fn public_url_path(&self) -> &str {
-        &self.public_url_path
+        self.public_url_path.as_str()
     }
 
     pub fn selected_url_path(&self) -> &str {
-        &self.selected_url_path
+        self.selected_url_path.as_str()
     }
 
     pub fn lexical_fs_path(&self) -> Option<&Path> {
@@ -241,7 +244,8 @@ pub struct AuthorizedPlan {
 }
 
 impl AuthorizedPlan {
-    pub fn new(
+    pub(crate) fn new(
+        generation: crate::config::ConfigurationGeneration,
         identity: OutcomeIdentity,
         scope: Scope,
         grant: AccessGrant,
@@ -261,7 +265,7 @@ impl AuthorizedPlan {
             identity.selected_url_path == resource.url_path,
             filesystem_identity_well_formed,
             resolved_target_bound,
-            grant.require(&resource),
+            grant.generation_matches(generation) && grant.require(&resource),
         ) {
             return None;
         }
@@ -273,9 +277,14 @@ impl AuthorizedPlan {
         })
     }
 
-    pub fn direct(scope: Scope, grant: AccessGrant, resource: ResourceKey) -> Option<Self> {
+    pub(crate) fn direct(
+        generation: crate::config::ConfigurationGeneration,
+        scope: Scope,
+        grant: AccessGrant,
+        resource: ResourceKey,
+    ) -> Option<Self> {
         let identity = OutcomeIdentity::direct(&resource.url_path, resource.fs_path.as_deref());
-        Self::new(identity, scope, grant, resource)
+        Self::new(generation, identity, scope, grant, resource)
     }
 
     pub fn identity(&self) -> &OutcomeIdentity {
@@ -297,38 +306,21 @@ impl AuthorizedPlan {
     pub fn bind_file(self, meta: &std::fs::Metadata) -> Option<Self> {
         let grant = self.grant.bind_file(&self.resource, meta)?;
         let resource = grant.key().clone();
-        Self::new(self.identity, self.scope, grant, resource)
+        Self::new(grant.generation, self.identity, self.scope, grant, resource)
     }
 
     pub fn bind_backend(self, backend_target: String) -> Option<Self> {
         let grant = self.grant.bind_backend(&self.resource, backend_target)?;
         let resource = grant.key().clone();
-        Self::new(self.identity, self.scope, grant, resource)
+        Self::new(grant.generation, self.identity, self.scope, grant, resource)
     }
 
-    pub fn bind_proxy(
+    pub(crate) fn into_outcome(
         self,
-        host: &str,
-        port: u16,
-        tls: bool,
-        upstream_path: &str,
+        generation: crate::config::ConfigurationGeneration,
+        sink: vapache_verified::TransformSink,
     ) -> Option<AuthorizedOutcome> {
-        let grant = self
-            .grant
-            .bind_proxy(&self.resource, host, port, tls, upstream_path)?;
-        let resource = grant.key().clone();
-        let plan = Self::new(self.identity, self.scope, grant, resource)?;
-        if !plan
-            .grant
-            .require_proxy_sink(&plan.resource, host, port, tls, upstream_path)
-        {
-            return None;
-        }
-        plan.into_outcome(vapache_verified::TransformSink::Proxy)
-    }
-
-    pub fn into_outcome(self, sink: vapache_verified::TransformSink) -> Option<AuthorizedOutcome> {
-        if !self.grant.require_sink(&self.resource, sink) {
+        if !self.grant.require_sink(generation, &self.resource, sink) {
             return None;
         }
         Some(AuthorizedOutcome { plan: self, sink })
@@ -365,21 +357,30 @@ impl AuthorizedOutcome {
         self.sink
     }
 
-    pub fn require_sink(&self, sink: vapache_verified::TransformSink) -> bool {
-        self.sink == sink && self.plan.grant.require_sink(&self.plan.resource, sink)
+    pub(crate) fn require_sink(
+        &self,
+        generation: crate::config::ConfigurationGeneration,
+        sink: vapache_verified::TransformSink,
+    ) -> bool {
+        self.sink == sink
+            && self
+                .plan
+                .grant
+                .require_sink(generation, &self.plan.resource, sink)
     }
 
     /// A local-file sink must retain both the resolved pathname and the
     /// inode captured from the descriptor that will actually be consumed.
     /// Checking this at the typed boundary prevents a caller from pairing an
     /// authorized outcome with a different descriptor/metadata tuple.
-    pub fn require_file_sink(
+    pub(crate) fn require_file_sink(
         &self,
+        generation: crate::config::ConfigurationGeneration,
         sink: vapache_verified::TransformSink,
         path: &Path,
         meta: &std::fs::Metadata,
     ) -> bool {
-        self.require_sink(sink)
+        self.require_sink(generation, sink)
             && self.identity().resolved_fs_path() == Some(path)
             && self.resource().fs_path.as_deref() == Some(path)
             && self.resource().file_dev == Some(meta.dev())
@@ -388,6 +389,12 @@ impl AuthorizedOutcome {
 }
 
 impl AccessGrant {
+    fn generation_matches(&self, generation: crate::config::ConfigurationGeneration) -> bool {
+        // The wildcard capability is only constructible by `test_grant`
+        // under cfg(test); production grants must match the active config.
+        self.wildcard || self.generation == generation
+    }
+
     pub fn require(&self, key: &ResourceKey) -> bool {
         self.wildcard || &self.key == key
     }
@@ -400,13 +407,19 @@ impl AccessGrant {
     /// grant minted before a retarget from reaching the new object; the
     /// verified capability additionally enforces the sink-specific inode,
     /// backend and cache-policy bindings.
-    pub fn require_sink(&self, key: &ResourceKey, sink: vapache_verified::TransformSink) -> bool {
+    pub(crate) fn require_sink(
+        &self,
+        generation: crate::config::ConfigurationGeneration,
+        key: &ResourceKey,
+        sink: vapache_verified::TransformSink,
+    ) -> bool {
         let exact_representation = sink != vapache_verified::TransformSink::Proxy
             || self
                 .proxy_representation
                 .as_ref()
                 .is_some_and(|binding| binding.matches_stored_key(key));
-        exact_representation
+        self.generation_matches(generation)
+            && exact_representation
             && vapache_verified::transform_sink_admit(self.require(key), self.pipeline, sink)
     }
 
@@ -416,13 +429,14 @@ impl AccessGrant {
     /// representation even when the grant itself is unchanged.
     pub(crate) fn require_proxy_sink(
         &self,
+        generation: crate::config::ConfigurationGeneration,
         key: &ResourceKey,
         host: &str,
         port: u16,
         tls: bool,
         upstream_path: &str,
     ) -> bool {
-        self.require_sink(key, vapache_verified::TransformSink::Proxy)
+        self.require_sink(generation, key, vapache_verified::TransformSink::Proxy)
             && self
                 .proxy_representation
                 .as_ref()
@@ -443,6 +457,7 @@ impl AccessGrant {
         key.backend_target = Some(backend_target);
         Some(AccessGrant {
             key,
+            generation: self.generation,
             pipeline: vapache_verified::transform_bind_backend(self.pipeline),
             proxy_representation: self.proxy_representation.clone(),
             wildcard: self.wildcard,
@@ -478,6 +493,7 @@ impl AccessGrant {
         key.backend_target = Some(backend_target.clone());
         Some(AccessGrant {
             key,
+            generation: self.generation,
             pipeline: vapache_verified::transform_bind_representation(
                 vapache_verified::transform_bind_backend(self.pipeline),
             ),
@@ -503,6 +519,7 @@ impl AccessGrant {
         key.file_ino = Some(meta.ino());
         Some(AccessGrant {
             key,
+            generation: self.generation,
             pipeline: vapache_verified::transform_bind_inode(self.pipeline),
             proxy_representation: self.proxy_representation.clone(),
             wildcard: self.wildcard,
@@ -514,11 +531,16 @@ fn authorized_pipeline(key: &ResourceKey) -> vapache_verified::TransformCapabili
     vapache_verified::transform_authorize(key.policy_fingerprint.is_some())
 }
 
-pub(crate) fn grant_if_allowed(access: Access, key: ResourceKey) -> Option<AccessGrant> {
+pub(crate) fn grant_if_allowed(
+    access: Access,
+    key: ResourceKey,
+    generation: crate::config::ConfigurationGeneration,
+) -> Option<AccessGrant> {
     match access {
         Access::Allowed => Some(AccessGrant {
             pipeline: authorized_pipeline(&key),
             key,
+            generation,
             proxy_representation: None,
             wildcard: false,
         }),
@@ -532,7 +554,9 @@ pub fn test_grant() -> AccessGrant {
         key: ResourceKey {
             vhost: 0,
             method: String::new(),
-            url_path: String::new(),
+            url_path: crate::request_plan::CanonicalTarget::from_url_path("/")
+                .expect("root is canonical")
+                .url_path,
             fs_path: None,
             proxy_url: None,
             cache_host: None,
@@ -544,6 +568,7 @@ pub fn test_grant() -> AccessGrant {
             backend_target: None,
             policy_fingerprint: None,
         },
+        generation: crate::config::ConfigurationGeneration::for_test(),
         // Unit tests deliberately use a fully-bound wildcard capability to
         // exercise downstream protocol behavior without reproducing access
         // evaluation in every fixture.
@@ -568,11 +593,13 @@ pub(crate) fn check_grant(
     url_path: &str,
     fs_path: Option<&Path>,
     key: ResourceKey,
+    generation: crate::config::ConfigurationGeneration,
 ) -> Result<AccessGrant, Access> {
     match check(scope, req, peer, identity, url_path, fs_path) {
         Access::Allowed => Ok(AccessGrant {
             pipeline: authorized_pipeline(&key),
             key,
+            generation,
             proxy_representation: None,
             wildcard: false,
         }),
@@ -1311,6 +1338,15 @@ mod tests {
     use super::*;
     use crate::config::{AuthPolicy, RequireEntry};
 
+    fn generation() -> crate::config::ConfigurationGeneration {
+        crate::config::ConfigurationGeneration::for_test()
+    }
+
+    fn path(value: &str) -> crate::request_plan::DecodedUrlPath {
+        crate::request_plan::DecodedUrlPath::from_canonical(value)
+            .expect("test policy path is canonical")
+    }
+
     fn reqs(v: Vec<Require>) -> Option<AuthPolicy> {
         Some(AuthPolicy::List(
             v.into_iter()
@@ -1530,22 +1566,22 @@ mod tests {
         valid.query = b"x=1".to_vec();
 
         assert_ne!(
-            ResourceKey::cache(None, &lossy_ff, "h.test", "/p"),
-            ResourceKey::cache(None, &lossy_fe, "h.test", "/p")
+            ResourceKey::cache(None, &lossy_ff, "h.test", &path("/p")),
+            ResourceKey::cache(None, &lossy_fe, "h.test", &path("/p"))
         );
         assert_eq!(
-            ResourceKey::cache(None, &lossy_ff, "h.test", "/p"),
-            ResourceKey::cache(None, &ff_again, "h.test", "/p")
+            ResourceKey::cache(None, &lossy_ff, "h.test", &path("/p")),
+            ResourceKey::cache(None, &ff_again, "h.test", &path("/p"))
         );
         // Equal valid queries still share an identity, and a different
         // query token remains distinct.
         assert_eq!(
-            ResourceKey::cache(None, &valid, "h.test", "/p"),
-            ResourceKey::cache(None, &valid, "h.test", "/p")
+            ResourceKey::cache(None, &valid, "h.test", &path("/p")),
+            ResourceKey::cache(None, &valid, "h.test", &path("/p"))
         );
         assert_ne!(
-            ResourceKey::cache(None, &valid, "h.test", "/p"),
-            ResourceKey::cache(None, &lossy_ff, "h.test", "/p")
+            ResourceKey::cache(None, &valid, "h.test", &path("/p")),
+            ResourceKey::cache(None, &lossy_ff, "h.test", &path("/p"))
         );
     }
 
@@ -1553,8 +1589,8 @@ mod tests {
     fn grant_binding_rejects_a_different_resource() {
         let req = req("GET");
         let scope = Scope::default();
-        let allowed = ResourceKey::request(None, &req, "/a", None, None);
-        let other = ResourceKey::request(None, &req, "/b", None, None);
+        let allowed = ResourceKey::request(None, &req, &path("/a"), None, None);
+        let other = ResourceKey::request(None, &req, &path("/b"), None, None);
         let grant = check_grant(
             &scope,
             &req,
@@ -1563,6 +1599,7 @@ mod tests {
             "/x",
             None,
             allowed.clone(),
+            generation(),
         )
         .expect("allowed");
         let meta = std::fs::metadata("/proc/self/exe").expect("self metadata");
@@ -1947,17 +1984,20 @@ mod tests {
     fn access_grant_is_only_created_for_allowed() {
         assert!(grant_if_allowed(
             Access::Allowed,
-            ResourceKey::request(None, &req("GET"), "/", None, None)
+            ResourceKey::request(None, &req("GET"), &path("/"), None, None),
+            generation(),
         )
         .is_some());
         assert!(grant_if_allowed(
             Access::Denied,
-            ResourceKey::request(None, &req("GET"), "/", None, None)
+            ResourceKey::request(None, &req("GET"), &path("/"), None, None),
+            generation(),
         )
         .is_none());
         assert!(grant_if_allowed(
             Access::AuthRequired,
-            ResourceKey::request(None, &req("GET"), "/", None, None)
+            ResourceKey::request(None, &req("GET"), &path("/"), None, None),
+            generation(),
         )
         .is_none());
     }
@@ -1967,11 +2007,54 @@ mod tests {
         let req = req("GET");
         let peer = "127.0.0.1".parse().unwrap();
         let scope = Scope::default();
-        let a = ResourceKey::request(None, &req, "/public/a", None, None);
-        let b = ResourceKey::request(None, &req, "/private/b", None, None);
-        let grant = check_grant(&scope, &req, peer, None, "/x", None, a.clone()).expect("allowed");
+        let a = ResourceKey::request(None, &req, &path("/public/a"), None, None);
+        let b = ResourceKey::request(None, &req, &path("/private/b"), None, None);
+        let grant = check_grant(
+            &scope,
+            &req,
+            peer,
+            None,
+            "/x",
+            None,
+            a.clone(),
+            generation(),
+        )
+        .expect("allowed");
         assert!(grant.require(&a));
         assert!(!grant.require(&b));
+    }
+
+    #[test]
+    fn access_grants_are_bound_to_the_configuration_generation() {
+        let request = req("GET");
+        let key = ResourceKey::request(None, &request, &path("/same"), None, None);
+        let grant = grant_if_allowed(Access::Allowed, key.clone(), generation()).unwrap();
+
+        assert!(
+            AuthorizedPlan::direct(generation(), Scope::default(), grant, key.clone()).is_some()
+        );
+
+        let cache_key =
+            ResourceKey::cache_policy(None, &request, "example.test", &path("/same"), [7; 32]);
+        let cache_grant =
+            grant_if_allowed(Access::Allowed, cache_key.clone(), generation()).unwrap();
+        let cache_plan =
+            AuthorizedPlan::direct(generation(), Scope::default(), cache_grant, cache_key).unwrap();
+        assert!(cache_plan
+            .into_outcome(
+                crate::config::ConfigurationGeneration::other_for_test(),
+                vapache_verified::TransformSink::Cache,
+            )
+            .is_none());
+
+        let stale = grant_if_allowed(Access::Allowed, key.clone(), generation()).unwrap();
+        assert!(AuthorizedPlan::direct(
+            crate::config::ConfigurationGeneration::other_for_test(),
+            Scope::default(),
+            stale,
+            key,
+        )
+        .is_none());
     }
 
     #[test]
@@ -1979,9 +2062,18 @@ mod tests {
         let req = req("GET");
         let peer = "127.0.0.1".parse().unwrap();
         let scope = Scope::default();
-        let key = ResourceKey::request(None, &req, "/file", None, None);
-        let grant =
-            check_grant(&scope, &req, peer, None, "/x", None, key.clone()).expect("allowed");
+        let key = ResourceKey::request(None, &req, &path("/file"), None, None);
+        let grant = check_grant(
+            &scope,
+            &req,
+            peer,
+            None,
+            "/x",
+            None,
+            key.clone(),
+            generation(),
+        )
+        .expect("allowed");
         let meta = std::fs::metadata("/proc/self/exe").expect("self metadata");
         let bound = grant.bind_file(&key, &meta).expect("file bound");
         assert_eq!(bound.key().file_dev, Some(meta.dev()));
@@ -1997,7 +2089,7 @@ mod tests {
         let key = ResourceKey::request(
             None,
             &req,
-            "/script.php",
+            &path("/script.php"),
             Some(Path::new("/proc/self/exe")),
             Some("fcgi://backend/script.php"),
         );
@@ -2009,16 +2101,22 @@ mod tests {
             "/script.php",
             Some(Path::new("/proc/self/exe")),
             key.clone(),
+            generation(),
         )
         .expect("allowed");
-        assert!(!grant.require_sink(&key, vapache_verified::TransformSink::StaticFile));
-        assert!(!grant.require_sink(&key, vapache_verified::TransformSink::Proxy));
+        assert!(!grant.require_sink(
+            generation(),
+            &key,
+            vapache_verified::TransformSink::StaticFile,
+        ));
+        assert!(!grant.require_sink(generation(), &key, vapache_verified::TransformSink::Proxy,));
 
         let proxy_bound = grant
             .bind_proxy(&key, "backend.test", 8080, false, "/upstream.php")
             .expect("proxy endpoint and representation bound");
         let proxy_key = proxy_bound.key().clone();
         assert!(proxy_bound.require_proxy_sink(
+            generation(),
             &proxy_key,
             "backend.test",
             8080,
@@ -2026,6 +2124,7 @@ mod tests {
             "/upstream.php"
         ));
         assert!(!proxy_bound.require_proxy_sink(
+            generation(),
             &proxy_key,
             "backend.test",
             8080,
@@ -2033,38 +2132,58 @@ mod tests {
             "/different-upstream.php"
         ));
         let mut retargeted_front = proxy_key.clone();
-        retargeted_front.url_path = "/different.php".into();
-        assert!(
-            !proxy_bound.require_sink(&retargeted_front, vapache_verified::TransformSink::Proxy)
-        );
+        retargeted_front.url_path = path("/different.php");
+        assert!(!proxy_bound.require_sink(
+            generation(),
+            &retargeted_front,
+            vapache_verified::TransformSink::Proxy,
+        ));
         let mut retargeted_backend = proxy_key;
         retargeted_backend.backend_target = Some("different-backend".into());
-        assert!(
-            !proxy_bound.require_sink(&retargeted_backend, vapache_verified::TransformSink::Proxy)
-        );
+        assert!(!proxy_bound.require_sink(
+            generation(),
+            &retargeted_backend,
+            vapache_verified::TransformSink::Proxy,
+        ));
 
         let meta = std::fs::metadata("/proc/self/exe").expect("self metadata");
         let file_bound = grant.bind_file(&key, &meta).expect("file bound");
         let file_key = file_bound.key().clone();
-        assert!(file_bound.require_sink(&file_key, vapache_verified::TransformSink::LocalCgi));
-        assert!(!file_bound.require_sink(&file_key, vapache_verified::TransformSink::FastCgi));
+        assert!(file_bound.require_sink(
+            generation(),
+            &file_key,
+            vapache_verified::TransformSink::LocalCgi,
+        ));
+        assert!(!file_bound.require_sink(
+            generation(),
+            &file_key,
+            vapache_verified::TransformSink::FastCgi,
+        ));
 
         let backend_bound = file_bound
             .bind_backend(&file_key, "fcgi-backend".into())
             .expect("backend bound");
         let backend_key = backend_bound.key().clone();
-        assert!(backend_bound.require_sink(&backend_key, vapache_verified::TransformSink::FastCgi));
+        assert!(backend_bound.require_sink(
+            generation(),
+            &backend_key,
+            vapache_verified::TransformSink::FastCgi,
+        ));
 
         let mut other = backend_key;
-        other.url_path = "/different.php".into();
-        assert!(!backend_bound.require_sink(&other, vapache_verified::TransformSink::FastCgi));
+        other.url_path = path("/different.php");
+        assert!(!backend_bound.require_sink(
+            generation(),
+            &other,
+            vapache_verified::TransformSink::FastCgi,
+        ));
     }
 
     #[test]
     fn cache_sink_requires_a_policy_fingerprint() {
         let req = req("GET");
         let scope = Scope::default();
-        let plain = ResourceKey::cache(None, &req, "example.test", "/a");
+        let plain = ResourceKey::cache(None, &req, "example.test", &path("/a"));
         let plain_grant = check_grant(
             &scope,
             &req,
@@ -2073,11 +2192,16 @@ mod tests {
             "/a",
             None,
             plain.clone(),
+            generation(),
         )
         .unwrap();
-        assert!(!plain_grant.require_sink(&plain, vapache_verified::TransformSink::Cache));
+        assert!(!plain_grant.require_sink(
+            generation(),
+            &plain,
+            vapache_verified::TransformSink::Cache,
+        ));
 
-        let policy = ResourceKey::cache_policy(None, &req, "example.test", "/a", [7; 32]);
+        let policy = ResourceKey::cache_policy(None, &req, "example.test", &path("/a"), [7; 32]);
         let policy_grant = check_grant(
             &scope,
             &req,
@@ -2086,9 +2210,14 @@ mod tests {
             "/a",
             None,
             policy.clone(),
+            generation(),
         )
         .unwrap();
-        assert!(policy_grant.require_sink(&policy, vapache_verified::TransformSink::Cache));
+        assert!(policy_grant.require_sink(
+            generation(),
+            &policy,
+            vapache_verified::TransformSink::Cache,
+        ));
     }
 
     #[test]
@@ -2098,7 +2227,7 @@ mod tests {
         let scope = Scope::default();
         let executable = Path::new("/proc/self/exe");
         let meta = std::fs::metadata(executable).expect("self metadata");
-        let key = ResourceKey::request(None, &request, "/selected", Some(executable), None);
+        let key = ResourceKey::request(None, &request, &path("/selected"), Some(executable), None);
 
         let mismatched_url = check_grant(
             &scope,
@@ -2108,10 +2237,17 @@ mod tests {
             "/selected",
             Some(executable),
             key.clone(),
+            generation(),
         )
         .unwrap();
         assert!(AuthorizedPlan::new(
-            OutcomeIdentity::selected("/public", "/other", Some(executable), Some(executable),),
+            generation(),
+            OutcomeIdentity::selected(
+                &path("/public"),
+                &path("/other"),
+                Some(executable),
+                Some(executable),
+            ),
             scope.clone(),
             mismatched_url,
             key.clone(),
@@ -2126,12 +2262,14 @@ mod tests {
             "/selected",
             Some(executable),
             key.clone(),
+            generation(),
         )
         .unwrap();
         assert!(AuthorizedPlan::new(
+            generation(),
             OutcomeIdentity::selected(
-                "/public",
-                "/selected",
+                &path("/public"),
+                &path("/selected"),
                 Some(executable),
                 Some(Path::new("/proc/self/status")),
             ),
@@ -2149,17 +2287,24 @@ mod tests {
             "/selected",
             Some(executable),
             key.clone(),
+            generation(),
         )
         .unwrap();
         let plan = AuthorizedPlan::new(
-            OutcomeIdentity::selected("/public", "/selected", Some(executable), Some(executable)),
+            generation(),
+            OutcomeIdentity::selected(
+                &path("/public"),
+                &path("/selected"),
+                Some(executable),
+                Some(executable),
+            ),
             scope.clone(),
             unbound,
             key.clone(),
         )
         .unwrap();
         assert!(plan
-            .into_outcome(vapache_verified::TransformSink::StaticFile)
+            .into_outcome(generation(), vapache_verified::TransformSink::StaticFile)
             .is_none());
 
         let file_grant = check_grant(
@@ -2170,25 +2315,35 @@ mod tests {
             "/selected",
             Some(executable),
             key.clone(),
+            generation(),
         )
         .unwrap();
         let outcome = AuthorizedPlan::new(
-            OutcomeIdentity::selected("/public", "/selected", Some(executable), Some(executable)),
+            generation(),
+            OutcomeIdentity::selected(
+                &path("/public"),
+                &path("/selected"),
+                Some(executable),
+                Some(executable),
+            ),
             scope,
             file_grant,
             key,
         )
         .and_then(|plan| plan.bind_file(&meta))
-        .and_then(|plan| plan.into_outcome(vapache_verified::TransformSink::StaticFile))
+        .and_then(|plan| {
+            plan.into_outcome(generation(), vapache_verified::TransformSink::StaticFile)
+        })
         .expect("file binding completes the static outcome");
         assert_eq!(outcome.identity().public_url_path(), "/public");
         assert_eq!(outcome.identity().selected_url_path(), "/selected");
         assert_eq!(outcome.identity().lexical_fs_path(), Some(executable));
         assert_eq!(outcome.identity().resolved_fs_path(), Some(executable));
-        assert!(outcome.require_sink(vapache_verified::TransformSink::StaticFile));
-        assert!(!outcome.require_sink(vapache_verified::TransformSink::LocalCgi));
+        assert!(outcome.require_sink(generation(), vapache_verified::TransformSink::StaticFile,));
+        assert!(!outcome.require_sink(generation(), vapache_verified::TransformSink::LocalCgi,));
         let other_meta = std::fs::metadata("/proc/self/status").expect("other metadata");
         assert!(!outcome.require_file_sink(
+            generation(),
             vapache_verified::TransformSink::StaticFile,
             executable,
             &other_meta,

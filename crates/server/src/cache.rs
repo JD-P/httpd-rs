@@ -662,7 +662,7 @@ pub fn request_scope_with_plan(
     // F55/I51: a lossy URL conversion can collapse distinct byte paths into
     // one cache identity.  The plan already rejected a non-UTF-8 canonical
     // path; keep the cache decision on that same identity.
-    let url_path = plan.url_path().to_string();
+    let url_path = plan.url_path().clone();
     // Most requests are outside every CacheEnable prefix.  Check the
     // inherited scope before resolving directory rules and .htaccess, since
     // that walk is far more expensive than the prefix test itself.
@@ -742,8 +742,8 @@ pub fn request_scope_with_plan(
                     .to_string();
                 lexical_fs_path = root.join(&st.rel_script);
                 fs_path = lexical_fs_path.clone();
-                cache_url_path = script_url.clone();
                 let target = crate::request_plan::CanonicalTarget::from_url_path(&script_url)?;
+                cache_url_path = target.url_path.clone();
                 let script_plan = crate::request_plan::RequestPlan::from_fs_target_for_request(
                     cfg,
                     vhost,
@@ -779,7 +779,7 @@ pub fn request_scope_with_plan(
     let mut directory_target = false;
     let mut index_selected = false;
     let mut opened_actual = None;
-    let mut multiview_binding: Option<(String, PathBuf)> = None;
+    let mut multiview_binding: Option<(crate::request_plan::DecodedUrlPath, PathBuf)> = None;
     let mut selected_name: Option<Vec<u8>> = None;
     match crate::files::resolve_target_checked(&root, current_rel, follow, owner_match_only) {
         crate::files::Target::File { file, .. } => {
@@ -798,9 +798,12 @@ pub fn request_scope_with_plan(
                 // The cache and live paths must consume the same typed decoded
                 // child identity. Reject anything that cannot be represented
                 // exactly as a canonical policy URL.
+                let directory_target =
+                    crate::request_plan::CanonicalTarget::from_url_path(&url_path)?;
+                let index_name = crate::request_plan::FilesystemName::new(&index.name)?;
                 let index_target = crate::request_plan::CanonicalTarget::from_selected_child(
-                    &url_path,
-                    &index.name,
+                    &directory_target.url_path,
+                    index_name,
                     false,
                 )?;
                 let index_url = index_target.url_path.clone();
@@ -1026,6 +1029,7 @@ pub fn request_scope_with_plan(
         &cache_url_path,
         Some(&fs_path),
         resource,
+        cfg.authorization_generation(),
     ) {
         Ok(grant) => grant,
         Err(_) => return None,
@@ -1074,8 +1078,19 @@ pub fn request_scope_with_plan(
         Some(&lexical_fs_path),
         Some(&fs_path),
     );
-    let authorization = crate::access::AuthorizedPlan::new(identity, scope, grant, resource)
-        .and_then(|plan| plan.into_outcome(vapache_verified::TransformSink::Cache))?;
+    let authorization = crate::access::AuthorizedPlan::new(
+        cfg.authorization_generation(),
+        identity,
+        scope,
+        grant,
+        resource,
+    )
+    .and_then(|plan| {
+        plan.into_outcome(
+            cfg.authorization_generation(),
+            vapache_verified::TransformSink::Cache,
+        )
+    })?;
     Some(CacheContext {
         epoch: cfg.cache_epoch(),
         authorization,
@@ -1411,7 +1426,10 @@ pub fn lookup_authorized(
     context: &CacheContext,
 ) -> Option<Response> {
     let authorization = context.authorization();
-    if !authorization.require_sink(vapache_verified::TransformSink::Cache) {
+    if !authorization.require_sink(
+        cfg.authorization_generation(),
+        vapache_verified::TransformSink::Cache,
+    ) {
         return None;
     }
     lookup(
@@ -1450,8 +1468,10 @@ pub fn lookup(
         return None;
     }
     let fingerprint = cache_policy_fingerprint(scope, req, peer, target, backend_transport_visible);
+    let path_identity = crate::request_plan::DecodedUrlPath::from_canonical(path)?;
     if !grant.require_sink(
-        &crate::access::ResourceKey::cache_policy(vhost, req, host, path, fingerprint),
+        cfg.authorization_generation(),
+        &crate::access::ResourceKey::cache_policy(vhost, req, host, &path_identity, fingerprint),
         vapache_verified::TransformSink::Cache,
     ) {
         return None;
@@ -2283,7 +2303,10 @@ pub fn store_authorized(
     context: &CacheContext,
 ) {
     let authorization = context.authorization();
-    if !authorization.require_sink(vapache_verified::TransformSink::Cache) {
+    if !authorization.require_sink(
+        cfg.authorization_generation(),
+        vapache_verified::TransformSink::Cache,
+    ) {
         return;
     }
     store(
@@ -2331,8 +2354,12 @@ pub fn store(
         return;
     }
     let fingerprint = cache_policy_fingerprint(scope, req, peer, target, backend_transport_visible);
+    let Some(path_identity) = crate::request_plan::DecodedUrlPath::from_canonical(path) else {
+        return;
+    };
     if !grant.require_sink(
-        &crate::access::ResourceKey::cache_policy(vhost, req, host, path, fingerprint),
+        cfg.authorization_generation(),
+        &crate::access::ResourceKey::cache_policy(vhost, req, host, &path_identity, fingerprint),
         vapache_verified::TransformSink::Cache,
     ) {
         return;
@@ -2758,11 +2785,13 @@ fn invalidation_location_path(
         return None;
     }
     let allow_encoded = cfg.encoded_slashes == crate::config::EncodedSlashes::On;
-    let canonical =
-        crate::request_plan::CanonicalTarget::from_raw_path(raw_path.as_bytes(), allow_encoded)
-            .ok()?;
+    let canonical = crate::request_plan::CanonicalTarget::from_raw_path(
+        crate::request_plan::WireUrlPath::new(raw_path.as_bytes()),
+        allow_encoded,
+    )
+    .ok()?;
     vapache_verified::cache_invalidation_target_admit(same_origin, true)
-        .then_some(canonical.url_path)
+        .then_some(canonical.url_path.into_string())
 }
 
 /// Invalidate the effective request URI and the two response-selected URI
@@ -2805,6 +2834,11 @@ pub fn invalidate_unsafe_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn policy_path(value: &str) -> crate::request_plan::DecodedUrlPath {
+        crate::request_plan::DecodedUrlPath::from_canonical(value)
+            .expect("test cache path is canonical")
+    }
 
     fn test_request() -> crate::http::Request {
         crate::http::Request {
@@ -4329,9 +4363,10 @@ AddType text/plain .txt\n\
             context.authorization().identity().lexical_fs_path(),
             Some(www.join("secret file.txt").as_path())
         );
-        assert!(context
-            .authorization()
-            .require_sink(vapache_verified::TransformSink::Cache));
+        assert!(context.authorization().require_sink(
+            cfg.authorization_generation(),
+            vapache_verified::TransformSink::Cache,
+        ));
 
         fs::write(
             www.join(".htaccess"),
@@ -5331,11 +5366,18 @@ CacheIgnoreQueryString On\n\
         assert_eq!(body_hit.body_len(), 5);
         assert!(body_hit.take_resident().unwrap().bytes() >= 5);
 
-        let wrong_resource =
-            crate::access::ResourceKey::cache(None, &req, "different-host", "/different-path");
-        let wrong_grant =
-            crate::access::grant_if_allowed(crate::access::Access::Allowed, wrong_resource)
-                .unwrap();
+        let wrong_resource = crate::access::ResourceKey::cache(
+            None,
+            &req,
+            "different-host",
+            &policy_path("/different-path"),
+        );
+        let wrong_grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            wrong_resource,
+            cfg.authorization_generation(),
+        )
+        .unwrap();
         assert!(lookup(
             &cfg,
             None,
@@ -6123,9 +6165,14 @@ CacheIgnoreQueryString On\n\
             .entries
             .contains_key(&stale_key));
 
-        let wrong_key = crate::access::ResourceKey::cache(None, &base_req, "other", "/other");
-        let wrong_grant =
-            crate::access::grant_if_allowed(crate::access::Access::Allowed, wrong_key).unwrap();
+        let wrong_key =
+            crate::access::ResourceKey::cache(None, &base_req, "other", &policy_path("/other"));
+        let wrong_grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            wrong_key,
+            cfg.authorization_generation(),
+        )
+        .unwrap();
         let mut response = Response::bytes(200, "text/plain", b"ok".to_vec());
         response.forbid_shared_cache();
         call(&cfg, &base_req, &mut response, &good, "local-error");

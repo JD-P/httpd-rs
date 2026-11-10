@@ -853,7 +853,7 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
     let resource_context = cfg.resource_budget.context(peer);
     vapached::resource::with_resource_context(resource_context, || {
         let target = vapached::request_plan::CanonicalTarget::from_raw_path(
-            raw_path.as_bytes(),
+            vapached::request_plan::WireUrlPath::new(raw_path.as_bytes()),
             allow_encoded,
         )
         .map_err(|e| format!("invalid request path '{raw_path}': {e:?}"))?;

@@ -590,6 +590,15 @@ mirror; alias, `<Files>` and access-file rewrite controls; and autoindex
 visibility. Focused Rust tests pin the constructor, selected MultiViews URL
 and decoded `LocationMatch` filtering of autoindex entries.
 
+The follow-up hardening makes that representation split a type boundary:
+`WireUrlPath`, `DecodedUrlPath` and `FilesystemName` are distinct, and policy
+keys/outcomes accept only the decoded form. The decoded value has a private
+inner string and descriptor-selected children must pass the single-component
+filesystem-name constructor before they can become URL identities. Access
+grants also carry the opaque immutable configuration-generation token, which
+every authorized plan and terminal sink checks; a grant from a retired reload
+generation therefore cannot authorize an otherwise identical representation.
+
 ## Pass 35 closure
 
 P35-A is closed at the configuration front end. `logical_lines()` now consumes

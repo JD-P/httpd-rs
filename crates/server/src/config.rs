@@ -3198,6 +3198,26 @@ impl Capabilities {
     }
 }
 
+/// Opaque identity of one immutable configuration generation.
+///
+/// Authorization grants carry this token so a grant minted while evaluating
+/// one generation cannot be paired with policy or a sink from another after
+/// a graceful reload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ConfigurationGeneration(u64);
+
+impl ConfigurationGeneration {
+    #[cfg(test)]
+    pub(crate) const fn for_test() -> Self {
+        Self(u64::MAX)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn other_for_test() -> Self {
+        Self(u64::MAX - 1)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Process-local identity of this immutable compiled configuration. Clones
@@ -3489,6 +3509,10 @@ impl Config {
 
     pub(crate) fn generation_retirement(&self) -> tokio::sync::watch::Receiver<bool> {
         self.generation_retired.subscribe()
+    }
+
+    pub(crate) fn authorization_generation(&self) -> ConfigurationGeneration {
+        ConfigurationGeneration(self.generation)
     }
 
     pub(crate) fn admit_generation_work<T>(&self, work: impl FnOnce() -> T) -> Option<T> {
