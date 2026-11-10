@@ -1851,12 +1851,14 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **754 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **772 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - The forked h2 HPACK path calls the executable verified kernel for integer
   encoding/decoding, overflow-free entry sizing, dynamic-table admission,
   eviction and resize accounting, dynamic wire-index conversion, and exact
-  Huffman encoded-length calculation. Integer encoding returns a fixed-capacity,
+  Huffman encoded-length calculation. Huffman decoding also establishes a
+  maximum output allocation and a linear loop-work allowance before decoding.
+  Integer encoding returns a fixed-capacity,
   stack-packed encoding of up to 16 bytes rather than allocating for every
   encoded header integer. The Huffman length result refines a recursive bit-length
   specification. Encoder lookup is a bounded,
@@ -1974,10 +1976,13 @@ construction: there is no second production interleaver.
   grammar; accepted hexadecimal bytes are tied to their mathematical value,
   framing/routing trailers are excluded, and the count/framing-byte transition
   is overflow-free.
-- `h2_header_field_admit` and `h2_control_event_step`. The HTTP/2 adapter
-  rechecks connection-specific fields at its downgrade boundary, and the
-  vendored codec maps concrete SETTINGS, PING, PRIORITY and WINDOW_UPDATE
-  events through one verified event-cost/refill/epoch transition.
+- `h2_header_field_admit`, `h2_frame_header_admit`,
+  `h2_header_block_step`, `h2_frame_work_step` and `h2_control_event_step`.
+  The vendored codec rejects invalid lengths, fixed frame shapes and stream
+  identifiers before payload allocation, then charges every wire frame
+  (including unknown and incomplete-continuation traffic) against one
+  connection work budget. The HTTP/2 adapter rechecks connection-specific
+  fields at its downgrade boundary.
 - `resource_budget_admit`, `connection_admit`, `h2_process_slot_admit`,
   `minimum_progress_rate_admit` and `response_body_read_lease_admit`.
   Aggregate/per-client counters use overflow-free admission; the H2 order
@@ -2144,10 +2149,11 @@ construction: there is no second production interleaver.
   adapter-local lifecycle and prove `Closed` is absorbing, so a closed ID
   cannot be reopened. `H2InputPhase`/`h2_input_phase_step` separately prove
   that a body waiter returns only to post-body general ownership, cannot wait
-  twice, and cannot escape the absorbing closed state. The h2 crate still owns wire framing and resets that it
-  handles internally without surfacing to the adapter; that external wire
-  behavior is now an explicit assumption rather than an unverified adapter
-  component.
+  twice, and cannot escape the absorbing closed state. The vendored fork uses
+  `h2_signed_window_increase`/`decrease` for the dependency's signed flow
+  windows and `h2_reset_expiry_step` to make delayed reset cleanup single-use.
+  The complete h2 connection and stream state machines remain an explicit
+  refinement assumption.
 - `cache_invalidation_status_admit` proves that only a successful unsafe
   request can invalidate cache entries; safe methods and every 1xx/4xx/5xx
   response are inert. `cache_trailing_slash_target_admit` prevents an
@@ -2205,10 +2211,11 @@ construction: there is no second production interleaver.
   is also used by admin `<IfFile>`), so it does not expose file contents.
 - `escape_log_bytes`.  Client-derived access-log fields are escaped by a
   verified primitive, including controls, quotes and backslashes.
-- HTTP request/header/body and compression budgets.  The verified HTTP/1
-  parser plus `H2Settings`, `H2HeaderState`, `H2Flow` and the fixed compression
-  cap cover the generic DoS class; the remaining HPACK/zero-window behavior is
-  delegated to the explicit h2 wire-framing assumption.
+- HTTP request/header/body and compression budgets. The verified HTTP/1
+  parser plus `H2Settings`, `H2HeaderState`, `H2Flow`, pre-allocation wire-head
+  admission, encoded-block/Huffman bounds, unified raw-frame work and the fixed
+  compression cap cover the generic DoS class. Complete h2 protocol-state
+  refinement remains explicit.
 - `cgi_env_entry_admit`.  Configured/rewrite environment entries pass only
   when their key is valid and not a calculated CGI/`HTTP_*` name.
 - CGI calculated-environment reservation.  `cgi::build_env` refuses to let

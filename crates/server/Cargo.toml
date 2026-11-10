@@ -13,8 +13,8 @@ name = "vapached"
 path = "src/main.rs"
 
 [dependencies]
-vapache-verified = { path = "../verified", version = "0.2.0" }
-vapache-pcre2 = { path = "../pcre2", version = "0.2.0" }
+vapache-verified = { path = "../verified", version = "0.2.1" }
+vapache-pcre2 = { path = "../pcre2", version = "0.2.1" }
 libc = "0.2"
 rustix = { version = "1", features = ["event", "fs", "net"] }
 regex = "1.11"

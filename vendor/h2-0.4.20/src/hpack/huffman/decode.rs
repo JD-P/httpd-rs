@@ -102,13 +102,21 @@ fn decode_code_slow(
     bits: &mut usize,
     dst: &mut [u8],
     o: &mut usize,
+    work: &mut usize,
 ) -> Result<(), DecoderError> {
     let mut table = 0;
     loop {
+        if *work == 0 {
+            return Err(DecoderError::InvalidHuffmanCode);
+        }
+        *work -= 1;
         let e = DECODE_TABLE[table * TABLE_WIDTH + (*acc >> 56) as usize];
         if e & BRANCH == 0 {
             let used = (e >> 8) as usize;
             if used > *bits {
+                return Err(DecoderError::InvalidHuffmanCode);
+            }
+            if *o >= dst.len() {
                 return Err(DecoderError::InvalidHuffmanCode);
             }
             dst[*o] = e as u8;
@@ -134,19 +142,24 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
     let len = src.len();
     let base_len = buf.len();
 
-    // Reserve the worst case output size. Every code is at least 5 bits,
-    // so `len` input bytes can't decode to more than `len * 8 / 5` output
-    // bytes. One more byte covers the fast path always writing two bytes
-    // even when it decoded only one symbol.
-    buf.resize(base_len + len * 8 / 5 + 1, 0);
+    // Establish both bounds in the executable verified kernel before any
+    // allocation or decode loop begins.
+    let bounds = vapache_verified::hpack_huffman_decode_bounds(base_len, len)
+        .ok_or(DecoderError::InvalidHuffmanCode)?;
+    buf.resize(bounds.total_len, 0);
     let dst = &mut buf[base_len..];
     let mut o = 0;
+    let mut work = bounds.work;
 
     let mut acc: u64 = 0;
     let mut bits: usize = 0;
     let mut pos: usize = 0;
 
     'outer: loop {
+        if work == 0 {
+            return Err(DecoderError::InvalidHuffmanCode);
+        }
+        work -= 1;
         // Fill the bit buffer. While 8 or more input bytes remain, load
         // the next 8 in one go and count as many whole bytes as fit under
         // the bits already in the buffer (bringing it to 56-63 bits). The
@@ -166,6 +179,10 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
         }
 
         while bits >= FAST_BITS {
+            if work == 0 {
+                return Err(DecoderError::InvalidHuffmanCode);
+            }
+            work -= 1;
             let entry = FAST_DECODE_TABLE[(acc >> (64 - FAST_BITS)) as usize];
             let count = (entry >> 16) & 0xff;
             if count == 0 {
@@ -175,10 +192,13 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
                 if bits < 30 && pos < len {
                     continue 'outer;
                 }
-                decode_code_slow(&mut acc, &mut bits, dst, &mut o)?;
+                decode_code_slow(&mut acc, &mut bits, dst, &mut o, &mut work)?;
                 continue;
             }
             let consumed = (entry >> 24) as usize;
+            if o.checked_add(1).is_none_or(|last| last >= dst.len()) {
+                return Err(DecoderError::InvalidHuffmanCode);
+            }
             dst[o] = entry as u8;
             dst[o + 1] = (entry >> 8) as u8;
             o += count as usize;
@@ -193,12 +213,16 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
 
     // Tail: the input is exhausted and fewer than 12 bits remain.
     while bits > 0 {
+        if work == 0 {
+            return Err(DecoderError::InvalidHuffmanCode);
+        }
+        work -= 1;
         // The encoder pads the last byte with up to 7 one-bits, which are
         // valid only between symbols. Anything else must decode.
         if bits < 8 && (acc >> (64 - bits)) == (1 << bits) - 1 {
             break;
         }
-        decode_code_slow(&mut acc, &mut bits, dst, &mut o)?;
+        decode_code_slow(&mut acc, &mut bits, dst, &mut o, &mut work)?;
     }
 
     buf.truncate(base_len + o);

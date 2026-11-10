@@ -10,20 +10,133 @@ use futures_core::Stream;
 
 use bytes::{Buf, BytesMut};
 
+use std::fmt;
 use std::io;
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
 use tokio_util::codec::FramedRead as InnerFramedRead;
-use tokio_util::codec::{LengthDelimitedCodec, LengthDelimitedCodecError};
+use tokio_util::codec::{Decoder, LengthDelimitedCodec, LengthDelimitedCodecError};
 
 // 16 MB "sane default" taken from golang http2
 const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
+const FRAME_WORK_BURST: u64 = 131_072;
+const FRAME_WORK_REFILL_PER_SECOND: u64 = 65_536;
+
+#[derive(Debug)]
+struct WireFrameCodec {
+    inner: LengthDelimitedCodec,
+}
+
+#[derive(Debug)]
+struct WireHeaderError(Reason);
+
+impl fmt::Display for WireHeaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HTTP/2 wire header rejected: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for WireHeaderError {}
+
+impl WireFrameCodec {
+    fn new() -> Self {
+        let inner = LengthDelimitedCodec::builder()
+            .big_endian()
+            .length_field_length(3)
+            .length_adjustment(9)
+            .num_skip(0)
+            .new_codec();
+        Self { inner }
+    }
+
+    fn max_frame_length(&self) -> usize {
+        self.inner.max_frame_length()
+    }
+
+    fn set_max_frame_length(&mut self, value: usize) {
+        self.inner.set_max_frame_length(value);
+    }
+}
+
+impl Decoder for WireFrameCodec {
+    type Item = BytesMut;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // Do not invoke LengthDelimitedCodec until the complete nine-byte head
+        // has been admitted: it reserves the declared frame payload as soon as
+        // it sees the three-byte length field.
+        if src.len() < frame::HEADER_LEN {
+            return Ok(None);
+        }
+        let payload_len = ((src[0] as u32) << 16) | ((src[1] as u32) << 8) | src[2] as u32;
+        let stream_id = u32::from_be_bytes([src[5], src[6], src[7], src[8]]) & 0x7fff_ffff;
+        let decision = vapache_verified::h2_frame_header_admit(
+            src[3],
+            src[4],
+            stream_id,
+            payload_len,
+            self.max_frame_length() as u32,
+        );
+        let reason = match decision {
+            vapache_verified::H2FrameHeaderDecision::Accept => None,
+            vapache_verified::H2FrameHeaderDecision::FrameSizeError => {
+                Some(Reason::FRAME_SIZE_ERROR)
+            }
+            vapache_verified::H2FrameHeaderDecision::ProtocolError => Some(Reason::PROTOCOL_ERROR),
+        };
+        if let Some(reason) = reason {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                WireHeaderError(reason),
+            ));
+        }
+        self.inner.decode(src)
+    }
+}
+
+#[derive(Debug)]
+struct FrameWorkBudget {
+    available: u64,
+    last_refill: Instant,
+}
+
+impl FrameWorkBudget {
+    fn new() -> Self {
+        Self {
+            available: FRAME_WORK_BURST,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn consume(&mut self, kind: vapache_verified::H2WireFrameKind, payload_len: u32) -> bool {
+        let now = Instant::now();
+        let seconds = now.saturating_duration_since(self.last_refill).as_secs();
+        let transition = vapache_verified::h2_frame_work_step(
+            self.available,
+            seconds,
+            kind,
+            payload_len,
+            FRAME_WORK_BURST,
+            FRAME_WORK_REFILL_PER_SECOND,
+        );
+        self.available = transition.available;
+        if transition.refill_seconds != 0 {
+            self.last_refill = self
+                .last_refill
+                .checked_add(Duration::from_secs(transition.refill_seconds))
+                .unwrap_or(now);
+        }
+        transition.admitted
+    }
+}
 
 #[derive(Debug)]
 pub struct FramedRead<T> {
-    inner: InnerFramedRead<T, LengthDelimitedCodec>,
+    inner: InnerFramedRead<T, WireFrameCodec>,
 
     decoder: FrameDecoder,
 }
@@ -38,6 +151,8 @@ struct FrameDecoder {
     max_continuation_frames: usize,
 
     partial: Option<Partial>,
+
+    frame_work_budget: FrameWorkBudget,
 }
 
 /// Partially loaded headers frame
@@ -49,7 +164,8 @@ struct Partial {
     /// Partial header payload
     buf: BytesMut,
 
-    continuation_frames_count: usize,
+    /// Verified cumulative sequencing/size state for this partial block.
+    header_block_state: vapache_verified::H2HeaderBlockState,
 }
 
 #[derive(Debug)]
@@ -59,7 +175,8 @@ enum Continuable {
 }
 
 impl<T> FramedRead<T> {
-    pub fn new(inner: InnerFramedRead<T, LengthDelimitedCodec>) -> FramedRead<T> {
+    pub fn new(io: T) -> FramedRead<T> {
+        let inner = InnerFramedRead::new(io, WireFrameCodec::new());
         let decoder = FrameDecoder::new(inner.decoder().max_frame_length());
         FramedRead { inner, decoder }
     }
@@ -123,6 +240,7 @@ impl FrameDecoder {
                 max_frame_size,
             ),
             partial: None,
+            frame_work_budget: FrameWorkBudget::new(),
         }
     }
 
@@ -156,13 +274,49 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
 
     // Parse the head
     let head = frame::Head::parse(&bytes);
-
-    if decoder.partial.is_some() && head.kind() != Kind::Continuation {
-        proto_err!(conn: "expected CONTINUATION, got {:?}", head.kind());
-        return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+    let kind = head.kind();
+    let payload_len = (bytes.len() - frame::HEADER_LEN) as u32;
+    let wire_kind = vapache_verified::h2_wire_frame_kind(bytes[3]);
+    if !decoder.frame_work_budget.consume(wire_kind, payload_len) {
+        proto_err!(conn: "HTTP/2 frame work budget exhausted");
+        return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
     }
 
-    let kind = head.kind();
+    let idle_header_block = vapache_verified::H2HeaderBlockState {
+        stream_id: 0,
+        encoded_bytes: 0,
+        continuation_frames: 0,
+    };
+    let current_header_block = decoder
+        .partial
+        .as_ref()
+        .map(|partial| partial.header_block_state)
+        .unwrap_or(idle_header_block);
+    let max_continuations = u32::try_from(decoder.max_continuation_frames)
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    let next_header_block = match vapache_verified::h2_header_block_step(
+        current_header_block,
+        bytes[3],
+        bytes[4],
+        u32::from(head.stream_id()),
+        payload_len,
+        decoder.max_header_list_size as u64,
+        max_continuations,
+    ) {
+        vapache_verified::H2HeaderBlockDecision::Accept(next) => next,
+        vapache_verified::H2HeaderBlockDecision::SequenceError => {
+            proto_err!(conn: "invalid HEADERS/CONTINUATION sequence");
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+        vapache_verified::H2HeaderBlockDecision::SizeError => {
+            proto_err!(conn: "encoded header block exceeded its frame/byte budget");
+            return Err(Error::library_go_away_data(
+                Reason::ENHANCE_YOUR_CALM,
+                "header_block_budget_exhausted",
+            ));
+        }
+    };
 
     tracing::trace!(frame.kind = ?kind);
 
@@ -219,7 +373,7 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
                 decoder.partial = Some(Partial {
                     frame: Continuable::$frame(frame),
                     buf: payload,
-                    continuation_frames_count: 0,
+                    header_block_state: next_header_block,
                 });
 
                 return Ok(None);
@@ -324,25 +478,6 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
                 return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
             }
 
-            // Check for CONTINUATION flood
-            if is_end_headers {
-                partial.continuation_frames_count = 0;
-            } else {
-                let cnt = partial.continuation_frames_count + 1;
-                if cnt > decoder.max_continuation_frames {
-                    tracing::debug!(
-                        "too_many_continuations, max = {}",
-                        decoder.max_continuation_frames
-                    );
-                    return Err(Error::library_go_away_data(
-                        Reason::ENHANCE_YOUR_CALM,
-                        "too_many_continuations",
-                    ));
-                } else {
-                    partial.continuation_frames_count = cnt;
-                }
-            }
-
             // Extend the buf
             if partial.buf.is_empty() {
                 partial.buf = bytes.split_off(frame::HEADER_LEN);
@@ -397,6 +532,7 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
             if is_end_headers {
                 partial.frame.into()
             } else {
+                partial.header_block_state = next_header_block;
                 decoder.partial = Some(partial);
                 return Ok(None);
             }
@@ -439,12 +575,112 @@ where
 fn map_err(err: io::Error) -> Error {
     if let io::ErrorKind::InvalidData = err.kind() {
         if let Some(custom) = err.get_ref() {
+            if let Some(header) = custom.downcast_ref::<WireHeaderError>() {
+                return Error::library_go_away(header.0);
+            }
             if custom.is::<LengthDelimitedCodecError>() {
                 return Error::library_go_away(Reason::FRAME_SIZE_ERROR);
             }
         }
     }
     err.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wire_head(payload_len: u32, kind: u8, flags: u8, stream_id: u32) -> BytesMut {
+        let mut bytes = BytesMut::with_capacity(frame::HEADER_LEN + payload_len as usize);
+        bytes.extend_from_slice(&[
+            (payload_len >> 16) as u8,
+            (payload_len >> 8) as u8,
+            payload_len as u8,
+            kind,
+            flags,
+        ]);
+        bytes.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn fixed_frame_shape_is_rejected_before_payload_reservation() {
+        let mut codec = WireFrameCodec::new();
+        codec.set_max_frame_length(frame::DEFAULT_MAX_FRAME_SIZE as usize);
+        let mut oversized_ping = wire_head(frame::DEFAULT_MAX_FRAME_SIZE, 6, 0, 0);
+        let capacity = oversized_ping.capacity();
+
+        let error = codec.decode(&mut oversized_ping).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(oversized_ping.capacity(), capacity);
+        assert_eq!(oversized_ping.len(), frame::HEADER_LEN);
+    }
+
+    #[test]
+    fn admitted_fixed_frame_is_delimited_normally() {
+        let mut codec = WireFrameCodec::new();
+        codec.set_max_frame_length(frame::DEFAULT_MAX_FRAME_SIZE as usize);
+        let mut ping = wire_head(8, 6, 0, 0);
+        ping.extend_from_slice(&[0; 8]);
+
+        let decoded = codec.decode(&mut ping).unwrap().unwrap();
+        assert_eq!(decoded.len(), frame::HEADER_LEN + 8);
+        assert!(ping.is_empty());
+    }
+
+    #[test]
+    fn unified_work_budget_charges_unknown_frames() {
+        let mut budget = FrameWorkBudget {
+            available: 1,
+            last_refill: Instant::now(),
+        };
+        assert!(!budget.consume(vapache_verified::H2WireFrameKind::Unknown, 0));
+        assert_eq!(budget.available, 1);
+    }
+
+    #[test]
+    fn malformed_partial_header_does_not_orphan_sequence_state() {
+        let mut decoder = FrameDecoder::new(frame::DEFAULT_MAX_FRAME_SIZE as usize);
+        let mut invalid = wire_head(5, 1, 0x20, 1);
+        invalid.extend_from_slice(&1u32.to_be_bytes());
+        invalid.extend_from_slice(&[0]);
+
+        assert!(decoder.decode(invalid).is_err());
+        assert!(decoder.partial.is_none());
+
+        let mut ping = wire_head(8, 6, 0, 0);
+        ping.extend_from_slice(&[0; 8]);
+        assert!(decoder.decode(ping).unwrap().is_some());
+    }
+
+    #[test]
+    fn verified_continuation_state_bounds_sequence_and_bytes() {
+        let idle = vapache_verified::H2HeaderBlockState {
+            stream_id: 0,
+            encoded_bytes: 0,
+            continuation_frames: 0,
+        };
+        let started = match vapache_verified::h2_header_block_step(idle, 1, 0, 1, 8, 16, 2) {
+            vapache_verified::H2HeaderBlockDecision::Accept(next) => next,
+            other => panic!("unexpected transition: {other:?}"),
+        };
+        assert_eq!(started.stream_id, 1);
+        assert!(matches!(
+            vapache_verified::h2_header_block_step(started, 9, 4, 3, 1, 16, 2),
+            vapache_verified::H2HeaderBlockDecision::SequenceError
+        ));
+        assert!(matches!(
+            vapache_verified::h2_header_block_step(started, 9, 4, 1, 9, 16, 2),
+            vapache_verified::H2HeaderBlockDecision::SizeError
+        ));
+        assert!(matches!(
+            vapache_verified::h2_header_block_step(started, 9, 4, 1, 8, 16, 2),
+            vapache_verified::H2HeaderBlockDecision::Accept(vapache_verified::H2HeaderBlockState {
+                stream_id: 0,
+                ..
+            })
+        ));
+    }
 }
 
 // ===== impl Continuable =====

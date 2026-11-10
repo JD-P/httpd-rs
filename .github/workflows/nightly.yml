@@ -38,6 +38,7 @@ jobs:
           - websocket_negotiation
           - h2_frames
           - h2_output
+          - h2_stateful
           - cache_metadata
           - tls_policy
           - ocsp_der

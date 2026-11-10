@@ -71,14 +71,15 @@ Pull-request CI checks deterministic generation and matrix completeness without
 requiring Apache modules. The fail-closed pre-adversarial/nightly gate runs both
 live campaigns against the release daemon.
 
-Seventeen libFuzzer targets cover:
+Eighteen libFuzzer targets cover:
 
 - HTTP request parsing and whole fragmented/pipelined connections;
 - configuration sections, full configuration compilation and `.htaccess`
   discovery/compilation;
 - rewrite expressions;
 - CGI, FastCGI and reverse-proxy response framing, plus WebSocket negotiation;
-- HTTP/2 frames, cache metadata, TLS policy and OCSP DER;
+- raw HTTP/2 frames and structured multi-frame HTTP/2 state transitions,
+  cache metadata, TLS policy and OCSP DER;
 - PCRE2 compile metadata and every public match/capture API, differentially
   checked against the pinned PCRE2 10.46 C oracle across byte, CRLF, UTF and
   UCP modes, plus production resource-limit monotonicity and cost boundaries;

@@ -62,6 +62,15 @@ slow-input pool therefore leaves all ordinary stream capacity available to
 unrelated clients; an overloaded completion remains accounted as slow input
 until its stream is reset.
 
+Before a declared HTTP/2 payload can cause the length-delimited codec to
+reserve memory, an executable verified frame-head gate checks the negotiated
+length, fixed-size frame families and stream-zero rules. Every admitted wire
+frame then consumes one unified per-connection work budget, including unknown
+frames and incomplete header-block continuations that never become semantic
+connection events. Encoded header blocks have cumulative byte and continuation
+ceilings, and HPACK Huffman decode establishes output-allocation and loop-work
+bounds before entering the decoder.
+
 All downstream-bound output is measured from the original response start.
 Partial writes and HTTP/2 capacity grants cannot renew the minimum average
 rate checkpoint or the absolute sixteen-interval lifetime.

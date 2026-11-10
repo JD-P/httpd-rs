@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "vapache-pcre2"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "regex-automata",
  "regex-syntax",
@@ -781,14 +781,14 @@ dependencies = [
 
 [[package]]
 name = "vapache-verified"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "vstd",
 ]
 
 [[package]]
 name = "vapached"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "bcrypt",

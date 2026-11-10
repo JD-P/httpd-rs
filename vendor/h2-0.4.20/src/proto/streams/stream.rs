@@ -94,6 +94,9 @@ pub(super) struct Stream {
     /// The time when this stream may have been locally reset.
     pub reset_at: Option<Instant>,
 
+    /// Verified single-use lifecycle for delayed local-reset reclamation.
+    pub reset_expiry_phase: vapache_verified::H2ResetExpiryPhase,
+
     /// Next node in list of reset streams that should expire eventually
     pub next_reset_expire: Option<store::Key>,
 
@@ -187,6 +190,7 @@ impl Stream {
             next_window_update: None,
             is_pending_window_update: false,
             reset_at: None,
+            reset_expiry_phase: vapache_verified::H2ResetExpiryPhase::Untracked,
             next_reset_expire: None,
             pending_recv: buffer::Deque::new(),
             is_recv: true,
@@ -582,8 +586,18 @@ impl store::Next for NextResetExpire {
 
     fn set_queued(stream: &mut Stream, val: bool) {
         if val {
+            assert_eq!(
+                stream.reset_expiry_phase,
+                vapache_verified::H2ResetExpiryPhase::Queued,
+                "reset expiry queued without verified admission"
+            );
             stream.reset_at = Some(Instant::now());
         } else {
+            stream.reset_expiry_phase = vapache_verified::h2_reset_expiry_step(
+                stream.reset_expiry_phase,
+                vapache_verified::H2ResetExpiryEvent::Reclaim,
+            )
+            .expect("reset expiry reclaimed more than once");
             stream.reset_at = None;
         }
     }
@@ -594,5 +608,34 @@ impl store::Next for NextResetExpire {
 impl ContentLength {
     pub fn is_head(&self) -> bool {
         matches!(*self, Self::Head)
+    }
+}
+
+#[cfg(test)]
+mod verified_reset_tests {
+    use super::*;
+
+    #[test]
+    fn delayed_reset_queue_is_single_use() {
+        let mut stream = Stream::new(StreamId::from(1), 65_535, 65_535);
+        stream.reset_expiry_phase = vapache_verified::h2_reset_expiry_step(
+            stream.reset_expiry_phase,
+            vapache_verified::H2ResetExpiryEvent::Enqueue,
+        )
+        .unwrap();
+        <NextResetExpire as store::Next>::set_queued(&mut stream, true);
+        assert!(stream.reset_at.is_some());
+
+        <NextResetExpire as store::Next>::set_queued(&mut stream, false);
+        assert!(stream.reset_at.is_none());
+        assert_eq!(
+            stream.reset_expiry_phase,
+            vapache_verified::H2ResetExpiryPhase::Reclaimed
+        );
+        assert!(vapache_verified::h2_reset_expiry_step(
+            stream.reset_expiry_phase,
+            vapache_verified::H2ResetExpiryEvent::Enqueue,
+        )
+        .is_none());
     }
 }

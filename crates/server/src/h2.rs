@@ -2116,13 +2116,18 @@ fn h2_task_end(
 /// than parking a fuzz worker on an incomplete connection.
 #[cfg(feature = "fuzzing")]
 pub fn fuzz_h2_frames(data: &[u8]) {
-    use tokio::io::AsyncWriteExt;
-    use tokio::time::{timeout, Duration};
-
     // Hit the fork's direct HPACK harness as well as the full framed state
     // machine below. The direct path runs stateless and maximum-bounded table
     // modes plus every integer prefix.
     h2::fuzz_bridge::fuzz_logic::fuzz_hpack(data);
+
+    run_h2_fuzz_wire(data[..data.len().min(256 * 1024)].to_vec());
+}
+
+#[cfg(feature = "fuzzing")]
+fn run_h2_fuzz_wire(input: Vec<u8>) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::{timeout, Duration};
 
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -2130,7 +2135,6 @@ pub fn fuzz_h2_frames(data: &[u8]) {
     else {
         return;
     };
-    let input = data[..data.len().min(256 * 1024)].to_vec();
     runtime.block_on(async move {
         let capacity = input.len().clamp(1024, 256 * 1024);
         let (mut raw_client, server_io) = tokio::io::duplex(capacity);
@@ -2152,6 +2156,104 @@ pub fn fuzz_h2_frames(data: &[u8]) {
         }
         let _ = writer.await;
     });
+}
+
+#[cfg(feature = "fuzzing")]
+fn append_h2_fuzz_frame(wire: &mut Vec<u8>, kind: u8, flags: u8, stream_id: u32, payload: &[u8]) {
+    const MAX_WIRE: usize = 256 * 1024;
+    if payload.len() > 16 * 1024
+        || wire.len().saturating_add(9).saturating_add(payload.len()) > MAX_WIRE
+    {
+        return;
+    }
+    let len = payload.len() as u32;
+    wire.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags]);
+    wire.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+    wire.extend_from_slice(payload);
+}
+
+/// Convert compact commands into deep SETTINGS/window/reset/continuation
+/// sequences. Unlike arbitrary wire fuzzing, every input reaches a complete
+/// preface and initial SETTINGS exchange before mutating the connection state.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_h2_stateful(data: &[u8]) {
+    h2::fuzz_bridge::fuzz_logic::fuzz_hpack(data);
+
+    let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    append_h2_fuzz_frame(&mut wire, 4, 0, 0, &[]);
+    let mut next_stream = 1u32;
+    let mut last_stream = 1u32;
+    let mut continuation_stream = None;
+
+    for command in data.chunks(8).take(4096) {
+        let byte = |index: usize| command.get(index).copied().unwrap_or(0);
+        let value = u32::from_be_bytes([byte(1), byte(2), byte(3), byte(4)]);
+        match byte(0) % 12 {
+            0 => {
+                last_stream = next_stream;
+                next_stream = next_stream.saturating_add(2).min(0x7fff_fffd);
+                let mut block = vec![0x82, 0x87, 0x84, 0x01, 9];
+                block.extend_from_slice(b"localhost");
+                append_h2_fuzz_frame(&mut wire, 1, 0x5, last_stream, &block);
+            }
+            1 => {
+                last_stream = next_stream;
+                next_stream = next_stream.saturating_add(2).min(0x7fff_fffd);
+                append_h2_fuzz_frame(&mut wire, 1, byte(5) & 1, last_stream, &[0x82]);
+                continuation_stream = Some(last_stream);
+            }
+            2 => {
+                let expected = continuation_stream.unwrap_or(last_stream);
+                let stream = if byte(5) & 1 == 0 {
+                    expected
+                } else {
+                    expected.saturating_add(2)
+                };
+                let end = byte(5) & 2 != 0;
+                append_h2_fuzz_frame(&mut wire, 9, if end { 4 } else { 0 }, stream, &command[1..]);
+                if end && stream == expected {
+                    continuation_stream = None;
+                }
+            }
+            3 => {
+                let setting = if byte(5) & 1 == 0 { 4u16 } else { 1u16 };
+                let mut payload = Vec::with_capacity(6);
+                payload.extend_from_slice(&setting.to_be_bytes());
+                payload.extend_from_slice(&value.to_be_bytes());
+                append_h2_fuzz_frame(&mut wire, 4, byte(5) & 1, 0, &payload);
+            }
+            4 => {
+                let increment = (value & 0x7fff_ffff).max(1);
+                let stream = if byte(5) & 1 == 0 { 0 } else { last_stream };
+                append_h2_fuzz_frame(&mut wire, 8, 0, stream, &increment.to_be_bytes());
+            }
+            5 => append_h2_fuzz_frame(&mut wire, 3, 0, last_stream, &value.to_be_bytes()),
+            6 => append_h2_fuzz_frame(&mut wire, 6, byte(5) & 1, 0, command),
+            7 => append_h2_fuzz_frame(&mut wire, 0xf0 | (byte(5) & 0x0f), 0, value, command),
+            8 => append_h2_fuzz_frame(
+                &mut wire,
+                2,
+                0,
+                last_stream,
+                &command[..5.min(command.len())],
+            ),
+            9 => {
+                let mut payload = Vec::with_capacity(8);
+                payload.extend_from_slice(&(last_stream & 0x7fff_ffff).to_be_bytes());
+                payload.extend_from_slice(&value.to_be_bytes());
+                append_h2_fuzz_frame(&mut wire, 7, 0, 0, &payload);
+            }
+            10 => append_h2_fuzz_frame(&mut wire, 0, byte(5) & 1, last_stream, &command[1..]),
+            _ => {
+                let promised = next_stream;
+                let mut payload = Vec::from((promised & 0x7fff_ffff).to_be_bytes());
+                payload.extend_from_slice(&[0x82, 0x87, 0x84]);
+                append_h2_fuzz_frame(&mut wire, 5, 4, last_stream, &payload);
+            }
+        }
+    }
+
+    run_h2_fuzz_wire(wire);
 }
 
 /// Exercise the outbound HTTP/2 header encoder and queued-frame lifecycle.

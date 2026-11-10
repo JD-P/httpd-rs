@@ -99,6 +99,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "h2_stateful"
+path = "fuzz_targets/h2_stateful.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "cache_metadata"
 path = "fuzz_targets/cache_metadata.rs"
 test = false

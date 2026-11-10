@@ -1,5 +1,5 @@
 use crate::frame::Reason;
-use crate::proto::{WindowSize, MAX_WINDOW_SIZE};
+use crate::proto::WindowSize;
 
 use std::fmt;
 
@@ -111,24 +111,16 @@ impl FlowControl {
     ///
     /// This is called after receiving a WINDOW_UPDATE frame
     pub fn inc_window(&mut self, sz: WindowSize) -> Result<(), Reason> {
-        let (val, overflow) = self.window_size.0.overflowing_add(sz as i32);
-
-        if overflow {
-            return Err(Reason::FLOW_CONTROL_ERROR);
-        }
-
-        if val > MAX_WINDOW_SIZE as i32 {
-            return Err(Reason::FLOW_CONTROL_ERROR);
-        }
+        let next = self.window_size.add(sz)?;
 
         tracing::trace!(
             "inc_window; sz={}; old={}; new={}",
             sz,
             self.window_size,
-            val
+            next
         );
 
-        self.window_size = Window(val);
+        self.window_size = next;
         Ok(())
     }
 
@@ -199,6 +191,17 @@ impl FlowControl {
 pub struct Window(i32);
 
 impl Window {
+    fn verified_encoding(&self) -> u64 {
+        (i64::from(self.0) - i64::from(i32::MIN)) as u64
+    }
+
+    fn from_verified_encoding(encoded: u64) -> Self {
+        assert!(encoded <= u64::from(u32::MAX));
+        let value = encoded as i64 + i64::from(i32::MIN);
+        assert!(value >= i64::from(i32::MIN) && value <= i64::from(i32::MAX));
+        Self(value as i32)
+    }
+
     pub fn as_size(&self) -> WindowSize {
         if self.0 < 0 {
             0
@@ -213,12 +216,10 @@ impl Window {
     }
 
     pub fn decrease_by(&mut self, other: WindowSize) -> Result<(), Reason> {
-        if let Some(v) = self.0.checked_sub(other as i32) {
-            self.0 = v;
-            Ok(())
-        } else {
-            Err(Reason::FLOW_CONTROL_ERROR)
-        }
+        let encoded = vapache_verified::h2_signed_window_decrease(self.verified_encoding(), other)
+            .ok_or(Reason::FLOW_CONTROL_ERROR)?;
+        *self = Self::from_verified_encoding(encoded);
+        Ok(())
     }
 
     pub fn increase_by(&mut self, other: WindowSize) -> Result<(), Reason> {
@@ -228,11 +229,31 @@ impl Window {
     }
 
     pub fn add(&self, other: WindowSize) -> Result<Self, Reason> {
-        if let Some(v) = self.0.checked_add(other as i32) {
-            Ok(Self(v))
-        } else {
-            Err(Reason::FLOW_CONTROL_ERROR)
-        }
+        let encoded = vapache_verified::h2_signed_window_increase(self.verified_encoding(), other)
+            .ok_or(Reason::FLOW_CONTROL_ERROR)?;
+        Ok(Self::from_verified_encoding(encoded))
+    }
+}
+
+#[cfg(test)]
+mod verified_window_tests {
+    use super::*;
+
+    #[test]
+    fn signed_window_bounds_fail_closed_without_mutation() {
+        let mut minimum = Window(i32::MIN);
+        assert_eq!(minimum.decrease_by(1), Err(Reason::FLOW_CONTROL_ERROR));
+        assert_eq!(minimum, Window(i32::MIN));
+
+        let maximum = Window(i32::MAX);
+        assert_eq!(maximum.add(1), Err(Reason::FLOW_CONTROL_ERROR));
+        assert_eq!(maximum, Window(i32::MAX));
+
+        let mut crossed = Window(0);
+        crossed.decrease_by(i32::MAX as u32).unwrap();
+        assert_eq!(crossed, Window(-i32::MAX));
+        crossed.increase_by(i32::MAX as u32).unwrap();
+        assert_eq!(crossed, Window(0));
     }
 }
 

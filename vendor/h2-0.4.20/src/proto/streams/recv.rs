@@ -1028,14 +1028,22 @@ impl Recv {
 
     /// Add a locally reset stream to queue to be eventually reaped.
     pub fn enqueue_reset_expiration(&mut self, stream: &mut store::Ptr, counts: &mut Counts) {
-        if !stream.state.is_local_error() || stream.is_pending_reset_expiration() {
+        if !stream.state.is_local_error()
+            || stream.is_pending_reset_expiration()
+            || stream.reset_expiry_phase != vapache_verified::H2ResetExpiryPhase::Untracked
+        {
             return;
         }
 
         if counts.can_inc_num_reset_streams() {
+            stream.reset_expiry_phase = vapache_verified::h2_reset_expiry_step(
+                stream.reset_expiry_phase,
+                vapache_verified::H2ResetExpiryEvent::Enqueue,
+            )
+            .expect("fresh reset expiry admission must queue");
             counts.inc_num_reset_streams();
             tracing::trace!("enqueue_reset_expiration; added {:?}", stream.id);
-            self.pending_reset_expired.push(stream);
+            assert!(self.pending_reset_expired.push(stream));
         } else {
             tracing::trace!(
                 "enqueue_reset_expiration; dropped {:?}, over max_concurrent_reset_streams",

@@ -12799,6 +12799,319 @@ pub fn h2_control_event_step(
     }
 }
 
+/// Wire-level frame kinds. Keeping this representation independent from the
+/// vendored crate lets the codec ask a verified kernel for admission before
+/// reserving the peer-declared payload length.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2WireFrameKind {
+    Data,
+    Headers,
+    Priority,
+    Reset,
+    Settings,
+    PushPromise,
+    Ping,
+    GoAway,
+    WindowUpdate,
+    Continuation,
+    Unknown,
+}
+
+pub fn h2_wire_frame_kind(raw: u8) -> (kind: H2WireFrameKind)
+    ensures
+        raw == 0 ==> kind == H2WireFrameKind::Data,
+        raw == 1 ==> kind == H2WireFrameKind::Headers,
+        raw == 2 ==> kind == H2WireFrameKind::Priority,
+        raw == 3 ==> kind == H2WireFrameKind::Reset,
+        raw == 4 ==> kind == H2WireFrameKind::Settings,
+        raw == 5 ==> kind == H2WireFrameKind::PushPromise,
+        raw == 6 ==> kind == H2WireFrameKind::Ping,
+        raw == 7 ==> kind == H2WireFrameKind::GoAway,
+        raw == 8 ==> kind == H2WireFrameKind::WindowUpdate,
+        raw == 9 ==> kind == H2WireFrameKind::Continuation,
+        raw > 9 ==> kind == H2WireFrameKind::Unknown,
+{
+    match raw {
+        0 => H2WireFrameKind::Data,
+        1 => H2WireFrameKind::Headers,
+        2 => H2WireFrameKind::Priority,
+        3 => H2WireFrameKind::Reset,
+        4 => H2WireFrameKind::Settings,
+        5 => H2WireFrameKind::PushPromise,
+        6 => H2WireFrameKind::Ping,
+        7 => H2WireFrameKind::GoAway,
+        8 => H2WireFrameKind::WindowUpdate,
+        9 => H2WireFrameKind::Continuation,
+        _ => H2WireFrameKind::Unknown,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2FrameHeaderDecision {
+    Accept,
+    FrameSizeError,
+    ProtocolError,
+}
+
+/// Admit the nine-byte HTTP/2 frame head before the codec reserves its
+/// payload. Besides the negotiated maximum, fixed-size frame families are
+/// checked here so a PING/RESET/etc. cannot force a useless 16 KiB read and
+/// allocation before being rejected.
+pub fn h2_frame_header_admit(
+    raw_kind: u8,
+    flags: u8,
+    stream_id: u32,
+    payload_len: u32,
+    max_frame: u32,
+) -> (decision: H2FrameHeaderDecision)
+    ensures
+        payload_len > max_frame ==> decision == H2FrameHeaderDecision::FrameSizeError,
+        decision == H2FrameHeaderDecision::Accept ==> payload_len <= max_frame,
+        raw_kind == 2 && decision == H2FrameHeaderDecision::Accept
+            ==> payload_len == 5 && stream_id != 0,
+        raw_kind == 3 && decision == H2FrameHeaderDecision::Accept
+            ==> payload_len == 4 && stream_id != 0,
+        raw_kind == 4 && decision == H2FrameHeaderDecision::Accept
+            ==> stream_id == 0 && ((flags & 1) == 0 || payload_len == 0),
+        raw_kind == 6 && decision == H2FrameHeaderDecision::Accept
+            ==> payload_len == 8 && stream_id == 0,
+        raw_kind == 7 && decision == H2FrameHeaderDecision::Accept
+            ==> payload_len >= 8 && stream_id == 0,
+        raw_kind == 8 && decision == H2FrameHeaderDecision::Accept ==> payload_len == 4,
+{
+    if payload_len > max_frame {
+        return H2FrameHeaderDecision::FrameSizeError;
+    }
+    let kind = h2_wire_frame_kind(raw_kind);
+    match kind {
+        H2WireFrameKind::Data | H2WireFrameKind::Headers => {
+            if stream_id == 0 {
+                H2FrameHeaderDecision::ProtocolError
+            } else {
+                H2FrameHeaderDecision::Accept
+            }
+        }
+        H2WireFrameKind::Priority => {
+            if payload_len != 5 {
+                H2FrameHeaderDecision::FrameSizeError
+            } else if stream_id == 0 {
+                H2FrameHeaderDecision::ProtocolError
+            } else {
+                H2FrameHeaderDecision::Accept
+            }
+        }
+        H2WireFrameKind::Reset => {
+            if payload_len != 4 {
+                H2FrameHeaderDecision::FrameSizeError
+            } else if stream_id == 0 {
+                H2FrameHeaderDecision::ProtocolError
+            } else {
+                H2FrameHeaderDecision::Accept
+            }
+        }
+        H2WireFrameKind::Settings => {
+            if stream_id != 0 {
+                H2FrameHeaderDecision::ProtocolError
+            } else if (flags & 1) != 0 {
+                if payload_len == 0 {
+                    H2FrameHeaderDecision::Accept
+                } else {
+                    H2FrameHeaderDecision::FrameSizeError
+                }
+            } else if payload_len % 6 == 0 {
+                H2FrameHeaderDecision::Accept
+            } else {
+                H2FrameHeaderDecision::FrameSizeError
+            }
+        }
+        H2WireFrameKind::PushPromise | H2WireFrameKind::Continuation => {
+            if stream_id == 0 {
+                H2FrameHeaderDecision::ProtocolError
+            } else {
+                H2FrameHeaderDecision::Accept
+            }
+        }
+        H2WireFrameKind::Ping => {
+            if payload_len != 8 {
+                H2FrameHeaderDecision::FrameSizeError
+            } else if stream_id != 0 {
+                H2FrameHeaderDecision::ProtocolError
+            } else {
+                H2FrameHeaderDecision::Accept
+            }
+        }
+        H2WireFrameKind::GoAway => {
+            if payload_len < 8 {
+                H2FrameHeaderDecision::FrameSizeError
+            } else if stream_id != 0 {
+                H2FrameHeaderDecision::ProtocolError
+            } else {
+                H2FrameHeaderDecision::Accept
+            }
+        }
+        H2WireFrameKind::WindowUpdate => {
+            if payload_len == 4 {
+                H2FrameHeaderDecision::Accept
+            } else {
+                H2FrameHeaderDecision::FrameSizeError
+            }
+        }
+        H2WireFrameKind::Unknown => H2FrameHeaderDecision::Accept,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct H2HeaderBlockState {
+    /// Zero means that no CONTINUATION is expected.
+    pub stream_id: u32,
+    pub encoded_bytes: u64,
+    pub continuation_frames: u32,
+}
+
+pub open spec fn h2_header_block_inv(state: H2HeaderBlockState, max_bytes: u64) -> bool {
+    &&& state.encoded_bytes <= max_bytes
+    &&& (state.stream_id == 0 ==> state.encoded_bytes == 0)
+    &&& (state.stream_id == 0 ==> state.continuation_frames == 0)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2HeaderBlockDecision {
+    Accept(H2HeaderBlockState),
+    SequenceError,
+    SizeError,
+}
+
+/// Advance HEADERS/PUSH_PROMISE/CONTINUATION sequencing and the cumulative
+/// encoded-byte/frame ceilings as one transition. `max_continuations` counts
+/// all continuation frames, including the final END_HEADERS frame.
+pub fn h2_header_block_step(
+    state: H2HeaderBlockState,
+    raw_kind: u8,
+    flags: u8,
+    stream_id: u32,
+    payload_len: u32,
+    max_bytes: u64,
+    max_continuations: u32,
+) -> (out: H2HeaderBlockDecision)
+    requires h2_header_block_inv(state, max_bytes),
+    ensures
+        match out {
+            H2HeaderBlockDecision::Accept(next) => h2_header_block_inv(next, max_bytes),
+            _ => true,
+        },
+{
+    let kind = h2_wire_frame_kind(raw_kind);
+    let end_headers = (flags & 4) != 0;
+    if state.stream_id != 0 {
+        if kind != H2WireFrameKind::Continuation || stream_id != state.stream_id {
+            return H2HeaderBlockDecision::SequenceError;
+        }
+        if state.continuation_frames >= max_continuations {
+            return H2HeaderBlockDecision::SizeError;
+        }
+        let next_bytes = match state.encoded_bytes.checked_add(payload_len as u64) {
+            Some(value) => value,
+            None => return H2HeaderBlockDecision::SizeError,
+        };
+        if next_bytes > max_bytes {
+            return H2HeaderBlockDecision::SizeError;
+        }
+        if end_headers {
+            H2HeaderBlockDecision::Accept(H2HeaderBlockState {
+                stream_id: 0,
+                encoded_bytes: 0,
+                continuation_frames: 0,
+            })
+        } else {
+            H2HeaderBlockDecision::Accept(H2HeaderBlockState {
+                stream_id,
+                encoded_bytes: next_bytes,
+                continuation_frames: state.continuation_frames + 1,
+            })
+        }
+    } else if kind == H2WireFrameKind::Continuation {
+        H2HeaderBlockDecision::SequenceError
+    } else if kind == H2WireFrameKind::Headers || kind == H2WireFrameKind::PushPromise {
+        if stream_id == 0 {
+            H2HeaderBlockDecision::SequenceError
+        } else if payload_len as u64 > max_bytes {
+            H2HeaderBlockDecision::SizeError
+        } else if end_headers {
+            H2HeaderBlockDecision::Accept(state)
+        } else {
+            H2HeaderBlockDecision::Accept(H2HeaderBlockState {
+                stream_id,
+                encoded_bytes: payload_len as u64,
+                continuation_frames: 0,
+            })
+        }
+    } else {
+        H2HeaderBlockDecision::Accept(state)
+    }
+}
+
+pub open spec fn h2_frame_work_cost_spec(kind: H2WireFrameKind, payload_len: u32) -> u64 {
+    match kind {
+        H2WireFrameKind::Data => 1,
+        H2WireFrameKind::Headers
+        | H2WireFrameKind::PushPromise
+        | H2WireFrameKind::Continuation => (4 + payload_len as int / 1024) as u64,
+        H2WireFrameKind::Reset => 4,
+        H2WireFrameKind::GoAway => 8,
+        H2WireFrameKind::Unknown => 2,
+        _ => 2,
+    }
+}
+
+pub fn h2_frame_work_cost(kind: H2WireFrameKind, payload_len: u32) -> (cost: u64)
+    ensures cost == h2_frame_work_cost_spec(kind, payload_len),
+{
+    match kind {
+        H2WireFrameKind::Data => 1,
+        H2WireFrameKind::Headers
+        | H2WireFrameKind::PushPromise
+        | H2WireFrameKind::Continuation => 4 + payload_len as u64 / 1024,
+        H2WireFrameKind::Reset => 4,
+        H2WireFrameKind::GoAway => 8,
+        H2WireFrameKind::Unknown => 2,
+        _ => 2,
+    }
+}
+
+/// Unified per-connection work transition consumed for every wire frame,
+/// including unknown frames and CONTINUATION fragments that never reach the
+/// higher connection state machine.
+pub fn h2_frame_work_step(
+    available: u64,
+    elapsed_seconds: u64,
+    kind: H2WireFrameKind,
+    payload_len: u32,
+    burst: u64,
+    refill_per_second: u64,
+) -> (out: H2ControlEventResult)
+    ensures
+        out.cost == h2_frame_work_cost_spec(kind, payload_len),
+        out.refill_seconds == elapsed_seconds,
+        out.available <= burst,
+        out.admitted ==> out.cost <= burst && out.available <= burst - out.cost,
+        !out.admitted ==> out.cost > out.available,
+{
+    let cost = h2_frame_work_cost(kind, payload_len);
+    let budget = h2_control_budget_step(
+        available,
+        elapsed_seconds,
+        cost,
+        burst,
+        refill_per_second,
+    );
+    H2ControlEventResult {
+        available: budget.available,
+        admitted: budget.admitted,
+        refill_seconds: elapsed_seconds,
+        cost,
+    }
+}
+
 /// HTTP/2 regular requests must carry the pseudo-header identity that HTTP/1
 /// obtains from the request target and Host field.  CONNECT is unsupported by
 /// the shared dispatcher, and fragments are never part of an HTTP request
@@ -13244,6 +13557,53 @@ pub fn hpack_huffman_encoded_len(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HpackHuffmanDecodeBounds {
+    pub total_len: usize,
+    pub work: usize,
+}
+
+/// Establish the allocation and loop-work ceilings before HPACK Huffman
+/// decoding begins. RFC 7541's shortest code is five bits, so eight encoded
+/// bits produce at most 8/5 symbols. Sixteen work units per input byte plus a
+/// fixed tail allowance dominates the fast lookup, refill and slow-table
+/// transitions used by the concrete decoder.
+pub fn hpack_huffman_decode_bounds(
+    base_len: usize,
+    input_len: usize,
+) -> (out: Option<HpackHuffmanDecodeBounds>)
+    ensures
+        match out {
+            Some(bounds) => {
+                &&& bounds.total_len >= base_len
+                &&& bounds.work >= 32
+                &&& bounds.work >= input_len
+            }
+            None => true,
+        },
+{
+    let bits = match input_len.checked_mul(8) {
+        Some(value) => value,
+        None => return None,
+    };
+    let decoded = match (bits / 5).checked_add(1) {
+        Some(value) => value,
+        None => return None,
+    };
+    let total_len = match base_len.checked_add(decoded) {
+        Some(value) => value,
+        None => return None,
+    };
+    let work = match input_len.checked_mul(16) {
+        Some(value) => match value.checked_add(32) {
+            Some(total) => total,
+            None => return None,
+        },
+        None => return None,
+    };
+    Some(HpackHuffmanDecodeBounds { total_len, work })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct H2Budget {
     pub active: u64,
     pub max_active: u64,
@@ -13468,6 +13828,40 @@ pub fn h2_settings() -> (s: H2Settings)
     }
 }
 
+/// The vendored h2 implementation represents the RFC's signed flow-control
+/// window as an i32. Encode that range as 0..=u32::MAX, with zero standing
+/// for i32::MIN, so every increase/decrease can use an executable verified
+/// checked transition without signed-cast ambiguity.
+pub fn h2_signed_window_increase(encoded: u64, amount: u32) -> (out: Option<u64>)
+    requires encoded <= u32::MAX as u64,
+    ensures
+        match out {
+            Some(next) => next == encoded + amount as u64 && next <= u32::MAX as u64,
+            None => encoded + amount as u64 > u32::MAX as u64,
+        },
+{
+    if amount as u64 > u32::MAX as u64 - encoded {
+        None
+    } else {
+        Some(encoded + amount as u64)
+    }
+}
+
+pub fn h2_signed_window_decrease(encoded: u64, amount: u32) -> (out: Option<u64>)
+    requires encoded <= u32::MAX as u64,
+    ensures
+        match out {
+            Some(next) => next + amount as u64 == encoded,
+            None => amount as u64 > encoded,
+        },
+{
+    if amount as u64 > encoded {
+        None
+    } else {
+        Some(encoded - amount as u64)
+    }
+}
+
 /// Abstract HTTP/2 flow-control state.  The h2 crate owns the wire windows;
 /// this model records the bound the adapter/config contract expects:
 /// connection and stream windows stay within their maxima, and the send
@@ -13681,6 +14075,66 @@ pub fn h2_stream_admit(active: &[u64], pending: &[u64], id: u64) -> (ok: bool)
     } else {
         true
     }
+}
+
+/// Lifecycle of the dependency's delayed local-reset queue. A stream can be
+/// queued once and reclaimed once; a later callback cannot silently put the
+/// same closed stream back into the expiry queue.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2ResetExpiryPhase {
+    Untracked,
+    Queued,
+    Reclaimed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2ResetExpiryEvent {
+    Enqueue,
+    Reclaim,
+}
+
+pub open spec fn h2_reset_expiry_step_spec(
+    phase: H2ResetExpiryPhase,
+    event: H2ResetExpiryEvent,
+) -> Option<H2ResetExpiryPhase> {
+    match (phase, event) {
+        (H2ResetExpiryPhase::Untracked, H2ResetExpiryEvent::Enqueue) => {
+            Some(H2ResetExpiryPhase::Queued)
+        },
+        (H2ResetExpiryPhase::Queued, H2ResetExpiryEvent::Reclaim) => {
+            Some(H2ResetExpiryPhase::Reclaimed)
+        },
+        _ => None,
+    }
+}
+
+pub fn h2_reset_expiry_step(
+    phase: H2ResetExpiryPhase,
+    event: H2ResetExpiryEvent,
+) -> (next: Option<H2ResetExpiryPhase>)
+    ensures next == h2_reset_expiry_step_spec(phase, event),
+{
+    match (phase, event) {
+        (H2ResetExpiryPhase::Untracked, H2ResetExpiryEvent::Enqueue) => {
+            Some(H2ResetExpiryPhase::Queued)
+        }
+        (H2ResetExpiryPhase::Queued, H2ResetExpiryEvent::Reclaim) => {
+            Some(H2ResetExpiryPhase::Reclaimed)
+        }
+        _ => None,
+    }
+}
+
+pub proof fn h2_reset_expiry_is_single_use(
+    phase: H2ResetExpiryPhase,
+)
+    ensures
+        h2_reset_expiry_step_spec(phase, H2ResetExpiryEvent::Enqueue)
+            == Some(H2ResetExpiryPhase::Queued)
+            ==> phase == H2ResetExpiryPhase::Untracked,
+        h2_reset_expiry_step_spec(H2ResetExpiryPhase::Reclaimed, H2ResetExpiryEvent::Enqueue)
+            .is_none(),
+{
 }
 
 /// Adapter-level stream lifecycle.  The h2 crate reports stream IDs and

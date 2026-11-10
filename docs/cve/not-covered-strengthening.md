@@ -73,8 +73,13 @@ limits, plus a connection idle timeout.  The adapter calls verified
 active slots, completed tasks release them, resets observed through
 `SendResponse::poll_reset`, body errors, timeouts or send failures enter the
 pending-reset budget, and a timer matching the h2 reset-stream duration
-reclaims them.  The h2 crate still owns wire framing, HPACK, SETTINGS state
-and some internal resets.  The adapter-boundary H2 rows (`CVE-2018-11763`,
+reclaims them. The vendored h2 fork now admits each nine-byte wire header
+through an executable verified gate before payload reservation, uses verified
+signed-window arithmetic, bounds complete continuation sequences and HPACK
+Huffman allocation/work, charges every raw frame to one connection budget,
+and makes delayed reset expiry a single-use lifecycle. The h2 crate still owns
+the complete connection/stream state-machine refinement. The adapter-boundary
+H2 rows (`CVE-2018-11763`,
 `CVE-2023-45802`, header limits, methods, timeouts, flow buffering) are
 closed by H2Settings, H2HeaderState, H2Flow, H2Budget/stream IDs, the idle
 timeout and Rust h2 ownership; proxy HTTP/2 backends are not implemented.
@@ -91,10 +96,11 @@ so duplicate early-reset/close cleanup is a no-op.  The early-reset
 conformance test sends HEADERS followed by RST_STREAM and verifies the
 listener remains healthy.
 
-This does not remove the remaining H2 proof debt: wire framing and resets
-handled internally by the h2 crate are still not a formal refinement.  No H2
-CVE row remains partial after the adapter-boundary models and runtime
-bounds.
+This does not claim a complete semantic refinement of the vendored h2 state
+machine. It does remove wire-header admission, signed flow-window arithmetic,
+continuation accounting, Huffman decode bounds and delayed-reset queue
+lifecycle from the undifferentiated dependency assumption. No H2 CVE row
+remains partial after the adapter/dependency kernels and runtime bounds.
 
 ## Rewrite rows retired
 
@@ -197,13 +203,16 @@ classes.  The resolved boundaries are:
 - explicit compression cap (8 MiB) with no post-disconnect worker;
 - request decompression filters are unsupported and fail closed;
 - APR-only OS/2, big-endian and `fnmatch` classes are not applicable;
-- HTTP/2 header/flow/settings models bound the adapter side; the response
-  path reserves/polls h2 capacity before every DATA send, so a zero-window
-  client cannot queue unbounded response bytes.
+- HTTP/2 header/flow/settings models bound the adapter side; executable
+  dependency kernels additionally gate frame allocation, signed flow-window
+  changes, continuation growth, Huffman decode work and reset expiry. The
+  response path reserves/polls h2 capacity before every DATA send, so a
+  zero-window client cannot queue unbounded response bytes.
 
-The HPACK/zero-window row (`CVE-2026-49975`) is now closed at this boundary;
-the h2 crate's internal HPACK state is still an external implementation
-assumption, not a Verus refinement.
+The HPACK/zero-window row (`CVE-2026-49975`) is now closed at this boundary.
+Dynamic HPACK tables are disabled in both directions by default, while the
+remaining literal/Huffman path has verified allocation/work bounds; the full
+HPACK and connection state machines are still not complete Verus refinements.
 
 ## CGI / FastCGI rows retired
 

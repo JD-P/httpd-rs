@@ -114,7 +114,7 @@ features = ["std"]
 default-features = false
 
 [dependencies.vapache-verified]
-version = "0.2.0"
+version = "0.2.1"
 path = "../../crates/verified"
 
 [dev-dependencies.env_logger]

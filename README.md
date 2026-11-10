@@ -685,10 +685,11 @@ tests/fuzz_smoke.sh                         # bounded run of every target
 FUZZ_SECONDS_PER_TARGET=900 tests/fuzz_campaign.sh
 ```
 
-The 17 targets cover individual HTTP requests, fragmented/pipelined
+The 18 targets cover individual HTTP requests, fragmented/pipelined
 connections, configuration tokenization and full compilation, `.htaccess`
 walks, rewrite expressions, CGI/FastCGI/proxy responses, WebSocket negotiation,
-HTTP/2 frames, cache metadata, TLS policy, OCSP DER, the adversarial PCRE2
+raw HTTP/2 frames and structured multi-frame HTTP/2 state transitions, cache
+metadata, TLS policy, OCSP DER, the adversarial PCRE2
 differential and PCRE2 resource-policy monotonicity, and stateful hierarchical
 resource ownership.
 The resource campaign mutates reserve/release, attribution, parent exhaustion,

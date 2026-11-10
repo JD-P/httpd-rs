@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-10",
   "verus": {
-    "verified_functions": 754,
+    "verified_functions": 772,
     "errors": 0
   },
   "obligations": [
@@ -505,7 +505,7 @@
     "assumptions": [
       "the safe-Rust regex automata backend implements its documented regular-language/capture semantics; the PCRE2 compatibility frontend is differentially checked against the test-only 10.46 C oracle",
       "when VapacheCapability UnstableFastCgiPaths is explicitly enabled, an external FastCGI backend opens SCRIPT_FILENAME after vapache's final descriptor/inode check and the deployment must provide the read-only script-tree invariant that VapacheFastCGIStablePath otherwise machine-enforces",
-      "h2 wire framing, TLS client-certificate chain validation, and CGI/proxy protocol details are outside the model",
+      "complete h2 connection/stream semantics beyond verified wire-header, arithmetic, continuation, Huffman-work and reset-expiry kernels; TLS client-certificate chain validation; and CGI/proxy protocol details are outside the model",
       "Apache httpd 2.4 differential behavior is the compatibility oracle for complex configuration payload normalization; Vapache's internal schema-to-sealed-IR-to-consumer kind refinement, argument preservation and primitive normalizers are mechanically checked",
       "the safe-Rust bcrypt, SHA-1, salted SHA-1 and MD5-crypt implementations satisfy their documented cryptographic and format contracts"
     ],
@@ -556,6 +556,7 @@
     "Overflow-safe request minimum-progress-rate admission",
     "HTTP/2 idempotent early-reset purge set and stream-ID ledger",
     "Rewrite backreference question-mark encoding and filesystem-target admission",
+    "HTTP/2 frame-head admission before allocation, unified raw-frame work, encoded continuation bounds, signed flow-window arithmetic, Huffman decode bounds and single-use reset expiry",
     "HTTP/2 settings, decoded-header budget and flow-control model",
     "HTTP/DoS connection and compression resource admission",
     "Overflow-safe pattern-times-subject glob-work admission",

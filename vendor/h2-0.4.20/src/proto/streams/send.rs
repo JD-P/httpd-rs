@@ -555,7 +555,9 @@ impl Send {
                             stream.send_flow
                         );
 
-                        // TODO: this decrement can underflow based on received frames!
+                        // The signed-window transition is checked by the
+                        // executable verified kernel; a peer-driven underflow
+                        // fails the connection closed without mutating state.
                         stream
                             .send_flow
                             .dec_send_window(dec)
