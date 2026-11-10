@@ -19,7 +19,7 @@ pcre2_runs=${FUZZ_PCRE2_RUNS:-16384}
 resource_runs=${FUZZ_RESOURCE_RUNS:-1024}
 corpus_root=$(mktemp -d /tmp/vapache-fuzz-smoke.XXXXXX)
 trap 'rm -rf "$corpus_root"' EXIT INT TERM
-targets=${FUZZ_TARGETS:-"http_request http_connection config_sections config_compile htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames cache_metadata tls_policy ocsp_der pcre2_differential pcre2_resource resource_transitions"}
+targets=${FUZZ_TARGETS:-"http_request http_connection config_sections config_compile htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames h2_output cache_metadata tls_policy ocsp_der pcre2_differential pcre2_resource resource_transitions"}
 
 for target in $targets; do
     mkdir "$corpus_root/$target"

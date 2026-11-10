@@ -35,7 +35,8 @@ pub fn response(
                  VapacheDiskFiles: {}\nVapacheDiskFileLimit: {}\n\
                  VapacheDiskFilesystems: {}\nVapacheDiskMinByteHeadroom: {}\n\
                  VapacheDiskMinFileHeadroom: {}\n\
-                 VapacheTransportBytes: {}\nVapacheTransportByteLimit: {}\n",
+                 VapacheTransportBytes: {}\nVapacheTransportByteLimit: {}\n\
+                 VapacheQueuedH2Outputs: {}\nVapacheH2HpackScratchHighWater: {}\n",
                 resource.disk_bytes,
                 resource.disk_byte_limit,
                 resource.disk_files,
@@ -45,6 +46,8 @@ pub fn response(
                 resource.disk_min_file_headroom,
                 resource.transport_bytes,
                 resource.transport_byte_limit,
+                resource.queued_h2_outputs,
+                resource.h2_hpack_scratch_high_water,
             ));
         }
         return Response::bytes(200, "text/plain", body.into_bytes());
@@ -59,7 +62,8 @@ pub fn response(
         body.push_str(&format!(
             "<p>Writable disk: {} / {} bytes, {} / {} files across {} filesystems; \
              most constrained filesystem has {} bytes and {} files available</p>\
-             <p>Transport buffers: {} / {} bytes</p>",
+             <p>Transport buffers: {} / {} bytes</p>\
+             <p>Queued H2 outputs: {}; HPACK scratch high-water: {} bytes</p>",
             resource.disk_bytes,
             resource.disk_byte_limit,
             resource.disk_files,
@@ -69,6 +73,8 @@ pub fn response(
             resource.disk_min_file_headroom,
             resource.transport_bytes,
             resource.transport_byte_limit,
+            resource.queued_h2_outputs,
+            resource.h2_hpack_scratch_high_water,
         ));
     }
     body.push_str("</body></html>\n");
@@ -89,6 +95,8 @@ mod tests {
             };
             let body = String::from_utf8(body).unwrap();
             assert!(body.contains("Transport"));
+            assert!(body.contains("QueuedH2") || body.contains("Queued H2"));
+            assert!(body.contains("Hpack") || body.contains("HPACK"));
             assert!(body.contains("Disk") || body.contains("disk"));
         }
         let crate::http::Body::Bytes(body) = response(true, false, &budget).body else {

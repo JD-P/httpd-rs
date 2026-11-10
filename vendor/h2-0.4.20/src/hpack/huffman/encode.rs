@@ -2,6 +2,13 @@ use crate::hpack::huffman::table::{ENCODE_CODES, ENCODE_CODE_LENGTHS};
 
 use bytes::{BufMut, BytesMut};
 
+pub fn encoded_len(src: &[u8]) -> usize {
+    let bits = src.iter().fold(0usize, |total, byte| {
+        total.saturating_add(ENCODE_CODE_LENGTHS[*byte as usize] as usize)
+    });
+    bits.saturating_add(7) / 8
+}
+
 pub fn encode(src: &[u8], dst: &mut BytesMut) {
     let mut bits = 0u64;
     let mut bits_len = 0;
@@ -58,6 +65,19 @@ mod test {
         dst.clear();
         encode(b"A", &mut dst);
         assert_eq!(&dst[..], &[(0x21 << 2) + 3]);
+    }
+
+    #[test]
+    fn encoded_length_matches_output_for_every_octet() {
+        let input = (0..=u8::MAX).collect::<Vec<_>>();
+        let mut dst = BytesMut::new();
+        encode(&input, &mut dst);
+        assert_eq!(encoded_len(&input), dst.len());
+        for byte in input {
+            dst.clear();
+            encode(&[byte], &mut dst);
+            assert_eq!(encoded_len(&[byte]), dst.len());
+        }
     }
 
     #[test]

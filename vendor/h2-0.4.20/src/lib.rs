@@ -144,7 +144,24 @@ pub use codec::{Codec, SendError, UserError};
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+
+/// Maximum HPACK scratch allocation retained for reuse by one connection.
+/// Larger one-off allocations are released after their header block has been
+/// copied into the framed writer.
+pub const MAX_RETAINED_HPACK_SCRATCH: usize = 160 * 1024;
+
+static HPACK_SCRATCH_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+
+/// Largest outbound HPACK scratch capacity observed by this process.
+pub fn hpack_scratch_high_water() -> usize {
+    HPACK_SCRATCH_HIGH_WATER.load(Ordering::Acquire)
+}
+
+pub(crate) fn record_hpack_scratch_capacity(capacity: usize) {
+    HPACK_SCRATCH_HIGH_WATER.fetch_max(capacity, Ordering::AcqRel);
+}
 
 /// Creates a future from a function that returns `Poll`.
 fn poll_fn<T, F: FnMut(&mut Context<'_>) -> T>(f: F) -> PollFn<F> {

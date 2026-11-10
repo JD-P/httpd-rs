@@ -59,7 +59,10 @@ impl Encoder {
 
     /// Returns a fully-written header block buffer for reuse.
     pub(crate) fn return_scratch(&mut self, scratch: BytesMut) {
-        self.scratch = scratch;
+        crate::record_hpack_scratch_capacity(scratch.capacity());
+        if scratch.capacity() <= crate::MAX_RETAINED_HPACK_SCRATCH {
+            self.scratch = scratch;
+        }
     }
 
     /// Queues a max size update.
@@ -134,6 +137,7 @@ impl Encoder {
                 }
             }
         }
+        crate::record_hpack_scratch_capacity(dst.capacity());
     }
 
     fn encode_size_updates(&mut self, dst: &mut BytesMut) {
@@ -254,49 +258,13 @@ fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut Byt
 }
 
 fn encode_str(val: &[u8], dst: &mut BytesMut) {
-    if !val.is_empty() {
-        let idx = position(dst);
-
-        // Push a placeholder byte for the length header
-        dst.put_u8(0);
-
-        // Encode with huffman
+    let huff_len = huffman::encoded_len(val);
+    if huff_len < val.len() {
+        encode_int(huff_len, 7, 0x80, dst);
         huffman::encode(val, dst);
-
-        let huff_len = position(dst) - (idx + 1);
-
-        if encode_int_one_byte(huff_len, 7) {
-            // Write the string head
-            dst[idx] = 0x80 | huff_len as u8;
-        } else {
-            // Write the head to a placeholder
-            const PLACEHOLDER_LEN: usize = 8;
-            let mut buf = [0u8; PLACEHOLDER_LEN];
-
-            let head_len = {
-                let mut head_dst = &mut buf[..];
-                encode_int(huff_len, 7, 0x80, &mut head_dst);
-                PLACEHOLDER_LEN - head_dst.remaining_mut()
-            };
-
-            // This is just done to reserve space in the destination
-            dst.put_slice(&buf[1..head_len]);
-
-            // Shift the header forward
-            for i in 0..huff_len {
-                let src_i = idx + 1 + (huff_len - (i + 1));
-                let dst_i = idx + head_len + (huff_len - (i + 1));
-                dst[dst_i] = dst[src_i];
-            }
-
-            // Copy in the head
-            for i in 0..head_len {
-                dst[idx + i] = buf[i];
-            }
-        }
     } else {
-        // Write an empty string
-        dst.put_u8(0);
+        encode_int(val.len(), 7, 0, dst);
+        dst.put_slice(val);
     }
 }
 
@@ -332,10 +300,6 @@ fn encode_int_one_byte(value: usize, prefix_bits: usize) -> bool {
     value < (1 << prefix_bits) - 1
 }
 
-fn position(buf: &BytesMut) -> usize {
-    buf.len()
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -363,9 +327,8 @@ mod test {
         let res = encode(&mut encoder, vec![method("PATCH")]);
 
         assert_eq!(res[0], 0b01000000 | 2); // Incremental indexing w/ name pulled from table
-        assert_eq!(res[1], 0x80 | 5); // header value w/ huffman coding
-
-        assert_eq!("PATCH", huff_decode(&res[2..7]));
+        assert_eq!(res[1], 5); // raw form is shorter than Huffman coding
+        assert_eq!(b"PATCH", &res[2..7]);
         assert_eq!(encoder.table.len(), 1);
 
         let res = encode(&mut encoder, vec![method("PATCH")]);
@@ -387,8 +350,8 @@ mod test {
         // Same name, new value should still use incremental
         let res = encode(&mut encoder, vec![header("content-language", "bar")]);
         assert_eq!(res[0], 0b01000000 | 27); // Indexed name
-        assert_eq!(res[1], 0x80 | 3); // header value w/ huffman coding
-        assert_eq!("bar", huff_decode(&res[2..5]));
+        assert_eq!(res[1], 3); // equal-length encodings prefer the raw form
+        assert_eq!(b"bar", &res[2..5]);
     }
 
     #[test]
@@ -558,8 +521,8 @@ mod test {
 
         // Encode second one
         let res = encode(&mut encoder, vec![header(name, "two")]);
-        assert_eq!(&[0x40 | 62, 0x80 | 3], &res[0..2]);
-        assert_eq!("two", huff_decode(&res[2..]));
+        assert_eq!(&[0x40 | 62, 3], &res[0..2]);
+        assert_eq!(b"two", &res[2..]);
         assert_eq!(5, res.len());
 
         // Encode the first one again
@@ -585,7 +548,8 @@ mod test {
         // This will evict the first header, while still referencing the header
         // name
         let res = encode(&mut encoder, vec![header("foo", "baz")]);
-        assert_eq!(&[0x40 | 63, 0, 0x80 | 3], &res[..3]);
+        assert_eq!(&[0x40 | 63, 0, 3], &res[..3]);
+        assert_eq!(b"baz", &res[3..]);
         assert_eq!(2, encoder.table.len());
 
         // Try adding the same header again
@@ -605,8 +569,8 @@ mod test {
         let res = encode(&mut encoder, vec![header("foo", "bar")]);
         assert_eq!(&[0, 0x80 | 2], &res[..2]);
         assert_eq!("foo", huff_decode(&res[2..4]));
-        assert_eq!(0x80 | 3, res[4]);
-        assert_eq!("bar", huff_decode(&res[5..8]));
+        assert_eq!(3, res[4]);
+        assert_eq!(b"bar", &res[5..8]);
         assert_eq!(0, encoder.table.len());
 
         // Encode a custom value
@@ -743,6 +707,32 @@ mod test {
         encoder.encode_size_updates(&mut dst);
         assert_eq!([63, 225, 31], &dst[..]);
         assert_eq!(DEFAULT_MAX_ALLOWED_SIZE, encoder.table.max_size());
+    }
+
+    #[test]
+    fn expanding_huffman_input_uses_the_raw_representation() {
+        let input = vec![0xdc; 4096];
+        assert!(huffman::encoded_len(&input) > input.len());
+        let mut dst = BytesMut::new();
+        encode_str(&input, &mut dst);
+        assert_eq!(dst[0] & 0x80, 0, "raw string must not set Huffman bit");
+        assert!(dst.len() <= input.len() + 8);
+
+        dst.clear();
+        encode_str(&vec![b'a'; 4096], &mut dst);
+        assert_ne!(dst[0] & 0x80, 0, "compressible input should use Huffman");
+    }
+
+    #[test]
+    fn oversized_scratch_is_observed_but_not_retained() {
+        let mut encoder = Encoder::default();
+        encoder.return_scratch(BytesMut::with_capacity(
+            crate::MAX_RETAINED_HPACK_SCRATCH + 1,
+        ));
+        assert_eq!(encoder.scratch.capacity(), 0);
+        assert!(
+            crate::hpack_scratch_high_water() > crate::MAX_RETAINED_HPACK_SCRATCH
+        );
     }
 
     #[test]

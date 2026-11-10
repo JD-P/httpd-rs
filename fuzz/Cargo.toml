@@ -92,6 +92,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "h2_output"
+path = "fuzz_targets/h2_output.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "cache_metadata"
 path = "fuzz_targets/cache_metadata.rs"
 test = false

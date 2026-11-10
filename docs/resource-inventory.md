@@ -39,13 +39,19 @@ is acquired and every coupled transfer succeeds before general
 connection/stream capacity is released. Dynamic backend slots, retained
 response bytes, still-live HTTP/2 transport slices, and spool bytes/files
 transfer with the response; their descriptors remain charged until the
-underlying reader finishes. A failed coupled transfer rolls back the tentative
-slow admission while retaining general protocol ownership. Slow spools have a
-separate reserve capped at one quarter of the configured general spool pool.
-An HTTP/1 connection that entered the slow class closes after its response
-instead of returning to keep-alive capacity. WebSocket upgrades similarly
-acquire their dedicated tunnel lease before releasing the general HTTP/1
-connection lease.
+underlying reader finishes. Every HTTP/2 response attaches its resident
+reservation to a never-indexed queued header value, so HPACK cannot retain
+ownership in its dynamic table after encoding. One shared transport owner is
+also attached to the head and every queued body or end-of-stream object. Once
+EOS is queued, the current ordinary-stream or slow-output admission moves into
+that owner and remains charged until h2 consumes or discards the final object.
+Resets and connection drops release the same owner. A failed coupled transfer
+rolls back the tentative slow admission while retaining general protocol
+ownership. Slow spools have a separate reserve capped at one quarter of the
+configured general spool pool. An HTTP/1 connection that entered the slow
+class closes after its response instead of returning to keep-alive capacity.
+WebSocket upgrades similarly acquire their dedicated tunnel lease before
+releasing the general HTTP/1 connection lease.
 
 HTTP/2 uploads use the verified
 `GeneralBeforeBody -> SlowInput -> GeneralAfterBody -> Closed` ownership
@@ -79,10 +85,14 @@ Cache entries retain their reservation until eviction.
 Accepted TCP transports and TCP proxy/FastCGI backends request 128 KiB send
 and receive buffers and hold a conservative 512 KiB kernel/dependency-buffer
 lease under one 256 MiB parent (CGI is conservatively charged through the same
-dynamic-backend lease). HTTP/2 additionally limits each h2 send buffer to 256
-KiB. Writable-disk and transport usage/limits, the number of discovered
-writable filesystems, and the most constrained filesystem's remaining byte
-and inode headroom are exported by `server-status?auto`.
+dynamic-backend lease). An established HTTP/2 transport holds another 512 KiB
+from that parent for rustls, the 256 KiB h2 send buffer, codec state, and HPACK
+scratch. Outbound HPACK uses raw strings whenever Huffman coding would not
+shrink them, and releases per-connection scratch whose capacity exceeds 160
+KiB. Writable-disk and transport usage/limits, queued H2 output owners, HPACK
+scratch high-water, the number of discovered writable filesystems, and the
+most constrained filesystem's remaining byte and inode headroom are exported
+by `server-status?auto`.
 
 Fixed-window process/source gates bound valid requests, malformed HTTP/1 head
 parsing, expensive operations, cache writes, and log bytes. HTTP/2 acquires

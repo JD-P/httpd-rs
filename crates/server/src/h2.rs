@@ -228,16 +228,66 @@ fn take_body_buffer(len: usize) -> Vec<u8> {
 struct PooledBuffer {
     buf: Option<Vec<u8>>,
     _resident: Arc<Mutex<ResidentLease>>,
+    _transport: Arc<QueuedH2TransportState>,
 }
 
 struct AccountedResponseBytes {
     data: Vec<u8>,
     _resident: Arc<Mutex<ResidentLease>>,
+    _transport: Arc<QueuedH2TransportState>,
+}
+
+struct QueuedResponseHeadOwnership {
+    resident: Arc<Mutex<ResidentLease>>,
+    transport: Arc<QueuedH2TransportState>,
+}
+
+struct AccountedResponseHeaderValue {
+    data: Vec<u8>,
+    _resident: Arc<Mutex<ResidentLease>>,
+    _transport: Arc<QueuedH2TransportState>,
+}
+
+#[derive(Default)]
+struct QueuedH2TransportState {
+    admission: Mutex<Option<crate::resource::QueuedH2TransportLease>>,
+}
+
+impl QueuedH2TransportState {
+    fn install(&self, admission: Option<crate::resource::QueuedH2TransportLease>) {
+        let Some(admission) = admission else {
+            return;
+        };
+        let mut current = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            current.replace(admission).is_none(),
+            "HTTP/2 transport admission installed twice"
+        );
+    }
+}
+
+struct QueuedH2TransportMarker {
+    _transport: Arc<QueuedH2TransportState>,
 }
 
 impl AsRef<[u8]> for AccountedResponseBytes {
     fn as_ref(&self) -> &[u8] {
         &self.data
+    }
+}
+
+impl AsRef<[u8]> for AccountedResponseHeaderValue {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl AsRef<[u8]> for QueuedH2TransportMarker {
+    fn as_ref(&self) -> &[u8] {
+        &[]
     }
 }
 
@@ -276,11 +326,52 @@ fn response_chunk_lease(
     Ok(resident)
 }
 
+fn response_header_value(
+    value: Vec<u8>,
+    ownership: &mut Option<QueuedResponseHeadOwnership>,
+) -> Result<HeaderValue, http::header::InvalidHeaderValue> {
+    match ownership.take() {
+        Some(QueuedResponseHeadOwnership {
+            resident,
+            transport,
+        }) => {
+            let mut value =
+                HeaderValue::from_maybe_shared(Bytes::from_owner(AccountedResponseHeaderValue {
+                    data: value,
+                    _resident: resident,
+                    _transport: transport,
+                }))?;
+            // The HPACK encoder stores indexable HeaderValue objects in its
+            // dynamic table. This field is an ownership carrier, so allowing
+            // it to be indexed would retain the completed response's leases
+            // until table eviction or connection close.
+            value.set_sensitive(true);
+            Ok(value)
+        }
+        None => HeaderValue::from_bytes(&value),
+    }
+}
+
+fn retain_queued_h2_transport(
+    output: &mut crate::resource::SlowOutputAdmission,
+    transport: &Arc<QueuedH2TransportState>,
+) -> io::Result<()> {
+    transport.install(output.retain_queued_h2_transport()?);
+    Ok(())
+}
+
+fn queued_h2_transport_marker(transport: &Arc<QueuedH2TransportState>) -> Bytes {
+    Bytes::from_owner(QueuedH2TransportMarker {
+        _transport: transport.clone(),
+    })
+}
+
 fn read_range(
     file: &std::fs::File,
     offset: u64,
     len: usize,
     resident: Arc<Mutex<ResidentLease>>,
+    transport: Arc<QueuedH2TransportState>,
 ) -> io::Result<Bytes> {
     let mut buf = take_body_buffer(len);
     let reader = FileAt { file, pos: offset };
@@ -288,6 +379,7 @@ fn read_range(
     Ok(Bytes::from_owner(PooledBuffer {
         buf: Some(buf),
         _resident: resident,
+        _transport: transport,
     }))
 }
 
@@ -729,9 +821,17 @@ async fn send_response_with_admission(
         || status == StatusCode::NOT_MODIFIED
         || head_only;
     let body_len = resp.body_len();
+    let end = no_body || body_len == 0;
     let preserved_content_length =
         crate::http::preserved_response_content_length(&resp, head_only)?;
     let header_sanitizer = crate::http::ResponseHeaderSanitizer::from_response(&resp)?;
+    let mut ownership = resp.take_retained_output_ownership();
+    let resident = ownership.share_resident()?;
+    let transport = Arc::new(QueuedH2TransportState::default());
+    let mut queued_head_ownership = Some(QueuedResponseHeadOwnership {
+        resident: resident.clone(),
+        transport: transport.clone(),
+    });
 
     let mut out = http::Response::builder().status(status);
     {
@@ -757,7 +857,7 @@ async fn send_response_with_admission(
             let name = HeaderName::from_bytes(lname.as_bytes()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid response header name")
             })?;
-            let value = HeaderValue::from_bytes(&value).map_err(|_| {
+            let value = response_header_value(value, &mut queued_head_ownership).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid response header value")
             })?;
             headers.append(name, value);
@@ -765,21 +865,24 @@ async fn send_response_with_admission(
         if !have_date {
             headers.append(
                 HeaderName::from_static("date"),
-                HeaderValue::from_str(&http_date_now())
+                response_header_value(http_date_now().into_bytes(), &mut queued_head_ownership)
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad date"))?,
             );
         }
         if !have_server {
             headers.append(
                 HeaderName::from_static("server"),
-                HeaderValue::from_bytes(cfg.server_header().as_bytes())
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad server"))?,
+                response_header_value(
+                    cfg.server_header().as_bytes().to_vec(),
+                    &mut queued_head_ownership,
+                )
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad server"))?,
             );
         }
         if let Some(length) = preserved_content_length {
             headers.append(
                 HeaderName::from_static("content-length"),
-                HeaderValue::from_str(&length.to_string())
+                response_header_value(length.to_string().into_bytes(), &mut queued_head_ownership)
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad length"))?,
             );
         } else if !status.is_informational()
@@ -791,17 +894,26 @@ async fn send_response_with_admission(
             // representation length use the actual selected body length.
             headers.append(
                 HeaderName::from_static("content-length"),
-                HeaderValue::from_str(&body_len.to_string())
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad length"))?,
+                response_header_value(
+                    body_len.to_string().into_bytes(),
+                    &mut queued_head_ownership,
+                )
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad length"))?,
             );
         }
+    }
+    if queued_head_ownership.is_some() {
+        return Err(io::Error::other(
+            "HTTP/2 response head has no field to retain transport ownership",
+        ));
     }
     let response = out
         .body(())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid response headers"))?;
 
-    let end = no_body || body_len == 0;
-    let mut ownership = resp.take_retained_output_ownership();
+    if end {
+        retain_queued_h2_transport(output, &transport)?;
+    }
     let mut send = respond
         .send_response(response, end)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -822,7 +934,7 @@ async fn send_response_with_admission(
             // coverage:ignore-start - body-length invariant
             send_data_bounded(
                 &mut send,
-                Bytes::new(),
+                queued_h2_transport_marker(&transport),
                 true,
                 output,
                 &mut progress,
@@ -837,10 +949,10 @@ async fn send_response_with_admission(
                 send_capacity(&mut send, data.len(), output, &mut progress, &mut ownership)
                     .await?
                     .min(data.len());
-            let resident = ownership.share_resident()?;
             let data = Bytes::from_owner(AccountedResponseBytes {
                 data,
-                _resident: resident,
+                _resident: resident.clone(),
+                _transport: transport.clone(),
             });
             let first = capacity.min(data.len());
             send.send_data(data.slice(..first), first == data.len())
@@ -894,7 +1006,9 @@ async fn send_response_with_admission(
                 ownership = next_ownership;
                 let n = result.map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
                 if n == 0 {
-                    send.send_data(Bytes::new(), true).map_err(send_io_error)?;
+                    send.send_data(queued_h2_transport_marker(&transport), true)
+                        .map_err(send_io_error)?;
+                    retain_queued_h2_transport(output, &transport)?;
                     ownership.finish();
                     output.finish_response();
                     return Ok(sent);
@@ -908,6 +1022,7 @@ async fn send_response_with_admission(
                 let data = Bytes::from_owner(PooledBuffer {
                     buf: Some(buf),
                     _resident: resident,
+                    _transport: transport.clone(),
                 });
                 send.send_data(data, left == 0).map_err(send_io_error)?;
                 progress.record(n);
@@ -937,11 +1052,14 @@ async fn send_response_with_admission(
                 let data = if offload {
                     let blocking_read = cfg.resource_budget.try_response_body_read_for(client)?;
                     let read_ownership = ownership.begin_read();
+                    let chunk_transport = transport.clone();
                     let (next_file, data, next_ownership) =
                         crate::fault::spawn_blocking(move || {
                             let _blocking_read = blocking_read;
                             let data = crate::fault::hit("transition.h2.output.file-read")
-                                .and_then(|()| read_range(&file, pos, capacity, resident));
+                                .and_then(|()| {
+                                    read_range(&file, pos, capacity, resident, chunk_transport)
+                                });
                             (file, data, read_ownership.complete_read())
                         })
                         .await
@@ -951,11 +1069,13 @@ async fn send_response_with_admission(
                     data?
                 } else {
                     crate::fault::hit("transition.h2.output.file-read")?;
-                    read_range(&file, pos, capacity, resident)?
+                    read_range(&file, pos, capacity, resident, transport.clone())?
                 };
                 let filled = data.len();
                 if filled == 0 {
-                    send.send_data(Bytes::new(), true).map_err(send_io_error)?;
+                    send.send_data(queued_h2_transport_marker(&transport), true)
+                        .map_err(send_io_error)?;
+                    retain_queued_h2_transport(output, &transport)?;
                     ownership.finish();
                     output.finish_response();
                     return Ok(sent);
@@ -971,6 +1091,7 @@ async fn send_response_with_admission(
             }
         }
     }
+    retain_queued_h2_transport(output, &transport)?;
     ownership.finish();
     output.finish_response();
     Ok(sent)
@@ -2027,6 +2148,105 @@ pub fn fuzz_h2_frames(data: &[u8]) {
             }
         }
         let _ = writer.await;
+    });
+}
+
+/// Exercise the outbound HTTP/2 header encoder and queued-frame lifecycle.
+/// Input selects flush, peer-reset, and connection-drop endings while header
+/// values cover both indexable ASCII and worst-case valid obs-text.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_h2_output(data: &[u8]) {
+    use tokio::time::{timeout, Duration};
+
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+    else {
+        return;
+    };
+    let control = data.first().copied().unwrap_or(0);
+    let mut value = data
+        .get(1..)
+        .unwrap_or_default()
+        .iter()
+        .take(128 * 1024)
+        .map(|byte| match *byte {
+            b'\t' | 0x20..=0x7e | 0x80..=0xff => *byte,
+            _ => 0xdc,
+        })
+        .collect::<Vec<_>>();
+    if value.is_empty() {
+        value.push(0xdc);
+    }
+    // A tiny committed seed can deterministically exercise the maximum
+    // admitted response-head value and the worst valid HPACK Huffman input.
+    // This avoids waiting for libFuzzer's length schedule to grow a corpus
+    // entry all the way to the protocol limit.
+    if control & 0x40 != 0 {
+        value.clear();
+        value.resize(128 * 1024, 0xdc);
+    }
+    runtime.block_on(async move {
+        let operation = async move {
+            let (client_io, server_io) = tokio::io::duplex(512 * 1024);
+            let (server_handshake, client_handshake) = tokio::join!(
+                h2::server::handshake(server_io),
+                h2::client::handshake(client_io)
+            );
+            let mut server_connection = server_handshake.ok()?;
+            let (mut client, client_connection) = client_handshake.ok()?;
+            let client_driver = tokio::spawn(async move { client_connection.await });
+            let request = http::Request::builder()
+                .uri("https://localhost/fuzz-output")
+                .body(())
+                .ok()?;
+            let (response, mut request_stream) = client.send_request(request, true).ok()?;
+            let (_, mut respond) = server_connection.accept().await?.ok()?;
+            let mut outgoing = http::Response::builder().status(200).body(()).ok()?;
+            let header = HeaderValue::from_bytes(&value).ok()?;
+            outgoing
+                .headers_mut()
+                .append(HeaderName::from_static("x-fuzz-output"), header);
+            let end = control & 1 == 0;
+            let mut send = respond.send_response(outgoing, end).ok()?;
+            if !end {
+                send.send_data(
+                    Bytes::copy_from_slice(&value[..value.len().min(1024)]),
+                    true,
+                )
+                .ok()?;
+            }
+
+            match (control >> 1) % 3 {
+                0 => {
+                    let server_driver =
+                        tokio::spawn(
+                            async move { while server_connection.accept().await.is_some() {} },
+                        );
+                    if let Ok(Ok(response)) = timeout(Duration::from_millis(20), response).await {
+                        let mut body = response.into_body();
+                        while let Ok(Some(Ok(chunk))) =
+                            timeout(Duration::from_millis(2), body.data()).await
+                        {
+                            let len = chunk.len();
+                            let _ = body.flow_control().release_capacity(len);
+                        }
+                    }
+                    server_driver.abort();
+                    let _ = server_driver.await;
+                }
+                1 => {
+                    request_stream.send_reset(h2::Reason::CANCEL);
+                    let _ = timeout(Duration::from_millis(20), server_connection.accept()).await;
+                }
+                _ => drop(server_connection),
+            }
+            drop((request_stream, client));
+            client_driver.abort();
+            let _ = client_driver.await;
+            Some(())
+        };
+        let _ = timeout(Duration::from_millis(50), operation).await;
     });
 }
 
@@ -3134,6 +3354,287 @@ mod tests {
         driver.abort();
         let _ = driver.await;
         (result, status, headers, body)
+    }
+
+    async fn assert_stalled_response_transport_lifetime(
+        cfg: Arc<Config>,
+        response: Response,
+        expected_body: &[u8],
+        minimum_resident: u64,
+    ) {
+        let budget = cfg.resource_budget.clone();
+        let client_ip = std::net::IpAddr::from([127, 0, 0, 1]);
+        let context = budget.context(client_ip);
+        let general = budget.try_h2_stream_in(&context).unwrap();
+        let mut output = crate::resource::SlowOutputAdmission::tracked_h2(context, general);
+
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let (server_handshake, client_handshake) = tokio::join!(
+            h2::server::handshake(server_io),
+            h2::client::handshake(client_io)
+        );
+        let mut connection = server_handshake.unwrap();
+        let (mut client, client_connection) = client_handshake.unwrap();
+        let client_driver = tokio::spawn(async move { client_connection.await });
+        let request = http::Request::builder()
+            .uri("https://localhost/stalled-output")
+            .body(())
+            .unwrap();
+        let (mut received, _) = client.send_request(request, true).unwrap();
+        let (_, respond) = connection.accept().await.unwrap().unwrap();
+
+        send_response_with_admission(respond, &cfg, response, false, &mut output)
+            .await
+            .unwrap();
+        let usage = budget.extended_usage();
+        assert_eq!(usage.0, 1, "queued response released H2 admission");
+        assert!(
+            usage.2 >= minimum_resident,
+            "queued response released resident accounting: {} < {minimum_resident}",
+            usage.2
+        );
+        assert_eq!(budget.telemetry().queued_h2_outputs, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut received)
+                .await
+                .is_err(),
+            "response arrived while the server connection was not being polled"
+        );
+
+        let server_driver =
+            tokio::spawn(async move { while connection.accept().await.is_some() {} });
+        let response = tokio::time::timeout(Duration::from_secs(1), &mut received)
+            .await
+            .expect("queued response did not flush")
+            .unwrap();
+        let mut recv = response.into_body();
+        let mut body = Vec::new();
+        while let Some(chunk) = recv.data().await {
+            let chunk = chunk.unwrap();
+            let len = chunk.len();
+            body.extend_from_slice(&chunk);
+            recv.flow_control().release_capacity(len).unwrap();
+        }
+        assert_eq!(body, expected_body);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.extended_usage().0 != 0
+                || budget.extended_usage().2 != 0
+                || budget.telemetry().queued_h2_outputs != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued response ownership did not release after flush");
+
+        drop(client);
+        client_driver.abort();
+        server_driver.abort();
+        let _ = client_driver.await;
+        let _ = server_driver.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_header_only_response_retains_memory_and_stream_admission() {
+        let (cfg, _logger, dir) = test_config("queued-header-ownership");
+        let budget = cfg.resource_budget.clone();
+        let client_ip = std::net::IpAddr::from([127, 0, 0, 1]);
+        let context = budget.context(client_ip);
+        let general = budget.try_h2_stream_in(&context).unwrap();
+        let mut output = crate::resource::SlowOutputAdmission::tracked_h2(context.clone(), general);
+
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let (server_handshake, client_handshake) = tokio::join!(
+            h2::server::handshake(server_io),
+            h2::client::handshake(client_io)
+        );
+        let mut connection = server_handshake.unwrap();
+        let (mut client, client_connection) = client_handshake.unwrap();
+        let client_driver = tokio::spawn(async move { client_connection.await });
+
+        let request = http::Request::builder()
+            .uri("https://localhost/header-only")
+            .body(())
+            .unwrap();
+        let (mut received, _) = client.send_request(request, true).unwrap();
+        let (_, respond) = connection.accept().await.unwrap().unwrap();
+
+        let retained = vec![b'h'; 60 * 1024];
+        let expected_resident = 256 + b"x-retained".len() as u64 + retained.len() as u64 + 4;
+        let mut response = Response::new(204);
+        response
+            .headers
+            .push((Cow::Borrowed("x-retained"), retained));
+        assert_eq!(
+            send_response_with_admission(respond, &cfg, response, false, &mut output)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // Do not poll the server connection after enqueue. The h2 state
+        // machine therefore still owns the HeaderMap, and both the resident
+        // bytes and general stream admission must follow that queued owner.
+        let usage = budget.extended_usage();
+        assert_eq!(usage.0, 1, "queued response head released H2 admission");
+        assert_eq!(
+            usage.2, expected_resident,
+            "queued response head released resident accounting"
+        );
+        assert_eq!(budget.telemetry().queued_h2_outputs, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut received)
+                .await
+                .is_err(),
+            "response arrived while the server connection was not being polled"
+        );
+
+        let server_driver =
+            tokio::spawn(async move { while connection.accept().await.is_some() {} });
+        let received = tokio::time::timeout(Duration::from_secs(1), &mut received)
+            .await
+            .expect("queued response head did not flush")
+            .unwrap();
+        assert_eq!(received.status(), StatusCode::NO_CONTENT);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.extended_usage().0 != 0
+                || budget.extended_usage().2 != 0
+                || budget.telemetry().queued_h2_outputs != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued response ownership did not release after flush");
+
+        drop((received, client));
+        client_driver.abort();
+        server_driver.abort();
+        let _ = client_driver.await;
+        let _ = server_driver.await;
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn indexable_response_header_cannot_retain_transport_ownership_in_hpack() {
+        let (cfg, _logger, dir) = test_config("indexable-header-ownership");
+        let mut response = Response::new(204);
+        response
+            .headers
+            .push((Cow::Borrowed("x-indexable"), b"small-value".to_vec()));
+        assert_stalled_response_transport_lifetime(cfg, response, &[], 256).await;
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_body_shape_retains_head_memory_and_stream_admission_until_transport_release() {
+        let (cfg, _logger, dir) = test_config("all-body-transport-ownership");
+        let retained = vec![b'h'; 60 * 1024];
+        let body = b"body-data".to_vec();
+
+        let mut bytes = Response::bytes(200, "application/octet-stream", body.clone());
+        bytes
+            .headers
+            .push((Cow::Borrowed("x-retained"), retained.clone()));
+        assert_stalled_response_transport_lifetime(
+            cfg.clone(),
+            bytes,
+            &body,
+            retained.len() as u64,
+        )
+        .await;
+
+        let path = dir.join("queued-body.bin");
+        fs::write(&path, &body).unwrap();
+        let mut file = Response::new(200);
+        file.headers
+            .push((Cow::Borrowed("x-retained"), retained.clone()));
+        file.body = Body::File {
+            file: File::open(&path).unwrap(),
+            offset: 0,
+            len: body.len() as u64,
+        };
+        assert_stalled_response_transport_lifetime(cfg.clone(), file, &body, retained.len() as u64)
+            .await;
+
+        let mut stream = Response::new(200);
+        stream
+            .headers
+            .push((Cow::Borrowed("x-retained"), retained.clone()));
+        stream.body = Body::Stream {
+            reader: Box::new(std::io::Cursor::new(body.clone())),
+            len: body.len() as u64,
+        };
+        assert_stalled_response_transport_lifetime(cfg, stream, &body, retained.len() as u64).await;
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_response_ownership_releases_on_reset_and_connection_drop() {
+        for reset in [true, false] {
+            let (cfg, _logger, dir) = test_config(if reset {
+                "queued-owner-reset"
+            } else {
+                "queued-owner-drop"
+            });
+            let budget = cfg.resource_budget.clone();
+            let client_ip = std::net::IpAddr::from([127, 0, 0, 1]);
+            let context = budget.context(client_ip);
+            let general = budget.try_h2_stream_in(&context).unwrap();
+            let mut output = crate::resource::SlowOutputAdmission::tracked_h2(context, general);
+            let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+            let (server_handshake, client_handshake) = tokio::join!(
+                h2::server::handshake(server_io),
+                h2::client::handshake(client_io)
+            );
+            let mut connection = server_handshake.unwrap();
+            let (mut client, client_connection) = client_handshake.unwrap();
+            let client_driver = tokio::spawn(async move { client_connection.await });
+            let request = http::Request::builder()
+                .uri("https://localhost/release-owner")
+                .body(())
+                .unwrap();
+            let (_received, mut request_stream) = client.send_request(request, true).unwrap();
+            let (_, respond) = connection.accept().await.unwrap().unwrap();
+            let mut response = Response::new(204);
+            response
+                .headers
+                .push((Cow::Borrowed("x-owner"), b"release-me".to_vec()));
+            send_response_with_admission(respond, &cfg, response, false, &mut output)
+                .await
+                .unwrap();
+            assert_eq!(budget.telemetry().queued_h2_outputs, 1);
+
+            let server_driver = if reset {
+                request_stream.send_reset(h2::Reason::CANCEL);
+                Some(tokio::spawn(async move {
+                    while connection.accept().await.is_some() {}
+                }))
+            } else {
+                drop(connection);
+                None
+            };
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while budget.extended_usage().0 != 0
+                    || budget.extended_usage().2 != 0
+                    || budget.telemetry().queued_h2_outputs != 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("queued H2 ownership did not release on reset/drop");
+
+            drop((request_stream, client));
+            client_driver.abort();
+            let _ = client_driver.await;
+            if let Some(server_driver) = server_driver {
+                server_driver.abort();
+                let _ = server_driver.await;
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4485,6 +4986,7 @@ mod tests {
         drop(PooledBuffer {
             buf: Some(buffer),
             _resident: resident,
+            _transport: Arc::new(QueuedH2TransportState::default()),
         });
         let reused = take_body_buffer(POOL_MAX_CAPACITY);
         assert!(reused.is_empty());
@@ -4498,10 +5000,12 @@ mod tests {
         drop(PooledBuffer {
             buf: None,
             _resident: resident.clone(),
+            _transport: Arc::new(QueuedH2TransportState::default()),
         });
         drop(PooledBuffer {
             buf: Some(Vec::with_capacity(1)),
             _resident: resident,
+            _transport: Arc::new(QueuedH2TransportState::default()),
         });
         assert_eq!(budget.extended_usage().2, 0);
     }
@@ -5363,6 +5867,7 @@ mod tests {
         let budget = Arc::new(ResourceBudget::default());
 
         let client = std::net::IpAddr::from([127, 0, 0, 1]);
+        let transport = Arc::new(QueuedH2TransportState::default());
         let middle = read_range(
             &file,
             3,
@@ -5370,6 +5875,7 @@ mod tests {
             Arc::new(Mutex::new(
                 response_chunk_lease(&budget, client, 5).unwrap(),
             )),
+            transport.clone(),
         )
         .unwrap();
         assert_eq!(&middle[..], b"34567");
@@ -5380,6 +5886,7 @@ mod tests {
             Arc::new(Mutex::new(
                 response_chunk_lease(&budget, client, 10).unwrap(),
             )),
+            transport.clone(),
         )
         .unwrap();
         assert_eq!(&whole[..], b"0123456789");
@@ -5390,6 +5897,7 @@ mod tests {
             Arc::new(Mutex::new(
                 response_chunk_lease(&budget, client, 5).unwrap(),
             )),
+            transport,
         )
         .unwrap();
         assert_eq!(&short[..], b"89");
@@ -5407,6 +5915,7 @@ mod tests {
         let bytes = Bytes::from_owner(AccountedResponseBytes {
             data: vec![b'x'; 16],
             _resident: Arc::clone(&resident),
+            _transport: Arc::new(QueuedH2TransportState::default()),
         });
         drop(resident);
         let tail = bytes.slice(8..);
@@ -5414,5 +5923,27 @@ mod tests {
         assert_eq!(budget.extended_usage().2, 16);
         drop(tail);
         assert_eq!(budget.extended_usage().2, 0);
+    }
+
+    #[test]
+    fn zero_length_eos_marker_retains_transport_admission() {
+        let budget = Arc::new(ResourceBudget::default());
+        let context = budget.context(std::net::IpAddr::from([192, 0, 2, 51]));
+        let general = budget.try_h2_stream_in(&context).unwrap();
+        let mut output = crate::resource::SlowOutputAdmission::tracked_h2(context, general);
+        let transport = Arc::new(QueuedH2TransportState::default());
+        retain_queued_h2_transport(&mut output, &transport).unwrap();
+        output.finish_response();
+
+        let marker = queued_h2_transport_marker(&transport);
+        let queued = marker.clone();
+        drop(transport);
+        drop(marker);
+        assert_eq!(budget.extended_usage().0, 1);
+        assert_eq!(budget.telemetry().queued_h2_outputs, 1);
+
+        drop(queued);
+        assert_eq!(budget.extended_usage().0, 0);
+        assert_eq!(budget.telemetry().queued_h2_outputs, 0);
     }
 }

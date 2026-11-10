@@ -42,6 +42,7 @@ struct CampaignState {
     spools: Vec<SpoolLease>,
     dynamics: Vec<DynamicLease>,
     outputs: Vec<SlowOutputAdmission>,
+    queued_h2_outputs: Vec<(ResourceContext, QueuedH2TransportLease)>,
     reads: Vec<ResponseBodyReadLease>,
     websockets: Vec<WebsocketLease>,
 }
@@ -49,6 +50,7 @@ struct CampaignState {
 impl CampaignState {
     fn clear(&mut self) {
         self.outputs.clear();
+        self.queued_h2_outputs.clear();
         self.reads.clear();
         self.websockets.clear();
         self.dynamics.clear();
@@ -80,6 +82,11 @@ impl CampaignState {
                 .filter_map(|lease| lease._slot.as_ref().map(|slot| slot.context.clone())),
         );
         contexts.extend(self.outputs.iter().map(|output| output.context.clone()));
+        contexts.extend(
+            self.queued_h2_outputs
+                .iter()
+                .map(|(context, _lease)| context.clone()),
+        );
         contexts.extend(self.reads.iter().map(|lease| lease._slot.context.clone()));
         contexts.extend(
             self.websockets
@@ -322,6 +329,7 @@ fn assert_empty(budget: &ResourceBudget) {
     assert_eq!(snapshot.filesystem_bytes, 0);
     assert_eq!(snapshot.filesystem_files, 0);
     assert_eq!(snapshot.transport_bytes, 0);
+    assert_eq!(budget.queued_h2_outputs.load(Ordering::Acquire), 0);
 }
 
 fn assert_scopes_empty(contexts: &[ResourceContext]) {
@@ -522,7 +530,26 @@ pub(super) fn run(data: &[u8]) {
             }
             20 => {
                 if let Some(index) = selected(&state.outputs, selector) {
-                    if magnitude & 1 == 0 {
+                    if magnitude & 3 == 0 {
+                        let before = budget.transition_snapshot();
+                        let context = state.outputs[index].context.clone();
+                        match state.outputs[index].retain_queued_h2_transport() {
+                            Ok(Some(lease)) => {
+                                // The response task can close independently;
+                                // the transport-owned head must keep the H2
+                                // stream charged until its owner is dropped.
+                                state.outputs[index].finish_response();
+                                assert_eq!(before, budget.transition_snapshot());
+                                insert_bounded(
+                                    &mut state.queued_h2_outputs,
+                                    (context, lease),
+                                    selector,
+                                );
+                            }
+                            Ok(None) => state.outputs[index].finish_response(),
+                            Err(_) => assert_eq!(before, budget.transition_snapshot()),
+                        }
+                    } else if magnitude & 1 == 0 {
                         state.outputs[index].finish_response();
                     } else {
                         let output = state.outputs.swap_remove(index);
@@ -531,7 +558,11 @@ pub(super) fn run(data: &[u8]) {
                 }
             }
             21 => {
-                if let Some(index) = selected(&state.outputs, selector) {
+                if magnitude & 1 == 0 {
+                    if let Some(index) = selected(&state.queued_h2_outputs, selector) {
+                        drop(state.queued_h2_outputs.swap_remove(index));
+                    }
+                } else if let Some(index) = selected(&state.outputs, selector) {
                     drop(state.outputs.swap_remove(index));
                 }
             }

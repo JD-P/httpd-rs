@@ -3,7 +3,7 @@ mod encode;
 mod table;
 
 pub use self::decode::decode;
-pub use self::encode::encode;
+pub use self::encode::{encode, encoded_len};
 
 #[cfg(test)]
 mod test {

@@ -3160,6 +3160,16 @@ async fn admit_tls_connection(
                 tls_identity,
                 retired,
                 move || {
+                    let h2_transport =
+                        h2_context
+                            .budget()
+                            .try_h2_transport_buffers()
+                            .map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::WouldBlock,
+                                    "HTTP/2 transport-buffer limit reached",
+                                )
+                            })?;
                     let established = try_reserve_h2_connection(&h2_context, connection_limit)
                         .ok_or_else(|| {
                             io::Error::new(
@@ -3168,7 +3178,7 @@ async fn admit_tls_connection(
                             )
                         })?;
                     drop(pending_guard);
-                    Ok((lifetime_guard, established))
+                    Ok((lifetime_guard, established, h2_transport))
                 },
             )
             .await;

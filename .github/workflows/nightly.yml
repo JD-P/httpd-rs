@@ -37,6 +37,7 @@ jobs:
           - proxy_response
           - websocket_negotiation
           - h2_frames
+          - h2_output
           - cache_metadata
           - tls_policy
           - ocsp_der

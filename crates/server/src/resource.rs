@@ -173,6 +173,7 @@ pub struct ResourceBudget {
     disk_ledgers: Mutex<DiskLedgers>,
     transport_bytes: AtomicU64,
     transport_byte_limit: u64,
+    queued_h2_outputs: AtomicU64,
     rates: Mutex<RateLedger>,
     next_scope: AtomicU64,
 }
@@ -210,6 +211,7 @@ impl Default for ResourceBudget {
             disk_ledgers: Mutex::new(DiskLedgers::default()),
             transport_bytes: AtomicU64::new(0),
             transport_byte_limit: DEFAULT_TRANSPORT_BUFFER_BUDGET,
+            queued_h2_outputs: AtomicU64::new(0),
             rates: Mutex::new(RateLedger::default()),
             next_scope: AtomicU64::new(1),
         }
@@ -282,6 +284,11 @@ const DEFAULT_TRANSPORT_BUFFER_BUDGET: u64 = 256 * 1024 * 1024;
 /// Conservative ownership charge for the kernel send/receive queues and the
 /// protocol/TLS buffers associated with one accepted transport.
 pub(crate) const TRANSPORT_BUFFER_CHARGE: u64 = 512 * 1024;
+/// Additional dependency-buffer allowance for an established HTTP/2
+/// connection. The base transport charge is consumed by the effective kernel
+/// socket buffers on Linux; this sibling charge covers rustls, HPACK scratch,
+/// codec buffers, and bounded connection state.
+pub(crate) const H2_TRANSPORT_BUFFER_CHARGE: u64 = 512 * 1024;
 pub(crate) const SOCKET_BUFFER_BYTES: usize = 128 * 1024;
 
 pub(crate) fn configure_transport_fd(fd: impl AsFd) -> io::Result<()> {
@@ -977,6 +984,8 @@ pub(crate) struct ResourceTelemetry {
     pub disk_min_file_headroom: u64,
     pub transport_bytes: u64,
     pub transport_byte_limit: u64,
+    pub queued_h2_outputs: u64,
+    pub h2_hpack_scratch_high_water: u64,
 }
 
 impl Drop for DescriptorLease {
@@ -1532,11 +1541,18 @@ impl ResourceBudget {
     }
 
     pub(crate) fn try_transport_buffers(self: &Arc<Self>) -> io::Result<TransportBufferLease> {
-        if !try_add(
-            &self.transport_bytes,
-            TRANSPORT_BUFFER_CHARGE,
-            self.transport_byte_limit,
-        ) {
+        self.try_transport_buffer_bytes(TRANSPORT_BUFFER_CHARGE)
+    }
+
+    pub(crate) fn try_h2_transport_buffers(self: &Arc<Self>) -> io::Result<TransportBufferLease> {
+        self.try_transport_buffer_bytes(H2_TRANSPORT_BUFFER_CHARGE)
+    }
+
+    fn try_transport_buffer_bytes(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> io::Result<TransportBufferLease> {
+        if !try_add(&self.transport_bytes, bytes, self.transport_byte_limit) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "aggregate transport-buffer limit reached",
@@ -1544,7 +1560,7 @@ impl ResourceBudget {
         }
         Ok(TransportBufferLease {
             budget: self.clone(),
-            bytes: TRANSPORT_BUFFER_CHARGE,
+            bytes,
         })
     }
 
@@ -1583,6 +1599,8 @@ impl ResourceBudget {
             disk_min_file_headroom,
             transport_bytes: self.transport_bytes.load(Ordering::Acquire),
             transport_byte_limit: self.transport_byte_limit,
+            queued_h2_outputs: self.queued_h2_outputs.load(Ordering::Acquire),
+            h2_hpack_scratch_high_water: ::h2::hpack_scratch_high_water() as u64,
         }
     }
 
@@ -2527,6 +2545,28 @@ pub struct CombinedH2Lease {
     _slot: SlotLease,
 }
 
+/// Keeps adapter-side stream admission alive while the h2 state machine owns
+/// the final queued objects for a response. The application task has finished
+/// at that point, but h2 may still retain a decoded `HeaderMap`, DATA buffer,
+/// or end-of-stream marker until the transport consumes it.
+#[derive(Debug)]
+pub(crate) struct QueuedH2TransportLease {
+    budget: Arc<ResourceBudget>,
+    _admission: QueuedH2Admission,
+}
+
+#[derive(Debug)]
+enum QueuedH2Admission {
+    General { _lease: CombinedH2Lease },
+    Slow { _lease: SlowOutputLease },
+}
+
+impl Drop for QueuedH2TransportLease {
+    fn drop(&mut self) {
+        self.budget.queued_h2_outputs.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SlowInputLease {
     _slot: SlotLease,
@@ -2748,6 +2788,54 @@ impl SlowOutputAdmission {
 
     pub(crate) fn is_slow_input(&self) -> bool {
         self.input_phase == Some(vapache_verified::H2InputPhase::SlowInput)
+    }
+
+    /// Transfer the current HTTP/2 output admission into transport-owned
+    /// response objects after EOS has been queued. Detached test senders have
+    /// no admission to transfer. A tracked response may own either its general
+    /// stream lease or the slow-output lease acquired while waiting for flow
+    /// control, but never both.
+    pub(crate) fn retain_queued_h2_transport(
+        &mut self,
+    ) -> io::Result<Option<QueuedH2TransportLease>> {
+        if self.input_phase.is_none() && self.general.is_none() && self.slow.is_none() {
+            return Ok(None);
+        }
+        if self.is_slow_input() {
+            return Err(io::Error::other(
+                "queued HTTP/2 response still owns slow-input admission",
+            ));
+        }
+        let admission = if self.is_slow() {
+            let slow = self.slow.take().ok_or_else(|| {
+                io::Error::other("queued HTTP/2 response lost slow-output ownership")
+            })?;
+            if self.general.is_some() {
+                self.slow = Some(slow);
+                return Err(io::Error::other(
+                    "queued HTTP/2 response owns both general and slow admission",
+                ));
+            }
+            QueuedH2Admission::Slow { _lease: slow }
+        } else {
+            match self.general.take() {
+                Some(GeneralOutputLease::H2 { _lease }) => QueuedH2Admission::General { _lease },
+                other => {
+                    self.general = other;
+                    return Err(io::Error::other(
+                        "queued HTTP/2 response lost general stream ownership",
+                    ));
+                }
+            }
+        };
+        self.context
+            .budget
+            .queued_h2_outputs
+            .fetch_add(1, Ordering::AcqRel);
+        Ok(Some(QueuedH2TransportLease {
+            budget: self.context.budget.clone(),
+            _admission: admission,
+        }))
     }
 
     /// Transfer an HTTP/2 stream that is about to wait for request DATA from
@@ -3069,6 +3157,22 @@ mod tests {
     }
 
     #[test]
+    fn established_h2_transport_charges_kernel_and_dependency_buffers() {
+        let total = TRANSPORT_BUFFER_CHARGE + H2_TRANSPORT_BUFFER_CHARGE;
+        let budget = Arc::new(ResourceBudget {
+            transport_byte_limit: total,
+            ..ResourceBudget::default()
+        });
+        let socket = budget.try_transport_buffers().unwrap();
+        let h2 = budget.try_h2_transport_buffers().unwrap();
+        assert_eq!(budget.telemetry().transport_bytes, total);
+        assert!(budget.try_transport_buffers().is_err());
+        assert!(budget.try_h2_transport_buffers().is_err());
+        drop((socket, h2));
+        assert_eq!(budget.telemetry().transport_bytes, 0);
+    }
+
+    #[test]
     fn disk_children_isolate_filesystems_beneath_the_shared_parent() {
         let budget = Arc::new(ResourceBudget {
             disk_byte_limit: 100,
@@ -3247,6 +3351,33 @@ mod tests {
         assert_eq!(budget.slot_usage(SlotKind::H1Connection), 1);
         drop(reclaimed);
         assert_eq!(budget.slot_usage(SlotKind::H1Connection), 0);
+    }
+
+    #[test]
+    fn queued_h2_transport_owns_general_or_slow_admission_until_release() {
+        let budget = Arc::new(ResourceBudget::default());
+        let context = budget.context(IpAddr::from([192, 0, 2, 45]));
+
+        let general = budget.try_h2_stream_in(&context).unwrap();
+        let mut output = SlowOutputAdmission::tracked_h2(context.clone(), general);
+        let queued = output.retain_queued_h2_transport().unwrap().unwrap();
+        output.finish_response();
+        assert_eq!(budget.slot_usage(SlotKind::H2Stream), 1);
+        assert_eq!(budget.telemetry().queued_h2_outputs, 1);
+        drop(queued);
+        assert_eq!(budget.slot_usage(SlotKind::H2Stream), 0);
+        assert_eq!(budget.telemetry().queued_h2_outputs, 0);
+
+        let general = budget.try_h2_stream_in(&context).unwrap();
+        let mut output = SlowOutputAdmission::tracked_h2(context, general);
+        output.enter_slow().unwrap();
+        let queued = output.retain_queued_h2_transport().unwrap().unwrap();
+        output.finish_response();
+        assert_eq!(budget.slot_usage(SlotKind::SlowOutput), 1);
+        assert_eq!(budget.telemetry().queued_h2_outputs, 1);
+        drop(queued);
+        assert_eq!(budget.slot_usage(SlotKind::SlowOutput), 0);
+        assert_eq!(budget.telemetry().queued_h2_outputs, 0);
     }
 
     #[test]
