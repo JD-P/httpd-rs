@@ -247,6 +247,10 @@ pub struct Builder {
     /// Initial `Settings` frame to send as part of the handshake.
     settings: Settings,
 
+    /// Local policy cap for the response HPACK encoder. Unlike the peer's
+    /// SETTINGS value, an untrusted connection cannot raise this limit.
+    max_send_header_table_size: usize,
+
     /// Initial target window size for new connections.
     initial_target_connection_window_size: Option<u32>,
 
@@ -395,6 +399,8 @@ where
         if let Some(max) = builder.settings.max_header_list_size() {
             codec.set_max_recv_header_list_size(max as usize);
         }
+
+        codec.set_max_send_header_table_size(builder.max_send_header_table_size);
 
         // Send initial settings frame.
         codec
@@ -659,6 +665,7 @@ impl Builder {
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
             pending_accept_reset_stream_max: proto::DEFAULT_REMOTE_RESET_STREAM_MAX,
             settings: Settings::default(),
+            max_send_header_table_size: frame::DEFAULT_SETTINGS_HEADER_TABLE_SIZE as usize,
             initial_target_connection_window_size: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
@@ -813,8 +820,21 @@ impl Builder {
     /// equal to or less than the header table size specified by the sender.
     ///
     /// The default value is 4,096.
+    /// This fork caps explicit values at 65,536 bytes.
     pub fn header_table_size(&mut self, size: u32) -> &mut Self {
-        self.settings.set_header_table_size(Some(size));
+        self.settings
+            .set_header_table_size(Some(size.min(crate::hpack::MAX_DYNAMIC_TABLE_SIZE as u32)));
+        self
+    }
+
+    /// Caps the dynamic table used to encode response headers.
+    ///
+    /// This is a local policy limit, separate from the table size advertised
+    /// by the peer. Setting it to zero keeps response HPACK stateless even if
+    /// the peer advertises the protocol default of 4,096 bytes.
+    /// This fork caps explicit values at 65,536 bytes.
+    pub fn max_send_header_table_size(&mut self, size: u32) -> &mut Self {
+        self.max_send_header_table_size = (size as usize).min(crate::hpack::MAX_DYNAMIC_TABLE_SIZE);
         self
     }
 

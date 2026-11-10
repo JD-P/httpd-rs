@@ -1,20 +1,20 @@
 use super::Header;
 
-use fnv::FnvHasher;
 use http::header;
 use http::method::Method;
 
 use std::collections::VecDeque;
-use std::hash::{Hash, Hasher};
-use std::{cmp, mem};
 
 /// HPACK encoder table
+///
+/// Entries are kept newest-first, exactly like the RFC address space. The
+/// previous implementation layered truncated FNV hashing, wrapping relative
+/// indices, Robin Hood probing, and linked same-name chains over this small
+/// bounded table. A linear walk is deterministic, collision-free, and makes
+/// the storage order identical to the wire-index order.
 #[derive(Debug)]
 pub struct Table {
-    mask: usize,
-    indices: Vec<Option<Pos>>,
-    slots: VecDeque<Slot>,
-    inserted: usize,
+    slots: VecDeque<Header>,
     // Size is in bytes
     size: usize,
     max_size: usize,
@@ -38,67 +38,13 @@ pub enum Index {
     NotIndexed(Header),
 }
 
-#[derive(Debug)]
-struct Slot {
-    hash: HashValue,
-    header: Header,
-    next: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct Pos {
-    index: usize,
-    hash: HashValue,
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-struct HashValue(usize);
-
-const MAX_SIZE: usize = 1 << 16;
-const DYN_OFFSET: usize = 62;
-
-macro_rules! probe_loop {
-    ($probe_var: ident < $len: expr, $body: expr) => {
-        debug_assert!($len > 0);
-        loop {
-            if $probe_var < $len {
-                $body
-                $probe_var += 1;
-            } else {
-                $probe_var = 0;
-            }
-        }
-    };
-}
-
 impl Table {
     pub fn new(max_size: usize, capacity: usize) -> Table {
-        if capacity == 0 {
-            Table {
-                mask: 0,
-                indices: vec![],
-                slots: VecDeque::new(),
-                inserted: 0,
-                size: 0,
-                max_size,
-            }
-        } else {
-            let capacity = cmp::max(to_raw_capacity(capacity).next_power_of_two(), 8);
-
-            Table {
-                mask: capacity.wrapping_sub(1),
-                indices: vec![None; capacity],
-                slots: VecDeque::with_capacity(usable_capacity(capacity)),
-                inserted: 0,
-                size: 0,
-                max_size,
-            }
+        Table {
+            slots: VecDeque::with_capacity(capacity),
+            size: 0,
+            max_size,
         }
-    }
-
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        usable_capacity(self.indices.len())
     }
 
     pub fn max_size(&self) -> usize {
@@ -112,8 +58,8 @@ impl Table {
         match *index {
             Indexed(_, ref h) => h,
             Name(_, ref h) => h,
-            Inserted(idx) => &self.slots[idx].header,
-            InsertedValue(_, idx) => &self.slots[idx].header,
+            Inserted(idx) => &self.slots[idx],
+            InsertedValue(_, idx) => &self.slots[idx],
             NotIndexed(ref h) => h,
         }
     }
@@ -124,8 +70,8 @@ impl Table {
         match *index {
             Indexed(idx, ..) => idx,
             Name(idx, ..) => idx,
-            Inserted(idx) => idx + DYN_OFFSET,
-            InsertedValue(_name_idx, slot_idx) => slot_idx + DYN_OFFSET,
+            Inserted(idx) => dynamic_index(idx, self.slots.len()),
+            InsertedValue(_name_idx, slot_idx) => dynamic_index(slot_idx, self.slots.len()),
             NotIndexed(_) => panic!("cannot resolve index"),
         }
     }
@@ -149,470 +95,107 @@ impl Table {
             return Index::Indexed(n, header);
         }
 
-        // Don't index large headers
-        if header.len() * 4 > self.max_size * 3 {
-            return Index::new(statik, header);
-        }
-
         self.index_dynamic(header, statik)
     }
 
     fn index_dynamic(&mut self, header: Header, statik: Option<(usize, bool)>) -> Index {
-        debug_assert!(self.assert_valid_state("one"));
+        debug_assert!(self.valid());
 
-        if header.len() + self.size < self.max_size || !header.is_sensitive() {
-            // Only grow internal storage if needed
-            self.reserve_one();
-        }
-
-        if self.indices.is_empty() {
-            // If `indices` is not empty, then it is impossible for all
-            // `indices` entries to be `Some`. So, we only need to check for the
-            // empty case.
-            return Index::new(statik, header);
-        }
-
-        let hash = hash_header(&header);
-
-        let desired_pos = desired_pos(self.mask, hash);
-        let mut probe = desired_pos;
-        let mut dist = 0;
-
-        // Start at the ideal position, checking all slots
-        probe_loop!(probe < self.indices.len(), {
-            if let Some(pos) = self.indices[probe] {
-                // The slot is already occupied, but check if it has a lower
-                // displacement.
-                let their_dist = probe_distance(self.mask, pos.hash, probe);
-
-                let slot_idx = pos.index.wrapping_add(self.inserted);
-
-                if their_dist < dist {
-                    // Index robinhood
-                    return self.index_vacant(header, hash, dist, probe, statik);
-                } else if pos.hash == hash && self.slots[slot_idx].header.name() == header.name() {
-                    // Matching name, check values
-                    return self.index_occupied(header, hash, pos.index, statik.map(|(n, _)| n));
+        let mut dynamic_name = None;
+        for (position, entry) in self.slots.iter().enumerate() {
+            if entry.name() == header.name() {
+                let wire_index = dynamic_index(position, self.slots.len());
+                if entry.value_eq(&header) {
+                    return Index::Indexed(wire_index, header);
                 }
-            } else {
-                return self.index_vacant(header, hash, dist, probe, statik);
+                if dynamic_name.is_none() {
+                    dynamic_name = Some(wire_index);
+                }
             }
+        }
 
-            dist += 1;
-        });
-    }
-
-    fn index_occupied(
-        &mut self,
-        header: Header,
-        hash: HashValue,
-        mut index: usize,
-        statik: Option<usize>,
-    ) -> Index {
-        debug_assert!(self.assert_valid_state("top"));
-
-        // There already is a match for the given header name. Check if a value
-        // matches. The header will also only be inserted if the table is not at
-        // capacity.
-        loop {
-            // Compute the real index into the VecDeque
-            let real_idx = index.wrapping_add(self.inserted);
-
-            if self.slots[real_idx].header.value_eq(&header) {
-                // We have a full match!
-                return Index::Indexed(real_idx + DYN_OFFSET, header);
-            }
-
-            if let Some(next) = self.slots[real_idx].next {
-                index = next;
-                continue;
-            }
-
-            if header.is_sensitive() {
-                // Should we assert this?
-                // debug_assert!(statik.is_none());
-                return Index::Name(real_idx + DYN_OFFSET, header);
-            }
-
-            self.update_size(header.len(), Some(index));
-
-            // Insert the new header
-            self.insert(header, hash);
-
-            // Recompute real_idx as it just changed.
-            let new_real_idx = index.wrapping_add(self.inserted);
-
-            // The previous node in the linked list may have gotten evicted
-            // while making room for this header.
-            if new_real_idx < self.slots.len() {
-                let idx = 0usize.wrapping_sub(self.inserted);
-
-                self.slots[new_real_idx].next = Some(idx);
-            }
-
-            debug_assert!(self.assert_valid_state("bottom"));
-
-            // Even if the previous header was evicted, we can still reference
-            // it when inserting the new one...
-            return if let Some(n) = statik {
-                // If name is in static table, use it instead
-                Index::InsertedValue(n, 0)
-            } else {
-                Index::InsertedValue(real_idx + DYN_OFFSET, 0)
+        let name_index = statik.map(|(index, _)| index).or(dynamic_name);
+        if header.is_sensitive() {
+            return match name_index {
+                Some(index) => Index::Name(index, header),
+                None => Index::NotIndexed(header),
             };
         }
-    }
 
-    fn index_vacant(
-        &mut self,
-        header: Header,
-        hash: HashValue,
-        mut dist: usize,
-        mut probe: usize,
-        statik: Option<(usize, bool)>,
-    ) -> Index {
-        if header.is_sensitive() {
-            return Index::new(statik, header);
+        let entry_size = header.len();
+        // nghttp2's 3/4-table heuristic avoids churning the entire table for
+        // one large field. Express it without multiplication overflow.
+        let index_limit = self.max_size - self.max_size / 4;
+        if entry_size > index_limit {
+            return match name_index {
+                Some(index) => Index::Name(index, header),
+                None => Index::NotIndexed(header),
+            };
         }
 
-        debug_assert!(self.assert_valid_state("top"));
-        debug_assert!(dist == 0 || self.indices[probe.wrapping_sub(1) & self.mask].is_some());
+        self.insert(header);
+        debug_assert!(self.valid());
+        match name_index {
+            Some(index) => Index::InsertedValue(index, 0),
+            None => Index::Inserted(0),
+        }
+    }
 
-        // Passing in `usize::MAX` for prev_idx since there is no previous
-        // header in this case.
-        if self.update_size(header.len(), None) {
-            while dist != 0 {
-                let back = probe.wrapping_sub(1) & self.mask;
-
-                if let Some(pos) = self.indices[back] {
-                    let their_dist = probe_distance(self.mask, pos.hash, back);
-
-                    if their_dist < (dist - 1) {
-                        probe = back;
-                        dist -= 1;
-                    } else {
-                        break;
-                    }
-                } else {
-                    probe = back;
-                    dist -= 1;
+    fn insert(&mut self, header: Header) {
+        let incoming = header.len();
+        loop {
+            match vapache_verified::hpack_table_insert_action(
+                self.size,
+                self.max_size,
+                incoming,
+                !self.slots.is_empty(),
+            ) {
+                vapache_verified::HpackTableInsertAction::Insert { new_size } => {
+                    self.size = new_size;
+                    self.slots.push_front(header);
+                    return;
+                }
+                vapache_verified::HpackTableInsertAction::Evict => self.evict_oldest(),
+                vapache_verified::HpackTableInsertAction::Clear => {
+                    self.slots.clear();
+                    self.size = 0;
+                    return;
                 }
             }
         }
-
-        debug_assert!(self.assert_valid_state("after update"));
-
-        self.insert(header, hash);
-
-        let pos_idx = 0usize.wrapping_sub(self.inserted);
-
-        let prev = self.indices[probe].replace(Pos {
-            index: pos_idx,
-            hash,
-        });
-
-        if let Some(mut prev) = prev {
-            // Shift forward
-            let mut probe = probe + 1;
-
-            probe_loop!(probe < self.indices.len(), {
-                let pos = &mut self.indices[probe];
-
-                prev = match pos.replace(prev) {
-                    Some(p) => p,
-                    None => break,
-                };
-            });
-        }
-
-        debug_assert!(self.assert_valid_state("bottom"));
-
-        if let Some((n, _)) = statik {
-            Index::InsertedValue(n, 0)
-        } else {
-            Index::Inserted(0)
-        }
-    }
-
-    fn insert(&mut self, header: Header, hash: HashValue) {
-        self.inserted = self.inserted.wrapping_add(1);
-
-        self.slots.push_front(Slot {
-            hash,
-            header,
-            next: None,
-        });
     }
 
     pub fn resize(&mut self, size: usize) {
         self.max_size = size;
-
-        if size == 0 {
-            self.size = 0;
-
-            self.indices.fill(None);
-
-            self.slots.clear();
-            self.inserted = 0;
-        } else {
-            self.converge(None);
+        loop {
+            match vapache_verified::hpack_table_resize_action(
+                self.size,
+                self.max_size,
+                !self.slots.is_empty(),
+            ) {
+                vapache_verified::HpackTableResizeAction::Done => break,
+                vapache_verified::HpackTableResizeAction::Evict => self.evict_oldest(),
+            }
         }
+        debug_assert!(self.valid());
     }
 
-    fn update_size(&mut self, len: usize, prev_idx: Option<usize>) -> bool {
-        self.size += len;
-        self.converge(prev_idx)
+    fn evict_oldest(&mut self) {
+        let entry = self
+            .slots
+            .pop_back()
+            .expect("verified HPACK transition requested eviction from a non-empty table");
+        self.size = vapache_verified::hpack_table_after_evict(self.size, entry.len())
+            .expect("HPACK table accounting diverged from its entries");
     }
 
-    fn converge(&mut self, prev_idx: Option<usize>) -> bool {
-        let mut ret = false;
-
-        while self.size > self.max_size {
-            ret = true;
-            self.evict(prev_idx);
-        }
-
-        ret
-    }
-
-    fn evict(&mut self, prev_idx: Option<usize>) {
-        let pos_idx = (self.slots.len() - 1).wrapping_sub(self.inserted);
-
-        debug_assert!(!self.slots.is_empty());
-        debug_assert!(self.assert_valid_state("one"));
-
-        // Remove the header
-        let slot = self.slots.pop_back().unwrap();
-        let mut probe = desired_pos(self.mask, slot.hash);
-
-        // Update the size
-        self.size -= slot.header.len();
-
-        debug_assert_eq!(
-            self.indices
+    fn valid(&self) -> bool {
+        self.size <= self.max_size
+            && self
+                .slots
                 .iter()
-                .filter_map(|p| *p)
-                .filter(|p| p.index == pos_idx)
-                .count(),
-            1
-        );
-
-        // Find the associated position
-        probe_loop!(probe < self.indices.len(), {
-            debug_assert!(self.indices[probe].is_some());
-
-            let mut pos = self.indices[probe].unwrap();
-
-            if pos.index == pos_idx {
-                if let Some(idx) = slot.next {
-                    pos.index = idx;
-                    self.indices[probe] = Some(pos);
-                } else if Some(pos.index) == prev_idx {
-                    pos.index = 0usize.wrapping_sub(self.inserted + 1);
-                    self.indices[probe] = Some(pos);
-                } else {
-                    self.indices[probe] = None;
-                    self.remove_phase_two(probe);
-                }
-
-                break;
-            }
-        });
-
-        debug_assert!(self.assert_valid_state("two"));
-    }
-
-    // Shifts all indices that were displaced by the header that has just been
-    // removed.
-    fn remove_phase_two(&mut self, probe: usize) {
-        let mut last_probe = probe;
-        let mut probe = probe + 1;
-
-        probe_loop!(probe < self.indices.len(), {
-            if let Some(pos) = self.indices[probe] {
-                if probe_distance(self.mask, pos.hash, probe) > 0 {
-                    self.indices[last_probe] = self.indices[probe].take();
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-
-            last_probe = probe;
-        });
-
-        debug_assert!(self.assert_valid_state("two"));
-    }
-
-    fn reserve_one(&mut self) {
-        let len = self.slots.len();
-
-        if len == self.capacity() {
-            if len == 0 {
-                let new_raw_cap = 8;
-                self.mask = 8 - 1;
-                self.indices = vec![None; new_raw_cap];
-            } else {
-                let raw_cap = self.indices.len();
-                self.grow(raw_cap << 1);
-            }
-        }
-    }
-
-    #[inline]
-    fn grow(&mut self, new_raw_cap: usize) {
-        // This path can never be reached when handling the first allocation in
-        // the map.
-
-        debug_assert!(self.assert_valid_state("top"));
-
-        // find first ideally placed element -- start of cluster
-        let mut first_ideal = 0;
-
-        for (i, pos) in self.indices.iter().enumerate() {
-            if let Some(pos) = *pos {
-                if 0 == probe_distance(self.mask, pos.hash, i) {
-                    first_ideal = i;
-                    break;
-                }
-            }
-        }
-
-        // visit the entries in an order where we can simply reinsert them
-        // into self.indices without any bucket stealing.
-        let old_indices = mem::replace(&mut self.indices, vec![None; new_raw_cap]);
-        self.mask = new_raw_cap.wrapping_sub(1);
-
-        for &pos in &old_indices[first_ideal..] {
-            self.reinsert_entry_in_order(pos);
-        }
-
-        for &pos in &old_indices[..first_ideal] {
-            self.reinsert_entry_in_order(pos);
-        }
-
-        debug_assert!(self.assert_valid_state("bottom"));
-    }
-
-    fn reinsert_entry_in_order(&mut self, pos: Option<Pos>) {
-        if let Some(pos) = pos {
-            // Find first empty bucket and insert there
-            let mut probe = desired_pos(self.mask, pos.hash);
-
-            probe_loop!(probe < self.indices.len(), {
-                if self.indices[probe].is_none() {
-                    // empty bucket, insert here
-                    self.indices[probe] = Some(pos);
-                    return;
-                }
-
-                debug_assert!({
-                    let them = self.indices[probe].unwrap();
-                    let their_distance = probe_distance(self.mask, them.hash, probe);
-                    let our_distance = probe_distance(self.mask, pos.hash, probe);
-
-                    their_distance >= our_distance
-                });
-            });
-        }
-    }
-
-    #[cfg(not(test))]
-    fn assert_valid_state(&self, _: &'static str) -> bool {
-        true
-    }
-
-    #[cfg(test)]
-    fn assert_valid_state(&self, _msg: &'static str) -> bool {
-        /*
-            // Checks that the internal map structure is valid
-            //
-            // Ensure all hash codes in indices match the associated slot
-            for pos in &self.indices {
-                if let Some(pos) = *pos {
-                    let real_idx = pos.index.wrapping_add(self.inserted);
-
-                    if real_idx.wrapping_add(1) != 0 {
-                        assert!(real_idx < self.slots.len(),
-                                "out of index; real={}; len={}, msg={}",
-                                real_idx, self.slots.len(), msg);
-
-                        assert_eq!(pos.hash, self.slots[real_idx].hash,
-                                   "index hash does not match slot; msg={}", msg);
-                    }
-                }
-            }
-
-            // Every index is only available once
-            for i in 0..self.indices.len() {
-                if self.indices[i].is_none() {
-                    continue;
-                }
-
-                for j in i+1..self.indices.len() {
-                    assert_ne!(self.indices[i], self.indices[j],
-                                "duplicate indices; msg={}", msg);
-                }
-            }
-
-            for (index, slot) in self.slots.iter().enumerate() {
-                let mut indexed = None;
-
-                // First, see if the slot is indexed
-                for (i, pos) in self.indices.iter().enumerate() {
-                    if let Some(pos) = *pos {
-                        let real_idx = pos.index.wrapping_add(self.inserted);
-                        if real_idx == index {
-                            indexed = Some(i);
-                            // Already know that there is no dup, so break
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(actual) = indexed {
-                    // Ensure that it is accessible..
-                    let desired = desired_pos(self.mask, slot.hash);
-                    let mut probe = desired;
-                    let mut dist = 0;
-
-                    probe_loop!(probe < self.indices.len(), {
-                        assert!(self.indices[probe].is_some(),
-                                "unexpected empty slot; probe={}; hash={:?}; msg={}",
-                                probe, slot.hash, msg);
-
-                        let pos = self.indices[probe].unwrap();
-
-                        let their_dist = probe_distance(self.mask, pos.hash, probe);
-                        let real_idx = pos.index.wrapping_add(self.inserted);
-
-                        if real_idx == index {
-                            break;
-                        }
-
-                        assert!(dist <= their_dist,
-                                "could not find entry; actual={}; desired={}" +
-                                "probe={}, dist={}; their_dist={}; index={}; msg={}",
-                                actual, desired, probe, dist, their_dist,
-                                index.wrapping_sub(self.inserted), msg);
-
-                        dist += 1;
-                    });
-                } else {
-                    // There is exactly one next link
-                    let cnt = self.slots.iter().map(|s| s.next)
-                        .filter(|n| *n == Some(index.wrapping_sub(self.inserted)))
-                        .count();
-
-                    assert_eq!(1, cnt, "more than one node pointing here; msg={}", msg);
-                }
-            }
-        */
-
-        // TODO: Ensure linked lists are correct: no cycles, etc...
-
-        true
+                .try_fold(0usize, |size, entry| size.checked_add(entry.len()))
+                == Some(self.size)
     }
 }
 
@@ -639,32 +222,9 @@ impl Index {
     }
 }
 
-#[inline]
-fn usable_capacity(cap: usize) -> usize {
-    cap - cap / 4
-}
-
-#[inline]
-fn to_raw_capacity(n: usize) -> usize {
-    n + n / 3
-}
-
-#[inline]
-fn desired_pos(mask: usize, hash: HashValue) -> usize {
-    hash.0 & mask
-}
-
-#[inline]
-fn probe_distance(mask: usize, hash: HashValue, current: usize) -> usize {
-    current.wrapping_sub(desired_pos(mask, hash)) & mask
-}
-
-fn hash_header(header: &Header) -> HashValue {
-    const MASK: u64 = (MAX_SIZE as u64) - 1;
-
-    let mut h = FnvHasher::default();
-    header.name().hash(&mut h);
-    HashValue((h.finish() & MASK) as usize)
+fn dynamic_index(position: usize, table_len: usize) -> usize {
+    vapache_verified::hpack_dynamic_index(position, table_len)
+        .expect("bounded HPACK table position must have a wire index")
 }
 
 /// Checks the static table for the header. If found, returns the index and a

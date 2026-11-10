@@ -95,6 +95,11 @@ impl<T, B> Codec<T, B> {
         self.framed_write().set_header_table_size(val)
     }
 
+    /// Set a local upper bound for the HPACK encoder's dynamic table.
+    pub fn set_max_send_header_table_size(&mut self, val: usize) {
+        self.framed_write().set_max_header_table_size(val)
+    }
+
     /// Set the decoder header table size size.
     pub fn set_recv_header_table_size(&mut self, val: usize) {
         self.inner.set_header_table_size(val)

@@ -3,10 +3,10 @@ use crate::hpack::huffman::table::{ENCODE_CODES, ENCODE_CODE_LENGTHS};
 use bytes::{BufMut, BytesMut};
 
 pub fn encoded_len(src: &[u8]) -> usize {
-    let bits = src.iter().fold(0usize, |total, byte| {
-        total.saturating_add(ENCODE_CODE_LENGTHS[*byte as usize] as usize)
-    });
-    bits.saturating_add(7) / 8
+    vapache_verified::hpack_huffman_encoded_len(src, &ENCODE_CODE_LENGTHS)
+        // Overflow means the Huffman representation cannot be materialized;
+        // the caller treats this sentinel as a request to emit raw bytes.
+        .unwrap_or(usize::MAX)
 }
 
 pub fn encode(src: &[u8], dst: &mut BytesMut) {

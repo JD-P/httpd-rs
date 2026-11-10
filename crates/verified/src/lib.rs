@@ -12898,6 +12898,330 @@ pub fn h2_header_admit(
 /// conforming projection: active streams and pending resets never exceed the
 /// configured maxima, and every transition is total (it returns `None` rather
 /// than underflowing).
+/// Result of decoding one HPACK integer. `consumed` is part of the verified
+/// result so the wire decoder never has to reconstruct cursor movement from
+/// untrusted continuation bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HpackIntegerDecode {
+    Value { value: u32, consumed: usize },
+    Underflow,
+    Overflow,
+    InvalidPrefix,
+}
+
+/// Decode the RFC 7541 integer representation with h2's five-octet limit.
+/// All shifts and additions are performed in `u64`; the final narrowing is
+/// admitted only after an explicit `u32` bound check.
+pub fn hpack_decode_integer(
+    input: &[u8],
+    prefix_size: u8,
+) -> (out: HpackIntegerDecode)
+    ensures
+        match out {
+            HpackIntegerDecode::Value { value: _, consumed } => {
+                &&& consumed >= 1
+                &&& consumed <= input@.len()
+                &&& consumed <= 5
+            }
+            HpackIntegerDecode::Underflow => input@.len() < 5,
+            HpackIntegerDecode::Overflow | HpackIntegerDecode::InvalidPrefix => true,
+        },
+{
+    if prefix_size < 1 || prefix_size > 8 {
+        return HpackIntegerDecode::InvalidPrefix;
+    }
+    if input.len() == 0 {
+        return HpackIntegerDecode::Underflow;
+    }
+
+    let mask: u8 = match prefix_size {
+        1 => 0x01,
+        2 => 0x03,
+        3 => 0x07,
+        4 => 0x0f,
+        5 => 0x1f,
+        6 => 0x3f,
+        7 => 0x7f,
+        _ => 0xff,
+    };
+    let mut value: u64 = (input[0] & mask) as u64;
+    if value < mask as u64 {
+        return HpackIntegerDecode::Value {
+            value: value as u32,
+            consumed: 1,
+        };
+    }
+
+    let mut consumed: usize = 1;
+    let mut shift: u32 = 0;
+    while consumed < input.len() && consumed < 5
+        invariant
+            1 <= consumed <= input@.len(),
+            consumed <= 5,
+            shift <= 28,
+            shift as int == 7 * (consumed as int - 1),
+        decreases 5 - consumed,
+    {
+        let byte = input[consumed];
+        consumed = consumed + 1;
+        let part = ((byte & 0x7f) as u64) << shift;
+        value = match value.checked_add(part) {
+            Some(next) => next,
+            None => return HpackIntegerDecode::Overflow,
+        };
+        shift = shift + 7;
+
+        if byte & 0x80 == 0 {
+            if value > u32::MAX as u64 {
+                return HpackIntegerDecode::Overflow;
+            }
+            return HpackIntegerDecode::Value {
+                value: value as u32,
+                consumed,
+            };
+        }
+    }
+
+    if consumed == 5 {
+        HpackIntegerDecode::Overflow
+    } else {
+        HpackIntegerDecode::Underflow
+    }
+}
+
+/// Encode one HPACK integer into an owned byte sequence. The caller supplies
+/// the representation bits in `first_byte`; the verified routine owns every
+/// byte-level continuation transition used by the wire encoder.
+pub fn hpack_encode_integer(
+    value: usize,
+    prefix_size: u8,
+    first_byte: u8,
+) -> (out: Option<Vec<u8>>)
+    ensures
+        match out {
+            Some(bytes) => bytes@.len() >= 1,
+            None => prefix_size < 1 || prefix_size > 8,
+        },
+{
+    if prefix_size < 1 || prefix_size > 8 {
+        return None;
+    }
+    let low_byte: u8 = match prefix_size {
+        1 => 0x01,
+        2 => 0x03,
+        3 => 0x07,
+        4 => 0x0f,
+        5 => 0x1f,
+        6 => 0x3f,
+        7 => 0x7f,
+        _ => 0xff,
+    };
+    let low: usize = low_byte as usize;
+    let mut out: Vec<u8> = Vec::new();
+    if value < low {
+        assert(value <= u8::MAX as usize);
+        out.push(first_byte | value as u8);
+        return Some(out);
+    }
+
+    out.push(first_byte | low_byte);
+    let mut remaining = value - low;
+    while remaining >= 128
+        invariant out@.len() >= 1,
+        decreases remaining,
+    {
+        out.push(0x80 | (remaining % 128) as u8);
+        remaining = remaining / 128;
+    }
+    out.push(remaining as u8);
+    Some(out)
+}
+
+/// Overflow-free RFC 7541 dynamic-table entry size (`name + value + 32`).
+pub fn hpack_entry_size(name_len: usize, value_len: usize) -> (out: Option<usize>)
+    ensures
+        match out {
+            Some(size) => size as int == name_len as int + value_len as int + 32,
+            None => true,
+        },
+{
+    let fields = match name_len.checked_add(value_len) {
+        Some(size) => size,
+        None => return None,
+    };
+    fields.checked_add(32)
+}
+
+/// The only admission transition used by both HPACK dynamic tables. Runtime
+/// code must either insert with the returned exact size, evict one oldest
+/// entry, or clear when the incoming entry can never fit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HpackTableInsertAction {
+    Insert { new_size: usize },
+    Evict,
+    Clear,
+}
+
+pub fn hpack_table_insert_action(
+    current_size: usize,
+    max_size: usize,
+    incoming_size: usize,
+    has_entries: bool,
+) -> (out: HpackTableInsertAction)
+    requires
+        current_size <= max_size,
+        has_entries || current_size == 0,
+    ensures
+        match out {
+            HpackTableInsertAction::Insert { new_size } => {
+                &&& new_size == current_size + incoming_size
+                &&& new_size <= max_size
+            }
+            HpackTableInsertAction::Evict => {
+                &&& has_entries
+                &&& incoming_size <= max_size
+                &&& incoming_size > max_size - current_size
+            }
+            HpackTableInsertAction::Clear => incoming_size > max_size,
+        },
+{
+    if incoming_size > max_size {
+        HpackTableInsertAction::Clear
+    } else if incoming_size <= max_size - current_size {
+        HpackTableInsertAction::Insert {
+            new_size: current_size + incoming_size,
+        }
+    } else {
+        if has_entries {
+            HpackTableInsertAction::Evict
+        } else {
+            // The preconditions make this branch unreachable: an empty table
+            // has size zero, and `incoming_size <= max_size` fits it.
+            assert(false);
+            HpackTableInsertAction::Clear
+        }
+    }
+}
+
+/// Exact accounting transition for removing an oldest dynamic-table entry.
+pub fn hpack_table_after_evict(
+    current_size: usize,
+    evicted_size: usize,
+) -> (out: Option<usize>)
+    ensures
+        match out {
+            Some(size) => size + evicted_size == current_size,
+            None => evicted_size > current_size,
+        },
+{
+    current_size.checked_sub(evicted_size)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HpackTableResizeAction {
+    Done,
+    Evict,
+}
+
+pub fn hpack_table_resize_action(
+    current_size: usize,
+    new_max_size: usize,
+    has_entries: bool,
+) -> (out: HpackTableResizeAction)
+    requires has_entries || current_size == 0,
+    ensures
+        match out {
+            HpackTableResizeAction::Done => current_size <= new_max_size,
+            HpackTableResizeAction::Evict => current_size > new_max_size && has_entries,
+        },
+{
+    if current_size <= new_max_size {
+        HpackTableResizeAction::Done
+    } else {
+        if has_entries {
+            HpackTableResizeAction::Evict
+        } else {
+            assert(false);
+            HpackTableResizeAction::Done
+        }
+    }
+}
+
+/// Convert a zero-based newest-first dynamic-table position into HPACK's
+/// one-based combined static/dynamic address space.
+pub fn hpack_dynamic_index(position: usize, table_len: usize) -> (out: Option<usize>)
+    ensures
+        match out {
+            Some(index) => index == position + 62 && position < table_len,
+            None => position >= table_len || position > usize::MAX - 62,
+        },
+{
+    if position >= table_len {
+        None
+    } else {
+        position.checked_add(62)
+    }
+}
+
+/// Compute the exact encoded byte length from a byte-to-code-length table.
+/// Returning `None` makes overflow a fail-closed request to use the raw HPACK
+/// string representation.
+pub open spec fn hpack_huffman_bit_length(
+    input: Seq<u8>,
+    code_lengths: Seq<u8>,
+    count: int,
+) -> nat
+    recommends 0 <= count <= input.len(), code_lengths.len() >= 256,
+    decreases count,
+{
+    if count <= 0 {
+        0
+    } else {
+        hpack_huffman_bit_length(input, code_lengths, count - 1)
+            + code_lengths[input[count - 1] as int] as nat
+    }
+}
+
+pub fn hpack_huffman_encoded_len(
+    input: &[u8],
+    code_lengths: &[u8],
+) -> (out: Option<usize>)
+    requires code_lengths@.len() >= 256,
+    ensures match out {
+        Some(length) => length as nat
+            == (hpack_huffman_bit_length(input@, code_lengths@, input@.len() as int) + 7) / 8,
+        None => true,
+    },
+{
+    assert(code_lengths.len() >= 256);
+    let mut bits: usize = 0;
+    let mut i: usize = 0;
+    while i < input.len()
+        invariant
+            0 <= i <= input@.len(),
+            code_lengths@.len() >= 256,
+            bits as nat == hpack_huffman_bit_length(input@, code_lengths@, i as int),
+        decreases input@.len() - i,
+    {
+        let symbol = input[i] as usize;
+        assert(symbol < 256);
+        assert(symbol < code_lengths.len());
+        let code_len = code_lengths[symbol] as usize;
+        bits = match bits.checked_add(code_len) {
+            Some(next) => next,
+            None => return None,
+        };
+        assert(hpack_huffman_bit_length(input@, code_lengths@, i as int + 1)
+            == hpack_huffman_bit_length(input@, code_lengths@, i as int)
+                + code_len as nat);
+        i = i + 1;
+    }
+    match bits.checked_add(7) {
+        Some(rounded) => Some(rounded / 8),
+        None => None,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct H2Budget {
     pub active: u64,
@@ -13077,6 +13401,11 @@ pub open spec fn h2_budget_step_spec(
 pub struct H2Settings {
     pub max_concurrent_streams: u32,
     pub max_header_list: u32,
+    /// Dynamic table accepted from the peer (SETTINGS_HEADER_TABLE_SIZE).
+    pub header_table_size: u32,
+    /// Independent local cap for the encoder, even if the peer advertises a
+    /// larger table. Zero makes response compression stateless as well.
+    pub max_send_header_table_size: u32,
     pub initial_window: u32,
     pub initial_connection_window: u32,
     pub max_frame: u32,
@@ -13087,6 +13416,8 @@ pub struct H2Settings {
 pub open spec fn h2_settings_sane(s: H2Settings) -> bool {
     &&& s.max_concurrent_streams > 0 && s.max_concurrent_streams <= 1024
     &&& s.max_header_list > 0 && s.max_header_list <= 16 * 1024 * 1024
+    &&& s.header_table_size <= 4096
+    &&& s.max_send_header_table_size <= 4096
     &&& s.initial_window > 0 && s.initial_window <= 16 * 1024 * 1024
     &&& s.initial_connection_window >= s.initial_window
     &&& s.initial_connection_window <= 16 * 1024 * 1024
@@ -13103,6 +13434,11 @@ pub fn h2_settings() -> (s: H2Settings)
         // one connection's request-body heap at roughly 2 MiB before spooling.
         max_concurrent_streams: 32,
         max_header_list: 131_072,
+        // Literal/static HPACK remains fully interoperable. Dynamic state is
+        // disabled in both directions by default and can be reintroduced only
+        // through an explicit, independently bounded policy change.
+        header_table_size: 0,
+        max_send_header_table_size: 0,
         initial_window: 256 * 1024,
         initial_connection_window: 1024 * 1024,
         max_frame: 16 * 1024,

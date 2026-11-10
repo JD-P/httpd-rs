@@ -1126,6 +1126,7 @@ impl Builder {
     /// equal to or less than the header table size specified by the sender.
     ///
     /// The default value is 4,096.
+    /// This fork caps explicit values at 65,536 bytes.
     ///
     /// # Examples
     ///
@@ -1148,7 +1149,8 @@ impl Builder {
     /// # pub fn main() {}
     /// ```
     pub fn header_table_size(&mut self, size: u32) -> &mut Self {
-        self.settings.set_header_table_size(Some(size));
+        self.settings
+            .set_header_table_size(Some(size.min(crate::hpack::MAX_DYNAMIC_TABLE_SIZE as u32)));
         self
     }
 

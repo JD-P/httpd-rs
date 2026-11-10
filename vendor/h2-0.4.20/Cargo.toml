@@ -48,6 +48,7 @@ repository = "https://github.com/hyperium/h2"
 features = ["stream"]
 
 [features]
+fuzzing = []
 stream = []
 unstable = []
 
@@ -77,9 +78,6 @@ version = "1.0.0"
 
 [dependencies.bytes]
 version = "1"
-
-[dependencies.fnv]
-version = "1.0.5"
 
 [dependencies.futures-core]
 version = "0.3"

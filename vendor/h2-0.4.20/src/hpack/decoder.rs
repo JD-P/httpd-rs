@@ -154,6 +154,7 @@ struct StringMarker {
 impl Decoder {
     /// Creates a new `Decoder` with all settings set to default values.
     pub fn new(size: usize) -> Decoder {
+        let size = size.min(super::MAX_DYNAMIC_TABLE_SIZE);
         Decoder {
             max_size_update: None,
             last_max_update: size,
@@ -165,6 +166,7 @@ impl Decoder {
     /// Queues a potential size update
     #[allow(dead_code)]
     pub fn queue_size_update(&mut self, size: usize) {
+        let size = size.min(super::MAX_DYNAMIC_TABLE_SIZE);
         let size = match self.max_size_update {
             Some(v) => cmp::max(v, size),
             None => size,
@@ -397,63 +399,20 @@ impl Representation {
     }
 }
 
-fn decode_int<B: Buf>(buf: &mut B, prefix_size: u8) -> Result<usize, DecoderError> {
-    // The octet limit is chosen such that the maximum allowed *value* can
-    // never overflow an unsigned 32-bit integer. The maximum value of any
-    // integer that can be encoded with 5 octets is ~2^28
-    const MAX_BYTES: usize = 5;
-    const VARINT_MASK: u8 = 0b0111_1111;
-    const VARINT_FLAG: u8 = 0b1000_0000;
-
-    if prefix_size < 1 || prefix_size > 8 {
-        return Err(DecoderError::InvalidIntegerPrefix);
-    }
-
-    if !buf.has_remaining() {
-        return Err(DecoderError::NeedMore(NeedMore::IntegerUnderflow));
-    }
-
-    let mask = if prefix_size == 8 {
-        0xFF
-    } else {
-        (1u8 << prefix_size).wrapping_sub(1)
-    };
-
-    let mut ret = (buf.get_u8() & mask) as usize;
-
-    if ret < mask as usize {
-        // Value fits in the prefix bits
-        return Ok(ret);
-    }
-
-    // The int did not fit in the prefix bits, so continue reading.
-    //
-    // The total number of bytes used to represent the int. The first byte was
-    // the prefix, so start at 1.
-    let mut bytes = 1;
-
-    // The rest of the int is stored as a varint -- 7 bits for the value and 1
-    // bit to indicate if it is the last byte.
-    let mut shift = 0;
-
-    while buf.has_remaining() {
-        let b = buf.get_u8();
-
-        bytes += 1;
-        ret += ((b & VARINT_MASK) as usize) << shift;
-        shift += 7;
-
-        if b & VARINT_FLAG == 0 {
-            return Ok(ret);
+fn decode_int(buf: &mut Cursor<&mut BytesMut>, prefix_size: u8) -> Result<usize, DecoderError> {
+    match vapache_verified::hpack_decode_integer(buf.chunk(), prefix_size) {
+        vapache_verified::HpackIntegerDecode::Value { value, consumed } => {
+            buf.advance(consumed);
+            Ok(value as usize)
         }
-
-        if bytes == MAX_BYTES {
-            // The spec requires that this situation is an error
-            return Err(DecoderError::IntegerOverflow);
+        vapache_verified::HpackIntegerDecode::Underflow => {
+            Err(DecoderError::NeedMore(NeedMore::IntegerUnderflow))
+        }
+        vapache_verified::HpackIntegerDecode::Overflow => Err(DecoderError::IntegerOverflow),
+        vapache_verified::HpackIntegerDecode::InvalidPrefix => {
+            Err(DecoderError::InvalidIntegerPrefix)
         }
     }
-
-    Err(DecoderError::NeedMore(NeedMore::IntegerUnderflow))
 }
 
 fn peek_u8<B: Buf>(buf: &B) -> Option<u8> {
@@ -532,52 +491,50 @@ impl Table {
     }
 
     fn insert(&mut self, entry: Header) {
-        let len = entry.len();
-
-        self.reserve(len);
-
-        if self.size + len <= self.max_size {
-            self.size += len;
-
-            // Track the entry
-            self.entries.push_front(entry);
+        let incoming = entry.len();
+        loop {
+            match vapache_verified::hpack_table_insert_action(
+                self.size,
+                self.max_size,
+                incoming,
+                !self.entries.is_empty(),
+            ) {
+                vapache_verified::HpackTableInsertAction::Insert { new_size } => {
+                    self.size = new_size;
+                    self.entries.push_front(entry);
+                    return;
+                }
+                vapache_verified::HpackTableInsertAction::Evict => self.evict_oldest(),
+                vapache_verified::HpackTableInsertAction::Clear => {
+                    self.entries.clear();
+                    self.size = 0;
+                    return;
+                }
+            }
         }
     }
 
     fn set_max_size(&mut self, size: usize) {
         self.max_size = size;
-        // Make the table size fit within the new constraints.
-        self.consolidate();
-    }
-
-    fn reserve(&mut self, size: usize) {
-        while self.size + size > self.max_size {
-            match self.entries.pop_back() {
-                Some(last) => {
-                    self.size -= last.len();
-                }
-                None => return,
+        loop {
+            match vapache_verified::hpack_table_resize_action(
+                self.size,
+                self.max_size,
+                !self.entries.is_empty(),
+            ) {
+                vapache_verified::HpackTableResizeAction::Done => return,
+                vapache_verified::HpackTableResizeAction::Evict => self.evict_oldest(),
             }
         }
     }
 
-    fn consolidate(&mut self) {
-        while self.size > self.max_size {
-            {
-                let last = match self.entries.back() {
-                    Some(x) => x,
-                    None => {
-                        // Can never happen as the size of the table must reach
-                        // 0 by the time we've exhausted all elements.
-                        panic!("Size of table != 0, but no headers left!");
-                    }
-                };
-
-                self.size -= last.len();
-            }
-
-            self.entries.pop_back();
-        }
+    fn evict_oldest(&mut self) {
+        let entry = self
+            .entries
+            .pop_back()
+            .expect("verified HPACK transition requested eviction from a non-empty table");
+        self.size = vapache_verified::hpack_table_after_evict(self.size, entry.len())
+            .expect("HPACK decoder accounting diverged from its entries");
     }
 }
 

@@ -1096,8 +1096,10 @@ mod test {
         // // Next is not indexed
         assert_eq!(&[15, 47, 0x80 | 3], &dst[12..15]);
         assert_eq!("zomg", huff_decode(&dst[15..18]));
-        assert_eq!(&[15, 47, 0x80 | 3], &dst[18..21]);
-        assert_eq!("sup", huff_decode(&dst[21..]));
+        // Equal-length Huffman output uses the raw representation to avoid
+        // spending CPU without reducing the wire size.
+        assert_eq!(&[15, 47, 3], &dst[18..21]);
+        assert_eq!(b"sup", &dst[21..]);
     }
 
     fn huff_decode(src: &[u8]) -> BytesMut {

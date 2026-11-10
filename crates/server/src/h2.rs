@@ -2121,6 +2121,11 @@ pub fn fuzz_h2_frames(data: &[u8]) {
     use tokio::io::AsyncWriteExt;
     use tokio::time::{timeout, Duration};
 
+    // Hit the fork's direct HPACK harness as well as the full framed state
+    // machine below. The direct path runs stateless and maximum-bounded table
+    // modes plus every integer prefix.
+    h2::fuzz_bridge::fuzz_logic::fuzz_hpack(data);
+
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -2298,6 +2303,11 @@ where
     builder
         // Bound compressed/decoded header memory before HPACK allocates.
         .max_header_list_size(settings.max_header_list)
+        // Keep HPACK stateless in both directions by default. The independent
+        // send cap means a peer cannot re-enable response-side dynamic state
+        // by advertising a larger table in its SETTINGS frame.
+        .header_table_size(settings.header_table_size)
+        .max_send_header_table_size(settings.max_send_header_table_size)
         .max_concurrent_streams(settings.max_concurrent_streams)
         // Bound stream/window and reset amplification.  The h2 crate owns
         // frame parsing; these limits control what the adapter will accept.

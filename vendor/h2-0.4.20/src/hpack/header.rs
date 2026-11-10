@@ -37,7 +37,11 @@ pub struct BytesStr(Bytes);
 
 pub fn len(name: &HeaderName, value: &HeaderValue) -> usize {
     let n: &str = name.as_ref();
-    32 + n.len() + value.len()
+    entry_size(n.len(), value.len())
+}
+
+fn entry_size(name_len: usize, value_len: usize) -> usize {
+    vapache_verified::hpack_entry_size(name_len, value_len).unwrap_or(usize::MAX)
 }
 
 impl Header<Option<HeaderName>> {
@@ -108,12 +112,12 @@ impl Header {
                 ref name,
                 ref value,
             } => len(name, value),
-            Header::Authority(ref v) => 32 + 10 + v.len(),
-            Header::Method(ref v) => 32 + 7 + v.as_ref().len(),
-            Header::Scheme(ref v) => 32 + 7 + v.len(),
-            Header::Path(ref v) => 32 + 5 + v.len(),
-            Header::Protocol(ref v) => 32 + 9 + v.as_str().len(),
-            Header::Status(_) => 32 + 7 + 3,
+            Header::Authority(ref v) => entry_size(10, v.len()),
+            Header::Method(ref v) => entry_size(7, v.as_ref().len()),
+            Header::Scheme(ref v) => entry_size(7, v.len()),
+            Header::Path(ref v) => entry_size(5, v.len()),
+            Header::Protocol(ref v) => entry_size(9, v.as_str().len()),
+            Header::Status(_) => entry_size(7, 3),
         }
     }
 

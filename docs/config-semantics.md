@@ -1851,7 +1851,17 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **739 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **754 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+
+- The forked h2 HPACK path calls the executable verified kernel for integer
+  encoding/decoding, overflow-free entry sizing, dynamic-table admission,
+  eviction and resize accounting, dynamic wire-index conversion, and exact
+  Huffman encoded-length calculation. The Huffman length result refines a
+  recursive bit-length specification. Encoder lookup is a bounded,
+  deterministic newest-first walk rather than a truncated FNV/Robin-Hood
+  index, and Vapache configures independent zero-byte receive and send dynamic
+  table limits by default; a peer SETTINGS frame cannot raise the local send
+  cap.
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.

@@ -131,7 +131,7 @@ pub mod ext;
 pub mod server;
 mod share;
 
-#[cfg(fuzzing)]
+#[cfg(any(fuzzing, feature = "fuzzing"))]
 #[cfg_attr(feature = "unstable", allow(missing_docs))]
 /// Fuzzing-only entry points for exercising internal HTTP/2 codecs.
 pub mod fuzz_bridge;

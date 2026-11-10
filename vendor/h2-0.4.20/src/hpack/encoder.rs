@@ -38,8 +38,8 @@ impl Encoder {
         }
     }
 
-    #[cfg(test)]
-    fn set_max_allowed_size(&mut self, max: usize) {
+    pub(crate) fn set_max_allowed_size(&mut self, max: usize) {
+        let max = max.min(super::MAX_DYNAMIC_TABLE_SIZE);
         self.max_allowed_size = max;
 
         if self.table.max_size() > max {
@@ -268,36 +268,20 @@ fn encode_str(val: &[u8], dst: &mut BytesMut) {
     }
 }
 
-/// Encode an integer into the given destination buffer
+/// Encode an integer using the executable Verus-checked HPACK kernel.
 fn encode_int<B: BufMut>(
-    mut value: usize,   // The integer to encode
+    value: usize,       // The integer to encode
     prefix_bits: usize, // The number of bits in the prefix
     first_byte: u8,     // The base upon which to start encoding the int
     dst: &mut B,
 ) {
-    if encode_int_one_byte(value, prefix_bits) {
-        dst.put_u8(first_byte | value as u8);
-        return;
-    }
-
-    let low = (1 << prefix_bits) - 1;
-
-    value -= low;
-
-    dst.put_u8(first_byte | low as u8);
-
-    while value >= 128 {
-        dst.put_u8(0b1000_0000 | value as u8);
-
-        value >>= 7;
-    }
-
-    dst.put_u8(value as u8);
-}
-
-/// Returns true if the in the int can be fully encoded in the first byte.
-fn encode_int_one_byte(value: usize, prefix_bits: usize) -> bool {
-    value < (1 << prefix_bits) - 1
+    let encoded = vapache_verified::hpack_encode_integer(
+        value,
+        u8::try_from(prefix_bits).expect("HPACK prefix width fits in u8"),
+        first_byte,
+    )
+    .expect("HPACK integer prefix width must be between one and eight");
+    dst.put_slice(&encoded);
 }
 
 #[cfg(test)]
@@ -580,6 +564,19 @@ mod test {
     }
 
     #[test]
+    fn local_zero_cap_cannot_be_raised_by_peer_update() {
+        let mut encoder = Encoder::default();
+        encoder.set_max_allowed_size(0);
+        encoder.update_max_size(4096);
+
+        let res = encode(&mut encoder, vec![header("foo", "bar")]);
+        assert_eq!(res[0], 0x20, "first block must announce table size zero");
+        assert_eq!(res[1], 0, "custom name must use a literal representation");
+        assert_eq!(encoder.table.max_size(), 0);
+        assert_eq!(encoder.table.len(), 0);
+    }
+
+    #[test]
     fn test_update_max_size_combos() {
         let mut encoder = Encoder::default();
         assert!(encoder.size_update.is_none());
@@ -681,16 +678,19 @@ mod test {
     }
 
     #[test]
-    fn test_large_size_update() {
+    fn test_absolute_dynamic_table_cap() {
         let mut encoder = Encoder::default();
         encoder.set_max_allowed_size(usize::MAX);
 
         encoder.update_max_size(1912930560);
-        assert_eq!(Some(SizeUpdate::One(1912930560)), encoder.size_update);
+        assert_eq!(
+            Some(SizeUpdate::One(super::super::MAX_DYNAMIC_TABLE_SIZE)),
+            encoder.size_update
+        );
 
         let mut dst = BytesMut::with_capacity(6);
         encoder.encode_size_updates(&mut dst);
-        assert_eq!([63, 225, 129, 148, 144, 7], &dst[..]);
+        assert_eq!([63, 225, 255, 3], &dst[..]);
     }
 
     #[test]
@@ -707,6 +707,39 @@ mod test {
         encoder.encode_size_updates(&mut dst);
         assert_eq!([63, 225, 31], &dst[..]);
         assert_eq!(DEFAULT_MAX_ALLOWED_SIZE, encoder.table.max_size());
+    }
+
+    #[test]
+    fn verified_integer_kernel_round_trips_bounded_values() {
+        let values = [0usize, 1, 30, 31, 127, 128, 1337, 1 << 20, (1 << 28) - 1];
+        for prefix in 1..=8 {
+            for value in values {
+                let encoded = vapache_verified::hpack_encode_integer(value, prefix, 0).unwrap();
+                match vapache_verified::hpack_decode_integer(&encoded, prefix) {
+                    vapache_verified::HpackIntegerDecode::Value {
+                        value: decoded,
+                        consumed,
+                    } => {
+                        assert_eq!(decoded as usize, value);
+                        assert_eq!(consumed, encoded.len());
+                    }
+                    other => panic!("failed to decode {value} with prefix {prefix}: {other:?}"),
+                }
+            }
+        }
+
+        assert_eq!(
+            vapache_verified::hpack_encode_integer(1337, 5, 0).unwrap(),
+            [0x1f, 0x9a, 0x0a]
+        );
+        assert_eq!(
+            vapache_verified::hpack_decode_integer(&[0x1f, 0x80], 5),
+            vapache_verified::HpackIntegerDecode::Underflow
+        );
+        assert_eq!(
+            vapache_verified::hpack_decode_integer(&[0x1f, 0x80, 0x80, 0x80, 0x80], 5),
+            vapache_verified::HpackIntegerDecode::Overflow
+        );
     }
 
     #[test]
@@ -730,9 +763,7 @@ mod test {
             crate::MAX_RETAINED_HPACK_SCRATCH + 1,
         ));
         assert_eq!(encoder.scratch.capacity(), 0);
-        assert!(
-            crate::hpack_scratch_high_water() > crate::MAX_RETAINED_HPACK_SCRATCH
-        );
+        assert!(crate::hpack_scratch_high_water() > crate::MAX_RETAINED_HPACK_SCRATCH);
     }
 
     #[test]

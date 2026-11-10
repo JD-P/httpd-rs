@@ -343,6 +343,13 @@ impl<T, B> FramedWrite<T, B> {
         self.encoder.hpack.update_max_size(val);
     }
 
+    /// Set a local policy cap on the encoder's dynamic table. This is
+    /// independent of the peer's SETTINGS value and therefore cannot be
+    /// relaxed by an untrusted peer.
+    pub fn set_max_header_table_size(&mut self, val: usize) {
+        self.encoder.hpack.set_max_allowed_size(val);
+    }
+
     /// Retrieve the last data frame that has been sent
     pub fn take_last_data_frame(&mut self) -> Option<frame::Data<B>> {
         self.encoder.last_data_frame.take()

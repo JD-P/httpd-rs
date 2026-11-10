@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-fuzzing = []
+fuzzing = ["h2/fuzzing"]
 fault-injection = []
 
 [[bin]]
