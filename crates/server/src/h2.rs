@@ -175,29 +175,15 @@ fn request_target(method: &str, uri: &http::Uri, https: bool) -> Option<Vec<u8>>
     admitted.then(|| path.expect("admitted path").as_str().as_bytes().to_vec())
 }
 
-/// Positional reader for a response body.  `read_at` avoids changing the
-/// descriptor offset (and the extra `lseek` syscall) when several streams or
-/// range requests share a file.  `Read::take` + `read_to_end` fill a
-/// `Vec::with_capacity` through the standard library's uninitialised spare
-/// capacity, so a large body does not first zero a same-sized buffer.
-struct FileAt<'a> {
-    file: &'a std::fs::File,
-    pos: u64,
-}
-
-impl Read for FileAt<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.file.read_at(buf, self.pos)?;
-        self.pos = self.pos.saturating_add(n as u64);
-        Ok(n)
-    }
-}
-
 /// Reuse bounded file/stream chunks across responses. The pool retains at
 /// most 4 MiB and receives a buffer only after h2 releases the last `Bytes`
 /// slice and its live response-resident lease.
 const POOL_MIN_CAPACITY: usize = 64 * 1024;
-const POOL_MAX_CAPACITY: usize = 64 * 1024;
+// Match the verified per-stream send-buffer ceiling so a large cached file
+// needs at most four blocking reads per MiB instead of sixteen. Capacity is
+// still acquired before allocation/read, and the pool's total retained-byte
+// ceiling remains unchanged.
+const POOL_MAX_CAPACITY: usize = 256 * 1024;
 const POOL_MAX_TOTAL: usize = 4 * 1024 * 1024;
 const POOL_MAX_ENTRIES: usize = 64;
 
@@ -217,9 +203,8 @@ fn take_body_buffer(len: usize) -> Vec<u8> {
     if let Some(index) = pool.free.iter().position(|buf| {
         buf.capacity() >= len && buf.capacity() <= len.saturating_mul(2).max(len + 4096)
     }) {
-        let mut buf = pool.free.swap_remove(index);
+        let buf = pool.free.swap_remove(index);
         pool.bytes = pool.bytes.saturating_sub(buf.capacity());
-        buf.clear();
         return buf;
     }
     Vec::with_capacity(len)
@@ -374,8 +359,21 @@ fn read_range(
     transport: Arc<QueuedH2TransportState>,
 ) -> io::Result<Bytes> {
     let mut buf = take_body_buffer(len);
-    let reader = FileAt { file, pos: offset };
-    reader.take(len as u64).read_to_end(&mut buf)?;
+    // Keep pooled buffers initialized between responses. The generic
+    // `Read::read_to_end` fallback issues small repeated reads for this
+    // positional wrapper; reading the admitted slice directly normally turns
+    // a 256 KiB cached chunk into one `pread64` call.
+    buf.resize(len, 0);
+    let mut filled = 0usize;
+    while filled < len {
+        match file.read_at(&mut buf[filled..], offset.saturating_add(filled as u64)) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    buf.truncate(filled);
     Ok(Bytes::from_owner(PooledBuffer {
         buf: Some(buf),
         _resident: resident,
@@ -1037,7 +1035,7 @@ async fn send_response_with_admission(
             // file chunk. This keeps zero-window streams allocation-free and
             // attaches resident accounting to every chunk queued in h2.
             const OFFLOAD_MIN: u64 = 256 * 1024;
-            const CHUNK: u64 = 64 * 1024;
+            const CHUNK: u64 = 256 * 1024;
             let offload = len >= OFFLOAD_MIN;
             let mut left = len;
             let mut pos = offset;
@@ -4999,7 +4997,10 @@ mod tests {
             _transport: Arc::new(QueuedH2TransportState::default()),
         });
         let reused = take_body_buffer(POOL_MAX_CAPACITY);
-        assert!(reused.is_empty());
+        // Reusing the initialized length avoids zero-filling a full file
+        // chunk on every response. Readers must overwrite and truncate the
+        // admitted slice before it can become response data.
+        assert_eq!(&reused[..], b"old data");
         assert!(reused.capacity() >= POOL_MAX_CAPACITY);
 
         // Empty and out-of-range owners exercise the no-op drop paths; they

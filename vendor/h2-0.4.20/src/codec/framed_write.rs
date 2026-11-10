@@ -60,21 +60,17 @@ enum Next<B> {
     Continuation(frame::Continuation),
 }
 
-/// Initialize the connection with this amount of write buffer.
-///
-/// The minimum MAX_FRAME_SIZE is 16kb, so always be able to send a HEADERS
-/// frame that big.
-const DEFAULT_BUFFER_CAPACITY: usize = 16 * 1_024;
+/// Initialize the connection with enough write buffer to batch three
+/// default-sized DATA frames plus their frame headers. This matters for TLS
+/// and other non-vectored transports: otherwise every 16 KiB HTTP/2 frame
+/// becomes a separate codec flush and TLS write.
+const DEFAULT_BUFFER_CAPACITY: usize = 64 * 1_024;
 
-/// Chain payloads bigger than this when vectored I/O is enabled. The remote
-/// will never advertise a max frame size less than this (well, the spec says
-/// the max frame size can't be less than 16kb, so not even close).
-const CHAIN_THRESHOLD: usize = 256;
-
-/// Chain payloads bigger than this when vectored I/O is **not** enabled.
-/// A larger value in this scenario will reduce the number of small and
-/// fragmented data being sent, and hereby improve the throughput.
-const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
+/// Copy default-sized DATA payloads into the bounded connection buffer,
+/// allowing several frames to be submitted to TLS in one write. Larger peer
+/// frame sizes retain the chained zero-copy path instead of forcing an
+/// unbounded copy.
+const CHAIN_THRESHOLD: usize = frame::DEFAULT_MAX_FRAME_SIZE as usize + 1;
 
 // TODO: Make generic
 impl<T, B> FramedWrite<T, B>
@@ -83,11 +79,6 @@ where
     B: Buf,
 {
     pub fn new(inner: T) -> FramedWrite<T, B> {
-        let chain_threshold = if inner.is_write_vectored() {
-            CHAIN_THRESHOLD
-        } else {
-            CHAIN_THRESHOLD_WITHOUT_VECTORED_IO
-        };
         FramedWrite {
             inner,
             final_flush_done: false,
@@ -97,8 +88,8 @@ where
                 next: None,
                 last_data_frame: None,
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
-                chain_threshold,
-                min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
+                chain_threshold: CHAIN_THRESHOLD,
+                min_buffer_capacity: CHAIN_THRESHOLD + frame::HEADER_LEN,
             },
         }
     }
@@ -372,6 +363,30 @@ impl<T: AsyncRead + Unpin, B> AsyncRead for FramedWrite<T, B> {
 
 // We never project the Pin to `B`.
 impl<T: Unpin, B> Unpin for FramedWrite<T, B> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn batches_three_default_sized_data_frames() {
+        let mut framed: FramedWrite<_, Bytes> = FramedWrite::new(tokio::io::sink());
+
+        for _ in 0..3 {
+            assert!(framed.has_capacity());
+            let data = frame::Data::new(
+                frame::StreamId::from(1),
+                Bytes::from(vec![0; frame::DEFAULT_MAX_FRAME_SIZE as usize]),
+            );
+            framed.buffer(data.into()).unwrap();
+        }
+
+        // Three default 16 KiB DATA frames fit in the 64 KiB staging buffer;
+        // accepting a fourth requires the caller to flush the batch first.
+        assert!(!framed.has_capacity());
+    }
+}
 
 #[cfg(feature = "unstable")]
 mod unstable {

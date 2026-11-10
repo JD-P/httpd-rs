@@ -12989,18 +12989,27 @@ pub fn hpack_decode_integer(
     }
 }
 
-/// Encode one HPACK integer into an owned byte sequence. The caller supplies
+/// Stack-only result of encoding one HPACK integer. Bytes are packed in wire
+/// order from the least-significant octet, avoiding a heap allocation for
+/// every encoded header integer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HpackIntegerEncoding {
+    pub packed: u128,
+    pub len: u8,
+}
+
+/// Encode one HPACK integer into a packed byte sequence. The caller supplies
 /// the representation bits in `first_byte`; the verified routine owns every
 /// byte-level continuation transition used by the wire encoder.
 pub fn hpack_encode_integer(
     value: usize,
     prefix_size: u8,
     first_byte: u8,
-) -> (out: Option<Vec<u8>>)
+) -> (out: Option<HpackIntegerEncoding>)
     ensures
         match out {
-            Some(bytes) => bytes@.len() >= 1,
-            None => prefix_size < 1 || prefix_size > 8,
+            Some(encoded) => 1 <= encoded.len <= 16,
+            None => true,
         },
 {
     if prefix_size < 1 || prefix_size > 8 {
@@ -13017,24 +13026,36 @@ pub fn hpack_encode_integer(
         _ => 0xff,
     };
     let low: usize = low_byte as usize;
-    let mut out: Vec<u8> = Vec::new();
     if value < low {
         assert(value <= u8::MAX as usize);
-        out.push(first_byte | value as u8);
-        return Some(out);
+        return Some(HpackIntegerEncoding {
+            packed: (first_byte | value as u8) as u128,
+            len: 1,
+        });
     }
 
-    out.push(first_byte | low_byte);
+    let mut packed: u128 = (first_byte | low_byte) as u128;
+    let mut len: u8 = 1;
     let mut remaining = value - low;
-    while remaining >= 128
-        invariant out@.len() >= 1,
+    while remaining >= 128 && len < 15
+        invariant 1 <= len <= 15,
         decreases remaining,
     {
-        out.push(0x80 | (remaining % 128) as u8);
+        let byte = 0x80 | (remaining % 128) as u8;
+        let shift = (len as u32) * 8;
+        packed = packed | ((byte as u128) << shift);
+        len = len + 1;
         remaining = remaining / 128;
     }
-    out.push(remaining as u8);
-    Some(out)
+    if remaining >= 128 {
+        // Rust targets use at most 64-bit `usize`, so this is unreachable in
+        // production. Keep the executable kernel total for wider models.
+        return None;
+    }
+    let shift = (len as u32) * 8;
+    packed = packed | ((remaining as u128) << shift);
+    len = len + 1;
+    Some(HpackIntegerEncoding { packed, len })
 }
 
 /// Overflow-free RFC 7541 dynamic-table entry size (`name + value + 32`).

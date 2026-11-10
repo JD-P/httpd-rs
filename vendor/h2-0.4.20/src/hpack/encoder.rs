@@ -275,13 +275,16 @@ fn encode_int<B: BufMut>(
     first_byte: u8,     // The base upon which to start encoding the int
     dst: &mut B,
 ) {
-    let encoded = vapache_verified::hpack_encode_integer(
+    let mut encoded = vapache_verified::hpack_encode_integer(
         value,
         u8::try_from(prefix_bits).expect("HPACK prefix width fits in u8"),
         first_byte,
     )
     .expect("HPACK integer prefix width must be between one and eight");
-    dst.put_slice(&encoded);
+    for _ in 0..encoded.len {
+        dst.put_u8(encoded.packed as u8);
+        encoded.packed >>= 8;
+    }
 }
 
 #[cfg(test)]
@@ -714,14 +717,19 @@ mod test {
         let values = [0usize, 1, 30, 31, 127, 128, 1337, 1 << 20, (1 << 28) - 1];
         for prefix in 1..=8 {
             for value in values {
-                let encoded = vapache_verified::hpack_encode_integer(value, prefix, 0).unwrap();
-                match vapache_verified::hpack_decode_integer(&encoded, prefix) {
+                let mut encoded = vapache_verified::hpack_encode_integer(value, prefix, 0).unwrap();
+                let mut bytes = Vec::with_capacity(encoded.len as usize);
+                for _ in 0..encoded.len {
+                    bytes.push(encoded.packed as u8);
+                    encoded.packed >>= 8;
+                }
+                match vapache_verified::hpack_decode_integer(&bytes, prefix) {
                     vapache_verified::HpackIntegerDecode::Value {
                         value: decoded,
                         consumed,
                     } => {
                         assert_eq!(decoded as usize, value);
-                        assert_eq!(consumed, encoded.len());
+                        assert_eq!(consumed, bytes.len());
                     }
                     other => panic!("failed to decode {value} with prefix {prefix}: {other:?}"),
                 }
@@ -730,7 +738,10 @@ mod test {
 
         assert_eq!(
             vapache_verified::hpack_encode_integer(1337, 5, 0).unwrap(),
-            [0x1f, 0x9a, 0x0a]
+            vapache_verified::HpackIntegerEncoding {
+                packed: 0x0a_9a_1f,
+                len: 3,
+            }
         );
         assert_eq!(
             vapache_verified::hpack_decode_integer(&[0x1f, 0x80], 5),
