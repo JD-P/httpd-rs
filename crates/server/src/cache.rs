@@ -2865,6 +2865,55 @@ mod tests {
     }
 
     #[test]
+    fn authorized_entry_points_reject_another_configuration_generation() {
+        let (dir, cfg) = disk_test_config("stale-authorization");
+        let request = test_request();
+        let url_path = policy_path("/x");
+        let generation = crate::config::ConfigurationGeneration::other_for_test();
+        let resource =
+            crate::access::ResourceKey::cache_policy(None, &request, "host", &url_path, [0; 32]);
+        let grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            resource.clone(),
+            generation,
+        )
+        .unwrap();
+        let target = dir.join("target");
+        let authorization = crate::access::AuthorizedPlan::new(
+            generation,
+            crate::access::OutcomeIdentity::selected(
+                &url_path,
+                &url_path,
+                Some(&target),
+                Some(&target),
+            ),
+            Scope::default(),
+            grant,
+            resource,
+        )
+        .and_then(|plan| plan.into_outcome(generation, vapache_verified::TransformSink::Cache))
+        .expect("cache outcome for the old generation");
+        let key = format!("stale-authorization-{}", std::process::id());
+        let context = CacheContext {
+            epoch: cfg.cache_epoch(),
+            authorization,
+            key: key.clone(),
+            backend_transport_visible: false,
+        };
+        let peer = "127.0.0.1:12345".parse().unwrap();
+
+        assert!(lookup_authorized(&cfg, None, &request, "host", peer, &context).is_none());
+        let mut response = Response::bytes(200, "text/plain", b"must not cache".to_vec());
+        store_authorized(&cfg, None, &request, "host", peer, &mut response, &context);
+        assert!(!entries()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entries
+            .contains_key(&key));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn disk_entries_round_trip_for_warm_start() {
         // Use the isolated disk fixture so an unrelated parallel cold-cache
         // scan cannot make this test's optional first store skip.
@@ -4367,6 +4416,7 @@ AddType text/plain .txt\n\
             cfg.authorization_generation(),
             vapache_verified::TransformSink::Cache,
         ));
+        assert!(!context.scope().conditional_error);
 
         fs::write(
             www.join(".htaccess"),

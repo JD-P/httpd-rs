@@ -2339,6 +2339,7 @@ mod tests {
         assert_eq!(outcome.identity().selected_url_path(), "/selected");
         assert_eq!(outcome.identity().lexical_fs_path(), Some(executable));
         assert_eq!(outcome.identity().resolved_fs_path(), Some(executable));
+        assert_eq!(outcome.sink(), vapache_verified::TransformSink::StaticFile);
         assert!(outcome.require_sink(generation(), vapache_verified::TransformSink::StaticFile,));
         assert!(!outcome.require_sink(generation(), vapache_verified::TransformSink::LocalCgi,));
         let other_meta = std::fs::metadata("/proc/self/status").expect("other metadata");

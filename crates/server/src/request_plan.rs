@@ -999,6 +999,8 @@ mod tests {
             false,
         )
         .is_none());
+        let borrowed: &str = docs.as_ref();
+        assert_eq!(borrowed, "/docs");
         assert!(DecodedUrlPath::from_canonical("/docs//").is_none());
     }
 
@@ -1039,6 +1041,7 @@ mod tests {
             CanonicalTarget::from_raw_path(WireUrlPath::new(b"/%ff"), false),
             Err(CanonicalError::Utf8)
         );
+        assert!(CanonicalTarget::from_normalized(b"/other".to_vec(), "/expected".into()).is_none());
         assert!(CanonicalTarget::from_url_path("relative").is_none());
         let identity =
             LayerIdentity::with_url_mount(Path::new("/srv/www"), Path::new("/srv/www"), "sub");
@@ -1139,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_index_scope_reuse_rejects_leaf_sensitive_policy() {
+    fn directory_index_scope_reuse_rejects_context_sensitive_policy() {
         let root = PathBuf::from("/srv/www");
         let base_plan = || RequestPlan {
             target: CanonicalTarget::from_url_path("/").unwrap(),
@@ -1165,6 +1168,7 @@ mod tests {
             "<DirectoryMatch \"index[.]html$\">\nRequire all denied\n</DirectoryMatch>\n",
             "<Directory \"/srv/www/*\">\nRequire all denied\n</Directory>\n",
             "<Directory \"/srv/www/index.html\">\nRequire all denied\n</Directory>\n",
+            "<Directory \"/srv/www\">\n<If \"true\">\nRequire all denied\n</If>\n</Directory>\n",
         ] {
             let cfg = load_config(&format!(
                 "Listen 127.0.0.1:0\nDocumentRoot /srv/www\n{policy}"
@@ -1180,7 +1184,7 @@ mod tests {
                 .unwrap();
             assert!(
                 child.precomputed_scope.is_none(),
-                "leaf-sensitive policy reused the directory scope: {policy}"
+                "context-sensitive policy reused the directory scope: {policy}"
             );
         }
 
