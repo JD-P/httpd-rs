@@ -1,0 +1,117 @@
+Pass-37 retained results
+Reviewed commit: 7ec4fa7ff2a93ee11fb188839781dd7379969e93 (worktree clean at start)
+Oracle: PCRE2 10.46 via pcre2 0.2.11 / pcre2-sys 0.2.10
+
+=== 1. Configuration surface accepts a divergent pattern ===
+ServerRoot "/tmp/opencode/p37-conf"
+Listen 127.0.0.1:0
+ServerName localhost
+PidFile "/tmp/opencode/p37-conf/httpd.pid"
+ErrorLog "/tmp/opencode/p37-conf/error.log"
+DocumentRoot "/tmp/opencode/p37-conf/www"
+RewriteEngine On
+RewriteCond %{REQUEST_URI} !\R\s
+RewriteRule ^ - [F]
+<Directory "/tmp/opencode/p37-conf/www">
+Require all granted
+</Directory>
+--- vapached -t ---
+Syntax OK
+rc=0
+
+=== 2. Retained fuzz artifacts ===
+adversarial/p37/crash-pcre2-crlf-multiline.bin
+ 30 28 3f 6d 29 5e 00 00 00 0d 0a 28 30 28 3f 6d
+ 29 5e 00 00 42 61 0a 28 ff ff ff ff 2a ff ff ff
+ ff ff ff 0a 0a
+adversarial/p37/crash-pcre2-crlf-multiline-at-offset.bin
+ 34 0d 5e 0a 0d 0d 0d
+
+=== 3. Standing differential probe output ===
+=== P37-A: retained pcre2_differential crash case (`find_at` offset API) ===
+## fuzz artifact crash-ee05338c89e80f39263bb634ec1f86df8d3497cf
+   pattern="(?m)^" caseless=false crlf=true multiline=false subject=[0, 0, 13, 10, 40, 48, 40, 63, 109, 41, 94, 0, 0, 66, 97, 10, 40, 255, 255, 255, 255, 42, 255, 255, 255, 255, 255, 255, 10, 10] start=3
+   is_match_at rust=Ok(true) oracle=Ok(true)
+   find_at rust=Ok(Some((4, 4))) oracle=Ok(Some((3, 3)))
+   VERDICT: DIVERGE
+
+## same artifact evaluated at production offset 0
+   pattern="(?m)^" caseless=false crlf=true multiline=false subject=[0, 0, 13, 10, 40, 48, 40, 63, 109, 41, 94, 0, 0, 66, 97, 10, 40, 255, 255, 255, 255, 42, 255, 255, 255, 255, 255, 255, 10, 10]
+   is_match rust=Ok(true) oracle=Ok(true)
+   captures rust=Some([Some((0, 0))]) oracle=Some([Some((0, 0))])
+   VERDICT: agree
+
+## second fuzz artifact crash-eb581b07f45ed837314ced5e21c3d9f8c06240df
+   pattern="\r^" caseless=false crlf=true multiline=true subject=[13, 13, 13] start=2
+   is_match_at rust=Ok(true) oracle=Ok(false)
+   find_at rust=Ok(Some((2, 3))) oracle=Ok(None)
+   VERDICT: DIVERGE
+
+## second artifact shape evaluated at production offset 0 (multiline + crlf)
+   pattern="\r^" caseless=false crlf=true multiline=true subject=[13, 13, 13]
+   is_match rust=Ok(true) oracle=Ok(true)
+   captures rust=Some([Some((0, 1))]) oracle=Some([Some((0, 1))])
+   VERDICT: agree
+
+=== P37-A: offset-0 / caseless-only divergences accepted by the configuration surface ===
+## split-capable `\R\s`: Rust matches CR LF NUL, PCRE2 requires CRLF then whitespace
+   pattern="\\R\\s" caseless=false crlf=false multiline=false subject=[13, 10, 0]
+   is_match rust=Ok(true) oracle=Ok(false)
+   captures rust=Some([Some((0, 2))]) oracle=None
+   VERDICT: DIVERGE
+
+## split-capable `\R\v`
+   pattern="\\R\\v" caseless=false crlf=false multiline=false subject=[13, 10]
+   is_match rust=Ok(true) oracle=Ok(false)
+   captures rust=Some([Some((0, 2))]) oracle=None
+   VERDICT: DIVERGE
+
+## `\R$` capture span: Rust consumes only CR of CRLF
+   pattern="\\R$" caseless=true crlf=false multiline=false subject=[120, 13, 10]
+   is_match rust=Ok(true) oracle=Ok(true)
+   captures rust=Some([Some((1, 2))]) oracle=Some([Some((1, 3))])
+   VERDICT: DIVERGE
+
+## `\R\Z` capture span
+   pattern="\\R\\Z" caseless=false crlf=false multiline=false subject=[0, 13, 10]
+   is_match rust=Ok(true) oracle=Ok(true)
+   captures rust=Some([Some((1, 2))]) oracle=Some([Some((1, 3))])
+   VERDICT: DIVERGE
+
+## multiline circumflex after a final newline
+   pattern="\\D(?m:^)$" caseless=false crlf=false multiline=false subject=[10]
+   is_match rust=Ok(true) oracle=Ok(false)
+   captures rust=Some([Some((0, 1))]) oracle=None
+   VERDICT: DIVERGE
+
+## multiline circumflex after CRLF via a preceding atom
+   pattern="(?:[^]a](?m:^))" caseless=true crlf=false multiline=false subject=[13, 10]
+   is_match rust=Ok(true) oracle=Ok(false)
+   captures rust=Some([Some((1, 2))]) oracle=None
+   VERDICT: DIVERGE
+
+## `\R(?m:^)$` combination
+   pattern="\\R(?m:^)$" caseless=false crlf=false multiline=false subject=[120, 10]
+   is_match rust=Ok(true) oracle=Ok(false)
+   captures rust=Some([Some((1, 2))]) oracle=None
+   VERDICT: DIVERGE
+
+=== Controls: request-reachable subject bytes (no CR/LF/NUL) agree ===
+   path with NEL: pattern="\\R\\s" rust=Ok(false) oracle=Ok(false) agree
+   path with obs-text: pattern="\\R\\s" rust=Ok(false) oracle=Ok(false) agree
+   ordinary path: pattern="(?m:^)$" rust=Ok(false) oracle=Ok(false) agree
+   ordinary path 2: pattern="\\D(?m:^)$" rust=Ok(false) oracle=Ok(false) agree
+   path with NEL: pattern="\\R$" rust=Ok(true) oracle=Ok(true) agree
+   path with obs-text: pattern="\\R\\Z" rust=Ok(false) oracle=Ok(false) agree
+
+=== P37-A: gate closure in the current tree ===
+   "\\R\\R": rejected (1)
+   "\\R\\C": rejected (1)
+   "\\R+?$": rejected (1)
+   "\\N*?\\R": rejected (1)
+   "\\S*\\R": rejected (1)
+   "\\R\\s": admitted by the Rust frontend
+   "\\R\\v": admitted by the Rust frontend
+   "\\R$": admitted by the Rust frontend
+   "\\R\\Z": admitted by the Rust frontend
+   "\\D(?m:^)$": admitted by the Rust frontend

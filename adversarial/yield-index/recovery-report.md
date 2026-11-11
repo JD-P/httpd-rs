@@ -380,6 +380,30 @@ Pass-36 numbers in `vulnerability-families.md` were derived by running
 `compute_yield.py` against a scratch copy of this index (16,969.5 adjusted
 points / 16.574 h = 1023.89 points per search-hour).
 
+- **S44 / Pass 37** — reviewed clean HEAD `7ec4fa7ff2a93ee11fb188839781dd7379969e93`;
+  confirmed **P37-A** (CRLF `\R` adjacency `\R\s`/`\R\v`/`\R$`/`\R\Z` admitted
+  and divergent; primary `unclassified`, medium, two unintended behaviors, one
+  remediation component) and **P37-B** (multiline `^` matches after a final
+  newline and the CRLF offset APIs diverge, breaking the repository's own
+  `pcre2_differential` target; primary `unclassified`, low, two unintended
+  behaviors, one remediation component). Both were found by fuzzing the newest
+  unreviewed commit `881cae7` and by a focused offset-0/caseless-only
+  differential; no request-reachable subject channel carries CR/LF, so no live
+  server exploit is claimed.
+
+Aggregate counts after the Pass 37 append: **34 engagements, 44 logical
+searches (56 segments), 199 claims — 137 confirmed, 11 duplicate, 1 invalid,
+50 unresolved**. Confirmed findings by primary family: `code_execution` 42,
+`denial_of_service` 29, `information_disclosure` 25, `authority_bypass` 20,
+`integrity_violation` 10, `unclassified` 7, `server_request_abuse` 3,
+`protocol_confusion` 1. Derived search duration total: **17 h 12 m 25 s**.
+
+The yield CSV/report files were **not** recomputed in this extension; the
+Pass-37 numbers in `vulnerability-families.md` were derived by adding the two
+new confirmed findings (medium, two behaviors → 5.0 points; low, two behaviors
+→ 0.5 points) to the Pass-36 totals: 16,975.0 adjusted points / 17.207 h =
+986.52 points per search-hour.
+
 ## Validation
 
 Run:

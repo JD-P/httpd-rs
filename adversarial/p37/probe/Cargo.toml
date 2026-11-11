@@ -1,0 +1,12 @@
+[package]
+name = "p37-probe"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone crate: keep it out of the repository workspace so the product
+# workspace is unaffected.
+[workspace]
+
+[dependencies]
+vapache-pcre2 = { path = "../../../crates/pcre2" }
+pcre2-c-oracle = { package = "pcre2", version = "0.2.11" }
