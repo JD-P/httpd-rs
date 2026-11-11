@@ -8725,12 +8725,20 @@ pub(crate) fn parse_request_read_timeout(
     // such as `xheader=5`, duplicate fields and arbitrary trailing text.
     fn component(value: &str) -> Option<(&str, Duration, Option<u64>)> {
         let (name, value) = value.split_once('=')?;
-        if !matches!(name, "header" | "body") {
+        let name = if name.eq_ignore_ascii_case("header") {
+            "header"
+        } else if name.eq_ignore_ascii_case("body") {
+            "body"
+        } else {
             return None;
-        }
+        };
         let (range, rate) = match value.split_once(',') {
             Some((range, rate)) => {
-                let rate = rate.strip_prefix("MinRate=")?.parse::<u64>().ok()?;
+                let (keyword, rate) = rate.split_once('=')?;
+                if !keyword.eq_ignore_ascii_case("MinRate") {
+                    return None;
+                }
+                let rate = rate.parse::<u64>().ok()?;
                 if rate == 0 {
                     return None;
                 }
@@ -15414,6 +15422,17 @@ ServerName localhost\n\
                 Some(Duration::from_secs(6)),
                 None,
                 None
+            ))
+        );
+        // Apache parses component and option names case-insensitively. Ubuntu
+        // 26.04's stock reqtimeout.conf uses the lowercase `minrate` spelling.
+        assert_eq!(
+            parse_request_read_timeout("HEADER=20-40,minrate=500 body=10,MINRATE=500"),
+            Some((
+                Some(Duration::from_secs(40)),
+                Some(Duration::from_secs(10)),
+                Some(500),
+                Some(500)
             ))
         );
         assert_eq!(parse_request_read_timeout("header=x body=y"), None);

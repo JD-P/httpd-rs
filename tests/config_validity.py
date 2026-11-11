@@ -119,6 +119,11 @@ def prefix(port: int) -> str:
 
 
 CASES = [
+    (
+        "RequestReadTimeout case-insensitive MinRate",
+        "RequestReadTimeout header=20-40,minrate=500\n"
+        "RequestReadTimeout body=10,minrate=500\n",
+    ),
     ("server-level AllowOverride", "AllowOverride All\n"),
     (
         "AllowOverride in Location",
