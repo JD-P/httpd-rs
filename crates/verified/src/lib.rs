@@ -10253,6 +10253,1090 @@ pub proof fn access_plan_interleaves(present: Seq<bool>)
     assert(access_tail().len() == 4);
 }
 
+// ---------------------------------------------------------------------------
+// Complete request-policy path state machine
+// ---------------------------------------------------------------------------
+
+/// One explicit control state for the security-relevant request-policy path.
+/// The detailed Directory/Files/Location/Condition ordering above is consumed
+/// while `FilesystemPolicy` is active; this machine composes that evaluator
+/// with both rewrite phases, authorization, cache classification and the
+/// final sink gate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RequestPolicyPhase {
+    Start,
+    UrlPolicy,
+    UrlRewrite,
+    FilesystemPlan,
+    FilesystemPolicy,
+    FilesystemRewrite,
+    Authorization,
+    CacheClassification,
+    SinkAdmission,
+    Complete,
+    Rejected,
+}
+
+/// Terminal route selected by policy. `Undecided` is not admissible at a
+/// sink. Proxy and FastCGI may be selected in URL space or by a filesystem
+/// rewrite; the transition that selects them records which policy phases ran.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RequestPolicyRoute {
+    Undecided,
+    StaticFile,
+    Directory,
+    LocalCgi,
+    FastCgi,
+    Proxy,
+    Redirect,
+    ServerStatus,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RequestPolicyCacheClass {
+    Unclassified,
+    Bypass,
+    Eligible,
+}
+
+/// Facts retained by the state machine. Rewrite retargets deliberately clear
+/// target authorization, cache and sink facts. `original_policy_present`
+/// survives them so a changed path cannot reach authorization completion
+/// until its original policy has also been admitted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RequestPolicyState {
+    pub phase: RequestPolicyPhase,
+    pub route: RequestPolicyRoute,
+    pub canonical_target: bool,
+    pub original_policy_present: bool,
+    pub target_url_policy: bool,
+    pub target_filesystem_policy: bool,
+    pub retargeted: bool,
+    pub original_authorized: bool,
+    pub target_authorized: bool,
+    pub cache: RequestPolicyCacheClass,
+    pub sink_admitted: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RequestPolicyEvent {
+    Canonicalize,
+    ApplyUrlPolicy,
+    UrlRewriteRetarget,
+    SelectLocal,
+    SelectUrlRoute { route: RequestPolicyRoute },
+    BuildFilesystemPlan,
+    ApplyFilesystemPolicy,
+    FilesystemRewriteRetarget,
+    SelectFilesystemRoute { route: RequestPolicyRoute },
+    AuthorizeOriginal,
+    AuthorizeTarget,
+    FinishAuthorization,
+    ClassifyCacheBypass,
+    ClassifyCacheEligible,
+    AdmitSink,
+    Reject,
+}
+
+pub open spec fn request_policy_start_spec() -> RequestPolicyState {
+    RequestPolicyState {
+        phase: RequestPolicyPhase::Start,
+        route: RequestPolicyRoute::Undecided,
+        canonical_target: false,
+        original_policy_present: false,
+        target_url_policy: false,
+        target_filesystem_policy: false,
+        retargeted: false,
+        original_authorized: false,
+        target_authorized: false,
+        cache: RequestPolicyCacheClass::Unclassified,
+        sink_admitted: false,
+    }
+}
+
+pub fn request_policy_start() -> (state: RequestPolicyState)
+    ensures state == request_policy_start_spec(),
+{
+    RequestPolicyState {
+        phase: RequestPolicyPhase::Start,
+        route: RequestPolicyRoute::Undecided,
+        canonical_target: false,
+        original_policy_present: false,
+        target_url_policy: false,
+        target_filesystem_policy: false,
+        retargeted: false,
+        original_authorized: false,
+        target_authorized: false,
+        cache: RequestPolicyCacheClass::Unclassified,
+        sink_admitted: false,
+    }
+}
+
+pub open spec fn request_policy_url_route_spec(route: RequestPolicyRoute) -> bool {
+    match route {
+        RequestPolicyRoute::FastCgi
+        | RequestPolicyRoute::Proxy
+        | RequestPolicyRoute::Redirect => true,
+        _ => false,
+    }
+}
+
+pub fn request_policy_url_route(route: RequestPolicyRoute) -> (ok: bool)
+    ensures ok == request_policy_url_route_spec(route),
+{
+    match route {
+        RequestPolicyRoute::FastCgi
+        | RequestPolicyRoute::Proxy
+        | RequestPolicyRoute::Redirect => true,
+        _ => false,
+    }
+}
+
+pub open spec fn request_policy_filesystem_route_spec(route: RequestPolicyRoute) -> bool {
+    match route {
+        RequestPolicyRoute::StaticFile
+        | RequestPolicyRoute::Directory
+        | RequestPolicyRoute::LocalCgi
+        | RequestPolicyRoute::FastCgi
+        | RequestPolicyRoute::Proxy
+        | RequestPolicyRoute::ServerStatus => true,
+        _ => false,
+    }
+}
+
+pub fn request_policy_filesystem_route(route: RequestPolicyRoute) -> (ok: bool)
+    ensures ok == request_policy_filesystem_route_spec(route),
+{
+    match route {
+        RequestPolicyRoute::StaticFile
+        | RequestPolicyRoute::Directory
+        | RequestPolicyRoute::LocalCgi
+        | RequestPolicyRoute::FastCgi
+        | RequestPolicyRoute::Proxy
+        | RequestPolicyRoute::ServerStatus => true,
+        _ => false,
+    }
+}
+
+pub open spec fn request_policy_cache_eligible_route_spec(route: RequestPolicyRoute) -> bool {
+    match route {
+        RequestPolicyRoute::StaticFile
+        | RequestPolicyRoute::Directory
+        | RequestPolicyRoute::LocalCgi
+        | RequestPolicyRoute::FastCgi => true,
+        _ => false,
+    }
+}
+
+pub fn request_policy_cache_eligible_route(route: RequestPolicyRoute) -> (ok: bool)
+    ensures ok == request_policy_cache_eligible_route_spec(route),
+{
+    match route {
+        RequestPolicyRoute::StaticFile
+        | RequestPolicyRoute::Directory
+        | RequestPolicyRoute::LocalCgi
+        | RequestPolicyRoute::FastCgi => true,
+        _ => false,
+    }
+}
+
+pub open spec fn request_policy_route_selected_spec(route: RequestPolicyRoute) -> bool {
+    route != RequestPolicyRoute::Undecided
+}
+
+pub fn request_policy_route_selected(route: RequestPolicyRoute) -> (selected: bool)
+    ensures selected == request_policy_route_selected_spec(route),
+{
+    match route {
+        RequestPolicyRoute::Undecided => false,
+        RequestPolicyRoute::StaticFile
+        | RequestPolicyRoute::Directory
+        | RequestPolicyRoute::LocalCgi
+        | RequestPolicyRoute::FastCgi
+        | RequestPolicyRoute::Proxy
+        | RequestPolicyRoute::Redirect
+        | RequestPolicyRoute::ServerStatus => true,
+    }
+}
+
+pub open spec fn request_policy_cache_classified_spec(
+    cache: RequestPolicyCacheClass,
+) -> bool {
+    cache != RequestPolicyCacheClass::Unclassified
+}
+
+pub fn request_policy_cache_classified(
+    cache: RequestPolicyCacheClass,
+) -> (classified: bool)
+    ensures classified == request_policy_cache_classified_spec(cache),
+{
+    match cache {
+        RequestPolicyCacheClass::Unclassified => false,
+        RequestPolicyCacheClass::Bypass | RequestPolicyCacheClass::Eligible => true,
+    }
+}
+
+pub open spec fn request_policy_phase_rejectable_spec(phase: RequestPolicyPhase) -> bool {
+    phase != RequestPolicyPhase::Complete && phase != RequestPolicyPhase::Rejected
+}
+
+pub fn request_policy_phase_rejectable(phase: RequestPolicyPhase) -> (rejectable: bool)
+    ensures rejectable == request_policy_phase_rejectable_spec(phase),
+{
+    match phase {
+        RequestPolicyPhase::Complete | RequestPolicyPhase::Rejected => false,
+        RequestPolicyPhase::Start
+        | RequestPolicyPhase::UrlPolicy
+        | RequestPolicyPhase::UrlRewrite
+        | RequestPolicyPhase::FilesystemPlan
+        | RequestPolicyPhase::FilesystemPolicy
+        | RequestPolicyPhase::FilesystemRewrite
+        | RequestPolicyPhase::Authorization
+        | RequestPolicyPhase::CacheClassification
+        | RequestPolicyPhase::SinkAdmission => true,
+    }
+}
+
+pub open spec fn request_policy_route_has_required_policy_spec(
+    state: RequestPolicyState,
+) -> bool {
+    request_policy_url_route_spec(state.route) && state.target_url_policy
+        || request_policy_filesystem_route_spec(state.route)
+            && state.target_url_policy
+            && state.target_filesystem_policy
+}
+
+pub fn request_policy_route_has_required_policy(
+    state: RequestPolicyState,
+) -> (ok: bool)
+    ensures ok == request_policy_route_has_required_policy_spec(state),
+{
+    request_policy_url_route(state.route) && state.target_url_policy
+        || request_policy_filesystem_route(state.route)
+            && state.target_url_policy
+            && state.target_filesystem_policy
+}
+
+pub open spec fn request_policy_authorization_complete_spec(
+    state: RequestPolicyState,
+) -> bool {
+    state.canonical_target
+        && state.original_policy_present
+        && request_policy_route_has_required_policy_spec(state)
+        && state.target_authorized
+        && (!state.retargeted || state.original_authorized)
+}
+
+pub fn request_policy_authorization_complete(
+    state: RequestPolicyState,
+) -> (ok: bool)
+    ensures ok == request_policy_authorization_complete_spec(state),
+{
+    state.canonical_target
+        && state.original_policy_present
+        && request_policy_route_has_required_policy(state)
+        && state.target_authorized
+        && (!state.retargeted || state.original_authorized)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RequestPolicyGuard {
+    Never,
+    Always,
+    CanonicalTarget,
+    UrlPolicyPresent,
+    FilesystemPolicyPresent,
+    RetargetedOriginalPolicy,
+    RoutePolicyPresent,
+    AuthorizationComplete,
+    CacheEligibleRoute,
+    SinkReady,
+    Rejectable,
+}
+
+pub open spec fn request_policy_guard_for_spec(
+    phase: RequestPolicyPhase,
+    event: RequestPolicyEvent,
+) -> RequestPolicyGuard {
+    match (phase, event) {
+        (RequestPolicyPhase::Start, RequestPolicyEvent::Canonicalize) => {
+            RequestPolicyGuard::Always
+        }
+        (RequestPolicyPhase::UrlPolicy, RequestPolicyEvent::ApplyUrlPolicy) => {
+            RequestPolicyGuard::CanonicalTarget
+        }
+        (RequestPolicyPhase::UrlRewrite, RequestPolicyEvent::UrlRewriteRetarget)
+        | (RequestPolicyPhase::UrlRewrite, RequestPolicyEvent::SelectLocal) => {
+            RequestPolicyGuard::UrlPolicyPresent
+        }
+        (
+            RequestPolicyPhase::UrlRewrite,
+            RequestPolicyEvent::SelectUrlRoute { route },
+        ) => {
+            if request_policy_url_route_spec(route) {
+                RequestPolicyGuard::UrlPolicyPresent
+            } else {
+                RequestPolicyGuard::Never
+            }
+        }
+        (RequestPolicyPhase::FilesystemPlan, RequestPolicyEvent::BuildFilesystemPlan) => {
+            RequestPolicyGuard::UrlPolicyPresent
+        }
+        (RequestPolicyPhase::FilesystemPolicy, RequestPolicyEvent::ApplyFilesystemPolicy) => {
+            RequestPolicyGuard::Always
+        }
+        (
+            RequestPolicyPhase::FilesystemRewrite,
+            RequestPolicyEvent::FilesystemRewriteRetarget,
+        ) => RequestPolicyGuard::FilesystemPolicyPresent,
+        (
+            RequestPolicyPhase::FilesystemRewrite,
+            RequestPolicyEvent::SelectFilesystemRoute { route },
+        ) => {
+            if request_policy_filesystem_route_spec(route) {
+                RequestPolicyGuard::FilesystemPolicyPresent
+            } else {
+                RequestPolicyGuard::Never
+            }
+        }
+        (RequestPolicyPhase::Authorization, RequestPolicyEvent::AuthorizeOriginal) => {
+            RequestPolicyGuard::RetargetedOriginalPolicy
+        }
+        (RequestPolicyPhase::Authorization, RequestPolicyEvent::AuthorizeTarget) => {
+            RequestPolicyGuard::RoutePolicyPresent
+        }
+        (RequestPolicyPhase::Authorization, RequestPolicyEvent::FinishAuthorization) => {
+            RequestPolicyGuard::AuthorizationComplete
+        }
+        (
+            RequestPolicyPhase::CacheClassification,
+            RequestPolicyEvent::ClassifyCacheBypass,
+        ) => RequestPolicyGuard::Always,
+        (
+            RequestPolicyPhase::CacheClassification,
+            RequestPolicyEvent::ClassifyCacheEligible,
+        ) => RequestPolicyGuard::CacheEligibleRoute,
+        (RequestPolicyPhase::SinkAdmission, RequestPolicyEvent::AdmitSink) => {
+            RequestPolicyGuard::SinkReady
+        }
+        (_, RequestPolicyEvent::Reject) => RequestPolicyGuard::Rejectable,
+        _ => RequestPolicyGuard::Never,
+    }
+}
+
+pub fn request_policy_guard_for(
+    phase: RequestPolicyPhase,
+    event: RequestPolicyEvent,
+) -> (guard: RequestPolicyGuard)
+    ensures guard == request_policy_guard_for_spec(phase, event),
+{
+    match (phase, event) {
+        (RequestPolicyPhase::Start, RequestPolicyEvent::Canonicalize) => {
+            RequestPolicyGuard::Always
+        }
+        (RequestPolicyPhase::UrlPolicy, RequestPolicyEvent::ApplyUrlPolicy) => {
+            RequestPolicyGuard::CanonicalTarget
+        }
+        (RequestPolicyPhase::UrlRewrite, RequestPolicyEvent::UrlRewriteRetarget)
+        | (RequestPolicyPhase::UrlRewrite, RequestPolicyEvent::SelectLocal) => {
+            RequestPolicyGuard::UrlPolicyPresent
+        }
+        (
+            RequestPolicyPhase::UrlRewrite,
+            RequestPolicyEvent::SelectUrlRoute { route },
+        ) => {
+            if request_policy_url_route(route) {
+                RequestPolicyGuard::UrlPolicyPresent
+            } else {
+                RequestPolicyGuard::Never
+            }
+        }
+        (RequestPolicyPhase::FilesystemPlan, RequestPolicyEvent::BuildFilesystemPlan) => {
+            RequestPolicyGuard::UrlPolicyPresent
+        }
+        (RequestPolicyPhase::FilesystemPolicy, RequestPolicyEvent::ApplyFilesystemPolicy) => {
+            RequestPolicyGuard::Always
+        }
+        (
+            RequestPolicyPhase::FilesystemRewrite,
+            RequestPolicyEvent::FilesystemRewriteRetarget,
+        ) => RequestPolicyGuard::FilesystemPolicyPresent,
+        (
+            RequestPolicyPhase::FilesystemRewrite,
+            RequestPolicyEvent::SelectFilesystemRoute { route },
+        ) => {
+            if request_policy_filesystem_route(route) {
+                RequestPolicyGuard::FilesystemPolicyPresent
+            } else {
+                RequestPolicyGuard::Never
+            }
+        }
+        (RequestPolicyPhase::Authorization, RequestPolicyEvent::AuthorizeOriginal) => {
+            RequestPolicyGuard::RetargetedOriginalPolicy
+        }
+        (RequestPolicyPhase::Authorization, RequestPolicyEvent::AuthorizeTarget) => {
+            RequestPolicyGuard::RoutePolicyPresent
+        }
+        (RequestPolicyPhase::Authorization, RequestPolicyEvent::FinishAuthorization) => {
+            RequestPolicyGuard::AuthorizationComplete
+        }
+        (
+            RequestPolicyPhase::CacheClassification,
+            RequestPolicyEvent::ClassifyCacheBypass,
+        ) => RequestPolicyGuard::Always,
+        (
+            RequestPolicyPhase::CacheClassification,
+            RequestPolicyEvent::ClassifyCacheEligible,
+        ) => RequestPolicyGuard::CacheEligibleRoute,
+        (RequestPolicyPhase::SinkAdmission, RequestPolicyEvent::AdmitSink) => {
+            RequestPolicyGuard::SinkReady
+        }
+        (_, RequestPolicyEvent::Reject) => RequestPolicyGuard::Rejectable,
+        _ => RequestPolicyGuard::Never,
+    }
+}
+
+pub open spec fn request_policy_guard_admit_spec(
+    state: RequestPolicyState,
+    guard: RequestPolicyGuard,
+) -> bool {
+    match guard {
+        RequestPolicyGuard::Never => false,
+        RequestPolicyGuard::Always => true,
+        RequestPolicyGuard::CanonicalTarget => state.canonical_target,
+        RequestPolicyGuard::UrlPolicyPresent => state.target_url_policy,
+        RequestPolicyGuard::FilesystemPolicyPresent => state.target_filesystem_policy,
+        RequestPolicyGuard::RetargetedOriginalPolicy => {
+            state.retargeted && state.original_policy_present
+        }
+        RequestPolicyGuard::RoutePolicyPresent => {
+            request_policy_route_has_required_policy_spec(state)
+        }
+        RequestPolicyGuard::AuthorizationComplete => {
+            request_policy_authorization_complete_spec(state)
+        }
+        RequestPolicyGuard::CacheEligibleRoute => {
+            request_policy_cache_eligible_route_spec(state.route)
+        }
+        RequestPolicyGuard::SinkReady => {
+            request_policy_authorization_complete_spec(state)
+                && request_policy_cache_classified_spec(state.cache)
+                && request_policy_route_selected_spec(state.route)
+        }
+        RequestPolicyGuard::Rejectable => request_policy_phase_rejectable_spec(state.phase),
+    }
+}
+
+pub fn request_policy_guard_admit(
+    state: RequestPolicyState,
+    guard: RequestPolicyGuard,
+) -> (admit: bool)
+    ensures admit == request_policy_guard_admit_spec(state, guard),
+{
+    proof {
+        reveal(request_policy_guard_admit_spec);
+    }
+    match guard {
+        RequestPolicyGuard::Never => {
+            proof {
+                assert(request_policy_guard_admit_spec(state, guard) == false);
+            }
+            false
+        }
+        RequestPolicyGuard::Always => {
+            proof {
+                assert(request_policy_guard_admit_spec(state, guard) == true);
+            }
+            true
+        }
+        RequestPolicyGuard::CanonicalTarget => {
+            proof {
+                assert(
+                    request_policy_guard_admit_spec(state, guard)
+                        == state.canonical_target
+                );
+            }
+            state.canonical_target
+        }
+        RequestPolicyGuard::UrlPolicyPresent => {
+            proof {
+                assert(
+                    request_policy_guard_admit_spec(state, guard)
+                        == state.target_url_policy
+                );
+            }
+            state.target_url_policy
+        }
+        RequestPolicyGuard::FilesystemPolicyPresent => {
+            proof {
+                assert(
+                    request_policy_guard_admit_spec(state, guard)
+                        == state.target_filesystem_policy
+                );
+            }
+            state.target_filesystem_policy
+        }
+        RequestPolicyGuard::RetargetedOriginalPolicy => {
+            let admit = state.retargeted && state.original_policy_present;
+            proof {
+                assert(request_policy_guard_admit_spec(state, guard) == admit);
+            }
+            admit
+        }
+        RequestPolicyGuard::RoutePolicyPresent => {
+            let admit = request_policy_route_has_required_policy(state);
+            proof {
+                assert(
+                    admit == request_policy_route_has_required_policy_spec(state)
+                );
+                assert(request_policy_guard_admit_spec(state, guard) == admit);
+            }
+            admit
+        }
+        RequestPolicyGuard::AuthorizationComplete => {
+            let admit = request_policy_authorization_complete(state);
+            proof {
+                assert(admit == request_policy_authorization_complete_spec(state));
+                assert(request_policy_guard_admit_spec(state, guard) == admit);
+            }
+            admit
+        }
+        RequestPolicyGuard::CacheEligibleRoute => {
+            let admit = request_policy_cache_eligible_route(state.route);
+            proof {
+                assert(
+                    admit == request_policy_cache_eligible_route_spec(state.route)
+                );
+                assert(request_policy_guard_admit_spec(state, guard) == admit);
+            }
+            admit
+        }
+        RequestPolicyGuard::SinkReady => {
+            let authorized = request_policy_authorization_complete(state);
+            let classified = request_policy_cache_classified(state.cache);
+            let selected = request_policy_route_selected(state.route);
+            let admit = authorized && classified && selected;
+            proof {
+                assert(
+                    authorized == request_policy_authorization_complete_spec(state)
+                );
+                assert(classified == request_policy_cache_classified_spec(state.cache));
+                assert(selected == request_policy_route_selected_spec(state.route));
+                assert(request_policy_guard_admit_spec(state, guard) == admit);
+            }
+            admit
+        }
+        RequestPolicyGuard::Rejectable => {
+            let admit = request_policy_phase_rejectable(state.phase);
+            proof {
+                assert(admit == request_policy_phase_rejectable_spec(state.phase));
+                assert(request_policy_guard_admit_spec(state, guard) == admit);
+            }
+            admit
+        }
+    }
+}
+
+pub open spec fn request_policy_transition_enabled_spec(
+    state: RequestPolicyState,
+    event: RequestPolicyEvent,
+) -> bool {
+    request_policy_guard_admit_spec(
+        state,
+        request_policy_guard_for_spec(state.phase, event),
+    )
+}
+
+pub fn request_policy_transition_enabled(
+    state: RequestPolicyState,
+    event: RequestPolicyEvent,
+) -> (enabled: bool)
+    ensures enabled == request_policy_transition_enabled_spec(state, event),
+{
+    let guard = request_policy_guard_for(state.phase, event);
+    request_policy_guard_admit(state, guard)
+}
+
+pub open spec fn request_policy_apply_spec(
+    state: RequestPolicyState,
+    event: RequestPolicyEvent,
+) -> Option<RequestPolicyState> {
+    match (state.phase, event) {
+        (RequestPolicyPhase::Start, RequestPolicyEvent::Canonicalize) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::UrlPolicy,
+                canonical_target: true,
+                ..state
+            })
+        }
+        (RequestPolicyPhase::UrlPolicy, RequestPolicyEvent::ApplyUrlPolicy) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::UrlRewrite,
+                original_policy_present: true,
+                target_url_policy: true,
+                ..state
+            })
+        }
+        (RequestPolicyPhase::UrlRewrite, RequestPolicyEvent::UrlRewriteRetarget) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::UrlPolicy,
+                route: RequestPolicyRoute::Undecided,
+                canonical_target: true,
+                original_policy_present: state.original_policy_present,
+                target_url_policy: false,
+                target_filesystem_policy: false,
+                retargeted: true,
+                original_authorized: false,
+                target_authorized: false,
+                cache: RequestPolicyCacheClass::Unclassified,
+                sink_admitted: false,
+            })
+        }
+        (RequestPolicyPhase::UrlRewrite, RequestPolicyEvent::SelectLocal) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::FilesystemPlan,
+                ..state
+            })
+        }
+        (
+            RequestPolicyPhase::UrlRewrite,
+            RequestPolicyEvent::SelectUrlRoute { route },
+        ) => Some(RequestPolicyState {
+            phase: RequestPolicyPhase::Authorization,
+            route,
+            ..state
+        }),
+        (RequestPolicyPhase::FilesystemPlan, RequestPolicyEvent::BuildFilesystemPlan) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::FilesystemPolicy,
+                ..state
+            })
+        }
+        (RequestPolicyPhase::FilesystemPolicy, RequestPolicyEvent::ApplyFilesystemPolicy) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::FilesystemRewrite,
+                target_filesystem_policy: true,
+                ..state
+            })
+        }
+        (
+            RequestPolicyPhase::FilesystemRewrite,
+            RequestPolicyEvent::FilesystemRewriteRetarget,
+        ) => Some(RequestPolicyState {
+            phase: RequestPolicyPhase::FilesystemPlan,
+            route: RequestPolicyRoute::Undecided,
+            canonical_target: true,
+            original_policy_present: state.original_policy_present,
+            target_url_policy: state.target_url_policy,
+            target_filesystem_policy: false,
+            retargeted: true,
+            original_authorized: false,
+            target_authorized: false,
+            cache: RequestPolicyCacheClass::Unclassified,
+            sink_admitted: false,
+        }),
+        (
+            RequestPolicyPhase::FilesystemRewrite,
+            RequestPolicyEvent::SelectFilesystemRoute { route },
+        ) => Some(RequestPolicyState {
+            phase: RequestPolicyPhase::Authorization,
+            route,
+            ..state
+        }),
+        (RequestPolicyPhase::Authorization, RequestPolicyEvent::AuthorizeOriginal) => {
+            Some(RequestPolicyState {
+                original_authorized: true,
+                ..state
+            })
+        }
+        (RequestPolicyPhase::Authorization, RequestPolicyEvent::AuthorizeTarget) => {
+            Some(RequestPolicyState {
+                target_authorized: true,
+                ..state
+            })
+        }
+        (RequestPolicyPhase::Authorization, RequestPolicyEvent::FinishAuthorization) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::CacheClassification,
+                ..state
+            })
+        }
+        (
+            RequestPolicyPhase::CacheClassification,
+            RequestPolicyEvent::ClassifyCacheBypass,
+        ) => Some(RequestPolicyState {
+            phase: RequestPolicyPhase::SinkAdmission,
+            cache: RequestPolicyCacheClass::Bypass,
+            ..state
+        }),
+        (
+            RequestPolicyPhase::CacheClassification,
+            RequestPolicyEvent::ClassifyCacheEligible,
+        ) => Some(RequestPolicyState {
+            phase: RequestPolicyPhase::SinkAdmission,
+            cache: RequestPolicyCacheClass::Eligible,
+            ..state
+        }),
+        (RequestPolicyPhase::SinkAdmission, RequestPolicyEvent::AdmitSink) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::Complete,
+                sink_admitted: true,
+                ..state
+            })
+        }
+        (_, RequestPolicyEvent::Reject) => Some(RequestPolicyState {
+            phase: RequestPolicyPhase::Rejected,
+            route: RequestPolicyRoute::Undecided,
+            target_authorized: false,
+            cache: RequestPolicyCacheClass::Unclassified,
+            sink_admitted: false,
+            ..state
+        }),
+        _ => None,
+    }
+}
+
+pub fn request_policy_apply(
+    state: RequestPolicyState,
+    event: RequestPolicyEvent,
+) -> (next: Option<RequestPolicyState>)
+    ensures next == request_policy_apply_spec(state, event),
+{
+    match (state.phase, event) {
+        (RequestPolicyPhase::Start, RequestPolicyEvent::Canonicalize) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::UrlPolicy,
+                canonical_target: true,
+                ..state
+            })
+        }
+        (RequestPolicyPhase::UrlPolicy, RequestPolicyEvent::ApplyUrlPolicy) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::UrlRewrite,
+                original_policy_present: true,
+                target_url_policy: true,
+                ..state
+            })
+        }
+        (RequestPolicyPhase::UrlRewrite, RequestPolicyEvent::UrlRewriteRetarget) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::UrlPolicy,
+                route: RequestPolicyRoute::Undecided,
+                canonical_target: true,
+                original_policy_present: state.original_policy_present,
+                target_url_policy: false,
+                target_filesystem_policy: false,
+                retargeted: true,
+                original_authorized: false,
+                target_authorized: false,
+                cache: RequestPolicyCacheClass::Unclassified,
+                sink_admitted: false,
+            })
+        }
+        (RequestPolicyPhase::UrlRewrite, RequestPolicyEvent::SelectLocal) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::FilesystemPlan,
+                ..state
+            })
+        }
+        (
+            RequestPolicyPhase::UrlRewrite,
+            RequestPolicyEvent::SelectUrlRoute { route },
+        ) => Some(RequestPolicyState {
+            phase: RequestPolicyPhase::Authorization,
+            route,
+            ..state
+        }),
+        (RequestPolicyPhase::FilesystemPlan, RequestPolicyEvent::BuildFilesystemPlan) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::FilesystemPolicy,
+                ..state
+            })
+        }
+        (RequestPolicyPhase::FilesystemPolicy, RequestPolicyEvent::ApplyFilesystemPolicy) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::FilesystemRewrite,
+                target_filesystem_policy: true,
+                ..state
+            })
+        }
+        (
+            RequestPolicyPhase::FilesystemRewrite,
+            RequestPolicyEvent::FilesystemRewriteRetarget,
+        ) => Some(RequestPolicyState {
+            phase: RequestPolicyPhase::FilesystemPlan,
+            route: RequestPolicyRoute::Undecided,
+            canonical_target: true,
+            original_policy_present: state.original_policy_present,
+            target_url_policy: state.target_url_policy,
+            target_filesystem_policy: false,
+            retargeted: true,
+            original_authorized: false,
+            target_authorized: false,
+            cache: RequestPolicyCacheClass::Unclassified,
+            sink_admitted: false,
+        }),
+        (
+            RequestPolicyPhase::FilesystemRewrite,
+            RequestPolicyEvent::SelectFilesystemRoute { route },
+        ) => Some(RequestPolicyState {
+            phase: RequestPolicyPhase::Authorization,
+            route,
+            ..state
+        }),
+        (RequestPolicyPhase::Authorization, RequestPolicyEvent::AuthorizeOriginal) => {
+            Some(RequestPolicyState {
+                original_authorized: true,
+                ..state
+            })
+        }
+        (RequestPolicyPhase::Authorization, RequestPolicyEvent::AuthorizeTarget) => {
+            Some(RequestPolicyState {
+                target_authorized: true,
+                ..state
+            })
+        }
+        (RequestPolicyPhase::Authorization, RequestPolicyEvent::FinishAuthorization) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::CacheClassification,
+                ..state
+            })
+        }
+        (
+            RequestPolicyPhase::CacheClassification,
+            RequestPolicyEvent::ClassifyCacheBypass,
+        ) => Some(RequestPolicyState {
+            phase: RequestPolicyPhase::SinkAdmission,
+            cache: RequestPolicyCacheClass::Bypass,
+            ..state
+        }),
+        (
+            RequestPolicyPhase::CacheClassification,
+            RequestPolicyEvent::ClassifyCacheEligible,
+        ) => Some(RequestPolicyState {
+            phase: RequestPolicyPhase::SinkAdmission,
+            cache: RequestPolicyCacheClass::Eligible,
+            ..state
+        }),
+        (RequestPolicyPhase::SinkAdmission, RequestPolicyEvent::AdmitSink) => {
+            Some(RequestPolicyState {
+                phase: RequestPolicyPhase::Complete,
+                sink_admitted: true,
+                ..state
+            })
+        }
+        (_, RequestPolicyEvent::Reject) => Some(RequestPolicyState {
+            phase: RequestPolicyPhase::Rejected,
+            route: RequestPolicyRoute::Undecided,
+            target_authorized: false,
+            cache: RequestPolicyCacheClass::Unclassified,
+            sink_admitted: false,
+            ..state
+        }),
+        _ => None,
+    }
+}
+
+pub open spec fn request_policy_step_spec(
+    state: RequestPolicyState,
+    event: RequestPolicyEvent,
+) -> Option<RequestPolicyState> {
+    if request_policy_transition_enabled_spec(state, event) {
+        request_policy_apply_spec(state, event)
+    } else {
+        None
+    }
+}
+
+/// Executable transition function consumed by the runtime reference model.
+/// An event presented in the wrong phase is rejected instead of being
+/// reordered or partially applied.
+pub fn request_policy_step(
+    state: RequestPolicyState,
+    event: RequestPolicyEvent,
+) -> (next: Option<RequestPolicyState>)
+    ensures next == request_policy_step_spec(state, event),
+{
+    if request_policy_transition_enabled(state, event) {
+        request_policy_apply(state, event)
+    } else {
+        None
+    }
+}
+
+pub open spec fn request_policy_invariant_facts_spec(
+    state: RequestPolicyState,
+    authorized: bool,
+) -> bool {
+    match state.phase {
+        RequestPolicyPhase::Complete => {
+            authorized
+                && request_policy_cache_classified_spec(state.cache)
+                && request_policy_route_selected_spec(state.route)
+                && state.sink_admitted
+        }
+        RequestPolicyPhase::Rejected => {
+            !request_policy_route_selected_spec(state.route)
+                && !state.target_authorized
+                && !request_policy_cache_classified_spec(state.cache)
+                && !state.sink_admitted
+        }
+        _ => !state.sink_admitted,
+    }
+}
+
+pub fn request_policy_invariant_facts(
+    state: RequestPolicyState,
+    authorized: bool,
+) -> (ok: bool)
+    ensures ok == request_policy_invariant_facts_spec(state, authorized),
+{
+    let classified = request_policy_cache_classified(state.cache);
+    let selected = request_policy_route_selected(state.route);
+    match state.phase {
+        RequestPolicyPhase::Complete => {
+            let ok = authorized && classified && selected && state.sink_admitted;
+            proof {
+                reveal(request_policy_invariant_facts_spec);
+                assert(classified == request_policy_cache_classified_spec(state.cache));
+                assert(selected == request_policy_route_selected_spec(state.route));
+                assert(request_policy_invariant_facts_spec(state, authorized) == ok);
+            }
+            ok
+        }
+        RequestPolicyPhase::Rejected => {
+            let ok = !selected
+                && !state.target_authorized
+                && !classified
+                && !state.sink_admitted;
+            proof {
+                reveal(request_policy_invariant_facts_spec);
+                assert(classified == request_policy_cache_classified_spec(state.cache));
+                assert(selected == request_policy_route_selected_spec(state.route));
+                assert(request_policy_invariant_facts_spec(state, authorized) == ok);
+            }
+            ok
+        }
+        _ => {
+            let ok = !state.sink_admitted;
+            proof {
+                reveal(request_policy_invariant_facts_spec);
+                assert(request_policy_invariant_facts_spec(state, authorized) == ok);
+            }
+            ok
+        }
+    }
+}
+
+pub open spec fn request_policy_invariant_spec(state: RequestPolicyState) -> bool {
+    request_policy_invariant_facts_spec(
+        state,
+        request_policy_authorization_complete_spec(state),
+    )
+}
+
+pub fn request_policy_invariant(state: RequestPolicyState) -> (ok: bool)
+    ensures ok == request_policy_invariant_spec(state),
+{
+    let authorized = request_policy_authorization_complete(state);
+    request_policy_invariant_facts(state, authorized)
+}
+
+pub proof fn request_policy_start_satisfies_invariant()
+    ensures request_policy_invariant_spec(request_policy_start_spec()),
+{
+}
+
+pub proof fn request_policy_step_preserves_invariant(
+    state: RequestPolicyState,
+    event: RequestPolicyEvent,
+    next: RequestPolicyState,
+)
+    requires
+        request_policy_invariant_spec(state),
+        request_policy_step_spec(state, event) == Some(next),
+    ensures request_policy_invariant_spec(next),
+{
+}
+
+pub proof fn request_policy_complete_implies_all_gates(state: RequestPolicyState)
+    requires
+        request_policy_invariant_spec(state),
+        state.phase == RequestPolicyPhase::Complete,
+    ensures
+        state.canonical_target,
+        state.original_policy_present,
+        request_policy_route_has_required_policy_spec(state),
+        state.target_authorized,
+        !state.retargeted || state.original_authorized,
+        state.cache != RequestPolicyCacheClass::Unclassified,
+        state.route != RequestPolicyRoute::Undecided,
+        state.sink_admitted,
+{
+}
+
+pub proof fn request_policy_step_to_complete_implies_all_gates(
+    state: RequestPolicyState,
+    event: RequestPolicyEvent,
+    next: RequestPolicyState,
+)
+    requires
+        request_policy_step_spec(state, event) == Some(next),
+        next.phase == RequestPolicyPhase::Complete,
+    ensures
+        request_policy_authorization_complete_spec(next),
+        next.cache != RequestPolicyCacheClass::Unclassified,
+        next.route != RequestPolicyRoute::Undecided,
+        next.sink_admitted,
+{
+}
+
+pub proof fn request_policy_retarget_clears_stale_admission(
+    state: RequestPolicyState,
+    event: RequestPolicyEvent,
+    next: RequestPolicyState,
+)
+    requires
+        event == RequestPolicyEvent::UrlRewriteRetarget
+            || event == RequestPolicyEvent::FilesystemRewriteRetarget,
+        request_policy_step_spec(state, event) == Some(next),
+    ensures
+        next.retargeted,
+        !next.original_authorized,
+        !next.target_authorized,
+        next.cache == RequestPolicyCacheClass::Unclassified,
+        !next.sink_admitted,
+{
+}
+
+pub proof fn request_policy_retargeted_sink_requires_original_authorization(
+    state: RequestPolicyState,
+)
+    requires
+        request_policy_invariant_spec(state),
+        state.phase == RequestPolicyPhase::Complete,
+        state.retargeted,
+    ensures state.original_authorized,
+{
+}
+
+pub proof fn request_policy_cache_classification_precedes_sink(state: RequestPolicyState)
+    requires
+        request_policy_invariant_spec(state),
+        state.phase == RequestPolicyPhase::Complete,
+    ensures state.cache != RequestPolicyCacheClass::Unclassified,
+{
+}
+
+pub proof fn request_policy_rejected_is_absorbing(
+    state: RequestPolicyState,
+    event: RequestPolicyEvent,
+)
+    requires state.phase == RequestPolicyPhase::Rejected,
+    ensures request_policy_step_spec(state, event).is_none(),
+{
+}
+
 /// Admit a filesystem-policy walk only while both dimensions of its work are
 /// bounded.  `ancestor_bytes` is the sum of the ancestor path lengths that a
 /// caller would copy, not merely the length of the final path.

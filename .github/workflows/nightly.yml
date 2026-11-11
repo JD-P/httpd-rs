@@ -28,6 +28,7 @@ jobs:
         target:
           - http_request
           - http_connection
+          - http_fields
           - config_sections
           - config_compile
           - config_grammars
@@ -47,6 +48,7 @@ jobs:
           - pcre2_grammar
           - pcre2_resource
           - resource_transitions
+          - policy_path
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Restore cumulative coverage corpus

@@ -199,47 +199,26 @@ pub(crate) fn unsupported_filters(scope: &Scope, media: Option<&str>, path: &[u8
     filters
 }
 
-fn q_value(value: &str) -> f32 {
-    let value = value.trim();
-    if let Some(rest) = value.strip_prefix("q=") {
-        rest.trim().parse::<f32>().unwrap_or(0.0)
-    } else if let Some(rest) = value.strip_prefix("Q=") {
-        rest.trim().parse::<f32>().unwrap_or(0.0)
-    } else {
-        0.0
-    }
-}
-
 fn accepts_encoding(req: &Request, kind: CompressionKind) -> bool {
     let Some(value) = req.header("accept-encoding") else {
         return false;
     };
-    let text = String::from_utf8_lossy(value);
-    let wanted = kind.encoding();
-    let mut wildcard = 0.0f32;
-    let mut explicit: Option<f32> = None;
-    for item in text.split(',') {
-        let mut parts = item.split(';');
-        let name = parts.next().unwrap_or("").trim();
-        let q = parts
-            .find_map(|p| {
-                let p = p.trim();
-                if p.to_ascii_lowercase().starts_with('q') {
-                    Some(q_value(p))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(1.0);
-        if name == "*" {
-            wildcard = q.max(wildcard);
-        } else if name.eq_ignore_ascii_case(wanted)
-            || (wanted == "gzip" && name.eq_ignore_ascii_case("x-gzip"))
+    let Some(items) = crate::http_fields::parse_weighted_list(value) else {
+        return false;
+    };
+    let wanted = kind.encoding().as_bytes();
+    let mut wildcard = crate::http_fields::QValue::ZERO;
+    let mut explicit = None;
+    for item in items {
+        if item.value == b"*" {
+            wildcard = wildcard.max(item.quality);
+        } else if item.value.eq_ignore_ascii_case(wanted)
+            || (wanted == b"gzip" && item.value.eq_ignore_ascii_case(b"x-gzip"))
         {
-            explicit = Some(q);
+            explicit = Some(item.quality);
         }
     }
-    explicit.unwrap_or(wildcard) > 0.0
+    explicit.unwrap_or(wildcard).milli() > 0
 }
 
 fn alter_etag(resp: &mut Response, kind: CompressionKind, scope: &Scope) {
@@ -838,16 +817,25 @@ mod tests {
         );
         add_vary_accept_encoding(&mut r);
 
-        assert_eq!(q_value("Q=0.5"), 0.5);
-        assert_eq!(q_value("quality=1"), 0.0);
-        assert_eq!(q_value("q=invalid"), 0.0);
         let no_encoding = request("");
         let mut no_encoding = no_encoding;
         no_encoding.headers.remove("accept-encoding");
         assert!(!accepts_encoding(&no_encoding, CompressionKind::Gzip));
-        assert!(accepts_encoding(
+        assert!(!accepts_encoding(
             &request("*;q=.4"),
             CompressionKind::Brotli
+        ));
+        assert!(accepts_encoding(
+            &request("*;q=0.4"),
+            CompressionKind::Brotli
+        ));
+        assert!(!accepts_encoding(
+            &request("gzip;q=2"),
+            CompressionKind::Gzip
+        ));
+        assert!(!accepts_encoding(
+            &request("gzip;quality=1;broken"),
+            CompressionKind::Gzip
         ));
         assert!(accepts_encoding(&request("x-gzip"), CompressionKind::Gzip));
         assert!(accepts_encoding(

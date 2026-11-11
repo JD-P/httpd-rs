@@ -6,17 +6,170 @@
 //! Directory/access walk -> DirectoryMatch -> depth-interleaved Files -> Location -> If
 //! ```
 //!
-//! It is intentionally kept free of I/O and `.htaccess` handling.  The live
+//! It is intentionally kept free of I/O and `.htaccess` handling. The live
 //! dispatcher uses the same phase helpers, and the tests at the bottom compare
 //! the reference result with `Config::effective_scope_req` for a generated
-//! corpus.  The eventual Verus model should target this interface: a finite
-//! scope, a finite rule list, and a request view.
+//! corpus. `RequestPolicyMachine` is the executable projection of the complete
+//! request path; its transition function and invariants are verified in the
+//! Verus crate.
 
 use crate::config::{apply_deferred_req, apply_normal_rule_list, Config, Scope, ScopeRule, VHost};
 use crate::http::Request;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
+
+/// Fail-closed executable wrapper around the verified request-policy state
+/// machine. Keeping this in the reference evaluator gives runtime tests and
+/// fuzzers one interface for phase ordering, rewrite invalidation,
+/// authorization, cache classification and terminal admission.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestPolicyMachine {
+    state: crate::verified::RequestPolicyState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidPolicyTransition {
+    pub phase: crate::verified::RequestPolicyPhase,
+    pub event: crate::verified::RequestPolicyEvent,
+}
+
+impl RequestPolicyMachine {
+    pub fn new() -> Self {
+        Self {
+            state: crate::verified::request_policy_start(),
+        }
+    }
+
+    pub fn state(&self) -> crate::verified::RequestPolicyState {
+        self.state
+    }
+
+    pub fn advance(
+        &mut self,
+        event: crate::verified::RequestPolicyEvent,
+    ) -> Result<(), InvalidPolicyTransition> {
+        let phase = self.state.phase;
+        let Some(next) = crate::verified::request_policy_step(self.state, event) else {
+            return Err(InvalidPolicyTransition { phase, event });
+        };
+        // This is proved for every reachable transition in Verus. Retain an
+        // executable fail-closed guard so a future projection change cannot
+        // turn proof/runtime drift into terminal admission.
+        if !crate::verified::request_policy_invariant(next) {
+            return Err(InvalidPolicyTransition { phase, event });
+        }
+        self.state = next;
+        Ok(())
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.state.phase == crate::verified::RequestPolicyPhase::Complete
+    }
+
+    pub fn is_rejected(&self) -> bool {
+        self.state.phase == crate::verified::RequestPolicyPhase::Rejected
+    }
+}
+
+impl Default for RequestPolicyMachine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Replay a finite abstract request path through the same verified transition
+/// function used by `RequestPolicyMachine`. This is intentionally total over
+/// arbitrary event bytes: the first invalid transition is returned rather
+/// than skipped.
+pub fn evaluate_policy_path(
+    events: &[crate::verified::RequestPolicyEvent],
+) -> Result<crate::verified::RequestPolicyState, InvalidPolicyTransition> {
+    let mut machine = RequestPolicyMachine::new();
+    for event in events {
+        machine.advance(*event)?;
+    }
+    Ok(machine.state())
+}
+
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_policy_path(data: &[u8]) {
+    use crate::verified::{RequestPolicyEvent as Event, RequestPolicyRoute as Route};
+
+    fn route(byte: u8) -> Route {
+        match byte % 8 {
+            0 => Route::Undecided,
+            1 => Route::StaticFile,
+            2 => Route::Directory,
+            3 => Route::LocalCgi,
+            4 => Route::FastCgi,
+            5 => Route::Proxy,
+            6 => Route::Redirect,
+            _ => Route::ServerStatus,
+        }
+    }
+
+    fn event(op: u8, arg: u8) -> Event {
+        match op % 18 {
+            0 => Event::Canonicalize,
+            1 => Event::ApplyUrlPolicy,
+            2 => Event::UrlRewriteRetarget,
+            3 => Event::SelectLocal,
+            4 => Event::SelectUrlRoute { route: route(arg) },
+            5 => Event::BuildFilesystemPlan,
+            6 => Event::ApplyFilesystemPolicy,
+            7 => Event::FilesystemRewriteRetarget,
+            8 => Event::SelectFilesystemRoute { route: route(arg) },
+            9 => Event::AuthorizeOriginal,
+            10 => Event::AuthorizeTarget,
+            11 => Event::FinishAuthorization,
+            12 => Event::ClassifyCacheBypass,
+            13 => Event::ClassifyCacheEligible,
+            14 => Event::AdmitSink,
+            _ => Event::Reject,
+        }
+    }
+
+    let mut machine = RequestPolicyMachine::new();
+    assert!(crate::verified::request_policy_invariant(machine.state()));
+    for pair in data.chunks(2) {
+        let before = machine.state();
+        let next_event = event(pair[0], pair.get(1).copied().unwrap_or(0));
+        match machine.advance(next_event) {
+            Ok(()) => {
+                let after = machine.state();
+                assert!(crate::verified::request_policy_invariant(after));
+                if matches!(
+                    next_event,
+                    Event::UrlRewriteRetarget | Event::FilesystemRewriteRetarget
+                ) {
+                    assert!(after.retargeted);
+                    assert!(!after.original_authorized);
+                    assert!(!after.target_authorized);
+                    assert_eq!(
+                        after.cache,
+                        crate::verified::RequestPolicyCacheClass::Unclassified
+                    );
+                    assert!(!after.sink_admitted);
+                }
+            }
+            Err(error) => {
+                assert_eq!(error.phase, before.phase);
+                assert_eq!(machine.state(), before);
+                // The total replay API must reject the same invalid prefix.
+                // It is the interface used when arbitrary event sequences
+                // cross the reference evaluator boundary.
+                let mut prefix = Vec::new();
+                // Avoid an attacker-sized allocation: this local replay only
+                // checks the single transition from the current state below.
+                prefix.push(next_event);
+                if before == crate::verified::request_policy_start() {
+                    assert!(evaluate_policy_path(&prefix).is_err());
+                }
+            }
+        }
+    }
+}
 
 /// Evaluate configuration rules in canonical order without touching the
 /// filesystem.  Conditional rules are collected and returned so a caller can
@@ -305,7 +458,10 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::http::{Headers, Request, Version};
-    use crate::verified::BodyFraming;
+    use crate::verified::{
+        BodyFraming, RequestPolicyCacheClass, RequestPolicyEvent, RequestPolicyPhase,
+        RequestPolicyRoute,
+    };
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
@@ -566,5 +722,196 @@ mod tests {
             crate::config::effective_handler(&lexical_handler_scope, b"link.txt"),
             None
         );
+    }
+
+    #[test]
+    fn complete_policy_machine_orders_every_security_gate() {
+        let state = evaluate_policy_path(&[
+            RequestPolicyEvent::Canonicalize,
+            RequestPolicyEvent::ApplyUrlPolicy,
+            RequestPolicyEvent::SelectLocal,
+            RequestPolicyEvent::BuildFilesystemPlan,
+            RequestPolicyEvent::ApplyFilesystemPolicy,
+            RequestPolicyEvent::SelectFilesystemRoute {
+                route: RequestPolicyRoute::StaticFile,
+            },
+            RequestPolicyEvent::AuthorizeTarget,
+            RequestPolicyEvent::FinishAuthorization,
+            RequestPolicyEvent::ClassifyCacheEligible,
+            RequestPolicyEvent::AdmitSink,
+        ])
+        .unwrap();
+        assert_eq!(state.phase, RequestPolicyPhase::Complete);
+        assert_eq!(state.cache, RequestPolicyCacheClass::Eligible);
+        assert!(state.target_authorized);
+        assert!(state.sink_admitted);
+    }
+
+    #[test]
+    fn rewrite_retarget_clears_stale_gates_and_requires_original_policy() {
+        let mut machine = RequestPolicyMachine::new();
+        for event in [
+            RequestPolicyEvent::Canonicalize,
+            RequestPolicyEvent::ApplyUrlPolicy,
+            RequestPolicyEvent::SelectLocal,
+            RequestPolicyEvent::BuildFilesystemPlan,
+            RequestPolicyEvent::ApplyFilesystemPolicy,
+            RequestPolicyEvent::FilesystemRewriteRetarget,
+        ] {
+            machine.advance(event).unwrap();
+        }
+        let retargeted = machine.state();
+        assert!(retargeted.retargeted);
+        assert!(!retargeted.target_authorized);
+        assert!(!retargeted.original_authorized);
+        assert_eq!(retargeted.cache, RequestPolicyCacheClass::Unclassified);
+
+        for event in [
+            RequestPolicyEvent::BuildFilesystemPlan,
+            RequestPolicyEvent::ApplyFilesystemPolicy,
+            RequestPolicyEvent::SelectFilesystemRoute {
+                route: RequestPolicyRoute::LocalCgi,
+            },
+            RequestPolicyEvent::AuthorizeTarget,
+        ] {
+            machine.advance(event).unwrap();
+        }
+        assert!(machine
+            .advance(RequestPolicyEvent::FinishAuthorization)
+            .is_err());
+        machine
+            .advance(RequestPolicyEvent::AuthorizeOriginal)
+            .unwrap();
+        machine
+            .advance(RequestPolicyEvent::FinishAuthorization)
+            .unwrap();
+        machine
+            .advance(RequestPolicyEvent::ClassifyCacheBypass)
+            .unwrap();
+        machine.advance(RequestPolicyEvent::AdmitSink).unwrap();
+        assert!(machine.is_complete());
+        assert!(machine.state().original_authorized);
+    }
+
+    #[test]
+    fn url_terminal_routes_still_cross_authorization_and_cache_classification() {
+        let state = evaluate_policy_path(&[
+            RequestPolicyEvent::Canonicalize,
+            RequestPolicyEvent::ApplyUrlPolicy,
+            RequestPolicyEvent::SelectUrlRoute {
+                route: RequestPolicyRoute::Proxy,
+            },
+            RequestPolicyEvent::AuthorizeTarget,
+            RequestPolicyEvent::FinishAuthorization,
+            RequestPolicyEvent::ClassifyCacheBypass,
+            RequestPolicyEvent::AdmitSink,
+        ])
+        .unwrap();
+        assert_eq!(state.phase, RequestPolicyPhase::Complete);
+        assert_eq!(state.route, RequestPolicyRoute::Proxy);
+        assert_eq!(state.cache, RequestPolicyCacheClass::Bypass);
+
+        let mut proxy = RequestPolicyMachine::new();
+        for event in [
+            RequestPolicyEvent::Canonicalize,
+            RequestPolicyEvent::ApplyUrlPolicy,
+            RequestPolicyEvent::SelectUrlRoute {
+                route: RequestPolicyRoute::Proxy,
+            },
+            RequestPolicyEvent::AuthorizeTarget,
+            RequestPolicyEvent::FinishAuthorization,
+        ] {
+            proxy.advance(event).unwrap();
+        }
+        assert!(proxy
+            .advance(RequestPolicyEvent::ClassifyCacheEligible)
+            .is_err());
+        assert!(proxy.advance(RequestPolicyEvent::AdmitSink).is_err());
+    }
+
+    #[test]
+    fn rejected_policy_path_is_absorbing() {
+        let mut machine = RequestPolicyMachine::new();
+        machine.advance(RequestPolicyEvent::Canonicalize).unwrap();
+        machine.advance(RequestPolicyEvent::Reject).unwrap();
+        assert!(machine.is_rejected());
+        assert!(machine.advance(RequestPolicyEvent::ApplyUrlPolicy).is_err());
+        assert!(machine.advance(RequestPolicyEvent::Reject).is_err());
+    }
+
+    #[test]
+    fn every_reachable_policy_state_satisfies_the_verified_invariant() {
+        let routes = [
+            RequestPolicyRoute::Undecided,
+            RequestPolicyRoute::StaticFile,
+            RequestPolicyRoute::Directory,
+            RequestPolicyRoute::LocalCgi,
+            RequestPolicyRoute::FastCgi,
+            RequestPolicyRoute::Proxy,
+            RequestPolicyRoute::Redirect,
+            RequestPolicyRoute::ServerStatus,
+        ];
+        let mut events = vec![
+            RequestPolicyEvent::Canonicalize,
+            RequestPolicyEvent::ApplyUrlPolicy,
+            RequestPolicyEvent::UrlRewriteRetarget,
+            RequestPolicyEvent::SelectLocal,
+            RequestPolicyEvent::BuildFilesystemPlan,
+            RequestPolicyEvent::ApplyFilesystemPolicy,
+            RequestPolicyEvent::FilesystemRewriteRetarget,
+            RequestPolicyEvent::AuthorizeOriginal,
+            RequestPolicyEvent::AuthorizeTarget,
+            RequestPolicyEvent::FinishAuthorization,
+            RequestPolicyEvent::ClassifyCacheBypass,
+            RequestPolicyEvent::ClassifyCacheEligible,
+            RequestPolicyEvent::AdmitSink,
+            RequestPolicyEvent::Reject,
+        ];
+        for route in routes {
+            events.push(RequestPolicyEvent::SelectUrlRoute { route });
+            events.push(RequestPolicyEvent::SelectFilesystemRoute { route });
+        }
+
+        let mut reachable = vec![crate::verified::request_policy_start()];
+        let mut cursor = 0;
+        while cursor < reachable.len() {
+            let state = reachable[cursor];
+            assert!(crate::verified::request_policy_invariant(state));
+            for event in &events {
+                let mut machine = RequestPolicyMachine { state };
+                let before = machine.state();
+                match machine.advance(*event) {
+                    Ok(()) => {
+                        let next = machine.state();
+                        assert!(crate::verified::request_policy_invariant(next));
+                        if !reachable.contains(&next) {
+                            reachable.push(next);
+                        }
+                    }
+                    Err(_) => assert_eq!(machine.state(), before),
+                }
+            }
+            cursor += 1;
+        }
+
+        assert!(reachable
+            .iter()
+            .any(|state| state.phase == RequestPolicyPhase::Complete));
+        assert!(reachable
+            .iter()
+            .any(|state| state.phase == RequestPolicyPhase::Rejected));
+        for state in reachable
+            .iter()
+            .filter(|state| state.phase == RequestPolicyPhase::Complete)
+        {
+            assert!(crate::verified::request_policy_authorization_complete(
+                *state
+            ));
+            assert!(crate::verified::request_policy_cache_classified(
+                state.cache
+            ));
+            assert!(crate::verified::request_policy_route_selected(state.route));
+            assert!(state.sink_admitted);
+        }
     }
 }

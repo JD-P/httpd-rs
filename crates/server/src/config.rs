@@ -35,7 +35,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 static NEXT_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -3607,13 +3607,14 @@ impl Config {
 
     pub(crate) fn directive_exists(&self, name: &str) -> Result<bool, String> {
         let name = name.to_ascii_lowercase();
-        if core_directive_exists(&name) {
+        let spec = directive_spec(&name);
+        if spec.core {
             return Ok(true);
         }
-        if let Some(owner) = directive_owner(&name) {
+        if let Some(owner) = spec.owner {
             return Ok(self.module_loaded(owner));
         }
-        if !known_directives().contains(name.as_str()) {
+        if !spec.apache_known {
             return Ok(false);
         }
         Err(format!(
@@ -3838,9 +3839,7 @@ pub enum Event {
 #[derive(Debug, Clone)]
 struct DirectiveIdentity {
     canonical: String,
-    security_sensitive: bool,
-    apache_known: bool,
-    schema: PayloadSchema,
+    spec: DirectiveSpec,
 }
 
 /// Minimum structural payload schema. Complex values (regular expressions,
@@ -4094,7 +4093,7 @@ const SSL_CA_REVOCATION_CHECK_KEYWORDS: &[&str] = &["none", "leaf", "chain"];
 /// Directive payloads are compiled while the immutable program is sealed.
 /// Remaining token payloads are exact strings or lists whose application is
 /// infallible; fallible semantic parsers have a closed value variant.
-pub(crate) fn directive_payload_schema(name: &str) -> PayloadSchema {
+fn build_directive_payload_schema(name: &str) -> PayloadSchema {
     let arity = directive_arity(name);
     let reject_empty = directive_rejects_empty(name);
     let value = match name {
@@ -4251,19 +4250,97 @@ pub(crate) fn directive_payload_schema(name: &str) -> PayloadSchema {
     PayloadSchema::typed(arity, reject_empty, value)
 }
 
-impl DirectiveIdentity {
-    fn new(
-        canonical: String,
-        known: &HashSet<&'static str>,
-        fail_closed: &HashSet<&'static str>,
-    ) -> Self {
-        let security_sensitive = is_security_directive_with(&canonical, fail_closed);
-        DirectiveIdentity {
-            security_sensitive,
-            apache_known: known.contains(canonical.as_str()),
-            schema: directive_payload_schema(&canonical),
-            canonical,
+/// The complete classification consumed by both configuration compilers.
+/// All string-to-policy decisions are made once while this immutable registry
+/// is constructed; later stages receive only these sealed facts.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirectiveSpec {
+    pub(crate) security_sensitive: bool,
+    pub(crate) apache_known: bool,
+    pub(crate) core: bool,
+    pub(crate) owner: Option<&'static str>,
+    pub(crate) schema: PayloadSchema,
+    pub(crate) access: Option<AccessDirectiveSpec>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AccessDirectiveSpec {
+    pub(crate) category: OverrideCategory,
+    pub(crate) disposition: crate::htaccess::DirectiveDisposition,
+    pub(crate) schema: PayloadSchema,
+}
+
+#[derive(Debug)]
+struct DirectiveRegistry {
+    entries: HashMap<&'static str, DirectiveSpec>,
+    fail_closed: HashSet<&'static str>,
+}
+
+fn directive_registry() -> &'static DirectiveRegistry {
+    static REGISTRY: OnceLock<DirectiveRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let known = known_directives();
+        let fail_closed = fail_closed_directives();
+        let mut entries = HashMap::with_capacity(known.len());
+        for name in known {
+            let schema = build_directive_payload_schema(name);
+            let access =
+                crate::htaccess::access_directive_shape(name).map(|(category, disposition)| {
+                    AccessDirectiveSpec {
+                        category,
+                        disposition,
+                        schema: crate::htaccess::access_directive_schema(name),
+                    }
+                });
+            let previous = entries.insert(
+                name,
+                DirectiveSpec {
+                    security_sensitive: is_security_directive_with(name, &fail_closed),
+                    apache_known: true,
+                    core: core_directive_exists(name),
+                    owner: directive_owner(name),
+                    schema,
+                    access,
+                },
+            );
+            assert!(
+                previous.is_none(),
+                "duplicate directive registry entry: {name}"
+            );
         }
+        DirectiveRegistry {
+            entries,
+            fail_closed,
+        }
+    })
+}
+
+pub(crate) fn directive_spec(name: &str) -> DirectiveSpec {
+    let registry = directive_registry();
+    registry.entries.get(name).copied().unwrap_or_else(|| {
+        let access =
+            crate::htaccess::access_directive_shape(name).map(|(category, disposition)| {
+                AccessDirectiveSpec {
+                    category,
+                    disposition,
+                    schema: crate::htaccess::access_directive_schema(name),
+                }
+            });
+        DirectiveSpec {
+            security_sensitive: is_security_directive_with(name, &registry.fail_closed),
+            apache_known: false,
+            core: false,
+            owner: None,
+            schema: build_directive_payload_schema(name),
+            access,
+        }
+    })
+}
+
+impl DirectiveIdentity {
+    fn new(canonical: String) -> Self {
+        let spec = directive_spec(&canonical);
+        DirectiveIdentity { spec, canonical }
     }
 
     fn as_str(&self) -> &str {
@@ -4493,10 +4570,6 @@ impl ConfigProgram {
         let mut instructions = Vec::with_capacity(events.len());
         let mut stack: Vec<usize> = Vec::new();
         let mut depth = 0usize;
-        // These registries are immutable for one compilation. Constructing
-        // them once keeps sealing linear in the number of input events.
-        let known = known_directives();
-        let fail_closed = fail_closed_directives();
         for event in events {
             match event {
                 Event::Directive { name, args, loc } => {
@@ -4505,9 +4578,10 @@ impl ConfigProgram {
                         vapache_verified::ConfigLineKind::Directive,
                     )
                     .ok_or("configuration program depth overflow")?;
-                    let identity = DirectiveIdentity::new(name, &known, &fail_closed);
-                    let payload = SealedPayload::seal(identity.as_str(), args, identity.schema)
-                        .map_err(|message| format!("{}:{}: {message}", loc.file, loc.line))?;
+                    let identity = DirectiveIdentity::new(name);
+                    let payload =
+                        SealedPayload::seal(identity.as_str(), args, identity.spec.schema)
+                            .map_err(|message| format!("{}:{}: {message}", loc.file, loc.line))?;
                     instructions.push(ProgramEvent::Directive {
                         identity,
                         payload,
@@ -5264,11 +5338,12 @@ impl ParserState {
                     return false;
                 };
                 let directive = directive.to_ascii_lowercase();
-                let found = if core_directive_exists(&directive) {
+                let spec = directive_spec(&directive);
+                let found = if spec.core {
                     true
-                } else if let Some(owner) = directive_owner(&directive) {
+                } else if let Some(owner) = spec.owner {
                     module_name_is_loaded(&self.module_names, owner)
-                } else if !known_directives().contains(directive.as_str()) {
+                } else if !spec.apache_known {
                     false
                 } else {
                     self.error(
@@ -6373,8 +6448,8 @@ impl Compile {
         identity: &DirectiveIdentity,
     ) -> vapache_verified::DirectiveDisposition {
         vapache_verified::directive_disposition(
-            identity.security_sensitive,
-            identity.apache_known,
+            identity.spec.security_sensitive,
+            identity.spec.apache_known,
             self.strict,
         )
     }
@@ -6392,7 +6467,7 @@ impl Compile {
     ) {
         let args = payload.as_slice();
         let name = identity.as_str();
-        if !payload.refines(identity.schema.value.semantic_kind()) {
+        if !payload.refines(identity.spec.schema.value.semantic_kind()) {
             self.directive_error(
                 loc,
                 format!("internal semantic payload mismatch for directive '{name}'"),
@@ -10463,7 +10538,7 @@ pub(crate) fn parse_listen(s: &str) -> Result<ListenSpec, String> {
 /// auth/TLS/proxy/filter/DAV/LDAP/cache family fails closed too.
 #[cfg(test)]
 fn is_security_directive(name: &str) -> bool {
-    is_security_directive_with(name, &fail_closed_directives())
+    directive_spec(name).security_sensitive
 }
 
 fn is_security_directive_with(name: &str, fail_closed: &HashSet<&'static str>) -> bool {
@@ -10594,7 +10669,7 @@ pub fn fuzz_config_grammars(data: &[u8]) {
     }
 }
 
-fn known_directives() -> HashSet<&'static str> {
+fn known_directives() -> Vec<&'static str> {
     // Directives from modules not yet implemented.  Keeping an explicit list
     // (rather than accepting every unknown token) means a typo in a security
     // directive is still a startup error under --strict-config.
@@ -10614,6 +10689,7 @@ fn known_directives() -> HashSet<&'static str> {
         "addicon",
         "addiconbyencoding",
         "addiconbytype",
+        "addinputfilter",
         "addlanguage",
         "addmoduleinfo",
         "addoutputfilter",
@@ -10679,7 +10755,11 @@ fn known_directives() -> HashSet<&'static str> {
         "authuserfile",
         "authzprovideralias",
         "browsermatch",
+        "browsermatchnocase",
         "browseripmatch",
+        "brotlialteretag",
+        "brotlicompressionalteretag",
+        "brotlicompressionquality",
         "buffersize",
         "cachedefaultexpire",
         "cachedetailheader",
@@ -10701,7 +10781,6 @@ fn known_directives() -> HashSet<&'static str> {
         "cacheminexpire",
         "cachenegotiateddocs",
         "cachequickhandler",
-        "cachereadsize",
         "cachereadsize",
         "cacheremote",
         "cacheroot",
@@ -10748,6 +10827,7 @@ fn known_directives() -> HashSet<&'static str> {
         "defaulttype",
         "deflatebuffersize",
         "deflatecompressionlevel",
+        "deflatealteretag",
         "deflatefilternote",
         "deflatememlevel",
         "deflatewindowssize",
@@ -10843,7 +10923,6 @@ fn known_directives() -> HashSet<&'static str> {
         "limitrequestline",
         "limitxmlrequestbody",
         "listen",
-        "gracefulshutdowntimeout",
         "gracefulshutdowntimeout",
         "maxconnectionsperchild",
         "listenbacklog",
@@ -10960,12 +11039,10 @@ fn known_directives() -> HashSet<&'static str> {
         "scriptlogbuffer",
         "scriptloglength",
         "seccacherequestheader",
-        "seccacherequestheader",
         "seccacherequestheaders",
         "seccacherequesttime",
         "seccachesocache",
         "seccachesocacheexpiry",
-        "seccheckerreq",
         "seccheckerreq",
         "secdebuglog",
         "secdebugloglevel",
@@ -11006,6 +11083,8 @@ fn known_directives() -> HashSet<&'static str> {
         "setenv",
         "setenvif",
         "setenvifexpr",
+        "setinputfilter",
+        "setoutputfilter",
         "setenvifnocase",
         "sethandler",
         "singlelisten",
@@ -11061,7 +11140,6 @@ fn known_directives() -> HashSet<&'static str> {
         "sslstaplingstandardcachetimeout",
         "sslstaplingstaplingnoverify",
         "sslstrictpeernamecheck",
-        "sslstrictpeernamecheck",
         "sslusername",
         "sslusestapling",
         "sslverifyclient",
@@ -11071,7 +11149,6 @@ fn known_directives() -> HashSet<&'static str> {
         "sslcertificatekeyfile",
         "sslcrlfile",
         "sslproxycrlfile",
-        "sslcertificatefile",
         "startservers",
         "status",
         "substitute",
@@ -11106,9 +11183,6 @@ fn known_directives() -> HashSet<&'static str> {
         "xsltengine",
         "xsltlocale",
         "xsltprocenv",
-        "sslstaplingcache",
-        "sslcertificatefile",
-        "protocols",
         "protocoldirective",
     ]
     .into_iter()

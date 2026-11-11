@@ -1,10 +1,10 @@
 # Configuration semantics: model and proof plan
 
-This document is the bridge between the implementation and a future
-machine-checked model of Apache configuration semantics.  It is deliberately
-smaller than the full Apache directive set.  The goal is to define the
-security-relevant core precisely enough to prove, and to state exactly which
-parts are still implementation detail.
+This document is the bridge between the implementation and the machine-checked
+core of Apache configuration semantics. It is deliberately smaller than the
+full Apache directive set. The goal is to define the security-relevant core
+precisely enough to prove, and to state exactly which parts are still
+implementation detail.
 
 The running implementation now uses `policy_ref::effective_scope_with_layers`
 for both configuration phases and access-file interleaving.  The access-file
@@ -951,6 +951,15 @@ field consume `proxy_response_status_line_parse` and
 chunk sizes, extensions and trailers use the same verified grammar as inbound
 HTTP/1 bodies.
 
+Representation selection and routing fields also cross one closed, byte-level
+grammar boundary. `http_fields.rs` consumes the complete field and returns
+typed qvalues, entity tags, cookies, dates and response status codes; malformed
+members cannot be recovered as a useful prefix. Compression negotiation and
+MultiViews share the exact fixed-point qvalue parser, conditional requests
+share the entity-tag/date parsers, and sticky proxy routing uses the strict
+Cookie parser. The same entry points are a dedicated fuzz target so mutations
+exercise the grammar independently of a complete request.
+
 ### I29 — `.htaccess` directive disposition closure
 
 ```text
@@ -965,14 +974,18 @@ Reject(d)    ==> parse(d) returns an error
 forall recognized d: category(d) is defined
 ```
 
-`DIRECTIVE_SPECS` is the authoritative registry: `directive_category()` derives
-the `AllowOverride` category from it, and `apply_directive()` refuses any name
-that is absent.  The exhaustive unit matrix asserts that every registry entry
-has exactly one effect case, that the case matches observed behavior under
-`AllowOverride All`, and that the directive is denied under `AllowOverride
-None`.  Adding a directive therefore requires an explicit disposition and a
-category; an accidental “recognized but silently ignored” directive fails the
-test.
+One immutable `DirectiveRegistry` is the authoritative classifier for both the
+main and access-file compilers. Each entry seals the canonical name, ownership,
+security disposition, main payload schema and, where applicable, its
+`AllowOverride` category, access disposition and access payload schema. Both
+compilers consume that sealed entry instead of reclassifying strings during
+execution. The exhaustive unit matrix asserts that every access entry exists in
+the main vocabulary, has exactly one effect case, matches observed behavior
+under `AllowOverride All`, is denied under `AllowOverride None`, and shares the
+same semantic payload domain where it is effectful. Duplicate names fail while
+the immutable registry is built. Adding a directive therefore requires one
+consistent identity and explicit disposition; an accidental “recognized but
+silently ignored” directive or vocabulary drift fails the test.
 
 The reviewed inert set is `AddCharset`, `AddLanguage`, `AddEncoding`,
 `RemoveCharset`, `RemoveEncoding`, `AddDescription`, `IndexOptions`,
@@ -1674,6 +1687,41 @@ access-file rewrite effects run during fixups, followed by mod_env's
 `SetEnv`/`PassEnv`/`UnsetEnv`, so those values may reach CGI/FastCGI but can
 never satisfy `Require env`, change `Require expr`, or select an ACL `<If>`.
 
+### I72 — One request-policy state machine
+
+```text
+Start -> URL policy -> URL rewrite
+      -> [filesystem plan -> filesystem policy -> filesystem rewrite]
+      -> authorization -> cache classification -> sink admission -> Complete
+```
+
+`RequestPolicyState` is the single finite reference state for this complete
+path. URL retargets loop back through URL policy. Filesystem retargets loop
+back through filesystem planning and the Directory/Files/Location/Condition
+evaluator. Either retarget clears route, target/original authorization, cache
+classification and sink admission; it retains only the fact that an original
+policy existed. A retargeted request therefore cannot finish authorization
+until both the current target and the original policy have admitted it.
+
+`RequestPolicyGuard` is a closed alphabet for transition preconditions. It
+separates the event/phase table from facts such as canonical-target presence,
+URL/filesystem policy completion, authorization completion, cache eligibility
+and terminal readiness. `request_policy_guard_for` and
+`request_policy_guard_admit` are executable refinements of their Verus
+specifications; `request_policy_step` composes them with the guard-free state
+update table and fails closed on any out-of-order event.
+
+The inductive invariant proves that only `Complete` may retain sink admission,
+and every complete state has canonical/original/required target policy,
+target authorization, original authorization after any retarget, a selected
+route and a nonempty cache classification. `Rejected` is absorbing and clears
+the terminal facts. `policy_ref::RequestPolicyMachine` is the runtime
+projection used by exhaustive finite reachability tests and the `policy_path`
+coverage-guided fuzzer. Production continues to enforce the same leaf gates
+through `RequestPlan`, `AccessGrant`, `AuthorizedPlan`/`AuthorizedOutcome` and
+`CacheContext`; the reference machine is the compositional oracle that makes
+their required ordering explicit.
+
 ### I51 — Cache key byte identity
 
 ```text
@@ -1906,6 +1954,12 @@ construction: there is no second production interleaver.
   then optional `FilesAccess { depth }`, followed by DirectoryMatch Files,
   Location, config conditions and access conditions.
   `access_plan_interleaves` proves the exact structure and suffix.
+- `RequestPolicyPhase`, `RequestPolicyEvent`, `RequestPolicyGuard` and
+  `request_policy_step`. These compose canonicalization, URL and filesystem
+  policy/rewrite phases, authorization, cache classification and terminal
+  admission around the detailed access plan. The executable guard and update
+  tables refine their specifications; the inductive invariant, completion,
+  retarget, cache-order and absorbing-rejection lemmas prove I72.
 - `ConfigRuleKind`, `config_rule_phase`, `config_deferred_slot` and
   `config_rule_precedes`. The runtime exhaustively projects every `MatchKind`
   into this model; phase collection and recursive nested-rule sorting consume
@@ -2519,16 +2573,17 @@ profile with its exact executable build ID before export; this avoids the Rust
 ## 12. Known gaps before formal proof
 
 - Configuration phases and access-file interleaving now run through a verified
-  source/depth plan consumed by the single production evaluator. Rule-kind
-  phase classification, deferred-slot selection and the recursive ordering
-  comparator also consume executable Verus decisions. Lexical transitions,
-  argument bounds and immutable section structure are verified and connected.
-  The closed schema/sealed-IR/compiler semantic domains, argument preservation,
-  primitive normalizers and wrong-domain rejection are mechanically connected;
-  complex constructor equivalence to Apache and concrete library sorting
-  remain covered by the explicit oracle/refinement assumption. Container/list
-  field merging, directive disposition and `.htaccess` layer-slot translation
-  use verified helpers.
+  source/depth plan consumed by the single production evaluator. The complete
+  request-policy reference path additionally runs through the verified I72
+  state machine, with rewrites, authorization, cache classification and sink
+  admission composed around that plan. Rule-kind phase classification,
+  deferred-slot selection and the recursive ordering comparator also consume
+  executable Verus decisions. Lexical transitions, argument bounds and
+  immutable section structure are verified and connected. Complex constructor
+  equivalence to Apache and concrete library sorting remain covered by the
+  explicit oracle/refinement assumption; they no longer leave the phase-order
+  relation itself implicit. Container/list field merging, directive
+  disposition and `.htaccess` layer-slot translation use verified helpers.
 - Some module-specific merge rules are not modelled.  `AllowOverrideList`,
   `Nonfatal=...`, `Include`/`IncludeOptional` and the covered contexts are now
   implemented or covered by the differential/context matrices.

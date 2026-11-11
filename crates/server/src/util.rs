@@ -288,63 +288,10 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// Parse the three HTTP date formats accepted by RFC 9110. Returns Unix seconds.
+/// Compatibility re-export for callers that historically imported the date
+/// parser from `util`; the closed grammar lives with the other HTTP fields.
 pub fn parse_http_date(s: &[u8]) -> Option<i64> {
-    let s = std::str::from_utf8(s).ok()?.trim();
-    // IMF-fixdate: Sun, 06 Nov 1994 08:49:37 GMT
-    if let Some((_, rest)) = s.split_once(", ") {
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        if parts.len() == 5 && parts[4] == "GMT" {
-            let day: u32 = parts[0].parse().ok()?;
-            let month = month_num(parts[1])?;
-            let year: i64 = parts[2].parse().ok()?;
-            let (hh, mm, ss) = parse_hms(parts[3])?;
-            return Some(
-                days_from_civil(year, month, day) * 86_400 + (hh * 3600 + mm * 60 + ss) as i64,
-            );
-        }
-        // RFC 850: Sunday, 06-Nov-94 08:49:37 GMT
-        if parts.len() == 3 && parts[2] == "GMT" {
-            let dmy: Vec<&str> = parts[0].split('-').collect();
-            if dmy.len() == 3 {
-                let day: u32 = dmy[0].parse().ok()?;
-                let month = month_num(dmy[1])?;
-                let mut year: i64 = dmy[2].parse().ok()?;
-                year += if year < 70 { 2000 } else { 1900 };
-                let (hh, mm, ss) = parse_hms(parts[1])?;
-                return Some(
-                    days_from_civil(year, month, day) * 86_400 + (hh * 3600 + mm * 60 + ss) as i64,
-                );
-            }
-        }
-    }
-    // asctime: Sun Nov  6 08:49:37 1994
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() == 5 {
-        let month = month_num(parts[1])?;
-        let day: u32 = parts[2].parse().ok()?;
-        let (hh, mm, ss) = parse_hms(parts[3])?;
-        let year: i64 = parts[4].parse().ok()?;
-        return Some(
-            days_from_civil(year, month, day) * 86_400 + (hh * 3600 + mm * 60 + ss) as i64,
-        );
-    }
-    None
-}
-
-fn parse_hms(s: &str) -> Option<(u32, u32, u32)> {
-    let mut it = s.split(':');
-    let h = it.next()?.parse().ok()?;
-    let m = it.next()?.parse().ok()?;
-    let sec = it.next()?.parse().ok()?;
-    if it.next().is_some() || h > 23 || m > 59 || sec > 60 {
-        return None;
-    }
-    Some((h, m, sec))
-}
-
-fn month_num(s: &str) -> Option<u32> {
-    MONTHS.iter().position(|m| *m == s).map(|i| i as u32 + 1)
+    crate::http_fields::parse_http_date(s)
 }
 
 /// Case-insensitive ASCII comparison.

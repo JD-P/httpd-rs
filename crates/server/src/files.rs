@@ -507,42 +507,11 @@ struct VariantScore {
     language_priority: usize,
 }
 
-fn quality_value(raw: &str) -> Option<u16> {
-    let raw = raw.trim();
-    let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
-    if fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    match whole {
-        "0" => {
-            let mut value = 0u16;
-            for (index, byte) in fraction.bytes().enumerate() {
-                value += u16::from(byte - b'0') * [100, 10, 1][index];
-            }
-            Some(value)
-        }
-        "1" if fraction.bytes().all(|byte| byte == b'0') => Some(1000),
-        _ => None,
-    }
-}
-
-fn item_quality<'a>(parts: impl Iterator<Item = &'a str>) -> u16 {
-    for parameter in parts {
-        let Some((name, value)) = parameter.trim().split_once('=') else {
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("q") {
-            return quality_value(value).unwrap_or(0);
-        }
-    }
-    1000
-}
-
 fn media_quality(header: Option<&[u8]>, media_type: &str) -> (u16, u8) {
     let Some(header) = header else {
         return (1000, 0);
     };
-    let Ok(header) = std::str::from_utf8(header) else {
+    let Some(items) = crate::http_fields::parse_weighted_list(header) else {
         return (0, 0);
     };
     let media_type = media_type.split(';').next().unwrap_or("").trim();
@@ -550,18 +519,18 @@ fn media_quality(header: Option<&[u8]>, media_type: &str) -> (u16, u8) {
         return (0, 0);
     };
     let mut selected: Option<(u8, u16)> = None;
-    for item in header.split(',') {
-        let mut parts = item.split(';');
-        let range = parts.next().unwrap_or("").trim();
-        let Some((kind, subtype)) = range.split_once('/') else {
+    for item in items {
+        let Some(slash) = item.value.iter().position(|byte| *byte == b'/') else {
             continue;
         };
-        let specificity = if kind == "*" && subtype == "*" {
+        let kind = &item.value[..slash];
+        let subtype = &item.value[slash + 1..];
+        let specificity = if kind == b"*" && subtype == b"*" {
             Some(0)
-        } else if kind.eq_ignore_ascii_case(candidate_type) && subtype == "*" {
+        } else if kind.eq_ignore_ascii_case(candidate_type.as_bytes()) && subtype == b"*" {
             Some(1)
-        } else if kind.eq_ignore_ascii_case(candidate_type)
-            && subtype.eq_ignore_ascii_case(candidate_subtype)
+        } else if kind.eq_ignore_ascii_case(candidate_type.as_bytes())
+            && subtype.eq_ignore_ascii_case(candidate_subtype.as_bytes())
         {
             Some(2)
         } else {
@@ -570,7 +539,7 @@ fn media_quality(header: Option<&[u8]>, media_type: &str) -> (u16, u8) {
         let Some(specificity) = specificity else {
             continue;
         };
-        let quality = item_quality(parts);
+        let quality = item.quality.milli();
         if selected
             .map(|(current, _)| specificity >= current)
             .unwrap_or(true)
@@ -591,21 +560,21 @@ fn language_quality(header: Option<&[u8]>, language: Option<&str>) -> u16 {
     let Some(language) = language else {
         return 1000;
     };
-    let Ok(header) = std::str::from_utf8(header) else {
+    let Some(items) = crate::http_fields::parse_weighted_list(header) else {
         return 0;
     };
     let mut best = 0u16;
-    for item in header.split(',') {
-        let mut parts = item.split(';');
-        let range = parts.next().unwrap_or("").trim();
-        let matches = range == "*"
-            || language.eq_ignore_ascii_case(range)
+    for item in items {
+        let range = item.value;
+        let matches = range == b"*"
+            || language.as_bytes().eq_ignore_ascii_case(range)
             || language
+                .as_bytes()
                 .get(..range.len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case(range))
                 && language.as_bytes().get(range.len()) == Some(&b'-');
         if matches {
-            best = best.max(item_quality(parts));
+            best = best.max(item.quality.milli());
         }
     }
     best
@@ -617,22 +586,21 @@ fn encoding_quality(header: Option<&[u8]>, encoding: Option<&str>) -> u16 {
         // offer. The identity representation remains universally eligible.
         return if encoding.is_none() { 1000 } else { 0 };
     };
-    let Ok(header) = std::str::from_utf8(header) else {
+    let Some(items) = crate::http_fields::parse_weighted_list(header) else {
         return 0;
     };
-    let candidate = encoding.unwrap_or("identity");
+    let candidate = encoding.unwrap_or("identity").as_bytes();
     let mut explicit = None;
     let mut wildcard = None;
-    for item in header.split(',') {
-        let mut parts = item.split(';');
-        let name = parts.next().unwrap_or("").trim();
-        let quality = item_quality(parts);
+    for item in items {
+        let name = item.value;
+        let quality = item.quality.milli();
         if name.eq_ignore_ascii_case(candidate)
-            || (candidate.eq_ignore_ascii_case("x-gzip") && name.eq_ignore_ascii_case("gzip"))
-            || (candidate.eq_ignore_ascii_case("gzip") && name.eq_ignore_ascii_case("x-gzip"))
+            || (candidate.eq_ignore_ascii_case(b"x-gzip") && name.eq_ignore_ascii_case(b"gzip"))
+            || (candidate.eq_ignore_ascii_case(b"gzip") && name.eq_ignore_ascii_case(b"x-gzip"))
         {
             explicit = Some(quality);
-        } else if name == "*" {
+        } else if name == b"*" {
             wildcard = Some(quality);
         }
     }
@@ -1454,39 +1422,30 @@ fn etag(meta: &Metadata, bits: u32) -> String {
 }
 
 fn header_etag_list_matches(value: &[u8], etag: &str, weak: bool) -> bool {
-    let v = std::str::from_utf8(value).unwrap_or("");
-    for part in v.split(',') {
-        let p = part.trim();
-        if p == "*" {
-            return true;
-        }
-        let (pw, pt) = if let Some(rest) = p.strip_prefix("W/") {
-            (true, rest)
-        } else {
-            (false, p)
-        };
-        let (ew, et) = if let Some(rest) = etag.strip_prefix("W/") {
-            (true, rest)
-        } else {
-            (false, etag)
-        };
-        if weak {
-            if pt == et {
-                return true;
+    let Some(wanted) = crate::http_fields::parse_entity_tag(etag.as_bytes()) else {
+        return false;
+    };
+    match crate::http_fields::parse_entity_tag_list(value) {
+        Some(crate::http_fields::EntityTagList::Any) => true,
+        Some(crate::http_fields::EntityTagList::Tags(tags)) => tags.into_iter().any(|tag| {
+            if weak {
+                tag.weak_eq(wanted)
+            } else {
+                tag.strong_eq(wanted)
             }
-        } else if !pw && !ew && pt == et {
-            return true;
-        }
+        }),
+        None => false,
     }
-    false
 }
 
 fn current_etag_matches(value: &[u8], etag: Option<&str>, weak: bool) -> bool {
-    if std::str::from_utf8(value).is_ok_and(|value| value.split(',').any(|part| part.trim() == "*"))
-    {
-        return true;
+    match crate::http_fields::parse_entity_tag_list(value) {
+        Some(crate::http_fields::EntityTagList::Any) => true,
+        Some(crate::http_fields::EntityTagList::Tags(_)) => {
+            etag.is_some_and(|etag| header_etag_list_matches(value, etag, weak))
+        }
+        None => false,
     }
-    etag.is_some_and(|etag| header_etag_list_matches(value, etag, weak))
 }
 
 fn representation_headers(
@@ -1561,17 +1520,14 @@ fn not_modified_response(
 /// authorize a partial response because the bytes may be from a different
 /// representation.
 fn if_range_matches(value: &[u8], etag: Option<&str>, mtime: i64) -> bool {
-    let Ok(value) = std::str::from_utf8(value) else {
-        return false;
-    };
-    let value = value.trim();
-    if value.starts_with("W/") {
-        return false;
+    let value = crate::util::trim_ascii(value);
+    if let Some(candidate) = crate::http_fields::parse_entity_tag(value) {
+        return !candidate.weak
+            && etag
+                .and_then(|etag| crate::http_fields::parse_entity_tag(etag.as_bytes()))
+                .is_some_and(|current| candidate.strong_eq(current));
     }
-    if value.starts_with('"') {
-        return etag.is_some_and(|etag| !etag.starts_with("W/") && value == etag);
-    }
-    parse_http_date(value.as_bytes()).is_some_and(|time| time == mtime)
+    parse_http_date(value).is_some_and(|time| time == mtime)
 }
 
 /// Serve an opened regular file, applying HTTP conditional and range rules.
@@ -2992,13 +2948,6 @@ mod tests {
 
     #[test]
     fn multiview_quality_parsers_fail_closed() {
-        assert_eq!(quality_value("0"), Some(0));
-        assert_eq!(quality_value("0.125"), Some(125));
-        assert_eq!(quality_value("1.000"), Some(1000));
-        assert_eq!(quality_value("1.001"), None);
-        assert_eq!(quality_value("0.0000"), None);
-        assert_eq!(item_quality(["level=1"].into_iter()), 1000);
-        assert_eq!(item_quality(["q=bad"].into_iter()), 0);
         assert_eq!(media_quality(None, "text/html"), (1000, 0));
         assert_eq!(media_quality(Some(b"\xff"), "text/html"), (0, 0));
         assert_eq!(media_quality(Some(b"text/html"), "invalid"), (0, 0));
@@ -3020,6 +2969,11 @@ mod tests {
         );
         assert_eq!(encoding_quality(Some(b"gzip"), Some("br")), 0);
         assert_eq!(encoding_quality(Some(b"\xff"), Some("br")), 0);
+        assert_eq!(encoding_quality(Some(b"gzip;q=2"), Some("gzip")), 0);
+        assert_eq!(
+            media_quality(Some(b"text/html;broken"), "text/html"),
+            (0, 0)
+        );
         assert_eq!(
             language_quality(Some(b"en;q=0.7, *;q=0.1"), Some("en-US")),
             700

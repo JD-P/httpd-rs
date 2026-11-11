@@ -784,10 +784,7 @@ fn check_health_stream(
     }
     let mut reader = BufReader::new(stream);
     match read_line(&mut reader) {
-        Ok(line) => std::str::from_utf8(&line)
-            .ok()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|status| status.parse::<u16>().ok())
+        Ok(line) => crate::http_fields::parse_response_status_line(&line)
             .is_some_and(|status| (200..400).contains(&status)),
         Err(_) => false,
     }
@@ -804,14 +801,10 @@ fn sticky_route(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
-    let cookie = req?.header("cookie")?;
-    for pair in cookie.split(|byte| *byte == b';') {
-        let pair = trim_ascii_bytes(pair);
-        let Some(eq) = pair.iter().position(|byte| *byte == b'=') else {
-            continue;
-        };
-        let name = trim_ascii_bytes(&pair[..eq]);
-        let value = trim_ascii_bytes(&pair[eq + 1..]);
+    let pairs = crate::http_fields::parse_cookie(req?.header("cookie")?)?;
+    for pair in pairs {
+        let name = pair.name;
+        let value = pair.value;
         if !cookie_names
             .iter()
             .any(|candidate| name.eq_ignore_ascii_case(candidate.as_bytes()))
@@ -1411,7 +1404,7 @@ fn read_line(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
 }
 
 fn parse_proxy_status_line(line: &[u8]) -> Option<u16> {
-    crate::verified::proxy_response_status_line_parse(line)
+    crate::http_fields::parse_response_status_line(line)
 }
 
 fn read_chunked(reader: &mut impl BufRead, out: &mut impl ProxyBodySink) -> std::io::Result<()> {
@@ -6422,17 +6415,11 @@ mod coverage_tests {
         assert_eq!(sticky_route(&balancer, Some(&r), None), None);
         r.headers = Headers::default();
         r.headers.push("Cookie", "malformed; route=node.1");
-        assert_eq!(
-            sticky_route(&balancer, Some(&r), None).as_deref(),
-            Some("1")
-        );
+        assert_eq!(sticky_route(&balancer, Some(&r), None), None);
         r.headers = Headers::default();
         r.headers
             .insert("cookie", b"bad=\xff; route=node.2".to_vec());
-        assert_eq!(
-            sticky_route(&balancer, Some(&r), None).as_deref(),
-            Some("2")
-        );
+        assert_eq!(sticky_route(&balancer, Some(&r), None), None);
         assert_eq!(sticky_route(&balancer, None, None), None);
 
         assert!(next_balancer_member(0, &balancer, None, None, None).is_none());
@@ -7111,6 +7098,11 @@ mod coverage_tests {
         };
         assert!(check_health_stream(
             Box::new(MockStream::new("HTTP/1.1 204 No Content\r\n\r\n")),
+            &spec,
+            &good
+        ));
+        assert!(!check_health_stream(
+            Box::new(MockStream::new("garbage 204\r\n")),
             &spec,
             &good
         ));

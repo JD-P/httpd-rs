@@ -14,7 +14,7 @@ cargo +"$NIGHTLY" --version >/dev/null
 
 SECONDS_PER_TARGET=${FUZZ_SECONDS_PER_TARGET:-300}
 MAX_LEN=${FUZZ_MAX_LEN:-1048576}
-TARGETS=${FUZZ_TARGETS:-"http_request http_connection config_sections config_compile htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames h2_output h2_stateful cache_metadata tls_policy ocsp_der pcre2_differential pcre2_grammar pcre2_resource resource_transitions"}
+TARGETS=${FUZZ_TARGETS:-"http_request http_connection http_fields config_sections config_compile config_grammars htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames h2_output h2_stateful cache_metadata tls_policy ocsp_der pcre2_differential pcre2_grammar pcre2_resource resource_transitions policy_path"}
 
 for target in $TARGETS; do
     echo "fuzz-campaign: $target (${SECONDS_PER_TARGET}s)"

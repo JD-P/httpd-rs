@@ -50,6 +50,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "http_fields"
+path = "fuzz_targets/http_fields.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "config_compile"
 path = "fuzz_targets/config_compile.rs"
 test = false
@@ -157,6 +164,13 @@ bench = false
 [[bin]]
 name = "resource_transitions"
 path = "fuzz_targets/resource_transitions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_path"
+path = "fuzz_targets/policy_path.rs"
 test = false
 doc = false
 bench = false

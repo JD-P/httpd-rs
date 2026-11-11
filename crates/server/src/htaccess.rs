@@ -1349,9 +1349,10 @@ impl AccessProgram {
                         vapache_verified::ConfigLineKind::Directive,
                     )
                     .ok_or_else(|| format!("line {line_number}: access program depth overflow"))?;
-                    let known = directive_category(&name).is_some();
-                    let payload = if known {
-                        SealedPayload::seal(&name, args, access_directive_schema(&name))
+                    let spec = crate::config::directive_spec(&name);
+                    let known = spec.access.is_some();
+                    let payload = if let Some(access) = spec.access {
+                        SealedPayload::seal(&name, args, access.schema)
                             .map_err(|error| format!("line {line_number}: {error}"))?
                     } else {
                         // Unknown directives are retained so Nonfatal=Unknown
@@ -2059,7 +2060,7 @@ fn skip_section(program: &AccessProgram, i: &mut usize, name: &str) -> Result<()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DirectiveDisposition {
+pub(crate) enum DirectiveDisposition {
     /// The directive must change the parsed scope or add a rule.
     Effectful,
     /// The directive is recognized but refused in `.htaccess`.
@@ -2307,7 +2308,7 @@ const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
         DirectiveDisposition::Effectful,
     ),
     (
-        "readmefile",
+        "readmename",
         OverrideCategory::Indexes,
         DirectiveDisposition::Reject,
     ),
@@ -2441,23 +2442,28 @@ static TEST_UNHANDLED_SPEC: (&str, OverrideCategory, DirectiveDisposition) = (
     DirectiveDisposition::Effectful,
 );
 
-fn directive_spec(
+pub(crate) fn access_directive_shape(
     name: &str,
-) -> Option<&'static (&'static str, OverrideCategory, DirectiveDisposition)> {
+) -> Option<(OverrideCategory, DirectiveDisposition)> {
     #[cfg(test)]
     {
         if name == TEST_REJECT_SPEC.0 {
-            return Some(&TEST_REJECT_SPEC);
+            return Some((TEST_REJECT_SPEC.1, TEST_REJECT_SPEC.2));
         }
         if name == TEST_UNHANDLED_SPEC.0 {
-            return Some(&TEST_UNHANDLED_SPEC);
+            return Some((TEST_UNHANDLED_SPEC.1, TEST_UNHANDLED_SPEC.2));
         }
     }
-    DIRECTIVE_SPECS.iter().find(|spec| spec.0 == name)
+    DIRECTIVE_SPECS
+        .iter()
+        .find(|spec| spec.0 == name)
+        .map(|spec| (spec.1, spec.2))
 }
 
 fn directive_category(name: &str) -> Option<OverrideCategory> {
-    directive_spec(name).map(|spec| spec.1)
+    crate::config::directive_spec(name)
+        .access
+        .map(|spec| spec.category)
 }
 
 #[cfg(test)]
@@ -2521,7 +2527,7 @@ fn directive_allowed_list(
 /// Schema used while sealing an access program, before section admission or
 /// execute-on-read skipping. A malformed child therefore cannot hide in an
 /// inactive wrapper and later acquire meaning after a configuration change.
-fn access_directive_schema(name: &str) -> PayloadSchema {
+pub(crate) fn access_directive_schema(name: &str) -> PayloadSchema {
     let (min, max) = match name {
         "authtype"
         | "authname"
@@ -2547,7 +2553,7 @@ fn access_directive_schema(name: &str) -> PayloadSchema {
         | "deflatememlevel"
         | "deflatewindowssize"
         | "headername"
-        | "readmefile"
+        | "readmename"
         | "cgipassauth" => (1, Some(1)),
         "errordocument" | "redirectpermanent" | "redirecttemp" => (2, Some(2)),
         "redirect" | "redirectmatch" | "rewritecond" | "rewriterule" => (2, Some(3)),
@@ -2650,15 +2656,15 @@ fn apply_directive(
     require_only: bool,
 ) -> Result<(), String> {
     let args = payload.as_slice();
-    if !payload.refines(access_directive_schema(name).value.semantic_kind()) {
+    let Some(spec) = crate::config::directive_spec(name).access else {
+        return Err(format!("unsupported .htaccess directive '{name}'"));
+    };
+    if !payload.refines(spec.schema.value.semantic_kind()) {
         return Err(format!(
             "internal semantic payload mismatch for .htaccess directive '{name}'"
         ));
     }
-    let Some(spec) = directive_spec(name) else {
-        return Err(format!("unsupported .htaccess directive '{name}'"));
-    };
-    if spec.2 == DirectiveDisposition::Reject {
+    if spec.disposition == DirectiveDisposition::Reject {
         return Err(match name {
             "allowmethods" => {
                 "AllowMethods is only allowed in directory configuration, not .htaccess".into()
@@ -3849,7 +3855,7 @@ mod tests {
             effect: ExpectedEffect::Changed,
         },
         DirectiveCase {
-            name: "readmefile",
+            name: "readmename",
             args: &["README"],
             effect: ExpectedEffect::Error,
         },
@@ -5638,12 +5644,30 @@ mod tests {
             if *disposition != DirectiveDisposition::Effectful {
                 continue;
             }
-            let access = access_directive_schema(name);
-            let main = crate::config::directive_payload_schema(name);
+            let spec = crate::config::directive_spec(name);
+            let access = spec.access.expect("registered access directive").schema;
+            let main = spec.schema;
             assert_eq!(
                 access.value.semantic_kind(),
                 main.value.semantic_kind(),
                 "main and .htaccess semantic schemas drifted for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn access_directives_are_owned_by_the_shared_registry() {
+        for (name, category, disposition) in DIRECTIVE_SPECS {
+            let spec = crate::config::directive_spec(name);
+            assert!(
+                spec.apache_known,
+                "{name} is missing from the main registry"
+            );
+            let access = spec.access.expect("registered access directive");
+            assert_eq!(access.category, *category, "category drift for {name}");
+            assert_eq!(
+                access.disposition, *disposition,
+                "disposition drift for {name}"
             );
         }
     }

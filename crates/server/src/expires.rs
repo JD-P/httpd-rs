@@ -32,6 +32,9 @@ fn duration(spec: &str) -> Option<i64> {
     }
     let n: i64 = words.get(i)?.parse().ok()?;
     let unit = words.get(i + 1)?.to_ascii_lowercase();
+    if i + 2 != words.len() {
+        return None;
+    }
     let seconds = match unit.trim_end_matches('s') {
         "second" => 1,
         "minute" => 60,
@@ -159,6 +162,7 @@ mod tests {
         assert_eq!(duration("access 1 year"), Some(31_536_000));
         assert!(duration("access 1 fortnight").is_none());
         assert!(duration("access nope seconds").is_none());
+        assert!(duration("access plus 1 hour garbage").is_none());
         assert!(duration("access 9223372036854775807 years").is_none());
     }
 
