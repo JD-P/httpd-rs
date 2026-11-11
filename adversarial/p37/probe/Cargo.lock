@@ -221,7 +221,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "vapache-pcre2"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "regex-automata",
  "regex-syntax",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "vapache-verified"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "vstd",
 ]

@@ -1095,7 +1095,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vapache-os"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "libc",
  "rustix",
@@ -1103,7 +1103,7 @@ dependencies = [
 
 [[package]]
 name = "vapache-pcre2"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "pcre2",
  "pcre2-sys",
@@ -1115,14 +1115,14 @@ dependencies = [
 
 [[package]]
 name = "vapache-verified"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "vstd",
 ]
 
 [[package]]
 name = "vapached"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.22.1",
  "bcrypt",
