@@ -1722,6 +1722,17 @@ through `RequestPlan`, `AccessGrant`, `AuthorizedPlan`/`AuthorizedOutcome` and
 `CacheContext`; the reference machine is the compositional oracle that makes
 their required ordering explicit.
 
+`whole_request_differential` is the production-path refinement oracle around
+that state machine. It generates one bounded logical request, serializes it as
+HTTP/1 and through the vendored HTTP/2 client/server codec, and then requires
+both decoded requests to have identical canonical request bytes, request plan,
+authorization outcome, selected backend identity, cache classification and
+response semantics. Denials must have neither a protected sink nor a backend,
+and the complete process, per-client, filesystem, transport and queued-output
+resource ledgers must return to zero after each protocol projection. The fixed
+seed matrix covers static, cache-eligible, denied, proxy, redirect and rewrite
+paths; the nightly campaign mutates their composed interactions.
+
 ### I51 — Cache key byte identity
 
 ```text
@@ -2524,6 +2535,9 @@ The pre-proof suite is:
 - `tests/adversarial_regressions.py` — end-to-end F23–F38 finding replays
   (authorization transforms, cache identity, alias/rewrite/FastCGI
   containment, request-header effects and CGI identity).
+- `whole_request_differential` — coverage-guided HTTP/1 versus HTTP/2
+  differential over the canonical request, request plan, authorization,
+  backend/cache binding, response semantics and resource-ledger lifetime.
 - Rust unit invariants in `config.rs`, `htaccess.rs`, `access.rs`, `cache.rs`,
   `fastcgi.rs`, `proxy.rs`, `rewrite.rs` and `server.rs`.
 

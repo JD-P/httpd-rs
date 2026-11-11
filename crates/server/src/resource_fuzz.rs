@@ -273,6 +273,7 @@ fn assert_consistent(budget: &ResourceBudget) {
                 .expect("client slot usage overflowed");
         }
     }
+    assert_eq!(client_slots, snapshot.client_slots);
     assert_eq!(client_slots, snapshot.slots);
     drop(slot_clients);
 
@@ -291,6 +292,7 @@ fn assert_consistent(budget: &ResourceBudget) {
                 .expect("client byte usage overflowed");
         }
     }
+    assert_eq!(client_bytes, snapshot.client_bytes);
     assert_eq!(client_bytes, snapshot.bytes);
     drop(byte_clients);
 
@@ -539,7 +541,12 @@ pub(super) fn run(data: &[u8]) {
                                 // the transport-owned head must keep the H2
                                 // stream charged until its owner is dropped.
                                 state.outputs[index].finish_response();
-                                assert_eq!(before, budget.transition_snapshot());
+                                let mut expected = before;
+                                expected.queued_h2_outputs = expected
+                                    .queued_h2_outputs
+                                    .checked_add(1)
+                                    .expect("queued HTTP/2 output usage overflowed");
+                                assert_eq!(expected, budget.transition_snapshot());
                                 insert_bounded(
                                     &mut state.queued_h2_outputs,
                                     (context, lease),

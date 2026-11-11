@@ -175,6 +175,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "whole_request_differential"
+path = "fuzz_targets/whole_request_differential.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
 

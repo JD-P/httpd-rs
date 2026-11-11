@@ -433,6 +433,119 @@ fn forbidden_h2_header(name: &str, value: &[u8]) -> bool {
     !crate::verified::h2_header_field_admit(name.as_bytes(), value)
 }
 
+struct H2HeadProjection {
+    request: Request,
+    declared: Option<u64>,
+}
+
+fn project_h2_target(
+    method: &str,
+    uri: &http::Uri,
+    https: bool,
+    field_size_limit: usize,
+) -> Result<Vec<u8>, Response> {
+    if uri.authority().is_some_and(|authority| {
+        !vapache_verified::h2_field_size_admit(
+            b"host".len() as u64,
+            authority.as_str().len() as u64,
+            field_size_limit as u64,
+        )
+    }) {
+        return Err(bad(431, "request header field too large"));
+    }
+    request_target(method, uri, https).ok_or_else(|| bad(400, "invalid HTTP/2 request target"))
+}
+
+/// Project the decoded HTTP/2 pseudo-header/header view into the same
+/// canonical `Request` consumed by HTTP/1 dispatch. This function owns the
+/// complete adapter boundary and is also used by the whole-request
+/// differential fuzzer; keeping one implementation prevents the oracle from
+/// silently drifting away from production.
+fn project_h2_head(
+    method: String,
+    target: Vec<u8>,
+    authority: Option<&str>,
+    fields: &http::HeaderMap,
+    request_line_limit: usize,
+    field_count_limit: usize,
+    field_size_limit: usize,
+) -> Result<H2HeadProjection, Response> {
+    let (raw_path, query) = match target.iter().position(|byte| *byte == b'?') {
+        Some(index) => (target[..index].to_vec(), target[index + 1..].to_vec()),
+        None => (target.clone(), Vec::new()),
+    };
+
+    let mut headers = crate::http::Headers::default();
+    let mut header_budget =
+        vapache_verified::h2_header_init(vapache_verified::h2_settings().max_header_list as u64);
+    let mut header_count = 0u64;
+    let mut largest_field = 0u64;
+    for (name, value) in fields.iter() {
+        let field_len = name.as_str().len().saturating_add(value.as_bytes().len()) as u64;
+        let Some(next) = vapache_verified::h2_header_add(header_budget, field_len) else {
+            return Err(bad(431, "request header list too large"));
+        };
+        header_budget = next;
+        header_count = header_count.saturating_add(1);
+        largest_field = largest_field.max(field_len);
+        if forbidden_h2_header(name.as_str(), value.as_bytes()) {
+            return Err(bad(400, "connection-specific HTTP/2 header"));
+        }
+
+        // :authority is authoritative. A legacy Host field still consumes
+        // the configured head budgets but cannot select a second identity.
+        if name.as_str() == "host" {
+            continue;
+        }
+        headers.push_merged(name.as_str(), value.as_bytes());
+    }
+    if let Some(authority) = authority {
+        let value = authority.as_bytes();
+        let field_len = b"host".len().saturating_add(value.len()) as u64;
+        let Some(next) = vapache_verified::h2_header_add(header_budget, field_len) else {
+            return Err(bad(431, "request header list too large"));
+        };
+        header_budget = next;
+        header_count = header_count.saturating_add(1);
+        largest_field = largest_field.max(field_len);
+        headers.push("host", value.to_vec());
+    }
+    let _ = header_budget;
+
+    if let Some(response) = head_error_response(vapache_verified::h2_head_admit(
+        method.as_bytes(),
+        target.len() as u64,
+        request_line_limit as u64,
+        header_count,
+        field_count_limit as u64,
+        largest_field,
+        field_size_limit as u64,
+    )) {
+        return Err(response);
+    }
+    let declared = canonicalize_content_length(&mut headers)
+        .map_err(|()| bad(400, "invalid Content-Length"))?;
+
+    Ok(H2HeadProjection {
+        request: Request {
+            method,
+            target,
+            raw_path,
+            query,
+            version: Version::Http2,
+            headers,
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            // DATA framing remains owned by h2. The caller installs the
+            // shared logical body marker after observing END_STREAM/CL.
+            framing: crate::verified::BodyFraming::None,
+        },
+        declared,
+    })
+}
+
 async fn read_body(
     mut recv: h2::RecvStream,
     limit: u64,
@@ -1256,39 +1369,20 @@ async fn handle_stream(
     // head admission below still determines final error precedence for all
     // fields, but no field parser should receive more than the configured
     // HTTP/1-compatible per-field limit first.
-    if uri.authority().is_some_and(|authority| {
-        !vapache_verified::h2_field_size_admit(
-            b"host".len() as u64,
-            authority.as_str().len() as u64,
-            cfg.limit_request_field_size as u64,
-        )
-    }) {
-        return send_response_with_admission(
-            respond,
-            &cfg,
-            bad(431, "request header field too large"),
-            false,
-            &mut output_admission,
-        )
-        .await
-        .is_err();
-    }
-    let Some(target) = request_target(&method, &uri, true) else {
-        return send_response_with_admission(
-            respond,
-            &cfg,
-            bad(400, "invalid HTTP/2 request target"),
-            false,
-            &mut output_admission,
-        )
-        .await
-        .is_err();
+    let target = match project_h2_target(&method, &uri, true, cfg.limit_request_field_size) {
+        Ok(target) => target,
+        Err(response) => {
+            return send_response_with_admission(
+                respond,
+                &cfg,
+                response,
+                false,
+                &mut output_admission,
+            )
+            .await
+            .is_err();
+        }
     };
-    let (raw_path, query) = match target.iter().position(|b| *b == b'?') {
-        Some(i) => (target[..i].to_vec(), target[i + 1..].to_vec()),
-        None => (target.clone(), Vec::new()),
-    };
-
     // The adapter creates a second owned representation of the decoded h2
     // request. Charge it before cloning and retain the lease through dispatch
     // and response sending.
@@ -1348,126 +1442,32 @@ async fn handle_stream(
     }
     let mut request_resident = Some(request_resident);
 
-    let mut headers = crate::http::Headers::default();
-    let mut header_budget =
-        vapache_verified::h2_header_init(vapache_verified::h2_settings().max_header_list as u64);
-    let mut header_count = 0u64;
-    let mut largest_field = 0u64;
-    for (name, value) in parts.headers.iter() {
-        let field_len = name.as_str().len().saturating_add(value.as_bytes().len()) as u64;
-        let Some(next) = vapache_verified::h2_header_add(header_budget, field_len) else {
-            let _ = send_response_with_admission(
-                respond,
-                &cfg,
-                bad(431, "request header list too large"),
-                false,
-                &mut output_admission,
-            )
-            .await;
-            return true;
-        };
-        header_budget = next;
-        header_count = header_count.saturating_add(1);
-        largest_field = largest_field.max(field_len);
-
-        // RFC 9113 forbids connection-specific fields.  The h2 codec rejects
-        // them today, but keep the downgrade boundary explicit in the
-        // adapter so a dependency behavior change cannot reintroduce the
-        // Transfer-Encoding smuggling primitive (CVE-2026-58150).
-        if forbidden_h2_header(name.as_str(), value.as_bytes()) {
-            let _ = send_response_with_admission(
-                respond,
-                &cfg,
-                bad(400, "connection-specific HTTP/2 header"),
-                false,
-                &mut output_admission,
-            )
-            .await;
-            return true;
-        }
-
-        // :authority is authoritative in HTTP/2.  Ignore any legacy Host
-        // header so a conflicting pair cannot select a different vhost than
-        // the one used for TLS SNI/absolute redirects. It still counts toward
-        // all request-head limits above.
-        if name.as_str() == "host" {
-            continue;
-        }
-        headers.push_merged(name.as_str(), value.as_bytes());
-    }
-    // HTTP/2 carries the authority in :authority (exposed through the URI),
-    // not in a Host header.  Apache exposes it as Host to modules/CGI.
-    if let Some(authority) = uri.authority() {
-        let value = authority.as_str().as_bytes();
-        let field_len = b"host".len().saturating_add(value.len()) as u64;
-        let Some(_next) = vapache_verified::h2_header_add(header_budget, field_len) else {
-            let _ = send_response_with_admission(
-                respond,
-                &cfg,
-                bad(431, "request header list too large"),
-                false,
-                &mut output_admission,
-            )
-            .await;
-            return true;
-        };
-        header_count = header_count.saturating_add(1);
-        largest_field = largest_field.max(field_len);
-        headers.push("host", value.to_vec());
-    }
-
-    // Apply the same request bounds as the HTTP/1 parser.  HTTP/2's HPACK
-    // decoder has its own table limits, but that does not replace Apache's
-    // LimitRequestLine/Fields/FieldSize policy.  The whole head is admitted by
-    // one verified decision function so rejection precedence cannot drift
-    // between the h2 and HTTP/1 paths.
-    let head_error = head_error_response(vapache_verified::h2_head_admit(
-        method.as_bytes(),
-        target.len() as u64,
-        cfg.limit_request_line as u64,
-        header_count,
-        cfg.limit_request_fields as u64,
-        largest_field,
-        cfg.limit_request_field_size as u64,
-    ));
-    if let Some(resp) = head_error {
-        return send_response_with_admission(respond, &cfg, resp, false, &mut output_admission)
-            .await
-            .is_err();
-    }
-    let declared = match canonicalize_content_length(&mut headers) {
-        Ok(declared) => declared,
-        Err(()) => {
-            // h2 validates Content-Length syntax and duplicates before
-            // yielding an accepted request.
-            // coverage:ignore-start - upstream h2 framing invariant
+    let H2HeadProjection {
+        request: mut req,
+        declared,
+    } = match project_h2_head(
+        method,
+        target,
+        uri.authority().map(|authority| authority.as_str()),
+        &parts.headers,
+        cfg.limit_request_line,
+        cfg.limit_request_fields,
+        cfg.limit_request_field_size,
+    ) {
+        Ok(projected) => projected,
+        Err(response) => {
             return send_response_with_admission(
                 respond,
                 &cfg,
-                bad(400, "invalid Content-Length"),
+                response,
                 false,
                 &mut output_admission,
             )
             .await
             .is_err();
-            // coverage:ignore-stop
         }
     };
-    headers.bind_request_scope(request_scope.clone());
-    let mut req = Request {
-        method,
-        target,
-        raw_path,
-        query,
-        version: Version::Http2,
-        headers,
-        body: Vec::new(),
-        body_spool: None,
-        keep_alive: true,
-        expect_continue: false,
-        // HTTP/2 framing is handled by the h2 crate before a `Request` exists.
-        framing: crate::verified::BodyFraming::None,
-    };
+    req.headers.bind_request_scope(request_scope.clone());
     if let Some(status) =
         tls_identity.request_status(&cfg, req.header_str("host").filter(|host| !host.is_empty()))
     {
@@ -2122,6 +2122,177 @@ pub fn fuzz_h2_frames(data: &[u8]) {
     h2::fuzz_bridge::fuzz_logic::fuzz_hpack(data);
 
     run_h2_fuzz_wire(data[..data.len().min(256 * 1024)].to_vec());
+}
+
+/// Encode one logical request through the real h2 client, decode it through
+/// the vendored server state machine, and consume the production head/body
+/// projection. The whole-request differential campaign pairs the result with
+/// the HTTP/1 parser before running both through policy and dispatch.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn differential_decode_request(
+    cfg: &Config,
+    method: &str,
+    target: &str,
+    fields: &[(String, Vec<u8>)],
+    body: &[u8],
+    peer: std::net::IpAddr,
+) -> Result<Request, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        let capacity = 64 * 1024;
+        let (client_io, server_io) = tokio::io::duplex(capacity);
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let server_driver = tokio::spawn(async move {
+            let Ok(mut connection) = h2::server::handshake(server_io).await else {
+                return;
+            };
+            let Some(Ok(first)) = connection.accept().await else {
+                return;
+            };
+            if accepted_tx.send(first).is_err() {
+                return;
+            }
+            while let Some(result) = connection.accept().await {
+                match result {
+                    Ok((_request, mut response)) => {
+                        response.send_reset(h2::Reason::REFUSED_STREAM);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let (mut client, client_connection) = h2::client::handshake(client_io)
+            .await
+            .map_err(|error| error.to_string())?;
+        let client_driver = tokio::spawn(async move {
+            let _ = client_connection.await;
+        });
+
+        let uri = format!("https://localhost{target}")
+            .parse::<http::Uri>()
+            .map_err(|error| error.to_string())?;
+        let mut outbound = http::Request::builder().method(method).uri(uri);
+        {
+            let headers = outbound
+                .headers_mut()
+                .ok_or_else(|| "HTTP/2 request builder lost its headers".to_string())?;
+            for (name, value) in fields {
+                let name =
+                    HeaderName::from_bytes(name.as_bytes()).map_err(|error| error.to_string())?;
+                let value = HeaderValue::from_bytes(value).map_err(|error| error.to_string())?;
+                headers.append(name, value);
+            }
+            if !body.is_empty() {
+                headers.insert(
+                    HeaderName::from_static("content-length"),
+                    HeaderValue::from_str(&body.len().to_string())
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        let outbound = outbound.body(()).map_err(|error| error.to_string())?;
+        let (_response, mut send) = client
+            .send_request(outbound, body.is_empty())
+            .map_err(|error| error.to_string())?;
+        if !body.is_empty() {
+            send.send_data(Bytes::copy_from_slice(body), true)
+                .map_err(|error| error.to_string())?;
+        }
+
+        let (request, mut respond) = tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+            .await
+            .map_err(|_| "HTTP/2 differential request timed out".to_string())?
+            .map_err(|_| "HTTP/2 differential connection closed".to_string())?;
+        let (parts, recv) = request.into_parts();
+        let target = project_h2_target(
+            parts.method.as_str(),
+            &parts.uri,
+            true,
+            cfg.limit_request_field_size,
+        )
+        .map_err(|response| format!("HTTP/2 target rejected with {}", response.status))?;
+        let H2HeadProjection {
+            request: mut projected,
+            declared,
+        } = project_h2_head(
+            parts.method.as_str().to_string(),
+            target,
+            parts.uri.authority().map(|authority| authority.as_str()),
+            &parts.headers,
+            cfg.limit_request_line,
+            cfg.limit_request_fields,
+            cfg.limit_request_field_size,
+        )
+        .map_err(|response| format!("HTTP/2 head rejected with {}", response.status))?;
+
+        let context = cfg.resource_budget.context(peer);
+        let mut resident = cfg
+            .resource_budget
+            .try_request_bytes_in(&context)
+            .map_err(|error| error.to_string())?;
+        let head_bytes = projected
+            .target
+            .len()
+            .saturating_add(
+                projected
+                    .headers
+                    .iter()
+                    .map(|(name, value)| name.len().saturating_add(value.len()).saturating_add(2))
+                    .sum::<usize>(),
+            )
+            .saturating_mul(2);
+        resident
+            .reserve(head_bytes as u64)
+            .map_err(|error| error.to_string())?;
+        projected
+            .headers
+            .bind_request_scope(crate::resource::RequestScope::new(context.clone()));
+
+        let has_body = declared.unwrap_or(0) > 0 || !recv.is_end_stream();
+        if has_body {
+            projected.framing = declared
+                .map(crate::verified::BodyFraming::Length)
+                .unwrap_or(crate::verified::BodyFraming::Chunked);
+            let decoded = read_body(
+                recv,
+                cfg.limit_request_body.min(crate::http::MAX_BODY_BUFFERED),
+                Duration::from_secs(1),
+                0,
+                cfg.resource_budget.clone(),
+                cfg.max_spool_bytes,
+                cfg.max_spool_files,
+                context,
+                &mut resident,
+                false,
+            )
+            .await
+            .map_err(|failure| match failure {
+                H2ReadFailure::Reset => "HTTP/2 body reset".to_string(),
+                H2ReadFailure::BackendClosed => "HTTP/2 body backend closed".to_string(),
+                H2ReadFailure::Response(response) => {
+                    format!("HTTP/2 body rejected with {}", response.status)
+                }
+            })?;
+            if declared.is_some_and(|length| length != decoded.len) {
+                return Err("HTTP/2 Content-Length mismatch".to_string());
+            }
+            projected.body = decoded.bytes;
+            projected.body_spool = decoded.spool;
+        } else if declared != Some(0) && declared.is_some() {
+            return Err("HTTP/2 empty body length mismatch".to_string());
+        }
+        projected.headers.hold_resident(resident);
+        respond.send_reset(h2::Reason::NO_ERROR);
+        drop(client);
+        client_driver.abort();
+        server_driver.abort();
+        let _ = client_driver.await;
+        let _ = server_driver.await;
+        Ok(projected)
+    })
 }
 
 #[cfg(feature = "fuzzing")]

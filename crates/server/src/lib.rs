@@ -62,6 +62,9 @@ pub mod status;
 pub mod tls;
 pub mod util;
 
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod whole_request_fuzz;
+
 pub use vapache_verified as verified;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
