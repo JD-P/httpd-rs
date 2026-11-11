@@ -758,6 +758,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vapache-os"
+version = "0.2.1"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
 name = "vapache-pcre2"
 version = "0.2.1"
 dependencies = [
@@ -796,6 +804,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-rustls",
+ "vapache-os",
  "vapache-pcre2",
  "vapache-verified",
  "webpki-roots",

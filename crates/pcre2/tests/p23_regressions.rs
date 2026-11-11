@@ -121,7 +121,7 @@ fn p23_g_h_i_j_capture_escape_and_empty_alternative_compatibility() {
 }
 
 #[test]
-fn p23_k_l_crlf_and_multiline_iteration_match_oracle() {
+fn p23_k_l_crlf_matches_and_multiline_start_fails_closed() {
     let mut rust_builder = rust::RegexBuilder::new();
     rust_builder.crlf(true);
     let mut oracle_builder = oracle::RegexBuilder::new();
@@ -134,21 +134,12 @@ fn p23_k_l_crlf_and_multiline_iteration_match_oracle() {
         assert_eq!(rust, oracle, "{pattern:?}");
     }
 
-    for (pattern, subject) in [
-        (r"(?m)^", b"a\n".as_slice()),
-        (r"(?m)^$", b"\n\n".as_slice()),
-    ] {
-        let rust: Vec<_> = rust::Regex::new(pattern)
-            .unwrap()
-            .find_iter(subject)
-            .map(|m| m.map(|m| (m.start(), m.end())).unwrap())
-            .collect();
-        let oracle: Vec<_> = oracle::Regex::new(pattern)
-            .unwrap()
-            .find_iter(subject)
-            .map(|m| m.map(|m| (m.start(), m.end())).unwrap())
-            .collect();
-        assert_eq!(rust, oracle, "{pattern:?}");
+    for pattern in [r"(?m)^", r"(?m)^$"] {
+        assert_eq!(
+            rust::Regex::new(pattern).unwrap_err().kind(),
+            ErrorKind::Unsupported,
+            "{pattern:?}",
+        );
     }
 }
 

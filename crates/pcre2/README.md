@@ -45,7 +45,7 @@ reinterpret them as word-boundary assertions, and Rust-only extended boundary
 forms such as `\b{start}` are rejected.
 UTF/UCP class and escape forms whose semantics would be narrowed by the
 byte-class lowering (including Unicode-sensitive POSIX classes, raw
-non-ASCII classes, `\C`, `\R`, `\h` and `\v`) likewise fail closed.
+non-ASCII classes, `\C`, `\h` and `\v`) likewise fail closed.
 Malformed UTF and UCP subjects fail closed in full. PCRE2's strict validation
 window varies with offsets, anchors and word boundaries, while
 `MATCH_INVALID_UTF` treats invalid sequences as barriers between valid
@@ -57,6 +57,14 @@ that a scalar-aware automata iterator cannot reproduce. Under ANYCRLF, generic
 classes that can start on the LF half of CRLF and lone-CR extended-comment
 terminators are rejected; explicit `\n`, positive byte classes, LF comments,
 and CRLF comments remain admitted.
+
+PCRE2's atomic `\R` line-sequence escape is excluded in every mode: preserving
+the indivisibility of CRLF changes match and capture priority according to the
+following atom, which the automata backend cannot express uniformly. A `^`
+anchor is likewise excluded whenever multiline mode is effective because
+PCRE2 and the backend disagree at a final newline and at CRLF start offsets.
+Quoted `\R`, literal carets, ordinary non-multiline `^`, and scopes that
+explicitly disable multiline mode remain in the admitted grammar.
 
 Resource policy is part of the API, not a timeout:
 

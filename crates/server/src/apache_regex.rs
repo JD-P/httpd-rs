@@ -66,6 +66,10 @@ mod tests {
             r"(?u:rust_unicode)",
             r"(?R:rust_crlf)",
             r"\b{start}",
+            r"\R",
+            r"\R\s",
+            r"(?m)^",
+            r"\D(?m:^)$",
             r"\y",
             "(?x)(?\r)",
         ] {

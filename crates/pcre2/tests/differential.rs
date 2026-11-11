@@ -112,8 +112,8 @@ const CASES: &[Case] = &[
         caseless: false,
     },
     Case {
-        pattern: r"a\Rb",
-        subject: b"a\r\nb",
+        pattern: r"a\vb",
+        subject: b"a\nb",
         caseless: false,
     },
     Case {

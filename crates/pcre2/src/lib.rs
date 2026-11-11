@@ -4,7 +4,8 @@
 //! API.  It compiles the regular subset of the PCRE2 10.46 pattern language
 //! to Rust's bounded automata engine.  Constructs that require a recursive
 //! backtracking interpreter (backreferences, recursion, look-around,
-//! conditionals and backtracking verbs) are rejected at compile time.
+//! conditionals and backtracking verbs), atomic CRLF line-sequence behavior,
+//! or exact multiline-start-anchor behavior are rejected at compile time.
 //!
 //! The matcher is byte oriented by default, just like PCRE2's 8-bit API
 //! without `PCRE2_UTF`/`PCRE2_UCP`.  No executable memory or native code is
@@ -73,7 +74,7 @@ impl Error {
     fn unsupported(offset: usize, construct: &str) -> Self {
         Self {
             kind: ErrorKind::Unsupported,
-            message: format!("{construct} requires PCRE2 backtracking semantics"),
+            message: format!("{construct} is outside the supported deterministic PCRE2 grammar"),
             offset: Some(offset),
         }
     }
@@ -205,6 +206,7 @@ pub mod bytes {
             let admitted = AdmittedPattern::parse(
                 pattern,
                 self.config.extended,
+                self.config.multi_line,
                 self.config.crlf,
                 self.config.nest_limit,
                 self.config.utf || self.config.ucp,
@@ -279,7 +281,6 @@ pub mod bytes {
                 translated_pattern: translation.pattern,
                 complexity,
                 final_newline_fallback: translation.final_newline_fallback,
-                multiline_start_anchor: translation.multiline_start_anchor,
                 inner: TieredEngine::new(cold, hir, self.config.size_limit),
                 public_to_inner: Arc::new(public_to_inner),
                 keep_groups: Arc::new(keep_groups),
@@ -411,7 +412,6 @@ pub mod bytes {
         translated_pattern: String,
         complexity: u64,
         final_newline_fallback: bool,
-        multiline_start_anchor: bool,
         inner: TieredEngine,
         public_to_inner: Arc<Vec<usize>>,
         keep_groups: Arc<Vec<usize>>,
@@ -570,15 +570,7 @@ pub mod bytes {
             let start = self.normalized_search_start(subject, start);
             let engine = self.inner.for_search();
             if self.public_to_inner.len() == 1 && self.keep_groups.is_empty() {
-                let mut spans = self.group_zero_spans(engine, subject, start);
-                if spans.as_ref().is_some_and(|spans| {
-                    spans[0].is_some_and(|(match_start, match_end)| {
-                        self.suppress_terminal_multiline_anchor(subject, match_start, match_end)
-                    })
-                }) {
-                    spans = None;
-                }
-                return Ok(spans);
+                return Ok(self.group_zero_spans(engine, subject, start));
             }
             let full = Self::engine_captures_at(engine, subject, start);
             let mut trimmed = None;
@@ -634,11 +626,6 @@ pub mod bytes {
                 if let Some(keep_start) = keep_start {
                     spans[0] = Some((keep_start, end));
                 }
-            }
-            if spans[0].is_some_and(|(match_start, match_end)| {
-                self.suppress_terminal_multiline_anchor(subject, match_start, match_end)
-            }) {
-                return Ok(None);
             }
             Ok(Some(spans))
         }
@@ -778,18 +765,6 @@ pub mod bytes {
             CaptureLocations {
                 spans: CaptureSpans::from_elem(None, self.captures_len()),
             }
-        }
-
-        fn suppress_terminal_multiline_anchor(
-            &self,
-            subject: &[u8],
-            start: usize,
-            end: usize,
-        ) -> bool {
-            self.multiline_start_anchor
-                && start == end
-                && end == subject.len()
-                && (subject.ends_with(b"\n") || (self.config.crlf && subject.ends_with(b"\r")))
         }
     }
 
@@ -956,14 +931,6 @@ pub mod bytes {
                 }
                 match self.re.find_at(self.subject, self.last_end) {
                     Ok(Some(matched)) => {
-                        if self.re.suppress_terminal_multiline_anchor(
-                            self.subject,
-                            matched.start(),
-                            matched.end(),
-                        ) {
-                            self.done = true;
-                            return None;
-                        }
                         if matched.start() == matched.end() {
                             self.last_end = matched.end() + 1;
                             // Match PCRE2's global-search rule: after a
@@ -1011,14 +978,6 @@ pub mod bytes {
                 match self.re.captures_at(self.subject, self.last_end) {
                     Ok(Some(captures)) => {
                         let matched = captures.get(0).expect("group zero always matches");
-                        if self.re.suppress_terminal_multiline_anchor(
-                            self.subject,
-                            matched.start(),
-                            matched.end(),
-                        ) {
-                            self.done = true;
-                            return None;
-                        }
                         if matched.start() == matched.end() {
                             self.last_end = matched.end() + 1;
                             if self.last_match == Some(matched.end()) {
@@ -1046,7 +1005,6 @@ pub mod bytes {
     struct Translation {
         pattern: String,
         final_newline_fallback: bool,
-        multiline_start_anchor: bool,
         keep_prefix: String,
     }
 
@@ -1078,6 +1036,9 @@ pub mod bytes {
     ///
     /// `class` and `escape` are parsed by their own positive productions
     /// below. There is deliberately no "other special group/escape" arm.
+    /// The atomic `\R` escape and `^` while multiline mode is effective are
+    /// excluded as complete grammar families because the automata backend
+    /// cannot reproduce their PCRE2 priority and offset semantics exactly.
     struct AdmittedPattern<'a> {
         source: &'a str,
     }
@@ -1085,18 +1046,30 @@ pub mod bytes {
     #[derive(Clone, Copy)]
     struct GrammarFrame {
         previous_extended: bool,
+        previous_multiline: bool,
     }
 
     enum SpecialGroup {
-        Comment { end: usize },
-        GlobalOptions { end: usize, extended: bool },
-        Open { body: usize, extended: bool },
+        Comment {
+            end: usize,
+        },
+        GlobalOptions {
+            end: usize,
+            extended: bool,
+            multiline: bool,
+        },
+        Open {
+            body: usize,
+            extended: bool,
+            multiline: bool,
+        },
     }
 
     impl<'a> AdmittedPattern<'a> {
         fn parse(
             source: &'a str,
             initial_extended: bool,
+            initial_multiline: bool,
             crlf: bool,
             nest_limit: u32,
             unicode_pattern: bool,
@@ -1104,6 +1077,7 @@ pub mod bytes {
             let bytes = source.as_bytes();
             let mut frames = Vec::new();
             let mut extended = initial_extended;
+            let mut multiline = initial_multiline;
             let mut i = 0usize;
             let mut repeatable = false;
             let mut branch_start = true;
@@ -1171,18 +1145,21 @@ pub mod bytes {
                         return Err(Error::unsupported(i, "backtracking control verb"));
                     }
                     b'(' if bytes.get(i + 1) == Some(&b'?') => {
-                        match admitted_special_group(bytes, i, extended, branch_start)? {
+                        match admitted_special_group(bytes, i, extended, multiline, branch_start)? {
                             SpecialGroup::Comment { end } => i = end,
                             SpecialGroup::GlobalOptions {
                                 end,
                                 extended: next_extended,
+                                multiline: next_multiline,
                             } => {
                                 i = end;
                                 extended = next_extended;
+                                multiline = next_multiline;
                             }
                             SpecialGroup::Open {
                                 body,
                                 extended: next_extended,
+                                multiline: next_multiline,
                             } => {
                                 if frames.len() >= nest_limit as usize {
                                     return Err(Error::resource(
@@ -1191,8 +1168,10 @@ pub mod bytes {
                                 }
                                 frames.push(GrammarFrame {
                                     previous_extended: extended,
+                                    previous_multiline: multiline,
                                 });
                                 extended = next_extended;
+                                multiline = next_multiline;
                                 i = body;
                                 repeatable = false;
                                 branch_start = true;
@@ -1207,6 +1186,7 @@ pub mod bytes {
                         }
                         frames.push(GrammarFrame {
                             previous_extended: extended,
+                            previous_multiline: multiline,
                         });
                         i += 1;
                         repeatable = false;
@@ -1217,6 +1197,7 @@ pub mod bytes {
                             .pop()
                             .ok_or_else(|| Error::syntax_at(i, "unmatched closing parenthesis"))?;
                         extended = frame.previous_extended;
+                        multiline = frame.previous_multiline;
                         i += 1;
                         repeatable = true;
                         branch_start = false;
@@ -1225,6 +1206,9 @@ pub mod bytes {
                         i += 1;
                         repeatable = false;
                         branch_start = true;
+                    }
+                    b'^' if multiline => {
+                        return Err(Error::unsupported(i, "multiline start anchor"));
                     }
                     b'^' | b'$' => {
                         i += 1;
@@ -1324,6 +1308,7 @@ pub mod bytes {
         bytes: &[u8],
         start: usize,
         initial_extended: bool,
+        initial_multiline: bool,
         branch_start: bool,
     ) -> Result<SpecialGroup, Error> {
         if bytes[start..].starts_with(b"(?#") {
@@ -1338,6 +1323,7 @@ pub mod bytes {
             return Ok(SpecialGroup::Open {
                 body: start + 3,
                 extended: initial_extended,
+                multiline: initial_multiline,
             });
         }
         if bytes[start..].starts_with(b"(?P<") {
@@ -1345,6 +1331,7 @@ pub mod bytes {
             return Ok(SpecialGroup::Open {
                 body: end + 1,
                 extended: initial_extended,
+                multiline: initial_multiline,
             });
         }
         if bytes[start..].starts_with(b"(?<")
@@ -1354,6 +1341,7 @@ pub mod bytes {
             return Ok(SpecialGroup::Open {
                 body: end + 1,
                 extended: initial_extended,
+                multiline: initial_multiline,
             });
         }
         if bytes[start..].starts_with(b"(?'") {
@@ -1361,20 +1349,28 @@ pub mod bytes {
             return Ok(SpecialGroup::Open {
                 body: end + 1,
                 extended: initial_extended,
+                multiline: initial_multiline,
             });
         }
 
         let mut i = start + 2;
         let mut enabled = true;
         let mut extended = initial_extended;
+        let mut multiline = initial_multiline;
         let mut saw_flag = false;
         let mut saw_dash = false;
         let mut saw_disabled_flag = false;
         while let Some(&byte) = bytes.get(i) {
             match byte {
-                b'i' | b'm' | b's' | b'U' => {
+                b'i' | b's' | b'U' => {
                     saw_flag = true;
                     saw_disabled_flag |= saw_dash;
+                    i += 1;
+                }
+                b'm' => {
+                    saw_flag = true;
+                    saw_disabled_flag |= saw_dash;
+                    multiline = enabled;
                     i += 1;
                 }
                 b'x' => {
@@ -1392,6 +1388,7 @@ pub mod bytes {
                     return Ok(SpecialGroup::Open {
                         body: i + 1,
                         extended,
+                        multiline,
                     });
                 }
                 b')' if saw_flag && (!saw_dash || saw_disabled_flag) => {
@@ -1404,6 +1401,7 @@ pub mod bytes {
                     return Ok(SpecialGroup::GlobalOptions {
                         end: i + 1,
                         extended,
+                        multiline,
                     });
                 }
                 _ => break,
@@ -1424,8 +1422,9 @@ pub mod bytes {
         }
         match escaped {
             b'A' | b'B' | b'b' | b'K' | b'Z' | b'z' => Ok((slash + 2, false)),
-            b'C' | b'D' | b'H' | b'N' | b'R' | b'S' | b'V' | b'W' | b'a' | b'd' | b'e' | b'f'
-            | b'h' | b'n' | b'r' | b's' | b't' | b'v' | b'w' => Ok((slash + 2, true)),
+            b'R' => Err(Error::unsupported(slash, "atomic CRLF line sequence")),
+            b'C' | b'D' | b'H' | b'N' | b'S' | b'V' | b'W' | b'a' | b'd' | b'e' | b'f' | b'h'
+            | b'n' | b'r' | b's' | b't' | b'v' | b'w' => Ok((slash + 2, true)),
             b'Q' => {
                 let content = slash + 2;
                 let end = bytes[content..]
@@ -1563,8 +1562,6 @@ pub mod bytes {
         let mut i = 0;
         let mut keep_count = 0;
         let mut final_newline_fallback = false;
-        let mut saw_multiline_start = false;
-        let mut alternation_offset = None;
         let mut effective_caseless = caseless;
         let mut option_scopes = Vec::new();
         while i < bytes.len() {
@@ -1735,12 +1732,10 @@ pub mod bytes {
                     i += 1;
                 }
                 b'^' => {
-                    saw_multiline_start |= effective_multiline;
                     out.push(b'^');
                     i += 1;
                 }
                 b'|' => {
-                    alternation_offset.get_or_insert(i);
                     out.push(b'|');
                     i += 1;
                 }
@@ -1763,7 +1758,7 @@ pub mod bytes {
                         return Err(Error::unsupported(i, "non-ASCII escape"));
                     }
                     match escaped {
-                        b'C' | b'R' | b'h' | b'H' | b'v' | b'V' if unicode_pattern => {
+                        b'C' | b'h' | b'H' | b'v' | b'V' if unicode_pattern => {
                             return Err(Error::unsupported(i, "Unicode-sensitive PCRE escape"));
                         }
                         b'Q' => {
@@ -1792,10 +1787,6 @@ pub mod bytes {
                         }
                         b'C' => {
                             out.extend_from_slice(b"(?s:.)");
-                            i += 2;
-                        }
-                        b'R' => {
-                            out.extend_from_slice(b"(?:\\r\\n|[\\n\\x0B\\f\\r\\x85])");
                             i += 2;
                         }
                         b'N' => {
@@ -1968,19 +1959,10 @@ pub mod bytes {
                 }
             }
         }
-        if saw_multiline_start {
-            if let Some(offset) = alternation_offset {
-                return Err(Error::unsupported(
-                    offset,
-                    "multiline start anchor across alternation",
-                ));
-            }
-        }
         let pattern = String::from_utf8(out).expect("translation preserves UTF-8");
         Ok(Translation {
             pattern,
             final_newline_fallback,
-            multiline_start_anchor: saw_multiline_start,
             keep_prefix,
         })
     }
@@ -2172,21 +2154,6 @@ pub mod bytes {
                 b'\\' if bytes.get(i + 1) == Some(&b'Q') => {
                     i = escape_atom_end(bytes, i);
                 }
-                b'\\' if bytes.get(i + 1) == Some(&b'R') => {
-                    let end = i + 2;
-                    let mut enclosing_end = end;
-                    while bytes.get(enclosing_end) == Some(&b')') {
-                        enclosing_end += 1;
-                    }
-                    if matches!(bytes.get(end), Some(b'*' | b'+' | b'?' | b'{'))
-                        || bytes.get(end..end + 2) == Some(b"\\R")
-                        || bytes.get(end..end + 2) == Some(b"\\C")
-                        || matches!(bytes.get(enclosing_end), Some(b'*' | b'+' | b'?' | b'{'))
-                    {
-                        return Err(Error::unsupported(i, "atomic CRLF line sequence"));
-                    }
-                    i = end;
-                }
                 b'\\' if crlf && bytes.get(i + 1) == Some(&b'B') => {
                     return Err(Error::unsupported(
                         i,
@@ -2212,15 +2179,6 @@ pub mod bytes {
                     if matches!(bytes.get(i + 1), Some(b'S') | Some(b'N'))
                         && matches!(bytes.get(i + 2), Some(b'*') | Some(b'+'))
                         && auto_possessified_line_atom(bytes, i + 3, extended_may_apply) =>
-                {
-                    return Err(Error::unsupported(
-                        i,
-                        "PCRE2 auto-possessified line sequence",
-                    ));
-                }
-                b'\\'
-                    if bytes.get(i + 1) == Some(&b'N')
-                        && bytes.get(i + 2..i + 6) == Some(b"*?\\R") =>
                 {
                     return Err(Error::unsupported(
                         i,
@@ -2302,7 +2260,7 @@ pub mod bytes {
                 i += relative_end + 4;
                 continue;
             }
-            return matches!(bytes.get(i..i + 2), Some(b"\\R" | b"\\v" | b"\\h"));
+            return matches!(bytes.get(i..i + 2), Some(b"\\v" | b"\\h"));
         }
     }
 

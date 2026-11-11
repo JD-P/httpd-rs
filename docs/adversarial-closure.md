@@ -100,8 +100,9 @@ returning through a different directive or dispatch path.
 | P33-A | MultiViews selected a sibling representation after the trailing-slash file check and retained the missing extensionless URL as its policy identity, bypassing exact/extension `Location` and per-directory rewrite guards | Trailing-slash spellings are rejected before negotiation. A selected sibling receives a decoded canonical `/name.ext` policy identity used for `Location`, candidate filesystem/access-file, resolved-inode authorization and per-directory rewrite fixups; only wire outputs such as `Content-Location` are percent-encoded. That policy is conjoined with the public URL scope. Deny/gone/redirect outcomes are honored, sink-changing rewrites fail closed, and the existing dynamic-handler refusal remains after the selected-name bind. Shared-cache planning consumes the same selected scope/rewrite transition and binds lookup/store to the selected URL and resolved target, so a hit cannot retain the missing public identity. Unit and Apache differential regressions cover direct and alias slash cases, extension `Location`, access-file rewrite, `<Files>`, cache binding/live policy, MultiViews-off, redirect, decoded names and handler refusal | I11 transform reauthorization; I57 decoded policy identity; `multiview_candidate_spec`, `multiview_authorization_meet_spec`, `multiview_cache_binding_spec` |
 | P34-A | MultiViews and autoindex synthesized authorization paths with wire percent-encoding, so decoded-spelling `Location`/`LocationMatch` guards missed names containing spaces, non-ASCII or literal `%` while direct requests were denied | `CanonicalTarget::from_selected_child` is the single typed constructor for implicitly selected filesystem children. It admits only valid UTF-8, exact canonical decoded paths; MultiViews dispatch, cache planning and per-entry autoindex authorization consume that identity. Invalid names fail implicit selection closed. Percent encoding remains only at `Content-Location` and listing-link serialization. A 12-case Apache differential plus Rust constructor, MultiViews and autoindex tests cover decoded and encoded mirrors, space, non-ASCII, literal `%`, alias, `<Files>` and rewrite controls | I57 decoded policy identity; I11 transform reauthorization |
 | P35-A | `.htaccess` dropped a physical comment before applying backslash continuation, so a `#\` line could expose a grant or handler section that Apache comments out or rejects | Main configuration and access files now share one continuation-first logical-line assembler; only complete logical lines are filtered as blank or comments. Sealing therefore sees Apache's exact directive/section stream and rejects a hidden handler's unmatched close. Unit and seven-case live Apache regressions cover hidden/chained grants, a hidden CGI section, plain controls and the main-config control | I7 fail-closed malformed access files; I29 access-file disposition closure |
-| P35-B | The PCRE2 translation kept greedy `\S`/`\N` repetitions backtrackable before `\R`/`\v`, while PCRE2 auto-possessified them; an obs-text NEL byte inverted a negated ACL guard and allowed a request Apache denied | The compatibility gate rejects unrepresentable `\S*`/`\S+`/`\N*`/`\N+` sequences immediately followed by `\R`, `\v` or `\h`, including nested/alternative shapes and adjacency hidden by PCRE comments or extended-mode whitespace. Simple line atoms remain supported and oracle-equivalent. Crate tests cover the full fail-closed family; the live differential requires Apache acceptance, Vapache configuration rejection and agreement on the simple `\v` control | `regex_dialect_admit`; `expr_regex_result` |
+| P35-B | The PCRE2 translation kept greedy `\S`/`\N` repetitions backtrackable before `\R`/`\v`, while PCRE2 auto-possessified them; an obs-text NEL byte inverted a negated ACL guard and allowed a request Apache denied | The compatibility gate rejects unrepresentable `\S*`/`\S+`/`\N*`/`\N+` sequences immediately followed by `\v` or `\h`, including nested/alternative shapes and adjacency hidden by PCRE comments or extended-mode whitespace. P37 subsequently removed `\R` from the admitted grammar entirely. Simple `\v`/`\h` atoms remain supported and oracle-equivalent. Crate tests cover the full fail-closed family; the live differential requires Apache acceptance, Vapache configuration rejection and agreement on the simple `\v` control | `regex_dialect_admit`; `expr_regex_result` |
 | P36-A | Main-config and per-directory internal rewrites preserved a trailing slash in the URL but passed that spelling as the slash-free mapping identity; `CanonicalTarget::from_normalized` rejected the pair and request-reachable `expect` calls aborted the release process | Rewrite canonicalization returns one `CanonicalTarget` containing both identities, so callers cannot assemble a mismatched pair. Per-directory URL-translation restarts retain the slash in the synthetic request while mapping with the normalized bytes. WebSocket request identity validation also fails closed rather than unwrapping. Unit dispatch and six-case live regressions cover main config, guarded/missing targets, attacker-written `.htaccess`, root and no-slash controls | I11 transform reauthorization; I57 decoded policy identity |
+| P37-A/B | `\R` lowering could split CRLF according to its following atom, while multiline `^` inherited backend-specific final-newline and offset semantics; both families remained admitted despite differing from PCRE2 | The closed grammar excludes atomic `\R` and every `^` evaluated with multiline mode enabled, including builder flags and nested/global inline-option scopes. This removes the obsolete match-time terminal-anchor filter and all enumerated `\R` adjacency exceptions. Quoted/literal spellings, non-multiline `^`, and explicit `(?-m:^)` controls remain admitted and oracle-checked. Both retained fuzzer artifacts now terminate at compile-time rejection | `regex_dialect_admit`; `expr_regex_result` |
 | Post-P31 slow-output generalization | HTTP/1 partial writes could renew `Timeout` indefinitely while retaining established-connection, dynamic-backend, response-memory and spool capacity; long-lived WebSockets also retained both their dedicated tunnel slot and general HTTP/1 connection admission | HTTP/1 writability and HTTP/2 flow control now use one irreversible general-to-slow ownership transition, common 128-process/32-source pool, anchored minimum rate and absolute lifetime. Dynamic slots and retained response/spool resources transfer to slow sibling pools; slow spools are capped at one quarter of the configured general pool. A classified HTTP/1 connection closes after output. WebSockets acquire their dedicated lease before surrendering general connection capacity. Deterministic saturation, cancellation, byte/file transfer, and live upgrade tests pin the complete handoff | `slow_output_phase_step_spec`, `minimum_progress_rate_spec`, `resource_budget_admit`, `resource_bounds` |
 | Post-P30 lease/fairness review | The same client-controlled-wait pattern remained in adjacent pools: an H2 client-limit rejection could retain a process stream slot while sending 503; retained response memory and shared spool files had only global caps; queued H2 responses released resident or stream admission when enqueue returned even though h2 still owned the head, body, or EOS state; an ownership-carrying header could be retained in the HPACK dynamic table; expanding Huffman output and retained scratch were not separately bounded; response reads, slow-body workers and `RewriteMap prg` helpers lacked source fairness; H2 used absolute response/idle lifetimes; parsed `MinRate` values did not constrain bodies | H2 acquires the validated effective-client slot before the process slot and resets immediately on either admission failure. Retained response memory is capped at 32 MiB per client, response reads at 8 per client, and every spool client at one quarter of the configured byte/file pool; dynamic allocations inherit client identity at creation. Compression/CGI/autoindex leases shrink from peak work to retained representation. Every queued response carries resident ownership in a never-indexed head field and transfers its general or slow-output admission into shared head/body/EOS ownership until h2 consumes or discards the final object. HPACK uses raw strings when Huffman is not shorter, drops scratch above 160 KiB, and established H2 transports carry a separate dependency-buffer charge. Reset/drop tests, outbound H2 fuzzing, queued-owner and scratch telemetry cover the release paths. Slow-body and program-map pools reserve three quarters for other sources. P31 subsequently replaced renewable H2 capacity-grant deadlines with an anchored minimum rate, absolute response ceiling and source-fair slow-output pool; connection idle timeout still applies only with no active stream. Header/body and H2-body `MinRate` checks run inside, and never extend, their hard absolute read deadline | `h2_process_slot_spec`, `slow_output_phase_step_spec`, `minimum_progress_rate_spec`, `resource_budget_admit`, `connection_admit`, `resource_bounds` |
 | Post-P28 DoS review | Capture expansion, polynomial glob rectangles, many individually cheap policy operations, wide access programs and native response heads still lacked one complete resource model | Request clones share a fail-sticky 16 Mi-unit work/4 MiB expansion meter; capture and dynamic-require output is admitted before allocation; every request-time glob debits its exact DP rectangle; access files have per-file, per-request and layer ceilings; response policy and both protocol writers enforce 256-field/128 KiB head limits and charge heads to the aggregate response-resident budget. The CVE-2011-4415 triage now names the concrete prevention instead of attributing memory consumption to Rust memory safety | `glob_match_resource_spec`, `bounded_expansion_append_spec`, `access_program_budget_spec`, `response_header_budget_spec`, `resource_bounds` |
@@ -614,12 +615,13 @@ access file fail closed, matching Apache.
 
 P35-B is closed at configuration load. PCRE2's auto-possessification has match
 semantics the automata backend cannot reproduce for greedy `\S`/`\N` classes
-adjacent to `\R`, `\v` or `\h`. `validate_line_constructs()` rejects that
-complete family as unsupported, including occurrences inside groups and
-alternatives and adjacency obscured by PCRE comments or extended-mode ignored
-text. Standalone line atoms remain accepted and checked against the test-only
-C PCRE2 oracle. This deliberately chooses a narrow configuration error over a
-request-time ACL truth-value difference.
+adjacent to `\v` or `\h`. `validate_line_constructs()` rejects that complete
+family as unsupported, including occurrences inside groups and alternatives
+and adjacency obscured by PCRE comments or extended-mode ignored text. P37
+later excludes `\R` at the grammar boundary rather than maintaining contextual
+exceptions for it. Standalone `\v`/`\h` atoms remain accepted and checked
+against the test-only C PCRE2 oracle. This deliberately chooses a narrow
+configuration error over a request-time ACL truth-value difference.
 
 ## Pass 36 closure
 
@@ -632,6 +634,25 @@ back into the synthetic request, so the slash survives the next translation
 round without contaminating the mapping key. Every request-derived use of the
 validated normalized constructor now returns a client error instead of
 unwrapping an invariant under the aborting release profile.
+
+## Pass 37 closure
+
+P37-A and P37-B are closed in the positive PCRE2 grammar. `\R` requires an
+atomic preference for CRLF over lone CR, but that preference changes captures
+and truth values according to the following atom in the non-backtracking
+backend. It is therefore no longer an admitted escape in any context. Likewise,
+`^` is rejected whenever multiline mode is effective, whether enabled by the
+builder, a global option or a scoped option; PCRE2's final-newline and CRLF
+start-offset semantics cannot be represented exactly by the backend anchor.
+
+This replaces both contextual blacklists and the incomplete match-time
+terminal-anchor suppression with two grammar-level exclusions. Quoted `\R`
+text, escaped/literal carets, ordinary `^`, and scopes that explicitly disable
+multiline mode remain admitted. The P37 regression suite covers every reported
+boolean, capture and offset shape, both retained fuzzer artifacts, nested flag
+scope, and lexical controls. The admission fuzzer also generates these families
+as exclusions, while its positive generator continues to require complete
+PCRE2 differential agreement.
 
 ## Regression surface
 
@@ -691,8 +712,9 @@ The closure is exercised by:
 - operator replay harnesses that reproduce the Apache-versus-vapached
   differentials in `adversarial/findings.md`, plus the repaired P34 synthesized
   identity differential in `adversarial/p34/exploit_p34.py`, the repaired P35
-  access-file/PCRE2 gates in `adversarial/p35/`, and the P36 trailing-slash
-  rewrite process-survival differential in `adversarial/p36/`.
+  access-file/PCRE2 gates in `adversarial/p35/`, the P36 trailing-slash
+  rewrite process-survival differential in `adversarial/p36/`, and the P37
+  PCRE2 compile-time exclusion regressions in `crates/pcre2/tests/`.
 
 Any new directive that changes a request-to-resource mapping, cache key,
 handler selection, authorization identity or inherited descriptor must state

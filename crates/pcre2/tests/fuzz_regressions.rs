@@ -149,36 +149,10 @@ fn utf_and_ucp_modes_fail_closed_on_invalid_subjects_and_align_valid_offsets() {
 }
 
 #[test]
-fn multiline_terminal_empty_match_is_suppressed_for_offset_apis() {
-    let rust = rust::Regex::new(r"(?m)^$").unwrap();
-    let oracle = oracle::Regex::new(r"(?m)^$").unwrap();
-    let subject = b"\n\n";
-    let start = subject.len();
-
+fn multiline_start_anchor_fails_closed_before_offset_apis() {
     assert_eq!(
-        rust.is_match_at(subject, start).unwrap(),
-        oracle.is_match_at(subject, start).unwrap()
-    );
-    assert_eq!(
-        rust.find_at(subject, start)
-            .unwrap()
-            .map(|matched| (matched.start(), matched.end())),
-        oracle
-            .find_at(subject, start)
-            .unwrap()
-            .map(|matched| (matched.start(), matched.end()))
-    );
-
-    let mut rust_locations = rust.capture_locations();
-    let mut oracle_locations = oracle.capture_locations();
-    assert_eq!(
-        rust.captures_read_at(&mut rust_locations, subject, start)
-            .unwrap()
-            .map(|matched| (matched.start(), matched.end())),
-        oracle
-            .captures_read_at(&mut oracle_locations, subject, start)
-            .unwrap()
-            .map(|matched| (matched.start(), matched.end()))
+        rust::Regex::new(r"(?m)^$").unwrap_err().kind(),
+        vapache_pcre2::ErrorKind::Unsupported,
     );
 }
 
