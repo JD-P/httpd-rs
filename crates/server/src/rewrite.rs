@@ -491,19 +491,30 @@ pub enum Outcome {
     Error(String),
 }
 
-fn rewrite_no_match_index(chain_flags: &[bool], next_index: usize, rule: &RewriteRule) -> usize {
-    match vapache_verified::rewrite_match_action(
+const REWRITE_RESTART_LIMIT: u64 = 10;
+
+fn rewrite_no_match_state(
+    state: vapache_verified::RewriteProgramState,
+    chain_flags: &[bool],
+    rule: &RewriteRule,
+) -> vapache_verified::RewriteProgramState {
+    let transition = vapache_verified::rewrite_program_step(
+        state,
+        vapache_verified::RewriteProgramEvent::NoMatch {
+            chain: rule.flags.chain,
+        },
         chain_flags,
-        next_index,
-        false,
-        rule.flags.chain,
-        rule.flags.forbidden,
-        rule.flags.gone,
-        rule.substitution == "-",
-    ) {
-        vapache_verified::RewriteMatchAction::Continue { index } => index,
-        _ => unreachable!("an unmatched rewrite rule can only continue"), // coverage:ignore-line - proved by rewrite_unmatched_rule_has_no_terminal_effect
-    }
+        REWRITE_RESTART_LIMIT,
+    )
+    .expect("a running rewrite machine has a current rule");
+    debug_assert!(matches!(
+        transition.action,
+        vapache_verified::RewriteProgramAction::Continue {
+            apply_query: false,
+            ..
+        }
+    ));
+    transition.state
 }
 
 pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
@@ -515,7 +526,6 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
     let mut path = ctx.url_path.to_string();
     let mut query = ctx.query.to_vec();
     let mut changed = false;
-    let mut final_pass = false;
     let mut cond_caps: Vec<Vec<u8>> = Vec::new();
     let mut effects = Effects::default();
     let mut filesystem_override: Option<FilesystemTarget> = None;
@@ -524,18 +534,16 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         return Outcome::Error("request policy expansion limit exceeded".into());
     }
     let mut vary: Vec<String> = Vec::new();
-    let mut idx = 0usize;
     let chain_flags: Vec<bool> = scope
         .rewrite_policy
         .rewrite_rules
         .iter()
         .map(|rule| rule.flags.chain)
         .collect();
-    let mut loops = 0u64;
+    let mut machine = vapache_verified::rewrite_program_start();
 
-    while idx < scope.rewrite_policy.rewrite_rules.len() {
-        let rule = &scope.rewrite_policy.rewrite_rules[idx];
-        idx += 1;
+    while machine.index < scope.rewrite_policy.rewrite_rules.len() {
+        let rule = &scope.rewrite_policy.rewrite_rules[machine.index];
         vary.clear();
         let subject = subject_for(rule, &path, ctx.fs_path);
         if !vapache_verified::htaccess_rewrite_subject_admit(
@@ -549,7 +557,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             );
         }
         let Some(subject) = subject else {
-            idx = rewrite_no_match_index(&chain_flags, idx, rule);
+            machine = rewrite_no_match_state(machine, &chain_flags, rule);
             continue;
         };
         if req
@@ -569,7 +577,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         let caps = rule.pattern.captures(subject.as_bytes());
         let cap_strings: Vec<Vec<u8>> = if rule.negated {
             if caps.is_some() {
-                idx = rewrite_no_match_index(&chain_flags, idx, rule);
+                machine = rewrite_no_match_state(machine, &chain_flags, rule);
                 continue;
             }
             Vec::new()
@@ -580,7 +588,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                     .map(|m| m.map(|m| m.as_bytes().to_vec()).unwrap_or_default())
                     .collect(),
                 None => {
-                    idx = rewrite_no_match_index(&chain_flags, idx, rule);
+                    machine = rewrite_no_match_state(machine, &chain_flags, rule);
                     continue;
                 }
             }
@@ -604,7 +612,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             Err(e) => return Outcome::Error(e),
         };
         if !conds {
-            idx = rewrite_no_match_index(&chain_flags, idx, rule);
+            machine = rewrite_no_match_state(machine, &chain_flags, rule);
             continue;
         }
 
@@ -643,51 +651,53 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             Err(e) => return Outcome::Error(e),
         }
 
-        match vapache_verified::rewrite_match_action(
+        let transition = vapache_verified::rewrite_program_step(
+            machine,
+            vapache_verified::RewriteProgramEvent::Matched {
+                forbidden: rule.flags.forbidden,
+                gone: rule.flags.gone,
+                no_substitution: rule.substitution == "-",
+                proxy: rule.flags.proxy,
+                redirect: rule.flags.redirect.is_some(),
+                query_string_append: rule.flags.qsa,
+                query_string_discard: rule.flags.qsd,
+                has_skip: rule.flags.skip.is_some(),
+                skip: rule.flags.skip.unwrap_or(0),
+                restart: rule.flags.next,
+                last: rule.flags.last,
+                end: rule.flags.end,
+            },
             &chain_flags,
-            idx,
-            true,
-            rule.flags.chain,
-            rule.flags.forbidden,
-            rule.flags.gone,
-            rule.substitution == "-",
-        ) {
-            vapache_verified::RewriteMatchAction::Forbidden => return Outcome::Forbidden,
-            vapache_verified::RewriteMatchAction::Gone => return Outcome::Gone,
-            vapache_verified::RewriteMatchAction::NoSubstitution => {
-                if rule.flags.qsd {
+            REWRITE_RESTART_LIMIT,
+        )
+        .expect("a running rewrite machine has a current rule");
+        match transition.action {
+            vapache_verified::RewriteProgramAction::Forbidden => return Outcome::Forbidden,
+            vapache_verified::RewriteProgramAction::Gone => return Outcome::Gone,
+            vapache_verified::RewriteProgramAction::Continue { query: action, .. }
+            | vapache_verified::RewriteProgramAction::Restart { query: action, .. }
+            | vapache_verified::RewriteProgramAction::Stop { query: action, .. } => {
+                if action == vapache_verified::RewriteQueryAction::Discard {
                     query.clear();
                 }
-                match vapache_verified::rewrite_advance(
-                    idx,
-                    chain_flags.len(),
-                    rule.flags.skip.is_some(),
-                    rule.flags.skip.unwrap_or(0),
-                    rule.flags.next,
-                    rule.flags.last,
-                    rule.flags.end,
-                    loops,
-                    10,
+                machine = transition.state;
+                if matches!(
+                    transition.action,
+                    vapache_verified::RewriteProgramAction::Stop { .. }
                 ) {
-                    vapache_verified::RewriteAdvance::Continue { index } => idx = index,
-                    vapache_verified::RewriteAdvance::Restart { completed } => {
-                        loops = completed;
-                        idx = 0;
-                    }
-                    vapache_verified::RewriteAdvance::Stop { final_pass: final_ } => {
-                        final_pass = final_;
-                        break;
-                    }
-                    vapache_verified::RewriteAdvance::RestartLimit => {
-                        return Outcome::Error("rewrite [N] loop limit exceeded".into());
-                    }
+                    break;
                 }
                 continue;
             }
-            vapache_verified::RewriteMatchAction::Expand => {}
-            vapache_verified::RewriteMatchAction::Continue { .. } => {
-                // coverage:ignore-start - executable verified action is called with matched=true
-                unreachable!("a matched rewrite rule cannot take the no-match transition")
+            vapache_verified::RewriteProgramAction::RestartLimit => {
+                return Outcome::Error("rewrite [N] loop limit exceeded".into());
+            }
+            vapache_verified::RewriteProgramAction::Expand => {
+                machine = transition.state;
+            }
+            _ => {
+                // coverage:ignore-start - excluded by the verified matched transition
+                return Outcome::Error("invalid matched rewrite transition".into());
                 // coverage:ignore-stop
             }
         }
@@ -755,12 +765,33 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         if joined.len() > MAX_REWRITE_OUTPUT_BYTES {
             return Outcome::Error("rewritten target exceeds 64 KiB".into());
         }
-        match vapache_verified::rewrite_query_action(
-            has_target_query,
-            rule.flags.qsa,
-            rule.flags.qsd,
-            !query.is_empty(),
-        ) {
+        let transition = vapache_verified::rewrite_program_step(
+            machine,
+            vapache_verified::RewriteProgramEvent::Expanded {
+                external,
+                has_target_query,
+                original_query_present: !query.is_empty(),
+            },
+            &chain_flags,
+            REWRITE_RESTART_LIMIT,
+        )
+        .expect("a running rewrite machine has a current rule");
+        let query_action = match transition.action {
+            vapache_verified::RewriteProgramAction::Continue { query, .. }
+            | vapache_verified::RewriteProgramAction::Restart { query, .. }
+            | vapache_verified::RewriteProgramAction::Stop { query, .. }
+            | vapache_verified::RewriteProgramAction::Proxy { query }
+            | vapache_verified::RewriteProgramAction::Redirect { query } => query,
+            vapache_verified::RewriteProgramAction::RestartLimit => {
+                return Outcome::Error("rewrite [N] loop limit exceeded".into());
+            }
+            _ => {
+                // coverage:ignore-start - excluded by the verified expanded transition
+                return Outcome::Error("invalid expanded rewrite transition".into());
+                // coverage:ignore-stop
+            }
+        };
+        match query_action {
             vapache_verified::RewriteQueryAction::Append => {
                 if !new_query.is_empty() {
                     if new_query.len() >= MAX_REWRITE_OUTPUT_BYTES {
@@ -867,12 +898,8 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         // clear an override either.
         filesystem_override = filesystem;
 
-        match vapache_verified::rewrite_sink(
-            rule.flags.proxy,
-            external,
-            rule.flags.redirect.is_some(),
-        ) {
-            vapache_verified::RewriteSink::Proxy => {
+        match transition.action {
+            vapache_verified::RewriteProgramAction::Proxy { .. } => {
                 let mut url = joined;
                 if !new_query.is_empty() {
                     let Ok(new_query) = std::str::from_utf8(&new_query) else {
@@ -883,7 +910,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                 }
                 return Outcome::Proxy { url, effects };
             }
-            vapache_verified::RewriteSink::Redirect => {
+            vapache_verified::RewriteProgramAction::Redirect { .. } => {
                 let status = rule.flags.redirect.unwrap_or(302);
                 let mut location = joined;
                 if !new_query.is_empty() {
@@ -910,36 +937,29 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                     effects,
                 };
             }
-            vapache_verified::RewriteSink::Internal => {}
+            vapache_verified::RewriteProgramAction::Continue { .. }
+            | vapache_verified::RewriteProgramAction::Restart { .. }
+            | vapache_verified::RewriteProgramAction::Stop { .. } => {}
+            _ => {
+                // coverage:ignore-start - excluded by the verified expanded transition
+                return Outcome::Error("invalid internal rewrite transition".into());
+                // coverage:ignore-stop
+            }
         }
 
         path = new_path_from_joined(&joined);
         query = new_query;
         changed = true;
-        match vapache_verified::rewrite_advance(
-            idx,
-            chain_flags.len(),
-            rule.flags.skip.is_some(),
-            rule.flags.skip.unwrap_or(0),
-            rule.flags.next,
-            rule.flags.last,
-            rule.flags.end,
-            loops,
-            10,
-        ) {
-            vapache_verified::RewriteAdvance::Continue { index } => idx = index,
-            vapache_verified::RewriteAdvance::Restart { completed } => {
-                loops = completed;
-                idx = 0;
+        machine = transition.state;
+        match transition.action {
+            vapache_verified::RewriteProgramAction::Continue { .. } => {}
+            vapache_verified::RewriteProgramAction::Restart { .. } => {
                 continue;
             }
-            vapache_verified::RewriteAdvance::Stop { final_pass: final_ } => {
-                final_pass = final_;
+            vapache_verified::RewriteProgramAction::Stop { .. } => {
                 break;
             }
-            vapache_verified::RewriteAdvance::RestartLimit => {
-                return Outcome::Error("rewrite [N] loop limit exceeded".into());
-            }
+            _ => unreachable!("terminal expanded actions returned before internal update"),
         }
     }
 
@@ -947,7 +967,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         Outcome::Internal {
             path,
             query,
-            final_pass,
+            final_pass: machine.final_pass,
             effects,
             filesystem: filesystem_override,
         }
@@ -2215,6 +2235,208 @@ mod tests {
             vapache_verified::rewrite_advance(1, 4, false, 0, false, true, true, 0, 10),
             RewriteAdvance::Stop { final_pass: true }
         );
+    }
+
+    #[test]
+    fn verified_rewrite_program_composes_control_query_and_terminal_states() {
+        use vapache_verified::{
+            RewriteProgramAction, RewriteProgramEvent, RewriteProgramPhase, RewriteQueryAction,
+        };
+
+        let chained = [true, true, false, false];
+        let transition = vapache_verified::rewrite_program_step(
+            vapache_verified::rewrite_program_start(),
+            RewriteProgramEvent::NoMatch { chain: true },
+            &chained,
+            10,
+        )
+        .unwrap();
+        assert_eq!(transition.state.index, 3);
+        assert_eq!(
+            transition.action,
+            RewriteProgramAction::Continue {
+                apply_query: false,
+                query: RewriteQueryAction::Preserve,
+            }
+        );
+
+        let rules = [false, false];
+        let first_restart = vapache_verified::rewrite_program_step(
+            vapache_verified::rewrite_program_start(),
+            RewriteProgramEvent::Matched {
+                forbidden: false,
+                gone: false,
+                no_substitution: true,
+                proxy: false,
+                redirect: false,
+                query_string_append: false,
+                query_string_discard: true,
+                has_skip: false,
+                skip: 0,
+                restart: true,
+                last: true,
+                end: true,
+            },
+            &rules,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            first_restart.action,
+            RewriteProgramAction::Restart {
+                query: RewriteQueryAction::Discard,
+                completed: 1,
+            }
+        );
+        assert_eq!(first_restart.state.index, 0);
+        let exhausted = vapache_verified::rewrite_program_step(
+            first_restart.state,
+            RewriteProgramEvent::Matched {
+                forbidden: false,
+                gone: false,
+                no_substitution: true,
+                proxy: false,
+                redirect: false,
+                query_string_append: false,
+                query_string_discard: false,
+                has_skip: false,
+                skip: 0,
+                restart: true,
+                last: false,
+                end: false,
+            },
+            &rules,
+            1,
+        )
+        .unwrap();
+        assert_eq!(exhausted.action, RewriteProgramAction::RestartLimit);
+        assert_eq!(exhausted.state.phase, RewriteProgramPhase::Failed);
+        assert!(vapache_verified::rewrite_program_step(
+            exhausted.state,
+            RewriteProgramEvent::NoMatch { chain: false },
+            &rules,
+            1,
+        )
+        .is_none());
+
+        let selected = vapache_verified::rewrite_program_step(
+            vapache_verified::rewrite_program_start(),
+            RewriteProgramEvent::Matched {
+                forbidden: false,
+                gone: false,
+                no_substitution: false,
+                proxy: true,
+                redirect: true,
+                query_string_append: true,
+                query_string_discard: false,
+                has_skip: true,
+                skip: usize::MAX,
+                restart: true,
+                last: true,
+                end: true,
+            },
+            &rules,
+            10,
+        )
+        .unwrap();
+        assert_eq!(selected.action, RewriteProgramAction::Expand);
+        assert_eq!(selected.state.phase, RewriteProgramPhase::Expanding);
+        assert!(vapache_verified::rewrite_program_step(
+            vapache_verified::rewrite_program_start(),
+            RewriteProgramEvent::Expanded {
+                external: true,
+                has_target_query: true,
+                original_query_present: true,
+            },
+            &rules,
+            10,
+        )
+        .is_none());
+        assert!(vapache_verified::rewrite_program_step(
+            selected.state,
+            RewriteProgramEvent::NoMatch { chain: false },
+            &rules,
+            10,
+        )
+        .is_none());
+        let terminal = vapache_verified::rewrite_program_step(
+            selected.state,
+            RewriteProgramEvent::Expanded {
+                external: true,
+                has_target_query: true,
+                original_query_present: true,
+            },
+            &rules,
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            terminal.action,
+            RewriteProgramAction::Proxy {
+                query: RewriteQueryAction::Append,
+            }
+        );
+        assert_eq!(terminal.state.phase, RewriteProgramPhase::Terminal);
+        assert!(vapache_verified::rewrite_program_step(
+            terminal.state,
+            RewriteProgramEvent::NoMatch { chain: false },
+            &rules,
+            10,
+        )
+        .is_none());
+
+        let stopped = vapache_verified::rewrite_program_step(
+            vapache_verified::rewrite_program_start(),
+            RewriteProgramEvent::Matched {
+                forbidden: false,
+                gone: false,
+                no_substitution: true,
+                proxy: false,
+                redirect: false,
+                query_string_append: false,
+                query_string_discard: false,
+                has_skip: false,
+                skip: 0,
+                restart: false,
+                last: true,
+                end: true,
+            },
+            &rules,
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            stopped.action,
+            RewriteProgramAction::Stop {
+                query: RewriteQueryAction::Preserve,
+                final_pass: true,
+            }
+        );
+        assert!(stopped.state.final_pass);
+        assert_eq!(stopped.state.phase, RewriteProgramPhase::Stopped);
+
+        let denied = vapache_verified::rewrite_program_step(
+            vapache_verified::rewrite_program_start(),
+            RewriteProgramEvent::Matched {
+                forbidden: true,
+                gone: true,
+                no_substitution: true,
+                proxy: true,
+                redirect: true,
+                query_string_append: true,
+                query_string_discard: true,
+                has_skip: true,
+                skip: usize::MAX,
+                restart: true,
+                last: true,
+                end: true,
+            },
+            &rules,
+            10,
+        )
+        .unwrap();
+        assert_eq!(denied.action, RewriteProgramAction::Forbidden);
+        assert_eq!(denied.state.phase, RewriteProgramPhase::Terminal);
     }
 
     #[test]

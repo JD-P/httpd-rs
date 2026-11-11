@@ -104,3 +104,65 @@ fn p37_lexical_and_scoped_non_multiline_controls_remain_supported() {
             .map(|matched| (matched.start(), matched.end())),
     );
 }
+
+#[test]
+fn verified_positive_grammar_tracks_scope_and_seals_the_source() {
+    use vapache_verified::{PcreGrammarEvent, PcreGrammarOptions};
+
+    let state = vapache_verified::pcre_grammar_start(false, false);
+    let state = vapache_verified::pcre_grammar_step(
+        state,
+        PcreGrammarEvent::Open {
+            extended: true,
+            multiline: true,
+        },
+        2,
+    )
+    .unwrap();
+    assert_eq!(
+        state.options,
+        PcreGrammarOptions {
+            extended: true,
+            multiline: true,
+        }
+    );
+    let state = vapache_verified::pcre_grammar_step(state, PcreGrammarEvent::Close, 2).unwrap();
+    assert_eq!(
+        state.options,
+        PcreGrammarOptions {
+            extended: false,
+            multiline: false,
+        }
+    );
+    let certificate = vapache_verified::pcre_grammar_finish(state, 17).unwrap();
+    assert!(vapache_verified::pcre_grammar_certificate_admit(
+        certificate,
+        17
+    ));
+    assert!(!vapache_verified::pcre_grammar_certificate_admit(
+        certificate,
+        18
+    ));
+
+    let state = vapache_verified::pcre_grammar_start(false, true);
+    assert!(vapache_verified::pcre_grammar_step(state, PcreGrammarEvent::StartAnchor, 0).is_none());
+    let state = vapache_verified::pcre_grammar_start(false, false);
+    assert!(
+        vapache_verified::pcre_grammar_step(state, PcreGrammarEvent::AtomicLineEscape, 0,)
+            .is_none()
+    );
+    let state = vapache_verified::pcre_grammar_start(false, false);
+    assert!(vapache_verified::pcre_grammar_step(state, PcreGrammarEvent::Close, 0).is_none());
+
+    let state = vapache_verified::pcre_grammar_start(false, false);
+    let state = vapache_verified::pcre_grammar_step(
+        state,
+        PcreGrammarEvent::Open {
+            extended: false,
+            multiline: false,
+        },
+        1,
+    )
+    .unwrap();
+    assert!(vapache_verified::pcre_grammar_finish(state, 2).is_none());
+}

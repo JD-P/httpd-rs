@@ -1860,8 +1860,10 @@ The first Verus model should cover:
 The following remain assumptions or separate proofs:
 
 - the safe-Rust regex automata backend implements its documented regular
-  language and capture semantics; the PCRE2 compatibility frontend is checked
-  against the test-only PCRE2 10.46 oracle and rejects backtracking constructs;
+  language and capture semantics; the PCRE2 positive grammar carries a
+  verified option-scope and exact-source certificate into translation, while
+  byte-to-event completeness and matching equivalence are checked against the
+  test-only PCRE2 10.46 oracle;
 - the filesystem contents match what the access-file walk sees;
 - path canonicalization and `openat` containment (already separately
   verified in `crates/verified`);
@@ -1910,7 +1912,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **772 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **822 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - The forked h2 HPACK path calls the executable verified kernel for integer
   encoding/decoding, overflow-free entry sizing, dynamic-table admission,
@@ -1980,10 +1982,20 @@ construction: there is no second production interleaver.
   consumes the verified `Config, Access` order for deferred conditions and
   resets `<If>/<ElseIf>/<Else>` chain state between the two source streams;
   `condition_source_plan_matches_access_tail` connects it to the phase plan.
-- `RewriteExpandToken`, `rewrite_match_action` and `rewrite_advance`. The
-  runtime expander and template guard share the verified token alphabet;
-  matched/unmatched rule actions and the bounded `[S]`/`[N]`/`[L]`/`[END]`
-  program-counter transition are shared by dash and internal substitutions.
+- `PcreGrammarState`, `pcre_grammar_step` and `PcreGrammarCertificate`. The
+  positive parser consumes one verified option-scope machine: group close
+  restores the exact parent `x`/`m` state, `\R` and multiline `^` have no
+  admitted transition, and only a balanced parse can seal a certificate bound
+  to the exact source length. Translation rechecks that certificate.
+- `RewriteProgramState`, `RewriteProgramEvent` and `rewrite_program_step`. The
+  production rewrite loop consumes this one two-stage machine for matched-rule
+  precedence, failed-chain jumps, query disposition, bounded `[N]`,
+  `[S]`/`[L]`/`[END]`, final-pass state and unique
+  internal/proxy/redirect/deny terminal selection. The Expanding phase seals
+  the rule's proxy, redirect, query and round-control flags before target
+  expansion; expanded observations are rejected outside that phase. Regex,
+  expansion and filesystem observations are event inputs rather than parallel control flow.
+  `RewriteExpandToken` remains the shared verified expansion alphabet.
 - `auth_merge_kind`.  `Scope::merge` uses this three-way verified decision
   (`Replace`/`And`/`Or`) before constructing the authorization tree.
   `auth_merge_kind_properties` proves that `And`/`Or` are impossible without
@@ -2488,9 +2500,9 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus
 ```
 
-The current ledger (2026-11-04) is:
+The current ledger (2026-11-11) is:
 
-- weighted obligations: **36.5 / 68.0 (53.7%)** if partial obligations receive
+- weighted obligations: **40.5 / 71.0 (57.0%)** if partial obligations receive
   half credit;
 - proof debt: **5 / 6** — 0 named unverified security components, 0 partially
   bound sinks, 5 assumptions and 0 accepted unmodeled security-directive
@@ -2499,7 +2511,7 @@ The current ledger (2026-11-04) is:
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **702 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **822 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

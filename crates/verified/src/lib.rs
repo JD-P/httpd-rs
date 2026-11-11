@@ -2366,6 +2366,236 @@ pub proof fn rewrite_backref_exclusions_require_escape(
 {
 }
 
+// ---------------------------------------------------------------------------
+// PCRE2 positive-grammar certificate
+// ---------------------------------------------------------------------------
+
+/// The option state which affects lexical admission in the deterministic
+/// PCRE2 subset.  Other PCRE2 options change matching but do not change the
+/// two grammar exclusions represented here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PcreGrammarOptions {
+    pub extended: bool,
+    pub multiline: bool,
+}
+
+/// Security-relevant events emitted by the positive grammar parser.  The
+/// parser cannot finish with an atomic line escape or a multiline start
+/// anchor because those events have no admitted transition.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PcreGrammarEvent {
+    Token,
+    Open {
+        extended: bool,
+        multiline: bool,
+    },
+    Close,
+    GlobalOptions {
+        extended: bool,
+        multiline: bool,
+    },
+    StartAnchor,
+    AtomicLineEscape,
+}
+
+/// Executable grammar state consumed directly by the PCRE2 frontend.  The
+/// option stack is part of the verified transition rather than a second
+/// handwritten parser stack, so closing a scoped option group necessarily
+/// restores the exact parent state.
+#[derive(PartialEq, Eq, Debug)]
+pub struct PcreGrammarState {
+    pub options: PcreGrammarOptions,
+    pub frames: Vec<PcreGrammarOptions>,
+}
+
+pub open spec fn pcre_grammar_state_inv(state: PcreGrammarState, nest_limit: u32) -> bool {
+    state.frames@.len() <= nest_limit
+}
+
+/// Exact relational specification for one positive-grammar transition.  This
+/// is deliberately independent of the executable Vec push/pop operations so
+/// the parser's concrete option stack refines a mathematical sequence.
+pub open spec fn pcre_grammar_step_refines(
+    state: PcreGrammarState,
+    event: PcreGrammarEvent,
+    nest_limit: u32,
+    out: Option<PcreGrammarState>,
+) -> bool {
+    match event {
+        PcreGrammarEvent::Token => match out {
+            Some(next) => next.options == state.options && next.frames@ == state.frames@,
+            None => false,
+        },
+        PcreGrammarEvent::StartAnchor => if state.options.multiline {
+            out.is_none()
+        } else {
+            match out {
+                Some(next) => next.options == state.options && next.frames@ == state.frames@,
+                None => false,
+            }
+        },
+        PcreGrammarEvent::AtomicLineEscape => out.is_none(),
+        PcreGrammarEvent::GlobalOptions { extended, multiline } => match out {
+            Some(next) =>
+                next.options == (PcreGrammarOptions { extended, multiline })
+                    && next.frames@ == state.frames@,
+            None => false,
+        },
+        PcreGrammarEvent::Open { extended, multiline } => {
+            if state.frames@.len() >= nest_limit {
+                out.is_none()
+            } else {
+                match out {
+                    Some(next) =>
+                        next.options == (PcreGrammarOptions { extended, multiline })
+                            && next.frames@
+                                == state.frames@.push(state.options),
+                    None => false,
+                }
+            }
+        }
+        PcreGrammarEvent::Close => {
+            if state.frames@.len() == 0 {
+                out.is_none()
+            } else {
+                match out {
+                    Some(next) =>
+                        next.options == state.frames@[state.frames@.len() - 1]
+                            && next.frames@ == state.frames@.drop_last(),
+                    None => false,
+                }
+            }
+        }
+    }
+}
+
+pub fn pcre_grammar_start(
+    extended: bool,
+    multiline: bool,
+) -> (state: PcreGrammarState)
+    ensures
+        pcre_grammar_state_inv(state, 0),
+        state.options == (PcreGrammarOptions { extended, multiline }),
+        state.frames@.len() == 0,
+{
+    PcreGrammarState {
+        options: PcreGrammarOptions { extended, multiline },
+        frames: Vec::new(),
+    }
+}
+
+pub fn pcre_grammar_step(
+    mut state: PcreGrammarState,
+    event: PcreGrammarEvent,
+    nest_limit: u32,
+) -> (out: Option<PcreGrammarState>)
+    requires pcre_grammar_state_inv(state, nest_limit),
+    ensures
+        pcre_grammar_step_refines(state, event, nest_limit, out),
+        match out {
+            Some(next) => pcre_grammar_state_inv(next, nest_limit),
+            None => true,
+        },
+        event == PcreGrammarEvent::AtomicLineEscape ==> out.is_none(),
+        event == PcreGrammarEvent::StartAnchor && state.options.multiline ==> out.is_none(),
+        event == PcreGrammarEvent::Close && state.frames@.len() == 0 ==> out.is_none(),
+{
+    match event {
+        PcreGrammarEvent::Token => Some(state),
+        PcreGrammarEvent::StartAnchor => {
+            if state.options.multiline {
+                None
+            } else {
+                Some(state)
+            }
+        }
+        PcreGrammarEvent::AtomicLineEscape => None,
+        PcreGrammarEvent::GlobalOptions { extended, multiline } => {
+            state.options = PcreGrammarOptions { extended, multiline };
+            Some(state)
+        }
+        PcreGrammarEvent::Open { extended, multiline } => {
+            if state.frames.len() >= nest_limit as usize {
+                None
+            } else {
+                let parent = state.options;
+                state.frames.push(parent);
+                state.options = PcreGrammarOptions { extended, multiline };
+                Some(state)
+            }
+        }
+        PcreGrammarEvent::Close => {
+            match state.frames.pop() {
+                Some(parent) => {
+                    state.options = parent;
+                    Some(state)
+                }
+                None => None,
+            }
+        }
+    }
+}
+
+/// A successful parse carries this certificate into translation.  It binds
+/// the certificate to the exact source length and records the two semantic
+/// families whose events are unconditionally rejected by the state machine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PcreGrammarCertificate {
+    pub source_len: u64,
+    pub balanced: bool,
+    pub atomic_line_free: bool,
+    pub multiline_start_free: bool,
+}
+
+pub fn pcre_grammar_finish(
+    state: PcreGrammarState,
+    source_len: u64,
+) -> (certificate: Option<PcreGrammarCertificate>)
+    ensures
+        certificate.is_some() <==> state.frames@.len() == 0,
+        match certificate {
+            Some(value) =>
+                value.source_len == source_len
+                    && value.balanced
+                    && value.atomic_line_free
+                    && value.multiline_start_free,
+            None => true,
+        },
+{
+    if state.frames.len() == 0 {
+        Some(PcreGrammarCertificate {
+            source_len,
+            balanced: true,
+            atomic_line_free: true,
+            multiline_start_free: true,
+        })
+    } else {
+        None
+    }
+}
+
+pub open spec fn pcre_grammar_certificate_spec(
+    certificate: PcreGrammarCertificate,
+    source_len: u64,
+) -> bool {
+    certificate.source_len == source_len
+        && certificate.balanced
+        && certificate.atomic_line_free
+        && certificate.multiline_start_free
+}
+
+pub fn pcre_grammar_certificate_admit(
+    certificate: PcreGrammarCertificate,
+    source_len: u64,
+) -> (ok: bool)
+    ensures ok == pcre_grammar_certificate_spec(certificate, source_len),
+{
+    certificate.source_len == source_len
+        && certificate.balanced
+        && certificate.atomic_line_free
+        && certificate.multiline_start_free
+}
+
 /// A persisted cache entry is usable only when its metadata carries the
 /// complete cache key and that key is exactly the one requested.  The digest
 /// filename is an index, not an authority for cache identity.
@@ -4928,6 +5158,705 @@ pub proof fn rewrite_restart_cannot_fall_through(
             RewriteAdvance::Restart { .. } | RewriteAdvance::RestartLimit => true,
             _ => false,
         },
+{
+}
+
+/// Complete control phase for one rewrite program. Regex evaluation,
+/// expansion bytes and filesystem observations are external inputs, but
+/// every program-counter, query, restart and terminal decision is made by the
+/// transition below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RewriteProgramPhase {
+    Running,
+    Expanding,
+    Stopped,
+    Terminal,
+    Failed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RewriteProgramControl {
+    pub proxy: bool,
+    pub redirect: bool,
+    pub query_string_append: bool,
+    pub query_string_discard: bool,
+    pub has_skip: bool,
+    pub skip: usize,
+    pub restart: bool,
+    pub last: bool,
+    pub end: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RewriteProgramState {
+    pub phase: RewriteProgramPhase,
+    pub index: usize,
+    pub completed_restarts: u64,
+    pub final_pass: bool,
+    pub pending: Option<RewriteProgramControl>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RewriteProgramEvent {
+    NoMatch {
+        chain: bool,
+    },
+    Matched {
+        forbidden: bool,
+        gone: bool,
+        no_substitution: bool,
+        proxy: bool,
+        redirect: bool,
+        query_string_append: bool,
+        query_string_discard: bool,
+        has_skip: bool,
+        skip: usize,
+        restart: bool,
+        last: bool,
+        end: bool,
+    },
+    Expanded {
+        external: bool,
+        has_target_query: bool,
+        original_query_present: bool,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RewriteProgramAction {
+    Continue {
+        apply_query: bool,
+        query: RewriteQueryAction,
+    },
+    Expand,
+    Restart {
+        query: RewriteQueryAction,
+        completed: u64,
+    },
+    Stop {
+        query: RewriteQueryAction,
+        final_pass: bool,
+    },
+    Proxy {
+        query: RewriteQueryAction,
+    },
+    Redirect {
+        query: RewriteQueryAction,
+    },
+    Forbidden,
+    Gone,
+    RestartLimit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RewriteProgramTransition {
+    pub state: RewriteProgramState,
+    pub action: RewriteProgramAction,
+}
+
+pub open spec fn rewrite_program_state_inv(
+    state: RewriteProgramState,
+    rule_count: usize,
+    restart_limit: u64,
+) -> bool {
+    state.index <= rule_count
+        && state.completed_restarts <= restart_limit
+        && match state.phase {
+            RewriteProgramPhase::Expanding => state.pending.is_some(),
+            _ => state.pending.is_none(),
+        }
+}
+
+pub open spec fn rewrite_program_can_step_spec(
+    state: RewriteProgramState,
+    rule_count: usize,
+) -> bool {
+    match state.phase {
+        RewriteProgramPhase::Running | RewriteProgramPhase::Expanding => {
+            state.index < rule_count
+        }
+        _ => false,
+    }
+}
+
+pub fn rewrite_program_can_step(
+    state: RewriteProgramState,
+    rule_count: usize,
+) -> (can_step: bool)
+    ensures can_step == rewrite_program_can_step_spec(state, rule_count),
+{
+    reveal(rewrite_program_can_step_spec);
+    match state.phase {
+        RewriteProgramPhase::Running | RewriteProgramPhase::Expanding => {
+            state.index < rule_count
+        }
+        _ => false,
+    }
+}
+
+pub open spec fn rewrite_program_event_admit_spec(
+    state: RewriteProgramState,
+    event: RewriteProgramEvent,
+    rule_count: usize,
+) -> bool {
+    state.index < rule_count
+        && match (state.phase, event) {
+            (RewriteProgramPhase::Running, RewriteProgramEvent::NoMatch { .. })
+            | (RewriteProgramPhase::Running, RewriteProgramEvent::Matched { .. }) => true,
+            (RewriteProgramPhase::Expanding, RewriteProgramEvent::Expanded { .. }) => {
+                state.pending.is_some()
+            }
+            _ => false,
+        }
+}
+
+pub fn rewrite_program_event_admit(
+    state: RewriteProgramState,
+    event: RewriteProgramEvent,
+    rule_count: usize,
+) -> (admit: bool)
+    ensures admit == rewrite_program_event_admit_spec(state, event, rule_count),
+{
+    reveal(rewrite_program_event_admit_spec);
+    state.index < rule_count
+        && match (state.phase, event) {
+            (RewriteProgramPhase::Running, RewriteProgramEvent::NoMatch { .. })
+            | (RewriteProgramPhase::Running, RewriteProgramEvent::Matched { .. }) => true,
+            (RewriteProgramPhase::Expanding, RewriteProgramEvent::Expanded { .. }) => {
+                state.pending.is_some()
+            }
+            _ => false,
+        }
+}
+
+pub fn rewrite_program_start() -> (state: RewriteProgramState)
+    ensures
+        state.phase == RewriteProgramPhase::Running,
+        state.index == 0,
+        state.completed_restarts == 0,
+        !state.final_pass,
+        state.pending.is_none(),
+{
+    RewriteProgramState {
+        phase: RewriteProgramPhase::Running,
+        index: 0,
+        completed_restarts: 0,
+        final_pass: false,
+        pending: None,
+    }
+}
+
+pub open spec fn rewrite_program_control_transition_spec(
+    state: RewriteProgramState,
+    rule_count: usize,
+    restart_limit: u64,
+    query: RewriteQueryAction,
+    has_skip: bool,
+    skip: usize,
+    restart: bool,
+    last: bool,
+    end: bool,
+) -> RewriteProgramTransition {
+    let next_index: usize = (state.index as int + 1) as usize;
+    match rewrite_advance_spec(
+        next_index as int,
+        rule_count as int,
+        has_skip,
+        skip as int,
+        restart,
+        last,
+        end,
+        state.completed_restarts,
+        restart_limit,
+    ) {
+        RewriteAdvance::Continue { index } => RewriteProgramTransition {
+            state: RewriteProgramState {
+                phase: RewriteProgramPhase::Running,
+                index,
+                completed_restarts: state.completed_restarts,
+                final_pass: state.final_pass,
+                pending: None,
+            },
+            action: RewriteProgramAction::Continue {
+                apply_query: true,
+                query,
+            },
+        },
+        RewriteAdvance::Restart { completed } => RewriteProgramTransition {
+            state: RewriteProgramState {
+                phase: RewriteProgramPhase::Running,
+                index: 0,
+                completed_restarts: completed,
+                final_pass: state.final_pass,
+                pending: None,
+            },
+            action: RewriteProgramAction::Restart { query, completed },
+        },
+        RewriteAdvance::Stop { final_pass } => RewriteProgramTransition {
+            state: RewriteProgramState {
+                phase: RewriteProgramPhase::Stopped,
+                index: next_index,
+                completed_restarts: state.completed_restarts,
+                final_pass,
+                pending: None,
+            },
+            action: RewriteProgramAction::Stop { query, final_pass },
+        },
+        RewriteAdvance::RestartLimit => RewriteProgramTransition {
+            state: RewriteProgramState {
+                phase: RewriteProgramPhase::Failed,
+                index: next_index,
+                completed_restarts: state.completed_restarts,
+                final_pass: state.final_pass,
+                pending: None,
+            },
+            action: RewriteProgramAction::RestartLimit,
+        },
+    }
+}
+
+/// Mathematical reference transition for the complete rewrite control
+/// machine.  Regex/condition evaluation and target expansion are observations
+/// in the event alphabet; all control, query and terminal decisions are made
+/// here and refined by `rewrite_program_step` below.
+pub open spec fn rewrite_program_step_spec(
+    state: RewriteProgramState,
+    event: RewriteProgramEvent,
+    chained: Seq<bool>,
+    restart_limit: u64,
+) -> Option<RewriteProgramTransition> {
+    if !rewrite_program_event_admit_spec(state, event, chained.len() as usize) {
+        None
+    } else {
+        let next_index: usize = (state.index as int + 1) as usize;
+        match event {
+            RewriteProgramEvent::NoMatch { chain } => {
+                let index = if chain {
+                    rewrite_chain_resume_spec(chained, next_index as int) as usize
+                } else {
+                    next_index
+                };
+                Some(RewriteProgramTransition {
+                    state: RewriteProgramState {
+                        phase: RewriteProgramPhase::Running,
+                        index,
+                        completed_restarts: state.completed_restarts,
+                        final_pass: state.final_pass,
+                        pending: None,
+                    },
+                    action: RewriteProgramAction::Continue {
+                        apply_query: false,
+                        query: RewriteQueryAction::Preserve,
+                    },
+                })
+            }
+            RewriteProgramEvent::Matched {
+                forbidden,
+                gone,
+                no_substitution,
+                proxy,
+                redirect,
+                query_string_append,
+                query_string_discard,
+                has_skip,
+                skip,
+                restart,
+                last,
+                end,
+            } => {
+                let control = RewriteProgramControl {
+                    proxy,
+                    redirect,
+                    query_string_append,
+                    query_string_discard,
+                    has_skip,
+                    skip,
+                    restart,
+                    last,
+                    end,
+                };
+                if forbidden {
+                    Some(RewriteProgramTransition {
+                        state: RewriteProgramState {
+                            phase: RewriteProgramPhase::Terminal,
+                            index: next_index,
+                            completed_restarts: state.completed_restarts,
+                            final_pass: state.final_pass,
+                            pending: None,
+                        },
+                        action: RewriteProgramAction::Forbidden,
+                    })
+                } else if gone {
+                    Some(RewriteProgramTransition {
+                        state: RewriteProgramState {
+                            phase: RewriteProgramPhase::Terminal,
+                            index: next_index,
+                            completed_restarts: state.completed_restarts,
+                            final_pass: state.final_pass,
+                            pending: None,
+                        },
+                        action: RewriteProgramAction::Gone,
+                    })
+                } else if no_substitution {
+                    Some(rewrite_program_control_transition_spec(
+                        state,
+                        chained.len() as usize,
+                        restart_limit,
+                        if control.query_string_discard {
+                            RewriteQueryAction::Discard
+                        } else {
+                            RewriteQueryAction::Preserve
+                        },
+                        control.has_skip,
+                        control.skip,
+                        control.restart,
+                        control.last,
+                        control.end,
+                    ))
+                } else {
+                    Some(RewriteProgramTransition {
+                        state: RewriteProgramState {
+                            phase: RewriteProgramPhase::Expanding,
+                            index: state.index,
+                            completed_restarts: state.completed_restarts,
+                            final_pass: state.final_pass,
+                            pending: Some(control),
+                        },
+                        action: RewriteProgramAction::Expand,
+                    })
+                }
+            }
+            RewriteProgramEvent::Expanded {
+                external,
+                has_target_query,
+                original_query_present,
+            } => {
+                match state.pending {
+                    None => None,
+                    Some(control) => {
+                        let query = rewrite_query_action_spec(
+                            has_target_query,
+                            control.query_string_append,
+                            control.query_string_discard,
+                            original_query_present,
+                        );
+                        match rewrite_sink_spec(control.proxy, external, control.redirect) {
+                        RewriteSink::Proxy => Some(RewriteProgramTransition {
+                            state: RewriteProgramState {
+                                phase: RewriteProgramPhase::Terminal,
+                                index: next_index,
+                                completed_restarts: state.completed_restarts,
+                                final_pass: state.final_pass,
+                                pending: None,
+                            },
+                            action: RewriteProgramAction::Proxy { query },
+                        }),
+                        RewriteSink::Redirect => Some(RewriteProgramTransition {
+                            state: RewriteProgramState {
+                                phase: RewriteProgramPhase::Terminal,
+                                index: next_index,
+                                completed_restarts: state.completed_restarts,
+                                final_pass: state.final_pass,
+                                pending: None,
+                            },
+                            action: RewriteProgramAction::Redirect { query },
+                        }),
+                            RewriteSink::Internal => Some(rewrite_program_control_transition_spec(
+                                state,
+                                chained.len() as usize,
+                                restart_limit,
+                                query,
+                                control.has_skip,
+                                control.skip,
+                                control.restart,
+                                control.last,
+                                control.end,
+                            )),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn rewrite_program_control_transition(
+    mut state: RewriteProgramState,
+    rule_count: usize,
+    restart_limit: u64,
+    query: RewriteQueryAction,
+    has_skip: bool,
+    skip: usize,
+    restart: bool,
+    last: bool,
+    end: bool,
+) -> (transition: RewriteProgramTransition)
+    requires
+        rewrite_program_state_inv(state, rule_count, restart_limit),
+        rewrite_program_can_step_spec(state, rule_count),
+    ensures
+        rewrite_program_state_inv(transition.state, rule_count, restart_limit),
+        transition == rewrite_program_control_transition_spec(
+            state,
+            rule_count,
+            restart_limit,
+            query,
+            has_skip,
+            skip,
+            restart,
+            last,
+            end,
+        ),
+{
+    let next_index = state.index + 1;
+    let advance = rewrite_advance(
+        next_index,
+        rule_count,
+        has_skip,
+        skip,
+        restart,
+        last,
+        end,
+        state.completed_restarts,
+        restart_limit,
+    );
+    state.pending = None;
+    match advance {
+        RewriteAdvance::Continue { index } => {
+            state.phase = RewriteProgramPhase::Running;
+            state.index = index;
+            RewriteProgramTransition {
+                state,
+                action: RewriteProgramAction::Continue {
+                    apply_query: true,
+                    query,
+                },
+            }
+        }
+        RewriteAdvance::Restart { completed } => {
+            state.phase = RewriteProgramPhase::Running;
+            state.index = 0;
+            state.completed_restarts = completed;
+            RewriteProgramTransition {
+                state,
+                action: RewriteProgramAction::Restart { query, completed },
+            }
+        }
+        RewriteAdvance::Stop { final_pass } => {
+            state.phase = RewriteProgramPhase::Stopped;
+            state.index = next_index;
+            state.final_pass = final_pass;
+            RewriteProgramTransition {
+                state,
+                action: RewriteProgramAction::Stop { query, final_pass },
+            }
+        }
+        RewriteAdvance::RestartLimit => {
+            state.phase = RewriteProgramPhase::Failed;
+            state.index = next_index;
+            RewriteProgramTransition {
+                state,
+                action: RewriteProgramAction::RestartLimit,
+            }
+        }
+    }
+}
+
+pub fn rewrite_program_step(
+    initial_state: RewriteProgramState,
+    event: RewriteProgramEvent,
+    chained: &[bool],
+    restart_limit: u64,
+) -> (out: Option<RewriteProgramTransition>)
+    requires rewrite_program_state_inv(initial_state, chained.len(), restart_limit),
+    ensures
+        out == rewrite_program_step_spec(initial_state, event, chained@, restart_limit),
+        out.is_some()
+            == rewrite_program_event_admit_spec(initial_state, event, chained.len()),
+        match out {
+            Some(transition) =>
+                rewrite_program_state_inv(transition.state, chained.len(), restart_limit),
+            None => true,
+        },
+        match event {
+            RewriteProgramEvent::NoMatch { .. } => match out {
+                Some(transition) => match transition.action {
+                    RewriteProgramAction::Continue { apply_query, .. } => !apply_query,
+                    _ => false,
+                },
+                None => true,
+            },
+            _ => true,
+        },
+{
+    if !rewrite_program_event_admit(initial_state, event, chained.len()) {
+        return None;
+    }
+    assert(rewrite_program_event_admit_spec(initial_state, event, chained.len()));
+    assert(rewrite_program_can_step_spec(initial_state, chained.len()));
+    let mut state = initial_state;
+    assert(rewrite_program_can_step_spec(state, chained.len()));
+    match event {
+        RewriteProgramEvent::NoMatch { chain } => {
+            let next_index = state.index + 1;
+            state.index = if chain {
+                rewrite_chain_resume(chained, next_index)
+            } else {
+                next_index
+            };
+            state.phase = RewriteProgramPhase::Running;
+            state.pending = None;
+            Some(RewriteProgramTransition {
+                state,
+                action: RewriteProgramAction::Continue {
+                    apply_query: false,
+                    query: RewriteQueryAction::Preserve,
+                },
+            })
+        }
+        RewriteProgramEvent::Matched {
+            forbidden,
+            gone,
+            no_substitution,
+            proxy,
+            redirect,
+            query_string_append,
+            query_string_discard,
+            has_skip,
+            skip,
+            restart,
+            last,
+            end,
+        } => {
+            let control = RewriteProgramControl {
+                proxy,
+                redirect,
+                query_string_append,
+                query_string_discard,
+                has_skip,
+                skip,
+                restart,
+                last,
+                end,
+            };
+            if forbidden {
+                state.phase = RewriteProgramPhase::Terminal;
+                state.index = state.index + 1;
+                state.pending = None;
+                Some(RewriteProgramTransition {
+                    state,
+                    action: RewriteProgramAction::Forbidden,
+                })
+            } else if gone {
+                state.phase = RewriteProgramPhase::Terminal;
+                state.index = state.index + 1;
+                state.pending = None;
+                Some(RewriteProgramTransition {
+                    state,
+                    action: RewriteProgramAction::Gone,
+                })
+            } else if no_substitution {
+                let query = if control.query_string_discard {
+                    RewriteQueryAction::Discard
+                } else {
+                    RewriteQueryAction::Preserve
+                };
+                assert(rewrite_program_can_step_spec(state, chained.len()));
+                Some(rewrite_program_control_transition(
+                    state,
+                    chained.len(),
+                    restart_limit,
+                    query,
+                    control.has_skip,
+                    control.skip,
+                    control.restart,
+                    control.last,
+                    control.end,
+                ))
+            } else {
+                state.phase = RewriteProgramPhase::Expanding;
+                state.pending = Some(control);
+                Some(RewriteProgramTransition {
+                    state,
+                    action: RewriteProgramAction::Expand,
+                })
+            }
+        }
+        RewriteProgramEvent::Expanded {
+            external,
+            has_target_query,
+            original_query_present,
+        } => {
+            let control = match state.pending {
+                Some(control) => control,
+                None => {
+                    assert(false);
+                    return None;
+                }
+            };
+            let query = rewrite_query_action(
+                has_target_query,
+                control.query_string_append,
+                control.query_string_discard,
+                original_query_present,
+            );
+            match rewrite_sink(control.proxy, external, control.redirect) {
+                RewriteSink::Proxy => {
+                    state.phase = RewriteProgramPhase::Terminal;
+                    state.index = state.index + 1;
+                    state.pending = None;
+                    Some(RewriteProgramTransition {
+                        state,
+                        action: RewriteProgramAction::Proxy { query },
+                    })
+                }
+                RewriteSink::Redirect => {
+                    state.phase = RewriteProgramPhase::Terminal;
+                    state.index = state.index + 1;
+                    state.pending = None;
+                    Some(RewriteProgramTransition {
+                        state,
+                        action: RewriteProgramAction::Redirect { query },
+                    })
+                }
+                RewriteSink::Internal => {
+                    assert(rewrite_program_can_step_spec(state, chained.len()));
+                    Some(rewrite_program_control_transition(
+                        state,
+                        chained.len(),
+                        restart_limit,
+                        query,
+                        control.has_skip,
+                        control.skip,
+                        control.restart,
+                        control.last,
+                        control.end,
+                    ))
+                }
+            }
+        }
+    }
+}
+
+pub proof fn rewrite_program_nonrunning_is_absorbing(
+    state: RewriteProgramState,
+    rule_count: usize,
+)
+    requires
+        state.phase == RewriteProgramPhase::Stopped
+            || state.phase == RewriteProgramPhase::Terminal
+            || state.phase == RewriteProgramPhase::Failed,
+    ensures !rewrite_program_can_step_spec(state, rule_count),
+{
+}
+
+pub proof fn rewrite_program_completed_restart_is_bounded(
+    transition: RewriteProgramTransition,
+    rule_count: usize,
+    restart_limit: u64,
+)
+    requires rewrite_program_state_inv(transition.state, rule_count, restart_limit),
+    ensures transition.state.completed_restarts <= restart_limit,
 {
 }
 

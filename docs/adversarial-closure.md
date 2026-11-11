@@ -646,13 +646,17 @@ builder, a global option or a scoped option; PCRE2's final-newline and CRLF
 start-offset semantics cannot be represented exactly by the backend anchor.
 
 This replaces both contextual blacklists and the incomplete match-time
-terminal-anchor suppression with two grammar-level exclusions. Quoted `\R`
-text, escaped/literal carets, ordinary `^`, and scopes that explicitly disable
-multiline mode remain admitted. The P37 regression suite covers every reported
-boolean, capture and offset shape, both retained fuzzer artifacts, nested flag
-scope, and lexical controls. The admission fuzzer also generates these families
-as exclusions, while its positive generator continues to require complete
-PCRE2 differential agreement.
+terminal-anchor suppression with two grammar-level exclusions. The positive
+parser now consumes the verified `PcreGrammarState` transition directly;
+scoped groups restore the exact parent option state, forbidden events have no
+transition, and a balanced parse seals an exact-source certificate that the
+translator must revalidate. Quoted `\R` text, escaped/literal carets, ordinary
+`^`, and scopes that explicitly disable multiline mode remain admitted. The
+P37 regression suite covers every reported boolean, capture and offset shape,
+both retained fuzzer artifacts, nested flag scope, certificate substitution
+and lexical controls. The admission fuzzer also generates these families as
+exclusions, while its positive generator continues to require complete PCRE2
+differential agreement.
 
 ## Regression surface
 

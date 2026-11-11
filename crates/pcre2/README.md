@@ -20,6 +20,13 @@ therefore rejected even if a future backend assigns them a meaning. All
 vapached directive and expression regex surfaces enter through this frontend;
 none parse configuration patterns with Rust `regex` directly.
 
+The parser's security-relevant option state is an executable Verus state
+machine. Scoped groups save and restore the exact parent `x`/`m` state, while
+atomic `\R` and multiline `^` have no admitted transition. A complete,
+balanced parse produces a verified certificate bound to the exact source
+length; translation rejects a missing, malformed or source-mismatched
+certificate before lowering the pattern.
+
 The executable backend uses `regex-automata` directly: a bounded Pike VM keeps
 cold starts small, and a shared lazy DFA is compiled after the first search
 for steady-state speed. Bounded backtracking is explicitly disabled in both

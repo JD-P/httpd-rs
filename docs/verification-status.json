@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-11",
   "verus": {
-    "verified_functions": 802,
+    "verified_functions": 822,
     "errors": 0
   },
   "obligations": [
@@ -40,6 +40,13 @@
       "status": "partial",
       "weight": 1.0,
       "evidence": "PolicyResult combinators and require_none are verified; expression integer/string comparisons run through expr_compare_ints/expr_compare_strs. P27 replaces recursive runtime glob execution with stack-safe iterative DP and consumes glob_match_resource_admit before request-controlled expression matching; exhaustive small-input tests refine both iterative dialects against the Verus fnmatch_spec/expr_glob_spec semantic oracles. A full proof that the DP implementation refines those recursive specifications remains outside Verus. P28 caps each expression value/concatenation at 1 MiB and one recursive evaluation at 4 MiB, with bounded_expansion_append_admit consumed before allocation and errors propagated fail-closed. P15 expression regexes compile through the safe-Rust non-backtracking PCRE2 compatibility frontend at configuration load; expr_regex_result proves an evaluation error cannot grant through negation, regex_engine_mode_admit excludes recursive backtracking/JIT, and the compile/capture/match resource predicates bound allocation and pattern-times-subject work. The admitted regex dialect is differentially checked against the test-only PCRE2 10.46 oracle. auth_file_immutable_admit is consumed by the no-symlink authentication-file opener; its proofs reject service ownership and group/other write authority. The authentication campaign adds byte-oriented Basic scheme admission, exact credential-cache snapshot reuse and group_provider_result, whose proof makes unavailable group data Denied even under negation. Strict UTF-8 decoding, cryptographic hash implementations, parent-chain kernel enforcement and the Rust automata backend's internal matching semantics remain outside the model."
+    },
+    {
+      "id": "pcre2_grammar_refinement",
+      "title": "PCRE2 positive grammar carries a verified admission certificate into translation",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "PcreGrammarState is the executable option-scope machine consumed directly by the positive parser. pcre_grammar_step_refines is the independent sequence-based transition relation: Open records the exact parent x/m option state, Close restores it, empty Close and excessive nesting reject, AtomicLineEscape has no admitted transition, and StartAnchor has no admitted transition while multiline is effective. The executable step is proved to refine that relation and preserve the stack invariant. A complete parse can call pcre_grammar_finish only with an empty scope stack; the resulting PcreGrammarCertificate binds the exact source length and the balanced/atomic-line-free/multiline-start-free facts, and translation rechecks that certificate before lowering. Regression tests cover scope restoration, unbalanced input, forbidden events and source substitution. Byte-to-event parser completeness and matching equivalence remain continuously checked against the test-only PCRE2 10.46 differential oracle; the safe-Rust automata backend remains an explicit ledger assumption."
     },
     {
       "id": "require_none_never_grants",
@@ -345,9 +352,9 @@
     {
       "id": "rewrite_flag_state_machine",
       "title": "Rewrite flags and rounds select one target: [PT] maps URLs, overrides are not sticky, dead flags warn",
-      "status": "partial",
+      "status": "mechanized",
       "weight": 1.0,
-      "evidence": "Partially implemented. rewrite_expand_token is the shared executable alphabet for variable/rule-capture/condition-capture interpretation and proxy-template admission. rewrite_match_action is the single post-match decision for chain failure, [F], [G], '-' and expansion; rewrite_advance is the shared bounded program-counter transition for [S], [N], [L] and [END] after both '-' and internal substitutions. rewrite_unmatched_rule_has_no_terminal_effect and rewrite_restart_cannot_fall_through prove the key control exclusions, while rewrite_chain_resume proves failed-chain skipping. rewrite_sink, rewrite_query_action and filesystem shape/candidate kernels cover terminal sink, query and [PT] selection. Runtime truth-table and dash-[END] regressions consume these executable forms. Regex matching, variable values, filesystem observations and target-string construction remain outside Verus."
+      "evidence": "RewriteProgramState and rewrite_program_step are the single executable control machine consumed by rewrite::process. rewrite_program_step_spec is the independent mathematical reference transition, and the executable step is proved exactly equal to it for every event. A matched-rule transition itself selects forbidden/gone/no-substitution/expansion precedence; expansion moves to an Expanding phase carrying sealed proxy, redirect, query and round-control flags, and an Expanded observation is rejected in every other phase. Regex/condition results, expanded target classification and filesystem observations enter as explicit observations; the machine owns the rule index, failed-chain resume, query action, bounded [N] restart count, [S]/[L]/[END] precedence, final-pass bit and the unique internal/proxy/redirect/forbidden/gone/restart-limit action. rewrite_program_state_inv proves every successful transition keeps the index and restart count bounded with pending controls only in Expanding, nonactive states are absorbing, and completed restarts cannot exceed the configured limit. The transition composes the previously verified rewrite_chain_resume, rewrite_query_action, rewrite_sink and rewrite_advance kernels, while rewrite_expand_token remains the shared expansion alphabet. Runtime tests cover chain jumps, forbidden precedence, phase-invalid events, sealed expansion flags, restart exhaustion, query action, terminal precedence and stopped/failed absorption. Regex matching, expansion bytes and filesystem facts remain external observations, not competing control-flow implementations."
     },
     {
       "id": "apache_options_reset",
@@ -497,7 +504,7 @@
       "evidence": "backend_resolution_binding_admit requires a validated resolver result to belong to the consuming immutable generation, backend_connected_endpoint_admit requires the kernel peer to equal the selected bound endpoint, and fastcgi_peer_identity_admit rejects a Unix listener outside the configured worker/endpoint-owner or uid-0 trust set. Runtime stores the first bounded DNS answer in an Arc-owned per-Config registry shared by proxy, WebSocket, health, TCP FastCGI and OCSP paths; concurrent first answers converge on one map entry, the map has no in-generation expiry, reload creates a distinct registry, and structural Arc lifetime prevents retirement cleanup from racing an in-flight background insertion. Linux strict Unix FastCGI additionally consumes SO_PEERCRED independently of before/after socket pathname metadata. Unit tests cover rebinding, generation separation, structural cleanup, invalid resolver ports, endpoint mismatch and peer uid mismatch; complete workspace tests cover every integrated consumer."
     }
   ],
-  "minimum_weighted_score": 3.5,
+  "minimum_weighted_score": 40.5,
   "proof_debt": {
     "max_total": 6,
     "unverified_security_components": [],
@@ -587,6 +594,7 @@
     "FastCGI endpoint-keyed stable-path component and POSIX-ACL admission",
     "Expression value truthiness, integer/string comparison, glob matching and fail-closed regex results, plus rewrite condition-chain folding",
     "Non-backtracking PCRE2-compatibility admission and deterministic resource bounds for expression patterns",
+    "PCRE2 positive-grammar scope machine and exact-source admission certificate",
     "Optional-repetition terminal-path and PikeVM active-set work dominance",
     "Directive disposition and fail-closed security fallback",
     "Shared request-to-target mapping for dispatch and cache authorization",
@@ -645,7 +653,7 @@
     "Depth-interleaved config/access Files phase plan",
     "Rewrite proxy-template dynamic-marker admission and complete chained-rule resume",
     "HTTP/1 duplicate-header merge-slot selection",
-    "Rewrite expansion-token, matched-action and bounded program-counter state machine",
+    "Complete rewrite control/query/restart/terminal state machine",
     "Recursive configuration kind/phase/deferred-slot/order decisions",
     "Exact config/access provenance and depth in the Directory/Files evaluation plan",
     "Config-before-access conditional source plan with independent chain state",

@@ -1041,12 +1041,7 @@ pub mod bytes {
     /// cannot reproduce their PCRE2 priority and offset semantics exactly.
     struct AdmittedPattern<'a> {
         source: &'a str,
-    }
-
-    #[derive(Clone, Copy)]
-    struct GrammarFrame {
-        previous_extended: bool,
-        previous_multiline: bool,
+        certificate: vapache_verified::PcreGrammarCertificate,
     }
 
     enum SpecialGroup {
@@ -1075,14 +1070,15 @@ pub mod bytes {
             unicode_pattern: bool,
         ) -> Result<Self, Error> {
             let bytes = source.as_bytes();
-            let mut frames = Vec::new();
-            let mut extended = initial_extended;
-            let mut multiline = initial_multiline;
+            let mut grammar =
+                vapache_verified::pcre_grammar_start(initial_extended, initial_multiline);
             let mut i = 0usize;
             let mut repeatable = false;
             let mut branch_start = true;
 
             while i < bytes.len() {
+                let extended = grammar.options.extended;
+                let multiline = grammar.options.multiline;
                 if extended && pcre_extended_ascii_whitespace(bytes[i]) {
                     i += 1;
                     continue;
@@ -1136,6 +1132,15 @@ pub mod bytes {
                         branch_start = false;
                     }
                     b'\\' => {
+                        if bytes.get(i + 1) == Some(&b'R') {
+                            let denied = vapache_verified::pcre_grammar_step(
+                                grammar,
+                                vapache_verified::PcreGrammarEvent::AtomicLineEscape,
+                                nest_limit,
+                            );
+                            debug_assert!(denied.is_none());
+                            return Err(Error::unsupported(i, "atomic CRLF line sequence"));
+                        }
                         let (end, can_repeat) = admitted_escape(bytes, i)?;
                         i = end;
                         repeatable = can_repeat;
@@ -1153,25 +1158,34 @@ pub mod bytes {
                                 multiline: next_multiline,
                             } => {
                                 i = end;
-                                extended = next_extended;
-                                multiline = next_multiline;
+                                grammar = vapache_verified::pcre_grammar_step(
+                                    grammar,
+                                    vapache_verified::PcreGrammarEvent::GlobalOptions {
+                                        extended: next_extended,
+                                        multiline: next_multiline,
+                                    },
+                                    nest_limit,
+                                )
+                                .ok_or_else(|| {
+                                    Error::syntax_at(i, "invalid global option transition")
+                                })?;
                             }
                             SpecialGroup::Open {
                                 body,
                                 extended: next_extended,
                                 multiline: next_multiline,
                             } => {
-                                if frames.len() >= nest_limit as usize {
-                                    return Err(Error::resource(
-                                        "pattern nesting exceeds the configured limit",
-                                    ));
-                                }
-                                frames.push(GrammarFrame {
-                                    previous_extended: extended,
-                                    previous_multiline: multiline,
-                                });
-                                extended = next_extended;
-                                multiline = next_multiline;
+                                grammar = vapache_verified::pcre_grammar_step(
+                                    grammar,
+                                    vapache_verified::PcreGrammarEvent::Open {
+                                        extended: next_extended,
+                                        multiline: next_multiline,
+                                    },
+                                    nest_limit,
+                                )
+                                .ok_or_else(|| {
+                                    Error::resource("pattern nesting exceeds the configured limit")
+                                })?;
                                 i = body;
                                 repeatable = false;
                                 branch_start = true;
@@ -1179,25 +1193,28 @@ pub mod bytes {
                         }
                     }
                     b'(' => {
-                        if frames.len() >= nest_limit as usize {
-                            return Err(Error::resource(
-                                "pattern nesting exceeds the configured limit",
-                            ));
-                        }
-                        frames.push(GrammarFrame {
-                            previous_extended: extended,
-                            previous_multiline: multiline,
-                        });
+                        grammar = vapache_verified::pcre_grammar_step(
+                            grammar,
+                            vapache_verified::PcreGrammarEvent::Open {
+                                extended,
+                                multiline,
+                            },
+                            nest_limit,
+                        )
+                        .ok_or_else(|| {
+                            Error::resource("pattern nesting exceeds the configured limit")
+                        })?;
                         i += 1;
                         repeatable = false;
                         branch_start = true;
                     }
                     b')' => {
-                        let frame = frames
-                            .pop()
-                            .ok_or_else(|| Error::syntax_at(i, "unmatched closing parenthesis"))?;
-                        extended = frame.previous_extended;
-                        multiline = frame.previous_multiline;
+                        grammar = vapache_verified::pcre_grammar_step(
+                            grammar,
+                            vapache_verified::PcreGrammarEvent::Close,
+                            nest_limit,
+                        )
+                        .ok_or_else(|| Error::syntax_at(i, "unmatched closing parenthesis"))?;
                         i += 1;
                         repeatable = true;
                         branch_start = false;
@@ -1207,10 +1224,18 @@ pub mod bytes {
                         repeatable = false;
                         branch_start = true;
                     }
-                    b'^' if multiline => {
-                        return Err(Error::unsupported(i, "multiline start anchor"));
+                    b'^' => {
+                        grammar = vapache_verified::pcre_grammar_step(
+                            grammar,
+                            vapache_verified::PcreGrammarEvent::StartAnchor,
+                            nest_limit,
+                        )
+                        .ok_or_else(|| Error::unsupported(i, "multiline start anchor"))?;
+                        i += 1;
+                        repeatable = false;
+                        branch_start = false;
                     }
-                    b'^' | b'$' => {
+                    b'$' => {
                         i += 1;
                         repeatable = false;
                         branch_start = false;
@@ -1276,10 +1301,15 @@ pub mod bytes {
                 }
             }
 
-            if !frames.is_empty() {
-                return Err(Error::syntax("unterminated group"));
+            let certificate = vapache_verified::pcre_grammar_finish(grammar, source.len() as u64)
+                .ok_or_else(|| Error::syntax("unterminated group"))?;
+            if !vapache_verified::pcre_grammar_certificate_admit(certificate, source.len() as u64) {
+                return Err(Error::syntax("invalid PCRE grammar certificate"));
             }
-            Ok(Self { source })
+            Ok(Self {
+                source,
+                certificate,
+            })
         }
     }
 
@@ -1524,6 +1554,12 @@ pub mod bytes {
         unicode_pattern: bool,
         ucp: bool,
     ) -> Result<Translation, Error> {
+        if !vapache_verified::pcre_grammar_certificate_admit(
+            admitted.certificate,
+            admitted.source.len() as u64,
+        ) {
+            return Err(Error::syntax("invalid PCRE grammar certificate"));
+        }
         let pattern = admitted.source;
         let quantifier_extended = extended || inline_option_may_enable(pattern, b'x');
         let invalid_quantifier = invalid_quantifier_placement(pattern, false, crlf).or_else(|| {
