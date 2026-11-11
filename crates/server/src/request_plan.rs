@@ -669,6 +669,60 @@ impl RequestPlan {
         })
     }
 
+    /// Retarget an internal rewrite within the same mapped directory while
+    /// retaining the request's descriptor-validated access-file snapshot.
+    /// Apache carries its per-directory configuration through this transition;
+    /// reopening the same `.htaccess` pathname made one logical request see
+    /// two policy versions and repeated the complete access-file walk.
+    ///
+    /// Reuse is deliberately narrow: URL mapping, execution class, policy
+    /// walk directory, and every layer identity must remain identical. Any
+    /// alias boundary or deeper/shallower target falls back to a fresh plan.
+    pub fn retarget_same_directory_rewrite(
+        &self,
+        cfg: &Config,
+        vhost: Option<&VHost>,
+        target: CanonicalTarget,
+    ) -> Option<Self> {
+        let (root, rel, script_alias) = crate::server::map_path(cfg, vhost, &target.norm)?;
+        if root != self.root || script_alias != self.script_alias {
+            return None;
+        }
+        let fs_path = root.join(&rel);
+        let source_walk_dir = if crate::files::is_dir_cached(&self.fs_path) {
+            self.fs_path.as_path()
+        } else {
+            self.fs_path.parent()?
+        };
+        let target_walk_dir = if crate::files::is_dir_cached(&fs_path) {
+            fs_path.as_path()
+        } else {
+            fs_path.parent()?
+        };
+        if source_walk_dir != target_walk_dir {
+            return None;
+        }
+        let identities_match = self.layers.iter().all(|layer| {
+            LayerIdentity::new(&root, &layer.identity.dir, &fs_path, &target.url_path)
+                == layer.identity
+        });
+        if !identities_match {
+            return None;
+        }
+        Some(Self {
+            target,
+            root,
+            rel,
+            fs_path,
+            script_alias,
+            layers: self.layers.clone(),
+            access_may_apply: self.access_may_apply,
+            preopened_target: None,
+            precomputed_scope: None,
+            skip_url_translation: false,
+        })
+    }
+
     /// A typed DirectoryIndex transition can reuse its already mapped target
     /// only when the configuration compiler proved that URL translation has
     /// no matching terminal rule for the child URL.
@@ -758,9 +812,8 @@ impl RequestPlan {
             !self.layers.is_empty(),
         );
         if use_layers {
-            let (scope, config_conditionals, access_conditionals) =
-                crate::policy_ref::effective_scope_with_layers(
-                    cfg,
+            let (scope, config_conditionals, access_conditionals) = cfg
+                .effective_scope_with_layers_cached(
                     vhost,
                     &self.fs_path,
                     &self.target.url_path,
@@ -770,8 +823,8 @@ impl RequestPlan {
                 );
             EvaluatedScope {
                 scope,
-                config_conditionals: Arc::new(config_conditionals),
-                access_conditionals: Arc::new(access_conditionals),
+                config_conditionals,
+                access_conditionals,
             }
         } else {
             let (scope, conditionals) = cfg.effective_scope_req_cached(
@@ -1137,6 +1190,47 @@ mod tests {
                 CanonicalTarget::from_url_path("/index.html").unwrap(),
                 None,
                 None,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn rewrite_retargets_same_directory_access_snapshot() {
+        let root = PathBuf::from("/srv/www");
+        let source_path = root.join("dir/old.html");
+        let layer = AccessLayer {
+            identity: LayerIdentity::new(&root, &root.join("dir"), &source_path, "/dir/old.html"),
+            scope: Arc::new(Scope::default()),
+            files: Vec::new(),
+            conditionals: Vec::new(),
+        };
+        let plan = RequestPlan {
+            target: CanonicalTarget::from_url_path("/dir/old.html").unwrap(),
+            root: root.clone(),
+            rel: PathBuf::from("dir/old.html"),
+            fs_path: source_path,
+            script_alias: false,
+            layers: vec![layer],
+            access_may_apply: true,
+            preopened_target: None,
+            precomputed_scope: None,
+            skip_url_translation: false,
+        };
+        let cfg = load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n");
+        let target = plan
+            .retarget_same_directory_rewrite(
+                &cfg,
+                None,
+                CanonicalTarget::from_url_path("/dir/new.html").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(target.fs_path(), Path::new("/srv/www/dir/new.html"));
+        assert!(Arc::ptr_eq(&plan.layers[0].scope, &target.layers[0].scope));
+        assert!(plan
+            .retarget_same_directory_rewrite(
+                &cfg,
+                None,
+                CanonicalTarget::from_url_path("/other/new.html").unwrap(),
             )
             .is_none());
     }

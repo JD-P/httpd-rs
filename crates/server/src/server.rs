@@ -1203,13 +1203,17 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                 return Ok(false);
             };
             let (url_root, url_fs_hint) = url_mapping_hint(&cfg, vhost, &canonical);
-            let (mut url_scope, url_conditionals) = cfg.url_translation_scope_req_deferred(
+            let (url_scope, url_conditionals) = cfg.url_translation_scope_req_deferred(
                 vhost,
                 &url_fs_hint,
                 &url_path,
                 &req,
                 peer.ip(),
             );
+            // WebSocket upgrade dispatch may move this scope into its
+            // long-lived authorization plan. Keep the ordinary request hot
+            // path shared and materialize an owned copy only for upgrades.
+            let mut url_scope = url_scope.as_ref().clone();
             crate::policy_ref::apply_conditionals(
                 &cfg,
                 vhost,
@@ -5680,7 +5684,7 @@ struct UrlPhaseLocal {
     owned_req: Option<Request>,
     rewrite_effects: crate::rewrite::Effects,
     filesystem: Option<crate::rewrite::FilesystemTarget>,
-    original: Option<(String, PathBuf, Scope)>,
+    original: Option<(String, PathBuf, Arc<Scope>)>,
 }
 
 enum UrlPhaseResult {
@@ -5690,9 +5694,37 @@ enum UrlPhaseResult {
 
 struct UrlPhaseStart<'a> {
     request_uri: &'a str,
+    /// Canonical target selected by the filesystem rewrite. Keeping this
+    /// separate from `Request` avoids cloning the complete request body merely
+    /// to replace its synthetic path.
+    target: CanonicalTarget,
     effects: crate::rewrite::Effects,
     stop_rewriting: bool,
     prior_scope: (&'a str, &'a Path, &'a Scope),
+}
+
+enum CapturedUrlScope<'a> {
+    /// A filesystem rewrite caller already owns this scope for the duration of
+    /// the nested URL translation pass.
+    Borrowed(&'a Scope),
+    /// Ordinary URL translation scopes come from the bounded immutable cache.
+    Shared(Arc<Scope>),
+}
+
+impl CapturedUrlScope<'_> {
+    fn as_scope(&self) -> &Scope {
+        match self {
+            Self::Borrowed(scope) => scope,
+            Self::Shared(scope) => scope,
+        }
+    }
+
+    fn into_shared(self) -> Arc<Scope> {
+        match self {
+            Self::Borrowed(scope) => Arc::new(scope.clone()),
+            Self::Shared(scope) => scope,
+        }
+    }
 }
 
 fn url_mapping_hint(
@@ -5718,7 +5750,7 @@ fn url_mapping_hint(
 fn authorize_url_phase_original(
     cfg: &Config,
     vhost: Option<&VHost>,
-    original: &(String, PathBuf, Scope),
+    original: &(String, PathBuf, CapturedUrlScope<'_>),
     req: &Request,
     effects: &crate::rewrite::Effects,
     peer: SocketAddr,
@@ -5727,7 +5759,7 @@ fn authorize_url_phase_original(
     server_name: &str,
 ) -> Result<Scope, Response> {
     let (url_path, fs_hint, captured_scope) = original;
-    let mut scope = captured_scope.clone();
+    let mut scope = captured_scope.as_scope().clone();
     apply_rewrite_effects(&mut scope, effects);
     let identity = CanonicalTarget::from_url_path(url_path)
         .expect("URL-phase authorization path was canonicalized");
@@ -6048,22 +6080,25 @@ fn run_url_translation_phase(
     start: Option<UrlPhaseStart<'_>>,
 ) -> UrlPhaseResult {
     let allow_encoded = cfg.encoded_slashes == EncodedSlashes::On;
-    let mut target = match CanonicalTarget::from_request(req, allow_encoded) {
-        Ok(target) => target,
-        Err(error) => {
-            return UrlPhaseResult::Terminal(error_response(
-                cfg,
-                vhost,
-                vhost.map(|v| &v.scope).unwrap_or(&cfg.global),
-                error.status(),
-                req,
-                &String::from_utf8_lossy(&req.raw_path),
-                local_port,
-                server_name,
-                peer.ip(),
-                local_ip,
-            ));
-        }
+    let mut target = match start.as_ref() {
+        Some(start) => start.target.clone(),
+        None => match CanonicalTarget::from_request(req, allow_encoded) {
+            Ok(target) => target,
+            Err(error) => {
+                return UrlPhaseResult::Terminal(error_response(
+                    cfg,
+                    vhost,
+                    vhost.map(|v| &v.scope).unwrap_or(&cfg.global),
+                    error.status(),
+                    req,
+                    &String::from_utf8_lossy(&req.raw_path),
+                    local_port,
+                    server_name,
+                    peer.ip(),
+                    local_ip,
+                ));
+            }
+        },
     };
     // Capture this before rewrites.  A filesystem rewrite re-entering this
     // phase supplies the original value explicitly through `UrlPhaseStart`.
@@ -6080,13 +6115,20 @@ fn run_url_translation_phase(
     let mut filesystem = None;
     let mut rounds = 0usize;
     let mut stop_rewriting = start.as_ref().is_some_and(|start| start.stop_rewriting);
-    let mut original: Option<(String, PathBuf, Scope)> = start.as_ref().map(|start| {
-        (
-            start.prior_scope.0.to_string(),
-            start.prior_scope.1.to_path_buf(),
-            start.prior_scope.2.clone(),
-        )
-    });
+    // A filesystem rewrite already owns the source scope in its caller. Keep
+    // that scope borrowed while URL translation proves the target is local;
+    // cloning it eagerly made every .htaccess rewrite deep-copy the complete
+    // policy tree even though only terminal proxy/redirect authorization can
+    // observe the copy.
+    let return_original = start.is_none();
+    let mut original: Option<(String, PathBuf, CapturedUrlScope<'_>)> =
+        start.as_ref().map(|start| {
+            (
+                start.prior_scope.0.to_string(),
+                start.prior_scope.1.to_path_buf(),
+                CapturedUrlScope::Borrowed(start.prior_scope.2),
+            )
+        });
 
     loop {
         let current_req = owned_req.as_ref().unwrap_or(req);
@@ -6098,21 +6140,21 @@ fn run_url_translation_phase(
             current_req,
             peer.ip(),
         );
-        apply_rewrite_effects(&mut scope, &effects);
-        crate::policy_ref::apply_conditionals(
-            cfg,
-            vhost,
-            &mut scope,
-            &conditionals,
-            &fs_hint,
-            &target.url_path,
-            current_req,
-            peer.ip(),
-        );
-        if original.is_none() {
-            original = Some((target.url_path.to_string(), fs_hint.clone(), scope.clone()));
+        if !effects.is_empty() {
+            apply_rewrite_effects(Arc::make_mut(&mut scope), &effects);
         }
-
+        if !conditionals.is_empty() {
+            crate::policy_ref::apply_conditionals(
+                cfg,
+                vhost,
+                Arc::make_mut(&mut scope),
+                &conditionals,
+                &fs_hint,
+                &target.url_path,
+                current_req,
+                peer.ip(),
+            );
+        }
         if !stop_rewriting {
             let rewrite_ctx = crate::rewrite::Context {
                 url_path: &target.url_path,
@@ -6175,7 +6217,18 @@ fn run_url_translation_phase(
                     location,
                     effects: rewrite_effects,
                 } => {
-                    let mut redirect_scope = scope;
+                    // A terminal rewrite on the first URL already carries
+                    // that URL's scope in `redirect_scope`.  Preserve a
+                    // second copy only when rewrite effects require a
+                    // distinct original-environment authorization pass.
+                    if original.is_none() && !rewrite_effects.is_empty() {
+                        original = Some((
+                            target.url_path.to_string(),
+                            fs_hint.clone(),
+                            CapturedUrlScope::Shared(Arc::clone(&scope)),
+                        ));
+                    }
+                    let mut redirect_scope = scope.as_ref().clone();
                     apply_rewrite_effects(&mut redirect_scope, &rewrite_effects);
                     let mut terminal_effects = effects.clone();
                     terminal_effects.merge(rewrite_effects);
@@ -6217,7 +6270,14 @@ fn run_url_translation_phase(
                     url,
                     effects: rewrite_effects,
                 } => {
-                    let mut proxy_scope = scope;
+                    if original.is_none() && !rewrite_effects.is_empty() {
+                        original = Some((
+                            target.url_path.to_string(),
+                            fs_hint.clone(),
+                            CapturedUrlScope::Shared(Arc::clone(&scope)),
+                        ));
+                    }
+                    let mut proxy_scope = scope.as_ref().clone();
                     apply_rewrite_effects(&mut proxy_scope, &rewrite_effects);
                     let (execute_path, query) = match url.split_once('?') {
                         Some((path, query)) => (path.to_string(), query.as_bytes().to_vec()),
@@ -6243,7 +6303,7 @@ fn run_url_translation_phase(
                         (url != &target.url_path || !effects.is_empty()).then_some((
                             url.as_str(),
                             fs.as_path(),
-                            prior,
+                            prior.as_scope(),
                         ))
                     });
                     return UrlPhaseResult::Terminal(dispatch_url_proxy(
@@ -6275,6 +6335,15 @@ fn run_url_translation_phase(
                     effects: rewrite_effects,
                     filesystem: rewrite_filesystem,
                 } => {
+                    // The branch always continues or leaves this loop, so the
+                    // original scope can move into the request-local snapshot
+                    // instead of being deep-cloned on every request.  The
+                    // snapshot is created only after a rewrite actually
+                    // occurs; the no-rewrite hot path allocates nothing for
+                    // original-URL reauthorization.
+                    let original_identity = original
+                        .is_none()
+                        .then(|| (target.url_path.to_string(), fs_hint.clone()));
                     effects.merge(rewrite_effects);
                     filesystem = rewrite_filesystem;
                     rounds += 1;
@@ -6313,6 +6382,13 @@ fn run_url_translation_phase(
                         rewritten.query = query;
                         owned_req = Some(rewritten);
                     }
+                    if let Some((url_path, fs_hint)) = original_identity {
+                        original = Some((
+                            url_path,
+                            fs_hint,
+                            CapturedUrlScope::Shared(Arc::clone(&scope)),
+                        ));
+                    }
                     target = rewritten_target;
                     // An effects-only rule (`RewriteRule ... - [E=...]`) must
                     // make its environment visible to deferred conditionals
@@ -6322,6 +6398,15 @@ fn run_url_translation_phase(
                     // suppressing another rewrite pass over the same target.
                     stop_rewriting = final_pass || same_target;
                     if filesystem.is_some() {
+                        break;
+                    }
+                    // The configuration compiler can prove that some target
+                    // URLs cannot rewrite, redirect, or enter a backend in
+                    // URL space. In that case the filesystem plan will still
+                    // apply all target Location/auth policy, so a second URL
+                    // loop would only repeat negative route checks. This is
+                    // the same proof used by typed DirectoryIndex plans.
+                    if !cfg.url_translation_may_terminate(vhost, &target.url_path) {
                         break;
                     }
                     continue;
@@ -6335,7 +6420,7 @@ fn run_url_translation_phase(
                 .map(|(redirect, location)| (redirect.status, location))
         {
             let location = append_redirect_query(location, current_req);
-            let mut redirect_scope = scope;
+            let mut redirect_scope = scope.as_ref().clone();
             if let Some(original) = original.as_ref().filter(|(url, _, _)| {
                 url != &target.url_path || !effects.is_empty() || owned_req.is_some()
             }) {
@@ -6398,13 +6483,13 @@ fn run_url_translation_phase(
                 (url != &target.url_path || !effects.is_empty()).then_some((
                     url.as_str(),
                     fs.as_path(),
-                    prior,
+                    prior.as_scope(),
                 ))
             });
             return UrlPhaseResult::Terminal(dispatch_url_proxy(
                 cfg,
                 vhost,
-                scope,
+                scope.as_ref().clone(),
                 prior,
                 current_req,
                 &request_uri,
@@ -6436,16 +6521,17 @@ fn run_url_translation_phase(
         break;
     }
 
-    let changed = original.as_ref().is_some_and(|(url, _, _)| {
-        url != &target.url_path || !effects.is_empty() || owned_req.is_some()
-    });
+    let changed = original.is_some() && return_original;
     UrlPhaseResult::Local(UrlPhaseLocal {
         request_uri,
         target,
         owned_req,
         rewrite_effects: effects,
         filesystem,
-        original: changed.then_some(original.expect("URL phase has an original scope")),
+        original: changed.then(|| {
+            let (url, path, scope) = original.expect("URL phase has an original scope");
+            (url, path, scope.into_shared())
+        }),
     })
 }
 
@@ -7080,7 +7166,6 @@ fn dispatch_inner(
             } => {
                 let rewrite_source_url = url_path.clone();
                 let rewrite_source_fs = fs_path.clone();
-                let rewrite_source_scope = scope.clone();
                 // The filesystem override is per-round: a later round without
                 // a file target must clear the earlier round's target so only
                 // the final round's filesystem selection can be applied (F68).
@@ -7119,13 +7204,13 @@ fn dispatch_inner(
                 if target.url_path == url_path && query == current_req.query {
                     break;
                 }
-                if original_scope_snapshot.is_none()
+                let source_is_original_snapshot = original_scope_snapshot.is_none()
                     && round_effects_empty
                     && rewrite_effects.is_empty()
                     && url_path == original_url_path
                     && fs_path == original_fs_path
-                    && current_req.query == original_req.query
-                {
+                    && current_req.query == original_req.query;
+                if source_is_original_snapshot {
                     // This is still the first round and no `[E=...]` effect or
                     // query mutation has changed the environment.  Reuse the
                     // exact scope already used for rewrite selection instead
@@ -7141,13 +7226,31 @@ fn dispatch_inner(
                 url_path = target.url_path.to_string();
                 norm = target.norm.clone();
 
-                if rewrite_filesystem.is_none() {
+                if rewrite_filesystem.is_none()
+                    && cfg.url_translation_may_terminate(vhost, &target.url_path)
+                {
+                    // This branch leaves the filesystem pass, so its current
+                    // scope can be moved into URL translation. On the common
+                    // first round the same value is also the retained
+                    // original-request scope; borrow that snapshot instead of
+                    // deep-cloning it solely to cross the phase boundary.
+                    let rewrite_source_scope_owned;
+                    let rewrite_source_scope = if source_is_original_snapshot {
+                        original_scope_snapshot
+                            .as_ref()
+                            .expect("source scope was retained for original authorization")
+                    } else {
+                        rewrite_source_scope_owned = std::mem::take(&mut scope);
+                        &rewrite_source_scope_owned
+                    };
                     // A per-directory internal rewrite starts a fresh URL
-                    // translation pass before the rewritten target's
-                    // filesystem is resolved. This is the key Apache phase
-                    // boundary: `/local -> /proxy` may retain the source
-                    // filesystem authorization, but the destination's
-                    // .htaccess cannot veto or mutate the ProxyPass route.
+                    // translation pass before a target that may route there.
+                    // The compile-time negative proof above lets ordinary
+                    // local targets proceed directly to their filesystem
+                    // plan. This preserves the key Apache phase boundary:
+                    // `/local -> /proxy` may retain the source filesystem
+                    // authorization, but the destination's .htaccess cannot
+                    // veto or mutate the ProxyPass route.
                     if rewrite_source_url != original_url_path
                         || rewrite_source_fs != original_fs_path
                     {
@@ -7167,23 +7270,17 @@ fn dispatch_inner(
                             return response;
                         }
                     }
-                    let mut translated_req = owned_req.as_ref().unwrap_or(req).clone();
-                    // `norm` is intentionally slash-free for filesystem
-                    // mapping, while the synthetic request must retain the
-                    // rewrite's meaningful trailing slash for the next URL
-                    // translation round.
-                    translated_req.raw_path = url_path.as_bytes().to_vec();
-                    translated_req.target = translated_req.raw_path.clone();
-                    if !translated_req.query.is_empty() {
-                        translated_req.target.push(b'?');
-                        translated_req
-                            .target
-                            .extend_from_slice(&translated_req.query);
-                    }
+                    // URL translation already carries a typed canonical
+                    // target. Do not clone the complete Request (including an
+                    // in-memory upload) just to replace raw_path/target; the
+                    // original wire identity and all request fields remain
+                    // valid inputs while the explicit target supplies the
+                    // synthetic path.
+                    let translation_req = owned_req.as_ref().unwrap_or(req);
                     let translated = run_url_translation_phase(
                         cfg,
                         vhost,
-                        &translated_req,
+                        translation_req,
                         peer,
                         local_ip,
                         local_port,
@@ -7191,12 +7288,13 @@ fn dispatch_inner(
                         server_name,
                         Some(UrlPhaseStart {
                             request_uri: &request_uri,
-                            effects: rewrite_effects.clone(),
+                            target,
+                            effects: std::mem::take(&mut rewrite_effects),
                             stop_rewriting: final_pass,
                             prior_scope: (
                                 &rewrite_source_url,
                                 &rewrite_source_fs,
-                                &rewrite_source_scope,
+                                rewrite_source_scope,
                             ),
                         }),
                     );
@@ -7208,19 +7306,24 @@ fn dispatch_inner(
                             norm = target.norm.clone();
                             rewrite_effects = local.rewrite_effects;
                             rewrite_filesystem = local.filesystem;
-                            owned_req = Some(local.owned_req.unwrap_or(translated_req));
+                            if let Some(rewritten_req) = local.owned_req {
+                                owned_req = Some(rewritten_req);
+                            }
                         }
                     }
                 }
                 // Rebuild the immutable plan for the rewritten URL.  The next
                 // loop iteration must use the same mapping/layer identities
                 // that dispatch will authorize and serve.
-                plan = match RequestPlan::resolve_for_request(
-                    cfg,
-                    vhost,
-                    target,
-                    owned_req.as_ref().unwrap_or(req),
-                ) {
+                let reused = plan.retarget_same_directory_rewrite(cfg, vhost, target.clone());
+                plan = match reused.map(Ok).unwrap_or_else(|| {
+                    RequestPlan::resolve_for_request(
+                        cfg,
+                        vhost,
+                        target,
+                        owned_req.as_ref().unwrap_or(req),
+                    )
+                }) {
                     Ok(plan) => plan,
                     Err(crate::request_plan::PlanError::Unmapped) => {
                         return error_response(
@@ -7394,7 +7497,9 @@ fn dispatch_inner(
     // client sent. This is deliberately URL-only: resolving the original URL
     // through Directory/Files/.htaccess would cross the phase boundary again.
     if let Some((original_url, original_fs_hint, mut original_scope)) = url_original {
-        apply_rewrite_effects(&mut original_scope, &rewrite_effects);
+        if !rewrite_effects.is_empty() {
+            apply_rewrite_effects(Arc::make_mut(&mut original_scope), &rewrite_effects);
+        }
         let original_identity = CanonicalTarget::from_url_path(&original_url)
             .expect("original request URL was canonicalized");
         let mut original_resource = access::ResourceKey::request(
@@ -11395,6 +11500,15 @@ mod tests {
     fn cov_dispatch(cfg: &Config, method: &str, path: &str) -> Response {
         let req = cov_req(method, path);
         dispatch(cfg, &req, cov_peer(), "127.0.0.1", 80)
+    }
+
+    #[test]
+    fn url_translation_without_rewrite_needs_no_original_scope_snapshot() {
+        let dir = cov_dir("url-no-rewrite-snapshot");
+        std::fs::write(dir.join("www/file.txt"), "ok\n").unwrap();
+        let cfg = cov_config(&dir, "");
+        assert_eq!(cov_dispatch(&cfg, "GET", "/file.txt").status, 200);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -3043,6 +3043,31 @@ struct CachedPolicy {
     conditionals: Arc<Vec<ScopeRule>>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedUrlPolicy {
+    scope: Arc<Scope>,
+    conditionals: Arc<Vec<ScopeRule>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedLayeredPolicy {
+    scope: Scope,
+    config_conditionals: Arc<Vec<ScopeRule>>,
+    access_conditionals: Arc<Vec<ScopeRule>>,
+    // Keep each parsed access-file scope alive for as long as its pointer is
+    // part of the key. A reparse therefore cannot reuse an allocator address
+    // and accidentally hit policy compiled from an older file version.
+    _layer_scopes: Vec<Arc<Scope>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LayeredPolicyCacheKey {
+    vhost: usize,
+    fs_path: PathBuf,
+    url_path: String,
+    layers: Vec<(crate::request_plan::LayerIdentity, usize)>,
+}
+
 type PolicyCacheKey = (usize, PathBuf, String);
 const POLICY_CACHE_MAX_ENTRIES: usize = 256;
 const POLICY_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -3081,6 +3106,56 @@ impl<V> BoundedPolicyCache<V> {
     }
 
     fn insert(&mut self, key: PolicyCacheKey, value: Arc<V>) {
+        let weight = Self::weight(&key);
+        if weight > POLICY_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some((_, old_weight)) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old_weight);
+        }
+        while self.entries.len() >= POLICY_CACHE_MAX_ENTRIES
+            || self.bytes.saturating_add(weight) > POLICY_CACHE_MAX_BYTES
+        {
+            let Some(victim) = self.entries.keys().next().cloned() else {
+                break;
+            };
+            if let Some((_, old_weight)) = self.entries.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(old_weight);
+            }
+        }
+        self.bytes = self.bytes.saturating_add(weight);
+        self.entries.insert(key, (value, weight));
+    }
+}
+
+#[derive(Debug, Default)]
+struct BoundedLayeredPolicyCache {
+    entries: HashMap<LayeredPolicyCacheKey, (Arc<CachedLayeredPolicy>, usize)>,
+    bytes: usize,
+}
+
+impl BoundedLayeredPolicyCache {
+    fn weight(key: &LayeredPolicyCacheKey) -> usize {
+        key.fs_path
+            .as_os_str()
+            .as_bytes()
+            .len()
+            .saturating_add(key.url_path.len())
+            .saturating_add(key.layers.iter().fold(0usize, |total, (identity, _)| {
+                total
+                    .saturating_add(identity.dir.as_os_str().as_bytes().len())
+                    .saturating_add(identity.mapping_root.as_os_str().as_bytes().len())
+                    .saturating_add(identity.url_mount.len())
+                    .saturating_add(std::mem::size_of::<usize>())
+            }))
+            .saturating_add(POLICY_CACHE_VALUE_CHARGE)
+    }
+
+    fn get(&self, key: &LayeredPolicyCacheKey) -> Option<Arc<CachedLayeredPolicy>> {
+        self.entries.get(key).map(|(value, _)| Arc::clone(value))
+    }
+
+    fn insert(&mut self, key: LayeredPolicyCacheKey, value: Arc<CachedLayeredPolicy>) {
         let weight = Self::weight(&key);
         if weight > POLICY_CACHE_MAX_BYTES {
             return;
@@ -3385,6 +3460,8 @@ pub struct Config {
     /// Access-file declarations are checked on every runtime read instead.
     auth_file_targets: Vec<PathBuf>,
     policy_cache: Arc<RwLock<BoundedPolicyCache<CachedPolicy>>>,
+    url_policy_cache: Arc<RwLock<BoundedPolicyCache<CachedUrlPolicy>>>,
+    layered_policy_cache: Arc<RwLock<BoundedLayeredPolicyCache>>,
     dir_scope_cache: Arc<RwLock<BoundedPolicyCache<Scope>>>,
 }
 
@@ -5590,6 +5667,8 @@ impl Compile {
             admin_input_targets,
             auth_file_targets: Vec::new(),
             policy_cache: Arc::new(RwLock::new(BoundedPolicyCache::default())),
+            url_policy_cache: Arc::new(RwLock::new(BoundedPolicyCache::default())),
+            layered_policy_cache: Arc::new(RwLock::new(BoundedLayeredPolicyCache::default())),
             dir_scope_cache: Arc::new(RwLock::new(BoundedPolicyCache::default())),
         };
         Compile {
@@ -14043,8 +14122,9 @@ ServerName localhost\n\
             req: &crate::http::Request,
             peer: std::net::IpAddr,
         ) -> Scope {
-            let (mut scope, conditionals) =
+            let (scope, conditionals) =
                 cfg.url_translation_scope_req_deferred(None, fs_path, url_path, req, peer);
+            let mut scope = scope.as_ref().clone();
             crate::policy_ref::apply_conditionals(
                 cfg,
                 None,
@@ -14077,6 +14157,22 @@ ServerName localhost\n\
         let private = url_scope(&c, Path::new("/srv/www/private"), "/private", &req, peer);
         assert_eq!(
             crate::access::check(&private, &req, peer, None, "/private", None),
+            crate::access::Access::Denied
+        );
+
+        // Populate the immutable URL-policy cache with a request for which
+        // the nested condition is false.  The next request uses the same
+        // cache key but must still evaluate its condition from that request's
+        // headers rather than caching the first authorization result.
+        let conditional = url_scope(
+            &c,
+            Path::new("/srv/www/conditional"),
+            "/conditional",
+            &req,
+            peer,
+        );
+        assert_eq!(
+            crate::access::check(&conditional, &req, peer, None, "/conditional", None),
             crate::access::Access::Denied
         );
 
@@ -17701,7 +17797,17 @@ impl Config {
         url_path: &str,
         req: &crate::http::Request,
         _peer: std::net::IpAddr,
-    ) -> (Scope, Vec<ScopeRule>) {
+    ) -> (Arc<Scope>, Arc<Vec<ScopeRule>>) {
+        let key = (
+            vhost.map(|v| v as *const VHost as usize).unwrap_or(0),
+            fs_path.to_path_buf(),
+            url_path.to_string(),
+        );
+        if let Ok(guard) = self.url_policy_cache.read() {
+            if let Some(cached) = guard.get(&key) {
+                return (Arc::clone(&cached.scope), Arc::clone(&cached.conditionals));
+            }
+        }
         let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
         let mut scope = base.clone();
         let rules: &[ScopeRule] = vhost
@@ -17737,7 +17843,14 @@ impl Config {
             }
         }
         conditionals.sort_by_key(|rule| rule.order);
-        (scope, conditionals)
+        let cached = Arc::new(CachedUrlPolicy {
+            scope: Arc::new(scope),
+            conditionals: Arc::new(conditionals),
+        });
+        if let Ok(mut guard) = self.url_policy_cache.write() {
+            guard.insert(key, Arc::clone(&cached));
+        }
+        (Arc::clone(&cached.scope), Arc::clone(&cached.conditionals))
     }
 
     /// True when this URL may terminate in URL translation before a
@@ -18088,6 +18201,63 @@ impl Config {
             );
         }
         (scope, conditionals)
+    }
+
+    /// Cached normal scope for a target whose effective policy includes
+    /// parsed access-file layers. Collection still opens and validates every
+    /// applicable access file on each client request, so edits are observed
+    /// immediately. Once those immutable layer versions are known, however,
+    /// the expensive Directory/Files/Location merge is request-independent
+    /// and need not be rebuilt for every request or internal rewrite round.
+    pub(crate) fn effective_scope_with_layers_cached(
+        &self,
+        vhost: Option<&VHost>,
+        fs_path: &Path,
+        url_path: &str,
+        req: &crate::http::Request,
+        peer: std::net::IpAddr,
+        layers: &[crate::policy_ref::AccessLayer],
+    ) -> (Scope, Arc<Vec<ScopeRule>>, Arc<Vec<ScopeRule>>) {
+        let layer_scopes: Vec<Arc<Scope>> = layers
+            .iter()
+            .map(|layer| Arc::clone(&layer.scope))
+            .collect();
+        let key = LayeredPolicyCacheKey {
+            vhost: vhost.map(|v| v as *const VHost as usize).unwrap_or(0),
+            fs_path: fs_path.to_path_buf(),
+            url_path: url_path.to_string(),
+            layers: layers
+                .iter()
+                .map(|layer| (layer.identity.clone(), Arc::as_ptr(&layer.scope) as usize))
+                .collect(),
+        };
+        if let Ok(guard) = self.layered_policy_cache.read() {
+            if let Some(cached) = guard.get(&key) {
+                return (
+                    cached.scope.clone(),
+                    Arc::clone(&cached.config_conditionals),
+                    Arc::clone(&cached.access_conditionals),
+                );
+            }
+        }
+        let (scope, config_conditionals, access_conditionals) =
+            crate::policy_ref::effective_scope_with_layers(
+                self, vhost, fs_path, url_path, req, peer, layers,
+            );
+        let cached = Arc::new(CachedLayeredPolicy {
+            scope: scope.clone(),
+            config_conditionals: Arc::new(config_conditionals),
+            access_conditionals: Arc::new(access_conditionals),
+            _layer_scopes: layer_scopes,
+        });
+        if let Ok(mut guard) = self.layered_policy_cache.write() {
+            guard.insert(key, Arc::clone(&cached));
+        }
+        (
+            scope,
+            Arc::clone(&cached.config_conditionals),
+            Arc::clone(&cached.access_conditionals),
+        )
     }
 
     pub fn effective_scope_req_deferred(
@@ -18721,5 +18891,60 @@ mod pass11_kernel_tests {
         assert!(cache.entries.len() <= POLICY_CACHE_MAX_ENTRIES);
         assert!(cache.bytes <= POLICY_CACHE_MAX_BYTES);
         assert!(!cache.entries.is_empty());
+    }
+
+    #[test]
+    fn layered_policy_cache_keys_each_parsed_access_file_version() {
+        let cfg = load_text_direct("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n");
+        let req = crate::http::Request {
+            method: "GET".into(),
+            target: b"/file.txt".to_vec(),
+            raw_path: b"/file.txt".to_vec(),
+            query: Vec::new(),
+            version: crate::http::Version::Http11,
+            headers: crate::http::Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        };
+        let identity = crate::request_plan::LayerIdentity::new(
+            Path::new("/srv/www"),
+            Path::new("/srv/www"),
+            Path::new("/srv/www/file.txt"),
+            "/file.txt",
+        );
+        let layer = |conditional_error| {
+            let mut scope = Scope::default();
+            scope.conditional_error = conditional_error;
+            crate::policy_ref::AccessLayer {
+                identity: identity.clone(),
+                scope: Arc::new(scope),
+                files: Vec::new(),
+                conditionals: Vec::new(),
+            }
+        };
+        let first = layer(false);
+        let second = layer(true);
+        let (scope, _, _) = cfg.effective_scope_with_layers_cached(
+            None,
+            Path::new("/srv/www/file.txt"),
+            "/file.txt",
+            &req,
+            "127.0.0.1".parse().unwrap(),
+            &[first],
+        );
+        assert!(!scope.conditional_error);
+        let (scope, _, _) = cfg.effective_scope_with_layers_cached(
+            None,
+            Path::new("/srv/www/file.txt"),
+            "/file.txt",
+            &req,
+            "127.0.0.1".parse().unwrap(),
+            &[second],
+        );
+        assert!(scope.conditional_error);
+        assert_eq!(cfg.layered_policy_cache.read().unwrap().entries.len(), 2);
     }
 }

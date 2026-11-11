@@ -73,6 +73,64 @@ fn append_rewrite_output(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> 
     Ok(())
 }
 
+/// Return whether evaluating a sealed rewrite template can consult the
+/// request environment. Built-in variables and rewrite maps read their own
+/// inputs directly; constructing the merged SetEnvIf/rewrite environment is
+/// only necessary for an `%{ENV:...}` reference. A capture in the reference
+/// name is treated conservatively because it can produce the `ENV:` prefix at
+/// runtime.
+fn template_reads_environment(template: &RewriteTemplate) -> bool {
+    template.parts.iter().any(|part| match part {
+        RewriteTemplatePart::Reference { name, map: None } => {
+            let mut prefix = Vec::new();
+            for part in name {
+                match part {
+                    RewriteNamePart::Literal(value) => prefix.extend_from_slice(value),
+                    RewriteNamePart::RuleCapture(_) | RewriteNamePart::ConditionCapture(_) => {
+                        return true;
+                    }
+                }
+                if prefix.len() >= 4 {
+                    break;
+                }
+            }
+            prefix
+                .get(..4)
+                .is_some_and(|value| value.eq_ignore_ascii_case(b"ENV:"))
+        }
+        _ => false,
+    })
+}
+
+fn rule_reads_environment(rule: &RewriteRule) -> bool {
+    rule.conditions.iter().any(|condition| {
+        condition.expr.is_some()
+            || condition
+                .test_template
+                .as_ref()
+                .is_some_and(template_reads_environment)
+    }) || template_reads_environment(&rule.substitution_template)
+        || rule.flags.env_templates.iter().any(|(name, value)| {
+            template_reads_environment(name)
+                || value.as_ref().is_some_and(template_reads_environment)
+        })
+        || rule
+            .flags
+            .cookie_templates
+            .iter()
+            .any(|cookie| cookie.fields.iter().any(template_reads_environment))
+        || rule
+            .flags
+            .handler_template
+            .as_ref()
+            .is_some_and(template_reads_environment)
+        || rule
+            .flags
+            .content_type_template
+            .as_ref()
+            .is_some_and(template_reads_environment)
+}
+
 pub struct Context<'a> {
     pub url_path: &'a str,
     pub fs_path: &'a Path,
@@ -529,7 +587,21 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
     let mut cond_caps: Vec<Vec<u8>> = Vec::new();
     let mut effects = Effects::default();
     let mut filesystem_override: Option<FilesystemTarget> = None;
-    let mut env: RequestEnvironment = scope.authorization_env(req, ctx.url_path, ctx.peer);
+    // Apache does not build the subprocess/auth environment merely to test a
+    // RewriteRule. Most rewrite programs never read `%{ENV:...}` at all, so
+    // keep that comparatively allocation-heavy merge off their hot path. The
+    // empty vector still records [E] effects between rules when no base
+    // environment can be observed.
+    let mut env: RequestEnvironment = if scope
+        .rewrite_policy
+        .rewrite_rules
+        .iter()
+        .any(rule_reads_environment)
+    {
+        scope.authorization_env(req, ctx.url_path, ctx.peer)
+    } else {
+        RequestEnvironment::new()
+    };
     if req.policy_budget_failed() {
         return Outcome::Error("request policy expansion limit exceeded".into());
     }
@@ -838,10 +910,29 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             rule.flags.passthrough,
             absolute,
         ) {
-            let candidate = fs::canonicalize(&joined).ok();
-            let docroot = fs::canonicalize(ctx.docroot).ok();
-            match (candidate, docroot) {
-                (Some(candidate), Some(docroot)) => {
+            // Most absolute substitutions are URL paths (for example
+            // `/index.html`), not literal filesystem names.  Do not resolve
+            // the document root unless the substitution itself names an
+            // existing filesystem object: `realpath()` probes every root
+            // component with `readlink`, which made an ordinary URL rewrite
+            // pay for a second path walk that could not affect the result.
+            // A real absolute-file substitution still takes the exact same
+            // descriptor-bound admission path below.
+            // A literal filesystem substitution must lexically name the
+            // current mapping root before we perform any path lookup. Apart
+            // from failing closed for paths outside that root, this prevents
+            // ordinary absolute URL substitutions from paying for a doomed
+            // realpath probe on every request.
+            let candidate = Path::new(&joined)
+                .starts_with(ctx.docroot)
+                .then(|| fs::canonicalize(&joined).ok())
+                .flatten();
+            match candidate.and_then(|candidate| {
+                fs::canonicalize(ctx.docroot)
+                    .ok()
+                    .map(|docroot| (candidate, docroot))
+            }) {
+                Some((candidate, docroot)) => {
                     let relative = candidate.strip_prefix(&docroot).ok();
                     let opened = relative.and_then(|relative| {
                         crate::files::probe_beneath(ctx.docroot, relative, false).ok()
@@ -886,7 +977,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                         None
                     }
                 }
-                _ => None,
+                None => None,
             }
         } else {
             None
