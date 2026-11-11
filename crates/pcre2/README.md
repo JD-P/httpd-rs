@@ -10,6 +10,16 @@ The frontend follows the PCRE2 10.46 pattern documentation and source:
 - <https://www.pcre.org/current/doc/html/pcre2pattern.html>
 - <https://github.com/PCRE2Project/pcre2/tree/pcre2-10.46>
 
+Admission is a positive grammar, not a blacklist. A deterministic,
+stack-bounded parser must consume the complete pattern as literals, byte
+classes, a fixed set of escapes, ordinary/named/noncapturing groups, the
+`imsUx` option grammar, alternation, anchors and bounded regular quantifiers.
+It returns an unforgeable admitted-pattern witness; only that type can enter
+translation. Unknown special-group and alphanumeric-escape namespaces are
+therefore rejected even if a future backend assigns them a meaning. All
+vapached directive and expression regex surfaces enter through this frontend;
+none parse configuration patterns with Rust `regex` directly.
+
 The executable backend uses `regex-automata` directly: a bounded Pike VM keeps
 cold starts small, and a shared lazy DFA is compiled after the first search
 for steady-state speed. Bounded backtracking is explicitly disabled in both
@@ -26,6 +36,13 @@ histories whose preference differs between engines are rejected at compile
 time. There is a `RegexBuilder::backtracking` compatibility knob so callers
 cannot accidentally assume that enabling it worked; requesting it returns a
 compile error because no fallback engine ships in production.
+Consequently Rust-regex-only inline options are rejected by construction: `u`
+has no PCRE2 inline spelling, and Rust's `R` flag conflicts with PCRE2's
+`(?R)` recursion syntax. The option production covers only global, scoped,
+combined and disabled forms composed from `imsUx`.
+PCRE2's literal `\<`/`\>` escapes are lowered before the Rust backend can
+reinterpret them as word-boundary assertions, and Rust-only extended boundary
+forms such as `\b{start}` are rejected.
 UTF/UCP class and escape forms whose semantics would be narrowed by the
 byte-class lowering (including Unicode-sensitive POSIX classes, raw
 non-ASCII classes, `\C`, `\R`, `\h` and `\v`) likewise fail closed.
@@ -34,6 +51,12 @@ window varies with offsets, anchors and word boundaries, while
 `MATCH_INVALID_UTF` treats invalid sequences as barriers between valid
 fragments. Rejecting the complete malformed subject is deliberately stronger
 than those context-dependent behaviors and avoids a false-positive match.
+UCP `\b`/`\B` also fail closed because the upstream byte iterator can advance
+into a UTF-8 scalar after an empty match and expose a fragment-barrier boundary
+that a scalar-aware automata iterator cannot reproduce. Under ANYCRLF, generic
+classes that can start on the LF half of CRLF and lone-CR extended-comment
+terminators are rejected; explicit `\n`, positive byte classes, LF comments,
+and CRLF comments remain admitted.
 
 Resource policy is part of the API, not a timeout:
 
@@ -75,17 +98,21 @@ the checksummed 10.46 tag and requires the importer to complete. Cargo forces
 the oracle C binding to build its bundled 10.46 source rather than selecting
 a runner-dependent system library through `pkg-config`.
 
-The unbounded complement is covered by `cargo fuzz run pcre2_differential` in
-the repository's `fuzz` package and by the default smoke and nightly campaigns.
-It feeds the same pattern, seven builder flags, raw byte subject, and several
-start offsets to this crate and the C oracle. It compares compile metadata,
-single-shot matches/captures, reusable capture locations, iterators, and cold
-versus hot engine tiers. Raw syntax mutation is paired with a generated grammar
-of the admitted subset, so an unexpected Rust rejection is itself a failure.
-Valid UTF behavior is differential; malformed UTF/UCP subjects exercise the
+The unbounded complement is covered by `cargo fuzz run pcre2_differential` and
+`cargo fuzz run pcre2_grammar` in the repository's `fuzz` package and by the
+default smoke and nightly campaigns. The full differential feeds the same
+pattern, seven builder flags, raw byte subject, and several start offsets to
+this crate and the C oracle. It compares compile metadata, single-shot
+matches/captures, reusable capture locations, iterators, and cold versus hot
+engine tiers. The admission-focused grammar target independently generates
+valid whitelist productions, deliberately excluded PCRE2 and Rust-regex forms,
+and lexical controls where syntax-looking text is quoted, escaped, commented,
+or inside a class. Every admitted raw pattern must compile in PCRE2, while
+generated admitted patterns also compare capture metadata and results. Valid
+UTF behavior is differential; malformed UTF/UCP subjects exercise the
 documented whole-subject fail-closed boundary. `pcre2_resource` independently
 keeps production limits active and checks compile/match limit monotonicity. The
-nightly coverage corpus is minimized and carried forward between runs. The C
+nightly coverage corpora are minimized and carried forward between runs. The C
 crate is a dev/fuzz dependency only and is absent from vapached's normal Cargo
 graph and release binary.
 

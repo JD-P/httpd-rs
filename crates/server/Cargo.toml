@@ -17,7 +17,6 @@ vapache-verified = { path = "../verified", version = "0.2.1" }
 vapache-pcre2 = { path = "../pcre2", version = "0.2.1" }
 libc = "0.2"
 rustix = { version = "1", features = ["event", "fs", "net"] }
-regex = "1.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }

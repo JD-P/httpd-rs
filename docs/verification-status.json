@@ -530,7 +530,7 @@
     "conformance": 176,
     "semantics": 339,
     "random": 300,
-    "finding_replay_cases": 108,
+    "finding_replay_cases": 109,
     "cve_replay_cases": 29,
     "unexplained_replay_failures": 0,
     "max_unexplained_replay_failures": 0,

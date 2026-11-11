@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end regressions for the pass-2 through pass-18 findings (F23-P18).
+"""End-to-end regressions for the pass-2 through pass-36 findings (F23-P36).
 
 The suite starts fresh vapached instances in temporary trees and exercises
 the exploit shapes from adversarial/findings.md: terminal rewrite/proxy authorization,
@@ -3517,6 +3517,199 @@ RewriteRule "^/expr-rewrite/secret\\.txt$" "-" [F,L]
         status, _, body = request(self.port, "/expr-cgi/secret.cgi")
         self.assertEqual(status, 403, body[:300])
         self.assertNotIn(b"P15-EXPR-CGI-EXEC", body)
+
+
+class P36TrailingSlashRewriteTests(unittest.TestCase):
+    """A slash-preserving rewrite must not abort the release daemon."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p36-", dir=TEST_TMPDIR))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        for directory in (
+            cls.www,
+            cls.www / "newdir",
+            cls.www / "target",
+            cls.www / "uploads",
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        (cls.www / "newdir" / "index.html").write_text("P36-MAIN\n")
+        (cls.www / "target" / "index.html").write_text("P36-ACCESS\n")
+        (cls.www / "uploads" / ".htaccess").write_text(
+            "RewriteEngine On\nRewriteRule ^boom$ /target/ [L]\n"
+        )
+        cls.port = free_port()
+        config = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+PidFile "{cls.base / 'vapached.pid'}"
+ErrorLog "{cls.base / 'error.log'}"
+DocumentRoot "{cls.www}"
+RewriteEngine On
+RewriteRule ^/legacy/$ /newdir/ [L]
+RewriteRule ^/missing$ /does-not-exist/ [L]
+RewriteCond %{{REQUEST_METHOD}} =GET
+RewriteRule ^/guarded$ /guarded/ [L]
+<Directory "{cls.www}">
+    AllowOverride None
+    Require all granted
+</Directory>
+<Directory "{cls.www / 'uploads'}">
+    AllowOverride FileInfo
+    Require all granted
+</Directory>
+"""
+        cls.proc, _ = start_vapached(cls.base, config)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        shutil.rmtree(getattr(cls, "base", Path("/nonexistent")), ignore_errors=True)
+
+    def assert_live_response(self, path: str, expected_status: int) -> bytes:
+        status, _, body = request(self.port, path)
+        self.assertEqual(status, expected_status, (path, body[:300]))
+        self.assertIsNone(self.proc.poll(), f"vapached exited after {path}")
+        return body
+
+    def test_main_and_access_file_trailing_slash_rewrites_stay_live(self):
+        self.assertIn(b"P36-MAIN", self.assert_live_response("/legacy/", 200))
+        self.assert_live_response("/missing", 404)
+        self.assert_live_response("/guarded", 404)
+        self.assertIn(b"P36-ACCESS", self.assert_live_response("/uploads/boom", 200))
+
+
+class PcreInlineOptionAdmissionTests(unittest.TestCase):
+    """Rust-only regex syntax must fail closed or retain PCRE2 meaning."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-pcre-inline-", dir=TEST_TMPDIR))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.www.mkdir()
+        cls.www.chmod(0o755)
+        cls.cases = {
+            "expr-global-u": '<If "%{HTTP:X-Test} =~ /(?u)^safe$/">\nRequire all granted\n</If>\n',
+            "expr-scoped-u": '<If "%{HTTP:X-Test} =~ /(?u:^safe$)/">\nRequire all granted\n</If>\n',
+            "expr-combined-u": '<If "%{HTTP:X-Test} =~ /(?iu:^safe$)/">\nRequire all granted\n</If>\n',
+            "expr-disable-u": '<If "%{HTTP:X-Test} =~ /(?-u:^safe$)/">\nRequire all granted\n</If>\n',
+            "expr-mixed-u": '<If "%{HTTP:X-Test} =~ /(?i-u:^safe$)/">\nRequire all granted\n</If>\n',
+            "expr-combined-r": '<If "%{HTTP:X-Test} =~ /(?iR:^safe$)/">\nRequire all granted\n</If>\n',
+            "expr-mixed-r": '<If "%{HTTP:X-Test} =~ /(?i-R:^safe$)/">\nRequire all granted\n</If>\n',
+            "expr-extended-boundary": '<If "%{HTTP:X-Test} =~ /\\b{start}/">\nRequire all granted\n</If>\n',
+            "files-global-u": '<FilesMatch "(?u)^index[.]html$">\nRequire all granted\n</FilesMatch>\n',
+            "files-combined-r": '<FilesMatch "(?iR:^index[.]html$)">\nRequire all granted\n</FilesMatch>\n',
+            "files-recursion-r": '<FilesMatch "(?R)">\nRequire all granted\n</FilesMatch>\n',
+            "files-extended-boundary": '<FilesMatch "\\b{start}">\nRequire all granted\n</FilesMatch>\n',
+        }
+        for name, access_file in cls.cases.items():
+            directory = cls.www / name
+            directory.mkdir()
+            directory.chmod(0o755)
+            (directory / "index.html").write_text(f"INLINE-OPTION-SECRET-{name}\n")
+            (directory / ".htaccess").write_text(access_file)
+
+        files_literal = cls.www / "files-literal-angle"
+        files_literal.mkdir()
+        files_literal.chmod(0o755)
+        (files_literal / "index.html").write_text("FILES-LITERAL-ANGLE-CONTROL\n")
+        (files_literal / ".htaccess").write_text(
+            '<FilesMatch "\\<">\nRequire all granted\n</FilesMatch>\n'
+        )
+
+        control = cls.www / "valid-ungreedy-control"
+        control.mkdir()
+        control.chmod(0o755)
+        (control / "index.html").write_text("INLINE-OPTION-CONTROL\n")
+        (control / ".htaccess").write_text(
+            '<If "%{HTTP:X-Test} =~ /(?U)^safe$/">\n'
+            "Require all granted\n"
+            "</If>\n"
+        )
+
+        literal_angle = cls.www / "literal-angle-control"
+        literal_angle.mkdir()
+        literal_angle.chmod(0o755)
+        (literal_angle / "index.html").write_text("LITERAL-ANGLE-CONTROL\n")
+        (literal_angle / ".htaccess").write_text(
+            '<If "%{HTTP:X-Test} =~ /\\</">\n'
+            "Require all granted\n"
+            "</If>\n"
+        )
+
+        cls.port = free_port()
+        config = f'''ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+PidFile "{cls.base / 'vapached.pid'}"
+ErrorLog "{cls.base / 'error.log'}"
+DocumentRoot "{cls.www}"
+<Directory />
+    AllowOverride None
+    Require all denied
+</Directory>
+<Directory "{cls.www}">
+    AllowOverride AuthConfig
+    Require all denied
+</Directory>
+'''
+        cls.proc, _ = start_vapached(cls.base, config)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        shutil.rmtree(getattr(cls, "base", Path("/nonexistent")), ignore_errors=True)
+
+    def test_rust_only_syntax_cannot_activate_access_file_grants(self):
+        for name in self.cases:
+            with self.subTest(name=name):
+                status, _, body = request(
+                    self.port,
+                    f"/{name}/index.html",
+                    {"X-Test": "safe"},
+                )
+                self.assertEqual(status, 500, (name, body[:300]))
+                self.assertNotIn(b"INLINE-OPTION-SECRET", body)
+                self.assertIsNone(self.proc.poll(), f"vapached exited after {name}")
+
+    def test_pcre2_ungreedy_option_remains_supported(self):
+        status, _, body = request(
+            self.port,
+            "/valid-ungreedy-control/index.html",
+            {"X-Test": "safe"},
+        )
+        self.assertEqual(status, 200, body[:300])
+        self.assertIn(b"INLINE-OPTION-CONTROL", body)
+
+    def test_expression_escaped_angle_retains_pcre2_literal_semantics(self):
+        # If the directive path leaked through to Rust regex, `\<` would be a
+        # word-start assertion and this FilesMatch would grant index.html.
+        status, _, body = request(self.port, "/files-literal-angle/index.html")
+        self.assertEqual(status, 403, body[:300])
+        self.assertNotIn(b"FILES-LITERAL-ANGLE-CONTROL", body)
+        self.assertIsNone(self.proc.poll())
+
+        status, _, body = request(
+            self.port,
+            "/literal-angle-control/index.html",
+            {"X-Test": "safe"},
+        )
+        self.assertEqual(status, 403, body[:300])
+        self.assertNotIn(b"LITERAL-ANGLE-CONTROL", body)
+        self.assertIsNone(self.proc.poll())
+
+        status, _, body = request(
+            self.port,
+            "/literal-angle-control/index.html",
+            {"X-Test": "<"},
+        )
+        self.assertEqual(status, 200, body[:300])
+        self.assertIn(b"LITERAL-ANGLE-CONTROL", body)
 
 
 if __name__ == "__main__":

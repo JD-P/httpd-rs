@@ -5709,7 +5709,9 @@ mod more_tests {
             .proxy_policy
             .proxy_rules
             .push(crate::config::ProxyRule {
-                pattern: std::sync::Arc::new(regex::bytes::Regex::new("^/(.*\\.php)$").unwrap()),
+                pattern: std::sync::Arc::new(
+                    crate::apache_regex::Regex::new("^/(.*\\.php)$").unwrap(),
+                ),
                 backend: "http://127.0.0.1:9000/$1".into(),
                 route_order: 0,
             });
@@ -5739,7 +5741,9 @@ mod more_tests {
             .proxy_policy
             .proxy_rules
             .push(crate::config::ProxyRule {
-                pattern: std::sync::Arc::new(regex::bytes::Regex::new("^/app/(.*)$").unwrap()),
+                pattern: std::sync::Arc::new(
+                    crate::apache_regex::Regex::new("^/app/(.*)$").unwrap(),
+                ),
                 backend: "http://127.0.0.1:9002/$1".into(),
                 route_order: 0,
             });

@@ -105,6 +105,10 @@ fn p23_g_h_i_j_capture_escape_and_empty_alternative_compatibility() {
         (r"\x{42}{2}", b"BB".as_slice()),
         (r"(\x{42})+", b"BB".as_slice()),
         (r"(\d{2})+", b"1234".as_slice()),
+        (r"^/(.*\.php(/.*)?)$", b"/script.php/info".as_slice()),
+        (r"^(?:/.*)?$", b"/path\n".as_slice()),
+        (r"\??$", b"?\n".as_slice()),
+        (r"\x{42}?$", b"B\n".as_slice()),
         (r"[[:alpha:]]-[a-z]", b"a-b".as_slice()),
         (r"a|", b"a".as_slice()),
     ] {

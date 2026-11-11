@@ -134,6 +134,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "pcre2_grammar"
+path = "fuzz_targets/pcre2_grammar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "pcre2_resource"
 path = "fuzz_targets/pcre2_resource.rs"
 test = false

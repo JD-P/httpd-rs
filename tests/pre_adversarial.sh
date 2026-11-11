@@ -119,6 +119,10 @@ step "P34 decoded synthesized-identity differential"
 P34_APACHE="$APACHE" P34_APACHE_MODULES="$APACHE_MODDIR" \
     python3 adversarial/p34/exploit_p34.py
 
+step "P36 trailing-slash rewrite process-survival differential"
+P36_APACHE="$APACHE" P36_APACHE_MODULES="$APACHE_MODDIR" \
+    python3 adversarial/p36/exploit_p36.py
+
 step "attacker-view information-disclosure noninterference"
 python3 tests/information_disclosure.py --all-probes
 

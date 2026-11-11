@@ -202,9 +202,17 @@ pub mod bytes {
                 return Err(Error::resource("pattern exceeds the configured byte limit"));
             }
 
-            let translation = translate(
+            let admitted = AdmittedPattern::parse(
                 pattern,
+                self.config.extended,
+                self.config.crlf,
+                self.config.nest_limit,
+                self.config.utf || self.config.ucp,
+            )?;
+            let translation = translate(
+                &admitted,
                 self.config.caseless,
+                self.config.dotall,
                 self.config.multi_line,
                 self.config.crlf,
                 self.config.extended,
@@ -838,6 +846,67 @@ pub mod bytes {
         pub fn is_empty(&self) -> bool {
             self.spans.is_empty()
         }
+
+        pub fn iter(&self) -> impl Iterator<Item = Option<Match<'s>>> + '_ {
+            (0..self.len()).map(|index| self.get(index))
+        }
+
+        /// Expand the capture-reference subset used by Apache configuration
+        /// values. Unknown references expand to empty and `$$` emits one
+        /// literal dollar, matching the former `regex::bytes` boundary.
+        pub fn expand(&self, replacement: &[u8], dst: &mut Vec<u8>) {
+            let mut i = 0usize;
+            while i < replacement.len() {
+                if replacement[i] != b'$' {
+                    dst.push(replacement[i]);
+                    i += 1;
+                    continue;
+                }
+                if replacement.get(i + 1) == Some(&b'$') {
+                    dst.push(b'$');
+                    i += 2;
+                    continue;
+                }
+
+                let (name, end) = if replacement.get(i + 1) == Some(&b'{') {
+                    let Some(close) = replacement[i + 2..]
+                        .iter()
+                        .position(|&byte| byte == b'}')
+                        .map(|relative| i + 2 + relative)
+                    else {
+                        dst.push(b'$');
+                        i += 1;
+                        continue;
+                    };
+                    (&replacement[i + 2..close], close + 1)
+                } else {
+                    let mut end = i + 1;
+                    while replacement
+                        .get(end)
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                    {
+                        end += 1;
+                    }
+                    if end == i + 1 {
+                        dst.push(b'$');
+                        i += 1;
+                        continue;
+                    }
+                    (&replacement[i + 1..end], end)
+                };
+
+                let matched = std::str::from_utf8(name).ok().and_then(|name| {
+                    name.parse::<usize>()
+                        .ok()
+                        .and_then(|index| self.get(index))
+                        .or_else(|| self.name(name))
+                });
+                if let Some(matched) = matched {
+                    dst.extend_from_slice(matched.as_bytes());
+                }
+                i = end;
+            }
+        }
     }
 
     impl fmt::Debug for Captures<'_> {
@@ -981,6 +1050,422 @@ pub mod bytes {
         keep_prefix: String,
     }
 
+    /// A proof-carrying parse result for the deliberately supported PCRE2
+    /// grammar. Translation never receives an unchecked source string: every
+    /// group form, option, escape, class and quantifier must be consumed by
+    /// this closed parser first.
+    ///
+    /// The concrete grammar is intentionally small (semantic restrictions,
+    /// such as capture-history equivalence, are checked after this parse):
+    ///
+    /// ```text
+    /// pattern       := branch ("|" branch)*
+    /// branch        := global_options* piece*
+    /// piece         := atom quantifier?
+    /// atom          := literal | class | escape | anchor | group
+    /// group         := "(" pattern ")"
+    ///                | "(?:" pattern ")"
+    ///                | "(?<" name ">" pattern ")"
+    ///                | "(?P<" name ">" pattern ")"
+    ///                | "(?\'" name "\'" pattern ")"
+    ///                | "(?" options ":" pattern ")"
+    ///                | "(?#" comment ")"
+    /// global_options:= "(?" options ")"       # branch start only
+    /// options       := [imsUx]+ ("-" [imsUx]+)?
+    /// quantifier    := ("*" | "+" | "?" | counted) "?"?
+    /// counted       := "{" digits ("," digits?)? "}"
+    /// ```
+    ///
+    /// `class` and `escape` are parsed by their own positive productions
+    /// below. There is deliberately no "other special group/escape" arm.
+    struct AdmittedPattern<'a> {
+        source: &'a str,
+    }
+
+    #[derive(Clone, Copy)]
+    struct GrammarFrame {
+        previous_extended: bool,
+    }
+
+    enum SpecialGroup {
+        Comment { end: usize },
+        GlobalOptions { end: usize, extended: bool },
+        Open { body: usize, extended: bool },
+    }
+
+    impl<'a> AdmittedPattern<'a> {
+        fn parse(
+            source: &'a str,
+            initial_extended: bool,
+            crlf: bool,
+            nest_limit: u32,
+            unicode_pattern: bool,
+        ) -> Result<Self, Error> {
+            let bytes = source.as_bytes();
+            let mut frames = Vec::new();
+            let mut extended = initial_extended;
+            let mut i = 0usize;
+            let mut repeatable = false;
+            let mut branch_start = true;
+
+            while i < bytes.len() {
+                if extended && pcre_extended_ascii_whitespace(bytes[i]) {
+                    i += 1;
+                    continue;
+                }
+                if extended && bytes[i] == b'#' {
+                    if crlf {
+                        let terminator = bytes[i..]
+                            .iter()
+                            .position(|&byte| matches!(byte, b'\r' | b'\n'))
+                            .map(|relative| i + relative);
+                        if terminator.is_some_and(|end| {
+                            bytes[end] == b'\r' && bytes.get(end + 1) != Some(&b'\n')
+                        }) {
+                            // PCRE2's ANYCRLF convention ends an extended
+                            // comment at a lone CR. regex-syntax only ends it
+                            // at LF, which could hide active syntax after the
+                            // CR. Admit LF and CRLF comments, and fail closed
+                            // on the unrepresentable lone-CR spelling.
+                            return Err(Error::unsupported(
+                                i,
+                                "CR-terminated extended-mode comment",
+                            ));
+                        }
+                    }
+                    i = bytes[i..]
+                        .iter()
+                        .position(|&byte| byte == b'\n')
+                        .map_or(bytes.len(), |relative| i + relative + 1);
+                    continue;
+                }
+                if extended
+                    && bytes[i] >= 0x80
+                    && non_ascii_extended_whitespace(source, i, unicode_pattern)
+                {
+                    // PCRE2 applies extended-mode lexing to decoded scalars
+                    // in UTF mode and to individual code units otherwise. A
+                    // UTF-8 continuation byte can therefore disappear in
+                    // byte mode (for example the 0x85 in U+00C5), changing
+                    // which preceding atom a quantifier binds to. Keep this
+                    // narrow lexical corner outside the admitted subset.
+                    return Err(Error::unsupported(
+                        i,
+                        "non-ASCII extended-mode pattern whitespace",
+                    ));
+                }
+
+                match bytes[i] {
+                    b'[' => {
+                        i = byte_class_end(source, i, crlf)?;
+                        repeatable = true;
+                        branch_start = false;
+                    }
+                    b'\\' => {
+                        let (end, can_repeat) = admitted_escape(bytes, i)?;
+                        i = end;
+                        repeatable = can_repeat;
+                        branch_start = false;
+                    }
+                    b'(' if bytes.get(i + 1) == Some(&b'*') => {
+                        return Err(Error::unsupported(i, "backtracking control verb"));
+                    }
+                    b'(' if bytes.get(i + 1) == Some(&b'?') => {
+                        match admitted_special_group(bytes, i, extended, branch_start)? {
+                            SpecialGroup::Comment { end } => i = end,
+                            SpecialGroup::GlobalOptions {
+                                end,
+                                extended: next_extended,
+                            } => {
+                                i = end;
+                                extended = next_extended;
+                            }
+                            SpecialGroup::Open {
+                                body,
+                                extended: next_extended,
+                            } => {
+                                if frames.len() >= nest_limit as usize {
+                                    return Err(Error::resource(
+                                        "pattern nesting exceeds the configured limit",
+                                    ));
+                                }
+                                frames.push(GrammarFrame {
+                                    previous_extended: extended,
+                                });
+                                extended = next_extended;
+                                i = body;
+                                repeatable = false;
+                                branch_start = true;
+                            }
+                        }
+                    }
+                    b'(' => {
+                        if frames.len() >= nest_limit as usize {
+                            return Err(Error::resource(
+                                "pattern nesting exceeds the configured limit",
+                            ));
+                        }
+                        frames.push(GrammarFrame {
+                            previous_extended: extended,
+                        });
+                        i += 1;
+                        repeatable = false;
+                        branch_start = true;
+                    }
+                    b')' => {
+                        let frame = frames
+                            .pop()
+                            .ok_or_else(|| Error::syntax_at(i, "unmatched closing parenthesis"))?;
+                        extended = frame.previous_extended;
+                        i += 1;
+                        repeatable = true;
+                        branch_start = false;
+                    }
+                    b'|' => {
+                        i += 1;
+                        repeatable = false;
+                        branch_start = true;
+                    }
+                    b'^' | b'$' => {
+                        i += 1;
+                        repeatable = false;
+                        branch_start = false;
+                    }
+                    b'*' | b'+' | b'?' => {
+                        if !repeatable {
+                            return Err(Error::syntax_at(
+                                i,
+                                "quantifier does not follow a repeatable item",
+                            ));
+                        }
+                        i += 1;
+                        match bytes.get(i) {
+                            Some(b'?') => i += 1,
+                            Some(b'+') => {
+                                return Err(Error::unsupported(i, "possessive quantifier"));
+                            }
+                            _ => {}
+                        }
+                        repeatable = false;
+                        branch_start = false;
+                    }
+                    b'{' => {
+                        let Some(end) = quantifier_end(&bytes[i..]) else {
+                            return Err(Error::syntax_at(i, "unescaped opening brace"));
+                        };
+                        if !repeatable {
+                            return Err(Error::syntax_at(
+                                i,
+                                "quantifier does not follow a repeatable item",
+                            ));
+                        }
+                        i += end;
+                        match bytes.get(i) {
+                            Some(b'?') => i += 1,
+                            Some(b'+') => {
+                                return Err(Error::unsupported(i, "possessive quantifier"));
+                            }
+                            _ => {}
+                        }
+                        repeatable = false;
+                        branch_start = false;
+                    }
+                    b']' | b'}' => {
+                        return Err(Error::syntax_at(i, "unescaped closing delimiter"));
+                    }
+                    b'.' => {
+                        i += 1;
+                        repeatable = true;
+                        branch_start = false;
+                    }
+                    byte if byte >= 0x80 => {
+                        let ch = source[i..].chars().next().expect("source is valid UTF-8");
+                        i += ch.len_utf8();
+                        repeatable = true;
+                        branch_start = false;
+                    }
+                    _ => {
+                        i += 1;
+                        repeatable = true;
+                        branch_start = false;
+                    }
+                }
+            }
+
+            if !frames.is_empty() {
+                return Err(Error::syntax("unterminated group"));
+            }
+            Ok(Self { source })
+        }
+    }
+
+    fn pcre_extended_ascii_whitespace(byte: u8) -> bool {
+        // Rust's `u8::is_ascii_whitespace` intentionally omits vertical tab,
+        // while PCRE2's default low-valued space table includes it.
+        byte.is_ascii_whitespace() || byte == b'\x0B'
+    }
+
+    fn non_ascii_extended_whitespace(source: &str, start: usize, unicode_pattern: bool) -> bool {
+        let ch = source[start..]
+            .chars()
+            .next()
+            .expect("start is a UTF-8 scalar boundary");
+        if unicode_pattern {
+            matches!(
+                ch,
+                '\u{0085}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}'
+            )
+        } else {
+            source.as_bytes()[start..start + ch.len_utf8()].contains(&0x85)
+        }
+    }
+
+    fn admitted_special_group(
+        bytes: &[u8],
+        start: usize,
+        initial_extended: bool,
+        branch_start: bool,
+    ) -> Result<SpecialGroup, Error> {
+        if bytes[start..].starts_with(b"(?#") {
+            let close = bytes[start + 3..]
+                .iter()
+                .position(|&byte| byte == b')')
+                .map(|relative| start + 3 + relative)
+                .ok_or_else(|| Error::syntax_at(start, "unterminated PCRE comment group"))?;
+            return Ok(SpecialGroup::Comment { end: close + 1 });
+        }
+        if bytes[start..].starts_with(b"(?:") {
+            return Ok(SpecialGroup::Open {
+                body: start + 3,
+                extended: initial_extended,
+            });
+        }
+        if bytes[start..].starts_with(b"(?P<") {
+            let end = validate_capture_name(bytes, start + 4, b'>', start)?;
+            return Ok(SpecialGroup::Open {
+                body: end + 1,
+                extended: initial_extended,
+            });
+        }
+        if bytes[start..].starts_with(b"(?<")
+            && !matches!(bytes.get(start + 3), Some(b'=') | Some(b'!'))
+        {
+            let end = validate_capture_name(bytes, start + 3, b'>', start)?;
+            return Ok(SpecialGroup::Open {
+                body: end + 1,
+                extended: initial_extended,
+            });
+        }
+        if bytes[start..].starts_with(b"(?'") {
+            let end = validate_capture_name(bytes, start + 3, b'\'', start)?;
+            return Ok(SpecialGroup::Open {
+                body: end + 1,
+                extended: initial_extended,
+            });
+        }
+
+        let mut i = start + 2;
+        let mut enabled = true;
+        let mut extended = initial_extended;
+        let mut saw_flag = false;
+        let mut saw_dash = false;
+        let mut saw_disabled_flag = false;
+        while let Some(&byte) = bytes.get(i) {
+            match byte {
+                b'i' | b'm' | b's' | b'U' => {
+                    saw_flag = true;
+                    saw_disabled_flag |= saw_dash;
+                    i += 1;
+                }
+                b'x' => {
+                    saw_flag = true;
+                    saw_disabled_flag |= saw_dash;
+                    extended = enabled;
+                    i += 1;
+                }
+                b'-' if !saw_dash => {
+                    saw_dash = true;
+                    enabled = false;
+                    i += 1;
+                }
+                b':' if saw_flag && (!saw_dash || saw_disabled_flag) => {
+                    return Ok(SpecialGroup::Open {
+                        body: i + 1,
+                        extended,
+                    });
+                }
+                b')' if saw_flag && (!saw_dash || saw_disabled_flag) => {
+                    if !branch_start {
+                        return Err(Error::syntax_at(
+                            start,
+                            "global option group must start a branch",
+                        ));
+                    }
+                    return Ok(SpecialGroup::GlobalOptions {
+                        end: i + 1,
+                        extended,
+                    });
+                }
+                _ => break,
+            }
+        }
+        Err(Error::unsupported(
+            start,
+            "group form outside the admitted PCRE2 grammar",
+        ))
+    }
+
+    fn admitted_escape(bytes: &[u8], slash: usize) -> Result<(usize, bool), Error> {
+        let escaped = *bytes
+            .get(slash + 1)
+            .ok_or_else(|| Error::syntax_at(slash, "trailing backslash"))?;
+        if escaped >= 0x80 {
+            return Err(Error::unsupported(slash, "non-ASCII escape"));
+        }
+        match escaped {
+            b'A' | b'B' | b'b' | b'K' | b'Z' | b'z' => Ok((slash + 2, false)),
+            b'C' | b'D' | b'H' | b'N' | b'R' | b'S' | b'V' | b'W' | b'a' | b'd' | b'e' | b'f'
+            | b'h' | b'n' | b'r' | b's' | b't' | b'v' | b'w' => Ok((slash + 2, true)),
+            b'Q' => {
+                let content = slash + 2;
+                let end = bytes[content..]
+                    .windows(2)
+                    .position(|pair| pair == b"\\E")
+                    .map(|relative| content + relative);
+                Ok(match end {
+                    Some(end) => (end + 2, end > content),
+                    None => (bytes.len(), bytes.len() > content),
+                })
+            }
+            b'c' => {
+                let control = *bytes
+                    .get(slash + 2)
+                    .ok_or_else(|| Error::syntax_at(slash, "incomplete control escape"))?;
+                if !(b' '..=b'~').contains(&control) {
+                    return Err(Error::syntax_at(
+                        slash,
+                        "control escape target must be printable ASCII",
+                    ));
+                }
+                Ok((slash + 3, true))
+            }
+            b'x' => parse_hex_escape(bytes, slash).map(|(_, end)| (end, true)),
+            b'o' => parse_braced_octal(bytes, slash).map(|(_, end)| (end, true)),
+            b'0'..=b'7' => parse_octal_escape(bytes, slash + 1).map(|(_, end)| (end, true)),
+            b'8' | b'9' | b'g' | b'k' => Err(Error::unsupported(slash, "backreference")),
+            b'G' => Err(Error::unsupported(slash, "start-of-match assertion")),
+            b'p' | b'P' | b'X' => Err(Error::unsupported(
+                slash,
+                "Unicode property or extended grapheme escape",
+            )),
+            byte if !byte.is_ascii_alphanumeric() => Ok((slash + 2, true)),
+            _ => Err(Error::syntax_at(
+                slash,
+                "escape outside the admitted PCRE2 grammar",
+            )),
+        }
+    }
+
     fn parse_hir(pattern: &str, config: &Config) -> Result<regex_syntax::hir::Hir, Error> {
         let unicode = config.ucp || config.utf;
         let mut builder = regex_syntax::ParserBuilder::new();
@@ -1031,14 +1516,16 @@ pub mod bytes {
     /// Translate PCRE-only regular constructs while rejecting every construct
     /// whose exact semantics cannot be represented by the automata backend.
     fn translate(
-        pattern: &str,
+        admitted: &AdmittedPattern<'_>,
         caseless: bool,
+        dotall: bool,
         multi_line: bool,
         crlf: bool,
         extended: bool,
         unicode_pattern: bool,
         ucp: bool,
     ) -> Result<Translation, Error> {
+        let pattern = admitted.source;
         let quantifier_extended = extended || inline_option_may_enable(pattern, b'x');
         let invalid_quantifier = invalid_quantifier_placement(pattern, false, crlf).or_else(|| {
             quantifier_extended
@@ -1059,7 +1546,14 @@ pub mod bytes {
         }
         let mut effective_multiline = leading_global_flag(pattern, b'm').unwrap_or(multi_line);
         let mut effective_extended = leading_global_flag(pattern, b'x').unwrap_or(extended);
-        validate_line_constructs(pattern, effective_extended, effective_multiline, crlf)?;
+        let dotall_may_apply = dotall || inline_option_may_enable(pattern, b's');
+        validate_line_constructs(
+            pattern,
+            effective_extended,
+            effective_multiline,
+            dotall_may_apply,
+            crlf,
+        )?;
 
         let bytes = pattern.as_bytes();
         let captures = capture_count(pattern, crlf, effective_extended);
@@ -1074,7 +1568,7 @@ pub mod bytes {
         let mut effective_caseless = caseless;
         let mut option_scopes = Vec::new();
         while i < bytes.len() {
-            if effective_extended && bytes[i].is_ascii_whitespace() {
+            if effective_extended && pcre_extended_ascii_whitespace(bytes[i]) {
                 out.push(bytes[i]);
                 i += 1;
                 continue;
@@ -1210,7 +1704,7 @@ pub mod bytes {
                             out.push(b'>');
                             i = name_end + 1;
                         }
-                        _ => {
+                        Some(b':') | Some(b'<') => {
                             option_scopes.push((
                                 effective_caseless,
                                 effective_extended,
@@ -1218,6 +1712,18 @@ pub mod bytes {
                             ));
                             out.push(b'(');
                             i += 1;
+                        }
+                        Some(b'P') if bytes.get(i + 3) == Some(&b'<') => {
+                            option_scopes.push((
+                                effective_caseless,
+                                effective_extended,
+                                effective_multiline,
+                            ));
+                            out.push(b'(');
+                            i += 1;
+                        }
+                        _ => {
+                            return Err(Error::syntax_at(i, "unrecognized special group"));
                         }
                     }
                 }
@@ -1328,8 +1834,10 @@ pub mod bytes {
                             let Some(&control) = bytes.get(i + 2) else {
                                 return Err(Error::syntax("incomplete control escape"));
                             };
-                            if control >= 0x80 {
-                                return Err(Error::syntax("control escape must be ASCII"));
+                            if !(b' '..=b'~').contains(&control) {
+                                return Err(Error::syntax(
+                                    "control escape target must be printable ASCII",
+                                ));
                             }
                             push_hex(&mut out, control.to_ascii_uppercase() ^ 0x40);
                             i += 3;
@@ -1359,16 +1867,92 @@ pub mod bytes {
                         b'8' | b'9' | b'g' | b'k' => {
                             return Err(Error::unsupported(i, "backreference"));
                         }
+                        // Rust regex extends word boundaries with forms such
+                        // as `\b{start}`. PCRE2 parses the brace text under
+                        // its own grammar instead of assigning those
+                        // assertions, so keep the whole extension namespace
+                        // fail closed.
+                        b'b' | b'B' if bytes.get(i + 2) == Some(&b'{') => {
+                            return Err(Error::unsupported(i, "Rust-only extended word boundary"));
+                        }
+                        b'b' | b'B' if ucp => {
+                            // pcre2's byte-slice iterators advance one byte
+                            // after an empty match. Under MATCH_INVALID_UTF,
+                            // landing inside a multi-byte scalar creates a
+                            // fragment barrier and an observable extra UCP
+                            // boundary. The automata iterator advances over
+                            // valid UTF scalars, so this API behavior cannot
+                            // be represented exactly.
+                            return Err(Error::unsupported(i, "UCP word boundary iteration"));
+                        }
+                        b'b' | b'B' if unicode_pattern && !ucp => {
+                            // PCRE2_UTF changes scalar decoding but leaves
+                            // character types ASCII unless PCRE2_UCP is also
+                            // set. The backend's Unicode parser would
+                            // otherwise widen this boundary.
+                            out.extend_from_slice(b"(?-u:\\");
+                            out.push(escaped);
+                            out.push(b')');
+                            i += 2;
+                        }
+                        b'd' if unicode_pattern && !ucp => {
+                            out.extend_from_slice(b"[0-9]");
+                            i += 2;
+                        }
+                        b'D' if unicode_pattern && !ucp => {
+                            out.extend_from_slice(b"[^0-9]");
+                            i += 2;
+                        }
+                        b'w' if unicode_pattern && !ucp => {
+                            out.extend_from_slice(b"[A-Za-z0-9_]");
+                            i += 2;
+                        }
+                        b'W' if unicode_pattern && !ucp => {
+                            out.extend_from_slice(b"[^A-Za-z0-9_]");
+                            i += 2;
+                        }
+                        b's' if unicode_pattern && !ucp => {
+                            out.extend_from_slice(b"[\\x09-\\x0D\\x20]");
+                            i += 2;
+                        }
+                        b'S' if unicode_pattern && !ucp => {
+                            out.extend_from_slice(b"[^\\x09-\\x0D\\x20]");
+                            i += 2;
+                        }
+                        // Rust regex assigns word-boundary assertions to
+                        // `\<` and `\>`. PCRE2 does not: a backslash before
+                        // either non-alphanumeric byte quotes the literal.
+                        // Remove the backslash so the backend cannot silently
+                        // reinterpret an Apache pattern as an assertion.
+                        b'<' | b'>' => {
+                            out.push(escaped);
+                            i += 2;
+                        }
                         b'p' | b'P' | b'X' => {
                             return Err(Error::unsupported(
                                 i,
                                 "Unicode property or extended grapheme escape",
                             ));
                         }
-                        _ => {
+                        b'A' | b'B' | b'b' | b'D' | b'd' | b'f' | b'n' | b'r' | b'S' | b's'
+                        | b't' | b'W' | b'w' | b'z' => {
                             out.push(b'\\');
                             out.push(escaped);
                             i += 2;
+                        }
+                        byte if !byte.is_ascii_alphanumeric() => {
+                            // PCRE2 quotes an escaped non-alphanumeric byte.
+                            // Render the literal independently of whatever
+                            // assertion or extension Rust may assign to that
+                            // escape spelling now or in a future release.
+                            push_hex(&mut out, byte);
+                            i += 2;
+                        }
+                        _ => {
+                            return Err(Error::syntax_at(
+                                i,
+                                "escape outside the admitted PCRE2 grammar",
+                            ));
                         }
                     }
                 }
@@ -1401,8 +1985,10 @@ pub mod bytes {
         })
     }
 
-    /// Return the byte just after an inline option header, whether it opens a
-    /// scoped group, and the effective translation-sensitive options.
+    /// Return the byte just after an admitted inline option header, whether
+    /// it opens a scoped group, and the effective translation-sensitive
+    /// options. `AdmittedPattern` guarantees that this is never called for an
+    /// option outside the closed `imsUx` production.
     fn inline_options(
         bytes: &[u8],
         start: usize,
@@ -1429,7 +2015,7 @@ pub mod bytes {
                     extended = enabled;
                     i += 1;
                 }
-                b's' => i += 1,
+                b's' | b'U' => i += 1,
                 b'-' => {
                     enabled = false;
                     i += 1;
@@ -1451,7 +2037,7 @@ pub mod bytes {
                 continue;
             }
             for byte in ch.to_string().as_bytes() {
-                if byte.is_ascii_whitespace() || *byte == b'#' || *byte >= 0x80 {
+                if pcre_extended_ascii_whitespace(*byte) || *byte == b'#' || *byte >= 0x80 {
                     push_hex(out, *byte);
                 } else {
                     let ch = *byte as char;
@@ -1558,6 +2144,7 @@ pub mod bytes {
         pattern: &str,
         extended: bool,
         effective_multiline: bool,
+        dotall_may_apply: bool,
         crlf: bool,
     ) -> Result<(), Error> {
         let bytes = pattern.as_bytes();
@@ -1568,7 +2155,7 @@ pub mod bytes {
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
-                byte if extended && byte.is_ascii_whitespace() => i += 1,
+                byte if extended && pcre_extended_ascii_whitespace(byte) => i += 1,
                 b'#' if extended => {
                     i = bytes[i..]
                         .iter()
@@ -1577,6 +2164,9 @@ pub mod bytes {
                 }
                 b'[' => {
                     let end = byte_class_end(pattern, i, false)?;
+                    if crlf && crlf_ambiguous_search_class(&bytes[i..end]) {
+                        return Err(Error::unsupported(i, "CRLF search-start character class"));
+                    }
                     i = end;
                 }
                 b'\\' if bytes.get(i + 1) == Some(&b'Q') => {
@@ -1602,6 +2192,21 @@ pub mod bytes {
                         i,
                         "CRLF start-offset non-boundary assertion",
                     ));
+                }
+                b'\\'
+                    if crlf
+                        && matches!(
+                            bytes.get(i + 1),
+                            Some(b's' | b'D' | b'W' | b'H' | b'v' | b'C')
+                        ) =>
+                {
+                    // With ANYCRLF, PCRE2 does not begin a generic character
+                    // class match at the LF half of CRLF. The automata engine
+                    // does, while explicit `\\n` and positive byte classes
+                    // remain valid starts in both engines. Keep generic
+                    // classes that can consume LF outside the admitted CRLF
+                    // subset instead of depending on PCRE2 start heuristics.
+                    return Err(Error::unsupported(i, "CRLF search-start character class"));
                 }
                 b'\\'
                     if matches!(bytes.get(i + 1), Some(b'S') | Some(b'N'))
@@ -1638,12 +2243,20 @@ pub mod bytes {
                     }
                     let previous = bytes[..i]
                         .iter()
-                        .rposition(|byte| !byte.is_ascii_whitespace())
-                        .and_then(|index| bytes.get(index));
-                    if previous == Some(&b'?') {
+                        .rposition(|byte| !pcre_extended_ascii_whitespace(*byte))
+                        .filter(|&index| bytes[index] == b'?');
+                    if previous.is_some_and(|lazy| {
+                        preceding_question_is_lazy_quantifier(bytes, lazy, extended)
+                    }) {
                         return Err(Error::unsupported(i, "lazy final-newline anchor priority"));
                     }
                     i += 1;
+                }
+                b'.' if crlf && dotall_may_apply => {
+                    return Err(Error::unsupported(
+                        i,
+                        "CRLF search-start dot character class",
+                    ));
                 }
                 _ => i += 1,
             }
@@ -1651,12 +2264,26 @@ pub mod bytes {
         Ok(())
     }
 
+    fn crlf_ambiguous_search_class(class: &[u8]) -> bool {
+        class.get(1) == Some(&b'^')
+            || class.windows(3).any(|window| window == b"[:^")
+            || [b"[:ascii:]".as_slice(), b"[:cntrl:]", b"[:space:]"]
+                .iter()
+                .any(|name| class.windows(name.len()).any(|window| window == *name))
+            || class.windows(2).any(|escape| {
+                escape[0] == b'\\' && matches!(escape[1], b's' | b'D' | b'W' | b'H' | b'v' | b'C')
+            })
+    }
+
     /// Recognize the next semantic atom after syntax PCRE discards before its
     /// auto-possessification pass.
     fn auto_possessified_line_atom(bytes: &[u8], mut i: usize, extended: bool) -> bool {
         loop {
             if extended {
-                while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+                while bytes
+                    .get(i)
+                    .is_some_and(|byte| pcre_extended_ascii_whitespace(*byte))
+                {
                     i += 1;
                 }
                 if bytes.get(i) == Some(&b'#') {
@@ -1679,9 +2306,53 @@ pub mod bytes {
         }
     }
 
+    /// The `?` immediately before an end anchor is hazardous only when it is
+    /// the lazy modifier of another quantifier. An optional atom/group such as
+    /// `(?:suffix)?$` has no competing lazy priority and is representable by
+    /// the two-pass final-newline lowering.
+    fn preceding_question_is_lazy_quantifier(
+        bytes: &[u8],
+        question: usize,
+        extended: bool,
+    ) -> bool {
+        let Some(previous) = bytes[..question]
+            .iter()
+            .rposition(|byte| !extended || !pcre_extended_ascii_whitespace(*byte))
+        else {
+            return false;
+        };
+        match bytes[previous] {
+            b'*' | b'+' | b'?' => !byte_is_escaped(bytes, previous),
+            b'}' => bytes[..=previous]
+                .iter()
+                .rposition(|&byte| byte == b'{')
+                .is_some_and(|open| {
+                    quantifier_end(&bytes[open..=previous]) == Some(previous - open + 1)
+                        && !byte_is_escaped(bytes, open)
+                        && !(open >= 2
+                            && matches!(bytes[open - 1], b'x' | b'o')
+                            && byte_is_escaped(bytes, open - 1))
+                }),
+            _ => false,
+        }
+    }
+
+    fn byte_is_escaped(bytes: &[u8], index: usize) -> bool {
+        let slashes = bytes[..index]
+            .iter()
+            .rev()
+            .take_while(|&&byte| byte == b'\\')
+            .count();
+        slashes % 2 == 1
+    }
+
     fn anchor_is_terminal(bytes: &[u8], mut i: usize, extended: bool) -> bool {
         loop {
-            while extended && bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            while extended
+                && bytes
+                    .get(i)
+                    .is_some_and(|byte| pcre_extended_ascii_whitespace(*byte))
+            {
                 i += 1;
             }
             if extended && bytes.get(i) == Some(&b'#') {
@@ -1699,7 +2370,7 @@ pub mod bytes {
         let bytes = pattern.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
-            if extended && bytes[i].is_ascii_whitespace() {
+            if extended && pcre_extended_ascii_whitespace(bytes[i]) {
                 i += 1;
                 continue;
             }
@@ -1733,7 +2404,7 @@ pub mod bytes {
         let mut count = 0;
         let mut i = 0;
         while i < bytes.len() {
-            if extended && bytes[i].is_ascii_whitespace() {
+            if extended && pcre_extended_ascii_whitespace(bytes[i]) {
                 i += 1;
                 continue;
             }
@@ -2219,7 +2890,7 @@ pub mod bytes {
         let mut i = 0;
         let mut repeatable = false;
         while i < bytes.len() {
-            if extended && bytes[i].is_ascii_whitespace() {
+            if extended && pcre_extended_ascii_whitespace(bytes[i]) {
                 i += 1;
                 continue;
             }
@@ -2434,9 +3105,9 @@ pub mod bytes {
                 }
                 b')' => {
                     let frame = stack.pop()?;
-                    let repeated = matches!(bytes.get(i + 1), Some(b'*' | b'+' | b'?' | b'{'));
+                    let repeats_capture = capture_quantifier_repeats(bytes, i + 1);
                     if frame.capturing
-                        && repeated
+                        && repeats_capture
                         && (frame.variable_repeat || (frame.alternation && frame.zero_width))
                     {
                         return Some(i + 1);
@@ -2447,6 +3118,49 @@ pub mod bytes {
             }
         }
         None
+    }
+
+    /// Whether the quantifier beginning at `start` can execute a capture more
+    /// than once. `?`, `{0,1}` and `{1}` cannot create capture-history
+    /// ambiguity and must not be rejected merely because their body contains
+    /// another repetition.
+    fn capture_quantifier_repeats(bytes: &[u8], start: usize) -> bool {
+        match bytes.get(start) {
+            Some(b'*' | b'+') => true,
+            Some(b'?') | None => false,
+            Some(b'{') => {
+                let Some(end) = quantifier_end(&bytes[start..]) else {
+                    return false;
+                };
+                let body = &bytes[start + 1..start + end - 1];
+                let (minimum, maximum) = match body.iter().position(|&byte| byte == b',') {
+                    Some(comma) => {
+                        let minimum = std::str::from_utf8(&body[..comma])
+                            .ok()
+                            .and_then(|digits| {
+                                (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+                            })
+                            .unwrap_or(0_u64);
+                        let maximum =
+                            std::str::from_utf8(&body[comma + 1..])
+                                .ok()
+                                .and_then(|digits| {
+                                    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+                                });
+                        (minimum, maximum)
+                    }
+                    None => {
+                        let exact = std::str::from_utf8(body)
+                            .ok()
+                            .and_then(|digits| digits.parse::<u64>().ok())
+                            .unwrap_or(u64::MAX);
+                        (exact, Some(exact))
+                    }
+                };
+                minimum > 1 || maximum.is_none_or(|maximum| maximum > 1)
+            }
+            _ => false,
+        }
     }
 
     fn global_option_group_end(bytes: &[u8], start: usize) -> Option<usize> {

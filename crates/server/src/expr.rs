@@ -2062,6 +2062,27 @@ mod tests {
         // is a configuration/load error rather than a request-time branch.
         assert!(parse(r"'secret' =~ /(?unterminated/").is_err());
         assert!(parse(r"'secretse' =~ /(se)cret\1/").is_err());
+        for pattern in [
+            r"(?u)^secret$",
+            r"(?u:^secret$)",
+            r"(?iu:^secret$)",
+            r"(?-u:^secret$)",
+            r"(?i-u:^secret$)",
+            r"(?iR:^secret$)",
+            r"(?i-R:^secret$)",
+            r"\b{start}",
+            r"\B{end-half}",
+        ] {
+            assert!(
+                ExprRegex::compile(pattern.into(), false).is_err(),
+                "accepted Rust-only regex syntax in {pattern:?}",
+            );
+        }
+        assert!(!eval_result(r"'secret' =~ /\</").unwrap().truthy());
+        assert!(eval_result(r"'<' =~ /\</").unwrap().truthy());
+        assert!(!eval_result(r"'secret' =~ /\>/").unwrap().truthy());
+        assert!(eval_result(r"'>' =~ /\>/").unwrap().truthy());
+        assert!(eval_result(r"'secret' =~ /(?U)^secret$/").unwrap().truthy());
 
         let regex = ExprRegex::compile("secret".into(), true).unwrap();
         let debug = format!("{regex:?}");

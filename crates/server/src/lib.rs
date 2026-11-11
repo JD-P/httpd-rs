@@ -30,6 +30,7 @@ macro_rules! eprintln {
 }
 
 pub mod access;
+pub mod apache_regex;
 pub mod auth;
 pub mod cache;
 pub mod cgi;

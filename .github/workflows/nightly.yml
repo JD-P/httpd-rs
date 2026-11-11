@@ -43,6 +43,7 @@ jobs:
           - tls_policy
           - ocsp_der
           - pcre2_differential
+          - pcre2_grammar
           - pcre2_resource
           - resource_transitions
     steps:

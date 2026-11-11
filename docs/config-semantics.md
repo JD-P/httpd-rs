@@ -2077,15 +2077,16 @@ construction: there is no second production interleaver.
   mechanize the cache key encoder/refinement, lookup consequences, store
   admission gates, freshness arithmetic and disk projection/eviction steps
   consumed by `cache.rs` (I51, I54).
-- `regex_dialect_admit` / `guard_regex` / `compile_regex`. Directive regexes
-  backed by Rust `regex` are admitted only after the verified dialect guard.
-  Expression regexes compile through the in-tree PCRE2 compatibility frontend
-  at configuration load. Regular Apache constructs retain their meaning while
+- `compile_regex` and expression-regex compilation share the in-tree PCRE2
+  compatibility frontend. Its positive, stack-bounded grammar must consume
+  every literal, class, escape, group, option and quantifier before an
+  unforgeable admitted-pattern witness can reach translation; directive
+  patterns are never parsed by Rust `regex` directly. Unknown syntax,
   backreferences, recursion, look-around and other recursive-backtracking
-  constructs fail closed. `regex_match_resource_admit` proves the overflow-free
-  pattern-times-subject work bound and `expr_regex_result` proves that an
-  evaluation error cannot grant even through negation. The Rust automata
-  backend still supplies matching semantics for the accepted bytecode.
+  constructs fail at configuration load. `regex_match_resource_admit` proves
+  the overflow-free pattern-times-subject work bound and `expr_regex_result`
+  proves that an evaluation error cannot grant even through negation. The Rust
+  automata backend still supplies matching semantics for the accepted bytecode.
 - `directive_disposition`. The configuration fallback uses a verified
   three-way fail-closed disposition for security-sensitive, known-but-
   unimplemented, and unknown directives. This is the executable form of I9;

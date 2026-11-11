@@ -1213,8 +1213,11 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
             if trailing_slash && url_path != "/" {
                 url_path.push('/');
             }
-            let canonical = CanonicalTarget::from_normalized(norm.clone(), url_path.clone())
-                .expect("validated websocket request path is canonical");
+            let Some(canonical) = CanonicalTarget::from_normalized(norm.clone(), url_path.clone())
+            else {
+                let _ = write_ws_error(stream, &cfg, 400, b"bad request path");
+                return Ok(false);
+            };
             let (url_root, url_fs_hint) = url_mapping_hint(&cfg, vhost, &canonical);
             let (mut url_scope, url_conditionals) = cfg.url_translation_scope_req_deferred(
                 vhost,
@@ -3848,14 +3851,11 @@ fn absolute_url_scheme(
     )
 }
 
-fn canonicalize_rewrite_path(path: &str) -> Option<String> {
-    let trailing = path.len() > 1 && path.ends_with('/');
-    let norm = normalize_uri_path(path.as_bytes())?;
-    let mut out = String::from_utf8_lossy(&norm).into_owned();
-    if trailing && out != "/" {
-        out.push('/');
-    }
-    Some(out)
+/// Convert a rewrite result into its paired policy and mapping identities.
+/// Keeping those spellings in one value prevents a slash-preserving URL such
+/// as `/dir/` from being passed as the slash-free mapping key `/dir`.
+fn canonicalize_rewrite_target(path: &str) -> Option<CanonicalTarget> {
+    CanonicalTarget::from_url_path(path)
 }
 
 fn strip_port(h: &str) -> &str {
@@ -6308,7 +6308,7 @@ fn run_url_translation_phase(
                             local_ip,
                         ));
                     }
-                    let Some(canonical) = canonicalize_rewrite_path(&path) else {
+                    let Some(rewritten_target) = canonicalize_rewrite_target(&path) else {
                         return UrlPhaseResult::Terminal(error_response(
                             cfg,
                             vhost,
@@ -6322,15 +6322,14 @@ fn run_url_translation_phase(
                             local_ip,
                         ));
                     };
-                    let same_target = canonical == target.url_path && query == current_req.query;
+                    let same_target =
+                        rewritten_target.url_path == target.url_path && query == current_req.query;
                     if !same_target && query != current_req.query {
                         let mut rewritten = current_req.clone();
                         rewritten.query = query;
                         owned_req = Some(rewritten);
                     }
-                    target =
-                        CanonicalTarget::from_normalized(canonical.as_bytes().to_vec(), canonical)
-                            .expect("canonicalized rewrite path remains canonical");
+                    target = rewritten_target;
                     // An effects-only rule (`RewriteRule ... - [E=...]`) must
                     // make its environment visible to deferred conditionals
                     // and authorization, but replaying the identical URL
@@ -7119,7 +7118,7 @@ fn dispatch_inner(
                         local_ip,
                     );
                 }
-                let Some(canonical) = canonicalize_rewrite_path(&path) else {
+                let Some(mut target) = canonicalize_rewrite_target(&path) else {
                     return error_response(
                         cfg,
                         vhost,
@@ -7133,7 +7132,7 @@ fn dispatch_inner(
                         local_ip,
                     );
                 };
-                if canonical == url_path && query == current_req.query {
+                if target.url_path == url_path && query == current_req.query {
                     break;
                 }
                 if original_scope_snapshot.is_none()
@@ -7155,10 +7154,8 @@ fn dispatch_inner(
                     r.query = query;
                     owned_req = Some(r);
                 }
-                url_path = canonical;
-                norm = url_path.as_bytes().to_vec();
-                let mut target = CanonicalTarget::from_normalized(norm.clone(), url_path.clone())
-                    .expect("canonicalized per-directory rewrite path remains canonical");
+                url_path = target.url_path.to_string();
+                norm = target.norm.clone();
 
                 if rewrite_filesystem.is_none() {
                     // A per-directory internal rewrite starts a fresh URL
@@ -7187,8 +7184,12 @@ fn dispatch_inner(
                         }
                     }
                     let mut translated_req = owned_req.as_ref().unwrap_or(req).clone();
-                    translated_req.raw_path = norm.clone();
-                    translated_req.target = norm.clone();
+                    // `norm` is intentionally slash-free for filesystem
+                    // mapping, while the synthetic request must retain the
+                    // rewrite's meaningful trailing slash for the next URL
+                    // translation round.
+                    translated_req.raw_path = url_path.as_bytes().to_vec();
+                    translated_req.target = translated_req.raw_path.clone();
                     if !translated_req.query.is_empty() {
                         translated_req.target.push(b'?');
                         translated_req
@@ -10293,10 +10294,16 @@ mod tests {
             "https://server.test:8443/x"
         );
 
-        assert_eq!(canonicalize_rewrite_path("relative"), None);
-        assert_eq!(canonicalize_rewrite_path("/a/b/").as_deref(), Some("/a/b/"));
-        assert_eq!(canonicalize_rewrite_path("/a/../b").as_deref(), Some("/b"));
-        assert_eq!(canonicalize_rewrite_path("/").as_deref(), Some("/"));
+        assert_eq!(canonicalize_rewrite_target("relative"), None);
+        let trailing = canonicalize_rewrite_target("/a/b/").unwrap();
+        assert_eq!(trailing.url_path, "/a/b/");
+        assert_eq!(trailing.norm, b"/a/b");
+        let collapsed = canonicalize_rewrite_target("/a/../b").unwrap();
+        assert_eq!(collapsed.url_path, "/b");
+        assert_eq!(collapsed.norm, b"/b");
+        let root = canonicalize_rewrite_target("/").unwrap();
+        assert_eq!(root.url_path, "/");
+        assert_eq!(root.norm, b"/");
 
         let cleaned = clean_alias_path(Path::new("/a/./b/../c"));
         assert_eq!(cleaned, PathBuf::from("/a/c"));
@@ -11994,6 +12001,42 @@ mod tests {
             403
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trailing_slash_rewrites_keep_mapping_and_url_identities_paired() {
+        let dir = cov_dir("trailing-slash-rewrites");
+        std::fs::create_dir_all(dir.join("www/newdir")).unwrap();
+        std::fs::create_dir_all(dir.join("www/target")).unwrap();
+        std::fs::create_dir_all(dir.join("www/uploads")).unwrap();
+        std::fs::write(dir.join("www/newdir/index.html"), "main rewrite\n").unwrap();
+        std::fs::write(dir.join("www/target/index.html"), "access rewrite\n").unwrap();
+        std::fs::write(
+            dir.join("www/uploads/.htaccess"),
+            "RewriteEngine On\nRewriteRule ^boom$ /target/ [L]\n",
+        )
+        .unwrap();
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "RewriteEngine On\n\
+                 RewriteRule ^/legacy/$ /newdir/ [L]\n\
+                 RewriteRule ^/missing$ /does-not-exist/ [L]\n\
+                 RewriteCond %{{REQUEST_METHOD}} =GET\n\
+                 RewriteRule ^/guarded$ /newdir/ [L]\n\
+                 <Directory \"{}/www/uploads\">\n\
+                 AllowOverride FileInfo\n\
+                 Require all granted\n\
+                 </Directory>\n",
+                dir.display()
+            ),
+        );
+
+        assert_eq!(cov_dispatch(&cfg, "GET", "/legacy/").status, 200);
+        assert_eq!(cov_dispatch(&cfg, "GET", "/missing").status, 404);
+        assert_eq!(cov_dispatch(&cfg, "GET", "/guarded").status, 200);
+        assert_eq!(cov_dispatch(&cfg, "GET", "/uploads/boom").status, 200);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

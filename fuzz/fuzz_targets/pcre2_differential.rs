@@ -19,7 +19,7 @@ type AllCaptureSpans = Vec<CaptureSpans>;
 // documented admitted subset. Raw mutation remains useful for totality and
 // Rust-accepts/PCRE2-rejects checks, while this mode makes an unexpected Rust
 // rejection a fuzz failure instead of silently classifying it as fail-closed.
-fn admitted_pattern(data: &[u8]) -> String {
+fn admitted_pattern(data: &[u8], flags: u8) -> String {
     if data.is_empty() {
         return String::new();
     }
@@ -40,16 +40,24 @@ fn admitted_pattern(data: &[u8]) -> String {
                 pattern.push('b');
                 true
             }
-            2 => {
+            2 if flags & 18 != 18 => {
                 pattern.push('.');
+                true
+            }
+            2 => {
+                pattern.push('c');
                 true
             }
             3 => {
                 pattern.push_str("[ab]");
                 true
             }
-            4 => {
+            4 if flags & 16 == 0 => {
                 pattern.push_str("[^a]");
+                true
+            }
+            4 => {
+                pattern.push_str("[bc]");
                 true
             }
             5 => {
@@ -60,8 +68,12 @@ fn admitted_pattern(data: &[u8]) -> String {
                 pattern.push_str(r"\w");
                 true
             }
-            7 => {
+            7 if flags & 16 == 0 => {
                 pattern.push_str(r"\s");
+                true
+            }
+            7 => {
+                pattern.push_str(r"[ \t]");
                 true
             }
             8 => {
@@ -244,7 +256,7 @@ fuzz_target!(|data: &[u8]| {
     let structured = control & 0x80 != 0;
     let generated_pattern;
     let pattern = if structured {
-        generated_pattern = admitted_pattern(&rest[..split]);
+        generated_pattern = admitted_pattern(&rest[..split], control & 0x7f);
         generated_pattern.as_str()
     } else {
         let Ok(pattern) = std::str::from_utf8(&rest[..split]) else {

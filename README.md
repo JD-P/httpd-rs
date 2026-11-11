@@ -606,12 +606,12 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus   # include the Verus gate
 ```
 
-Current ledger: **53.7% weighted obligations**, **5/6 proof debt**,
+Current ledger: **55.0% weighted obligations**, **5/6 proof debt**,
 **8/8 grant-required sinks**, **8/8 path-target-bound sinks**, **5/8
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
-failures**, **108 adversarial replay cases** covering the findings classes,
-and **686 Verus functions with 0 errors** (including the I3 fast-path
+failures**, **109 adversarial replay cases** covering the findings classes,
+and **772 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -648,7 +648,7 @@ requiring a grant. Raising a budget is a deliberate, reviewable change.
 cargo test --workspace          # Rust unit tests
 python3 tests/conformance.py    # 165 local vapached conformance tests
 python3 tests/conformance.py --differential  # also compare with Apache
-python3 tests/adversarial_regressions.py  # F23-P18 end-to-end replay suite
+python3 tests/adversarial_regressions.py  # F23-P36 end-to-end replay suite
 ```
 
 The conformance suite starts a real `vapached` and covers HTTP/1.1, HTTPS,

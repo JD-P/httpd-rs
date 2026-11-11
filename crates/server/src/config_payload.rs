@@ -213,7 +213,7 @@ pub(crate) struct SealedHeader {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SealedAliasRegex {
-    pub(crate) pattern: std::sync::Arc<regex::bytes::Regex>,
+    pub(crate) pattern: std::sync::Arc<crate::apache_regex::Regex>,
     pub(crate) target: String,
 }
 
@@ -234,7 +234,7 @@ pub(crate) struct SealedProxyReverse {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SealedProxyMatch {
-    pub(crate) pattern: std::sync::Arc<regex::bytes::Regex>,
+    pub(crate) pattern: std::sync::Arc<crate::apache_regex::Regex>,
     pub(crate) backend: String,
     pub(crate) fastcgi: bool,
 }

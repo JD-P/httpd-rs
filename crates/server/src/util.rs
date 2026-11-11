@@ -114,7 +114,7 @@ pub(crate) fn bounded_policy_ancestor_dirs(path: &Path) -> Result<Vec<PathBuf>, 
 
 pub fn expand_regex_captures(
     template: &str,
-    captures: &regex::bytes::Captures<'_>,
+    captures: &vapache_pcre2::bytes::Captures<'_>,
 ) -> Option<String> {
     if template.len() > MAX_CAPTURE_EXPANSION_BYTES || captures.len() > MAX_CAPTURE_GROUPS {
         return None;
@@ -797,7 +797,7 @@ mod tests {
 
     #[test]
     fn capture_expansion_is_bounded_before_replacement() {
-        let regex = regex::bytes::Regex::new("^/(.*)$").unwrap();
+        let regex = crate::apache_regex::Regex::new("^/(.*)$").unwrap();
         let input = format!("/{}", "x".repeat(8190));
         let captures = regex.captures(input.as_bytes()).unwrap();
         assert_eq!(

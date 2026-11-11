@@ -3565,7 +3565,7 @@ AddHandler cgi-script .cgi\n\
                 }),
                 ("proxy.rules", |s| {
                     s.proxy_policy.proxy_rules.push(crate::config::ProxyRule {
-                        pattern: std::sync::Arc::new(regex::bytes::Regex::new("^/x$").unwrap()),
+                        pattern: std::sync::Arc::new(crate::apache_regex::Regex::new("^/x$").unwrap()),
                         backend: "http://127.0.0.1:9000/".into(),
                         route_order: 0,
                     })

@@ -4815,7 +4815,7 @@ mod tests {
         );
         assert_eq!(access_root_for(&cfg, None, &dir.join("other")), www);
 
-        let re = |p: &str| regex::bytes::Regex::new(p).unwrap();
+        let re = |p: &str| crate::apache_regex::Regex::new(p).unwrap();
         assert!(rule_matches(&MatchKind::Always, "x", "/x"));
         assert!(rule_matches(&MatchKind::Files(re("x")), "x", "/x"));
         assert!(rule_matches(&MatchKind::FilesMatch(re("x")), "x", "/x"));

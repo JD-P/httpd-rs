@@ -2776,7 +2776,7 @@ mod tests {
                 .proxy_policy
                 .proxy_rules
                 .push(crate::config::ProxyRule {
-                    pattern: std::sync::Arc::new(regex::bytes::Regex::new(pattern).unwrap()),
+                    pattern: std::sync::Arc::new(crate::apache_regex::Regex::new(pattern).unwrap()),
                     backend: backend.into(),
                     route_order: order,
                 });

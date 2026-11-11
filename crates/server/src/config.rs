@@ -19,11 +19,9 @@ use crate::scope_policy::{
     CompressionPolicy, ContentPolicy, EnvironmentPolicy, ErrorDocumentPolicy, HeaderPolicy,
     MappingPolicy, OptionsPolicy, Originated, OverridePolicy, ProxyPolicy, RewriteCachePolicy,
 };
-// Apache's directive regexes operate on request bytes and use ASCII character
-// classes unless UTF mode was explicitly requested.  Keeping one byte-regex
-// type for every directive surface prevents Unicode `\w`/`\b` semantics and
-// lossy UTF-8 conversion from silently changing an ACL decision.
-use regex::bytes::Regex;
+// Every directive surface uses the same closed PCRE2-subset grammar as
+// expression regexes. No source pattern is parsed by Rust regex directly.
+use crate::apache_regex::Regex;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -9296,83 +9294,12 @@ pub(crate) fn parse_allow_methods(args: &[String]) -> Result<AllowMethods, Strin
     Ok(AllowMethods::Only(methods))
 }
 
-/// Compile a configuration-supplied regex only after the verified dialect
-/// admission check.  The external engine is assumed to implement the accepted
-/// regular subset; PCRE-only constructs are rejected at load time rather than
-/// silently changing meaning.
-pub(crate) fn guard_regex(pattern: &str) -> Result<(), String> {
-    let inline_unicode_classes = directive_regex_enables_unicode(pattern);
-    if !vapache_verified::directive_regex_pattern_admit(true, false, inline_unicode_classes) {
-        return Err(
-            "unsupported regex mode: inline Unicode classes are not Apache-compatible".into(),
-        );
-    }
-    if vapache_verified::regex_dialect_admit(pattern.as_bytes()) {
-        Ok(())
-    } else {
-        Err("unsupported regex dialect: backreferences/look-around/control bytes".into())
-    }
-}
-
-/// `RegexBuilder::unicode(false)` sets only the default: Rust's regex syntax
-/// can turn Unicode classes back on with `(?u)`, `(?iu:...)` or `(?i-u:...)`.
-/// PCRE does not use that option spelling, so accepting it both violates the
-/// Apache dialect and reopens P16-B. Ignore escaped text and character classes
-/// while examining inline option groups.
-fn directive_regex_enables_unicode(pattern: &str) -> bool {
-    let bytes = pattern.as_bytes();
-    let mut i = 0;
-    let mut in_class = false;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i = (i + 2).min(bytes.len()),
-            b'[' if !in_class => {
-                in_class = true;
-                i += 1;
-            }
-            b']' if in_class => {
-                in_class = false;
-                i += 1;
-            }
-            b'(' if !in_class && bytes.get(i + 1) == Some(&b'?') => {
-                let mut j = i + 2;
-                let mut option_group = false;
-                while let Some(&flag) = bytes.get(j) {
-                    if matches!(flag, b':' | b')') {
-                        break;
-                    }
-                    if !matches!(flag, b'i' | b'm' | b's' | b'R' | b'U' | b'u' | b'x' | b'-') {
-                        break;
-                    }
-                    option_group = true;
-                    if flag == b'u' {
-                        return true;
-                    }
-                    j += 1;
-                }
-                i += if option_group { 2 } else { 1 };
-            }
-            _ => i += 1,
-        }
-    }
-    false
-}
-
 pub(crate) fn compile_regex(pattern: &str) -> Result<Regex, String> {
     compile_regex_flags(pattern, false)
 }
 
 pub(crate) fn compile_regex_flags(pattern: &str, nocase: bool) -> Result<Regex, String> {
-    guard_regex(pattern)?;
-    let unicode_classes = false;
-    if !vapache_verified::directive_regex_mode_admit(true, unicode_classes) {
-        return Err("directive regex mode is not Apache-compatible".into());
-    }
-    regex::bytes::RegexBuilder::new(pattern)
-        .unicode(unicode_classes)
-        .case_insensitive(nocase)
-        .build()
-        .map_err(|e| e.to_string())
+    Regex::compile(pattern, nocase)
 }
 
 /// True when the string contains one of the shell wildcard characters that
@@ -13920,6 +13847,22 @@ ServerName localhost\n\
         assert!(!compile_regex(r"\badmin\b").unwrap().is_match(b"xadminx"));
         assert!(compile_regex(r"(?u)^\w+$").is_err());
         assert!(compile_regex(r"(?iu:^\w+$)").is_err());
+        assert!(compile_regex(r"(?R)").is_err());
+        assert!(compile_regex(r"(?iR:^admin$)").is_err());
+        assert!(compile_regex(r"(?i-R:^admin$)").is_err());
+        // In PCRE2 these are escaped literal angle brackets, not the
+        // Rust-regex word-boundary extensions of the same spelling.
+        let escaped_lt = compile_regex(r"\<").unwrap();
+        assert!(escaped_lt.is_match(b"<"));
+        assert!(!escaped_lt.is_match(b"word"));
+        let escaped_gt = compile_regex(r"\>").unwrap();
+        assert!(escaped_gt.is_match(b">"));
+        assert!(!escaped_gt.is_match(b"word"));
+        assert!(compile_regex(r"\b{start}").is_err());
+        assert!(compile_regex(r"\B{end-half}").is_err());
+        assert!(compile_regex("(?x)(?\r)").is_err());
+        assert!(compile_regex("(?x)(?i \t:a)").is_err());
+        assert!(compile_regex(r"(?U)^admin$").is_ok());
 
         let mut scope = Scope::default();
         scope.environment_policy.set_env.push(Originated::main((
