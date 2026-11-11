@@ -11,8 +11,8 @@
 //! compatibility placeholder.
 
 use crate::config_payload::{
-    PayloadArity, PayloadSchema, PayloadValidation, PayloadValueSchema, SealedPayload,
-    SealedRewriteMapSource,
+    valid_rewrite_map_name, PayloadArity, PayloadSchema, PayloadValidation, PayloadValueSchema,
+    SealedPayload, SealedRewriteMapSource,
 };
 use crate::scope_policy::{
     AuthorizationPolicy, AutoIndexIcon, AutoIndexIconMatch, AutoIndexIconRule, AutoIndexPolicy,
@@ -768,6 +768,68 @@ pub struct RewriteFlags {
     pub noescape_chars: String,
     pub backref_no_plus: bool,
     pub unsafe_prefix_stat: bool,
+    pub(crate) env_templates: Vec<(RewriteTemplate, Option<RewriteTemplate>)>,
+    pub(crate) cookie_templates: Vec<RewriteCookieTemplate>,
+    pub(crate) handler_template: Option<RewriteTemplate>,
+    pub(crate) content_type_template: Option<RewriteTemplate>,
+}
+
+/// A closed, load-time grammar for every string expanded by mod_rewrite.
+/// Runtime evaluation walks these nodes and never searches for delimiters.
+///
+/// template           := *( literal | rule-capture | cond-capture
+///                          | variable-reference | map-reference )
+/// variable-reference := "%{" variable-name "}"
+/// map-reference      := "${" map-name ":" map-key "}"
+/// rule-capture       := ("$" | "\\") DIGIT
+/// cond-capture       := "%" DIGIT
+///
+/// `variable-name` is one of the supported built-ins, `ENV:name`,
+/// `HTTP:name`, or `HTTP_NAME`. Only variable suffixes and map keys may
+/// contain capture nodes; map names are static identifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RewriteTemplate {
+    pub(crate) source: String,
+    pub(crate) parts: Vec<RewriteTemplatePart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RewriteCookieTemplate {
+    pub(crate) source: String,
+    pub(crate) fields: Vec<RewriteTemplate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RewriteTemplatePart {
+    Literal(Vec<u8>),
+    RuleCapture(u8),
+    ConditionCapture(u8),
+    Reference {
+        name: Vec<RewriteNamePart>,
+        map: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RewriteNamePart {
+    Literal(Vec<u8>),
+    RuleCapture(u8),
+    ConditionCapture(u8),
+}
+
+impl RewriteTemplate {
+    fn is_static(&self) -> bool {
+        self.parts
+            .iter()
+            .all(|part| matches!(part, RewriteTemplatePart::Literal(_)))
+    }
+
+    fn map_names(&self) -> impl Iterator<Item = &str> {
+        self.parts.iter().filter_map(|part| match part {
+            RewriteTemplatePart::Reference { map: Some(map), .. } => Some(map.as_str()),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -780,6 +842,7 @@ pub struct RewriteCondFlags {
 #[derive(Debug, Clone)]
 pub struct RewriteCond {
     pub test: String,
+    pub(crate) test_template: Option<RewriteTemplate>,
     pub pattern: String,
     pub flags: RewriteCondFlags,
     /// Precompiled regex for ordinary condition patterns.  File tests and
@@ -793,6 +856,7 @@ pub struct RewriteRule {
     pub pattern: Arc<Regex>,
     pub negated: bool,
     pub substitution: String,
+    pub(crate) substitution_template: RewriteTemplate,
     pub flags: RewriteFlags,
     pub conditions: Vec<RewriteCond>,
     /// URL prefix used to resolve relative substitutions in per-directory
@@ -5322,6 +5386,9 @@ fn authz_section_allowed(section: SectionKind) -> bool {
 }
 
 pub(crate) fn parse_fastcgi_policy_endpoint(raw: &str) -> Result<FastCgiEndpoint, String> {
+    if raw.is_empty() || raw.trim() != raw || raw.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err("FastCGI policy endpoint contains invalid whitespace or controls".into());
+    }
     if let Some(path) = raw.strip_prefix("unix:") {
         let path = PathBuf::from(path);
         if path.as_os_str().is_empty() || !path.is_absolute() || raw.contains('|') {
@@ -5349,35 +5416,9 @@ pub(crate) fn parse_fastcgi_policy_endpoint(raw: &str) -> Result<FastCgiEndpoint
     {
         return Err("TCP FastCGI policy endpoint must contain only host[:port]".into());
     }
-    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
-        let close = rest
-            .find(']')
-            .ok_or_else(|| "unterminated IPv6 FastCGI policy endpoint".to_string())?;
-        let host = &rest[..close];
-        let suffix = &rest[close + 1..];
-        let port = if suffix.is_empty() {
-            9000
-        } else {
-            suffix
-                .strip_prefix(':')
-                .ok_or_else(|| "invalid IPv6 FastCGI policy endpoint".to_string())?
-                .parse::<u16>()
-                .map_err(|_| "invalid FastCGI policy port".to_string())?
-        };
-        (host.to_ascii_lowercase(), port)
-    } else {
-        if authority.matches(':').count() > 1 {
-            return Err("IPv6 FastCGI policy endpoints must use brackets".into());
-        }
-        match authority.rsplit_once(':') {
-            Some((host, port)) => (
-                host.to_ascii_lowercase(),
-                port.parse::<u16>()
-                    .map_err(|_| "invalid FastCGI policy port".to_string())?,
-            ),
-            None => (authority.to_ascii_lowercase(), 9000),
-        }
-    };
+    let (host, port) = crate::util::parse_http_authority(authority.as_bytes(), 9000)
+        .ok_or_else(|| "invalid TCP FastCGI policy endpoint".to_string())?;
+    let host = host.to_ascii_lowercase();
     if host.is_empty() || port == 0 {
         return Err("invalid TCP FastCGI policy endpoint".into());
     }
@@ -5711,6 +5752,62 @@ impl Compile {
             }
         }
         self.cfg.vhosts = self.vhosts_raw;
+        let no_maps = HashSet::new();
+        if let Some(map) =
+            rewrite_scope_unknown_map(&self.cfg.global, &self.cfg.global_rules, &no_maps)
+        {
+            return Err(ConfigError {
+                file: String::new(),
+                line: 0,
+                msg: format!("RewriteRule references undefined RewriteMap '{map}'"),
+            });
+        }
+        let global_maps: HashSet<String> = self
+            .cfg
+            .global
+            .rewrite_policy
+            .rewrite_maps
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        for container in &self.cfg.proxy_containers {
+            if let Some(map) =
+                rewrite_scope_unknown_map(&container.delta, &container.rules, &global_maps)
+            {
+                return Err(ConfigError {
+                    file: String::new(),
+                    line: 0,
+                    msg: format!("RewriteRule references undefined RewriteMap '{map}'"),
+                });
+            }
+        }
+        for vhost in &self.cfg.vhosts {
+            if let Some(map) = rewrite_scope_unknown_map(&vhost.scope, &vhost.rules, &no_maps) {
+                return Err(ConfigError {
+                    file: String::new(),
+                    line: 0,
+                    msg: format!("RewriteRule references undefined RewriteMap '{map}'"),
+                });
+            }
+            let vhost_maps: HashSet<String> = vhost
+                .scope
+                .rewrite_policy
+                .rewrite_maps
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect();
+            for container in &vhost.proxy_containers {
+                if let Some(map) =
+                    rewrite_scope_unknown_map(&container.delta, &container.rules, &vhost_maps)
+                {
+                    return Err(ConfigError {
+                        file: String::new(),
+                        line: 0,
+                        msg: format!("RewriteRule references undefined RewriteMap '{map}'"),
+                    });
+                }
+            }
+        }
         let wildcard_patterns = self
             .cfg
             .vhosts
@@ -6872,15 +6969,33 @@ impl Compile {
                             return;
                         };
                         let mut map = HashMap::new();
-                        for line in data.lines() {
+                        for (line_index, line) in data.lines().enumerate() {
                             let line = line.trim();
                             if line.is_empty() || line.starts_with('#') {
                                 continue;
                             }
                             let Some((k, v)) = line.split_once(char::is_whitespace) else {
-                                continue;
+                                self.directive_error(
+                                    loc,
+                                    format!(
+                                        "RewriteMap '{name}' line {} requires a key and value",
+                                        line_index + 1
+                                    ),
+                                );
+                                return;
                             };
-                            map.insert(k.to_string(), v.trim().to_string());
+                            let value = v.trim();
+                            if k.is_empty() || value.is_empty() || map.contains_key(k) {
+                                self.directive_error(
+                                    loc,
+                                    format!(
+                                        "RewriteMap '{name}' line {} has an empty or duplicate key/value",
+                                        line_index + 1
+                                    ),
+                                );
+                                return;
+                            }
+                            map.insert(k.to_string(), value.to_string());
                         }
                         scope
                             .rewrite_policy
@@ -6897,19 +7012,39 @@ impl Compile {
                             return;
                         };
                         let mut map = HashMap::new();
-                        for line in data.lines() {
+                        for (line_index, line) in data.lines().enumerate() {
                             let line = line.trim();
                             if line.is_empty() || line.starts_with('#') {
                                 continue;
                             }
                             let Some((k, v)) = line.split_once(char::is_whitespace) else {
-                                continue;
+                                self.directive_error(
+                                    loc,
+                                    format!(
+                                        "RewriteMap '{name}' line {} requires a key and value",
+                                        line_index + 1
+                                    ),
+                                );
+                                return;
                             };
-                            let choices = v
-                                .trim()
+                            let raw_choices = v.trim();
+                            if k.is_empty()
+                                || raw_choices.is_empty()
+                                || map.contains_key(k)
+                                || raw_choices.split('|').any(|choice| choice.trim().is_empty())
+                            {
+                                self.directive_error(
+                                    loc,
+                                    format!(
+                                        "RewriteMap '{name}' line {} has an empty or duplicate key/value",
+                                        line_index + 1
+                                    ),
+                                );
+                                return;
+                            }
+                            let choices = raw_choices
                                 .split('|')
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
+                                .map(|choice| choice.trim().to_string())
                                 .collect::<Vec<_>>();
                             map.insert(k.to_string(), choices);
                         }
@@ -8449,33 +8584,73 @@ pub(crate) fn parse_status_list(value: &str) -> (Vec<u16>, Vec<String>) {
 pub(crate) fn parse_request_read_timeout(
     raw: &str,
 ) -> Option<(Option<Duration>, Option<Duration>, Option<u64>, Option<u64>)> {
-    let part = |prefix: &str| -> Option<(Duration, Option<u64>)> {
-        let start = raw.find(prefix)? + prefix.len();
-        let mut values = raw[start..]
-            .split(|c: char| c == ',' || c == ' ' || c == '\t')
-            .filter(|v| !v.is_empty());
-        let time = values
-            .next()?
-            .split('-')
-            // Preserve Apache's range maximum as the hard lifetime ceiling.
-            // Using only the initial value and then extending it from an
-            // attacker-controlled count made the timeout effectively
-            // unbounded.
-            .next_back()?
-            .parse::<u64>()
-            .ok()
-            .map(Duration::from_secs)?;
-        let mut rate = None;
-        for value in values {
-            if let Some(v) = value.strip_prefix("MinRate=") {
-                rate = v.parse::<u64>().ok();
-                break;
-            }
+    // RequestReadTimeout := component (RWS component)*
+    // component          := ("header" | "body") "=" seconds
+    //                       [ "-" seconds ] [ ",MinRate=" rate ]
+    //
+    // This deliberately parses the complete input.  The old implementation
+    // searched for `header=`/`body=` substrings and therefore admitted values
+    // such as `xheader=5`, duplicate fields and arbitrary trailing text.
+    fn component(value: &str) -> Option<(&str, Duration, Option<u64>)> {
+        let (name, value) = value.split_once('=')?;
+        if !matches!(name, "header" | "body") {
+            return None;
         }
-        Some((time, rate))
-    };
-    let header = part("header=");
-    let body = part("body=");
+        let (range, rate) = match value.split_once(',') {
+            Some((range, rate)) => {
+                let rate = rate.strip_prefix("MinRate=")?.parse::<u64>().ok()?;
+                if rate == 0 {
+                    return None;
+                }
+                (range, Some(rate))
+            }
+            None => (value, None),
+        };
+        if range.is_empty() || range.contains(',') {
+            return None;
+        }
+        let (initial, maximum) = match range.split_once('-') {
+            Some((initial, maximum)) => {
+                if maximum.contains('-') {
+                    return None;
+                }
+                (initial.parse::<u64>().ok()?, maximum.parse::<u64>().ok()?)
+            }
+            None => {
+                let seconds = range.parse::<u64>().ok()?;
+                (seconds, seconds)
+            }
+        };
+        if initial == 0 || maximum == 0 || maximum < initial {
+            return None;
+        }
+        Some((name, Duration::from_secs(maximum), rate))
+    }
+
+    if raw.is_empty()
+        || raw.trim() != raw
+        || raw
+            .bytes()
+            .any(|byte| byte.is_ascii_control() && byte != b'\t')
+    {
+        return None;
+    }
+    let mut header = None;
+    let mut body = None;
+    for token in raw
+        .split(|character| matches!(character, ' ' | '\t'))
+        .filter(|token| !token.is_empty())
+    {
+        let (name, timeout, rate) = component(token)?;
+        let slot = if name == "header" {
+            &mut header
+        } else {
+            &mut body
+        };
+        if slot.replace((timeout, rate)).is_some() {
+            return None;
+        }
+    }
     if header.is_none() && body.is_none() {
         None
     } else {
@@ -9643,19 +9818,297 @@ pub(crate) fn parse_require(args: &[String]) -> Require {
     }
 }
 
+fn rewrite_name_parts(value: &str) -> Result<Vec<RewriteNamePart>, String> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.contains(&b'{') || bytes.contains(&b'}') {
+        return Err("rewrite reference has an empty or nested name".into());
+    }
+    let mut parts = Vec::new();
+    let mut literal = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let capture = if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            match bytes[i] {
+                b'$' | b'\\' => Some(RewriteNamePart::RuleCapture(bytes[i + 1] - b'0')),
+                b'%' => Some(RewriteNamePart::ConditionCapture(bytes[i + 1] - b'0')),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(capture) = capture {
+            if !literal.is_empty() {
+                parts.push(RewriteNamePart::Literal(std::mem::take(&mut literal)));
+            }
+            parts.push(capture);
+            i += 2;
+        } else {
+            literal.push(bytes[i]);
+            i += 1;
+        }
+    }
+    if !literal.is_empty() {
+        parts.push(RewriteNamePart::Literal(literal));
+    }
+    Ok(parts)
+}
+
+fn rewrite_rule_unknown_map<'a>(rule: &'a RewriteRule, maps: &HashSet<String>) -> Option<&'a str> {
+    rule.flags
+        .env_templates
+        .iter()
+        .flat_map(|(name, value)| std::iter::once(name).chain(value.iter()))
+        .chain(
+            rule.flags
+                .cookie_templates
+                .iter()
+                .flat_map(|cookie| cookie.fields.iter()),
+        )
+        .chain(rule.flags.handler_template.iter())
+        .chain(rule.flags.content_type_template.iter())
+        .chain(std::iter::once(&rule.substitution_template))
+        .chain(
+            rule.conditions
+                .iter()
+                .filter_map(|condition| condition.test_template.as_ref()),
+        )
+        .flat_map(RewriteTemplate::map_names)
+        .find(|name| !maps.contains(*name))
+}
+
+fn rewrite_rules_unknown_map<'a>(
+    rules: &'a [ScopeRule],
+    inherited_maps: &HashSet<String>,
+) -> Option<&'a str> {
+    for rule in rules {
+        let mut maps = inherited_maps.clone();
+        maps.extend(
+            rule.delta
+                .rewrite_policy
+                .rewrite_maps
+                .iter()
+                .map(|(name, _)| name.clone()),
+        );
+        if let Some(name) = rule
+            .delta
+            .rewrite_policy
+            .rewrite_rules
+            .iter()
+            .find_map(|rewrite| rewrite_rule_unknown_map(rewrite, &maps))
+        {
+            return Some(name);
+        }
+        if let Some(name) = rewrite_rules_unknown_map(&rule.nested, &maps) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn rewrite_scope_unknown_map<'a>(
+    scope: &'a Scope,
+    rules: &'a [ScopeRule],
+    inherited_maps: &HashSet<String>,
+) -> Option<&'a str> {
+    let mut maps = inherited_maps.clone();
+    maps.extend(
+        scope
+            .rewrite_policy
+            .rewrite_maps
+            .iter()
+            .map(|(name, _)| name.clone()),
+    );
+    scope
+        .rewrite_policy
+        .rewrite_rules
+        .iter()
+        .find_map(|rule| rewrite_rule_unknown_map(rule, &maps))
+        .or_else(|| rewrite_rules_unknown_map(rules, &maps))
+}
+
+fn valid_rewrite_reference(marker: u8, value: &str) -> bool {
+    const BUILTINS: &[&str] = &[
+        "REQUEST_URI",
+        "REQUEST_FILENAME",
+        "SCRIPT_FILENAME",
+        "DOCUMENT_ROOT",
+        "QUERY_STRING",
+        "HTTP_HOST",
+        "REMOTE_ADDR",
+        "SERVER_PORT",
+        "HTTPS",
+        "REQUEST_METHOD",
+        "SERVER_NAME",
+        "REQUEST_SCHEME",
+        "SERVER_PROTOCOL",
+        "THE_REQUEST",
+    ];
+    if marker == b'%' {
+        if BUILTINS.contains(&value) {
+            return true;
+        }
+        if let Some(name) = value.strip_prefix("ENV:") {
+            return !name.is_empty()
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'%' | b'\\')
+                });
+        }
+        if let Some(name) = value.strip_prefix("HTTP:") {
+            return !name.is_empty()
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric()
+                        || matches!(
+                            byte,
+                            b'!' | b'#'
+                                | b'$'
+                                | b'%'
+                                | b'&'
+                                | b'\''
+                                | b'*'
+                                | b'+'
+                                | b'-'
+                                | b'.'
+                                | b'^'
+                                | b'_'
+                                | b'`'
+                                | b'|'
+                                | b'~'
+                                | b'\\'
+                        )
+                });
+        }
+        if let Some(name) = value.strip_prefix("HTTP_") {
+            return !name.is_empty()
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'%' | b'\\')
+                });
+        }
+        return false;
+    }
+    if marker == b'$' {
+        if let Some((map, key)) = value.split_once(':') {
+            return !key.is_empty()
+                && !key
+                    .bytes()
+                    .any(|byte| byte.is_ascii_control() || byte == b'{' || byte == b'}')
+                && valid_rewrite_map_name(map);
+        }
+    }
+    false
+}
+
+pub(crate) fn parse_rewrite_template(value: &str) -> Result<RewriteTemplate, String> {
+    let bytes = value.as_bytes();
+    let mut parts = Vec::new();
+    let mut literal = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && matches!(bytes[i], b'$' | b'%') && bytes[i + 1] == b'{' {
+            if !literal.is_empty() {
+                parts.push(RewriteTemplatePart::Literal(std::mem::take(&mut literal)));
+            }
+            let close = bytes[i + 2..]
+                .iter()
+                .position(|byte| *byte == b'}')
+                .map(|offset| i + 2 + offset)
+                .ok_or_else(|| "unterminated rewrite reference".to_string())?;
+            let name = std::str::from_utf8(&bytes[i + 2..close])
+                .map_err(|_| "rewrite reference name is not valid UTF-8".to_string())?;
+            if !valid_rewrite_reference(bytes[i], name) {
+                return Err(format!(
+                    "unsupported rewrite reference '{}{{{name}}}'",
+                    bytes[i] as char
+                ));
+            }
+            let map = if bytes[i] == b'$'
+                && !name.starts_with("ENV:")
+                && !name.starts_with("HTTP:")
+                && !name.starts_with("HTTP_")
+            {
+                name.split_once(':').map(|(map, _)| map.to_string())
+            } else {
+                None
+            };
+            parts.push(RewriteTemplatePart::Reference {
+                name: rewrite_name_parts(name)?,
+                map,
+            });
+            i = close + 1;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let capture = match bytes[i] {
+                b'$' | b'\\' => Some(RewriteTemplatePart::RuleCapture(bytes[i + 1] - b'0')),
+                b'%' => Some(RewriteTemplatePart::ConditionCapture(bytes[i + 1] - b'0')),
+                _ => None,
+            };
+            if let Some(capture) = capture {
+                if !literal.is_empty() {
+                    parts.push(RewriteTemplatePart::Literal(std::mem::take(&mut literal)));
+                }
+                parts.push(capture);
+                i += 2;
+                continue;
+            }
+        }
+        if bytes[i] == b'}' {
+            return Err("unmatched '}' in rewrite template".into());
+        }
+        literal.push(bytes[i]);
+        i += 1;
+    }
+    if !literal.is_empty() {
+        parts.push(RewriteTemplatePart::Literal(literal));
+    }
+    Ok(RewriteTemplate {
+        source: value.to_string(),
+        parts,
+    })
+}
+
+fn parse_rewrite_cookie_template(value: &str) -> Result<RewriteCookieTemplate, String> {
+    // cookie := name (":" | ";") value
+    //           [ delimiter domain [ delimiter lifetime [ delimiter path
+    //           [ delimiter secure [ delimiter httponly [ delimiter samesite ]]]]]]
+    //
+    // A leading semicolon selects Apache's alternate semicolon-delimited
+    // spelling. Delimiters are consumed before expansion, so captures cannot
+    // inject new cookie attributes at request time.
+    let fields: Vec<&str> = if let Some(rest) = value.strip_prefix(';') {
+        rest.split(';').collect()
+    } else {
+        value.split(':').collect()
+    };
+    if !(2..=8).contains(&fields.len()) {
+        return Err("RewriteRule [CO] requires 2 to 8 cookie fields".into());
+    }
+    if fields[0].is_empty() {
+        return Err("RewriteRule [CO] cookie has an empty name".into());
+    }
+    Ok(RewriteCookieTemplate {
+        source: value.to_string(),
+        fields: fields
+            .into_iter()
+            .map(parse_rewrite_template)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
 pub(crate) fn parse_rewrite_flags(args: &[String]) -> Result<RewriteFlags, String> {
-    let raw = args.join(",");
-    let raw = raw.trim().replace('[', "").replace(']', "");
+    let raw = parse_rewrite_flag_list(args, "RewriteRule")?;
     let mut out = RewriteFlags::default();
     if raw.is_empty() {
         return Ok(out);
     }
-    for flag in raw.split(',') {
-        let flag = flag.trim();
-        if flag.is_empty() {
-            continue;
-        }
+    let mut seen = HashSet::new();
+    for flag in raw {
         let upper = flag.to_ascii_uppercase();
+        let name = upper
+            .split_once('=')
+            .map_or(upper.as_str(), |(name, _)| name);
+        if !matches!(name, "E" | "CO") && !seen.insert(name.to_string()) {
+            return Err(format!("duplicate RewriteRule flag '[{name}]'"));
+        }
         match upper.as_str() {
             "L" => out.last = true,
             "END" => {
@@ -9718,22 +10171,52 @@ pub(crate) fn parse_rewrite_flags(args: &[String]) -> Result<RewriteFlags, Strin
             }
             _ if upper.starts_with("E=") => {
                 let raw = &flag[2..];
+                if raw.is_empty() {
+                    return Err("RewriteRule [E] requires a variable name".into());
+                }
                 if let Some(name) = raw.strip_prefix('!') {
+                    if name.is_empty() {
+                        return Err("RewriteRule [E] requires a variable name".into());
+                    }
                     out.env.push((name.to_string(), None));
+                    out.env_templates
+                        .push((parse_rewrite_template(name)?, None));
                 } else if let Some((k, v)) = raw.split_once(':') {
+                    if k.is_empty() {
+                        return Err("RewriteRule [E] requires a variable name".into());
+                    }
                     out.env.push((k.to_string(), Some(v.to_string())));
+                    out.env_templates.push((
+                        parse_rewrite_template(k)?,
+                        Some(parse_rewrite_template(v)?),
+                    ));
                 } else {
                     out.env.push((raw.to_string(), Some(String::new())));
+                    out.env_templates.push((
+                        parse_rewrite_template(raw)?,
+                        Some(parse_rewrite_template("")?),
+                    ));
                 }
             }
             _ if upper.starts_with("CO=") => {
-                out.cookies.push(flag[3..].to_string());
+                let cookie = &flag[3..];
+                out.cookies.push(cookie.to_string());
+                out.cookie_templates
+                    .push(parse_rewrite_cookie_template(cookie)?);
             }
             _ if upper.starts_with("H=") => {
+                if flag[2..].is_empty() {
+                    return Err("RewriteRule [H] requires a handler".into());
+                }
                 out.handler = Some(flag[2..].to_string());
+                out.handler_template = Some(parse_rewrite_template(&flag[2..])?);
             }
             _ if upper.starts_with("T=") => {
+                if flag[2..].is_empty() {
+                    return Err("RewriteRule [T] requires a content type".into());
+                }
                 out.content_type = Some(flag[2..].to_string());
+                out.content_type_template = Some(parse_rewrite_template(&flag[2..])?);
             }
             _ if upper.starts_with("S=") => {
                 out.skip = Some(
@@ -9756,32 +10239,58 @@ pub(crate) fn parse_rewrite_flags(args: &[String]) -> Result<RewriteFlags, Strin
     Ok(out)
 }
 
-fn reject_rewrite_lookahead(value: &str) -> Result<(), String> {
-    let lower = value.to_ascii_lowercase();
-    if lower.contains("%{la-") || lower.contains("${la-") {
-        return Err("mod_rewrite lookahead (%{LA-...}) is unsupported and fails closed".into());
+/// Parse the complete bracketed flag production shared by RewriteRule and
+/// RewriteCond.  Brackets are delimiters, not characters to erase.
+///
+/// flags := "[" flag (OWS "," OWS flag)* "]"
+fn parse_rewrite_flag_list(args: &[String], directive: &str) -> Result<Vec<String>, String> {
+    if args.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(())
+    let raw = args.join(" ");
+    let raw = raw.trim();
+    let inner = raw
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or_else(|| format!("{directive} flags must be enclosed by one '[' and ']' pair"))?;
+    if inner.is_empty() || inner.contains(['[', ']']) {
+        return Err(format!("{directive} has a malformed flag list '{raw}'"));
+    }
+    inner
+        .split(',')
+        .map(|flag| {
+            let flag = flag.trim();
+            if flag.is_empty() {
+                Err(format!("{directive} flag list contains an empty item"))
+            } else {
+                Ok(flag.to_string())
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn parse_rewrite_cond(args: &[String]) -> Result<RewriteCond, String> {
-    for arg in args {
-        reject_rewrite_lookahead(arg)?;
-    }
     if args.first().map(|a| a.eq_ignore_ascii_case("expr")) == Some(true) {
         let mut flags = RewriteCondFlags::default();
         let mut end = args.len();
-        let last = args.last().expect("expr condition has an expression");
-        if last.trim_start().starts_with('[') {
-            let raw = last.trim().replace(['[', ']'], "");
-            for flag in raw.split(',') {
-                match flag.trim().to_ascii_uppercase().as_str() {
+        if let Some(flag_start) = args[1..]
+            .iter()
+            .rposition(|value| value.trim_start().starts_with('['))
+            .map(|index| index + 1)
+        {
+            let mut seen = HashSet::new();
+            for flag in parse_rewrite_flag_list(&args[flag_start..], "RewriteCond")? {
+                let upper = flag.to_ascii_uppercase();
+                if !seen.insert(upper.clone()) {
+                    return Err(format!("duplicate RewriteCond flag '[{upper}]'"));
+                }
+                match upper.as_str() {
                     "NC" => flags.nocase = true,
                     "OR" => flags.or = true,
                     other => return Err(format!("unsupported RewriteCond flag '[{other}]'")),
                 }
             }
-            end -= 1;
+            end = flag_start;
         }
         let expr = crate::expr::parse(&args[1..end].join(" "))
             .map_err(|e| format!("bad RewriteCond expr: {e}"))?;
@@ -9790,6 +10299,7 @@ pub(crate) fn parse_rewrite_cond(args: &[String]) -> Result<RewriteCond, String>
         crate::expr::validate_vars(&expr).map_err(|e| format!("bad RewriteCond expr: {e}"))?;
         return Ok(RewriteCond {
             test: String::new(),
+            test_template: None,
             pattern: String::new(),
             flags,
             regex: None,
@@ -9799,24 +10309,26 @@ pub(crate) fn parse_rewrite_cond(args: &[String]) -> Result<RewriteCond, String>
     if args.len() < 2 {
         return Err("RewriteCond requires a test string and a pattern".into());
     }
+    let test_template = parse_rewrite_template(&args[0])
+        .map_err(|error| format!("invalid RewriteCond test string: {error}"))?;
     let mut flags = RewriteCondFlags::default();
-    let raw = args[2..].join(",");
-    let raw = raw.trim().replace('[', "").replace(']', "");
+    let raw = parse_rewrite_flag_list(&args[2..], "RewriteCond")?;
     if !raw.is_empty() {
-        for flag in raw.split(',') {
-            match flag.trim().to_ascii_uppercase().as_str() {
+        let mut seen = HashSet::new();
+        for flag in raw {
+            let upper = flag.to_ascii_uppercase();
+            if !seen.insert(upper.clone()) {
+                return Err(format!("duplicate RewriteCond flag '[{upper}]'"));
+            }
+            match upper.as_str() {
                 "NC" => flags.nocase = true,
                 "OR" => flags.or = true,
                 "AND" => {}
-                "" => {}
                 other => return Err(format!("unsupported RewriteCond flag '[{other}]'")),
             }
         }
     }
     let raw_pattern = args[1].as_str();
-    if raw_pattern.contains("%{") || raw_pattern.contains("${") {
-        return Err("variables are not supported in RewriteCond patterns".into());
-    }
     let stripped = raw_pattern.strip_prefix('!').unwrap_or(raw_pattern);
     let regex = if stripped.starts_with("-f")
         || stripped.starts_with("-d")
@@ -9835,6 +10347,7 @@ pub(crate) fn parse_rewrite_cond(args: &[String]) -> Result<RewriteCond, String>
     };
     Ok(RewriteCond {
         test: args[0].clone(),
+        test_template: Some(test_template),
         pattern: args[1].clone(),
         flags,
         regex,
@@ -9850,10 +10363,9 @@ pub(crate) fn parse_rewrite_rule(
     if args.len() < 2 {
         return Err("RewriteRule requires a pattern and substitution".into());
     }
-    for arg in args.iter().take(2) {
-        reject_rewrite_lookahead(arg)?;
-    }
     let flags = parse_rewrite_flags(&args[2..])?;
+    let substitution_template = parse_rewrite_template(&args[1])
+        .map_err(|error| format!("invalid RewriteRule substitution: {error}"))?;
     if flags.proxy && !proxy_template_authority_safe(&args[1]) {
         return Err(
             "RewriteRule [P] authority may not be derived from a request capture or variable"
@@ -9861,9 +10373,6 @@ pub(crate) fn parse_rewrite_rule(
         );
     }
     let raw_pattern = &args[0];
-    if raw_pattern.contains("%{") || raw_pattern.contains("${") {
-        return Err("variables are not supported in RewriteRule patterns".into());
-    }
     let (negated, pattern) = match raw_pattern.strip_prefix('!') {
         Some(p) => (true, p),
         None => (false, raw_pattern.as_str()),
@@ -9874,6 +10383,7 @@ pub(crate) fn parse_rewrite_rule(
         pattern: Arc::new(pattern),
         negated,
         substitution: args[1].clone(),
+        substitution_template,
         flags,
         conditions: Vec::new(),
         base: normalize_rewrite_base(base),
@@ -9918,34 +10428,24 @@ pub(crate) fn parse_ip_net(s: &str) -> Option<(IpAddr, u8)> {
 }
 
 pub(crate) fn parse_listen(s: &str) -> Result<ListenSpec, String> {
-    let s = s.trim();
-    if s.is_empty() {
+    if s.is_empty() || s.trim() != s {
         return Err("empty Listen".into());
     }
-    let (addr, port) = if let Some(rest) = s.strip_prefix('[') {
-        let end = rest.find(']').ok_or("bad IPv6 Listen address")?;
-        let a = &rest[..end];
-        let after = &rest[end + 1..];
-        let p = after.strip_prefix(':').unwrap_or("80");
-        (a.to_string(), p.to_string())
-    } else if let Some((a, p)) = s.rsplit_once(':') {
-        if a.contains(':') {
-            // IPv6 without brackets.
-            (s.to_string(), "80".to_string())
-        } else {
-            (a.to_string(), p.to_string())
-        }
+    let (addr, port) = if s.bytes().all(|byte| byte.is_ascii_digit()) {
+        ("0.0.0.0".to_string(), s.parse::<u16>().ok())
+    } else if s.contains(':') && !s.starts_with('[') && s.parse::<IpAddr>().is_ok() {
+        // Apache permits an unbracketed IPv6 literal only when no port follows.
+        (s.to_string(), Some(80))
+    } else if let Some(port) = s.strip_prefix("*:").or_else(|| s.strip_prefix(':')) {
+        ("0.0.0.0".to_string(), port.parse::<u16>().ok())
+    } else if !s.contains(':') {
+        return Err(format!("invalid Listen port in '{s}'"));
     } else {
-        ("0.0.0.0".to_string(), s.to_string())
+        crate::util::parse_http_authority(s.as_bytes(), 80)
+            .map(|(host, port)| (host, Some(port)))
+            .ok_or_else(|| format!("invalid Listen endpoint '{s}'"))?
     };
-    let port: u16 = port
-        .parse()
-        .map_err(|_| format!("invalid Listen port in '{s}'"))?;
-    let addr = if addr.is_empty() || addr == "*" {
-        "0.0.0.0".to_string()
-    } else {
-        addr
-    };
+    let port = port.ok_or_else(|| format!("invalid Listen port in '{s}'"))?;
     Ok(ListenSpec {
         raw: s.to_string(),
         addr,
@@ -10027,29 +10527,71 @@ fn fail_closed_directives() -> HashSet<&'static str> {
 }
 
 pub(crate) fn proxy_template_authority_safe(value: &str) -> bool {
-    let value = value.trim();
+    if value.is_empty() || value.trim() != value {
+        return false;
+    }
     let Some((_, rest)) = value.split_once("://") else {
         // Non-URL backends (notably Unix FastCGI sockets) must not be
         // derivable from a rewrite capture either.
-        return vapache_verified::rewrite_template_static(value.as_bytes());
+        return parse_rewrite_template(value).is_ok_and(|template| template.is_static());
     };
     let end = rest
         .find(|c| c == '/' || c == '?' || c == '#')
         .unwrap_or(rest.len());
     let authority = &rest[..end];
     !authority.is_empty()
-        && vapache_verified::rewrite_template_static(authority.as_bytes())
+        && parse_rewrite_template(authority).is_ok_and(|template| template.is_static())
         && !authority.contains('@')
 }
 
 pub(crate) fn supported_proxy_backend(value: &str, allow_fastcgi: bool) -> bool {
-    let value = value.trim();
-    value.starts_with("http://")
-        || value.starts_with("https://")
-        || value.starts_with("ws://")
-        || value.starts_with("wss://")
-        || value.starts_with("balancer://")
-        || (allow_fastcgi && value.starts_with("unix:"))
+    if value.is_empty() || value.trim() != value {
+        return false;
+    }
+    if crate::proxy::valid_http_backend(value) {
+        return true;
+    }
+    if let Some(name) = value.strip_prefix("balancer://") {
+        let name = name.strip_suffix('/').unwrap_or(name);
+        return !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    }
+    allow_fastcgi && crate::fastcgi::valid_backend_syntax(value)
+}
+
+/// Exercise the closed configuration subgrammars independently of filesystem
+/// configuration loading. Accepted RequestReadTimeout values are rendered into
+/// their canonical grammar and reparsed to enforce semantic round-tripping.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_config_grammars(data: &[u8]) {
+    let Ok(text) = std::str::from_utf8(data) else {
+        return;
+    };
+    let _ = parse_rewrite_template(text);
+    let args: Vec<String> = text.split_ascii_whitespace().map(str::to_string).collect();
+    let _ = parse_rewrite_flags(&args);
+    let _ = parse_rewrite_cond(&args);
+    let _ = parse_rewrite_rule(&args, "/", false);
+    let _ = parse_listen(text);
+    let _ = supported_proxy_backend(text, true);
+
+    if let Some((header, body, header_rate, body_rate)) = parse_request_read_timeout(text) {
+        let mut canonical = Vec::new();
+        if let Some(timeout) = header {
+            let rate = header_rate.map_or_else(String::new, |rate| format!(",MinRate={rate}"));
+            canonical.push(format!("header={}{rate}", timeout.as_secs()));
+        }
+        if let Some(timeout) = body {
+            let rate = body_rate.map_or_else(String::new, |rate| format!(",MinRate={rate}"));
+            canonical.push(format!("body={}{rate}", timeout.as_secs()));
+        }
+        assert_eq!(
+            parse_request_read_timeout(&canonical.join(" ")),
+            Some((header, body, header_rate, body_rate))
+        );
+    }
 }
 
 fn known_directives() -> HashSet<&'static str> {
@@ -11606,11 +12148,27 @@ mod tests {
         assert!(
             load_with_root("Listen 127.0.0.1:0\nRewriteMap bad rnd:invalid-utf8.map\n").is_err()
         );
+        for (file, contents, kind) in [
+            ("missing-value.map", "key\n", "txt"),
+            ("duplicate.map", "key one\nkey two\n", "txt"),
+            ("empty-choice.map", "key one||two\n", "rnd"),
+        ] {
+            std::fs::write(dir.join(file), contents).unwrap();
+            assert!(load_with_root(&format!(
+                "Listen 127.0.0.1:0\nRewriteMap bad {kind}:{file}\n"
+            ))
+            .is_err());
+        }
         let good = maps("Listen 127.0.0.1:0\nRewriteMap t txt:good.txt\n");
         assert!(matches!(
             good.as_slice(),
             [(_, RewriteMap::Txt(m))] if m.get("alpha").map(String::as_str) == Some("one")
         ));
+        assert!(load_with_root(
+            "Listen 127.0.0.1:0\nRewriteRule ^x$ ${later:x}\nRewriteMap later txt:good.txt\n"
+        )
+        .is_ok());
+        assert!(load_with_root("Listen 127.0.0.1:0\nRewriteRule ^x$ ${missing:x}\n").is_err());
         // int: unknown functions are rejected at load; known ones register.
         assert!(load_with_root("Listen 127.0.0.1:0\nRewriteMap ix int:nosuch\n").is_err());
         let int_map = maps("Listen 127.0.0.1:0\nRewriteMap up int:toupper\n");
@@ -14684,7 +15242,7 @@ ServerName localhost\n\
         );
         assert_eq!(parse_status_list("500,,404"), (vec![500, 404], Vec::new()));
         assert_eq!(
-            parse_request_read_timeout("header=10-20, body=30-40 MinRate=99"),
+            parse_request_read_timeout("header=10-20,MinRate=99 body=30-40,MinRate=99"),
             Some((
                 Some(Duration::from_secs(20)),
                 Some(Duration::from_secs(40)),
@@ -14693,7 +15251,7 @@ ServerName localhost\n\
             ))
         );
         assert_eq!(
-            parse_request_read_timeout("header=5 MinRate=7 body=6 MinRate=8"),
+            parse_request_read_timeout("header=5,MinRate=7 body=6,MinRate=8"),
             Some((
                 Some(Duration::from_secs(5)),
                 Some(Duration::from_secs(6)),
@@ -14712,6 +15270,13 @@ ServerName localhost\n\
         );
         assert_eq!(parse_request_read_timeout("header=x body=y"), None);
         assert_eq!(parse_request_read_timeout("none"), None);
+        assert_eq!(parse_request_read_timeout("xheader=5"), None);
+        assert_eq!(parse_request_read_timeout("header=5 trailing"), None);
+        assert_eq!(parse_request_read_timeout("header=5 header=6"), None);
+        assert_eq!(parse_request_read_timeout("header=5,Unknown=7"), None);
+        assert_eq!(parse_request_read_timeout(" header=5"), None);
+        assert_eq!(parse_request_read_timeout("header=5 "), None);
+        assert_eq!(parse_request_read_timeout("header=5\nbody=6"), None);
         assert_eq!(parse_duration("5ms"), Some(Duration::from_millis(5)));
         assert_eq!(parse_duration("5s"), Some(Duration::from_secs(5)));
         assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
@@ -14838,55 +15403,34 @@ ServerName localhost\n\
         ));
 
         assert!(
-            parse_rewrite_flags(&[
-                "L".into(),
-                "END".into(),
-                "QSA,NC".into(),
-                "NE".into(),
-                "PT".into(),
-                "P".into(),
-                "C".into(),
-                "N".into()
-            ])
-            .unwrap()
-            .last
+            parse_rewrite_flags(&["[L,END,QSA,NC,NE,PT,P,C,N]".into()])
+                .unwrap()
+                .last
         );
         assert!(parse_rewrite_flags(&[
-            "QSD".into(),
-            "QSL".into(),
-            "UNSAFEALLOW3F".into(),
-            "B".into(),
-            "BNE".into(),
-            "BNP".into(),
-            "BCTLS".into(),
-            "UNSAFEPREFIXSTAT".into(),
-            "F".into(),
-            "G".into()
+            "[QSD,QSL,UNSAFEALLOW3F,B,BNE,BNP,BCTLS,UNSAFEPREFIXSTAT,F,G]".into()
         ])
         .is_ok());
-        assert!(parse_rewrite_flags(&["DPI".into()]).is_err());
-        assert!(parse_rewrite_flags(&["NS".into()]).is_err());
+        assert!(parse_rewrite_flags(&["[DPI]".into()]).is_err());
+        assert!(parse_rewrite_flags(&["[NS]".into()]).is_err());
         assert_eq!(
-            parse_rewrite_flags(&["R".into()]).unwrap().redirect,
+            parse_rewrite_flags(&["[R]".into()]).unwrap().redirect,
             Some(302)
         );
         for code in ["R=301", "R=PERMANENT", "R=TEMP", "R=SEEOTHER", "R=399"] {
-            assert!(parse_rewrite_flags(&[code.into()]).is_ok(), "{code}");
+            assert!(
+                parse_rewrite_flags(&[format!("[{code}]")]).is_ok(),
+                "{code}"
+            );
         }
-        assert!(parse_rewrite_flags(&["R=bad".into()]).is_err());
-        assert!(parse_rewrite_flags(&["R=200".into()]).is_err());
-        let custom = parse_rewrite_flags(&["B= !".into(), "BNE=&".into()]).unwrap();
+        assert!(parse_rewrite_flags(&["[R=bad]".into()]).is_err());
+        assert!(parse_rewrite_flags(&["[R=200]".into()]).is_err());
+        let custom = parse_rewrite_flags(&["[B= !,BNE=&]".into()]).unwrap();
         assert!(custom.escape_backrefs);
         assert_eq!(custom.escape_chars, " !");
         assert_eq!(custom.noescape_chars, "&");
         let env = parse_rewrite_flags(&[
-            "E=SET:value".into(),
-            "E=EMPTY".into(),
-            "E=!DROP".into(),
-            "CO=name:value".into(),
-            "H=handler".into(),
-            "T=text/plain".into(),
-            "S=2".into(),
+            "[E=SET:value,E=EMPTY,E=!DROP,CO=name:value,H=handler,T=text/plain,S=2]".into(),
         ])
         .unwrap();
         assert_eq!(env.env.len(), 3);
@@ -14897,16 +15441,43 @@ ServerName localhost\n\
         assert_eq!(env.handler.as_deref(), Some("handler"));
         assert_eq!(env.content_type.as_deref(), Some("text/plain"));
         assert_eq!(env.skip, Some(2));
-        assert!(parse_rewrite_flags(&["S=bad".into()]).is_err());
-        assert!(parse_rewrite_flags(&["NOPE".into()]).is_err());
-        assert!(parse_rewrite_flags(&["".into(), ",".into()]).is_ok());
+        assert!(parse_rewrite_flags(&["[S=bad]".into()]).is_err());
+        assert!(parse_rewrite_flags(&["[NOPE]".into()]).is_err());
+        assert!(parse_rewrite_flags(&["[R=301,R=302]".into()]).is_err());
+        for malformed in [
+            "[E=]",
+            "[E=!]",
+            "[E=:value]",
+            "[CO=]",
+            "[CO=name]",
+            "[CO=:value]",
+            "[CO=a:b:c:d:e:f:g:h:i]",
+            "[H=]",
+            "[T=]",
+        ] {
+            assert!(
+                parse_rewrite_flags(&[malformed.into()]).is_err(),
+                "{malformed}"
+            );
+        }
+        for malformed in ["", "L", "[L", "L]", "[[L]]", "[L,,NC]", "[]"] {
+            assert!(
+                parse_rewrite_flags(&[malformed.into()]).is_err(),
+                "{malformed}"
+            );
+        }
 
         assert!(parse_rewrite_cond(&["%{LA-REQUEST}".into()]).is_err());
         assert!(parse_rewrite_cond(&["expr".into(), "true".into(), "[NC,OR]".into()]).is_ok());
+        assert!(
+            parse_rewrite_cond(&["expr".into(), "true".into(), "[NC,".into(), "OR]".into()])
+                .is_ok()
+        );
         assert!(parse_rewrite_cond(&["expr".into(), "true".into(), "[BAD]".into()]).is_err());
         assert!(parse_rewrite_cond(&["expr".into()]).is_err());
         assert!(parse_rewrite_cond(&["only".into()]).is_err());
-        assert!(parse_rewrite_cond(&["x".into(), "^a$".into(), "[NC,AND,,]".into()]).is_ok());
+        assert!(parse_rewrite_cond(&["x".into(), "^a$".into(), "[NC,AND,,]".into()]).is_err());
+        assert!(parse_rewrite_cond(&["x".into(), "^a$".into(), "[NC,NC]".into()]).is_err());
         assert!(parse_rewrite_cond(&["x".into(), "^a$".into(), "[BAD]".into()]).is_err());
         assert!(parse_rewrite_cond(&["x".into(), "%{HTTP_HOST}".into()]).is_err());
         assert!(parse_rewrite_cond(&["x".into(), "(".into()]).is_err());
@@ -14929,6 +15500,8 @@ ServerName localhost\n\
             parse_rewrite_rule(&["^/x$".into(), "$1".into(), "[P]".into()], "/", false).is_err()
         );
         assert!(parse_rewrite_rule(&["%{HTTP_HOST}".into(), "/x".into()], "/", false).is_err());
+        assert!(parse_rewrite_rule(&["^x$".into(), "${REQUEST_URI}".into()], "/", false).is_err());
+        assert!(parse_rewrite_rule(&["^x$".into(), "%{map:key}".into()], "/", false).is_err());
         let negated =
             parse_rewrite_rule(&["!^/x$".into(), "/y".into(), "[NC]".into()], "base", true)
                 .unwrap();
@@ -14960,6 +15533,9 @@ ServerName localhost\n\
         assert_eq!(parse_listen(":8080").unwrap().addr, "0.0.0.0");
         assert!(parse_listen("127.0.0.1:bad").is_err());
         assert!(parse_listen("[::1").is_err());
+        assert!(parse_listen("[::1]junk").is_err());
+        assert!(parse_listen("example.test").is_err());
+        assert!(parse_listen(" 8080").is_err());
 
         assert!(proxy_template_authority_safe("http://backend"));
         assert!(!proxy_template_authority_safe("http://$1/"));
@@ -14977,7 +15553,10 @@ ServerName localhost\n\
         assert!(supported_proxy_backend("ws://x", false));
         assert!(supported_proxy_backend("wss://x", false));
         assert!(supported_proxy_backend("balancer://x", false));
+        assert!(supported_proxy_backend("balancer://x/", false));
+        assert!(!supported_proxy_backend("balancer://x//", false));
         assert!(supported_proxy_backend("unix:/x", true));
+        assert!(!supported_proxy_backend("unix:relative.sock", true));
         assert!(!supported_proxy_backend("unix:/x", false));
         assert!(!supported_proxy_backend("ftp://x", false));
         assert!(is_security_directive("sslverifyclient"));
@@ -14996,8 +15575,8 @@ ServerName localhost\n\
             "text/html html htm\ntext/plain txt\n",
         )
         .unwrap();
-        std::fs::write(dir.join("types.txt"), "one value\n# skip\nbadline\n").unwrap();
-        std::fs::write(dir.join("rnd.txt"), "key one|two\nempty |\n").unwrap();
+        std::fs::write(dir.join("types.txt"), "one value\n# skip\ntwo other\n").unwrap();
+        std::fs::write(dir.join("rnd.txt"), "key one|two\nother three|four\n").unwrap();
         let mime = dir.join("mime.types").to_string_lossy().to_string();
         let types = dir.join("types.txt").to_string_lossy().to_string();
         let rnd = dir.join("rnd.txt").to_string_lossy().to_string();
@@ -15354,10 +15933,10 @@ ServerName plain.test\n\
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(dir.join("rel")).unwrap();
         std::fs::write(dir.join("mime.types"), "text/html html\n").unwrap();
-        std::fs::write(dir.join("types.txt"), "one value\n# skip\nbadline\n").unwrap();
+        std::fs::write(dir.join("types.txt"), "one value\n# skip\ntwo other\n").unwrap();
         std::fs::write(
             dir.join("rnd.txt"),
-            "key one|two\nempty |\n# skip\nbadline\n",
+            "key one|two\nother three|four\n# skip\n",
         )
         .unwrap();
         let relative = dir

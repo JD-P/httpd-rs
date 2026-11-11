@@ -409,7 +409,9 @@ fn canonical_proxy_url(backend: &HttpBackend, path: &str) -> String {
 }
 
 fn parse_http_url(value: &str) -> Option<HttpBackend> {
-    let value = value.trim();
+    if value.is_empty() || value.trim() != value {
+        return None;
+    }
     let (rest, tls, default_port) = if let Some(rest) = value.strip_prefix("http://") {
         (rest, false, 80)
     } else if let Some(rest) = value.strip_prefix("https://") {
@@ -425,32 +427,25 @@ fn parse_http_url(value: &str) -> Option<HttpBackend> {
         Some((a, p)) => (a, format!("/{p}")),
         None => (rest, "/".to_string()),
     };
-    // Bracketed IPv6 literals contain colons; do not split them as a port.
-    let (host, port) = if let Some(inside) = authority.strip_prefix('[') {
-        let (host, after) = inside.split_once(']')?;
-        let port = if let Some(port) = after.strip_prefix(':') {
-            port.parse().ok()?
-        } else if after.is_empty() {
-            default_port
-        } else {
-            return None;
-        };
-        (format!("[{host}]"), port)
-    } else {
-        match authority.rsplit_once(':') {
-            Some((h, p)) => (h.to_string(), p.parse().ok()?),
-            None => (authority.to_string(), default_port),
-        }
-    };
-    if host.is_empty() || !valid_backend_host(&host) {
+    if base
+        .bytes()
+        .any(|byte| !(0x21..=0x7e).contains(&byte) || byte == b'#')
+    {
         return None;
     }
+    let bracketed = authority.starts_with('[');
+    let (host, port) = crate::util::parse_http_authority(authority.as_bytes(), default_port)?;
+    let host = if bracketed { format!("[{host}]") } else { host };
     Some(HttpBackend {
         host,
         port,
         base,
         tls,
     })
+}
+
+pub(crate) fn valid_http_backend(value: &str) -> bool {
+    parse_http_url(value).is_some()
 }
 
 /// A backend authority is configuration- or rewrite-derived.  Reject control

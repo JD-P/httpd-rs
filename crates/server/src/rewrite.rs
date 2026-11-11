@@ -21,7 +21,8 @@
 //! remediation), with a load-time warning in the main config.
 
 use crate::config::{
-    RequestEnvironment, RewriteCond, RewriteMap, RewriteProgram, RewriteRule, Scope,
+    RequestEnvironment, RewriteCond, RewriteMap, RewriteNamePart, RewriteProgram, RewriteRule,
+    RewriteTemplate, RewriteTemplatePart, Scope,
 };
 use crate::http::Request;
 use crate::scope_policy::Originated;
@@ -224,8 +225,9 @@ fn escape_backref_value(value: &[u8], spec: &EscapeSpec) -> Vec<u8> {
 }
 
 /// Build an Apache-shaped `Set-Cookie` value for `[CO=name:value:domain:
-/// lifetime:path:secure:httponly:samesite]`.  The caller has already expanded
-/// backreferences in the raw flag text.
+/// lifetime:path:secure:httponly:samesite]`. The structural delimiters were
+/// consumed when the configuration was loaded; each field is expanded on its
+/// own before reaching this function.
 ///
 /// The colon-split field layout follows Apache, but the fields are validated
 /// so a capture can never inject further attributes: the name must be an RFC
@@ -233,13 +235,11 @@ fn escape_backref_value(value: &[u8], spec: &EscapeSpec) -> Vec<u8> {
 /// visible set (attribute separators `;`, `,` and `"` excluded), and the
 /// `secure`/`httponly`/`samesite` slots accept exactly their documented
 /// tokens.
-fn build_cookie(raw: &str) -> Result<String, String> {
-    let fields: Vec<&str> = if let Some(rest) = raw.strip_prefix(';') {
-        rest.split(';').collect()
-    } else {
-        raw.splitn(8, ':').collect()
-    };
-    let name = fields.first().copied().unwrap_or("").trim();
+fn build_cookie_fields(fields: &[String]) -> Result<String, String> {
+    if !(2..=8).contains(&fields.len()) {
+        return Err("RewriteRule [CO] requires 2 to 8 cookie fields".into());
+    }
+    let name = fields.first().map_or("", String::as_str).trim();
     if name.is_empty() {
         return Err("RewriteRule [CO] cookie has an empty name".into());
     }
@@ -248,7 +248,7 @@ fn build_cookie(raw: &str) -> Result<String, String> {
             "invalid RewriteRule [CO] cookie name '{name}' (must be an RFC 6265 token)"
         ));
     }
-    let value = fields.get(1).copied().unwrap_or("");
+    let value = fields.get(1).map_or("", String::as_str);
     if !is_cookie_value(value) {
         return Err(format!(
             "invalid RewriteRule [CO] cookie value '{value}' (cookie-octets only)"
@@ -332,6 +332,18 @@ fn build_cookie(raw: &str) -> Result<String, String> {
     Ok(out)
 }
 
+#[cfg(test)]
+fn build_cookie(raw: &str) -> Result<String, String> {
+    let fields = if let Some(rest) = raw.strip_prefix(';') {
+        rest.split(';')
+    } else {
+        raw.split(':')
+    }
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    build_cookie_fields(&fields)
+}
+
 /// RFC 6265 `token` for a cookie-name: 1*tchar (`;`, `,`, `=`, whitespace and
 /// control bytes are separators and cannot appear).
 fn is_cookie_name(name: &str) -> bool {
@@ -362,16 +374,53 @@ fn rule_effects(
     env: &[(String, Vec<u8>)],
 ) -> Result<Effects, String> {
     let mut effects = Effects::default();
-    for (name, value) in &rule.flags.env {
-        let name = expand_backrefs(
-            name, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
+    if rule.flags.env.len() != rule.flags.env_templates.len()
+        || rule.flags.cookies.len() != rule.flags.cookie_templates.len()
+        || rule.flags.handler.as_deref()
+            != rule
+                .flags
+                .handler_template
+                .as_ref()
+                .map(|template| template.source.as_str())
+        || rule.flags.content_type.as_deref()
+            != rule
+                .flags
+                .content_type_template
+                .as_ref()
+                .map(|template| template.source.as_str())
+    {
+        return Err("rewrite effect templates do not match the sealed rule".into());
+    }
+    for ((name, value), (name_template, value_template)) in
+        rule.flags.env.iter().zip(&rule.flags.env_templates)
+    {
+        if name != &name_template.source
+            || value.as_deref()
+                != value_template
+                    .as_ref()
+                    .map(|template| template.source.as_str())
+        {
+            return Err("rewrite environment template does not match the sealed rule".into());
+        }
+        let name = expand_rewrite_template_string(
+            name_template,
+            caps,
+            cond_caps,
+            req,
+            ctx,
+            path,
+            query,
+            maps,
+            env,
+            true,
+            None,
         )?;
         if name.is_empty() {
             return Err("RewriteRule [E] has an empty variable name".into());
         }
-        let value = match value {
-            Some(v) => Some(expand_backrefs_bytes(
-                v, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
+        let value = match value_template {
+            Some(template) => Some(expand_rewrite_template(
+                template, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
             )?),
             None => None,
         };
@@ -385,30 +434,29 @@ fn rule_effects(
             effects.env.push((name, value));
         }
     }
-    for cookie in &rule.flags.cookies {
-        let cookie = expand_backrefs(
-            cookie, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
-        )?;
-        effects.cookies.push(build_cookie(&cookie)?);
+    for (cookie, template) in rule.flags.cookies.iter().zip(&rule.flags.cookie_templates) {
+        if cookie != &template.source {
+            return Err("rewrite cookie template does not match the sealed rule".into());
+        }
+        let fields = template
+            .fields
+            .iter()
+            .map(|field| {
+                expand_rewrite_template_string(
+                    field, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        effects.cookies.push(build_cookie_fields(&fields)?);
     }
-    if let Some(handler) = &rule.flags.handler {
-        effects.handler = Some(expand_backrefs(
-            handler, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
+    if let Some(template) = &rule.flags.handler_template {
+        effects.handler = Some(expand_rewrite_template_string(
+            template, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
         )?);
     }
-    if let Some(content_type) = &rule.flags.content_type {
-        effects.content_type = Some(expand_backrefs(
-            content_type,
-            caps,
-            cond_caps,
-            req,
-            ctx,
-            path,
-            query,
-            maps,
-            env,
-            true,
-            None,
+    if let Some(template) = &rule.flags.content_type_template {
+        effects.content_type = Some(expand_rewrite_template_string(
+            template, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
         )?);
     }
     Ok(effects)
@@ -516,24 +564,9 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         {
             return Outcome::Error("request policy work limit exceeded".into());
         }
-        let conds = match conditions_match(
-            rule,
-            req,
-            ctx,
-            &path,
-            &query,
-            &mut cond_caps,
-            &scope.rewrite_policy.rewrite_maps,
-            &env,
-            &mut vary,
-        ) {
-            Ok(v) => v,
-            Err(e) => return Outcome::Error(e),
-        };
-        if !conds {
-            idx = rewrite_no_match_index(&chain_flags, idx, rule);
-            continue;
-        }
+        // A RewriteRule pattern is matched before its RewriteCond list.
+        // Besides avoiding condition work for an inapplicable rule, this
+        // makes the rule's `$N` captures available to condition test strings.
         let caps = rule.pattern.captures(subject.as_bytes());
         let cap_strings: Vec<Vec<u8>> = if rule.negated {
             if caps.is_some() {
@@ -553,6 +586,28 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                 }
             }
         };
+        // `%N` belongs to this rule's RewriteCond list. Never let a capture
+        // from an earlier rule satisfy or alter a later rule.
+        cond_caps.clear();
+        let conds = match conditions_match(
+            rule,
+            &cap_strings,
+            req,
+            ctx,
+            &path,
+            &query,
+            &mut cond_caps,
+            &scope.rewrite_policy.rewrite_maps,
+            &env,
+            &mut vary,
+        ) {
+            Ok(v) => v,
+            Err(e) => return Outcome::Error(e),
+        };
+        if !conds {
+            idx = rewrite_no_match_index(&chain_flags, idx, rule);
+            continue;
+        }
 
         for name in vary.drain(..) {
             if !effects.vary.iter().any(|v| v.eq_ignore_ascii_case(&name)) {
@@ -639,8 +694,13 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         }
 
         let spec = escape_spec(&rule.flags);
-        let expanded = match expand_backrefs(
-            &rule.substitution,
+        if rule.substitution_template.source != rule.substitution {
+            return Outcome::Error(
+                "RewriteRule substitution does not match its sealed grammar".into(),
+            );
+        }
+        let expanded = match expand_rewrite_template_string(
+            &rule.substitution_template,
             &cap_strings,
             &cond_caps,
             req,
@@ -927,6 +987,7 @@ fn subject_for<'a>(
 
 fn conditions_match(
     rule: &RewriteRule,
+    caps: &[Vec<u8>],
     req: &Request,
     ctx: &Context<'_>,
     path: &str,
@@ -967,7 +1028,16 @@ fn conditions_match(
             ors.push(cond.flags.or);
             continue;
         }
-        let value = expand_vars_bytes(&cond.test, req, ctx, path, query, cond_caps, maps, env)?;
+        let template = cond
+            .test_template
+            .as_ref()
+            .ok_or_else(|| "RewriteCond is missing its sealed test-string grammar".to_string())?;
+        if template.source != cond.test {
+            return Err("RewriteCond test string does not match its sealed grammar".into());
+        }
+        let value = expand_rewrite_template(
+            template, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
+        )?;
         req.charge_policy_work(
             (cond.pattern.len() as u64)
                 .saturating_add(value.len() as u64)
@@ -1162,6 +1232,83 @@ fn file_test(value: &str, ctx: &Context<'_>, test: FileTest) -> bool {
     }
 }
 
+fn expand_rewrite_name(
+    parts: &[RewriteNamePart],
+    caps: &[Vec<u8>],
+    cond_caps: &[Vec<u8>],
+) -> Result<String, String> {
+    let mut out = Vec::new();
+    for part in parts {
+        match part {
+            RewriteNamePart::Literal(value) => append_rewrite_output(&mut out, value)?,
+            RewriteNamePart::RuleCapture(index) => {
+                if let Some(value) = caps.get(*index as usize) {
+                    append_rewrite_output(&mut out, value)?;
+                }
+            }
+            RewriteNamePart::ConditionCapture(index) => {
+                if let Some(value) = cond_caps.get(*index as usize) {
+                    append_rewrite_output(&mut out, value)?;
+                }
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| "rewrite reference name is not valid UTF-8".into())
+}
+
+fn append_rewrite_expansion(
+    out: &mut Vec<u8>,
+    value: &[u8],
+    allow_3f: bool,
+    escape: Option<&EscapeSpec>,
+) -> Result<(), String> {
+    if let Some(spec) = escape {
+        append_rewrite_output(out, &escape_backref_value(value, spec))
+    } else if allow_3f {
+        append_rewrite_output(out, value)
+    } else {
+        append_rewrite_output(out, &vapache_verified::rewrite_backref_no_qmark(value))
+    }
+}
+
+fn expand_rewrite_template(
+    template: &RewriteTemplate,
+    caps: &[Vec<u8>],
+    cond_caps: &[Vec<u8>],
+    req: &Request,
+    ctx: &Context<'_>,
+    path: &str,
+    query: &[u8],
+    maps: &[(String, RewriteMap)],
+    env: &[(String, Vec<u8>)],
+    allow_3f: bool,
+    escape: Option<&EscapeSpec>,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(template.source.len());
+    for part in &template.parts {
+        match part {
+            RewriteTemplatePart::Literal(value) => append_rewrite_output(&mut out, value)?,
+            RewriteTemplatePart::RuleCapture(index) => {
+                if let Some(value) = caps.get(*index as usize) {
+                    append_rewrite_expansion(&mut out, value, allow_3f, escape)?;
+                }
+            }
+            RewriteTemplatePart::ConditionCapture(index) => {
+                if let Some(value) = cond_caps.get(*index as usize) {
+                    append_rewrite_expansion(&mut out, value, allow_3f, escape)?;
+                }
+            }
+            RewriteTemplatePart::Reference { name, .. } => {
+                let name = expand_rewrite_name(name, caps, cond_caps)?;
+                let value = variable_value_bytes(&name, req, ctx, path, query, maps, env)?;
+                append_rewrite_expansion(&mut out, &value, allow_3f, escape)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
 fn expand_vars_bytes(
     test: &str,
     req: &Request,
@@ -1172,41 +1319,20 @@ fn expand_vars_bytes(
     maps: &[(String, RewriteMap)],
     env: &[(String, Vec<u8>)],
 ) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(test.len());
-    let mut i = 0;
-    let bytes = test.as_bytes();
-    while i < bytes.len() {
-        match vapache_verified::rewrite_expand_token(bytes, i) {
-            vapache_verified::RewriteExpandToken::Variable => {
-                if let Some(end) = test[i + 2..].find('}') {
-                    let name = String::from_utf8(expand_caps_bytes(
-                        &test[i + 2..i + 2 + end],
-                        &[],
-                        cond_caps,
-                    )?)
-                    .map_err(|_| "RewriteCond variable name is not valid UTF-8".to_string())?;
-                    append_rewrite_output(
-                        &mut out,
-                        &variable_value_bytes(&name, req, ctx, path, query, maps, env)?,
-                    )?;
-                    i += 2 + end + 1;
-                    continue;
-                }
-            }
-            vapache_verified::RewriteExpandToken::ConditionCapture { index } => {
-                if let Some(v) = cond_caps.get(index as usize) {
-                    append_rewrite_output(&mut out, v)?;
-                }
-                i += 2;
-                continue;
-            }
-            vapache_verified::RewriteExpandToken::Literal
-            | vapache_verified::RewriteExpandToken::RuleCapture { .. } => {}
-        }
-        append_rewrite_output(&mut out, &bytes[i..i + 1])?;
-        i += 1;
-    }
-    Ok(out)
+    let template = crate::config::parse_rewrite_template(test)?;
+    expand_rewrite_template(
+        &template,
+        &[],
+        cond_caps,
+        req,
+        ctx,
+        path,
+        query,
+        maps,
+        env,
+        true,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -1597,6 +1723,7 @@ fn read_prg_line(mut input: impl Read) -> (Vec<u8>, bool) {
     (line, complete)
 }
 
+#[cfg(test)]
 fn expand_caps_bytes(
     name: &str,
     caps: &[Vec<u8>],
@@ -1630,6 +1757,7 @@ fn expand_caps_bytes(
     Ok(out)
 }
 
+#[cfg(test)]
 fn expand_backrefs_bytes(
     s: &str,
     caps: &[Vec<u8>],
@@ -1643,66 +1771,13 @@ fn expand_backrefs_bytes(
     allow_3f: bool,
     escape: Option<&EscapeSpec>,
 ) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match vapache_verified::rewrite_expand_token(bytes, i) {
-            vapache_verified::RewriteExpandToken::Variable => {
-                if let Some(end) = s[i + 2..].find('}') {
-                    let name = String::from_utf8(expand_caps_bytes(
-                        &s[i + 2..i + 2 + end],
-                        caps,
-                        cond_caps,
-                    )?)
-                    .map_err(|_| "rewrite variable name is not valid UTF-8".to_string())?;
-                    let value = variable_value_bytes(&name, req, ctx, path, query, maps, env)?;
-                    if let Some(spec) = escape {
-                        append_rewrite_output(&mut out, &escape_backref_value(&value, spec))?;
-                    } else if allow_3f {
-                        append_rewrite_output(&mut out, &value)?;
-                    } else {
-                        append_rewrite_output(
-                            &mut out,
-                            &vapache_verified::rewrite_backref_no_qmark(&value),
-                        )?;
-                    }
-                    i += 2 + end + 1;
-                    continue;
-                }
-            }
-            token @ (vapache_verified::RewriteExpandToken::RuleCapture { .. }
-            | vapache_verified::RewriteExpandToken::ConditionCapture { .. }) => {
-                let (index, pool) = match token {
-                    vapache_verified::RewriteExpandToken::RuleCapture { index } => (index, caps),
-                    vapache_verified::RewriteExpandToken::ConditionCapture { index } => {
-                        (index, cond_caps)
-                    }
-                    _ => unreachable!(), // coverage:ignore-line - outer pattern admits only capture variants
-                };
-                if let Some(v) = pool.get(index as usize) {
-                    if let Some(spec) = escape {
-                        append_rewrite_output(&mut out, &escape_backref_value(v, spec))?;
-                    } else if !allow_3f {
-                        append_rewrite_output(
-                            &mut out,
-                            &vapache_verified::rewrite_backref_no_qmark(v),
-                        )?;
-                    } else {
-                        append_rewrite_output(&mut out, v)?;
-                    }
-                }
-                i += 2;
-                continue;
-            }
-            vapache_verified::RewriteExpandToken::Literal => {}
-        }
-        append_rewrite_output(&mut out, &bytes[i..i + 1])?;
-        i += 1;
-    }
-    Ok(out)
+    let template = crate::config::parse_rewrite_template(s)?;
+    expand_rewrite_template(
+        &template, caps, cond_caps, req, ctx, path, query, maps, env, allow_3f, escape,
+    )
 }
 
+#[cfg(test)]
 fn expand_backrefs(
     s: &str,
     caps: &[Vec<u8>],
@@ -1718,6 +1793,25 @@ fn expand_backrefs(
 ) -> Result<String, String> {
     String::from_utf8(expand_backrefs_bytes(
         s, caps, cond_caps, req, ctx, path, query, maps, env, allow_3f, escape,
+    )?)
+    .map_err(|_| "rewrite expansion is not valid UTF-8".to_string())
+}
+
+fn expand_rewrite_template_string(
+    template: &RewriteTemplate,
+    caps: &[Vec<u8>],
+    cond_caps: &[Vec<u8>],
+    req: &Request,
+    ctx: &Context<'_>,
+    path: &str,
+    query: &[u8],
+    maps: &[(String, RewriteMap)],
+    env: &[(String, Vec<u8>)],
+    allow_3f: bool,
+    escape: Option<&EscapeSpec>,
+) -> Result<String, String> {
+    String::from_utf8(expand_rewrite_template(
+        template, caps, cond_caps, req, ctx, path, query, maps, env, allow_3f, escape,
     )?)
     .map_err(|_| "rewrite expansion is not valid UTF-8".to_string())
 }
@@ -1883,6 +1977,34 @@ mod tests {
             process(&scope, &request, &ctx("/old", &root.join("old"), root)),
             Outcome::Forbidden
         ));
+    }
+
+    #[test]
+    fn condition_captures_do_not_leak_between_rules() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        let mut first = parse_rewrite_rule(&["^/old$".into(), "-".into()], "/", false).unwrap();
+        first
+            .conditions
+            .push(parse_rewrite_cond(&["%{REQUEST_URI}".into(), "^/(old)$".into()]).unwrap());
+        scope.rewrite_policy.rewrite_rules.push(first);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/old$".into(), "-".into(), "[E=LEAK:%1,L]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+
+        let request = req();
+        let root = Path::new("/tmp");
+        match process(&scope, &request, &ctx("/old", &root.join("old"), root)) {
+            Outcome::Internal { effects, .. } => {
+                assert_eq!(effects.env, vec![("LEAK".into(), Some(Vec::new()))]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
@@ -2426,7 +2548,7 @@ mod tests {
         )
         .is_err());
         assert!(expand_backrefs_bytes(
-            "${QUERY_STRING}",
+            "%{QUERY_STRING}",
             &[],
             &[],
             &req(),
@@ -2590,12 +2712,7 @@ mod tests {
         // Rule 1 without [L]: rewrites /q onto the file path and keeps going,
         // which used to make the file target stick across this round (F68).
         scope.rewrite_policy.rewrite_rules.push(
-            parse_rewrite_rule(
-                &["^/q$".into(), "%{QUERY_STRING}".into(), "".into()],
-                "/",
-                false,
-            )
-            .unwrap(),
+            parse_rewrite_rule(&["^/q$".into(), "%{QUERY_STRING}".into()], "/", false).unwrap(),
         );
         // Rule 2 with [L]: an ordinary URL rewrite with no filesystem target.
         scope.rewrite_policy.rewrite_rules.push(
@@ -3100,10 +3217,15 @@ mod tests {
         let mut scope = Scope::default();
         scope.rewrite_policy.rewrite_engine = Some(true);
         let cond = parse_rewrite_cond(&["%{QUERY_STRING}".into(), "^x=1$".into()]).unwrap();
-        let mut rule =
-            parse_rewrite_rule(&["^old$".into(), "new".into(), "[L,QSA]".into()], "/", true)
-                .unwrap();
+        let mut rule = parse_rewrite_rule(
+            &["^o(ld)$".into(), "new".into(), "[L,QSA]".into()],
+            "/",
+            true,
+        )
+        .unwrap();
         rule.conditions.push(cond);
+        rule.conditions
+            .push(parse_rewrite_cond(&["$1".into(), "^ld$".into()]).unwrap());
         scope.rewrite_policy.rewrite_rules.push(rule);
         let r = req();
         let root = Path::new("/tmp");
@@ -3355,7 +3477,7 @@ mod tests {
     #[test]
     fn malformed_conditions_and_flags_are_rejected() {
         assert!(parse_rewrite_cond(&["%{REQUEST_URI}".into(), "[".into()]).is_err());
-        assert!(parse_rewrite_cond(&["%{NOT_A_REWRITE_VAR}".into(), "^$".into()]).is_ok());
+        assert!(parse_rewrite_cond(&["%{NOT_A_REWRITE_VAR}".into(), "^$".into()]).is_err());
         assert!(parse_rewrite_rule(&["^x$".into(), "y".into(), "[C]".into()], "/", true).is_ok());
         assert!(
             parse_rewrite_rule(&["^x$".into(), "y".into(), "[UNKNOWN]".into()], "/", true).is_err()
@@ -3365,8 +3487,9 @@ mod tests {
         scope.rewrite_policy.rewrite_engine = Some(true);
         let mut rule =
             parse_rewrite_rule(&["^old$".into(), "new".into(), "[L]".into()], "/", true).unwrap();
-        rule.conditions
-            .push(parse_rewrite_cond(&["%{NOT_A_REWRITE_VAR}".into(), "^$".into()]).unwrap());
+        let mut condition = parse_rewrite_cond(&["%{REQUEST_URI}".into(), "^$".into()]).unwrap();
+        condition.test = "%{NOT_A_REWRITE_VAR}".into();
+        rule.conditions.push(condition);
         scope.rewrite_policy.rewrite_rules.push(rule);
         let r = req();
         let root = Path::new("/tmp");
@@ -3575,6 +3698,14 @@ mod tests {
         assert_eq!(e.handler.as_deref(), Some("handler"));
         assert_eq!(e.content_type.as_deref(), Some("text/plain"));
 
+        // Cookie delimiters belong to the load-time grammar. A capture that
+        // expands to `:` remains data in the value field and cannot create a
+        // Domain (or any other attribute) during request processing.
+        let rule = parsed_rule("^/old$", "-", "[CO=name:$1]", "/", false);
+        let caps = vec![b"old".to_vec(), b"value:attacker.test".to_vec()];
+        let e = rule_effects(&rule, &caps, &[], &r, &c, "/old", b"", &[], &[]).unwrap();
+        assert_eq!(e.cookies, vec!["name=value:attacker.test"]);
+
         let mut bad = rule.clone();
         bad.flags.env.push((String::new(), Some("x".into())));
         assert!(rule_effects(&bad, &[], &[], &r, &c, "/old", b"", &[], &[]).is_err());
@@ -3767,7 +3898,7 @@ mod tests {
 
         assert_eq!(
             expand_vars(
-                "${REQUEST_URI}-%{REQUEST_URI}-%1-é",
+                "%{REQUEST_URI}-%{REQUEST_URI}-%1-é",
                 &r,
                 &c,
                 "/path",
@@ -3780,14 +3911,8 @@ mod tests {
             "/path-/path-cap-é"
         );
         assert!(expand_vars("%{NOPE}", &r, &c, "/path", b"", &[], &[], &[]).is_err());
-        assert_eq!(
-            expand_vars("${unterminated", &r, &c, "/", b"", &[], &[], &[]).unwrap(),
-            "${unterminated"
-        );
-        assert_eq!(
-            expand_vars("%{unterminated", &r, &c, "/", b"", &[], &[], &[]).unwrap(),
-            "%{unterminated"
-        );
+        assert!(expand_vars("${unterminated", &r, &c, "/", b"", &[], &[], &[]).is_err());
+        assert!(expand_vars("%{unterminated", &r, &c, "/", b"", &[], &[], &[]).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4006,7 +4131,7 @@ mod tests {
         );
         assert_eq!(
             expand_backrefs(
-                "${REQUEST_URI}-%{REQUEST_URI}-$1-%1-\\1",
+                "%{REQUEST_URI}-%{REQUEST_URI}-$1-%1-\\1",
                 &caps,
                 &cond,
                 &r,
@@ -4045,7 +4170,7 @@ mod tests {
             "one "
         );
         assert!(expand_backrefs(
-            "${REQUEST_URI}",
+            "%{REQUEST_URI}",
             &caps,
             &cond,
             &r,
@@ -4074,23 +4199,20 @@ mod tests {
         )
         .unwrap()
         .contains("%2f"));
-        assert_eq!(
-            expand_backrefs(
-                "${unterminated %{unterminated",
-                &caps,
-                &cond,
-                &r,
-                &c,
-                "/old",
-                b"",
-                &[],
-                &[],
-                true,
-                None,
-            )
-            .unwrap(),
-            "${unterminated %{unterminated"
-        );
+        assert!(expand_backrefs(
+            "${unterminated %{unterminated",
+            &caps,
+            &cond,
+            &r,
+            &c,
+            "/old",
+            b"",
+            &[],
+            &[],
+            true,
+            None,
+        )
+        .is_err());
         assert_eq!(
             escape_redirect_location("a b\"<>\\^`{|}"),
             "a%20b%22%3c%3e%5c%5e%60%7b%7c%7d"
@@ -4457,8 +4579,12 @@ mod tests {
             assert!(matches!(process(&next, &r, &c), Outcome::Error(_)));
         }
 
-        let bad_expand = scope_with(vec![parsed_rule("^/x$", "${UNKNOWN}", "[L]", "/", false)]);
-        assert!(matches!(process(&bad_expand, &r, &c), Outcome::Error(_)));
+        assert!(parse_rewrite_rule(
+            &["^/x$".into(), "${UNKNOWN}".into(), "[L]".into()],
+            "/",
+            false,
+        )
+        .is_err());
 
         let mut bad_effect = parsed_rule("^/x$", "/y", "[L]", "/", false);
         bad_effect.flags.env.push((String::new(), Some("x".into())));

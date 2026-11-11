@@ -85,6 +85,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "config_grammars"
+path = "fuzz_targets/config_grammars.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "h2_frames"
 path = "fuzz_targets/h2_frames.rs"
 test = false

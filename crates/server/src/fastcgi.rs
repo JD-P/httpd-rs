@@ -205,7 +205,9 @@ pub(crate) fn open_script(
 }
 
 fn parse_backend(value: &str) -> Option<Backend> {
-    let value = value.trim();
+    if value.is_empty() || value.trim() != value {
+        return None;
+    }
     let value = value.strip_prefix("proxy:").unwrap_or(value);
     if let Some(rest) = value.strip_prefix("unix:") {
         let (sock, url) = match rest.split_once('|') {
@@ -213,6 +215,20 @@ fn parse_backend(value: &str) -> Option<Backend> {
             None => (rest, ""),
         };
         if sock.is_empty() {
+            return None;
+        }
+        if sock.bytes().any(|byte| byte.is_ascii_control()) {
+            return None;
+        }
+        let socket_path = Path::new(sock);
+        if !socket_path.is_absolute()
+            || socket_path.components().any(|component| {
+                !matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+        {
             return None;
         }
         let prefix = if url.is_empty() {
@@ -240,29 +256,18 @@ fn split_host_path(rest: &str) -> Option<(String, u16, String)> {
         Some((h, p)) => (h, format!("/{p}")),
         None => (rest, String::new()),
     };
-    let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
-        let close = rest.find(']')?;
-        let host = rest[..close].to_string();
-        let suffix = &rest[close + 1..];
-        let port = if suffix.is_empty() {
-            9000
-        } else {
-            suffix.strip_prefix(':')?.parse().ok()?
-        };
-        (host, port)
-    } else {
-        if hostport.matches(':').count() > 1 {
-            return None;
-        }
-        match hostport.rsplit_once(':') {
-            Some((host, port)) => (host.to_string(), port.parse().ok()?),
-            None => (hostport.to_string(), 9000),
-        }
-    };
-    if host.is_empty() {
+    if path
+        .bytes()
+        .any(|byte| !(0x21..=0x7e).contains(&byte) || byte == b'#')
+    {
         return None;
     }
+    let (host, port) = crate::util::parse_http_authority(hostport.as_bytes(), 9000)?;
     Some((host, port, path))
+}
+
+pub(crate) fn valid_backend_syntax(value: &str) -> bool {
+    parse_backend(value).is_some()
 }
 
 fn clean_script_path(path: &Path) -> PathBuf {

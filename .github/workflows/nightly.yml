@@ -30,6 +30,7 @@ jobs:
           - http_connection
           - config_sections
           - config_compile
+          - config_grammars
           - htaccess_walk
           - rewrite_expr
           - cgi_response

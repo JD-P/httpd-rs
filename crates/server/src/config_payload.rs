@@ -1278,8 +1278,18 @@ impl SealedPayload {
     }
 }
 
+pub(crate) fn valid_rewrite_map_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphanumeric() && (index != 0 || !byte.is_ascii_digit())
+        })
+}
+
 fn compile_rewrite_map(args: &[String]) -> Result<SealedRewriteMap, String> {
     let name = args[0].clone();
+    if !valid_rewrite_map_name(&name) {
+        return Err(format!("invalid RewriteMap name '{name}'"));
+    }
     let (kind, source) = args[1].split_once(':').unwrap_or(("txt", &args[1]));
     if source.is_empty() {
         return Err("RewriteMap requires a non-empty map source".into());

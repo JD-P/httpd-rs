@@ -8,7 +8,7 @@
 
 use rustls::pki_types::{CertificateDer, UnixTime};
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::MetadataExt;
@@ -42,17 +42,27 @@ fn parse_tlv(data: &[u8], pos: usize) -> Option<Tlv> {
         return None;
     }
     let tag = data[pos];
+    // Every structure consumed here uses the single-octet DER tag form.
+    if tag & 0x1f == 0x1f {
+        return None;
+    }
     let first = data[pos + 1];
     let (len, content_start) = if first & 0x80 == 0 {
         (first as usize, pos + 2)
     } else {
         let n = (first & 0x7f) as usize;
-        if n == 0 || n > 8 || pos + 2 + n > data.len() {
+        if n == 0 || n > std::mem::size_of::<usize>() || pos + 2 + n > data.len() {
+            return None;
+        }
+        if data[pos + 2] == 0 {
             return None;
         }
         let mut len = 0usize;
         for &b in &data[pos + 2..pos + 2 + n] {
             len = len.checked_mul(256)?.checked_add(b as usize)?;
+        }
+        if len < 128 {
+            return None;
         }
         (len, pos + 2 + n)
     };
@@ -104,160 +114,269 @@ struct CertInfo {
     ocsp_url: Option<String>,
 }
 
-fn parse_spki(data: &[u8], spki: Tlv) -> Option<Vec<u8>> {
-    let mut p = spki.content_start;
-    while p < spki.content_end {
-        let t = parse_tlv(data, p)?;
-        p = t.end;
-        if t.tag == 0x03 {
-            if t.content_start >= t.content_end {
-                return None;
-            }
-            // The first octet is the number of unused bits.
-            let unused = data[t.content_start];
-            if unused > 7 {
-                return None;
-            }
-            return Some(data[t.content_start + 1..t.content_end].to_vec());
-        }
+fn valid_algorithm_identifier(data: &[u8], algorithm: Tlv) -> bool {
+    if algorithm.tag != 0x30 {
+        return false;
     }
-    None
+    let Some(oid) = parse_tlv(data, algorithm.content_start) else {
+        return false;
+    };
+    if oid.tag != 0x06 || oid.content_start == oid.content_end {
+        return false;
+    }
+    if oid.end == algorithm.content_end {
+        return true;
+    }
+    parse_tlv(data, oid.end).is_some_and(|parameters| parameters.end == algorithm.content_end)
 }
 
-fn parse_aia_value(data: &[u8], value: Tlv) -> Option<String> {
+fn valid_bit_string_content(
+    data: &[u8],
+    content_start: usize,
+    content_end: usize,
+    require_payload: bool,
+) -> bool {
+    if content_start >= content_end {
+        return false;
+    }
+    let unused = data[content_start];
+    let payload = &data[content_start + 1..content_end];
+    if unused > 7 || (require_payload && payload.is_empty()) {
+        return false;
+    }
+    unused == 0
+        || payload
+            .last()
+            .is_some_and(|last| last & ((1u8 << unused) - 1) == 0)
+}
+
+fn valid_bit_string(data: &[u8], value: Tlv, require_payload: bool) -> bool {
+    value.tag == 0x03
+        && valid_bit_string_content(
+            data,
+            value.content_start,
+            value.content_end,
+            require_payload,
+        )
+}
+
+fn valid_validity(data: &[u8], validity: Tlv) -> bool {
+    if validity.tag != 0x30 {
+        return false;
+    }
+    let Some(not_before) = parse_tlv(data, validity.content_start) else {
+        return false;
+    };
+    let Some(not_after) = parse_tlv(data, not_before.end) else {
+        return false;
+    };
+    matches!(not_before.tag, 0x17 | 0x18)
+        && matches!(not_after.tag, 0x17 | 0x18)
+        && not_before.content_start != not_before.content_end
+        && not_after.content_start != not_after.content_end
+        && not_after.end == validity.content_end
+}
+
+fn parse_spki(data: &[u8], spki: Tlv) -> Option<Vec<u8>> {
+    let algorithm = parse_tlv(data, spki.content_start)?;
+    if !valid_algorithm_identifier(data, algorithm) {
+        return None;
+    }
+    let key = parse_tlv(data, algorithm.end)?;
+    if key.end != spki.content_end || !valid_bit_string(data, key, true) {
+        return None;
+    }
+    Some(data[key.content_start + 1..key.content_end].to_vec())
+}
+
+fn parse_aia_value(data: &[u8], value: Tlv) -> Option<Option<String>> {
     let seq = parse_tlv(data, value.content_start)?;
-    if seq.tag != 0x30 {
+    if seq.tag != 0x30 || seq.end != value.content_end {
         return None;
     }
     let mut p = seq.content_start;
+    let mut ocsp_url = None;
     while p < seq.content_end {
         let ad = parse_tlv(data, p)?;
         p = ad.end;
         if ad.tag != 0x30 {
-            continue;
+            return None;
         }
         let oid = parse_tlv(data, ad.content_start)?;
-        let mut q = oid.end;
-        let Some(gn) = parse_tlv(data, q) else {
-            continue;
-        };
-        q = gn.end;
-        let _ = q;
+        let gn = parse_tlv(data, oid.end)?;
+        if oid.tag != 0x06 || oid.content_start == oid.content_end || gn.end != ad.content_end {
+            return None;
+        }
         // 1.3.6.1.5.5.7.48.1 (id-ad-ocsp)
-        if oid.tag == 0x06
-            && raw(data, oid) == [0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01]
-            && gn.tag == 0x86
-        {
-            return std::str::from_utf8(&data[gn.content_start..gn.content_end])
-                .ok()
-                .map(|s| s.to_string());
+        if raw(data, oid) == [0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01] {
+            if gn.tag != 0x86 || ocsp_url.is_some() {
+                return None;
+            }
+            ocsp_url = Some(
+                std::str::from_utf8(&data[gn.content_start..gn.content_end])
+                    .ok()?
+                    .to_string(),
+            );
         }
     }
-    None
+    Some(ocsp_url)
 }
 
-fn parse_aia(data: &[u8], wrapper: Tlv) -> Option<String> {
+fn parse_extensions(data: &[u8], wrapper: Tlv) -> Option<Option<String>> {
     // [3] EXPLICIT Extensions
     let extensions = parse_tlv(data, wrapper.content_start)?;
-    if extensions.tag != 0x30 {
+    if extensions.tag != 0x30 || extensions.end != wrapper.content_end {
         return None;
     }
     let aia_oid = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
     let mut p = extensions.content_start;
+    let mut seen_oids = HashSet::new();
+    let mut ocsp_url = None;
     while p < extensions.content_end {
         let ext = parse_tlv(data, p)?;
         p = ext.end;
         if ext.tag != 0x30 {
-            continue;
+            return None;
         }
         let oid = parse_tlv(data, ext.content_start)?;
-        if oid.tag != 0x06 || &data[oid.content_start..oid.content_end] != aia_oid {
-            continue;
+        if oid.tag != 0x06
+            || oid.content_start == oid.content_end
+            || !seen_oids.insert(&data[oid.content_start..oid.content_end])
+        {
+            return None;
         }
         let mut q = oid.end;
-        let mut value = None;
-        while q < ext.content_end {
-            let t = parse_tlv(data, q)?;
-            q = t.end;
-            if t.tag == 0x04 {
-                value = Some(t);
+        let mut value = parse_tlv(data, q)?;
+        if value.tag == 0x01 {
+            if value.content_end != value.content_start + 1
+                || !matches!(data[value.content_start], 0x00 | 0xff)
+            {
+                return None;
             }
+            q = value.end;
+            value = parse_tlv(data, q)?;
         }
-        if let Some(value) = value {
-            if let Some(url) = parse_aia_value(data, value) {
-                return Some(url);
+        if value.tag != 0x04 || value.end != ext.content_end {
+            return None;
+        }
+        if data[oid.content_start..oid.content_end] == aia_oid {
+            if ocsp_url.is_some() {
+                return None;
             }
+            ocsp_url = parse_aia_value(data, value)?;
         }
     }
-    None
+    Some(ocsp_url)
 }
 
 fn parse_cert(der_bytes: &[u8]) -> Option<CertInfo> {
     let outer = parse_tlv(der_bytes, 0)?;
-    if outer.tag != 0x30 {
+    if outer.tag != 0x30 || outer.end != der_bytes.len() {
         return None;
     }
     let tbs = parse_tlv(der_bytes, outer.content_start)?;
     if tbs.tag != 0x30 {
         return None;
     }
+    let signature_algorithm = parse_tlv(der_bytes, tbs.end)?;
+    let signature = parse_tlv(der_bytes, signature_algorithm.end)?;
+    if !valid_algorithm_identifier(der_bytes, signature_algorithm)
+        || !valid_bit_string(der_bytes, signature, true)
+        || signature.end != outer.content_end
+    {
+        return None;
+    }
+
+    // TBSCertificate := [0] Version OPTIONAL, serial, signature, issuer,
+    // validity, subject, subjectPublicKeyInfo, [1], [2], [3] Extensions.
+    // Every mandatory field is consumed at its exact position; optional fields
+    // are unique and ordered.
     let mut p = tbs.content_start;
-    let mut stage = 0u8;
-    let mut serial = None;
-    let mut subject_name = None;
-    let mut issuer_key = None;
+    let first = parse_tlv(der_bytes, p)?;
+    let mut version_number = 0u8;
+    if first.tag == 0xa0 {
+        let version = parse_tlv(der_bytes, first.content_start)?;
+        if version.tag != 0x02
+            || version.end != first.content_end
+            || version.content_end != version.content_start + 1
+            || der_bytes[version.content_start] > 2
+        {
+            return None;
+        }
+        version_number = der_bytes[version.content_start];
+        p = first.end;
+    }
+    let serial = parse_tlv(der_bytes, p)?;
+    if serial.tag != 0x02 || serial.content_start == serial.content_end {
+        return None;
+    }
+    p = serial.end;
+    let tbs_signature = parse_tlv(der_bytes, p)?;
+    if !valid_algorithm_identifier(der_bytes, tbs_signature) {
+        return None;
+    }
+    p = tbs_signature.end;
+    let issuer = parse_tlv(der_bytes, p)?;
+    if issuer.tag != 0x30 {
+        return None;
+    }
+    p = issuer.end;
+    let validity = parse_tlv(der_bytes, p)?;
+    if !valid_validity(der_bytes, validity) {
+        return None;
+    }
+    p = validity.end;
+    let subject = parse_tlv(der_bytes, p)?;
+    if subject.tag != 0x30 {
+        return None;
+    }
+    p = subject.end;
+    let spki = parse_tlv(der_bytes, p)?;
+    if spki.tag != 0x30 {
+        return None;
+    }
+    let issuer_key = parse_spki(der_bytes, spki)?;
+    p = spki.end;
+    if raw(der_bytes, tbs_signature) != raw(der_bytes, signature_algorithm) {
+        return None;
+    }
+
     let mut ocsp_url = None;
+    let mut last_optional = 0u8;
     while p < tbs.content_end {
         let t = parse_tlv(der_bytes, p)?;
         p = t.end;
-        match stage {
-            0 => {
-                if t.tag == 0x02 {
-                    serial = Some(raw(der_bytes, t).to_vec());
-                    stage = 1;
+        let order = match t.tag {
+            0x81 => 1,
+            0x82 => 2,
+            0xa3 => 3,
+            _ => return None,
+        };
+        if order <= last_optional {
+            return None;
+        }
+        last_optional = order;
+        match t.tag {
+            0x81 | 0x82 => {
+                if version_number == 0
+                    || !valid_bit_string_content(der_bytes, t.content_start, t.content_end, false)
+                {
+                    return None;
                 }
             }
-            1 => {
-                if t.tag == 0x30 {
-                    stage = 2;
+            0xa3 => {
+                if version_number != 2 {
+                    return None;
                 }
+                ocsp_url = parse_extensions(der_bytes, t)?;
             }
-            2 => {
-                if t.tag == 0x30 {
-                    stage = 3;
-                }
-            }
-            3 => {
-                if t.tag == 0x30 {
-                    stage = 4;
-                }
-            }
-            4 => {
-                if t.tag == 0x30 {
-                    subject_name = Some(raw(der_bytes, t).to_vec());
-                    stage = 5;
-                }
-            }
-            5 => {
-                if t.tag == 0x30 {
-                    issuer_key = parse_spki(der_bytes, t);
-                    stage = 6;
-                }
-            }
-            6 => {
-                if t.tag == 0xa3 {
-                    ocsp_url = parse_aia(der_bytes, t);
-                }
-            }
-            // `stage` is initialized at zero and is only advanced through
-            // six; no parser transition can construct another value.
-            _ => {} // coverage:ignore-line
+            _ => unreachable!("optional certificate tag was classified above"),
         }
     }
     Some(CertInfo {
-        serial: serial?,
-        subject_name: subject_name?,
-        issuer_key: issuer_key?,
+        serial: raw(der_bytes, serial).to_vec(),
+        subject_name: raw(der_bytes, subject).to_vec(),
+        issuer_key,
         ocsp_url,
     })
 }
@@ -288,7 +407,10 @@ fn build_request(leaf: &CertInfo, issuer: &CertInfo) -> Option<Vec<u8>> {
 }
 
 fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
-    let rest = url.trim().strip_prefix("http://")?;
+    if url.is_empty() || url.trim() != url {
+        return None;
+    }
+    let rest = url.strip_prefix("http://")?;
     let split = rest.find('/').unwrap_or(rest.len());
     let authority = &rest[..split];
     let path = if split == rest.len() {
@@ -340,10 +462,35 @@ fn read_http_line(reader: &mut impl BufRead) -> Option<String> {
         line.extend_from_slice(available);
         reader.consume(take);
     }
-    while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
-        line.pop();
+    if !line.ends_with(b"\r\n") {
+        return None;
     }
+    line.truncate(line.len() - 2);
     String::from_utf8(line).ok()
+}
+
+fn valid_http_field_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 fn fetch_response(
@@ -393,7 +540,16 @@ fn fetch_response(
     stream.write_all(request).ok()?;
     let mut reader = BufReader::new(stream);
     let status = read_http_line(&mut reader)?;
-    if !status.split_whitespace().nth(1)?.starts_with("200") {
+    let mut status_parts = status.splitn(3, ' ');
+    let version = status_parts.next();
+    let code = status_parts.next();
+    let reason = status_parts.next()?;
+    if !matches!(version, Some("HTTP/1.0" | "HTTP/1.1"))
+        || code != Some("200")
+        || reason
+            .bytes()
+            .any(|byte| byte.is_ascii_control() && byte != b'\t')
+    {
         return None;
     }
     let mut content_length = None;
@@ -407,10 +563,23 @@ fn fetch_response(
         if line.is_empty() {
             break;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse::<usize>().ok();
+        let (name, value) = line.split_once(':')?;
+        if !valid_http_field_name(name)
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_control() && byte != b'\t')
+        {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return None;
             }
+            let parsed = crate::util::parse_u64(value.trim().as_bytes())?;
+            content_length = Some(usize::try_from(parsed).ok()?);
         }
     }
     let mut body = Vec::new();
@@ -1369,15 +1538,23 @@ mod tests {
     use super::*;
 
     fn minimal_cert(url: Option<&str>) -> Vec<u8> {
+        let algorithm = der(0x30, &der(0x06, &[0x2a]));
         let mut fields = vec![
             der(0x02, &[1]),
+            algorithm.clone(),
             der(0x30, &[]),
-            der(0x30, &[]),
-            der(0x30, &[]),
+            der(
+                0x30,
+                &[der(0x18, b"20200101000000Z"), der(0x18, b"20300101000000Z")].concat(),
+            ),
             der(0x30, &[0x05, 0x00]),
-            der(0x30, &der(0x03, &[0, 1, 2, 3])),
+            der(
+                0x30,
+                &[algorithm.clone(), der(0x03, &[0, 1, 2, 3])].concat(),
+            ),
         ];
         if let Some(url) = url {
+            fields.insert(0, der(0xa0, &der(0x02, &[2])));
             let access = der(
                 0x30,
                 &[
@@ -1397,7 +1574,15 @@ mod tests {
             );
             fields.push(der(0xa3, &der(0x30, &extension)));
         }
-        der(0x30, &der(0x30, &fields.concat()))
+        der(
+            0x30,
+            &[
+                der(0x30, &fields.concat()),
+                algorithm,
+                der(0x03, &[0, 1, 2, 3]),
+            ]
+            .concat(),
+        )
     }
 
     fn serve(response: Vec<u8>) -> Option<Vec<u8>> {
@@ -1534,9 +1719,9 @@ mod tests {
         )
         .is_none());
         let bad_wrapper = der(0xa3, &der(0x04, b"x"));
-        assert!(parse_aia(&bad_wrapper, parse_tlv(&bad_wrapper, 0).unwrap()).is_none());
+        assert!(parse_extensions(&bad_wrapper, parse_tlv(&bad_wrapper, 0).unwrap()).is_none());
         let skipped_extension = der(0xa3, &der(0x30, &der(0x04, b"x")));
-        assert!(parse_aia(
+        assert!(parse_extensions(
             &skipped_extension,
             parse_tlv(&skipped_extension, 0).unwrap()
         )
@@ -1564,6 +1749,8 @@ mod tests {
         assert!(parse_http_url("http:///path").is_none());
         assert!(parse_http_url("http://host:bad/").is_none());
         assert!(parse_http_url("http://user@host/").is_none());
+        assert!(parse_http_url(" http://host/").is_none());
+        assert!(parse_http_url("http://host/ ").is_none());
         assert!(parse_http_url("http://host/path\r\nX-Injected: yes").is_none());
         assert!(parse_http_url("http://host/path#fragment").is_none());
         assert_eq!(
@@ -1670,6 +1857,16 @@ mod tests {
             Some(b"body".to_vec())
         );
         assert!(serve(b"HTTP/1.1 500 Error\r\n\r\n".to_vec()).is_none());
+        assert!(serve(b"HTTP/1.1 200 OK\n\nbody".to_vec()).is_none());
+        assert!(serve(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n".to_vec()
+        )
+        .is_none());
+        assert!(
+            serve(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".to_vec())
+                .is_none()
+        );
+        assert!(serve(b"HTTP/1.1 200 OK\r\nBad Name: x\r\n\r\n".to_vec()).is_none());
         assert!(serve(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nno".to_vec()).is_none());
         assert!(serve(b"HTTP/1.1 200 OK\r\nContent-Length: 2097153\r\n\r\n".to_vec()).is_none());
         let mut oversized_body = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();

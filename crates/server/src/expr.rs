@@ -1170,7 +1170,17 @@ impl<'a> Parser<'a> {
                 while self.pos < self.input.len()
                     && self.input.as_bytes()[self.pos].is_ascii_alphabetic()
                 {
-                    nocase |= self.input.as_bytes()[self.pos] == b'i';
+                    let modifier = self.input.as_bytes()[self.pos];
+                    if modifier != b'i' {
+                        return Err(format!(
+                            "unsupported expression regex modifier '{}'",
+                            modifier as char
+                        ));
+                    }
+                    if nocase {
+                        return Err("duplicate expression regex modifier 'i'".into());
+                    }
+                    nocase = true;
                     self.pos += 1;
                 }
                 let out = String::from_utf8(out)
@@ -1977,6 +1987,8 @@ mod tests {
             "'unterminated",
             "%{unterminated",
             "'a' =~ /unterminated",
+            "'a' =~ /a/g",
+            "'a' =~ /a/ii",
             "(true",
             "true trailing",
             "?",

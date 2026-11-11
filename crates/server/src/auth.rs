@@ -284,6 +284,13 @@ fn read_bounded(reader: impl Read) -> Option<String> {
 }
 
 fn parse_auth_file(data: &str) -> Option<(ParsedAuthFile, usize)> {
+    // auth-file := *( empty-line | comment-line | entry-line )
+    // comment-line := "#" *UTF8
+    // entry-line := name ":" value
+    //
+    // `name` is non-empty strict UTF-8 with no colon/control byte and no
+    // leading or trailing ASCII whitespace. `value` excludes control bytes
+    // other than HTAB. Every non-comment line must match `entry-line`.
     let mut users: HashMap<String, Option<String>> = HashMap::new();
     let mut groups_by_user: HashMap<String, Vec<String>> = HashMap::new();
     let mut weight = 0usize;
@@ -292,10 +299,24 @@ fn parse_auth_file(data: &str) -> Option<(ParsedAuthFile, usize)> {
             continue;
         }
         let Some((name, value)) = line.split_once(':') else {
-            continue;
+            return None;
         };
+        if name.is_empty()
+            || name.trim_matches(|character: char| character.is_ascii_whitespace()) != name
+            || name
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b':')
+        {
+            return None;
+        }
         let name = name.to_string();
         let value = value.trim_end_matches('\r').to_string();
+        if value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() && !matches!(byte, b'\t'))
+        {
+            return None;
+        }
         weight = weight
             .checked_add(name.len())?
             .checked_add(value.len())?
@@ -579,10 +600,10 @@ mod tests {
         let groups = temp_path("groups");
         std::fs::write(
             &users,
-            "# comment\nmalformed\nalice:$apr1$gqijKP2Z$nBjZURLWP3/zSfPLTfhVM0\r\n",
+            "# comment\nalice:$apr1$gqijKP2Z$nBjZURLWP3/zSfPLTfhVM0\r\n",
         )
         .unwrap();
-        std::fs::write(&groups, "malformed\n admins: alice bob\nother: bob\n").unwrap();
+        std::fs::write(&groups, "admins: alice bob\nother: bob\n").unwrap();
         let mut scope = Scope::default();
         scope.authorization.auth_type = Some("BASIC".into());
         scope.authorization.auth_user_file = Some(users.clone());
@@ -596,6 +617,10 @@ mod tests {
         );
         assert!(authenticate(&scope, &request(Some(basic(b"alice:wrong"))), true).is_none());
         assert!(authenticate(&scope, &request(Some(basic(b"nobody:secret"))), true).is_none());
+
+        std::fs::write(&groups, "malformed\nadmins: alice\n").unwrap();
+        let identity = authenticate(&scope, &request(Some(basic(b"alice:secret"))), true).unwrap();
+        assert!(identity.groups.is_none());
 
         std::fs::write(&groups, b"admins: alice\xff\n").unwrap();
         let identity = authenticate(&scope, &request(Some(basic(b"alice:secret"))), true).unwrap();

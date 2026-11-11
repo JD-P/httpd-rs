@@ -1905,9 +1905,19 @@ fn encode_meta(key: &str, entry: &Entry) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn decode_meta(data: &[u8]) -> Option<Entry> {
-    let text = std::str::from_utf8(data).ok()?;
-    let mut lines = text.lines();
+fn decode_meta_record(data: &[u8]) -> Option<(Entry, Option<Vec<u8>>)> {
+    // meta-record := version LF *( singleton-field | vary-field | header-field )
+    // singleton-field := ("K" | "S" | "T" | "E" | "P" | "G") SP atom LF
+    // vary-field := "V" SP base64-name SP base64-value LF
+    // header-field := "H" SP base64-name SP base64-value LF
+    //
+    // Field kinds and singleton multiplicity are closed. Decoded names and
+    // values must satisfy the HTTP field grammar before becoming a Response.
+    let text = std::str::from_utf8(data).ok()?.strip_suffix('\n')?;
+    if text.contains('\r') {
+        return None;
+    }
+    let mut lines = text.split('\n');
     let version = lines.next()?;
     if version != "V1"
         && version != "V2"
@@ -1926,67 +1936,121 @@ fn decode_meta(data: &[u8]) -> Option<Entry> {
     // V1 entries predate the configuration-generation field and are never
     // admissible in a live configuration.
     let mut epoch = Some(0u64);
-    let mut vary = Vec::new();
-    let mut headers = Vec::new();
+    let mut seen_epoch = false;
+    let mut key = None;
+    let mut vary: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut headers: Vec<(String, Vec<u8>)> = Vec::new();
     for line in lines {
-        let mut parts = line.splitn(3, ' ');
-        let kind = parts.next()?;
+        let (kind, rest) = line.split_once(' ')?;
         match kind {
-            "S" => status = parts.next()?.parse::<u16>().ok(),
-            "T" => stored = parts.next()?.parse::<i64>().ok(),
-            "E" => expires = parts.next()?.parse::<i64>().ok(),
+            "K" if version == "V7" => {
+                if key.is_some() || rest.is_empty() || rest.contains(' ') {
+                    return None;
+                }
+                key = Some(STANDARD.decode(rest).ok()?);
+            }
+            "S" => {
+                if status.is_some() || rest.is_empty() || rest.contains(' ') {
+                    return None;
+                }
+                let parsed = rest.parse::<u16>().ok()?;
+                if !(100..=599).contains(&parsed) {
+                    return None;
+                }
+                status = Some(parsed);
+            }
+            "T" => {
+                if stored.is_some() || rest.is_empty() || rest.contains(' ') {
+                    return None;
+                }
+                stored = Some(rest.parse::<i64>().ok()?);
+            }
+            "E" => {
+                if expires.is_some() || rest.is_empty() || rest.contains(' ') {
+                    return None;
+                }
+                expires = Some(rest.parse::<i64>().ok()?);
+            }
             "P" => {
-                let raw = STANDARD.decode(parts.next()?).ok()?;
+                if policy.is_some() || rest.is_empty() || rest.contains(' ') {
+                    return None;
+                }
+                let raw = STANDARD.decode(rest).ok()?;
                 policy = Some(<[u8; 32]>::try_from(raw.as_slice()).ok()?);
             }
-            "G" => epoch = parts.next()?.parse::<u64>().ok(),
+            "G" => {
+                if seen_epoch || rest.is_empty() || rest.contains(' ') {
+                    return None;
+                }
+                seen_epoch = true;
+                epoch = Some(rest.parse::<u64>().ok()?);
+            }
             "V" | "H" => {
-                let name = STANDARD.decode(parts.next()?).ok()?;
-                let value = STANDARD.decode(parts.next().unwrap_or("")).ok()?;
+                let (name, value) = rest.split_once(' ')?;
+                if name.is_empty() || value.contains(' ') {
+                    return None;
+                }
+                let name = STANDARD.decode(name).ok()?;
+                let value = STANDARD.decode(value).ok()?;
                 let name = String::from_utf8(name).ok()?;
+                if !crate::verified::valid_token(name.as_bytes())
+                    || crate::verified::sanitize_header_value(&value).is_none()
+                    || crate::http::ResponseHeaderSanitizer::new().is_hop_by_hop(&name)
+                {
+                    return None;
+                }
                 if kind == "V" {
+                    if vary
+                        .iter()
+                        .any(|(existing, _)| existing.eq_ignore_ascii_case(&name))
+                    {
+                        return None;
+                    }
                     vary.push((name, value));
                 } else {
                     headers.push((name, value));
                 }
             }
-            _ => {}
+            _ => return None,
         }
     }
-    Some(Entry {
-        status: status?,
-        headers,
-        body: Vec::new(),
-        body_len: 0,
-        stored: stored?,
-        expires: expires?,
-        policy: policy?,
-        epoch: epoch?,
-        vary,
-        _resident: None,
-    })
+    if version == "V7" && (key.is_none() || !seen_epoch) {
+        return None;
+    }
+    let status = status?;
+    if !vapache_verified::cache_store_status_admit(status)
+        || !cache_metadata_singletons_valid(&headers)
+    {
+        return None;
+    }
+    Some((
+        Entry {
+            status,
+            headers,
+            body: Vec::new(),
+            body_len: 0,
+            stored: stored?,
+            expires: expires?,
+            policy: policy?,
+            epoch: epoch?,
+            vary,
+            _resident: None,
+        },
+        key,
+    ))
+}
+
+fn decode_meta(data: &[u8]) -> Option<Entry> {
+    decode_meta_record(data).map(|(entry, _)| entry)
 }
 
 /// Return the exact cache key carried by current metadata.  Older metadata is
 /// deliberately unkeyed: it can be decoded for diagnostics, but it is never
 /// served and is removed conservatively by targeted invalidation.
 fn decode_meta_key(data: &[u8]) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(data).ok()?;
-    let mut lines = text.lines();
-    // V7 deliberately invalidates representations admitted before every
-    // Cache-Control line, qualified private/no-cache directives, malformed
-    // Vary metadata and ambiguous singleton fields failed closed.  Older
-    // entries can otherwise replay a representation the current admission
-    // policy would refuse to store.
-    if lines.next()? != "V7" {
-        return None;
-    }
-    for line in lines {
-        if let Some(encoded) = line.strip_prefix("K ") {
-            return STANDARD.decode(encoded).ok();
-        }
-    }
-    None
+    data.starts_with(b"V7\n")
+        .then(|| decode_meta_record(data)?.1)
+        .flatten()
 }
 
 /// Exercise both metadata decoders on arbitrary and truncated disk records.
@@ -5684,7 +5748,7 @@ CacheIgnoreQueryString On\n\
             )
             .as_bytes()
         )
-        .is_some());
+        .is_none());
         assert!(decode_meta(b"not-a-metadata-version\n").is_none());
         // Historical metadata remains decodable for diagnostics but can
         // never supply the exact current-format key used by disk_load. V7
@@ -5695,6 +5759,30 @@ CacheIgnoreQueryString On\n\
             STANDARD.encode([0u8; 32])
         );
         assert!(decode_meta(legacy_v4.as_bytes()).is_some());
+        assert!(decode_meta(
+            format!(
+                "V4\nS 200\nS 201\nT 1\nE 2\nP {}\nG 1\n",
+                STANDARD.encode([0u8; 32])
+            )
+            .as_bytes()
+        )
+        .is_none());
+        for (name, value) in [
+            (b"bad name".as_slice(), b"ok".as_slice()),
+            (b"x", b"a\r\nb"),
+            (b"Connection", b"close"),
+        ] {
+            assert!(decode_meta(
+                format!(
+                    "V4\nS 200\nT 1\nE 2\nP {}\nG 1\nH {} {}\n",
+                    STANDARD.encode([0u8; 32]),
+                    STANDARD.encode(name),
+                    STANDARD.encode(value)
+                )
+                .as_bytes()
+            )
+            .is_none());
+        }
         assert!(decode_meta_key(b"V4\nK YQ==\n").is_none());
         assert!(decode_meta_key(b"V5\nK YQ==\n").is_none());
         assert!(decode_meta_key(b"V6\nK YQ==\n").is_none());
