@@ -17,15 +17,27 @@ export TSAN_OPTIONS=${TSAN_OPTIONS:-halt_on_error=1:second_deadlock_stack=1}
 
 case "$sanitizer" in
     address)
-        # ASan's runtime is not fork-safe. Exercise the entire library except
-        # the test whose purpose is to fork a CGI worker.
+        # First exercise every audited syscall wrapper with the smallest
+        # possible instrumented binary, then the server's composed paths.
+        cargo +"$NIGHTLY" test -p vapache-os \
+            --target x86_64-unknown-linux-gnu -- --test-threads=1
+        # ASan's runtime is not fork-safe and its overhead intentionally
+        # violates one wall-clock progress test. Exclude only those probes;
+        # their syscall cores run in the dedicated crate above and in the
+        # ordinary/weekly suites.
         cargo +"$NIGHTLY" test -p vapached --lib --all-features \
             --target x86_64-unknown-linux-gnu -- --test-threads=1 \
-            --skip cgi::tests::child_process_and_worker_main_paths
+            --skip cgi::tests::child_process_and_worker_main_paths \
+            --skip h2::tests::progressing_h2_response_outlives_the_idle_and_send_intervals \
+            --skip rewrite::tests::maps_backrefs_and_url_helpers \
+            --skip rewrite::tests::prg_descriptor_isolation_subprocess \
+            --skip tls::tests::privileged_broker_reports_ready_only_after_descriptor_isolation
         ;;
     leak)
         # The unit-test binary intentionally owns process-global regex and
         # Loom state. Standalone integration binaries give LSan a clean exit.
+        cargo +"$NIGHTLY" test -p vapache-os \
+            --target x86_64-unknown-linux-gnu -- --test-threads=1
         cargo +"$NIGHTLY" test -p vapached --all-features \
             --test properties --test failpoints --test fault_injection \
             --target x86_64-unknown-linux-gnu -- --test-threads=1

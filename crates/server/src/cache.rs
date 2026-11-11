@@ -21,9 +21,9 @@ use std::fs::{self, File, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
@@ -1838,24 +1838,19 @@ pub fn prepare_dir(cfg: &Config, dir: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::ffi::CString;
-        if unsafe { libc::geteuid() } == 0 {
+        if vapache_os::effective_uid() == 0 {
             let user = CString::new(cfg.user.as_str()).ok(); // coverage:ignore-start - root-only ownership handoff
             let group = CString::new(cfg.group.as_str()).ok();
-            let uid = user.as_ref().and_then(|u| unsafe {
-                let pw = libc::getpwnam(u.as_ptr());
-                (!pw.is_null()).then(|| (*pw).pw_uid)
-            });
-            let gid = group.as_ref().and_then(|g| unsafe {
-                let gr = libc::getgrnam(g.as_ptr());
-                (!gr.is_null()).then(|| (*gr).gr_gid)
-            });
-            unsafe {
-                if let Some(uid) = uid {
-                    let gid = gid.unwrap_or(u32::MAX);
-                    let _ = libc::fchown(opened.as_raw_fd(), uid, gid);
-                }
-                let _ = libc::fchmod(opened.as_raw_fd(), 0o770); // coverage:ignore-stop
+            let uid = user
+                .as_deref()
+                .and_then(|value| vapache_os::lookup_user_id(value).ok());
+            let gid = group
+                .as_deref()
+                .and_then(|value| vapache_os::lookup_group_id(value).ok());
+            if let Some(uid) = uid {
+                let _ = vapache_os::fchown_optional(opened.as_fd(), Some(uid), gid);
             }
+            let _ = vapache_os::fchmod(opened.as_fd(), 0o770); // coverage:ignore-stop
         }
     }
 }
@@ -3324,342 +3319,343 @@ AddHandler cgi-script .cgi\n\
             |scope: &Scope| cache_policy_fingerprint(scope, &request, peer, target, false);
         let baseline = fingerprint(&Scope::default());
 
-        let cases: Vec<(&str, fn(&mut Scope))> =
-            vec![
-                ("options.changes", |s| s.options.push_add(1)),
-                ("override.mode", |s| {
-                    s.override_policy.set_mode(crate::config::OverrideMode::All)
-                }),
-                ("override.allow_list", |s| {
-                    s.override_policy.set_allow_list(vec!["Require".into()])
-                }),
-                ("override.nonfatal", |s| {
-                    s.override_policy
-                        .set_nonfatal(crate::config::NonfatalMode::All)
-                }),
-                ("authorization.requires", |s| {
-                    s.authorization.add_require(
-                        crate::config::RequireNode::Provider(crate::config::Require::AllGranted),
-                        None,
-                    )
-                }),
-                ("authorization.auth_merging", |s| {
-                    s.authorization.auth_merging = Some(crate::config::AuthMerging::And)
-                }),
-                ("authorization.allow_methods", |s| {
-                    s.authorization.allow_methods = Some(crate::config::AllowMethods::Reset)
-                }),
-                ("authorization.legacy", |s| {
-                    s.authorization.legacy = Some(crate::config::LegacyAccess::default())
-                }),
-                ("authorization.auth_type", |s| {
-                    s.authorization.auth_type = Some("basic".into())
-                }),
-                ("authorization.auth_name", |s| {
-                    s.authorization.auth_name = Some("realm".into())
-                }),
-                ("authorization.auth_user_file", |s| {
-                    s.authorization.auth_user_file = Some("/tmp/users".into())
-                }),
-                ("authorization.auth_group_file", |s| {
-                    s.authorization.auth_group_file = Some("/tmp/groups".into())
-                }),
-                ("header.add_headers", |s| {
-                    s.header_policy.add_headers.push(("X-A".into(), "1".into()))
-                }),
-                ("header.set_headers", |s| {
-                    s.header_policy.set_headers.push(("X-A".into(), "1".into()))
-                }),
-                ("header.unset_headers", |s| {
-                    s.header_policy.unset_headers.push("X-A".into())
-                }),
-                ("header.always_add_headers", |s| {
-                    s.header_policy
-                        .always_add_headers
-                        .push(("X-A".into(), "1".into()))
-                }),
-                ("header.always_set_headers", |s| {
-                    s.header_policy
-                        .always_set_headers
-                        .push(("X-A".into(), "1".into()))
-                }),
-                ("header.always_unset_headers", |s| {
-                    s.header_policy.always_unset_headers.push("X-A".into())
-                }),
-                ("header.expires_active", |s| {
-                    s.header_policy.expires_active = Some(true)
-                }),
-                ("header.expires_default", |s| {
-                    s.header_policy.expires_default = Some("access plus 1 hour".into())
-                }),
-                ("header.expires_by_type", |s| {
-                    s.header_policy
-                        .expires_by_type
-                        .push(("text/html".into(), "access plus 1 hour".into()))
-                }),
-                ("header.cookies", |s| {
-                    s.header_policy.cookies.push("session".into())
-                }),
-                ("header.vary", |s| {
-                    s.header_policy.vary.push("Accept".into())
-                }),
-                ("content.document_root", |s| {
-                    s.content_policy.document_root = Some("/srv".into())
-                }),
-                ("content.directory_index", |s| {
-                    s.content_policy.directory_index = Some(vec!["index.html".into()])
-                }),
-                ("content.index_ignore", |s| {
-                    s.content_policy.index_ignore.push("*.secret".into())
-                }),
-                ("content.default_charset", |s| {
-                    s.content_policy.default_charset = Some("utf-8".into())
-                }),
-                ("content.file_etag", |s| {
-                    s.content_policy.file_etag = Some(1)
-                }),
-                ("content.enable_sendfile", |s| {
-                    s.content_policy.enable_sendfile = Some(true)
-                }),
-                ("content.directory_slash", |s| {
-                    s.content_policy.directory_slash = Some(false)
-                }),
-                ("content.add_types", |s| {
-                    s.content_policy
-                        .add_types
-                        .push(("text/plain".into(), ".txt".into()))
-                }),
-                ("content.remove_types", |s| {
-                    s.content_policy.remove_types.push(".txt".into())
-                }),
-                ("content.force_type", |s| {
-                    s.content_policy.force_type = Some("text/plain".into())
-                }),
-                ("content.access_file_names", |s| {
-                    s.content_policy.access_file_names = Some(vec![".htaccess".into()])
-                }),
-                ("mapping.aliases", |s| {
-                    s.mapping_policy.aliases.push(crate::config::Alias::prefix(
-                        "/x".into(),
-                        "/srv/x".into(),
-                        false,
-                    ))
-                }),
-                ("mapping.redirects", |s| {
-                    s.mapping_policy.redirects.push(crate::config::Redirect {
-                        from: "/x".into(),
-                        to: "/y".into(),
-                        status: 302,
-                        regex: None,
-                    })
-                }),
-                ("mapping.handlers", |s| {
-                    s.mapping_policy
-                        .handlers
-                        .push(crate::config::Handler::add(".x".into(), "handler".into()))
-                }),
-                ("mapping.unsupported_filters", |s| {
-                    s.mapping_policy.unsupported_filters.push("INCLUDES".into())
-                }),
-                ("error.documents", |s| {
-                    s.error_policy
-                        .push(404, crate::config::ErrorDoc::Text("missing".into()))
-                }),
-                ("environment.set_env", |s| {
-                    s.environment_policy
-                        .set_env
-                        .push(crate::scope_policy::Originated::main((
-                            "A".into(),
-                            "1".into(),
-                        )))
-                }),
-                ("environment.cgi_pass_auth", |s| {
-                    s.environment_policy.cgi_pass_auth = Some(true)
-                }),
-                ("environment.rewrite_env", |s| {
-                    s.environment_policy
-                        .rewrite_env
-                        .push(crate::scope_policy::Originated::main((
-                            "EARLY".into(),
-                            b"1".to_vec(),
-                        )))
-                }),
-                ("environment.rewrite_unset_env", |s| {
-                    s.environment_policy
-                        .rewrite_unset_env
-                        .push(crate::scope_policy::Originated::main("EARLY".into()))
-                }),
-                ("environment.rewrite_late_env", |s| {
-                    s.environment_policy.rewrite_late_env.push(
-                        crate::scope_policy::Originated::main(("LATE".into(), b"1".to_vec())),
-                    )
-                }),
-                ("environment.rewrite_late_unset_env", |s| {
-                    s.environment_policy
-                        .rewrite_late_unset_env
-                        .push(crate::scope_policy::Originated::main("LATE".into()))
-                }),
-                ("environment.access_rewrite_env", |s| {
-                    s.environment_policy.rewrite_late_env.push(
-                        crate::scope_policy::Originated::access(("ACCESS".into(), b"1".to_vec())),
-                    )
-                }),
-                ("environment.access_rewrite_unset_env", |s| {
-                    s.environment_policy
-                        .rewrite_late_unset_env
-                        .push(crate::scope_policy::Originated::access("ACCESS".into()))
-                }),
-                ("environment.unset_env", |s| {
-                    s.environment_policy
-                        .unset_env
-                        .push(crate::scope_policy::Originated::main("A".into()))
-                }),
-                ("environment.pass_env", |s| {
-                    s.environment_policy
-                        .pass_env
-                        .push(crate::scope_policy::Originated::main("PATH".into()))
-                }),
-                ("environment.set_env_if", |s| {
-                    s.environment_policy
-                        .set_env_if
-                        .push(crate::scope_policy::Originated::main(
-                            crate::config::parse_env_rule(
-                                "SetEnvIf",
-                                &["X-Test".into(), "yes".into(), "A=1".into()],
-                            )
-                            .unwrap(),
-                        ))
-                }),
-                ("environment.access_set_env", |s| {
-                    s.environment_policy
-                        .set_env
-                        .push(crate::scope_policy::Originated::access((
-                            "A".into(),
-                            "1".into(),
-                        )))
-                }),
-                ("environment.access_unset_env", |s| {
-                    s.environment_policy
-                        .unset_env
-                        .push(crate::scope_policy::Originated::access("A".into()))
-                }),
-                ("environment.access_pass_env", |s| {
-                    s.environment_policy
-                        .pass_env
-                        .push(crate::scope_policy::Originated::access("PATH".into()))
-                }),
-                ("environment.access_set_env_if", |s| {
-                    s.environment_policy
-                        .set_env_if
-                        .push(crate::scope_policy::Originated::access(
-                            crate::config::parse_env_rule(
-                                "SetEnvIf",
-                                &["X-Test".into(), "yes".into(), "A=1".into()],
-                            )
-                            .unwrap(),
-                        ))
-                }),
-                ("rewrite.engine", |s| {
-                    s.rewrite_policy.rewrite_engine = Some(true)
-                }),
-                ("rewrite.maps", |s| {
-                    s.rewrite_policy.rewrite_maps.push((
-                        "m".into(),
-                        crate::config::RewriteMap::Txt(std::collections::HashMap::from([(
-                            "a".into(),
-                            "b".into(),
-                        )])),
-                    ))
-                }),
-                ("rewrite.cache_enable", |s| {
-                    s.rewrite_policy
-                        .cache_enable
-                        .push(("/".into(), "disk".into()))
-                }),
-                ("rewrite.cache_disable", |s| {
-                    s.rewrite_policy.cache_disable.push("/private".into())
-                }),
-                ("rewrite.inherit", |s| {
-                    s.rewrite_policy.rewrite_inherit = Some(true)
-                }),
-                ("rewrite.base", |s| {
-                    s.rewrite_policy.rewrite_base = Some("/base/".into())
-                }),
-                ("rewrite.match_base", |s| {
-                    s.rewrite_policy.rewrite_match_base = Some("/match/".into())
-                }),
-                ("rewrite.rules", |s| {
-                    s.rewrite_policy.rewrite_rules.push(
-                        crate::config::parse_rewrite_rule(
-                            &["^/x$".into(), "/y".into(), "[L]".into()],
-                            "/",
-                            false,
+        let cases: Vec<(&str, fn(&mut Scope))> = vec![
+            ("options.changes", |s| s.options.push_add(1)),
+            ("override.mode", |s| {
+                s.override_policy.set_mode(crate::config::OverrideMode::All)
+            }),
+            ("override.allow_list", |s| {
+                s.override_policy.set_allow_list(vec!["Require".into()])
+            }),
+            ("override.nonfatal", |s| {
+                s.override_policy
+                    .set_nonfatal(crate::config::NonfatalMode::All)
+            }),
+            ("authorization.requires", |s| {
+                s.authorization.add_require(
+                    crate::config::RequireNode::Provider(crate::config::Require::AllGranted),
+                    None,
+                )
+            }),
+            ("authorization.auth_merging", |s| {
+                s.authorization.auth_merging = Some(crate::config::AuthMerging::And)
+            }),
+            ("authorization.allow_methods", |s| {
+                s.authorization.allow_methods = Some(crate::config::AllowMethods::Reset)
+            }),
+            ("authorization.legacy", |s| {
+                s.authorization.legacy = Some(crate::config::LegacyAccess::default())
+            }),
+            ("authorization.auth_type", |s| {
+                s.authorization.auth_type = Some("basic".into())
+            }),
+            ("authorization.auth_name", |s| {
+                s.authorization.auth_name = Some("realm".into())
+            }),
+            ("authorization.auth_user_file", |s| {
+                s.authorization.auth_user_file = Some("/tmp/users".into())
+            }),
+            ("authorization.auth_group_file", |s| {
+                s.authorization.auth_group_file = Some("/tmp/groups".into())
+            }),
+            ("header.add_headers", |s| {
+                s.header_policy.add_headers.push(("X-A".into(), "1".into()))
+            }),
+            ("header.set_headers", |s| {
+                s.header_policy.set_headers.push(("X-A".into(), "1".into()))
+            }),
+            ("header.unset_headers", |s| {
+                s.header_policy.unset_headers.push("X-A".into())
+            }),
+            ("header.always_add_headers", |s| {
+                s.header_policy
+                    .always_add_headers
+                    .push(("X-A".into(), "1".into()))
+            }),
+            ("header.always_set_headers", |s| {
+                s.header_policy
+                    .always_set_headers
+                    .push(("X-A".into(), "1".into()))
+            }),
+            ("header.always_unset_headers", |s| {
+                s.header_policy.always_unset_headers.push("X-A".into())
+            }),
+            ("header.expires_active", |s| {
+                s.header_policy.expires_active = Some(true)
+            }),
+            ("header.expires_default", |s| {
+                s.header_policy.expires_default = Some("access plus 1 hour".into())
+            }),
+            ("header.expires_by_type", |s| {
+                s.header_policy
+                    .expires_by_type
+                    .push(("text/html".into(), "access plus 1 hour".into()))
+            }),
+            ("header.cookies", |s| {
+                s.header_policy.cookies.push("session".into())
+            }),
+            ("header.vary", |s| {
+                s.header_policy.vary.push("Accept".into())
+            }),
+            ("content.document_root", |s| {
+                s.content_policy.document_root = Some("/srv".into())
+            }),
+            ("content.directory_index", |s| {
+                s.content_policy.directory_index = Some(vec!["index.html".into()])
+            }),
+            ("content.index_ignore", |s| {
+                s.content_policy.index_ignore.push("*.secret".into())
+            }),
+            ("content.default_charset", |s| {
+                s.content_policy.default_charset = Some("utf-8".into())
+            }),
+            ("content.file_etag", |s| {
+                s.content_policy.file_etag = Some(1)
+            }),
+            ("content.enable_sendfile", |s| {
+                s.content_policy.enable_sendfile = Some(true)
+            }),
+            ("content.directory_slash", |s| {
+                s.content_policy.directory_slash = Some(false)
+            }),
+            ("content.add_types", |s| {
+                s.content_policy
+                    .add_types
+                    .push(("text/plain".into(), ".txt".into()))
+            }),
+            ("content.remove_types", |s| {
+                s.content_policy.remove_types.push(".txt".into())
+            }),
+            ("content.force_type", |s| {
+                s.content_policy.force_type = Some("text/plain".into())
+            }),
+            ("content.access_file_names", |s| {
+                s.content_policy.access_file_names = Some(vec![".htaccess".into()])
+            }),
+            ("mapping.aliases", |s| {
+                s.mapping_policy.aliases.push(crate::config::Alias::prefix(
+                    "/x".into(),
+                    "/srv/x".into(),
+                    false,
+                ))
+            }),
+            ("mapping.redirects", |s| {
+                s.mapping_policy.redirects.push(crate::config::Redirect {
+                    from: "/x".into(),
+                    to: "/y".into(),
+                    status: 302,
+                    regex: None,
+                })
+            }),
+            ("mapping.handlers", |s| {
+                s.mapping_policy
+                    .handlers
+                    .push(crate::config::Handler::add(".x".into(), "handler".into()))
+            }),
+            ("mapping.unsupported_filters", |s| {
+                s.mapping_policy.unsupported_filters.push("INCLUDES".into())
+            }),
+            ("error.documents", |s| {
+                s.error_policy
+                    .push(404, crate::config::ErrorDoc::Text("missing".into()))
+            }),
+            ("environment.set_env", |s| {
+                s.environment_policy
+                    .set_env
+                    .push(crate::scope_policy::Originated::main((
+                        "A".into(),
+                        "1".into(),
+                    )))
+            }),
+            ("environment.cgi_pass_auth", |s| {
+                s.environment_policy.cgi_pass_auth = Some(true)
+            }),
+            ("environment.rewrite_env", |s| {
+                s.environment_policy
+                    .rewrite_env
+                    .push(crate::scope_policy::Originated::main((
+                        "EARLY".into(),
+                        b"1".to_vec(),
+                    )))
+            }),
+            ("environment.rewrite_unset_env", |s| {
+                s.environment_policy
+                    .rewrite_unset_env
+                    .push(crate::scope_policy::Originated::main("EARLY".into()))
+            }),
+            ("environment.rewrite_late_env", |s| {
+                s.environment_policy
+                    .rewrite_late_env
+                    .push(crate::scope_policy::Originated::main((
+                        "LATE".into(),
+                        b"1".to_vec(),
+                    )))
+            }),
+            ("environment.rewrite_late_unset_env", |s| {
+                s.environment_policy
+                    .rewrite_late_unset_env
+                    .push(crate::scope_policy::Originated::main("LATE".into()))
+            }),
+            ("environment.access_rewrite_env", |s| {
+                s.environment_policy
+                    .rewrite_late_env
+                    .push(crate::scope_policy::Originated::access((
+                        "ACCESS".into(),
+                        b"1".to_vec(),
+                    )))
+            }),
+            ("environment.access_rewrite_unset_env", |s| {
+                s.environment_policy
+                    .rewrite_late_unset_env
+                    .push(crate::scope_policy::Originated::access("ACCESS".into()))
+            }),
+            ("environment.unset_env", |s| {
+                s.environment_policy
+                    .unset_env
+                    .push(crate::scope_policy::Originated::main("A".into()))
+            }),
+            ("environment.pass_env", |s| {
+                s.environment_policy
+                    .pass_env
+                    .push(crate::scope_policy::Originated::main("PATH".into()))
+            }),
+            ("environment.set_env_if", |s| {
+                s.environment_policy
+                    .set_env_if
+                    .push(crate::scope_policy::Originated::main(
+                        crate::config::parse_env_rule(
+                            "SetEnvIf",
+                            &["X-Test".into(), "yes".into(), "A=1".into()],
                         )
                         .unwrap(),
-                    )
-                }),
-                ("rewrite.pending_conds", |s| {
-                    s.rewrite_policy.pending_rewrite_conds.push(
-                        crate::config::parse_rewrite_cond(&[
-                            "%{REQUEST_URI}".into(),
-                            "^/x$".into(),
-                        ])
+                    ))
+            }),
+            ("environment.access_set_env", |s| {
+                s.environment_policy
+                    .set_env
+                    .push(crate::scope_policy::Originated::access((
+                        "A".into(),
+                        "1".into(),
+                    )))
+            }),
+            ("environment.access_unset_env", |s| {
+                s.environment_policy
+                    .unset_env
+                    .push(crate::scope_policy::Originated::access("A".into()))
+            }),
+            ("environment.access_pass_env", |s| {
+                s.environment_policy
+                    .pass_env
+                    .push(crate::scope_policy::Originated::access("PATH".into()))
+            }),
+            ("environment.access_set_env_if", |s| {
+                s.environment_policy
+                    .set_env_if
+                    .push(crate::scope_policy::Originated::access(
+                        crate::config::parse_env_rule(
+                            "SetEnvIf",
+                            &["X-Test".into(), "yes".into(), "A=1".into()],
+                        )
                         .unwrap(),
+                    ))
+            }),
+            ("rewrite.engine", |s| {
+                s.rewrite_policy.rewrite_engine = Some(true)
+            }),
+            ("rewrite.maps", |s| {
+                s.rewrite_policy.rewrite_maps.push((
+                    "m".into(),
+                    crate::config::RewriteMap::Txt(std::collections::HashMap::from([(
+                        "a".into(),
+                        "b".into(),
+                    )])),
+                ))
+            }),
+            ("rewrite.cache_enable", |s| {
+                s.rewrite_policy
+                    .cache_enable
+                    .push(("/".into(), "disk".into()))
+            }),
+            ("rewrite.cache_disable", |s| {
+                s.rewrite_policy.cache_disable.push("/private".into())
+            }),
+            ("rewrite.inherit", |s| {
+                s.rewrite_policy.rewrite_inherit = Some(true)
+            }),
+            ("rewrite.base", |s| {
+                s.rewrite_policy.rewrite_base = Some("/base/".into())
+            }),
+            ("rewrite.match_base", |s| {
+                s.rewrite_policy.rewrite_match_base = Some("/match/".into())
+            }),
+            ("rewrite.rules", |s| {
+                s.rewrite_policy.rewrite_rules.push(
+                    crate::config::parse_rewrite_rule(
+                        &["^/x$".into(), "/y".into(), "[L]".into()],
+                        "/",
+                        false,
                     )
-                }),
-                ("compression.rules", |s| {
-                    s.compression_policy.compression_rules.push(
-                        crate::config::CompressionRule::Set(vec![
-                            crate::config::CompressionKind::Gzip,
-                        ]),
-                    )
-                }),
-                ("compression.deflate_level", |s| {
-                    s.compression_policy.deflate_level = Some(6)
-                }),
-                ("compression.brotli_quality", |s| {
-                    s.compression_policy.brotli_quality = Some(5)
-                }),
-                ("compression.deflate_alter_etag", |s| {
-                    s.compression_policy.deflate_alter_etag =
-                        Some(crate::config::AlterEtag::AddSuffix)
-                }),
-                ("compression.brotli_alter_etag", |s| {
-                    s.compression_policy.brotli_alter_etag = Some(crate::config::AlterEtag::Remove)
-                }),
-                ("proxy.rules", |s| {
-                    s.proxy_policy.proxy_rules.push(crate::config::ProxyRule {
-                        pattern: std::sync::Arc::new(crate::apache_regex::Regex::new("^/x$").unwrap()),
+                    .unwrap(),
+                )
+            }),
+            ("rewrite.pending_conds", |s| {
+                s.rewrite_policy.pending_rewrite_conds.push(
+                    crate::config::parse_rewrite_cond(&["%{REQUEST_URI}".into(), "^/x$".into()])
+                        .unwrap(),
+                )
+            }),
+            ("compression.rules", |s| {
+                s.compression_policy
+                    .compression_rules
+                    .push(crate::config::CompressionRule::Set(vec![
+                        crate::config::CompressionKind::Gzip,
+                    ]))
+            }),
+            ("compression.deflate_level", |s| {
+                s.compression_policy.deflate_level = Some(6)
+            }),
+            ("compression.brotli_quality", |s| {
+                s.compression_policy.brotli_quality = Some(5)
+            }),
+            ("compression.deflate_alter_etag", |s| {
+                s.compression_policy.deflate_alter_etag = Some(crate::config::AlterEtag::AddSuffix)
+            }),
+            ("compression.brotli_alter_etag", |s| {
+                s.compression_policy.brotli_alter_etag = Some(crate::config::AlterEtag::Remove)
+            }),
+            ("proxy.rules", |s| {
+                s.proxy_policy.proxy_rules.push(crate::config::ProxyRule {
+                    pattern: std::sync::Arc::new(crate::apache_regex::Regex::new("^/x$").unwrap()),
+                    backend: "http://127.0.0.1:9000/".into(),
+                    route_order: 0,
+                })
+            }),
+            ("proxy.passes", |s| {
+                s.proxy_policy
+                    .proxy_passes
+                    .push(crate::config::ProxyPassRule {
+                        prefix: "/x".into(),
                         backend: "http://127.0.0.1:9000/".into(),
+                        sticky_cookie: None,
+                        fail_on_status: Vec::new(),
                         route_order: 0,
                     })
-                }),
-                ("proxy.passes", |s| {
-                    s.proxy_policy
-                        .proxy_passes
-                        .push(crate::config::ProxyPassRule {
-                            prefix: "/x".into(),
-                            backend: "http://127.0.0.1:9000/".into(),
-                            sticky_cookie: None,
-                            fail_on_status: Vec::new(),
-                            route_order: 0,
-                        })
-                }),
-                ("proxy.reverses", |s| {
-                    s.proxy_policy
-                        .proxy_reverses
-                        .push(crate::config::ProxyReverseRule {
-                            front: "/x".into(),
-                            backend: "http://127.0.0.1:9000/".into(),
-                        })
-                }),
-                ("proxy.preserve_host", |s| {
-                    s.proxy_policy.preserve_host = Some(true)
-                }),
-                ("proxy.ca_file", |s| {
-                    s.proxy_policy.proxy_ca_file = Some("/tmp/ca.pem".into())
-                }),
-            ];
+            }),
+            ("proxy.reverses", |s| {
+                s.proxy_policy
+                    .proxy_reverses
+                    .push(crate::config::ProxyReverseRule {
+                        front: "/x".into(),
+                        backend: "http://127.0.0.1:9000/".into(),
+                    })
+            }),
+            ("proxy.preserve_host", |s| {
+                s.proxy_policy.preserve_host = Some(true)
+            }),
+            ("proxy.ca_file", |s| {
+                s.proxy_policy.proxy_ca_file = Some("/tmp/ca.pem".into())
+            }),
+        ];
 
         for (name, mutate) in cases {
             let mut scope = Scope::default();

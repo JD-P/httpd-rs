@@ -17,9 +17,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -697,8 +696,8 @@ pub fn init_pool(cfg: &Config) -> Result<(), String> {
 
 fn worker_ids(user: &str, group: &str) -> Result<(u32, u32), String> {
     worker_ids_for(
-        unsafe { libc::geteuid() },
-        unsafe { libc::getegid() },
+        vapache_os::effective_uid(),
+        vapache_os::effective_gid(),
         user,
         group,
     )
@@ -712,59 +711,19 @@ fn worker_ids_for(euid: u32, egid: u32, user: &str, group: &str) -> Result<(u32,
         n
     } else {
         let cuser = std::ffi::CString::new(user).map_err(|_| "invalid CGI user".to_string())?;
-        let pw = unsafe { libc::getpwnam(cuser.as_ptr()) };
-        if pw.is_null() {
-            return Err(format!("CGI user '{user}' not found"));
-        }
-        unsafe { (*pw).pw_uid }
+        vapache_os::lookup_user_id(&cuser).map_err(|_| format!("CGI user '{user}' not found"))?
     };
     let gid = if let Ok(n) = group.parse::<u32>() {
         n
     } else {
         let cgroup = std::ffi::CString::new(group).map_err(|_| "invalid CGI group".to_string())?;
-        let gr = unsafe { libc::getgrnam(cgroup.as_ptr()) };
-        if gr.is_null() {
-            return Err(format!("CGI group '{group}' not found"));
-        }
-        unsafe { (*gr).gr_gid }
+        vapache_os::lookup_group_id(&cgroup)
+            .map_err(|_| format!("CGI group '{group}' not found"))?
     };
     if uid == 0 || gid == 0 {
         return Err("refusing to run CGI workers as root user/group".into());
     }
     Ok((uid, gid))
-}
-
-fn prepare_worker_fd(child_fd: i32, target: i32, parent_pid: libc::pid_t) -> std::io::Result<()> {
-    crate::process::bind_to_parent(parent_pid)?;
-    crate::process::cloexec_unrelated_descriptors()?;
-    if unsafe { libc::dup2(child_fd, target) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    crate::process::set_cloexec(target, false)
-}
-
-fn child_process_setup(
-    timeout: Duration,
-    retained_fd: Option<i32>,
-    parent_pid: libc::pid_t,
-) -> std::io::Result<()> {
-    crate::process::bind_to_parent(parent_pid)?;
-    crate::process::cloexec_unrelated_descriptors()?;
-    if let Some(fd) = retained_fd {
-        crate::process::set_cloexec(fd, false)?;
-    }
-    unsafe {
-        if libc::setsid() < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        libc::umask(0o022);
-    }
-    crate::process::no_new_privileges()?;
-    crate::process::disable_dumping()?;
-    crate::process::set_limit(libc::RLIMIT_CPU, timeout.as_secs().max(1))?;
-    crate::process::set_limit(libc::RLIMIT_FSIZE, MAX_OUTPUT as u64)?;
-    crate::process::set_limit(libc::RLIMIT_NOFILE, 128)?;
-    Ok(())
 }
 
 fn start_pool(uid: u32, gid: u32, user: &str) -> Result<CgiPool, String> {
@@ -785,7 +744,7 @@ fn start_pool_with_exe(
     user: &str,
     count: usize,
 ) -> Result<CgiPool, String> {
-    let parent_pid = unsafe { libc::getpid() };
+    let parent_pid = vapache_os::current_pid();
     let mut workers = Vec::with_capacity(count);
     for _ in 0..count {
         match start_pool_worker(exe, uid, gid, user, parent_pid) {
@@ -839,9 +798,9 @@ fn start_pool_worker(
     }
     // Keep the descriptor across this exec (the worker needs it). The worker
     // sets FD_CLOEXEC itself before spawning scripts.
-    unsafe {
-        cmd.pre_exec(move || prepare_worker_fd(child_fd, WORKER_FD, parent_pid));
-    }
+    let mut setup = vapache_os::ChildSetup::inherited(parent_pid);
+    setup.duplicate_fd = Some((child_fd, WORKER_FD));
+    vapache_os::configure_child(&mut cmd, setup);
     crate::fault::hit("cgi.worker.spawn").map_err(|e| format!("cannot spawn CGI worker: {e}"))?;
     let proc = cmd
         .spawn()
@@ -868,8 +827,8 @@ fn start_pool_worker(
 
 fn drop_worker_privileges(uid: u32, gid: u32, user: &str) -> bool {
     drop_worker_privileges_for(
-        unsafe { libc::geteuid() },
-        unsafe { libc::getegid() },
+        vapache_os::effective_uid(),
+        vapache_os::effective_gid(),
         uid,
         gid,
         user,
@@ -886,36 +845,28 @@ fn drop_worker_privileges_for(euid: u32, egid: u32, uid: u32, gid: u32, user: &s
     if !init_worker_groups(user, gid) {
         return false;
     }
-    unsafe {
-        if libc::setresgid(gid, gid, gid) != 0 || libc::setresuid(uid, uid, uid) != 0 {
-            return false;
-        }
-    }
-    true
+    vapache_os::set_res_gid(gid).is_ok() && vapache_os::set_res_uid(uid).is_ok()
 }
 
 fn init_worker_groups(user: &str, gid: u32) -> bool {
     if user.parse::<u32>().is_ok() {
-        return unsafe { libc::setgroups(0, std::ptr::null()) == 0 };
+        return vapache_os::clear_supplementary_groups().is_ok();
     }
     let Ok(cuser) = std::ffi::CString::new(user) else {
         return false;
     };
-    let pw = unsafe { libc::getpwnam(cuser.as_ptr()) };
-    if pw.is_null() {
-        return false;
-    }
-    unsafe { libc::initgroups(cuser.as_ptr(), gid as libc::gid_t) == 0 }
+    vapache_os::initialize_supplementary_groups(&cuser, gid).is_ok()
 }
 
 /// CGI worker process entry point.  It is spawned once per pool slot and is
 /// deliberately tiny and single-threaded until it has completed a request, so
 /// fork/exec avoids copying the main server's address space and TLB entries.
 pub fn worker_main(fd: i32, uid: u32, gid: u32, user: &str, parent_pid: libc::pid_t) {
-    if crate::process::bind_to_parent(parent_pid).is_err() || unsafe { libc::setsid() } < 0 {
+    if crate::process::bind_to_parent(parent_pid).is_err() || vapache_os::create_session().is_err()
+    {
         std::process::exit(1);
     }
-    unsafe { libc::umask(0o022) };
+    vapache_os::set_umask(0o022);
     if !drop_worker_privileges(uid, gid, user) {
         std::process::exit(1);
     }
@@ -941,10 +892,7 @@ pub fn worker_main(fd: i32, uid: u32, gid: u32, user: &str, parent_pid: libc::pi
 }
 
 fn stream_from_fd(fd: i32) -> Option<UnixStream> {
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-        return None;
-    }
-    Some(unsafe { UnixStream::from_raw_fd(fd) })
+    vapache_os::claim_inherited_unix_stream(fd).ok()
 }
 
 fn worker_request(stream: &mut UnixStream) -> Result<bool, String> {
@@ -1258,7 +1206,7 @@ fn read_bytes_budgeted(
 
 fn inheritable_fd_path(file: &File) -> Result<PathBuf, String> {
     let fd = file.as_raw_fd();
-    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+    if !vapache_os::raw_fd_is_open(fd) {
         return Err("cannot inspect CGI script descriptor".into());
     }
     Ok(PathBuf::from(format!("/proc/self/fd/{fd}")))
@@ -1390,10 +1338,16 @@ fn run_local(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let parent_pid = unsafe { libc::getpid() };
-    unsafe {
-        cmd.pre_exec(move || child_process_setup(timeout, retained_fd, parent_pid));
-    }
+    let mut setup = vapache_os::ChildSetup::inherited(vapache_os::current_pid());
+    setup.retained_fd = retained_fd;
+    setup.create_session = true;
+    setup.umask = Some(0o022);
+    setup.no_new_privileges = true;
+    setup.disable_dumping = true;
+    setup.cpu_seconds = Some(timeout.as_secs().max(1));
+    setup.file_size = Some(MAX_OUTPUT as u64);
+    setup.open_files = Some(128);
+    vapache_os::configure_child(&mut cmd, setup);
     let spawn_result = crate::fault::hit("cgi.spawn")
         .map_err(|e| format!("cannot execute {}: {e}", path.display()))
         .and_then(|()| {
@@ -1465,10 +1419,8 @@ fn run_local(
 }
 
 fn kill_group(pid: i32) {
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-        libc::kill(pid, libc::SIGKILL);
-    }
+    let _ = vapache_os::kill(-pid, libc::SIGKILL);
+    let _ = vapache_os::kill(pid, libc::SIGKILL);
 }
 
 fn wait_with_deadline(
@@ -1559,14 +1511,9 @@ fn read_limited_with_deadline(
             return Err("CGI timeout".into());
         }
         let remaining = deadline.saturating_duration_since(now);
-        let wait_ms = remaining.as_millis().min(100) as i32;
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
-        if !poll_result(rc, std::io::Error::last_os_error())? {
+        let wait = remaining.min(Duration::from_millis(100));
+        let ready = vapache_os::poll_readable_raw(fd, wait).map_err(|error| error.to_string())?;
+        if !ready {
             continue;
         }
         match crate::fault::hit("cgi.output.read").and_then(|()| reader.read(&mut chunk)) {
@@ -1829,6 +1776,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::io::Cursor;
+    use std::os::fd::OwnedFd;
 
     fn tempdir(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("vapache-cgi-{}-{name}", std::process::id()));
@@ -2491,14 +2439,17 @@ mod tests {
         }
     }
 
-    fn closed_file(path: &Path) -> File {
-        // Keep the path argument so tests read as "the authorized file is
-        // closed", but return a deterministic invalid descriptor.  Closing a
-        // real high descriptor and handing its number to another thread lets a
-        // parallel test reuse that fd before fcntl() runs, which made the
-        // bad-descriptor assertions flaky.
-        let _ = File::open(path).unwrap();
-        unsafe { File::from_raw_fd(i32::MAX) }
+    fn unreadable_file(path: &Path) -> File {
+        // A directory is a valid, uniquely owned descriptor but fails ordinary
+        // file reads and executable handoff. This exercises error handling
+        // without violating Rust's I/O-safety contract with a fabricated fd.
+        File::open(path.parent().expect("fixture has a parent")).unwrap()
+    }
+
+    fn unseekable_file() -> File {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        File::from(OwnedFd::from(stream))
     }
 
     fn response_header<'a>(resp: &'a Response, name: &str) -> Option<&'a [u8]> {
@@ -2633,8 +2584,8 @@ mod tests {
         let missing = test_ctx(&cfg, &req, &dir, Path::new("missing.sh"), None);
         assert_eq!(execute(&missing).status, 500);
 
-        let bad_file = std::mem::ManuallyDrop::new(closed_file(&dir.join("stderr.sh")));
-        let bad = test_ctx(&cfg, &req, &dir, Path::new("stderr.sh"), Some(&*bad_file));
+        let bad_file = unreadable_file(&dir.join("stderr.sh"));
+        let bad = test_ctx(&cfg, &req, &dir, Path::new("stderr.sh"), Some(&bad_file));
         assert_eq!(execute(&bad).status, 500);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2767,7 +2718,8 @@ mod tests {
         assert!(pid >= 0);
         if pid == 0 {
             let parent_pid = unsafe { libc::getppid() };
-            let ok = prepare_worker_fd(child.as_raw_fd(), 99, parent_pid).is_ok();
+            let ok =
+                vapache_os::prepare_inherited_worker_fd(child.as_raw_fd(), 99, parent_pid).is_ok();
             unsafe { libc::_exit(if ok { 0 } else { 1 }) };
         }
         let mut status = 0;
@@ -2917,8 +2869,7 @@ mod tests {
         assert!(init_pool(&cfg).is_ok());
         shutdown_pool();
 
-        let bad =
-            std::mem::ManuallyDrop::new(BodySource::File(closed_file(&dir.join("httpd.conf"))));
+        let bad = BodySource::File(unseekable_file());
         let (stream, _peer) = UnixStream::pair().unwrap();
         let mut child = Command::new("/bin/cat")
             .stdin(Stdio::piped())
@@ -3056,8 +3007,8 @@ mod tests {
             "ok.sh",
             "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nok\\n'\n",
         );
-        let closed = std::mem::ManuallyDrop::new(closed_file(&path));
-        assert!(inheritable_fd_path(&closed).is_err());
+        let unreadable = unreadable_file(&path);
+        assert!(inheritable_fd_path(&unreadable).is_ok());
         assert!(run_local(
             &path,
             &dir,
@@ -3186,9 +3137,15 @@ mod tests {
     fn child_process_and_worker_main_paths() {
         let pid = unsafe { libc::fork() };
         if pid == 0 {
-            let setup =
-                child_process_setup(Duration::from_secs(1), None, unsafe { libc::getppid() })
-                    .is_ok();
+            let mut profile = vapache_os::ChildSetup::inherited(unsafe { libc::getppid() });
+            profile.create_session = true;
+            profile.umask = Some(0o022);
+            profile.no_new_privileges = true;
+            profile.disable_dumping = true;
+            profile.cpu_seconds = Some(1);
+            profile.file_size = Some(MAX_OUTPUT as u64);
+            profile.open_files = Some(128);
+            let setup = vapache_os::setup_current_child(profile).is_ok();
             let euid = unsafe { libc::geteuid() };
             let egid = unsafe { libc::getegid() };
             let (uid, gid, user) = if euid == 0 {

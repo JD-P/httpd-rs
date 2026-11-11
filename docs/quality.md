@@ -138,10 +138,33 @@ runtime.
 
 ## Unsafe and dependency boundaries
 
-`unsafe_op_in_unsafe_fn` is denied. `tests/unsafe_inventory.py` rejects any
-increase above the per-file baseline in `docs/unsafe-baseline.json`; moving or
-adding an unsafe boundary therefore requires an explicit review and baseline
-change.
+Production server code forbids `unsafe`; the only production exception is the
+small `vapache-os` crate. Its safe API accepts `BorrowedFd` for existing
+descriptors and returns owning `File`, `OwnedFd`, `UnixStream`, or
+`TcpListener` values for newly acquired descriptors. Raw descriptor numbers
+remain only where an exec boundary makes an owner impossible to carry, and
+they are validated before an I/O-safety type is constructed.
+
+Every unsafe block in that crate has a unique `SAFETY[OSnnn]` contract.
+`tests/unsafe_inventory.py` hashes both the contract and the complete block in
+`docs/unsafe-baseline.json`; it also hashes the remaining test-only syscall
+probes exactly. A changed, moved, added, or removed block therefore requires a
+reviewed baseline update, rather than merely fitting below a textual budget.
+The in-tree PCRE2 engine, verified kernels, server binary, and vendored h2 fork
+all forbid unsafe code independently.
+
+The process boundary has two additional runtime invariants. The privileged TLS
+broker refuses to call `fork` after any thread exists, and `Command` children
+use one fixed `ChildSetup` state applied by a syscall-only `pre_exec` closure.
+Descriptor isolation, parent-death binding, session creation, dump policy, and
+resource limits are data in that state rather than arbitrary post-fork Rust
+callbacks. Unit tests exercise invalid inherited descriptors, retained
+descriptor ownership, descriptor isolation, and the multithreaded-fork guard.
+
+Nightly ASan first runs the syscall crate in isolation and then the composed
+server suite; LSan uses clean-exit integration binaries to avoid intentional
+process-global caches. TSan remains focused on concurrent resource admission
+and regex compilation.
 
 `cargo-deny` enforces licenses, registries and wildcard-dependency policy;
 `cargo-audit` checks RustSec; Dependabot proposes Cargo and workflow updates.
@@ -150,6 +173,15 @@ versions are exemptions, not claimed audits: a dependency update must be
 explicitly reviewed and added or imported before `cargo vet --locked` passes.
 Weekly jobs also build a CycloneDX SBOM, check public API compatibility and
 compare two isolated release-build hashes.
+
+`tests/dependency_unsafe.py` separately records the exact syntactic unsafe,
+build-script, and native-source exposure of the locked Linux production graph
+in `docs/dependency-unsafe.json`. The main concentrations are generated syscall
+bindings and wrappers (`linux-raw-sys`, `libc`, `rustix`), async/storage
+primitives (`tokio`, `mio`, `bytes`, `hashbrown`, `smallvec`), and `ring`.
+`ring` is the only runtime dependency in that graph with a material native-code
+implementation; `cc` is present as its build tool. This inventory is an
+update-review ratchet, while cargo-vet supplies the source-review evidence.
 
 Production expression matching uses the in-tree, safe-Rust
 `vapache-pcre2` compatibility engine. It compiles the admitted regular PCRE2

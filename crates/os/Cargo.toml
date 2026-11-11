@@ -1,0 +1,16 @@
+[package]
+name = "vapache-os"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+rustix = { version = "1", features = ["fs", "process"] }
+
+[lints.rust]
+# `unsafe` is expected only in this crate and every block is contract-tracked
+# by tests/unsafe_inventory.py. Keep the compiler's stricter operation lint,
+# while avoiding one warning per audited syscall on every workspace build.
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"

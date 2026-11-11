@@ -1,5 +1,7 @@
 //! `vapached` command line, daemon lifecycle and privilege handling.
 
+#![forbid(unsafe_code)]
+
 // musl's allocator serializes Vapache's allocation-heavy policy path under
 // concurrent static requests. Keep the portable static build, but give it the
 // same scalable allocation behavior as the native glibc build.
@@ -10,7 +12,7 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -310,30 +312,18 @@ fn user_ids(user: &str, group: &str) -> Result<(libc::uid_t, libc::gid_t, CStrin
     let uid = if let Ok(n) = user.parse::<u32>() {
         n
     } else {
-        unsafe {
-            let pw = libc::getpwnam(cuser.as_ptr());
-            if pw.is_null() {
-                return Err(format!("user '{user}' not found"));
-            }
-            (*pw).pw_uid
-        }
+        vapache_os::lookup_user_id(&cuser).map_err(|_| format!("user '{user}' not found"))?
     };
     let gid = if let Ok(n) = group.parse::<u32>() {
         n
     } else {
-        unsafe {
-            let gr = libc::getgrnam(cgroup.as_ptr());
-            if gr.is_null() {
-                return Err(format!("group '{group}' not found"));
-            }
-            (*gr).gr_gid
-        }
+        vapache_os::lookup_group_id(&cgroup).map_err(|_| format!("group '{group}' not found"))?
     };
     Ok((uid, gid, cuser))
 }
 
 fn effective_ids() -> (u32, u32) {
-    unsafe { (libc::geteuid(), libc::getegid()) }
+    (vapache_os::effective_uid(), vapache_os::effective_gid())
 }
 
 fn effective_uid() -> u32 {
@@ -357,114 +347,27 @@ fn drop_privileges(user: &str, group: &str) -> Result<(), String> {
     let (euid, egid) = effective_ids();
     validate_service_identity(euid, egid, uid, gid)?;
     if euid != 0 {
-        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-            return Err(format!(
-                "cannot set no_new_privs: {}",
-                std::io::Error::last_os_error()
-            ));
+        if let Err(error) = vapache_os::no_new_privileges() {
+            return Err(format!("cannot set no_new_privs: {error}"));
         }
         return Ok(());
     }
-    unsafe {
-        // coverage:ignore-start - privileged syscall failure
-        let groups_result = if user.parse::<u32>().is_ok() {
-            // A numeric User has no NSS name from which supplementary groups
-            // can be derived. Clear root's inherited groups explicitly.
-            libc::setgroups(0, std::ptr::null())
-        } else {
-            libc::initgroups(cuser.as_ptr(), gid as libc::gid_t)
-        };
-        if groups_result != 0 {
-            // NSS/kernel failure after both configured identities resolved is
-            // not deterministically injectable in the test environment.
-            return Err(format!(
-                "initgroups failed: {}",
-                std::io::Error::last_os_error()
-            ));
-            // coverage:ignore-stop
-        }
-        // coverage:ignore-start - privileged syscall failure
-        if libc::setresgid(gid, gid, gid) != 0 {
-            // A root process with a resolved gid cannot deterministically
-            // induce this kernel failure without syscall fault injection.
-            return Err(format!(
-                "setresgid failed: {}",
-                std::io::Error::last_os_error()
-            ));
-            // coverage:ignore-stop
-        }
-        // coverage:ignore-start - privileged syscall failure
-        if libc::setresuid(uid, uid, uid) != 0 {
-            // As above, retain the fail-closed branch for kernel/capability
-            // changes while excluding an uninjectable syscall failure.
-            return Err(format!(
-                "setresuid failed: {}",
-                std::io::Error::last_os_error()
-            ));
-            // coverage:ignore-stop
-        }
-        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-            return Err(format!(
-                "cannot set no_new_privs: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+    // coverage:ignore-start - privileged syscall failures
+    if user.parse::<u32>().is_ok() {
+        vapache_os::clear_supplementary_groups()
+    } else {
+        vapache_os::initialize_supplementary_groups(&cuser, gid)
     }
+    .map_err(|error| format!("initgroups failed: {error}"))?;
+    vapache_os::set_res_gid(gid).map_err(|error| format!("setresgid failed: {error}"))?;
+    vapache_os::set_res_uid(uid).map_err(|error| format!("setresuid failed: {error}"))?;
+    vapache_os::no_new_privileges().map_err(|error| format!("cannot set no_new_privs: {error}"))?;
+    // coverage:ignore-stop
     Ok(()) // coverage:ignore-line - root-only successful privilege drop
 }
 
 fn daemonize() -> Result<(), String> {
-    unsafe {
-        let pid = libc::fork();
-        if pid < 0 {
-            return Err("fork failed".into()); // coverage:ignore-line - kernel resource failure
-        }
-        if pid > 0 {
-            std::process::exit(0);
-        }
-        if libc::setsid() < 0 {
-            return Err("setsid failed".into()); // coverage:ignore-line - kernel session failure
-        }
-        libc::signal(libc::SIGHUP, libc::SIG_IGN);
-        let pid2 = libc::fork();
-        if pid2 < 0 {
-            return Err("second fork failed".into()); // coverage:ignore-line - kernel resource failure
-        }
-        if pid2 > 0 {
-            std::process::exit(0);
-        }
-        libc::umask(0o027);
-        let devnull = CString::new("/dev/null").unwrap();
-        let fd = libc::open(devnull.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
-        if fd < 0 {
-            return Err(format!(
-                "cannot open /dev/null: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        for target in 0..=2 {
-            if libc::dup2(fd, target) < 0 {
-                if fd > 2 {
-                    libc::close(fd);
-                }
-                return Err(format!(
-                    "cannot redirect daemon standard streams: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
-        if fd > 2 {
-            libc::close(fd);
-        }
-        let root = CString::new("/").unwrap();
-        if libc::chdir(root.as_ptr()) != 0 {
-            return Err(format!(
-                "cannot enter daemon root directory: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
-    Ok(())
+    vapache_os::daemonize().map_err(|error| format!("daemonization failed: {error}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -747,15 +650,8 @@ fn open_verified_pid(
     service_uid: Option<u32>,
 ) -> Result<(std::fs::File, ProcessIdentity), String> {
     let expected = read_pid_record(path, service_uid)?;
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, expected.pid, 0) as libc::c_int };
-    if fd < 0 {
-        return Err(format!(
-            "pidfd_open({}) failed: {}",
-            expected.pid,
-            std::io::Error::last_os_error()
-        ));
-    }
-    let pidfd = unsafe { std::fs::File::from_raw_fd(fd) };
+    let pidfd = vapache_os::pidfd_open(expected.pid)
+        .map_err(|error| format!("pidfd_open({}) failed: {error}", expected.pid))?;
     let actual = process_identity_with_executable_fallback(
         expected.pid,
         Some((expected.executable_dev, expected.executable_ino)),
@@ -788,20 +684,10 @@ fn read_pid(path: &Path, service_uid: Option<u32>) -> Result<i32, String> {
 
 fn kill_action(path: &Path, service_uid: Option<u32>, sig: libc::c_int) -> Result<i32, String> {
     let (pidfd, identity) = open_verified_pid(path, service_uid)?;
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd.as_raw_fd(),
-            sig,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    if rc != 0 {
+    if let Err(error) = vapache_os::pidfd_send_signal(pidfd.as_fd(), sig) {
         return Err(format!(
-            "pidfd_send_signal({}) failed: {}",
-            identity.pid,
-            std::io::Error::last_os_error()
+            "pidfd_send_signal({}) failed: {error}",
+            identity.pid
         ));
     }
     Ok(identity.pid)
@@ -1321,12 +1207,7 @@ fn main() {
         vapached::tls::shutdown_privileged_file_broker();
         std::process::exit(1);
     }
-    unsafe {
-        libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, on_reload as libc::sighandler_t);
-        libc::signal(libc::SIGUSR1, on_reopen as libc::sighandler_t);
-    }
+    vapache_os::install_signal_handlers(on_signal, on_reload, on_reopen);
     logger.info(&format!(
         "vapached/{} started, listening on {} socket(s)",
         vapached::VERSION,

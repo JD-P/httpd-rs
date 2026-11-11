@@ -13,6 +13,7 @@ name = "vapached"
 path = "src/main.rs"
 
 [dependencies]
+vapache-os = { path = "../os", version = "0.2.1" }
 vapache-verified = { path = "../verified", version = "0.2.1" }
 vapache-pcre2 = { path = "../pcre2", version = "0.2.1" }
 libc = "0.2"

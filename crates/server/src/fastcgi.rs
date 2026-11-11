@@ -22,7 +22,6 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 #[cfg(test)]
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
@@ -721,172 +720,22 @@ fn connect_unix_timeout(
     deadline: Instant,
     request_scope: Option<&crate::resource::RequestScope>,
 ) -> io::Result<UnixStream> {
-    let bytes = path.as_os_str().as_bytes();
-    // SAFETY: every bit pattern is valid for sockaddr_un; this temporary is
-    // used only to obtain the platform sun_path capacity.
-    let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
-        .sun_path
-        .len();
-    if bytes.is_empty() || bytes.len() >= capacity || bytes.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid FastCGI Unix socket path",
-        ));
-    }
     crate::fault::hit("fastcgi.unix.socket")?;
-    // SAFETY: socket has no pointer operands. A successful descriptor is
-    // immediately placed under the guard below.
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    struct FdGuard(RawFd);
-    impl Drop for FdGuard {
-        fn drop(&mut self) {
-            // SAFETY: FdGuard exclusively owns this successfully-created fd.
-            unsafe {
-                libc::close(self.0);
-            }
+    vapache_os::connect_unix_timeout(path, deadline, || {
+        request_scope.is_some_and(crate::resource::RequestScope::is_cancelled)
+    })
+    .map_err(|error| {
+        if error.kind() == io::ErrorKind::ConnectionAborted {
+            io::Error::new(error.kind(), "FastCGI request scope cancelled")
+        } else {
+            error
         }
-    }
-    let guard = FdGuard(fd);
-    // SAFETY: zero is a valid initial representation for sockaddr_un and its
-    // family/path fields are initialized before the kernel observes it.
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    // SAFETY: bytes was checked strictly shorter than sun_path above, and the
-    // source and destination are distinct live allocations.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            address.sun_path.as_mut_ptr().cast::<u8>(),
-            bytes.len(),
-        );
-    }
-    let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path)
-        .saturating_add(bytes.len())
-        .saturating_add(1) as libc::socklen_t;
-    // SAFETY: address remains live for the call and address_len covers only
-    // the initialized family, pathname bytes and trailing zero byte.
-    let connected = unsafe {
-        libc::connect(
-            fd,
-            (&address as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
-            address_len,
-        )
-    };
-    if connected != 0 {
-        let error = io::Error::last_os_error();
-        if !matches!(
-            error.raw_os_error(),
-            Some(code) if code == libc::EINPROGRESS || code == libc::EAGAIN
-        ) {
-            return Err(error);
-        }
-        loop {
-            if request_scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "FastCGI request scope cancelled",
-                ));
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "FastCGI Unix connection deadline exceeded",
-                ));
-            }
-            let wait = remaining.min(Duration::from_millis(100)).as_millis().max(1) as i32;
-            let mut poll = libc::pollfd {
-                fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            // SAFETY: poll points to one live pollfd, matching nfds=1.
-            let result = unsafe { libc::poll(&mut poll, 1, wait) };
-            if result == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "FastCGI Unix connection deadline exceeded",
-                ));
-            }
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            let mut socket_error: libc::c_int = 0;
-            let mut length = std::mem::size_of_val(&socket_error) as libc::socklen_t;
-            // SAFETY: both output pointers are live and length describes the
-            // exact c_int buffer supplied to getsockopt.
-            if unsafe {
-                libc::getsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_ERROR,
-                    (&mut socket_error as *mut libc::c_int).cast(),
-                    &mut length,
-                )
-            } != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            if socket_error != 0 {
-                return Err(io::Error::from_raw_os_error(socket_error));
-            }
-            break;
-        }
-    }
-    // SAFETY: fd remains exclusively owned by guard and both fcntl commands
-    // use the argument shape required by F_GETFL/F_SETFL.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    std::mem::forget(guard);
-    // SAFETY: guard ownership was deliberately transferred after every
-    // fallible setup step; UnixStream is now the descriptor's sole owner.
-    Ok(unsafe { UnixStream::from_raw_fd(fd) })
+    })
 }
 
 #[cfg(target_os = "linux")]
 fn unix_peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    let mut credentials = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: credentials and length are live output buffers of exactly the
-    // shape required by SO_PEERCRED, and stream owns a connected Unix fd.
-    if unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut length,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    if length as usize != std::mem::size_of::<libc::ucred>() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "FastCGI peer returned malformed credentials",
-        ));
-    }
-    Ok(credentials.uid)
+    vapache_os::unix_peer_uid(stream)
 }
 
 #[cfg(target_os = "linux")]
@@ -1572,24 +1421,9 @@ fn path_has_posix_acl(path: &Path) -> io::Result<bool> {
     })?;
     for name in ["system.posix_acl_access", "system.posix_acl_default"] {
         let name = std::ffi::CString::new(name).expect("static xattr name");
-        // SAFETY: path/name are live NUL-terminated strings. Linux permits a
-        // null value pointer with size zero for this length-only query.
-        let len = unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
-        if len > 0 {
+        if vapache_os::path_xattr_exists(&path, &name)? {
             return Ok(true);
         }
-        if len == 0 {
-            continue;
-        }
-        let err = io::Error::last_os_error();
-        let code = err.raw_os_error();
-        if code == Some(libc::ENODATA)
-            || code == Some(libc::ENOTSUP)
-            || code == Some(libc::EOPNOTSUPP)
-        {
-            continue;
-        }
-        return Err(err);
     }
     Ok(false)
 }

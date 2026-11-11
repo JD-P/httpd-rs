@@ -29,8 +29,7 @@ use crate::scope_policy::Originated;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::IpAddr;
-use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -1575,26 +1574,16 @@ fn run_prg_map_timeout(program: &RewriteProgram, key: &str, timeout: Duration) -
     // parent-side spawns must never inherit the retained program descriptor.
     // Mark every other descriptor CLOEXEC in the child so an accidental
     // non-CLOEXEC daemon descriptor cannot cross this boundary.
-    let parent_pid = unsafe { libc::getpid() };
-    // coverage:ignore-start - runs in the forked child before coverage can flush
-    unsafe {
-        command.pre_exec(move || {
-            crate::process::bind_to_parent(parent_pid)?;
-            crate::process::cloexec_unrelated_descriptors()?;
-            crate::process::set_cloexec(exec_fd, false)?;
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            libc::umask(0o077);
-            crate::process::no_new_privileges()?;
-            crate::process::disable_dumping()?;
-            crate::process::set_limit(libc::RLIMIT_CPU, timeout.as_secs().max(1))?;
-            crate::process::set_limit(libc::RLIMIT_FSIZE, 1024 * 1024)?;
-            crate::process::set_limit(libc::RLIMIT_NOFILE, 64)?;
-            Ok(())
-        });
-    }
-    // coverage:ignore-stop
+    let mut setup = vapache_os::ChildSetup::inherited(vapache_os::current_pid());
+    setup.retained_fd = Some(exec_fd);
+    setup.create_session = true;
+    setup.umask = Some(0o077);
+    setup.no_new_privileges = true;
+    setup.disable_dumping = true;
+    setup.cpu_seconds = Some(timeout.as_secs().max(1));
+    setup.file_size = Some(1024 * 1024);
+    setup.open_files = Some(64);
+    vapache_os::configure_child(&mut command, setup);
     if crate::fault::hit("rewrite.program.spawn").is_err() {
         return String::new();
     }
@@ -1624,9 +1613,7 @@ fn finish_prg_map(
 
 fn abort_prg_map(mut child: std::process::Child) -> String {
     let pid = child.id() as i32;
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
+    let _ = vapache_os::kill(-pid, libc::SIGKILL);
     let _ = child.kill();
     let _ = child.wait();
     String::new()
@@ -1649,9 +1636,7 @@ fn wait_prg_output(mut child: std::process::Child, timeout: Duration) -> String 
     // already produced a valid line. A successful lookup does not grant its
     // background descendants daemon lifetime. Signal before wait/reap so the
     // numeric PID cannot be recycled as an unrelated process-group id.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
+    let _ = vapache_os::kill(-pid, libc::SIGKILL);
     let _ = child.kill();
     let _ = child.wait();
     if !admitted {
@@ -1663,16 +1648,13 @@ fn wait_prg_output(mut child: std::process::Child, timeout: Duration) -> String 
 }
 
 fn read_prg_line_with_deadline(
-    input: &mut (impl Read + AsRawFd),
+    input: &mut (impl Read + AsFd),
     deadline: Instant,
 ) -> (Vec<u8>, bool, bool) {
     if crate::fault::hit("rewrite.program.read").is_err() {
         return (Vec::new(), false, false);
     }
-    let flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0
-        || unsafe { libc::fcntl(input.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-    {
+    if vapache_os::set_nonblocking(input.as_fd(), true).is_err() {
         return (Vec::new(), false, false);
     }
     let mut line = Vec::with_capacity(256);

@@ -3025,24 +3025,7 @@ const RESPONSE_NOTSENT_LOWAT: libc::c_uint = 64 * 1024;
 
 #[cfg(target_os = "linux")]
 pub(crate) fn configure_response_progress_wakeups(fd: BorrowedFd<'_>) -> io::Result<()> {
-    let value = RESPONSE_NOTSENT_LOWAT;
-    // SAFETY: `fd` is borrowed for this call and `value` points to a live
-    // c_uint of the exact size passed to setsockopt. Non-TCP descriptors
-    // return ENOPROTOOPT and retain the ordinary deadline behavior.
-    let result = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            libc::IPPROTO_TCP,
-            libc::TCP_NOTSENT_LOWAT,
-            (&value as *const libc::c_uint).cast(),
-            std::mem::size_of_val(&value) as libc::socklen_t,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    vapache_os::set_tcp_notsent_lowat(fd, RESPONSE_NOTSENT_LOWAT)
 }
 
 #[cfg(not(target_os = "linux"))]

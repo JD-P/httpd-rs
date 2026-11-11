@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), forbid(unsafe_code))]
+
 //! vapached: an Apache HTTPD-compatible web server with a Verus-verified
 //! security core.
 //!

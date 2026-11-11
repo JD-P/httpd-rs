@@ -129,4 +129,5 @@ jobs:
       - name: Dependency review ledger
         run: |
           python3 tests/dependency_audit_policy.py
+          python3 tests/dependency_unsafe.py
           cargo vet --locked

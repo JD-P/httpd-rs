@@ -1,121 +1,18 @@
-//! Linux process and descriptor-isolation primitives.
+//! Safe server-facing process and descriptor-isolation API.
 //!
-//! Keep the raw syscall boundary in one place.  Child `pre_exec` hooks may use
-//! these functions because they perform only libc syscalls and construct an
-//! `io::Error` on failure; they do not allocate, lock, or consult process-wide
-//! Rust state after `fork`.
+//! Raw syscalls live in `vapache-os`; this module preserves the original
+//! domain names used by the server while keeping production code safe Rust.
 
-use std::io;
+pub use vapache_os::close_inherited_descriptors;
+pub(crate) use vapache_os::{
+    bind_to_parent, child_exited_unreaped, disable_dumping, no_new_privileges, set_limit,
+};
+#[cfg(test)]
+pub(crate) use vapache_os::{cloexec_unrelated_descriptors, RlimitResource};
 
-#[cfg(target_env = "gnu")]
-type RlimitResource = libc::__rlimit_resource_t;
-#[cfg(not(target_env = "gnu"))]
-type RlimitResource = libc::c_int;
-
-pub(crate) const FIRST_NONSTANDARD_FD: u32 = 3;
-// linux/close_range.h: apply FD_CLOEXEC instead of closing immediately.  This
-// preserves Rust's private exec-error pipe until exec while guaranteeing that
-// every unrelated descriptor disappears in the new image.
-const CLOSE_RANGE_CLOEXEC_FLAG: u32 = 1 << 2;
-
-fn close_range(first: u32, flags: u32) -> io::Result<()> {
-    let result = unsafe { libc::syscall(libc::SYS_close_range, first, u32::MAX, flags) };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-/// Close every inherited descriptor other than stdin/stdout/stderr.  Normal
-/// daemon startup calls this before it opens configuration, listeners or logs,
-/// so only Vapache-owned descriptors can reach the later daemon fork.
-pub fn close_inherited_descriptors() -> io::Result<()> {
-    close_range(FIRST_NONSTANDARD_FD, 0)
-}
-
-/// Make every non-standard descriptor close on the next exec.  Child setup
-/// can subsequently clear CLOEXEC on its one explicitly retained descriptor.
-pub(crate) fn cloexec_unrelated_descriptors() -> io::Result<()> {
-    close_range(FIRST_NONSTANDARD_FD, CLOSE_RANGE_CLOEXEC_FLAG)
-}
-
-pub(crate) fn set_cloexec(fd: libc::c_int, enabled: bool) -> io::Result<()> {
-    let current = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if current < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let updated = if enabled {
-        current | libc::FD_CLOEXEC
-    } else {
-        current & !libc::FD_CLOEXEC
-    };
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, updated) } < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-pub(crate) fn set_limit(resource: RlimitResource, value: u64) -> io::Result<()> {
-    let limit = libc::rlimit {
-        rlim_cur: value as libc::rlim_t,
-        rlim_max: value as libc::rlim_t,
-    };
-    if unsafe { libc::setrlimit(resource, &limit) } != 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-/// Arm a child so it cannot survive the parent that owns its protocol state.
-/// The post-prctl parent check closes the fork-to-prctl orphan race.
-pub(crate) fn bind_to_parent(parent: libc::pid_t) -> io::Result<()> {
-    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::getppid() } != parent {
-        return Err(io::Error::from_raw_os_error(libc::ESRCH));
-    }
-    Ok(())
-}
-
-pub(crate) fn no_new_privileges() -> io::Result<()> {
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-pub(crate) fn disable_dumping() -> io::Result<()> {
-    set_limit(libc::RLIMIT_CORE, 0)?;
-    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-/// Report whether a direct child has exited without reaping it. Keeping the
-/// child as a zombie preserves ownership of its numeric PID/PGID until the
-/// caller has signalled and cleaned up any descendants in that process group.
-pub(crate) fn child_exited_unreaped(pid: libc::pid_t) -> io::Result<bool> {
-    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            info.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let info = unsafe { info.assume_init() };
-    Ok(unsafe { info.si_pid() } != 0)
+#[cfg(test)]
+pub(crate) fn set_cloexec(fd: std::os::fd::RawFd, enabled: bool) -> std::io::Result<()> {
+    vapache_os::set_cloexec_raw(fd, enabled)
 }
 
 #[cfg(test)]

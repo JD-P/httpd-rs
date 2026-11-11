@@ -29,7 +29,7 @@ use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::net::IpAddr;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -1446,19 +1446,7 @@ impl RewriteProgram {
         // this immutable snapshot also closes same-inode write races between
         // the check and execve.
         let name = CString::new("vapache-rewritemap-prg").expect("static memfd name");
-        let fd = unsafe {
-            libc::syscall(
-                libc::SYS_memfd_create,
-                name.as_ptr(),
-                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-            )
-        };
-        if fd < 0 {
-            // coverage:ignore-start -- kernel/platform lacks required memfd support
-            return Err(std::io::Error::last_os_error());
-            // coverage:ignore-stop
-        }
-        let mut file = unsafe { File::from_raw_fd(fd as i32) };
+        let mut file = vapache_os::create_memfd(&name)?;
         let copied = std::io::copy(
             &mut source
                 .by_ref()
@@ -1486,18 +1474,8 @@ impl RewriteProgram {
             ));
             // coverage:ignore-stop
         }
-        if unsafe { libc::fchmod(file.as_raw_fd(), 0o500) } != 0 {
-            // coverage:ignore-start -- kernel rejects mode change on a new memfd
-            return Err(std::io::Error::last_os_error());
-            // coverage:ignore-stop
-        }
-        let seals =
-            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
-            // coverage:ignore-start -- kernel rejects sealing despite MFD_ALLOW_SEALING
-            return Err(std::io::Error::last_os_error());
-            // coverage:ignore-stop
-        }
+        vapache_os::fchmod(file.as_fd(), 0o500)?;
+        vapache_os::seal_file(file.as_fd())?;
         Ok(Self {
             path,
             admin_trust_path,

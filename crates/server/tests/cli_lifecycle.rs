@@ -5,7 +5,6 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,8 +37,8 @@ fn free_port() -> u16 {
 }
 
 fn service_ids() -> (u32, u32) {
-    let uid = unsafe { libc::geteuid() };
-    let gid = unsafe { libc::getegid() };
+    let uid = vapache_os::effective_uid();
+    let gid = vapache_os::effective_gid();
     if uid == 0 {
         (65534, 65534)
     } else {
@@ -117,14 +116,9 @@ fn spawn_foreground_with_inherited_fd(root: &Path, config: &Path, fd: i32) -> Ch
     // Install the descriptor in the child after std::process has prepared its
     // own descriptor table. Vapache must close it before opening any server
     // resource, regardless of the launcher's CLOEXEC discipline.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(source, fd) < 0 || libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    let mut setup = vapache_os::ChildSetup::inherited(vapache_os::current_pid());
+    setup.duplicate_fd = Some((source, fd));
+    vapache_os::configure_child(&mut command, setup);
     command.spawn().unwrap()
 }
 
@@ -172,7 +166,7 @@ fn read_pid(root: &Path) -> i32 {
 }
 
 fn signal(pid: i32, sig: i32) {
-    assert_eq!(unsafe { libc::kill(pid, sig) }, 0);
+    vapache_os::kill(pid, sig).unwrap();
 }
 
 fn http_body(port: u16, path: &str) -> Vec<u8> {

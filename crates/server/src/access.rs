@@ -1269,68 +1269,7 @@ fn forward_dns_confirms(host: &str, ip: IpAddr) -> bool {
 }
 
 fn reverse_dns(ip: IpAddr) -> Result<String, std::io::Error> {
-    let sa = std::net::SocketAddr::new(ip, 0);
-    let (storage, len) = socket_addr_to_storage(&sa);
-    let mut host = [0i8; libc::NI_MAXHOST as usize];
-    let rc = unsafe {
-        libc::getnameinfo(
-            &storage as *const _ as *const libc::sockaddr,
-            len,
-            host.as_mut_ptr(),
-            host.len() as libc::socklen_t,
-            std::ptr::null_mut(),
-            0,
-            libc::NI_NAMEREQD,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let c = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) };
-    Ok(c.to_string_lossy().into_owned())
-}
-
-fn socket_addr_to_storage(sa: &std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    match sa {
-        std::net::SocketAddr::V4(v4) => {
-            let s = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: v4.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
-                },
-                sin_zero: [0; 8],
-            };
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    &s as *const _ as *const u8,
-                    &mut storage as *mut _ as *mut u8,
-                    std::mem::size_of_val(&s),
-                );
-            }
-            (storage, std::mem::size_of_val(&s) as libc::socklen_t)
-        }
-        std::net::SocketAddr::V6(v6) => {
-            let s = libc::sockaddr_in6 {
-                sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                sin6_port: v6.port().to_be(),
-                sin6_flowinfo: v6.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: v6.ip().octets(),
-                },
-                sin6_scope_id: v6.scope_id(),
-            };
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    &s as *const _ as *const u8,
-                    &mut storage as *mut _ as *mut u8,
-                    std::mem::size_of_val(&s),
-                );
-            }
-            (storage, std::mem::size_of_val(&s) as libc::socklen_t)
-        }
-    }
+    vapache_os::reverse_dns(ip)
 }
 
 #[cfg(test)]

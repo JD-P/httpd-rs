@@ -175,6 +175,7 @@ pub fn rebind(cfg: &Config, previous: &[Bound]) -> io::Result<Vec<Bound>> {
     Ok(out)
 }
 
+#[cfg(test)]
 fn create_tcp_socket(domain: libc::c_int) -> io::Result<libc::c_int> {
     let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -184,6 +185,7 @@ fn create_tcp_socket(domain: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 
+#[cfg(test)]
 fn bind_fd(
     fd: libc::c_int,
     storage: &libc::sockaddr_storage,
@@ -197,6 +199,7 @@ fn bind_fd(
     }
 }
 
+#[cfg(test)]
 fn listen_fd(fd: libc::c_int, backlog: i32) -> io::Result<()> {
     if unsafe { libc::listen(fd, backlog.max(1)) } != 0 {
         Err(io::Error::last_os_error())
@@ -205,6 +208,7 @@ fn listen_fd(fd: libc::c_int, backlog: i32) -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
 fn finish_listener(fd: libc::c_int, backlog: i32) -> io::Result<TcpListener> {
     if let Err(e) = listen_fd(fd, backlog) {
         unsafe { libc::close(fd) };
@@ -215,30 +219,10 @@ fn finish_listener(fd: libc::c_int, backlog: i32) -> io::Result<TcpListener> {
 }
 
 fn bind_reuse(addr: SocketAddr, backlog: i32) -> io::Result<TcpListener> {
-    let domain = if addr.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
-    };
-    let fd = create_tcp_socket(domain)?;
-    let one: libc::c_int = 1;
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            &one as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&one) as libc::socklen_t,
-        );
-    }
-    let storage = sockaddr_storage(addr);
-    if let Err(e) = bind_fd(fd, &storage.0, storage.1) {
-        unsafe { libc::close(fd) };
-        return Err(e);
-    }
-    finish_listener(fd, backlog)
+    vapache_os::bind_tcp_listener(addr, backlog)
 }
 
+#[cfg(test)]
 fn sockaddr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     match addr {

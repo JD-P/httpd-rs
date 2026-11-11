@@ -9,8 +9,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::io::{self, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::FileTypeExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -216,20 +216,11 @@ fn configured_user_id(user: &str) -> std::io::Result<u32> {
     }
     let user = std::ffi::CString::new(user)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid User"))?;
-    let uid = unsafe {
-        let entry = libc::getpwnam(user.as_ptr());
-        (!entry.is_null()).then(|| (*entry).pw_uid)
-    };
-    uid.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "configured User does not exist",
-        )
-    })
+    vapache_os::lookup_user_id(&user)
 }
 
 fn running_privileged() -> bool {
-    (unsafe { libc::geteuid() }) == 0
+    vapache_os::effective_uid() == 0
 }
 
 fn open_log(
@@ -485,10 +476,9 @@ impl Logger {
             // coverage:ignore-start - root-only ownership handoff
             let group = CString::new(cfg.group.as_str()).ok();
             let uid = configured_user_id(&cfg.user).ok();
-            let gid = group.as_ref().and_then(|g| unsafe {
-                let gr = libc::getgrnam(g.as_ptr());
-                (!gr.is_null()).then(|| (*gr).gr_gid)
-            });
+            let gid = group
+                .as_deref()
+                .and_then(|value| vapache_os::lookup_group_id(value).ok());
             let Some(uid) = uid else { return };
             let full = |path: &str| {
                 let p = PathBuf::from(path);
@@ -515,10 +505,8 @@ impl Logger {
                     continue;
                 }
                 let gid = gid.unwrap_or(u32::MAX);
-                unsafe {
-                    let _ = libc::fchown(file.as_raw_fd(), uid, gid);
-                    let _ = libc::fchmod(file.as_raw_fd(), 0o640); // coverage:ignore-stop
-                }
+                let _ = vapache_os::fchown(file.as_fd(), uid, gid);
+                let _ = vapache_os::fchmod(file.as_fd(), 0o640); // coverage:ignore-stop
             }
         }
     }

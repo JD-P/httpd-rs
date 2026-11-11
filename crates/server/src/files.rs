@@ -20,9 +20,10 @@ use std::ffi::{CStr, CString, OsString};
 use std::fmt::Write as _;
 use std::fs::{File, Metadata};
 use std::io::{self, Read};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -40,25 +41,13 @@ const RESOLVE_BENEATH: u64 = 0x08;
 fn openat2_file(dir: &File, path: &CStr, how: &OpenHow) -> io::Result<File> {
     const MAX_TRANSIENT_RETRIES: usize = 8;
     for attempt in 0..=MAX_TRANSIENT_RETRIES {
-        let injected = crate::fault::hit("fs.openat2").err();
-        let file = if injected.is_none() {
-            unsafe {
-                let fd = libc::syscall(
-                    libc::SYS_openat2,
-                    dir.as_raw_fd(),
-                    path.as_ptr(),
-                    how as *const OpenHow,
-                    std::mem::size_of::<OpenHow>(),
-                );
-                (fd >= 0).then(|| File::from_raw_fd(fd as i32))
-            }
-        } else {
-            None
+        let result = crate::fault::hit("fs.openat2").and_then(|()| {
+            vapache_os::openat2(dir.as_fd(), path, how.flags, how.mode, how.resolve)
+        });
+        let error = match result {
+            Ok(file) => return Ok(file),
+            Err(error) => error,
         };
-        if let Some(file) = file {
-            return Ok(file);
-        }
-        let error = injected.unwrap_or_else(io::Error::last_os_error);
         let transient = matches!(
             error.kind(),
             io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
@@ -74,18 +63,12 @@ pub fn make_admin_dir_root_owned(dir: &File, mode: libc::mode_t) -> io::Result<(
     if effective_uid() != 0 {
         return Ok(());
     }
-    let failed = unsafe {
-        libc::fchown(dir.as_raw_fd(), 0, 0) != 0 || libc::fchmod(dir.as_raw_fd(), mode) != 0
-    };
-    if failed {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    vapache_os::fchown(dir.as_fd(), 0, 0)?;
+    vapache_os::fchmod(dir.as_fd(), mode)
 }
 
 pub(crate) fn effective_uid() -> u32 {
-    unsafe { libc::geteuid() }
+    vapache_os::effective_uid()
 }
 
 /// Trust policy captured when an administrative configuration generation is
@@ -458,9 +441,7 @@ pub fn ensure_admin_dir(path: &Path, mode: libc::mode_t) -> io::Result<File> {
         current = match open_component() {
             Ok(dir) => dir,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let rc = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), mode) };
-                if rc != 0 {
-                    let create_error = io::Error::last_os_error();
+                if let Err(create_error) = vapache_os::mkdirat(current.as_fd(), &name, mode) {
                     if create_error.kind() != io::ErrorKind::AlreadyExists {
                         return Err(create_error);
                     }
@@ -800,18 +781,9 @@ fn with_fd_link<R>(file: &File, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
     };
     let mut component = [0u8; 24];
     let name = fd_component(fd, &mut component);
-    let n = unsafe {
-        libc::readlinkat(
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-        )
-    };
-    if n < 0 {
-        return None;
-    }
-    let n = n as usize;
+    let n = vapache_os::readlinkat_into(dir.as_fd(), name, &mut buf)
+        .ok()?
+        .len();
     if n == 0 {
         return None;
     }

@@ -15,7 +15,6 @@ use rustls::{RootCertStore, ServerConfig, SupportedProtocolVersion};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::IpAddr;
-use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -167,7 +166,7 @@ fn tls_file_specs(cfg: &Config) -> Vec<(PathBuf, u64)> {
 /// unprivileged request process can ask only for TLS paths authorized by the
 /// root-owned startup configuration, never for an arbitrary pathname.
 pub fn install_privileged_file_broker(cfg: &Config, service_uid: u32) -> Result<(), String> {
-    if unsafe { libc::geteuid() } != 0 {
+    if vapache_os::effective_uid() != 0 {
         return Ok(());
     }
     if PRIVILEGED_FILE_BROKER.get().is_some() {
@@ -183,53 +182,24 @@ pub fn install_privileged_file_broker(cfg: &Config, service_uid: u32) -> Result<
         })?;
     }
 
-    let mut sockets = [-1; 2];
-    if unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-            sockets.as_mut_ptr(),
-        )
-    } != 0
-    {
-        return Err(format!(
-            "cannot create privileged TLS broker socket: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let parent_pid = unsafe { libc::getpid() };
+    let (mut stream, child_stream) = UnixStream::pair()
+        .map_err(|error| format!("cannot create privileged TLS broker socket: {error}"))?;
+    let parent_pid = vapache_os::current_pid();
     // Do not allocate from Rust's inherited heap in the post-fork child.
     let child_specs = specs.clone();
     if let Err(error) = crate::fault::hit("tls.broker.fork") {
-        unsafe {
-            libc::close(sockets[0]);
-            libc::close(sockets[1]);
-        }
         return Err(format!("cannot fork privileged TLS broker: {error}"));
     }
-    let child = unsafe { libc::fork() };
-    if child < 0 {
-        unsafe {
-            libc::close(sockets[0]);
-            libc::close(sockets[1]);
+    let child = match vapache_os::fork_single_threaded()
+        .map_err(|error| format!("cannot fork privileged TLS broker: {error}"))?
+    {
+        vapache_os::ForkResult::Child => {
+            drop(stream);
+            privileged_broker_child(child_stream, parent_pid, child_specs, service_uid);
         }
-        return Err(format!(
-            "cannot fork privileged TLS broker: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    if child == 0 {
-        unsafe {
-            libc::close(sockets[0]);
-        }
-        privileged_broker_child(sockets[1], parent_pid, child_specs, service_uid);
-    }
-
-    unsafe {
-        libc::close(sockets[1]);
-    }
-    let mut stream = unsafe { UnixStream::from_raw_fd(sockets[0]) };
+        vapache_os::ForkResult::Parent(child) => child,
+    };
+    drop(child_stream);
     if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(5))) {
         terminate_failed_broker(&stream, child);
         return Err(format!("cannot configure privileged TLS broker: {error}"));
@@ -260,9 +230,7 @@ pub fn install_privileged_file_broker(cfg: &Config, service_uid: u32) -> Result<
                 .unwrap_or_else(|error| error.into_inner());
             let _ = broker.stream.write_all(&BROKER_SHUTDOWN.to_ne_bytes());
             let _ = broker.stream.shutdown(std::net::Shutdown::Both);
-            unsafe {
-                libc::waitpid(broker.pid, std::ptr::null_mut(), 0);
-            }
+            let _ = vapache_os::wait(broker.pid);
             Err("privileged TLS broker was already installed".to_string())
         }
     }
@@ -270,188 +238,41 @@ pub fn install_privileged_file_broker(cfg: &Config, service_uid: u32) -> Result<
 
 fn terminate_failed_broker(stream: &UnixStream, child: libc::pid_t) {
     let _ = stream.shutdown(std::net::Shutdown::Both);
-    unsafe {
-        libc::kill(child, libc::SIGKILL);
-        libc::waitpid(child, std::ptr::null_mut(), 0);
-    }
+    let _ = vapache_os::kill(child, libc::SIGKILL);
+    let _ = vapache_os::wait(child);
 }
 
 fn privileged_broker_child(
-    fd: libc::c_int,
+    stream: UnixStream,
     parent_pid: libc::pid_t,
     specs: Vec<(PathBuf, u64)>,
     service_uid: u32,
 ) -> ! {
-    unsafe {
-        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0
-            || libc::getppid() != parent_pid
-        {
-            libc::_exit(1);
-        }
-        if fd != 3 {
-            if libc::dup2(fd, 3) < 0 {
-                libc::_exit(1);
-            }
-            libc::close(fd);
-        }
-        if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) < 0 {
-            // A bounded close loop can miss a launcher-supplied descriptor
-            // above its guessed ceiling. The broker retains uid 0 and its
-            // seccomp profile permits reads, so incomplete isolation is not a
-            // safe compatibility fallback.
-            libc::_exit(1);
-        }
-        libc::close(0);
-        libc::close(1);
-        libc::close(2);
-        if harden_privileged_broker().is_err() {
-            libc::_exit(1);
-        }
-        let mut stream = UnixStream::from_raw_fd(3);
-        if stream.write_all(&[1]).is_err() {
-            libc::_exit(1);
-        }
-        privileged_broker_loop(&mut stream, &specs, service_uid);
-        libc::_exit(0);
+    if vapache_os::set_parent_death_signal(libc::SIGTERM, parent_pid).is_err() {
+        vapache_os::exit_immediately(1);
     }
-}
-
-#[cfg(target_env = "gnu")]
-type RlimitResource = libc::__rlimit_resource_t;
-#[cfg(not(target_env = "gnu"))]
-type RlimitResource = libc::c_int;
-
-fn set_broker_limit(resource: RlimitResource, value: libc::rlim_t) -> std::io::Result<()> {
-    let limit = libc::rlimit {
-        rlim_cur: value,
-        rlim_max: value,
+    let Ok(mut stream) = vapache_os::isolate_privileged_broker(stream) else {
+        // A bounded close loop can miss a launcher-supplied descriptor above
+        // its guessed ceiling. The root broker therefore has no fallback.
+        vapache_os::exit_immediately(1);
     };
-    if unsafe { libc::setrlimit(resource, &limit) } != 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+    if harden_privileged_broker().is_err() || stream.write_all(&[1]).is_err() {
+        vapache_os::exit_immediately(1);
     }
+    privileged_broker_loop(&mut stream, &specs, service_uid);
+    vapache_os::exit_immediately(0)
 }
 
 fn harden_privileged_broker() -> std::io::Result<()> {
-    restrict_privileged_broker_process()?;
-    install_broker_seccomp()
+    vapache_os::harden_privileged_file_broker()
 }
 
 fn restrict_privileged_broker_process() -> std::io::Result<()> {
-    set_broker_limit(libc::RLIMIT_CORE, 0)?;
-    set_broker_limit(libc::RLIMIT_FSIZE, 0)?;
-    set_broker_limit(libc::RLIMIT_NOFILE, 4)?;
-    set_broker_limit(libc::RLIMIT_CPU, 60)?;
-    set_broker_limit(libc::RLIMIT_AS, 512 * 1024 * 1024)?;
-    let restriction_failed = unsafe {
-        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0
-            || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-    };
-    if restriction_failed {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    vapache_os::restrict_privileged_file_broker_process()
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn install_broker_seccomp() -> std::io::Result<()> {
-    const BPF_LD_W_ABS: u16 = 0x20;
-    const BPF_JMP_JEQ_K: u16 = 0x15;
-    const BPF_RET_K: u16 = 0x06;
-    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
-    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-    #[cfg(target_arch = "x86_64")]
-    const AUDIT_ARCH: u32 = 0xc000_003e;
-    #[cfg(target_arch = "aarch64")]
-    const AUDIT_ARCH: u32 = 0xc000_00b7;
-
-    fn statement(code: u16, k: u32) -> libc::sock_filter {
-        libc::sock_filter {
-            code,
-            jt: 0,
-            jf: 0,
-            k,
-        }
-    }
-    fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
-        libc::sock_filter { code, jt, jf, k }
-    }
-
-    // Keep this deliberately smaller than a general Rust process profile.
-    // The helper can read immutable files and answer its one socket; it cannot
-    // create sockets, execute, change identity, inspect processes, or write
-    // filesystem objects even though it retains uid 0.
-    let allowed = [
-        libc::SYS_read,
-        libc::SYS_write,
-        // Rust's static-musl UnixStream implementation uses recvfrom/sendto
-        // for the already-connected broker socket where glibc uses read/write.
-        // The broker retains no other socket descriptor and cannot create one.
-        libc::SYS_recvfrom,
-        libc::SYS_sendto,
-        libc::SYS_close,
-        // Static musl uses open for File::open("/"); glibc uses openat. The
-        // certificate path itself is still resolved by the openat2 policy.
-        libc::SYS_open,
-        libc::SYS_openat,
-        libc::SYS_openat2,
-        libc::SYS_readlinkat,
-        libc::SYS_fstat,
-        libc::SYS_newfstatat,
-        libc::SYS_statx,
-        libc::SYS_lseek,
-        libc::SYS_mmap,
-        libc::SYS_mprotect,
-        libc::SYS_munmap,
-        libc::SYS_mremap,
-        libc::SYS_brk,
-        libc::SYS_madvise,
-        libc::SYS_fcntl,
-        libc::SYS_futex,
-        libc::SYS_clock_gettime,
-        libc::SYS_rt_sigaction,
-        libc::SYS_rt_sigprocmask,
-        libc::SYS_rt_sigreturn,
-        libc::SYS_restart_syscall,
-        libc::SYS_exit,
-        libc::SYS_exit_group,
-    ];
-    let mut filter = Vec::with_capacity(5 + allowed.len() * 2);
-    // struct seccomp_data: syscall number at byte 0, audit arch at byte 4.
-    filter.push(statement(BPF_LD_W_ABS, 4));
-    filter.push(jump(BPF_JMP_JEQ_K, AUDIT_ARCH, 1, 0));
-    filter.push(statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
-    filter.push(statement(BPF_LD_W_ABS, 0));
-    for syscall in allowed {
-        filter.push(jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1));
-        filter.push(statement(BPF_RET_K, SECCOMP_RET_ALLOW));
-    }
-    filter.push(statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
-    let program = libc::sock_fprog {
-        len: filter.len() as u16,
-        filter: filter.as_mut_ptr(),
-    };
-    if unsafe {
-        libc::prctl(
-            libc::PR_SET_SECCOMP,
-            libc::SECCOMP_MODE_FILTER,
-            &program as *const libc::sock_fprog,
-        )
-    } != 0
-    {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn install_broker_seccomp() -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "the privileged TLS broker has no seccomp profile for this architecture",
-    ))
+    vapache_os::install_broker_seccomp()
 }
 
 fn privileged_broker_loop(stream: &mut UnixStream, specs: &[(PathBuf, u64)], service_uid: u32) {
@@ -563,9 +384,7 @@ pub fn shutdown_privileged_file_broker() {
     let mut broker = broker.lock().unwrap_or_else(|error| error.into_inner());
     let _ = broker.stream.write_all(&BROKER_SHUTDOWN.to_ne_bytes());
     let _ = broker.stream.shutdown(std::net::Shutdown::Both);
-    unsafe {
-        libc::waitpid(broker.pid, std::ptr::null_mut(), 0);
-    }
+    let _ = vapache_os::wait(broker.pid);
 }
 
 #[derive(Debug)]
@@ -1754,7 +1573,7 @@ mod tests {
     use rustls::pki_types::ServerName;
     use rustls::server::StoresServerSessions as _;
     use rustls::{ClientConfig, ClientConnection, HandshakeKind, ServerConnection};
-    use std::os::fd::{AsRawFd, IntoRawFd};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1844,7 +1663,7 @@ mod tests {
             assert!(pid >= 0);
             if pid == 0 {
                 drop(client);
-                privileged_broker_child(server.into_raw_fd(), parent_pid, Vec::new(), u32::MAX);
+                privileged_broker_child(server, parent_pid, Vec::new(), u32::MAX);
             }
             drop(server);
             let mut ready = [0u8; 1];
@@ -1907,7 +1726,7 @@ mod tests {
             assert!(pid >= 0);
             if pid == 0 {
                 drop(client);
-                privileged_broker_child(server.into_raw_fd(), parent_pid, vec![(key, 64)], 65_534);
+                privileged_broker_child(server, parent_pid, vec![(key, 64)], 65_534);
             }
             drop(server);
             let mut ready = [0u8; 1];

@@ -283,8 +283,7 @@ impl BytesStr {
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        // Safety: check valid utf-8 in constructor
-        unsafe { std::str::from_utf8_unchecked(self.0.as_ref()) }
+        std::str::from_utf8(self.0.as_ref()).expect("BytesStr constructors validate UTF-8")
     }
 
     pub(crate) fn into_inner(self) -> Bytes {
