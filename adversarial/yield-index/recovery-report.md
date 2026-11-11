@@ -353,6 +353,33 @@ the initial reconstruction. The yield CSV/report were **not** recomputed in
 this extension; run `compute_yield.py` to regenerate them from the extended
 JSONL index.
 
+## Pass 36 extension (appended after the Pass-33/34/35 extensions)
+
+On 2026-11-10 the Pass 36 logical search (`S43`) and its claims were appended
+without modifying any earlier row. The index already contained the Pass 34
+(`S41`) and Pass 35 (`S42`) searches from earlier extensions; their rows are
+unchanged.
+
+- **S43 / Pass 36** — reviewed clean HEAD `3e4ce6cd0e97d8582c58a3729ae47b3e33a29d53`;
+  confirmed **P36-A** (trailing-slash internal rewrite aborts the whole
+  process: `CanonicalTarget::from_normalized` rejects the slash-suffixed
+  canonical passed by both rewrite call sites; primary `denial_of_service`,
+  critical, one unintended behavior, one remediation component) and preserved
+  two negative observations (a stale P33 battery expectation and a
+  rewrite-to-`/` parity divergence).
+
+Aggregate counts after the Pass 36 append: **33 engagements, 43 logical
+searches (55 segments), 197 claims — 135 confirmed, 11 duplicate, 1 invalid,
+50 unresolved**. Confirmed findings by primary family: `code_execution` 42,
+`denial_of_service` 29, `information_disclosure` 25, `authority_bypass` 20,
+`integrity_violation` 10, `unclassified` 5, `server_request_abuse` 3,
+`protocol_confusion` 1. Derived search duration total: **16 h 34 m 25 s**.
+
+The yield CSV/report files were **not** recomputed in this extension; the
+Pass-36 numbers in `vulnerability-families.md` were derived by running
+`compute_yield.py` against a scratch copy of this index (16,969.5 adjusted
+points / 16.574 h = 1023.89 points per search-hour).
+
 ## Validation
 
 Run:

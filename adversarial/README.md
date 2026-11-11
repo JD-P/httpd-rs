@@ -89,6 +89,9 @@ prevents re-deriving them from scratch.
 | `p35/results_p35.txt` | Pass-35 retained HEAD run output: every P35-A divergence reproduces and all controls agree |
 | `p35/pcre2_guard_p35.py` | Pass-35 guarded-regex fail-closed regression: Apache must accept the four confirmed greedy-class/`\R`/`\v` shapes while Vapache rejects them at configuration load; the simple-`\v` control still runs live and agrees on plain/NEL values |
 | `p35/results_p35_pcre2.txt` | Pass-35 retained HEAD run output: Apache denies and vapache allows the four confirmed guards |
+| `findings_p36.md` | Pass-36 write-up (**P36-A**, open at HEAD `3e4ce6c`, regression from `93c834f`): an internal rewrite whose canonical result ends with `/` makes `CanonicalTarget::from_normalized` reject the slash-suffixed `norm` passed by both rewrite call sites; the `.expect()` under `panic = "abort"` aborts the whole process from one unauthenticated request, in main configuration and in `.htaccess`; observations P36-O1 (stale P33 battery expectation) and P36-O2 (rewrite-to-`/` parity) preserved |
+| `p36/exploit_p36.py` | Pass-36 Apache 2.4.69 differential reproducer (six cases): main-config trailing-slash rewrite, missing target, `RewriteCond` guard, `.htaccess` per-directory rewrite, plus no-trailing-slash and root-rewrite controls; exits 0 while the aborts reproduce and must be converted into a remediation regression once fixed |
+| `p36/results_p36.txt` | Pass-36 retained HEAD run output: four `SIGABRT` rows (rc=-6) and two surviving controls |
 
 ## Pre-adversarial gate
 
