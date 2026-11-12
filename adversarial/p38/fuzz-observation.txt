@@ -1,0 +1,56 @@
+# Pass-38 multi_request_state fuzz observation (invalid as a vulnerability)
+
+`cargo +nightly fuzz run multi_request_state` on the reviewed HEAD
+`67ca87b` produced a deterministic crash artifact within the first fuzzing
+minutes:
+
+- original artifact (40 bytes):
+  `adversarial/p38/crash-multi-request-state-failover-accounting.bin`
+- minimized artifact (24 bytes):
+  `adversarial/p38/minimized-multi-request-state-failover-accounting.bin`
+  `[39, 48, 255, 255, 255, 48, 48, 41, 52, 48, 127, 94, 141, 100, 64, 65, 39, 101, 119, 10, 59, 127, 94, 141]`
+- panic: `crates/server/src/whole_request_fuzz.rs:1174`
+  `assertion left == right failed: pre-sink cancellation did not suppress the dynamic effect`
+  (`backend_effect = true` for a step whose `cancel_before_sink` is true)
+
+## Why this is a harness accounting bug, not a product defect
+
+The minimized input is two stateful steps:
+
+1. Step 0: `PUT /balanced/<token>` (idempotent method; backend `x-fuzz`
+   byte selects the ambiguous-framing response mode 3) with balancer member 0
+   marked unhealthy before preparation. The request is **not** cancelled.
+2. Step 1: `OPTIONS /balanced/?q=&n=119` with `cancel_before_sink = true`.
+
+For step 0, the ambiguous upstream response is a replayable transport failure
+for an idempotent method (`proxy_method_is_idempotent` accepts `PUT`;
+`proxy_retry_admit(true, true)` is true), so `execute_authorized_with_proxy_base`
+fails over to the alternate balancer member. That produces **two** upstream
+attempts and therefore two recorded `proxy_exchanges` entries for one
+`execute_prepared_snapshot` call, which pops only one.
+
+Evidence for the two attempts: replaying the minimized input prints
+`vapache proxy error: ambiguous proxy response framing` exactly **2** times.
+If the cancelled step 1 had contacted the backend, the count would be 3; the
+production `DynamicOutcomeToken::start_backend` cancellation check
+(`crates/server/src/server.rs:4100-4114`) therefore does suppress the
+cancelled request's sink.
+
+The leftover exchange from step 0 is popped by the cancelled step 1, and the
+harness assertion reports a cancellation failure that did not happen.
+
+## Replay
+
+```sh
+cargo +nightly fuzz run multi_request_state \
+  adversarial/p38/minimized-multi-request-state-failover-accounting.bin -- -runs=1
+```
+
+All four tracked `fuzz/corpus/multi_request_state` seeds
+(`access-replacement`, `backend-failover`, `in-flight-retirement`,
+`warm-reload-lookup`) pass at the reviewed HEAD. The finding is recorded in
+the index as an `invalid` claim (P38-B) so the false-positive rate of the
+review remains measurable; no product remediation is required for the crash
+itself. The harness accounting fix would be to compare per-request exchange
+*deltas* (or drain-and-count per execution) instead of popping a single
+exchange.

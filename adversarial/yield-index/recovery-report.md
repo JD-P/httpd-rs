@@ -404,6 +404,40 @@ new confirmed findings (medium, two behaviors → 5.0 points; low, two behaviors
 → 0.5 points) to the Pass-36 totals: 16,975.0 adjusted points / 17.207 h =
 986.52 points per search-hour.
 
+- **S45 / Pass 38** — reviewed clean HEAD `67ca87bdccb3932919c2efabb850d7320c2265b2`;
+  confirmed **P38-A** (backslash-continuation token joining inserts a space
+  where Apache concatenates the next physical line directly; primary
+  `code_execution`, high, two unintended behaviors, one remediation component)
+  and **P38-E** (HTTP/2 empty-DATA flood bypasses the 100-frame anti-flood cap
+  on terminal streams because the `1f35e19` decision-table early returns skip
+  the DATA-frame accounting; primary `denial_of_service`, high, one unintended
+  behavior, one remediation component). Recorded **P38-B** and **P38-D** as
+  `invalid` fuzzing-harness false positives (`multi_request_state` exchange
+  accounting; `whole_request_differential` round-robin member comparison and
+  an extra planning pass that trips the expensive-parse admission), and
+  **P38-C** as `unresolved` (a policy-budget-exhausted partial URL scope is
+  cached process-wide and later fails closed with 500 for that URL; not
+  reproduced, requires an unusually large rule set). P38-A is a new root cause
+  sibling of P35-A: a valid `<FilesMatch>` or `<LocationMatch>` guard split
+  across a continuation silently stops matching (Apache 403, vapache 200 with
+  the protected body), and a split `SetHandler`/`Require` that Apache rejects
+  for the whole access file becomes active policy (uploaded CGI executes,
+  protected file is served). Retained evidence is in `adversarial/p38/`.
+
+Aggregate counts after the Pass 38 append: **35 engagements, 45 logical
+searches (57 segments), 204 claims — 139 confirmed, 11 duplicate, 3 invalid,
+51 unresolved**. Confirmed findings by primary family: `code_execution` 43,
+`denial_of_service` 30, `information_disclosure` 25, `authority_bypass` 20,
+`integrity_violation` 10, `unclassified` 7, `server_request_abuse` 3,
+`protocol_confusion` 1. Derived search duration total: **17 h 52 m 33 s**.
+
+The yield CSV/report files were **not** recomputed in this extension; the
+Pass-38 numbers in `vulnerability-families.md` were derived by adding the new
+confirmed findings (P38-A high, two behaviors → 50.0 points; P38-E high, one
+behavior → 100.0 points) to the Pass-37 totals: 17,125.0 adjusted points /
+17.876 h = 958.00 points per search-hour. P38-B, P38-C and P38-D contribute
+zero points.
+
 ## Validation
 
 Run:

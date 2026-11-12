@@ -1,0 +1,82 @@
+# Pass-38 HTTP/2 empty-DATA flood observation (P38-E, confirmed)
+
+Subject: HEAD `67ca87bdccb3932919c2efabb850d7320c2265b2`
+(`target/release/vapached`, rebuilt from the checked-out tree).
+Regression commit: `1f35e19` "Harden HTTP/2 lifecycle state handling".
+Oracle/measurement: local TLS+ALPN HTTP/2 client (`h2-data-flood/h2raw.py`)
+against the lab config `h2-data-flood/httpd.conf` (static-only vhost,
+`Protocols h2 http/1.1`), loopback only.
+
+## Root cause
+
+`1f35e19` added decision-table early returns to `Inner::recv_data` in the
+vendored h2 fork. All of them return before the only call to
+`counts.record_data_frame`:
+
+- `vendor/h2-0.4.20/src/proto/streams/streams.rs:697-718` — stream not found
+  but present in the bounded forgotten tombstones: `ignore_data` then return.
+- `vendor/h2-0.4.20/src/proto/streams/streams.rs:737-741` — found stream whose
+  verified decision is `Ignore` (locally reset): `ignore_data`, return.
+- `vendor/h2-0.4.20/src/proto/streams/streams.rs:742-758` — found stream whose
+  decision is `StreamClosed` (peer half/fully closed): `ignore_data` plus
+  `send_repeat_reset`, return.
+
+`counts.record_data_frame(payload_len)` now runs only on the `Process` path
+(`streams.rs:779-784`) and only when the frame is not END_STREAM.
+`record_data_frame` is the enforcer of `MAX_RECV_EMPTY_DATA_FRAMES = 100`
+(`vendor/h2-0.4.20/src/proto/mod.rs:40`,
+`vendor/h2-0.4.20/src/proto/streams/counts.rs:161-179`), the mitigation the
+repository's own CVE matrix records for CVE-2019-9518 ("empty frames imposed
+parser/state work disproportionate to their wire size") and CVE-2020-12603.
+
+The only remaining bound is the unified per-connection frame-work budget
+(`h2_frame_work_cost_spec`, `crates/verified/src/lib.rs:15823-15834`), which
+charges one unit per DATA frame and refills 65,536 units/s
+(`crates/server/src/h2.rs`-driven `FrameWorkBudget`): about 65k empty DATA
+frames/s per connection sustained.
+
+## Independent reproduction (2026-11-12, release binary)
+
+```
+CONTROL: GOAWAY after 101 empty DATA frames: last=1 code=11 debug=b'too_many_data_frames'
+BYPASS setup RST: [('SETTINGS', 0), ('SETTINGS', 0), ('WINDOW_UPDATE', 0), ('RST_STREAM', 1)]
+BYPASS: 20000 empty DATA frames in 5.0s, NO GOAWAY, connection alive
+```
+
+A second paced run measured the sustained rate and cost:
+
+```
+sent=395000 in 8.0s = 49351 frames/s; server CPU=0.15s = 0.38 us/frame
+goaway: NONE (connection alive)
+```
+
+The bypass shape: send `HEADERS :method POST, content-length: 1` (no
+END_STREAM), then a 2-byte `DATA "ab"`. The server resets the stream with
+`RST_STREAM(PROTOCOL_ERROR)` (content-length overflow). The stream is now
+locally reset, so every following empty `DATA` frame takes the `Ignore`
+early return. The control sends the same empty `DATA` frames on a normal open
+stream and receives GOAWAY `ENHANCE_YOUR_CALM` after 101 frames.
+
+The `StreamClosed` variant (peer half-closed) additionally queues one
+`send_repeat_reset` per input frame, a small wire amplification on top of the
+CPU cost.
+
+## Impact
+
+An unauthenticated HTTP/2 client can pin server CPU with a sustained ~65k
+frames/s per connection of 9-byte frames (about 0.6 MB/s), instead of the
+intended lifetime cap of 100 empty DATA frames per stream. The cost is paid
+per connection and multiplies across the documented per-client/per-process
+HTTP/2 connection limits; the pre-commit behavior tore the connection down
+after 100 frames. No crash and no response corruption were observed; this is
+resource exhaustion, not memory unsafety.
+
+## Evidence
+
+- `adversarial/p38/h2-data-flood/repro_data_budget_bypass.py` — control and
+  bypass reproducer.
+- `adversarial/p38/h2-data-flood/h2raw.py` — raw TLS/ALPN HTTP/2 client.
+- `adversarial/p38/h2-data-flood/httpd.conf`, `runner3.py` — lab server and
+  static-body probe.
+- Independent source audit in `adversarial/p38/subagent-h2-lifecycle-review.md`
+  (subagent report summary; h2spec, fuzzing and unit-suite results included).

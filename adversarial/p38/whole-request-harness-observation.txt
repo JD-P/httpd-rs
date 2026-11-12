@@ -1,0 +1,55 @@
+# Pass-38 whole_request_differential harness observation (P38-D, invalid)
+
+Two deterministic `whole_request_differential` crashes at HEAD `67ca87b` were
+reproduced and diagnosed. Both are test-harness artifacts; neither is a
+protocol-projection or product defect.
+
+## 1. Round-robin balancer member compared across the H1 and H2 evaluations
+
+- Artifact: `crash-whole-request-roundrobin-balancer.bin` (10 bytes,
+  `GET/PUT /balanced/780a?q=780a&n=105`).
+- Panic: `whole_request_fuzz.rs:1381` `protocol projections diverged`.
+- The two snapshots are identical except `backend_exchange.fields.host`:
+  `127.0.0.1:44045` versus `127.0.0.1:34257`.
+- Cause: the fixture's `balancer://stateful/` selection is round-robin;
+  `next_balancer_member` increments a per-generation counter
+  (`crates/server/src/proxy.rs:909-916`), so the H1 evaluation and the H2
+  evaluation legitimately select different members. The fixture's own unit
+  test `balanced_failover_selects_the_alternative_member` asserts the
+  alternation. The comparison should pin or normalize the member.
+
+## 2. The harness's extra planning pass trips the expensive-parse admission
+
+- Artifact: `crash-whole-request-access-plan.bin` (52 bytes) and its
+  minimizer output `minimized-whole-request-access-plan.bin` (1 byte, `0x76`
+  = `GET /access/guard.cgi`).
+- Panic: `whole_request_fuzz.rs:1381`; the only difference is
+  `plan: Rejected { status: 500, class: "filesystem" }` (H1) versus
+  `plan: Filesystem { ... }` (H2). The same H1 evaluation's dispatch prepared
+  and executed the CGI handler and returned `200` with the CGI body.
+- Instrumented copy of HEAD (`plan_snapshot`'s error branch printing the
+  error) produced:
+
+  ```
+  P38DIAG plan error for /access/guard.cgi: AccessFiles(".../www/access/.htaccess: access-file parse capacity exhausted") budget_failed=false
+  ```
+
+- Cause: `htaccess::parse_cached` takes a process-wide expensive-operation
+  lease (`crates/server/src/resource.rs:2648-2684`) before parsing an access
+  file; the fixture's PEER client context has already consumed its
+  expensive-op budget by the time the harness's extra `plan_snapshot` pass
+  runs, and the admission fails transiently. The evaluation's own dispatch
+  runs moments later (after the rate bucket refills) and succeeds.
+- Product control: a standalone server with the same fixture config
+  (static-only `/access/.htaccess`, `AllowOverride AuthConfig`,
+  `Options +ExecCGI`) returns `200` for every `GET /access/guard.cgi`,
+  including the first request after startup.
+
+Replay:
+
+```sh
+cargo +nightly fuzz run whole_request_differential \
+  adversarial/p38/minimized-whole-request-access-plan.bin -- -runs=1
+cargo +nightly fuzz run whole_request_differential \
+  adversarial/p38/crash-whole-request-roundrobin-balancer.bin -- -runs=1
+```
