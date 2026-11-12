@@ -12492,6 +12492,10 @@ SSLOptions +StrictRequire\n";
         assert_eq!(cfg.apache_mpm_tuning.threads_per_child, Some(25));
         assert!(cfg.extended_status);
 
+        assert!(autoindex_icon("(ALT)").is_err());
+        assert!(autoindex_icon("").is_err());
+        assert!(autoindex_icon("(bad\n,/icons/bad.gif)").is_err());
+
         for directive in ["IndexOptions -FancyIndexing", "MaxConnectionsPerChild 1"] {
             assert!(
                 load_text(&format!("Listen 127.0.0.1:0\n{directive}\n"), false).is_err(),

@@ -574,6 +574,10 @@ pub struct CacheContext {
 }
 
 impl CacheContext {
+    pub(crate) fn generation_is_current(&self, cfg: &Config) -> bool {
+        vapache_verified::cache_generation_admit(self.epoch, cfg.cache_epoch())
+    }
+
     pub fn authorization(&self) -> &crate::access::AuthorizedOutcome {
         &self.authorization
     }

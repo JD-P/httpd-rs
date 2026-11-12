@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-12",
   "verus": {
-    "verified_functions": 842,
+    "verified_functions": 856,
     "errors": 0
   },
   "obligations": [
@@ -124,6 +124,13 @@
       "status": "mechanized",
       "weight": 1.0,
       "evidence": "InternalRequestKind and internal_request_projection are the executable transition policy consumed by the sole internal dispatcher: DirectoryIndex preserves the selected application's method, body, query and exact header/body storage, while a local ErrorDocument becomes a bodyless GET with only its configured query and the exact expected entity, conditional-range, hop-by-hop, upgrade and Connection-nominated header set removed. Both preserve the mutable request target, version and keep-alive decision as well as clone-shared wire method/target/version, request-scope lineage, authenticated identity, public URI, proxy session and resident-byte lease. Header projection and request-context/identity preservation are computed as separate facts. The runtime computes exact equality for every projected field and consumes internal_request_runtime_refines; its Verus specification is one complete conjunction, and admitted_internal_request_refines_every_field proves admission cannot omit a field. A sealed ProjectedInternalRequest carries that complete refinement into the consuming authorization boundary, so no caller can substitute a boolean certificate. Each move-only AuthorizedOutcome also stores the exact InternalRequestKind and DecodedUrlPath; internal_request_outcome_admit plus internal_request_outcome_binds_kind_target_and_projection prove the sink class, target and full runtime projection are jointly required before dispatch. error_document_depth_step owns recursion, internal_request_target_admit rejects ambiguous local targets at compile time and dispatch, directory_index_name_admit binds the literal probe to the URL component, and deferred-handler tests prove the exact projection and token are rebuilt after lazy body acquisition."
+    },
+    {
+      "id": "dynamic_outcome_lifecycle",
+      "title": "Dynamic execution preserves authorization, finalization, cache and output order",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "DynamicOutcomeState is the executable Prepared -> Backend -> Response -> Output/Aborted machine for the facts formerly implicit in nested PreparedHandler wrappers. Its initial state records the complete handler tree's required internal projection, ErrorDocument finalizer and dispatch/cache finalizer. StartBackend requires authorization, backend binding and any internal projection; BackendComplete requires a structurally valid response; cache consideration requires an admitted response, an active dispatch finalizer and the current configuration generation; output requires every required outer finalizer; Aborted is absorbing. The executable transition and readiness predicates refine their Verus specifications, and separate lemmas prove backend, cache, output and abort consequences. The move-only runtime DynamicOutcomeToken is created once from the typed handler tree and consumed immediately around the concrete proxy, FastCGI and CGI side effects, response parser, local ErrorDocument restoration, cache lookup/store and terminal response boundary; an invalid transition fails closed. A cancelled request is moved to Aborted before StartBackend, so it cannot open a proxy/FastCGI exchange or launch CGI. The whole_request_differential campaign executes those live backends for H1 and H2, compares exact proxy/FastCGI request serialization and fully finalized response semantics across fragmented, chunked, empty and malformed replies, exercises cold/warm cache, pre-sink cancellation and local/external ErrorDocument plus CGI/FastCGI/proxy DirectoryIndex, and checks the complete resource ledger after each projection."
     },
     {
       "id": "cache_generation_epoch",

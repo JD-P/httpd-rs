@@ -10,11 +10,13 @@ use crate::config::Config;
 use crate::http::{Body, Limits, Request, Response};
 use crate::request_plan::{CanonicalErrorOrPlan, RequestPlan};
 use crate::server::{BodyRouteDecision, PreparedHandler, PreparedRouteDecision};
-use std::io::{Cursor, Read};
-use std::net::{IpAddr, SocketAddr};
+use std::collections::VecDeque;
+use std::io::{Cursor, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::FileExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const LOCAL_IP: &str = "127.0.0.1";
 const LOCAL_PORT: u16 = 443;
@@ -27,6 +29,7 @@ struct LogicalRequest {
     fields: Vec<(String, Vec<u8>)>,
     body: Vec<u8>,
     denied_route: bool,
+    cancel_before_sink: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -98,13 +101,20 @@ enum CacheSnapshot {
 
 #[derive(Debug, PartialEq, Eq)]
 enum ResponseSnapshot {
-    Prepared(&'static str),
     Complete {
         status: u16,
         headers: Vec<(String, Vec<u8>)>,
-        body_kind: &'static str,
         body: Vec<u8>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BackendExchangeSnapshot {
+    kind: &'static str,
+    method: String,
+    target: Vec<u8>,
+    fields: Vec<(String, Vec<u8>)>,
+    body: Vec<u8>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -115,16 +125,302 @@ struct WholeRequestSnapshot {
     sink: SinkSnapshot,
     backend: Option<BackendSnapshot>,
     cache: CacheSnapshot,
+    backend_exchange: Option<BackendExchangeSnapshot>,
+    backend_effect: bool,
     response: ResponseSnapshot,
 }
 
 struct Fixture {
     config: Config,
+    proxy_exchanges: Arc<Mutex<VecDeque<BackendExchangeSnapshot>>>,
+    fastcgi_exchanges: Arc<Mutex<VecDeque<BackendExchangeSnapshot>>>,
+}
+
+fn push_exchange(
+    exchanges: &Arc<Mutex<VecDeque<BackendExchangeSnapshot>>>,
+    exchange: BackendExchangeSnapshot,
+) {
+    exchanges
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push_back(exchange);
+}
+
+fn try_pop_exchange(
+    exchanges: &Arc<Mutex<VecDeque<BackendExchangeSnapshot>>>,
+) -> Option<BackendExchangeSnapshot> {
+    exchanges
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .pop_front()
+}
+
+fn exchange_mode(exchange: &BackendExchangeSnapshot, name: &str) -> u8 {
+    exchange
+        .fields
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| value.first().copied())
+        .map(|byte| match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => byte,
+        })
+        .unwrap_or(0)
+        % 4
+}
+
+fn read_proxy_exchange(stream: &mut TcpStream) -> std::io::Result<BackendExchangeSnapshot> {
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    let mut wire = Vec::new();
+    let head_end = loop {
+        if wire.len() > 128 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "proxy request head exceeded differential bound",
+            ));
+        }
+        if let Some(end) = wire.windows(4).position(|window| window == b"\r\n\r\n") {
+            break end + 4;
+        }
+        let mut chunk = [0u8; 4096];
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "proxy request ended before its head",
+            ));
+        }
+        wire.extend_from_slice(&chunk[..read]);
+    };
+    let head = &wire[..head_end - 4];
+    let mut lines = head.split(|byte| *byte == b'\n');
+    let request_line = lines.next().unwrap_or_default();
+    let request_line = request_line.strip_suffix(b"\r").unwrap_or(request_line);
+    let mut parts = request_line.splitn(3, |byte| *byte == b' ');
+    let method = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+    let target = parts.next().unwrap_or_default().to_vec();
+    let mut fields = Vec::new();
+    let mut content_length = 0usize;
+    for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        let name = String::from_utf8_lossy(&line[..colon]).to_ascii_lowercase();
+        let value = line[colon + 1..]
+            .iter()
+            .copied()
+            .skip_while(|byte| *byte == b' ' || *byte == b'\t')
+            .collect::<Vec<_>>();
+        if name == "content-length" {
+            content_length = String::from_utf8_lossy(&value).parse().unwrap_or(0);
+        }
+        fields.push((name, value));
+    }
+    fields.sort();
+    let mut body = wire[head_end..].to_vec();
+    while body.len() < content_length {
+        let mut chunk = [0u8; 4096];
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+    Ok(BackendExchangeSnapshot {
+        kind: "proxy",
+        method,
+        target,
+        fields,
+        body,
+    })
+}
+
+fn start_proxy_backend(
+    exchanges: Arc<Mutex<VecDeque<BackendExchangeSnapshot>>>,
+) -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind differential proxy backend");
+    let port = listener.local_addr().expect("proxy backend address").port();
+    let thread = std::thread::spawn(move || {
+        for accepted in listener.incoming() {
+            let Ok(mut stream) = accepted else {
+                continue;
+            };
+            let Ok(exchange) = read_proxy_exchange(&mut stream) else {
+                continue;
+            };
+            let mode = exchange_mode(&exchange, "x-fuzz");
+            push_exchange(&exchanges, exchange);
+            let response: &[u8] = match mode {
+                0 => b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: public, max-age=60\r\nX-Backend: proxy\r\nContent-Length: 20\r\nConnection: close\r\n\r\nwhole-request proxy\n",
+                1 => b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nwhole\r\nF\r\n-request proxy\n\r\n0\r\nX-Trailer: done\r\n\r\n",
+                2 => b"HTTP/1.1 204 No Content\r\nX-Backend: proxy\r\nConnection: close\r\n\r\n",
+                _ => b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbad!",
+            };
+            for chunk in response.chunks(3) {
+                if stream.write_all(chunk).is_err() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+    });
+    (port, thread)
+}
+
+fn fastcgi_len(bytes: &[u8], position: &mut usize) -> Option<usize> {
+    let first = *bytes.get(*position)?;
+    *position += 1;
+    if first & 0x80 == 0 {
+        Some(first as usize)
+    } else {
+        let tail = bytes.get(*position..position.checked_add(3)?)?;
+        *position += 3;
+        Some(
+            (((first & 0x7f) as usize) << 24)
+                | ((tail[0] as usize) << 16)
+                | ((tail[1] as usize) << 8)
+                | tail[2] as usize,
+        )
+    }
+}
+
+fn parse_fastcgi_params(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut fields = Vec::new();
+    let mut position = 0usize;
+    while position < bytes.len() {
+        let Some(name_len) = fastcgi_len(bytes, &mut position) else {
+            break;
+        };
+        let Some(value_len) = fastcgi_len(bytes, &mut position) else {
+            break;
+        };
+        let Some(end) = position
+            .checked_add(name_len)
+            .and_then(|p| p.checked_add(value_len))
+        else {
+            break;
+        };
+        if end > bytes.len() {
+            break;
+        }
+        let name = String::from_utf8_lossy(&bytes[position..position + name_len]).into_owned();
+        position += name_len;
+        let value = bytes[position..position + value_len].to_vec();
+        position += value_len;
+        // This is the one intentional protocol projection: a backend may
+        // observe the incoming protocol version, while every security- and
+        // application-bearing field must remain byte-identical.
+        if name != "SERVER_PROTOCOL" {
+            fields.push((name, value));
+        }
+    }
+    fields.sort();
+    fields
+}
+
+fn fastcgi_record(out: &mut Vec<u8>, kind: u8, content: &[u8]) {
+    out.push(1);
+    out.push(kind);
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&(content.len() as u16).to_be_bytes());
+    out.push(0);
+    out.push(0);
+    out.extend_from_slice(content);
+}
+
+fn read_fastcgi_exchange(stream: &mut UnixStream) -> std::io::Result<BackendExchangeSnapshot> {
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    let mut params = Vec::new();
+    let mut body = Vec::new();
+    loop {
+        let mut header = [0u8; 8];
+        stream.read_exact(&mut header)?;
+        if header[0] != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid FastCGI version",
+            ));
+        }
+        let kind = header[1];
+        let len = u16::from_be_bytes([header[4], header[5]]) as usize;
+        let padding = header[6] as usize;
+        let mut content = vec![0u8; len.saturating_add(padding)];
+        stream.read_exact(&mut content)?;
+        content.truncate(len);
+        match kind {
+            4 => params.extend_from_slice(&content),
+            5 if len == 0 => break,
+            5 => body.extend_from_slice(&content),
+            _ => {}
+        }
+    }
+    let fields = parse_fastcgi_params(&params);
+    let value = |name: &str| {
+        fields
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default()
+    };
+    Ok(BackendExchangeSnapshot {
+        kind: "fastcgi",
+        method: String::from_utf8_lossy(&value("REQUEST_METHOD")).into_owned(),
+        target: value("REQUEST_URI"),
+        fields,
+        body,
+    })
+}
+
+fn start_fastcgi_backend(
+    socket: PathBuf,
+    exchanges: Arc<Mutex<VecDeque<BackendExchangeSnapshot>>>,
+) -> std::thread::JoinHandle<()> {
+    let listener = UnixListener::bind(&socket).expect("bind differential FastCGI backend");
+    std::thread::spawn(move || {
+        for accepted in listener.incoming() {
+            let Ok(mut stream) = accepted else {
+                continue;
+            };
+            let Ok(exchange) = read_fastcgi_exchange(&mut stream) else {
+                continue;
+            };
+            let mode = exchange_mode(&exchange, "HTTP_X_FUZZ");
+            push_exchange(&exchanges, exchange);
+            let mut response = Vec::new();
+            let (head, body): (&[u8], &[u8]) = match mode {
+                0 => (
+                    b"Status: 202 Accepted\r\nContent-Type: text/plain\r\nCache-Control: public, max-age=60\r\nX-Backend: fastcgi\r\n\r\n",
+                    b"whole-request fastcgi\n",
+                ),
+                1 => (b"Status: 204 No Content\r\nX-Backend: fastcgi\r\n\r\n", b""),
+                2 => (
+                    b"Status: 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n",
+                    b"bad!",
+                ),
+                _ => (
+                    b"Status: 404 Not Found\r\nContent-Type: text/plain\r\nX-Backend: fastcgi\r\n\r\n",
+                    b"fastcgi missing\n",
+                ),
+            };
+            fastcgi_record(&mut response, 6, head);
+            for chunk in body.chunks(4) {
+                fastcgi_record(&mut response, 6, chunk);
+            }
+            fastcgi_record(&mut response, 6, &[]);
+            fastcgi_record(&mut response, 3, &[0u8; 8]);
+            let _ = stream.write_all(&response);
+        }
+    })
 }
 
 fn fixture() -> &'static Fixture {
     static FIXTURE: OnceLock<Fixture> = OnceLock::new();
     FIXTURE.get_or_init(|| {
+        vapache_os::ignore_sigpipe().expect("install whole-request fuzz SIGPIPE disposition");
         let root =
             std::env::temp_dir().join(format!("vapache-whole-request-fuzz-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -135,6 +431,12 @@ fn fixture() -> &'static Fixture {
                 .expect("create internal-transition fixture directory");
         }
         std::fs::create_dir_all(root.join("cache")).expect("create response cache root");
+        let proxy_exchanges = Arc::new(Mutex::new(VecDeque::new()));
+        let fastcgi_exchanges = Arc::new(Mutex::new(VecDeque::new()));
+        let (proxy_port, _proxy_thread) = start_proxy_backend(proxy_exchanges.clone());
+        let fastcgi_socket = root.join("whole-request-fcgi.sock");
+        let _fastcgi_thread =
+            start_fastcgi_backend(fastcgi_socket.clone(), fastcgi_exchanges.clone());
         std::fs::write(root.join("www/public.txt"), b"public representation\n")
             .expect("write public fixture");
         std::fs::write(root.join("www/cache/item.txt"), b"cache representation\n")
@@ -151,8 +453,12 @@ fn fixture() -> &'static Fixture {
         .expect("write denied DirectoryIndex fixture");
         std::fs::write(root.join("www/index.html"), b"index representation\n")
             .expect("write index fixture");
-        std::fs::write(root.join("www/errors/404.txt"), b"local error representation\n")
-            .expect("write local ErrorDocument fixture");
+        let error_cgi = root.join("www/errors/404.cgi");
+        std::fs::write(
+            &error_cgi,
+            b"#!/bin/sh\nprintf 'Status: 200 OK\\r\\nContent-Type: text/plain\\r\\nX-Backend: cgi-error\\r\\n\\r\\n'\nprintf 'error:%s|%s|%s\\n' \"$REQUEST_METHOD\" \"$QUERY_STRING\" \"$SCRIPT_NAME\"\ncat\n",
+        )
+        .expect("write dynamic ErrorDocument fixture");
         std::fs::write(root.join("www/fcgi-dir/index.php"), b"<?php echo 'index'; ?>\n")
             .expect("write FastCGI index fixture");
         std::fs::write(root.join("www/proxy-dir/index.txt"), b"proxy index selection\n")
@@ -160,7 +466,7 @@ fn fixture() -> &'static Fixture {
         let cgi_index = root.join("www/app/index.cgi");
         std::fs::write(
             &cgi_index,
-            b"#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nwhole-request CGI\\n'\n",
+            b"#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\nX-Backend: cgi\\r\\n\\r\\nwhole-request CGI\\n'\n",
         )
         .expect("write CGI index fixture");
         let mut permissions = std::fs::metadata(&cgi_index)
@@ -168,7 +474,10 @@ fn fixture() -> &'static Fixture {
             .permissions();
         use std::os::unix::fs::PermissionsExt as _;
         permissions.set_mode(0o755);
-        std::fs::set_permissions(&cgi_index, permissions).expect("make CGI index executable");
+        std::fs::set_permissions(&cgi_index, permissions.clone())
+            .expect("make CGI index executable");
+        std::fs::set_permissions(&error_cgi, permissions)
+            .expect("make ErrorDocument CGI executable");
 
         let config_path = root.join("httpd.conf");
         let config_text = format!(
@@ -182,13 +491,12 @@ fn fixture() -> &'static Fixture {
              VapacheCapability FastCgi On\n\
              VapacheCapability UnstableFastCgiPaths On\n\
              DirectoryIndex index.html\n\
-             ErrorDocument 404 /errors/404.txt?source=local\n\
+             ErrorDocument 404 /errors/404.cgi?source=local\n\
              CacheRoot \"{}/cache\"\n\
              CacheEnable disk /cache\n\
-             Header set Cache-Control no-store\n\
-             ProxyPass /proxy http://127.0.0.1:9/upstream/\n\
-             ProxyPass /proxy-dir/index.txt http://127.0.0.1:9/upstream/index.txt\n\
-             ProxyPassMatch ^/fcgi-dir/(.*\\.php)$ \"unix:/tmp/vapache-whole-request-missing.sock|fcgi://localhost{}/www/fcgi-dir/\"\n\
+             ProxyPass /proxy http://127.0.0.1:{}/upstream/\n\
+             ProxyPass /proxy-dir/index.txt http://127.0.0.1:{}/upstream/index.txt\n\
+             ProxyPassMatch ^/fcgi-dir/(.*\\.php)$ \"unix:{}|fcgi://localhost{}/www/fcgi-dir/\"\n\
              Redirect 302 /redirect /public.txt\n\
              AddHandler cgi-script .cgi\n\
              RewriteEngine On\n\
@@ -202,6 +510,10 @@ fn fixture() -> &'static Fixture {
              <Directory \"{}/www/app\">\n\
              Options +ExecCGI\n\
              DirectoryIndex index.cgi\n\
+             Require all granted\n\
+             </Directory>\n\
+             <Directory \"{}/www/errors\">\n\
+             Options +ExecCGI\n\
              Require all granted\n\
              </Directory>\n\
              <Directory \"{}/www/fcgi-dir\">\n\
@@ -223,6 +535,10 @@ fn fixture() -> &'static Fixture {
             root.display(),
             root.display(),
             root.display(),
+            proxy_port,
+            proxy_port,
+            fastcgi_socket.display(),
+            root.display(),
             root.display(),
             root.display(),
             root.display(),
@@ -240,7 +556,11 @@ fn fixture() -> &'static Fixture {
         )
         .unwrap_or_else(|errors| panic!("whole-request config: {errors:?}"));
         assert!(config.resource_budget.transition_usage_is_zero());
-        Fixture { config }
+        Fixture {
+            config,
+            proxy_exchanges,
+            fastcgi_exchanges,
+        }
     })
 }
 
@@ -355,6 +675,7 @@ fn logical_request(data: &[u8]) -> LogicalRequest {
         fields,
         body,
         denied_route,
+        cancel_before_sink: byte(7) & 0x80 != 0,
     }
 }
 
@@ -364,6 +685,17 @@ fn encode_h1(logical: &LogicalRequest) -> Vec<u8> {
     wire.push(b' ');
     wire.extend_from_slice(logical.target.as_bytes());
     wire.extend_from_slice(b" HTTP/1.1\r\nHost: localhost\r\n");
+    // HTTP/1 requires the hop-by-hop Connection token before forwarding TE,
+    // while HTTP/2 forbids Connection entirely.  This is a wire projection of
+    // the same logical `TE: trailers` field, not an application-visible
+    // difference, so canonical snapshots omit Connection below.
+    if logical
+        .fields
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("te"))
+    {
+        wire.extend_from_slice(b"Connection: TE\r\n");
+    }
     for (name, value) in &logical.fields {
         wire.extend_from_slice(name.as_bytes());
         wire.extend_from_slice(b": ");
@@ -421,6 +753,7 @@ fn canonical_snapshot(request: &Request) -> CanonicalRequestSnapshot {
     let mut headers = request
         .headers
         .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("connection"))
         .map(|(name, value)| (name.to_string(), value.to_vec()))
         .collect::<Vec<_>>();
     headers.sort();
@@ -555,9 +888,9 @@ fn response_snapshot(response: Response) -> ResponseSnapshot {
         .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
         .collect::<Vec<_>>();
     headers.sort();
-    let (body_kind, body) = match response.body {
-        Body::Empty => ("empty", Vec::new()),
-        Body::Bytes(body) => ("bytes", body),
+    let body = match response.body {
+        Body::Empty => Vec::new(),
+        Body::Bytes(body) => body,
         Body::File { file, offset, len } => {
             assert!(
                 len <= 1024 * 1024,
@@ -575,7 +908,7 @@ fn response_snapshot(response: Response) -> ResponseSnapshot {
                 filled += read;
             }
             body.truncate(filled);
-            ("file", body)
+            body
         }
         Body::Stream { reader, len } => {
             assert!(
@@ -588,13 +921,12 @@ fn response_snapshot(response: Response) -> ResponseSnapshot {
                 .read_to_end(&mut body)
                 .expect("read differential stream response");
             assert_eq!(body.len() as u64, len);
-            ("stream", body)
+            body
         }
     };
     ResponseSnapshot::Complete {
         status,
         headers,
-        body_kind,
         body,
     }
 }
@@ -603,6 +935,8 @@ struct RouteSnapshot {
     authorization: AuthorizationSnapshot,
     sink: SinkSnapshot,
     backend: Option<BackendSnapshot>,
+    backend_exchange: Option<BackendExchangeSnapshot>,
+    backend_effect: bool,
     route_cache: Option<CacheSnapshot>,
     response: ResponseSnapshot,
 }
@@ -615,15 +949,23 @@ fn cache_context_snapshot(context: &crate::cache::CacheContext) -> CacheSnapshot
     }
 }
 
-fn prepared_snapshot(handler: PreparedHandler) -> RouteSnapshot {
+fn prepared_identity(
+    handler: &PreparedHandler,
+) -> (SinkSnapshot, BackendSnapshot, Option<CacheSnapshot>) {
     match handler {
         PreparedHandler::FinalizeDispatch { handler, cache, .. } => {
-            let mut snapshot = prepared_snapshot(*handler);
-            snapshot.route_cache = cache.as_deref().map(cache_context_snapshot);
-            snapshot
+            let (sink, backend, nested_cache) = prepared_identity(handler);
+            (
+                sink,
+                backend,
+                cache
+                    .as_deref()
+                    .map(cache_context_snapshot)
+                    .or(nested_cache),
+            )
         }
         PreparedHandler::FinalizeErrorDocument { handler, .. }
-        | PreparedHandler::FinalizeInternalRequest { handler, .. } => prepared_snapshot(*handler),
+        | PreparedHandler::FinalizeInternalRequest { handler, .. } => prepared_identity(handler),
         PreparedHandler::Proxy {
             authorization,
             target,
@@ -631,18 +973,16 @@ fn prepared_snapshot(handler: PreparedHandler) -> RouteSnapshot {
         } => {
             let selected = target.binding_key();
             let authorized = authorization.resource().backend_target.clone();
-            RouteSnapshot {
-                authorization: AuthorizationSnapshot::Granted,
-                sink: SinkSnapshot::Proxy,
-                backend: Some(BackendSnapshot {
+            (
+                SinkSnapshot::Proxy,
+                BackendSnapshot {
                     kind: "proxy",
                     selected,
                     authorized,
                     resource: authorization.resource().clone(),
-                }),
-                route_cache: None,
-                response: ResponseSnapshot::Prepared("proxy"),
-            }
+                },
+                None,
+            )
         }
         PreparedHandler::FastCgi {
             authorization,
@@ -655,18 +995,16 @@ fn prepared_snapshot(handler: PreparedHandler) -> RouteSnapshot {
             // available at this side-effect-free differential boundary.
             let selected = target.script_filename().display().to_string();
             let authorized = authorization.resource().backend_target.clone();
-            RouteSnapshot {
-                authorization: AuthorizationSnapshot::Granted,
-                sink: SinkSnapshot::FastCgi,
-                backend: Some(BackendSnapshot {
+            (
+                SinkSnapshot::FastCgi,
+                BackendSnapshot {
                     kind: "fastcgi",
                     selected,
                     authorized,
                     resource: authorization.resource().clone(),
-                }),
-                route_cache: None,
-                response: ResponseSnapshot::Prepared("fastcgi"),
-            }
+                },
+                None,
+            )
         }
         PreparedHandler::Cgi {
             authorization,
@@ -675,19 +1013,71 @@ fn prepared_snapshot(handler: PreparedHandler) -> RouteSnapshot {
         } => {
             use std::os::unix::fs::MetadataExt as _;
             let selected = format!("{}:{}", script_meta.dev(), script_meta.ino());
-            RouteSnapshot {
-                authorization: AuthorizationSnapshot::Granted,
-                sink: SinkSnapshot::Cgi,
-                backend: Some(BackendSnapshot {
+            (
+                SinkSnapshot::Cgi,
+                BackendSnapshot {
                     kind: "cgi",
                     selected,
                     authorized: authorization.resource().backend_target.clone(),
                     resource: authorization.resource().clone(),
-                }),
-                route_cache: None,
-                response: ResponseSnapshot::Prepared("cgi"),
-            }
+                },
+                None,
+            )
         }
+    }
+}
+
+fn execute_prepared_snapshot(
+    fixture: &Fixture,
+    cfg: &Config,
+    request: &mut Request,
+    handler: PreparedHandler,
+    cancel_before_sink: bool,
+) -> RouteSnapshot {
+    let (sink, backend, route_cache) = prepared_identity(&handler);
+    if cancel_before_sink {
+        request
+            .request_scope()
+            .expect("decoded request has a cancellation scope")
+            .cancel();
+    }
+    let peer = SocketAddr::new(PEER, 4242);
+    let response =
+        crate::server::execute_prepared_handler(cfg, request, peer, LOCAL_PORT, true, handler);
+    let (backend_exchange, backend_effect) = match sink {
+        SinkSnapshot::Proxy => {
+            let exchange = try_pop_exchange(&fixture.proxy_exchanges);
+            let effect = exchange.is_some();
+            (exchange, effect)
+        }
+        SinkSnapshot::FastCgi => {
+            let exchange = try_pop_exchange(&fixture.fastcgi_exchanges);
+            let effect = exchange.is_some();
+            (exchange, effect)
+        }
+        SinkSnapshot::Cgi => (
+            None,
+            response
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-backend")),
+        ),
+        SinkSnapshot::None | SinkSnapshot::StaticFile | SinkSnapshot::Redirect => {
+            unreachable!("a prepared handler always owns a dynamic sink")
+        }
+    };
+    assert_eq!(
+        backend_effect, !cancel_before_sink,
+        "pre-sink cancellation did not suppress the dynamic effect"
+    );
+    RouteSnapshot {
+        authorization: AuthorizationSnapshot::Granted,
+        sink,
+        backend: Some(backend),
+        backend_exchange,
+        backend_effect,
+        route_cache,
+        response: response_snapshot(response),
     }
 }
 
@@ -720,16 +1110,25 @@ fn response_route(response: Response) -> RouteSnapshot {
         authorization,
         sink,
         backend: None,
+        backend_exchange: None,
+        backend_effect: false,
         route_cache: None,
         response: response_snapshot(response),
     }
 }
 
-fn route_snapshot(cfg: &Config, request: &mut Request) -> RouteSnapshot {
+fn route_snapshot(
+    fixture: &Fixture,
+    cfg: &Config,
+    request: &mut Request,
+    cancel_before_sink: bool,
+) -> RouteSnapshot {
     let peer = SocketAddr::new(PEER, 4242);
     if !matches!(request.framing, crate::verified::BodyFraming::None) {
         match crate::server::probe_request_body(cfg, request, peer, LOCAL_IP, LOCAL_PORT, true) {
-            BodyRouteDecision::Read { handler, .. } => prepared_snapshot(handler),
+            BodyRouteDecision::Read { handler, .. } => {
+                execute_prepared_snapshot(fixture, cfg, request, handler, cancel_before_sink)
+            }
             BodyRouteDecision::Drain(response, _) | BodyRouteDecision::Respond(response, _) => {
                 response_route(response)
             }
@@ -737,19 +1136,26 @@ fn route_snapshot(cfg: &Config, request: &mut Request) -> RouteSnapshot {
     } else {
         match crate::server::probe_prepared_handler(cfg, request, peer, LOCAL_IP, LOCAL_PORT, true)
         {
-            PreparedRouteDecision::Prepared { handler, .. } => prepared_snapshot(handler),
+            PreparedRouteDecision::Prepared { handler, .. } => {
+                execute_prepared_snapshot(fixture, cfg, request, handler, cancel_before_sink)
+            }
             PreparedRouteDecision::Respond(response, _) => response_route(response),
         }
     }
 }
 
-fn evaluate(cfg: &Config, mut request: Request) -> WholeRequestSnapshot {
+fn evaluate(
+    fixture: &Fixture,
+    cfg: &Config,
+    mut request: Request,
+    cancel_before_sink: bool,
+) -> WholeRequestSnapshot {
     let canonical = canonical_snapshot(&request);
     let (plan, owned_plan) = plan_snapshot(cfg, &request);
     let cache = crate::expr::with_connection(true, LOCAL_PORT, || {
         cache_snapshot(cfg, &request, owned_plan.as_ref())
     });
-    let route = route_snapshot(cfg, &mut request);
+    let route = route_snapshot(fixture, cfg, &mut request, cancel_before_sink);
     if let Some(route_cache) = route.route_cache.as_ref() {
         assert_eq!(route_cache, &cache);
     }
@@ -764,6 +1170,8 @@ fn evaluate(cfg: &Config, mut request: Request) -> WholeRequestSnapshot {
         sink: route.sink,
         backend: route.backend,
         cache,
+        backend_exchange: route.backend_exchange,
+        backend_effect: route.backend_effect,
         response: route.response,
     }
 }
@@ -775,28 +1183,56 @@ fn compare_protocols(data: &[u8]) -> WholeRequestSnapshot {
     assert!(cfg.resource_budget.transition_usage_is_zero());
     let baseline = cfg.resource_budget.transition_snapshot();
 
-    let h1 = evaluate(cfg, decode_h1(cfg, &logical));
+    let h1 = evaluate(
+        fixture,
+        cfg,
+        decode_h1(cfg, &logical),
+        logical.cancel_before_sink,
+    );
+    let h1_warm = matches!(h1.cache, CacheSnapshot::Eligible { .. }).then(|| {
+        evaluate(
+            fixture,
+            cfg,
+            decode_h1(cfg, &logical),
+            logical.cancel_before_sink,
+        )
+    });
+    crate::cache::clear(cfg);
     assert_eq!(cfg.resource_budget.transition_snapshot(), baseline);
     assert!(cfg.resource_budget.transition_usage_is_zero());
 
-    let h2_request = crate::h2::differential_decode_request(
-        cfg,
-        logical.method,
-        &logical.target,
-        &logical.fields,
-        &logical.body,
-        PEER,
-    )
-    .unwrap_or_else(|error| panic!("generated HTTP/2 request failed: {error}; {logical:?}"));
-    let h2 = evaluate(cfg, h2_request);
+    let decode_h2 = || {
+        crate::h2::differential_decode_request(
+            cfg,
+            logical.method,
+            &logical.target,
+            &logical.fields,
+            &logical.body,
+            PEER,
+        )
+        .unwrap_or_else(|error| panic!("generated HTTP/2 request failed: {error}; {logical:?}"))
+    };
+    let h2_request = decode_h2();
+    let h2 = evaluate(fixture, cfg, h2_request, logical.cancel_before_sink);
+    let h2_warm = matches!(h2.cache, CacheSnapshot::Eligible { .. })
+        .then(|| evaluate(fixture, cfg, decode_h2(), logical.cancel_before_sink));
+    crate::cache::clear(cfg);
     assert_eq!(cfg.resource_budget.transition_snapshot(), baseline);
     assert!(cfg.resource_budget.transition_usage_is_zero());
 
     assert_eq!(h1, h2, "protocol projections diverged for {logical:?}");
+    assert_eq!(
+        h1_warm, h2_warm,
+        "warm-cache protocol projections diverged for {logical:?}"
+    );
     if logical.denied_route {
         assert!(matches!(h1.authorization, AuthorizationSnapshot::Denied(_)));
         assert_eq!(h1.sink, SinkSnapshot::None);
         assert!(h1.backend.is_none());
+    }
+    if logical.cancel_before_sink {
+        assert!(!h1.backend_effect);
+        assert!(h1.backend_exchange.is_none());
     }
     h1
 }
@@ -809,6 +1245,123 @@ pub fn run(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_outcome_machine_requires_every_admission_fact() {
+        use vapache_verified::{
+            dynamic_outcome_initial, dynamic_outcome_step, DynamicOutcomeEvent as Event,
+            DynamicOutcomePhase as Phase,
+        };
+
+        let nested = dynamic_outcome_initial(2, 0, 0);
+        let nested_once = dynamic_outcome_step(
+            nested,
+            Event::CompleteInternalProjection,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            dynamic_outcome_step(nested_once, Event::StartBackend, true, true, false, false)
+                .is_none()
+        );
+        let nested_twice = dynamic_outcome_step(
+            nested_once,
+            Event::CompleteInternalProjection,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            dynamic_outcome_step(nested_twice, Event::StartBackend, true, true, false, false)
+                .is_some()
+        );
+
+        let initial = dynamic_outcome_initial(1, 1, 1);
+        assert!(
+            dynamic_outcome_step(initial, Event::StartBackend, false, true, false, false).is_none()
+        );
+        assert!(
+            dynamic_outcome_step(initial, Event::StartBackend, true, true, false, false).is_none()
+        );
+        let projected = dynamic_outcome_step(
+            initial,
+            Event::CompleteInternalProjection,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let backend =
+            dynamic_outcome_step(projected, Event::StartBackend, true, true, false, false).unwrap();
+        assert_eq!(backend.phase, Phase::Backend);
+        assert!(
+            dynamic_outcome_step(backend, Event::BackendComplete, false, false, false, false,)
+                .is_none()
+        );
+        let response =
+            dynamic_outcome_step(backend, Event::BackendComplete, false, false, true, false)
+                .unwrap();
+        let error = dynamic_outcome_step(
+            response,
+            Event::ApplyErrorFinalizer,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let dispatch = dynamic_outcome_step(
+            error,
+            Event::BeginDispatchFinalizer,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            dynamic_outcome_step(dispatch, Event::ConsiderCache, false, false, false, false,)
+                .is_none()
+        );
+        let cached =
+            dynamic_outcome_step(dispatch, Event::ConsiderCache, false, false, false, true)
+                .unwrap();
+        let finalized = dynamic_outcome_step(
+            cached,
+            Event::CompleteDispatchFinalizer,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let output =
+            dynamic_outcome_step(finalized, Event::AdmitOutput, false, false, true, false).unwrap();
+        assert_eq!(output.phase, Phase::Output);
+
+        let aborted =
+            dynamic_outcome_step(backend, Event::Abort, false, false, false, false).unwrap();
+        assert_eq!(aborted.phase, Phase::Aborted);
+        for event in [
+            Event::StartBackend,
+            Event::BackendComplete,
+            Event::CompleteInternalProjection,
+            Event::ApplyErrorFinalizer,
+            Event::BeginDispatchFinalizer,
+            Event::ConsiderCache,
+            Event::CompleteDispatchFinalizer,
+            Event::AdmitOutput,
+            Event::Abort,
+        ] {
+            assert!(dynamic_outcome_step(aborted, event, true, true, true, true).is_none());
+        }
+    }
 
     #[test]
     fn fixed_whole_request_protocol_matrix_agrees() {
@@ -847,11 +1400,12 @@ mod tests {
         assert_eq!(rewrite.sink, SinkSnapshot::StaticFile);
 
         let local_error = compare_protocols(b"\x0c\x01\x00\x00\x00\x00\x03\x00local-error");
+        assert_eq!(local_error.authorization, AuthorizationSnapshot::Granted);
+        assert_eq!(local_error.sink, SinkSnapshot::Cgi);
         assert!(matches!(
-            local_error.authorization,
-            AuthorizationSnapshot::Rejected(404)
+            local_error.response,
+            ResponseSnapshot::Complete { status: 404, .. }
         ));
-        assert_eq!(local_error.sink, SinkSnapshot::None);
 
         let external_error = compare_protocols(b"\x0d\x01\x00\x00\x00\x00\x03\x00external-error");
         assert_eq!(external_error.authorization, AuthorizationSnapshot::Granted);
@@ -876,5 +1430,15 @@ mod tests {
             AuthorizationSnapshot::Denied(_)
         ));
         assert_eq!(denied_index.sink, SinkSnapshot::None);
+
+        for cancelled in [
+            b"\x06\x00\x00\x00\x00\x00\x00\x80cancel-proxy".as_slice(),
+            b"\x0f\x00\x00\x00\x00\x00\x00\x80cancel-fastcgi".as_slice(),
+            b"\x0e\x00\x00\x00\x00\x00\x00\x80cancel-cgi".as_slice(),
+        ] {
+            let result = compare_protocols(cancelled);
+            assert!(!result.backend_effect);
+            assert!(result.backend_exchange.is_none());
+        }
     }
 }

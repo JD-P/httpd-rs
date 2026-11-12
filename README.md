@@ -606,12 +606,12 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus   # include the Verus gate
 ```
 
-Current ledger: **58.5% weighted obligations**, **5/6 proof debt**,
+Current ledger: **59.0% weighted obligations**, **5/6 proof debt**,
 **11/11 grant-required sinks**, **11/11 path-target-bound sinks**, **6/11
 inode-bound sinks**, **3/11 backend-target-bound sinks**, **3/11
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **109 adversarial replay cases** covering the findings classes,
-and **842 Verus functions with 0 errors** (including the I3 fast-path
+and **856 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -631,7 +631,7 @@ freshness, disk-accounting and SHA-256 policy-binding proofs for I51/I54).
 
 The ledger lives in `docs/verification-status.json`. It records:
 
-- weighted progress on the seventy-one proof obligations,
+- weighted progress on the seventy-two proof obligations,
 - named unverified security components,
 - sinks that need stronger resource binding,
 - explicit assumptions and unmodeled directive classes,
@@ -685,13 +685,18 @@ tests/fuzz_smoke.sh                         # bounded run of every target
 FUZZ_SECONDS_PER_TARGET=900 tests/fuzz_campaign.sh
 ```
 
-The 18 targets cover individual HTTP requests, fragmented/pipelined
+The 24 targets cover individual HTTP requests, fragmented/pipelined
 connections, configuration tokenization and full compilation, `.htaccess`
 walks, rewrite expressions, CGI/FastCGI/proxy responses, WebSocket negotiation,
 raw HTTP/2 frames and structured multi-frame HTTP/2 state transitions, cache
 metadata, TLS policy, OCSP DER, the adversarial PCRE2
 differential and PCRE2 resource-policy monotonicity, and stateful hierarchical
-resource ownership.
+resource ownership. The whole-request target executes real proxy, FastCGI and
+CGI handlers after both wire decoders, compares exact backend requests and
+final responses, runs cache-eligible cases cold and warm, and covers local and
+external ErrorDocument plus CGI/FastCGI/proxy DirectoryIndex orchestration.
+Its cancellation projection aborts after routing but before sink admission and
+requires that no proxy, FastCGI or CGI effect occurs and every lease is returned.
 The resource campaign mutates reserve/release, attribution, parent exhaustion,
 slow-input/output handoffs, cross-ledger rejection and RAII teardown while
 checking ledger conservation after every operation. The original PCRE2 fuzzer
@@ -845,7 +850,7 @@ current instrumented suite is 691 Rust library tests, 8 CLI unit tests, 31 Rust
 integration/property tests, 168 conformance tests and 333 fixed configuration
 cases. The module-by-module reason for the remaining debt and the intended test
 mechanism for each major module are tracked in `docs/coverage-debt.md`.
-The separate Verus gate proves 842 functions with 0 errors; proof-only code is
+The separate Verus gate proves 856 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Real-application integration lives under [`tests/deployments`](tests/deployments/README.md).

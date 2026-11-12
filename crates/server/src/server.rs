@@ -4035,7 +4035,185 @@ pub(crate) enum PreparedHandler {
     },
 }
 
+#[derive(Default)]
+struct DynamicOutcomeRequirements {
+    internal_projection: u64,
+    error_finalizer: u64,
+    dispatch_finalizer: u64,
+}
+
+struct DynamicOutcomeToken {
+    state: vapache_verified::DynamicOutcomeState,
+}
+
+impl DynamicOutcomeToken {
+    fn for_handler(handler: &PreparedHandler) -> Self {
+        let mut requirements = DynamicOutcomeRequirements::default();
+        handler.collect_outcome_requirements(&mut requirements);
+        Self {
+            state: vapache_verified::dynamic_outcome_initial(
+                requirements.internal_projection,
+                requirements.error_finalizer,
+                requirements.dispatch_finalizer,
+            ),
+        }
+    }
+
+    fn advance(
+        &mut self,
+        event: vapache_verified::DynamicOutcomeEvent,
+        authorized: bool,
+        backend_bound: bool,
+        response_valid: bool,
+        generation_current: bool,
+    ) -> bool {
+        // One deterministic boundary covers every verified outcome transition.
+        // Fault campaigns select a particular event by failing after the
+        // preceding successful transitions in the prepared handler.
+        if crate::fault::hit("transition.dynamic.outcome").is_err() {
+            return false;
+        }
+        let Some(next) = vapache_verified::dynamic_outcome_step(
+            self.state,
+            event,
+            authorized,
+            backend_bound,
+            response_valid,
+            generation_current,
+        ) else {
+            return false;
+        };
+        self.state = next;
+        true
+    }
+
+    fn complete_internal_projection(&mut self) -> bool {
+        self.advance(
+            vapache_verified::DynamicOutcomeEvent::CompleteInternalProjection,
+            false,
+            false,
+            false,
+            false,
+        )
+    }
+
+    fn start_backend(&mut self, request: &Request) -> bool {
+        if request
+            .request_scope()
+            .is_some_and(crate::resource::RequestScope::is_cancelled)
+        {
+            return false;
+        }
+        self.advance(
+            vapache_verified::DynamicOutcomeEvent::StartBackend,
+            true,
+            true,
+            false,
+            false,
+        )
+    }
+
+    fn complete_backend(&mut self, response: &Response) -> bool {
+        self.advance(
+            vapache_verified::DynamicOutcomeEvent::BackendComplete,
+            false,
+            false,
+            crate::http::response_headers_valid(response),
+            false,
+        )
+    }
+
+    fn apply_error_finalizer(&mut self) -> bool {
+        self.advance(
+            vapache_verified::DynamicOutcomeEvent::ApplyErrorFinalizer,
+            false,
+            false,
+            false,
+            false,
+        )
+    }
+
+    fn begin_dispatch_finalizer(&mut self) -> bool {
+        self.advance(
+            vapache_verified::DynamicOutcomeEvent::BeginDispatchFinalizer,
+            false,
+            false,
+            false,
+            false,
+        )
+    }
+
+    fn consider_cache(&mut self, generation_current: bool) -> bool {
+        self.advance(
+            vapache_verified::DynamicOutcomeEvent::ConsiderCache,
+            false,
+            false,
+            false,
+            generation_current,
+        )
+    }
+
+    fn complete_dispatch_finalizer(&mut self) -> bool {
+        self.advance(
+            vapache_verified::DynamicOutcomeEvent::CompleteDispatchFinalizer,
+            false,
+            false,
+            false,
+            false,
+        )
+    }
+
+    fn admit_output(&mut self, response: &Response) -> bool {
+        self.advance(
+            vapache_verified::DynamicOutcomeEvent::AdmitOutput,
+            false,
+            false,
+            crate::http::response_headers_valid(response),
+            false,
+        )
+    }
+
+    fn abort(&mut self) {
+        let _ = self.advance(
+            vapache_verified::DynamicOutcomeEvent::Abort,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+}
+
 impl PreparedHandler {
+    fn collect_outcome_requirements(&self, out: &mut DynamicOutcomeRequirements) {
+        match self {
+            PreparedHandler::FinalizeDispatch { handler, .. } => {
+                out.dispatch_finalizer = out
+                    .dispatch_finalizer
+                    .checked_add(1)
+                    .expect("prepared handler finalizer count is bounded");
+                handler.collect_outcome_requirements(out);
+            }
+            PreparedHandler::FinalizeErrorDocument { handler, .. } => {
+                out.error_finalizer = out
+                    .error_finalizer
+                    .checked_add(1)
+                    .expect("prepared handler finalizer count is bounded");
+                handler.collect_outcome_requirements(out);
+            }
+            PreparedHandler::FinalizeInternalRequest { handler, .. } => {
+                out.internal_projection = out
+                    .internal_projection
+                    .checked_add(1)
+                    .expect("prepared handler projection count is bounded");
+                handler.collect_outcome_requirements(out);
+            }
+            PreparedHandler::Proxy { .. }
+            | PreparedHandler::FastCgi { .. }
+            | PreparedHandler::Cgi { .. } => {}
+        }
+    }
+
     fn kind(&self) -> vapache_verified::PreparedHandlerKind {
         match self {
             PreparedHandler::FinalizeDispatch { handler, .. }
@@ -4047,7 +4225,12 @@ impl PreparedHandler {
         }
     }
 
-    fn execute(self, cfg: &Config, req: &mut Request) -> Response {
+    fn execute(
+        self,
+        cfg: &Config,
+        req: &mut Request,
+        outcome: &mut DynamicOutcomeToken,
+    ) -> Response {
         match self {
             PreparedHandler::FinalizeDispatch {
                 handler,
@@ -4059,7 +4242,11 @@ impl PreparedHandler {
                 https,
                 invalidation_path,
             } => {
-                let mut response = handler.execute(cfg, req);
+                let mut response = handler.execute(cfg, req, outcome);
+                if !outcome.begin_dispatch_finalizer() {
+                    outcome.abort();
+                    return Response::policy_error();
+                }
                 let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
                 let unsafe_method =
                     !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
@@ -4073,15 +4260,21 @@ impl PreparedHandler {
                     .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
                 if let Ok(_filesystem_work) = cfg.resource_budget.try_filesystem_work_in(&context) {
                     if let Some(cache) = cache {
-                        crate::cache::store_authorized(
-                            cfg,
-                            vhost,
-                            req,
-                            &host,
-                            peer,
-                            &mut response,
-                            &cache,
-                        );
+                        if cache.generation_is_current(cfg) {
+                            if !outcome.consider_cache(true) {
+                                outcome.abort();
+                                return Response::policy_error();
+                            }
+                            crate::cache::store_authorized(
+                                cfg,
+                                vhost,
+                                req,
+                                &host,
+                                peer,
+                                &mut response,
+                                &cache,
+                            );
+                        }
                     }
                     if must_invalidate {
                         crate::cache::invalidate_unsafe_response(
@@ -4099,6 +4292,10 @@ impl PreparedHandler {
                     // let later bounded maintenance remove the files.
                     crate::cache::invalidate_generation_only(cfg);
                 }
+                if !outcome.complete_dispatch_finalizer() {
+                    outcome.abort();
+                    return Response::policy_error();
+                }
                 response
             }
             PreparedHandler::FinalizeErrorDocument {
@@ -4109,10 +4306,15 @@ impl PreparedHandler {
                 port,
                 host,
             } => {
-                let response = handler.execute(cfg, req);
-                crate::files::finalize_prepared_error_document(
+                let response = handler.execute(cfg, req, outcome);
+                let response = crate::files::finalize_prepared_error_document(
                     cfg, &scope, status, req, &url_path, port, &host, response,
-                )
+                );
+                if !outcome.apply_error_finalizer() {
+                    outcome.abort();
+                    return Response::policy_error();
+                }
+                response
             }
             PreparedHandler::FinalizeInternalRequest {
                 handler,
@@ -4126,14 +4328,20 @@ impl PreparedHandler {
                     kind,
                     cfg.encoded_slashes == EncodedSlashes::On,
                 ) else {
+                    outcome.abort();
                     return Response::policy_error();
                 };
                 let Some((mut internal, _authorization)) = projected
                     .into_authorized_request(cfg.authorization_generation(), authorization)
                 else {
+                    outcome.abort();
                     return Response::policy_error();
                 };
-                handler.execute(cfg, &mut internal)
+                if !outcome.complete_internal_projection() {
+                    outcome.abort();
+                    return Response::policy_error();
+                }
+                handler.execute(cfg, &mut internal, outcome)
             }
             PreparedHandler::Proxy {
                 vhost_index,
@@ -4148,6 +4356,10 @@ impl PreparedHandler {
                 url_path,
                 query_override,
             } => {
+                if !outcome.start_backend(req) {
+                    outcome.abort();
+                    return Response::policy_error();
+                }
                 let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
                 let original_query =
                     query_override.map(|query| std::mem::replace(&mut req.query, query));
@@ -4168,6 +4380,10 @@ impl PreparedHandler {
                 if let Some(original_query) = original_query {
                     req.query = original_query;
                 }
+                if !outcome.complete_backend(&response) {
+                    outcome.abort();
+                    return Response::policy_error();
+                }
                 response
             }
             PreparedHandler::FastCgi {
@@ -4182,8 +4398,12 @@ impl PreparedHandler {
                 url_path,
                 mapping_root,
             } => {
+                if !outcome.start_backend(req) {
+                    outcome.abort();
+                    return Response::policy_error();
+                }
                 let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
-                run_authorized_fastcgi(
+                let response = run_authorized_fastcgi(
                     cfg,
                     vhost,
                     req,
@@ -4196,7 +4416,12 @@ impl PreparedHandler {
                     &target,
                     &authorization,
                     &mapping_root,
-                )
+                );
+                if !outcome.complete_backend(&response) {
+                    outcome.abort();
+                    return Response::policy_error();
+                }
+                response
             }
             PreparedHandler::Cgi {
                 vhost_index,
@@ -4216,8 +4441,12 @@ impl PreparedHandler {
                 script_meta,
                 _descriptor_lease,
             } => {
+                if !outcome.start_backend(req) {
+                    outcome.abort();
+                    return Response::policy_error();
+                }
                 let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
-                run_authorized_cgi(
+                let response = run_authorized_cgi(
                     cfg,
                     vhost,
                     req,
@@ -4235,7 +4464,12 @@ impl PreparedHandler {
                     &authorization,
                     Some(&script_file),
                     Some(&script_meta),
-                )
+                );
+                if !outcome.complete_backend(&response) {
+                    outcome.abort();
+                    return Response::policy_error();
+                }
+                response
             }
         }
     }
@@ -4318,13 +4552,20 @@ pub(crate) fn execute_prepared_handler(
         // leases. No backend side effect has happened yet.
         return Response::memory_overload();
     }
+    let mut outcome = DynamicOutcomeToken::for_handler(&handler);
     let context = req
         .resource_context()
         .cloned()
         .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
-    crate::resource::with_resource_context(context, || {
-        crate::expr::with_connection(tls, local_port, || handler.execute(cfg, req))
-    })
+    let response = crate::resource::with_resource_context(context, || {
+        crate::expr::with_connection(tls, local_port, || handler.execute(cfg, req, &mut outcome))
+    });
+    if outcome.admit_output(&response) {
+        response
+    } else {
+        outcome.abort();
+        Response::policy_error()
+    }
 }
 
 fn selected_vhost_index(cfg: &Config, vhost: Option<&VHost>) -> Option<usize> {
@@ -10392,9 +10633,7 @@ mod tests {
             permissions.set_mode(0o755);
             std::fs::set_permissions(path, permissions).unwrap();
         }
-        let cfg = cov_config(
-            &dir,
-            &format!(
+        let config_body = format!(
                 "AddHandler cgi-script .cgi\n\
                  ErrorDocument 404 /error.cgi?configured=1\n\
                  ErrorDocument 405 /error.cgi?configured=1\n\
@@ -10402,8 +10641,8 @@ mod tests {
                  <Directory \"{}/www/app\">\nOptions +ExecCGI\nDirectoryIndex index.cgi\n</Directory>\n",
                 dir.display(),
                 dir.display(),
-            ),
-        );
+            );
+        let cfg = cov_config(&dir, &config_body);
 
         fn has_error_finalizer(handler: &PreparedHandler) -> bool {
             match handler {
@@ -10442,6 +10681,7 @@ mod tests {
         error.framing = crate::verified::BodyFraming::Length(8);
         error.headers.insert("content-length", b"8".to_vec());
         error.headers.insert("content-type", b"text/plain".to_vec());
+        let error_template = error.clone();
         assert_eq!(execute(error), "GET|configured=1|unset|");
 
         let mut index = cov_req("POST", "/app/?original=1");
@@ -10452,6 +10692,136 @@ mod tests {
         index.headers.insert("content-length", b"8".to_vec());
         index.headers.insert("content-type", b"text/plain".to_vec());
         assert_eq!(execute(index), "POST|original=1|8|payload");
+
+        let prepare_error = |cfg: &Config| {
+            let mut req = error_template.clone();
+            let handler =
+                match probe_prepared_handler(cfg, &mut req, cov_peer(), "127.0.0.1", 80, false) {
+                    PreparedRouteDecision::Prepared { handler, .. } => handler,
+                    PreparedRouteDecision::Respond(response, _) => {
+                        panic!("expected prepared error CGI, got {}", response.status)
+                    }
+                };
+            (req, handler)
+        };
+        fn replace_internal_target(handler: &mut PreparedHandler, target: &str) -> bool {
+            match handler {
+                PreparedHandler::FinalizeInternalRequest {
+                    internal_target, ..
+                } => {
+                    *internal_target = target.to_string();
+                    true
+                }
+                PreparedHandler::FinalizeDispatch { handler, .. }
+                | PreparedHandler::FinalizeErrorDocument { handler, .. } => {
+                    replace_internal_target(handler, target)
+                }
+                PreparedHandler::Proxy { .. }
+                | PreparedHandler::FastCgi { .. }
+                | PreparedHandler::Cgi { .. } => false,
+            }
+        }
+
+        // A malformed deferred target and a generation change are both
+        // rejected before the local script can acquire execution authority.
+        let (mut malformed_req, mut malformed_handler) = prepare_error(&cfg);
+        assert!(replace_internal_target(&mut malformed_handler, "relative"));
+        assert_eq!(
+            execute_prepared_handler(
+                &cfg,
+                &mut malformed_req,
+                cov_peer(),
+                80,
+                false,
+                malformed_handler,
+            )
+            .status,
+            500
+        );
+        let (mut stale_req, stale_handler) = prepare_error(&cfg);
+        let next_generation = cov_config(&dir, &config_body);
+        assert_eq!(
+            execute_prepared_handler(
+                &next_generation,
+                &mut stale_req,
+                cov_peer(),
+                80,
+                false,
+                stale_handler,
+            )
+            .status,
+            500
+        );
+
+        #[cfg(feature = "fault-injection")]
+        {
+            let _fault_guard = crate::fault::test_guard();
+            // ErrorDocument CGI has seven ordered outcome transitions:
+            // projection, backend start/complete, error finalization,
+            // dispatch begin/complete, and output admission.
+            for after in 0..7 {
+                crate::fault::clear();
+                let (mut req, handler) = prepare_error(&cfg);
+                crate::fault::configure(
+                    "transition.dynamic.outcome",
+                    after,
+                    io::ErrorKind::ConnectionAborted,
+                );
+                let response =
+                    execute_prepared_handler(&cfg, &mut req, cov_peer(), 80, false, handler);
+                assert_eq!(
+                    response.status, 500,
+                    "transition {after} did not fail closed"
+                );
+            }
+            crate::fault::clear();
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn dynamic_outcome_backend_completion_failures_close_proxy_and_fastcgi() {
+        let _test_guard = ADMISSION_TEST_LOCK.lock().unwrap();
+        let _fault_guard = crate::fault::test_guard();
+        let dir = cov_dir("dynamic-outcome-backends");
+        std::fs::write(dir.join("www/script.php"), "<?php\n").unwrap();
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "ProxyPass /proxy http://127.0.0.1:9/\n\
+                 ProxyPassMatch ^/(.*\\.php)$ \"unix:/tmp/vapache-missing-outcome.sock|fcgi://localhost{}/www/\"\n",
+                dir.display(),
+            ),
+        );
+
+        for (path, expected) in [
+            ("/proxy", vapache_verified::PreparedHandlerKind::Proxy),
+            (
+                "/script.php",
+                vapache_verified::PreparedHandlerKind::FastCgi,
+            ),
+        ] {
+            crate::fault::clear();
+            let mut req = cov_req("GET", path);
+            let handler =
+                match probe_prepared_handler(&cfg, &mut req, cov_peer(), "127.0.0.1", 80, false) {
+                    PreparedRouteDecision::Prepared { handler, .. } => handler,
+                    PreparedRouteDecision::Respond(response, _) => {
+                        panic!("expected prepared {expected:?}, got {}", response.status)
+                    }
+                };
+            assert_eq!(handler.kind(), expected);
+            // StartBackend succeeds; BackendComplete is the second event.
+            crate::fault::configure(
+                "transition.dynamic.outcome",
+                1,
+                io::ErrorKind::ConnectionAborted,
+            );
+            let response = execute_prepared_handler(&cfg, &mut req, cov_peer(), 80, false, handler);
+            assert_eq!(response.status, 500, "{expected:?} completion escaped");
+        }
+        crate::fault::clear();
         let _ = std::fs::remove_dir_all(dir);
     }
 

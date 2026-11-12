@@ -409,7 +409,7 @@ pub fn execute(ctx: &CgiContext) -> Response {
         None => None,
     };
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzzing"))]
     return execute_direct_for_test(
         ctx,
         &original_path,
@@ -420,7 +420,7 @@ pub fn execute(ctx: &CgiContext) -> Response {
         resource_context,
     );
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "fuzzing")))]
     if let Some(pool) = POOL.get() {
         execute_via_pool(
             pool,
@@ -438,7 +438,7 @@ pub fn execute(ctx: &CgiContext) -> Response {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzzing"))]
 fn execute_direct_for_test(
     ctx: &CgiContext,
     path: &Path,

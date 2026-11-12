@@ -1742,11 +1742,20 @@ that state machine. It generates one bounded logical request, serializes it as
 HTTP/1 and through the vendored HTTP/2 client/server codec, and then requires
 both decoded requests to have identical canonical request bytes, request plan,
 authorization outcome, selected backend identity, cache classification and
-response semantics. Denials must have neither a protected sink nor a backend,
-and the complete process, per-client, filesystem, transport and queued-output
-resource ledgers must return to zero after each protocol projection. The fixed
-seed matrix covers static, cache-eligible, denied, proxy, redirect and rewrite
-paths; the nightly campaign mutates their composed interactions.
+response semantics. Proxy and FastCGI routes reach scripted live backends and
+compare their exact normalized method, target/parameters, fields and body;
+CGI executes under the fuzz-only direct adapter. Fragmented, chunked, empty
+and malformed backend responses reach the production parsers, cache-eligible
+paths run both cold and warm, and local ErrorDocument finalization must restore
+the outer status after its CGI completes. A deterministic cancellation
+projection aborts after the authorized route is prepared but before dynamic
+sink admission; both protocols must produce the same terminal response without
+a proxy transcript, FastCGI transcript or CGI marker. Denials must have neither
+a protected sink nor a backend, and the complete process, per-client,
+filesystem, transport and queued-output resource ledgers must return to zero
+after each protocol projection. The fixed seed matrix also covers external
+ErrorDocument and CGI/FastCGI/proxy/denied DirectoryIndex; the nightly campaign
+mutates their composed interactions.
 
 ### I51 — Cache key byte identity
 
@@ -2523,7 +2532,7 @@ python3 tests/verification_status.py --run-verus
 
 The current ledger (2026-11-12) is:
 
-- weighted obligations: **41.5 / 71.0 (58.5%)** if partial obligations receive
+- weighted obligations: **42.5 / 72.0 (59.0%)** if partial obligations receive
   half credit;
 - proof debt: **5 / 6** — 0 named unverified security components, 0 partially
   bound sinks, 5 assumptions and 0 accepted unmodeled security-directive
@@ -2532,7 +2541,7 @@ The current ledger (2026-11-12) is:
   inode-bound, **3/11** backend-target-bound, **3/11** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **842 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **856 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

@@ -4382,6 +4382,416 @@ pub proof fn request_closed_phase_is_absorbing(event: RequestPhaseEvent)
 {
 }
 
+/// Lifecycle of a prepared dynamic outcome between policy routing and the
+/// protocol adapter's ordinary output phase.  `RequestPhase` owns body and
+/// transport scheduling; this companion machine owns the security-relevant
+/// facts which used to be implicit inside nested `PreparedHandler` wrappers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DynamicOutcomePhase {
+    Prepared,
+    Backend,
+    Response,
+    Output,
+    Aborted,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DynamicOutcomeEvent {
+    StartBackend,
+    BackendComplete,
+    CompleteInternalProjection,
+    ApplyErrorFinalizer,
+    BeginDispatchFinalizer,
+    ConsiderCache,
+    CompleteDispatchFinalizer,
+    AdmitOutput,
+    Abort,
+}
+
+/// The wrapper requirements are captured before the move-only prepared route
+/// is executed. Completion counters can therefore only advance toward their
+/// captured requirements; a nested handler cannot silently discard an outer
+/// projection or finalizer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DynamicOutcomeState {
+    pub phase: DynamicOutcomePhase,
+    pub requires_internal_projection: u64,
+    pub requires_error_finalizer: u64,
+    pub requires_dispatch_finalizer: u64,
+    pub internal_projection_complete: u64,
+    pub error_finalizer_complete: u64,
+    pub dispatch_finalizer_active: bool,
+    pub dispatch_finalizer_complete: u64,
+    pub cache_considered: bool,
+    pub response_admitted: bool,
+}
+
+pub open spec fn dynamic_outcome_initial_spec(
+    requires_internal_projection: u64,
+    requires_error_finalizer: u64,
+    requires_dispatch_finalizer: u64,
+) -> DynamicOutcomeState {
+    DynamicOutcomeState {
+        phase: DynamicOutcomePhase::Prepared,
+        requires_internal_projection,
+        requires_error_finalizer,
+        requires_dispatch_finalizer,
+        internal_projection_complete: 0,
+        error_finalizer_complete: 0,
+        dispatch_finalizer_active: false,
+        dispatch_finalizer_complete: 0,
+        cache_considered: false,
+        response_admitted: false,
+    }
+}
+
+pub fn dynamic_outcome_initial(
+    requires_internal_projection: u64,
+    requires_error_finalizer: u64,
+    requires_dispatch_finalizer: u64,
+) -> (state: DynamicOutcomeState)
+    ensures state == dynamic_outcome_initial_spec(
+        requires_internal_projection,
+        requires_error_finalizer,
+        requires_dispatch_finalizer,
+    ),
+{
+    DynamicOutcomeState {
+        phase: DynamicOutcomePhase::Prepared,
+        requires_internal_projection,
+        requires_error_finalizer,
+        requires_dispatch_finalizer,
+        internal_projection_complete: 0,
+        error_finalizer_complete: 0,
+        dispatch_finalizer_active: false,
+        dispatch_finalizer_complete: 0,
+        cache_considered: false,
+        response_admitted: false,
+    }
+}
+
+pub open spec fn dynamic_outcome_ready_for_dispatch_spec(state: DynamicOutcomeState) -> bool {
+    match state.phase {
+        DynamicOutcomePhase::Response => {
+            state.response_admitted
+                && state.internal_projection_complete == state.requires_internal_projection
+                && state.error_finalizer_complete == state.requires_error_finalizer
+                && !state.dispatch_finalizer_active
+        }
+        _ => false,
+    }
+}
+
+pub open spec fn dynamic_outcome_ready_for_output_spec(state: DynamicOutcomeState) -> bool {
+    dynamic_outcome_ready_for_dispatch_spec(state)
+        && state.dispatch_finalizer_complete == state.requires_dispatch_finalizer
+}
+
+pub fn dynamic_outcome_ready_for_dispatch(state: DynamicOutcomeState) -> (ready: bool)
+    ensures ready == dynamic_outcome_ready_for_dispatch_spec(state),
+{
+    reveal(dynamic_outcome_ready_for_dispatch_spec);
+    match state.phase {
+        DynamicOutcomePhase::Response => {
+            state.response_admitted
+                && state.internal_projection_complete == state.requires_internal_projection
+                && state.error_finalizer_complete == state.requires_error_finalizer
+                && !state.dispatch_finalizer_active
+        }
+        _ => false,
+    }
+}
+
+pub fn dynamic_outcome_ready_for_output(state: DynamicOutcomeState) -> (ready: bool)
+    ensures ready == dynamic_outcome_ready_for_output_spec(state),
+{
+    reveal(dynamic_outcome_ready_for_output_spec);
+    dynamic_outcome_ready_for_dispatch(state)
+        && state.dispatch_finalizer_complete == state.requires_dispatch_finalizer
+}
+
+/// `authorized` and `backend_bound` are meaningful for StartBackend,
+/// `response_valid` for BackendComplete/AdmitOutput, and
+/// `generation_current` for ConsiderCache.  Keeping them as explicit inputs
+/// makes each effectful boundary state its exact admission fact.
+pub open spec fn dynamic_outcome_step_spec(
+    state: DynamicOutcomeState,
+    event: DynamicOutcomeEvent,
+    authorized: bool,
+    backend_bound: bool,
+    response_valid: bool,
+    generation_current: bool,
+) -> Option<DynamicOutcomeState> {
+    match (state.phase, event) {
+        (DynamicOutcomePhase::Prepared, DynamicOutcomeEvent::StartBackend) => {
+            if authorized
+                && backend_bound
+                && state.internal_projection_complete == state.requires_internal_projection {
+                Some(DynamicOutcomeState { phase: DynamicOutcomePhase::Backend, ..state })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Backend, DynamicOutcomeEvent::BackendComplete) => {
+            if response_valid {
+                Some(DynamicOutcomeState {
+                    phase: DynamicOutcomePhase::Response,
+                    response_admitted: true,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Prepared, DynamicOutcomeEvent::CompleteInternalProjection) => {
+            if state.internal_projection_complete < state.requires_internal_projection
+                && !state.dispatch_finalizer_active {
+                Some(DynamicOutcomeState {
+                    internal_projection_complete: (state.internal_projection_complete + 1) as u64,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Response, DynamicOutcomeEvent::ApplyErrorFinalizer) => {
+            if state.error_finalizer_complete < state.requires_error_finalizer
+                && !state.dispatch_finalizer_active {
+                Some(DynamicOutcomeState {
+                    error_finalizer_complete: (state.error_finalizer_complete + 1) as u64,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Response, DynamicOutcomeEvent::BeginDispatchFinalizer) => {
+            if dynamic_outcome_ready_for_dispatch_spec(state)
+                && state.dispatch_finalizer_complete < state.requires_dispatch_finalizer {
+                Some(DynamicOutcomeState { dispatch_finalizer_active: true, ..state })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Response, DynamicOutcomeEvent::ConsiderCache) => {
+            if state.response_admitted
+                && state.dispatch_finalizer_active
+                && generation_current {
+                Some(DynamicOutcomeState { cache_considered: true, ..state })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Response, DynamicOutcomeEvent::CompleteDispatchFinalizer) => {
+            if state.dispatch_finalizer_active
+                && state.dispatch_finalizer_complete < state.requires_dispatch_finalizer {
+                Some(DynamicOutcomeState {
+                    dispatch_finalizer_active: false,
+                    dispatch_finalizer_complete: (state.dispatch_finalizer_complete + 1) as u64,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Response, DynamicOutcomeEvent::AdmitOutput) => {
+            if dynamic_outcome_ready_for_output_spec(state) && response_valid {
+                Some(DynamicOutcomeState { phase: DynamicOutcomePhase::Output, ..state })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Prepared, DynamicOutcomeEvent::Abort)
+        | (DynamicOutcomePhase::Backend, DynamicOutcomeEvent::Abort)
+        | (DynamicOutcomePhase::Response, DynamicOutcomeEvent::Abort) => Some(
+            DynamicOutcomeState { phase: DynamicOutcomePhase::Aborted, ..state },
+        ),
+        _ => None,
+    }
+}
+
+pub fn dynamic_outcome_step(
+    state: DynamicOutcomeState,
+    event: DynamicOutcomeEvent,
+    authorized: bool,
+    backend_bound: bool,
+    response_valid: bool,
+    generation_current: bool,
+) -> (next: Option<DynamicOutcomeState>)
+    ensures next == dynamic_outcome_step_spec(
+        state,
+        event,
+        authorized,
+        backend_bound,
+        response_valid,
+        generation_current,
+    ),
+{
+    reveal(dynamic_outcome_step_spec);
+    match (state.phase, event) {
+        (DynamicOutcomePhase::Prepared, DynamicOutcomeEvent::StartBackend) => {
+            if authorized
+                && backend_bound
+                && state.internal_projection_complete == state.requires_internal_projection {
+                Some(DynamicOutcomeState { phase: DynamicOutcomePhase::Backend, ..state })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Backend, DynamicOutcomeEvent::BackendComplete) => {
+            if response_valid {
+                Some(DynamicOutcomeState {
+                    phase: DynamicOutcomePhase::Response,
+                    response_admitted: true,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Prepared, DynamicOutcomeEvent::CompleteInternalProjection) => {
+            if state.internal_projection_complete < state.requires_internal_projection
+                && !state.dispatch_finalizer_active {
+                Some(DynamicOutcomeState {
+                    internal_projection_complete: state.internal_projection_complete + 1u64,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Response, DynamicOutcomeEvent::ApplyErrorFinalizer) => {
+            if state.error_finalizer_complete < state.requires_error_finalizer
+                && !state.dispatch_finalizer_active {
+                Some(DynamicOutcomeState {
+                    error_finalizer_complete: state.error_finalizer_complete + 1u64,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Response, DynamicOutcomeEvent::BeginDispatchFinalizer) => {
+            if dynamic_outcome_ready_for_dispatch(state)
+                && state.dispatch_finalizer_complete < state.requires_dispatch_finalizer {
+                Some(DynamicOutcomeState { dispatch_finalizer_active: true, ..state })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Response, DynamicOutcomeEvent::ConsiderCache) => {
+            if state.response_admitted
+                && state.dispatch_finalizer_active
+                && generation_current {
+                Some(DynamicOutcomeState { cache_considered: true, ..state })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Response, DynamicOutcomeEvent::CompleteDispatchFinalizer) => {
+            if state.dispatch_finalizer_active
+                && state.dispatch_finalizer_complete < state.requires_dispatch_finalizer {
+                Some(DynamicOutcomeState {
+                    dispatch_finalizer_active: false,
+                    dispatch_finalizer_complete: state.dispatch_finalizer_complete + 1u64,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Response, DynamicOutcomeEvent::AdmitOutput) => {
+            if dynamic_outcome_ready_for_output(state) && response_valid {
+                Some(DynamicOutcomeState { phase: DynamicOutcomePhase::Output, ..state })
+            } else {
+                None
+            }
+        }
+        (DynamicOutcomePhase::Prepared, DynamicOutcomeEvent::Abort)
+        | (DynamicOutcomePhase::Backend, DynamicOutcomeEvent::Abort)
+        | (DynamicOutcomePhase::Response, DynamicOutcomeEvent::Abort) => Some(
+            DynamicOutcomeState { phase: DynamicOutcomePhase::Aborted, ..state },
+        ),
+        _ => None,
+    }
+}
+
+pub proof fn dynamic_backend_start_requires_authorization_and_binding(
+    state: DynamicOutcomeState,
+    authorized: bool,
+    backend_bound: bool,
+)
+    ensures
+        dynamic_outcome_step_spec(
+            state,
+            DynamicOutcomeEvent::StartBackend,
+            authorized,
+            backend_bound,
+            false,
+            false,
+        ).is_some() ==> authorized && backend_bound,
+{
+}
+
+pub proof fn dynamic_cache_requires_finalization_and_current_generation(
+    state: DynamicOutcomeState,
+    generation_current: bool,
+)
+    ensures
+        dynamic_outcome_step_spec(
+            state,
+            DynamicOutcomeEvent::ConsiderCache,
+            false,
+            false,
+            false,
+            generation_current,
+        ).is_some() ==> state.response_admitted
+            && state.dispatch_finalizer_active
+            && generation_current,
+{
+}
+
+pub proof fn dynamic_output_requires_every_outer_finalizer(
+    state: DynamicOutcomeState,
+    response_valid: bool,
+)
+    ensures
+        dynamic_outcome_step_spec(
+            state,
+            DynamicOutcomeEvent::AdmitOutput,
+            false,
+            false,
+            response_valid,
+            false,
+        ).is_some() ==> state.response_admitted
+            && response_valid
+            && state.internal_projection_complete == state.requires_internal_projection
+            && state.error_finalizer_complete == state.requires_error_finalizer
+            && state.dispatch_finalizer_complete == state.requires_dispatch_finalizer,
+{
+}
+
+pub proof fn dynamic_aborted_outcome_is_absorbing(
+    state: DynamicOutcomeState,
+    event: DynamicOutcomeEvent,
+    authorized: bool,
+    backend_bound: bool,
+    response_valid: bool,
+    generation_current: bool,
+)
+    requires state.phase == DynamicOutcomePhase::Aborted,
+    ensures
+        dynamic_outcome_step_spec(
+            state,
+            event,
+            authorized,
+            backend_bound,
+            response_valid,
+            generation_current,
+        ).is_none(),
+{
+}
+
 /// A request that is selected without returning to the wire parser.  The two
 /// currently supported transitions deliberately have different semantics:
 /// DirectoryIndex is the selected application resource, while ErrorDocument

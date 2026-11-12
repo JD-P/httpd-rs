@@ -1059,6 +1059,21 @@ pub fn install_signal_handlers(
     }
 }
 
+/// Make pipe/socket peer shutdown an ordinary `EPIPE` I/O result. Rust's
+/// executable runtime normally installs this disposition, but embedders such
+/// as libFuzzer provide their own `main` and therefore need to request it
+/// explicitly before starting worker threads.
+pub fn ignore_sigpipe() -> io::Result<()> {
+    // SAFETY[OS089]: SIG_IGN is a valid SIGPIPE disposition. Callers install
+    // it during single-threaded process initialization before any I/O worker.
+    let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    if previous == libc::SIG_ERR {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn move_unix_stream_to_fd(stream: UnixStream, target: RawFd) -> io::Result<UnixStream> {
     let source = stream.into_raw_fd();
     if source == target {
