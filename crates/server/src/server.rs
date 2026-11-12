@@ -3972,9 +3972,16 @@ pub(crate) enum PreparedHandler {
         scope: Scope,
         status: u16,
         url_path: String,
-        internal_target: String,
         port: u16,
         host: String,
+    },
+    /// Rebuild and execute one previously authorized internal projection only
+    /// after a deferred dynamic handler's request body is available.
+    FinalizeInternalRequest {
+        handler: Box<PreparedHandler>,
+        authorization: access::AuthorizedOutcome,
+        kind: vapache_verified::InternalRequestKind,
+        internal_target: String,
     },
     Proxy {
         vhost_index: Option<usize>,
@@ -4032,7 +4039,8 @@ impl PreparedHandler {
     fn kind(&self) -> vapache_verified::PreparedHandlerKind {
         match self {
             PreparedHandler::FinalizeDispatch { handler, .. }
-            | PreparedHandler::FinalizeErrorDocument { handler, .. } => handler.kind(),
+            | PreparedHandler::FinalizeErrorDocument { handler, .. }
+            | PreparedHandler::FinalizeInternalRequest { handler, .. } => handler.kind(),
             PreparedHandler::Proxy { .. } => vapache_verified::PreparedHandlerKind::Proxy,
             PreparedHandler::FastCgi { .. } => vapache_verified::PreparedHandlerKind::FastCgi,
             PreparedHandler::Cgi { .. } => vapache_verified::PreparedHandlerKind::Cgi,
@@ -4098,24 +4106,39 @@ impl PreparedHandler {
                 scope,
                 status,
                 url_path,
-                internal_target,
                 port,
                 host,
             } => {
-                // Routing happened against the same projection during the
-                // head phase. Rebuild it from the now-complete outer request
-                // so a deferred handler cannot regain the original method,
-                // body, query, framing or upgrade state.
-                let mut internal = project_internal_request(
-                    req,
-                    &internal_target,
-                    vapache_verified::InternalRequestKind::ErrorDocument,
-                )
-                .expect("a prepared ErrorDocument retained its validated target");
-                let response = handler.execute(cfg, &mut internal);
+                let response = handler.execute(cfg, req);
                 crate::files::finalize_prepared_error_document(
                     cfg, &scope, status, req, &url_path, port, &host, response,
                 )
+            }
+            PreparedHandler::FinalizeInternalRequest {
+                handler,
+                authorization,
+                kind,
+                internal_target,
+            } => {
+                let Some(mut internal) = project_internal_request(req, &internal_target, kind)
+                else {
+                    return Response::policy_error();
+                };
+                let Ok(target) = CanonicalTarget::from_request(
+                    &internal,
+                    cfg.encoded_slashes == EncodedSlashes::On,
+                ) else {
+                    return Response::policy_error();
+                };
+                if !authorization.require_internal_request(
+                    cfg.authorization_generation(),
+                    kind,
+                    &target.url_path,
+                    true,
+                ) {
+                    return Response::policy_error();
+                }
+                handler.execute(cfg, &mut internal)
             }
             PreparedHandler::Proxy {
                 vhost_index,
@@ -4515,17 +4538,140 @@ fn project_internal_request(
         projection.strip_entity_and_hop_headers,
         !projection.preserve_body
     );
+    let method_projected = if projection.preserve_method {
+        internal.method == req.method
+    } else {
+        internal.method == "GET"
+    };
+    let body_projected = if projection.preserve_body {
+        let spool_matches = match (&internal.body_spool, &req.body_spool) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        };
+        internal.body == req.body
+            && spool_matches
+            && internal.body_len() == req.body_len()
+            && internal.framing == req.framing
+            && internal.expect_continue == req.expect_continue
+    } else {
+        internal.body.is_empty()
+            && internal.body_spool.is_none()
+            && internal.body_len() == 0
+            && matches!(internal.framing, crate::verified::BodyFraming::None)
+            && !internal.expect_continue
+    };
+    let expected_query = if projection.preserve_query {
+        req.query.as_slice()
+    } else {
+        target_query.unwrap_or(&[])
+    };
+    let headers_projected = internal
+        .headers
+        .internal_projection_matches(&req.headers, kind);
+    if !vapache_verified::internal_request_runtime_refines(
+        internal.raw_path == path.as_bytes(),
+        internal.wire_target() == req.wire_target(),
+        internal.wire_method() == req.wire_method(),
+        internal.wire_version() == req.wire_version(),
+        method_projected,
+        body_projected,
+        internal.query == expected_query,
+        headers_projected,
+        headers_projected,
+    ) {
+        return None;
+    }
     Some(internal)
 }
 
 /// Perform one typed internal request through the normal dispatcher so
 /// handlers, access rules and `.htaccess` overrides are applied exactly as
 /// for a client request while transition-specific state is projected once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_local_error_document(
+    cfg: &Config,
+    req: &Request,
+    url: &str,
+    vhost: Option<&VHost>,
+    server_name: &str,
+    peer: SocketAddr,
+    local_ip: &str,
+    local_port: u16,
+) -> Response {
+    let Some(projected) = project_internal_request(
+        req,
+        url,
+        vapache_verified::InternalRequestKind::ErrorDocument,
+    ) else {
+        return Response::policy_error();
+    };
+    let Ok(target) =
+        CanonicalTarget::from_request(&projected, cfg.encoded_slashes == EncodedSlashes::On)
+    else {
+        return Response::policy_error();
+    };
+    let plan = match RequestPlan::resolve_for_request(cfg, vhost, target.clone(), &projected) {
+        Ok(plan) => plan,
+        Err(_) => return Response::policy_error(),
+    };
+    let scope = plan.effective_scope(cfg, vhost, &projected, peer.ip());
+    let mut resource = access::ResourceKey::request(
+        vhost,
+        &projected,
+        &target.url_path,
+        Some(plan.fs_path()),
+        None,
+    );
+    let grant = match helper_access_response(
+        cfg,
+        vhost,
+        &scope,
+        &projected,
+        &target.url_path,
+        plan.fs_path(),
+        local_port,
+        server_name,
+        peer.ip(),
+        local_ip,
+        &mut resource,
+    ) {
+        Ok(grant) => grant,
+        Err(response) => return response,
+    };
+    let Some(authorization) =
+        access::AuthorizedPlan::direct(cfg.authorization_generation(), scope, grant, resource)
+            .and_then(|plan| {
+                plan.into_internal_outcome(
+                    cfg.authorization_generation(),
+                    vapache_verified::InternalRequestKind::ErrorDocument,
+                    target.url_path.clone(),
+                )
+            })
+    else {
+        return Response::policy_error();
+    };
+    internal_dispatch(
+        cfg,
+        req,
+        url,
+        vapache_verified::InternalRequestKind::ErrorDocument,
+        authorization,
+        Some(plan),
+        vhost,
+        server_name,
+        peer,
+        local_ip,
+        local_port,
+    )
+}
+
 pub(crate) fn internal_dispatch(
     cfg: &Config,
     req: &Request,
     url: &str,
     kind: vapache_verified::InternalRequestKind,
+    authorization: access::AuthorizedOutcome,
     initial_plan: Option<RequestPlan>,
     vhost: Option<&VHost>,
     server_name: &str,
@@ -4540,11 +4686,24 @@ pub(crate) fn internal_dispatch(
             b"Invalid or recursive internal request\n".to_vec(),
         );
     };
+    let Ok(projected_target) =
+        CanonicalTarget::from_request(&internal, cfg.encoded_slashes == EncodedSlashes::On)
+    else {
+        return Response::policy_error();
+    };
+    if !authorization.require_internal_request(
+        cfg.authorization_generation(),
+        kind,
+        &projected_target.url_path,
+        true,
+    ) {
+        return Response::policy_error();
+    }
     // Internal requests preserve the Host field and run synchronously inside
     // one immutable configuration generation. The caller's already selected
     // vhost/server identity is therefore authoritative; selecting and parsing
     // it again can neither change policy nor improve isolation.
-    dispatch_inner(
+    let mut response = dispatch_inner(
         cfg,
         &internal,
         peer,
@@ -4558,7 +4717,19 @@ pub(crate) fn internal_dispatch(
         // one-slot child quota would reject DirectoryIndex/ErrorDocument
         // processing despite no additional concurrent work.
         true,
-    )
+    );
+    if response.has_prepared_handler() {
+        let handler = response
+            .take_prepared_handler()
+            .expect("prepared internal response retained its handler");
+        return Response::prepared_handler(PreparedHandler::FinalizeInternalRequest {
+            handler: Box::new(handler),
+            authorization,
+            kind,
+            internal_target: url.to_string(),
+        });
+    }
+    response
 }
 
 /// Evaluate the full configuration/access-file scope for one filesystem and
@@ -5137,44 +5308,29 @@ fn bind_multiview_grant(
         } => {
             let mut redirect_scope = target_scope;
             apply_rewrite_effects(&mut redirect_scope, &effects);
-            // A positive rewrite redirect is a terminal result, so the
-            // ordinary post-rewrite authorization below will not run.  Bind
-            // the conjoined public/selected policy before returning it.
-            if status < 400 {
-                let mut redirect_key = access::ResourceKey::request(
-                    vhost,
-                    req,
-                    &selected_identity.url_path,
-                    Some(actual_path),
-                    None,
-                );
-                if let Err(response) = helper_access_response(
-                    cfg,
-                    vhost,
-                    &redirect_scope,
-                    req,
-                    selected_url_path,
-                    actual_path,
-                    local_port,
-                    server_name,
-                    peer,
-                    local_ip,
-                    &mut redirect_key,
-                ) {
-                    return Err(response);
-                }
-            }
-            return Err(url_redirect_response(
+            let authorization = authorize_redirect_outcome(
                 cfg,
                 vhost,
                 &redirect_scope,
                 req,
+                public_url_path,
+                selected_url_path,
+                actual_path,
+                local_port,
+                server_name,
+                peer,
+                local_ip,
+            )?;
+            return Err(url_redirect_response(
+                cfg,
+                vhost,
+                req,
                 status,
                 &location,
-                public_url_path,
                 server_name,
                 local_port,
                 https,
+                authorization,
             ));
         }
         crate::rewrite::Outcome::Internal {
@@ -5798,18 +5954,78 @@ fn append_redirect_query(location: String, req: &Request) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn url_redirect_response(
+fn authorize_redirect_outcome(
     cfg: &Config,
     vhost: Option<&VHost>,
     scope: &Scope,
     req: &Request,
+    public_url_path: &str,
+    selected_url_path: &str,
+    fs_path: &Path,
+    local_port: u16,
+    server_name: &str,
+    peer: IpAddr,
+    local_ip: &str,
+) -> Result<access::AuthorizedOutcome, Response> {
+    let public =
+        CanonicalTarget::from_url_path(public_url_path).ok_or_else(Response::policy_error)?;
+    let selected =
+        CanonicalTarget::from_url_path(selected_url_path).ok_or_else(Response::policy_error)?;
+    let mut resource =
+        access::ResourceKey::request(vhost, req, &selected.url_path, Some(fs_path), None);
+    let grant = helper_access_response(
+        cfg,
+        vhost,
+        scope,
+        req,
+        selected_url_path,
+        fs_path,
+        local_port,
+        server_name,
+        peer,
+        local_ip,
+        &mut resource,
+    )?;
+    let identity = access::OutcomeIdentity::selected(
+        &public.url_path,
+        &selected.url_path,
+        Some(fs_path),
+        Some(fs_path),
+    );
+    access::AuthorizedPlan::new(
+        cfg.authorization_generation(),
+        identity,
+        scope.clone(),
+        grant,
+        resource,
+    )
+    .and_then(|plan| {
+        plan.into_outcome(
+            cfg.authorization_generation(),
+            vapache_verified::TransformSink::Redirect,
+        )
+    })
+    .ok_or_else(Response::policy_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn url_redirect_response(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
     status: u16,
     location: &str,
-    url_path: &str,
     server_name: &str,
     local_port: u16,
     https: bool,
+    authorization: access::AuthorizedOutcome,
 ) -> Response {
+    if !authorization.require_sink(
+        cfg.authorization_generation(),
+        vapache_verified::TransformSink::Redirect,
+    ) {
+        return Response::policy_error();
+    }
     let location = if location.starts_with("//") {
         format!("{}:{location}", if https { "https" } else { "http" })
     } else if location.starts_with('/') {
@@ -5829,7 +6045,8 @@ fn url_redirect_response(
     if req.method == "HEAD" {
         response.body = Body::Empty;
     }
-    if scope
+    if authorization
+        .scope()
         .header_policy
         .apply(&mut response.headers, response.status < 400)
         .is_err()
@@ -5837,10 +6054,10 @@ fn url_redirect_response(
         return Response::policy_error();
     }
     crate::compression::finalize_budgeted(
-        scope,
+        authorization.scope(),
         req,
         &mut response,
-        url_path.as_bytes(),
+        authorization.identity().public_url_path().as_bytes(),
         &cfg.resource_budget,
     );
     response
@@ -6253,17 +6470,32 @@ fn run_url_translation_phase(
                         };
                         redirect_scope.restrict_policy_with(&original_scope);
                     }
-                    return UrlPhaseResult::Terminal(url_redirect_response(
+                    let authorization = match authorize_redirect_outcome(
                         cfg,
                         vhost,
                         &redirect_scope,
                         current_req,
+                        &request_uri,
+                        &target.url_path,
+                        &fs_hint,
+                        local_port,
+                        server_name,
+                        peer.ip(),
+                        local_ip,
+                    ) {
+                        Ok(authorization) => authorization,
+                        Err(response) => return UrlPhaseResult::Terminal(response),
+                    };
+                    return UrlPhaseResult::Terminal(url_redirect_response(
+                        cfg,
+                        vhost,
+                        current_req,
                         status,
                         &location,
-                        &target.url_path,
                         server_name,
                         local_port,
                         https,
+                        authorization,
                     ));
                 }
                 crate::rewrite::Outcome::Proxy {
@@ -6440,17 +6672,32 @@ fn run_url_translation_phase(
                 };
                 redirect_scope.restrict_policy_with(&original_scope);
             }
-            return UrlPhaseResult::Terminal(url_redirect_response(
+            let authorization = match authorize_redirect_outcome(
                 cfg,
                 vhost,
                 &redirect_scope,
                 current_req,
+                &request_uri,
+                &target.url_path,
+                &fs_hint,
+                local_port,
+                server_name,
+                peer.ip(),
+                local_ip,
+            ) {
+                Ok(authorization) => authorization,
+                Err(response) => return UrlPhaseResult::Terminal(response),
+            };
+            return UrlPhaseResult::Terminal(url_redirect_response(
+                cfg,
+                vhost,
+                current_req,
                 redirect_status,
                 &location,
-                &target.url_path,
                 server_name,
                 local_port,
                 https,
+                authorization,
             ));
         }
         if current_req.policy_budget_failed() {
@@ -7118,44 +7365,33 @@ fn dispatch_inner(
                         return r; // coverage:ignore-line - filesystem race
                     }
                 }
-                let location = if location.starts_with("//") {
-                    format!("{}:{}", if https { "https" } else { "http" }, location)
-                } else if location.starts_with('/') {
-                    absolute_url_scheme(
-                        cfg,
-                        vhost,
-                        current_req,
-                        &location,
-                        &server_name,
-                        local_port,
-                        https,
-                    )
-                } else {
-                    location
-                };
-                let mut r = simple_html(
-                    status,
-                    &format!("The document has moved to {location}"),
-                    Some(&location),
-                );
-                if current_req.method == "HEAD" {
-                    r.body = Body::Empty;
-                }
-                if scope
-                    .header_policy
-                    .apply(&mut r.headers, r.status < 400)
-                    .is_err()
-                {
-                    return Response::policy_error();
-                }
-                crate::compression::finalize_budgeted(
+                let authorization = match authorize_redirect_outcome(
+                    cfg,
+                    vhost,
                     &scope,
                     current_req,
-                    &mut r,
-                    url_path.as_bytes(),
-                    &cfg.resource_budget,
+                    &original_url_path,
+                    &url_path,
+                    &fs_path,
+                    local_port,
+                    &server_name,
+                    peer.ip(),
+                    local_ip,
+                ) {
+                    Ok(authorization) => authorization,
+                    Err(response) => return response,
+                };
+                return url_redirect_response(
+                    cfg,
+                    vhost,
+                    current_req,
+                    status,
+                    &location,
+                    &server_name,
+                    local_port,
+                    https,
+                    authorization,
                 );
-                return r;
             }
             crate::rewrite::Outcome::Internal {
                 path,
@@ -7536,40 +7772,33 @@ fn dispatch_inner(
     // filesystem mapping, matching Apache's URL translation order.
     if let Some((red, loc)) = match_redirect(&scope, &url_path, Some(req)) {
         let loc = append_redirect_query(loc, req);
-        let loc = if loc.is_empty() {
-            String::new()
-        } else if loc.starts_with('/') {
-            absolute_url_scheme(cfg, vhost, req, &loc, &server_name, local_port, https)
-        } else {
-            loc
-        };
-        let mut r = if loc.is_empty() {
-            simple_html(red.status, "", None)
-        } else {
-            simple_html(
-                red.status,
-                &format!("The document has moved to {loc}"),
-                Some(&loc),
-            )
-        };
-        if req.method == "HEAD" {
-            r.body = Body::Empty;
-        }
-        if scope
-            .header_policy
-            .apply(&mut r.headers, r.status < 400)
-            .is_err()
-        {
-            return Response::policy_error();
-        }
-        crate::compression::finalize_budgeted(
+        let authorization = match authorize_redirect_outcome(
+            cfg,
+            vhost,
             &scope,
             req,
-            &mut r,
-            url_path.as_bytes(),
-            &cfg.resource_budget,
+            &original_url_path,
+            &url_path,
+            &fs_path,
+            local_port,
+            &server_name,
+            peer.ip(),
+            local_ip,
+        ) {
+            Ok(authorization) => authorization,
+            Err(response) => return response,
+        };
+        return url_redirect_response(
+            cfg,
+            vhost,
+            req,
+            red.status,
+            &loc,
+            &server_name,
+            local_port,
+            https,
+            authorization,
         );
-        return r;
     }
     if req.policy_budget_failed() {
         return Response::policy_error();
@@ -8216,64 +8445,6 @@ fn dispatch_inner(
                     Err(r) => return r,
                 }
             }
-            if let Some(index) =
-                directory_index_target(cfg, &scope, req, &file, &auth_url, &req.raw_path)
-            {
-                let crate::files::DirectoryIndex { name, file, meta } = index;
-                let auth_parent = CanonicalTarget::from_url_path(&auth_url);
-                let index_name = crate::request_plan::FilesystemName::new(&name);
-                let Some(index_target) =
-                    auth_parent
-                        .as_ref()
-                        .zip(index_name)
-                        .and_then(|(parent, name)| {
-                            CanonicalTarget::from_selected_child(&parent.url_path, name, false)
-                        })
-                else {
-                    return Response::policy_error();
-                };
-                let index_url = index_target.url_path.to_string();
-                let index_plan = plan.retarget_directory_index(
-                    cfg,
-                    vhost,
-                    index_target,
-                    Some((file, meta, follow_symlinks, owner_match_only)),
-                    (rewrite_rounds == 0
-                        && rewrite_effects.is_empty()
-                        && original_url_path == url_path
-                        && original_fs_path == fs_path)
-                        .then_some(scope),
-                );
-                return internal_dispatch(
-                    cfg,
-                    req,
-                    &index_url,
-                    vapache_verified::InternalRequestKind::DirectoryIndex,
-                    index_plan,
-                    vhost,
-                    &server_name,
-                    peer,
-                    local_ip,
-                    local_port,
-                );
-            }
-            if req.method == "POST" {
-                let mut r = error_response(
-                    cfg,
-                    vhost,
-                    &scope,
-                    405,
-                    req,
-                    &url_path,
-                    local_port,
-                    &server_name,
-                    peer.ip(),
-                    local_ip,
-                );
-                r.headers
-                    .push(("Allow".into(), b"GET, HEAD, OPTIONS".to_vec()));
-                return r;
-            }
             let Some(actual_path) = crate::files::fd_path_cow(&file, &fs_path) else {
                 return error_response(
                     cfg,
@@ -8313,6 +8484,72 @@ fn dispatch_inner(
                 Ok(v) => v,
                 Err(r) => return r, // coverage:ignore-line
             };
+            if let Some(index) =
+                directory_index_target(cfg, &scope, req, &file, &auth_url, &req.raw_path)
+            {
+                let crate::files::DirectoryIndex { name, file, meta } = index;
+                let auth_parent = CanonicalTarget::from_url_path(&auth_url);
+                let index_name = crate::request_plan::FilesystemName::new(&name);
+                let Some(index_target) =
+                    auth_parent
+                        .as_ref()
+                        .zip(index_name)
+                        .and_then(|(parent, name)| {
+                            CanonicalTarget::from_selected_child(&parent.url_path, name, false)
+                        })
+                else {
+                    return Response::policy_error();
+                };
+                let index_url = index_target.url_path.to_string();
+                let internal_authorization = target_authorization
+                    .into_internal_outcome(
+                        cfg.authorization_generation(),
+                        vapache_verified::InternalRequestKind::DirectoryIndex,
+                        index_target.url_path.clone(),
+                    )
+                    .expect("DirectoryIndex retained its inode-bound source authorization");
+                let index_plan = plan.retarget_directory_index(
+                    cfg,
+                    vhost,
+                    index_target,
+                    Some((file, meta, follow_symlinks, owner_match_only)),
+                    (rewrite_rounds == 0
+                        && rewrite_effects.is_empty()
+                        && original_url_path == url_path
+                        && original_fs_path == fs_path)
+                        .then_some(scope),
+                );
+                return internal_dispatch(
+                    cfg,
+                    req,
+                    &index_url,
+                    vapache_verified::InternalRequestKind::DirectoryIndex,
+                    internal_authorization,
+                    index_plan,
+                    vhost,
+                    &server_name,
+                    peer,
+                    local_ip,
+                    local_port,
+                );
+            }
+            if req.method == "POST" {
+                let mut r = error_response(
+                    cfg,
+                    vhost,
+                    &scope,
+                    405,
+                    req,
+                    &url_path,
+                    local_port,
+                    &server_name,
+                    peer.ip(),
+                    local_ip,
+                );
+                r.headers
+                    .push(("Allow".into(), b"GET, HEAD, OPTIONS".to_vec()));
+                return r;
+            }
             let authorization = target_authorization
                 .into_outcome(
                     cfg.authorization_generation(),
@@ -8332,7 +8569,7 @@ fn dispatch_inner(
                 local_port,
                 peer.ip(),
                 local_ip,
-                &authorization,
+                authorization,
             )
         }
         Target::Forbidden => error_response(
@@ -10027,7 +10264,10 @@ mod tests {
         fn has_error_finalizer(handler: &PreparedHandler) -> bool {
             match handler {
                 PreparedHandler::FinalizeErrorDocument { .. } => true,
-                PreparedHandler::FinalizeDispatch { handler, .. } => has_error_finalizer(handler),
+                PreparedHandler::FinalizeDispatch { handler, .. }
+                | PreparedHandler::FinalizeInternalRequest { handler, .. } => {
+                    has_error_finalizer(handler)
+                }
                 PreparedHandler::Proxy { .. }
                 | PreparedHandler::FastCgi { .. }
                 | PreparedHandler::Cgi { .. } => false,

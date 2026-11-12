@@ -1977,6 +1977,7 @@ fn serve_directory_inner(
     port: u16,
     peer: std::net::IpAddr,
     local_ip: &str,
+    authorization: Option<crate::access::AuthorizedOutcome>,
 ) -> Response {
     let options = scope.effective_options();
     let follow_symlinks = options.contains(crate::config::Options::FOLLOW_SYMLINKS);
@@ -1993,6 +1994,22 @@ fn serve_directory_inner(
         owner_match_only,
     ) {
         DirAction::Redirect(loc) => {
+            if let Some(authorization) = authorization {
+                let Some(authorization) = authorization.into_sink(
+                    cfg.authorization_generation(),
+                    vapache_verified::TransformSink::Redirect,
+                ) else {
+                    return Response::policy_error();
+                };
+                if !authorization.require_sink(
+                    cfg.authorization_generation(),
+                    vapache_verified::TransformSink::Redirect,
+                ) {
+                    return Response::policy_error();
+                }
+            } else if !cfg!(test) {
+                return Response::policy_error();
+            }
             let canonical_authority = if (!crate::expr::request_is_https() && port == 80)
                 || (crate::expr::request_is_https() && port == 443)
             {
@@ -2043,18 +2060,23 @@ fn serve_directory_inner(
         DirAction::Index(_, _, name) => {
             let parent = crate::request_plan::CanonicalTarget::from_url_path(url_path);
             let child = crate::request_plan::FilesystemName::new(&name);
-            let Some(index_url) = parent
-                .as_ref()
-                .zip(child)
-                .and_then(|(parent, child)| {
-                    crate::request_plan::CanonicalTarget::from_selected_child(
-                        &parent.url_path,
-                        child,
-                        false,
-                    )
-                })
-                .map(|target| target.url_path.into_string())
-            else {
+            let Some(index_target) = parent.as_ref().zip(child).and_then(|(parent, child)| {
+                crate::request_plan::CanonicalTarget::from_selected_child(
+                    &parent.url_path,
+                    child,
+                    false,
+                )
+            }) else {
+                return Response::policy_error();
+            };
+            let index_url = index_target.url_path.to_string();
+            let Some(authorization) = authorization.and_then(|authorization| {
+                authorization.into_internal(
+                    cfg.authorization_generation(),
+                    vapache_verified::InternalRequestKind::DirectoryIndex,
+                    index_target.url_path.clone(),
+                )
+            }) else {
                 return Response::policy_error();
             };
             crate::server::internal_dispatch(
@@ -2062,6 +2084,7 @@ fn serve_directory_inner(
                 req,
                 &index_url,
                 vapache_verified::InternalRequestKind::DirectoryIndex,
+                authorization,
                 None,
                 vhost,
                 host,
@@ -2164,13 +2187,14 @@ fn authorized_autoindex_entries(
     Ok(visible)
 }
 
+#[cfg(test)]
 pub fn serve_directory(
     cfg: &Config,
     vhost: Option<&VHost>,
     scope: &Scope,
     req: &Request,
     dir: File,
-    meta: &Metadata,
+    _meta: &Metadata,
     fs_path: &std::path::Path,
     url_path: &str,
     raw_path: &[u8],
@@ -2192,7 +2216,7 @@ pub fn serve_directory(
         );
     }
     let mut r = serve_directory_inner(
-        cfg, vhost, scope, req, dir, url_path, raw_path, host, port, peer, local_ip,
+        cfg, vhost, scope, req, dir, url_path, raw_path, host, port, peer, local_ip, None,
     );
     if scope
         .header_policy
@@ -2226,7 +2250,7 @@ pub fn serve_authorized_directory(
     port: u16,
     peer: std::net::IpAddr,
     local_ip: &str,
-    authorization: &crate::access::AuthorizedOutcome,
+    authorization: crate::access::AuthorizedOutcome,
 ) -> Response {
     if !authorization.require_file_sink(
         cfg.authorization_generation(),
@@ -2248,23 +2272,36 @@ pub fn serve_authorized_directory(
             local_ip,
         );
     }
-    serve_directory(
+    let scope = authorization.scope().clone();
+    let mut response = serve_directory_inner(
         cfg,
         vhost,
-        authorization.scope(),
+        &scope,
         req,
         dir,
-        meta,
-        fs_path,
         url_path,
         raw_path,
         host,
         port,
         peer,
         local_ip,
-        authorization.grant(),
-        authorization.resource(),
-    )
+        Some(authorization),
+    );
+    if scope
+        .header_policy
+        .apply(&mut response.headers, response.status < 400)
+        .is_err()
+    {
+        return Response::policy_error();
+    }
+    crate::compression::finalize_budgeted(
+        &scope,
+        req,
+        &mut response,
+        url_path.as_bytes(),
+        &cfg.resource_budget,
+    );
+    response
 }
 
 fn autoindex(
@@ -2624,10 +2661,6 @@ pub fn error_response(
             scope: scope.clone(),
             status,
             url_path: url_path.to_string(),
-            internal_target: match scope.error_document(status) {
-                Some(ErrorDoc::Local(path)) => path.clone(),
-                _ => unreachable!("a prepared local ErrorDocument retained its target"),
-            },
             port,
             host: host.to_string(),
         });
@@ -2723,12 +2756,10 @@ fn serve_error_document(
     if req.error_document_depth() >= 1 {
         return None;
     }
-    let mut response = crate::server::internal_dispatch(
+    let mut response = crate::server::dispatch_local_error_document(
         cfg,
         req,
         path,
-        vapache_verified::InternalRequestKind::ErrorDocument,
-        None,
         vhost,
         server_name,
         std::net::SocketAddr::new(peer, 0),
@@ -2768,6 +2799,37 @@ mod tests {
     fn policy_path(value: &str) -> crate::request_plan::DecodedUrlPath {
         crate::request_plan::DecodedUrlPath::from_canonical(value)
             .expect("test file path is canonical")
+    }
+
+    fn directory_outcome(
+        cfg: &Config,
+        scope: &Scope,
+        req: &Request,
+        url_path: &str,
+        fs_path: &Path,
+        meta: &Metadata,
+    ) -> crate::access::AuthorizedOutcome {
+        let resource = crate::access::ResourceKey::request(
+            None,
+            req,
+            &policy_path(url_path),
+            Some(fs_path),
+            None,
+        );
+        crate::access::AuthorizedPlan::direct(
+            cfg.authorization_generation(),
+            scope.clone(),
+            crate::access::test_grant(),
+            resource,
+        )
+        .and_then(|plan| plan.bind_file(meta))
+        .and_then(|plan| {
+            plan.into_outcome(
+                cfg.authorization_generation(),
+                vapache_verified::TransformSink::Directory,
+            )
+        })
+        .expect("test directory outcome")
     }
     use crate::http::{Headers, Version};
     use std::collections::HashMap;
@@ -3795,18 +3857,30 @@ mod tests {
         ));
 
         cfg.directory_index = vec!["index.html".into()];
+        let index_request = request("GET", b"/");
+        let index_dir = File::open(&root).unwrap();
+        let index_meta = index_dir.metadata().unwrap();
+        let index_authorization = directory_outcome(
+            &cfg,
+            &Scope::default(),
+            &index_request,
+            "/",
+            &root,
+            &index_meta,
+        );
         let indexed = serve_directory_inner(
             &cfg,
             None,
             &Scope::default(),
-            &request("GET", b"/"),
-            File::open(&root).unwrap(),
+            &index_request,
+            index_dir,
             "/",
             b"/",
             "example.test",
             80,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "127.0.0.1",
+            Some(index_authorization),
         );
         assert_eq!(indexed.status, 200);
         let mut owner_scope = Scope::default();
@@ -3816,19 +3890,25 @@ mod tests {
         owner_scope
             .options
             .push_add(crate::config::Options::SYMLINKS_IF_OWNER_MATCH);
+        let owner_request = request("GET", b"/");
+        let owner_dir = File::open(&root).unwrap();
+        let owner_meta = owner_dir.metadata().unwrap();
+        let owner_authorization =
+            directory_outcome(&cfg, &owner_scope, &owner_request, "/", &root, &owner_meta);
         assert_eq!(
             serve_directory_inner(
                 &cfg,
                 None,
                 &owner_scope,
-                &request("GET", b"/"),
-                File::open(&root).unwrap(),
+                &owner_request,
+                owner_dir,
                 "/",
                 b"/",
                 "example.test",
                 80,
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 "127.0.0.1",
+                Some(owner_authorization),
             )
             .status,
             200
@@ -3960,6 +4040,7 @@ mod tests {
                 443,
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 "127.0.0.1",
+                None,
             );
             assert!(redirected
                 .headers
@@ -3981,6 +4062,7 @@ mod tests {
             8080,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "127.0.0.1",
+            None,
         );
         assert!(redirected
             .headers
@@ -4068,6 +4150,7 @@ mod tests {
             80,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "127.0.0.1",
+            None,
         );
         assert_eq!(response.status, 503);
         std::fs::remove_dir_all(&root).unwrap();

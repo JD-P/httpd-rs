@@ -1697,6 +1697,14 @@ pub enum TransformSink {
     FastCgi,
     Proxy,
     Cache,
+    /// A positive response whose only externally interpreted target is the
+    /// validated Location value. It still requires the selected request
+    /// resource to have passed the ordinary authorization gate.
+    Redirect,
+    /// Admission to the typed DirectoryIndex internal-request transition.
+    DirectoryIndex,
+    /// Admission to the typed local ErrorDocument recovery transition.
+    ErrorDocument,
 }
 
 /// Runtime `AuthorizedPlan` construction must retain one coherent identity:
@@ -1972,8 +1980,12 @@ pub open spec fn transform_sink_needs_inode(sink: TransformSink) -> bool {
         TransformSink::StaticFile
         | TransformSink::Directory
         | TransformSink::LocalCgi
-        | TransformSink::FastCgi => true,
-        TransformSink::Proxy | TransformSink::Cache => false,
+        | TransformSink::FastCgi
+        | TransformSink::DirectoryIndex => true,
+        TransformSink::Proxy
+        | TransformSink::Cache
+        | TransformSink::Redirect
+        | TransformSink::ErrorDocument => false,
     }
 }
 
@@ -2005,8 +2017,12 @@ pub fn transform_sink_requires_inode(sink: TransformSink) -> (needed: bool)
         TransformSink::StaticFile
         | TransformSink::Directory
         | TransformSink::LocalCgi
-        | TransformSink::FastCgi => true,
-        TransformSink::Proxy | TransformSink::Cache => false,
+        | TransformSink::FastCgi
+        | TransformSink::DirectoryIndex => true,
+        TransformSink::Proxy
+        | TransformSink::Cache
+        | TransformSink::Redirect
+        | TransformSink::ErrorDocument => false,
     }
 }
 
@@ -4443,6 +4459,199 @@ pub fn internal_request_projection(
             preserve_query: false,
             preserve_client_identity: true,
             strip_entity_and_hop_headers: true,
+        },
+    }
+}
+
+/// Internal orchestration is part of the same terminal capability algebra as
+/// body, tunnel, cache and redirect sinks.  The runtime stores both this sink
+/// class and the exact projected target in its move-only AuthorizedOutcome.
+pub open spec fn internal_request_sink_spec(kind: InternalRequestKind) -> TransformSink {
+    match kind {
+        InternalRequestKind::DirectoryIndex => TransformSink::DirectoryIndex,
+        InternalRequestKind::ErrorDocument => TransformSink::ErrorDocument,
+    }
+}
+
+pub fn internal_request_sink(kind: InternalRequestKind) -> (sink: TransformSink)
+    ensures sink == internal_request_sink_spec(kind),
+{
+    match kind {
+        InternalRequestKind::DirectoryIndex => TransformSink::DirectoryIndex,
+        InternalRequestKind::ErrorDocument => TransformSink::ErrorDocument,
+    }
+}
+
+pub open spec fn internal_request_sink_matches_spec(
+    kind: InternalRequestKind,
+    sink: TransformSink,
+) -> bool {
+    match kind {
+        InternalRequestKind::DirectoryIndex => match sink {
+            TransformSink::DirectoryIndex => true,
+            _ => false,
+        },
+        InternalRequestKind::ErrorDocument => match sink {
+            TransformSink::ErrorDocument => true,
+            _ => false,
+        },
+    }
+}
+
+pub fn internal_request_sink_matches(
+    kind: InternalRequestKind,
+    sink: TransformSink,
+) -> (matches: bool)
+    ensures matches == internal_request_sink_matches_spec(kind, sink),
+{
+    match kind {
+        InternalRequestKind::DirectoryIndex => match sink {
+            TransformSink::DirectoryIndex => true,
+            _ => false,
+        },
+        InternalRequestKind::ErrorDocument => match sink {
+            TransformSink::ErrorDocument => true,
+            _ => false,
+        },
+    }
+}
+
+/// Executable refinement boundary for the safe-Rust Request projection.  The
+/// caller computes every fact by exact equality against the source request,
+/// configured target and the expected filtered header set.  Admission is one
+/// conjunction so a future field or transition cannot silently take a
+/// positive path after only a partial comparison.
+pub open spec fn internal_request_runtime_refines_spec(
+    target_bound: bool,
+    wire_target_preserved: bool,
+    wire_method_preserved: bool,
+    wire_version_preserved: bool,
+    method_projected: bool,
+    body_projected: bool,
+    query_projected: bool,
+    client_identity_preserved: bool,
+    headers_projected: bool,
+) -> bool {
+    target_bound
+        && wire_target_preserved
+        && wire_method_preserved
+        && wire_version_preserved
+        && method_projected
+        && body_projected
+        && query_projected
+        && client_identity_preserved
+        && headers_projected
+}
+
+pub fn internal_request_runtime_refines(
+    target_bound: bool,
+    wire_target_preserved: bool,
+    wire_method_preserved: bool,
+    wire_version_preserved: bool,
+    method_projected: bool,
+    body_projected: bool,
+    query_projected: bool,
+    client_identity_preserved: bool,
+    headers_projected: bool,
+) -> (admit: bool)
+    ensures admit == internal_request_runtime_refines_spec(
+        target_bound,
+        wire_target_preserved,
+        wire_method_preserved,
+        wire_version_preserved,
+        method_projected,
+        body_projected,
+        query_projected,
+        client_identity_preserved,
+        headers_projected,
+    ),
+{
+    target_bound
+        && wire_target_preserved
+        && wire_method_preserved
+        && wire_version_preserved
+        && method_projected
+        && body_projected
+        && query_projected
+        && client_identity_preserved
+        && headers_projected
+}
+
+pub proof fn admitted_internal_request_refines_every_field(
+    target_bound: bool,
+    wire_target_preserved: bool,
+    wire_method_preserved: bool,
+    wire_version_preserved: bool,
+    method_projected: bool,
+    body_projected: bool,
+    query_projected: bool,
+    client_identity_preserved: bool,
+    headers_projected: bool,
+)
+    requires internal_request_runtime_refines_spec(
+        target_bound,
+        wire_target_preserved,
+        wire_method_preserved,
+        wire_version_preserved,
+        method_projected,
+        body_projected,
+        query_projected,
+        client_identity_preserved,
+        headers_projected,
+    ),
+    ensures
+        target_bound,
+        wire_target_preserved,
+        wire_method_preserved,
+        wire_version_preserved,
+        method_projected,
+        body_projected,
+        query_projected,
+        client_identity_preserved,
+        headers_projected,
+{
+}
+
+pub open spec fn internal_request_outcome_spec(
+    kind: InternalRequestKind,
+    sink: TransformSink,
+    exact_target: bool,
+    runtime_refines: bool,
+) -> bool {
+    internal_request_sink_matches_spec(kind, sink) && exact_target && runtime_refines
+}
+
+pub fn internal_request_outcome_admit(
+    kind: InternalRequestKind,
+    sink: TransformSink,
+    exact_target: bool,
+    runtime_refines: bool,
+) -> (admit: bool)
+    ensures admit == internal_request_outcome_spec(kind, sink, exact_target, runtime_refines),
+{
+    internal_request_sink_matches(kind, sink) && exact_target && runtime_refines
+}
+
+pub proof fn internal_request_outcome_binds_kind_target_and_projection(
+    kind: InternalRequestKind,
+    sink: TransformSink,
+    exact_target: bool,
+    runtime_refines: bool,
+)
+    requires internal_request_outcome_spec(kind, sink, exact_target, runtime_refines),
+    ensures
+        sink == internal_request_sink_spec(kind),
+        exact_target,
+        runtime_refines,
+{
+    match kind {
+        InternalRequestKind::DirectoryIndex => match sink {
+            TransformSink::DirectoryIndex => {},
+            _ => {},
+        },
+        InternalRequestKind::ErrorDocument => match sink {
+            TransformSink::ErrorDocument => {},
+            _ => {},
         },
     }
 }

@@ -674,6 +674,10 @@ impl RequestScope {
         self.state.cancelled.store(true, Ordering::Release);
     }
 
+    pub(crate) fn same_lineage(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     pub(crate) fn guard(&self) -> RequestScopeGuard {
         RequestScopeGuard {
             scope: self.clone(),

@@ -323,8 +323,30 @@ impl AuthorizedPlan {
         if !self.grant.require_sink(generation, &self.resource, sink) {
             return None;
         }
-        Some(AuthorizedOutcome { plan: self, sink })
+        Some(AuthorizedOutcome {
+            plan: self,
+            sink,
+            internal: None,
+        })
     }
+
+    pub(crate) fn into_internal_outcome(
+        self,
+        generation: crate::config::ConfigurationGeneration,
+        kind: vapache_verified::InternalRequestKind,
+        target: DecodedUrlPath,
+    ) -> Option<AuthorizedOutcome> {
+        let sink = vapache_verified::internal_request_sink(kind);
+        let mut outcome = self.into_outcome(generation, sink)?;
+        outcome.internal = Some(InternalOutcomeBinding { kind, target });
+        Some(outcome)
+    }
+}
+
+#[derive(Debug)]
+struct InternalOutcomeBinding {
+    kind: vapache_verified::InternalRequestKind,
+    target: DecodedUrlPath,
 }
 
 /// Sink-bound terminal authorization.  Production body/tunnel/cache entry
@@ -334,6 +356,7 @@ impl AuthorizedPlan {
 pub struct AuthorizedOutcome {
     plan: AuthorizedPlan,
     sink: vapache_verified::TransformSink,
+    internal: Option<InternalOutcomeBinding>,
 }
 
 impl AuthorizedOutcome {
@@ -357,6 +380,29 @@ impl AuthorizedOutcome {
         self.sink
     }
 
+    /// Consume a terminal authorization when orchestration selects a more
+    /// specific sink without changing the authorized resource. This is used
+    /// for a directory-to-redirect transition; a caller cannot retain and
+    /// reuse the previous sink token afterward.
+    pub(crate) fn into_sink(
+        self,
+        generation: crate::config::ConfigurationGeneration,
+        sink: vapache_verified::TransformSink,
+    ) -> Option<Self> {
+        self.plan.into_outcome(generation, sink)
+    }
+
+    /// Consume the current terminal token and bind one exact internal target
+    /// and transition kind. The nested dispatcher is the only consumer.
+    pub(crate) fn into_internal(
+        self,
+        generation: crate::config::ConfigurationGeneration,
+        kind: vapache_verified::InternalRequestKind,
+        target: DecodedUrlPath,
+    ) -> Option<Self> {
+        self.plan.into_internal_outcome(generation, kind, target)
+    }
+
     pub(crate) fn require_sink(
         &self,
         generation: crate::config::ConfigurationGeneration,
@@ -367,6 +413,26 @@ impl AuthorizedOutcome {
                 .plan
                 .grant
                 .require_sink(generation, &self.plan.resource, sink)
+    }
+
+    pub(crate) fn require_internal_request(
+        &self,
+        generation: crate::config::ConfigurationGeneration,
+        kind: vapache_verified::InternalRequestKind,
+        target: &DecodedUrlPath,
+        runtime_refines: bool,
+    ) -> bool {
+        let exact_target = self
+            .internal
+            .as_ref()
+            .is_some_and(|binding| binding.kind == kind && binding.target == *target);
+        self.require_sink(generation, vapache_verified::internal_request_sink(kind))
+            && vapache_verified::internal_request_outcome_admit(
+                kind,
+                self.sink,
+                exact_target,
+                runtime_refines,
+            )
     }
 
     /// A local-file sink must retain both the resolved pathname and the
@@ -2287,6 +2353,58 @@ mod tests {
             vapache_verified::TransformSink::StaticFile,
             executable,
             &other_meta,
+        ));
+    }
+
+    #[test]
+    fn internal_outcome_binds_transition_kind_and_exact_target() {
+        let request = req("GET");
+        let peer = "127.0.0.1".parse().unwrap();
+        let scope = Scope::default();
+        let key = ResourceKey::request(None, &request, &path("/missing"), None, None);
+        let grant = check_grant(
+            &scope,
+            &request,
+            peer,
+            None,
+            "/missing",
+            None,
+            key.clone(),
+            generation(),
+        )
+        .unwrap();
+        let outcome = AuthorizedPlan::direct(generation(), scope, grant, key)
+            .and_then(|plan| {
+                plan.into_internal_outcome(
+                    generation(),
+                    vapache_verified::InternalRequestKind::ErrorDocument,
+                    path("/errors/404.html"),
+                )
+            })
+            .expect("authorized ErrorDocument transition");
+        assert!(outcome.require_internal_request(
+            generation(),
+            vapache_verified::InternalRequestKind::ErrorDocument,
+            &path("/errors/404.html"),
+            true,
+        ));
+        assert!(!outcome.require_internal_request(
+            generation(),
+            vapache_verified::InternalRequestKind::ErrorDocument,
+            &path("/errors/403.html"),
+            true,
+        ));
+        assert!(!outcome.require_internal_request(
+            generation(),
+            vapache_verified::InternalRequestKind::DirectoryIndex,
+            &path("/errors/404.html"),
+            true,
+        ));
+        assert!(!outcome.require_internal_request(
+            generation(),
+            vapache_verified::InternalRequestKind::ErrorDocument,
+            &path("/errors/404.html"),
+            false,
         ));
     }
 

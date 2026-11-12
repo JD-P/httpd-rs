@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-12",
   "verus": {
-    "verified_functions": 836,
+    "verified_functions": 842,
     "errors": 0
   },
   "obligations": [
@@ -114,16 +114,16 @@
     {
       "id": "terminal_sink_gate",
       "title": "Every positive terminal outcome enforces original-URL and current-target grants",
-      "status": "partial",
+      "status": "mechanized",
       "weight": 1.0,
-      "evidence": "TransformCapability plus AccessGrant::require_sink mechanize the final exact-resource and sink-binding gate for static/directory, CGI/FastCGI, proxy, WebSocket and cache outcomes. authorized_plan_identity_spec additionally requires one coherent public URL, selected URL, lexical/resolved identity and exact grant; production sink adapters consume the resulting move-only AuthorizedPlan/AuthorizedOutcome, cache lookup/store own it through CacheContext, failover replaces it atomically, and local-file adapters reject descriptor/inode substitution. The complete RequestPolicyState reference machine now makes SinkAdmission a distinct phase after authorization and cache classification; request_policy_step_to_complete_implies_all_gates and request_policy_complete_implies_all_gates prove no completed trace can omit canonical/original/target policy, target authorization, required original authorization after a rewrite, route selection, cache classification or sink admission. MultiViews candidate admission additionally requires a missing public target, same-directory basename match, regular typed representation, static handler, acceptable negotiation result and bounded scan. multiview_authorization_meet_spec requires the public URL, selected URL, resolved inode and selected-name rewrite result together; dispatch consumes that admission after exact URL/path/dev/inode binding. multiview_cache_binding_spec requires cache lookup/store to use the selected URL and resolved target, and the cache planner consumes the same selected scope/rewrite transition as dispatch. Original-URL and current-target scopes are both enforced and F23 covers rewrite-then-proxy/redirect. Redirect and error-response orchestration remain runtime projections outside the protected body/tunnel/cache sink types, so the broader all-positive-outcomes production-refinement obligation remains partial."
+      "evidence": "TransformCapability plus AccessGrant::require_sink mechanize the final exact-resource and sink-binding gate for static/directory, CGI/FastCGI, proxy, WebSocket, cache and redirect outcomes. authorized_plan_identity_spec additionally requires one coherent public URL, selected URL, lexical/resolved identity and exact grant; production sink adapters consume the resulting move-only AuthorizedPlan/AuthorizedOutcome, cache lookup/store own it through CacheContext, failover replaces it atomically, and local-file adapters reject descriptor/inode substitution. Redirect, DirectoryIndex and ErrorDocument are closed TransformSink variants: every routing redirect consumes a Redirect outcome, while DirectoryIndex and local ErrorDocument consume an outcome additionally bound to the exact InternalRequestKind and projected target. Deferred internal handlers retain that outcome across body acquisition and revalidate it immediately before dispatch. The complete RequestPolicyState reference machine makes SinkAdmission a distinct phase after authorization and cache classification; request_policy_step_to_complete_implies_all_gates and request_policy_complete_implies_all_gates prove no completed trace can omit canonical/original/target policy, target authorization, required original authorization after a rewrite, route selection, cache classification or sink admission. MultiViews candidate admission additionally requires a missing public target, same-directory basename match, regular typed representation, static handler, acceptable negotiation result and bounded scan. multiview_authorization_meet_spec requires the public URL, selected URL, resolved inode and selected-name rewrite result together; dispatch consumes that admission after exact URL/path/dev/inode binding. multiview_cache_binding_spec requires cache lookup/store to use the selected URL and resolved target, and the cache planner consumes the same selected scope/rewrite transition as dispatch. Original-URL and current-target scopes are both enforced and F23 covers rewrite-then-proxy/redirect."
     },
     {
       "id": "internal_request_projection",
       "title": "Internal request transitions preserve only kind-authorized state",
-      "status": "partial",
+      "status": "mechanized",
       "weight": 1.0,
-      "evidence": "InternalRequestKind and internal_request_projection are the executable transition policy consumed by the sole internal dispatcher: DirectoryIndex preserves the selected application's method, body and query, while a local ErrorDocument becomes a bodyless GET with only its configured query. Both preserve an immutable clone-shared wire method/target/version identity and client identity. error_document_depth_step owns recursion in the request, internal_request_target_admit rejects ambiguous local targets at compile time and again at dispatch, directory_index_name_admit binds the literal filename probe to the URL component, and response-local shared-cache provenance replaces executor-thread state. Runtime projection tests cover THE_REQUEST identity plus entity, conditional-range, hop-by-hop and Connection-nominated header removal; deferred CGI tests prove the same projection is rebuilt after lazy body acquisition. Byte-for-byte refinement of the safe-Rust Request mutation and header-name set to this typed policy remains outside Verus."
+      "evidence": "InternalRequestKind and internal_request_projection are the executable transition policy consumed by the sole internal dispatcher: DirectoryIndex preserves the selected application's method, body, query and exact header/body storage, while a local ErrorDocument becomes a bodyless GET with only its configured query and the exact expected entity, conditional-range, hop-by-hop, upgrade and Connection-nominated header set removed. Both preserve clone-shared wire method/target/version, request-scope lineage, authenticated identity, public URI, proxy session and resident-byte lease. The runtime computes exact equality for every projected field and consumes internal_request_runtime_refines; its Verus specification is one complete conjunction, and admitted_internal_request_refines_every_field proves admission cannot omit a field. Each move-only AuthorizedOutcome also stores the exact InternalRequestKind and DecodedUrlPath; internal_request_outcome_admit plus internal_request_outcome_binds_kind_target_and_projection prove the sink class, target and full runtime projection are jointly required before dispatch. error_document_depth_step owns recursion, internal_request_target_admit rejects ambiguous local targets at compile time and dispatch, directory_index_name_admit binds the literal probe to the URL component, and deferred-handler tests prove the exact projection and token are rebuilt after lazy body acquisition."
     },
     {
       "id": "cache_generation_epoch",
@@ -504,7 +504,7 @@
       "evidence": "backend_resolution_binding_admit requires a validated resolver result to belong to the consuming immutable generation, backend_connected_endpoint_admit requires the kernel peer to equal the selected bound endpoint, and fastcgi_peer_identity_admit rejects a Unix listener outside the configured worker/endpoint-owner or uid-0 trust set. Runtime stores the first bounded DNS answer in an Arc-owned per-Config registry shared by proxy, WebSocket, health, TCP FastCGI and OCSP paths; concurrent first answers converge on one map entry, the map has no in-generation expiry, reload creates a distinct registry, and structural Arc lifetime prevents retirement cleanup from racing an in-flight background insertion. Linux strict Unix FastCGI additionally consumes SO_PEERCRED independently of before/after socket pathname metadata. Unit tests cover rebinding, generation separation, structural cleanup, invalid resolver ports, endpoint mismatch and peer uid mismatch; complete workspace tests cover every integrated consumer."
     }
   ],
-  "minimum_weighted_score": 40.5,
+  "minimum_weighted_score": 41.5,
   "proof_debt": {
     "max_total": 6,
     "unverified_security_components": [],
@@ -523,12 +523,12 @@
     "max_unmodeled_security_directive_classes": 0
   },
   "sinks": {
-    "total": 8,
-    "grant_required": 8,
-    "path_target_bound": 8,
-    "inode_bound": 5,
+    "total": 11,
+    "grant_required": 11,
+    "path_target_bound": 11,
+    "inode_bound": 6,
     "policy_key_bound": 3,
-    "minimum_inode_bound": 5,
+    "minimum_inode_bound": 6,
     "backend_target_bound": 3,
     "minimum_backend_target_bound": 3,
     "minimum_policy_key_bound": 3
@@ -664,11 +664,11 @@
     "Process-global compatibility capability admission and disabled-surface rejection",
     "Privilege-drop service identity and pidfd process-control admission",
     "WebSocket negotiation selection syntax, offered-set and uniqueness admission",
-    "Typed DirectoryIndex and ErrorDocument internal-request projection, probe/URL identity, target syntax and recursion admission",
+    "Typed DirectoryIndex and ErrorDocument internal-request projection, exact target/outcome binding, complete runtime refinement, probe/URL identity, target syntax and recursion admission",
     "Byte-oriented Basic authentication scheme and ASCII-separator admission",
     "Complete authentication-file cache snapshot reuse admission",
     "Monotonic request-owned authenticated-identity transition",
     "Fail-closed unavailable group-provider result under positive and negated rules",
-    "Move-only authorized plan/outcome identity from public and selected URLs through exact local/backend/cache sink binding"
+    "Move-only authorized plan/outcome identity from public and selected URLs through exact local/backend/cache/redirect/internal sink binding"
   ]
 }

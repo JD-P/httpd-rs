@@ -428,14 +428,17 @@ pass the verified ambiguity gate.
 The runtime packages those facts in one move-only pipeline. `OutcomeIdentity`
 retains the public URL, selected URL and lexical/resolved filesystem identities;
 `AuthorizedPlan` adds the effective scope, exact `ResourceKey` and grant; and
-`AuthorizedOutcome` adds the admitted terminal sink. Its constructor consumes
-the executable `authorized_plan_identity_admit` predicate, so a selected-URL,
-resolved-target or grant mismatch cannot produce a plan. Production static,
-directory, CGI, FastCGI, HTTP proxy, WebSocket and cache entry points accept
-this artifact instead of independently supplied identity/grant fields. The
-local-file adapters additionally compare the opened descriptor's device and
-inode with the outcome immediately before use, while balancer failover replaces
-the whole outcome atomically.
+`AuthorizedOutcome` adds the admitted terminal sink. Redirect, DirectoryIndex
+and local ErrorDocument are terminal sink classes too; an internal outcome also
+stores the exact `InternalRequestKind` and `DecodedUrlPath` it authorizes. Its
+constructor consumes the executable `authorized_plan_identity_admit` predicate,
+so a selected-URL, resolved-target or grant mismatch cannot produce a plan.
+Production static, directory, redirect, CGI, FastCGI, HTTP proxy, WebSocket,
+cache and internal-request entry points accept this artifact instead of
+independently supplied identity/grant fields. The local-file adapters
+additionally compare the opened descriptor's device and inode with the outcome
+immediately before use, while balancer failover replaces the whole outcome
+atomically.
 
 ### I11 — Reauthorize every target-changing transform
 
@@ -585,6 +588,14 @@ it cannot recursively invoke itself.  Its recovery projection removes entity,
 conditional-range and hop-by-hop/upgrade metadata (including fields nominated
 by `Connection`) before a local or proxied handler runs.  Cache exclusion is a
 property of the returned response rather than executor-thread state.
+The internal dispatcher accepts a move-only outcome bound to the transition
+kind and exact target. It checks every projected field against the source
+request: immutable wire identity, method/body/query semantics, the complete
+header set, scope lineage, peer/authenticated identity, public URI, proxy
+session and resident-byte lease. The executable Verus gate is one conjunction
+over those facts. A deferred CGI/FastCGI/proxy handler retains the outcome and
+rebuilds the same projection immediately before execution, after lazy body
+acquisition, so orchestration cannot bypass the terminal boundary.
 Until Apache-style arbitrary URI index candidates are implemented,
 `DirectoryIndex` values must be literal, unescaped single-component names;
 this keeps the file probed during selection identical to the URL dispatched.
@@ -691,7 +702,11 @@ forall executions:
 ```
 
 A transform adds an obligation; it never replaces one.  Static, directory,
-CGI, FastCGI, proxy and positive redirect outcomes all consume the gate.
+CGI, FastCGI, proxy, cache and positive redirect outcomes all consume the
+move-only gate. DirectoryIndex consumes an inode-bound directory outcome and
+rebinds it to its exact child URL; local ErrorDocument authorizes its recovery
+target and consumes an outcome bound to that exact internal transition. The
+sole internal dispatcher rejects a kind, target or projection mismatch.
 In particular a rewrite chain such as `/admin -> /front -> [P] backend`
 still authorizes `/admin` before the proxy sink, and a positive `[R]` after a
 rewrite does the same.  The gate uses the original request context and applies
@@ -1943,12 +1958,14 @@ construction: there is no second production interleaver.
   `PreparedHandlerKind` proves every typed backend IR kind requires bounded
   dynamic admission.
 - `InternalRequestKind`, `internal_request_projection`,
+  `internal_request_runtime_refines`, `internal_request_outcome_admit`,
   `error_document_depth_step` and `internal_request_target_admit`, consumed by
   the sole internal dispatcher and configuration compiler. `DirectoryIndex`
   preserves application method/body/query state; local `ErrorDocument`
   projects a bodyless GET with its configured query, while both retain the
-  wire method/target/version and client identity. Concrete header mutation
-  remains covered by runtime refinement tests. `directory_index_name_admit`
+  wire method/target/version and client identity. Exact runtime comparisons
+  cover every projected field and header, and the move-only outcome binds the
+  exact transition kind and target before dispatch. `directory_index_name_admit`
   additionally binds the literal filename probe to the internal URL component.
 - `multiview_candidate_spec`, `multiview_authorization_meet_spec` and
   `multiview_cache_binding_spec`, consumed by negotiation, final inode binding

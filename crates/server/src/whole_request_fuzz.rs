@@ -542,7 +542,8 @@ fn prepared_snapshot(handler: PreparedHandler) -> RouteSnapshot {
             snapshot.route_cache = cache.as_deref().map(cache_context_snapshot);
             snapshot
         }
-        PreparedHandler::FinalizeErrorDocument { handler, .. } => prepared_snapshot(*handler),
+        PreparedHandler::FinalizeErrorDocument { handler, .. }
+        | PreparedHandler::FinalizeInternalRequest { handler, .. } => prepared_snapshot(*handler),
         PreparedHandler::Proxy {
             authorization,
             target,

@@ -314,6 +314,64 @@ impl Headers {
                 )
         });
     }
+
+    pub(crate) fn internal_projection_matches(
+        &self,
+        source: &Self,
+        kind: vapache_verified::InternalRequestKind,
+    ) -> bool {
+        let entries_match = match kind {
+            vapache_verified::InternalRequestKind::DirectoryIndex => {
+                std::sync::Arc::ptr_eq(&self.entries, &source.entries)
+            }
+            vapache_verified::InternalRequestKind::ErrorDocument => {
+                let mut expected = source.clone();
+                expected.strip_internal_recovery_headers();
+                self.entries.as_ref() == expected.entries.as_ref()
+            }
+        };
+        let request_scope_matches = match (&self.request_scope, &source.request_scope) {
+            (Some(left), Some(right)) => left.same_lineage(right),
+            (None, None) => true,
+            _ => false,
+        };
+        let proxy_session_matches = match (&self.proxy_session, &source.proxy_session) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        };
+        let resident_lease_matches = match (&self.resident_lease, &source.resident_lease) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        };
+        let transition_state_matches = match kind {
+            vapache_verified::InternalRequestKind::DirectoryIndex => {
+                let streaming_matches = match (&self.streaming_body, &source.streaming_body) {
+                    (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+                    (None, None) => true,
+                    _ => false,
+                };
+                streaming_matches
+                    && self.discarded_body_len == source.discarded_body_len
+                    && self.error_document_depth == source.error_document_depth
+            }
+            vapache_verified::InternalRequestKind::ErrorDocument => {
+                self.streaming_body.is_none()
+                    && self.discarded_body_len == 0
+                    && self.error_document_depth == source.error_document_depth.saturating_add(1)
+            }
+        };
+        entries_match
+            && std::sync::Arc::ptr_eq(&self.policy_budget, &source.policy_budget)
+            && request_scope_matches
+            && std::sync::Arc::ptr_eq(&self.authenticated_identity, &source.authenticated_identity)
+            && std::sync::Arc::ptr_eq(&self.public_uri, &source.public_uri)
+            && proxy_session_matches
+            && resident_lease_matches
+            && self.handler_probe == source.handler_probe
+            && transition_state_matches
+    }
 }
 
 fn header_merge_separator(name: &[u8]) -> &'static [u8] {
