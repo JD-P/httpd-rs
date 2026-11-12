@@ -613,6 +613,30 @@ fn update_health(spec: &HealthSpec, ok: bool) {
     }
 }
 
+/// Deterministic health transition for the composed multi-request campaign.
+/// Production health workers reach the same generation-keyed map through
+/// `update_health`; this hook avoids wall-clock probes while preserving the
+/// exact member-selection state consumed by routing.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn differential_set_member_health(
+    cfg: &Config,
+    balancer: &str,
+    member: &str,
+    healthy: bool,
+) {
+    health_map()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(
+            health_key(cfg.generation, balancer, member),
+            MemberHealth {
+                healthy,
+                passes: 0,
+                fails: 0,
+            },
+        );
+}
+
 fn balancer_specs(cfg: &Config, balancer: &Balancer) -> Vec<HealthSpec> {
     if !balancer.health_enabled() {
         return Vec::new();

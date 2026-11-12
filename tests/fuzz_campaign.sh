@@ -14,7 +14,7 @@ cargo +"$NIGHTLY" --version >/dev/null
 
 SECONDS_PER_TARGET=${FUZZ_SECONDS_PER_TARGET:-300}
 MAX_LEN=${FUZZ_MAX_LEN:-1048576}
-TARGETS=${FUZZ_TARGETS:-"http_request http_connection http_fields config_sections config_compile config_grammars htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames h2_output h2_stateful cache_metadata tls_policy ocsp_der pcre2_differential pcre2_grammar pcre2_resource resource_transitions policy_path whole_request_differential"}
+TARGETS=${FUZZ_TARGETS:-"http_request http_connection http_fields config_sections config_compile config_grammars htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames h2_output h2_stateful cache_metadata tls_policy ocsp_der pcre2_differential pcre2_grammar pcre2_resource resource_transitions policy_path whole_request_differential multi_request_state"}
 
 report_failure() {
     failed_target=$1
@@ -57,6 +57,7 @@ for target in $TARGETS; do
         || dictionary="-dict=fuzz/dictionaries/$dictionary_target.dict"
     target_max_len=$MAX_LEN
     [ "$target" != whole_request_differential ] || target_max_len=256
+    [ "$target" != multi_request_state ] || target_max_len=96
     if ! cargo +"$NIGHTLY" fuzz run "$target" "$corpus" -- \
             -max_total_time="$SECONDS_PER_TARGET" \
             -timeout=10 \

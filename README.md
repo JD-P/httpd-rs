@@ -685,7 +685,7 @@ tests/fuzz_smoke.sh                         # bounded run of every target
 FUZZ_SECONDS_PER_TARGET=900 tests/fuzz_campaign.sh
 ```
 
-The 24 targets cover individual HTTP requests, fragmented/pipelined
+The 25 targets cover individual HTTP requests, fragmented/pipelined
 connections, configuration tokenization and full compilation, `.htaccess`
 walks, rewrite expressions, CGI/FastCGI/proxy responses, WebSocket negotiation,
 raw HTTP/2 frames and structured multi-frame HTTP/2 state transitions, cache
@@ -697,6 +697,11 @@ final responses, runs cache-eligible cases cold and warm, and covers local and
 external ErrorDocument plus CGI/FastCGI/proxy DirectoryIndex orchestration.
 Its cancellation projection aborts after routing but before sink admission and
 requires that no proxy, FastCGI or CGI effect occurs and every lease is returned.
+The multi-request target retains connection generation and mutable cache,
+access-file and backend-health state across a bounded sequence. It requires H1
+and H2 to agree when warm cache entries meet reload, in-flight outcomes cross
+retirement, access files are atomically replaced between planning and
+execution, balancer health changes, and old connections attempt new work.
 The resource campaign mutates reserve/release, attribution, parent exhaustion,
 slow-input/output handoffs, cross-ledger rejection and RAII teardown while
 checking ledger conservation after every operation. The original PCRE2 fuzzer

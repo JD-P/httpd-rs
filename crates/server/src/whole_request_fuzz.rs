@@ -1,10 +1,11 @@
-//! Whole-request HTTP/1 versus HTTP/2 differential campaign.
+//! Whole-request HTTP/1 versus HTTP/2 differential campaigns.
 //!
-//! Inputs describe one bounded logical request. The harness encodes that
-//! request through both wire protocols, then compares the canonical request,
-//! production plan, authorization/terminal route, backend binding, cache
-//! classification and response semantics. Every owned policy/sink artifact is
-//! dropped before the complete resource ledger is checked for zero.
+//! The single-request campaign compares the canonical request, production
+//! plan, authorization/terminal route, backend binding, cache classification
+//! and response semantics. The stateful campaign additionally schedules
+//! reload, access-file and backend-health transitions before admission and
+//! between preparation and sink execution. Every owned policy/sink artifact
+//! is dropped before the complete resource ledger is checked for zero.
 
 use crate::config::Config;
 use crate::http::{Body, Limits, Request, Response};
@@ -130,10 +131,54 @@ struct WholeRequestSnapshot {
     response: ResponseSnapshot,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WireProtocol {
+    H1,
+    H2,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StatefulOutcomeSnapshot {
+    Completed(WholeRequestSnapshot),
+    /// The connection was bound to a retired generation. The wire request was
+    /// decoded, but no request plan, authorization or sink was admitted.
+    Refused(CanonicalRequestSnapshot),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StatefulStepSnapshot {
+    active_generation: usize,
+    connection_generation: usize,
+    outcome: StatefulOutcomeSnapshot,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StatefulTrace {
+    steps: Vec<StatefulStepSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+struct StatefulStep {
+    logical: LogicalRequest,
+    reload_before: bool,
+    reconnect_before: bool,
+    access_before: Option<bool>,
+    health_before: Option<bool>,
+    reload_after_prepare: bool,
+    access_after_prepare: Option<bool>,
+    health_after_prepare: Option<bool>,
+    reconnect_after: bool,
+}
+
 struct Fixture {
     config: Config,
+    root: PathBuf,
+    old_config_path: PathBuf,
+    next_config_path: PathBuf,
+    balancer_members: [String; 2],
     proxy_exchanges: Arc<Mutex<VecDeque<BackendExchangeSnapshot>>>,
     fastcgi_exchanges: Arc<Mutex<VecDeque<BackendExchangeSnapshot>>>,
+    stateful_lock: Mutex<()>,
 }
 
 fn push_exchange(
@@ -426,7 +471,14 @@ fn fixture() -> &'static Fixture {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("www/cache")).expect("create cache document root");
         std::fs::create_dir_all(root.join("www/denied")).expect("create denied document root");
-        for directory in ["errors", "external", "app", "fcgi-dir", "proxy-dir"] {
+        for directory in [
+            "errors",
+            "external",
+            "app",
+            "fcgi-dir",
+            "proxy-dir",
+            "access",
+        ] {
             std::fs::create_dir_all(root.join("www").join(directory))
                 .expect("create internal-transition fixture directory");
         }
@@ -434,6 +486,12 @@ fn fixture() -> &'static Fixture {
         let proxy_exchanges = Arc::new(Mutex::new(VecDeque::new()));
         let fastcgi_exchanges = Arc::new(Mutex::new(VecDeque::new()));
         let (proxy_port, _proxy_thread) = start_proxy_backend(proxy_exchanges.clone());
+        let (proxy_failover_port, _proxy_failover_thread) =
+            start_proxy_backend(proxy_exchanges.clone());
+        let balancer_members = [
+            format!("http://127.0.0.1:{proxy_port}"),
+            format!("http://127.0.0.1:{proxy_failover_port}"),
+        ];
         let fastcgi_socket = root.join("whole-request-fcgi.sock");
         let _fastcgi_thread =
             start_fastcgi_backend(fastcgi_socket.clone(), fastcgi_exchanges.clone());
@@ -478,8 +536,26 @@ fn fixture() -> &'static Fixture {
             .expect("make CGI index executable");
         std::fs::set_permissions(&error_cgi, permissions)
             .expect("make ErrorDocument CGI executable");
+        let access_cgi = root.join("www/access/guard.cgi");
+        std::fs::write(
+            &access_cgi,
+            b"#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\nX-Backend: cgi-access\\r\\n\\r\\naccess request\\n'\n",
+        )
+        .expect("write access-file transition CGI fixture");
+        let mut access_permissions = std::fs::metadata(&access_cgi)
+            .expect("stat access-file transition CGI fixture")
+            .permissions();
+        access_permissions.set_mode(0o755);
+        std::fs::set_permissions(&access_cgi, access_permissions)
+            .expect("make access-file transition CGI executable");
+        std::fs::write(
+            root.join("www/access/.htaccess"),
+            b"Require all granted\n",
+        )
+        .expect("write initial access-file policy");
 
         let config_path = root.join("httpd.conf");
+        let next_config_path = root.join("httpd-next.conf");
         let config_text = format!(
             "ServerRoot \"{}\"\n\
              Listen 127.0.0.1:0\n\
@@ -489,13 +565,20 @@ fn fixture() -> &'static Fixture {
              DocumentRoot \"{}/www\"\n\
              VapacheCapability Cgi On\n\
              VapacheCapability FastCgi On\n\
+             VapacheCapability AccessFiles On\n\
              VapacheCapability UnstableFastCgiPaths On\n\
              DirectoryIndex index.html\n\
              ErrorDocument 404 /errors/404.cgi?source=local\n\
              CacheRoot \"{}/cache\"\n\
              CacheEnable disk /cache\n\
+             CacheHeader On\n\
              ProxyPass /proxy http://127.0.0.1:{}/upstream/\n\
              ProxyPass /proxy-dir/index.txt http://127.0.0.1:{}/upstream/index.txt\n\
+             <Proxy \"balancer://stateful\">\n\
+             BalancerMember http://127.0.0.1:{} hcuri=/health hcfails=1 hcpasses=1\n\
+             BalancerMember http://127.0.0.1:{} hcuri=/health hcfails=1 hcpasses=1\n\
+             </Proxy>\n\
+             ProxyPass /balanced balancer://stateful/\n\
              ProxyPassMatch ^/fcgi-dir/(.*\\.php)$ \"unix:{}|fcgi://localhost{}/www/fcgi-dir/\"\n\
              Redirect 302 /redirect /public.txt\n\
              AddHandler cgi-script .cgi\n\
@@ -524,6 +607,11 @@ fn fixture() -> &'static Fixture {
              DirectoryIndex index.txt\n\
              Require all granted\n\
              </Directory>\n\
+             <Directory \"{}/www/access\">\n\
+             AllowOverride AuthConfig\n\
+             Options +ExecCGI\n\
+             Require all granted\n\
+             </Directory>\n\
              <Location /location-denied>\n\
              Require all denied\n\
              </Location>\n\
@@ -537,6 +625,8 @@ fn fixture() -> &'static Fixture {
             root.display(),
             proxy_port,
             proxy_port,
+            proxy_port,
+            proxy_failover_port,
             fastcgi_socket.display(),
             root.display(),
             root.display(),
@@ -545,8 +635,16 @@ fn fixture() -> &'static Fixture {
             root.display(),
             root.display(),
             root.display(),
+            root.display(),
         );
-        std::fs::write(&config_path, config_text).expect("write whole-request config");
+        std::fs::write(&config_path, &config_text).expect("write whole-request config");
+        std::fs::write(
+            &next_config_path,
+            format!(
+                "{config_text}\n<Location /cache>\nRequire all denied\n</Location>\n"
+            ),
+        )
+        .expect("write reload whole-request config");
         let config = Config::load(
             &config_path,
             &root,
@@ -558,8 +656,13 @@ fn fixture() -> &'static Fixture {
         assert!(config.resource_budget.transition_usage_is_zero());
         Fixture {
             config,
+            root,
+            old_config_path: config_path,
+            next_config_path,
+            balancer_members,
             proxy_exchanges,
             fastcgi_exchanges,
+            stateful_lock: Mutex::new(()),
         }
     })
 }
@@ -579,7 +682,7 @@ fn hex_token(data: &[u8]) -> String {
 fn logical_request(data: &[u8]) -> LogicalRequest {
     let byte = |index: usize| data.get(index).copied().unwrap_or(0);
     let token = hex_token(data.get(8..).unwrap_or_default());
-    let (path, denied_route) = match byte(0) % 18 {
+    let (path, denied_route) = match byte(0) % 20 {
         0 => ("/public.txt".to_string(), false),
         1 => ("/./public.txt".to_string(), false),
         2 => ("/%70ublic.txt".to_string(), false),
@@ -597,7 +700,9 @@ fn logical_request(data: &[u8]) -> LogicalRequest {
         14 => ("/app/".to_string(), false),
         15 => ("/fcgi-dir/".to_string(), false),
         16 => ("/proxy-dir/".to_string(), false),
-        _ => ("/denied/".to_string(), true),
+        17 => ("/denied/".to_string(), true),
+        18 => ("/access/guard.cgi".to_string(), false),
+        _ => (format!("/balanced/{token}"), false),
     };
     let query = if byte(1) & 1 == 0 {
         String::new()
@@ -1117,45 +1222,84 @@ fn response_route(response: Response) -> RouteSnapshot {
     }
 }
 
-fn route_snapshot(
-    fixture: &Fixture,
-    cfg: &Config,
-    request: &mut Request,
-    cancel_before_sink: bool,
-) -> RouteSnapshot {
+enum ProbedRoute {
+    Prepared(PreparedHandler),
+    Responded(RouteSnapshot),
+}
+
+fn probe_route(cfg: &Config, request: &mut Request) -> ProbedRoute {
     let peer = SocketAddr::new(PEER, 4242);
     if !matches!(request.framing, crate::verified::BodyFraming::None) {
         match crate::server::probe_request_body(cfg, request, peer, LOCAL_IP, LOCAL_PORT, true) {
-            BodyRouteDecision::Read { handler, .. } => {
-                execute_prepared_snapshot(fixture, cfg, request, handler, cancel_before_sink)
-            }
+            BodyRouteDecision::Read { handler, .. } => ProbedRoute::Prepared(handler),
             BodyRouteDecision::Drain(response, _) | BodyRouteDecision::Respond(response, _) => {
-                response_route(response)
+                ProbedRoute::Responded(response_route(response))
             }
         }
     } else {
         match crate::server::probe_prepared_handler(cfg, request, peer, LOCAL_IP, LOCAL_PORT, true)
         {
-            PreparedRouteDecision::Prepared { handler, .. } => {
-                execute_prepared_snapshot(fixture, cfg, request, handler, cancel_before_sink)
+            PreparedRouteDecision::Prepared { handler, .. } => ProbedRoute::Prepared(handler),
+            PreparedRouteDecision::Respond(response, _) => {
+                ProbedRoute::Responded(response_route(response))
             }
-            PreparedRouteDecision::Respond(response, _) => response_route(response),
         }
     }
 }
 
-fn evaluate(
+fn finish_route(
     fixture: &Fixture,
     cfg: &Config,
-    mut request: Request,
+    request: &mut Request,
+    route: ProbedRoute,
     cancel_before_sink: bool,
-) -> WholeRequestSnapshot {
+) -> RouteSnapshot {
+    match route {
+        ProbedRoute::Prepared(handler) => {
+            execute_prepared_snapshot(fixture, cfg, request, handler, cancel_before_sink)
+        }
+        ProbedRoute::Responded(route) => route,
+    }
+}
+
+struct PreparedEvaluation {
+    request: Request,
+    canonical: CanonicalRequestSnapshot,
+    plan: PlanSnapshot,
+    cache: CacheSnapshot,
+    route: ProbedRoute,
+}
+
+fn prepare_evaluation(cfg: &Config, mut request: Request) -> PreparedEvaluation {
     let canonical = canonical_snapshot(&request);
     let (plan, owned_plan) = plan_snapshot(cfg, &request);
     let cache = crate::expr::with_connection(true, LOCAL_PORT, || {
         cache_snapshot(cfg, &request, owned_plan.as_ref())
     });
-    let route = route_snapshot(fixture, cfg, &mut request, cancel_before_sink);
+    let route = probe_route(cfg, &mut request);
+    PreparedEvaluation {
+        request,
+        canonical,
+        plan,
+        cache,
+        route,
+    }
+}
+
+fn finish_evaluation(
+    fixture: &Fixture,
+    cfg: &Config,
+    prepared: PreparedEvaluation,
+    cancel_before_sink: bool,
+) -> WholeRequestSnapshot {
+    let PreparedEvaluation {
+        mut request,
+        canonical,
+        plan,
+        cache,
+        route,
+    } = prepared;
+    let route = finish_route(fixture, cfg, &mut request, route, cancel_before_sink);
     if let Some(route_cache) = route.route_cache.as_ref() {
         assert_eq!(route_cache, &cache);
     }
@@ -1176,8 +1320,22 @@ fn evaluate(
     }
 }
 
+fn evaluate(
+    fixture: &Fixture,
+    cfg: &Config,
+    request: Request,
+    cancel_before_sink: bool,
+) -> WholeRequestSnapshot {
+    let prepared = prepare_evaluation(cfg, request);
+    finish_evaluation(fixture, cfg, prepared, cancel_before_sink)
+}
+
 fn compare_protocols(data: &[u8]) -> WholeRequestSnapshot {
     let fixture = fixture();
+    let _stateful_guard = fixture
+        .stateful_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let cfg = &fixture.config;
     let logical = logical_request(data);
     assert!(cfg.resource_budget.transition_usage_is_zero());
@@ -1237,6 +1395,347 @@ fn compare_protocols(data: &[u8]) -> WholeRequestSnapshot {
     h1
 }
 
+fn drain_backend_exchanges(fixture: &Fixture) {
+    fixture
+        .proxy_exchanges
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    fixture
+        .fastcgi_exchanges
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+}
+
+fn replace_access_file(fixture: &Fixture, granted: bool) {
+    let directory = fixture.root.join("www/access");
+    let next = directory.join(".htaccess.stateful-next");
+    std::fs::write(
+        &next,
+        if granted {
+            b"Require all granted\n".as_slice()
+        } else {
+            b"Require all denied\n".as_slice()
+        },
+    )
+    .expect("write replacement access-file policy");
+    std::fs::rename(next, directory.join(".htaccess"))
+        .expect("atomically replace access-file policy");
+}
+
+fn load_stateful_configs(fixture: &Fixture) -> [Config; 2] {
+    replace_access_file(fixture, true);
+    let old = Config::load(
+        &fixture.old_config_path,
+        &fixture.root,
+        &Default::default(),
+        &Default::default(),
+        false,
+    )
+    .unwrap_or_else(|errors| panic!("stateful old config: {errors:?}"));
+    let mut candidate = Config::load(
+        &fixture.next_config_path,
+        &fixture.root,
+        &Default::default(),
+        &Default::default(),
+        false,
+    )
+    .unwrap_or_else(|errors| panic!("stateful candidate config: {errors:?}"));
+    candidate
+        .validate_reload_from(&old)
+        .expect("stateful reload candidate must be compatible");
+    candidate.resource_budget = old.resource_budget.clone();
+    crate::cache::prepare(&old);
+    crate::cache::prepare(&candidate);
+    crate::cache::clear(&old);
+    assert!(old.resource_budget.transition_usage_is_zero());
+    [old, candidate]
+}
+
+fn parse_stateful_steps(data: &[u8]) -> Vec<StatefulStep> {
+    const RECORD: usize = 16;
+    let record_count = data.len().div_ceil(RECORD).clamp(2, 6);
+    (0..record_count)
+        .map(|index| {
+            let start = index.saturating_mul(RECORD);
+            let end = start.saturating_add(RECORD).min(data.len());
+            let mut record = [0u8; RECORD];
+            if start < data.len() {
+                record[..end - start].copy_from_slice(&data[start..end]);
+            }
+            let before = record[8];
+            let after = record[10];
+            StatefulStep {
+                logical: logical_request(&record),
+                reload_before: before & 0x01 != 0,
+                reconnect_before: before & 0x02 != 0,
+                access_before: (before & 0x04 != 0).then_some(record[9] & 0x01 != 0),
+                health_before: (before & 0x08 != 0).then_some(record[9] & 0x02 != 0),
+                reload_after_prepare: after & 0x01 != 0,
+                access_after_prepare: (after & 0x02 != 0).then_some(record[11] & 0x01 != 0),
+                health_after_prepare: (after & 0x04 != 0).then_some(record[11] & 0x02 != 0),
+                reconnect_after: after & 0x08 != 0,
+            }
+        })
+        .collect()
+}
+
+struct H1SequenceDecoder {
+    stream: Cursor<Vec<u8>>,
+    buffered: Vec<u8>,
+}
+
+impl H1SequenceDecoder {
+    fn new(steps: &[StatefulStep]) -> Self {
+        let mut wire = Vec::new();
+        for step in steps {
+            wire.extend_from_slice(&encode_h1(&step.logical));
+        }
+        Self {
+            stream: Cursor::new(wire),
+            buffered: Vec::new(),
+        }
+    }
+
+    fn decode(&mut self, cfg: &Config) -> Request {
+        let mut limits = Limits::default();
+        limits.request_line = cfg.limit_request_line;
+        limits.fields = cfg.limit_request_fields;
+        limits.field_size = cfg.limit_request_field_size;
+        limits.body = cfg.limit_request_body;
+        limits.resource_budget = cfg.resource_budget.clone();
+        limits.max_spool_bytes = cfg.max_spool_bytes;
+        limits.max_spool_files = cfg.max_spool_files;
+        limits.https = true;
+        let context = cfg.resource_budget.context(PEER);
+        let mut request = crate::resource::with_resource_context(context.clone(), || {
+            crate::http::read_request(&mut self.stream, &mut self.buffered, &limits, |_| {})
+        })
+        .expect("generated stateful HTTP/1 request must parse")
+        .expect("generated stateful HTTP/1 request must not be EOF");
+        request
+            .headers
+            .bind_request_scope(crate::resource::RequestScope::new(context));
+        request
+    }
+}
+
+fn decode_stateful_request(
+    protocol: WireProtocol,
+    h1: &mut H1SequenceDecoder,
+    cfg: &Config,
+    logical: &LogicalRequest,
+) -> Request {
+    match protocol {
+        WireProtocol::H1 => h1.decode(cfg),
+        WireProtocol::H2 => crate::h2::differential_decode_request(
+            cfg,
+            logical.method,
+            &logical.target,
+            &logical.fields,
+            &logical.body,
+            PEER,
+        )
+        .unwrap_or_else(|error| {
+            panic!("generated stateful HTTP/2 request failed: {error}; {logical:?}")
+        }),
+    }
+}
+
+fn commit_stateful_reload(configs: &[Config; 2], active_generation: &mut usize) {
+    if *active_generation != 0 {
+        return;
+    }
+    configs[0].retire_generation();
+    crate::cache::clear_reload(&configs[0], &configs[1]);
+    *active_generation = 1;
+}
+
+fn set_stateful_health(fixture: &Fixture, cfg: &Config, member_zero_healthy: bool) {
+    crate::proxy::differential_set_member_health(
+        cfg,
+        "stateful",
+        &fixture.balancer_members[0],
+        member_zero_healthy,
+    );
+    // Keep the alternate viable so an unhealthy primary deterministically
+    // exercises failover instead of the no-backend error path.
+    crate::proxy::differential_set_member_health(
+        cfg,
+        "stateful",
+        &fixture.balancer_members[1],
+        true,
+    );
+}
+
+fn normalize_resource(resource: &mut crate::access::ResourceKey) {
+    // Vhost identity is deliberately a process-local pointer. Independently
+    // compiled but semantically equal protocol runs cannot compare it.
+    resource.vhost = 0;
+}
+
+fn normalize_whole_request(snapshot: &mut WholeRequestSnapshot) {
+    if let Some(backend) = snapshot.backend.as_mut() {
+        normalize_resource(&mut backend.resource);
+    }
+    if let CacheSnapshot::Eligible { resource, .. } = &mut snapshot.cache {
+        normalize_resource(resource);
+    }
+}
+
+fn response_has_cache_hit(snapshot: &WholeRequestSnapshot) -> bool {
+    let ResponseSnapshot::Complete { headers, .. } = &snapshot.response;
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("x-cache") && value.eq_ignore_ascii_case(b"HIT")
+    })
+}
+
+fn run_stateful_protocol(
+    fixture: &Fixture,
+    steps: &[StatefulStep],
+    protocol: WireProtocol,
+) -> StatefulTrace {
+    let configs = load_stateful_configs(fixture);
+    let baseline = configs[0].resource_budget.transition_snapshot();
+    let mut h1 = H1SequenceDecoder::new(steps);
+    let mut active_generation = 0usize;
+    let mut connection_generation = 0usize;
+    let mut access_granted = true;
+    let mut member_zero_healthy = [true, true];
+    let mut snapshots = Vec::with_capacity(steps.len());
+
+    for step in steps {
+        if step.reload_before {
+            commit_stateful_reload(&configs, &mut active_generation);
+        }
+        if let Some(granted) = step.access_before {
+            replace_access_file(fixture, granted);
+            access_granted = granted;
+        }
+        if let Some(healthy) = step.health_before {
+            set_stateful_health(fixture, &configs[active_generation], healthy);
+            member_zero_healthy[active_generation] = healthy;
+        }
+        if step.reconnect_before {
+            connection_generation = active_generation;
+        }
+
+        let cfg = &configs[connection_generation];
+        let request = decode_stateful_request(protocol, &mut h1, cfg, &step.logical);
+        let refused_canonical = canonical_snapshot(&request);
+        let admitted = cfg.admit_generation_work(|| prepare_evaluation(cfg, request));
+        assert_eq!(
+            admitted.is_some(),
+            connection_generation == active_generation,
+            "generation admission disagreed with the connection binding"
+        );
+        let access_granted_at_prepare = access_granted;
+        let member_zero_healthy_at_prepare = member_zero_healthy[connection_generation];
+        let outcome = if let Some(prepared) = admitted {
+            if step.reload_after_prepare {
+                commit_stateful_reload(&configs, &mut active_generation);
+            }
+            if let Some(granted) = step.access_after_prepare {
+                replace_access_file(fixture, granted);
+                access_granted = granted;
+            }
+            if let Some(healthy) = step.health_after_prepare {
+                set_stateful_health(fixture, &configs[active_generation], healthy);
+                member_zero_healthy[active_generation] = healthy;
+            }
+            let mut completed =
+                finish_evaluation(fixture, cfg, prepared, step.logical.cancel_before_sink);
+            normalize_whole_request(&mut completed);
+            if connection_generation == 1 && completed.canonical.raw_path.starts_with(b"/cache") {
+                assert!(matches!(
+                    completed.authorization,
+                    AuthorizationSnapshot::Denied(_)
+                ));
+                assert_eq!(completed.sink, SinkSnapshot::None);
+                assert!(completed.backend.is_none());
+                assert!(!response_has_cache_hit(&completed));
+            }
+            if matches!(completed.authorization, AuthorizationSnapshot::Denied(_)) {
+                assert_eq!(completed.sink, SinkSnapshot::None);
+                assert!(completed.backend.is_none());
+                assert!(!completed.backend_effect);
+            }
+            if completed
+                .canonical
+                .raw_path
+                .starts_with(b"/access/guard.cgi")
+            {
+                assert_eq!(
+                    matches!(completed.authorization, AuthorizationSnapshot::Granted),
+                    access_granted_at_prepare,
+                    "access-file replacement affected the wrong planning epoch"
+                );
+            }
+            if completed.canonical.raw_path.starts_with(b"/balanced/")
+                && !member_zero_healthy_at_prepare
+                && completed.backend_effect
+            {
+                let expected = fixture.balancer_members[1]
+                    .strip_prefix("http://")
+                    .expect("fixture balancer member is HTTP");
+                let exchange = completed
+                    .backend_exchange
+                    .as_ref()
+                    .expect("effectful proxy request has an exchange");
+                let host = exchange
+                    .fields
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+                    .map(|(_, value)| value.as_slice())
+                    .expect("proxy exchange carries Host");
+                assert_eq!(host, expected.as_bytes(), "unhealthy member was selected");
+            }
+            StatefulOutcomeSnapshot::Completed(completed)
+        } else {
+            StatefulOutcomeSnapshot::Refused(refused_canonical)
+        };
+        snapshots.push(StatefulStepSnapshot {
+            active_generation,
+            connection_generation,
+            outcome,
+        });
+        if step.reconnect_after {
+            connection_generation = active_generation;
+        }
+    }
+
+    crate::cache::clear(&configs[0]);
+    crate::cache::clear(&configs[1]);
+    drain_backend_exchanges(fixture);
+    assert_eq!(configs[0].resource_budget.transition_snapshot(), baseline);
+    assert!(configs[0].resource_budget.transition_usage_is_zero());
+    StatefulTrace { steps: snapshots }
+}
+
+fn compare_stateful_steps(steps: &[StatefulStep]) -> StatefulTrace {
+    let fixture = fixture();
+    let _stateful_guard = fixture
+        .stateful_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    drain_backend_exchanges(fixture);
+    let h1 = run_stateful_protocol(fixture, steps, WireProtocol::H1);
+    replace_access_file(fixture, true);
+    drain_backend_exchanges(fixture);
+    let h2 = run_stateful_protocol(fixture, steps, WireProtocol::H2);
+    replace_access_file(fixture, true);
+    assert_eq!(h1, h2, "stateful protocol projections diverged: {steps:#?}");
+    h1
+}
+
+/// Run a bounded sequence through reload, access-file, health and connection
+/// transitions, then require HTTP/1 and HTTP/2 to agree on every outcome.
+pub fn run_stateful(data: &[u8]) {
+    let steps = parse_stateful_steps(data);
+    let _ = compare_stateful_steps(&steps);
+}
+
 /// Run one bounded logical request through both complete protocol paths.
 pub fn run(data: &[u8]) {
     let _ = compare_protocols(data);
@@ -1245,6 +1744,29 @@ pub fn run(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stateful_step(route: u8) -> StatefulStep {
+        let mut request = [0u8; 16];
+        request[0] = route;
+        StatefulStep {
+            logical: logical_request(&request),
+            reload_before: false,
+            reconnect_before: false,
+            access_before: None,
+            health_before: None,
+            reload_after_prepare: false,
+            access_after_prepare: None,
+            health_after_prepare: None,
+            reconnect_after: false,
+        }
+    }
+
+    fn completed(step: &StatefulStepSnapshot) -> &WholeRequestSnapshot {
+        let StatefulOutcomeSnapshot::Completed(snapshot) = &step.outcome else {
+            panic!("expected completed request, got {step:#?}");
+        };
+        snapshot
+    }
 
     #[test]
     fn dynamic_outcome_machine_requires_every_admission_fact() {
@@ -1440,5 +1962,75 @@ mod tests {
             assert!(!result.backend_effect);
             assert!(result.backend_exchange.is_none());
         }
+    }
+
+    #[test]
+    fn fixed_multi_request_transition_matrix_agrees() {
+        // An old-generation cache entry cannot cross the reload boundary into
+        // a candidate whose authorization policy now denies the same URL.
+        let warm = stateful_step(3);
+        let warm_lookup = stateful_step(3);
+        let mut post_reload_lookup = stateful_step(3);
+        post_reload_lookup.reload_before = true;
+        post_reload_lookup.reconnect_before = true;
+        let trace = compare_stateful_steps(&[warm, warm_lookup, post_reload_lookup]);
+        assert!(matches!(
+            completed(&trace.steps[0]).cache,
+            CacheSnapshot::Eligible { .. }
+        ));
+        assert!(response_has_cache_hit(completed(&trace.steps[1])));
+        assert!(matches!(
+            completed(&trace.steps[2]).authorization,
+            AuthorizationSnapshot::Denied(_)
+        ));
+        assert!(!response_has_cache_hit(completed(&trace.steps[2])));
+
+        // A request admitted before retirement retains its move-only outcome,
+        // while another stream/request on the old connection is refused. A
+        // newly established connection binds the candidate generation.
+        let mut in_flight = stateful_step(18);
+        in_flight.reload_after_prepare = true;
+        let stale_connection = stateful_step(0);
+        let mut new_connection = stateful_step(0);
+        new_connection.reconnect_before = true;
+        let trace = compare_stateful_steps(&[in_flight, stale_connection, new_connection]);
+        assert_eq!(completed(&trace.steps[0]).sink, SinkSnapshot::Cgi);
+        assert!(matches!(
+            trace.steps[1].outcome,
+            StatefulOutcomeSnapshot::Refused(_)
+        ));
+        assert_eq!(completed(&trace.steps[2]).sink, SinkSnapshot::StaticFile);
+
+        // Atomic replacement after planning cannot revoke or retarget an
+        // already-prepared outcome, but the next lookup observes the inode
+        // replacement and its denied policy.
+        let mut access_in_flight = stateful_step(18);
+        access_in_flight.access_after_prepare = Some(false);
+        let denied_fresh_lookup = stateful_step(18);
+        let trace = compare_stateful_steps(&[access_in_flight, denied_fresh_lookup]);
+        assert_eq!(completed(&trace.steps[0]).sink, SinkSnapshot::Cgi);
+        assert!(matches!(
+            completed(&trace.steps[1]).authorization,
+            AuthorizationSnapshot::Denied(_)
+        ));
+        assert!(!completed(&trace.steps[1]).backend_effect);
+
+        // Health changes are generation-keyed and affect the next selection,
+        // not the concrete backend bound into an in-flight authorization.
+        let mut selected_before_failure = stateful_step(19);
+        selected_before_failure.health_after_prepare = Some(false);
+        let selected_after_failure = stateful_step(19);
+        let trace = compare_stateful_steps(&[selected_before_failure, selected_after_failure]);
+        let first = completed(&trace.steps[0])
+            .backend
+            .as_ref()
+            .expect("first balanced request has a backend");
+        let second = completed(&trace.steps[1])
+            .backend
+            .as_ref()
+            .expect("failover request has a backend");
+        assert_ne!(first.selected, second.selected);
+        assert_eq!(first.authorized, first.resource.backend_target);
+        assert_eq!(second.authorized, second.resource.backend_target);
     }
 }

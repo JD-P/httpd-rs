@@ -1757,6 +1757,20 @@ after each protocol projection. The fixed seed matrix also covers external
 ErrorDocument and CGI/FastCGI/proxy/denied DirectoryIndex; the nightly campaign
 mutates their composed interactions.
 
+`multi_request_state` extends that oracle across a bounded sequence instead of
+resetting after one request. It compiles distinct old and candidate
+configuration generations, shares their process resource budget as production
+does, and mutates reload, connection, atomic access-file and generation-keyed
+backend-health state before admission or after an authorized handler is
+prepared. HTTP/1 uses one pipelined parser/buffer across the sequence; HTTP/2
+models streams bound to the same immutable connection generation. The two
+protocol traces must agree on canonical requests and every completed outcome.
+An admitted request may finish across retirement without being rebound, later
+requests on that old keep-alive/H2 connection must be refused, a reconnect must
+use the candidate, old cache entries may not cross the reload, access-file and
+health replacements affect only fresh planning, denials cannot reach a sink,
+and the shared resource ledger must return to zero after both traces.
+
 ### I51 — Cache key byte identity
 
 ```text
@@ -2580,6 +2594,9 @@ The pre-proof suite is:
 - `whole_request_differential` — coverage-guided HTTP/1 versus HTTP/2
   differential over the canonical request, request plan, authorization,
   backend/cache binding, response semantics and resource-ledger lifetime.
+- `multi_request_state` — whole-request sequences crossing cache warmup,
+  configuration retirement, access-file replacement, backend failover and
+  old keep-alive/H2 connections.
 - Rust unit invariants in `config.rs`, `htaccess.rs`, `access.rs`, `cache.rs`,
   `fastcgi.rs`, `proxy.rs`, `rewrite.rs` and `server.rs`.
 

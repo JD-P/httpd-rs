@@ -182,6 +182,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "multi_request_state"
+path = "fuzz_targets/multi_request_state.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
 
