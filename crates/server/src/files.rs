@@ -1994,22 +1994,6 @@ fn serve_directory_inner(
         owner_match_only,
     ) {
         DirAction::Redirect(loc) => {
-            if let Some(authorization) = authorization {
-                let Some(authorization) = authorization.into_sink(
-                    cfg.authorization_generation(),
-                    vapache_verified::TransformSink::Redirect,
-                ) else {
-                    return Response::policy_error();
-                };
-                if !authorization.require_sink(
-                    cfg.authorization_generation(),
-                    vapache_verified::TransformSink::Redirect,
-                ) {
-                    return Response::policy_error();
-                }
-            } else if !cfg!(test) {
-                return Response::policy_error();
-            }
             let canonical_authority = if (!crate::expr::request_is_https() && port == 80)
                 || (crate::expr::request_is_https() && port == 443)
             {
@@ -2044,6 +2028,20 @@ fn serve_directory_inner(
             } else {
                 loc
             };
+            if let Some(authorization) = authorization {
+                let Some(authorization) =
+                    authorization.into_redirect(cfg.authorization_generation(), 301, loc.clone())
+                else {
+                    return Response::policy_error();
+                };
+                debug_assert!(authorization.require_redirect(
+                    cfg.authorization_generation(),
+                    301,
+                    &loc
+                ));
+            } else if !cfg!(test) {
+                return Response::policy_error(); // coverage:ignore-line - production callers always carry the sealed directory outcome
+            }
             let mut r = Response::new(301);
             r.headers.push(("Location".into(), loc.clone()));
             r.headers.push((
@@ -2582,9 +2580,25 @@ fn error_response_inner(
                     t.as_bytes().to_vec(),
                 )
             }
-            ErrorDoc::External(url) => {
+            ErrorDoc::External(_) => {
+                let Some(authorization) =
+                    crate::access::AuthorizedRecoveryRedirect::from_error_document(
+                        cfg.authorization_generation(),
+                        scope,
+                        status,
+                    )
+                else {
+                    return Response::policy_error(); // coverage:ignore-line - matched External from the same immutable scope
+                };
+                let Some((response_status, location)) =
+                    authorization.into_parts(cfg.authorization_generation(), scope)
+                else {
+                    return Response::policy_error(); // coverage:ignore-line - token is consumed against the same immutable generation and scope
+                };
+                let url = std::str::from_utf8(&location)
+                    .expect("configured ErrorDocument location is valid UTF-8");
                 let mut r = Response::bytes(
-                    302,
+                    response_status,
                     "text/html; charset=iso-8859-1",
                     format!(
                         "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n<html><head>\n<title>302 Found</title>\n</head><body>\n<h1>Found</h1>\n<p>The document has moved <a href=\"{}\">here</a>.</p>\n</body></html>\n",
@@ -2592,7 +2606,7 @@ fn error_response_inner(
                     )
                     .into_bytes(),
                 );
-                r.headers.push(("Location".into(), url.as_bytes().to_vec()));
+                r.headers.push(("Location".into(), location));
                 return r;
             }
             ErrorDoc::Local(path) => {
@@ -4114,6 +4128,66 @@ mod tests {
             .iter()
             .any(|(n, v)| { n.eq_ignore_ascii_case("cache-control") && v == b"no-cache" }));
         assert!(!error_message(431, "/").is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn directory_redirect_rejects_an_outcome_from_another_generation() {
+        let (root, cfg) = config("directory-stale-redirect");
+        let request = request("GET", b"/dir");
+        let directory = File::open(&root).unwrap();
+        let metadata = directory.metadata().unwrap();
+        let scope = Scope::default();
+        let resource = crate::access::ResourceKey::request(
+            None,
+            &request,
+            &policy_path("/dir"),
+            Some(&root),
+            None,
+        );
+        let grant = crate::access::check_grant(
+            &scope,
+            &request,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            None,
+            "/dir",
+            Some(&root),
+            resource.clone(),
+            cfg.authorization_generation(),
+        )
+        .expect("directory grant");
+        let authorization = crate::access::AuthorizedPlan::direct(
+            cfg.authorization_generation(),
+            scope.clone(),
+            grant,
+            resource,
+        )
+        .and_then(|plan| plan.bind_file(&metadata))
+        .and_then(|plan| {
+            plan.into_outcome(
+                cfg.authorization_generation(),
+                vapache_verified::TransformSink::Directory,
+            )
+        })
+        .expect("directory outcome");
+        let mut reloaded = cfg.clone();
+        reloaded.generation = reloaded.generation.wrapping_add(1);
+
+        let response = serve_directory_inner(
+            &reloaded,
+            None,
+            &scope,
+            &request,
+            directory,
+            "/dir",
+            b"/dir",
+            "example.test",
+            80,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "127.0.0.1",
+            Some(authorization),
+        );
+        assert_eq!(response.status, 500);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

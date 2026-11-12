@@ -315,12 +315,12 @@ impl Headers {
         });
     }
 
-    pub(crate) fn internal_projection_matches(
+    pub(crate) fn internal_projection_facts(
         &self,
         source: &Self,
         kind: vapache_verified::InternalRequestKind,
-    ) -> bool {
-        let entries_match = match kind {
+    ) -> (bool, bool) {
+        let headers_projected = match kind {
             vapache_verified::InternalRequestKind::DirectoryIndex => {
                 std::sync::Arc::ptr_eq(&self.entries, &source.entries)
             }
@@ -362,15 +362,19 @@ impl Headers {
                     && self.error_document_depth == source.error_document_depth.saturating_add(1)
             }
         };
-        entries_match
-            && std::sync::Arc::ptr_eq(&self.policy_budget, &source.policy_budget)
-            && request_scope_matches
-            && std::sync::Arc::ptr_eq(&self.authenticated_identity, &source.authenticated_identity)
-            && std::sync::Arc::ptr_eq(&self.public_uri, &source.public_uri)
-            && proxy_session_matches
-            && resident_lease_matches
-            && self.handler_probe == source.handler_probe
-            && transition_state_matches
+        let request_context_projected =
+            std::sync::Arc::ptr_eq(&self.policy_budget, &source.policy_budget)
+                && request_scope_matches
+                && std::sync::Arc::ptr_eq(
+                    &self.authenticated_identity,
+                    &source.authenticated_identity,
+                )
+                && std::sync::Arc::ptr_eq(&self.public_uri, &source.public_uri)
+                && proxy_session_matches
+                && resident_lease_matches
+                && self.handler_probe == source.handler_probe
+                && transition_state_matches;
+        (headers_projected, request_context_projected)
     }
 }
 

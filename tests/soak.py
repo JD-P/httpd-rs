@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target/release/vapached"))
 DURATION = int(os.environ.get("SOAK_SECONDS", "30"))
 WORKERS = int(os.environ.get("SOAK_WORKERS", "24"))
+ATTACK_SOURCE = "127.0.0.2"
+HEALTH_SOURCE = "127.0.0.3"
 SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
 SERVICE_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
 
@@ -33,8 +35,16 @@ def rss_kib(pid):
     return 0
 
 
-def probe(port):
-    with socket.create_connection(("127.0.0.1", port), timeout=2) as stream:
+def connection(port, source, timeout=2):
+    stream = socket.socket()
+    stream.settimeout(timeout)
+    stream.bind((source, 0))
+    stream.connect(("127.0.0.1", port))
+    return stream
+
+
+def probe(port, source=HEALTH_SOURCE):
+    with connection(port, source) as stream:
         stream.sendall(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         return stream.recv(4096)
 
@@ -43,7 +53,7 @@ def health(port):
     return b" 200 " in probe(port)
 
 
-def worker(port, stop, failures, seed):
+def worker(port, stop, stats, stats_lock, seed):
     randomizer = random.Random(seed)
     requests = [
         b"GET /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -53,8 +63,12 @@ def worker(port, stop, failures, seed):
         b"GET / HTTP/1.1\nHost: localhost\n\n",
     ]
     while not stop.is_set():
+        with stats_lock:
+            stats["attempts"] += 1
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=1) as stream:
+            with connection(port, ATTACK_SOURCE, timeout=1) as stream:
+                with stats_lock:
+                    stats["accepted"] += 1
                 request = randomizer.choice(requests)
                 split = randomizer.randrange(1, len(request) + 1)
                 stream.sendall(request[:split])
@@ -68,7 +82,12 @@ def worker(port, stop, failures, seed):
                     pass
         except OSError:
             if not stop.is_set():
-                failures.append("connection failure")
+                with stats_lock:
+                    stats["refused"] += 1
+                # Admission refusal is expected load shedding for the attack
+                # identity. Back off so one refusal epoch is not counted as
+                # hundreds of thousands of independent availability events.
+                time.sleep(0.01)
 
 
 def main():
@@ -131,23 +150,56 @@ DocumentRoot "{base}/www"
                     )
                 baseline = rss_kib(process.pid)
                 stop = threading.Event()
-                failures = []
+                stats = {"attempts": 0, "accepted": 0, "refused": 0}
+                stats_lock = threading.Lock()
                 workers = [
-                    threading.Thread(target=worker, args=(port, stop, failures, index), daemon=True)
+                    threading.Thread(
+                        target=worker,
+                        args=(port, stop, stats, stats_lock, index),
+                        daemon=True,
+                    )
                     for index in range(WORKERS)
                 ]
                 for thread in workers:
                     thread.start()
-                time.sleep(DURATION)
+                health_latencies = []
+                health_failures = []
+                soak_deadline = time.monotonic() + DURATION
+                while time.monotonic() < soak_deadline:
+                    started = time.monotonic()
+                    try:
+                        if not health(port):
+                            health_failures.append("non-200 response")
+                    except OSError as error:
+                        health_failures.append(str(error))
+                    else:
+                        health_latencies.append(time.monotonic() - started)
+                    time.sleep(0.05)
                 stop.set()
                 for thread in workers:
                     thread.join(timeout=2)
                 assert process.poll() is None, "vapached died during soak"
                 assert health(port), "vapached failed post-soak health check"
+                assert not health_failures, (
+                    "unrelated source lost availability during attack: "
+                    f"{len(health_failures)} failures"
+                )
+                assert health_latencies, "no unrelated-source health probes completed"
+                assert max(health_latencies) < 2, (
+                    "unrelated source exceeded the health latency bound: "
+                    f"{max(health_latencies):.3f}s"
+                )
                 growth = max(0, rss_kib(process.pid) - baseline)
                 assert growth < 256 * 1024, f"RSS grew by {growth} KiB"
-                assert len(failures) < WORKERS * 4, f"excess connection failures: {len(failures)}"
-                print(f"soak: pass ({DURATION}s, {WORKERS} workers, RSS +{growth} KiB)")
+                with stats_lock:
+                    final_stats = stats.copy()
+                assert final_stats["accepted"] > 0, "attack traffic made no progress"
+                assert final_stats["refused"] <= final_stats["attempts"], "invalid refusal accounting"
+                print(
+                    f"soak: pass ({DURATION}s, {WORKERS} workers, "
+                    f"accepted {final_stats['accepted']}, refused {final_stats['refused']}, "
+                    f"health max {max(health_latencies):.3f}s, RSS +{growth} KiB)"
+                )
             finally:
                 process.terminate()
                 try:

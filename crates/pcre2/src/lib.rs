@@ -1902,25 +1902,15 @@ pub mod bytes {
                         b'b' | b'B' if bytes.get(i + 2) == Some(&b'{') => {
                             return Err(Error::unsupported(i, "Rust-only extended word boundary"));
                         }
-                        b'b' | b'B' if ucp => {
-                            // pcre2's byte-slice iterators advance one byte
-                            // after an empty match. Under MATCH_INVALID_UTF,
-                            // landing inside a multi-byte scalar creates a
-                            // fragment barrier and an observable extra UCP
-                            // boundary. The automata iterator advances over
-                            // valid UTF scalars, so this API behavior cannot
-                            // be represented exactly.
-                            return Err(Error::unsupported(i, "UCP word boundary iteration"));
-                        }
-                        b'b' | b'B' if unicode_pattern && !ucp => {
-                            // PCRE2_UTF changes scalar decoding but leaves
-                            // character types ASCII unless PCRE2_UCP is also
-                            // set. The backend's Unicode parser would
-                            // otherwise widen this boundary.
-                            out.extend_from_slice(b"(?-u:\\");
-                            out.push(escaped);
-                            out.push(b')');
-                            i += 2;
+                        b'b' | b'B' if unicode_pattern => {
+                            // PCRE2_UTF tests ASCII word membership only at
+                            // Unicode scalar boundaries when UCP is disabled.
+                            // The backend's byte-mode ASCII boundary can also
+                            // test the interior bytes of a UTF-8 scalar. UCP
+                            // has a separate empty-match iteration mismatch.
+                            // Neither behavior has an exact backend encoding,
+                            // so keep both Unicode modes outside the whitelist.
+                            return Err(Error::unsupported(i, "Unicode word boundary"));
                         }
                         b'd' if unicode_pattern && !ucp => {
                             out.extend_from_slice(b"[0-9]");

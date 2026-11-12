@@ -307,7 +307,7 @@ fn generated_excluded(data: &[u8], flags: u8) -> &'static str {
         r"[[:cntrl:]]X",
         r"[[:ascii:]]X",
     ];
-    const UCP_EXCLUDED: &[&str] = &[r"\b", r"\B"];
+    const UNICODE_EXCLUDED: &[&str] = &[r"\b", r"\B"];
     const CRLF_EXTENDED_EXCLUDED: &[&str] = &["# comment\r(("];
     const EXTENDED_EXCLUDED: &[&str] = &["\\++\x0B?"];
     let control = data.first().copied().unwrap_or(0);
@@ -315,8 +315,8 @@ fn generated_excluded(data: &[u8], flags: u8) -> &'static str {
         CRLF_EXTENDED_EXCLUDED[usize::from(control) % CRLF_EXTENDED_EXCLUDED.len()]
     } else if flags & 8 != 0 && control & 0x10 != 0 {
         EXTENDED_EXCLUDED[usize::from(control) % EXTENDED_EXCLUDED.len()]
-    } else if flags & 64 != 0 && control & 0x40 != 0 {
-        UCP_EXCLUDED[usize::from(control) % UCP_EXCLUDED.len()]
+    } else if flags & (32 | 64) != 0 && control & 0x40 != 0 {
+        UNICODE_EXCLUDED[usize::from(control) % UNICODE_EXCLUDED.len()]
     } else if flags & 16 != 0 && control & 0x80 != 0 {
         CRLF_EXCLUDED[usize::from(control) % CRLF_EXCLUDED.len()]
     } else {

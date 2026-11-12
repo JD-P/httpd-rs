@@ -4,7 +4,7 @@
 //! provider we do not understand denies access, and any malformed
 //! directive is rejected at configuration time.
 
-use crate::config::{AuthPolicy, Order, Require, RequireNode, Satisfy, Scope};
+use crate::config::{AuthPolicy, ErrorDoc, Order, Require, RequireNode, Satisfy, Scope};
 use crate::http::Request;
 use crate::verified::{
     combine_and, combine_or, ipv4_in_net, ipv6_in_net, require_none_multi, PolicyResult,
@@ -320,6 +320,13 @@ impl AuthorizedPlan {
         generation: crate::config::ConfigurationGeneration,
         sink: vapache_verified::TransformSink,
     ) -> Option<AuthorizedOutcome> {
+        // Redirects carry response data that must be bound at the same time as
+        // the sink.  Keeping the generic constructor unavailable for that
+        // variant prevents a caller from authorizing one Location/status pair
+        // and emitting another.
+        if sink == vapache_verified::TransformSink::Redirect {
+            return None;
+        }
         if !self.grant.require_sink(generation, &self.resource, sink) {
             return None;
         }
@@ -327,6 +334,33 @@ impl AuthorizedPlan {
             plan: self,
             sink,
             internal: None,
+            redirect: None,
+        })
+    }
+
+    pub(crate) fn into_redirect_outcome(
+        self,
+        generation: crate::config::ConfigurationGeneration,
+        status: u16,
+        location: Vec<u8>,
+    ) -> Option<AuthorizedOutcome> {
+        let sink = vapache_verified::TransformSink::Redirect;
+        if !self.grant.require_sink(generation, &self.resource, sink)
+            || !vapache_verified::redirect_outcome_admit(
+                sink,
+                true,
+                true,
+                !location.is_empty(),
+                status,
+            )
+        {
+            return None;
+        }
+        Some(AuthorizedOutcome {
+            plan: self,
+            sink,
+            internal: None,
+            redirect: Some(RedirectOutcomeBinding { status, location }),
         })
     }
 
@@ -349,6 +383,12 @@ struct InternalOutcomeBinding {
     target: DecodedUrlPath,
 }
 
+#[derive(Debug)]
+struct RedirectOutcomeBinding {
+    status: u16,
+    location: Vec<u8>,
+}
+
 /// Sink-bound terminal authorization.  Production body/tunnel/cache entry
 /// points consume this type instead of accepting independently supplied
 /// scope, grant, key, URL and target values.
@@ -357,6 +397,7 @@ pub struct AuthorizedOutcome {
     plan: AuthorizedPlan,
     sink: vapache_verified::TransformSink,
     internal: Option<InternalOutcomeBinding>,
+    redirect: Option<RedirectOutcomeBinding>,
 }
 
 impl AuthorizedOutcome {
@@ -380,16 +421,16 @@ impl AuthorizedOutcome {
         self.sink
     }
 
-    /// Consume a terminal authorization when orchestration selects a more
-    /// specific sink without changing the authorized resource. This is used
-    /// for a directory-to-redirect transition; a caller cannot retain and
-    /// reuse the previous sink token afterward.
-    pub(crate) fn into_sink(
+    /// Consume a previously authorized representation and bind the exact
+    /// redirect response selected by directory orchestration.
+    pub(crate) fn into_redirect(
         self,
         generation: crate::config::ConfigurationGeneration,
-        sink: vapache_verified::TransformSink,
+        status: u16,
+        location: Vec<u8>,
     ) -> Option<Self> {
-        self.plan.into_outcome(generation, sink)
+        self.plan
+            .into_redirect_outcome(generation, status, location)
     }
 
     /// Consume the current terminal token and bind one exact internal target
@@ -415,23 +456,47 @@ impl AuthorizedOutcome {
                 .require_sink(generation, &self.plan.resource, sink)
     }
 
-    pub(crate) fn require_internal_request(
-        &self,
+    pub(crate) fn into_internal_request(
+        self,
         generation: crate::config::ConfigurationGeneration,
         kind: vapache_verified::InternalRequestKind,
         target: &DecodedUrlPath,
-        runtime_refines: bool,
-    ) -> bool {
+    ) -> Option<Self> {
         let exact_target = self
             .internal
             .as_ref()
             .is_some_and(|binding| binding.kind == kind && binding.target == *target);
-        self.require_sink(generation, vapache_verified::internal_request_sink(kind))
+        (self.require_sink(generation, vapache_verified::internal_request_sink(kind))
             && vapache_verified::internal_request_outcome_admit(
                 kind,
                 self.sink,
                 exact_target,
-                runtime_refines,
+                // Only the sealed ProjectedInternalRequest can call this
+                // consuming boundary, so refinement is evidence carried by
+                // the type rather than a caller-supplied boolean.
+                true,
+            ))
+        .then_some(self)
+    }
+
+    pub(crate) fn require_redirect(
+        &self,
+        generation: crate::config::ConfigurationGeneration,
+        status: u16,
+        location: &[u8],
+    ) -> bool {
+        let Some(binding) = self.redirect.as_ref() else {
+            return false;
+        };
+        let status_matches = binding.status == status;
+        let location_matches = binding.location == location;
+        self.require_sink(generation, vapache_verified::TransformSink::Redirect)
+            && vapache_verified::redirect_outcome_admit(
+                self.sink,
+                status_matches,
+                location_matches,
+                !location.is_empty(),
+                status,
             )
     }
 
@@ -451,6 +516,56 @@ impl AuthorizedOutcome {
             && self.resource().fs_path.as_deref() == Some(path)
             && self.resource().file_dev == Some(meta.dev())
             && self.resource().file_ino == Some(meta.ino())
+    }
+}
+
+/// A configured recovery redirect is deliberately separate from an ordinary
+/// access grant: ErrorDocument can run after the original request was denied.
+/// The move-only value binds the immutable configuration generation, original
+/// error status, emitted status and exact Location without pretending that the
+/// recovery response was authorized as a normal content resource.
+#[derive(Debug)]
+pub(crate) struct AuthorizedRecoveryRedirect {
+    generation: crate::config::ConfigurationGeneration,
+    original_status: u16,
+    response_status: u16,
+    location: Vec<u8>,
+}
+
+impl AuthorizedRecoveryRedirect {
+    pub(crate) fn from_error_document(
+        generation: crate::config::ConfigurationGeneration,
+        scope: &Scope,
+        original_status: u16,
+    ) -> Option<Self> {
+        let ErrorDoc::External(location) = scope.error_document(original_status)? else {
+            return None;
+        };
+        let response_status = 302;
+        vapache_verified::recovery_redirect_admit(true, true, true, response_status).then(|| Self {
+            generation,
+            original_status,
+            response_status,
+            location: location.as_bytes().to_vec(),
+        })
+    }
+
+    pub(crate) fn into_parts(
+        self,
+        generation: crate::config::ConfigurationGeneration,
+        scope: &Scope,
+    ) -> Option<(u16, Vec<u8>)> {
+        let configured = match scope.error_document(self.original_status) {
+            Some(ErrorDoc::External(location)) => location.as_bytes() == self.location,
+            _ => false,
+        };
+        vapache_verified::recovery_redirect_admit(
+            self.generation == generation,
+            configured,
+            true,
+            self.response_status,
+        )
+        .then_some((self.response_status, self.location))
     }
 }
 
@@ -2362,50 +2477,145 @@ mod tests {
         let peer = "127.0.0.1".parse().unwrap();
         let scope = Scope::default();
         let key = ResourceKey::request(None, &request, &path("/missing"), None, None);
-        let grant = check_grant(
-            &scope,
-            &request,
-            peer,
-            None,
-            "/missing",
-            None,
-            key.clone(),
-            generation(),
-        )
-        .unwrap();
-        let outcome = AuthorizedPlan::direct(generation(), scope, grant, key)
-            .and_then(|plan| {
-                plan.into_internal_outcome(
-                    generation(),
-                    vapache_verified::InternalRequestKind::ErrorDocument,
-                    path("/errors/404.html"),
-                )
-            })
-            .expect("authorized ErrorDocument transition");
-        assert!(outcome.require_internal_request(
-            generation(),
-            vapache_verified::InternalRequestKind::ErrorDocument,
-            &path("/errors/404.html"),
-            true,
-        ));
-        assert!(!outcome.require_internal_request(
-            generation(),
-            vapache_verified::InternalRequestKind::ErrorDocument,
-            &path("/errors/403.html"),
-            true,
-        ));
-        assert!(!outcome.require_internal_request(
-            generation(),
-            vapache_verified::InternalRequestKind::DirectoryIndex,
-            &path("/errors/404.html"),
-            true,
-        ));
-        assert!(!outcome.require_internal_request(
-            generation(),
-            vapache_verified::InternalRequestKind::ErrorDocument,
-            &path("/errors/404.html"),
-            false,
-        ));
+        let outcome = || {
+            let grant = check_grant(
+                &scope,
+                &request,
+                peer,
+                None,
+                "/missing",
+                None,
+                key.clone(),
+                generation(),
+            )
+            .unwrap();
+            AuthorizedPlan::direct(generation(), scope.clone(), grant, key.clone())
+                .and_then(|plan| {
+                    plan.into_internal_outcome(
+                        generation(),
+                        vapache_verified::InternalRequestKind::ErrorDocument,
+                        path("/errors/404.html"),
+                    )
+                })
+                .expect("authorized ErrorDocument transition")
+        };
+        assert!(outcome()
+            .into_internal_request(
+                generation(),
+                vapache_verified::InternalRequestKind::ErrorDocument,
+                &path("/errors/404.html"),
+            )
+            .is_some());
+        assert!(outcome()
+            .into_internal_request(
+                generation(),
+                vapache_verified::InternalRequestKind::ErrorDocument,
+                &path("/errors/403.html"),
+            )
+            .is_none());
+        assert!(outcome()
+            .into_internal_request(
+                generation(),
+                vapache_verified::InternalRequestKind::DirectoryIndex,
+                &path("/errors/404.html"),
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn redirect_outcome_binds_exact_status_and_location() {
+        let request = req("GET");
+        let peer = "127.0.0.1".parse().unwrap();
+        let scope = Scope::default();
+        let key = ResourceKey::request(None, &request, &path("/old"), None, None);
+        let plan = || {
+            let grant = check_grant(
+                &scope,
+                &request,
+                peer,
+                None,
+                "/old",
+                None,
+                key.clone(),
+                generation(),
+            )
+            .unwrap();
+            AuthorizedPlan::direct(generation(), scope.clone(), grant, key.clone())
+                .expect("authorized redirect plan")
+        };
+
+        // The generic terminal constructor cannot mint a redirect without
+        // simultaneously binding the exact status and Location.
+        assert!(plan()
+            .into_outcome(generation(), vapache_verified::TransformSink::Redirect)
+            .is_none());
+        assert!(plan()
+            .into_redirect_outcome(generation(), 200, Vec::new())
+            .is_none());
+        assert!(plan()
+            .into_redirect_outcome(generation(), 404, b"https://example.test/new".to_vec())
+            .is_none());
+
+        let unbound = plan()
+            .into_outcome(generation(), vapache_verified::TransformSink::ErrorDocument)
+            .expect("non-redirect outcome");
+        assert!(!unbound.require_redirect(generation(), 302, b"https://example.test/new"));
+
+        let outcome = plan()
+            .into_redirect_outcome(generation(), 302, b"https://example.test/new".to_vec())
+            .expect("redirect outcome");
+        assert!(outcome.require_redirect(generation(), 302, b"https://example.test/new"));
+        assert!(!outcome.require_redirect(generation(), 301, b"https://example.test/new"));
+        assert!(!outcome.require_redirect(generation(), 302, b"https://example.test/other"));
+    }
+
+    #[test]
+    fn recovery_redirect_is_bound_to_generation_status_and_configuration() {
+        let mut scope = Scope::default();
+        scope.error_policy.push(
+            404,
+            ErrorDoc::External("https://errors.example.test/not-found".into()),
+        );
+        let outcome = AuthorizedRecoveryRedirect::from_error_document(generation(), &scope, 404)
+            .expect("configured recovery redirect");
+        let (status, location) = outcome
+            .into_parts(generation(), &scope)
+            .expect("matching recovery sink");
+        assert_eq!(status, 302);
+        assert_eq!(location, b"https://errors.example.test/not-found");
+
+        let stale = AuthorizedRecoveryRedirect::from_error_document(generation(), &scope, 404)
+            .expect("configured recovery redirect");
+        assert!(stale
+            .into_parts(
+                crate::config::ConfigurationGeneration::other_for_test(),
+                &scope,
+            )
+            .is_none());
+
+        let substituted =
+            AuthorizedRecoveryRedirect::from_error_document(generation(), &scope, 404)
+                .expect("configured recovery redirect");
+        scope.error_policy.push(
+            404,
+            ErrorDoc::External("https://errors.example.test/substituted".into()),
+        );
+        assert!(substituted.into_parts(generation(), &scope).is_none());
+
+        let missing = AuthorizedRecoveryRedirect::from_error_document(generation(), &scope, 404)
+            .expect("configured recovery redirect");
+        assert!(missing
+            .into_parts(generation(), &Scope::default())
+            .is_none());
+
+        let mut local_scope = Scope::default();
+        local_scope
+            .error_policy
+            .push(404, ErrorDoc::Local("/errors/404.html".into()));
+        assert!(
+            AuthorizedRecoveryRedirect::from_error_document(generation(), &local_scope, 404,)
+                .is_none()
+        );
     }
 
     #[test]

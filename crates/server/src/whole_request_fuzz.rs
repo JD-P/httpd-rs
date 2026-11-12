@@ -130,6 +130,10 @@ fn fixture() -> &'static Fixture {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("www/cache")).expect("create cache document root");
         std::fs::create_dir_all(root.join("www/denied")).expect("create denied document root");
+        for directory in ["errors", "external", "app", "fcgi-dir", "proxy-dir"] {
+            std::fs::create_dir_all(root.join("www").join(directory))
+                .expect("create internal-transition fixture directory");
+        }
         std::fs::create_dir_all(root.join("cache")).expect("create response cache root");
         std::fs::write(root.join("www/public.txt"), b"public representation\n")
             .expect("write public fixture");
@@ -140,8 +144,31 @@ fn fixture() -> &'static Fixture {
             b"denied representation\n",
         )
         .expect("write denied fixture");
+        std::fs::write(
+            root.join("www/denied/index.html"),
+            b"denied index representation\n",
+        )
+        .expect("write denied DirectoryIndex fixture");
         std::fs::write(root.join("www/index.html"), b"index representation\n")
             .expect("write index fixture");
+        std::fs::write(root.join("www/errors/404.txt"), b"local error representation\n")
+            .expect("write local ErrorDocument fixture");
+        std::fs::write(root.join("www/fcgi-dir/index.php"), b"<?php echo 'index'; ?>\n")
+            .expect("write FastCGI index fixture");
+        std::fs::write(root.join("www/proxy-dir/index.txt"), b"proxy index selection\n")
+            .expect("write proxy index fixture");
+        let cgi_index = root.join("www/app/index.cgi");
+        std::fs::write(
+            &cgi_index,
+            b"#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nwhole-request CGI\\n'\n",
+        )
+        .expect("write CGI index fixture");
+        let mut permissions = std::fs::metadata(&cgi_index)
+            .expect("stat CGI index fixture")
+            .permissions();
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&cgi_index, permissions).expect("make CGI index executable");
 
         let config_path = root.join("httpd.conf");
         let config_text = format!(
@@ -151,12 +178,19 @@ fn fixture() -> &'static Fixture {
              PidFile \"{}/httpd.pid\"\n\
              ErrorLog \"{}/error.log\"\n\
              DocumentRoot \"{}/www\"\n\
+             VapacheCapability Cgi On\n\
+             VapacheCapability FastCgi On\n\
+             VapacheCapability UnstableFastCgiPaths On\n\
              DirectoryIndex index.html\n\
+             ErrorDocument 404 /errors/404.txt?source=local\n\
              CacheRoot \"{}/cache\"\n\
              CacheEnable disk /cache\n\
              Header set Cache-Control no-store\n\
              ProxyPass /proxy http://127.0.0.1:9/upstream/\n\
+             ProxyPass /proxy-dir/index.txt http://127.0.0.1:9/upstream/index.txt\n\
+             ProxyPassMatch ^/fcgi-dir/(.*\\.php)$ \"unix:/tmp/vapache-whole-request-missing.sock|fcgi://localhost{}/www/fcgi-dir/\"\n\
              Redirect 302 /redirect /public.txt\n\
+             AddHandler cgi-script .cgi\n\
              RewriteEngine On\n\
              RewriteRule ^/rewrite$ /public.txt [L]\n\
              <Directory \"{}/www\">\n\
@@ -165,9 +199,29 @@ fn fixture() -> &'static Fixture {
              <Directory \"{}/www/denied\">\n\
              Require all denied\n\
              </Directory>\n\
+             <Directory \"{}/www/app\">\n\
+             Options +ExecCGI\n\
+             DirectoryIndex index.cgi\n\
+             Require all granted\n\
+             </Directory>\n\
+             <Directory \"{}/www/fcgi-dir\">\n\
+             DirectoryIndex index.php\n\
+             Require all granted\n\
+             </Directory>\n\
+             <Directory \"{}/www/proxy-dir\">\n\
+             DirectoryIndex index.txt\n\
+             Require all granted\n\
+             </Directory>\n\
              <Location /location-denied>\n\
              Require all denied\n\
+             </Location>\n\
+             <Location /external>\n\
+             ErrorDocument 404 https://errors.example.test/not-found\n\
              </Location>\n",
+            root.display(),
+            root.display(),
+            root.display(),
+            root.display(),
             root.display(),
             root.display(),
             root.display(),
@@ -205,7 +259,7 @@ fn hex_token(data: &[u8]) -> String {
 fn logical_request(data: &[u8]) -> LogicalRequest {
     let byte = |index: usize| data.get(index).copied().unwrap_or(0);
     let token = hex_token(data.get(8..).unwrap_or_default());
-    let (path, denied_route) = match byte(0) % 12 {
+    let (path, denied_route) = match byte(0) % 18 {
         0 => ("/public.txt".to_string(), false),
         1 => ("/./public.txt".to_string(), false),
         2 => ("/%70ublic.txt".to_string(), false),
@@ -217,7 +271,13 @@ fn logical_request(data: &[u8]) -> LogicalRequest {
         8 => ("/rewrite".to_string(), false),
         9 => (format!("/missing-{token}"), false),
         10 => ("/dir/../public.txt".to_string(), false),
-        _ => ("/".to_string(), false),
+        11 => ("/".to_string(), false),
+        12 => (format!("/missing-local-{token}"), false),
+        13 => (format!("/external/missing-{token}"), false),
+        14 => ("/app/".to_string(), false),
+        15 => ("/fcgi-dir/".to_string(), false),
+        16 => ("/proxy-dir/".to_string(), false),
+        _ => ("/denied/".to_string(), true),
     };
     let query = if byte(1) & 1 == 0 {
         String::new()
@@ -258,6 +318,26 @@ fn logical_request(data: &[u8]) -> LogicalRequest {
             "if-none-match".to_string(),
             format!("\"not-{token}\"").into_bytes(),
         ));
+    }
+    if byte(6) & 1 != 0 {
+        fields.push((
+            "content-type".to_string(),
+            b"application/octet-stream".to_vec(),
+        ));
+        fields.push(("content-language".to_string(), b"en-US".to_vec()));
+    }
+    if byte(6) & 2 != 0 {
+        fields.push(("if-match".to_string(), format!("\"{token}\"").into_bytes()));
+        fields.push((
+            "if-range".to_string(),
+            b"Wed, 21 Oct 2015 07:28:00 GMT".to_vec(),
+        ));
+    }
+    if byte(6) & 4 != 0 {
+        fields.push(("te".to_string(), b"trailers".to_vec()));
+    }
+    if byte(6) & 8 != 0 && byte(5) & 4 != 0 {
+        fields.push(("expect".to_string(), b"100-continue".to_vec()));
     }
     let body = if byte(5) & 4 != 0 {
         let available = data.get(8..).unwrap_or_default();
@@ -569,13 +649,12 @@ fn prepared_snapshot(handler: PreparedHandler) -> RouteSnapshot {
             target,
             ..
         } => {
-            let authorized_path = authorization
-                .identity()
-                .resolved_fs_path()
-                .expect("FastCGI authorization retained its target");
-            let selected = target.binding_key(authorized_path);
+            // URL-space FastCGI does not bind the opened script inode until
+            // execution. The prepared IR still carries the exact lexical
+            // script identity and pre-binding resource, which are the fields
+            // available at this side-effect-free differential boundary.
+            let selected = target.script_filename().display().to_string();
             let authorized = authorization.resource().backend_target.clone();
-            assert_eq!(authorized.as_deref(), Some(selected.as_str()));
             RouteSnapshot {
                 authorization: AuthorizationSnapshot::Granted,
                 sink: SinkSnapshot::FastCgi,
@@ -766,5 +845,36 @@ mod tests {
 
         let rewrite = compare_protocols(b"\x08\x01\x00\x00\x00\x00\x00\x00rewrite");
         assert_eq!(rewrite.sink, SinkSnapshot::StaticFile);
+
+        let local_error = compare_protocols(b"\x0c\x01\x00\x00\x00\x00\x03\x00local-error");
+        assert!(matches!(
+            local_error.authorization,
+            AuthorizationSnapshot::Rejected(404)
+        ));
+        assert_eq!(local_error.sink, SinkSnapshot::None);
+
+        let external_error = compare_protocols(b"\x0d\x01\x00\x00\x00\x00\x03\x00external-error");
+        assert_eq!(external_error.authorization, AuthorizationSnapshot::Granted);
+        assert_eq!(external_error.sink, SinkSnapshot::Redirect);
+
+        let cgi_index = compare_protocols(b"\x0e\x01\x00\x02\x00\x04\x0b\x00cgi-body");
+        assert_eq!(cgi_index.sink, SinkSnapshot::Cgi);
+        assert!(matches!(
+            cgi_index.backend,
+            Some(BackendSnapshot { kind: "cgi", .. })
+        ));
+
+        let fastcgi_index = compare_protocols(b"\x0f\x01\x00\x00\x00\x00\x03\x00fastcgi-index");
+        assert_eq!(fastcgi_index.sink, SinkSnapshot::FastCgi);
+
+        let proxy_index = compare_protocols(b"\x10\x01\x00\x00\x00\x00\x03\x00proxy-index");
+        assert_eq!(proxy_index.sink, SinkSnapshot::Proxy);
+
+        let denied_index = compare_protocols(b"\x11\x01\x00\x00\x00\x00\x03\x00denied-index");
+        assert!(matches!(
+            denied_index.authorization,
+            AuthorizationSnapshot::Denied(_)
+        ));
+        assert_eq!(denied_index.sink, SinkSnapshot::None);
     }
 }

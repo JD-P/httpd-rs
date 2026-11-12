@@ -4120,24 +4120,19 @@ impl PreparedHandler {
                 kind,
                 internal_target,
             } => {
-                let Some(mut internal) = project_internal_request(req, &internal_target, kind)
-                else {
-                    return Response::policy_error();
-                };
-                let Ok(target) = CanonicalTarget::from_request(
-                    &internal,
+                let Some(projected) = project_internal_request(
+                    req,
+                    &internal_target,
+                    kind,
                     cfg.encoded_slashes == EncodedSlashes::On,
                 ) else {
                     return Response::policy_error();
                 };
-                if !authorization.require_internal_request(
-                    cfg.authorization_generation(),
-                    kind,
-                    &target.url_path,
-                    true,
-                ) {
+                let Some((mut internal, _authorization)) = projected
+                    .into_authorized_request(cfg.authorization_generation(), authorization)
+                else {
                     return Response::policy_error();
-                }
+                };
                 handler.execute(cfg, &mut internal)
             }
             PreparedHandler::Proxy {
@@ -4502,11 +4497,42 @@ fn dispatch_inner_request(
     resp
 }
 
+/// Complete, sealed evidence that one synthetic request was derived by the
+/// only supported projection function and passed the executable refinement
+/// conjunction.  Callers can inspect the projected request while selecting
+/// its plan, but cannot construct or mutate this witness directly.
+struct ProjectedInternalRequest {
+    request: Request,
+    kind: vapache_verified::InternalRequestKind,
+    target: CanonicalTarget,
+}
+
+impl ProjectedInternalRequest {
+    fn request(&self) -> &Request {
+        &self.request
+    }
+
+    fn target(&self) -> &CanonicalTarget {
+        &self.target
+    }
+
+    fn into_authorized_request(
+        self,
+        generation: crate::config::ConfigurationGeneration,
+        authorization: access::AuthorizedOutcome,
+    ) -> Option<(Request, access::AuthorizedOutcome)> {
+        let authorization =
+            authorization.into_internal_request(generation, self.kind, &self.target.url_path)?;
+        Some((self.request, authorization))
+    }
+}
+
 fn project_internal_request(
     req: &Request,
     url: &str,
     kind: vapache_verified::InternalRequestKind,
-) -> Option<Request> {
+    allow_encoded_slashes: bool,
+) -> Option<ProjectedInternalRequest> {
     let (path, target_query) = crate::util::split_internal_request_target(url)?;
     let projection = vapache_verified::internal_request_projection(kind);
     debug_assert!(projection.preserve_wire_target);
@@ -4538,22 +4564,40 @@ fn project_internal_request(
         projection.strip_entity_and_hop_headers,
         !projection.preserve_body
     );
+    let target =
+        internal_request_refinement_target(req, &internal, url, kind, allow_encoded_slashes)?;
+    Some(ProjectedInternalRequest {
+        request: internal,
+        kind,
+        target,
+    })
+}
+
+fn internal_request_refinement_target(
+    source: &Request,
+    internal: &Request,
+    url: &str,
+    kind: vapache_verified::InternalRequestKind,
+    allow_encoded_slashes: bool,
+) -> Option<CanonicalTarget> {
+    let (path, target_query) = crate::util::split_internal_request_target(url)?;
+    let projection = vapache_verified::internal_request_projection(kind);
     let method_projected = if projection.preserve_method {
-        internal.method == req.method
+        internal.method == source.method
     } else {
         internal.method == "GET"
     };
     let body_projected = if projection.preserve_body {
-        let spool_matches = match (&internal.body_spool, &req.body_spool) {
+        let spool_matches = match (&internal.body_spool, &source.body_spool) {
             (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
             (None, None) => true,
             _ => false,
         };
-        internal.body == req.body
+        internal.body == source.body
             && spool_matches
-            && internal.body_len() == req.body_len()
-            && internal.framing == req.framing
-            && internal.expect_continue == req.expect_continue
+            && internal.body_len() == source.body_len()
+            && internal.framing == source.framing
+            && internal.expect_continue == source.expect_continue
     } else {
         internal.body.is_empty()
             && internal.body_spool.is_none()
@@ -4562,27 +4606,31 @@ fn project_internal_request(
             && !internal.expect_continue
     };
     let expected_query = if projection.preserve_query {
-        req.query.as_slice()
+        source.query.as_slice()
     } else {
         target_query.unwrap_or(&[])
     };
-    let headers_projected = internal
+    let (headers_projected, request_context_projected) = internal
         .headers
-        .internal_projection_matches(&req.headers, kind);
+        .internal_projection_facts(&source.headers, kind);
+    let target = CanonicalTarget::from_request(&internal, allow_encoded_slashes).ok()?;
     if !vapache_verified::internal_request_runtime_refines(
         internal.raw_path == path.as_bytes(),
-        internal.wire_target() == req.wire_target(),
-        internal.wire_method() == req.wire_method(),
-        internal.wire_version() == req.wire_version(),
+        internal.target == source.target,
+        internal.version == source.version,
+        internal.keep_alive == source.keep_alive,
+        internal.wire_target() == source.wire_target(),
+        internal.wire_method() == source.wire_method(),
+        internal.wire_version() == source.wire_version(),
         method_projected,
         body_projected,
         internal.query == expected_query,
-        headers_projected,
+        request_context_projected,
         headers_projected,
     ) {
         return None;
     }
-    Some(internal)
+    Some(target)
 }
 
 /// Perform one typed internal request through the normal dispatcher so
@@ -4603,22 +4651,21 @@ pub(crate) fn dispatch_local_error_document(
         req,
         url,
         vapache_verified::InternalRequestKind::ErrorDocument,
+        cfg.encoded_slashes == EncodedSlashes::On,
     ) else {
         return Response::policy_error();
     };
-    let Ok(target) =
-        CanonicalTarget::from_request(&projected, cfg.encoded_slashes == EncodedSlashes::On)
-    else {
-        return Response::policy_error();
-    };
-    let plan = match RequestPlan::resolve_for_request(cfg, vhost, target.clone(), &projected) {
+    let target = projected.target().clone();
+    let projected_request = projected.request();
+    let plan = match RequestPlan::resolve_for_request(cfg, vhost, target.clone(), projected_request)
+    {
         Ok(plan) => plan,
         Err(_) => return Response::policy_error(),
     };
-    let scope = plan.effective_scope(cfg, vhost, &projected, peer.ip());
+    let scope = plan.effective_scope(cfg, vhost, projected_request, peer.ip());
     let mut resource = access::ResourceKey::request(
         vhost,
-        &projected,
+        projected_request,
         &target.url_path,
         Some(plan.fs_path()),
         None,
@@ -4627,7 +4674,7 @@ pub(crate) fn dispatch_local_error_document(
         cfg,
         vhost,
         &scope,
-        &projected,
+        projected_request,
         &target.url_path,
         plan.fs_path(),
         local_port,
@@ -4651,11 +4698,10 @@ pub(crate) fn dispatch_local_error_document(
     else {
         return Response::policy_error();
     };
-    internal_dispatch(
+    internal_dispatch_projected(
         cfg,
-        req,
+        projected,
         url,
-        vapache_verified::InternalRequestKind::ErrorDocument,
         authorization,
         Some(plan),
         vhost,
@@ -4679,26 +4725,48 @@ pub(crate) fn internal_dispatch(
     local_ip: &str,
     local_port: u16,
 ) -> Response {
-    let Some(internal) = project_internal_request(req, url, kind) else {
+    let Some(projected) =
+        project_internal_request(req, url, kind, cfg.encoded_slashes == EncodedSlashes::On)
+    else {
         return Response::bytes(
             500,
             "text/plain; charset=UTF-8",
             b"Invalid or recursive internal request\n".to_vec(),
         );
     };
-    let Ok(projected_target) =
-        CanonicalTarget::from_request(&internal, cfg.encoded_slashes == EncodedSlashes::On)
+    internal_dispatch_projected(
+        cfg,
+        projected,
+        url,
+        authorization,
+        initial_plan,
+        vhost,
+        server_name,
+        peer,
+        local_ip,
+        local_port,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn internal_dispatch_projected(
+    cfg: &Config,
+    projected: ProjectedInternalRequest,
+    url: &str,
+    authorization: access::AuthorizedOutcome,
+    initial_plan: Option<RequestPlan>,
+    vhost: Option<&VHost>,
+    server_name: &str,
+    peer: SocketAddr,
+    local_ip: &str,
+    local_port: u16,
+) -> Response {
+    let kind = projected.kind;
+    let Some((internal, authorization)) =
+        projected.into_authorized_request(cfg.authorization_generation(), authorization)
     else {
         return Response::policy_error();
     };
-    if !authorization.require_internal_request(
-        cfg.authorization_generation(),
-        kind,
-        &projected_target.url_path,
-        true,
-    ) {
-        return Response::policy_error();
-    }
     // Internal requests preserve the Host field and run synchronously inside
     // one immutable configuration generation. The caller's already selected
     // vhost/server identity is therefore authoritative; selecting and parsing
@@ -5320,6 +5388,9 @@ fn bind_multiview_grant(
                 server_name,
                 peer,
                 local_ip,
+                status,
+                &location,
+                https,
             )?;
             return Err(url_redirect_response(
                 cfg,
@@ -5966,6 +6037,9 @@ fn authorize_redirect_outcome(
     server_name: &str,
     peer: IpAddr,
     local_ip: &str,
+    status: u16,
+    location: &str,
+    https: bool,
 ) -> Result<access::AuthorizedOutcome, Response> {
     let public =
         CanonicalTarget::from_url_path(public_url_path).ok_or_else(Response::policy_error)?;
@@ -6000,12 +6074,34 @@ fn authorize_redirect_outcome(
         resource,
     )
     .and_then(|plan| {
-        plan.into_outcome(
+        let location =
+            normalized_redirect_location(cfg, vhost, req, location, server_name, local_port, https);
+        plan.into_redirect_outcome(
             cfg.authorization_generation(),
-            vapache_verified::TransformSink::Redirect,
+            status,
+            location.into_bytes(),
         )
     })
     .ok_or_else(Response::policy_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalized_redirect_location(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
+    location: &str,
+    server_name: &str,
+    local_port: u16,
+    https: bool,
+) -> String {
+    if location.starts_with("//") {
+        format!("{}:{location}", if https { "https" } else { "http" })
+    } else if location.starts_with('/') {
+        absolute_url_scheme(cfg, vhost, req, location, server_name, local_port, https)
+    } else {
+        location.to_string()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6020,19 +6116,12 @@ fn url_redirect_response(
     https: bool,
     authorization: access::AuthorizedOutcome,
 ) -> Response {
-    if !authorization.require_sink(
-        cfg.authorization_generation(),
-        vapache_verified::TransformSink::Redirect,
-    ) {
+    let location =
+        normalized_redirect_location(cfg, vhost, req, location, server_name, local_port, https);
+    if !authorization.require_redirect(cfg.authorization_generation(), status, location.as_bytes())
+    {
         return Response::policy_error();
     }
-    let location = if location.starts_with("//") {
-        format!("{}:{location}", if https { "https" } else { "http" })
-    } else if location.starts_with('/') {
-        absolute_url_scheme(cfg, vhost, req, location, server_name, local_port, https)
-    } else {
-        location.to_string()
-    };
     let mut response = if location.is_empty() {
         simple_html(status, "", None)
     } else {
@@ -6482,6 +6571,9 @@ fn run_url_translation_phase(
                         server_name,
                         peer.ip(),
                         local_ip,
+                        status,
+                        &location,
+                        https,
                     ) {
                         Ok(authorization) => authorization,
                         Err(response) => return UrlPhaseResult::Terminal(response),
@@ -6684,6 +6776,9 @@ fn run_url_translation_phase(
                 server_name,
                 peer.ip(),
                 local_ip,
+                redirect_status,
+                &location,
+                https,
             ) {
                 Ok(authorization) => authorization,
                 Err(response) => return UrlPhaseResult::Terminal(response),
@@ -7377,6 +7472,9 @@ fn dispatch_inner(
                     &server_name,
                     peer.ip(),
                     local_ip,
+                    status,
+                    &location,
+                    https,
                 ) {
                     Ok(authorization) => authorization,
                     Err(response) => return response,
@@ -7784,6 +7882,9 @@ fn dispatch_inner(
             &server_name,
             peer.ip(),
             local_ip,
+            red.status,
+            &loc,
+            https,
         ) {
             Ok(authorization) => authorization,
             Err(response) => return response,
@@ -10152,8 +10253,10 @@ mod tests {
             &outer,
             "/dir/index.php",
             vapache_verified::InternalRequestKind::DirectoryIndex,
+            false,
         )
         .unwrap();
+        let index = index.request();
         assert_eq!(index.target, outer.target);
         assert_eq!(index.raw_path, b"/dir/index.php");
         assert_eq!(index.method, "POST");
@@ -10163,12 +10266,49 @@ mod tests {
         assert_eq!(index.header("x-hop"), Some(b"secret".as_slice()));
         assert_eq!(index.public_uri(), Some("/missing"));
 
+        let rejects_index_mutation = |candidate: &Request| {
+            assert!(internal_request_refinement_target(
+                &outer,
+                candidate,
+                "/dir/index.php",
+                vapache_verified::InternalRequestKind::DirectoryIndex,
+                false,
+            )
+            .is_none());
+        };
+        let mut mutated = index.clone();
+        mutated.target.push(b'x');
+        rejects_index_mutation(&mutated);
+        let mut mutated = index.clone();
+        mutated.version = Version::Http2;
+        rejects_index_mutation(&mutated);
+        let mut mutated = index.clone();
+        mutated.keep_alive = !mutated.keep_alive;
+        rejects_index_mutation(&mutated);
+        let mut mutated = index.clone();
+        mutated.raw_path = b"/dir/other.php".to_vec();
+        rejects_index_mutation(&mutated);
+        let mut mutated = index.clone();
+        mutated.method = "GET".to_string();
+        rejects_index_mutation(&mutated);
+        let mut mutated = index.clone();
+        mutated.query.push(b'x');
+        rejects_index_mutation(&mutated);
+        let mut mutated = index.clone();
+        mutated.body.push(b'x');
+        rejects_index_mutation(&mutated);
+        let mut mutated = index.clone();
+        mutated.headers.insert("x-substituted", b"1".to_vec());
+        rejects_index_mutation(&mutated);
+
         let error = project_internal_request(
             &outer,
             "/errors/show.php?status=404?detail=missing",
             vapache_verified::InternalRequestKind::ErrorDocument,
+            false,
         )
         .unwrap();
+        let error = error.request();
         assert_eq!(error.target, outer.target);
         assert_eq!(error.wire_method(), "POST");
         assert_eq!(error.wire_target(), outer.target);
@@ -10204,13 +10344,16 @@ mod tests {
             &outer,
             "/errors/show.php",
             vapache_verified::InternalRequestKind::ErrorDocument,
+            false,
         )
         .unwrap();
+        let inherited_query = inherited_query.request();
         assert_eq!(inherited_query.query, b"");
         assert!(project_internal_request(
             &error,
             "/errors/again",
             vapache_verified::InternalRequestKind::ErrorDocument,
+            false,
         )
         .is_none());
 
@@ -10227,6 +10370,7 @@ mod tests {
                 &outer,
                 invalid,
                 vapache_verified::InternalRequestKind::ErrorDocument,
+                false,
             )
             .is_none());
         }
@@ -13498,6 +13642,23 @@ mod tests {
         let head = cov_dispatch(&manual, "HEAD", "/directrel");
         assert_eq!(head.status, 302);
         assert_eq!(head.body_len(), 0);
+
+        // A directory-scoped Redirect is unavailable during the early URL
+        // phase. It must still traverse the same exact-status/Location sink
+        // boundary after filesystem and access-file scope composition.
+        let late_redirect = cov_config(
+            &dir,
+            &format!(
+                "<Directory \"{}/www\">\nRedirect 301 /late-old /late-new\n</Directory>\n",
+                dir.display()
+            ),
+        );
+        let late = cov_dispatch(&late_redirect, "GET", "/late-old");
+        assert_eq!(late.status, 301);
+        assert!(late.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("location")
+                && value == format!("http://localhost/late-new").as_bytes()
+        }));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -4522,92 +4522,116 @@ pub fn internal_request_sink_matches(
 /// conjunction so a future field or transition cannot silently take a
 /// positive path after only a partial comparison.
 pub open spec fn internal_request_runtime_refines_spec(
-    target_bound: bool,
+    dispatch_target_bound: bool,
+    request_target_preserved: bool,
+    request_version_preserved: bool,
+    keep_alive_preserved: bool,
     wire_target_preserved: bool,
     wire_method_preserved: bool,
     wire_version_preserved: bool,
     method_projected: bool,
     body_projected: bool,
     query_projected: bool,
-    client_identity_preserved: bool,
+    request_context_projected: bool,
     headers_projected: bool,
 ) -> bool {
-    target_bound
+    dispatch_target_bound
+        && request_target_preserved
+        && request_version_preserved
+        && keep_alive_preserved
         && wire_target_preserved
         && wire_method_preserved
         && wire_version_preserved
         && method_projected
         && body_projected
         && query_projected
-        && client_identity_preserved
+        && request_context_projected
         && headers_projected
 }
 
 pub fn internal_request_runtime_refines(
-    target_bound: bool,
+    dispatch_target_bound: bool,
+    request_target_preserved: bool,
+    request_version_preserved: bool,
+    keep_alive_preserved: bool,
     wire_target_preserved: bool,
     wire_method_preserved: bool,
     wire_version_preserved: bool,
     method_projected: bool,
     body_projected: bool,
     query_projected: bool,
-    client_identity_preserved: bool,
+    request_context_projected: bool,
     headers_projected: bool,
 ) -> (admit: bool)
     ensures admit == internal_request_runtime_refines_spec(
-        target_bound,
+        dispatch_target_bound,
+        request_target_preserved,
+        request_version_preserved,
+        keep_alive_preserved,
         wire_target_preserved,
         wire_method_preserved,
         wire_version_preserved,
         method_projected,
         body_projected,
         query_projected,
-        client_identity_preserved,
+        request_context_projected,
         headers_projected,
     ),
 {
-    target_bound
+    dispatch_target_bound
+        && request_target_preserved
+        && request_version_preserved
+        && keep_alive_preserved
         && wire_target_preserved
         && wire_method_preserved
         && wire_version_preserved
         && method_projected
         && body_projected
         && query_projected
-        && client_identity_preserved
+        && request_context_projected
         && headers_projected
 }
 
 pub proof fn admitted_internal_request_refines_every_field(
-    target_bound: bool,
+    dispatch_target_bound: bool,
+    request_target_preserved: bool,
+    request_version_preserved: bool,
+    keep_alive_preserved: bool,
     wire_target_preserved: bool,
     wire_method_preserved: bool,
     wire_version_preserved: bool,
     method_projected: bool,
     body_projected: bool,
     query_projected: bool,
-    client_identity_preserved: bool,
+    request_context_projected: bool,
     headers_projected: bool,
 )
     requires internal_request_runtime_refines_spec(
-        target_bound,
+        dispatch_target_bound,
+        request_target_preserved,
+        request_version_preserved,
+        keep_alive_preserved,
         wire_target_preserved,
         wire_method_preserved,
         wire_version_preserved,
         method_projected,
         body_projected,
         query_projected,
-        client_identity_preserved,
+        request_context_projected,
         headers_projected,
     ),
     ensures
-        target_bound,
+        dispatch_target_bound,
+        request_target_preserved,
+        request_version_preserved,
+        keep_alive_preserved,
         wire_target_preserved,
         wire_method_preserved,
         wire_version_preserved,
         method_projected,
         body_projected,
         query_projected,
-        client_identity_preserved,
+        request_context_projected,
         headers_projected,
 {
 }
@@ -4654,6 +4678,120 @@ pub proof fn internal_request_outcome_binds_kind_target_and_projection(
             _ => {},
         },
     }
+}
+
+/// A redirect-table capability is useful only for the concrete terminal
+/// response bound when the move-only outcome was constructed. Apache's table
+/// also represents terminal 4xx/5xx mappings, which must not carry Location.
+/// Status and Location are separate facts so neither can drift at emission.
+pub open spec fn redirect_outcome_spec(
+    sink: TransformSink,
+    status_matches: bool,
+    location_matches: bool,
+    location_present: bool,
+    status: u16,
+) -> bool {
+    match sink {
+        TransformSink::Redirect => {
+            status_matches
+                && location_matches
+                && 300 <= status
+                && status < 600
+                && (status < 400 || !location_present)
+        },
+        _ => false,
+    }
+}
+
+pub fn redirect_outcome_admit(
+    sink: TransformSink,
+    status_matches: bool,
+    location_matches: bool,
+    location_present: bool,
+    status: u16,
+) -> (admit: bool)
+    ensures admit == redirect_outcome_spec(
+        sink,
+        status_matches,
+        location_matches,
+        location_present,
+        status,
+    ),
+{
+    match sink {
+        TransformSink::Redirect => {
+            status_matches
+                && location_matches
+                && 300 <= status
+                && status < 600
+                && (status < 400 || !location_present)
+        },
+        _ => false,
+    }
+}
+
+pub proof fn admitted_redirect_binds_status_and_location(
+    sink: TransformSink,
+    status_matches: bool,
+    location_matches: bool,
+    location_present: bool,
+    status: u16,
+)
+    requires redirect_outcome_spec(
+        sink,
+        status_matches,
+        location_matches,
+        location_present,
+        status,
+    ),
+    ensures
+        sink == TransformSink::Redirect,
+        status_matches,
+        location_matches,
+        300 <= status,
+        status < 600,
+        status >= 400 ==> !location_present,
+{
+    match sink {
+        TransformSink::Redirect => {},
+        _ => {},
+    }
+}
+
+/// ErrorDocument recovery can intentionally follow an access denial, so it
+/// has a configuration-bound authorization rather than a fabricated resource
+/// grant.  It still binds the generation, configured target and exact 3xx.
+pub open spec fn recovery_redirect_spec(
+    generation_matches: bool,
+    configured_target_matches: bool,
+    response_bound: bool,
+    status: u16,
+) -> bool {
+    generation_matches
+        && configured_target_matches
+        && response_bound
+        && 300 <= status
+        && status < 400
+}
+
+pub fn recovery_redirect_admit(
+    generation_matches: bool,
+    configured_target_matches: bool,
+    response_bound: bool,
+    status: u16,
+) -> (admit: bool)
+    ensures admit == recovery_redirect_spec(
+        generation_matches,
+        configured_target_matches,
+        response_bound,
+        status,
+    ),
+{
+    generation_matches
+        && configured_target_matches
+        && response_bound
+        && 300 <= status
+        && status < 400
 }
 
 pub proof fn directory_index_preserves_application_request()

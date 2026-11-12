@@ -601,23 +601,6 @@ fn utf_without_ucp_keeps_ascii_character_types() {
     }
 
     let mut rust_builder = rust::RegexBuilder::new();
-    rust_builder.utf(true);
-    let rust = rust_builder.build(r"\b").unwrap();
-    let mut oracle_builder = oracle::RegexBuilder::new();
-    oracle_builder.utf(true);
-    let oracle = oracle_builder.build(r"\b").unwrap();
-    let subject = "aěb".as_bytes();
-    let rust_boundaries: Result<Vec<_>, _> = rust
-        .find_iter(subject)
-        .map(|result| result.map(|matched| (matched.start(), matched.end())))
-        .collect();
-    let oracle_boundaries: Result<Vec<_>, _> = oracle
-        .find_iter(subject)
-        .map(|result| result.map(|matched| (matched.start(), matched.end())))
-        .collect();
-    assert_eq!(rust_boundaries.is_err(), oracle_boundaries.is_err());
-
-    let mut rust_builder = rust::RegexBuilder::new();
     rust_builder.ucp(true);
     let rust = rust_builder.build(r"\w+").unwrap();
     let mut oracle_builder = oracle::RegexBuilder::new();
@@ -632,4 +615,31 @@ fn utf_without_ucp_keeps_ascii_character_types() {
             .unwrap()
             .map(|matched| (matched.start(), matched.end())),
     );
+}
+
+#[test]
+fn unicode_word_boundaries_fail_closed_instead_of_matching_inside_utf8_scalars() {
+    for pattern in [r"\b", r"\B"] {
+        for configure in [
+            |builder: &mut rust::RegexBuilder| {
+                builder.utf(true);
+            },
+            |builder: &mut rust::RegexBuilder| {
+                builder.ucp(true);
+            },
+        ] {
+            let mut rust_builder = rust::RegexBuilder::new();
+            configure(&mut rust_builder);
+            assert!(rust_builder.build(pattern).is_err(), "{pattern:?}");
+        }
+
+        let byte_builder = rust::RegexBuilder::new();
+        assert!(byte_builder.build(pattern).is_ok(), "{pattern:?}");
+    }
+
+    let mut oracle_builder = oracle::RegexBuilder::new();
+    oracle_builder.utf(true);
+    let oracle = oracle_builder.build(r"\B").unwrap();
+    let matched = oracle.find("aěb\n\0".as_bytes()).unwrap().unwrap();
+    assert_eq!((matched.start(), matched.end()), (5, 5));
 }
