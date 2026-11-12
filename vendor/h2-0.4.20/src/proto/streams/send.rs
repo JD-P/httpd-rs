@@ -276,6 +276,27 @@ impl Send {
         self.prioritize.reclaim_all_capacity(stream, counts);
     }
 
+    /// Report a peer violation on a stream whose terminal cause must remain
+    /// available to the receive state machine. This deliberately queues a
+    /// second RST_STREAM without replacing that cause. It also supersedes any
+    /// not-yet-encoded application response or earlier implicit reset.
+    pub fn send_repeat_reset<B>(
+        &mut self,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        reason: Reason,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) {
+        debug_assert!(stream.state.is_reset() || stream.state.is_recv_end_stream());
+        self.prioritize.clear_queue(buffer, stream);
+        self.prioritize.reclaim_all_capacity(stream, counts);
+        let frame = frame::Reset::new(stream.id, reason);
+        tracing::trace!("send_repeat_reset -- queueing; frame={:?}", frame);
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+    }
+
     pub fn schedule_implicit_reset(
         &mut self,
         stream: &mut store::Ptr,

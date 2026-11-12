@@ -71,6 +71,24 @@ connection events. Encoded header blocks have cumulative byte and continuation
 ceilings, and HPACK Huffman decode establishes output-allocation and loop-work
 bounds before entering the decoder.
 
+HTTP/2 stream ownership is represented once at the adapter boundary. One
+ledger stores each stream ID and lifecycle phase together with its active and
+delayed-reset counters; a transition is computed in full before any field is
+mutated, and connection close applies the verified terminal transition before
+clearing every record. The lifecycle fuzz campaign asserts uniqueness, exact
+counter/phase agreement, configured maxima and zero terminal ownership after
+every generated transition sequence.
+
+Inside the vendored state machine, SETTINGS synchronization and peer
+HEADERS/DATA classification consume closed verified transition tables. A
+terminal stream's exact close cause is retained in a FIFO tombstone set bounded
+by the configured reset limits and an absolute 1,024-entry ceiling. That bound
+lets the codec distinguish a closed lower stream (STREAM_CLOSED) from an ID the
+peer skipped (PROTOCOL_ERROR) without turning historical stream IDs into an
+unbounded connection-lifetime map. Repeated error resets replace queued
+application output and reclaim its flow capacity; they do not reopen or change
+the retained terminal cause.
+
 All downstream-bound output is measured from the original response start.
 Partial writes and HTTP/2 capacity grants cannot renew the minimum average
 rate checkpoint or the absolute sixteen-interval lifetime.
@@ -130,12 +148,13 @@ Some mutable state is intentionally process-owned rather than request-owned:
   the executable Verus lending predicate therefore preserves at least 56
   workers for filesystem/policy/static work even if every backend stalls;
 - configuration-generation state (including the monotonic process-local ID
-  allocator and cache-publication barrier), signal flags, logging
-  serialization, and privileged TLS file-broker state;
+  allocator and cache-publication barrier), the immutable once-initialized
+  directive registry, signal flags, logging serialization, and privileged TLS
+  file-broker state;
 - telemetry counters, thread-local formatting buffers, request-local metadata
   memoization, collision-resistant temporary-name counters, and the
-  deterministic task/thread fault plans compiled only for fault-injection
-  testing.
+  deterministic task/thread fault plans and once-initialized whole-request
+  fixture compiled only for fuzz/fault-injection testing.
 
 These objects have bounds or constant cardinality at their definitions and do
 not grant request execution capacity. `tests/resource_inventory.py` makes the

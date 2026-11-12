@@ -33,6 +33,7 @@ ALLOWED_MUTABLE_STATICS = {
     ("cache.rs", "USAGE"), ("cache.rs", "SCAN"), ("cache.rs", "LOCKS"),
     ("cgi.rs", "POOL"),
     ("config.rs", "NEXT"), ("config.rs", "NEXT_FIXTURE"),
+    ("config.rs", "REGISTRY"),
     ("config.rs", "NEXT_CONFIG_GENERATION"),
     ("expr.rs", "REQUEST_HTTPS"), ("expr.rs", "REQUEST_PORT"),
     ("expr.rs", "REQUEST_SERVER_NAME"),
@@ -66,6 +67,7 @@ ALLOWED_MUTABLE_STATICS = {
     ("status.rs", "BYTES"),
     ("tls.rs", "PRIVILEGED_FILE_BROKER"),
     ("util.rs", "HTTP_DATE_CACHE"),
+    ("whole_request_fuzz.rs", "FIXTURE"),
 }
 
 FORBIDDEN_SPLIT_LEDGERS = {

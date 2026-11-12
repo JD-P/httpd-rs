@@ -15738,6 +15738,7 @@ pub enum H2BudgetEvent {
     Finish,
     Reset,
     Reclaim,
+    ConnectionClose,
 }
 
 pub open spec fn h2_budget_step_spec(
@@ -15785,7 +15786,26 @@ pub open spec fn h2_budget_step_spec(
                 max_pending_resets: b.max_pending_resets,
             })
         },
+        H2BudgetEvent::ConnectionClose => Some(H2Budget {
+            active: 0,
+            max_active: b.max_active,
+            pending_resets: 0,
+            max_pending_resets: b.max_pending_resets,
+        }),
     }
+}
+
+pub proof fn h2_budget_connection_close_releases_all(b: H2Budget)
+    requires h2_budget_inv(b),
+    ensures
+        h2_budget_step_spec(b, H2BudgetEvent::ConnectionClose)
+            == Some(H2Budget {
+                active: 0,
+                max_active: b.max_active,
+                pending_resets: 0,
+                max_pending_resets: b.max_pending_resets,
+            }),
+{
 }
 
 /// Bound settings used by the HTTP/2 adapter.  The values are deliberately
@@ -15805,6 +15825,132 @@ pub struct H2Settings {
     pub max_frame: u32,
     pub max_reset_streams: u32,
     pub max_send_buffer: u32,
+}
+
+/// The SETTINGS exchange has two independent halves: local settings wait for
+/// an ACK, while remote settings wait for our ACK to be queued before they are
+/// applied. Keeping both halves in one executable state prevents an ACK from
+/// being accepted without an outstanding local settings frame and prevents a
+/// second remote settings frame from replacing one that has not been applied.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2LocalSettingsPhase {
+    ToSend,
+    WaitingAck,
+    Synced,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct H2SettingsSync {
+    pub local: H2LocalSettingsPhase,
+    pub remote_pending: bool,
+    pub remote_initial_seen: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2SettingsSyncEvent {
+    QueueLocal,
+    LocalSent,
+    ReceiveAck,
+    ReceiveRemote,
+    ApplyRemote,
+}
+
+pub open spec fn h2_settings_sync_step_spec(
+    state: H2SettingsSync,
+    event: H2SettingsSyncEvent,
+) -> Option<H2SettingsSync> {
+    match (state.local, state.remote_pending, event) {
+        (H2LocalSettingsPhase::Synced, pending, H2SettingsSyncEvent::QueueLocal) => {
+            Some(H2SettingsSync {
+                local: H2LocalSettingsPhase::ToSend,
+                remote_pending: pending,
+                remote_initial_seen: state.remote_initial_seen,
+            })
+        },
+        (H2LocalSettingsPhase::ToSend, pending, H2SettingsSyncEvent::LocalSent) => {
+            Some(H2SettingsSync {
+                local: H2LocalSettingsPhase::WaitingAck,
+                remote_pending: pending,
+                remote_initial_seen: state.remote_initial_seen,
+            })
+        },
+        (H2LocalSettingsPhase::WaitingAck, pending, H2SettingsSyncEvent::ReceiveAck) => {
+            Some(H2SettingsSync {
+                local: H2LocalSettingsPhase::Synced,
+                remote_pending: pending,
+                remote_initial_seen: state.remote_initial_seen,
+            })
+        },
+        (local, false, H2SettingsSyncEvent::ReceiveRemote) => Some(H2SettingsSync {
+            local,
+            remote_pending: true,
+            remote_initial_seen: state.remote_initial_seen,
+        }),
+        (local, true, H2SettingsSyncEvent::ApplyRemote) => Some(H2SettingsSync {
+            local,
+            remote_pending: false,
+            remote_initial_seen: true,
+        }),
+        _ => None,
+    }
+}
+
+pub fn h2_settings_sync_step(
+    state: H2SettingsSync,
+    event: H2SettingsSyncEvent,
+) -> (next: Option<H2SettingsSync>)
+    ensures next == h2_settings_sync_step_spec(state, event),
+{
+    match (state.local, state.remote_pending, event) {
+        (H2LocalSettingsPhase::Synced, pending, H2SettingsSyncEvent::QueueLocal) => {
+            Some(H2SettingsSync {
+                local: H2LocalSettingsPhase::ToSend,
+                remote_pending: pending,
+                remote_initial_seen: state.remote_initial_seen,
+            })
+        }
+        (H2LocalSettingsPhase::ToSend, pending, H2SettingsSyncEvent::LocalSent) => {
+            Some(H2SettingsSync {
+                local: H2LocalSettingsPhase::WaitingAck,
+                remote_pending: pending,
+                remote_initial_seen: state.remote_initial_seen,
+            })
+        }
+        (H2LocalSettingsPhase::WaitingAck, pending, H2SettingsSyncEvent::ReceiveAck) => {
+            Some(H2SettingsSync {
+                local: H2LocalSettingsPhase::Synced,
+                remote_pending: pending,
+                remote_initial_seen: state.remote_initial_seen,
+            })
+        }
+        (local, false, H2SettingsSyncEvent::ReceiveRemote) => Some(H2SettingsSync {
+            local,
+            remote_pending: true,
+            remote_initial_seen: state.remote_initial_seen,
+        }),
+        (local, true, H2SettingsSyncEvent::ApplyRemote) => Some(H2SettingsSync {
+            local,
+            remote_pending: false,
+            remote_initial_seen: true,
+        }),
+        _ => None,
+    }
+}
+
+pub proof fn h2_settings_ack_requires_waiting(state: H2SettingsSync)
+    ensures
+        h2_settings_sync_step_spec(state, H2SettingsSyncEvent::ReceiveAck).is_some()
+            ==> state.local == H2LocalSettingsPhase::WaitingAck,
+{
+}
+
+pub proof fn h2_settings_remote_apply_is_monotone(state: H2SettingsSync)
+    ensures
+        match h2_settings_sync_step_spec(state, H2SettingsSyncEvent::ApplyRemote) {
+            Some(next) => next.remote_initial_seen && !next.remote_pending,
+            None => !state.remote_pending,
+        },
+{
 }
 
 pub open spec fn h2_settings_sane(s: H2Settings) -> bool {
@@ -16088,6 +16234,143 @@ pub fn h2_stream_admit(active: &[u64], pending: &[u64], id: u64) -> (ok: bool)
     } else {
         true
     }
+}
+
+/// Coarse receive-side RFC stream phase used at the vendored dependency's
+/// frame-dispatch boundary. The dependency retains its richer send/receive
+/// state, but every peer-controlled frame is first classified through this
+/// closed decision table so a closed stream cannot accidentally fall through
+/// a trailer or ordinary DATA path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2PeerStreamPhase {
+    Idle,
+    Open,
+    HalfClosedRemote,
+    ClosedRemoteReset,
+    ClosedEndStream,
+    ClosedLocalReset,
+    Forgotten,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2PeerFrame {
+    Headers,
+    MalformedHeaders,
+    Data,
+    Priority,
+    Reset,
+    WindowUpdate,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2PeerFrameDecision {
+    Process,
+    Ignore,
+    StreamClosed,
+    StreamProtocolError,
+    ConnectionProtocolError,
+    ConnectionStreamClosed,
+}
+
+pub open spec fn h2_peer_frame_decision_spec(
+    phase: H2PeerStreamPhase,
+    frame: H2PeerFrame,
+) -> H2PeerFrameDecision {
+    match phase {
+        H2PeerStreamPhase::Idle => match frame {
+            H2PeerFrame::Headers | H2PeerFrame::MalformedHeaders | H2PeerFrame::Priority => {
+                H2PeerFrameDecision::Process
+            },
+            _ => H2PeerFrameDecision::ConnectionProtocolError,
+        },
+        H2PeerStreamPhase::Open => H2PeerFrameDecision::Process,
+        H2PeerStreamPhase::HalfClosedRemote => match frame {
+            H2PeerFrame::Priority | H2PeerFrame::Reset | H2PeerFrame::WindowUpdate => {
+                H2PeerFrameDecision::Process
+            },
+            H2PeerFrame::Headers | H2PeerFrame::MalformedHeaders | H2PeerFrame::Data => {
+                H2PeerFrameDecision::StreamClosed
+            },
+        },
+        H2PeerStreamPhase::ClosedRemoteReset | H2PeerStreamPhase::Forgotten => match frame {
+            H2PeerFrame::Priority => H2PeerFrameDecision::Process,
+            _ => H2PeerFrameDecision::StreamClosed,
+        },
+        H2PeerStreamPhase::ClosedEndStream => match frame {
+            H2PeerFrame::Priority => H2PeerFrameDecision::Process,
+            _ => H2PeerFrameDecision::ConnectionStreamClosed,
+        },
+        H2PeerStreamPhase::ClosedLocalReset => match frame {
+            H2PeerFrame::MalformedHeaders => H2PeerFrameDecision::StreamProtocolError,
+            _ => H2PeerFrameDecision::Ignore,
+        },
+    }
+}
+
+pub fn h2_peer_frame_decision(
+    phase: H2PeerStreamPhase,
+    frame: H2PeerFrame,
+) -> (decision: H2PeerFrameDecision)
+    ensures decision == h2_peer_frame_decision_spec(phase, frame),
+{
+    match phase {
+        H2PeerStreamPhase::Idle => match frame {
+            H2PeerFrame::Headers | H2PeerFrame::MalformedHeaders | H2PeerFrame::Priority => {
+                H2PeerFrameDecision::Process
+            }
+            _ => H2PeerFrameDecision::ConnectionProtocolError,
+        },
+        H2PeerStreamPhase::Open => H2PeerFrameDecision::Process,
+        H2PeerStreamPhase::HalfClosedRemote => match frame {
+            H2PeerFrame::Priority | H2PeerFrame::Reset | H2PeerFrame::WindowUpdate => {
+                H2PeerFrameDecision::Process
+            }
+            H2PeerFrame::Headers | H2PeerFrame::MalformedHeaders | H2PeerFrame::Data => {
+                H2PeerFrameDecision::StreamClosed
+            }
+        },
+        H2PeerStreamPhase::ClosedRemoteReset | H2PeerStreamPhase::Forgotten => match frame {
+            H2PeerFrame::Priority => H2PeerFrameDecision::Process,
+            _ => H2PeerFrameDecision::StreamClosed,
+        },
+        H2PeerStreamPhase::ClosedEndStream => match frame {
+            H2PeerFrame::Priority => H2PeerFrameDecision::Process,
+            _ => H2PeerFrameDecision::ConnectionStreamClosed,
+        },
+        H2PeerStreamPhase::ClosedLocalReset => match frame {
+            H2PeerFrame::MalformedHeaders => H2PeerFrameDecision::StreamProtocolError,
+            _ => H2PeerFrameDecision::Ignore,
+        },
+    }
+}
+
+pub proof fn h2_headers_after_remote_reset_are_stream_local()
+    ensures
+        h2_peer_frame_decision_spec(
+            H2PeerStreamPhase::ClosedRemoteReset,
+            H2PeerFrame::Headers,
+        ) == H2PeerFrameDecision::StreamClosed,
+{
+}
+
+pub proof fn h2_closed_stream_never_processes_payload(
+    phase: H2PeerStreamPhase,
+    frame: H2PeerFrame,
+)
+    requires
+        phase == H2PeerStreamPhase::ClosedRemoteReset
+            || phase == H2PeerStreamPhase::Forgotten,
+        frame == H2PeerFrame::Headers || frame == H2PeerFrame::Data,
+    ensures h2_peer_frame_decision_spec(phase, frame) == H2PeerFrameDecision::StreamClosed,
+{
+}
+
+pub proof fn h2_end_stream_rejects_payload_at_connection_scope(frame: H2PeerFrame)
+    requires frame == H2PeerFrame::Headers || frame == H2PeerFrame::Data,
+    ensures
+        h2_peer_frame_decision_spec(H2PeerStreamPhase::ClosedEndStream, frame)
+            == H2PeerFrameDecision::ConnectionStreamClosed,
+{
 }
 
 /// Lifecycle of the dependency's delayed local-reset queue. A stream can be
@@ -16417,6 +16700,12 @@ pub fn h2_budget_step(b: H2Budget, event: H2BudgetEvent) -> (out: Option<H2Budge
         H2BudgetEvent::Finish => h2_budget_finish(b),
         H2BudgetEvent::Reset => h2_budget_reset(b),
         H2BudgetEvent::Reclaim => h2_budget_reclaim(b),
+        H2BudgetEvent::ConnectionClose => Some(H2Budget {
+            active: 0,
+            max_active: b.max_active,
+            pending_resets: 0,
+            max_pending_resets: b.max_pending_resets,
+        }),
     }
 }
 
@@ -16514,6 +16803,17 @@ pub proof fn h2_budget_replay_preserves_inv(
                     assert(h2_budget_inv(next));
                     h2_budget_replay_preserves_inv(next, events.skip(1));
                 }
+            }
+            H2BudgetEvent::ConnectionClose => {
+                let next = H2Budget {
+                    active: 0,
+                    max_active: b.max_active,
+                    pending_resets: 0,
+                    max_pending_resets: b.max_pending_resets,
+                };
+                assert(h2_budget_step_spec(b, event) == Some(next));
+                assert(h2_budget_inv(next));
+                h2_budget_replay_preserves_inv(next, events.skip(1));
             }
         }
     }

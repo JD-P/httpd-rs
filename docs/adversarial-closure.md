@@ -658,6 +658,39 @@ and lexical controls. The admission fuzzer also generates these families as
 exclusions, while its positive generator continues to require complete PCRE2
 differential agreement.
 
+## Post-P37 HTTP/2 lifecycle closure
+
+Strict h2spec exposed a family rather than one isolated reset bug. The
+vendored state machine had collapsed remote reset, clean END_STREAM, local
+reset and forgotten streams into outcomes that were too similar; it also
+could suppress a more specific protocol/flow-control reset after an implicit
+local reset. That produced wrong stream-versus-connection error scope, lost
+remote reset causes, accepted pseudo-fields in trailers, treated a skipped
+lower stream as a closed one, and let a static-only rejection response race a
+terminal Content-Length mismatch.
+
+The systematic repair has three layers. First, SETTINGS synchronization and
+peer HEADERS/DATA admission consume explicit verified transition tables.
+Second, the vendored stream store retains a bounded exact terminal-cause FIFO
+and can emit a cause-preserving repeat reset after discarding queued
+application output. Third, the adapter owns one lifecycle ledger for stream
+identity, phase, active capacity and delayed-reset capacity; every transition
+is atomic and connection close is proved to zero the ledger. Static-only
+requests drain through the bounded body state before a 400/405 is committed,
+while authorization denials remain immediate so rejected uploads cannot
+occupy the slow-input pool.
+
+The zero-dynamic-table policy remains intact. h2spec 2.6.0 generic cases 5/14
+and 5/15 are excluded because they unconditionally send nonzero table-size
+updates despite the advertised zero limit; the standards-aware HPACK 6.3
+limit test remains enabled. Every other selected strict generic, HTTP/2 and
+HPACK section passes. Each section uses a fresh server because h2spec
+deliberately leaves faulted connections for endpoint reap time, and combining
+unrelated sections on one source would test the production connection reserve
+rather than the protocol assertion. The stateful lifecycle fuzzer exercises
+arbitrary begin/finish/reset/reclaim/close sequences and checks exact ledger
+consistency after every event.
+
 ## Regression surface
 
 The closure is exercised by:

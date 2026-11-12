@@ -5,26 +5,14 @@ use std::task::{Context, Poll};
 
 #[derive(Debug)]
 pub(crate) struct Settings {
-    /// Our local SETTINGS sync state with the remote.
-    local: Local,
+    /// The sole SETTINGS exchange phase. Payloads are retained separately
+    /// while this verified state says they are queued or awaiting an ACK.
+    sync: vapache_verified::H2SettingsSync,
+    local: Option<frame::Settings>,
     /// Received SETTINGS frame pending processing. The ACK must be written to
     /// the socket first then the settings applied **before** receiving any
     /// further frames.
     remote: Option<frame::Settings>,
-    /// Whether the connection has received the initial SETTINGS frame from the
-    /// remote peer.
-    has_received_remote_initial_settings: bool,
-}
-
-#[derive(Debug)]
-enum Local {
-    /// We want to send these SETTINGS to the remote when the socket is ready.
-    ToSend(frame::Settings),
-    /// We have sent these SETTINGS and are waiting for the remote to ACK
-    /// before we apply them.
-    WaitingAck(frame::Settings),
-    /// Our local settings are in sync with the remote.
-    Synced,
 }
 
 impl Settings {
@@ -32,9 +20,13 @@ impl Settings {
         Settings {
             // We assume the initial local SETTINGS were flushed during
             // the handshake process.
-            local: Local::WaitingAck(local),
+            sync: vapache_verified::H2SettingsSync {
+                local: vapache_verified::H2LocalSettingsPhase::WaitingAck,
+                remote_pending: false,
+                remote_initial_seen: false,
+            },
+            local: Some(local),
             remote: None,
-            has_received_remote_initial_settings: false,
         }
     }
 
@@ -51,8 +43,12 @@ impl Settings {
         P: Peer,
     {
         if frame.is_ack() {
-            match &self.local {
-                Local::WaitingAck(local) => {
+            match self.sync.local {
+                vapache_verified::H2LocalSettingsPhase::WaitingAck => {
+                    let local = self
+                        .local
+                        .as_ref()
+                        .expect("SETTINGS WaitingAck phase lost its payload");
                     tracing::debug!("received settings ACK; applying {:?}", local);
 
                     if let Some(max) = local.max_frame_size() {
@@ -68,10 +64,16 @@ impl Settings {
                     }
 
                     streams.apply_local_settings(local)?;
-                    self.local = Local::Synced;
+                    self.sync = vapache_verified::h2_settings_sync_step(
+                        self.sync,
+                        vapache_verified::H2SettingsSyncEvent::ReceiveAck,
+                    )
+                    .expect("WaitingAck must accept its sole ACK");
+                    self.local = None;
                     Ok(())
                 }
-                Local::ToSend(..) | Local::Synced => {
+                vapache_verified::H2LocalSettingsPhase::ToSend
+                | vapache_verified::H2LocalSettingsPhase::Synced => {
                     // We haven't sent any SETTINGS frames to be ACKed, so
                     // this is very bizarre! Remote is either buggy or malicious.
                     proto_err!(conn: "received unexpected settings ack");
@@ -79,9 +81,15 @@ impl Settings {
                 }
             }
         } else {
-            // We always ACK before reading more frames, so `remote` should
-            // always be none!
-            assert!(self.remote.is_none());
+            let Some(next) = vapache_verified::h2_settings_sync_step(
+                self.sync,
+                vapache_verified::H2SettingsSyncEvent::ReceiveRemote,
+            ) else {
+                proto_err!(conn: "received SETTINGS before the previous frame was applied");
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            };
+            debug_assert!(self.remote.is_none());
+            self.sync = next;
             self.remote = Some(frame);
             Ok(())
         }
@@ -89,23 +97,22 @@ impl Settings {
 
     pub(crate) fn send_settings(&mut self, frame: frame::Settings) -> Result<(), UserError> {
         assert!(!frame.is_ack());
-        match &self.local {
-            Local::ToSend(..) | Local::WaitingAck(..) => Err(UserError::SendSettingsWhilePending),
-            Local::Synced => {
+        match self.sync.local {
+            vapache_verified::H2LocalSettingsPhase::ToSend
+            | vapache_verified::H2LocalSettingsPhase::WaitingAck => {
+                Err(UserError::SendSettingsWhilePending)
+            }
+            vapache_verified::H2LocalSettingsPhase::Synced => {
                 tracing::trace!("queue to send local settings: {:?}", frame);
-                self.local = Local::ToSend(frame);
+                self.sync = vapache_verified::h2_settings_sync_step(
+                    self.sync,
+                    vapache_verified::H2SettingsSyncEvent::QueueLocal,
+                )
+                .expect("Synced SETTINGS phase must permit one queued update");
+                self.local = Some(frame);
                 Ok(())
             }
         }
-    }
-
-    /// Sets `true` to `self.has_received_remote_initial_settings`.
-    /// Returns `true` if this method is called for the first time.
-    /// (i.e. it is the initial SETTINGS frame from the remote peer)
-    fn mark_remote_initial_settings_as_received(&mut self) -> bool {
-        let has_received = self.has_received_remote_initial_settings;
-        self.has_received_remote_initial_settings = true;
-        !has_received
     }
 
     pub(crate) fn poll_send<T, B, C, P>(
@@ -133,7 +140,7 @@ impl Settings {
 
             tracing::trace!("ACK sent; applying settings");
 
-            let is_initial = self.mark_remote_initial_settings_as_received();
+            let is_initial = !self.sync.remote_initial_seen;
             streams.apply_remote_settings(&settings, is_initial)?;
 
             if let Some(val) = settings.header_table_size() {
@@ -143,24 +150,42 @@ impl Settings {
             if let Some(val) = settings.max_frame_size() {
                 dst.set_max_send_frame_size(val as usize);
             }
+            self.sync = vapache_verified::h2_settings_sync_step(
+                self.sync,
+                vapache_verified::H2SettingsSyncEvent::ApplyRemote,
+            )
+            .expect("a retained remote SETTINGS payload must be pending");
         }
 
         self.remote = None;
 
-        match &self.local {
-            Local::ToSend(settings) => {
+        match self.sync.local {
+            vapache_verified::H2LocalSettingsPhase::ToSend => {
                 if !dst.poll_ready(cx)?.is_ready() {
                     return Poll::Pending;
                 }
 
                 // Buffer the settings frame
+                let settings = self
+                    .local
+                    .as_ref()
+                    .expect("SETTINGS ToSend phase lost its payload");
                 dst.buffer(settings.clone().into())
                     .expect("invalid settings frame");
                 tracing::trace!("local settings sent; waiting for ack: {:?}", settings);
 
-                self.local = Local::WaitingAck(settings.clone());
+                self.sync = vapache_verified::h2_settings_sync_step(
+                    self.sync,
+                    vapache_verified::H2SettingsSyncEvent::LocalSent,
+                )
+                .expect("ToSend SETTINGS phase must wait for its ACK");
             }
-            Local::WaitingAck(..) | Local::Synced => {}
+            vapache_verified::H2LocalSettingsPhase::WaitingAck => {
+                debug_assert!(self.local.is_some());
+            }
+            vapache_verified::H2LocalSettingsPhase::Synced => {
+                debug_assert!(self.local.is_none());
+            }
         }
 
         Poll::Ready(Ok(()))

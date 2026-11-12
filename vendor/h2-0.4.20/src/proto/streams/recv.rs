@@ -419,6 +419,14 @@ impl Recv {
         frame: frame::Headers,
         stream: &mut store::Ptr,
     ) -> Result<(), Error> {
+        // RFC 9113 §8.1.2.1 permits pseudo-header fields only in the initial
+        // header block. Do not discard the separately decoded pseudo fields
+        // when projecting a trailer block into its ordinary field map.
+        if frame.pseudo() != &frame::Pseudo::default() {
+            proto_err!(stream: "recv_trailers: pseudo-header in trailers; stream={:?};", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+        }
+
         // Transition the state
         stream.state.recv_close()?;
 

@@ -1,4 +1,7 @@
 use super::*;
+use std::collections::VecDeque;
+
+const MAX_FORGOTTEN_STREAMS: usize = 1024;
 
 #[derive(Debug)]
 struct Budget {
@@ -86,6 +89,14 @@ pub(super) struct Counts {
     /// Number of empty, non-final DATA frames received over the lifetime of
     /// the connection.
     num_recv_empty_data_frames: usize,
+
+    /// Exact causes for recently released streams. Stream identifiers are
+    /// monotone and never reusable, so a bounded FIFO is sufficient to
+    /// distinguish a genuinely closed stream from a skipped lower ID. Without
+    /// this, both cases collapse into `id < next_id` even though RFC 9113
+    /// requires STREAM_CLOSED for the former and PROTOCOL_ERROR for the latter.
+    forgotten: VecDeque<(StreamId, vapache_verified::H2PeerStreamPhase)>,
+    max_forgotten: usize,
 }
 
 impl Counts {
@@ -106,7 +117,37 @@ impl Counts {
             data_frame_budget: Budget::new(config.data_frame_budget.resolve(None)),
             data_frame_budget_is_auto: config.data_frame_budget.is_auto(),
             num_recv_empty_data_frames: 0,
+            forgotten: VecDeque::new(),
+            max_forgotten: config
+                .local_reset_max
+                .max(config.remote_reset_max)
+                .max(1)
+                .min(MAX_FORGOTTEN_STREAMS),
         }
+    }
+
+    pub fn forgotten_phase(
+        &self,
+        id: StreamId,
+    ) -> Option<vapache_verified::H2PeerStreamPhase> {
+        self.forgotten
+            .iter()
+            .rev()
+            .find_map(|(forgotten, phase)| (*forgotten == id).then_some(*phase))
+    }
+
+    fn remember_released(&mut self, stream: &Stream) {
+        let phase = stream.state.peer_recv_phase();
+        debug_assert!(matches!(
+            phase,
+            vapache_verified::H2PeerStreamPhase::ClosedRemoteReset
+                | vapache_verified::H2PeerStreamPhase::ClosedEndStream
+                | vapache_verified::H2PeerStreamPhase::ClosedLocalReset
+        ));
+        if self.forgotten.len() == self.max_forgotten {
+            self.forgotten.pop_front();
+        }
+        self.forgotten.push_back((stream.id, phase));
     }
 
     pub fn set_target_connection_window_size(&mut self, size: WindowSize) {
@@ -325,6 +366,7 @@ impl Counts {
 
         // Release the stream if it requires releasing
         if stream.is_released() {
+            self.remember_released(&stream);
             stream.remove();
         }
     }

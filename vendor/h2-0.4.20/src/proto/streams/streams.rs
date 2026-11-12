@@ -489,21 +489,44 @@ impl Inner {
         let key = match self.store.find_entry(id) {
             Entry::Occupied(e) => e.key(),
             Entry::Vacant(e) => {
-                // Client: it's possible to send a request, and then send
-                // a RST_STREAM while the response HEADERS were in transit.
-                //
-                // Server: we can't reset a stream before having received
-                // the request headers, so don't allow.
-                if !peer.is_server() {
-                    // This may be response headers for a stream we've already
-                    // forgotten about...
-                    if self.actions.may_have_forgotten_stream(peer, id) {
-                        tracing::debug!(
-                            "recv_headers for old stream={:?}, sending STREAM_CLOSED",
-                            id,
-                        );
-                        return Err(Error::library_reset(id, Reason::STREAM_CLOSED));
-                    }
+                if let Some(phase) = self.counts.forgotten_phase(id) {
+                    let malformed = !frame.is_end_stream()
+                        || frame.pseudo() != &frame::Pseudo::default();
+                    let kind = if phase == vapache_verified::H2PeerStreamPhase::ClosedLocalReset
+                        && malformed
+                    {
+                        vapache_verified::H2PeerFrame::MalformedHeaders
+                    } else {
+                        vapache_verified::H2PeerFrame::Headers
+                    };
+                    return match vapache_verified::h2_peer_frame_decision(phase, kind) {
+                        vapache_verified::H2PeerFrameDecision::Ignore => {
+                            Ok(RecvOutcome::Processed)
+                        }
+                        vapache_verified::H2PeerFrameDecision::StreamClosed => {
+                            Err(Error::library_reset(id, Reason::STREAM_CLOSED))
+                        }
+                        vapache_verified::H2PeerFrameDecision::StreamProtocolError => {
+                            Err(Error::library_reset(id, Reason::PROTOCOL_ERROR))
+                        }
+                        vapache_verified::H2PeerFrameDecision::ConnectionProtocolError => {
+                            Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
+                        }
+                        vapache_verified::H2PeerFrameDecision::ConnectionStreamClosed => {
+                            Err(Error::library_go_away(Reason::STREAM_CLOSED))
+                        }
+                        vapache_verified::H2PeerFrameDecision::Process => {
+                            Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
+                        }
+                    };
+                }
+
+                // A client might have forgotten a locally-created request
+                // older than the exact bounded tombstone window. Server-side
+                // lower IDs are not granted that ambiguity: an ID that was
+                // skipped is a connection-level PROTOCOL_ERROR.
+                if !peer.is_server() && self.actions.may_have_forgotten_stream(peer, id) {
+                    return Err(Error::library_reset(id, Reason::STREAM_CLOSED));
                 }
 
                 match self
@@ -532,12 +555,55 @@ impl Inner {
             return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
         }
 
-        if stream.state.is_local_error() {
-            // Locally reset streams must ignore frames "for some time".
-            // This is because the remote may have sent trailers before
-            // receiving the RST_STREAM frame.
-            tracing::trace!("recv_headers; ignoring trailers on {:?}", stream.id);
-            return Ok(RecvOutcome::Processed);
+        let header_kind = if stream.state.is_local_error()
+            && (!frame.is_end_stream() || frame.pseudo() != &frame::Pseudo::default())
+        {
+            vapache_verified::H2PeerFrame::MalformedHeaders
+        } else {
+            vapache_verified::H2PeerFrame::Headers
+        };
+        match vapache_verified::h2_peer_frame_decision(
+            stream.state.peer_recv_phase(),
+            header_kind,
+        ) {
+            vapache_verified::H2PeerFrameDecision::Process => {}
+            vapache_verified::H2PeerFrameDecision::Ignore => {
+                return Ok(RecvOutcome::Processed);
+            }
+            vapache_verified::H2PeerFrameDecision::StreamClosed => {
+                let actions = &mut self.actions;
+                let mut buffer = send_buffer.inner.lock().unwrap();
+                self.counts.transition(stream, |counts, stream| {
+                    actions.send.send_repeat_reset(
+                        &mut *buffer,
+                        stream,
+                        Reason::STREAM_CLOSED,
+                        counts,
+                        &mut actions.task,
+                    );
+                });
+                return Ok(RecvOutcome::Processed);
+            }
+            vapache_verified::H2PeerFrameDecision::StreamProtocolError => {
+                let actions = &mut self.actions;
+                let mut buffer = send_buffer.inner.lock().unwrap();
+                self.counts.transition(stream, |counts, stream| {
+                    actions.send.send_repeat_reset(
+                        &mut *buffer,
+                        stream,
+                        Reason::PROTOCOL_ERROR,
+                        counts,
+                        &mut actions.task,
+                    );
+                });
+                return Ok(RecvOutcome::Processed);
+            }
+            vapache_verified::H2PeerFrameDecision::ConnectionProtocolError => {
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            }
+            vapache_verified::H2PeerFrameDecision::ConnectionStreamClosed => {
+                return Err(Error::library_go_away(Reason::STREAM_CLOSED));
+            }
         }
 
         let actions = &mut self.actions;
@@ -628,16 +694,33 @@ impl Inner {
                     return Ok(());
                 }
 
-                if self.actions.may_have_forgotten_stream(peer, id) {
-                    tracing::debug!("recv_data for old stream={:?}, sending STREAM_CLOSED", id,);
-
+                if let Some(phase) = self.counts.forgotten_phase(id) {
                     let sz = frame.flow_controlled_len();
-                    // This should have been enforced at the codec::FramedRead layer, so
-                    // this is just a sanity check.
                     assert!(sz <= super::MAX_WINDOW_SIZE as usize);
-                    let sz = sz as WindowSize;
-                    self.actions.recv.ignore_data(sz)?;
+                    self.actions.recv.ignore_data(sz as WindowSize)?;
+                    return match vapache_verified::h2_peer_frame_decision(
+                        phase,
+                        vapache_verified::H2PeerFrame::Data,
+                    ) {
+                        vapache_verified::H2PeerFrameDecision::Ignore => Ok(()),
+                        vapache_verified::H2PeerFrameDecision::StreamClosed => {
+                            Err(Error::library_reset(id, Reason::STREAM_CLOSED))
+                        }
+                        vapache_verified::H2PeerFrameDecision::ConnectionStreamClosed => {
+                            Err(Error::library_go_away(Reason::STREAM_CLOSED))
+                        }
+                        vapache_verified::H2PeerFrameDecision::ConnectionProtocolError
+                        | vapache_verified::H2PeerFrameDecision::StreamProtocolError
+                        | vapache_verified::H2PeerFrameDecision::Process => {
+                            Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
+                        }
+                    };
+                }
 
+                if !peer.is_server() && self.actions.may_have_forgotten_stream(peer, id) {
+                    let sz = frame.flow_controlled_len();
+                    assert!(sz <= super::MAX_WINDOW_SIZE as usize);
+                    self.actions.recv.ignore_data(sz as WindowSize)?;
                     return Err(Error::library_reset(id, Reason::STREAM_CLOSED));
                 }
 
@@ -645,6 +728,44 @@ impl Inner {
                 return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
             }
         };
+
+        match vapache_verified::h2_peer_frame_decision(
+            stream.state.peer_recv_phase(),
+            vapache_verified::H2PeerFrame::Data,
+        ) {
+            vapache_verified::H2PeerFrameDecision::Process => {}
+            vapache_verified::H2PeerFrameDecision::Ignore => {
+                let sz = frame.flow_controlled_len();
+                assert!(sz <= super::MAX_WINDOW_SIZE as usize);
+                return self.actions.recv.ignore_data(sz as WindowSize);
+            }
+            vapache_verified::H2PeerFrameDecision::StreamClosed => {
+                let sz = frame.flow_controlled_len();
+                assert!(sz <= super::MAX_WINDOW_SIZE as usize);
+                self.actions.recv.ignore_data(sz as WindowSize)?;
+                let actions = &mut self.actions;
+                let mut buffer = send_buffer.inner.lock().unwrap();
+                self.counts.transition(stream, |counts, stream| {
+                    actions.send.send_repeat_reset(
+                        &mut *buffer,
+                        stream,
+                        Reason::STREAM_CLOSED,
+                        counts,
+                        &mut actions.task,
+                    );
+                });
+                return Ok(());
+            }
+            vapache_verified::H2PeerFrameDecision::StreamProtocolError => {
+                return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
+            }
+            vapache_verified::H2PeerFrameDecision::ConnectionProtocolError => {
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            }
+            vapache_verified::H2PeerFrameDecision::ConnectionStreamClosed => {
+                return Err(Error::library_go_away(Reason::STREAM_CLOSED));
+            }
+        }
 
         let actions = &mut self.actions;
 
@@ -1803,9 +1924,22 @@ impl Actions {
             if counts.can_inc_num_local_error_resets() {
                 counts.inc_num_local_error_resets();
 
-                // Reset the stream.
-                self.send
-                    .send_reset(reason, initiator, buffer, stream, counts, &mut self.task);
+                // A more specific error discovered after an implicit/local
+                // reset still has to reach the peer. The ordinary send path
+                // suppresses double resets, so terminal streams use the
+                // cause-preserving repeat path.
+                if stream.state.is_reset() {
+                    self.send.send_repeat_reset(
+                        buffer,
+                        stream,
+                        reason,
+                        counts,
+                        &mut self.task,
+                    );
+                } else {
+                    self.send
+                        .send_reset(reason, initiator, buffer, stream, counts, &mut self.task);
+                }
                 self.recv.enqueue_reset_expiration(stream, counts);
                 // if a RecvStream is parked, ensure it's notified
                 stream.notify_recv();

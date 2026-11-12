@@ -48,51 +48,167 @@ enum H2TaskEvent {
     Ended { stream_id: u64, reset: bool },
 }
 
-/// Adapter-side stream identity ledger.  This is the runtime projection of
-/// the verified idempotent purge set: a stream may be ended and scheduled for
-/// reset cleanup at most once, even if the same early-RST/completion path is
-/// observed more than once.
-#[derive(Default)]
-struct H2StreamIds {
-    active: Vec<u64>,
-    pending_resets: Vec<u64>,
+#[derive(Clone, Copy)]
+struct H2StreamRecord {
+    id: u64,
+    phase: vapache_verified::H2StreamPhase,
 }
 
-impl H2StreamIds {
+/// One adapter-side lifecycle ledger owns stream identity, phase and aggregate
+/// capacity. Transitions are computed completely before mutation, so a failed
+/// phase or budget transition cannot update only half of the accounting state.
+struct H2ConnectionLedger {
+    budget: vapache_verified::H2Budget,
+    streams: Vec<H2StreamRecord>,
+}
+
+impl H2ConnectionLedger {
+    fn new(max_active: u64, max_pending_resets: u64) -> Self {
+        Self {
+            budget: vapache_verified::h2_budget_new(max_active, max_pending_resets),
+            streams: Vec::new(),
+        }
+    }
+
+    fn active(&self) -> u64 {
+        self.budget.active
+    }
+
+    fn pending_resets(&self) -> u64 {
+        self.budget.pending_resets
+    }
+
+    #[cfg(any(test, feature = "fuzzing"))]
+    fn is_consistent(&self) -> bool {
+        let active = self
+            .streams
+            .iter()
+            .filter(|stream| stream.phase == vapache_verified::H2StreamPhase::Active)
+            .count() as u64;
+        let pending = self
+            .streams
+            .iter()
+            .filter(|stream| stream.phase == vapache_verified::H2StreamPhase::AwaitingReset)
+            .count() as u64;
+        let unique = self.streams.iter().enumerate().all(|(index, stream)| {
+            self.streams[index + 1..]
+                .iter()
+                .all(|other| stream.id != other.id)
+        });
+        unique
+            && active == self.active()
+            && pending == self.pending_resets()
+            && self.active() <= self.budget.max_active
+            && self.pending_resets() <= self.budget.max_pending_resets
+            && active.saturating_add(pending) == self.streams.len() as u64
+    }
+
     fn begin(&mut self, stream_id: u64) -> bool {
-        if !vapache_verified::h2_stream_admit(&self.active, &self.pending_resets, stream_id) {
-            false
-        } else {
-            self.active.push(stream_id);
-            true
+        if self.streams.iter().any(|stream| stream.id == stream_id) {
+            return false;
         }
+        let Some(phase) = vapache_verified::h2_stream_phase_step(
+            vapache_verified::H2StreamPhase::Idle,
+            vapache_verified::H2StreamEvent::Begin,
+        ) else {
+            return false;
+        };
+        let Some(budget) =
+            vapache_verified::h2_budget_step(self.budget, vapache_verified::H2BudgetEvent::Begin)
+        else {
+            return false;
+        };
+        self.budget = budget;
+        self.streams.push(H2StreamRecord {
+            id: stream_id,
+            phase,
+        });
+        true
     }
 
-    fn end(&mut self, stream_id: u64) -> bool {
-        if let Some(i) = self.active.iter().position(|id| *id == stream_id) {
-            self.active.swap_remove(i);
-            true
+    fn end(&mut self, stream_id: u64, reset: bool) -> bool {
+        let Some(index) = self
+            .streams
+            .iter()
+            .position(|stream| stream.id == stream_id)
+        else {
+            return false;
+        };
+        let event = if reset {
+            vapache_verified::H2StreamEvent::Reset
         } else {
-            false
-        }
-    }
-
-    fn schedule_purge(&mut self, stream_id: u64) -> bool {
-        if vapache_verified::h2_purge_contains_exec(&self.pending_resets, stream_id) {
-            false
+            vapache_verified::H2StreamEvent::Finish
+        };
+        let Some(phase) = vapache_verified::h2_stream_phase_step(self.streams[index].phase, event)
+        else {
+            return false;
+        };
+        let Some(finished) =
+            vapache_verified::h2_budget_step(self.budget, vapache_verified::H2BudgetEvent::Finish)
+        else {
+            return false;
+        };
+        let budget = if reset {
+            let Some(reset_budget) =
+                vapache_verified::h2_budget_step(finished, vapache_verified::H2BudgetEvent::Reset)
+            else {
+                return false;
+            };
+            reset_budget
         } else {
-            self.pending_resets.push(stream_id);
-            true
+            finished
+        };
+        self.budget = budget;
+        self.streams[index].phase = phase;
+        if !reset {
+            self.streams.swap_remove(index);
         }
+        true
     }
 
     fn reclaim(&mut self, stream_id: u64) -> bool {
-        if let Some(i) = self.pending_resets.iter().position(|id| *id == stream_id) {
-            self.pending_resets.swap_remove(i);
-            true
-        } else {
-            false
+        let Some(index) = self
+            .streams
+            .iter()
+            .position(|stream| stream.id == stream_id)
+        else {
+            return false;
+        };
+        let Some(phase) = vapache_verified::h2_stream_phase_step(
+            self.streams[index].phase,
+            vapache_verified::H2StreamEvent::Reclaim,
+        ) else {
+            return false;
+        };
+        let Some(budget) =
+            vapache_verified::h2_budget_step(self.budget, vapache_verified::H2BudgetEvent::Reclaim)
+        else {
+            return false;
+        };
+        debug_assert_eq!(phase, vapache_verified::H2StreamPhase::Closed);
+        self.budget = budget;
+        self.streams.swap_remove(index);
+        true
+    }
+
+    fn close(&mut self) -> bool {
+        if self.streams.iter().any(|stream| {
+            vapache_verified::h2_stream_phase_step(
+                stream.phase,
+                vapache_verified::H2StreamEvent::ConnectionClose,
+            ) != Some(vapache_verified::H2StreamPhase::Closed)
+        }) {
+            return false;
         }
+        let Some(budget) = vapache_verified::h2_budget_step(
+            self.budget,
+            vapache_verified::H2BudgetEvent::ConnectionClose,
+        ) else {
+            return false;
+        };
+        self.budget = budget;
+        self.streams.clear();
+        self.active() == 0 && self.pending_resets() == 0
     }
 }
 
@@ -1511,25 +1627,6 @@ async fn handle_stream(
         .await
         .is_err();
     }
-    if has_body && !cfg.body_handlers_possible() {
-        let status = if matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS") {
-            400
-        } else {
-            405
-        };
-        return send_response_with_admission(
-            respond,
-            &cfg,
-            bad(
-                status,
-                "request body is not accepted by a static-only configuration",
-            ),
-            req.is_head(),
-            &mut output_admission,
-        )
-        .await
-        .is_err();
-    }
     if has_body {
         // HTTP/2 owns the wire framing, but the shared policy/cache pipeline
         // still needs an explicit marker that DATA is pending. In particular,
@@ -1547,7 +1644,26 @@ async fn handle_stream(
     let mut body_remote_user = None;
     let mut drain_after_body = None;
     let mut recv = Some(recv);
-    if has_body {
+    if has_body && !cfg.body_handlers_possible() {
+        let status = if matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+            400
+        } else {
+            405
+        };
+        phase = vapache_verified::request_phase_step(
+            phase,
+            vapache_verified::RequestPhaseEvent::RouteNeedsDrain,
+        )
+        .expect("HTTP/2 static-only body-drain phase transition");
+        drain_after_body = Some((
+            bad(
+                status,
+                "request body is not accepted by a static-only configuration",
+            ),
+            None,
+        ));
+    }
+    if has_body && drain_after_body.is_none() {
         // Route, rewrite and authorization complete before DATA is accepted.
         // This is the HTTP/2 projection of the same lazy-body transition used
         // by HTTP/1 (and, importantly, it happens before allocating a spool).
@@ -1608,8 +1724,9 @@ async fn handle_stream(
                 .expect("HTTP/2 early response phase transition");
                 early = Some(response);
                 early_remote_user = remote_user;
-                // Dropping the receive half discards already queued DATA and
-                // stops returning stream-level credit for further upload.
+                // A policy denial is terminal without interpreting a body.
+                // Dropping the receive half prevents an untrusted upload from
+                // converting that rejection into a slow-input occupation.
                 drop(recv.take());
             }
             Err(_) => {
@@ -1617,7 +1734,8 @@ async fn handle_stream(
                 return true;
             }
         }
-    } else {
+    }
+    if !has_body {
         // Bodyless dynamic requests use the same prepared-handler IR.  Route
         // and authorization run under stream admission, then the
         // potentially slow backend phase runs independently of that worker.
@@ -2075,42 +2193,6 @@ async fn handle_stream(
     false
 }
 
-/// Compose the two H2Budget transitions for a task completion.  A normal
-/// completion releases the active slot; a reset releases it and consumes one
-/// pending-reset slot.  `None` means the connection should fail closed.
-fn h2_task_end(
-    budget: vapache_verified::H2Budget,
-    reset: bool,
-) -> Option<vapache_verified::H2Budget> {
-    let active = vapache_verified::h2_stream_phase_step(
-        vapache_verified::H2StreamPhase::Idle,
-        vapache_verified::H2StreamEvent::Begin,
-    )?;
-    let ended = vapache_verified::h2_stream_phase_step(
-        active,
-        if reset {
-            vapache_verified::H2StreamEvent::Reset
-        } else {
-            vapache_verified::H2StreamEvent::Finish
-        },
-    )?;
-    debug_assert_eq!(
-        if reset {
-            vapache_verified::h2_stream_phase_step(ended, vapache_verified::H2StreamEvent::Reclaim)
-        } else {
-            Some(ended)
-        },
-        Some(vapache_verified::H2StreamPhase::Closed)
-    );
-    let finished =
-        vapache_verified::h2_budget_step(budget, vapache_verified::H2BudgetEvent::Finish)?;
-    if reset {
-        vapache_verified::h2_budget_step(finished, vapache_verified::H2BudgetEvent::Reset)
-    } else {
-        Some(finished)
-    }
-}
-
 /// Feed arbitrary wire bytes through the patched h2 state machine.  This is
 /// deliberately bounded: malformed inputs must terminate promptly rather
 /// than parking a fuzz worker on an incomplete connection.
@@ -2122,6 +2204,38 @@ pub fn fuzz_h2_frames(data: &[u8]) {
     h2::fuzz_bridge::fuzz_logic::fuzz_hpack(data);
 
     run_h2_fuzz_wire(data[..data.len().min(256 * 1024)].to_vec());
+}
+
+/// Exercise the exact adapter ledger independently of async scheduling. Every
+/// byte sequence is a sequence of valid or rejected lifecycle operations;
+/// rejected transitions must leave identity, phase, and capacity consistent.
+#[cfg(feature = "fuzzing")]
+fn fuzz_h2_lifecycle(data: &[u8]) {
+    let mut lifecycle = H2ConnectionLedger::new(8, 8);
+    for command in data.chunks(2).take(16 * 1024) {
+        let operation = command.first().copied().unwrap_or(0) % 5;
+        let stream_id = u64::from(command.get(1).copied().unwrap_or(0) % 16) * 2 + 1;
+        match operation {
+            0 => {
+                let _ = lifecycle.begin(stream_id);
+            }
+            1 => {
+                let _ = lifecycle.end(stream_id, false);
+            }
+            2 => {
+                let _ = lifecycle.end(stream_id, true);
+            }
+            3 => {
+                let _ = lifecycle.reclaim(stream_id);
+            }
+            _ => {
+                assert!(lifecycle.close());
+            }
+        }
+        assert!(lifecycle.is_consistent());
+    }
+    assert!(lifecycle.close());
+    assert!(lifecycle.is_consistent());
 }
 
 /// Encode one logical request through the real h2 client, decode it through
@@ -2349,6 +2463,7 @@ fn append_h2_fuzz_frame(wire: &mut Vec<u8>, kind: u8, flags: u8, stream_id: u32,
 #[cfg(feature = "fuzzing")]
 pub fn fuzz_h2_stateful(data: &[u8]) {
     h2::fuzz_bridge::fuzz_logic::fuzz_hpack(data);
+    fuzz_h2_lifecycle(data);
 
     let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
     append_h2_fuzz_frame(&mut wire, 4, 0, 0, &[]);
@@ -2621,16 +2736,15 @@ where
     let initial_request_deadline = tokio::time::sleep(preface_timeout);
     tokio::pin!(initial_request_deadline);
 
-    // The same verified budget is used for every accepted stream.  The h2
-    // crate still owns frame parsing and its own reset counters; this loop
+    // One ledger stores stream identity, phase, and aggregate capacity. The
+    // h2 crate still owns frame parsing and its own reset counters; this loop
     // projects the adapter's task lifecycle and observed reset errors into
-    // the H2Budget state machine.  Events are prioritized so a completed
+    // the verified transition system. Events are prioritized so a completed
     // task releases its slot before another request is accepted.
-    let mut budget = vapache_verified::h2_budget_new(
+    let mut lifecycle = H2ConnectionLedger::new(
         settings.max_concurrent_streams as u64,
         settings.max_reset_streams as u64,
     );
-    let mut stream_ids = H2StreamIds::default();
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let mut tasks = tokio::task::JoinSet::new();
     let mut reset_reclaims: BinaryHeap<Reverse<(Instant, u64)>> = BinaryHeap::new();
@@ -2667,31 +2781,21 @@ where
             Some(event) = events_rx.recv() => {
                 match event {
                     H2TaskEvent::Ended { stream_id, reset } => {
-                        // Idempotent cleanup: a duplicate early-reset or close
-                        // notification for the same stream is ignored instead
-                        // of decrementing the budget twice.
-                        if !stream_ids.end(stream_id) {
+                        // Identity, phase, and capacity move together or not
+                        // at all. A failure can also mean reset capacity was
+                        // exhausted, so fail closed instead of guessing.
+                        if !lifecycle.end(stream_id, reset) {
                             // One RAII guard owns the sole Ended event.
-                            logger.error("HTTP/2 duplicate stream completion ignored"); // coverage:ignore-line - guard uniqueness invariant
-                            continue; // coverage:ignore-line - guard uniqueness invariant
-                        }
-                        let Some(next) = h2_task_end(budget, reset) else {
-                            // Either the accounting state was lost, or the
-                            // reset budget is exhausted.  Do not let queued
-                            // reset wakeups grow without bound.
-                            // h2's stricter stream/reset settings and the
-                            // verified budget transition make this unreachable.
-                            // coverage:ignore-start - verified budget invariant
-                            logger.error("HTTP/2 stream/reset budget exhausted; closing connection");
+                            // coverage:ignore-start - guard/budget invariant
+                            logger.error("HTTP/2 invalid stream lifecycle transition; closing connection");
                             conn.abrupt_shutdown(h2::Reason::ENHANCE_YOUR_CALM);
                             break 'connection Ok(());
                             // coverage:ignore-stop
-                        };
-                        budget = next;
-                        if budget.active == 0 {
+                        }
+                        if lifecycle.active() == 0 {
                             idle_timer.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
                         }
-                        if reset && stream_ids.schedule_purge(stream_id) {
+                        if reset {
                             reset_reclaims.push(Reverse((Instant::now() + H2_RESET_RECLAIM, stream_id)));
                         }
                     }
@@ -2711,23 +2815,16 @@ where
                     let Reverse((_, stream_id)) = reset_reclaims
                         .pop()
                         .expect("peeked reset reclaim deadline");
-                    if !stream_ids.reclaim(stream_id) {
-                        continue;
-                    }
-                    if let Some(next) = vapache_verified::h2_budget_step(
-                        budget,
-                        vapache_verified::H2BudgetEvent::Reclaim,
-                    ) {
-                        budget = next;
-                    }
+                    // A stale timer cannot reclaim a second time.
+                    let _ = lifecycle.reclaim(stream_id);
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)), if draining && budget.active == 0 => {
+            _ = tokio::time::sleep(Duration::from_millis(50)), if draining && lifecycle.active() == 0 => {
                 // Give the state machine one scheduling turn to flush GOAWAY,
                 // then release an otherwise idle retired transport.
                 break 'connection Ok(());
             }
-            _ = &mut idle_timer, if budget.active == 0 => {
+            _ = &mut idle_timer, if lifecycle.active() == 0 => {
                 logger.error("HTTP/2 connection idle timeout");
                 conn.abrupt_shutdown(h2::Reason::NO_ERROR);
                 break 'connection Ok(());
@@ -2766,29 +2863,14 @@ where
                         Err(error) => break 'connection Err(error),
                     };
                 }
-                let Some(next) = vapache_verified::h2_budget_step(
-                    budget,
-                    vapache_verified::H2BudgetEvent::Begin,
-                ) else {
-                    // This should be unreachable while h2's own max-stream
-                    // setting is at least as strict; refuse rather than
-                    // spawning an untracked task if it ever is not.
-                    // The h2 builder rejects at the same (or lower) active
-                    // stream limit before accept can yield this request.
+                if !lifecycle.begin(stream_id) {
+                    // This is unreachable while h2's own stream/identity
+                    // admission is at least as strict. Never spawn a task
+                    // whose identity and capacity are not both recorded.
                     // coverage:ignore-start - upstream h2 admission invariant
-                    logger.error("HTTP/2 active-stream budget rejected a stream");
+                    logger.error("HTTP/2 lifecycle ledger rejected a stream");
                     respond.send_reset(h2::Reason::REFUSED_STREAM);
                     continue;
-                    // coverage:ignore-stop
-                };
-                budget = next;
-                if !stream_ids.begin(stream_id) {
-                    // h2 guarantees connection-unique monotonically assigned
-                    // stream identifiers for accepted requests.
-                    // coverage:ignore-start - upstream h2 identity invariant
-                    logger.error("HTTP/2 duplicate stream identifier; closing connection");
-                    conn.abrupt_shutdown(h2::Reason::PROTOCOL_ERROR);
-                    break 'connection Ok(());
                     // coverage:ignore-stop
                 }
                 let cfg = cfg.clone();
@@ -2831,15 +2913,18 @@ where
     // cannot detach request tasks. Aborting first drops each cancellation
     // guard; blocking backend clones observe the shared request scope and
     // retain their ordinary deadline as a final fail-safe.
-    debug_assert_eq!(
-        vapache_verified::h2_stream_phase_step(
-            vapache_verified::H2StreamPhase::Active,
-            vapache_verified::H2StreamEvent::ConnectionClose,
-        ),
-        Some(vapache_verified::H2StreamPhase::Closed)
-    );
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+    // Ended events produced while aborting are intentionally not replayed:
+    // connection teardown is the terminal transition for every remaining
+    // active or reset-pending stream and releases both counters.
+    let ledger_closed = lifecycle.close();
+    debug_assert!(ledger_closed);
+    if !ledger_closed {
+        // coverage:ignore-start - guarded by the verified lifecycle transitions
+        logger.error("HTTP/2 lifecycle ledger rejected connection close");
+        // coverage:ignore-stop
+    }
     drop(established_guard);
     outcome
 }
@@ -6039,21 +6124,20 @@ mod tests {
         assert_eq!(budget.active, 0);
 
         let budget = vapache_verified::h2_budget_step(
-            vapache_verified::h2_budget_new(1, 1),
+            vapache_verified::h2_budget_new(2, 2),
             vapache_verified::H2BudgetEvent::Begin,
         )
         .unwrap();
-        let budget = h2_task_end(budget, true).unwrap();
+        let budget =
+            vapache_verified::h2_budget_step(budget, vapache_verified::H2BudgetEvent::Reset)
+                .unwrap();
+        let budget = vapache_verified::h2_budget_step(
+            budget,
+            vapache_verified::H2BudgetEvent::ConnectionClose,
+        )
+        .unwrap();
         assert_eq!(budget.active, 0);
-        assert_eq!(budget.pending_resets, 1);
-        let budget =
-            vapache_verified::h2_budget_step(budget, vapache_verified::H2BudgetEvent::Reclaim)
-                .unwrap();
         assert_eq!(budget.pending_resets, 0);
-        let budget =
-            vapache_verified::h2_budget_step(budget, vapache_verified::H2BudgetEvent::Begin)
-                .unwrap();
-        assert!(h2_task_end(budget, false).is_some());
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         {
@@ -6120,16 +6204,86 @@ mod tests {
 
     #[test]
     fn h2_stream_cleanup_is_idempotent() {
-        let mut ids = H2StreamIds::default();
-        assert!(ids.begin(1));
-        assert!(!ids.begin(1));
-        assert!(ids.end(1));
-        assert!(!ids.end(1));
-        assert!(ids.schedule_purge(1));
-        assert!(!ids.schedule_purge(1));
-        assert!(ids.reclaim(1));
-        assert!(!ids.reclaim(1));
-        assert!(ids.begin(1));
+        let mut lifecycle = H2ConnectionLedger::new(2, 1);
+        assert!(lifecycle.begin(1));
+        assert!(lifecycle.is_consistent());
+        assert!(!lifecycle.begin(1));
+        assert_eq!(lifecycle.active(), 1);
+        assert!(lifecycle.end(1, true));
+        assert!(lifecycle.is_consistent());
+        assert!(!lifecycle.end(1, true));
+        assert_eq!(lifecycle.active(), 0);
+        assert_eq!(lifecycle.pending_resets(), 1);
+        assert!(lifecycle.reclaim(1));
+        assert!(lifecycle.is_consistent());
+        assert!(!lifecycle.reclaim(1));
+        assert_eq!(lifecycle.pending_resets(), 0);
+        assert!(lifecycle.begin(1));
+        assert!(lifecycle.end(1, false));
+        assert_eq!(lifecycle.active(), 0);
+        assert!(lifecycle.begin(3));
+        assert!(lifecycle.close());
+        assert!(lifecycle.is_consistent());
+        assert_eq!(lifecycle.active(), 0);
+        assert_eq!(lifecycle.pending_resets(), 0);
+        assert!(lifecycle.streams.is_empty());
+    }
+
+    #[test]
+    fn h2_settings_exchange_is_an_explicit_state_machine() {
+        use vapache_verified::{
+            H2LocalSettingsPhase as Local, H2SettingsSync, H2SettingsSyncEvent as Event,
+        };
+
+        let state = H2SettingsSync {
+            local: Local::WaitingAck,
+            remote_pending: false,
+            remote_initial_seen: false,
+        };
+        assert!(vapache_verified::h2_settings_sync_step(state, Event::QueueLocal).is_none());
+        let state = vapache_verified::h2_settings_sync_step(state, Event::ReceiveAck).unwrap();
+        assert_eq!(state.local, Local::Synced);
+        let state = vapache_verified::h2_settings_sync_step(state, Event::QueueLocal).unwrap();
+        assert_eq!(state.local, Local::ToSend);
+        let state = vapache_verified::h2_settings_sync_step(state, Event::LocalSent).unwrap();
+        assert_eq!(state.local, Local::WaitingAck);
+        let state = vapache_verified::h2_settings_sync_step(state, Event::ReceiveRemote).unwrap();
+        assert!(state.remote_pending);
+        assert!(vapache_verified::h2_settings_sync_step(state, Event::ReceiveRemote).is_none());
+        let state = vapache_verified::h2_settings_sync_step(state, Event::ApplyRemote).unwrap();
+        assert!(!state.remote_pending);
+        assert!(state.remote_initial_seen);
+    }
+
+    #[test]
+    fn h2_closed_stream_frames_use_one_classifier() {
+        use vapache_verified::{
+            H2PeerFrame as Frame, H2PeerFrameDecision as Decision, H2PeerStreamPhase as Phase,
+        };
+
+        assert_eq!(
+            vapache_verified::h2_peer_frame_decision(Phase::ClosedRemoteReset, Frame::Headers),
+            Decision::StreamClosed
+        );
+        assert_eq!(
+            vapache_verified::h2_peer_frame_decision(Phase::ClosedEndStream, Frame::Data),
+            Decision::ConnectionStreamClosed
+        );
+        assert_eq!(
+            vapache_verified::h2_peer_frame_decision(Phase::ClosedLocalReset, Frame::Headers),
+            Decision::Ignore
+        );
+        assert_eq!(
+            vapache_verified::h2_peer_frame_decision(
+                Phase::ClosedLocalReset,
+                Frame::MalformedHeaders,
+            ),
+            Decision::StreamProtocolError
+        );
+        assert_eq!(
+            vapache_verified::h2_peer_frame_decision(Phase::Idle, Frame::Data),
+            Decision::ConnectionProtocolError
+        );
     }
 
     #[test]

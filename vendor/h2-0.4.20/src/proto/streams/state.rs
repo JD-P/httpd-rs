@@ -90,6 +90,31 @@ enum Cause {
 }
 
 impl State {
+    /// Project the dependency's detailed send/receive state into the verified
+    /// peer-frame admission machine. This is the only mapping used before
+    /// HEADERS and DATA are dispatched, so closed streams cannot be mistaken
+    /// for ordinary trailer/body states by separate ad-hoc branches.
+    pub fn peer_recv_phase(&self) -> vapache_verified::H2PeerStreamPhase {
+        match &self.inner {
+            Idle => vapache_verified::H2PeerStreamPhase::Idle,
+            ReservedLocal | ReservedRemote | Open { .. } | HalfClosedLocal(..) => {
+                vapache_verified::H2PeerStreamPhase::Open
+            }
+            HalfClosedRemote(..) => vapache_verified::H2PeerStreamPhase::HalfClosedRemote,
+            Closed(Cause::EndStream) => vapache_verified::H2PeerStreamPhase::ClosedEndStream,
+            Closed(Cause::ScheduledLibraryReset(..)) => {
+                vapache_verified::H2PeerStreamPhase::ClosedLocalReset
+            }
+            Closed(Cause::Error(error) | Cause::ErrorAfterEndStream(error)) => {
+                if error.is_local() {
+                    vapache_verified::H2PeerStreamPhase::ClosedLocalReset
+                } else {
+                    vapache_verified::H2PeerStreamPhase::ClosedRemoteReset
+                }
+            }
+        }
+    }
+
     /// Opens the send-half of a stream if it is not already open.
     pub fn send_open(&mut self, eos: bool) -> Result<(), UserError> {
         let local = Streaming;
@@ -260,9 +285,6 @@ impl State {
     pub fn recv_reset(&mut self, frame: frame::Reset, queued: bool) {
         let recv_end_stream = self.is_recv_end_stream();
         match self.inner {
-            // If the stream is already in a `Closed` state, do nothing,
-            // provided that there are no frames still in the send queue.
-            Closed(..) if !queued => {}
             // A notionally `Closed` stream may still have queued frames in
             // the following cases:
             //
@@ -276,7 +298,11 @@ impl State {
             //
             // In either of these cases, we want to overwrite the stream's
             // previous state with the received RST_STREAM, so that the queue
-            // will be cleared by `Prioritize::pop_frame`.
+            // will be cleared by `Prioritize::pop_frame`. We also retain a
+            // newly received reset after an already-flushed local close: RFC
+            // 9113 gives later non-PRIORITY frames stream-local STREAM_CLOSED
+            // semantics specifically *after receiving* RST_STREAM, so losing
+            // this cause changes the required error scope.
             ref state => {
                 tracing::trace!(
                     "recv_reset; frame={:?}; state={:?}; queued={:?}",
