@@ -75,6 +75,57 @@ impl Drop for ConfigGenerationGuard {
 /// effectively unbounded thread/HTTP2-connection ceiling.
 pub const MAX_IMPLEMENTED_REQUEST_WORKERS: usize = 512;
 
+/// Configuration generations may discover access files at request time, but
+/// the set of file identities that can become executable policy must remain
+/// bounded. Main-configuration inputs are sealed before serving; this limit
+/// applies only to access files and administrative files named by them.
+const MAX_RUNTIME_ADMIN_INPUTS: usize = 16_384;
+
+#[derive(Debug, Clone, Default)]
+struct AdministrativeInputManifest {
+    paths: HashSet<PathBuf>,
+    inodes: HashSet<(u64, u64)>,
+}
+
+impl AdministrativeInputManifest {
+    fn absolute_path(path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    }
+
+    fn insert(&mut self, path: &Path, metadata: Option<&std::fs::Metadata>) {
+        // Retain both the configured spelling and its resolved spelling. The
+        // request path is already descriptor-resolved, so membership remains
+        // an in-memory operation on the hot path rather than another
+        // canonicalize/stat round trip for every ordinary response.
+        self.paths.insert(Self::absolute_path(path));
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            self.paths.insert(canonical);
+        }
+        if let Some(metadata) = metadata {
+            self.inodes.insert((metadata.dev(), metadata.ino()));
+        } else if let Ok(metadata) = std::fs::metadata(path) {
+            self.inodes.insert((metadata.dev(), metadata.ino()));
+        }
+    }
+
+    fn contains(&self, path: &Path, dev: Option<u64>, ino: Option<u64>) -> bool {
+        self.paths.contains(&Self::absolute_path(path))
+            || dev
+                .zip(ino)
+                .is_some_and(|identity| self.inodes.contains(&identity))
+    }
+
+    fn len(&self) -> usize {
+        self.paths.len().saturating_add(self.inodes.len())
+    }
+}
+
 // Certbot 4.x's Apache installer emits this Mozilla-derived TLS 1.2 policy.
 // Rustls offers the six ECDHE suites in this list and no DHE/anonymous suite,
 // so its fixed policy is a strict subset of the expression.
@@ -3459,6 +3510,18 @@ pub struct Config {
     /// Main-configuration password/group databases validated before serving.
     /// Access-file declarations are checked on every runtime read instead.
     auth_file_targets: Vec<PathBuf>,
+    /// Administrative inputs that are publication-sensitive but do not use
+    /// the root-owned parent-validation policy. RewriteMap program spellings
+    /// live here because execution is bound to a sealed descriptor snapshot;
+    /// their canonical trust path remains in `admin_input_targets`.
+    publication_input_targets: Vec<PathBuf>,
+    /// File identities that are inputs to this configuration generation and
+    /// therefore can never be published or executed as request content.
+    administrative_publication_manifest: AdministrativeInputManifest,
+    /// Access files and the administrative paths named by them are discovered
+    /// lazily. Keep that generation-local observation bounded and shared by
+    /// Config clones so every terminal sink sees the same non-publication set.
+    runtime_administrative_inputs: Arc<RwLock<AdministrativeInputManifest>>,
     policy_cache: Arc<RwLock<BoundedPolicyCache<CachedPolicy>>>,
     url_policy_cache: Arc<RwLock<BoundedPolicyCache<CachedUrlPolicy>>>,
     layered_policy_cache: Arc<RwLock<BoundedLayeredPolicyCache>>,
@@ -3466,6 +3529,64 @@ pub struct Config {
 }
 
 impl Config {
+    fn seal_administrative_publication_manifest(&mut self) {
+        let mut manifest = AdministrativeInputManifest::default();
+        for path in self
+            .admin_input_targets
+            .iter()
+            .chain(self.auth_file_targets.iter())
+            .chain(self.publication_input_targets.iter())
+        {
+            manifest.insert(path, None);
+        }
+        self.administrative_publication_manifest = manifest;
+    }
+
+    /// Register an access file or an administrative file named by one. This
+    /// happens only after the access-file pathname has been descriptor-opened,
+    /// so aliases and symlink-resolved content can be rejected by inode as
+    /// well as by configured spelling.
+    pub(crate) fn register_runtime_administrative_input(
+        &self,
+        path: &Path,
+        metadata: Option<&std::fs::Metadata>,
+    ) -> Result<(), String> {
+        let mut manifest = self
+            .runtime_administrative_inputs
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if manifest.len() >= MAX_RUNTIME_ADMIN_INPUTS
+            && !manifest.contains(
+                path,
+                metadata.map(MetadataExt::dev),
+                metadata.map(MetadataExt::ino),
+            )
+        {
+            return Err("runtime administrative-input manifest is full".into());
+        }
+        manifest.insert(path, metadata);
+        Ok(())
+    }
+
+    /// Terminal non-publication predicate for the exact resolved request
+    /// representation. It deliberately accepts both path and inode evidence:
+    /// the path reserves a configured name across replacement, while the inode
+    /// closes aliases, hard links and symlink-resolved spellings.
+    pub(crate) fn is_administrative_input(
+        &self,
+        path: &Path,
+        dev: Option<u64>,
+        ino: Option<u64>,
+    ) -> bool {
+        self.administrative_publication_manifest
+            .contains(path, dev, ino)
+            || self
+                .runtime_administrative_inputs
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains(path, dev, ino)
+    }
+
     pub(crate) fn body_handlers_possible(&self) -> bool {
         self.body_handlers_possible
     }
@@ -5666,6 +5787,11 @@ impl Compile {
             admin_file_trust,
             admin_input_targets,
             auth_file_targets: Vec::new(),
+            publication_input_targets: Vec::new(),
+            administrative_publication_manifest: AdministrativeInputManifest::default(),
+            runtime_administrative_inputs: Arc::new(RwLock::new(
+                AdministrativeInputManifest::default(),
+            )),
             policy_cache: Arc::new(RwLock::new(BoundedPolicyCache::default())),
             url_policy_cache: Arc::new(RwLock::new(BoundedPolicyCache::default())),
             layered_policy_cache: Arc::new(RwLock::new(BoundedLayeredPolicyCache::default())),
@@ -5986,6 +6112,7 @@ impl Compile {
                 self.cfg.admin_input_targets.push(path);
             }
         }
+        self.cfg.seal_administrative_publication_manifest();
         self.cfg.warnings = std::mem::take(&mut self.warnings);
         Ok(self.cfg)
     }
@@ -7227,6 +7354,16 @@ impl Compile {
                             {
                                 self.cfg.admin_input_targets.push(trusted.clone());
                             }
+                        }
+                        if !self
+                            .cfg
+                            .publication_input_targets
+                            .iter()
+                            .any(|known| known == &program.path)
+                        {
+                            self.cfg
+                                .publication_input_targets
+                                .push(program.path.clone());
                         }
                         scope
                             .rewrite_policy

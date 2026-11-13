@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "updated": "2026-11-12",
+  "updated": "2026-11-13",
   "verus": {
-    "verified_functions": 856,
+    "verified_functions": 858,
     "errors": 0
   },
   "obligations": [
@@ -504,6 +504,13 @@
       "evidence": "service_identity_admit is consumed before binding/startup and again by drop_privileges; its proofs reject uid/gid zero and require an already-unprivileged process to match both configured effective IDs. pid_control_admit is consumed after pidfd_open and proves that special/non-positive PIDs, UID changes or any recorded identity mismatch cannot reach pidfd_send_signal. Runtime binds the sidecar to boot ID, process start time and executable device/inode, validates root-owned PID artifacts and refreshes the recorded UID after setresuid. Root-owned administrative-input trust is captured before privilege drop and retained across reload; every discovered include/TLS/types/map/proxy-CA parent is checked against the service uid, including empty optional includes, and privileged RewriteMap programs require a root-controlled canonical source before sealing. Reload rejects changes to startup-only identity, pid, root, backlog and listener fields and prepares logs, TLS/OCSP and background generations before one commit point. configuration_generation_admit proves retired generations reject new work; runtime shares one retirement identity across listener loops for the same Config and linearizes H1/H2 admission under a read gate against commit's write gate. It retires only after candidate preparation, closes H1 keep-alive and WebSockets, sends H2 GOAWAY while draining admitted streams, and namespaces access-file IR plus proxy health/failure state until the last old Config drops. A pre-thread root TLS broker accepts only numeric IDs from an exact startup allowlist, closes inherited descriptors and standard streams, disables dumps/new privileges, installs tight rlimits plus a seccomp read-only syscall profile, enforces root-owned stable bounded reads and exits with its parent. Root-capable lifecycle tests cover same-path rotation and mutable replacement rejection; reload integration covers rejected-candidate continuity and successful old-connection retirement. Kernel pidfd/procfs identity semantics, daemon fork orchestration and filesystem ownership enforcement remain outside Verus and are covered by lifecycle/integration tests."
     },
     {
+      "id": "administrative_input_nonpublication",
+      "title": "Registered administrative inputs cannot enter local content sinks",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "administrative_input_sink_spec is the executable closed-world gate for the complete TransformSink enum. administrative_input_never_reaches_local_content_sink proves that an input classified as configuration, access policy, credentials, MIME data, rewrite data, TLS material or proxy trust cannot enter StaticFile, Directory, LocalCgi, FastCgi, Cache or DirectoryIndex. AuthorizedPlan retains the classification through target and inode binding and consumes the gate at the move-only outcome boundary. Config seals main/include/TLS/TypesConfig/RewriteMap/proxy-CA/auth paths before serving; access-file descriptor identities and AuthUserFile/AuthGroupFile paths parsed from them enter a bounded generation-local registry. Path plus device/inode matching closes aliases, symlinks and hard links. The P39 regression removes the shipped .ht* rule and root deny, then covers custom AccessFileName, direct/alias/symlink/hard-link publication, DirectoryIndex, local ErrorDocument, autoindex, cache planning, CGI/FastCGI execution attempts and a non-administrative dotfile control; the TLS protocol suite repeats the active-access-file denial over H1 and H2. Filesystem discovery and kernel path/inode semantics remain integration evidence rather than Verus assumptions about the sink theorem."
+    },
+    {
       "id": "dynamic_backend_identity",
       "title": "Dynamic backend endpoints remain bound to one configuration identity",
       "status": "mechanized",
@@ -676,6 +683,7 @@
     "Complete authentication-file cache snapshot reuse admission",
     "Monotonic request-owned authenticated-identity transition",
     "Fail-closed unavailable group-provider result under positive and negated rules",
-    "Move-only authorized plan/outcome identity from public and selected URLs through exact local/backend/cache/redirect/internal sink binding"
+    "Move-only authorized plan/outcome identity from public and selected URLs through exact local/backend/cache/redirect/internal sink binding",
+    "Registered administrative-input exclusion from every local content, execution, directory, index and cache sink"
   ]
 }

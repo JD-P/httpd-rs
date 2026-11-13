@@ -952,6 +952,10 @@ fn parse_cached(
     opened: OpenedAccessFile,
 ) -> Result<Arc<Parsed>, String> {
     let meta = &opened.meta;
+    // An effective access file is executable configuration, never request
+    // content. Register its descriptor identity before cache lookup or parse
+    // so malformed files and alternate aliases fail closed at terminal sinks.
+    cfg.register_runtime_administrative_input(path, Some(meta))?;
     let nonfatal_key = match nonfatal {
         NonfatalMode::None => 0,
         NonfatalMode::Override => 1,
@@ -1001,7 +1005,9 @@ fn parse_cached(
             .map(|(_, parsed)| Arc::clone(parsed))
         {
             drop(guard);
-            return validate_hit(parsed);
+            let parsed = validate_hit(parsed)?;
+            register_parsed_administrative_inputs(cfg, &parsed)?;
+            return Ok(parsed);
         }
     }
     let key = probe.to_owned();
@@ -1010,7 +1016,9 @@ fn parse_cached(
         if let Some(parsed) = guard.get(&key).cloned() {
             guard.last = Some((key.clone(), Arc::clone(&parsed)));
             drop(guard);
-            return validate_hit(parsed);
+            let parsed = validate_hit(parsed)?;
+            register_parsed_administrative_inputs(cfg, &parsed)?;
+            return Ok(parsed);
         }
     }
     // Parse outside the lock: a slow filesystem read must not serialize
@@ -1023,9 +1031,36 @@ fn parse_cached(
     let parsed = Arc::new(parse_access_bytes(
         cfg, path, &data, mode, allow_list, nonfatal, identity,
     )?);
+    register_parsed_administrative_inputs(cfg, &parsed)?;
     let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
     guard.insert(key, Arc::clone(&parsed));
     Ok(parsed)
+}
+
+fn register_scope_administrative_inputs(cfg: &Config, scope: &Scope) -> Result<(), String> {
+    for path in [
+        scope.authorization.auth_user_file.as_deref(),
+        scope.authorization.auth_group_file.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        cfg.register_runtime_administrative_input(path, None)?;
+    }
+    Ok(())
+}
+
+fn register_rule_administrative_inputs(cfg: &Config, rules: &[ScopeRule]) -> Result<(), String> {
+    for rule in rules {
+        register_scope_administrative_inputs(cfg, &rule.delta)?;
+        register_rule_administrative_inputs(cfg, &rule.nested)?;
+    }
+    Ok(())
+}
+
+fn register_parsed_administrative_inputs(cfg: &Config, parsed: &Parsed) -> Result<(), String> {
+    register_scope_administrative_inputs(cfg, &parsed.scope)?;
+    register_rule_administrative_inputs(cfg, &parsed.rules)
 }
 
 #[cfg(test)]

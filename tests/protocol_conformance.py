@@ -42,6 +42,7 @@ def start_tls_server(base, protocols="h2 http/1.1"):
     (base / "logs").mkdir()
     (base / "www").mkdir()
     (base / "www/index.html").write_text("httpd-rs protocol test\n")
+    (base / "www/.htaccess").write_text("# P39-H2-ACCESS-POLICY-SECRET\n")
     cert = base / "cert.pem"
     key = base / "key.pem"
     subprocess.run([
@@ -60,9 +61,10 @@ Group {SERVICE_GROUP}
 ServerName localhost
 TraceEnable Off
 Protocols {protocols}
+HttpdRsCapability AccessFiles On
 DocumentRoot "{base}/www"
 <Directory "{base}/www">
-    AllowOverride None
+    AllowOverride FileInfo
     Require all granted
 </Directory>
 <VirtualHost *:{port}>
@@ -132,6 +134,30 @@ def check_tls(port):
     print("protocol-conformance: TLS versions and ALPN pass")
 
 
+def check_administrative_input_parity(port):
+    for option, expected_version in (("--http1.1", "1.1"), ("--http2", "2")):
+        completed = subprocess.run(
+            [
+                "curl",
+                "--silent",
+                "--show-error",
+                "--insecure",
+                option,
+                "--write-out",
+                "\\nP39:%{http_code}:%{http_version}",
+                f"https://127.0.0.1:{port}/.htaccess",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        body, marker = completed.stdout.rsplit(b"\nP39:", 1)
+        status, version = marker.decode().split(":", 1)
+        assert status == "403", (option, status, body[:200])
+        assert version == expected_version, (option, version)
+        assert b"P39-H2-ACCESS-POLICY-SECRET" not in body
+    print("protocol-conformance: H1/H2 administrative-input parity pass")
+
+
 def check_alpn_policy():
     with tempfile.TemporaryDirectory(prefix="httpd-rs-http1-only-") as temporary:
         process, output, port = start_tls_server(temporary, "http/1.1")
@@ -183,6 +209,7 @@ def main():
             process, output, port = start_tls_server(temporary)
             try:
                 check_tls(port)
+                check_administrative_input_parity(port)
                 check_alpn_policy()
             finally:
                 stop_tls_server(process, output)

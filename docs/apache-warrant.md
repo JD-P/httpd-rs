@@ -84,9 +84,20 @@ Run:
 tests/apache_source_inventory.sh
 ```
 
-The script downloads the pinned archive, verifies its SHA-256 digest, extracts
-it into a temporary directory, reruns the extractor, and compares the result
-with the checked-in manifest.
+The same pinned run also validates
+`docs/apache-configuration-warrant.json`. That parallel ledger covers security
+controls supplied by upstream example configuration, Debian and Ubuntu
+defaults, the packaged systemd unit, and the real-application deployment
+fixtures. Every observed guard is classified as an intrinsic invariant, a
+generated baseline, an operator-owned application rule, or an irrelevant
+unsupported feature. Its `support_effect` is fixed to `observation-only`, so
+discovering an Apache or distribution guard cannot expand the compatibility
+surface.
+
+The script downloads the pinned upstream archives, verifies their SHA-256
+digests, fetches the exact Debian and Ubuntu configuration commits into the
+same temporary workspace, reruns both warrant validators, and compares the
+result with the checked-in manifests.
 
 To inspect a new Apache release or extractor result, run:
 

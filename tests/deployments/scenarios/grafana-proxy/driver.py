@@ -72,7 +72,8 @@ def read_frame(stream: socket.socket) -> tuple[int, bytes]:
 def open_websocket(port: int, path: str, *, authority_port: int | None = None) -> socket.socket:
     stream = socket.create_connection(("127.0.0.1", port), timeout=15)
     stream.settimeout(15)
-    key = base64.b64encode(b"httpd-rs-grafana!").decode()
+    # RFC 6455 requires a base64-encoded 16-byte nonce.
+    key = base64.b64encode(b"httpd-rs-grafana").decode()
     authority_port = authority_port or port
     request = (
         f"GET {path} HTTP/1.1\r\n"

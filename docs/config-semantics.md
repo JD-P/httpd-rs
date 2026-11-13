@@ -772,6 +772,21 @@ process is now unprivileged. Directives whose effects live in process identity,
 the pid guard, path base or kernel listeners require a full restart instead of
 creating a configuration/runtime split.
 
+The same manifest is also a terminal non-publication boundary. Main and
+included configuration, TLS and proxy trust material, `TypesConfig`, file-backed
+rewrite maps, and main-configuration authentication databases are sealed before
+serving. Effective access files and authentication databases named by them are
+added to a bounded generation-local registry when their descriptor snapshots
+are parsed. The registry retains both canonical path and device/inode identity,
+so a URL alias, symlink or hard link cannot turn policy or credentials into
+content. A registered administrative input cannot enter static-file,
+directory/autoindex, DirectoryIndex, CGI, FastCGI or cache sinks. Local
+ErrorDocument orchestration may begin from a denied input, but its selected
+target is reauthorized and subjected to the same gate. Ordinary dotfiles are
+not denied merely because of their name. Generated deployment configurations
+retain the root-filesystem deny as defense in depth; correctness does not rely
+on Apache's conventional `.ht*` filename rule.
+
 Reload itself uses a prepare/commit boundary. Listener-stop and generation
 retirement are separate states: a rejected candidate resumes the same live
 generation and does not invalidate its established connections. The candidate logger, listener

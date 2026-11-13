@@ -241,15 +241,37 @@ pub struct AuthorizedPlan {
     scope: Scope,
     grant: AccessGrant,
     resource: ResourceKey,
+    administrative_input: bool,
 }
 
 impl AuthorizedPlan {
     pub(crate) fn new(
+        cfg: &crate::config::Config,
+        identity: OutcomeIdentity,
+        scope: Scope,
+        grant: AccessGrant,
+        resource: ResourceKey,
+    ) -> Option<Self> {
+        let administrative_input = identity.resolved_fs_path().is_some_and(|path| {
+            cfg.is_administrative_input(path, resource.file_dev, resource.file_ino)
+        });
+        Self::new_with_administrative_input(
+            cfg.authorization_generation(),
+            identity,
+            scope,
+            grant,
+            resource,
+            administrative_input,
+        )
+    }
+
+    fn new_with_administrative_input(
         generation: crate::config::ConfigurationGeneration,
         identity: OutcomeIdentity,
         scope: Scope,
         grant: AccessGrant,
         resource: ResourceKey,
+        administrative_input: bool,
     ) -> Option<Self> {
         let filesystem_identity_well_formed =
             identity.lexical_fs_path.is_some() == identity.resolved_fs_path.is_some();
@@ -274,17 +296,40 @@ impl AuthorizedPlan {
             scope,
             grant,
             resource,
+            administrative_input,
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        generation: crate::config::ConfigurationGeneration,
+        identity: OutcomeIdentity,
+        scope: Scope,
+        grant: AccessGrant,
+        resource: ResourceKey,
+    ) -> Option<Self> {
+        Self::new_with_administrative_input(generation, identity, scope, grant, resource, false)
+    }
+
     pub(crate) fn direct(
+        cfg: &crate::config::Config,
+        scope: Scope,
+        grant: AccessGrant,
+        resource: ResourceKey,
+    ) -> Option<Self> {
+        let identity = OutcomeIdentity::direct(&resource.url_path, resource.fs_path.as_deref());
+        Self::new(cfg, identity, scope, grant, resource)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_for_test(
         generation: crate::config::ConfigurationGeneration,
         scope: Scope,
         grant: AccessGrant,
         resource: ResourceKey,
     ) -> Option<Self> {
         let identity = OutcomeIdentity::direct(&resource.url_path, resource.fs_path.as_deref());
-        Self::new(generation, identity, scope, grant, resource)
+        Self::new_for_test(generation, identity, scope, grant, resource)
     }
 
     pub fn identity(&self) -> &OutcomeIdentity {
@@ -303,16 +348,41 @@ impl AuthorizedPlan {
         &self.resource
     }
 
-    pub fn bind_file(self, meta: &std::fs::Metadata) -> Option<Self> {
+    pub(crate) fn is_administrative_input(&self) -> bool {
+        self.administrative_input
+    }
+
+    pub fn bind_file(self, cfg: &crate::config::Config, meta: &std::fs::Metadata) -> Option<Self> {
         let grant = self.grant.bind_file(&self.resource, meta)?;
         let resource = grant.key().clone();
-        Self::new(grant.generation, self.identity, self.scope, grant, resource)
+        Self::new(cfg, self.identity, self.scope, grant, resource)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_file_for_test(self, meta: &std::fs::Metadata) -> Option<Self> {
+        let grant = self.grant.bind_file(&self.resource, meta)?;
+        let resource = grant.key().clone();
+        Self::new_with_administrative_input(
+            grant.generation,
+            self.identity,
+            self.scope,
+            grant,
+            resource,
+            self.administrative_input,
+        )
     }
 
     pub fn bind_backend(self, backend_target: String) -> Option<Self> {
         let grant = self.grant.bind_backend(&self.resource, backend_target)?;
         let resource = grant.key().clone();
-        Self::new(grant.generation, self.identity, self.scope, grant, resource)
+        Self::new_with_administrative_input(
+            grant.generation,
+            self.identity,
+            self.scope,
+            grant,
+            resource,
+            self.administrative_input,
+        )
     }
 
     pub(crate) fn into_outcome(
@@ -327,7 +397,9 @@ impl AuthorizedPlan {
         if sink == httpd_rs_verified::TransformSink::Redirect {
             return None;
         }
-        if !self.grant.require_sink(generation, &self.resource, sink) {
+        if !httpd_rs_verified::administrative_input_sink_admit(self.administrative_input, sink)
+            || !self.grant.require_sink(generation, &self.resource, sink)
+        {
             return None;
         }
         Some(AuthorizedOutcome {
@@ -2431,16 +2503,21 @@ mod tests {
         let key = ResourceKey::request(None, &request, &path("/same"), None, None);
         let grant = grant_if_allowed(Access::Allowed, key.clone(), generation()).unwrap();
 
-        assert!(
-            AuthorizedPlan::direct(generation(), Scope::default(), grant, key.clone()).is_some()
-        );
+        assert!(AuthorizedPlan::direct_for_test(
+            generation(),
+            Scope::default(),
+            grant,
+            key.clone()
+        )
+        .is_some());
 
         let cache_key =
             ResourceKey::cache_policy(None, &request, "example.test", &path("/same"), [7; 32]);
         let cache_grant =
             grant_if_allowed(Access::Allowed, cache_key.clone(), generation()).unwrap();
         let cache_plan =
-            AuthorizedPlan::direct(generation(), Scope::default(), cache_grant, cache_key).unwrap();
+            AuthorizedPlan::direct_for_test(generation(), Scope::default(), cache_grant, cache_key)
+                .unwrap();
         assert!(cache_plan
             .into_outcome(
                 crate::config::ConfigurationGeneration::other_for_test(),
@@ -2449,7 +2526,7 @@ mod tests {
             .is_none());
 
         let stale = grant_if_allowed(Access::Allowed, key.clone(), generation()).unwrap();
-        assert!(AuthorizedPlan::direct(
+        assert!(AuthorizedPlan::direct_for_test(
             crate::config::ConfigurationGeneration::other_for_test(),
             Scope::default(),
             stale,
@@ -2641,7 +2718,7 @@ mod tests {
             generation(),
         )
         .unwrap();
-        assert!(AuthorizedPlan::new(
+        assert!(AuthorizedPlan::new_for_test(
             generation(),
             OutcomeIdentity::selected(
                 &path("/public"),
@@ -2666,7 +2743,7 @@ mod tests {
             generation(),
         )
         .unwrap();
-        assert!(AuthorizedPlan::new(
+        assert!(AuthorizedPlan::new_for_test(
             generation(),
             OutcomeIdentity::selected(
                 &path("/public"),
@@ -2691,7 +2768,7 @@ mod tests {
             generation(),
         )
         .unwrap();
-        let plan = AuthorizedPlan::new(
+        let plan = AuthorizedPlan::new_for_test(
             generation(),
             OutcomeIdentity::selected(
                 &path("/public"),
@@ -2719,7 +2796,7 @@ mod tests {
             generation(),
         )
         .unwrap();
-        let outcome = AuthorizedPlan::new(
+        let outcome = AuthorizedPlan::new_for_test(
             generation(),
             OutcomeIdentity::selected(
                 &path("/public"),
@@ -2731,7 +2808,7 @@ mod tests {
             file_grant,
             key,
         )
-        .and_then(|plan| plan.bind_file(&meta))
+        .and_then(|plan| plan.bind_file_for_test(&meta))
         .and_then(|plan| {
             plan.into_outcome(generation(), httpd_rs_verified::TransformSink::StaticFile)
         })
@@ -2770,7 +2847,7 @@ mod tests {
                 generation(),
             )
             .unwrap();
-            AuthorizedPlan::direct(generation(), scope.clone(), grant, key.clone())
+            AuthorizedPlan::direct_for_test(generation(), scope.clone(), grant, key.clone())
                 .and_then(|plan| {
                     plan.into_internal_outcome(
                         generation(),
@@ -2821,7 +2898,7 @@ mod tests {
                 generation(),
             )
             .unwrap();
-            AuthorizedPlan::direct(generation(), scope.clone(), grant, key.clone())
+            AuthorizedPlan::direct_for_test(generation(), scope.clone(), grant, key.clone())
                 .expect("authorized redirect plan")
         };
 

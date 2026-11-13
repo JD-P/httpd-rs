@@ -51,8 +51,20 @@ def make_repository(root: Path) -> Path:
     return projects
 
 
+def deployment_perl5lib() -> str:
+    value = os.environ.get("HTTPD_RS_DEPLOY_PERL5LIB", "")
+    if any(character in value for character in ('"', "\r", "\n")):
+        raise DeploymentError(
+            "HTTPD_RS_DEPLOY_PERL5LIB contains characters unsafe for generated configuration"
+        )
+    return value
+
+
 def locate_git_apps() -> tuple[Path, Path, Path]:
-    module = command(["perl", "-MCGI", "-e", "1"], check=False)
+    environment = os.environ.copy()
+    if perl5lib := deployment_perl5lib():
+        environment["PERL5LIB"] = perl5lib
+    module = command(["perl", "-MCGI", "-e", "1"], env=environment, check=False)
     if module.returncode != 0:
         raise DeploymentError("Gitweb requires Perl CGI.pm (install libcgi-pm-perl)")
     gitweb = Path("/usr/share/gitweb/gitweb.cgi")
@@ -125,6 +137,8 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
     empty_docroot = context.run_dir / "empty"
     empty_docroot.mkdir()
     port = free_port()
+    perl5lib = deployment_perl5lib()
+    perl_environment = f'SetEnv PERL5LIB "{perl5lib}"' if perl5lib else ""
 
     authorization = ""
     if variant["access"] == "basic":
@@ -140,6 +154,7 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
 SetEnv GITWEB_CONFIG "{gitweb_config}"
 SetEnv GIT_PROJECT_ROOT "{projects}"
 SetEnv GIT_HTTP_EXPORT_ALL 1
+{perl_environment}
 ScriptAlias /gitweb "{gitweb}"
 ScriptAlias /git/ "{backend}/"
 Alias /gitweb-static/ "{gitweb_static}/"

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import http.cookiejar
+import grp
 import json
 import os
+import pwd
 import re
 import shutil
 import urllib.parse
@@ -20,6 +22,7 @@ from lib import (
     free_port,
     request,
     require_response,
+    service_identity,
     start_apache,
     start_httpd_rs,
     wait_for_path,
@@ -148,6 +151,25 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
     )
     socket_path = php_run / "php-fpm.sock"
     wait_for_path(socket_path, timeout=60)
+    service_user, service_group = service_identity()
+    current_user = pwd.getpwuid(os.geteuid()).pw_name
+    current_group = grp.getgrgid(os.getegid()).gr_name
+    if service_user == current_user and service_group == current_group:
+        # In developer-only same-identity runs the host daemon is not in the
+        # container's www-data group. Keep the socket group-only and bind the
+        # stable-path policy to the invoking group instead of making it world
+        # writable.
+        socket_group = os.getgid()
+        compose.exec(
+            "wordpress",
+            ["chown", f"33:{socket_group}", "/run/httpd-rs-php/php-fpm.sock"],
+            user="0",
+        )
+        compose.exec(
+            "wordpress",
+            ["chmod", "0660", "/run/httpd-rs-php/php-fpm.sock"],
+            user="0",
+        )
 
     # The official image populates the staging tree.  Freeze executable PHP as
     # root-owned and leave only the upload directory writable by PHP-FPM.

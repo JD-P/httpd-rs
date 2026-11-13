@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end regressions for the pass-2 through pass-38 findings (F23-P38).
+"""End-to-end regressions for the pass-2 through pass-39 findings (F23-P39).
 
 The suite starts fresh httpd-rs instances in temporary trees and exercises
 the exploit shapes from adversarial/findings.md: terminal rewrite/proxy authorization,
@@ -14,7 +14,8 @@ rewrite bases, SetHandler/server-status cache classification, lossless cache
 key bytes, ErrorDocument cache scoping, canonical REQUEST_URI identity,
 access-file rewrite subjects above the mapping root, explicit-target
 access-layer binding for symlinked mapping roots, and the pass-10
-resolved-target/rewrite scope conjunction.
+resolved-target/rewrite scope conjunction, plus registered administrative-input
+non-publication without relying on Apache's generated filename guard.
 
 Usage:
     cargo build --release -p httpd-rs
@@ -363,6 +364,12 @@ class F23ToF38Tests(unittest.TestCase):
             cls.www / "exprtest",
             cls.www / "reqnone-main",
             cls.www / "reqnone-ht",
+            cls.www / "admin-index",
+            cls.www / "admin-error",
+            cls.www / "access-auth",
+            cls.www / "access-local",
+            cls.www / "custom-access",
+            cls.www / "admin-list",
             cls.logs,
             cls.cache,
             cls.base / "private" / "sub",
@@ -374,6 +381,63 @@ class F23ToF38Tests(unittest.TestCase):
         cls.cache.chmod(0o777)
 
         (cls.www / "hello.txt").write_text("hello\n")
+        # P39: deliberately omit Apache's shipped <Files ".ht*"> guard. The
+        # product invariant must keep active administrative inputs out of
+        # static, alias, index, ErrorDocument, autoindex and cache sinks.
+        (cls.www / ".htaccess").write_text("# P39-ROOT-ACCESS-SECRET\n")
+        (cls.www / ".ordinary-dotfile").write_text("P39-ORDINARY-DOTFILE\n")
+        (cls.www / "mime.types").write_text("text/plain txt p39\n")
+        (cls.www / "rewrite.map").write_text("legacy hello\n")
+        (cls.www / "map-helper.cgi").write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'P39-ADMIN-CGI-EXECUTED\\n'\n"
+        )
+        (cls.www / "map-helper.cgi").chmod(0o755)
+        (cls.www / "admin.include").write_text("# P39-INCLUDED-CONFIG-SECRET\n")
+        (cls.www / "public.htpasswd").write_text("alice:{SHA}placeholder\n")
+        (cls.www / "public.htgroup").write_text("admins: alice\n")
+        (cls.www / "admin-fastcgi.php").write_text("alice:{SHA}placeholder\n")
+        (cls.www / "admin-index" / ".htaccess").write_text(
+            "# P39-DIRECTORY-INDEX-SECRET\n"
+        )
+        (cls.www / "access-link").symlink_to(".htaccess")
+        os.link(cls.www / ".htaccess", cls.www / "access-hardlink")
+        (cls.www / "access-users.db").write_text("alice:{SHA}placeholder\n")
+        (cls.www / "access-auth" / "protected.txt").write_text("protected\n")
+        (cls.www / "access-auth" / ".htaccess").write_text(
+            "AuthType Basic\n"
+            'AuthName "P39 access auth"\n'
+            f'AuthUserFile "{cls.www / "access-users.db"}"\n'
+            "Require valid-user\n"
+        )
+        (cls.www / "access-local" / "local-users.db").write_text(
+            "alice:{SHA}placeholder\n"
+        )
+        (cls.www / "access-local" / "protected.txt").write_text("protected\n")
+        (cls.www / "access-local" / ".htaccess").write_text(
+            "AuthType Basic\n"
+            'AuthName "P39 local access auth"\n'
+            f'AuthUserFile "{cls.www / "access-local" / "local-users.db"}"\n'
+            '<Files "protected.txt">\n'
+            "Require valid-user\n"
+            "</Files>\n"
+        )
+        (cls.www / "custom-access" / "access.policy").write_text(
+            "# P39-CUSTOM-ACCESS-POLICY-SECRET\nRequire all granted\n"
+        )
+        (cls.www / "custom-access" / "public.txt").write_text("public\n")
+        (cls.www / "admin-list" / "public.txt").write_text("public\n")
+        for source, name in (
+            (cls.www / ".htaccess", "access-input"),
+            (cls.www / "public.htpasswd", "auth-input"),
+            (cls.www / "mime.types", "types-input"),
+            (cls.www / "rewrite.map", "map-input"),
+            (cls.www / "map-helper.cgi", "program-input"),
+            (cls.www / "admin.include", "include-input"),
+            (cls.www / "admin-fastcgi.php", "fastcgi-input"),
+        ):
+            os.link(source, cls.www / "admin-list" / name)
         (cls.www / "secret.txt").write_text("WALLET-ENV-SECRET\n")
         (cls.www / "admin" / "wallet.dat").write_text("WALLET-DIR-SECRET\n")
         (cls.www / "list" / "public.txt").write_text("public\n")
@@ -519,6 +583,7 @@ class F23ToF38Tests(unittest.TestCase):
         cls.port = free_port()
         cls.config = cls.base / "vp.conf"
         cls.write_config()
+        os.link(cls.config, cls.www / "admin-list" / "main-config-input")
         cls.proc = subprocess.Popen(
             [str(HTTPD_RS), "-f", str(cls.config), "-DFOREGROUND"],
             stdout=subprocess.PIPE,
@@ -549,12 +614,17 @@ ErrorLog "{cls.logs}/error.log"
 LogLevel warn
 Timeout 30
 DocumentRoot "{cls.www}"
+AccessFileName .htaccess access.policy
+TypesConfig "{cls.www}/mime.types"
+Include "{cls.www}/admin.include"
 CacheRoot "{cls.cache}"
 CacheEnable disk /
 CacheHeader On
 CacheDefaultExpire 600
 AddHandler cgi-script .cgi
 DirectoryIndex index.html
+RewriteMap p39 txt:{cls.www}/rewrite.map
+RewriteMap p39helper prg:{cls.www}/map-helper.cgi
 <Directory "{cls.www}">
     AllowOverride All
     Options +Indexes +ExecCGI +FollowSymLinks
@@ -583,6 +653,13 @@ DirectoryIndex index.html
     AllowOverride AuthConfig
     Require all granted
 </Directory>
+<Directory "{cls.www}/admin-index">
+    DirectoryIndex .htaccess
+    AllowOverride FileInfo
+</Directory>
+<Directory "{cls.www}/admin-error">
+    ErrorDocument 404 /.htaccess
+</Directory>
 <Directory "{cls.base}/private">
     AllowOverride All
     Require all granted
@@ -600,8 +677,11 @@ DirectoryIndex index.html
 </Files>
 ProxyPassMatch ^/(.*\\.php)$ "unix:{cls.base}/fcgi.sock|fcgi://localhost{cls.www}/"
 Alias /wallet "{cls.base}/private/wallet.dat"
+Alias /p39-config "{cls.config}"
+Alias /p39-access-alias "{cls.www}/.htaccess"
 Alias /run "{cls.www}/cgi/alias-run.cgi"
 ScriptAlias /exec "{cls.www}/cgi/alias-run.cgi"
+ScriptAlias /p39-exec "{cls.www}/map-helper.cgi"
 AliasMatch "^/wallet-regex$" "{cls.base}/private/wallet.dat/"
 AliasMatch "^/wallet-regex-noslash$" "{cls.base}/private/wallet.dat"
 ScriptAliasMatch "^/secret-run-regex$" "{cls.base}/private/secret.cgi/"
@@ -662,6 +742,19 @@ RewriteRule ^/query-rewrite$ /hello.txt?new=1 [L]
     AuthType Basic
     AuthName "CGI Realm"
     AuthUserFile "{cls.base}/.htpasswd"
+    Require valid-user
+</Location>
+<Location "/p39-auth">
+    AuthType Basic
+    AuthName "P39 administrative inputs"
+    AuthUserFile "{cls.www}/public.htpasswd"
+    AuthGroupFile "{cls.www}/public.htgroup"
+    Require valid-user
+</Location>
+<Location "/p39-auth-fastcgi">
+    AuthType Basic
+    AuthName "P39 FastCGI administrative input"
+    AuthUserFile "{cls.www}/admin-fastcgi.php"
     Require valid-user
 </Location>
 SetEnvIf X-Block yes BLOCK=1
@@ -871,6 +964,81 @@ AliasMatch "^/escape(.*)$" "$1"
         self.assertEqual(status, 200, body[:200])
         self.assertIn(b"REMOTE_USER=[alice]", body)
         self.assertIn(b"AUTH_TYPE=[Basic]", body)
+
+    def test_p39_registered_administrative_inputs_cannot_be_published(self):
+        probes = (
+            ("/.htaccess", b"P39-ROOT-ACCESS-SECRET"),
+            ("/custom-access/access.policy", b"P39-CUSTOM-ACCESS-POLICY-SECRET"),
+            ("/access-link", b"P39-ROOT-ACCESS-SECRET"),
+            ("/access-hardlink", b"P39-ROOT-ACCESS-SECRET"),
+            ("/public.htpasswd", b"alice:"),
+            ("/public.htgroup", b"admins:"),
+            ("/mime.types", b"text/plain"),
+            ("/rewrite.map", b"legacy hello"),
+            ("/admin.include", b"P39-INCLUDED-CONFIG-SECRET"),
+            ("/p39-config", b"ServerRoot"),
+            ("/p39-access-alias", b"P39-ROOT-ACCESS-SECRET"),
+        )
+        for path, marker in probes:
+            # The second request exercises cache lookup after the first denial;
+            # administrative inputs must never produce a reusable cache entry.
+            for _ in range(2):
+                status, _, body = request(self.port, path)
+                self.assertEqual(status, 403, f"{path}: {body[:200]}")
+                self.assertNotIn(marker, body, path)
+
+    def test_p39_administrative_inputs_cannot_enter_execution_sinks(self):
+        for path, marker in (
+            ("/p39-exec", b"P39-ADMIN-CGI-EXECUTED"),
+            ("/admin-fastcgi.php", b"alice:"),
+        ):
+            status, _, body = request(self.port, path)
+            self.assertEqual(status, 403, f"{path}: {body[:200]}")
+            self.assertNotIn(marker, body, path)
+
+    def test_p39_access_file_auth_inputs_are_registered_and_denied(self):
+        # A database under the same access-controlled tree is discovered by
+        # the access walk for its own first request; no warm-up is needed.
+        status, _, body = request(self.port, "/access-local/local-users.db")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"alice:", body)
+
+        # Loading this policy discovers the custom-named sibling credential
+        # database. Once it is an active input to this generation, aliases and
+        # direct publication of the same file identity must fail closed.
+        status, _, body = request(self.port, "/access-auth/protected.txt")
+        self.assertEqual(status, 401, body[:200])
+        status, _, body = request(self.port, "/access-users.db")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"alice:", body)
+
+    def test_p39_internal_and_directory_sinks_do_not_leak_admin_inputs(self):
+        for path, marker in (
+            ("/admin-index/", b"P39-DIRECTORY-INDEX-SECRET"),
+            ("/admin-error/missing", b"P39-ROOT-ACCESS-SECRET"),
+        ):
+            status, _, body = request(self.port, path)
+            self.assertIn(status, (403, 404), f"{path}: {body[:200]}")
+            self.assertNotIn(marker, body, path)
+
+        status, _, body = request(self.port, "/admin-list/")
+        self.assertEqual(status, 200, body[:200])
+        for name in (
+            b"access-input",
+            b"auth-input",
+            b"types-input",
+            b"map-input",
+            b"program-input",
+            b"include-input",
+            b"fastcgi-input",
+            b"main-config-input",
+        ):
+            self.assertNotIn(name, body)
+
+    def test_p39_unregistered_dotfile_remains_ordinary_content(self):
+        status, _, body = request(self.port, "/.ordinary-dotfile")
+        self.assertEqual(status, 200, body[:200])
+        self.assertEqual(body, b"P39-ORDINARY-DOTFILE\n")
 
     def test_f39_single_file_alias_reads_target_htaccess(self):
         status, _, body = request(self.port, "/wallet")

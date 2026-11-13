@@ -1707,6 +1707,59 @@ pub enum TransformSink {
     ErrorDocument,
 }
 
+/// Administrative inputs are policy, trust or credential material rather
+/// than application content. They may participate in URL-only routing and
+/// recovery orchestration, but no local body, execution, directory or cache
+/// sink may consume them. DirectoryIndex and ErrorDocument subsequently
+/// authorize their selected target, so this rule is applied again there.
+pub open spec fn administrative_input_sink_spec(
+    administrative_input: bool,
+    sink: TransformSink,
+) -> bool {
+    !administrative_input
+        || match sink {
+            TransformSink::Proxy | TransformSink::Redirect | TransformSink::ErrorDocument => true,
+            TransformSink::StaticFile
+            | TransformSink::Directory
+            | TransformSink::LocalCgi
+            | TransformSink::FastCgi
+            | TransformSink::Cache
+            | TransformSink::DirectoryIndex => false,
+        }
+}
+
+pub fn administrative_input_sink_admit(
+    administrative_input: bool,
+    sink: TransformSink,
+) -> (admit: bool)
+    ensures admit == administrative_input_sink_spec(administrative_input, sink),
+{
+    !administrative_input
+        || match sink {
+            TransformSink::Proxy | TransformSink::Redirect | TransformSink::ErrorDocument => true,
+            TransformSink::StaticFile
+            | TransformSink::Directory
+            | TransformSink::LocalCgi
+            | TransformSink::FastCgi
+            | TransformSink::Cache
+            | TransformSink::DirectoryIndex => false,
+        }
+}
+
+pub proof fn administrative_input_never_reaches_local_content_sink(
+    sink: TransformSink,
+)
+    requires
+        sink == TransformSink::StaticFile
+            || sink == TransformSink::Directory
+            || sink == TransformSink::LocalCgi
+            || sink == TransformSink::FastCgi
+            || sink == TransformSink::Cache
+            || sink == TransformSink::DirectoryIndex,
+    ensures !administrative_input_sink_spec(true, sink),
+{
+}
+
 /// Runtime `AuthorizedPlan` construction must retain one coherent identity:
 /// a nonempty public URL, the exact selected URL named by the grant, a
 /// lexical/resolved filesystem pair (or neither for URL-only backends), and

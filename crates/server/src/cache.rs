@@ -1082,14 +1082,8 @@ pub fn request_scope_with_plan(
         Some(&lexical_fs_path),
         Some(&fs_path),
     );
-    let authorization = crate::access::AuthorizedPlan::new(
-        cfg.authorization_generation(),
-        identity,
-        scope,
-        grant,
-        resource,
-    )
-    .and_then(|plan| {
+    let authorization = crate::access::AuthorizedPlan::new(cfg, identity, scope, grant, resource)
+        .and_then(|plan| {
         plan.into_outcome(
             cfg.authorization_generation(),
             httpd_rs_verified::TransformSink::Cache,
@@ -3121,7 +3115,7 @@ mod tests {
         )
         .unwrap();
         let target = dir.join("target");
-        let authorization = crate::access::AuthorizedPlan::new(
+        let authorization = crate::access::AuthorizedPlan::new_for_test(
             generation,
             crate::access::OutcomeIdentity::selected(
                 &url_path,

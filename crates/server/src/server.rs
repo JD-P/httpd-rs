@@ -1418,13 +1418,8 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                         return Ok(false);
                     }
                 };
-                let authorization = access::AuthorizedPlan::direct(
-                    cfg.authorization_generation(),
-                    scope,
-                    _grant,
-                    resource,
-                )
-                .expect("WebSocket route retained one authorized identity");
+                let authorization = access::AuthorizedPlan::direct(&cfg, scope, _grant, resource)
+                    .expect("WebSocket route retained one authorized identity");
                 if let Some((tls, handle)) = stream.take_tls_stream() {
                     // The TLS stream has been consumed by the tunnel; there is
                     // no safe way to inject a response here.
@@ -4928,14 +4923,13 @@ pub(crate) fn dispatch_local_error_document(
         Err(response) => return response,
     };
     let Some(authorization) =
-        access::AuthorizedPlan::direct(cfg.authorization_generation(), scope, grant, resource)
-            .and_then(|plan| {
-                plan.into_internal_outcome(
-                    cfg.authorization_generation(),
-                    httpd_rs_verified::InternalRequestKind::ErrorDocument,
-                    target.url_path.clone(),
-                )
-            })
+        access::AuthorizedPlan::direct(cfg, scope, grant, resource).and_then(|plan| {
+            plan.into_internal_outcome(
+                cfg.authorization_generation(),
+                httpd_rs_verified::InternalRequestKind::ErrorDocument,
+                target.url_path.clone(),
+            )
+        })
     else {
         return Response::policy_error();
     };
@@ -5182,27 +5176,22 @@ fn bind_target_grant(
                     Some(fs_path),
                     Some(actual_path),
                 );
-                access::AuthorizedPlan::new(
-                    cfg.authorization_generation(),
-                    identity,
-                    scope.clone(),
-                    bound,
-                    key,
+                access::AuthorizedPlan::new(cfg, identity, scope.clone(), bound, key).ok_or_else(
+                    || {
+                        error_response(
+                            cfg,
+                            vhost,
+                            scope,
+                            500,
+                            req,
+                            public_url_path,
+                            local_port,
+                            server_name,
+                            peer,
+                            local_ip,
+                        )
+                    },
                 )
-                .ok_or_else(|| {
-                    error_response(
-                        cfg,
-                        vhost,
-                        scope,
-                        500,
-                        req,
-                        public_url_path,
-                        local_port,
-                        server_name,
-                        peer,
-                        local_ip,
-                    )
-                })
             }
             None => Err(error_response(
                 cfg,
@@ -5328,14 +5317,7 @@ fn bind_target_grant(
                 Some(fs_path),
                 Some(actual_path),
             );
-            access::AuthorizedPlan::new(
-                cfg.authorization_generation(),
-                identity,
-                target_scope,
-                bound,
-                key,
-            )
-            .ok_or_else(|| {
+            access::AuthorizedPlan::new(cfg, identity, target_scope, bound, key).ok_or_else(|| {
                 error_response(
                     cfg,
                     vhost,
@@ -5736,14 +5718,7 @@ fn bind_multiview_grant(
         Some(candidate_fs),
         Some(actual_path),
     );
-    access::AuthorizedPlan::new(
-        cfg.authorization_generation(),
-        identity,
-        target_scope,
-        bound,
-        key,
-    )
-    .ok_or_else(|| {
+    access::AuthorizedPlan::new(cfg, identity, target_scope, bound, key).ok_or_else(|| {
         error_response(
             cfg,
             vhost,
@@ -5915,14 +5890,7 @@ fn authorize_resolved_target(
         Some(lexical_target_plan.fs_path()),
         Some(target_fs),
     );
-    access::AuthorizedPlan::new(
-        cfg.authorization_generation(),
-        identity,
-        target_scope,
-        grant,
-        key,
-    )
-    .ok_or_else(|| {
+    access::AuthorizedPlan::new(cfg, identity, target_scope, grant, key).ok_or_else(|| {
         error_response(
             cfg,
             vhost,
@@ -6010,7 +5978,7 @@ pub(crate) fn autoindex_entry_visible(
         server_name,
         local_ip,
     ) {
-        Ok(_) => Ok(true),
+        Ok(plan) => Ok(!plan.is_administrative_input()),
         Err(response) if matches!(response.status, 401 | 403 | 404) => Ok(false),
         Err(response) => Err(response),
     }
@@ -6307,23 +6275,24 @@ fn authorize_redirect_outcome(
         Some(fs_path),
         Some(fs_path),
     );
-    access::AuthorizedPlan::new(
-        cfg.authorization_generation(),
-        identity,
-        scope.clone(),
-        grant,
-        resource,
-    )
-    .and_then(|plan| {
-        let location =
-            normalized_redirect_location(cfg, vhost, req, location, server_name, local_port, https);
-        plan.into_redirect_outcome(
-            cfg.authorization_generation(),
-            status,
-            location.into_bytes(),
-        )
-    })
-    .ok_or_else(Response::policy_error)
+    access::AuthorizedPlan::new(cfg, identity, scope.clone(), grant, resource)
+        .and_then(|plan| {
+            let location = normalized_redirect_location(
+                cfg,
+                vhost,
+                req,
+                location,
+                server_name,
+                local_port,
+                https,
+            );
+            plan.into_redirect_outcome(
+                cfg.authorization_generation(),
+                status,
+                location.into_bytes(),
+            )
+        })
+        .ok_or_else(Response::policy_error)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6516,13 +6485,8 @@ fn dispatch_url_proxy(
             query_override,
         } => {
             if req.handler_probe() {
-                let authorization = access::AuthorizedPlan::direct(
-                    cfg.authorization_generation(),
-                    scope,
-                    grant,
-                    resource,
-                )
-                .expect("URL proxy route retained one authorized identity");
+                let authorization = access::AuthorizedPlan::direct(cfg, scope, grant, resource)
+                    .expect("URL proxy route retained one authorized identity");
                 return Response::prepared_handler(PreparedHandler::Proxy {
                     vhost_index: selected_vhost_index(cfg, vhost),
                     proxy_base_scope,
@@ -6545,13 +6509,8 @@ fn dispatch_url_proxy(
             } else {
                 req
             };
-            let authorization = access::AuthorizedPlan::direct(
-                cfg.authorization_generation(),
-                scope,
-                grant,
-                resource,
-            )
-            .expect("URL proxy route retained one authorized identity");
+            let authorization = access::AuthorizedPlan::direct(cfg, scope, grant, resource)
+                .expect("URL proxy route retained one authorized identity");
             proxy::execute_authorized_with_proxy_base(
                 cfg,
                 vhost,
@@ -6569,13 +6528,8 @@ fn dispatch_url_proxy(
         }
         UrlProxySelection::FastCgi(target) => {
             if req.handler_probe() {
-                let authorization = access::AuthorizedPlan::direct(
-                    cfg.authorization_generation(),
-                    scope,
-                    grant,
-                    resource,
-                )
-                .expect("URL FastCGI route retained one authorized identity");
+                let authorization = access::AuthorizedPlan::direct(cfg, scope, grant, resource)
+                    .expect("URL FastCGI route retained one authorized identity");
                 return Response::prepared_handler(PreparedHandler::FastCgi {
                     vhost_index: selected_vhost_index(cfg, vhost),
                     authorization,
@@ -6589,13 +6543,8 @@ fn dispatch_url_proxy(
                     mapping_root: mapping_root.to_path_buf(),
                 });
             }
-            let authorization = access::AuthorizedPlan::direct(
-                cfg.authorization_generation(),
-                scope,
-                grant,
-                resource,
-            )
-            .expect("URL FastCGI route retained one authorized identity");
+            let authorization = access::AuthorizedPlan::direct(cfg, scope, grant, resource)
+                .expect("URL FastCGI route retained one authorized identity");
             run_authorized_fastcgi(
                 cfg,
                 vhost,
@@ -7602,13 +7551,9 @@ fn dispatch_inner(
                     }
                 }
                 if current_req.handler_probe() {
-                    let authorization = access::AuthorizedPlan::direct(
-                        cfg.authorization_generation(),
-                        scope,
-                        _grant,
-                        resource,
-                    )
-                    .expect("rewrite proxy route retained one authorized identity");
+                    let authorization =
+                        access::AuthorizedPlan::direct(cfg, scope, _grant, resource)
+                            .expect("rewrite proxy route retained one authorized identity");
                     return Response::prepared_handler(PreparedHandler::Proxy {
                         vhost_index: selected_vhost_index(cfg, vhost),
                         proxy_base_scope,
@@ -7625,13 +7570,8 @@ fn dispatch_inner(
                 }
                 let mut proxy_req = current_req.clone();
                 proxy_req.query = query.as_bytes().to_vec();
-                let authorization = access::AuthorizedPlan::direct(
-                    cfg.authorization_generation(),
-                    scope,
-                    _grant,
-                    resource,
-                )
-                .expect("rewrite proxy route retained one authorized identity");
+                let authorization = access::AuthorizedPlan::direct(cfg, scope, _grant, resource)
+                    .expect("rewrite proxy route retained one authorized identity");
                 return proxy::execute_authorized_with_proxy_base(
                     cfg,
                     vhost,
@@ -8279,13 +8219,8 @@ fn dispatch_inner(
     if fastcgi_wins {
         if let Some(target) = fastcgi_target {
             if req.handler_probe() {
-                let authorization = access::AuthorizedPlan::direct(
-                    cfg.authorization_generation(),
-                    scope,
-                    grant,
-                    resource,
-                )
-                .expect("FastCGI route retained one authorized identity");
+                let authorization = access::AuthorizedPlan::direct(cfg, scope, grant, resource)
+                    .expect("FastCGI route retained one authorized identity");
                 return Response::prepared_handler(PreparedHandler::FastCgi {
                     vhost_index: selected_vhost_index(cfg, vhost),
                     authorization,
@@ -8299,13 +8234,8 @@ fn dispatch_inner(
                     mapping_root: root,
                 });
             }
-            let authorization = access::AuthorizedPlan::direct(
-                cfg.authorization_generation(),
-                scope,
-                grant,
-                resource,
-            )
-            .expect("FastCGI route retained one authorized identity");
+            let authorization = access::AuthorizedPlan::direct(cfg, scope, grant, resource)
+                .expect("FastCGI route retained one authorized identity");
             return run_authorized_fastcgi(
                 cfg,
                 vhost,
@@ -8325,13 +8255,8 @@ fn dispatch_inner(
 
     if let Some(target) = proxy_target {
         if req.handler_probe() {
-            let authorization = access::AuthorizedPlan::direct(
-                cfg.authorization_generation(),
-                scope,
-                grant,
-                resource,
-            )
-            .expect("proxy route retained one authorized identity");
+            let authorization = access::AuthorizedPlan::direct(cfg, scope, grant, resource)
+                .expect("proxy route retained one authorized identity");
             return Response::prepared_handler(PreparedHandler::Proxy {
                 vhost_index: selected_vhost_index(cfg, vhost),
                 proxy_base_scope,
@@ -8346,9 +8271,8 @@ fn dispatch_inner(
                 query_override: None,
             });
         }
-        let authorization =
-            access::AuthorizedPlan::direct(cfg.authorization_generation(), scope, grant, resource)
-                .expect("proxy route retained one authorized identity");
+        let authorization = access::AuthorizedPlan::direct(cfg, scope, grant, resource)
+            .expect("proxy route retained one authorized identity");
         return proxy::execute_authorized_with_proxy_base(
             cfg,
             vhost,
@@ -8433,6 +8357,20 @@ fn dispatch_inner(
                 Ok(v) => v,
                 Err(r) => return r,
             };
+            if target_authorization.is_administrative_input() {
+                return error_response(
+                    cfg,
+                    vhost,
+                    target_authorization.scope(),
+                    403,
+                    req,
+                    &url_path,
+                    local_port,
+                    &server_name,
+                    peer.ip(),
+                    local_ip,
+                );
+            }
             let scope = target_authorization.scope();
             // Handler, MIME and dispatch decisions bind to the lexical
             // request-mapped filename (F69/I70): an in-root symlink whose
@@ -8559,7 +8497,7 @@ fn dispatch_inner(
                         &server_name,
                         local_ip,
                     ) {
-                        Ok(plan) => match plan.bind_file(&meta) {
+                        Ok(plan) => match plan.bind_file(cfg, &meta) {
                             Some(bound) => bound,
                             None => return Response::policy_error(),
                         },
@@ -9022,6 +8960,20 @@ fn dispatch_inner(
                             }
                         };
                         let target_scope = target_authorization.scope();
+                        if target_authorization.is_administrative_input() {
+                            return error_response(
+                                cfg,
+                                vhost,
+                                target_scope,
+                                403,
+                                req,
+                                &url_path,
+                                local_port,
+                                &server_name,
+                                peer.ip(),
+                                local_ip,
+                            );
+                        }
                         let handler = crate::config::effective_handler(target_scope, &view.name)
                             .map(str::trim)
                             .filter(|handler| {
@@ -9242,13 +9194,27 @@ fn dispatch_inner(
                         }
                     };
                     let script_root = actual_path.parent().unwrap_or(root.as_path()).to_path_buf();
+                    if target_authorization.is_administrative_input() {
+                        return error_response(
+                            cfg,
+                            vhost,
+                            target_authorization.scope(),
+                            403,
+                            req,
+                            &url_path,
+                            local_port,
+                            &server_name,
+                            peer.ip(),
+                            local_ip,
+                        );
+                    }
                     let script_rel = actual_path
                         .file_name()
                         .map(PathBuf::from)
                         .unwrap_or_else(|| st.rel_script.clone());
                     if cgi::is_cgi(cfg, target_authorization.scope(), actual_name, script_alias) {
                         let authorization = target_authorization
-                            .bind_file(&st.meta)
+                            .bind_file(cfg, &st.meta)
                             .and_then(|plan| {
                                 plan.into_outcome(
                                     cfg.authorization_generation(),
@@ -9712,12 +9678,26 @@ fn run_fastcgi_with_public_url(
         Err(r) => return r,
     };
     let target_scope = target_authorization.scope().clone();
+    if target_authorization.is_administrative_input() {
+        return error_response(
+            cfg,
+            vhost,
+            &target_scope,
+            403,
+            req,
+            url_path,
+            local_port,
+            server_name,
+            peer.ip(),
+            local_ip,
+        );
+    }
     let backend_binding = target.binding_key(&authorized_path);
     let backend_binds_both =
         backend_binding.contains("|lexical=") && backend_binding.contains("|authorized=");
     // coverage:ignore-start
     let Some(authorization) = target_authorization
-        .bind_file(&script_binding.meta)
+        .bind_file(cfg, &script_binding.meta)
         .and_then(|plan| plan.bind_backend(backend_binding))
         .and_then(|plan| {
             plan.into_outcome(

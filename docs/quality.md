@@ -21,6 +21,7 @@ python3 tests/unsafe_inventory.py
 python3 tests/resource_inventory.py
 python3 tests/verification_status.py
 python3 tests/apache_warrant.py
+python3 tests/apache_configuration_warrant.py
 ```
 
 `tests/pre_adversarial.sh` is the fail-closed release gate. It additionally
@@ -134,6 +135,15 @@ source to eight state-space families, assigns independent authorities and
 dimensions to all fuzz targets, and explicitly records deliberately unsupported
 module families. Every unclaimed Apache item defaults outside the compatibility
 surface; source discovery never generates implementation or parser support.
+
+`tests/apache_configuration_warrant.py` applies the same separation to
+configuration-layer security controls from upstream examples, Debian/Ubuntu,
+the packaged service unit and real-application fixtures. It requires every
+guard family to be classified as intrinsic, generated, operator-owned or
+irrelevant because its feature is rejected, and fixes the ledger's support
+effect to observation-only. The weekly source run verifies the exact upstream
+files and distribution commits; the pull-request gate verifies the ledger and
+all repository evidence.
 
 The policy acknowledges the exact inventory digest, so source or extractor
 drift fails CI until its diff is reviewed. The weekly gate reproduces the

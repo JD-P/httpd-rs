@@ -825,6 +825,9 @@ DocumentRoot "{document_root}"
     AllowOverride None
     Require all granted
 </Directory>
+<Files ".ht*">
+    Require all denied
+</Files>
 {extra.rstrip()}
 """
 
@@ -936,6 +939,14 @@ def common_httpd_rs_config(
     user, group = service_identity()
     pid_file = logs / "httpd-rs.pid"
     capability_lines = "".join(f"HttpdRsCapability {name} On\n" for name in capabilities)
+    # The developer-only --allow-same-identity harness mode cannot make an
+    # authentication database service-immutable: its operator and daemon are
+    # deliberately the same Unix identity.  Keep that compatibility escape
+    # hatch usable without weakening normal root/passwordless-sudo runs.
+    current_user = pwd.getpwuid(os.geteuid()).pw_name
+    current_group = grp.getgrgid(os.getegid()).gr_name
+    if user == current_user and group == current_group:
+        capability_lines += "HttpdRsCapability MutableAuthFiles On\n"
     config = f"""ServerRoot "{server_root}"
 Listen {port}
 User {user}
@@ -959,6 +970,9 @@ TypesConfig /etc/mime.types
     AllowOverride None
     Require all granted
 </Directory>
+<Files ".ht*">
+    Require all denied
+</Files>
 {extra.rstrip()}
 """
     return config, pid_file

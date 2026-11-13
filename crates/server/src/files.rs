@@ -2153,6 +2153,13 @@ fn authorized_autoindex_entries(
         let Some(actual_path) = fd_path(&file) else {
             return Err(Response::policy_error());
         };
+        // Autoindex is itself a publication sink: the filename, type and size
+        // are observable even when a subsequent GET would be denied. Use the
+        // descriptor identity here so a hard link with an innocuous name
+        // cannot advertise a registered administrative input.
+        if cfg.is_administrative_input(&actual_path, Some(meta.dev()), Some(meta.ino())) {
+            continue;
+        }
         let Some(parent) = crate::request_plan::CanonicalTarget::from_url_path(url_path) else {
             return Err(Response::policy_error());
         };
@@ -2831,12 +2838,12 @@ mod tests {
             None,
         );
         crate::access::AuthorizedPlan::direct(
-            cfg.authorization_generation(),
+            cfg,
             scope.clone(),
             crate::access::test_grant(),
             resource,
         )
-        .and_then(|plan| plan.bind_file(meta))
+        .and_then(|plan| plan.bind_file(cfg, meta))
         .and_then(|plan| {
             plan.into_outcome(
                 cfg.authorization_generation(),
@@ -4159,20 +4166,16 @@ mod tests {
             cfg.authorization_generation(),
         )
         .expect("directory grant");
-        let authorization = crate::access::AuthorizedPlan::direct(
-            cfg.authorization_generation(),
-            scope.clone(),
-            grant,
-            resource,
-        )
-        .and_then(|plan| plan.bind_file(&metadata))
-        .and_then(|plan| {
-            plan.into_outcome(
-                cfg.authorization_generation(),
-                httpd_rs_verified::TransformSink::Directory,
-            )
-        })
-        .expect("directory outcome");
+        let authorization =
+            crate::access::AuthorizedPlan::direct(&cfg, scope.clone(), grant, resource)
+                .and_then(|plan| plan.bind_file(&cfg, &metadata))
+                .and_then(|plan| {
+                    plan.into_outcome(
+                        cfg.authorization_generation(),
+                        httpd_rs_verified::TransformSink::Directory,
+                    )
+                })
+                .expect("directory outcome");
         let mut reloaded = cfg.clone();
         reloaded.generation = reloaded.generation.wrapping_add(1);
 

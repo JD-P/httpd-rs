@@ -2665,19 +2665,16 @@ where
             "access grant does not cover websocket target",
         ));
     }
-    let Some(authorization) = crate::access::AuthorizedPlan::new(
-        cfg.authorization_generation(),
-        identity,
-        scope.clone(),
-        bound,
-        expected,
-    )
-    .and_then(|plan| {
-        plan.into_outcome(
-            cfg.authorization_generation(),
-            httpd_rs_verified::TransformSink::Proxy,
+    let Some(authorization) =
+        crate::access::AuthorizedPlan::new(cfg, identity, scope.clone(), bound, expected).and_then(
+            |plan| {
+                plan.into_outcome(
+                    cfg.authorization_generation(),
+                    httpd_rs_verified::TransformSink::Proxy,
+                )
+            },
         )
-    }) else {
+    else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "websocket authorization identities disagree",
@@ -3776,14 +3773,7 @@ fn authorize_failover(
         next_resource.fs_path.as_deref(),
         next_resource.fs_path.as_deref(),
     );
-    crate::access::AuthorizedPlan::new(
-        cfg.authorization_generation(),
-        identity,
-        next_scope,
-        bound,
-        expected,
-    )?
-    .into_outcome(
+    crate::access::AuthorizedPlan::new(cfg, identity, next_scope, bound, expected)?.into_outcome(
         cfg.authorization_generation(),
         httpd_rs_verified::TransformSink::Proxy,
     )
@@ -4016,19 +4006,15 @@ fn execute_with_proxy_identity(
             local_ip,
         );
     }
-    let Some(mut active_authorization) = crate::access::AuthorizedPlan::new(
-        cfg.authorization_generation(),
-        identity,
-        scope.clone(),
-        bound,
-        active_resource,
-    )
-    .and_then(|plan| {
-        plan.into_outcome(
-            cfg.authorization_generation(),
-            httpd_rs_verified::TransformSink::Proxy,
-        )
-    }) else {
+    let Some(mut active_authorization) =
+        crate::access::AuthorizedPlan::new(cfg, identity, scope.clone(), bound, active_resource)
+            .and_then(|plan| {
+                plan.into_outcome(
+                    cfg.authorization_generation(),
+                    httpd_rs_verified::TransformSink::Proxy,
+                )
+            })
+    else {
         return error(
             cfg,
             vhost,

@@ -42,6 +42,17 @@ print(value)
 PY
 }
 
+read_config_pin() {
+    python3 - "$1" "$2" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+ledger = json.loads(Path("docs/apache-configuration-warrant.json").read_text())
+print(ledger["source_pins"][sys.argv[1]][sys.argv[2]])
+PY
+}
+
 URL=$(read_pin archive_url)
 EXPECTED=$(read_pin archive_sha256)
 RELEASE=$(read_pin release)
@@ -56,6 +67,10 @@ FRAMEWORK_URL=$(read_test_pin submodules.Apache-Test.archive_url)
 FRAMEWORK_EXPECTED=$(read_test_pin submodules.Apache-Test.archive_sha256)
 FRAMEWORK_COMMIT=$(read_test_pin submodules.Apache-Test.commit)
 FRAMEWORK_ARCHIVE=$WORK/perl-apache-test.tar.gz
+DEBIAN_REPO=$(read_config_pin debian repository)
+DEBIAN_COMMIT=$(read_config_pin debian commit)
+UBUNTU_REPO=$(read_config_pin ubuntu repository)
+UBUNTU_COMMIT=$(read_config_pin ubuntu commit)
 
 curl --fail --location --retry 3 "$URL" -o "$ARCHIVE"
 printf '%s  %s\n' "$EXPECTED" "$ARCHIVE" | sha256sum --check -
@@ -83,6 +98,18 @@ test -d "$FRAMEWORK_SOURCE/lib" || {
 }
 cp -R "$FRAMEWORK_SOURCE"/. "$TEST_SOURCE/Apache-Test/"
 
+# Distribution configuration is a separate source of security defaults from
+# upstream httpd code. Fetch exact commits so a moving distro branch can only
+# create a visible ledger-review failure, never silently change the warrant.
+git init -q "$WORK/debian"
+git -C "$WORK/debian" remote add origin "$DEBIAN_REPO"
+git -C "$WORK/debian" fetch -q --depth=1 origin "$DEBIAN_COMMIT"
+git -C "$WORK/debian" checkout -q --detach FETCH_HEAD
+git init -q "$WORK/ubuntu"
+git -C "$WORK/ubuntu" remote add origin "$UBUNTU_REPO"
+git -C "$WORK/ubuntu" fetch -q --depth=1 origin "$UBUNTU_COMMIT"
+git -C "$WORK/ubuntu" checkout -q --detach FETCH_HEAD
+
 if [ "$MODE" = update ]; then
     python3 tests/apache_warrant.py \
         --source "$SOURCE" \
@@ -104,3 +131,8 @@ else
         --check-source
     python3 tests/apache_warrant.py
 fi
+
+python3 tests/apache_configuration_warrant.py \
+    --apache-source "$SOURCE" \
+    --debian-source "$WORK/debian" \
+    --ubuntu-source "$WORK/ubuntu"
