@@ -1,0 +1,75 @@
+Pass 40 retained release-binary reproduction
+============================================
+
+Reviewed subject:
+  3b9620a1bc91713f0f08feb172f72b0de7bbc02b
+  target/release/httpd-rs rebuilt from this clean product tree before the pass
+
+Command:
+  python3 adversarial/p40/exploit_p40.py
+
+Run 1:
+
+binary=/workspace/vapache/target/release/httpd-rs
+bcrypt_cost=12 samples_per_candidate=7
+missing_user_seconds=0.001218,0.001324,0.001477,0.001160,0.001496,0.001315,0.001482
+known_user_wrong_password_seconds=0.254694,0.263687,0.263455,0.255079,0.266385,0.250064,0.254105
+missing_user_median_s=0.001324
+known_user_wrong_password_median_s=0.255079
+median_timing_ratio=192.7x
+failure_responses_byte_equivalent=True
+failure_status=401 body_len=318
+valid_password_status=200 body=b'P40 protected resource\n'
+RESULT: VULNERABLE — Basic-auth usernames are remotely enumerable by timing
+
+Independent run 2:
+
+binary=/workspace/vapache/target/release/httpd-rs
+bcrypt_cost=12 samples_per_candidate=7
+missing_user_seconds=0.000782,0.000894,0.000869,0.001739,0.000956,0.001147,0.001015
+known_user_wrong_password_seconds=0.247382,0.244038,0.258368,0.267047,0.269330,0.256415,0.261007
+missing_user_median_s=0.000956
+known_user_wrong_password_median_s=0.258368
+median_timing_ratio=270.2x
+failure_responses_byte_equivalent=True
+failure_status=401 body_len=318
+valid_password_status=200 body=b'P40 protected resource\n'
+RESULT: VULNERABLE — Basic-auth usernames are remotely enumerable by timing
+
+Independent run 3 (after retaining explicit exploit timing):
+
+binary=/workspace/vapache/target/release/httpd-rs
+bcrypt_cost=12 samples_per_candidate=7
+missing_user_seconds=0.000911,0.001019,0.000826,0.002442,0.001043,0.000972,0.000963
+known_user_wrong_password_seconds=0.251120,0.243482,0.368852,0.263983,0.243479,0.244043,0.240208
+missing_user_median_s=0.000972
+known_user_wrong_password_median_s=0.244043
+median_timing_ratio=251.1x
+failure_responses_byte_equivalent=True
+failure_status=401 body_len=318
+valid_password_status=200 body=b'P40 protected resource\n'
+exploit_execution_time_s=2.169
+RESULT: VULNERABLE — Basic-auth usernames are remotely enumerable by timing
+
+Interpretation:
+
+The requests alternated a nonexistent username and the configured username on
+fresh loopback TCP connections after warming the parsed AuthUserFile cache.
+Both failure classes returned byte-equivalent stable responses (Date excluded):
+status 401, the same headers, and the same 318-byte body.  The configured-user
+class nevertheless incurred the cost-12 bcrypt verifier and was 192.7x,
+270.2x, and 251.1x slower by median in the three runs.  The successful-password control
+returned the protected marker with status 200, proving that the measured
+username names a live account rather than a dead fixture.
+
+Rejected hypotheses from the same pass:
+
+- Repeated RST_STREAM does not consume the vendored h2 control-frame bucket,
+  but the universal frame-work limiter charges four units per reset and caps
+  it at a 131,072-unit burst / 65,536-unit-per-second refill. Pending-accept
+  reset streams have an additional limit. This was retained as hardening debt,
+  not inflated into a vulnerability claim.
+- A source audit suggested MultiViews negotiation headers were appended after
+  ordinary Header policy. A live Apache 2.4.69 control also retained
+  Content-Location/TCN and combined its negotiation Vary with `Header set
+  Vary Origin`, so the proposed security differential was rejected.
