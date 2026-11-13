@@ -71,6 +71,16 @@ inode, size, mtime and ctime snapshot. An absent or unreadable group provider
 is distinct from a successful lookup with no memberships and denies both
 positive and negated group requirements.
 
+`AuthUserFile` has an additional work-profile invariant: every username must
+be unique, every password record must be structurally valid, and all records
+must use one hash scheme, work factor, and salt shape. Startup rejects a main
+configuration that violates it; an access-file-selected database fails closed
+at runtime. The parsed generation retains one verifier as a dummy, so every
+syntactically valid Basic credential executes exactly one real-or-dummy
+verification. Bcrypt admission is additionally weighted exponentially by its
+configured cost, preventing equalized missing-user work from becoming an
+unbounded high-cost CPU primitive.
+
 ## 1. Scope of the model
 
 In scope:
@@ -2301,6 +2311,11 @@ construction: there is no second production interleaver.
 - `bcrypt_cost_admit` rejects bcrypt costs outside 4..=17 before invoking the
   password library. SHA/SSHA and MD5-crypt verification compares the complete
   fixed representation in constant time, while bcrypt uses its verifier.
+  Password files are typed and validated once, require a uniform verifier
+  profile, and select a generation-local real or dummy record before entering
+  the common verification boundary. Bcrypt's CPU ledger charges `2^(cost-5)`
+  units (with cost 4 charged as one), in addition to the ordinary bounded
+  expensive-operation lease.
   `expr_regex_size_admit` binds compatibility-pattern and
   subject sizes to 64 KiB; `regex_match_resource_admit` additionally proves
   the overflow-free pattern-times-subject ceiling, while compile/capture

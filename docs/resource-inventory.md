@@ -26,7 +26,9 @@ The slot ledger covers pending connections, HTTP/1 workers, slow-body workers,
 TLS handshakes, HTTP/2 connections, ordinary streams and a shared source-fair
 slow-input and slow-output class, dynamic backend requests, blocking response reads,
 WebSocket tunnels, expensive CPU operations, `RewriteMap prg` helpers, and
-general/slow spool files. Filesystem lookup/cache work has a separate
+general/slow spool files. Bcrypt additionally holds a weighted CPU lease whose
+charge doubles with each configured cost step; the ordinary expensive-work
+lease still caps cheap hashes by operation count. Filesystem lookup/cache work has a separate
 64-process/8-source phase, so a stalled mount cannot occupy every request
 worker or any dynamic-backend slot. The adjustable byte ledger covers request memory,
 general/slow response memory, general/slow request/backend/proxy spools, and
@@ -154,7 +156,9 @@ Some mutable state is intentionally process-owned rather than request-owned:
 - telemetry counters, thread-local formatting buffers, request-local metadata
   memoization, collision-resistant temporary-name counters, and the
   deterministic task/thread fault plans and once-initialized whole-request
-  fixture compiled only for fuzz/fault-injection testing.
+  fixture compiled only for fuzz/fault-injection testing. Authentication tests
+  also use one thread-local verifier-call counter to assert that known and
+  unknown usernames each cross the verification boundary exactly once.
 
 These objects have bounds or constant cardinality at their definitions and do
 not grant request execution capacity. `tests/resource_inventory.py` makes the

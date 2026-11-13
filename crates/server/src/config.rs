@@ -3510,6 +3510,10 @@ pub struct Config {
     /// Main-configuration password/group databases validated before serving.
     /// Access-file declarations are checked on every runtime read instead.
     auth_file_targets: Vec<PathBuf>,
+    /// Password databases need a stricter semantic pass than group files:
+    /// every record must select the same verifier work profile so unknown
+    /// users can execute indistinguishable dummy work.
+    auth_user_file_targets: Vec<PathBuf>,
     /// Administrative inputs that are publication-sensitive but do not use
     /// the root-owned parent-validation policy. RewriteMap program spellings
     /// live here because execution is bound to a sealed descriptor snapshot;
@@ -3892,6 +3896,9 @@ impl Config {
         let mutable = self.capability_enabled(Capability::MutableAuthFiles);
         for path in &self.auth_file_targets {
             crate::auth::validate_auth_file(path, mutable, service_uid)?;
+        }
+        for path in &self.auth_user_file_targets {
+            crate::auth::validate_auth_user_file(path, mutable, service_uid)?;
         }
         Ok(())
     }
@@ -5787,6 +5794,7 @@ impl Compile {
             admin_file_trust,
             admin_input_targets,
             auth_file_targets: Vec::new(),
+            auth_user_file_targets: Vec::new(),
             publication_input_targets: Vec::new(),
             administrative_publication_manifest: AdministrativeInputManifest::default(),
             runtime_administrative_inputs: Arc::new(RwLock::new(
@@ -8731,6 +8739,9 @@ impl Compile {
                 };
                 if !self.cfg.auth_file_targets.contains(&full) {
                     self.cfg.auth_file_targets.push(full.clone());
+                }
+                if !self.cfg.auth_user_file_targets.contains(&full) {
+                    self.cfg.auth_user_file_targets.push(full.clone());
                 }
                 scope.authorization.auth_user_file = Some(full);
             }
@@ -12013,6 +12024,13 @@ mod tests {
         )
         .unwrap();
         assert!(mutable.validate_auth_files(service_uid).is_ok());
+
+        std::fs::write(
+            &auth_file,
+            "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\nbob:$apr1$gqijKP2Z$nBjZURLWP3/zSfPLTfhVM0\n",
+        )
+        .unwrap();
+        assert!(mutable.validate_auth_files(service_uid).is_err());
 
         std::fs::write(&auth_file, b"alice:\xff\n").unwrap();
         assert!(mutable.validate_auth_files(service_uid).is_err());

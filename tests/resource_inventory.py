@@ -13,7 +13,7 @@ EXPECTED_SLOTS = {
     "ExpensiveCpu", "PendingConnection", "H1Connection", "RequestWorker",
     "RequestBodyWorker", "H2Connection", "TlsHandshake",
     "RewriteProgram", "SpoolFile", "SlowSpoolFile",
-    "FilesystemWork",
+    "FilesystemWork", "BcryptCpu",
 }
 EXPECTED_BYTES = {
     "Spool", "SlowSpool", "RequestResident", "ResponseResident",
@@ -28,6 +28,7 @@ EXPECTED_PHYSICAL = {"FileDescriptor", "Task", "ResidentMemory"}
 ALLOWED_MUTABLE_STATICS = {
     ("access.rs", "SENDER"),
     ("auth.rs", "CACHE"), ("auth.rs", "NEXT_TEMP"),
+    ("auth.rs", "PASSWORD_VERIFY_CALLS"),
     ("cache.rs", "CACHE_EPOCH"), ("cache.rs", "BARRIER"),
     ("cache.rs", "CACHE"),
     ("cache.rs", "USAGE"), ("cache.rs", "SCAN"), ("cache.rs", "LOCKS"),

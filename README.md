@@ -81,6 +81,11 @@ Implemented today:
   default their parent chain and file must be outside the service identity's
   mutation authority; deployments that intentionally update them as the
   service account must opt in with `HttpdRsCapability MutableAuthFiles On`.
+  Each `AuthUserFile` must use one uniform hash scheme, work factor, and salt
+  shape; malformed, duplicate, or mixed-profile files fail closed. Unknown
+  users execute one cached dummy verification of that same profile, avoiding
+  username-dependent password-work timing without adding another hash to
+  successful requests.
   SHA/SSHA and MD5-crypt outputs are compared in constant time; bcrypt uses
   its verifier. Plaintext and unknown hash formats fail closed.
 - TLS 1.2/1.3 via Rustls with `SSLEngine`, certificate chains, SNI virtual-host

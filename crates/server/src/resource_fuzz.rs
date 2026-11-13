@@ -25,6 +25,7 @@ const SLOT_KINDS: [SlotKind; SlotKind::COUNT] = [
     SlotKind::SpoolFile,
     SlotKind::SlowSpoolFile,
     SlotKind::FilesystemWork,
+    SlotKind::BcryptCpu,
 ];
 const BYTE_KINDS: [ByteKind; ByteKind::COUNT] = [
     ByteKind::Spool,

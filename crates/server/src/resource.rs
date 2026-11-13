@@ -39,10 +39,14 @@ pub(crate) enum SlotKind {
     SpoolFile,
     SlowSpoolFile,
     FilesystemWork,
+    /// Relative bcrypt CPU work. A separate ordinary `ExpensiveCpu` lease
+    /// still caps operation count; this weighted ledger prevents high-cost
+    /// hashes from consuming the same allowance as low-cost hashes.
+    BcryptCpu,
 }
 
 impl SlotKind {
-    const COUNT: usize = 17;
+    const COUNT: usize = 18;
 
     const fn index(self) -> usize {
         self as usize
@@ -120,6 +124,7 @@ struct RateLedger {
     request_parse: RateWindow,
     request: RateWindow,
     expensive: RateWindow,
+    bcrypt: RateWindow,
     cache_write: RateWindow,
     log_bytes: RateWindow,
 }
@@ -227,6 +232,11 @@ impl Default for ResourceBudget {
 /// multiplying expensive work by its per-connection stream allowance.
 pub const MAX_EXPENSIVE_OPS: u64 = 32;
 pub const MAX_EXPENSIVE_OPS_PER_CLIENT: u64 = 8;
+/// Bcrypt work is normalized to cost 5. The process allowance admits 32
+/// concurrent cost-12 checks or one cost-17 check; the ordinary expensive-op
+/// lease independently caps cheap checks at 32 process-wide and 8 per client.
+pub const MAX_BCRYPT_WORK_UNITS: u64 = 4_096;
+pub const MAX_BCRYPT_WORK_UNITS_PER_CLIENT: u64 = 4_096;
 pub const MAX_DYNAMIC_REQUESTS_PER_CLIENT: u64 = 8;
 pub const MAX_RESPONSE_BODY_READS: u64 = 32;
 pub const MAX_RESPONSE_BODY_READS_PER_CLIENT: u64 = 8;
@@ -274,6 +284,8 @@ pub const MAX_REQUEST_HEADS_PER_SECOND: u64 = 2_000_000;
 pub const MAX_REQUEST_HEADS_PER_CLIENT_PER_SECOND: u64 = 500_000;
 pub const MAX_EXPENSIVE_OPS_PER_SECOND: u64 = 256;
 pub const MAX_EXPENSIVE_OPS_PER_CLIENT_PER_SECOND: u64 = 64;
+pub const MAX_BCRYPT_WORK_UNITS_PER_SECOND: u64 = 4_096;
+pub const MAX_BCRYPT_WORK_UNITS_PER_CLIENT_PER_SECOND: u64 = 4_096;
 pub const MAX_CACHE_WRITE_UNITS_PER_SECOND: u64 = 64 * 1024 * 1024;
 pub const MAX_CACHE_WRITE_UNITS_PER_CLIENT_PER_SECOND: u64 = 16 * 1024 * 1024;
 pub const MAX_LOG_BYTES_PER_SECOND: u64 = 16 * 1024 * 1024;
@@ -416,7 +428,7 @@ const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
         DynamicBackend => [0, 2, 256 * 1024],
         Websocket => [1, 0, 64 * 1024],
         RewriteProgram => [3, 1, 128 * 1024],
-        SpoolFile | SlowSpoolFile | FilesystemWork => [0, 0, 0],
+        SpoolFile | SlowSpoolFile | FilesystemWork | BcryptCpu => [0, 0, 0],
         TlsHandshake => [0, 0, 128 * 1024],
         RequestBodyWorker | ExpensiveCpu => [0, 0, 0],
     }
@@ -627,9 +639,22 @@ impl ResourceContext {
         request_limit: Option<u64>,
         message: &'static str,
     ) -> io::Result<SlotLease> {
-        self.budget.try_slot(
+        self.slot_amount(kind, 1, process_limit, client_limit, request_limit, message)
+    }
+
+    fn slot_amount(
+        &self,
+        kind: SlotKind,
+        amount: u64,
+        process_limit: u64,
+        client_limit: Option<u64>,
+        request_limit: Option<u64>,
+        message: &'static str,
+    ) -> io::Result<SlotLease> {
+        self.budget.try_slot_amount(
             self,
             kind,
+            amount,
             process_limit,
             client_limit,
             request_limit,
@@ -1691,10 +1716,32 @@ impl ResourceBudget {
         }
     }
 
+    #[cfg(any(test, feature = "fuzzing"))]
     fn try_slot(
         self: &Arc<Self>,
         context: &ResourceContext,
         kind: SlotKind,
+        process_limit: u64,
+        client_limit: Option<u64>,
+        request_limit: Option<u64>,
+        message: &'static str,
+    ) -> io::Result<SlotLease> {
+        self.try_slot_amount(
+            context,
+            kind,
+            1,
+            process_limit,
+            client_limit,
+            request_limit,
+            message,
+        )
+    }
+
+    fn try_slot_amount(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+        kind: SlotKind,
+        amount: u64,
         process_limit: u64,
         client_limit: Option<u64>,
         request_limit: Option<u64>,
@@ -1707,8 +1754,11 @@ impl ResourceBudget {
             ));
         }
         let index = kind.index();
+        if amount == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
         let charged_request = if let Some(limit) = request_limit {
-            if !try_add(&context.local.slots[index], 1, limit) {
+            if !try_add(&context.local.slots[index], amount, limit) {
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
             }
             true
@@ -1722,16 +1772,16 @@ impl ResourceBudget {
             .unwrap_or_else(|error| error.into_inner());
         let charged_client = if let (Some(client), Some(limit)) = (context.client, client_limit) {
             let usage = clients.entry(client).or_insert([0; SlotKind::COUNT]);
-            if !httpd_rs_verified::hierarchical_resource_admit(usage[index], 1, limit) {
+            if !httpd_rs_verified::hierarchical_resource_admit(usage[index], amount, limit) {
                 if usage.iter().all(|value| *value == 0) {
                     clients.remove(&client);
                 }
                 if charged_request {
-                    context.local.slots[index].fetch_sub(1, Ordering::AcqRel);
+                    context.local.slots[index].fetch_sub(amount, Ordering::AcqRel);
                 }
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
             }
-            usage[index] += 1;
+            usage[index] += amount;
             true
         } else {
             false
@@ -1743,12 +1793,12 @@ impl ResourceBudget {
         if !httpd_rs_verified::hierarchical_acquisition_order_admit(
             !charged_request || request_limit.is_some(),
             !charged_client || client_limit.is_some(),
-        ) || !try_add(&self.slot_process[index], 1, process_limit)
+        ) || !try_add(&self.slot_process[index], amount, process_limit)
         {
             if charged_client {
                 if let Some(client) = context.client {
                     if let Some(usage) = clients.get_mut(&client) {
-                        usage[index] = usage[index].saturating_sub(1);
+                        usage[index] = usage[index].saturating_sub(amount);
                         if usage.iter().all(|value| *value == 0) {
                             clients.remove(&client);
                         }
@@ -1757,17 +1807,17 @@ impl ResourceBudget {
             }
             drop(clients);
             if charged_request {
-                context.local.slots[index].fetch_sub(1, Ordering::AcqRel);
+                context.local.slots[index].fetch_sub(amount, Ordering::AcqRel);
             }
             return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
         }
-        let physical = slot_physical_charge(kind);
+        let physical = slot_physical_charge(kind).map(|charge| charge.saturating_mul(amount));
         if !self.try_physical(physical) {
-            self.slot_process[index].fetch_sub(1, Ordering::AcqRel);
+            self.slot_process[index].fetch_sub(amount, Ordering::AcqRel);
             if charged_client {
                 if let Some(client) = context.client {
                     if let Some(usage) = clients.get_mut(&client) {
-                        usage[index] = usage[index].saturating_sub(1);
+                        usage[index] = usage[index].saturating_sub(amount);
                         if usage.iter().all(|value| *value == 0) {
                             clients.remove(&client);
                         }
@@ -1776,7 +1826,7 @@ impl ResourceBudget {
             }
             drop(clients);
             if charged_request {
-                context.local.slots[index].fetch_sub(1, Ordering::AcqRel);
+                context.local.slots[index].fetch_sub(amount, Ordering::AcqRel);
             }
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -1787,7 +1837,7 @@ impl ResourceBudget {
         Ok(SlotLease {
             context: context.clone(),
             kind,
-            amount: 1,
+            amount,
             process_limit,
             charged_client,
             charged_request,
@@ -2647,6 +2697,12 @@ pub struct ExpensiveLease {
     _slot: SlotLease,
 }
 
+#[derive(Debug)]
+pub(crate) struct BcryptLease {
+    _operation: ExpensiveLease,
+    _work: SlotLease,
+}
+
 pub fn try_expensive() -> Option<ExpensiveLease> {
     #[cfg(test)]
     let context = current_or_test_context();
@@ -2683,6 +2739,53 @@ pub(crate) fn try_expensive_in(context: &ResourceContext) -> Option<ExpensiveLea
     }
     drop(rates);
     Some(ExpensiveLease { _slot: slot })
+}
+
+/// Admit a bcrypt verifier by both operation count and exponential work
+/// factor. Cost 5 is one unit; every additional cost bit doubles the charge.
+/// Unknown and known Basic-auth users call this same gate after selecting a
+/// real or dummy verifier with the file's uniform cost.
+pub(crate) fn try_bcrypt(cost: u32) -> Option<BcryptLease> {
+    if !httpd_rs_verified::bcrypt_cost_admit(cost) {
+        return None;
+    }
+    #[cfg(test)]
+    let context = current_or_test_context();
+    #[cfg(not(test))]
+    let context = current_context()?;
+    let operation = try_expensive_in(&context)?;
+    let units = 1u64.checked_shl(cost.saturating_sub(5)).unwrap_or(u64::MAX);
+    let work = context
+        .slot_amount(
+            SlotKind::BcryptCpu,
+            units,
+            MAX_BCRYPT_WORK_UNITS,
+            Some(MAX_BCRYPT_WORK_UNITS_PER_CLIENT),
+            Some(MAX_BCRYPT_WORK_UNITS),
+            "bcrypt work-factor limit reached",
+        )
+        .ok()?;
+    let mut rates = context
+        .budget
+        .rates
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !ResourceBudget::admit_rate_amount(
+        &mut rates.bcrypt,
+        context.client,
+        std::time::Instant::now(),
+        units,
+        MAX_BCRYPT_WORK_UNITS_PER_SECOND,
+        MAX_BCRYPT_WORK_UNITS_PER_CLIENT_PER_SECOND,
+    ) {
+        drop(rates);
+        return None;
+    }
+    drop(rates);
+    Some(BcryptLease {
+        _operation: operation,
+        _work: work,
+    })
 }
 
 #[derive(Debug)]
@@ -3862,6 +3965,23 @@ mod tests {
             assert!(with_expensive_client(second, try_expensive).is_some());
             drop(leases);
             assert!(try_expensive().is_some());
+        });
+    }
+
+    #[test]
+    fn bcrypt_admission_accounts_for_exponential_cost() {
+        let budget = Arc::new(ResourceBudget::default());
+        let context = budget.context("192.0.2.55".parse().unwrap());
+        with_resource_context(context, || {
+            let lease = try_bcrypt(17).expect("one maximum-cost verifier");
+            assert_eq!(budget.slot_usage(SlotKind::ExpensiveCpu), 1);
+            assert_eq!(budget.slot_usage(SlotKind::BcryptCpu), 4_096);
+            assert!(try_bcrypt(4).is_none());
+            drop(lease);
+            assert_eq!(budget.slot_usage(SlotKind::ExpensiveCpu), 0);
+            assert_eq!(budget.slot_usage(SlotKind::BcryptCpu), 0);
+            assert!(try_bcrypt(3).is_none());
+            assert!(try_bcrypt(18).is_none());
         });
     }
 

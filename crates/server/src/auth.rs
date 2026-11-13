@@ -57,8 +57,12 @@ pub fn authenticate(scope: &Scope, req: &Request, mutable_auth_files: bool) -> O
         return None;
     }
     let file = scope.authorization.auth_user_file.as_ref()?;
-    let stored = lookup_user(file, user, mutable_auth_files)?;
-    if !verify_password(password, &stored) {
+    let (known_user, password_matches) =
+        authenticate_password(file, user, password, mutable_auth_files)?;
+    // A syntactically valid credential always executes exactly one verifier.
+    // Missing users select the generation-bound dummy from the parsed file;
+    // do not turn this into a short-circuiting boolean expression.
+    if !(known_user & password_matches) {
         return None;
     }
     // Group authorization is a separate provider. Preserve its unavailable
@@ -137,8 +141,185 @@ struct AuthFileCache {
 }
 
 struct ParsedAuthFile {
-    users: HashMap<String, Option<String>>,
+    passwords: Option<PasswordDatabase>,
     groups_by_user: HashMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PasswordProfile {
+    Sha,
+    SaltedSha { salt_len: usize },
+    Apr1 { salt_len: usize },
+    UnixMd5 { salt_len: usize },
+    Bcrypt { cost: u32 },
+}
+
+#[derive(Clone)]
+enum PasswordVerifier {
+    Sha([u8; 20]),
+    SaltedSha {
+        digest: [u8; 20],
+        salt: Box<[u8]>,
+    },
+    Md5Crypt {
+        stored: Box<str>,
+        salt: Box<[u8]>,
+        magic: &'static str,
+    },
+    Bcrypt {
+        stored: Box<str>,
+        cost: u32,
+    },
+}
+
+impl PasswordVerifier {
+    fn parse(stored: &str) -> Option<(PasswordProfile, Self)> {
+        if let Some(encoded) = stored.strip_prefix("{SHA}") {
+            let decoded = STANDARD
+                .decode(encoded)
+                .or_else(|_| STANDARD_NO_PAD.decode(encoded))
+                .ok()?;
+            let digest = <[u8; 20]>::try_from(decoded.as_slice()).ok()?;
+            return Some((PasswordProfile::Sha, Self::Sha(digest)));
+        }
+        if let Some(encoded) = stored.strip_prefix("{SSHA}") {
+            let decoded = STANDARD
+                .decode(encoded)
+                .or_else(|_| STANDARD_NO_PAD.decode(encoded))
+                .ok()?;
+            if decoded.len() < 20 {
+                return None;
+            }
+            let digest = <[u8; 20]>::try_from(&decoded[..20]).ok()?;
+            let salt = Box::<[u8]>::from(&decoded[20..]);
+            return Some((
+                PasswordProfile::SaltedSha {
+                    salt_len: salt.len(),
+                },
+                Self::SaltedSha { digest, salt },
+            ));
+        }
+        for (magic, apr1) in [("$apr1$", true), ("$1$", false)] {
+            let Some(rest) = stored.strip_prefix(magic) else {
+                continue;
+            };
+            let (salt, encoded) = rest.split_once('$')?;
+            if salt.len() > 8
+                || encoded.len() != 22
+                || !encoded.bytes().all(|byte| CRYPT_ALPHABET.contains(&byte))
+            {
+                return None;
+            }
+            let profile = if apr1 {
+                PasswordProfile::Apr1 {
+                    salt_len: salt.len(),
+                }
+            } else {
+                PasswordProfile::UnixMd5 {
+                    salt_len: salt.len(),
+                }
+            };
+            return Some((
+                profile,
+                Self::Md5Crypt {
+                    stored: stored.into(),
+                    salt: salt.as_bytes().into(),
+                    magic,
+                },
+            ));
+        }
+        if stored.starts_with("$2") {
+            // Use the same parser as verification. Merely checking the shape
+            // here would admit non-canonical bcrypt base64 that `verify`
+            // rejects before doing any work, recreating a timing oracle.
+            let parts = stored.parse::<bcrypt::HashParts>().ok()?;
+            let cost = parts.get_cost();
+            if httpd_rs_verified::bcrypt_cost_admit(cost) {
+                return Some((
+                    PasswordProfile::Bcrypt { cost },
+                    Self::Bcrypt {
+                        stored: stored.into(),
+                        cost,
+                    },
+                ));
+            }
+        }
+        None
+    }
+
+    fn verify(&self, password: &[u8]) -> bool {
+        #[cfg(test)]
+        PASSWORD_VERIFY_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+        match self {
+            Self::Sha(expected) => {
+                bool::from(Sha1::digest(password).as_slice().ct_eq(expected.as_slice()))
+            }
+            Self::SaltedSha { digest, salt } => {
+                let mut h = Sha1::new();
+                h.update(password);
+                h.update(salt);
+                bool::from(h.finalize().as_slice().ct_eq(digest.as_slice()))
+            }
+            Self::Md5Crypt {
+                stored,
+                salt,
+                magic,
+            } => {
+                let Some(_expensive) = crate::resource::try_expensive() else {
+                    return false;
+                };
+                let computed = md5_crypt(password, salt, magic);
+                bool::from(computed.as_bytes().ct_eq(stored.as_bytes()))
+            }
+            Self::Bcrypt { stored, cost } => {
+                let Some(_expensive) = crate::resource::try_bcrypt(*cost) else {
+                    return false;
+                };
+                bcrypt::verify(password, stored.as_ref()).unwrap_or(false)
+            }
+        }
+    }
+}
+
+struct PasswordDatabase {
+    users: HashMap<String, PasswordVerifier>,
+    dummy: PasswordVerifier,
+}
+
+impl PasswordDatabase {
+    fn parse(users: &HashMap<String, Option<String>>) -> Option<Self> {
+        let mut profile = None;
+        let mut parsed = HashMap::with_capacity(users.len());
+        let mut dummy = None;
+        for (user, stored) in users {
+            let (candidate_profile, verifier) = PasswordVerifier::parse(stored.as_ref()?)?;
+            if profile
+                .as_ref()
+                .is_some_and(|expected| expected != &candidate_profile)
+            {
+                return None;
+            }
+            profile.get_or_insert(candidate_profile);
+            dummy.get_or_insert_with(|| verifier.clone());
+            parsed.insert(user.clone(), verifier);
+        }
+        Some(Self {
+            users: parsed,
+            dummy: dummy?,
+        })
+    }
+
+    fn select(&self, user: &str) -> (bool, &PasswordVerifier) {
+        match self.users.get(user) {
+            Some(verifier) => (true, verifier),
+            None => (false, &self.dummy),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PASSWORD_VERIFY_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn auth_file_cache() -> &'static Mutex<AuthFileCache> {
@@ -350,9 +531,10 @@ fn parse_auth_file(data: &str) -> Option<(ParsedAuthFile, usize)> {
                 .push(group.clone());
         }
     }
+    let passwords = PasswordDatabase::parse(&users);
     Some((
         ParsedAuthFile {
-            users,
+            passwords,
             groups_by_user,
         },
         weight,
@@ -373,9 +555,33 @@ pub fn validate_auth_file(path: &Path, mutable: bool, service_uid: u32) -> Resul
         })
 }
 
-fn lookup_user(path: &Path, user: &str, mutable: bool) -> Option<String> {
+/// Validate the password-record semantics for a main-configuration
+/// `AuthUserFile`. Group files share the bounded file reader but deliberately
+/// do not use this password-specific grammar.
+pub fn validate_auth_user_file(path: &Path, mutable: bool, service_uid: u32) -> Result<(), String> {
+    let data = read_small_uncached(path, mutable, service_uid).ok_or_else(|| {
+        format!(
+            "authentication file {} must be bounded strict UTF-8 and, unless MutableAuthFiles is enabled, operator-controlled",
+            path.display()
+        )
+    })?;
+    data.passwords.as_ref().map(|_| ()).ok_or_else(|| {
+        format!(
+            "AuthUserFile {} must contain unique, valid password records with one uniform hash scheme, cost, and salt shape",
+            path.display()
+        )
+    })
+}
+
+fn authenticate_password(
+    path: &Path,
+    user: &str,
+    password: &[u8],
+    mutable: bool,
+) -> Option<(bool, bool)> {
     let data = read_small(path, mutable)?;
-    data.users.get(user)?.clone()
+    let (known_user, verifier) = data.passwords.as_ref()?.select(user);
+    Some((known_user, verifier.verify(password)))
 }
 
 fn groups_for(path: &Path, user: &str, mutable: bool) -> Option<Vec<String>> {
@@ -383,70 +589,12 @@ fn groups_for(path: &Path, user: &str, mutable: bool) -> Option<Vec<String>> {
     Some(data.groups_by_user.get(user).cloned().unwrap_or_default())
 }
 
+#[cfg(test)]
 fn verify_password(password: &[u8], stored: &str) -> bool {
-    if let Some(encoded) = stored.strip_prefix("{SHA}") {
-        let Ok(expected) = STANDARD
-            .decode(encoded)
-            .or_else(|_| STANDARD_NO_PAD.decode(encoded))
-        else {
-            return false;
-        };
-        if expected.len() != 20 {
-            return false;
-        }
-        return bool::from(Sha1::digest(password).as_slice().ct_eq(expected.as_slice()));
-    }
-    if let Some(encoded) = stored.strip_prefix("{SSHA}") {
-        let Ok(decoded) = STANDARD
-            .decode(encoded)
-            .or_else(|_| STANDARD_NO_PAD.decode(encoded))
-        else {
-            return false;
-        };
-        if decoded.len() < 20 {
-            return false;
-        }
-        let mut h = Sha1::new();
-        h.update(password);
-        h.update(&decoded[20..]);
-        return bool::from(h.finalize().as_slice().ct_eq(&decoded[..20]));
-    }
-    if stored.starts_with("$apr1$") {
-        let Some(_expensive) = crate::resource::try_expensive() else {
-            return false;
-        };
-        return md5_crypt_matches(password, stored, "$apr1$");
-    }
-    if stored.starts_with("$1$") {
-        let Some(_expensive) = crate::resource::try_expensive() else {
-            return false;
-        };
-        return md5_crypt_matches(password, stored, "$1$");
-    }
-    if stored.starts_with("$2a$")
-        || stored.starts_with("$2b$")
-        || stored.starts_with("$2x$")
-        || stored.starts_with("$2y$")
-    {
-        let cost = stored
-            .split('$')
-            .nth(2)
-            .and_then(|cost| cost.parse::<u32>().ok())
-            .unwrap_or(u32::MAX);
-        if !httpd_rs_verified::bcrypt_cost_admit(cost) {
-            return false;
-        }
-        let Some(_expensive) = crate::resource::try_expensive() else {
-            return false;
-        };
-        let Ok(password) = std::str::from_utf8(password) else {
-            return false;
-        };
-        return bcrypt::verify(password, stored).unwrap_or(false);
-    }
-    false
+    PasswordVerifier::parse(stored).is_some_and(|(_, verifier)| verifier.verify(password))
 }
 
+#[cfg(test)]
 fn md5_crypt_matches(password: &[u8], stored: &str, magic: &str) -> bool {
     let Some(rest) = stored.strip_prefix(magic) else {
         return false;
@@ -638,6 +786,54 @@ mod tests {
     }
 
     #[test]
+    fn missing_and_present_users_each_execute_one_uniform_verifier() {
+        let users = temp_path("uniform-dummy-users");
+        std::fs::write(&users, "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n").unwrap();
+        let mut scope = Scope::default();
+        scope.authorization.auth_type = Some("Basic".into());
+        scope.authorization.auth_user_file = Some(users.clone());
+
+        PASSWORD_VERIFY_CALLS.with(|calls| calls.set(0));
+        assert!(authenticate(&scope, &request(Some(basic(b"nobody:wrong"))), true).is_none());
+        assert_eq!(PASSWORD_VERIFY_CALLS.with(std::cell::Cell::get), 1);
+        assert!(authenticate(&scope, &request(Some(basic(b"alice:wrong"))), true).is_none());
+        assert_eq!(PASSWORD_VERIFY_CALLS.with(std::cell::Cell::get), 2);
+        assert!(authenticate(&scope, &request(Some(basic(b"alice:test"))), true).is_some());
+        assert_eq!(PASSWORD_VERIFY_CALLS.with(std::cell::Cell::get), 3);
+
+        std::fs::remove_file(users).unwrap();
+    }
+
+    #[test]
+    fn password_database_requires_valid_unique_uniform_records() {
+        let uniform = parse_auth_file(
+            "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\nbob:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=\n",
+        )
+        .unwrap()
+        .0;
+        assert!(uniform.passwords.is_some());
+
+        for invalid in [
+            "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\nbob:{SSHA}cHh4eHh4eHh4eHh4eHh4eHh4eHg=\n",
+            "alice:{SHA}%%%\n",
+            "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\nalice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n",
+            "alice:$2y$05$lFdvgVrS6ROEENEOjKS5h.y4SA05OvKSOFRPC1BcjARNhNt.DQ8jC\nbob:$2y$06$lFdvgVrS6ROEENEOjKS5h.y4SA05OvKSOFRPC1BcjARNhNt.DQ8jC\n",
+            // Alphabet-valid but non-canonical bcrypt base64 must be rejected
+            // by the verification backend's parser during configuration.
+            "alice:$2y$05$lFdvgVrS6ROEENEOjKS5h.y4SA05OvKSOFRPC1BcjARNhNt.DQ8jD\n",
+            "",
+        ] {
+            assert!(parse_auth_file(invalid).unwrap().0.passwords.is_none());
+        }
+
+        // Group-file syntax remains independently valid even though it is not
+        // a password database.
+        let group = parse_auth_file("admins: alice bob\n").unwrap().0;
+        assert!(group.passwords.is_none());
+        assert_eq!(group.groups_by_user["alice"], ["admins"]);
+    }
+
+    #[test]
     fn group_provider_failure_does_not_erase_valid_user_authentication() {
         let users = temp_path("valid-user-users");
         std::fs::write(&users, "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n").unwrap();
@@ -820,7 +1016,7 @@ mod tests {
     #[test]
     fn auth_file_caches_evict_at_their_entry_ceiling() {
         let parsed = Arc::new(ParsedAuthFile {
-            users: HashMap::new(),
+            passwords: None,
             groups_by_user: HashMap::new(),
         });
         {
@@ -970,5 +1166,28 @@ mod tests {
         assert!(!verify_password(b"password", "password"));
         assert!(!verify_password(b"password", "{PLAIN}password"));
         assert!(!verify_password(b"password", "{CRYPT}xyz"));
+    }
+
+    #[test]
+    #[ignore = "manual authentication-path benchmark"]
+    fn benchmark_basic_authentication_path() {
+        let users = temp_path("benchmark-users");
+        std::fs::write(&users, "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n").unwrap();
+        let mut scope = Scope::default();
+        scope.authorization.auth_type = Some("Basic".into());
+        scope.authorization.auth_user_file = Some(users.clone());
+        let header = basic(b"alice:test");
+        let iterations = 500_000u32;
+        let started = Instant::now();
+        for _ in 0..iterations {
+            assert!(authenticate(&scope, &request(Some(header.clone())), true).is_some());
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "basic_auth_benchmark iterations={iterations} elapsed_s={:.6} ns_per_op={:.1}",
+            elapsed.as_secs_f64(),
+            elapsed.as_nanos() as f64 / f64::from(iterations)
+        );
+        std::fs::remove_file(users).unwrap();
     }
 }
