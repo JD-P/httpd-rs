@@ -690,7 +690,15 @@ rustup toolchain install nightly-2026-10-29 --profile minimal --component llvm-t
 tests/fuzz_smoke.sh                         # bounded run of every target
 FUZZ_SECONDS_PER_TARGET=900 tests/fuzz_campaign.sh
 tests/long_fuzz.sh --nightly latest --hours 12 --jobs 4 --coverage --strict-semantic
+python3 tests/resource_profile_campaign.py --output artifacts/resource-warrant --perf record
 ```
+
+The resource campaign combines process/cgroup/perf measurements from the real
+benchmark and deployment workloads with a checked static inventory of
+allocation, iteration, I/O, task, synchronization, algorithm and syscall
+effects. See [the request resource warrant](docs/resource-warrant.md) for how
+that inventory becomes typed accounting and Verus proof work rather than an
+assumption that unobserved code is harmless.
 
 The 30 targets cover individual HTTP requests, fragmented/pipelined
 connections, configuration tokenization and full compilation, `.htaccess`

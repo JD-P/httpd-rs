@@ -1,0 +1,170 @@
+{
+  "schema": 1,
+  "claim": "Every request-reachable variable-cost effect must be mapped to a typed lease, proved to have a constant hard bound, or recorded as a pinned external assumption with an independent runtime backstop.",
+  "scope": {
+    "source_roots": [
+      "crates/server/src",
+      "crates/pcre2/src",
+      "crates/os/src",
+      "vendor/h2-0.4.20/src"
+    ],
+    "excluded_paths": [
+      "crates/server/src/whole_request_fuzz.rs"
+    ],
+    "excluded": [
+      "Rust code lexically inside #[cfg(test)] modules",
+      "whole_request_fuzz.rs, which is compiled only for tests and the fuzzing feature",
+      "benchmark and test clients, which are workload generators rather than request sinks",
+      "startup-only effects remain inventoried unless they are lexically test-only"
+    ]
+  },
+  "resources": [
+    {
+      "id": "cpu-time",
+      "attacker_axes": ["input bytes", "input structure", "configured algorithm/quality", "request concurrency"],
+      "dynamic_measurements": ["process CPU ticks", "perf task-clock/cycles/instructions", "context switches"],
+      "accounting_apis": ["ExpensiveLease", "BcryptLease", "CompressionLease", "FilesystemWorkLease", "RequestPolicyBudget"],
+      "verus_targets": ["resource_budget_admit", "dynamic_compression_budget", "regex_match_resource_admit", "policy_path_work_admit"],
+      "os_backstop": "cgroup CPU quota or service CPUWeight/CPUQuota"
+    },
+    {
+      "id": "resident-memory",
+      "attacker_axes": ["body bytes", "header bytes", "response bytes", "cache cardinality", "concurrency"],
+      "dynamic_measurements": ["VmRSS/VmHWM", "smaps PSS", "cgroup memory.current/memory.peak"],
+      "accounting_apis": ["ResidentLease", "ByteLease", "CompressionLease", "CacheResidentLease"],
+      "verus_targets": ["request_body_memory_admit", "bounded_expansion_append_admit", "dynamic_compression_budget"],
+      "os_backstop": "cgroup memory.max plus process OOM policy"
+    },
+    {
+      "id": "private-memory",
+      "attacker_axes": ["allocator-owned request state", "dependency workspace", "thread stacks"],
+      "dynamic_measurements": ["smaps private clean/dirty", "smaps anonymous", "optional heap profiler"],
+      "accounting_apis": ["ResidentLease", "ByteLease", "CompressionLease"],
+      "verus_targets": ["resource_budget_admit", "dynamic_compression_workspace_spec"],
+      "os_backstop": "cgroup memory.max"
+    },
+    {
+      "id": "tasks",
+      "attacker_axes": ["connection concurrency", "stream concurrency", "backend concurrency", "blocking operations"],
+      "dynamic_measurements": ["process count", "thread count", "cgroup pids.current/pids.peak"],
+      "accounting_apis": ["TaskLease", "RequestWorkerLease", "DynamicLease", "H2StreamLease"],
+      "verus_targets": ["resource_budget_admit", "h2_process_slot_admit", "request_worker_lend_admit"],
+      "os_backstop": "cgroup pids.max and fixed worker pools"
+    },
+    {
+      "id": "file-descriptors",
+      "attacker_axes": ["connections", "backend connections", "open files", "spools", "subprocess pipes"],
+      "dynamic_measurements": ["/proc PID fd count and target class"],
+      "accounting_apis": ["DescriptorLease", "SpoolLease", "DynamicLease", "TransportBufferLease"],
+      "verus_targets": ["resource_budget_admit", "connection_admit"],
+      "os_backstop": "RLIMIT_NOFILE"
+    },
+    {
+      "id": "sockets",
+      "attacker_axes": ["accepted transports", "backend attempts", "WebSocket tunnels", "DNS helpers"],
+      "dynamic_measurements": ["socket descriptors", "transport bytes"],
+      "accounting_apis": ["DescriptorLease", "TransportBufferLease", "DynamicLease", "WebsocketLease"],
+      "verus_targets": ["connection_admit", "transform_proxy_sink_implies_representation_bound"],
+      "os_backstop": "RLIMIT_NOFILE, listen backlog and cgroup memory.max"
+    },
+    {
+      "id": "pipes",
+      "attacker_axes": ["CGI concurrency", "RewriteMap helpers", "privileged broker operations"],
+      "dynamic_measurements": ["pipe descriptors"],
+      "accounting_apis": ["DescriptorLease", "DynamicLease", "RewriteProgramLease"],
+      "verus_targets": ["resource_budget_admit"],
+      "os_backstop": "RLIMIT_NOFILE and fixed helper pools"
+    },
+    {
+      "id": "filesystem-io",
+      "attacker_axes": ["path depth", "access-file depth", "cache operations", "response bytes", "log bytes"],
+      "dynamic_measurements": ["procfs read/write bytes and syscall counts", "optional syscall trace"],
+      "accounting_apis": ["FilesystemWorkLease", "DiskLease", "SpoolLease", "ResponseBodyReadLease"],
+      "verus_targets": ["policy_path_work_admit", "response_body_read_lease_admit", "cache_invalidation_remove_admit"],
+      "os_backstop": "filesystem quotas, cgroup io.max and bounded worker pools"
+    }
+  ],
+  "effect_families": [
+    {
+      "id": "heap-allocation",
+      "resources": ["resident-memory", "private-memory", "cpu-time"],
+      "accounting_markers": ["ResidentLease", "ByteLease", "reserve_resident", "admit_resident", "charge_expansion", "CompressionLease"],
+      "description": "Heap allocation, collection capacity growth, cloning into owned storage and whole-input collection."
+    },
+    {
+      "id": "data-growth",
+      "resources": ["resident-memory", "private-memory", "cpu-time", "filesystem-io"],
+      "accounting_markers": ["reserve", "charge", "MAX_", "limit", "admit", "SpoolLease", "DiskLease"],
+      "description": "Incremental growth or whole-stream reads/writes whose cost can scale with input."
+    },
+    {
+      "id": "cpu-iteration",
+      "resources": ["cpu-time"],
+      "accounting_markers": ["work_units", "try_expensive", "try_filesystem_work", "policy_budget", "MAX_", "limit", "admit"],
+      "description": "Loops and iterator exhaustions that may scale with attacker-selected cardinality."
+    },
+    {
+      "id": "task-process",
+      "resources": ["tasks", "file-descriptors", "pipes", "resident-memory"],
+      "accounting_markers": ["TaskLease", "DynamicLease", "RewriteProgramLease", "try_task", "try_dynamic", "worker"],
+      "description": "Thread, task, blocking job, subprocess and bounded-channel creation."
+    },
+    {
+      "id": "filesystem",
+      "resources": ["filesystem-io", "file-descriptors", "cpu-time", "resident-memory"],
+      "accounting_markers": ["FilesystemWorkLease", "DescriptorLease", "DiskLease", "SpoolLease", "try_filesystem", "try_disk"],
+      "description": "Filesystem lookup, directory traversal, metadata, open, read, write, rename and removal."
+    },
+    {
+      "id": "network",
+      "resources": ["sockets", "file-descriptors", "resident-memory", "cpu-time"],
+      "accounting_markers": ["TransportBufferLease", "DynamicLease", "WebsocketLease", "DescriptorLease", "try_transport", "try_dynamic"],
+      "description": "Listener, accepted transport, outbound connection and socket I/O."
+    },
+    {
+      "id": "synchronization",
+      "resources": ["cpu-time", "tasks", "resident-memory"],
+      "accounting_markers": ["SlotLease", "Semaphore", "bounded", "sync_channel", "MAX_", "limit"],
+      "description": "Locks, channels, semaphores and waits that can retain tasks or create queues."
+    },
+    {
+      "id": "compression-regex-crypto",
+      "resources": ["cpu-time", "resident-memory", "private-memory"],
+      "accounting_markers": ["CompressionLease", "BcryptLease", "ExpensiveLease", "RegexLease", "resource_admit", "work_units"],
+      "description": "Variable-cost algorithms and dependency workspaces."
+    },
+    {
+      "id": "unsafe-ffi-syscall",
+      "resources": ["cpu-time", "resident-memory", "file-descriptors", "filesystem-io", "sockets", "tasks"],
+      "accounting_markers": ["httpd_rs_os", "DescriptorLease", "TaskLease", "DiskLease", "TransportBufferLease"],
+      "description": "FFI, raw descriptor construction and direct syscalls whose resource effects are not visible to Rust's type system."
+    }
+  ],
+  "audited_gateways": [
+    "crates/server/src/resource.rs",
+    "crates/os/src",
+    "crates/server/src/process.rs"
+  ],
+  "external_assumptions": [
+    {
+      "component": "brotli 8.0.4",
+      "resource": "CPU and encoder workspace",
+      "warrant": "pinned safe-Rust dependency; public custom allocator is metered; qualities 10/11 are rejected; cgroup memory/CPU remain independent backstops"
+    },
+    {
+      "component": "vendored h2 0.4.20 fork",
+      "resource": "stream/HPACK/codec CPU and memory",
+      "warrant": "source is included in static closure; adapter and fork limits are typed and fuzzed; transport buffers retain a physical-parent lease"
+    },
+    {
+      "component": "Rust allocator and standard library",
+      "resource": "allocation metadata, collection growth constants and thread stacks",
+      "warrant": "dynamic private/RSS measurement plus cgroup memory.max; attacker-proportional payload bytes require typed resident accounting"
+    },
+    {
+      "component": "Linux kernel and filesystems",
+      "resource": "socket buffers, page cache, dentries, descriptors, task and disk accounting",
+      "warrant": "procfs/cgroup observations, RLIMITs, filesystem child ledgers and service-level cgroup backstops"
+    }
+  ]
+}

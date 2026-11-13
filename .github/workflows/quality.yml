@@ -60,7 +60,10 @@ jobs:
       - name: Unsafe boundary budget
         run: python3 tests/unsafe_inventory.py
       - name: Resource ownership inventory
-        run: python3 tests/resource_inventory.py
+        run: |
+          python3 tests/resource_inventory.py
+          python3 tests/resource_warrant.py
+          python3 tests/resource_profile_selftest.py
       - name: Verification ledger and CVE matrix
         run: |
           python3 tests/verification_status.py

@@ -131,6 +131,7 @@ nav:
       - Adversarial closure: adversarial-closure.md
       - Coverage debt: coverage-debt.md
       - Resource ownership: resource-inventory.md
+      - Request resource warrant: resource-warrant.md
       - PCRE2 benchmark: pcre2-benchmark.md
       - Vulnerability trends: vulnerability_trends.md
   - Project:

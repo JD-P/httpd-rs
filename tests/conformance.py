@@ -2204,7 +2204,9 @@ class CompressionTests(Base):
         self.assertEqual(st, 200)
         self.assertEqual(h["content-encoding"][0], "gzip")
         self.assertEqual(gzip.decompress(b), b"hello world\n")
-        self.assertEqual(int(h["content-length"][0]), len(b))
+        # Compression is streamed through a bounded workspace, so the encoded
+        # length is deliberately not materialized before headers are sent.
+        self.assertNotIn("content-length", h)
         self.assertTrue(any("accept-encoding" in v.lower() for v in h.get("vary", [])))
         self.assertTrue(h["etag"][0].endswith('-gzip"'))
 

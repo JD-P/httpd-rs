@@ -100,6 +100,8 @@ tests/fuzz_smoke.sh
 
 step "Verus proof and verification-ledger gate"
 python3 tests/resource_inventory.py
+python3 tests/resource_warrant.py
+python3 tests/resource_profile_selftest.py
 python3 tests/verification_status.py --run-verus
 
 step "configuration grammar and validity differentials"

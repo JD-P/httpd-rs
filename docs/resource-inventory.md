@@ -179,3 +179,15 @@ distinction executable: adding a mutable static or a resource class fails CI
 until this inventory and its allowlist are reviewed. It also rejects the old
 standalone worker, TLS, H2, rewrite-helper, expensive-operation, and policy
 resident ledgers.
+
+The enum/static inventory is complemented by the hybrid request-resource
+warrant described in `docs/resource-warrant.md`. Its static scanner inventories
+allocation, growth, CPU iteration, task/process, filesystem, network,
+synchronization, variable-cost dependency and unsafe/syscall effects across
+production Rust and the vendored h2 fork. Its runtime profiler records the CPU,
+memory, task, descriptor and I/O resources exercised by the existing benchmark
+and deployment workloads. CI rejects a new syntactic effect site until the
+checked inventory is deliberately regenerated; dynamic absence never removes a
+static obligation. Each site remains proof debt until its cost and lifetime are
+refined to a typed lease or constant bound, or documented as a pinned external
+assumption with an independent OS backstop.
