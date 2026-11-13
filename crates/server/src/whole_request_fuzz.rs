@@ -1710,7 +1710,7 @@ fn run_stateful_protocol(
                     .expect("fixture balancer member is HTTP");
                 let exchange = completed
                     .backend_exchanges
-                    .last()
+                    .first()
                     .expect("effectful proxy request has an exchange");
                 let host = exchange
                     .fields
@@ -1718,7 +1718,11 @@ fn run_stateful_protocol(
                     .find(|(name, _)| name.eq_ignore_ascii_case("host"))
                     .map(|(_, value)| value.as_slice())
                     .expect("proxy exchange carries Host");
-                assert_eq!(host, expected.as_bytes(), "unhealthy member was selected");
+                assert_eq!(
+                    host,
+                    expected.as_bytes(),
+                    "prepared request selected an unhealthy member"
+                );
             }
             StatefulOutcomeSnapshot::Completed(completed)
         } else {
@@ -2070,6 +2074,41 @@ mod tests {
         assert_ne!(first.selected, second.selected);
         assert_eq!(first.authorized, first.resource.backend_target);
         assert_eq!(second.authorized, second.resource.backend_target);
+
+        // A request prepared while member zero is unhealthy starts on member
+        // one. If member zero recovers before an ambiguous response triggers
+        // failover, it may be selected only by the separately authorized
+        // retry. The prepared-selection invariant therefore concerns the
+        // first exchange, not the last exchange in the complete transcript.
+        let mut retry_after_recovery = stateful_step(19);
+        retry_after_recovery.health_before = Some(false);
+        retry_after_recovery.health_after_prepare = Some(true);
+        retry_after_recovery.logical.fields[0].1 = b"3".to_vec();
+        let trace = compare_stateful_steps(&[retry_after_recovery, stateful_step(0)]);
+        let retry = completed(&trace.steps[0]);
+        assert_eq!(retry.backend_exchanges.len(), 2);
+        let exchange_host = |exchange: &BackendExchangeSnapshot| {
+            exchange
+                .fields
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+                .map(|(_, value)| value.clone())
+                .expect("proxy exchange carries Host")
+        };
+        assert_eq!(
+            exchange_host(&retry.backend_exchanges[0]),
+            fixture().balancer_members[1]
+                .strip_prefix("http://")
+                .unwrap()
+                .as_bytes()
+        );
+        assert_eq!(
+            exchange_host(&retry.backend_exchanges[1]),
+            fixture().balancer_members[0]
+                .strip_prefix("http://")
+                .unwrap()
+                .as_bytes()
+        );
     }
 
     #[test]

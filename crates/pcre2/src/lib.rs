@@ -2488,6 +2488,14 @@ pub mod bytes {
     }
 
     fn parse_radix(bytes: &[u8], radix: u32) -> Result<u8, Error> {
+        let valid_digit = |byte: &u8| match radix {
+            8 => matches!(byte, b'0'..=b'7'),
+            16 => byte.is_ascii_hexdigit(),
+            _ => false,
+        };
+        if bytes.is_empty() || !bytes.iter().all(valid_digit) {
+            return Err(Error::syntax("invalid numeric escape"));
+        }
         let text = std::str::from_utf8(bytes).map_err(|_| Error::syntax("non-ASCII escape"))?;
         let value = u16::from_str_radix(text, radix)
             .map_err(|_| Error::syntax("escape is outside the byte range"))?;

@@ -30,6 +30,20 @@ fn spans_oracle(pattern: &str, subject: &[u8]) -> Vec<Vec<Option<(usize, usize)>
 }
 
 #[test]
+fn numeric_escapes_reject_signs_outside_the_pcre2_grammar() {
+    for pattern in [r"\o{+01}", r"\o{-01}", r"\x{+01}", r"\x{-01}"] {
+        assert!(
+            oracle::Regex::new(pattern).is_err(),
+            "oracle unexpectedly admitted {pattern:?}"
+        );
+        assert!(
+            rust::Regex::new(pattern).is_err(),
+            "httpd-rs unexpectedly admitted {pattern:?}"
+        );
+    }
+}
+
+#[test]
 fn byte_mode_quantifies_non_ascii_pattern_bytes_like_pcre2() {
     for (pattern, subject) in [
         ("é*", b"".as_slice()),
