@@ -25,8 +25,8 @@ IMPORT_DIRS=()
 [[ -z ${LONG_FUZZ_IMPORT_DIR:-} ]] || IMPORT_DIRS+=("$LONG_FUZZ_IMPORT_DIR")
 DRY_RUN=0
 
-ALL_TARGETS="http_request http_connection http_fields request_identity config_physical_lines config_sections config_compile config_grammars htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames h2_output h2_stateful cache_metadata cache_stateful tls_policy tls_identity_reload ocsp_der pcre2_differential pcre2_grammar pcre2_resource resource_transitions policy_path whole_request_differential multi_request_state"
-HIGH_YIELD_TARGETS="request_identity config_physical_lines config_sections config_compile config_grammars htaccess_walk rewrite_expr h2_frames h2_output h2_stateful cache_stateful tls_identity_reload pcre2_differential pcre2_grammar pcre2_resource resource_transitions policy_path whole_request_differential multi_request_state"
+ALL_TARGETS="http_request http_connection http_fields request_identity config_physical_lines config_sections config_compile config_grammars htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames h2_output h2_stateful cache_metadata cache_stateful tls_policy tls_identity_reload ocsp_der pcre2_differential pcre2_grammar pcre2_resource resource_transitions brotli_resource policy_path whole_request_differential multi_request_state"
+HIGH_YIELD_TARGETS="request_identity config_physical_lines config_sections config_compile config_grammars htaccess_walk rewrite_expr h2_frames h2_output h2_stateful cache_stateful tls_identity_reload pcre2_differential pcre2_grammar pcre2_resource resource_transitions brotli_resource policy_path whole_request_differential multi_request_state"
 
 usage() {
     cat <<'EOF'
@@ -183,7 +183,7 @@ else
             TARGET_TEXT="config_physical_lines config_sections config_compile config_grammars htaccess_walk"
             ;;
         adversarial)
-            TARGET_TEXT="request_identity config_physical_lines config_sections config_compile config_grammars htaccess_walk rewrite_expr pcre2_differential pcre2_grammar pcre2_resource policy_path whole_request_differential multi_request_state h2_frames h2_output h2_stateful cache_stateful tls_identity_reload resource_transitions"
+            TARGET_TEXT="request_identity config_physical_lines config_sections config_compile config_grammars htaccess_walk rewrite_expr pcre2_differential pcre2_grammar pcre2_resource policy_path whole_request_differential multi_request_state h2_frames h2_output h2_stateful cache_stateful tls_identity_reload resource_transitions brotli_resource"
             ;;
         full|all)
             TARGET_TEXT=$ALL_TARGETS
@@ -234,6 +234,7 @@ target_max_len() {
         config_physical_lines) echo 65536 ;;
         request_identity|tls_identity_reload) echo 256 ;;
         cache_stateful) echo 128 ;;
+        brotli_resource) echo 262144 ;;
         whole_request_differential) echo 256 ;;
         multi_request_state) echo 96 ;;
         *) echo 1048576 ;;

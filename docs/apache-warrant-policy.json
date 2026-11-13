@@ -690,6 +690,32 @@
         "historical-adversarial-finding"
       ],
       "evidence": [
+        "crates/server/src/compression.rs",
+        "crates/verified/src/lib.rs",
+        "docs/resource-inventory.md"
+      ],
+      "families": [
+        "mapping-and-transforms",
+        "terminal-response"
+      ],
+      "id": "response-compression-resource-bounds",
+      "state_dimensions": [
+        "algorithm and quality",
+        "body size and entropy",
+        "full, partial and cancelled downstream consumption",
+        "CPU and transient-memory pressure",
+        "workspace bound and lease teardown"
+      ],
+      "targets": [
+        "brotli_resource"
+      ]
+    },
+    {
+      "authorities": [
+        "internal-security-invariant",
+        "historical-adversarial-finding"
+      ],
+      "evidence": [
         "crates/server/src/resource.rs",
         "tests/resource_inventory.py",
         "crates/server/src/policy_ref.rs"

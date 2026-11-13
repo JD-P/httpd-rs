@@ -197,6 +197,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "brotli_resource"
+path = "fuzz_targets/brotli_resource.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "policy_path"
 path = "fuzz_targets/policy_path.rs"
 test = false

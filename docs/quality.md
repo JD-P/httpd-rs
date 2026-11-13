@@ -106,11 +106,12 @@ content-addressed corpora, logs and artifacts in an ignored state directory.
 uploaded cumulative nightly corpora before the run, and `--import` accepts the
 same artifact tree when GitHub's artifact redirect is unavailable. The runner
 generates a finite semantic seed matrix and emits baseline/final JSON censuses
-for all 29 targets, covering wire and grammar families, identity/reload
+for all 30 targets, covering wire and grammar families, identity/reload
 dimensions, request route/method pairs, multi-request transitions, policy/H2/
-resource opcodes, PCRE modes/flags and continuation classes separately from
-libFuzzer edge/features. The warrant validator rejects a target without a
-census and an Apache-derived family without a corresponding fuzz target.
+resource opcodes, PCRE modes/flags, Brotli quality/pressure/consumption and
+continuation classes separately from libFuzzer edge/features. The warrant
+validator rejects a target without a census and an Apache-derived family
+without a corresponding fuzz target.
 The same closure check requires Cargo, the smoke/sustained/local schedules and
 the nightly matrix to name exactly the same target set.
 `--strict-semantic` enforces those buckets, while
@@ -122,7 +123,7 @@ slash run, whitespace near miss and EOF form before mutation begins.
 The configuration physical-line, expression-parser and both PCRE2 targets
 receive 16,384 smoke executions by default because their adversarial boundary
 failures required sustained mutation to discover; the resource state machine
-receives 1,024.
+receives 1,024 and the Brotli resource target receives 512.
 
 ### Apache-derived warrant closure
 

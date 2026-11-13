@@ -448,6 +448,19 @@ def classify_declared(target: str, data: bytes, groups: dict[str, SemanticGroup]
             chunk = data[offset:offset + 4]
             observe(groups, "operation", chunk[0] % 8)
             observe(groups, "key", (chunk[1] if len(chunk) > 1 else 0) % 4)
+    elif target == "brotli_resource":
+        if len(data) < 7:
+            return
+        observe(groups, "quality", data[0] % 12)
+        observe(groups, "consumption", ("cancel", "prefix", "full", "chunked")[data[1] % 4])
+        observe(groups, "pressure", ("none", "cpu", "memory")[data[2] % 3])
+        observe(groups, "pattern", ("raw", "repeated", "ramp", "alternating")[data[3] % 4])
+        observe(groups, "size", ("corpus", "empty", "one", "4k", "256k")[data[4] % 5])
+        observe(
+            groups,
+            "gate",
+            ("normal", "range", "no_transform", "encoded", "head", "no_body_status", "oversize")[data[5] % 7],
+        )
     elif target == "tls_policy":
         forms = {
             "hostname": bool(re.fullmatch(rb"[A-Za-z0-9.-]+", data)) and b"TLS" not in upper,
@@ -498,6 +511,14 @@ DECLARED_SPECS: dict[str, dict[str, set[str]]] = {
     "h2_output": {"response_shape": {"headers_only", "headers_and_data"}, "terminal": {"drain", "peer_reset", "connection_drop"}, "header_size": {"ordinary", "maximum"}},
     "cache_metadata": {"version": {"1", "2", "3", "4", "5", "6", "7", "invalid"}, "field_family": {"key", "header", "vary", "duplicate_singleton", "malformed"}},
     "cache_stateful": {"operation": {str(i) for i in range(8)}, "key": {str(i) for i in range(4)}, "reload_root": {"shared", "moved"}},
+    "brotli_resource": {
+        "quality": {str(i) for i in range(12)},
+        "consumption": {"cancel", "prefix", "full", "chunked"},
+        "pressure": {"none", "cpu", "memory"},
+        "pattern": {"raw", "repeated", "ramp", "alternating"},
+        "size": {"corpus", "empty", "one", "4k", "256k"},
+        "gate": {"normal", "range", "no_transform", "encoded", "head", "no_body_status", "oversize"},
+    },
     "tls_policy": {"policy_form": {"hostname", "wildcard", "tls12", "tls13", "all_with_exclusions", "invalid"}},
     "tls_identity_reload": {"sni": {str(i) for i in range(6)}, "authority": {str(i) for i in range(6)}, "client_certificate": {"0", "1"}, "verify_mode": {"0", "1", "2"}},
     "ocsp_der": {"parser_family": {"der_sequence", "generalized_time", "http_url", "https_reject", "malformed"}},
@@ -549,6 +570,26 @@ def declared_seeds(target: str) -> list[bytes]:
         return [frame(kind) for kind in range(10)] + [b"not-a-frame"]
     if target == "cache_stateful":
         return [bytes((operation, key | (0x80 if (operation + key) & 1 else 0), operation + key, 0x41)) for operation in range(8) for key in range(4)]
+    if target == "brotli_resource":
+        output = []
+        # Cover every finite control family marginally; libFuzzer then
+        # composes them while the corpus census reports missing dimensions.
+        widths = (12, 4, 3, 4, 5, 7)
+        for offset, width in enumerate(widths):
+            for value in range(width):
+                control = bytearray((5, 2, 0, 0, 2, 0, 0x41, 0x42))
+                control[offset] = value
+                output.append(bytes(control))
+        # Keep the expensive supported boundary and both deliberately
+        # unavailable Zopfli qualities in the resumable corpus.
+        output.extend(
+            (
+                bytes((9, 3, 0, 3, 4, 0, 0x7F, 0x42)),
+                bytes((10, 2, 0, 1, 4, 0, 0x41, 0x42)),
+                bytes((11, 2, 0, 2, 4, 0, 0x41, 0x42)),
+            )
+        )
+        return output
     if target == "tls_identity_reload":
         output = []
         for index in range(6):

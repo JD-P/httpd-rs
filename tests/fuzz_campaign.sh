@@ -14,7 +14,7 @@ cargo +"$NIGHTLY" --version >/dev/null
 
 SECONDS_PER_TARGET=${FUZZ_SECONDS_PER_TARGET:-300}
 MAX_LEN=${FUZZ_MAX_LEN:-1048576}
-TARGETS=${FUZZ_TARGETS:-"http_request http_connection http_fields request_identity config_physical_lines config_sections config_compile config_grammars htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames h2_output h2_stateful cache_metadata cache_stateful tls_policy tls_identity_reload ocsp_der pcre2_differential pcre2_grammar pcre2_resource resource_transitions policy_path whole_request_differential multi_request_state"}
+TARGETS=${FUZZ_TARGETS:-"http_request http_connection http_fields request_identity config_physical_lines config_sections config_compile config_grammars htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames h2_output h2_stateful cache_metadata cache_stateful tls_policy tls_identity_reload ocsp_der pcre2_differential pcre2_grammar pcre2_resource resource_transitions brotli_resource policy_path whole_request_differential multi_request_state"}
 
 # Preserve finite semantic dimensions as corpus inputs in addition to
 # libFuzzer's structural edge features. This makes the cumulative nightly
@@ -66,6 +66,7 @@ for target in $TARGETS; do
     case "$target" in
         request_identity|tls_identity_reload) target_max_len=256 ;;
         cache_stateful) target_max_len=128 ;;
+        brotli_resource) target_max_len=262144 ;;
     esac
     [ "$target" != whole_request_differential ] || target_max_len=256
     [ "$target" != multi_request_state ] || target_max_len=96

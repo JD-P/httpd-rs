@@ -439,6 +439,32 @@
         "historical-adversarial-finding"
       ],
       "evidence": [
+        "crates/server/src/compression.rs",
+        "crates/verified/src/lib.rs",
+        "docs/resource-inventory.md"
+      ],
+      "families": [
+        "mapping-and-transforms",
+        "terminal-response"
+      ],
+      "id": "response-compression-resource-bounds",
+      "state_dimensions": [
+        "algorithm and quality",
+        "body size and entropy",
+        "full, partial and cancelled downstream consumption",
+        "CPU and transient-memory pressure",
+        "workspace bound and lease teardown"
+      ],
+      "targets": [
+        "brotli_resource"
+      ]
+    },
+    {
+      "authorities": [
+        "internal-security-invariant",
+        "historical-adversarial-finding"
+      ],
+      "evidence": [
         "crates/server/src/resource.rs",
         "tests/resource_inventory.py",
         "crates/server/src/policy_ref.rs"
@@ -16472,8 +16498,8 @@
       "source": "server/vhost.c"
     }
   ],
-  "ledger_sha256": "8099ae9749f1fd3b60fcfb9f8e647d459973bdf43ae5bef14fb7172d988544e9",
-  "policy_sha256": "f8be2ccc77375a4cb78b9d792108845e21c7f43be5d1be1e419c455e288e9514",
+  "ledger_sha256": "b98999c9d9b9c53389486aee41fb2ff06446957046b6e88836616e6a01e227eb",
+  "policy_sha256": "3bbf8d545f8408733e8847b8f40d73e23e35ff4720b0ca7fd2604b7c796ed332",
   "schema": 1,
   "source_files": [
     {
@@ -20019,7 +20045,7 @@
     "external_httpd_test_files": 1221,
     "external_httpd_test_status": "pinned-inventory",
     "families": 8,
-    "fuzz_targets_with_warrants": 29,
+    "fuzz_targets_with_warrants": 30,
     "httpd_rs_registry_names_absent_from_pinned_apache": 168,
     "runtime_source_files": 460,
     "source_components": 159,

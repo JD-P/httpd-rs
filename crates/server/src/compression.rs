@@ -793,6 +793,212 @@ fn finalize_inner(
     alter_etag(resp, kind, scope);
 }
 
+/// Drive the real Brotli output path as a resource-lifecycle state machine.
+///
+/// The input controls quality, downstream consumption/cancellation, budget
+/// pressure, body shape/size and output-filter bypasses.  Successful streams
+/// must round-trip, rejected qualities and pressure must preserve identity,
+/// the metered allocator must stay inside the verified workspace profile, and
+/// every exit must release the hierarchical compression lease.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_brotli_resource(data: &[u8]) {
+    const MAX_FUZZ_BODY: usize = 256 * 1024;
+    if data.len() < 7 {
+        return;
+    }
+
+    let quality = u32::from(data[0] % 12);
+    let consume = data[1] % 4;
+    let pressure = data[2] % 3;
+    let pattern = data[3] % 4;
+    let size_class = data[4] % 5;
+    let gate = data[5] % 7;
+    let entropy = &data[7..];
+    let requested_len = match size_class {
+        0 => entropy.len().min(MAX_FUZZ_BODY),
+        1 => 0,
+        2 => 1,
+        3 => 4 * 1024,
+        _ => MAX_FUZZ_BODY,
+    };
+    let fallback = data[6];
+    let mut source = Vec::with_capacity(requested_len);
+    for index in 0..requested_len {
+        let byte = match pattern {
+            0 => entropy
+                .get(index % entropy.len().max(1))
+                .copied()
+                .unwrap_or(fallback),
+            1 => fallback,
+            2 => fallback.wrapping_add(index as u8),
+            _ => {
+                if index & 1 == 0 {
+                    fallback
+                } else {
+                    !fallback
+                }
+            }
+        };
+        source.push(byte);
+    }
+
+    let budget = Arc::new(crate::resource::ResourceBudget::default());
+    let client = std::net::IpAddr::from([192, 0, 2, 41]);
+    let mut headers = crate::http::Headers::default();
+    headers.insert("accept-encoding", b"br".to_vec());
+    headers.bind_request_scope(crate::resource::RequestScope::new(budget.context(client)));
+    let mut request = Request {
+        method: "GET".into(),
+        target: b"/fuzz.txt".to_vec(),
+        raw_path: b"/fuzz.txt".to_vec(),
+        query: Vec::new(),
+        version: crate::http::Version::Http11,
+        headers,
+        body: Vec::new(),
+        body_spool: None,
+        keep_alive: true,
+        expect_continue: false,
+        framing: crate::verified::BodyFraming::None,
+    };
+
+    let context = request
+        .resource_context()
+        .expect("fuzz request lost its resource context");
+    let pressure_lease = match pressure {
+        1 => crate::resource::try_compression_in(
+            context,
+            crate::resource::MAX_COMPRESSION_WORK_UNITS_PER_CLIENT,
+            1,
+        ),
+        2 => crate::resource::try_compression_in(
+            context,
+            1,
+            crate::resource::MAX_COMPRESSION_TRANSIENT_BYTES_PER_CLIENT,
+        ),
+        _ => None,
+    };
+    if pressure != 0 {
+        assert!(
+            pressure_lease.is_some(),
+            "failed to establish fuzz pressure"
+        );
+    }
+
+    let mut scope = Scope::default();
+    scope
+        .compression_policy
+        .compression_rules
+        .push(CompressionRule::Set(vec![CompressionKind::Brotli]));
+    scope.compression_policy.brotli_quality = Some(quality);
+    let mut response = Response::new(200);
+    response
+        .headers
+        .push((Cow::Borrowed("Content-Type"), b"text/plain".to_vec()));
+    response.body = Body::Bytes(source.clone());
+
+    match gate {
+        1 => request.headers.insert("range", b"bytes=0-1".to_vec()),
+        2 => response.headers.push((
+            Cow::Borrowed("Cache-Control"),
+            b"public, no-transform".to_vec(),
+        )),
+        3 => response
+            .headers
+            .push((Cow::Borrowed("Content-Encoding"), b"gzip".to_vec())),
+        4 => request.method = "HEAD".into(),
+        5 => response.status = 204,
+        6 => {
+            response.body = Body::Stream {
+                reader: Box::new(Cursor::new(Vec::new())),
+                len: MAX_COMPRESS_BODY + 1,
+            };
+        }
+        _ => {}
+    }
+
+    let admitted_profile = httpd_rs_verified::dynamic_compression_budget(
+        httpd_rs_verified::DynamicCompressionKind::Brotli,
+        quality,
+        if gate == 6 {
+            MAX_COMPRESS_BODY + 1
+        } else {
+            source.len() as u64
+        },
+    );
+    finalize_budgeted(&scope, &request, &mut response, b"/fuzz.txt", &budget);
+
+    let selected = header(&response, "content-encoding")
+        .is_some_and(|value| value.eq_ignore_ascii_case(b"br"));
+    let should_select = gate == 0 && pressure == 0 && admitted_profile.is_some();
+    assert_eq!(
+        selected, should_select,
+        "Brotli admission disagreed with the verified resource profile"
+    );
+
+    if selected {
+        assert!(
+            !budget.transition_usage_is_zero(),
+            "encoded body did not retain its compression lease"
+        );
+        let Body::UnknownLengthStream {
+            mut reader,
+            max_len,
+        } = std::mem::replace(&mut response.body, Body::Empty)
+        else {
+            panic!("admitted Brotli response was not streamed");
+        };
+        assert_eq!(
+            max_len,
+            max_encoded_len(CompressionKind::Brotli, source.len() as u64)
+        );
+
+        let mut encoded = Vec::new();
+        match consume {
+            0 => {}
+            1 => {
+                let mut prefix = vec![0u8; usize::from(data[6]).max(1)];
+                reader
+                    .read(&mut prefix)
+                    .expect("metered Brotli prefix read");
+            }
+            2 => {
+                reader
+                    .read_to_end(&mut encoded)
+                    .expect("metered Brotli full read");
+            }
+            _ => {
+                let chunk_len = 64 + usize::from(data[6]) * 32;
+                let mut chunk = vec![0u8; chunk_len];
+                loop {
+                    let read = reader.read(&mut chunk).expect("metered Brotli chunk read");
+                    if read == 0 {
+                        break;
+                    }
+                    encoded.extend_from_slice(&chunk[..read]);
+                    assert!(encoded.len() as u64 <= max_len);
+                }
+            }
+        }
+        drop(reader);
+
+        if consume >= 2 {
+            let mut decoded = Vec::new();
+            brotli::Decompressor::new(Cursor::new(encoded), 4096)
+                .read_to_end(&mut decoded)
+                .expect("Brotli fuzz output did not decode");
+            assert_eq!(decoded, source, "Brotli round trip changed the body");
+        }
+    }
+
+    drop(response);
+    drop(pressure_lease);
+    drop(request);
+    assert!(
+        budget.transition_usage_is_zero(),
+        "Brotli completion/cancellation retained a resource lease"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -692,7 +692,7 @@ FUZZ_SECONDS_PER_TARGET=900 tests/fuzz_campaign.sh
 tests/long_fuzz.sh --nightly latest --hours 12 --jobs 4 --coverage --strict-semantic
 ```
 
-The 29 targets cover individual HTTP requests, fragmented/pipelined
+The 30 targets cover individual HTTP requests, fragmented/pipelined
 connections, configuration tokenization and full compilation, `.htaccess`
 walks, physical-line continuation refinement, rewrite expressions,
 CGI/FastCGI/proxy responses, WebSocket negotiation,
@@ -700,9 +700,10 @@ raw HTTP/2 frames and structured multi-frame HTTP/2 state transitions, cache
 metadata plus stateful publication/corruption/reload cleanup, TLS policy plus
 handshake-identity/reload transitions, request identity and environment-phase
 provenance, OCSP DER, the adversarial PCRE2
-differential and PCRE2 resource-policy monotonicity, and stateful hierarchical
-resource ownership. The whole-request target executes real proxy, FastCGI and
-CGI handlers after both wire decoders, compares exact backend requests and
+differential and PCRE2 resource-policy monotonicity, stateful hierarchical
+resource ownership, and metered Brotli encoding under CPU/memory pressure and
+downstream cancellation. The whole-request target executes real proxy, FastCGI
+and CGI handlers after both wire decoders, compares exact backend requests and
 final responses, runs cache-eligible cases cold and warm, and covers local and
 external ErrorDocument plus CGI/FastCGI/proxy DirectoryIndex orchestration.
 Its cancellation projection aborts after routing but before sink admission and
@@ -723,12 +724,12 @@ fuzz failure, while the resource target keeps production limits active. The P24
 expression-parser crash and non-ASCII PCRE2 byte-boundary cases are permanent
 seeds. The physical-line, expression and both PCRE2 targets receive 16,384
 executions in the default smoke gate; the resource state machine receives
-1,024. Nightly coverage
+1,024 and the Brotli resource target receives 512. Nightly coverage
 corpora are minimized and carried into the next run; dictionaries and committed
 bootstrap seeds live beside the targets.
 
 `tests/long_fuzz.sh` is the workstation campaign. Its default `full` profile
-touches all 29 targets before repeating any target, then gives a second
+touches all 30 targets before repeating any target, then gives a second
 weighted slot to the configuration/PCRE2, identity/reload, composed-request,
 HTTP/2 and resource state machines. The narrower `adversarial` profile remains
 available for focused follow-up. It imports committed
@@ -739,7 +740,8 @@ artifacts across interrupts and later runs without modifying the committed
 corpus. Every target has a finite semantic census and generated seed matrix;
 these retain declared wire forms, grammar families, identity/reload states,
 request route/method pairs, state transitions, H2/resource/policy opcodes,
-PCRE modes/flags and continuation classes even after structural minimization.
+PCRE modes/flags, Brotli quality/pressure/consumption and continuation classes
+even after structural minimization.
 The initial and final JSON census reports corpus hashes, executions, edge/features,
 RSS and missing semantic buckets; `--strict-semantic` makes a missing bucket a
 failure. A closure check rejects drift between Cargo's fuzz binaries and the
