@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end regressions for the pass-2 through pass-36 findings (F23-P36).
+"""End-to-end regressions for the pass-2 through pass-38 findings (F23-P38).
 
 The suite starts fresh vapached instances in temporary trees and exercises
 the exploit shapes from adversarial/findings.md: terminal rewrite/proxy authorization,
@@ -3580,6 +3580,137 @@ RewriteRule ^/guarded$ /guarded/ [L]
         self.assert_live_response("/missing", 404)
         self.assert_live_response("/guarded", 404)
         self.assertIn(b"P36-ACCESS", self.assert_live_response("/uploads/boom", 200))
+
+
+class P38ContinuationJoinTests(unittest.TestCase):
+    """Backslash-newline removal must preserve Apache's exact token stream."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p38-", dir=TEST_TMPDIR))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        for name in (
+            "files",
+            "handler",
+            "handler_double",
+            "handler_space",
+            "grant",
+            "grant_eof",
+            "rewrite",
+            "main",
+        ):
+            directory = cls.www / name
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+            (directory / "private.txt").write_text(f"P38-SECRET-{name}\n")
+
+        (cls.www / "files" / ".htaccess").write_text(
+            '<FilesMatch "^priv\\\nate[.]txt$">\n'
+            "Require all denied\n"
+            "</FilesMatch>\n"
+        )
+        handler = cls.www / "handler" / "run.txt"
+        handler.write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'P38-CGI-MUST-NOT-RUN\\n'\n"
+        )
+        handler.chmod(0o755)
+        (cls.www / "handler" / ".htaccess").write_text(
+            "Options +ExecCGI\nSetHandler\\\ncgi-script\n"
+        )
+        for name, directive in (
+            ("handler_double", "SetHandl\\\\\ner cgi-script\n"),
+            ("handler_space", "SetHandl\\   \ner cgi-script\n"),
+        ):
+            handler = cls.www / name / "run.txt"
+            handler.write_text(
+                "#!/bin/sh\n"
+                "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+                "printf 'P38-CGI-MUST-NOT-RUN\\n'\n"
+            )
+            handler.chmod(0o755)
+            (cls.www / name / ".htaccess").write_text(
+                f"Options +ExecCGI\n{directive}"
+            )
+        (cls.www / "grant" / ".htaccess").write_text(
+            "Require\\\nall granted\n"
+        )
+        (cls.www / "grant_eof" / ".htaccess").write_bytes(b"Require all granted\\")
+        (cls.www / "rewrite" / ".htaccess").write_text(
+            "RewriteEngine On\nRewriteRule ^priv\\\nate[.]txt$ - [F]\n"
+        )
+
+        cls.port = free_port()
+        config = f'''ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+PidFile "{cls.base / 'vapached.pid'}"
+ErrorLog "{cls.base / 'error.log'}"
+DocumentRoot "{cls.www}"
+<LocationMatch "^/main/private[.]txt\\
+$">
+    Require all denied
+</LocationMatch>
+<Directory "{cls.www}">
+    AllowOverride None
+    Require all granted
+</Directory>
+<Directory "{cls.www / 'files'}">
+    AllowOverride AuthConfig
+</Directory>
+<Directory "{cls.www / 'handler'}">
+    AllowOverride FileInfo Options
+    Options +ExecCGI
+</Directory>
+<Directory "{cls.www / 'handler_double'}">
+    AllowOverride FileInfo Options
+    Options +ExecCGI
+</Directory>
+<Directory "{cls.www / 'handler_space'}">
+    AllowOverride FileInfo Options
+    Options +ExecCGI
+</Directory>
+<Directory "{cls.www / 'grant'}">
+    AllowOverride AuthConfig
+    Require all denied
+</Directory>
+<Directory "{cls.www / 'grant_eof'}">
+    AllowOverride AuthConfig
+    Require all denied
+</Directory>
+<Directory "{cls.www / 'rewrite'}">
+    AllowOverride FileInfo
+    Options +FollowSymLinks
+</Directory>
+'''
+        cls.proc, _ = start_vapached(cls.base, config)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        shutil.rmtree(getattr(cls, "base", Path("/nonexistent")), ignore_errors=True)
+
+    def assert_closed(self, path: str, status: int):
+        actual, _, body = request(self.port, path)
+        self.assertEqual(actual, status, (path, body[:300]))
+        self.assertNotIn(b"P38-SECRET", body)
+        self.assertNotIn(b"P38-CGI-MUST-NOT-RUN", body)
+        self.assertIsNone(self.proc.poll(), f"vapached exited after {path}")
+
+    def test_continued_guards_keep_their_exact_regex(self):
+        self.assert_closed("/files/private.txt", 403)
+        self.assert_closed("/rewrite/private.txt", 403)
+        self.assert_closed("/main/private.txt", 403)
+
+    def test_continued_directive_names_remain_apache_invalid(self):
+        self.assert_closed("/handler/run.txt", 500)
+        self.assert_closed("/handler_double/run.txt", 500)
+        self.assert_closed("/handler_space/run.txt", 500)
+        self.assert_closed("/grant/private.txt", 500)
+        self.assert_closed("/grant_eof/private.txt", 500)
 
 
 class PcreInlineOptionAdmissionTests(unittest.TestCase):

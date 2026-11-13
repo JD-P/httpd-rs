@@ -87,6 +87,10 @@ cargo build --release -p vapached
 step "executable documentation"
 python3 tests/docs.py
 
+step "Apache source warrant and binary-oracle closure"
+python3 tests/apache_warrant.py
+python3 tests/apache_warrant.py --check-binary
+
 step "Rust workspace tests"
 cargo test --workspace -- --test-threads=1
 

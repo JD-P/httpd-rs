@@ -2059,6 +2059,184 @@ pub fn fuzz_decode_metadata(data: &[u8]) {
     let _ = decode_meta_key(data);
 }
 
+/// Exercise cache persistence as a bounded state machine. Unlike the metadata
+/// parser target, this drives actual body/meta publication, corruption
+/// cleanup, quota eviction, reload epochs, temporary-file cleanup, and final
+/// resource-ledger release.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_cache_stateful(data: &[u8]) {
+    fn entry(cfg: &Config, body: Vec<u8>, expires: i64, selector: u8) -> Entry {
+        Entry {
+            // `disk_store` is downstream of the verified cache-admission
+            // gate. Keep the state machine inside that contract so a failed
+            // decode means persistence disagrees with an admitted entry,
+            // rather than merely demonstrating that the decoder correctly
+            // rejects an uncacheable status.
+            status: [200, 203, 300, 301, 308, 404, 410][usize::from(selector) % 7],
+            headers: vec![("content-type".into(), b"text/plain".to_vec())],
+            body_len: body.len() as u64,
+            body,
+            stored: unix_now(),
+            expires,
+            policy: [selector; 32],
+            epoch: cfg.cache_epoch(),
+            vary: (selector & 1 != 0)
+                .then(|| vec![("accept".into(), b"text/plain".to_vec())])
+                .unwrap_or_default(),
+            _resident: None,
+        }
+    }
+
+    fn load(cfg: &Config, key: &str) -> Option<Entry> {
+        let client = "127.0.0.1".parse().expect("static cache fuzz client");
+        let mut resident = cfg.resource_budget.try_response_bytes_for(client);
+        disk_load_accounted(cfg, key, &mut resident)
+    }
+
+    fn config(root: &Path, max_disk_size: u64) -> Config {
+        let mut cfg = crate::config::fuzz_config(root.parent().unwrap_or(root));
+        cfg.cache.root = Some(root.to_path_buf());
+        cfg.cache.max_disk_size = max_disk_size;
+        cfg.cache.max_memory_size = 0;
+        cfg.cache.max_file_size = 4096;
+        fs::create_dir_all(root).expect("create cache fuzz root");
+        disk_usage()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(root.to_path_buf(), DiskUsageState::default());
+        cfg
+    }
+
+    let root =
+        std::env::temp_dir().join(format!("vapache-cache-state-fuzz-{}", std::process::id()));
+    let old_root = root.join("old");
+    let candidate_root = root.join("candidate");
+    for cache_root in [&old_root, &candidate_root] {
+        if let Some(usage) = disk_usage()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(cache_root)
+        {
+            drop(usage);
+        }
+    }
+    *entries().lock().unwrap_or_else(|error| error.into_inner()) = MemoryCache::default();
+    let _ = fs::remove_dir_all(&root);
+
+    let limit = 64 + u64::from(data.first().copied().unwrap_or(0) % 32) * 32;
+    let old = config(&old_root, limit);
+    let candidate_cache_root = if data.get(1).is_some_and(|byte| byte & 0x80 != 0) {
+        old_root.clone()
+    } else {
+        candidate_root
+    };
+    let candidate = config(&candidate_cache_root, limit);
+    let keys = ["host\n/a\n", "host\n/b\n", "other\n/a\n", "host\n/c?q=1\n"];
+    let mut retired = false;
+
+    for (step, command) in data.chunks(4).take(32).enumerate() {
+        let byte = |index: usize| command.get(index).copied().unwrap_or(0);
+        let key = keys[usize::from(byte(1)) % keys.len()];
+        let body_len = usize::from(byte(2) % 96);
+        let body = vec![byte(3); body_len];
+        let active = if retired { &candidate } else { &old };
+        match byte(0) % 8 {
+            0 => {
+                let stored = entry(active, body.clone(), unix_now() + 60, byte(3));
+                disk_store(active, key, &stored);
+                if stored.body_len.saturating_add(256) <= active.cache.max_disk_size {
+                    if let Some(loaded) = load(active, key) {
+                        assert_eq!(loaded.body, body);
+                        assert_eq!(loaded.epoch, active.cache_epoch());
+                    }
+                }
+            }
+            1 => {
+                disk_store(active, key, &entry(active, body, unix_now() + 60, byte(3)));
+                if let Some(stem) = cache_stem(active, key) {
+                    let _ = fs::write(stem.with_extension("meta"), &data[..data.len().min(64)]);
+                    assert!(load(active, key).is_none());
+                    assert!(!stem.with_extension("body").exists());
+                    assert!(!stem.with_extension("meta").exists());
+                }
+            }
+            2 => {
+                disk_store(active, key, &entry(active, body, unix_now() + 60, byte(3)));
+                if let Some(stem) = cache_stem(active, key) {
+                    let _ = fs::remove_file(stem.with_extension("body"));
+                    assert!(load(active, key).is_none());
+                    assert!(!stem.with_extension("meta").exists());
+                }
+            }
+            3 => {
+                let stem = active
+                    .cache
+                    .root
+                    .as_ref()
+                    .expect("cache fuzz root")
+                    .join(format!("partial-{step}"));
+                fs::write(stem.with_extension("body.tmp"), &body)
+                    .expect("write cache fuzz body temporary");
+                fs::write(stem.with_extension("meta.tmp"), b"partial")
+                    .expect("write cache fuzz metadata temporary");
+                clear(active);
+                assert!(!stem.with_extension("body.tmp").exists());
+                assert!(!stem.with_extension("meta.tmp").exists());
+            }
+            4 => {
+                disk_store(active, key, &entry(active, body, unix_now() + 60, byte(3)));
+                if retired {
+                    clear(&candidate);
+                    assert!(load(&candidate, key).is_none());
+                } else {
+                    clear_reload(&old, &candidate);
+                    assert!(load(&old, key).is_none());
+                    assert!(load(&candidate, key).is_none());
+                    retired = true;
+                }
+            }
+            5 => {
+                // Start with an empty active generation so this operation
+                // isolates quota admission/eviction from older entries.
+                clear(active);
+                disk_store(active, key, &entry(active, body, unix_now() + 60, byte(3)));
+                if let Some(usage) = disk_usage()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(active.cache.root.as_ref().expect("cache fuzz root"))
+                {
+                    assert!(usage.total <= active.cache.max_disk_size);
+                }
+            }
+            6 => {
+                // Store is optional when the entry cannot fit the quota. An
+                // earlier representation may therefore survive a rejected
+                // replacement; clear it first so this transition isolates
+                // expiry cleanup for the candidate entry.
+                clear(active);
+                disk_store(active, key, &entry(active, body, unix_now() - 1, byte(3)));
+                assert!(load(active, key).is_none());
+            }
+            _ => {
+                let original = entry(active, body, unix_now() + 60, byte(3));
+                let encoded = encode_meta(key, &original);
+                let decoded = decode_meta(&encoded).expect("encoded cache metadata round trip");
+                assert_eq!(decoded.status, original.status);
+                assert_eq!(decoded.epoch, original.epoch);
+                assert_eq!(decode_meta_key(&encoded).as_deref(), Some(key.as_bytes()));
+            }
+        }
+    }
+
+    clear_reload(&old, &candidate);
+    let old_budget = Arc::clone(&old.resource_budget);
+    let candidate_budget = Arc::clone(&candidate.resource_budget);
+    drop((old, candidate));
+    assert!(old_budget.transition_usage_is_zero());
+    assert!(candidate_budget.transition_usage_is_zero());
+    let _ = fs::remove_dir_all(&root);
+}
+
 fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
     let Some(stem) = cache_stem(cfg, key) else {
         return;

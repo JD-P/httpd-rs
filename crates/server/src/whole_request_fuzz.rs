@@ -126,7 +126,7 @@ struct WholeRequestSnapshot {
     sink: SinkSnapshot,
     backend: Option<BackendSnapshot>,
     cache: CacheSnapshot,
-    backend_exchange: Option<BackendExchangeSnapshot>,
+    backend_exchanges: Vec<BackendExchangeSnapshot>,
     backend_effect: bool,
     response: ResponseSnapshot,
 }
@@ -171,7 +171,6 @@ struct StatefulStep {
 }
 
 struct Fixture {
-    config: Config,
     root: PathBuf,
     old_config_path: PathBuf,
     next_config_path: PathBuf,
@@ -191,13 +190,14 @@ fn push_exchange(
         .push_back(exchange);
 }
 
-fn try_pop_exchange(
+fn take_exchanges(
     exchanges: &Arc<Mutex<VecDeque<BackendExchangeSnapshot>>>,
-) -> Option<BackendExchangeSnapshot> {
+) -> Vec<BackendExchangeSnapshot> {
     exchanges
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .pop_front()
+        .drain(..)
+        .collect()
 }
 
 fn exchange_mode(exchange: &BackendExchangeSnapshot, name: &str) -> u8 {
@@ -645,17 +645,7 @@ fn fixture() -> &'static Fixture {
             ),
         )
         .expect("write reload whole-request config");
-        let config = Config::load(
-            &config_path,
-            &root,
-            &Default::default(),
-            &Default::default(),
-            false,
-        )
-        .unwrap_or_else(|errors| panic!("whole-request config: {errors:?}"));
-        assert!(config.resource_budget.transition_usage_is_zero());
         Fixture {
-            config,
             root,
             old_config_path: config_path,
             next_config_path,
@@ -1040,7 +1030,7 @@ struct RouteSnapshot {
     authorization: AuthorizationSnapshot,
     sink: SinkSnapshot,
     backend: Option<BackendSnapshot>,
-    backend_exchange: Option<BackendExchangeSnapshot>,
+    backend_exchanges: Vec<BackendExchangeSnapshot>,
     backend_effect: bool,
     route_cache: Option<CacheSnapshot>,
     response: ResponseSnapshot,
@@ -1140,6 +1130,14 @@ fn execute_prepared_snapshot(
     cancel_before_sink: bool,
 ) -> RouteSnapshot {
     let (sink, backend, route_cache) = prepared_identity(&handler);
+    match sink {
+        SinkSnapshot::Proxy => assert!(take_exchanges(&fixture.proxy_exchanges).is_empty()),
+        SinkSnapshot::FastCgi => assert!(take_exchanges(&fixture.fastcgi_exchanges).is_empty()),
+        SinkSnapshot::Cgi => {}
+        SinkSnapshot::None | SinkSnapshot::StaticFile | SinkSnapshot::Redirect => {
+            unreachable!("a prepared handler always owns a dynamic sink")
+        }
+    }
     if cancel_before_sink {
         request
             .request_scope()
@@ -1149,27 +1147,25 @@ fn execute_prepared_snapshot(
     let peer = SocketAddr::new(PEER, 4242);
     let response =
         crate::server::execute_prepared_handler(cfg, request, peer, LOCAL_PORT, true, handler);
-    let (backend_exchange, backend_effect) = match sink {
+    let (backend_exchanges, backend_effect) = match sink {
         SinkSnapshot::Proxy => {
-            let exchange = try_pop_exchange(&fixture.proxy_exchanges);
-            let effect = exchange.is_some();
-            (exchange, effect)
+            let exchanges = take_exchanges(&fixture.proxy_exchanges);
+            let effect = !exchanges.is_empty();
+            (exchanges, effect)
         }
         SinkSnapshot::FastCgi => {
-            let exchange = try_pop_exchange(&fixture.fastcgi_exchanges);
-            let effect = exchange.is_some();
-            (exchange, effect)
+            let exchanges = take_exchanges(&fixture.fastcgi_exchanges);
+            let effect = !exchanges.is_empty();
+            (exchanges, effect)
         }
         SinkSnapshot::Cgi => (
-            None,
+            Vec::new(),
             response
                 .headers
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case("x-backend")),
         ),
-        SinkSnapshot::None | SinkSnapshot::StaticFile | SinkSnapshot::Redirect => {
-            unreachable!("a prepared handler always owns a dynamic sink")
-        }
+        SinkSnapshot::None | SinkSnapshot::StaticFile | SinkSnapshot::Redirect => unreachable!(),
     };
     assert_eq!(
         backend_effect, !cancel_before_sink,
@@ -1179,7 +1175,7 @@ fn execute_prepared_snapshot(
         authorization: AuthorizationSnapshot::Granted,
         sink,
         backend: Some(backend),
-        backend_exchange,
+        backend_exchanges,
         backend_effect,
         route_cache,
         response: response_snapshot(response),
@@ -1215,7 +1211,7 @@ fn response_route(response: Response) -> RouteSnapshot {
         authorization,
         sink,
         backend: None,
-        backend_exchange: None,
+        backend_exchanges: Vec::new(),
         backend_effect: false,
         route_cache: None,
         response: response_snapshot(response),
@@ -1314,7 +1310,7 @@ fn finish_evaluation(
         sink: route.sink,
         backend: route.backend,
         cache,
-        backend_exchange: route.backend_exchange,
+        backend_exchanges: route.backend_exchanges,
         backend_effect: route.backend_effect,
         response: route.response,
     }
@@ -1330,38 +1326,60 @@ fn evaluate(
     finish_evaluation(fixture, cfg, prepared, cancel_before_sink)
 }
 
+fn load_fixture_config(fixture: &Fixture) -> Config {
+    let cfg = Config::load(
+        &fixture.old_config_path,
+        &fixture.root,
+        &Default::default(),
+        &Default::default(),
+        false,
+    )
+    .unwrap_or_else(|errors| panic!("whole-request config: {errors:?}"));
+    assert!(cfg.resource_budget.transition_usage_is_zero());
+    cfg
+}
+
 fn compare_protocols(data: &[u8]) -> WholeRequestSnapshot {
     let fixture = fixture();
     let _stateful_guard = fixture
         .stateful_lock
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let cfg = &fixture.config;
     let logical = logical_request(data);
-    assert!(cfg.resource_budget.transition_usage_is_zero());
-    let baseline = cfg.resource_budget.transition_snapshot();
+    drain_backend_exchanges(fixture);
 
-    let h1 = evaluate(
+    let h1_cfg = load_fixture_config(fixture);
+    let h1_baseline = h1_cfg.resource_budget.transition_snapshot();
+
+    let mut h1 = evaluate(
         fixture,
-        cfg,
-        decode_h1(cfg, &logical),
+        &h1_cfg,
+        decode_h1(&h1_cfg, &logical),
         logical.cancel_before_sink,
     );
+    normalize_whole_request(&mut h1);
     let h1_warm = matches!(h1.cache, CacheSnapshot::Eligible { .. }).then(|| {
-        evaluate(
+        let mut snapshot = evaluate(
             fixture,
-            cfg,
-            decode_h1(cfg, &logical),
+            &h1_cfg,
+            decode_h1(&h1_cfg, &logical),
             logical.cancel_before_sink,
-        )
+        );
+        normalize_whole_request(&mut snapshot);
+        snapshot
     });
-    crate::cache::clear(cfg);
-    assert_eq!(cfg.resource_budget.transition_snapshot(), baseline);
-    assert!(cfg.resource_budget.transition_usage_is_zero());
+    crate::cache::clear(&h1_cfg);
+    assert_eq!(h1_cfg.resource_budget.transition_snapshot(), h1_baseline);
+    assert!(h1_cfg.resource_budget.transition_usage_is_zero());
+    drop(h1_cfg);
+    drain_backend_exchanges(fixture);
+
+    let h2_cfg = load_fixture_config(fixture);
+    let h2_baseline = h2_cfg.resource_budget.transition_snapshot();
 
     let decode_h2 = || {
         crate::h2::differential_decode_request(
-            cfg,
+            &h2_cfg,
             logical.method,
             &logical.target,
             &logical.fields,
@@ -1371,12 +1389,16 @@ fn compare_protocols(data: &[u8]) -> WholeRequestSnapshot {
         .unwrap_or_else(|error| panic!("generated HTTP/2 request failed: {error}; {logical:?}"))
     };
     let h2_request = decode_h2();
-    let h2 = evaluate(fixture, cfg, h2_request, logical.cancel_before_sink);
-    let h2_warm = matches!(h2.cache, CacheSnapshot::Eligible { .. })
-        .then(|| evaluate(fixture, cfg, decode_h2(), logical.cancel_before_sink));
-    crate::cache::clear(cfg);
-    assert_eq!(cfg.resource_budget.transition_snapshot(), baseline);
-    assert!(cfg.resource_budget.transition_usage_is_zero());
+    let mut h2 = evaluate(fixture, &h2_cfg, h2_request, logical.cancel_before_sink);
+    normalize_whole_request(&mut h2);
+    let h2_warm = matches!(h2.cache, CacheSnapshot::Eligible { .. }).then(|| {
+        let mut snapshot = evaluate(fixture, &h2_cfg, decode_h2(), logical.cancel_before_sink);
+        normalize_whole_request(&mut snapshot);
+        snapshot
+    });
+    crate::cache::clear(&h2_cfg);
+    assert_eq!(h2_cfg.resource_budget.transition_snapshot(), h2_baseline);
+    assert!(h2_cfg.resource_budget.transition_usage_is_zero());
 
     assert_eq!(h1, h2, "protocol projections diverged for {logical:?}");
     assert_eq!(
@@ -1390,7 +1412,7 @@ fn compare_protocols(data: &[u8]) -> WholeRequestSnapshot {
     }
     if logical.cancel_before_sink {
         assert!(!h1.backend_effect);
-        assert!(h1.backend_exchange.is_none());
+        assert!(h1.backend_exchanges.is_empty());
     }
     h1
 }
@@ -1680,8 +1702,8 @@ fn run_stateful_protocol(
                     .strip_prefix("http://")
                     .expect("fixture balancer member is HTTP");
                 let exchange = completed
-                    .backend_exchange
-                    .as_ref()
+                    .backend_exchanges
+                    .last()
                     .expect("effectful proxy request has an exchange");
                 let host = exchange
                     .fields
@@ -1960,7 +1982,7 @@ mod tests {
         ] {
             let result = compare_protocols(cancelled);
             assert!(!result.backend_effect);
-            assert!(result.backend_exchange.is_none());
+            assert!(result.backend_exchanges.is_empty());
         }
     }
 
@@ -2032,5 +2054,29 @@ mod tests {
         assert_ne!(first.selected, second.selected);
         assert_eq!(first.authorized, first.resource.backend_target);
         assert_eq!(second.authorized, second.resource.backend_target);
+    }
+
+    #[test]
+    fn p38_differential_artifacts_are_stable_regressions() {
+        // P38-D: independent H1/H2 executions must not share round-robin or
+        // request-policy rate-bucket state.
+        let access_plan = compare_protocols(b"v");
+        assert_eq!(access_plan.sink, SinkSnapshot::Cgi);
+
+        let balanced_index = compare_protocols(b"cgi-index\n");
+        assert_eq!(balanced_index.sink, SinkSnapshot::Proxy);
+
+        // P38-B: proxy retries produce multiple exchange records. The
+        // stateful harness must drain the entire transcript before it checks
+        // cancellation/accounting invariants or starts another request.
+        let retry_accounting = [
+            39, 48, 255, 255, 255, 48, 48, 41, 52, 48, 127, 94, 141, 100, 64, 65, 39, 101, 119, 10,
+            59, 127, 94, 141,
+        ];
+        let trace = compare_stateful_steps(&parse_stateful_steps(&retry_accounting));
+        assert!(trace.steps.iter().any(|step| match &step.outcome {
+            StatefulOutcomeSnapshot::Completed(snapshot) => snapshot.backend_exchanges.len() > 1,
+            StatefulOutcomeSnapshot::Refused(_) => false,
+        }));
     }
 }

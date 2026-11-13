@@ -14,6 +14,33 @@ env:
   VAPACHE_NIGHTLY_TOOLCHAIN: nightly-2026-10-29
 
 jobs:
+  apache-source-warrant:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Reproduce pinned Apache source inventory
+        run: tests/apache_source_inventory.sh
+
+  apache-source-coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Apache coverage build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential gcovr libapr1-dev libaprutil1-dev libbrotli-dev \
+            libcurl4-openssl-dev libnghttp2-dev libpcre2-dev libssl-dev zlib1g-dev
+      - name: Instrument Apache and run the differential corpus
+        run: tests/apache_source_coverage.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: apache-source-coverage
+          path: artifacts/apache-source-coverage
+
   mutation:
     runs-on: ubuntu-24.04
     timeout-minutes: 360

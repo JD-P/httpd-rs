@@ -13,17 +13,29 @@
 pub fn logical_lines_with_numbers(text: &str) -> Vec<(usize, String)> {
     let mut logical: Vec<(usize, String)> = Vec::new();
     let mut pending: Option<(usize, String)> = None;
-    for (idx, raw_line) in text.lines().enumerate() {
+    for (idx, physical) in text.split_inclusive('\n').enumerate() {
         let lineno = idx + 1;
-        let mut line = raw_line.trim_end_matches('\r').to_string();
-        let continued = line.trim_end().ends_with('\\');
+        let has_newline = physical.ends_with('\n');
+        let mut raw_line = physical.strip_suffix('\n').unwrap_or(physical);
+        if has_newline {
+            raw_line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        }
+        // Apache recognizes a continuation only when `\\` is the final byte
+        // before LF or CRLF. Trailing whitespace makes it an ordinary line,
+        // and a backslash at EOF has no newline to continue. Remove exactly
+        // one backslash, so a physical `foo\\\\` + newline + `bar` becomes
+        // `foo\\bar`, not `foobar`.
+        let mut line = raw_line.to_string();
+        let continued = has_newline && line.ends_with('\\');
         if continued {
-            line = line.trim_end().trim_end_matches('\\').to_string();
+            line.pop();
         }
         match &mut pending {
             Some((start, buf)) => {
-                buf.push(' ');
-                buf.push_str(line.trim_start());
+                // Apache removes the continuation backslash and newline, but
+                // otherwise preserves both physical lines. It neither
+                // invents a token separator nor trims continuation indent.
+                buf.push_str(&line);
                 if !continued {
                     let (s, b) = pending.take().unwrap();
                     logical.push((s, b));
@@ -235,6 +247,40 @@ pub fn parse_line(text: &str) -> Result<ConfigLine, String> {
 mod tests {
     use super::*;
 
+    const CONTINUATION_TEMPLATES: &[&str] = &[
+        "SetHandlercgi-script",
+        "Requireall granted",
+        "<FilesMatch \"^private[.]txt$\">",
+        "<LocationMatch \"^/private[.]txt$\">",
+        "RewriteRule ^private[.]txt$ - [F]",
+        "Options +ExecCGI",
+        "#Require all granted",
+        "Header set X-Continuation exact",
+    ];
+
+    fn insert_continuations(template: &str, boundaries: &[(usize, &str)]) -> String {
+        let chars: Vec<char> = template.chars().collect();
+        let mut physical = String::new();
+        for boundary in 0..=chars.len() {
+            for (_, ending) in boundaries.iter().filter(|(at, _)| *at == boundary) {
+                physical.push('\\');
+                physical.push_str(ending);
+            }
+            if let Some(ch) = chars.get(boundary) {
+                physical.push(*ch);
+            }
+        }
+        physical.push('\n');
+        physical
+    }
+
+    fn parsed_logical_lines(text: &str) -> Vec<Result<ConfigLine, String>> {
+        logical_lines(text)
+            .into_iter()
+            .map(|line| parse_line(line.trim_start()))
+            .collect()
+    }
+
     #[test]
     fn tokenizes_quotes_and_escaped_whitespace() {
         assert_eq!(tokenize("a \"b c\" d").unwrap(), vec!["a", "b c", "d"]);
@@ -259,9 +305,25 @@ mod tests {
     fn frontend_error_and_continuation_edges() {
         assert_eq!(
             logical_lines_with_numbers(concat!("one \\", "\n  two \\", "\n three\nfour \\")),
-            vec![(1, "one  two  three".into()), (4, "four ".into())]
+            vec![(1, "one   two  three".into()), (4, "four \\".into())]
         );
-        assert_eq!(logical_lines("value\\"), vec!["value"]);
+        assert_eq!(
+            logical_lines("SetHandler\\\ncgi-script\nRequire\\\nall granted\n"),
+            vec!["SetHandlercgi-script", "Requireall granted"]
+        );
+        assert_eq!(
+            logical_lines("<FilesMatch \"^priv\\\nate[.]txt$\">\n"),
+            vec!["<FilesMatch \"^private[.]txt$\">"]
+        );
+        assert_eq!(
+            logical_lines_with_numbers("SetHandler\\\\\ncgi-script\n"),
+            vec![(1, "SetHandler\\cgi-script".into())]
+        );
+        assert_eq!(
+            logical_lines_with_numbers("SetHandler\\   \ncgi-script\n"),
+            vec![(1, "SetHandler\\   ".into()), (2, "cgi-script".into())]
+        );
+        assert_eq!(logical_lines("value\\"), vec!["value\\"]);
         assert!(tokenize("\"closed\"suffix").is_err());
         let too_many = std::iter::repeat_n("x", 257).collect::<Vec<_>>().join(" ");
         assert!(tokenize(&too_many).is_err());
@@ -279,6 +341,85 @@ mod tests {
         assert_eq!(directive.name(), "require");
         assert_eq!(start.name(), "directory");
         assert_eq!(end.name(), "directory");
+    }
+
+    #[test]
+    fn continuation_matrix_exhausts_boundaries_chains_and_near_misses() {
+        let endings = ["\n", "\r\n"];
+        for template in CONTINUATION_TEMPLATES {
+            let plain = format!("{template}\n");
+            let expected_lines = logical_lines(&plain);
+            let expected_ir = parsed_logical_lines(&plain);
+            let boundary_count = template.chars().count() + 1;
+
+            // Every single boundary, including before the first and after the
+            // final character, under both Apache line-ending spellings.
+            for boundary in 0..boundary_count {
+                for ending in endings {
+                    let physical = insert_continuations(template, &[(boundary, ending)]);
+                    assert_eq!(logical_lines(&physical), expected_lines, "{physical:?}");
+                    assert_eq!(parsed_logical_lines(&physical), expected_ir, "{physical:?}");
+                }
+            }
+
+            // Every ordered pair of split points.  This covers separate and
+            // adjacent continuation chains without asking mutation to find a
+            // particular combination.
+            for first in 0..boundary_count {
+                for second in 0..boundary_count {
+                    for first_ending in endings {
+                        for second_ending in endings {
+                            let physical = insert_continuations(
+                                template,
+                                &[(first, first_ending), (second, second_ending)],
+                            );
+                            assert_eq!(logical_lines(&physical), expected_lines, "{physical:?}");
+                            assert_eq!(
+                                parsed_logical_lines(&physical),
+                                expected_ir,
+                                "{physical:?}"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // A longer chain at one boundary catches implementations that
+            // retain or delete the wrong physical line after the first join.
+            for boundary in 0..boundary_count {
+                let physical = insert_continuations(
+                    template,
+                    &[(boundary, "\n"), (boundary, "\r\n"), (boundary, "\n")],
+                );
+                assert_eq!(logical_lines(&physical), expected_lines, "{physical:?}");
+                assert_eq!(parsed_logical_lines(&physical), expected_ir, "{physical:?}");
+            }
+        }
+
+        // Near misses are just as security-sensitive as valid joins: exactly
+        // one slash is removed, trailing horizontal whitespace disables the
+        // join, and no physical newline means no continuation.
+        for slash_count in 1..=3 {
+            let slashes = "\\".repeat(slash_count);
+            for ending in endings {
+                let physical = format!("left{slashes}{ending}right\n");
+                assert_eq!(
+                    logical_lines_with_numbers(&physical),
+                    vec![(1, format!("left{}right", "\\".repeat(slash_count - 1)))]
+                );
+                for suffix in [" ", "\t", "  \t"] {
+                    let physical = format!("left{slashes}{suffix}{ending}right\n");
+                    assert_eq!(
+                        logical_lines_with_numbers(&physical),
+                        vec![(1, format!("left{slashes}{suffix}")), (2, "right".into())]
+                    );
+                }
+            }
+            assert_eq!(
+                logical_lines_with_numbers(&format!("left{slashes}")),
+                vec![(1, format!("left{slashes}"))]
+            );
+        }
     }
 
     #[test]

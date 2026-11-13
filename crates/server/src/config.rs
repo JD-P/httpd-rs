@@ -10734,6 +10734,42 @@ pub fn fuzz_config_grammars(data: &[u8]) {
     }
 }
 
+/// Construct the ordinary sealed defaults without filesystem parsing. Fuzz
+/// drivers use this as a bounded starting point before installing only the
+/// policy fields they are intended to vary. Keeping the constructor here
+/// prevents fuzz-only replicas of `Config` from silently omitting a new
+/// generation, resource, or retirement field.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_config(server_root: &Path) -> Config {
+    let parser = ParserState {
+        events: Vec::new(),
+        section_stack: Vec::new(),
+        modules: HashSet::new(),
+        module_names: HashSet::new(),
+        defines: HashMap::new(),
+        env: HashMap::new(),
+        depth: 0,
+        warnings: Vec::new(),
+        errors: Vec::new(),
+        initial_server_root: server_root.to_path_buf(),
+        server_root: server_root.to_path_buf(),
+        include_count: 0,
+        config_bytes: 0,
+        admin_file_trust: crate::files::AdminFileTrust::for_current_process(),
+        admin_service_uid: None,
+        admin_input_targets: Vec::new(),
+    };
+    Compile::new(
+        parser,
+        ConfigProgram {
+            instructions: Vec::new().into_boxed_slice(),
+        },
+        false,
+        false,
+    )
+    .cfg
+}
+
 fn known_directives() -> Vec<&'static str> {
     // Directives from modules not yet implemented.  Keeping an explicit list
     // (rather than accepting every unknown token) means a typo in a security
@@ -14200,6 +14236,48 @@ ServerName localhost\n\
         assert_eq!(
             crate::access::check(&conditional, &allowed_req, peer, None, "/conditional", None),
             crate::access::Access::Allowed
+        );
+    }
+
+    #[test]
+    fn request_budget_failure_does_not_poison_the_url_policy_cache() {
+        let c = load_text(
+            concat!(
+                "Listen 127.0.0.1:0\n",
+                "<Location /poison>\n",
+                "Require all denied\n",
+                "</Location>\n",
+            ),
+            false,
+        )
+        .unwrap();
+        let peer = "127.0.0.1".parse().unwrap();
+        let exhausted = test_request("GET");
+        exhausted
+            .charge_policy_work(crate::resource::MAX_POLICY_WORK_UNITS)
+            .unwrap();
+        let (failed, _) = c.url_translation_scope_req_deferred(
+            None,
+            Path::new("/srv/www/poison"),
+            "/poison",
+            &exhausted,
+            peer,
+        );
+        assert!(failed.conditional_error);
+        assert!(exhausted.policy_budget_failed());
+
+        let fresh = test_request("GET");
+        let (scope, _) = c.url_translation_scope_req_deferred(
+            None,
+            Path::new("/srv/www/poison"),
+            "/poison",
+            &fresh,
+            peer,
+        );
+        assert!(!scope.conditional_error);
+        assert_eq!(
+            crate::access::check(&scope, &fresh, peer, None, "/poison", None),
+            crate::access::Access::Denied
         );
     }
 
@@ -17870,8 +17948,13 @@ impl Config {
             scope: Arc::new(scope),
             conditionals: Arc::new(conditionals),
         });
-        if let Ok(mut guard) = self.url_policy_cache.write() {
-            guard.insert(key, Arc::clone(&cached));
+        // A request-local work-budget failure is not immutable policy. Caching
+        // its partial scope would turn one exhausted request into a process-
+        // wide 500 for later requests that still have a full budget.
+        if !cached.scope.conditional_error {
+            if let Ok(mut guard) = self.url_policy_cache.write() {
+                guard.insert(key, Arc::clone(&cached));
+            }
         }
         (Arc::clone(&cached.scope), Arc::clone(&cached.conditionals))
     }

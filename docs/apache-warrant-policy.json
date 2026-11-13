@@ -1,0 +1,816 @@
+{
+  "acknowledged_inventory_sha256": "d502b041d8b9b92b19330300ad5c64f886befb52f0ff2928c141b35ceb9cf5d8",
+  "compatibility_claim_semantics": "directive-entry-point-only; syntax-context-and-semantics-remain-evidence-bounded",
+  "compatibility_claims": [
+    {
+      "directive": "<Directory",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/config_grammar.py",
+        "tests/config_semantics.py"
+      ],
+      "family": "configuration-and-merge"
+    },
+    {
+      "directive": "<Files",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/config_grammar.py",
+        "tests/config_semantics.py::section_override_cases"
+      ],
+      "family": "configuration-and-merge"
+    },
+    {
+      "directive": "<If",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/config_grammar.py",
+        "tests/config_semantics.py"
+      ],
+      "family": "configuration-and-merge"
+    },
+    {
+      "directive": "<Limit",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/config_grammar.py",
+        "tests/config_semantics.py::generated_cases"
+      ],
+      "family": "authorization"
+    },
+    {
+      "directive": "Alias",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/conformance.py",
+        "tests/transform_differential.py"
+      ],
+      "family": "mapping-and-transforms"
+    },
+    {
+      "directive": "AllowOverride",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/config_grammar.py",
+        "tests/config_semantics.py::generated_cases"
+      ],
+      "family": "configuration-and-merge"
+    },
+    {
+      "directive": "AllowOverrideList",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/config_grammar.py",
+        "tests/config_semantics.py::section_override_cases"
+      ],
+      "family": "configuration-and-merge"
+    },
+    {
+      "directive": "AuthMerging",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/config_grammar.py",
+        "tests/config_semantics.py"
+      ],
+      "family": "authorization"
+    },
+    {
+      "directive": "DirectoryIndex",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/config_grammar.py",
+        "tests/transform_differential.py"
+      ],
+      "family": "mapping-and-transforms"
+    },
+    {
+      "directive": "ErrorDocument",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/config_grammar.py",
+        "fuzz/fuzz_targets/whole_request_differential.rs"
+      ],
+      "family": "terminal-response"
+    },
+    {
+      "directive": "Header",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/config_grammar.py",
+        "tests/conformance.py"
+      ],
+      "family": "terminal-response"
+    },
+    {
+      "directive": "Options",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/config_grammar.py",
+        "tests/config_semantics.py"
+      ],
+      "family": "configuration-and-merge"
+    },
+    {
+      "directive": "ProxyPass",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/conformance.py",
+        "tests/transform_differential.py"
+      ],
+      "family": "backend-and-sinks"
+    },
+    {
+      "directive": "RemoteIPHeader",
+      "disposition": "deliberately-stricter",
+      "evidence": [
+        "tests/config_semantics.py",
+        "tests/adversarial_regressions.py"
+      ],
+      "family": "request-identity-and-environment"
+    },
+    {
+      "directive": "Require",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/config_grammar.py",
+        "tests/config_semantics.py"
+      ],
+      "family": "authorization"
+    },
+    {
+      "directive": "RewriteCond",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/conformance.py",
+        "fuzz/fuzz_targets/rewrite_expr.rs"
+      ],
+      "family": "mapping-and-transforms"
+    },
+    {
+      "directive": "RewriteRule",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/conformance.py",
+        "tests/transform_differential.py"
+      ],
+      "family": "mapping-and-transforms"
+    },
+    {
+      "directive": "SetEnvIf",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/config_semantics.py",
+        "tests/conformance.py"
+      ],
+      "family": "request-identity-and-environment"
+    },
+    {
+      "directive": "SetHandler",
+      "disposition": "supported-subset",
+      "evidence": [
+        "tests/conformance.py",
+        "tests/transform_differential.py"
+      ],
+      "family": "backend-and-sinks"
+    }
+  ],
+  "default_disposition": "outside-claimed-surface",
+  "deliberately_unsupported": [
+    {
+      "evidence": [
+        "docs/reference/apache-compatibility.md"
+      ],
+      "id": "webdav-module",
+      "reason": "WebDAV as an Apache module is deliberately not implemented.",
+      "source_globs": [
+        "modules/dav/**"
+      ]
+    },
+    {
+      "evidence": [
+        "docs/reference/apache-compatibility.md"
+      ],
+      "id": "dynamic-language-and-ssi-handlers",
+      "reason": "SSI, mod_lua and in-process dynamic language handlers are outside the product boundary.",
+      "source_globs": [
+        "modules/generators/mod_include.c",
+        "modules/lua/**"
+      ]
+    },
+    {
+      "evidence": [
+        "docs/reference/apache-compatibility.md"
+      ],
+      "id": "unsupported-mappers",
+      "reason": "UserDir, MultiViews and virtual-host alias mapping are deliberately unsupported.",
+      "source_globs": [
+        "modules/mappers/mod_negotiation.c",
+        "modules/mappers/mod_userdir.c",
+        "modules/mappers/mod_vhost_alias.c"
+      ]
+    },
+    {
+      "evidence": [
+        "docs/reference/apache-compatibility.md",
+        "docs/cve/apache2-cve-matrix.json"
+      ],
+      "id": "unsupported-authentication",
+      "reason": "Digest, LDAP and DBM authentication are deliberately unsupported and must fail closed.",
+      "source_globs": [
+        "modules/aaa/mod_auth_digest.c",
+        "modules/aaa/mod_authn_dbm.c",
+        "modules/aaa/mod_authz_dbm.c",
+        "modules/aaa/mod_authnz_ldap.c",
+        "modules/ldap/**"
+      ]
+    },
+    {
+      "evidence": [
+        "docs/reference/apache-compatibility.md",
+        "docs/cve/apache2-cve-matrix.json"
+      ],
+      "id": "unsupported-proxy-protocols",
+      "reason": "AJP, FTP, SCGI and uWSGI proxy protocols are not part of the supported backend set.",
+      "source_globs": [
+        "modules/proxy/mod_proxy_ajp.c",
+        "modules/proxy/mod_proxy_ftp.c",
+        "modules/proxy/mod_proxy_scgi.c",
+        "modules/proxy/mod_proxy_uwsgi.c"
+      ]
+    },
+    {
+      "evidence": [
+        "docs/reference/apache-compatibility.md"
+      ],
+      "id": "unsupported-external-filters-and-info",
+      "reason": "External filters and server-info are deliberately not implemented.",
+      "source_globs": [
+        "modules/filters/mod_ext_filter.c",
+        "modules/generators/mod_info.c"
+      ]
+    }
+  ],
+  "families": [
+    {
+      "compatibility": "explicit-subset-only",
+      "minimum_covered_apache_branches": 1450,
+      "dimensions": [
+        "directive and section",
+        "argument grammar",
+        "context mask",
+        "nesting",
+        "repeat and merge order",
+        "include and reload generation"
+      ],
+      "evidence": [
+        "tests/config_grammar.py",
+        "tests/config_validity.py",
+        "tests/config_semantics.py",
+        "fuzz/fuzz_targets/config_compile.rs",
+        "fuzz/fuzz_targets/config_sections.rs"
+      ],
+      "id": "configuration-and-merge",
+      "source_globs": [
+        "server/config.c",
+        "server/core.c",
+        "server/request.c"
+      ]
+    },
+    {
+      "compatibility": "security-refinement",
+      "minimum_covered_apache_branches": 325,
+      "dimensions": [
+        "provider result",
+        "negation",
+        "Require container",
+        "method mask",
+        "scope merge",
+        "challenge and denial"
+      ],
+      "evidence": [
+        "tests/config_semantics.py",
+        "crates/server/src/policy_ref.rs",
+        "fuzz/fuzz_targets/policy_path.rs"
+      ],
+      "id": "authorization",
+      "source_globs": [
+        "modules/aaa/mod_access_compat.c",
+        "modules/aaa/mod_allowmethods.c",
+        "modules/aaa/mod_auth_basic.c",
+        "modules/aaa/mod_authn_core.c",
+        "modules/aaa/mod_authn_file.c",
+        "modules/aaa/mod_authz_core.c",
+        "modules/aaa/mod_authz_groupfile.c",
+        "modules/aaa/mod_authz_host.c",
+        "modules/aaa/mod_authz_user.c"
+      ]
+    },
+    {
+      "compatibility": "security-refinement",
+      "minimum_covered_apache_branches": 160,
+      "dimensions": [
+        "transport and effective client",
+        "trusted proxy chain",
+        "early and late environment",
+        "header source",
+        "capture expansion"
+      ],
+      "evidence": [
+        "tests/config_semantics.py",
+        "tests/adversarial_regressions.py",
+        "crates/server/src/policy_ref.rs",
+        "fuzz/fuzz_targets/request_identity.rs"
+      ],
+      "id": "request-identity-and-environment",
+      "source_globs": [
+        "modules/metadata/mod_env.c",
+        "modules/metadata/mod_remoteip.c",
+        "modules/metadata/mod_setenvif.c",
+        "modules/metadata/mod_version.c"
+      ]
+    },
+    {
+      "compatibility": "security-refinement",
+      "minimum_covered_apache_branches": 525,
+      "dimensions": [
+        "URI spelling",
+        "filesystem identity",
+        "alias",
+        "rewrite phase and flags",
+        "DirectoryIndex",
+        "internal redirect",
+        "reauthorization"
+      ],
+      "evidence": [
+        "tests/transform_differential.py",
+        "tests/conformance.py",
+        "fuzz/fuzz_targets/rewrite_expr.rs",
+        "fuzz/fuzz_targets/whole_request_differential.rs"
+      ],
+      "id": "mapping-and-transforms",
+      "source_globs": [
+        "modules/mappers/mod_alias.c",
+        "modules/mappers/mod_dir.c",
+        "modules/mappers/mod_rewrite.c"
+      ]
+    },
+    {
+      "compatibility": "security-refinement",
+      "minimum_covered_apache_branches": 500,
+      "dimensions": [
+        "static and CGI sink",
+        "FastCGI lexical and canonical identity",
+        "HTTP and WebSocket backend",
+        "backend serialization",
+        "health and failover",
+        "cancellation"
+      ],
+      "evidence": [
+        "tests/conformance.py",
+        "tests/transform_differential.py",
+        "fuzz/fuzz_targets/whole_request_differential.rs",
+        "fuzz/fuzz_targets/multi_request_state.rs"
+      ],
+      "id": "backend-and-sinks",
+      "source_globs": [
+        "modules/generators/mod_cgi.c",
+        "modules/generators/mod_cgid.c",
+        "modules/proxy/mod_proxy.c",
+        "modules/proxy/mod_proxy_fcgi.c",
+        "modules/proxy/mod_proxy_http.c",
+        "modules/proxy/mod_proxy_wstunnel.c"
+      ]
+    },
+    {
+      "compatibility": "protocol-oracle",
+      "minimum_covered_apache_branches": 1150,
+      "dimensions": [
+        "H1 parsing and framing",
+        "H2 frame and stream state",
+        "header compression",
+        "flow control",
+        "reset and retirement",
+        "resource ownership"
+      ],
+      "evidence": [
+        "fuzz/fuzz_targets/http_connection.rs",
+        "fuzz/fuzz_targets/h2_stateful.rs",
+        "tests/protocol_conformance.py",
+        "tests/resource_inventory.py"
+      ],
+      "id": "protocol-state",
+      "source_globs": [
+        "modules/http/**",
+        "modules/http2/**",
+        "server/protocol.c"
+      ]
+    },
+    {
+      "compatibility": "security-refinement",
+      "minimum_covered_apache_branches": 80,
+      "dimensions": [
+        "cache lookup and store",
+        "headers and status",
+        "ErrorDocument",
+        "redirect",
+        "stream completion",
+        "secret noninterference"
+      ],
+      "evidence": [
+        "tests/information_disclosure.py",
+        "tests/conformance.py",
+        "fuzz/fuzz_targets/cache_metadata.rs",
+        "fuzz/fuzz_targets/cache_stateful.rs",
+        "fuzz/fuzz_targets/whole_request_differential.rs"
+      ],
+      "id": "terminal-response",
+      "source_globs": [
+        "modules/cache/mod_cache.c",
+        "modules/cache/mod_cache_disk.c",
+        "modules/metadata/mod_headers.c"
+      ]
+    },
+    {
+      "compatibility": "explicit-subset-only",
+      "minimum_covered_apache_branches": 750,
+      "dimensions": [
+        "TLS version and ALPN",
+        "client identity",
+        "certificate reload",
+        "stapling",
+        "proxy trust",
+        "failure retention"
+      ],
+      "evidence": [
+        "tests/conformance.py",
+        "fuzz/fuzz_targets/tls_policy.rs",
+        "fuzz/fuzz_targets/tls_identity_reload.rs",
+        "fuzz/fuzz_targets/ocsp_der.rs"
+      ],
+      "id": "tls-and-peer-identity",
+      "source_globs": [
+        "modules/ssl/**"
+      ]
+    }
+  ],
+  "fuzz_warrants": [
+    {
+      "authorities": [
+        "protocol-specification",
+        "internal-security-invariant",
+        "historical-adversarial-finding"
+      ],
+      "evidence": [
+        "crates/server/src/http.rs",
+        "tests/adversarial_regressions.py"
+      ],
+      "families": [
+        "protocol-state"
+      ],
+      "id": "http-wire-and-fields",
+      "state_dimensions": [
+        "request target and method",
+        "header grammar and duplicate combination",
+        "fragmentation and pipelining",
+        "body framing and trailers",
+        "connection completion and cancellation"
+      ],
+      "targets": [
+        "http_request",
+        "http_connection",
+        "http_fields"
+      ]
+    },
+    {
+      "authorities": [
+        "apache-source-and-binary",
+        "historical-adversarial-finding",
+        "internal-security-invariant"
+      ],
+      "evidence": [
+        "crates/server/src/access.rs",
+        "crates/server/src/config.rs",
+        "tests/config_semantics.py"
+      ],
+      "families": [
+        "request-identity-and-environment"
+      ],
+      "id": "request-identity-and-environment",
+      "state_dimensions": [
+        "H1 and H2 identity projection",
+        "trusted, internal and untrusted proxy chain",
+        "public and private presented address",
+        "early, late and fixup environment phase",
+        "main and access-file provenance",
+        "authorization and FastCGI visibility"
+      ],
+      "targets": [
+        "request_identity"
+      ]
+    },
+    {
+      "authorities": [
+        "apache-source-and-binary",
+        "historical-adversarial-finding",
+        "internal-security-invariant"
+      ],
+      "evidence": [
+        "tests/config_grammar.py",
+        "tests/config_semantics.py",
+        "docs/apache-access-parity.md"
+      ],
+      "families": [
+        "configuration-and-merge",
+        "authorization"
+      ],
+      "id": "configuration-language",
+      "state_dimensions": [
+        "physical and logical line boundary",
+        "directive argument grammar",
+        "section nesting and context",
+        "main and access-file compilation",
+        "directory walk and override admission"
+      ],
+      "targets": [
+        "config_physical_lines",
+        "config_sections",
+        "config_compile",
+        "config_grammars",
+        "htaccess_walk"
+      ]
+    },
+    {
+      "authorities": [
+        "apache-source-and-binary",
+        "upstream-reference-oracle",
+        "historical-adversarial-finding"
+      ],
+      "evidence": [
+        "crates/server/src/rewrite.rs",
+        "tests/config_semantics.py",
+        "tests/transform_differential.py"
+      ],
+      "families": [
+        "mapping-and-transforms"
+      ],
+      "id": "rewrite-and-regex-boundary",
+      "state_dimensions": [
+        "expression grammar",
+        "capture and expansion",
+        "rewrite phase",
+        "flag combination",
+        "target identity and reauthorization"
+      ],
+      "targets": [
+        "rewrite_expr"
+      ]
+    },
+    {
+      "authorities": [
+        "protocol-specification",
+        "internal-security-invariant",
+        "historical-adversarial-finding"
+      ],
+      "evidence": [
+        "crates/server/src/cgi.rs",
+        "crates/server/src/fastcgi.rs",
+        "crates/server/src/proxy.rs",
+        "tests/conformance.py"
+      ],
+      "families": [
+        "backend-and-sinks",
+        "terminal-response"
+      ],
+      "id": "backend-wire-formats",
+      "state_dimensions": [
+        "record and header framing",
+        "status restoration",
+        "stream completion",
+        "malformed upstream response",
+        "upgrade negotiation"
+      ],
+      "targets": [
+        "cgi_response",
+        "fastcgi_records",
+        "proxy_response",
+        "websocket_negotiation"
+      ]
+    },
+    {
+      "authorities": [
+        "protocol-specification",
+        "historical-adversarial-finding",
+        "internal-security-invariant"
+      ],
+      "evidence": [
+        "tests/protocol_conformance.py",
+        "crates/server/src/h2.rs",
+        "vendor/h2-0.4.20/src"
+      ],
+      "families": [
+        "protocol-state"
+      ],
+      "id": "http2-state-machine",
+      "state_dimensions": [
+        "frame grammar and output",
+        "stream lifecycle",
+        "HPACK table policy",
+        "flow control",
+        "reset flood and resource retirement"
+      ],
+      "targets": [
+        "h2_frames",
+        "h2_output",
+        "h2_stateful"
+      ]
+    },
+    {
+      "authorities": [
+        "internal-security-invariant",
+        "protocol-specification"
+      ],
+      "evidence": [
+        "crates/server/src/cache.rs",
+        "crates/server/src/tls.rs",
+        "crates/server/src/ocsp.rs"
+      ],
+      "families": [
+        "terminal-response",
+        "tls-and-peer-identity"
+      ],
+      "id": "cache-and-tls-metadata",
+      "state_dimensions": [
+        "cache identity and freshness",
+        "cache publication, corruption and quota cleanup",
+        "TLS version and cipher policy",
+        "certificate identity",
+        "SNI and Host transition",
+        "OCSP DER grammar",
+        "reload and failure retention"
+      ],
+      "targets": [
+        "cache_metadata",
+        "cache_stateful",
+        "tls_policy",
+        "tls_identity_reload",
+        "ocsp_der"
+      ]
+    },
+    {
+      "authorities": [
+        "upstream-reference-oracle",
+        "historical-adversarial-finding",
+        "internal-security-invariant"
+      ],
+      "evidence": [
+        "crates/pcre2/src",
+        "docs/adversarial-closure.md"
+      ],
+      "families": [
+        "authorization",
+        "mapping-and-transforms"
+      ],
+      "id": "pcre2-closed-grammar",
+      "state_dimensions": [
+        "admitted grammar production",
+        "byte, UTF and UCP mode",
+        "compile and match result",
+        "capture semantics",
+        "resource limit and cost monotonicity"
+      ],
+      "targets": [
+        "pcre2_differential",
+        "pcre2_grammar",
+        "pcre2_resource"
+      ]
+    },
+    {
+      "authorities": [
+        "internal-security-invariant",
+        "historical-adversarial-finding"
+      ],
+      "evidence": [
+        "crates/server/src/resource.rs",
+        "tests/resource_inventory.py",
+        "crates/server/src/policy_ref.rs"
+      ],
+      "families": [
+        "authorization",
+        "backend-and-sinks",
+        "protocol-state"
+      ],
+      "id": "policy-and-resource-state",
+      "state_dimensions": [
+        "policy event order",
+        "route and terminal outcome",
+        "reservation and release",
+        "parent exhaustion",
+        "ownership transfer and teardown"
+      ],
+      "targets": [
+        "resource_transitions",
+        "policy_path"
+      ]
+    },
+    {
+      "authorities": [
+        "apache-source-and-binary",
+        "internal-security-invariant",
+        "historical-adversarial-finding"
+      ],
+      "evidence": [
+        "crates/server/src/whole_request_fuzz.rs",
+        "tests/transform_differential.py",
+        "tests/information_disclosure.py"
+      ],
+      "families": [
+        "authorization",
+        "backend-and-sinks",
+        "configuration-and-merge",
+        "mapping-and-transforms",
+        "terminal-response"
+      ],
+      "id": "whole-and-multi-request-composition",
+      "state_dimensions": [
+        "H1 and H2 canonical equivalence",
+        "request plan and sink admission",
+        "backend and cache outcome",
+        "reload generation",
+        "access-file replacement",
+        "backend health and connection age"
+      ],
+      "targets": [
+        "whole_request_differential",
+        "multi_request_state"
+      ]
+    }
+  ],
+  "oracle_build": {
+    "apr": "1.7.5",
+    "apr_util": "1.6.3",
+    "flavor": "Debian 2.4.69-1~deb13u1",
+    "mpm": "event",
+    "pcre2": "10.46"
+  },
+  "oracle_modules": [
+    "access_compat_module",
+    "alias_module",
+    "allowmethods_module",
+    "auth_basic_module",
+    "authn_core_module",
+    "authn_file_module",
+    "authz_core_module",
+    "authz_groupfile_module",
+    "authz_host_module",
+    "authz_user_module",
+    "autoindex_module",
+    "brotli_module",
+    "cache_disk_module",
+    "cache_module",
+    "cgi_module",
+    "deflate_module",
+    "dir_module",
+    "env_module",
+    "expires_module",
+    "filter_module",
+    "headers_module",
+    "http2_module",
+    "mime_module",
+    "mpm_event_module",
+    "negotiation_module",
+    "proxy_balancer_module",
+    "proxy_hcheck_module",
+    "proxy_fcgi_module",
+    "proxy_http_module",
+    "proxy_module",
+    "remoteip_module",
+    "reqtimeout_module",
+    "rewrite_module",
+    "setenvif_module",
+    "socache_shmcb_module",
+    "ssl_module",
+    "status_module"
+  ],
+  "schema": 1,
+  "source_pin": {
+    "archive_sha256": "c5e6ebc66e349b87d7fc6916ae7cc2a808ed348003de134cf9e9d89d3e2cc73d",
+    "archive_url": "https://archive.apache.org/dist/httpd/httpd-2.4.69.tar.bz2",
+    "release": "2.4.69",
+    "tag": "2.4.69"
+  },
+  "support_expansion": "explicit-claim-with-evidence-only",
+  "upstream_test_pin": {
+    "archive_sha256": "c5527bb3f90dc8310a814b557e8b455536b900e6c17278d5266bf81e823d75ed",
+    "archive_url": "https://github.com/apache/httpd-tests/archive/2879045700cffa0e1041f337083b873ddedaf240.tar.gz",
+    "commit": "2879045700cffa0e1041f337083b873ddedaf240",
+    "repository": "https://github.com/apache/httpd-tests",
+    "submodules": {
+      "Apache-Test": {
+        "archive_sha256": "3ab159ba3a3d802cfd7173c278fb6fe21527a5b75665b2f332d3ef1bad11689e",
+        "archive_url": "https://github.com/apache/perl-apache-test/archive/ed33bc9265f494ae2fd099a7653da5aa6e173b4d.tar.gz",
+        "commit": "ed33bc9265f494ae2fd099a7653da5aa6e173b4d",
+        "repository": "https://github.com/apache/perl-apache-test"
+      }
+    }
+  }
+}

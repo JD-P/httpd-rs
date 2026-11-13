@@ -1,0 +1,4 @@
+<FilesMatch "^priv\
+ate[.]txt$">
+Require all denied
+</FilesMatch>

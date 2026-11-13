@@ -4,7 +4,7 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-NIGHTLY=${VAPACHE_NIGHTLY_TOOLCHAIN:-nightly}
+NIGHTLY=${VAPACHE_NIGHTLY_TOOLCHAIN:-nightly-2026-10-29}
 
 if ! cargo +"$NIGHTLY" fuzz --version >/dev/null 2>&1; then
     echo "fuzz-campaign: cargo-fuzz is required" >&2
@@ -14,7 +14,13 @@ cargo +"$NIGHTLY" --version >/dev/null
 
 SECONDS_PER_TARGET=${FUZZ_SECONDS_PER_TARGET:-300}
 MAX_LEN=${FUZZ_MAX_LEN:-1048576}
-TARGETS=${FUZZ_TARGETS:-"http_request http_connection http_fields config_sections config_compile config_grammars htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames h2_output h2_stateful cache_metadata tls_policy ocsp_der pcre2_differential pcre2_grammar pcre2_resource resource_transitions policy_path whole_request_differential multi_request_state"}
+TARGETS=${FUZZ_TARGETS:-"http_request http_connection http_fields request_identity config_physical_lines config_sections config_compile config_grammars htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames h2_output h2_stateful cache_metadata cache_stateful tls_policy tls_identity_reload ocsp_der pcre2_differential pcre2_grammar pcre2_resource resource_transitions policy_path whole_request_differential multi_request_state"}
+
+# Preserve finite semantic dimensions as corpus inputs in addition to
+# libFuzzer's structural edge features. This makes the cumulative nightly
+# corpus resume with every declared route/mode/transition represented.
+python3 tests/fuzz_report.py --state fuzz --targets "$TARGETS" \
+    --seed-matrix --output fuzz/semantic-baseline.json
 
 report_failure() {
     failed_target=$1
@@ -56,6 +62,11 @@ for target in $TARGETS; do
     [ ! -f "fuzz/dictionaries/$dictionary_target.dict" ] \
         || dictionary="-dict=fuzz/dictionaries/$dictionary_target.dict"
     target_max_len=$MAX_LEN
+    [ "$target" != config_physical_lines ] || target_max_len=65536
+    case "$target" in
+        request_identity|tls_identity_reload) target_max_len=256 ;;
+        cache_stateful) target_max_len=128 ;;
+    esac
     [ "$target" != whole_request_differential ] || target_max_len=256
     [ "$target" != multi_request_state ] || target_max_len=96
     if ! cargo +"$NIGHTLY" fuzz run "$target" "$corpus" -- \
@@ -80,3 +91,8 @@ for target in $TARGETS; do
         fi
     fi
 done
+
+# cmin is intentionally structural; restore and verify the semantic seed
+# matrix after it has minimized the edge corpus.
+python3 tests/fuzz_report.py --state fuzz --targets "$TARGETS" \
+    --seed-matrix --strict-semantic --output fuzz/semantic-summary.json

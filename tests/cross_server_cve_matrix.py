@@ -1857,7 +1857,7 @@ OVERRIDES: dict[str, tuple[str, str, str, str, str, str]] = {
     "CVE-2019-9518": (
         "prevented", "http2",
         "empty frames imposed parser/state work disproportionate to their wire size",
-        "empty DATA and continuation/header abuse have hard limits; SETTINGS, PING, PRIORITY and tiny flow updates share a slowly refilled control-frame budget before state work",
+        "empty DATA, including frames discarded on reset/closed/forgotten streams, and continuation/header abuse have hard limits; SETTINGS, PING, PRIORITY and tiny flow updates share a slowly refilled control-frame budget before state work",
         "high", "HTTP/2 Network DoS advisory and vendored frame-budget implementation/tests",
     ),
     "CVE-2020-9481": (

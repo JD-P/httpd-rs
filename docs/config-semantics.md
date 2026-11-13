@@ -2466,7 +2466,15 @@ abstract model/projection proof over these policy objects.
 Both the main configuration parser and `.htaccess` use the shared logical-line
 assembler and tokenizer. A physical trailing backslash is resolved before the
 complete logical line is classified as a comment, so `#\` swallows the next
-physical line exactly as it does in Apache.
+physical line exactly as it does in Apache. Resolution deletes only that
+single final backslash and the following LF or CRLF: whitespace after a
+backslash disables continuation, a run loses only its final backslash, and a
+backslash at EOF remains literal. Resolution inserts no separator and preserves
+all leading whitespace on the continuation line. Thus a split token or quoted
+pattern is concatenated byte-for-byte, while indentation remains significant
+as ordinary token-separating whitespace. The `config_physical_lines` fuzzer
+checks this projection against an independent byte-oriented model and requires
+equivalent physical encodings to produce the same parsed `ConfigLine` IR.
 Quote, escape, whitespace, section-tag delimiter, EOF, argument-count,
 argument-arity/nonempty and structural-depth decisions are executable Verus
 kernels used by production. After includes and execute-on-read conditions are
@@ -2597,6 +2605,13 @@ The pre-proof suite is:
 - `multi_request_state` — whole-request sequences crossing cache warmup,
   configuration retirement, access-file replacement, backend failover and
   old keep-alive/H2 connections.
+- `request_identity` — H1/H2 RemoteIP chain equivalence, trusted/internal
+  transitions, environment phase visibility and access-file provenance.
+- `cache_stateful` — disk publication, metadata/body corruption, quota,
+  expiration, reload invalidation and complete resource-ledger teardown.
+- `tls_identity_reload` — SNI/Host policy selection, client-certificate
+  identity, listener-policy uniformity and rejection of stale handshake
+  identities across configuration generations.
 - Rust unit invariants in `config.rs`, `htaccess.rs`, `access.rs`, `cache.rs`,
   `fastcgi.rs`, `proxy.rs`, `rewrite.rs` and `server.rs`.
 

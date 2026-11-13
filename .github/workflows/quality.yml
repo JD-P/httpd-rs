@@ -64,6 +64,7 @@ jobs:
       - name: Verification ledger and CVE matrix
         run: |
           python3 tests/verification_status.py
+          python3 tests/apache_warrant.py
           python3 tests/cve_matrix.py --check
           python3 tests/cross_server_cve_matrix.py --check
       - name: Certbot Apache control command routing

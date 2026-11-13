@@ -8,7 +8,7 @@ command -v cargo-mutants >/dev/null 2>&1 || {
     exit 2
 }
 
-files=${MUTATION_FILES:-"access.rs request_plan.rs scope_policy.rs cache.rs http.rs rewrite.rs resource.rs"}
+files=${MUTATION_FILES:-"access.rs request_plan.rs scope_policy.rs cache.rs http.rs rewrite.rs resource.rs config_frontend.rs"}
 args=
 for file in $files; do
     args="$args --file crates/server/src/$file"

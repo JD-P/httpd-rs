@@ -25,7 +25,7 @@
       "title": "Configuration schema to sealed IR to compiler refinement",
       "status": "mechanized",
       "weight": 1.0,
-      "evidence": "ConfigSemanticKind closes all 46 payload domains. config_semantic_kind_code_is_injective proves its executable encoding is lossless; config_semantic_seal_admit requires schema/IR kind identity and complete argument-count preservation; config_semantic_projection_admit gates every main/access compiler entry and typed getter; config_semantic_refinement_is_transitive proves actual schema, sealed-value and consumer kind equality, while substitution is rejected. Production sealing consumes exact verified On/Off, decimal/range and first-keyword constructors. Capability, stable FastCGI identity, AllowOverride, proxy/balancer health, ServerAlias, LogLevel, SSLSessionCache and RewriteMap effect payloads compile once before mutation; an exhaustive access/main table test rejects effectful schema drift. Apache compatibility of complex constructors remains a differential oracle rather than an internal refinement assumption."
+      "evidence": "ConfigSemanticKind closes all 46 payload domains. config_semantic_kind_code_is_injective proves its executable encoding is lossless; config_semantic_seal_admit requires schema/IR kind identity and complete argument-count preservation; config_semantic_projection_admit gates every main/access compiler entry and typed getter; config_semantic_refinement_is_transitive proves actual schema, sealed-value and consumer kind equality, while substitution is rejected. Production sealing consumes exact verified On/Off, decimal/range and first-keyword constructors. Capability, stable FastCGI identity, AllowOverride, proxy/balancer health, ServerAlias, LogLevel, SSLSessionCache and RewriteMap effect payloads compile once before mutation; an exhaustive access/main table test rejects effectful schema drift. P38 pins Apache's exact physical continuation in the shared main/access logical-line assembler: only one final backslash followed by LF/CRLF is removed, no separator is inserted, indentation is preserved, and trailing whitespace/backslash runs/EOF remain literal. config_physical_lines continuously compares production with an independent byte-oriented oracle and requires equivalent physical encodings to preserve the parsed ConfigLine IR. A deterministic matrix exhausts every insertion boundary, LF/CRLF, ordered split pair, continuation chain, one-to-three-backslash run, whitespace near miss and EOF form before the long-running mutation campaign begins. Apache compatibility of complex constructors remains a differential oracle rather than an internal refinement assumption."
     },
     {
       "id": "htaccess_interleave",
@@ -67,7 +67,7 @@
       "title": "htaccess/cache fast-path over-approximation",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "prefilter_sound proves both boolean implications in Verus: htaccess_may_apply false admits no access-file layer, while cache_base_scope_only_sound proves a path outside the inherited base enable list remains disabled when the compiler has excluded CacheEnable from every rule delta. cache_base_scope_admit is consumed at that compiler boundary; the path-pattern matcher and parser-to-ActiveLayer/rule-tree refinement remain explicit assumptions"
+      "evidence": "prefilter_sound proves both boolean implications in Verus: htaccess_may_apply false admits no access-file layer, while cache_base_scope_only_sound proves a path outside the inherited base enable list remains disabled when the compiler has excluded CacheEnable from every rule delta. cache_base_scope_admit is consumed at that compiler boundary. P38 also excludes any deferred URL-policy scope carrying a request-local conditional/work-budget error from the immutable policy cache; a fresh-request regression proves the failed request cannot poison later evaluation. The path-pattern matcher and parser-to-ActiveLayer/rule-tree refinement remain explicit assumptions"
     },
     {
       "id": "acl_reachability",
@@ -568,7 +568,7 @@
     "HTTP/2 client-before-process stream admission ordering",
     "HTTP/2 general-to-source-fair slow-output ownership transition",
     "Overflow-safe request minimum-progress-rate admission",
-    "HTTP/2 closed-world peer HEADERS/DATA classifier with distinct remote-reset, clean-end, local-reset, forgotten and idle outcomes",
+    "HTTP/2 closed-world peer HEADERS/DATA classifier with distinct remote-reset, clean-end, local-reset, forgotten and idle outcomes, plus terminal DATA hard-limit accounting",
     "Rewrite backreference question-mark encoding and filesystem-target admission",
     "HTTP/2 frame-head admission before allocation, unified raw-frame work, encoded continuation bounds, signed flow-window arithmetic, Huffman decode bounds and single-use reset expiry",
     "HTTP/2 SETTINGS synchronization state machine, decoded-header budget and flow-control model",

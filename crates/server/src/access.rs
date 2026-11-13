@@ -1245,6 +1245,284 @@ fn same_method(configured: &str, request: &str) -> bool {
     configured == request
 }
 
+/// Exercise the complete request-identity boundary: RemoteIP chain walking,
+/// the H1/H2 header projections, SetEnvIf phase visibility, FastCGI
+/// provenance filtering, and `Require env`'s case-insensitive lookup. The
+/// generated policies use only the deliberately supported subset.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_request_identity_environment(data: &[u8]) {
+    use crate::config::RemoteIpProxy;
+    use crate::http::{Headers, Version};
+    use crate::resource::RequestScope;
+    use crate::scope_policy::{EnvironmentPolicy, Originated};
+
+    fn address(selector: u8) -> IpAddr {
+        match selector % 8 {
+            0 => "127.0.0.1".parse().unwrap(),
+            1 => "10.1.2.3".parse().unwrap(),
+            2 => "192.168.4.5".parse().unwrap(),
+            3 => "8.8.8.8".parse().unwrap(),
+            4 => "100.64.0.1".parse().unwrap(),
+            5 => "172.32.0.1".parse().unwrap(),
+            6 => "2001:db8::1".parse().unwrap(),
+            _ => "fc00::1".parse().unwrap(),
+        }
+    }
+
+    fn address_text(selector: u8) -> &'static str {
+        match selector % 10 {
+            0 => "127.0.0.1",
+            1 => "10.1.2.3",
+            2 => "192.168.4.5",
+            3 => "8.8.8.8",
+            4 => "100.64.0.1",
+            5 => "172.32.0.1",
+            6 => "2001:db8::1",
+            7 => "fc00::1",
+            8 => "not-an-address",
+            _ => "",
+        }
+    }
+
+    fn public_candidate(ip: IpAddr) -> bool {
+        match canonical_ip(ip) {
+            IpAddr::V4(ip) => {
+                let [a, b, _, _] = ip.octets();
+                !(a == 10
+                    || a == 127
+                    || (a == 169 && b == 254)
+                    || (a == 172 && b & 0xf0 == 16)
+                    || (a == 192 && b == 168))
+            }
+            IpAddr::V6(ip) => ip.octets()[0] & 0xe0 == 0x20,
+        }
+    }
+
+    fn proxy_class(proxies: &[RemoteIpProxy], ip: IpAddr) -> vapache_verified::RemoteIpProxyClass {
+        proxies
+            .iter()
+            .find(|proxy| ip_in_net(canonical_ip(ip), proxy.network, proxy.bits))
+            .map(|proxy| {
+                if proxy.internal {
+                    vapache_verified::RemoteIpProxyClass::Internal
+                } else {
+                    vapache_verified::RemoteIpProxyClass::Trusted
+                }
+            })
+            .unwrap_or(vapache_verified::RemoteIpProxyClass::Untrusted)
+    }
+
+    fn reference_remoteip(
+        header_enabled: bool,
+        proxies: &[RemoteIpProxy],
+        peer: SocketAddr,
+        value: Option<&[u8]>,
+    ) -> SocketAddr {
+        let peer = crate::access::canonical_socket_addr(peer);
+        if !header_enabled || proxies.is_empty() {
+            return peer;
+        }
+        let Some(value) = value else {
+            return peer;
+        };
+        let text = String::from_utf8_lossy(value);
+        let mut current = peer.ip();
+        let mut selected = peer;
+        let mut chain_internal = true;
+        for part in text.split(',').rev() {
+            let presenter = proxy_class(proxies, current);
+            let next_internal = vapache_verified::remoteip_next_internal(chain_internal, presenter);
+            let Ok(candidate) = part.trim_matches(' ').parse::<IpAddr>() else {
+                break;
+            };
+            let candidate = canonical_ip(candidate);
+            if !vapache_verified::remoteip_candidate_admit(
+                presenter,
+                next_internal,
+                true,
+                public_candidate(candidate),
+            ) {
+                break;
+            }
+            selected = SocketAddr::new(candidate, peer.port());
+            current = candidate;
+            chain_internal = next_internal;
+        }
+        selected
+    }
+
+    fn request(
+        version: Version,
+        value: &[u8],
+        budget: &Arc<crate::resource::ResourceBudget>,
+        peer: IpAddr,
+    ) -> Request {
+        let mut headers = Headers::default();
+        headers.insert("host", b"identity.test".to_vec());
+        headers.insert("user-agent", b"vapache-fuzz".to_vec());
+        headers.insert("x-forwarded-for", value.to_vec());
+        headers.bind_request_scope(RequestScope::new(budget.context(peer)));
+        Request {
+            method: "GET".into(),
+            target: b"/identity?fuzz=1".to_vec(),
+            raw_path: b"/identity".to_vec(),
+            query: b"fuzz=1".to_vec(),
+            version,
+            headers,
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        }
+    }
+
+    let byte = |index: usize| data.get(index).copied().unwrap_or(0);
+    let mode = byte(0) % 4;
+    let peer_ip = address(byte(1));
+    let peer = SocketAddr::new(peer_ip, 12345);
+    let mut chain = Vec::new();
+    for index in 0..=usize::from(byte(2) % 5) {
+        chain.push(address_text(byte(3 + index)));
+    }
+    let chain = chain.join(if byte(8) & 1 == 0 { ", " } else { "," });
+
+    let root = std::env::temp_dir();
+    let mut cfg = crate::config::fuzz_config(&root);
+    cfg.remoteip_header = (mode != 0).then(|| "X-Forwarded-For".to_string());
+    if mode >= 2 {
+        cfg.remoteip_proxies.push(RemoteIpProxy {
+            network: canonical_ip(peer_ip),
+            bits: if peer_ip.is_ipv4() { 32 } else { 128 },
+            internal: mode == 3,
+        });
+        // Permit selected intermediate hops to present the next element. The
+        // class is independently varied so trusted/private transitions are
+        // reachable without accepting arbitrary proxy networks.
+        for index in 0..3 {
+            let network = address(byte(9 + index));
+            cfg.remoteip_proxies.push(RemoteIpProxy {
+                network: canonical_ip(network),
+                bits: if network.is_ipv4() { 32 } else { 128 },
+                internal: byte(12 + index) & 1 != 0,
+            });
+        }
+    }
+
+    let h1 = request(
+        Version::Http11,
+        chain.as_bytes(),
+        &cfg.resource_budget,
+        peer_ip,
+    );
+    let h2 = request(
+        Version::Http2,
+        chain.as_bytes(),
+        &cfg.resource_budget,
+        peer_ip,
+    );
+    let h1_identity = cfg.client_addr(peer, &h1);
+    let h2_identity = cfg.client_addr_from_headers(peer, &h2.headers);
+    assert_eq!(h1_identity, h2_identity);
+    assert_eq!(
+        h1_identity,
+        reference_remoteip(
+            cfg.remoteip_header.is_some(),
+            &cfg.remoteip_proxies,
+            peer,
+            Some(chain.as_bytes()),
+        )
+    );
+
+    let attributes = [
+        "Remote_Addr",
+        "Request_URI",
+        "Request_Method",
+        "Request_Protocol",
+        "Host",
+        "User-Agent",
+    ];
+    let patterns = [".*", "^GET$", "^/identity$", "^(.*)$", "^never$"];
+    let attribute = attributes[usize::from(byte(15)) % attributes.len()];
+    let pattern = patterns[usize::from(byte(16)) % patterns.len()];
+    let rule = crate::config::parse_env_rule(
+        if byte(17) & 1 == 0 {
+            "setenvif"
+        } else {
+            "setenvifnocase"
+        },
+        &[attribute.into(), pattern.into(), "GATE=$1".into()],
+    )
+    .expect("bounded supported SetEnvIf rule");
+    let origin_access = byte(18) & 1 != 0;
+    let originated = if origin_access {
+        Originated::access(rule)
+    } else {
+        Originated::main(rule)
+    };
+    let mut scope = Scope::default();
+    scope.environment_policy = EnvironmentPolicy::default();
+    scope.environment_policy.set_env_if.push(originated);
+    scope
+        .environment_policy
+        .rewrite_env
+        .push(Originated::main(("EARLY".into(), b"1".to_vec())));
+    scope
+        .environment_policy
+        .rewrite_late_env
+        .push(Originated::main(("LATE".into(), b"1".to_vec())));
+    scope
+        .environment_policy
+        .set_env
+        .push(Originated::main(("FIXUP".into(), "1".into())));
+
+    let h1_auth = scope.authorization_env(&h1, "/identity", h1_identity.ip());
+    let h1_complete = scope.request_env(&h1, "/identity", h1_identity.ip());
+    let fastcgi = scope.fastcgi_env(&h1, "/identity", h1_identity.ip());
+    assert!(!h1_auth
+        .iter()
+        .any(|(name, _)| name == "LATE" || name == "FIXUP"));
+    assert!(h1_complete.iter().any(|(name, _)| name == "LATE"));
+    assert!(h1_complete.iter().any(|(name, _)| name == "FIXUP"));
+    if origin_access {
+        assert!(!fastcgi
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("GATE")));
+    }
+
+    let require = Require::Env {
+        negate: false,
+        names: vec!["gate".into()],
+    };
+    let granted = matches!(
+        eval_require(
+            &require,
+            &h1,
+            h1_identity.ip(),
+            None,
+            &h1_auth,
+            Path::new("/"),
+            "/identity",
+            None,
+        ),
+        PolicyResult::Granted
+    );
+    assert_eq!(
+        granted,
+        h1_auth
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("GATE"))
+    );
+
+    let h2_auth = scope.authorization_env(&h2, "/identity", h2_identity.ip());
+    if !attribute.eq_ignore_ascii_case("Request_Protocol") {
+        assert_eq!(h1_auth, h2_auth);
+    }
+
+    drop((h1_auth, h1_complete, fastcgi, h2_auth, h1, h2));
+    assert!(cfg.resource_budget.transition_usage_is_zero());
+}
+
 /// Canonicalize an IPv4-mapped IPv6 address to IPv4 before it is used for an
 /// authorization or identity decision.  A dual-stack listener reports IPv4
 /// peers as `::ffff:a.b.c.d`; without this step IPv4 `Require` networks and

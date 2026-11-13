@@ -86,8 +86,10 @@ pub(super) struct Counts {
     /// Whether the DATA frame budget follows the target connection window.
     data_frame_budget_is_auto: bool,
 
-    /// Number of empty, non-final DATA frames received over the lifetime of
-    /// the connection.
+    /// Number of repeatable empty DATA frames received over the lifetime of
+    /// the connection. A final frame on a live stream is excluded, but DATA
+    /// discarded for a terminal/forgotten stream remains repeatable and is
+    /// therefore charged by the lifecycle boundary.
     num_recv_empty_data_frames: usize,
 
     /// Exact causes for recently released streams. Stream identifiers are

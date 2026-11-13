@@ -20,6 +20,7 @@ python3 tests/docs.py
 python3 tests/unsafe_inventory.py
 python3 tests/resource_inventory.py
 python3 tests/verification_status.py
+python3 tests/apache_warrant.py
 ```
 
 `tests/pre_adversarial.sh` is the fail-closed release gate. It additionally
@@ -71,15 +72,18 @@ Pull-request CI checks deterministic generation and matrix completeness without
 requiring Apache modules. The fail-closed pre-adversarial/nightly gate runs both
 live campaigns against the release daemon.
 
-Eighteen libFuzzer targets cover:
+Twenty-nine libFuzzer targets cover:
 
 - HTTP request parsing and whole fragmented/pipelined connections;
-- configuration sections, full configuration compilation and `.htaccess`
-  discovery/compilation;
+- configuration physical-line refinement against an independent Apache
+  continuation model, sections, full configuration compilation and
+  `.htaccess` discovery/compilation;
 - rewrite expressions;
 - CGI, FastCGI and reverse-proxy response framing, plus WebSocket negotiation;
-- raw HTTP/2 frames and structured multi-frame HTTP/2 state transitions,
-  cache metadata, TLS policy and OCSP DER;
+- raw HTTP/2 frames and structured multi-frame HTTP/2 state transitions;
+- cache metadata plus stateful disk publication, corruption, quota and reload
+  cleanup; TLS policy plus SNI/Host/client-identity reload transitions; OCSP
+  DER; and H1/H2 RemoteIP/environment provenance;
 - PCRE2 compile metadata and every public match/capture API, differentially
   checked against the pinned PCRE2 10.46 C oracle across byte, CRLF, UTF and
   UCP modes, plus production resource-limit monotonicity and cost boundaries;
@@ -93,9 +97,53 @@ Each target has a seed corpus and, where useful, a protocol dictionary.
 time-based campaign. Nightly jobs restore each target's latest coverage corpus,
 merge new coverage, minimize the result and cache that next generation in
 addition to uploading the corpus and crash artifacts for inspection.
-The expression-parser and both PCRE2 targets receive 16,384 smoke executions by
-default because their adversarial boundary failures required sustained mutation
-to discover; the resource state machine receives 1,024.
+`tests/long_fuzz.sh` provides the corresponding resumable workstation run. Its
+default full schedule touches every target once before using duplicate slots
+to weight historically high-yield composed and stateful targets, while keeping
+content-addressed corpora, logs and artifacts in an ignored state directory.
+`--nightly latest` merges the
+uploaded cumulative nightly corpora before the run, and `--import` accepts the
+same artifact tree when GitHub's artifact redirect is unavailable. The runner
+generates a finite semantic seed matrix and emits baseline/final JSON censuses
+for all 29 targets, covering wire and grammar families, identity/reload
+dimensions, request route/method pairs, multi-request transitions, policy/H2/
+resource opcodes, PCRE modes/flags and continuation classes separately from
+libFuzzer edge/features. The warrant validator rejects a target without a
+census and an Apache-derived family without a corresponding fuzz target.
+The same closure check requires Cargo, the smoke/sustained/local schedules and
+the nightly matrix to name exactly the same target set.
+`--strict-semantic` enforces those buckets, while
+`--coverage` replays retained inputs under LLVM line/branch instrumentation.
+Its continuation profile focuses on the physical/logical configuration
+boundary implicated by P38-A. That finite boundary is also deterministically
+enumerated across every insertion point, LF/CRLF, ordered split pair, chain,
+slash run, whitespace near miss and EOF form before mutation begins.
+The configuration physical-line, expression-parser and both PCRE2 targets
+receive 16,384 smoke executions by default because their adversarial boundary
+failures required sustained mutation to discover; the resource state machine
+receives 1,024.
+
+### Apache-derived warrant closure
+
+`tests/apache_warrant.py` keeps Apache observation separate from Vapache
+support policy. A checksum-pinned 2.4.69 source manifest inventories directive,
+hook, provider, filter and configuration-callback registrations, runtime source
+files, tests shipped in the source tarball, and the commit-pinned external
+`apache-httpd-test` suite with its submodule. The reviewed policy maps relevant
+source to eight state-space families, assigns independent authorities and
+dimensions to all fuzz targets, and explicitly records deliberately unsupported
+module families. Every unclaimed Apache item defaults outside the compatibility
+surface; source discovery never generates implementation or parser support.
+
+The policy acknowledges the exact inventory digest, so source or extractor
+drift fails CI until its diff is reviewed. The weekly gate reproduces the
+manifest from the official archive. A second weekly job builds that source
+with GCC branch coverage, drives the Apache differential corpus, and emits a
+per-family uncovered-branch queue; a family with no compiled file or covered
+line/branch, or a covered-branch count below its checked-in ratchet, fails. The
+pre-adversarial gate also checks that the executable Apache oracle is version
+2.4.69 and that every module named by the differential harnesses is available.
+See `docs/apache-warrant.md` for the dispositions and update procedure.
 
 ## Failure and memory models
 

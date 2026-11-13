@@ -364,49 +364,49 @@
     },
     "OS075": {
       "path": "crates/os/src/lib.rs",
-      "line": 1067,
+      "line": 1082,
       "contract_sha256": "beba559af1bdeb3819230990e2c293bdc2574fdbbb2bd539bababb1867654649",
       "block_sha256": "b6a77fbb40c8ab9412de9ac0f1213b253a55692425eea8f5f34516dc6ab4be15"
     },
     "OS076": {
       "path": "crates/os/src/lib.rs",
-      "line": 1071,
+      "line": 1086,
       "contract_sha256": "63a8ea22de4232d613492993bac44bd83f221258dd8b59f87ea404d522bca5de",
       "block_sha256": "ff4367fd703210d7a301932775520c05131d87dca071d4080a3f22b73d3c6e9e"
     },
     "OS077": {
       "path": "crates/os/src/lib.rs",
-      "line": 1074,
+      "line": 1089,
       "contract_sha256": "4287a9e50580fc6f527b329c2651ecfd1f0f04c9a3da3c36fcdf4c44bd8bfcc2",
       "block_sha256": "6cb82b2d551eb6992ef1a3dbe342db518665119d66859d22b9fd3643bbfbcf95"
     },
     "OS078": {
       "path": "crates/os/src/lib.rs",
-      "line": 1079,
+      "line": 1094,
       "contract_sha256": "8c9966f88adbba6369acdb4e2e8bfc62f55531004c18aa1d86918a1b72fcd148",
       "block_sha256": "6cb82b2d551eb6992ef1a3dbe342db518665119d66859d22b9fd3643bbfbcf95"
     },
     "OS079": {
       "path": "crates/os/src/lib.rs",
-      "line": 1081,
+      "line": 1096,
       "contract_sha256": "d0a10b0e3096462ee4fd9bc00e7a87e806f9aacc7cf5ba5826b586fadcc4d804",
       "block_sha256": "631d29e11ce64c268495d9e8493e7ba726a6afb12f6b82b7e3f8f7cb976e3702"
     },
     "OS080": {
       "path": "crates/os/src/lib.rs",
-      "line": 1088,
+      "line": 1103,
       "contract_sha256": "6ced6c2c7d5007547d5fdfd630ef69be998df109fe9085ad41cc902ea0e5a609",
       "block_sha256": "8b59f0afb1c7c4bbddd93c6fad35e402c4c6ead8d7be461f26a659a87d6349b7"
     },
     "OS081": {
       "path": "crates/os/src/lib.rs",
-      "line": 1104,
+      "line": 1119,
       "contract_sha256": "8295d3af76d22200fda13b8af60b1442a609e0cf29e47d67c25bce32b7786f39",
       "block_sha256": "a6f67d01b2dd82c71866b8a40851844094c514aec8508aaec7d6e4bf9b1cd2e7"
     },
     "OS082": {
       "path": "crates/os/src/lib.rs",
-      "line": 1198,
+      "line": 1213,
       "contract_sha256": "60236757d0e5d6d24e6055febb6b54415193cdb24a00f470b594f5ab971477cb",
       "block_sha256": "6bb6f5e6ec2d8a8ed04abcac20ddef8e8cf135dc7b8c70d5cab4562b4c43d65b"
     },
@@ -433,6 +433,12 @@
       "line": 203,
       "contract_sha256": "3abbf8aa79f630302645e204a18ba3db355746039cada6edfb1a270e42871c90",
       "block_sha256": "736c89c8abfd7befd1dc77ed676bf13e2664656a2b4a59fb9181943c606becef"
+    },
+    "OS089": {
+      "path": "crates/os/src/lib.rs",
+      "line": 1069,
+      "contract_sha256": "94caeeb1bc64a4af35da6f9982004762fe88777808ac419fdc337cf47a742d89",
+      "block_sha256": "1e8874ac4f37544a520729f41ca386739221321b0019b3052fd840cdfe1c51b2"
     }
   },
   "server_test_blocks": {

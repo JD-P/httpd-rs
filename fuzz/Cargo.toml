@@ -29,6 +29,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "config_physical_lines"
+path = "fuzz_targets/config_physical_lines.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "cgi_response"
 path = "fuzz_targets/cgi_response.rs"
 test = false
@@ -52,6 +59,13 @@ bench = false
 [[bin]]
 name = "http_fields"
 path = "fuzz_targets/http_fields.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_identity"
+path = "fuzz_targets/request_identity.rs"
 test = false
 doc = false
 bench = false
@@ -127,8 +141,22 @@ doc = false
 bench = false
 
 [[bin]]
+name = "cache_stateful"
+path = "fuzz_targets/cache_stateful.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "tls_policy"
 path = "fuzz_targets/tls_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_identity_reload"
+path = "fuzz_targets/tls_identity_reload.rs"
 test = false
 doc = false
 bench = false

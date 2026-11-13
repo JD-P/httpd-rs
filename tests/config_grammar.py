@@ -23,7 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
-APACHE = shutil.which("apache2") or "/usr/sbin/apache2"
+APACHE = os.environ.get("APACHE", shutil.which("apache2") or "/usr/sbin/apache2")
 
 
 def load_validity():

@@ -399,6 +399,7 @@ struct SniResolver {
 /// adapters before any request can select a virtual host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TlsConnectionIdentity {
+    generation: crate::config::ConfigurationGeneration,
     sni: Option<String>,
     local_ip: Option<IpAddr>,
     port: u16,
@@ -990,6 +991,172 @@ pub fn fuzz_tls_policy(data: &[u8]) {
     }
 }
 
+/// Exercise the TLS policy that is bound to a completed handshake, including
+/// SNI/Host transitions, listener-wide policy uniformity, client identity,
+/// and graceful-reload generation separation. Certificate parsing and OCSP
+/// DER have their own byte-oriented target; this driver focuses on the
+/// composed policy state machine without doing filesystem I/O per mutation.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_tls_identity_reload(data: &[u8]) {
+    use crate::config::{ClientVerify, CustomLog, DirectoryRuleIndex, ListenSpec, Scope};
+
+    fn select<'a>(values: &'a [&'a str], byte: u8) -> &'a str {
+        values[usize::from(byte) % values.len()]
+    }
+
+    fn policy(data: &[u8], offset: usize) -> SslConfig {
+        let byte = |index: usize| data.get(offset + index).copied().unwrap_or(0);
+        let cert = select(&["cert-a.pem", "cert-b.pem", "cert-c.pem"], byte(0));
+        let key = select(&["key-a.pem", "key-b.pem", "key-c.pem"], byte(1));
+        let ca = select(&["ca-a.pem", "ca-b.pem"], byte(2));
+        let crl = select(&["crl-a.pem", "crl-b.pem"], byte(3));
+        SslConfig {
+            engine: byte(4) & 1 == 0,
+            engine_set: true,
+            cert_file: Some(PathBuf::from(cert)),
+            key_file: Some(PathBuf::from(key)),
+            chain_file: (byte(5) & 1 != 0).then(|| PathBuf::from(cert)),
+            protocols: Some(
+                select(
+                    &["all -SSLv3 -TLSv1 -TLSv1.1", "TLSv1.2", "TLSv1.3"],
+                    byte(6),
+                )
+                .to_string(),
+            ),
+            cipher_suite: Some(
+                select(
+                    &["DEFAULT", "HIGH:!aNULL", "TLS_AES_256_GCM_SHA384"],
+                    byte(7),
+                )
+                .to_string(),
+            ),
+            honor_cipher_order: Some(byte(8) & 1 != 0),
+            session_cache: Some(byte(9) & 1 != 0),
+            session_cache_timeout: Some(Duration::from_secs(u64::from(byte(10) % 8))),
+            session_tickets: Some(byte(11) & 1 != 0),
+            verify_client: Some(match byte(12) % 3 {
+                0 => ClientVerify::None,
+                1 => ClientVerify::Optional,
+                _ => ClientVerify::Require,
+            }),
+            ca_file: Some(PathBuf::from(ca)),
+            ca_revocation_file: Some(PathBuf::from(crl)),
+            ca_revocation_check: Some(match byte(13) % 3 {
+                0 => ClientRevocationCheck::None,
+                1 => ClientRevocationCheck::Leaf,
+                _ => ClientRevocationCheck::Chain,
+            }),
+            stapling: byte(14) & 1 != 0,
+            stapling_set: true,
+            stapling_force_url: (byte(15) & 1 != 0)
+                .then(|| "http://ocsp.example.test/".to_string()),
+            stapling_responder_timeout: Duration::from_secs(u64::from(byte(16) % 8)),
+            stapling_standard_cache_timeout: Duration::from_secs(u64::from(byte(17) % 8)),
+            stapling_return_responder_errors: byte(18) & 1 != 0,
+        }
+    }
+
+    fn vhost(name: &str, aliases: &[&str], ssl: SslConfig) -> VHost {
+        VHost {
+            addrs: vec!["*:443".into()],
+            ports: vec![443],
+            server_name: Some(name.into()),
+            aliases: aliases.iter().map(|alias| (*alias).to_string()).collect(),
+            scope: Scope::default(),
+            delta: Scope::default(),
+            rules: Vec::new(),
+            directory_index: DirectoryRuleIndex::default(),
+            proxy_containers: Vec::new(),
+            log_formats: HashMap::new(),
+            custom_logs: Vec::<CustomLog>::new(),
+            error_log: None,
+            log_level: None,
+            server_admin: None,
+            protocols: vec![HttpProtocol::Http2, HttpProtocol::Http11],
+            ssl,
+        }
+    }
+
+    fn config(data: &[u8], offset: usize) -> Config {
+        let mut cfg = crate::config::fuzz_config(&std::env::temp_dir());
+        cfg.listeners = vec![ListenSpec {
+            raw: "127.0.0.1:443".into(),
+            addr: "127.0.0.1".into(),
+            port: 443,
+        }];
+        cfg.vhosts = vec![
+            vhost("a.test", &["*.a.test"], policy(data, offset)),
+            vhost("b.test", &["*.b.test"], policy(data, offset + 19)),
+            vhost("c.test", &[], policy(data, offset + 38)),
+        ];
+        cfg.rebuild_vhost_index();
+        cfg
+    }
+
+    let byte = |index: usize| data.get(index).copied().unwrap_or(0);
+    let old = config(data, 0);
+    let candidate = config(data, 57);
+    let names = [
+        "a.test",
+        "x.a.test",
+        "b.test",
+        "x.b.test",
+        "c.test",
+        "unknown.test",
+    ];
+    let sni = select(&names, byte(114));
+    let authority = select(&names, byte(115));
+    let local_ip = Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let client_certificate =
+        (byte(116) & 1 != 0).then_some(b"bounded-client-certificate".as_slice());
+
+    for left in &old.vhosts {
+        for right in &old.vhosts {
+            assert_eq!(
+                tls_vhost_policy_equal(&left.ssl, &right.ssl),
+                tls_vhost_policy_equal(&right.ssl, &left.ssl)
+            );
+        }
+    }
+    let policies: Vec<&SslConfig> = old.vhosts.iter().map(|vhost| &vhost.ssl).collect();
+    let mut reversed = policies.clone();
+    reversed.reverse();
+    assert_eq!(
+        ensure_uniform_client_policy(&policies, 443).is_ok(),
+        ensure_uniform_client_policy(&reversed, 443).is_ok()
+    );
+    assert_eq!(
+        ensure_uniform_protocol_policy(&policies, 443).is_ok(),
+        ensure_uniform_protocol_policy(&reversed, 443).is_ok()
+    );
+    assert_eq!(
+        ensure_uniform_cipher_preference(&policies, 443).is_ok(),
+        ensure_uniform_cipher_preference(&reversed, 443).is_ok()
+    );
+    assert_eq!(
+        ensure_uniform_resumption_policy(&policies, 443).is_ok(),
+        ensure_uniform_resumption_policy(&reversed, 443).is_ok()
+    );
+
+    let Ok(identity) =
+        TlsConnectionIdentity::from_parts(&old, local_ip, 443, Some(sni), client_certificate)
+    else {
+        // Absence of a required client certificate is itself a closed policy
+        // outcome. The uniformity/equality transitions above still ran.
+        return;
+    };
+    let before = identity.request_status(&old, Some(authority));
+    assert_eq!(before, identity.request_status(&old, Some(authority)));
+    assert_eq!(identity.request_status(&old, None), Some(400));
+    // A reload candidate has a distinct immutable generation. It cannot be
+    // paired with an identity authenticated by the old handshake, even when
+    // virtual-host positions and all policy text happen to match.
+    assert_eq!(
+        identity.request_status(&candidate, Some(authority)),
+        Some(421)
+    );
+}
+
 fn vhost_applies(v: &VHost, port: u16, local_ip: Option<IpAddr>) -> bool {
     match local_ip {
         Some(ip) => Config::vhost_address_applies(v, ip, port),
@@ -1155,6 +1322,7 @@ impl TlsConnectionIdentity {
             identity
         });
         Ok(Self {
+            generation: cfg.authorization_generation(),
             sni,
             local_ip,
             port,
@@ -1186,6 +1354,13 @@ impl TlsConnectionIdentity {
     /// the RFC-defined signal that a coalesced connection selected an
     /// incompatible vhost.
     pub(crate) fn request_status(&self, cfg: &Config, authority: Option<&str>) -> Option<u16> {
+        // A TLS handshake authenticates one immutable configuration
+        // generation. Even if a caller accidentally pairs an old connection
+        // with a same-index virtual host from a reload candidate, the new
+        // certificate/client-auth policy was never negotiated on that wire.
+        if self.generation != cfg.authorization_generation() {
+            return Some(421);
+        }
         if !vapache_verified::tls_sni_authority_admit(self.sni.is_some(), authority.is_some()) {
             return Some(400);
         }
@@ -2679,9 +2854,7 @@ mod tests {
     #[test]
     fn tls_connection_identity_binds_sni_host_and_verified_client() {
         let dir = tempdir("connection-identity");
-        let cfg = test_config(
-            &dir,
-            "Listen 127.0.0.1:443\n\
+        let config_text = "Listen 127.0.0.1:443\n\
              <VirtualHost *:443>\n\
                ServerName a.test\n\
                SSLEngine On\n\
@@ -2699,8 +2872,8 @@ mod tests {
                SSLEngine On\n\
                SSLCertificateFile /tls/a.pem\n\
                SSLCertificateKeyFile /tls/a.key\n\
-             </VirtualHost>\n",
-        );
+             </VirtualHost>\n";
+        let cfg = test_config(&dir, config_text);
         let ip = Some("127.0.0.1".parse().unwrap());
         let identity = TlsConnectionIdentity::from_parts(
             &cfg,
@@ -2716,6 +2889,11 @@ mod tests {
         assert_eq!(identity.request_status(&cfg, Some("alias.test")), None);
         assert_eq!(identity.request_status(&cfg, Some("b.test")), Some(421));
         assert_eq!(identity.request_status(&cfg, None), Some(400));
+        let reloaded = test_config(&dir, config_text);
+        assert_eq!(
+            identity.request_status(&reloaded, Some("a.test")),
+            Some(421)
+        );
 
         let no_sni = TlsConnectionIdentity::from_parts(&cfg, ip, 443, None, None).unwrap();
         assert_eq!(no_sni.request_status(&cfg, Some("a.test")), None);

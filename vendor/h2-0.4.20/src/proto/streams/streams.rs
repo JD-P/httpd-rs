@@ -105,6 +105,17 @@ struct Actions {
     conn_error: Option<proto::Error>,
 }
 
+/// Charge DATA framing even when stream lifecycle rules discard the frame.
+/// Terminal and forgotten streams are attacker-addressable, and returning
+/// before `Counts::record_data_frame` would let empty/small-frame floods evade
+/// the connection's hard framing-overhead limit.
+fn record_discarded_data_frame(counts: &mut Counts, frame: &frame::Data) -> Result<(), Error> {
+    counts.record_data_frame(frame.payload().len()).map_err(|_| {
+        tracing::debug!("too many small DATA frames on a terminal stream");
+        Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_data_frames")
+    })
+}
+
 /// Contains the buffer of frames to be written to the wire.
 #[derive(Debug)]
 struct SendBuffer<B> {
@@ -685,6 +696,7 @@ impl Inner {
                         self.actions.recv.max_stream_id()
                     );
 
+                    record_discarded_data_frame(&mut self.counts, &frame)?;
                     // We still need to account for connection-level flow control.
                     let sz = frame.flow_controlled_len();
                     assert!(sz <= super::MAX_WINDOW_SIZE as usize);
@@ -695,6 +707,7 @@ impl Inner {
                 }
 
                 if let Some(phase) = self.counts.forgotten_phase(id) {
+                    record_discarded_data_frame(&mut self.counts, &frame)?;
                     let sz = frame.flow_controlled_len();
                     assert!(sz <= super::MAX_WINDOW_SIZE as usize);
                     self.actions.recv.ignore_data(sz as WindowSize)?;
@@ -718,6 +731,7 @@ impl Inner {
                 }
 
                 if !peer.is_server() && self.actions.may_have_forgotten_stream(peer, id) {
+                    record_discarded_data_frame(&mut self.counts, &frame)?;
                     let sz = frame.flow_controlled_len();
                     assert!(sz <= super::MAX_WINDOW_SIZE as usize);
                     self.actions.recv.ignore_data(sz as WindowSize)?;
@@ -735,11 +749,13 @@ impl Inner {
         ) {
             vapache_verified::H2PeerFrameDecision::Process => {}
             vapache_verified::H2PeerFrameDecision::Ignore => {
+                record_discarded_data_frame(&mut self.counts, &frame)?;
                 let sz = frame.flow_controlled_len();
                 assert!(sz <= super::MAX_WINDOW_SIZE as usize);
                 return self.actions.recv.ignore_data(sz as WindowSize);
             }
             vapache_verified::H2PeerFrameDecision::StreamClosed => {
+                record_discarded_data_frame(&mut self.counts, &frame)?;
                 let sz = frame.flow_controlled_len();
                 assert!(sz <= super::MAX_WINDOW_SIZE as usize);
                 self.actions.recv.ignore_data(sz as WindowSize)?;

@@ -29,6 +29,8 @@ jobs:
           - http_request
           - http_connection
           - http_fields
+          - request_identity
+          - config_physical_lines
           - config_sections
           - config_compile
           - config_grammars
@@ -42,7 +44,9 @@ jobs:
           - h2_output
           - h2_stateful
           - cache_metadata
+          - cache_stateful
           - tls_policy
+          - tls_identity_reload
           - ocsp_der
           - pcre2_differential
           - pcre2_grammar
@@ -82,6 +86,7 @@ jobs:
           path: |
             fuzz/artifacts/${{ matrix.target }}
             fuzz/corpus/${{ matrix.target }}
+            fuzz/semantic-summary.json
 
   sanitizers:
     runs-on: ubuntu-24.04
@@ -168,10 +173,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+      - run: >-
+          rustup toolchain install "$VAPACHE_NIGHTLY_TOOLCHAIN"
+          --profile minimal --component llvm-tools-preview
       - name: LLVM branch coverage
         run: >-
-          cargo llvm-cov --workspace --all-features --branch --lcov
-          --output-path branch-coverage.lcov
+          cargo +"$VAPACHE_NIGHTLY_TOOLCHAIN" llvm-cov
+          --workspace --all-features --branch --lcov
+          --output-path branch-coverage.lcov -- --test-threads=1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: branch-coverage

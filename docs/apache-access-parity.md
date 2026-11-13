@@ -108,27 +108,26 @@ a false condition that negation could turn into access.
 
 ## Extracted Apache models
 
-The proposed Apache extractor would help.  A source-derived transition system,
-SMT model, or Lean embedding can cover combinations that a hand-maintained
-differential corpus will miss and can turn “Apache already handles this” into a
-refinement obligation.  The useful deliverable is the extractor plus a pinned,
-reproducible model artifact; a prose claim of bisimilarity is not itself a
-security boundary.
+`tests/apache_warrant.py` now produces a checksum-pinned inventory of Apache
+directive registrations, hooks, providers, filters, configuration callbacks,
+source tests, and the external `apache-httpd-test` corpus. The inventory is
+deliberately conservative: registrations in conditional source are observed
+whether or not this particular oracle build enables them. The separately
+instrumented Apache build records which source branches the differential
+corpus actually reaches.
 
-When such an artifact is available, integration should require:
+This is an evidence and coverage model, not an extracted Apache transition
+system. `docs/apache-warrant-policy.json` is the only place that may make a
+narrow compatibility claim, every such claim requires repository evidence,
+and the default classification is `outside-claimed-surface`. Therefore a newly
+observed Apache feature can create a review or test obligation but cannot make
+VApache accept that feature.
 
-1. Pin the Apache source revision and extractor revision and check in the model
-   hash and generation command.
-2. Validate the extracted model against the Apache binary on a generated
-   configuration/request corpus.  This catches extraction and build-option
-   drift.
-3. Translate the supported subset into VApache's request-to-sink state and
-   prove the security-refinement rule above.  Unsupported Apache states must
-   reject at configuration load, not disappear from the model.
-4. Keep the live differential gate.  It is an independent check of the
-   extractor, model translation, and VApache runtime wiring.
-
-Until an extractor artifact is published, the same structure is applied
-manually: read the relevant upstream module, encode its decision as a consumed
-kernel, and add fixed plus generated binary differentials.  This makes Apache
-parity a pre-merge control instead of an adversarial-review afterthought.
+A future source-derived transition system, SMT model, or Lean embedding could
+cover combinations that the registration inventory and hand-maintained
+differential corpus miss. Such an artifact must still be pinned, validated
+against the Apache binary, restricted to the explicitly supported subset, and
+checked against VApache's request-to-sink state. Unsupported Apache states must
+reject at configuration load rather than disappear from the model. The live
+differential gate remains an independent check of any semantic extractor and
+of VApache's runtime wiring.

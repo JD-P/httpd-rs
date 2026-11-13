@@ -4,6 +4,8 @@
 /fuzz/target/
 /fuzz/artifacts/
 /fuzz/coverage/
+/fuzz/semantic-*.json
+/.fuzz-long/
 
 # LLVM raw coverage profiles from tests/coverage.sh
 *.profraw

@@ -5977,6 +5977,82 @@ mod tests {
         assert!(!accepted, "malformed request reached the application");
     }
 
+    fn append_raw_h2_frame(
+        wire: &mut Vec<u8>,
+        kind: u8,
+        flags: u8,
+        stream_id: u32,
+        payload: &[u8],
+    ) {
+        let len = payload.len() as u32;
+        wire.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags]);
+        wire.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+        wire.extend_from_slice(payload);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_stream_empty_data_flood_reaches_the_hard_frame_cap() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            while let Some(accepted) = connection.accept().await {
+                match accepted {
+                    Ok((request, mut respond)) => {
+                        // Put the peer-open stream into the same locally-reset
+                        // lifecycle state used by rejected request bodies.
+                        drop(request);
+                        respond.send_reset(h2::Reason::CANCEL);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        append_raw_h2_frame(&mut wire, 4, 0, 0, &[]); // SETTINGS
+                                                      // Indexed GET, HTTPS and `/`, plus literal :authority=localhost.
+        let mut headers = vec![0x82, 0x87, 0x84, 0x01, 0x09];
+        headers.extend_from_slice(b"localhost");
+        append_raw_h2_frame(&mut wire, 1, 0x04, 1, &headers);
+        // Vendored h2's MAX_RECV_EMPTY_DATA_FRAMES is 100; send the first
+        // frame beyond the cap.
+        for _ in 0..=100 {
+            append_raw_h2_frame(&mut wire, 0, 0, 1, &[]);
+        }
+        client_io.write_all(&wire).await.unwrap();
+
+        let mut received = Vec::new();
+        let goaway = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = client_io.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "terminal DATA flood closed without GOAWAY");
+                received.extend_from_slice(&chunk[..read]);
+                let mut offset = 0usize;
+                while received.len().saturating_sub(offset) >= 9 {
+                    let len = ((received[offset] as usize) << 16)
+                        | ((received[offset + 1] as usize) << 8)
+                        | received[offset + 2] as usize;
+                    if received.len().saturating_sub(offset) < 9 + len {
+                        break;
+                    }
+                    let kind = received[offset + 3];
+                    let payload = &received[offset + 9..offset + 9 + len];
+                    if kind == 7 && payload.len() >= 8 {
+                        return u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                    }
+                    offset += 9 + len;
+                }
+            }
+        })
+        .await
+        .expect("terminal DATA flood did not produce GOAWAY");
+        assert_eq!(goaway, h2::Reason::ENHANCE_YOUR_CALM.into());
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn h2_parser_rejects_missing_path_and_fragments_before_uri_normalization() {
         let mut base = vec![

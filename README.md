@@ -680,16 +680,20 @@ the pre-adversarial gate. Longer campaigns use cargo-fuzz:
 
 ```sh
 cargo install cargo-fuzz
-rustup toolchain install nightly --profile minimal
+rustup toolchain install nightly-2026-10-29 --profile minimal --component llvm-tools-preview
 tests/fuzz_smoke.sh                         # bounded run of every target
 FUZZ_SECONDS_PER_TARGET=900 tests/fuzz_campaign.sh
+tests/long_fuzz.sh --nightly latest --hours 12 --jobs 4 --coverage --strict-semantic
 ```
 
-The 25 targets cover individual HTTP requests, fragmented/pipelined
+The 29 targets cover individual HTTP requests, fragmented/pipelined
 connections, configuration tokenization and full compilation, `.htaccess`
-walks, rewrite expressions, CGI/FastCGI/proxy responses, WebSocket negotiation,
+walks, physical-line continuation refinement, rewrite expressions,
+CGI/FastCGI/proxy responses, WebSocket negotiation,
 raw HTTP/2 frames and structured multi-frame HTTP/2 state transitions, cache
-metadata, TLS policy, OCSP DER, the adversarial PCRE2
+metadata plus stateful publication/corruption/reload cleanup, TLS policy plus
+handshake-identity/reload transitions, request identity and environment-phase
+provenance, OCSP DER, the adversarial PCRE2
 differential and PCRE2 resource-policy monotonicity, and stateful hierarchical
 resource ownership. The whole-request target executes real proxy, FastCGI and
 CGI handlers after both wire decoders, compares exact backend requests and
@@ -711,10 +715,33 @@ start offsets, engine tiers, CRLF, malformed UTF and
 Unicode modes. An admitted-subset grammar makes unexpected compile rejection a
 fuzz failure, while the resource target keeps production limits active. The P24
 expression-parser crash and non-ASCII PCRE2 byte-boundary cases are permanent
-seeds. The expression and both PCRE2 targets receive 16,384 executions in the
-default smoke gate; the resource state machine receives 1,024. Nightly coverage
+seeds. The physical-line, expression and both PCRE2 targets receive 16,384
+executions in the default smoke gate; the resource state machine receives
+1,024. Nightly coverage
 corpora are minimized and carried into the next run; dictionaries and committed
 bootstrap seeds live beside the targets.
+
+`tests/long_fuzz.sh` is the workstation campaign. Its default `full` profile
+touches all 29 targets before repeating any target, then gives a second
+weighted slot to the configuration/PCRE2, identity/reload, composed-request,
+HTTP/2 and resource state machines. The narrower `adversarial` profile remains
+available for focused follow-up. It imports committed
+seeds by content hash into `.fuzz-long/`; `--nightly latest` additionally merges
+the latest uploaded nightly corpora and artifacts, while `--import DIR` accepts
+a manually downloaded artifact tree. It keeps coverage corpora, logs and crash
+artifacts across interrupts and later runs without modifying the committed
+corpus. Every target has a finite semantic census and generated seed matrix;
+these retain declared wire forms, grammar families, identity/reload states,
+request route/method pairs, state transitions, H2/resource/policy opcodes,
+PCRE modes/flags and continuation classes even after structural minimization.
+The initial and final JSON census reports corpus hashes, executions, edge/features,
+RSS and missing semantic buckets; `--strict-semantic` makes a missing bucket a
+failure. A closure check rejects drift between Cargo's fuzz binaries and the
+smoke, sustained, workstation and nightly schedules. `--coverage` replays each
+corpus under LLVM line/branch instrumentation
+and stores text, profile and JSON reports under `.fuzz-long/coverage/`. The
+`continuation` profile concentrates on configuration physical/logical-line
+refinement; `--state` can place the persistent campaign on a larger disk.
 Property tests, Loom interleaving exploration, deterministic
 failure injection, Miri, sanitizers, mutation testing, protocol suites,
 supply-chain checks and scheduled soak/performance jobs are described in
@@ -1032,7 +1059,9 @@ bench             Apache-vs-vapache static/feature/cache/app benchmark harness a
 3. Add h2c and cleartext HTTP/2 upgrade support for parity with mixed
    deployments.
 4. Grow the conformance suite toward the full Apache test corpus and track
-   line/branch coverage with `cargo-llvm-cov`.
+   Apache-oracle line/branch coverage alongside the source-derived warrant
+   ledger. The source-tarball and external `apache-httpd-test` cases are pinned
+   and inventoried; their supported-subset semantic triage remains ongoing.
 5. Port chunked request-body decoding and response-header serialization into
    Verus, reusing the verified token, header-value and framing predicates.
 6. Continue tuning large-file throughput (the 1 MB scenario is sensitive to

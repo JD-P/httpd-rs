@@ -103,6 +103,10 @@ returning through a different directive or dispatch path.
 | P35-B | The PCRE2 translation kept greedy `\S`/`\N` repetitions backtrackable before `\R`/`\v`, while PCRE2 auto-possessified them; an obs-text NEL byte inverted a negated ACL guard and allowed a request Apache denied | The compatibility gate rejects unrepresentable `\S*`/`\S+`/`\N*`/`\N+` sequences immediately followed by `\v` or `\h`, including nested/alternative shapes and adjacency hidden by PCRE comments or extended-mode whitespace. P37 subsequently removed `\R` from the admitted grammar entirely. Simple `\v`/`\h` atoms remain supported and oracle-equivalent. Crate tests cover the full fail-closed family; the live differential requires Apache acceptance, Vapache configuration rejection and agreement on the simple `\v` control | `regex_dialect_admit`; `expr_regex_result` |
 | P36-A | Main-config and per-directory internal rewrites preserved a trailing slash in the URL but passed that spelling as the slash-free mapping identity; `CanonicalTarget::from_normalized` rejected the pair and request-reachable `expect` calls aborted the release process | Rewrite canonicalization returns one `CanonicalTarget` containing both identities, so callers cannot assemble a mismatched pair. Per-directory URL-translation restarts retain the slash in the synthetic request while mapping with the normalized bytes. WebSocket request identity validation also fails closed rather than unwrapping. Unit dispatch and six-case live regressions cover main config, guarded/missing targets, attacker-written `.htaccess`, root and no-slash controls | I11 transform reauthorization; I57 decoded policy identity |
 | P37-A/B | `\R` lowering could split CRLF according to its following atom, while multiline `^` inherited backend-specific final-newline and offset semantics; both families remained admitted despite differing from PCRE2 | The closed grammar excludes atomic `\R` and every `^` evaluated with multiline mode enabled, including builder flags and nested/global inline-option scopes. This removes the obsolete match-time terminal-anchor filter and all enumerated `\R` adjacency exceptions. Quoted/literal spellings, non-multiline `^`, and explicit `(?-m:^)` controls remain admitted and oracle-checked. Both retained fuzzer artifacts now terminate at compile-time rejection | `regex_dialect_admit`; `expr_regex_result` |
+| P38-A | The shared configuration front end inserted a space and stripped indentation at a backslash-newline, while Apache deletes exactly the backslash and newline; split guard tokens could therefore disappear and split directive names could become active | Logical-line assembly now recognizes only a final backslash followed by LF/CRLF, removes exactly one, and concatenates while preserving every other byte; trailing whitespace, backslash runs and EOF are pinned separately. Main configuration and access files consume the same assembler. Unit and live Apache/Vapache regressions cover FilesMatch, LocationMatch, RewriteRule, SetHandler and Require; `config_physical_lines` continuously refines the implementation against an independent byte model and equivalent parsed IR | `configuration_semantic_refinement`; I7 fail-closed malformed access files |
+| P38-C | A request-local URL-policy work-budget failure could store its partial `conditional_error` scope in the process-wide immutable-policy cache, denying later requests after their fresh budgets recovered | Deferred URL-policy results carrying a conditional evaluation error are never cached. A fresh request recomputes the scope under its own budget; a regression exhausts one request and proves the next request is unaffected | `resource_bounds`; `phase_order` |
+| P38-E | DATA frames discarded for reset, closed or forgotten streams returned before empty-frame accounting, so a peer could send unbounded zero-length terminal-stream DATA at low bandwidth | Every terminal/ignored DATA disposition now passes the shared DATA-frame counter before returning. The existing live-stream final-frame exception remains, but repeatable terminal frames consume the hard limit and trigger `ENHANCE_YOUR_CALM`. A raw HTTP/2 regression resets a stream, sends 101 empty DATA frames and requires GOAWAY | `h2_peer_frame_decision`; `resource_bounds` |
+| P38-B/D (harness) | Retry transcripts left queued backend exchanges, while H1/H2 differential executions shared round-robin and rate-bucket state, producing false accounting and protocol mismatches | Dynamic snapshots drain and retain the complete retry transcript. H1 and H2 now compile independent immutable fixtures with independent mutable counters and resource budgets, then compare normalized outputs and zero ledgers. All three minimized artifacts are permanent unit regressions and replay cleanly under libFuzzer | Test-oracle reliability; `dynamic_outcome_lifecycle` |
 | Post-P31 slow-output generalization | HTTP/1 partial writes could renew `Timeout` indefinitely while retaining established-connection, dynamic-backend, response-memory and spool capacity; long-lived WebSockets also retained both their dedicated tunnel slot and general HTTP/1 connection admission | HTTP/1 writability and HTTP/2 flow control now use one irreversible general-to-slow ownership transition, common 128-process/32-source pool, anchored minimum rate and absolute lifetime. Dynamic slots and retained response/spool resources transfer to slow sibling pools; slow spools are capped at one quarter of the configured general pool. A classified HTTP/1 connection closes after output. WebSockets acquire their dedicated lease before surrendering general connection capacity. Deterministic saturation, cancellation, byte/file transfer, and live upgrade tests pin the complete handoff | `slow_output_phase_step_spec`, `minimum_progress_rate_spec`, `resource_budget_admit`, `resource_bounds` |
 | Post-P30 lease/fairness review | The same client-controlled-wait pattern remained in adjacent pools: an H2 client-limit rejection could retain a process stream slot while sending 503; retained response memory and shared spool files had only global caps; queued H2 responses released resident or stream admission when enqueue returned even though h2 still owned the head, body, or EOS state; an ownership-carrying header could be retained in the HPACK dynamic table; expanding Huffman output and retained scratch were not separately bounded; response reads, slow-body workers and `RewriteMap prg` helpers lacked source fairness; H2 used absolute response/idle lifetimes; parsed `MinRate` values did not constrain bodies | H2 acquires the validated effective-client slot before the process slot and resets immediately on either admission failure. Retained response memory is capped at 32 MiB per client, response reads at 8 per client, and every spool client at one quarter of the configured byte/file pool; dynamic allocations inherit client identity at creation. Compression/CGI/autoindex leases shrink from peak work to retained representation. Every queued response carries resident ownership in a never-indexed head field and transfers its general or slow-output admission into shared head/body/EOS ownership until h2 consumes or discards the final object. HPACK uses raw strings when Huffman is not shorter, drops scratch above 160 KiB, and established H2 transports carry a separate dependency-buffer charge. Reset/drop tests, outbound H2 fuzzing, queued-owner and scratch telemetry cover the release paths. Slow-body and program-map pools reserve three quarters for other sources. P31 subsequently replaced renewable H2 capacity-grant deadlines with an anchored minimum rate, absolute response ceiling and source-fair slow-output pool; connection idle timeout still applies only with no active stream. Header/body and H2-body `MinRate` checks run inside, and never extend, their hard absolute read deadline | `h2_process_slot_spec`, `slow_output_phase_step_spec`, `minimum_progress_rate_spec`, `resource_budget_admit`, `connection_admit`, `resource_bounds` |
 | Post-P28 DoS review | Capture expansion, polynomial glob rectangles, many individually cheap policy operations, wide access programs and native response heads still lacked one complete resource model | Request clones share a fail-sticky 16 Mi-unit work/4 MiB expansion meter; capture and dynamic-require output is admitted before allocation; every request-time glob debits its exact DP rectangle; access files have per-file, per-request and layer ceilings; response policy and both protocol writers enforce 256-field/128 KiB head limits and charge heads to the aggregate response-resident budget. The CVE-2011-4415 triage now names the concrete prevention instead of attributing memory consumption to Rust memory safety | `glob_match_resource_spec`, `bounded_expansion_append_spec`, `access_program_budget_spec`, `response_header_budget_spec`, `resource_bounds` |
@@ -658,6 +662,48 @@ and lexical controls. The admission fuzzer also generates these families as
 exclusions, while its positive generator continues to require complete PCRE2
 differential agreement.
 
+## Pass-38 closure
+
+P38-A is closed at the shared logical-line boundary. Apache continuation is
+exact deletion of one final backslash and its LF or CRLF; it neither inserts a
+separator nor trims the following physical line. A backslash followed by
+whitespace does not continue, a run loses only its final backslash, and a
+backslash at EOF remains literal. The production assembler now performs that
+exact concatenation before tokenization or comment classification. This
+restores guards split inside quoted regexes and causes
+split directive names such as `SetHandler\\\ncgi-script` and
+`Require\\\nall granted` to remain single, invalid tokens. Unit tests preserve
+interior indentation, while the live differential covers FilesMatch,
+LocationMatch, RewriteRule, handler and authorization cases. The dedicated
+`config_physical_lines` target compares arbitrary physical input to an
+independent byte-level oracle and requires continuation insertion at every
+generated character boundary to preserve both logical text and parsed IR. A
+deterministic matrix separately exhausts every boundary (including before the
+first character), LF/CRLF, ordered two-split combination, three-line chain,
+one-to-three-backslash run, trailing horizontal-whitespace near miss and EOF
+form, so the finite grammar does not depend on mutation luck.
+
+P38-C is closed by separating immutable policy from request-local evaluation
+failure. A deferred URL-policy scope marked `conditional_error` is returned to
+the current request but is not inserted in `url_policy_cache`; a later request
+therefore evaluates it with a fresh work budget. The regression deliberately
+exhausts the first request's budget and proves a fresh request observes the
+underlying deny rather than the partial cached error.
+
+P38-E is closed inside the vendored stream state machine. Every DATA frame
+discarded because its stream is reset, closed, forgotten or beyond a received
+GOAWAY now consumes the same empty/tiny-DATA counter before the early return.
+Only a terminal DATA frame on a live stream retains the one-frame exception.
+A raw-wire regression locally resets a stream, submits 101 empty terminal DATA
+frames and requires a connection GOAWAY with `ENHANCE_YOUR_CALM`.
+
+P38-B and P38-D were oracle defects, not product defects. Backend transcript
+capture now drains all retry exchanges rather than one item. Whole-request H1
+and H2 projections compile separate fixtures and own independent resource,
+rate and round-robin state, so only their canonical observable outputs are
+compared. The exact three minimized P38 byte sequences are unit regressions in
+addition to their retained libFuzzer artifacts.
+
 ## Post-P37 HTTP/2 lifecycle closure
 
 Strict h2spec exposed a family rather than one isolated reset bug. The
@@ -751,7 +797,9 @@ The closure is exercised by:
   identity differential in `adversarial/p34/exploit_p34.py`, the repaired P35
   access-file/PCRE2 gates in `adversarial/p35/`, the P36 trailing-slash
   rewrite process-survival differential in `adversarial/p36/`, and the P37
-  PCRE2 compile-time exclusion regressions in `crates/pcre2/tests/`.
+  PCRE2 compile-time exclusion regressions in `crates/pcre2/tests/`, plus the
+  P38 exact-continuation differential and retained whole-request artifacts in
+  `adversarial/p38/`.
 
 Any new directive that changes a request-to-resource mapping, cache key,
 handler selection, authorization identity or inherited descriptor must state
