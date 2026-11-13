@@ -3,32 +3,32 @@
    (Apache merged the URL into one token `/a/dest`; a space-inserting
     assembler would have accepted the directive.)
 ## A-split-filesmatch-htaccess
-   vapached -t rc=0
-   GET /sub/private.txt       apache=403 (leak=False exec=False)  vapache=200 (leak=True exec=False)
+   httpd-rs -t rc=0
+   GET /sub/private.txt       apache=403 (leak=False exec=False)  httpd-rs=200 (leak=True exec=False)
 ## A-control-plain-filesmatch
-   vapached -t rc=0
-   GET /sub/private.txt       apache=403 (leak=False exec=False)  vapache=403 (leak=False exec=False)
+   httpd-rs -t rc=0
+   GET /sub/private.txt       apache=403 (leak=False exec=False)  httpd-rs=403 (leak=False exec=False)
 ## B-split-sethandler-htaccess
-   vapached -t rc=0
-   GET /sub/run.txt           apache=500 (leak=False exec=False)  vapache=200 (leak=False exec=True)
+   httpd-rs -t rc=0
+   GET /sub/run.txt           apache=500 (leak=False exec=False)  httpd-rs=200 (leak=False exec=True)
 ## B-control-plain-sethandler
-   vapached -t rc=0
-   GET /sub/run.txt           apache=200 (leak=False exec=True)  vapache=200 (leak=False exec=True)
+   httpd-rs -t rc=0
+   GET /sub/run.txt           apache=200 (leak=False exec=True)  httpd-rs=200 (leak=False exec=True)
 ## C-split-grant-htaccess
-   vapached -t rc=0
-   GET /sub/private.txt       apache=500 (leak=False exec=False)  vapache=200 (leak=True exec=False)
+   httpd-rs -t rc=0
+   GET /sub/private.txt       apache=500 (leak=False exec=False)  httpd-rs=200 (leak=True exec=False)
 ## C-control-plain-grant
-   vapached -t rc=0
-   GET /sub/private.txt       apache=200 (leak=True exec=False)  vapache=200 (leak=True exec=False)
+   httpd-rs -t rc=0
+   GET /sub/private.txt       apache=200 (leak=True exec=False)  httpd-rs=200 (leak=True exec=False)
 ## F-split-rewrite-observation
-   vapached -t rc=0
-   GET /sub/private.txt       apache=403 (leak=False exec=False)  vapache=500 (leak=False exec=False)
+   httpd-rs -t rc=0
+   GET /sub/private.txt       apache=403 (leak=False exec=False)  httpd-rs=500 (leak=False exec=False)
 ## E-mainconfig-split-locationmatch
-   vapached -t rc=0
-   GET /sub/private.txt       apache=403 (leak=False exec=False)  vapache=200 (leak=True exec=False)
+   httpd-rs -t rc=0
+   GET /sub/private.txt       apache=403 (leak=False exec=False)  httpd-rs=200 (leak=True exec=False)
 ## E-control-plain-locationmatch
-   vapached -t rc=0
-   GET /sub/private.txt       apache=403 (leak=False exec=False)  vapache=403 (leak=False exec=False)
+   httpd-rs -t rc=0
+   GET /sub/private.txt       apache=403 (leak=False exec=False)  httpd-rs=403 (leak=False exec=False)
 fixtures retained under /tmp/opencode/p38-harness
 P38-A CONFIRMED at the reviewed HEAD: continuation token joining
-inserts a space on Vapache where Apache concatenates directly
+inserts a space on httpd-rs where Apache concatenates directly

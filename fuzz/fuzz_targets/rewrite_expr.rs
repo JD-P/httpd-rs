@@ -3,8 +3,8 @@
 use libfuzzer_sys::fuzz_target;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
-use vapached::expr::{parse, validate_vars, Context};
-use vapached::http::{Headers, Request, Version};
+use httpd_rs::expr::{parse, validate_vars, Context};
+use httpd_rs::http::{Headers, Request, Version};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(text) = std::str::from_utf8(data) else {
@@ -25,7 +25,7 @@ fuzz_target!(|data: &[u8]| {
         body_spool: None,
         keep_alive: true,
         expect_continue: false,
-        framing: vapached::verified::BodyFraming::None,
+        framing: httpd_rs::verified::BodyFraming::None,
     };
     let env = [("FUZZ".to_string(), b"1".to_vec())];
     let mut context = Context::new(

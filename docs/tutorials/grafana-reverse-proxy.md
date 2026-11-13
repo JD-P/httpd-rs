@@ -6,7 +6,7 @@ contracts: DOC-DEPLOY-GRAFANA-001
 scenario: grafana-proxy
 ---
 
-# Put Grafana behind Vapache on a VPS
+# Put Grafana behind httpd-rs on a VPS
 
 This tutorial publishes Grafana below `/grafana/` at
 `https://monitor.example.test/grafana/`. The same route carries Grafana's HTTP
@@ -15,12 +15,12 @@ and WebSocket traffic.
 ## What you will do
 
 You will install Grafana, bind it to loopback, configure its public URL, add
-the Vapache route, check redirects, use Grafana Live, and reconnect after a
+the httpd-rs route, check redirects, use Grafana Live, and reconnect after a
 reload.
 
 ## Before you start
 
-Complete [Prepare a Debian VPS for a Vapache
+Complete [Prepare a Debian VPS for a httpd-rs
 tutorial](prepare-debian-vps.md). Point `monitor.example.test` at the VPS and
 open TCP ports 80 and 443 in the provider firewall.
 
@@ -76,7 +76,7 @@ Replace `your-user` and `VPS-IP` with your administrative SSH login. Open
 `http://127.0.0.1:3000/grafana/`, sign in with Grafana's initial credentials,
 and replace the initial administrator password.
 
-## 3. Configure Vapache
+## 3. Configure httpd-rs
 
 Create `/etc/apache2/sites-available/grafana.conf` with a temporary HTTP-only
 host, enable it, and obtain the certificate:
@@ -89,8 +89,8 @@ host, enable it, and obtain the certificate:
 
 ```console
 $ sudo a2ensite grafana.conf
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot certonly --apache --domain monitor.example.test
 ```
 
@@ -113,11 +113,11 @@ Replace it with the final configuration:
 </VirtualHost>
 ```
 
-Test the configuration, reload Vapache, and verify renewal:
+Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -131,7 +131,7 @@ $ curl -I https://monitor.example.test/grafana/
 Confirm that every redirect uses the public HTTPS URL and retains `/grafana/`.
 Open Grafana Live in a browser and confirm that it receives updates.
 
-Reload Vapache while Grafana Live is open. The existing WebSocket can close
+Reload httpd-rs while Grafana Live is open. The existing WebSocket can close
 during reload. Confirm that the browser reconnects and resumes receiving
 updates.
 

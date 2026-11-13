@@ -6,7 +6,7 @@
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` (`mime`, `dir`, `authz_core`,
   `authz_host`), loopback only.
 - **Harness:** `adversarial/p30/exploit_p30.py` — 8 differential verdicts
-  (vapache stall attack, refresh-cycle persistence, recovery, Apache oracle on
+  (httpd-rs stall attack, refresh-cycle persistence, recovery, Apache oracle on
   the `bench/bench.py` shape); `adversarial/p30/exploit_p30_h2.py` — the
   HTTP/1-stall → HTTP/2 cross-protocol denial (`nghttp`).
 - **Retained evidence:** `/tmp/opencode/p30-harness/` (fixtures, configs and
@@ -16,7 +16,7 @@
   (write-deadline expiry while the client keeps reading),
   `/tmp/opencode/p30/probe12.py` (default-`Timeout 60` 48/48 probe run).
 - **Method:** prior-pass remediation review (P25-B/P26-B), source audit of the
-  lease budget, then live Apache-versus-vapached differentials and an
+  lease budget, then live Apache-versus-httpd-rs differentials and an
   HTTP/1-versus-HTTP/2 cross-protocol check on the project's own static
   benchmark configuration.
 
@@ -24,7 +24,7 @@
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
 | **P30-A** | `serve_connection` takes one of the **32 process-wide** `blocking_reads` leases for every response with `body_len() > 64 KiB` and holds it until the whole body is written. 32 sockets from a **single IPv4 address** send a `GET` for a >64 KiB file, read only the response head, and never read the body. All 32 leases stay occupied for the full `Timeout` (default 60 s); every other response with a body above 64 KiB — static files, CGI/FastCGI output, proxied bodies, cache hits — is replaced by `503 Response memory capacity is temporarily exhausted` process-wide. Reissuing each held request every ~50 s (32 requests/minute, zero body bytes read) sustains the denial indefinitely. | victim `200` + full body on every probe (45/45) | victim `503` with the overload body on every probe (48/48) | remote unauthenticated denial of every >64 KiB response |
 | **P30-A′** | The same counter is consumed by `h2::handle_stream` for **every HTTP/2 request dispatch** (`h2.rs:946`). While the plain-HTTP/1 stalls hold the budget, **all** HTTP/2 requests on any listener — including a 3-byte file — receive `503` (`request execution capacity exhausted`). An attacker speaking HTTP/1 on one listener can therefore take down HTTP/2 service on another. | h2 `200` | h2 `503` for every request | cross-protocol denial |
@@ -126,7 +126,7 @@ again after they are released.
 
 ### 3.1 Retained battery (`python3 adversarial/p30/exploit_p30.py --keep`)
 
-Apache/2.4.69 on 127.0.0.1:19990 and vapached on 127.0.0.1:19991, identical
+Apache/2.4.69 on 127.0.0.1:19990 and httpd-rs on 127.0.0.1:19991, identical
 static configuration, `Timeout 60`, 32 stalled holders from **127.0.0.2**:
 
 ```text
@@ -152,14 +152,14 @@ PASS  B1 Apache serves the same victims: big=HTTP/1.1 200 OK(4194304B) medium=HT
 addresses, probed every 0.25 s for 12 s at the same default `Timeout 60`:
 
 ```text
-vapache: victim during attack (big, medium): {('503', '503'): 48}
+httpd-rs: victim during attack (big, medium): {('503', '503'): 48}
          victim small.txt: 200 OK (3B), holders_held=32
 apache:  victim during attack (big, medium): {('200', '200'): 45}
 ```
 
 ### 3.2 Cross-protocol denial (`adversarial/p30/exploit_p30_h2.py`)
 
-vapached with a cleartext listener on 19993 and a TLS/h2 listener
+httpd-rs with a cleartext listener on 19993 and a TLS/h2 listener
 (`Protocols h2 http/1.1`) on 19994; 32 stalled HTTP/1 responses on 19993 from
 127.0.0.2:
 
@@ -262,13 +262,13 @@ The attacker does not even need to read anything to hold a lease for a full
 ## 8. Reproduction
 
 ```sh
-cd /root/vapache
-cargo build --release -p vapached
-python3 adversarial/p30/exploit_p30.py            # 8 verdicts (vapache + Apache)
-python3 adversarial/p30/exploit_p30.py A          # vapache stall attack only
+cd /root/httpd-rs
+cargo build --release -p httpd-rs
+python3 adversarial/p30/exploit_p30.py            # 8 verdicts (httpd-rs + Apache)
+python3 adversarial/p30/exploit_p30.py A          # httpd-rs stall attack only
 python3 adversarial/p30/exploit_p30.py --keep     # retain fixtures and logs
 
-# Cross-protocol HTTP/1-stall -> HTTP/2 denial (vapache only, needs nghttp):
+# Cross-protocol HTTP/1-stall -> HTTP/2 denial (httpd-rs only, needs nghttp):
 python3 adversarial/p30/exploit_p30_h2.py
 ```
 
@@ -282,7 +282,7 @@ still returns `200`; Apache returns `200` with the full body for all three.
 ## 9. Retained files
 
 - `adversarial/p30/exploit_p30.py` — the 8-verdict differential battery
-  (vapache stall attack, refresh-cycle persistence, recovery, Apache oracle;
+  (httpd-rs stall attack, refresh-cycle persistence, recovery, Apache oracle;
   fixtures under `/tmp/opencode/p30-harness` when `--keep` is given).
 - `adversarial/p30/exploit_p30_h2.py` — HTTP/1-stall → HTTP/2 (`nghttp`)
   cross-protocol denial harness with a generated self-signed certificate;

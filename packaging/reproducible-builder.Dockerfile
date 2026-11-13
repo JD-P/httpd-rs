@@ -38,7 +38,7 @@ RUN --mount=type=secret,id=proxy_ca,required=false,mode=0444 \
 
 # Cache only Cargo.lock-verified sources in the builder. The release run below
 # is network-isolated and therefore cannot acquire different build inputs.
-WORKDIR /opt/vapache-source
+WORKDIR /opt/httpd-rs-source
 COPY . .
 RUN --mount=type=secret,id=proxy_ca,required=false,mode=0444 \
     if [ -s /run/secrets/proxy_ca ]; then \

@@ -29,7 +29,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 87994.0,
           "mean_ms": 0.714,
           "p99_ms": null,
@@ -77,7 +77,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 320176.0,
           "mean_ms": 2.81,
           "p99_ms": null,
@@ -125,7 +125,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 174646.5,
           "mean_ms": 4.08,
           "p99_ms": null,
@@ -173,7 +173,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 4189.5,
           "mean_ms": 10.8,
           "p99_ms": null,
@@ -199,11 +199,11 @@
   ],
   "config_test_ms": {
     "apache": 16.06388300024264,
-    "vapache": 3.304654999737977
+    "httpd-rs": 3.304654999737977
   },
   "config_test_errors": {
     "apache": "",
-    "vapache": ""
+    "httpd-rs": ""
   },
   "memory": {
     "apache": {
@@ -211,7 +211,7 @@
       "threads": 385,
       "pss_kb": 167964
     },
-    "vapache": {
+    "httpd-rs": {
       "processes": 17,
       "threads": 18,
       "pss_kb": 131468

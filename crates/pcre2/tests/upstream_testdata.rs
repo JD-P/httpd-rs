@@ -2,14 +2,14 @@
 //!
 //! Set `PCRE2_TESTDATA` to a PCRE2 10.46 `testdata` directory. The runner
 //! imports the single-line 8-bit cases from `testinput1`, compiles every case
-//! admitted by vapache's non-backtracking dialect in both engines, and checks
+//! admitted by httpd-rs's non-backtracking dialect in both engines, and checks
 //! captures byte-for-byte. Complex `pcre2test` control records are skipped;
 //! the deterministic corpus and libFuzzer target cover the importer itself.
 
 use std::path::Path;
 
+use httpd_rs_pcre2::bytes as rust;
 use pcre2_c_oracle::bytes as oracle;
-use vapache_pcre2::bytes as rust;
 
 #[derive(Clone, Copy, Default)]
 struct Flags {

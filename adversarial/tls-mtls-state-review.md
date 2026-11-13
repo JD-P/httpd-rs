@@ -75,16 +75,16 @@ presented at each destination.
 
 ### 4. Default session lifetime was unbounded until capacity eviction
 
-When `SSLSessionCacheTimeout` was omitted, Vapache used Rustls's bounded memory
+When `SSLSessionCacheTimeout` was omitted, httpd-rs used Rustls's bounded memory
 cache directly. TLS 1.2 entries in that cache do not expire by time, so a
 resumed mTLS identity could outlive Apache's default revocation/rotation window.
 
-Vapache now always uses a bounded expiring store when session caching is
+httpd-rs now always uses a bounded expiring store when session caching is
 enabled, with Apache's 300-second default and the configured timeout when
 present. The store remains capped at 256 entries, removes expired values on
 access/insertion and redacts cached traffic secrets from `Debug`. Real TLS 1.2
 and TLS 1.3 full-handshake/resumption integration tests prove that SNI and the
-verified client chain survive resumption and yield the identical Vapache
+verified client chain survive resumption and yield the identical httpd-rs
 connection identity. Reload constructs a new store, so sessions cannot cross
 configuration generations.
 
@@ -97,7 +97,7 @@ deny clients while claiming compatibility. It now fails configuration loading.
 
 Omitted `SSLVerifyClient` and explicit `none` are treated as the same effective
 policy, and an unused CA path does not create a false listener-policy mismatch.
-Per-location client-auth directives remain rejected because Vapache does not
+Per-location client-auth directives remain rejected because httpd-rs does not
 perform TLS renegotiation and must not globalize a request-local policy.
 
 ### 6. Connection-wide TLS directives could escape location scope
@@ -130,7 +130,7 @@ the `ServerName`; hostname/IP certificate verification remains mandatory.
 An OCSP response was checked for freshness when fetched or loaded, but the
 live `CertifiedKey` retained the response until the configured cache-refresh
 interval. A response with an earlier `nextUpdate` could therefore remain
-stapled after Vapache's own validator would reject it.
+stapled after httpd-rs's own validator would reject it.
 
 Validation now returns the authenticated response deadline as well as a
 boolean verdict. Each TLS generation records that deadline, schedules refresh
@@ -143,10 +143,10 @@ the shared certificate key.
 
 ### 10. Client-certificate revocation had no usable supported path
 
-Vapache correctly rejected unsupported `SSLOCSP*` directives, but it also
+httpd-rs correctly rejected unsupported `SSLOCSP*` directives, but it also
 treated Apache's CRL configuration as unsupported. Operators could enforce a
 trust anchor and certificate lifetime but could not deploy revocation without
-placing a different TLS terminator in front of Vapache.
+placing a different TLS terminator in front of httpd-rs.
 
 `SSLCARevocationFile` and `SSLCARevocationCheck none|leaf|chain` are now typed
 configuration fields and part of the listener's immutable handshake policy.
@@ -201,5 +201,5 @@ Rustls/WebPKI cryptography, X.509 and CRL parsing/path/revocation validation,
 handshake transcript binding and persisted-session decoding remain external
 trusted dependencies.
 The operating system's randomness and time sources are also assumptions.
-Vapache's formal layer proves the policy joins around those results; it does
+httpd-rs's formal layer proves the policy joins around those results; it does
 not reimplement or claim to prove the cryptographic protocol.

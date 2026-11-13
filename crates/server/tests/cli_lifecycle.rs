@@ -14,13 +14,13 @@ use std::time::{Duration, Instant};
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
 fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_vapached")
+    env!("CARGO_BIN_EXE_httpd-rs")
 }
 
 fn test_dir(name: &str) -> PathBuf {
     let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "vapache-cli-{name}-{}-{sequence}",
+        "httpd-rs-cli-{name}-{}-{sequence}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&path);
@@ -37,8 +37,8 @@ fn free_port() -> u16 {
 }
 
 fn service_ids() -> (u32, u32) {
-    let uid = vapache_os::effective_uid();
-    let gid = vapache_os::effective_gid();
+    let uid = httpd_rs_os::effective_uid();
+    let gid = httpd_rs_os::effective_gid();
     if uid == 0 {
         (65534, 65534)
     } else {
@@ -49,24 +49,24 @@ fn service_ids() -> (u32, u32) {
 fn config_text(root: &Path, port: u16, extra: &str) -> String {
     let (uid, gid) = service_ids();
     format!(
-        "VapacheCapability AbsoluteRequestTarget On\n\
-         VapacheCapability AccessFiles On\n\
-         VapacheCapability AutoIndex On\n\
-         VapacheCapability Cgi On\n\
-         VapacheCapability FastCgi On\n\
-         VapacheCapability LegacyAuthz On\n\
-         VapacheCapability RequestTrailers On\n\
-         VapacheCapability RewriteProgram On\n\
-         VapacheCapability ServerStatus On\n\
-         VapacheCapability Trace On\n\
-         VapacheCapability UnstableFastCgiPaths On\n\
-         VapacheCapability MutableAuthFiles On\n\
+        "HttpdRsCapability AbsoluteRequestTarget On\n\
+         HttpdRsCapability AccessFiles On\n\
+         HttpdRsCapability AutoIndex On\n\
+         HttpdRsCapability Cgi On\n\
+         HttpdRsCapability FastCgi On\n\
+         HttpdRsCapability LegacyAuthz On\n\
+         HttpdRsCapability RequestTrailers On\n\
+         HttpdRsCapability RewriteProgram On\n\
+         HttpdRsCapability ServerStatus On\n\
+         HttpdRsCapability Trace On\n\
+         HttpdRsCapability UnstableFastCgiPaths On\n\
+         HttpdRsCapability MutableAuthFiles On\n\
          ServerRoot {root}\n\
          Listen 127.0.0.1:{port}\n\
          ServerName localhost\n\
          User {uid}\n\
          Group {gid}\n\
-         PidFile {root}/vapached.pid\n\
+         PidFile {root}/httpd-rs.pid\n\
          ErrorLog {root}/error.log\n\
          DocumentRoot {root}/www\n\
          <Directory {root}/www>\n\
@@ -114,11 +114,11 @@ fn spawn_foreground_with_inherited_fd(root: &Path, config: &Path, fd: i32) -> Ch
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // Install the descriptor in the child after std::process has prepared its
-    // own descriptor table. Vapache must close it before opening any server
+    // own descriptor table. httpd-rs must close it before opening any server
     // resource, regardless of the launcher's CLOEXEC discipline.
-    let mut setup = vapache_os::ChildSetup::inherited(vapache_os::current_pid());
+    let mut setup = httpd_rs_os::ChildSetup::inherited(httpd_rs_os::current_pid());
     setup.duplicate_fd = Some((source, fd));
-    vapache_os::configure_child(&mut command, setup);
+    httpd_rs_os::configure_child(&mut command, setup);
     command.spawn().unwrap()
 }
 
@@ -130,7 +130,7 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
         }
         thread::sleep(Duration::from_millis(20));
     }
-    panic!("timed out waiting for vapached lifecycle transition");
+    panic!("timed out waiting for httpd-rs lifecycle transition");
 }
 
 fn wait_running(root: &Path, config: &Path, port: u16) {
@@ -152,13 +152,13 @@ fn connect_when_ready(port: u16) -> TcpStream {
             Err(_) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(20));
             }
-            Err(error) => panic!("timed out connecting to vapached: {error}"),
+            Err(error) => panic!("timed out connecting to httpd-rs: {error}"),
         }
     }
 }
 
 fn read_pid(root: &Path) -> i32 {
-    fs::read_to_string(root.join("vapached.pid"))
+    fs::read_to_string(root.join("httpd-rs.pid"))
         .unwrap()
         .trim()
         .parse()
@@ -166,7 +166,7 @@ fn read_pid(root: &Path) -> i32 {
 }
 
 fn signal(pid: i32, sig: i32) {
-    vapache_os::kill(pid, sig).unwrap();
+    httpd_rs_os::kill(pid, sig).unwrap();
 }
 
 fn http_body(port: u16, path: &str) -> Vec<u8> {
@@ -226,10 +226,10 @@ fn wait_success(mut child: Child) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "vapached exited with {status}");
+            assert!(status.success(), "httpd-rs exited with {status}");
             return;
         }
-        assert!(Instant::now() < deadline, "vapached did not exit");
+        assert!(Instant::now() < deadline, "httpd-rs did not exit");
         thread::sleep(Duration::from_millis(20));
     }
 }
@@ -268,7 +268,7 @@ fn cli_information_explain_and_startup_failures() {
     fs::write(&missing_capability, "Listen 127.0.0.1:0\nTraceEnable On\n").unwrap();
     let audit = output(&root, &missing_capability, &["--audit-capabilities"]);
     assert!(audit.status.success(), "{audit:?}");
-    assert!(String::from_utf8_lossy(&audit.stdout).contains("VapacheCapability Trace On"));
+    assert!(String::from_utf8_lossy(&audit.stdout).contains("HttpdRsCapability Trace On"));
 
     assert_eq!(
         output(&root, &config, &["-k", "status"]).status.code(),
@@ -397,7 +397,7 @@ fn cli_information_explain_and_startup_failures() {
     );
     missing_user = missing_user.replace(
         &format!("User {}", service_ids().0),
-        "User vapache-user-that-does-not-exist",
+        "User httpd-rs-user-that-does-not-exist",
     );
     fs::write(&user_config, missing_user).unwrap();
     assert!(!output(&root, &user_config, &["-X"]).status.success());
@@ -537,7 +537,7 @@ fn daemon_and_active_graceful_drain() {
         .status
         .success());
     wait_until(|| TcpStream::connect(("127.0.0.1", daemon_port)).is_err());
-    let _ = fs::remove_file(daemon_root.join("vapached.pid"));
+    let _ = fs::remove_file(daemon_root.join("httpd-rs.pid"));
 
     let drain_root = test_dir("drain");
     let script = drain_root.join("www/slow.cgi");

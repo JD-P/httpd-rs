@@ -6,9 +6,9 @@ contracts: DOC-DEPLOY-MASTODON-001
 scenario: mastodon-proxy
 ---
 
-# Put Mastodon web and streaming services behind Vapache
+# Put Mastodon web and streaming services behind httpd-rs
 
-This tutorial publishes Mastodon at `https://social.example.test/`. Vapache
+This tutorial publishes Mastodon at `https://social.example.test/`. httpd-rs
 sends the streaming route to Mastodon's streaming service and all other
 requests to the web service.
 
@@ -16,12 +16,12 @@ requests to the web service.
 
 You will install Mastodon, PostgreSQL, Redis, Ruby, and Node.js, run Mastodon's
 production setup, bind its web and streaming services to loopback, configure
-Vapache, publish one status, reload Vapache, reconnect the user stream, and
+httpd-rs, publish one status, reload httpd-rs, reconnect the user stream, and
 receive the status event.
 
 ## Before you start
 
-Complete [Prepare a Debian VPS for a Vapache
+Complete [Prepare a Debian VPS for a httpd-rs
 tutorial](prepare-debian-vps.md). Use a VPS with at least 4 GiB of memory and
 point `social.example.test` at it. Open TCP ports 80 and 443 in the provider
 firewall.
@@ -128,7 +128,7 @@ LOCAL_DOMAIN=social.example.test
 This tutorial uses the same domain for account names and the web interface, so
 it does not need a separate `WEB_DOMAIN` value.
 
-## 4. Configure Vapache
+## 4. Configure httpd-rs
 
 Create `/etc/apache2/sites-available/mastodon.conf` with a temporary HTTP-only
 host, enable it, and obtain the certificate:
@@ -141,8 +141,8 @@ host, enable it, and obtain the certificate:
 
 ```console
 $ sudo a2ensite mastodon.conf
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot certonly --apache --domain social.example.test
 ```
 
@@ -169,11 +169,11 @@ before the catch-all web route:
 </VirtualHost>
 ```
 
-Test the configuration, reload Vapache, and verify renewal:
+Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -183,7 +183,7 @@ $ sudo certbot renew --dry-run
 $ curl --fail https://social.example.test/api/v2/instance
 ```
 
-Sign in with the test account and open its user stream. Reload Vapache and
+Sign in with the test account and open its user stream. Reload httpd-rs and
 confirm that the streaming client reconnects. Publish a status through the web
 application and confirm that the same status arrives on the reconnected stream.
 This tests the web service, background job, Redis delivery, streaming service,

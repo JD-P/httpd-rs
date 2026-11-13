@@ -1,7 +1,7 @@
 # Pass 29 — recursive ancestor plan aborts the process; quadratic 404 prefix walk burns a core
 
 - **Date:** 2026-11-02
-- **Subject:** HEAD `de8853b` (`target/release/vapached`; no product source was
+- **Subject:** HEAD `de8853b` (`target/release/httpd-rs`; no product source was
   edited).
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` (`mime`, `dir`, `alias`,
   `rewrite`, `authz_core`, `authz_host`), loopback only.
@@ -13,22 +13,22 @@
   no-access-file variant), `/tmp/opencode/p29/probe_*.py`,
   `/tmp/opencode/p29/saturate*.py` (lab calibration).
 - **Method:** call-graph audit from the request path into the verified
-  planning kernels, then live Apache-versus-vapached differentials on the
+  planning kernels, then live Apache-versus-httpd-rs differentials on the
   project's own conformance and static benchmark configuration shapes.
 
 ---
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
-| **P29-A** | An attacker-written `.htaccess` `RewriteRule ^(.*)$ /x/$1…$1 [L]` (80 repeats, ~200 bytes) expands a **518-byte request** into a ~40 KiB internal target with **~20,000 path components**. The rewritten target is not under the `AllowOverride` directory, so the access-file component/ancestor caps never fire. Dispatch calls `policy_ref::effective_scope_with_layers_and_file_name`, which hands the whole ancestor vector to the recursive verified kernel `access_walk_plan_exec_from`; 18,042 frames exhaust the 2 MiB blocking-pool stack and `panic = "abort"` kills the whole process (`thread 'vapache-io' has overflowed its stack`, `fatal runtime error: stack overflow, aborting`, `SIGABRT`). `LimitRequestLine` stays at the default 8190. | `500` in 1 ms, alive | `SIGABRT` after 310 ms, no response | remote one-request whole-process denial of service |
+| **P29-A** | An attacker-written `.htaccess` `RewriteRule ^(.*)$ /x/$1…$1 [L]` (80 repeats, ~200 bytes) expands a **518-byte request** into a ~40 KiB internal target with **~20,000 path components**. The rewritten target is not under the `AllowOverride` directory, so the access-file component/ancestor caps never fire. Dispatch calls `policy_ref::effective_scope_with_layers_and_file_name`, which hands the whole ancestor vector to the recursive verified kernel `access_walk_plan_exec_from`; 18,042 frames exhaust the 2 MiB blocking-pool stack and `panic = "abort"` kills the whole process (`thread 'httpd-rs-io' has overflowed its stack`, `fatal runtime error: stack overflow, aborting`, `SIGABRT`). `LimitRequestLine` stays at the default 8190. | `500` in 1 ms, alive | `SIGABRT` after 310 ms, no response | remote one-request whole-process denial of service |
 | **P29-A′** | The same kernel is reachable with **no access file at all**: on the default static configuration a single request whose URL has ≥ ~18,500 components (a ~37 KiB path) reaches the same recursion. That only needs `LimitRequestLine ≥ ~38 KiB` (a documented, commonly raised compatibility knob; the default 8190 caps the path at ~4,000 components). | `403` in < 1 ms, alive | `SIGABRT`, no response | remote one-request whole-process denial of service |
 | **P29-B** | `cgi::find_script_checked` runs on **every** `Target::NotFound` (and from the cache scope) even when no CGI/PATH_INFO handler exists, rebuilding a growing `PathBuf` for every prefix of the request path. One maximum-length 404 (8,175-byte request line, 4,080 components) burns **39–45 ms of CPU**; 16 connections from one address consume **7.7 of 8 cores** at ~190 rps and raise a control GET to ~9 ms. | `0.15 ms/req`; 53,359 reqs in 5 s using 1.3 cores; control 1.9 ms | `39 ms/req`; 981 reqs in 5 s using 7.7 cores; control 9.2 ms | remote CPU exhaustion (≈260× CPU per request) |
 
 Both are remote, unauthenticated and need no request body, no upload
 execution and no symlink. P29-A is reachable on the project's own
-access-file benchmark shape (`VapacheCapability AccessFiles On` plus
+access-file benchmark shape (`HttpdRsCapability AccessFiles On` plus
 `AllowOverride FileInfo`/`All`, the `tests/conformance.py` /
 `bench/feature_bench.py` tree). P29-B is reachable on the plain static
 `bench/bench.py` shape (`AllowOverride None`, no capabilities).
@@ -101,12 +101,12 @@ chain:
 
 ```text
 access_walk_plan_exec_from × 18,042          (#0..#18044)
-vapache_verified::access_plan_exec           (#18045)
-vapached::policy_ref::effective_scope_with_layers_and_file_name   (#18046)
-vapached::policy_ref::effective_scope_with_layers                (#18047)
-<vapached::config::Config>::effective_scope_req_cached            (#18048)
-<vapached::request_plan::RequestPlan>::evaluate_scope             (#18049)
-vapached::server::dispatch_inner                                  (#18050)
+httpd_rs_verified::access_plan_exec           (#18045)
+httpd_rs::policy_ref::effective_scope_with_layers_and_file_name   (#18046)
+httpd_rs::policy_ref::effective_scope_with_layers                (#18047)
+<httpd_rs::config::Config>::effective_scope_req_cached            (#18048)
+<httpd_rs::request_plan::RequestPlan>::evaluate_scope             (#18049)
+httpd_rs::server::dispatch_inner                                  (#18050)
 ```
 
 ### 2.2 P29-A′ — the same kernel on a stock static configuration
@@ -157,13 +157,13 @@ each iteration additionally walks the full prefix in the kernel (measured
 `python3 adversarial/p29/exploit_p29.py --keep` (5/5 verdicts passed):
 
 ```text
-PASS  A1 vapache stack-overflow abort: request_line=558B k=250 rc=-6 status=<no response> in 310 ms;
-      log: thread 'vapache-io' (47941) has overflowed its stack | fatal runtime error: stack overflow, aborting
+PASS  A1 httpd-rs stack-overflow abort: request_line=558B k=250 rc=-6 status=<no response> in 310 ms;
+      log: thread 'httpd-rs-io' (47941) has overflowed its stack | fatal runtime error: stack overflow, aborting
 PASS  A2 Apache oracle: apache HTTP/1.1 500 Internal Server Error in 1 ms alive=True
-PASS  A3 rewrite-removal control: vapache HTTP/1.1 404 Not Found in 6 ms alive=True
-PASS  B1 single-request CPU amplification: request_line=8215B: vapache 39.1 ms/req (25 rps),
+PASS  A3 rewrite-removal control: httpd-rs HTTP/1.1 404 Not Found in 6 ms alive=True
+PASS  B1 single-request CPU amplification: request_line=8215B: httpd-rs 39.1 ms/req (25 rps),
       apache 0.15 ms/req (4878 rps)
-PASS  B2 16-connection saturation: vapache 981 reqs in 5.1s cpu=39.2s (7.7 cores) control=9.2 ms HTTP/1.1 200 OK;
+PASS  B2 16-connection saturation: httpd-rs 981 reqs in 5.1s cpu=39.2s (7.7 cores) control=9.2 ms HTTP/1.1 200 OK;
       apache 53359 reqs cpu=6.5s (1.3 cores) control=1.9 ms HTTP/1.1 200 OK
 ```
 
@@ -185,15 +185,15 @@ Host: localhost
 Connection: close
 ```
 
-- vapache: no response; after ~310 ms the process aborts. Kept log:
-  `thread 'vapache-io' (47941) has overflowed its stack` /
+- httpd-rs: no response; after ~310 ms the process aborts. Kept log:
+  `thread 'httpd-rs-io' (47941) has overflowed its stack` /
   `fatal runtime error: stack overflow, aborting`; `rc=-6`.
 - Rewritten target: `/x/` + 80 × 501-byte subject ≈ 40,083 bytes, ≈ 20,080
   components — inside the P28 64 KiB byte cap, far outside any stack bound.
 - Apache: `500 Internal Server Error` in 1 ms (`mod_rewrite` logs the
   over-long URI), process alive.
 - Control: with the access file removed, the same request is `404` in 6 ms
-  on vapache and the process stays up.
+  on httpd-rs and the process stays up.
 
 The gdb replay of this exact request (`/tmp/opencode/p29/gdb3.log`) captures
 the signal with **18,042 `access_walk_plan_exec_from` frames** and the caller
@@ -214,7 +214,7 @@ Threshold bisection on this shape:
 components  path bytes  result
 16,500      33,002      404, alive
 18,000      36,002      404, alive
-19,000      38,002      SIGABRT: thread 'vapache-io' has overflowed its stack
+19,000      38,002      SIGABRT: thread 'httpd-rs-io' has overflowed its stack
 20,000      40,002      SIGABRT
 32,000      64,002      SIGABRT
 ```
@@ -229,9 +229,9 @@ Config: the `bench/bench.py` shape (`DocumentRoot`, `AllowOverride None`,
 Request: `GET /a/a/…/a/b` (8,175-byte request line, 4,080 components,
 `404`).
 
-- Single stream: 200 requests for vapache cost 39.1 ms/req (25 rps);
+- Single stream: 200 requests for httpd-rs cost 39.1 ms/req (25 rps);
   Apache 0.15 ms/req (4,878 rps) — ≈260× more CPU per request.
-- 16 simultaneous connections from 127.0.0.1 for 5 s: vapache serves 981
+- 16 simultaneous connections from 127.0.0.1 for 5 s: httpd-rs serves 981
   requests and consumes 39.2 s of CPU (**7.7 of 8 cores**) while a control
   `GET /index.html` rises to 9.2 ms; Apache serves 53,359 requests using
   1.3 cores with the control at 1.9 ms.
@@ -244,7 +244,7 @@ Request: `GET /a/a/…/a/b` (8,175-byte request line, 4,080 components,
 ## 4. Reachability and threat model
 
 - **Precondition for P29-A:** one attacker-written `.htaccess` in a writable
-  directory of a tree that enables access files (`VapacheCapability
+  directory of a tree that enables access files (`HttpdRsCapability
   AccessFiles On`) with a category that admits `RewriteEngine`/`RewriteRule`
   (`FileInfo` or `All`) — exactly the conformance/feature-benchmark shape
   (`www/htaccess` `AllowOverride All`, `www/htaccess/cat-fileinfo`
@@ -324,8 +324,8 @@ Request: `GET /a/a/…/a/b` (8,175-byte request line, 4,080 components,
 ## 7. Reproduction
 
 ```sh
-cd /root/vapache
-cargo build --release -p vapached
+cd /root/httpd-rs
+cargo build --release -p httpd-rs
 python3 adversarial/p29/exploit_p29.py            # all 5 verdicts
 python3 adversarial/p29/exploit_p29.py A          # stack-overflow abort + oracle
 python3 adversarial/p29/exploit_p29.py B          # prefix-walk CPU burn + oracle
@@ -334,16 +334,16 @@ python3 adversarial/p29/exploit_p29.py --keep     # retain fixtures and logs
 
 Minimal P29-A repro: `.htaccess` with
 `RewriteEngine On` / `RewriteRule ^(.*)$ /x/$1$1…$1 [L]` (80 `$1`) under
-`AllowOverride FileInfo` + `VapacheCapability AccessFiles On`; request
-`/rw/` + `a/`×250 + `a`. vapache aborts in ~310 ms; Apache answers `500` in
+`AllowOverride FileInfo` + `HttpdRsCapability AccessFiles On`; request
+`/rw/` + `a/`×250 + `a`. httpd-rs aborts in ~310 ms; Apache answers `500` in
 ~1 ms.
 
 Minimal P29-A′ repro: static config with `LimitRequestLine 65536`; request
-`/a/a/…/a` with 19,000 components. vapache aborts; Apache answers
+`/a/a/…/a` with 19,000 components. httpd-rs aborts; Apache answers
 `404`/`403` in under a millisecond.
 
 Minimal P29-B repro: static config; request `/a/a/…/a/b` with 4,080
-components. vapache burns ~40 ms of CPU and answers `404`; Apache answers
+components. httpd-rs burns ~40 ms of CPU and answers `404`; Apache answers
 `404` in ~0.15 ms.
 
 ## 8. Retained files

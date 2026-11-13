@@ -1,7 +1,7 @@
 # Pass 32 — HTTP/2 request-body waits retain the process-wide 256-stream dispatch pool; eight sources deny every other client by rolling replacement
 
 - **Date:** 2026-11-03
-- **Subject:** HEAD `e1251ec` (`target/release/vapached`; no product source was
+- **Subject:** HEAD `e1251ec` (`target/release/httpd-rs`; no product source was
   edited).
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` + `mod_http2` + `mod_ssl`,
   loopback only.
@@ -11,7 +11,7 @@
   controls), `adversarial/p32/oracle_apache.py` (the same 256-body hold against
   Apache). Retained run output: `adversarial/p32/results_p32.txt`.
 - **Method:** source audit of HTTP/2 stream admission and the request-body read
-  path, then live Apache-versus-vapached differentials using Python `h2` and
+  path, then live Apache-versus-httpd-rs differentials using Python `h2` and
   the project's TLS/h2 configuration shape. All traffic is loopback.
 - **Remediation status:** fixed in the 2026-11-05 working tree. A stream waiting
   for request-body DATA now transfers into a separate 128-process/32-source
@@ -23,7 +23,7 @@
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
 | **P32-A** | `admit_stream_before_spawn` acquires a process-wide `H2Stream` lease before dispatch (`MAX_H2_STREAMS = 256`). An HTTP/2 request with `Content-Length: 1000` and no DATA then enters `read_body` while still holding that lease; the lease is stored in `SlowOutputAdmission`, which transfers only on a **downstream output** stall. Eight source addresses × one TLS/h2 connection × 32 partial bodies fill all 256 slots. The body deadline releases one stream at `Timeout`, but the attacker immediately opens a replacement, at roughly 4–9 new stream heads per second. A separate-source victim is refused with `RST_STREAM REFUSED_STREAM` (error 7) before routing for every probe. | victim `200` for every probe while 256 CGI bodies are held | victim refused for 750/750 probes over 150 s; recovery immediate on release | remote cross-client denial of all HTTP/2 service |
 
@@ -226,7 +226,7 @@ pool at all. That is the missing piece this pass demonstrates live.
 
 ## 3. Live evidence
 
-All runs use `target/release/vapached` at HEAD `e1251ec`, TLS/h2 on
+All runs use `target/release/httpd-rs` at HEAD `e1251ec`, TLS/h2 on
 `127.0.0.1:19994`, one connection per source address, and 32 partial bodies
 per connection. The fixture sets `Timeout 60` except in §3.3, which uses the
 stock 30-second body timeout. Holders bind `127.0.0.2` through `127.0.0.9`;
@@ -420,13 +420,13 @@ the initial 128 admission threshold demonstrate the ownership separation.
 
 Performance validation used three alternating samples per server and rejected
 every sample containing a failed or non-2xx request. The ordinary HTTP/1
-static suite measured Vapache/Apache throughput ratios of 0.96x (small), 0.95x
-(1.1 KiB), 1.03x (10 KiB), and 1.38x (1 MiB); Vapache p99 was 1, 1, 1, and
+static suite measured httpd-rs/Apache throughput ratios of 0.96x (small), 0.95x
+(1.1 KiB), 1.03x (10 KiB), and 1.38x (1 MiB); httpd-rs p99 was 1, 1, 1, and
 2 ms respectively. A targeted HTTP/2 run used two connections with four
 streams each, staying within every single-source useful-work pool. It measured
 0.99x for the tiny static response, 1.10x for 10 KiB, and 2.21x for CGI POST.
 CGI POST exercises the new request-body ownership transfer; all 3,456 selected
-Vapache responses were 2xx. The transfer therefore did not introduce an
+httpd-rs responses were 2xx. The transfer therefore did not introduce an
 observable throughput regression in the affected path.
 
 The implementation follows the original remediation requirements:
@@ -461,8 +461,8 @@ The implementation follows the original remediation requirements:
 ## 7. Reproduction
 
 ```sh
-cd /root/vapache
-cargo build --release -p vapached
+cd /root/httpd-rs
+cargo build --release -p httpd-rs
 
 # Full pool, rolling replacement, separate-source victim.
 python3 adversarial/p32/rolling.py --measure-seconds 150 --probe-interval 0.2

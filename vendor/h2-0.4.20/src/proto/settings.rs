@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 pub(crate) struct Settings {
     /// The sole SETTINGS exchange phase. Payloads are retained separately
     /// while this verified state says they are queued or awaiting an ACK.
-    sync: vapache_verified::H2SettingsSync,
+    sync: httpd_rs_verified::H2SettingsSync,
     local: Option<frame::Settings>,
     /// Received SETTINGS frame pending processing. The ACK must be written to
     /// the socket first then the settings applied **before** receiving any
@@ -20,8 +20,8 @@ impl Settings {
         Settings {
             // We assume the initial local SETTINGS were flushed during
             // the handshake process.
-            sync: vapache_verified::H2SettingsSync {
-                local: vapache_verified::H2LocalSettingsPhase::WaitingAck,
+            sync: httpd_rs_verified::H2SettingsSync {
+                local: httpd_rs_verified::H2LocalSettingsPhase::WaitingAck,
                 remote_pending: false,
                 remote_initial_seen: false,
             },
@@ -44,7 +44,7 @@ impl Settings {
     {
         if frame.is_ack() {
             match self.sync.local {
-                vapache_verified::H2LocalSettingsPhase::WaitingAck => {
+                httpd_rs_verified::H2LocalSettingsPhase::WaitingAck => {
                     let local = self
                         .local
                         .as_ref()
@@ -64,16 +64,16 @@ impl Settings {
                     }
 
                     streams.apply_local_settings(local)?;
-                    self.sync = vapache_verified::h2_settings_sync_step(
+                    self.sync = httpd_rs_verified::h2_settings_sync_step(
                         self.sync,
-                        vapache_verified::H2SettingsSyncEvent::ReceiveAck,
+                        httpd_rs_verified::H2SettingsSyncEvent::ReceiveAck,
                     )
                     .expect("WaitingAck must accept its sole ACK");
                     self.local = None;
                     Ok(())
                 }
-                vapache_verified::H2LocalSettingsPhase::ToSend
-                | vapache_verified::H2LocalSettingsPhase::Synced => {
+                httpd_rs_verified::H2LocalSettingsPhase::ToSend
+                | httpd_rs_verified::H2LocalSettingsPhase::Synced => {
                     // We haven't sent any SETTINGS frames to be ACKed, so
                     // this is very bizarre! Remote is either buggy or malicious.
                     proto_err!(conn: "received unexpected settings ack");
@@ -81,9 +81,9 @@ impl Settings {
                 }
             }
         } else {
-            let Some(next) = vapache_verified::h2_settings_sync_step(
+            let Some(next) = httpd_rs_verified::h2_settings_sync_step(
                 self.sync,
-                vapache_verified::H2SettingsSyncEvent::ReceiveRemote,
+                httpd_rs_verified::H2SettingsSyncEvent::ReceiveRemote,
             ) else {
                 proto_err!(conn: "received SETTINGS before the previous frame was applied");
                 return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
@@ -98,15 +98,15 @@ impl Settings {
     pub(crate) fn send_settings(&mut self, frame: frame::Settings) -> Result<(), UserError> {
         assert!(!frame.is_ack());
         match self.sync.local {
-            vapache_verified::H2LocalSettingsPhase::ToSend
-            | vapache_verified::H2LocalSettingsPhase::WaitingAck => {
+            httpd_rs_verified::H2LocalSettingsPhase::ToSend
+            | httpd_rs_verified::H2LocalSettingsPhase::WaitingAck => {
                 Err(UserError::SendSettingsWhilePending)
             }
-            vapache_verified::H2LocalSettingsPhase::Synced => {
+            httpd_rs_verified::H2LocalSettingsPhase::Synced => {
                 tracing::trace!("queue to send local settings: {:?}", frame);
-                self.sync = vapache_verified::h2_settings_sync_step(
+                self.sync = httpd_rs_verified::h2_settings_sync_step(
                     self.sync,
-                    vapache_verified::H2SettingsSyncEvent::QueueLocal,
+                    httpd_rs_verified::H2SettingsSyncEvent::QueueLocal,
                 )
                 .expect("Synced SETTINGS phase must permit one queued update");
                 self.local = Some(frame);
@@ -150,9 +150,9 @@ impl Settings {
             if let Some(val) = settings.max_frame_size() {
                 dst.set_max_send_frame_size(val as usize);
             }
-            self.sync = vapache_verified::h2_settings_sync_step(
+            self.sync = httpd_rs_verified::h2_settings_sync_step(
                 self.sync,
-                vapache_verified::H2SettingsSyncEvent::ApplyRemote,
+                httpd_rs_verified::H2SettingsSyncEvent::ApplyRemote,
             )
             .expect("a retained remote SETTINGS payload must be pending");
         }
@@ -160,7 +160,7 @@ impl Settings {
         self.remote = None;
 
         match self.sync.local {
-            vapache_verified::H2LocalSettingsPhase::ToSend => {
+            httpd_rs_verified::H2LocalSettingsPhase::ToSend => {
                 if !dst.poll_ready(cx)?.is_ready() {
                     return Poll::Pending;
                 }
@@ -174,16 +174,16 @@ impl Settings {
                     .expect("invalid settings frame");
                 tracing::trace!("local settings sent; waiting for ack: {:?}", settings);
 
-                self.sync = vapache_verified::h2_settings_sync_step(
+                self.sync = httpd_rs_verified::h2_settings_sync_step(
                     self.sync,
-                    vapache_verified::H2SettingsSyncEvent::LocalSent,
+                    httpd_rs_verified::H2SettingsSyncEvent::LocalSent,
                 )
                 .expect("ToSend SETTINGS phase must wait for its ACK");
             }
-            vapache_verified::H2LocalSettingsPhase::WaitingAck => {
+            httpd_rs_verified::H2LocalSettingsPhase::WaitingAck => {
                 debug_assert!(self.local.is_some());
             }
-            vapache_verified::H2LocalSettingsPhase::Synced => {
+            httpd_rs_verified::H2LocalSettingsPhase::Synced => {
                 debug_assert!(self.local.is_none());
             }
         }

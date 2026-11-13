@@ -74,8 +74,8 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: sudo apt-get install -y apache2 wrk
-      - name: Build Vapache once for every scenario
-        run: cargo build --locked --release -p vapached
+      - name: Build httpd-rs once for every scenario
+        run: cargo build --locked --release -p httpd-rs
       - name: Run real-application deployments
         env:
           INPUT_PROFILE: ${{ inputs.profile }}
@@ -100,7 +100,7 @@ jobs:
           args=(
             --profile "$profile"
             --sample-count "$sample_count"
-            --vapached target/release/vapached
+            --httpd-rs target/release/httpd-rs
             --artifacts deployment-results
             --remove-images
           )

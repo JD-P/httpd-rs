@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run real applications behind Vapache with reproducible stochastic sampling."""
+"""Run real applications behind httpd-rs with reproducible stochastic sampling."""
 
 from __future__ import annotations
 
@@ -177,7 +177,7 @@ def group_cases_by_scenario(cases: list[Case]) -> list[Case]:
 
 def import_driver(scenario: Scenario):
     path = scenario.path / "driver.py"
-    module_name = "vapache_deployment_" + scenario.identifier.replace("-", "_")
+    module_name = "httpd_rs_deployment_" + scenario.identifier.replace("-", "_")
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise DeploymentError(f"cannot load {path}")
@@ -198,7 +198,7 @@ def require_prerequisites(scenario: Scenario) -> None:
 
 def check_disk(scenario: Scenario) -> None:
     default_reserve = "2048" if scenario.images else "256"
-    reserve_mb = int(os.environ.get("VAPACHE_DEPLOY_DISK_RESERVE_MB", default_reserve))
+    reserve_mb = int(os.environ.get("HTTPD_RS_DEPLOY_DISK_RESERVE_MB", default_reserve))
     docker_root = Path("/")
     if scenario.images and shutil.which("docker"):
         result = subprocess.run(
@@ -229,14 +229,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scenario", help="restrict the run to one scenario")
     parser.add_argument("--sample-count", type=int, default=10)
     parser.add_argument("--seed", type=lambda value: int(value, 0))
-    parser.add_argument("--vapached", type=Path, default=ROOT / "target/release/vapached")
+    parser.add_argument("--httpd-rs", type=Path, default=ROOT / "target/release/httpd-rs")
     default_run_root = (
-        Path("/run/vapache-deployments")
+        Path("/run/httpd-rs-deployments")
         if os.geteuid() == 0 or privilege_prefix()
-        else Path("/tmp/vapache-deployments")
+        else Path("/tmp/httpd-rs-deployments")
     )
     parser.add_argument("--run-root", type=Path, default=default_run_root)
-    parser.add_argument("--artifacts", type=Path, default=Path("/tmp/vapache-deployment-results"))
+    parser.add_argument("--artifacts", type=Path, default=Path("/tmp/httpd-rs-deployment-results"))
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--remove-images", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--benchmark", action="store_true")
@@ -276,7 +276,7 @@ def prepare_run_root(path: Path) -> None:
 def write_benchmark_summary(artifact_root: Path, results: list[dict[str, Any]]) -> None:
     rows: list[dict[str, Any]] = []
     results_by_case = {str(result["case"]): result for result in results}
-    for benchmark in sorted(artifact_root.glob("*/apache-vapache-benchmark.json")):
+    for benchmark in sorted(artifact_root.glob("*/apache-httpd-rs-benchmark.json")):
         data = json.loads(benchmark.read_text())
         case = benchmark.parent.name
         result = results_by_case.get(case, {})
@@ -296,10 +296,10 @@ def write_benchmark_summary(artifact_root: Path, results: list[dict[str, Any]]) 
                 "scenario": result.get("scenario"),
                 "path": data.get("path"),
                 "apache_requests_per_second": data["median_requests_per_second"]["apache"],
-                "vapache_requests_per_second": data["median_requests_per_second"]["vapache"],
-                "vapache_to_apache_ratio": data.get("vapache_to_apache_ratio"),
+                "httpd_rs_requests_per_second": data["median_requests_per_second"]["httpd-rs"],
+                "httpd_rs_to_apache_ratio": data.get("httpd_rs_to_apache_ratio"),
                 "apache_p99_latency_ms": median_metric("apache", "p99_latency_ms"),
-                "vapache_p99_latency_ms": median_metric("vapache", "p99_latency_ms"),
+                "httpd_rs_p99_latency_ms": median_metric("httpd-rs", "p99_latency_ms"),
             }
         )
     output = {"version": 1, "benchmarks": rows}
@@ -309,21 +309,21 @@ def write_benchmark_summary(artifact_root: Path, results: list[dict[str, Any]]) 
     lines = [
         "# Canonical application benchmark summary",
         "",
-        "| scenario | path | Apache req/s | Vapache req/s | ratio | Apache p99 ms | Vapache p99 ms |",
+        "| scenario | path | Apache req/s | httpd-rs req/s | ratio | Apache p99 ms | httpd-rs p99 ms |",
         "|---|---|---:|---:|---:|---:|---:|",
     ]
     def metric(value: float | None, digits: int) -> str:
         return f"{value:.{digits}f}" if value is not None else "n/a"
 
     for row in rows:
-        ratio = row["vapache_to_apache_ratio"]
+        ratio = row["httpd_rs_to_apache_ratio"]
         apache_p99 = row["apache_p99_latency_ms"]
-        vapache_p99 = row["vapache_p99_latency_ms"]
+        httpd_rs_p99 = row["httpd_rs_p99_latency_ms"]
         ratio_text = f"{ratio:.3f}x" if ratio is not None else "n/a"
         lines.append(
             f"| {row['scenario']} | `{row['path']}` | "
-            f"{row['apache_requests_per_second']:.2f} | {row['vapache_requests_per_second']:.2f} | "
-            f"{ratio_text} | {metric(apache_p99, 3)} | {metric(vapache_p99, 3)} |"
+            f"{row['apache_requests_per_second']:.2f} | {row['httpd_rs_requests_per_second']:.2f} | "
+            f"{ratio_text} | {metric(apache_p99, 3)} | {metric(httpd_rs_p99, 3)} |"
         )
     if not rows:
         lines.append("| _no completed differential benchmarks_ | | | | | | |")
@@ -365,15 +365,15 @@ def main() -> int:
         with contextlib.suppress(OSError):
             run_root.rmdir()
         return 0
-    if not args.vapached.is_file():
-        raise DeploymentError(f"Vapache binary not found: {args.vapached}")
+    if not args.httpd_rs.is_file():
+        raise DeploymentError(f"httpd-rs binary not found: {args.httpd_rs}")
     if os.geteuid() != 0 and not privilege_prefix() and not args.allow_same_identity:
         raise DeploymentError(
-            "deployment scenarios require root or passwordless sudo so Vapache can use a distinct service identity"
+            "deployment scenarios require root or passwordless sudo so httpd-rs can use a distinct service identity"
         )
     if args.allow_same_identity and os.geteuid() != 0 and not privilege_prefix():
         print(
-            "WARNING: local compatibility run uses the invoking identity for Vapache; "
+            "WARNING: local compatibility run uses the invoking identity for httpd-rs; "
             "CI must run without --allow-same-identity",
             file=sys.stderr,
             flush=True,
@@ -399,7 +399,7 @@ def main() -> int:
             profile=args.profile,
             run_dir=run_dir,
             artifact_dir=artifact_dir,
-            vapached=args.vapached.resolve(),
+            httpd_rs=args.httpd_rs.resolve(),
             images=case.scenario.images,
             remove_images=args.remove_images and remaining[case.scenario.identifier] == 1,
             benchmark=args.benchmark,

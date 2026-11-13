@@ -15,7 +15,7 @@ services:
     environment:
       POSTGRES_DB: bakerydemo
       POSTGRES_USER: bakerydemo
-      POSTGRES_PASSWORD: vapache-wagtail-db
+      POSTGRES_PASSWORD: httpd-rs-wagtail-db
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=128m
       - /run/postgresql:rw,nosuid,nodev,size=32m
@@ -42,10 +42,10 @@ services:
       database:
         condition: service_healthy
     environment:
-      ADMIN_PASSWORD: vapache-wagtail-password-42
-      DATABASE_URL: postgres://bakerydemo:vapache-wagtail-db@database/bakerydemo
+      ADMIN_PASSWORD: httpd-rs-wagtail-password-42
+      DATABASE_URL: postgres://bakerydemo:httpd-rs-wagtail-db@database/bakerydemo
       DJANGO_ALLOWED_HOSTS: 127.0.0.1,deployment.test
-      DJANGO_SECRET_KEY: vapache-wagtail-integration-secret
+      DJANGO_SECRET_KEY: httpd-rs-wagtail-integration-secret
       REDIS_URL: ""
       SECURE_HSTS_SECONDS: "0"
       SECURE_SSL_REDIRECT: "False"

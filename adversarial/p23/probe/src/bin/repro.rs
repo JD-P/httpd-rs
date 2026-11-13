@@ -1,5 +1,5 @@
 use pcre2_c_oracle::bytes as oracle;
-use vapache_pcre2::bytes as rust;
+use httpd_rs_pcre2::bytes as rust;
 
 fn rbuild(p: &str, flags: (bool, bool, bool, bool)) -> Result<rust::Regex, String> {
     let (i, s, m, crlf) = flags;
@@ -123,7 +123,7 @@ fn main() {
     show("P23-F inline-x-class", r"(?x)[ a#b ]", b" ", n);
     show("P23-F scoped-x", r"(?x:\Qa b\E)", b"a b", n);
 
-    show("P23-G keep-name", r"a(?P<__vapache_pcre2_keep_0>b)", b"ab", n);
+    show("P23-G keep-name", r"a(?P<__httpd_rs_pcre2_keep_0>b)", b"ab", n);
 
     show("P23-H octal101", r"\101", b"A", n);
     show("P23-H octal10", r"\10", b"\x08", n);

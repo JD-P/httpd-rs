@@ -122,8 +122,8 @@ pub(crate) enum PayloadValueSchema {
 }
 
 impl PayloadValueSchema {
-    pub(crate) const fn semantic_kind(self) -> vapache_verified::ConfigSemanticKind {
-        use vapache_verified::ConfigSemanticKind as Kind;
+    pub(crate) const fn semantic_kind(self) -> httpd_rs_verified::ConfigSemanticKind {
+        use httpd_rs_verified::ConfigSemanticKind as Kind;
         match self {
             Self::Tokens => Kind::Tokens,
             Self::DirectoryIndex => Kind::DirectoryIndex,
@@ -304,7 +304,7 @@ impl SealedHeader {
 
 #[derive(Debug, Clone)]
 enum SealedValue {
-    TokenClass(vapache_verified::ConfigSemanticKind),
+    TokenClass(httpd_rs_verified::ConfigSemanticKind),
     Capability(crate::config::Capability, bool),
     FastCgiStablePath(Option<crate::config::FastCgiStablePathPolicy>),
     ServerAliases(Vec<String>),
@@ -352,8 +352,8 @@ enum SealedValue {
 }
 
 impl SealedValue {
-    fn semantic_kind(&self) -> vapache_verified::ConfigSemanticKind {
-        use vapache_verified::ConfigSemanticKind as Kind;
+    fn semantic_kind(&self) -> httpd_rs_verified::ConfigSemanticKind {
+        use httpd_rs_verified::ConfigSemanticKind as Kind;
         match self {
             Self::TokenClass(kind) => *kind,
             Self::Capability(_, _) => Kind::Capability,
@@ -409,7 +409,7 @@ impl SealedValue {
 pub(crate) struct SealedPayload {
     args: Box<[String]>,
     value: SealedValue,
-    semantic_kind: vapache_verified::ConfigSemanticKind,
+    semantic_kind: httpd_rs_verified::ConfigSemanticKind,
 }
 
 impl SealedPayload {
@@ -419,14 +419,14 @@ impl SealedPayload {
         schema: PayloadSchema,
     ) -> Result<Self, String> {
         let has_empty = args.iter().any(String::is_empty);
-        if !vapache_verified::config_payload_schema_admit(
+        if !httpd_rs_verified::config_payload_schema_admit(
             args.len(),
             schema.arity.min,
             schema.arity.max,
             schema.reject_empty,
             has_empty,
         ) {
-            if !vapache_verified::config_argument_arity_admit(
+            if !httpd_rs_verified::config_argument_arity_admit(
                 args.len(),
                 schema.arity.min,
                 schema.arity.max,
@@ -448,7 +448,7 @@ impl SealedPayload {
             PayloadValueSchema::DirectoryIndex => {
                 for name in &args {
                     let bytes = name.as_bytes();
-                    if !vapache_verified::directory_index_name_admit(
+                    if !httpd_rs_verified::directory_index_name_admit(
                         !name.is_empty(),
                         matches!(name.as_str(), "." | ".."),
                         bytes.iter().any(|byte| matches!(*byte, b'/' | b'\\')),
@@ -465,7 +465,7 @@ impl SealedPayload {
                 SealedValue::TokenClass(schema_kind)
             }
             PayloadValueSchema::OnOff => match args.as_slice() {
-                [value] => match vapache_verified::config_on_off(value.as_bytes()) {
+                [value] => match httpd_rs_verified::config_on_off(value.as_bytes()) {
                     Some(value) => SealedValue::OnOff(value),
                     None => {
                         return Err(format!(
@@ -481,8 +481,8 @@ impl SealedPayload {
             },
             PayloadValueSchema::Unsigned { min, max } => {
                 let value = match args.as_slice() {
-                    [value] => vapache_verified::config_bounded_unsigned(
-                        vapache_verified::parse_decimal_u64(value.as_bytes()),
+                    [value] => httpd_rs_verified::config_bounded_unsigned(
+                        httpd_rs_verified::parse_decimal_u64(value.as_bytes()),
                         min,
                         max,
                     ),
@@ -502,7 +502,7 @@ impl SealedPayload {
                             .iter()
                             .map(|keyword| keyword.as_bytes().to_vec())
                             .collect::<Vec<_>>();
-                        vapache_verified::config_keyword_index(value.as_bytes(), &vocabulary)
+                        httpd_rs_verified::config_keyword_index(value.as_bytes(), &vocabulary)
                     }
                     _ => None,
                 }
@@ -767,9 +767,9 @@ impl SealedPayload {
             }
             PayloadValueSchema::Validated(PayloadValidation::Capability) => {
                 let capability = crate::config::Capability::parse(&args[0])
-                    .ok_or_else(|| format!("unknown vapache capability '{}'", args[0]))?;
-                let enabled = vapache_verified::config_on_off(args[1].as_bytes())
-                    .ok_or_else(|| "VapacheCapability requires On or Off".to_string())?;
+                    .ok_or_else(|| format!("unknown httpd-rs capability '{}'", args[0]))?;
+                let enabled = httpd_rs_verified::config_on_off(args[1].as_bytes())
+                    .ok_or_else(|| "HttpdRsCapability requires On or Off".to_string())?;
                 SealedValue::Capability(capability, enabled)
             }
             PayloadValueSchema::Validated(PayloadValidation::FastCgiStablePath) => {
@@ -777,20 +777,20 @@ impl SealedPayload {
                     SealedValue::FastCgiStablePath(None)
                 } else {
                     if args.len() < 5 || !args[0].eq_ignore_ascii_case("on") {
-                        return Err("VapacheFastCGIStablePath requires 'Off' or 'On <unix-endpoint> <backend-uid> <endpoint-owner-uid> <trusted-owner-uid>...'".into());
+                        return Err("HttpdRsFastCGIStablePath requires 'Off' or 'On <unix-endpoint> <backend-uid> <endpoint-owner-uid> <trusted-owner-uid>...'".into());
                     }
                     let endpoint = crate::config::parse_fastcgi_policy_endpoint(&args[1])?;
                     if matches!(endpoint, crate::config::FastCgiEndpoint::Tcp { .. }) {
-                        return Err("VapacheFastCGIStablePath requires a Unix socket; TCP cannot authenticate the backend process".into());
+                        return Err("HttpdRsFastCGIStablePath requires a Unix socket; TCP cannot authenticate the backend process".into());
                     }
                     let parse_uid = |raw: &str, field: &str| {
-                        vapache_verified::parse_decimal_u64(raw.as_bytes())
+                        httpd_rs_verified::parse_decimal_u64(raw.as_bytes())
                             .and_then(|value| u32::try_from(value).ok())
                             .ok_or_else(|| format!("invalid {field} uid '{raw}'"))
                     };
                     let backend_uid = parse_uid(&args[2], "FastCGI backend")?;
                     if backend_uid == 0 {
-                        return Err("VapacheFastCGIStablePath rejects uid 0 backends".into());
+                        return Err("HttpdRsFastCGIStablePath rejects uid 0 backends".into());
                     }
                     let endpoint_owner_uid = parse_uid(&args[3], "Unix FastCGI endpoint-owner")?;
                     let mut trusted_owner_uids = Vec::new();
@@ -853,7 +853,7 @@ impl SealedPayload {
                 SealedValue::TokenClass(schema_kind)
             }
         };
-        if !vapache_verified::config_semantic_seal_admit(
+        if !httpd_rs_verified::config_semantic_seal_admit(
             schema_kind,
             value.semantic_kind(),
             source_argument_count,
@@ -870,8 +870,8 @@ impl SealedPayload {
         })
     }
 
-    pub(crate) fn refines(&self, consumer: vapache_verified::ConfigSemanticKind) -> bool {
-        vapache_verified::config_semantic_projection_admit(self.semantic_kind, consumer)
+    pub(crate) fn refines(&self, consumer: httpd_rs_verified::ConfigSemanticKind) -> bool {
+        httpd_rs_verified::config_semantic_projection_admit(self.semantic_kind, consumer)
     }
 
     pub(crate) fn as_slice(&self) -> &[String] {
@@ -879,7 +879,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn capability(&self) -> Option<(crate::config::Capability, bool)> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::Capability) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::Capability) {
             return None;
         }
         match self.value {
@@ -891,7 +891,7 @@ impl SealedPayload {
     pub(crate) fn fastcgi_stable_path(
         &self,
     ) -> Option<&Option<crate::config::FastCgiStablePathPolicy>> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::FastCgiStablePath) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::FastCgiStablePath) {
             return None;
         }
         match &self.value {
@@ -901,7 +901,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn server_aliases(&self) -> Option<&[String]> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::ServerAliases) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::ServerAliases) {
             return None;
         }
         match &self.value {
@@ -911,7 +911,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn rewrite_map(&self) -> Option<&SealedRewriteMap> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::RewriteMap) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::RewriteMap) {
             return None;
         }
         match &self.value {
@@ -921,7 +921,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn log_level(&self) -> Option<&str> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::LogLevel) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::LogLevel) {
             return None;
         }
         match &self.value {
@@ -931,7 +931,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn ssl_session_cache(&self) -> Option<bool> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::SslSessionCache) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::SslSessionCache) {
             return None;
         }
         match self.value {
@@ -941,7 +941,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn balancer_member(&self) -> Option<&crate::config::BalancerMember> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::BalancerMember) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::BalancerMember) {
             return None;
         }
         match &self.value {
@@ -951,7 +951,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn proxy_set(&self) -> Option<&SealedProxySet> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::ProxySet) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::ProxySet) {
             return None;
         }
         match &self.value {
@@ -961,7 +961,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn proxy_health_template(&self) -> Option<(&str, &crate::config::HealthTemplate)> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::ProxyHealthTemplate) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::ProxyHealthTemplate) {
             return None;
         }
         match &self.value {
@@ -971,7 +971,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn allow_override(&self) -> Option<&SealedAllowOverride> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::AllowOverride) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::AllowOverride) {
             return None;
         }
         match &self.value {
@@ -981,7 +981,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn allow_override_list(&self) -> Option<&SealedAllowOverrideList> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::AllowOverrideList) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::AllowOverrideList) {
             return None;
         }
         match &self.value {
@@ -991,7 +991,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn on_off(&self) -> Option<bool> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::OnOff) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::OnOff) {
             return None;
         }
         match self.value {
@@ -1001,7 +1001,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn unsigned(&self) -> Option<u64> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::Unsigned) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::Unsigned) {
             return None;
         }
         match self.value {
@@ -1011,7 +1011,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn keyword(&self) -> Option<usize> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::Keyword) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::Keyword) {
             return None;
         }
         match self.value {
@@ -1021,7 +1021,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn options(&self) -> Option<&SealedOptions> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::Options) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::Options) {
             return None;
         }
         match &self.value {
@@ -1031,7 +1031,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn require(&self) -> Option<&crate::config::Require> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::Require) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::Require) {
             return None;
         }
         match &self.value {
@@ -1041,7 +1041,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn legacy_hosts(&self) -> Option<&[crate::config::HostSpec]> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::LegacyHosts) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::LegacyHosts) {
             return None;
         }
         match &self.value {
@@ -1051,7 +1051,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn file_etag(&self) -> Option<u32> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::FileEtag) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::FileEtag) {
             return None;
         }
         match self.value {
@@ -1061,7 +1061,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn error_document(&self) -> Option<(u16, &crate::config::ErrorDoc)> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::ErrorDocument) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::ErrorDocument) {
             return None;
         }
         match &self.value {
@@ -1071,7 +1071,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn header(&self) -> Option<&SealedHeader> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::Header) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::Header) {
             return None;
         }
         match &self.value {
@@ -1081,7 +1081,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn redirect(&self) -> Option<&crate::config::Redirect> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::Redirect) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::Redirect) {
             return None;
         }
         match &self.value {
@@ -1091,7 +1091,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn rewrite_cond(&self) -> Option<&crate::config::RewriteCond> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::RewriteCond) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::RewriteCond) {
             return None;
         }
         match &self.value {
@@ -1101,7 +1101,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn rewrite_rule(&self) -> Option<&crate::config::RewriteRule> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::RewriteRule) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::RewriteRule) {
             return None;
         }
         match &self.value {
@@ -1111,7 +1111,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn http_protocols(&self) -> Option<&[crate::config::HttpProtocol]> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::HttpProtocols) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::HttpProtocols) {
             return None;
         }
         match &self.value {
@@ -1121,7 +1121,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn expires_default(&self) -> Option<&str> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::ExpiresDefault) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::ExpiresDefault) {
             return None;
         }
         match &self.value {
@@ -1131,7 +1131,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn expires_by_type(&self) -> Option<(&str, &str)> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::ExpiresByType) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::ExpiresByType) {
             return None;
         }
         match &self.value {
@@ -1141,7 +1141,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn environment_rule(&self) -> Option<&crate::config::EnvRule> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::EnvironmentRule) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::EnvironmentRule) {
             return None;
         }
         match &self.value {
@@ -1151,7 +1151,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn glob_patterns(&self) -> Option<&[String]> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::GlobPatterns) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::GlobPatterns) {
             return None;
         }
         match &self.value {
@@ -1161,7 +1161,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn allow_methods(&self) -> Option<&crate::config::AllowMethods> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::AllowMethods) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::AllowMethods) {
             return None;
         }
         match &self.value {
@@ -1173,7 +1173,7 @@ impl SealedPayload {
     pub(crate) fn request_read_timeout(
         &self,
     ) -> Option<(Option<Duration>, Option<Duration>, Option<u64>, Option<u64>)> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::RequestReadTimeout) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::RequestReadTimeout) {
             return None;
         }
         match self.value {
@@ -1188,7 +1188,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn listen(&self) -> Option<&crate::config::ListenSpec> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::Listen) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::Listen) {
             return None;
         }
         match &self.value {
@@ -1198,7 +1198,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn remote_ip_networks(&self) -> Option<&[(IpAddr, u8)]> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::RemoteIpNetworks) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::RemoteIpNetworks) {
             return None;
         }
         match &self.value {
@@ -1208,7 +1208,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn ssl_protocol(&self) -> Option<&str> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::SslProtocol) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::SslProtocol) {
             return None;
         }
         match &self.value {
@@ -1218,7 +1218,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn unit_float(&self) -> Option<f64> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::UnitFloat) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::UnitFloat) {
             return None;
         }
         match self.value {
@@ -1228,7 +1228,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn ocsp_responder_url(&self) -> Option<&str> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::OcspResponderUrl) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::OcspResponderUrl) {
             return None;
         }
         match &self.value {
@@ -1238,7 +1238,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn alias_regex(&self) -> Option<&SealedAliasRegex> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::AliasRegex) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::AliasRegex) {
             return None;
         }
         match &self.value {
@@ -1248,7 +1248,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn proxy_pass(&self) -> Option<&SealedProxyPass> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::ProxyPass) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::ProxyPass) {
             return None;
         }
         match &self.value {
@@ -1258,7 +1258,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn proxy_pass_reverse(&self) -> Option<&SealedProxyReverse> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::ProxyPassReverse) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::ProxyPassReverse) {
             return None;
         }
         match &self.value {
@@ -1268,7 +1268,7 @@ impl SealedPayload {
     }
 
     pub(crate) fn proxy_pass_match(&self) -> Option<&SealedProxyMatch> {
-        if !self.refines(vapache_verified::ConfigSemanticKind::ProxyPassMatch) {
+        if !self.refines(httpd_rs_verified::ConfigSemanticKind::ProxyPassMatch) {
             return None;
         }
         match &self.value {
@@ -1399,7 +1399,7 @@ fn validate_compatibility_payload(
                 return Err("SSLRandomSeed requires startup|connect, a builtin/file:/exec:/egd: source, and optional byte count".into());
             }
             if args.get(2).is_some_and(|value| {
-                vapache_verified::parse_decimal_u64(value.as_bytes()).is_none()
+                httpd_rs_verified::parse_decimal_u64(value.as_bytes()).is_none()
             }) {
                 return Err("SSLRandomSeed requires startup|connect, a builtin/file:/exec:/egd: source, and optional byte count".into());
             }
@@ -1645,7 +1645,8 @@ fn parse_duration(value: &str) -> Option<Duration> {
     } else {
         (value, 1_000)
     };
-    let millis = vapache_verified::parse_decimal_u64(digits.as_bytes())?.checked_mul(multiplier)?;
+    let millis =
+        httpd_rs_verified::parse_decimal_u64(digits.as_bytes())?.checked_mul(multiplier)?;
     Some(Duration::from_millis(millis))
 }
 
@@ -1895,7 +1896,7 @@ mod tests {
 
     #[test]
     fn semantic_refinement_codes_are_complete_and_projections_fail_closed() {
-        use vapache_verified::ConfigSemanticKind as Kind;
+        use httpd_rs_verified::ConfigSemanticKind as Kind;
         let kinds = [
             Kind::Tokens,
             Kind::DirectoryIndex,
@@ -1946,7 +1947,7 @@ mod tests {
         ];
         let mut codes = kinds
             .into_iter()
-            .map(vapache_verified::config_semantic_kind_code)
+            .map(httpd_rs_verified::config_semantic_kind_code)
             .collect::<Vec<_>>();
         codes.sort_unstable();
         assert_eq!(codes, (0u8..46).collect::<Vec<_>>());
@@ -1962,19 +1963,19 @@ mod tests {
         assert_eq!(toggle.keyword(), None);
         assert!(toggle.refines(Kind::OnOff));
         assert!(!toggle.refines(Kind::Tokens));
-        assert!(vapache_verified::config_semantic_seal_admit(
+        assert!(httpd_rs_verified::config_semantic_seal_admit(
             Kind::OnOff,
             Kind::OnOff,
             1,
             1
         ));
-        assert!(!vapache_verified::config_semantic_seal_admit(
+        assert!(!httpd_rs_verified::config_semantic_seal_admit(
             Kind::OnOff,
             Kind::Unsigned,
             1,
             1
         ));
-        assert!(!vapache_verified::config_semantic_seal_admit(
+        assert!(!httpd_rs_verified::config_semantic_seal_admit(
             Kind::OnOff,
             Kind::OnOff,
             1,
@@ -1985,7 +1986,7 @@ mod tests {
     #[test]
     fn effectful_validated_payloads_are_compiled_once() {
         let capability = SealedPayload::seal(
-            "vapachecapability",
+            "httpdrscapability",
             vec!["FastCgi".into(), "oN".into()],
             PayloadSchema::typed(
                 PayloadArity::TWO,
@@ -2001,7 +2002,7 @@ mod tests {
         assert!(capability.fastcgi_stable_path().is_none());
 
         let stable = SealedPayload::seal(
-            "vapachefastcgistablepath",
+            "httpdrsfastcgistablepath",
             vec![
                 "On".into(),
                 "unix:/run/php.sock".into(),

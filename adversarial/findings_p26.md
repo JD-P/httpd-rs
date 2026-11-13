@@ -12,9 +12,9 @@
     (pre-fix binary `fbb26fd` populates a persisted cache; the P25 fix
     binary `5545d7f` serves from it).
   - `/tmp/opencode/p26-cache-repro/slow.py` — P26-B slow-download
-    differential (vapache HEAD vs Apache 2.4.69, both `Timeout 2`).
-- **Retained evidence:** build trees `/tmp/opencode/vapache-p26-old`
-  (`fbb26fd`) and `/tmp/opencode/vapache-p26-fix` (`5545d7f`); fixtures and
+    differential (httpd-rs HEAD vs Apache 2.4.69, both `Timeout 2`).
+- **Retained evidence:** build trees `/tmp/opencode/httpd-rs-p26-old`
+  (`fbb26fd`) and `/tmp/opencode/httpd-rs-p26-fix` (`5545d7f`); fixtures and
   logs under `/tmp/opencode/p26-cache-repro/work` and
   `/tmp/opencode/p26-slow`.
 - **Method:** source review of the P25 remediation and the protocol-boundary
@@ -26,7 +26,7 @@
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
 | **P26-A** | The P25-A trailing-slash fix is applied in `dispatch_inner` **after** the cache lookup in `dispatch_inner_request`. The fix commit `5545d7f` neither bumps `CACHE_EPOCH` nor changes the cache-key policy material. A cache entry for `/private.txt/` written by the immediately preceding release (`fbb26fd`/`93d6172`, which still served the file) therefore remains valid after upgrading to `5545d7f`, and the protected bytes are served from the cache, bypassing the new 404. HEAD is safe only because later commits incidentally changed the policy-fingerprint material (invalidating the key), not because the fix deliberately invalidated the cache. | `404` for `/private.txt/` | upgrade to `5545d7f`: `200` + `SECRET-CONTENT` from the persisted cache; HEAD: `404` only because its cache key material changed | authorization bypass via stale persisted cache (incomplete remediation) |
 | **P26-B** | The P25-B fix gives the whole response an **absolute total deadline** (`deadline = now + Timeout`). A legitimate client that reads slowly but continuously is disconnected when the total deadline expires, truncating the transfer. Apache's `Timeout` is per-I/O and keeps sending while the client makes progress. | continues sending while the client reads within each `Timeout` interval | aborts at about `Timeout`; a 64 MiB file read at ~1 MiB/s is cut off after ~4.3 s at `Timeout 2` | availability regression / legitimate download truncation introduced by the P25-B remediation |
@@ -183,7 +183,7 @@ write the response, not the time a single write may stall.
 
 Apache's `Timeout` is per-I/O: a client that keeps reading (each read within
 the interval) receives the whole object even if the transfer takes longer
-than `Timeout`. The new vapache deadline instead aborts the connection once
+than `Timeout`. The new httpd-rs deadline instead aborts the connection once
 `now >= deadline`, regardless of whether the client is still making
 progress. For large files on slow links (mobile, congested uplinks, large
 video/archive downloads), the transfer is truncated at `Timeout`.
@@ -194,11 +194,11 @@ video/archive downloads), the transfer is truncated at `Timeout`.
 client reads 64 KiB then sleeps 62.5 ms ≈ 1 MiB/s for up to 6 s):
 
 ```text
-vapache: bytes=4423951 elapsed=4.32s closed=True
+httpd-rs: bytes=4423951 elapsed=4.32s closed=True
 apache: bytes=6255552 elapsed=6.01s closed=False
 ```
 
-- vapache aborted at its ~2 s deadline; the client drained the ~2.5 MiB
+- httpd-rs aborted at its ~2 s deadline; the client drained the ~2.5 MiB
   socket buffer and saw EOF at 4.32 s after receiving only 4.42 MB of the
   64 MiB object. A real client would see a truncated/aborted download.
 - Apache kept sending for the whole 6.01 s test window (6.26 MB read) and
@@ -252,14 +252,14 @@ apache: bytes=6255552 elapsed=6.01s closed=False
 ## 5. Reproduction
 
 ```sh
-cd /root/vapache
-cargo build --release -p vapached
+cd /root/httpd-rs
+cargo build --release -p httpd-rs
 
 # P26-A: build the pre-fix and fix binaries in separate worktrees
-git worktree add /tmp/opencode/vapache-p26-old fbb26fd
-git worktree add /tmp/opencode/vapache-p26-fix 5545d7f
-(cd /tmp/opencode/vapache-p26-old && cargo build --release -p vapached)
-(cd /tmp/opencode/vapache-p26-fix && cargo build --release -p vapached)
+git worktree add /tmp/opencode/httpd-rs-p26-old fbb26fd
+git worktree add /tmp/opencode/httpd-rs-p26-fix 5545d7f
+(cd /tmp/opencode/httpd-rs-p26-old && cargo build --release -p httpd-rs)
+(cd /tmp/opencode/httpd-rs-p26-fix && cargo build --release -p httpd-rs)
 python3 /tmp/opencode/p26-cache-repro/repro.py
 
 # P26-B: slow-download differential (requires Apache 2.4.69 modules)
@@ -282,5 +282,5 @@ the P26-B harness leaves `/tmp/opencode/p26-slow` for inspection.
   against Apache.
 - `/tmp/opencode/p26-cache-repro/work/cache/` — persisted meta/body files
   from the P26-A run (`G 1`, `S 200`, key and policy fingerprint).
-- `/tmp/opencode/vapache-p26-old/` — worktree at `fbb26fd`.
-- `/tmp/opencode/vapache-p26-fix/` — worktree at `5545d7f`.
+- `/tmp/opencode/httpd-rs-p26-old/` — worktree at `fbb26fd`.
+- `/tmp/opencode/httpd-rs-p26-fix/` — worktree at `5545d7f`.

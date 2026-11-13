@@ -23,7 +23,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 140137.65,
           "mean_ms": 1.74,
           "p99_ms": 37.44,
@@ -59,7 +59,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 148470.56,
           "mean_ms": 0.3473,
           "p99_ms": 1.15,
@@ -95,7 +95,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 142383.36,
           "mean_ms": 0.35878,
           "p99_ms": 1.44,
@@ -131,7 +131,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 10867.25,
           "mean_ms": 0.96,
           "p99_ms": 3.06,
@@ -167,7 +167,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 119769.8,
           "mean_ms": 0.534,
           "p99_ms": 1.0,
@@ -203,7 +203,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 170731.71,
           "mean_ms": 0.30233,
           "p99_ms": 1.02,
@@ -239,7 +239,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 164889.23,
           "mean_ms": 0.3132,
           "p99_ms": 0.96,
@@ -275,7 +275,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 186648.9,
           "mean_ms": 0.27727999999999997,
           "p99_ms": 1.02,
@@ -311,7 +311,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 119605.14,
           "mean_ms": 0.45413,
           "p99_ms": 1.29,
@@ -347,7 +347,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 94260.04,
           "mean_ms": 0.61227,
           "p99_ms": 1.67,
@@ -383,7 +383,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 188898.49,
           "mean_ms": 0.27001,
           "p99_ms": 1.03,
@@ -419,7 +419,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 210477.87,
           "mean_ms": 0.24192,
           "p99_ms": 1.12,
@@ -455,7 +455,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 166421.45,
           "mean_ms": 0.31786000000000003,
           "p99_ms": 1.23,
@@ -491,7 +491,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 123701.27,
           "mean_ms": 0.44266,
           "p99_ms": 1.31,
@@ -527,7 +527,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 170387.6,
           "mean_ms": 0.31894,
           "p99_ms": 1.44,
@@ -563,7 +563,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 165118.89,
           "mean_ms": 0.31593,
           "p99_ms": 1.09,
@@ -599,7 +599,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 207117.9,
           "mean_ms": 0.24691,
           "p99_ms": 1.14,
@@ -635,7 +635,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 164702.33,
           "mean_ms": 0.31615,
           "p99_ms": 1.15,
@@ -671,7 +671,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 165866.61,
           "mean_ms": 0.31581,
           "p99_ms": 1.11,
@@ -707,7 +707,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 162204.99,
           "mean_ms": 0.3348,
           "p99_ms": 1.39,
@@ -743,7 +743,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 204709.94,
           "mean_ms": 0.29956,
           "p99_ms": 1.94,
@@ -779,7 +779,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 208101.28,
           "mean_ms": 0.25448,
           "p99_ms": 1.21,
@@ -815,7 +815,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 153422.36,
           "mean_ms": 0.39792,
           "p99_ms": 2.28,
@@ -851,7 +851,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 189630.7,
           "mean_ms": 0.28901,
           "p99_ms": 1.91,
@@ -887,7 +887,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 151582.26,
           "mean_ms": 0.37206,
           "p99_ms": 1.85,
@@ -923,7 +923,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 4368.38,
           "mean_ms": 7.62,
           "p99_ms": 24.53,
@@ -959,7 +959,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 4369.54,
           "mean_ms": 7.48,
           "p99_ms": 21.84,
@@ -995,7 +995,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 137462.26,
           "mean_ms": 0.39266,
           "p99_ms": 1.09,
@@ -1031,7 +1031,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 203874.58,
           "mean_ms": 0.29513,
           "p99_ms": 2.11,
@@ -1067,7 +1067,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 2933.65,
           "mean_ms": 1.1,
           "p99_ms": 2.45,
@@ -1103,7 +1103,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 192278.65,
           "mean_ms": 0.26638999999999996,
           "p99_ms": 1.22,
@@ -1139,7 +1139,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 2542.13,
           "mean_ms": 53.87,
           "p99_ms": 923.65,
@@ -1175,7 +1175,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 123650.13,
           "mean_ms": 0.44381,
           "p99_ms": 1.23,
@@ -1211,7 +1211,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 49816.04,
           "mean_ms": 1.46,
           "p99_ms": 8.81,
@@ -1247,7 +1247,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 83227.7,
           "mean_ms": 0.82401,
           "p99_ms": 5.38,
@@ -1283,7 +1283,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 124099.6,
           "mean_ms": 0.46463,
           "p99_ms": 2.12,
@@ -1319,7 +1319,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 3344.24,
           "mean_ms": 9.7,
           "p99_ms": 25.44,
@@ -1355,7 +1355,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 4582.7,
           "mean_ms": 3.491,
           "p99_ms": 6.0,
@@ -1397,7 +1397,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 83722.0,
           "mean_ms": 0.749,
           "p99_ms": null,
@@ -1445,7 +1445,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 268016.0,
           "mean_ms": 3.34,
           "p99_ms": null,
@@ -1493,7 +1493,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 180029.0,
           "mean_ms": 3.9,
           "p99_ms": null,
@@ -1541,7 +1541,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 5216.0,
           "mean_ms": 8.98,
           "p99_ms": null,
@@ -1589,7 +1589,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 186912.0,
           "mean_ms": 4.79,
           "p99_ms": null,
@@ -1637,7 +1637,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 154656.0,
           "mean_ms": 6.21,
           "p99_ms": null,
@@ -1685,7 +1685,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 134960.0,
           "mean_ms": 7.36,
           "p99_ms": null,
@@ -1733,7 +1733,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 2760.0,
           "mean_ms": 92.03,
           "p99_ms": null,
@@ -1781,7 +1781,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 4280.0,
           "mean_ms": 14.91,
           "p99_ms": null,
@@ -1807,11 +1807,11 @@
   ],
   "config_test_ms": {
     "apache": 18.146435992093757,
-    "vapache": 4.416169002070092
+    "httpd-rs": 4.416169002070092
   },
   "config_test_errors": {
     "apache": "",
-    "vapache": ""
+    "httpd-rs": ""
   },
   "memory": {
     "apache": {
@@ -1819,7 +1819,7 @@
       "threads": 385,
       "pss_kb": 113977
     },
-    "vapache": {
+    "httpd-rs": {
       "processes": 17,
       "threads": 20,
       "pss_kb": 46583

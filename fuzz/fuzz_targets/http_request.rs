@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use std::io::Cursor;
-use vapached::http::{read_request, Limits};
+use httpd_rs::http::{read_request, Limits};
 
 fuzz_target!(|data: &[u8]| {
     let mut input = Cursor::new(data.to_vec());

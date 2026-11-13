@@ -1,0 +1,39 @@
+[Unit]
+Description=httpd-rs HTTP Server
+Documentation=https://github.com/JD-P/httpd-rs
+After=network.target remote-fs.target nss-lookup.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/httpd-rs
+EnvironmentFile=-/etc/sysconfig/httpd-rs
+UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH ENV BASH_ENV SHELLOPTS BASHOPTS CDPATH IFS GCONV_PATH PYTHONPATH PERL5LIB RUBYLIB
+ExecStartPre=/usr/sbin/httpd-rsctl configtest
+ExecStart=/usr/sbin/httpd-rsctl foreground
+ExecReload=/usr/sbin/httpd-rsctl graceful
+KillMode=mixed
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+UMask=0027
+LockPersonality=true
+RemoveIPC=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=full
+RestrictRealtime=true
+# RestrictSUIDSGID's seccomp policy makes openat2 return ENOSYS. httpd-rs needs
+# openat2 for descriptor-contained configuration and content path resolution.
+SystemCallArchitectures=native
+Restart=on-abort
+OOMPolicy=continue
+LimitNOFILE=8192
+TasksMax=2048
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=multi-user.target

@@ -94,22 +94,22 @@ impl State {
     /// peer-frame admission machine. This is the only mapping used before
     /// HEADERS and DATA are dispatched, so closed streams cannot be mistaken
     /// for ordinary trailer/body states by separate ad-hoc branches.
-    pub fn peer_recv_phase(&self) -> vapache_verified::H2PeerStreamPhase {
+    pub fn peer_recv_phase(&self) -> httpd_rs_verified::H2PeerStreamPhase {
         match &self.inner {
-            Idle => vapache_verified::H2PeerStreamPhase::Idle,
+            Idle => httpd_rs_verified::H2PeerStreamPhase::Idle,
             ReservedLocal | ReservedRemote | Open { .. } | HalfClosedLocal(..) => {
-                vapache_verified::H2PeerStreamPhase::Open
+                httpd_rs_verified::H2PeerStreamPhase::Open
             }
-            HalfClosedRemote(..) => vapache_verified::H2PeerStreamPhase::HalfClosedRemote,
-            Closed(Cause::EndStream) => vapache_verified::H2PeerStreamPhase::ClosedEndStream,
+            HalfClosedRemote(..) => httpd_rs_verified::H2PeerStreamPhase::HalfClosedRemote,
+            Closed(Cause::EndStream) => httpd_rs_verified::H2PeerStreamPhase::ClosedEndStream,
             Closed(Cause::ScheduledLibraryReset(..)) => {
-                vapache_verified::H2PeerStreamPhase::ClosedLocalReset
+                httpd_rs_verified::H2PeerStreamPhase::ClosedLocalReset
             }
             Closed(Cause::Error(error) | Cause::ErrorAfterEndStream(error)) => {
                 if error.is_local() {
-                    vapache_verified::H2PeerStreamPhase::ClosedLocalReset
+                    httpd_rs_verified::H2PeerStreamPhase::ClosedLocalReset
                 } else {
-                    vapache_verified::H2PeerStreamPhase::ClosedRemoteReset
+                    httpd_rs_verified::H2PeerStreamPhase::ClosedRemoteReset
                 }
             }
         }

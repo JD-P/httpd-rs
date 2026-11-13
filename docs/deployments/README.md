@@ -13,7 +13,7 @@ evidence summary.
 The feature-to-application rationale is maintained in the
 [application coverage inventory](coverage.md).
 
-| Application | Vapache mode | Workflows exercised |
+| Application | httpd-rs mode | Workflows exercised |
 |---|---|---|
 | Hugo | static | generated routes, custom errors, `.htaccess`, Basic auth, compression, ranges and cache |
 | Gitweb + smart Git HTTP | CGI | query strings, `PATH_INFO`, CGI environment, authentication and a real clone |
@@ -32,9 +32,9 @@ The feature-to-application rationale is maintained in the
 ## Hugo
 
 The generator runs with no network, a read-only container root, no Linux
-capabilities and only the temporary site source mounted. Vapache serves the
+capabilities and only the temporary site source mounted. httpd-rs serves the
 generated `public/` tree directly. The canonical case enables
-`VapacheCapability AccessFiles On` specifically to test a small `.htaccess`
+`HttpdRsCapability AccessFiles On` specifically to test a small `.htaccess`
 rewrite/header policy; deployments that keep all policy in the main
 configuration should leave that capability disabled.
 
@@ -48,7 +48,7 @@ and authenticated response.
 worker pool. This requires the explicit global gate:
 
 ```apache
-VapacheCapability Cgi On
+HttpdRsCapability Cgi On
 ```
 
 The executable and repository trees must not be writable by the service
@@ -62,9 +62,9 @@ smart-HTTP clone, optionally under Basic authentication.
 The tested layout uses a protected Unix socket rather than loopback TCP:
 
 ```apache
-VapacheCapability AccessFiles On
-VapacheCapability FastCgi On
-VapacheFastCGIStablePath On unix:/run/php/php-fpm.sock 33 33 0 DEPLOY_UID
+HttpdRsCapability AccessFiles On
+HttpdRsCapability FastCgi On
+HttpdRsFastCGIStablePath On unix:/run/php/php-fpm.sock 33 33 0 DEPLOY_UID
 ProxyPassMatch ^/(.*\.php(/.*)?)$ \
     "unix:/run/php/php-fpm.sock|fcgi://localhost/srv/wordpress/"
 ```
@@ -92,7 +92,7 @@ The standard WordPress permalink `.htaccess` works with
 
 ## Grafana
 
-Grafana listens on a loopback-only port and Vapache owns the public endpoint.
+Grafana listens on a loopback-only port and httpd-rs owns the public endpoint.
 Both root and `/grafana/` subpath deployments are sampled. The subpath form is:
 
 ```apache
@@ -100,10 +100,10 @@ ProxyPass /grafana/ http://127.0.0.1:3000/
 ProxyPassReverse /grafana/ http://127.0.0.1:3000/
 ```
 
-`GF_SERVER_ROOT_URL` must name the public Vapache URL and
-`GF_SERVER_SERVE_FROM_SUB_PATH` must be enabled for the subpath form. Vapache
+`GF_SERVER_ROOT_URL` must name the public httpd-rs URL and
+`GF_SERVER_SERVE_FROM_SUB_PATH` must be enabled for the subpath form. httpd-rs
 uses the same route for the `/api/live/ws` upgrade. The test opens a real
-Grafana Live WebSocket, reloads Vapache while it is open, and verifies a
+Grafana Live WebSocket, reloads httpd-rs while it is open, and verifies a
 bidirectional ping/pong before closing it.
 
 ## Gitea
@@ -112,7 +112,7 @@ Gitea is part of the stochastic manual population rather than the fixed
 nightly quota. It runs as the invoking unprivileged uid with SQLite state in a
 scenario bind directory, no SSH listener, and an internal-only container
 network. Both root and `/gitea/` mounts are selectable. The workflow creates a
-repository through the API, pushes a commit through Vapache's HTTP proxy, then
+repository through the API, pushes a commit through httpd-rs's HTTP proxy, then
 clones it and checks the resulting content. This covers request bodies and
 streaming behavior that a simple health endpoint would miss.
 
@@ -125,15 +125,15 @@ compatibility adaptations:
 
 - two PCRE negative lookaheads become ordered, bounded rewrite rules;
 - `Header append` becomes the equivalent supported `Header add` form;
-- `RequestHeader unset Proxy` is removed because Vapache never creates
+- `RequestHeader unset Proxy` is removed because httpd-rs never creates
   `HTTP_PROXY` from the request `Proxy` field;
-- `AddEncoding` moves to main configuration, where Vapache supports it.
+- `AddEncoding` moves to main configuration, where httpd-rs supports it.
 
 The adapter fails if those exact upstream lines drift, so a future Drupal
 change cannot silently discard policy. The test installs a real profile,
 loads a clean URL, rejects `composer.json`, rejects direct `.htaccess` access,
 and reloads the server. The FastCGI `SCRIPT_FILENAME` path must exist
-identically in Vapache's and PHP-FPM's mount namespaces.
+identically in httpd-rs's and PHP-FPM's mount namespaces.
 
 ## Jenkins
 
@@ -171,7 +171,7 @@ ProxyPass / http://BACKEND:9000/
 ProxyPassReverse / http://BACKEND:9000/
 ```
 
-Vapache validates the request authority before reconstructing the upstream
+httpd-rs validates the request authority before reconstructing the upstream
 header and preserves its non-default port. The test creates a bucket, uploads
 an approximately 1 MiB object using AWS's per-chunk signature chain, reloads,
 checks a byte range and listing, then removes the object and bucket. Do not
@@ -208,16 +208,16 @@ uses `ProxyPreserveHost On`; the private container address is never accepted
 as an application host. The test reads fixture content through Wagtail's API,
 performs a real CSRF-bound admin login, exercises both one- and two-worker
 Gunicorn configurations, and proves the authenticated session remains valid
-after Vapache reload.
+after httpd-rs reload.
 
 ## Bugzilla through generic FastCGI
 
 Bugzilla is built from a digest-verified 5.2 source commit and served by
 `fcgiwrap` as `www-data`. The executable application tree is root-owned and
 immutable after `checksetup.pl`; only Bugzilla's generated data is writable by
-the worker. Vapache's FastCGI stable-path policy binds the Unix socket to UID
+the worker. httpd-rs's FastCGI stable-path policy binds the Unix socket to UID
 33 and permits only the release owner and root along the script path. The
-socket is mode `0660`, owned by the backend UID and Vapache's service group;
+socket is mode `0660`, owned by the backend UID and httpd-rs's service group;
 unrelated local users cannot bypass the front end. Direct reads of Perl
 modules, templates and `localconfig` are denied. The test uses the real
 two-pass installer, MariaDB, the REST version endpoint through `PATH_INFO`,
@@ -228,7 +228,7 @@ authenticated reload.
 
 Mastodon is the deliberately large operational-composition case. PostgreSQL,
 Redis, Puma, Sidekiq and Mastodon's dedicated Node streaming service share an
-internal-only container network. Vapache is the only public HTTP path. The two
+internal-only container network. httpd-rs is the only public HTTP path. The two
 backends require ordered routes, with the streaming prefix before the general
 web route:
 
@@ -247,7 +247,7 @@ web route:
 
 `LOCAL_DOMAIN` and the preserved public `Host` must agree; do not substitute
 an ephemeral private backend address. Mastodon production mode requires HTTPS;
-terminate TLS at Vapache so its non-spoofable connection state generates the
+terminate TLS at httpd-rs so its non-spoofable connection state generates the
 correct `X-Forwarded-Proto: https`. Do not accept a client-supplied forwarded
 scheme on a plaintext listener. The checked-in cryptographic values and
 database password are isolated test fixtures, not deployment defaults. A real
@@ -255,7 +255,7 @@ installation must generate independent Rails encryption, OTP, VAPID and
 database secrets and retain them across upgrades.
 
 The workflow creates a confirmed local account and scoped bearer token, opens
-an authenticated stream, reloads Vapache, reconnects under the new policy
+an authenticated stream, reloads httpd-rs, reconnects under the new policy
 generation, publishes a real status through Puma, and waits for Sidekiq and
 Redis to deliver that exact status through the streaming WebSocket. One- and
 two-worker Puma layouts plus user and public-local streams are stochastically
@@ -265,6 +265,6 @@ container can see the source checkout.
 ## Future expansion
 
 The representative application inventory is complete. Add another application
-only when it exposes a distinct Vapache boundary rather than duplicating an
+only when it exposes a distinct httpd-rs boundary rather than duplicating an
 implementation language behind ordinary HTTP. CalDAV/CardDAV can deepen the
 existing Nextcloud case without another deployment.

@@ -51,25 +51,25 @@ Example:
 
 Set `ProxyPreserveHost On` only in the virtual host that needs it.
 
-## 3. Use Vapache forwarding headers
+## 3. Use httpd-rs forwarding headers
 
-Vapache removes client-supplied `Forwarded`, `X-Forwarded-For`,
+httpd-rs removes client-supplied `Forwarded`, `X-Forwarded-For`,
 `X-Forwarded-Proto`, and `X-Forwarded-Host` fields. It then emits:
 
-| Field | Vapache source |
+| Field | httpd-rs source |
 |---|---|
 | `X-Forwarded-For` | Client IP address |
 | `X-Forwarded-Proto` | Actual HTTP or TLS state |
 | `X-Forwarded-Host` | Validated public request host |
 
-Configure the backend to trust these fields only from the Vapache proxy
+Configure the backend to trust these fields only from the httpd-rs proxy
 address. Do not use `RequestHeader` to construct a second forwarded-header
-chain. Vapache rejects that unsupported request-mutation policy.
+chain. httpd-rs rejects that unsupported request-mutation policy.
 
 ## 4. Ask your agent to find the application settings
 
 Give your coding agent the application name and version, its proxy deployment
-documentation, the public URL, the private backend endpoint, and the Vapache
+documentation, the public URL, the private backend endpoint, and the httpd-rs
 virtual host.
 
 Ask the agent to return:
@@ -90,8 +90,8 @@ The configuration must not trust forwarded fields from a public client.
 Run:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ curl --fail --show-error --head https://app.example.test/
 ```
 
@@ -104,7 +104,7 @@ Check a redirect from within the prefix and a request outside the prefix.
 Order specific proxy routes before a catch-all route.
 
 If the verification fails, restore the previous proxy directives and reload
-Vapache. Keep the backend on its private endpoint while you correct its public
+httpd-rs. Keep the backend on its private endpoint while you correct its public
 URL or trusted-proxy configuration.
 
 <!--

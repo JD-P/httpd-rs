@@ -16,11 +16,11 @@ socket at `/run/php/wordpress-fpm.sock`. The example domain is
 
 You will install MariaDB, PHP-FPM, and WordPress, separate executable code from
 writable uploads, configure the PHP-FPM socket, enable pretty permalinks, test
-an upload and REST request, and reload Vapache.
+an upload and REST request, and reload httpd-rs.
 
 ## Before you start
 
-Complete [Prepare a Debian VPS for a Vapache
+Complete [Prepare a Debian VPS for a httpd-rs
 tutorial](prepare-debian-vps.md). Point `www.example.test` at the VPS and open
 TCP ports 80 and 443 in the provider firewall. This Debian 13 example uses
 PHP-FPM user ID `33`; the identity check below verifies that value.
@@ -75,7 +75,7 @@ $ sudo -u wordpress-deploy wp core download --version=6.8.3 \
 $ sudo -u wordpress-deploy wp config create --path=/srv/wordpress/current \
     --dbname=wordpress --dbuser=wordpress --prompt=dbpass
 $ sudo -u wordpress-deploy wp core install --path=/srv/wordpress/current \
-    --url=https://www.example.test --title='Vapache WordPress tutorial' \
+    --url=https://www.example.test --title='httpd-rs WordPress tutorial' \
     --admin_user=admin --admin_email=admin@example.test \
     --prompt=admin_password
 $ sudo -u wordpress-deploy wp rewrite structure '/%postname%/' --hard \
@@ -141,7 +141,7 @@ Keep `/srv/wordpress/current` read-only to PHP-FPM. Give PHP-FPM write access to
 `/srv/wordpress/shared/uploads`, and make `wp-content/uploads` refer to that
 writable data path through the deployment process.
 
-## 5. Configure Vapache
+## 5. Configure httpd-rs
 
 Create `/etc/apache2/sites-available/wordpress.conf` with a temporary HTTP-only
 host, enable it, and obtain the certificate:
@@ -154,17 +154,17 @@ host, enable it, and obtain the certificate:
 
 ```console
 $ sudo a2ensite wordpress.conf
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot certonly --apache --domain www.example.test
 ```
 
 Replace it with the final configuration:
 
 ```apache
-VapacheCapability AccessFiles On
-VapacheCapability FastCgi On
-VapacheFastCGIStablePath On unix:/run/php/wordpress-fpm.sock 33 0 0
+HttpdRsCapability AccessFiles On
+HttpdRsCapability FastCgi On
+HttpdRsFastCGIStablePath On unix:/run/php/wordpress-fpm.sock 33 0 0
 
 <VirtualHost *:80>
     ServerName www.example.test
@@ -195,11 +195,11 @@ VapacheFastCGIStablePath On unix:/run/php/wordpress-fpm.sock 33 0 0
 </VirtualHost>
 ```
 
-Test the configuration, reload Vapache, and verify renewal:
+Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -211,11 +211,11 @@ $ curl --fail https://www.example.test/wp-json/
 
 In the WordPress dashboard, upload one PNG file and create a post that uses the
 pretty permalink configured in step 2. Open the resulting post and media URL.
-Place a harmless file named `vapache-test.php` in the upload directory and
+Place a harmless file named `httpd-rs-test.php` in the upload directory and
 confirm that an HTTP request for it is denied rather than executed or returned
 as source. Remove the file after the test.
 
-Reload Vapache and repeat the REST and permalink requests.
+Reload httpd-rs and repeat the REST and permalink requests.
 
 <!--
 Deployment contract only; not operator instructions.

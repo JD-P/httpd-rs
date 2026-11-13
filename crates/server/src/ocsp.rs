@@ -511,7 +511,7 @@ fn fetch_response(
         }
         if let Ok(s) = TcpStream::connect_timeout(&candidate, remaining) {
             let actual = s.peer_addr().ok()?;
-            if vapache_verified::backend_connected_endpoint_admit(actual == candidate, true) {
+            if httpd_rs_verified::backend_connected_endpoint_admit(actual == candidate, true) {
                 stream = Some(s);
                 break;
             }
@@ -1616,7 +1616,7 @@ mod tests {
 
     #[test]
     fn cached_responses_must_be_cryptographically_valid() {
-        let dir = std::env::temp_dir().join(format!("vapache-ocsp-cache-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-ocsp-cache-{}", std::process::id()));
         let path = dir.join("response.ocsp");
         let chain = [
             CertificateDer::from(minimal_cert(None)),
@@ -1635,8 +1635,10 @@ mod tests {
     fn cache_rejects_links_fifos_and_oversized_files() {
         use std::os::unix::fs::symlink;
 
-        let dir =
-            std::env::temp_dir().join(format!("vapache-ocsp-cache-objects-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "httpd-rs-ocsp-cache-objects-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let victim = dir.join("victim");

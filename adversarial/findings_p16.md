@@ -4,12 +4,12 @@
 > environment provenance is excluded from FastCGI parameters; directive
 > regexes use ASCII-default byte semantics; header guards match raw bytes; and
 > the P16-D SetEnvIf semantics are regression-pinned. The retained harness now
-> requires Apache/vapache parity instead of reproducing the differentials, and
+> requires Apache/httpd-rs parity instead of reproducing the differentials, and
 > its FastCGI cases use a built-in protocol mock so PHP-FPM is not required.
 
 - **Date:** 2026-10-28
-- **Subject:** `target/release/vapached` built at HEAD `8454631`. No product source was edited. The only retained additions for this pass are `adversarial/p16/exploit_p16.py`, this write-up and the `adversarial/README.md` index entry.
-- **Build note:** `vendor/h2-0.4.20` is an intentional upstream patch: public `h2` 0.4.20 accepts a `:path` containing a `#` fragment and lets `http::uri::PathAndQuery` truncate it before vapache can validate the pseudo-header. HEAD `8454631` deletes that tree but leaves the `[patch.crates-io] h2 = { path = "vendor/h2-0.4.20" }` entry, so a clean checkout cannot build. The directory was restored from the parent commit with `git checkout 6b781ea -- vendor/h2-0.4.20`; this restores the intended patched dependency and does not participate in any finding.
+- **Subject:** `target/release/httpd-rs` built at HEAD `8454631`. No product source was edited. The only retained additions for this pass are `adversarial/p16/exploit_p16.py`, this write-up and the `adversarial/README.md` index entry.
+- **Build note:** `vendor/h2-0.4.20` is an intentional upstream patch: public `h2` 0.4.20 accepts a `:path` containing a `#` fragment and lets `http::uri::PathAndQuery` truncate it before httpd-rs can validate the pseudo-header. HEAD `8454631` deletes that tree but leaves the `[patch.crates-io] h2 = { path = "vendor/h2-0.4.20" }` entry, so a clean checkout cannot build. The directory was restored from the parent commit with `git checkout 6b781ea -- vendor/h2-0.4.20`; this restores the intended patched dependency and does not participate in any finding.
 - **Oracle:** Apache/2.4.69 (Debian), `/usr/sbin/apache2 -X`, and PHP-FPM 8.4.27 (`php-fpm8.4`, Debian defaults, Unix socket). Loopback only.
 - **Harness:** `adversarial/p16/exploit_p16.py` — 36 differential verdicts across four findings, with twenty Apache/parity controls (§7).
 - **Method:** targeted audit of the environment vector into FastCGI, a differential sweep of the Rust `regex` dialect at every directive-regex compiled through `config.rs::compile_regex`, a raw-byte header sweep of the `SetEnvIf`/`RewriteCond`/expression guard paths, and a comparison of Apache's documented `SetEnvIf` value/chaining/capture semantics.
@@ -18,9 +18,9 @@
 
 ## 1. Executive summary
 
-Four new findings, all rooted in a representation vapache sends or interprets differently from Apache:
+Four new findings, all rooted in a representation httpd-rs sends or interprets differently from Apache:
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
 | **P16-A** | `.htaccess` environment entries are forwarded to FastCGI as PHP-FPM per-request configuration. An attacker-writable access file can inject `PHP_VALUE`/`PHP_ADMIN_VALUE`; `auto_prepend_file` then executes an uploaded non-PHP file as PHP | Access-file `SetEnv`/`SetEnvIf` values (including `PHP_VALUE`) are **not** forwarded by `mod_proxy_fcgi`; request returns `200` without execution. A main-config `SetEnv PHP_VALUE` **is** forwarded | The same access-file `PHP_VALUE`/`PHP_ADMIN_VALUE` reaches PHP-FPM; the uploaded file executes (`PREPEND`, marker written) | remote code execution via untrusted configuration/environment provenance |
 | **P16-B** | Directive regexes use Rust `regex` Unicode class semantics while Apache uses PCRE's ASCII-by-default classes. `\b`, `\W`, `\D`, `\S` therefore change meaning for non-ASCII input | A `RewriteCond` deny guard such as `\badmin\b` matches `éadmin` and returns `403`; the protected CGI does not execute. A positive `SetEnvIf User-Agent ^\w+$` / `Require env` gate does not match `é` and returns `403` | The same deny guard misses `éadmin` and the protected CGI executes (`200`, `EXEC-P16B`). The positive gate matches `é` (Unicode `\w`) and the protected CGI executes, where Apache denies | fail-open access-control guards and over-grant allow gates |
@@ -65,12 +65,12 @@ let ctx = CgiContext {
 let mut r = fastcgi::execute_bound(&ctx, scope, &target, &script_binding);
 ```
 
-`cgi::build_env` appends every admitted entry (`crates/server/src/cgi.rs:266-276`). The admission kernel only rejects invalid keys and variables already calculated by vapache (`crates/server/src/cgi.rs:148-174` — the CGI names plus `HTTP_*`); `PHP_VALUE` and `PHP_ADMIN_VALUE` are neither calculated CGI variables nor `HTTP_*`, so they pass:
+`cgi::build_env` appends every admitted entry (`crates/server/src/cgi.rs:266-276`). The admission kernel only rejects invalid keys and variables already calculated by httpd-rs (`crates/server/src/cgi.rs:148-174` — the CGI names plus `HTTP_*`); `PHP_VALUE` and `PHP_ADMIN_VALUE` are neither calculated CGI variables nor `HTTP_*`, so they pass:
 
 ```rust
 for (k, v) in ctx.env {
     let key_valid = !k.is_empty() && !k.contains('=') && !k.as_bytes().contains(&0);
-    if !vapache_verified::cgi_env_entry_admit(key_valid, reserved_cgi_env(k)) {
+    if !httpd_rs_verified::cgi_env_entry_admit(key_valid, reserved_cgi_env(k)) {
         continue;
     }
     env.retain(|(n, _)| n != k.as_str());
@@ -102,12 +102,12 @@ Requesting any PHP script in the directory executes `avatar.txt` first:
 ```
 GET /index.php
   Apache 2.4.69: 200  (no prepend, no marker)
-  vapache HEAD:  200  (PREPEND, marker written)
+  httpd-rs HEAD:  200  (PREPEND, marker written)
 ```
 
 The battery covers the same primitive through the variants an operator is likely to meet:
 
-| Case | Access-file directive | Override | Apache | vapache |
+| Case | Access-file directive | Override | Apache | httpd-rs |
 |---|---|---|---|---|
 | **A1** | `SetEnv PHP_VALUE auto_prepend_file=uploads/avatar.txt` | `All` | 200, no exec | 200, **exec** |
 | **A2** | `SetEnv PHP_ADMIN_VALUE auto_prepend_file=…` | `All` | 200, no exec | 200, **exec** |
@@ -146,7 +146,7 @@ The FastCGI environment needs a provenance boundary, not another flat denylist:
 
 ```rust
 pub(crate) fn guard_regex(pattern: &str) -> Result<(), String> {
-    if vapache_verified::regex_dialect_admit(pattern.as_bytes()) { Ok(()) }
+    if httpd_rs_verified::regex_dialect_admit(pattern.as_bytes()) { Ok(()) }
     else { Err("unsupported regex dialect: backreferences/look-around/control bytes".into()) }
 }
 
@@ -186,12 +186,12 @@ GET /secret/run.cgi
 X-User: éadmin
 
   Apache 2.4.69: 403  (PCRE ASCII: é is non-word, \b matches before admin)
-  vapache HEAD:  200  EXEC-P16B
+  httpd-rs HEAD:  200  EXEC-P16B
 ```
 
 The other class escapes produce the same differential:
 
-| Case | Pattern | Header | Apache | vapache |
+| Case | Pattern | Header | Apache | httpd-rs |
 |---|---|---|---|---|
 | **B1** | `\badmin\b` | `éadmin` | 403, no exec | 200, **EXEC** |
 | **B1** | `^\W+$` | `é` | 403, no exec | 200, **EXEC** |
@@ -218,9 +218,9 @@ SetEnvIf User-Agent ^\w+$ TRUSTED
 </Directory>
 ```
 
-With `User-Agent: é`, Apache's ASCII PCRE does not match `^\w+$`, `TRUSTED` is absent, and the request is `403`; vapache's Unicode-aware `\w` matches `é`, `TRUSTED` is set, and the same CGI executes:
+With `User-Agent: é`, Apache's ASCII PCRE does not match `^\w+$`, `TRUSTED` is absent, and the request is `403`; httpd-rs's Unicode-aware `\w` matches `é`, `TRUSTED` is set, and the same CGI executes:
 
-| Case | Pattern | User-Agent | Apache | vapache |
+| Case | Pattern | User-Agent | Apache | httpd-rs |
 |---|---|---|---|---|
 | **B2** | `^\w+$` | `é` | 403, no exec | 200, **EXEC** |
 | **B2 control** | `^\w+$` | `abc` | 200, EXEC | 200, EXEC |
@@ -230,8 +230,8 @@ The ASCII and space controls show that the gate is live on both servers; only th
 
 ### 3.3 Impact
 
-- **Fail-open deny guards.** A guard that denies a header/path pattern on Apache can silently stop matching on vapache, exposing the protected resource. The harness's protected resource is an executable CGI; the same shape can protect a `.php` handler, an upload tree, or a rewrite-selected file.
-- **Over-grant allow guards (B2).** The opposite direction is demonstrated by the `SetEnvIf`/`Require env` gate: an allow rule written with `^\w+$`, `^\d+$` or `^\s+$` accepts Unicode input on vapache that Apache rejects. Any security decision that uses these classes as a positive gate inherits the bug.
+- **Fail-open deny guards.** A guard that denies a header/path pattern on Apache can silently stop matching on httpd-rs, exposing the protected resource. The harness's protected resource is an executable CGI; the same shape can protect a `.php` handler, an upload tree, or a rewrite-selected file.
+- **Over-grant allow guards (B2).** The opposite direction is demonstrated by the `SetEnvIf`/`Require env` gate: an allow rule written with `^\w+$`, `^\d+$` or `^\s+$` accepts Unicode input on httpd-rs that Apache rejects. Any security decision that uses these classes as a positive gate inherits the bug.
 - **No `.htaccess` is required.** P16-B works under `AllowOverride None` and the benchmark config, because `RewriteCond`/`RewriteRule`/`SetEnvIf` in the main configuration use the same compiler. The attacker only needs to control the tested header (or, at the other call sites, a path component).
 - **Blast radius beyond rewrite.** `FilesMatch`/`LocationMatch`/`DirectoryMatch`/`AliasMatch`/`RedirectMatch` patterns use `compile_regex` and share the Unicode semantics. A `<FilesMatch "^\W…">`-style deny or allow can differ in the same way; those non-rewrite call sites were not separately differential-tested in this pass, but `SetEnvIf` now is (B2) and the shared compiler is the invariant to fix.
 - The impact is configuration-dependent: it requires a guard/allow rule that uses one of the affected class escapes with attacker-controlled non-ASCII input. It is not an unconditional RCE by itself, but it is a complete bypass of a guard that an operator reasonably expects to behave as Apache does.
@@ -241,7 +241,7 @@ The ASCII and space controls show that the gate is live on both servers; only th
 1. **Compile directive regexes with Apache-compatible ASCII semantics.** The project already uses `pcre2::bytes` for expression regexes (`crates/server/src/expr.rs:11-44`); using the same engine for `compile_regex`, `RewriteCond` and `RewriteRule` removes the dialect split. If a PCRE2 migration is too large for one change, set `unicode(false)` on the Rust `regex` builder at all three sites (and any direct builder) so `\b`, `\w`, `\d`, `\s` and their negations are ASCII, and keep `.` byte-oriented like PCRE.
 2. **Do not leave direct builders behind.** Route `RewriteCond`/`RewriteRule` through the single `compile_regex` helper so a future fix cannot miss them, and add a unit test that compiles the same pattern through every directive parser.
 3. **Add non-ASCII regressions** for `\b`, `\W`, `\D`, `\S`, `\w`, `\d`, `\s` at the `RewriteCond`/`RewriteRule` and `SetEnvIf`/`FilesMatch` sites. The four B1 rows and three B1 controls are the minimal fail-open differential; the B2 row and two controls are the minimal over-grant differential. The normal test suite should also pin the ASCII positive and `xadminx` negative cases.
-4. **Do not "fix" this by rejecting non-ASCII input.** Apache accepts the header/path and makes a policy decision; vapache must make the same decision, not return a different error. The control `<If>` case shows the project already has the correct PCRE behaviour available.
+4. **Do not "fix" this by rejecting non-ASCII input.** Apache accepts the header/path and makes a policy decision; httpd-rs must make the same decision, not return a different error. The control `<If>` case shows the project already has the correct PCRE behaviour available.
 
 ---
 
@@ -257,13 +257,13 @@ pub fn header_str(&self, name: &str) -> Option<&str> {
 }
 ```
 
-HTTP/1.1 field values are byte strings; RFC 9110 permits `obs-text` (`%x80-FF`) in them, and Apache's regex engines match those bytes directly. Vapache instead converts each value to UTF-8 and silently substitutes an empty string on failure at every guard consumer:
+HTTP/1.1 field values are byte strings; RFC 9110 permits `obs-text` (`%x80-FF`) in them, and Apache's regex engines match those bytes directly. httpd-rs instead converts each value to UTF-8 and silently substitutes an empty string on failure at every guard consumer:
 
 - `Scope::request_env` (`config.rs:1502-1513`) calls `header_str(...).unwrap_or_default()` for `SetEnvIf`;
 - `rewrite.rs:1117` does the same for `RewriteCond %{HTTP:...}`;
 - `expr.rs:300-321` does the same for `<If>`, `Require expr` and `RewriteCond expr`.
 
-A header value such as `\xFFsqlmap` is therefore the empty string on vapache, while Apache's PCRE still sees the bytes and matches `sqlmap`. Any **negative** guard (deny when the signature matches) disappears: `SetEnvIf` + `Require not env`, `RewriteCond ... [F]`, or `<If>`-wrapped `Require all denied`. Positive allow guards fail closed in the same situation, so the security-relevant direction is a deny/blocklist bypass.
+A header value such as `\xFFsqlmap` is therefore the empty string on httpd-rs, while Apache's PCRE still sees the bytes and matches `sqlmap`. Any **negative** guard (deny when the signature matches) disappears: `SetEnvIf` + `Require not env`, `RewriteCond ... [F]`, or `<If>`-wrapped `Require all denied`. Positive allow guards fail closed in the same situation, so the security-relevant direction is a deny/blocklist bypass.
 
 This is independent of P16-B: it needs no special regex class and no non-ASCII Unicode character; one invalid byte anywhere in the field is enough, and the valid UTF-8 controls still match on both servers.
 
@@ -297,7 +297,7 @@ RewriteRule ^ - [F]
 </Directory>
 ```
 
-| Case | Guard | Header value | Apache | vapache |
+| Case | Guard | Header value | Apache | httpd-rs |
 |---|---|---|---|---|
 | **C1** | `SetEnvIf User-Agent` / `Require not env` | `\xFFsqlmap` | 403, no exec | 200, **EXEC** |
 | **C2** | `RewriteCond %{HTTP:X-User}` / `[F]` | `\xFFsqlmap` | 403, no exec | 200, **EXEC** |
@@ -316,7 +316,7 @@ The ASCII controls show the guard is live in each directive; the benign and inva
 - **Header deny-guard/blocklist bypass with no `.htaccess`.** The benchmark posture uses `AllowOverride None`; all three guards are main-configuration directives. One invalid byte in the tested header defeats the guard and executes the protected CGI.
 - **WAF-style and application blacklist rules are affected.** A rule that blocks `sqlmap` by matching `User-Agent`, `Referer`, a custom `X-*` header, or another request field is bypassed by prefixing the signature with `\xFF`; the request reaches the protected handler.
 - **The same byte/string boundary affects appliance and application decisions.** Any later directive or expression that reads the header through `header_str` sees the empty string, not the raw value. Positive allow rules tend to fail closed, but the negative rules that are the common shape of a deny/blocklist fail open.
-- **Not a malformed-request rejection.** Apache accepts obs-text in a field value, and vapache's verified parser also accepts it; the request is well-formed on both. The servers disagree only after parsing, when vapache converts to UTF-8 for the policy layer.
+- **Not a malformed-request rejection.** Apache accepts obs-text in a field value, and httpd-rs's verified parser also accepts it; the request is well-formed on both. The servers disagree only after parsing, when httpd-rs converts to UTF-8 for the policy layer.
 
 ### 4.4 Fix
 
@@ -379,7 +379,7 @@ SetEnvIf User-Agent "^([a-z]+)$" ID=$1
 </RequireAll>
 ```
 
-| Case | Shape | `User-Agent` | Apache | vapache |
+| Case | Shape | `User-Agent` | Apache | httpd-rs |
 |---|---|---|---|---|
 | **D1** | valueless `BLOCK` + expression value test | `sqlmap` | 403, no exec | 200, **EXEC** |
 | D1 control | `BLOCK=1` + same test | `sqlmap` | 403, no exec | 403, no exec |
@@ -394,9 +394,9 @@ The D1 control (`BLOCK=1`) proves the expression syntax and guard are live on bo
 
 ### 5.3 Impact
 
-- **Server-side ACL bypass with no `.htaccess`.** D2 is the strongest shape: `SetEnvIf` chaining plus `Require not env` is entirely main-configuration, and the protected CGI executes on vapache while Apache denies. D1/D3 show the same bypass when an operator checks the value with `Require expr` or uses a capture in an action.
-- **The environment contract is wrong for applications too.** A CGI/PHP application that reads `BLOCK`, `ID` or a chained variable sees `""` or the literal `$1` on vapache, and `"1"`/the captured text on Apache. Application-level deny logic that treats a nonempty/truthy value as a block can therefore fail open without any server-side expression.
-- **No malformed request is required.** The trigger is a normal `User-Agent` (or other header) value that matches a configured signature; the differential is entirely in how vapache builds the environment.
+- **Server-side ACL bypass with no `.htaccess`.** D2 is the strongest shape: `SetEnvIf` chaining plus `Require not env` is entirely main-configuration, and the protected CGI executes on httpd-rs while Apache denies. D1/D3 show the same bypass when an operator checks the value with `Require expr` or uses a capture in an action.
+- **The environment contract is wrong for applications too.** A CGI/PHP application that reads `BLOCK`, `ID` or a chained variable sees `""` or the literal `$1` on httpd-rs, and `"1"`/the captured text on Apache. Application-level deny logic that treats a nonempty/truthy value as a block can therefore fail open without any server-side expression.
+- **No malformed request is required.** The trigger is a normal `User-Agent` (or other header) value that matches a configured signature; the differential is entirely in how httpd-rs builds the environment.
 - **Broader `SetEnvIf` compatibility surface.** The same parser is used for `.htaccess`, `BrowserMatch` and `BrowserMatchNoCase`; the missing special variables (`Remote_Addr`, `Server_Addr`, `Request_Protocol`, …) and header-name regex attributes are adjacent gaps that were not separately differential-tested in this pass, so the fix should close the documented semantics as a unit.
 
 ### 5.4 Fix
@@ -413,7 +413,7 @@ The D1 control (`BLOCK=1`) proves the expression syntax and guard are live on bo
 - **P16-B** needs no `.htaccess` and no benchmark deviation. `bench/app_bench.py` uses `AllowOverride None`; the main-config `RewriteCond`/`SetEnvIf` in B1/B2 is compiled by the same code and the guard/allow decision is changed with a request header. Only the rule's use of `\b`/`\W`/`\D`/`\S` (fail-open) or `\w`/`\d`/`\s` (over-grant) is required.
 - **P16-C** also needs no `.htaccess` and no benchmark deviation. Its three guard shapes (`SetEnvIf` + `Require not env`, `RewriteCond` + `[F]`, `<If>` deny) are main-configuration directives, and the attacker only adds one obs-text byte to a header the guard already inspects. A blocklist/WAF rule that matches a signature in `User-Agent`, `Referer` or a custom header is bypassed while the request stays a valid HTTP field value.
 - **P16-D** also needs no `.htaccess` and no benchmark deviation. The strongest shape (D2) uses `SetEnvIf` chaining and `Require not env`, both valid main-configuration directives; the attacker supplies a matching `User-Agent`. D1/D3 require the operator to test the env value or use a capture in the action, which is the documented Apache behavior.
-- **P16-A** needs the deployment to enable per-directory overrides (`AllowOverride All` or `FileInfo`), which the benchmark config does not. This is the same precondition as F60/P14-A: a shared-hosting or application-managed tree where `.htaccess` is writable and a non-PHP upload is possible. The finding is still a remotely exploitable RCE in that common deployment class, and it is a direct consequence of vapache's environment handling rather than a misconfiguration of the application.
+- **P16-A** needs the deployment to enable per-directory overrides (`AllowOverride All` or `FileInfo`), which the benchmark config does not. This is the same precondition as F60/P14-A: a shared-hosting or application-managed tree where `.htaccess` is writable and a non-PHP upload is possible. The finding is still a remotely exploitable RCE in that common deployment class, and it is a direct consequence of httpd-rs's environment handling rather than a misconfiguration of the application.
 - The Apache oracle for all four findings is a stock Debian Apache 2.4.69, the same package used by the benchmark and by the previous pass harnesses.
 
 ---
@@ -423,7 +423,7 @@ The D1 control (`BLOCK=1`) proves the expression syntax and guard are live on bo
 ```sh
 # Build (restore the deleted vendor directory first on this HEAD)
 git checkout 6b781ea -- vendor/h2-0.4.20
-cargo build --release -p vapached
+cargo build --release -p httpd-rs
 
 # Full battery: P16-A A1-A6 + P16-B B1-B2 + P16-C C1-C3 + P16-D D1-D3 (36 verdicts)
 python3 adversarial/p16/exploit_p16.py
@@ -442,50 +442,50 @@ Expected final line:
 36/36 differential verdicts
 ```
 
-The retained remediation harness builds its fixture under `/tmp/opencode/p16-harness`, binds Apache and vapached to sibling loopback ports, starts a fresh built-in FastCGI Unix-socket mock per A case, and kills only its own process groups. The mock reports whether `PHP_VALUE` or `PHP_ADMIN_VALUE` reached the backend, so PHP-FPM is no longer a test dependency. The B, C and D groups need Apache's `mod_cgi`/`mod_rewrite`/`mod_setenvif` and `mod_authz_core`.
+The retained remediation harness builds its fixture under `/tmp/opencode/p16-harness`, binds Apache and httpd-rs to sibling loopback ports, starts a fresh built-in FastCGI Unix-socket mock per A case, and kills only its own process groups. The mock reports whether `PHP_VALUE` or `PHP_ADMIN_VALUE` reached the backend, so PHP-FPM is no longer a test dependency. The B, C and D groups need Apache's `mod_cgi`/`mod_rewrite`/`mod_setenvif` and `mod_authz_core`.
 
 The full observed row set:
 
 ```
-PASS A1-setenv       apache=200 prepend=False/False  vapache=200 prepend=True/True
-PASS A2-admin-value  apache=200 prepend=False/False  vapache=200 prepend=True/True
-PASS A3-setenvif     apache=200 prepend=False/False  vapache=200 prepend=True/True
-PASS A4-subdir       apache=200 prepend=False/False  vapache=200 prepend=True/True
-PASS A5-fileinfo     apache=200 prepend=False/False  vapache=200 prepend=True/True
-PASS A6-no-htaccess  apache=200 prepend=False/False  vapache=200 prepend=False/False
-PASS A6-safe-env     apache=200 prepend=False/False  vapache=200 prepend=False/False
-PASS A6-override-none apache=200 prepend=False/False vapache=200 prepend=False/False
-PASS A6-main-config  apache=200 prepend=True/True   vapache=200 prepend=True/True
-PASS B1-boundary     apache=403/noexec vapache=200/EXEC
-PASS B1-nonword      apache=403/noexec vapache=200/EXEC
-PASS B1-nondigit     apache=403/noexec vapache=200/EXEC
-PASS B1-nonspace     apache=403/noexec vapache=200/EXEC
-PASS B1-control-ascii  apache=403 vapache=403
-PASS B1-control-nomatch apache=200 vapache=200
-PASS B1-control-if-pcre apache=403 vapache=403
-PASS B2-setenvif-grant apache=403/noexec vapache=200/EXEC
-PASS B2-control-ascii apache=200/EXEC vapache=200/EXEC
-PASS B2-control-space apache=403/noexec vapache=403/noexec
-PASS C1-setenvif-invalid apache=403/noexec vapache=200/EXEC
-PASS C1-control-ascii apache=403/noexec vapache=403/noexec
-PASS C1-control-benign apache=200/EXEC vapache=200/EXEC
-PASS C1-control-invalid-only apache=200/EXEC vapache=200/EXEC
-PASS C1-control-valid-utf8 apache=403/noexec vapache=403/noexec
-PASS C2-rewritecond-invalid apache=403/noexec vapache=200/EXEC
-PASS C2-control-ascii apache=403/noexec vapache=403/noexec
-PASS C3-if-invalid apache=403/noexec vapache=200/EXEC
-PASS C3-control-ascii apache=403/noexec vapache=403/noexec
-PASS D1-empty-value apache=403/noexec vapache=200/EXEC
-PASS D1-control-explicit apache=403/noexec vapache=403/noexec
-PASS D1-control-benign apache=200/EXEC vapache=200/EXEC
-PASS D2-chain apache=403/noexec vapache=200/EXEC
-PASS D2-control-single apache=403/noexec vapache=403/noexec
-PASS D2-control-benign apache=200/EXEC vapache=200/EXEC
-PASS D3-backref apache=403/noexec vapache=200/EXEC
-PASS D3-control-benign apache=200/EXEC vapache=200/EXEC
+PASS A1-setenv       apache=200 prepend=False/False  httpd-rs=200 prepend=True/True
+PASS A2-admin-value  apache=200 prepend=False/False  httpd-rs=200 prepend=True/True
+PASS A3-setenvif     apache=200 prepend=False/False  httpd-rs=200 prepend=True/True
+PASS A4-subdir       apache=200 prepend=False/False  httpd-rs=200 prepend=True/True
+PASS A5-fileinfo     apache=200 prepend=False/False  httpd-rs=200 prepend=True/True
+PASS A6-no-htaccess  apache=200 prepend=False/False  httpd-rs=200 prepend=False/False
+PASS A6-safe-env     apache=200 prepend=False/False  httpd-rs=200 prepend=False/False
+PASS A6-override-none apache=200 prepend=False/False httpd-rs=200 prepend=False/False
+PASS A6-main-config  apache=200 prepend=True/True   httpd-rs=200 prepend=True/True
+PASS B1-boundary     apache=403/noexec httpd-rs=200/EXEC
+PASS B1-nonword      apache=403/noexec httpd-rs=200/EXEC
+PASS B1-nondigit     apache=403/noexec httpd-rs=200/EXEC
+PASS B1-nonspace     apache=403/noexec httpd-rs=200/EXEC
+PASS B1-control-ascii  apache=403 httpd-rs=403
+PASS B1-control-nomatch apache=200 httpd-rs=200
+PASS B1-control-if-pcre apache=403 httpd-rs=403
+PASS B2-setenvif-grant apache=403/noexec httpd-rs=200/EXEC
+PASS B2-control-ascii apache=200/EXEC httpd-rs=200/EXEC
+PASS B2-control-space apache=403/noexec httpd-rs=403/noexec
+PASS C1-setenvif-invalid apache=403/noexec httpd-rs=200/EXEC
+PASS C1-control-ascii apache=403/noexec httpd-rs=403/noexec
+PASS C1-control-benign apache=200/EXEC httpd-rs=200/EXEC
+PASS C1-control-invalid-only apache=200/EXEC httpd-rs=200/EXEC
+PASS C1-control-valid-utf8 apache=403/noexec httpd-rs=403/noexec
+PASS C2-rewritecond-invalid apache=403/noexec httpd-rs=200/EXEC
+PASS C2-control-ascii apache=403/noexec httpd-rs=403/noexec
+PASS C3-if-invalid apache=403/noexec httpd-rs=200/EXEC
+PASS C3-control-ascii apache=403/noexec httpd-rs=403/noexec
+PASS D1-empty-value apache=403/noexec httpd-rs=200/EXEC
+PASS D1-control-explicit apache=403/noexec httpd-rs=403/noexec
+PASS D1-control-benign apache=200/EXEC httpd-rs=200/EXEC
+PASS D2-chain apache=403/noexec httpd-rs=200/EXEC
+PASS D2-control-single apache=403/noexec httpd-rs=403/noexec
+PASS D2-control-benign apache=200/EXEC httpd-rs=200/EXEC
+PASS D3-backref apache=403/noexec httpd-rs=200/EXEC
+PASS D3-control-benign apache=200/EXEC httpd-rs=200/EXEC
 ```
 
-The A6 controls are deliberately all on the `expect_vapache=False` side except the main-config positive control:
+The A6 controls are deliberately all on the `expect_httpd_rs=False` side except the main-config positive control:
 
 - `A6-no-htaccess` — no access file; neither server executes.
 - `A6-safe-env` — `SetEnv APP_ENV production`; a harmless name is not a PHP control parameter, neither executes.
@@ -498,11 +498,11 @@ The B1 controls pin the guard itself: ASCII `admin` is denied by both, `xadminx`
 
 ## 8. Scope and limitations
 
-- **Local only.** Apache and vapached bind `127.0.0.1`; PHP-FPM uses a Unix socket under the fixture. No public address or external backend is contacted.
+- **Local only.** Apache and httpd-rs bind `127.0.0.1`; PHP-FPM uses a Unix socket under the fixture. No public address or external backend is contacted.
 - **P16-A precondition.** The deployment must parse the access file (`AllowOverride All`/`FileInfo`). The benchmark's `AllowOverride None` makes the A group fail closed by construction (`A6-override-none`), which is why the finding is stated for the override-enabled deployment class rather than the default benchmark run. The `.htaccess` and upload are attacker content; no product source is modified.
 - **P16-B precondition.** The rule must use an affected class escape on an attacker-influenced value. The battery demonstrates the four fail-open deny forms (B1) and one over-grant allow form (B2); the shared `compile_regex` call sites mean the same class of bug can appear in other directives, but those additional sites were not individually differential-tested here.
 - **P16-C precondition.** The guard must read an attacker-influenced header through the current string conversion and must be a negative/deny shape (match means block). The battery demonstrates `SetEnvIf`/`Require not env`, `RewriteCond`/`[F]` and `<If>` deny; a positive `Require env` or positive expression gate fails closed when the header becomes empty, so it is an availability/parity difference rather than an access bypass.
-- **P16-D precondition.** The guard must depend on one of the documented `SetEnvIf` semantics that vapache does not implement: a valueless action's value, an earlier env variable as an attribute, or a `$n` capture in an action value. D2 (`Require not env` plus chaining) is the most broadly usable shape; D1/D3 require the operator to test the value or use a capture.
+- **P16-D precondition.** The guard must depend on one of the documented `SetEnvIf` semantics that httpd-rs does not implement: a valueless action's value, an earlier env variable as an attribute, or a `$n` capture in an action value. D2 (`Require not env` plus chaining) is the most broadly usable shape; D1/D3 require the operator to test the value or use a capture.
 - **Apache version.** The oracle is Apache 2.4.69 (Debian) with `mod_proxy_fcgi` and PHP-FPM 8.4.27. The P16-A recommendation (do not trust access-file environment for FastCGI, or reserve backend-control names) is safe regardless of a particular Apache point release; the P16-B recommendation (ASCII/PCRE parity) follows Apache's documented regex semantics, the P16-C recommendation (match raw field bytes) follows Apache's byte-oriented request handling, and the P16-D recommendation follows mod_setenvif's documented `1`/chaining/`$n` semantics.
 - **No denial-of-service or memory-safety finding is claimed.** The harness records only the status/content and marker execution differentials above.
 

@@ -1,4 +1,4 @@
-# P32 retained live runs against target/release/vapached, HEAD e1251ec.
+# P32 retained live runs against target/release/httpd-rs, HEAD e1251ec.
 # Setup: 8 loopback source addresses (127.0.0.2 through 127.0.0.9), one TLS/h2
 # connection each, 32 partial POST /hold bodies each, no DATA; victim source
 # 127.0.0.1. Apache oracle: Apache/2.4.69 mpm_event + mod_http2 + mod_ssl,

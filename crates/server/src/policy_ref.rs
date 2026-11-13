@@ -484,7 +484,7 @@ mod tests {
 
     fn load(name: &str, text: &str) -> Config {
         let dir = PathBuf::from(std::env::temp_dir())
-            .join(format!("vapache-policy-ref-{}-{name}", std::process::id()));
+            .join(format!("httpd-rs-policy-ref-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");

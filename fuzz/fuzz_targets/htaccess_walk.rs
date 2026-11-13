@@ -4,13 +4,13 @@ use libfuzzer_sys::fuzz_target;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::OnceLock;
-use vapached::config::Config;
+use httpd_rs::config::Config;
 
 fn root() -> &'static std::path::Path {
     static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
         let root =
-            std::env::temp_dir().join(format!("vapache-htaccess-fuzz-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-htaccess-fuzz-{}", std::process::id()));
         fs::create_dir_all(root.join("a/b/c")).expect("create access-file fuzz root");
         fs::write(root.join("a/b/c/target.txt"), b"target").expect("write fuzz target");
         root
@@ -33,7 +33,7 @@ fuzz_target!(|data: &[u8]| {
     }
     fs::write(dirs[depth].join(".htaccess"), &data[1..]).expect("write access file");
     let config = format!(
-        "VapacheCapability AccessFiles On\nListen 127.0.0.1:0\nDocumentRoot {}\n<Directory {}>\nAllowOverride All\nRequire all granted\n</Directory>\n",
+        "HttpdRsCapability AccessFiles On\nListen 127.0.0.1:0\nDocumentRoot {}\n<Directory {}>\nAllowOverride All\nRequire all granted\n</Directory>\n",
         root().display(),
         root().display()
     );
@@ -44,6 +44,6 @@ fuzz_target!(|data: &[u8]| {
     };
     let target = root().join("a/b/c/target.txt");
     let mut scope = cfg.effective_scope(None, &target, "/a/b/c/target.txt");
-    let _ = vapached::htaccess::apply(&cfg, None, &mut scope, &target, "/a/b/c/target.txt");
-    let _ = vapached::htaccess::collect_layers(&cfg, None, &target, "/a/b/c/target.txt");
+    let _ = httpd_rs::htaccess::apply(&cfg, None, &mut scope, &target, "/a/b/c/target.txt");
+    let _ = httpd_rs::htaccess::collect_layers(&cfg, None, &target, "/a/b/c/target.txt");
 });

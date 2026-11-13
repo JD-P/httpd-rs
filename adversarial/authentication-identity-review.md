@@ -18,9 +18,9 @@ request.
 `authenticate` converted the complete `Authorization` field to UTF-8 and used
 Rust's Unicode `trim`/`char::is_whitespace`. HTTP field values permit obs-text,
 but Apache's authentication grammar is byte-oriented. A UTF-8 em-space after
-`Basic` was therefore a separator in Vapache and ordinary data in Apache.
+`Basic` was therefore a separator in httpd-rs and ordinary data in Apache.
 With otherwise valid credentials, the retained raw-wire oracle produced
-Apache `401` versus Vapache `200`.
+Apache `401` versus httpd-rs `200`.
 
 Basic scheme parsing now consumes bytes, recognizes only ASCII SP/HTAB at the
 scheme boundary, rejects whitespace inside the token, and sends the resulting
@@ -64,11 +64,11 @@ site, with a proof that the conflicting transition is rejected.
 An absent or unreadable `AuthGroupFile` produced an empty group vector. A
 positive `Require group` still denied, but a negated group provider could turn
 the missing provider into a neutral result and allow a surrounding
-`<RequireAll>` containing another positive provider. Vapache now treats this
+`<RequireAll>` containing another positive provider. httpd-rs now treats this
 as an unavailable security provider: a provider that was never configured or
 could not be read must not become evidence for a negative authorization claim.
 The raw Apache 2.4.69 oracle returns `200` for this exact missing-provider
-configuration; Vapache's `403` is therefore recorded as deliberate fail-closed
+configuration; httpd-rs's `403` is therefore recorded as deliberate fail-closed
 hardening rather than accidental parity drift.
 
 Identity now carries `None` for unavailable group data and `Some(empty)` for a

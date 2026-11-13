@@ -8,7 +8,7 @@ compression, shared-cache admission, disk persistence and the HTTP/1 and
 HTTP/2 writers. WebSocket switching responses were reviewed as the separate
 raw-protocol transition they are. The threat model includes a compromised or
 less-trusted application backend attempting to affect another cache user or
-to make Vapache and a downstream recipient interpret different metadata.
+to make httpd-rs and a downstream recipient interpret different metadata.
 
 ## Remediated findings
 
@@ -41,7 +41,7 @@ lines.
 ### R2: response-normalization provenance was lost before caching
 
 HTTP and CGI backends may use `Connection` to nominate other fields for
-hop-local removal. Vapache removed those fields before constructing the
+hop-local removal. httpd-rs removed those fields before constructing the
 internal response. That made the immediate response safe to forward, but it
 also erased the evidence that representation metadata had been removed. The
 normalized response could then look eligible for the shared cache.
@@ -84,7 +84,7 @@ The record reader accepted STDOUT, STDERR and END_REQUEST records without
 checking their request ID, ignored unexpected application records, accepted a
 nonzero reserved header byte, and treated malformed or non-complete
 END_REQUEST bodies as success. This weakened the record boundary even though
-Vapache currently uses one request per backend connection.
+httpd-rs currently uses one request per backend connection.
 
 Recognized response records must now carry request ID 1. Only management
 records may use ID 0 and be ignored; unknown application records fail closed.
@@ -134,7 +134,7 @@ unoffered or duplicate selections cannot be admitted.
 - Chunk sizes, chunk count/framing work, trailer count/bytes and total bodies
   are bounded. Trailers are validated and discarded rather than merged into
   cached metadata.
-- Vapache does not decompress backend bodies, so a compressed upstream body
+- httpd-rs does not decompress backend bodies, so a compressed upstream body
   cannot expand inside the server. Locally generated compression remains
   resource-accounted.
 - Proxy and FastCGI bodies have explicit output ceilings and aggregate spool

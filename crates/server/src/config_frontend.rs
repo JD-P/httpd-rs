@@ -80,44 +80,44 @@ pub(crate) fn tokenize(s: &str) -> Result<Vec<String>, String> {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut current: Option<Vec<u8>> = None;
-    let mut state = vapache_verified::ConfigLexState::Between;
+    let mut state = httpd_rs_verified::ConfigLexState::Between;
     let mut i = 0;
     while i < b.len() {
         let next = b.get(i + 1).copied();
-        let step = vapache_verified::config_lex_step(state, b[i], next);
+        let step = httpd_rs_verified::config_lex_step(state, b[i], next);
         state = step.state;
         match step.action {
-            vapache_verified::ConfigLexAction::Skip => {}
-            vapache_verified::ConfigLexAction::Begin => {
+            httpd_rs_verified::ConfigLexAction::Skip => {}
+            httpd_rs_verified::ConfigLexAction::Begin => {
                 debug_assert!(current.is_none());
                 current = Some(Vec::new());
             }
-            vapache_verified::ConfigLexAction::Push => {
+            httpd_rs_verified::ConfigLexAction::Push => {
                 current
                     .as_mut()
                     .expect("verified lexer pushes only inside a token")
                     .push(b[i]);
             }
-            vapache_verified::ConfigLexAction::PushNext => {
+            httpd_rs_verified::ConfigLexAction::PushNext => {
                 current
                     .as_mut()
                     .expect("verified lexer escapes only inside a token")
                     .push(next.expect("verified two-byte transition requires a next byte"));
             }
-            vapache_verified::ConfigLexAction::Finish => {
+            httpd_rs_verified::ConfigLexAction::Finish => {
                 finish_token(&mut out, &mut current)?;
             }
-            vapache_verified::ConfigLexAction::CloseQuote => {}
-            vapache_verified::ConfigLexAction::RejectAfterQuote => {
+            httpd_rs_verified::ConfigLexAction::CloseQuote => {}
+            httpd_rs_verified::ConfigLexAction::RejectAfterQuote => {
                 return Err("characters after closing quote".into());
             }
         }
         i += usize::from(step.advance);
     }
-    match vapache_verified::config_lex_eof(state) {
-        vapache_verified::ConfigLexEof::Complete => {}
-        vapache_verified::ConfigLexEof::Finish => finish_token(&mut out, &mut current)?,
-        vapache_verified::ConfigLexEof::UnterminatedQuote => {
+    match httpd_rs_verified::config_lex_eof(state) {
+        httpd_rs_verified::ConfigLexEof::Complete => {}
+        httpd_rs_verified::ConfigLexEof::Finish => finish_token(&mut out, &mut current)?,
+        httpd_rs_verified::ConfigLexEof::UnterminatedQuote => {
             return Err("unterminated quoted string".into());
         }
     }
@@ -125,7 +125,7 @@ pub(crate) fn tokenize(s: &str) -> Result<Vec<String>, String> {
 }
 
 fn finish_token(out: &mut Vec<String>, current: &mut Option<Vec<u8>>) -> Result<(), String> {
-    let Some(next_count) = vapache_verified::config_argument_count_step(out.len()) else {
+    let Some(next_count) = httpd_rs_verified::config_argument_count_step(out.len()) else {
         return Err("too many arguments".into());
     };
     let bytes = current
@@ -151,11 +151,11 @@ pub(crate) fn tokenize_config(s: &str) -> Result<Vec<String>, String> {
     }
     if t.starts_with('<') {
         let b = t.as_bytes();
-        let mut quote = vapache_verified::ConfigTagQuote::Unquoted;
+        let mut quote = httpd_rs_verified::ConfigTagQuote::Unquoted;
         let mut end = None;
         let mut i = 1;
         while i < b.len() {
-            let step = vapache_verified::config_tag_step(quote, b[i], b.get(i + 1).copied());
+            let step = httpd_rs_verified::config_tag_step(quote, b[i], b.get(i + 1).copied());
             quote = step.quote;
             if step.delimiter {
                 // Apache permits an unquoted comparison operator in
@@ -208,10 +208,12 @@ pub fn parse_line(text: &str) -> Result<ConfigLine, String> {
     if tokens.is_empty() {
         return Err("empty configuration line".into());
     }
-    let kind =
-        vapache_verified::config_line_kind(tokens[0].starts_with("</"), tokens[0].starts_with('<'));
+    let kind = httpd_rs_verified::config_line_kind(
+        tokens[0].starts_with("</"),
+        tokens[0].starts_with('<'),
+    );
     match kind {
-        vapache_verified::ConfigLineKind::SectionEnd => {
+        httpd_rs_verified::ConfigLineKind::SectionEnd => {
             let name = tokens[0]
                 .trim_start_matches("</")
                 .trim_end_matches('>')
@@ -222,7 +224,7 @@ pub fn parse_line(text: &str) -> Result<ConfigLine, String> {
             }
             Ok(ConfigLine::SectionEnd { name })
         }
-        vapache_verified::ConfigLineKind::SectionStart => {
+        httpd_rs_verified::ConfigLineKind::SectionStart => {
             let name = tokens[0]
                 .trim_start_matches('<')
                 .trim_end_matches('>')
@@ -236,7 +238,7 @@ pub fn parse_line(text: &str) -> Result<ConfigLine, String> {
                 args: tokens[1..].to_vec(),
             })
         }
-        vapache_verified::ConfigLineKind::Directive => Ok(ConfigLine::Directive {
+        httpd_rs_verified::ConfigLineKind::Directive => Ok(ConfigLine::Directive {
             name: tokens[0].to_ascii_lowercase(),
             args: tokens[1..].to_vec(),
         }),
@@ -324,6 +326,10 @@ mod tests {
             vec![(1, "SetHandler\\   ".into()), (2, "cgi-script".into())]
         );
         assert_eq!(logical_lines("value\\"), vec!["value\\"]);
+        assert_eq!(
+            logical_lines_with_numbers("value\\\n"),
+            vec![(1, "value".into())]
+        );
         assert!(tokenize("\"closed\"suffix").is_err());
         let too_many = std::iter::repeat_n("x", 257).collect::<Vec<_>>().join(" ");
         assert!(tokenize(&too_many).is_err());

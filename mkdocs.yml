@@ -1,0 +1,144 @@
+site_name: httpd-rs
+site_description: Migration, operation, compatibility, and security documentation for httpd-rs
+site_url: https://jd-p.github.io/httpd-rs/
+repo_url: https://github.com/JD-P/httpd-rs
+repo_name: JD-P/httpd-rs
+edit_uri: edit/main/docs/
+docs_dir: docs
+site_dir: site
+use_directory_urls: true
+strict: true
+
+theme:
+  name: material
+  language: en
+  font: false
+  icon:
+    logo: material/shield-check
+    repo: fontawesome/brands/github
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Use dark theme
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Use light theme
+
+plugins:
+  - search
+
+hooks:
+  - tests/mkdocs_hooks.py
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - meta
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+extra_css:
+  - assets/stylesheets/extra.css
+
+nav:
+  - Home: README.md
+  - Tutorials:
+      - Choose a tutorial: tutorials/README.md
+      - Prepare a Debian VPS: tutorials/prepare-debian-vps.md
+      - Migrate a Debian static site: tutorials/migrate-debian-static-site.md
+      - Serve a Hugo site: tutorials/hugo-static-site.md
+      - PHP and FastCGI:
+          - WordPress: tutorials/wordpress-php-fpm.md
+          - Drupal: tutorials/drupal-php-fpm.md
+          - Nextcloud: tutorials/nextcloud-php-fpm.md
+          - Bugzilla: tutorials/bugzilla-fastcgi.md
+      - Reverse proxies:
+          - Gitea: tutorials/gitea-reverse-proxy.md
+          - Grafana: tutorials/grafana-reverse-proxy.md
+          - Jenkins: tutorials/jenkins-reverse-proxy.md
+          - JupyterLab: tutorials/jupyterlab-reverse-proxy.md
+          - Mastodon: tutorials/mastodon-tls-streaming.md
+          - MinIO: tutorials/minio-reverse-proxy.md
+          - Wagtail and Gunicorn: tutorials/wagtail-gunicorn.md
+      - Git CGI: tutorials/git-cgi.md
+  - How-to guides:
+      - Guide index: how-to/README.md
+      - Evaluate a migration: how-to/evaluate-security-driven-migration.md
+      - Assess an Apache configuration: how-to/assess-apache-configuration.md
+      - Investigate a rejected directive: how-to/investigate-rejected-directive.md
+      - Operate the service: how-to/operate-httpd-rs-service.md
+      - Migrate TLS and Certbot: how-to/migrate-tls-and-certbot.md
+      - Configure PHP-FPM sockets: how-to/configure-php-fpm-unix-socket.md
+      - Configure proxy authority: how-to/configure-proxy-authority.md
+      - Move .htaccess policy: how-to/move-htaccess-to-main-config.md
+      - Replace a writable PHP layout: how-to/replace-writable-php-layout.md
+      - Roll back to Apache: how-to/roll-back-to-apache.md
+      - Evaluate an Apache CVE: how-to/evaluate-apache-cve.md
+  - Reference:
+      - Apache compatibility: reference/apache-compatibility.md
+      - Tested deployments: deployments/README.md
+      - Deployment coverage: deployments/coverage.md
+  - Architecture and security:
+      - Contributor architecture: explanation/README.md
+      - The shape of httpd-rs: explanation/the-shape-of-httpd-rs.md
+      - Security properties and limits: explanation/security-expectations.md
+      - Compatibility as security policy: explanation/compatibility-is-a-security-policy.md
+      - Configuration generations: explanation/configuration-generations.md
+      - Delegation and authority: explanation/delegation-is-an-authority-handoff.md
+      - Building a security argument: explanation/building-a-security-argument.md
+  - Evidence:
+      - Quality model: quality.md
+      - CVE review:
+          - Method and inventory: cve/README.md
+          - Apache CVE matrix: cve/apache2-cve-matrix.md
+          - Cross-server CVE matrix: cve/cross-server-cve-matrix.md
+          - Coverage strengthening: cve/not-covered-strengthening.md
+      - Apache source warrant: apache-warrant.md
+      - Apache access parity: apache-access-parity.md
+      - Configuration semantics: config-semantics.md
+      - Adversarial closure: adversarial-closure.md
+      - Coverage debt: coverage-debt.md
+      - Resource ownership: resource-inventory.md
+      - PCRE2 benchmark: pcre2-benchmark.md
+      - Vulnerability trends: vulnerability_trends.md
+  - Project:
+      - Build and host this site: site-build.md
+      - Audiences: audiences.md
+      - Documentation style: style.md
+      - Documentation contracts: reference/documentation-contracts.md
+      - Apache documentation audit: audits/apache-2.4.md
+      - Agent handoff: agent-handoff.md
+
+copyright: Copyright &copy; httpd-rs contributors

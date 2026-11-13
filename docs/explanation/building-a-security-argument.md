@@ -5,9 +5,9 @@ status: draft
 prose_style: discursive
 ---
 
-# How Vapache builds a security argument
+# How httpd-rs builds a security argument
 
-Vapache uses safe Rust, formal verification, differential testing, adversarial
+httpd-rs uses safe Rust, formal verification, differential testing, adversarial
 regressions, real-application deployments, and CVE analysis. None of those is
 the security argument by itself. The argument is the connection between a
 specific property, the mechanism intended to enforce it, the evidence that the
@@ -41,7 +41,7 @@ refinement boundary.
 
 Verus is strongest where the inputs and state transitions can be stated
 without pretending to model Linux, Rustls, a filesystem, or an application.
-Vapache therefore concentrates proofs around parsers, bounded arithmetic,
+httpd-rs therefore concentrates proofs around parsers, bounded arithmetic,
 policy combinators, admission rules, and monotonic state machines.
 
 The runtime must still consume the proved decision correctly. That connection
@@ -65,7 +65,7 @@ relationships. Apache differential tests check claimed compatibility semantics
 against a concrete oracle. Adversarial regressions preserve exploit shapes and
 known failure modes. Fault and chaos tests ask whether partial I/O, process
 death, resource pressure, or failed preparation turns into a policy violation.
-Real-application deployments test the seams between Vapache and software whose
+Real-application deployments test the seams between httpd-rs and software whose
 behavior is too rich to model faithfully in a small fixture.
 
 These layers are not interchangeable. A WordPress deployment can show that an
@@ -78,12 +78,12 @@ also demonstrating that both servers share an unsafe semantic.
 ## CVE matrices are structured comparison, not replay results
 
 The CVE matrices ask whether the root cause described by an advisory exists in
-Vapache, fails closed, is absent, or remains outside the formal model. This is
+httpd-rs, fails closed, is absent, or remains outside the formal model. This is
 valuable because it turns a vague “independent implementation” claim into a
 row-by-row comparison of causes.
 
 It is not equivalent to replaying every proof of concept, and a `prevented`
-classification does not exclude an independent Vapache defect in the same
+classification does not exclude an independent httpd-rs defect in the same
 subsystem. The [CVE methodology](../cve/README.md) says this explicitly.
 Contributors updating a row must preserve the distinction between preventing
 the advisory's stated cause and proving that the complete feature is safe.
@@ -96,7 +96,7 @@ behavior, filesystem ownership enforcement, administrator integrity, or
 application semantics. Calling these assumptions “trusted” does not make them
 small; it makes their location explicit.
 
-The strongest Vapache claims therefore state their scope. “The verified
+The strongest httpd-rs claims therefore state their scope. “The verified
 parser rejects conflicting framing” is stronger than “request smuggling is
 impossible,” because the former identifies the property and leaves room to
 review proxy translation, HTTP/2 adaptation, and backend interpretation as

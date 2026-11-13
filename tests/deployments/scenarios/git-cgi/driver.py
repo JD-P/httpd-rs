@@ -13,13 +13,13 @@ from lib import (
     basic_authorization,
     command,
     common_apache_config,
-    common_vapache_config,
+    common_httpd_rs_config,
     differential_benchmark,
     free_port,
     make_readable_tree,
     require_response,
     start_apache,
-    start_vapache,
+    start_httpd_rs,
 )
 
 
@@ -36,10 +36,10 @@ def make_repository(root: Path) -> Path:
     environment = os.environ.copy()
     environment.update(
         {
-            "GIT_AUTHOR_NAME": "Vapache Integration",
-            "GIT_AUTHOR_EMAIL": "integration@vapache.invalid",
-            "GIT_COMMITTER_NAME": "Vapache Integration",
-            "GIT_COMMITTER_EMAIL": "integration@vapache.invalid",
+            "GIT_AUTHOR_NAME": "httpd-rs Integration",
+            "GIT_AUTHOR_EMAIL": "integration@httpd-rs.invalid",
+            "GIT_COMMITTER_NAME": "httpd-rs Integration",
+            "GIT_COMMITTER_EMAIL": "integration@httpd-rs.invalid",
         }
     )
     command([GIT, "add", "README.md"], cwd=working, env=environment)
@@ -89,7 +89,7 @@ def documented_routes(
     replacements = {
         "/etc/gitweb.conf": os.fspath(gitweb_config),
         "/srv/git": os.fspath(projects),
-        "/etc/vapache/auth/git.htpasswd": os.fspath(auth_file),
+        "/etc/httpd-rs/auth/git.htpasswd": os.fspath(auth_file),
         "/usr/share/gitweb/gitweb.cgi": os.fspath(gitweb),
         "/usr/share/gitweb/static": os.fspath(gitweb_static),
         "/usr/lib/git-core/git-http-backend": os.fspath(backend),
@@ -112,7 +112,7 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
     gitweb_config = context.run_dir / "gitweb_config.perl"
     gitweb_config.write_text(
         f"$projectroot = '{projects}';\n"
-        "$site_name = 'Vapache Gitweb Integration';\n"
+        "$site_name = 'httpd-rs Gitweb Integration';\n"
         "$projects_list = $projectroot;\n"
         "$feature{'pathinfo'}{'default'} = [1];\n"
         "@stylesheets = ('/gitweb-static/gitweb.css');\n"
@@ -166,21 +166,21 @@ Alias /gitweb-static/ "{gitweb_static}/"
             gitweb_static,
             backend,
         )
-    config, pid_file = common_vapache_config(
+    config, pid_file = common_httpd_rs_config(
         context.run_dir,
         port,
         empty_docroot,
         capabilities=("Cgi",),
         extra=extra,
     )
-    server = start_vapache(context, config, pid_file, port)
+    server = start_httpd_rs(context, config, pid_file, port)
     request_headers: dict[str, str] = {}
     if variant["access"] == "basic":
         require_response(port, "/gitweb", status=401)
         require_response(port, "/git/demo.git/info/refs?service=git-upload-pack", status=401)
         request_headers["Authorization"] = basic_authorization("alice", "secret")
 
-    require_response(port, "/gitweb", contains=b"Vapache Gitweb Integration", headers=request_headers)
+    require_response(port, "/gitweb", contains=b"httpd-rs Gitweb Integration", headers=request_headers)
     require_response(port, "/gitweb/?p=demo.git;a=summary", contains=b"demo.git", headers=request_headers)
     info_headers, info_body = require_response(
         port,
@@ -203,7 +203,7 @@ Alias /gitweb-static/ "{gitweb_static}/"
 
     if variant["reload"] == "after-start":
         server.reload()
-        require_response(port, "/gitweb", contains=b"Vapache Gitweb Integration", headers=request_headers)
+        require_response(port, "/gitweb", contains=b"httpd-rs Gitweb Integration", headers=request_headers)
     if context.benchmark:
         path = "/gitweb/?p=demo.git;a=summary" if variant["application"] == "gitweb" else "/git/demo.git/info/refs?service=git-upload-pack"
         apache_port = free_port()
@@ -258,7 +258,7 @@ Alias /gitweb-static/ "{gitweb_static}/"
             port,
             apache_port,
             path,
-            context.artifact_dir / "apache-vapache-benchmark.json",
+            context.artifact_dir / "apache-httpd-rs-benchmark.json",
             headers=benchmark_headers,
             connections=2,
         )

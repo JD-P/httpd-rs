@@ -2,7 +2,7 @@
 
 - **Date:** 2026-11-10
 - **Subject:** HEAD `3e4ce6cd0e97d8582c58a3729ae47b3e33a29d53`
-  (`target/release/vapached`, rebuilt from the checked-out tree; no product
+  (`target/release/httpd-rs`, rebuilt from the checked-out tree; no product
   source was edited).
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` + `mod_rewrite` +
   `mod_authz_core` + `mod_mime` + `mod_dir`, loopback only.
@@ -10,7 +10,7 @@
   output `adversarial/p36/results_p36.txt`.
 - **Method:** audit of the newest unreviewed commit `93c834f` ("Make
   authorization identities representation-safe") plus live Apache-versus-
-  vapached differentials over trailing-slash internal rewrites in main
+  httpd-rs differentials over trailing-slash internal rewrites in main
   configuration and attacker-writable `.htaccess`.
 - **Disposition:** **P36-A confirmed and unfixed at HEAD.** One
   unauthenticated request that reaches an internal rewrite whose result ends
@@ -22,9 +22,9 @@
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapached at HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs at HEAD | Class |
 |---|---------|---------------|------------------|-------|
-| **P36-A** | `CanonicalTarget::from_normalized` (tightened by `93c834f`) now requires its `norm` argument to be the slash-less canonical form, but the two rewrite call sites still pass the slash-suffixed `canonical` string. When a rewrite result ends with `/` (except exactly `/`) the constructor returns `None` and `.expect("canonicalized rewrite path remains canonical")` panics. Release builds use `panic = "abort"`, so the request kills the entire process. | Main config `RewriteRule ^/legacy/$ /newdir/ [L]` and `RewriteRule ^/x$ /does-not-exist/ [L]`: `404`, Apache stays alive. `.htaccess` `RewriteRule ^boom$ /target/ [L]` under `AllowOverride FileInfo`: `200` and the rewritten target is served. | `SIGABRT` (`rc=-6`), connection closed without a response, process gone (`thread 'vapache-request-…' panicked at crates/server/src/server.rs:6333:30` / `:7161:22`). | denial of service — whole-process abort, one unauthenticated request |
+| **P36-A** | `CanonicalTarget::from_normalized` (tightened by `93c834f`) now requires its `norm` argument to be the slash-less canonical form, but the two rewrite call sites still pass the slash-suffixed `canonical` string. When a rewrite result ends with `/` (except exactly `/`) the constructor returns `None` and `.expect("canonicalized rewrite path remains canonical")` panics. Release builds use `panic = "abort"`, so the request kills the entire process. | Main config `RewriteRule ^/legacy/$ /newdir/ [L]` and `RewriteRule ^/x$ /does-not-exist/ [L]`: `404`, Apache stays alive. `.htaccess` `RewriteRule ^boom$ /target/ [L]` under `AllowOverride FileInfo`: `200` and the rewritten target is served. | `SIGABRT` (`rc=-6`), connection closed without a response, process gone (`thread 'httpd-rs-request-…' panicked at crates/server/src/server.rs:6333:30` / `:7161:22`). | denial of service — whole-process abort, one unauthenticated request |
 
 P36-A is the strongest class this project records: a single request from any
 unauthenticated client destroys the server process (all vhosts, all
@@ -103,47 +103,47 @@ disagreement had been reviewed.
 
 ### 2.2 Reachable shapes and live evidence
 
-`adversarial/p36/exploit_p36.py` runs Apache and vapached on sibling loopback
+`adversarial/p36/exploit_p36.py` runs Apache and httpd-rs on sibling loopback
 ports over one fixture tree. Retained output
 (`adversarial/p36/results_p36.txt`):
 
 ```text
 ## A main-config trailing-slash rewrite aborts the process
    /legacy/       apache=404 (oracle alive=True)
-   -> VULNERABLE: vapache aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
+   -> VULNERABLE: httpd-rs aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
 
 ## A2 missing target still aborts (target need not exist)
    /x             apache=404 (oracle alive=True)
-   -> VULNERABLE: vapache aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
+   -> VULNERABLE: httpd-rs aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
 
 ## A3 RewriteCond guard still reaches the abort
    /x             apache=404 (oracle alive=True)
-   -> VULNERABLE: vapache aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
+   -> VULNERABLE: httpd-rs aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
 
 ## B .htaccess per-directory trailing-slash rewrite aborts (FileInfo)
    /uploads/boom  apache=200 (oracle alive=True)
-   -> VULNERABLE: vapache aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
+   -> VULNERABLE: httpd-rs aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
 
 ## C control: no-trailing-slash rewrite survives
    /x             apache=200 (oracle alive=True)
-   -> control vapache=200 survived
+   -> control httpd-rs=200 survived
 
 ## C2 control: root rewrite survives
    /x             apache=403 (oracle alive=True)
-   -> control vapache=200 survived
+   -> control httpd-rs=200 survived
 ```
 
-Retained daemon evidence (`/tmp/opencode/p36-harness/case*/vapached.log`
+Retained daemon evidence (`/tmp/opencode/p36-harness/case*/httpd-rs.log`
 when `--keep` is used):
 
 ```text
-thread 'vapache-request-1' (31555) panicked at crates/server/src/server.rs:6333:30:
+thread 'httpd-rs-request-1' (31555) panicked at crates/server/src/server.rs:6333:30:
 canonicalized rewrite path remains canonical
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 ```
 
 ```text
-thread 'vapache-request-1' (32063) panicked at crates/server/src/server.rs:7161:22:
+thread 'httpd-rs-request-1' (32063) panicked at crates/server/src/server.rs:7161:22:
 canonicalized per-directory rewrite path remains canonical
 ```
 
@@ -155,7 +155,7 @@ Confirmed properties:
   though the rewritten target does not exist; the panic happens before any
   filesystem resolution.
 - **`.htaccess` / per-directory.** With `AllowOverride FileInfo` and
-  `VapacheCapability AccessFiles On`, a one-line access file
+  `HttpdRsCapability AccessFiles On`, a one-line access file
   (`RewriteEngine On` + `RewriteRule ^boom$ /target/ [L]`) aborts on
   `GET /uploads/boom` (`server.rs:7161`); Apache rewrites and serves the
   target (`200`).
@@ -239,13 +239,13 @@ vulnerability, not a safety net.
 
 At HEAD, `adversarial/p33/exploit_p33.py` case B
 (`MultiViews` + `<LocationMatch "\.txt$"> Require all denied`, request
-`/secret`) returns `vapache=404` where the retained remediation output
-(`adversarial/p33/results_p33.txt`) records `vapache=403`:
+`/secret`) returns `httpd-rs=404` where the retained remediation output
+(`adversarial/p33/results_p33.txt`) records `httpd-rs=403`:
 
 ```text
 ## B extension Location guard
-   /secret        apache=404 vapache=404 leaked=False
-   -> FAIL: vapache expected 403, got 404 for /secret
+   /secret        apache=404 httpd-rs=404 leaked=False
+   -> FAIL: httpd-rs expected 403, got 404 for /secret
 ```
 
 No protected content is disclosed (`leaked=False`), and 404 is at least as
@@ -262,14 +262,14 @@ unresolved observation, not a vulnerability claim.
 With `<Directory /> Require all denied` + a granted `DocumentRoot`, main-config
 `RewriteRule ^/x$ / [L]` returns `403` on Apache 2.4.69 (the oracle log shows
 it resolves the substitution as a filesystem path: `client denied by server
-configuration: /`) and `200` with the DocumentRoot index on vapache. Only
-public DocumentRoot content is served on vapache, and the same request can be
+configuration: /`) and `200` with the DocumentRoot index on httpd-rs. Only
+public DocumentRoot content is served on httpd-rs, and the same request can be
 made directly, so no protected content is exposed under either interpretation.
 Recorded as an unresolved parity observation.
 
 ### Environment notes
 
-- `adversarial/p16/exploit_p16.py` reports `vapached did not listen` for every
+- `adversarial/p16/exploit_p16.py` reports `httpd-rs did not listen` for every
   case at HEAD because the harness (`os.chmod(RUN, 0o777)` at
   `exploit_p16.py:875`) makes the configuration tree writable by the service
   account, which the newer administrative-path hardening rejects; this is a
@@ -283,7 +283,7 @@ Recorded as an unresolved parity observation.
 
 ## 4. Retained files
 
-- `adversarial/p36/exploit_p36.py` — six-case Apache/vapached trailing-slash
+- `adversarial/p36/exploit_p36.py` — six-case Apache/httpd-rs trailing-slash
   rewrite reproducer; exits 0 while the aborts reproduce and 1 once the server
   survives (convert to a remediation regression at that point).
 - `adversarial/p36/results_p36.txt` — retained HEAD run output (four

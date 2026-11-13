@@ -3,5 +3,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    vapached::resource::fuzz_resource_transitions(data);
+    httpd_rs::resource::fuzz_resource_transitions(data);
 });

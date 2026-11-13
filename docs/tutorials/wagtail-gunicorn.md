@@ -6,7 +6,7 @@ contracts: DOC-DEPLOY-WAGTAIL-001
 scenario: wagtail-proxy
 ---
 
-# Put Wagtail and Gunicorn behind Vapache on a VPS
+# Put Wagtail and Gunicorn behind httpd-rs on a VPS
 
 This tutorial publishes a Wagtail site from Gunicorn at
 `https://cms.example.test/`.
@@ -14,12 +14,12 @@ This tutorial publishes a Wagtail site from Gunicorn at
 ## What you will do
 
 You will install PostgreSQL, Wagtail, and Gunicorn, create a Wagtail project and
-systemd service, configure Django's public authority, add the Vapache route,
-test the public site and admin login, reload Vapache, and reuse the session.
+systemd service, configure Django's public authority, add the httpd-rs route,
+test the public site and admin login, reload httpd-rs, and reuse the session.
 
 ## Before you start
 
-Complete [Prepare a Debian VPS for a Vapache
+Complete [Prepare a Debian VPS for a httpd-rs
 tutorial](prepare-debian-vps.md). Point `cms.example.test` at the VPS and open
 TCP ports 80 and 443 in the provider firewall.
 
@@ -113,7 +113,7 @@ $ sudo systemctl enable --now wagtail-gunicorn.service
 $ curl -I -H 'Host: cms.example.test' http://127.0.0.1:8000/
 ```
 
-## 3. Configure Vapache
+## 3. Configure httpd-rs
 
 Create `/etc/apache2/sites-available/wagtail.conf` with a temporary HTTP-only
 host, enable it, and obtain the certificate:
@@ -126,8 +126,8 @@ host, enable it, and obtain the certificate:
 
 ```console
 $ sudo a2ensite wagtail.conf
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot certonly --apache --domain cms.example.test
 ```
 
@@ -156,11 +156,11 @@ Replace it with the final configuration:
 </VirtualHost>
 ```
 
-Test the configuration, reload Vapache, and verify renewal:
+Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -171,11 +171,11 @@ $ curl --fail https://cms.example.test/
 ```
 
 Sign in to Wagtail administration through the public URL and open a page-edit
-screen. Reload Vapache and open the dashboard with the same session. Confirm
+screen. Reload httpd-rs and open the dashboard with the same session. Confirm
 that redirects and form targets use `https://cms.example.test` and never expose
 port `8000`.
 
-The `/static/` request is served by Vapache rather than Gunicorn. Confirm that
+The `/static/` request is served by httpd-rs rather than Gunicorn. Confirm that
 the Wagtail administration page loads its style sheets after the reload.
 
 <!--

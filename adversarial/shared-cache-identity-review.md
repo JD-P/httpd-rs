@@ -11,7 +11,7 @@ context.
 
 ## Identity contract
 
-A Vapache cache entry is now partitioned by all of the following:
+A httpd-rs cache entry is now partitioned by all of the following:
 
 - configuration generation, server root, selected virtual host, listener
   address/port and HTTP versus HTTPS scheme;
@@ -25,7 +25,7 @@ A Vapache cache entry is now partitioned by all of the following:
 - response `Vary` dimensions, freshness, the exact policy digest and the
   complete persisted base key.
 
-This is deliberately conservative. Vapache already partitions entries by
+This is deliberately conservative. httpd-rs already partitions entries by
 client address and all request headers. The source port is added only when
 handler classification says the response can observe it; static entries
 remain reusable across connections, while HTTP protocol identity is retained
@@ -81,7 +81,7 @@ make an origin-stale entry admissible.
 
 ### C4: unsafe-method invalidation omitted response-selected targets
 
-After a successful unsafe request, Vapache invalidated only the effective
+After a successful unsafe request, httpd-rs invalidated only the effective
 request URI. RFC 9111 also requires invalidating same-origin URIs named by
 `Location` and `Content-Location`; leaving them live can replay state that the
 successful operation just changed.

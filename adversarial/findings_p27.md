@@ -1,7 +1,7 @@
 # Pass 27 — adversarial break of the verified glob kernels (one-request process abort and permanent worker starvation)
 
 - **Date:** 2026-11-01
-- **Subject:** HEAD `5b5dbb7` (`target/release/vapached`; no product source was
+- **Subject:** HEAD `5b5dbb7` (`target/release/httpd-rs`; no product source was
   edited). The two preceding protocol-hardening commits (`ec79965`, `55eff45`)
   are also covered by the same root cause.
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` (+ `authz_core`,
@@ -14,14 +14,14 @@
   `thread 'conn' has overflowed its stack` exits), `/tmp/opencode/p27-glob/`
   (calibration probes), `/tmp/opencode/p27-stack/` (first stack-overflow run).
 - **Method:** source audit of the verified `fnmatch`/`glob` kernels and every
-  runtime call site, then live Apache-versus-vapached differentials on the
+  runtime call site, then live Apache-versus-httpd-rs differentials on the
   project's own benchmark/conformance `.htaccess` shapes.
 
 ---
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
 | **P27-A** | The verified glob kernel `fnmatch_match` is verified total (`decreases pattern.len() + value.len()`) but has no depth cap and recurses once per `*` before matching any input. A `.htaccess` `<Files>` pattern of ~40,000 stars (≈40 KB, carved out of the 1 MiB `MAX_HTACCESS` budget) overflows the default 2 MiB connection-thread stack on the next request; the release profile is `panic = "abort"`, so **one unauthenticated request kills the whole server** (`thread 'conn' … has overflowed its stack / fatal runtime error: stack overflow, aborting`, `SIGABRT`). The same kill works from `IndexIgnore` and under `AllowOverride All`, `AuthConfig` and `Indexes`. | refuses the `.htaccess` line with `500 Line too long` (its own 8190-byte per-line cap), server stays alive | `SIGABRT` (`rc=-6`) on the first request | remote whole-process denial of service (single request) |
 | **P27-B** | The same kernel is exponential-time: `*a*a*…*b` against `aaaa…a` explores `C(n+k, k)` recursive paths with no work budget, no `try_expensive` lease and no dispatch deadline. A 12-star pattern plus a 400-byte basename (a <500-byte request) pins a connection worker forever; the worker never returns **even after the client disconnects**, so repeated requests exhaust all `MaxRequestWorkers` permanently (fresh clients receive `503`; the process must be restarted). Under `AllowOverride AuthConfig` the pattern/value pair can be supplied per request through one-line `Require expr "%{HTTP:X-P} -strmatch %{HTTP:X-V}"`, so no large `.htaccess` payload is needed. | `403` in 0.4 ms; workers free | timeout at 2 s, CPU pinned forever; 64/64 workers wedged, fresh client `503` after every attacker socket is closed | remote worker-exhaustion denial of service (no recovery) |
@@ -128,19 +128,19 @@ for the glob family.
 `/tmp/opencode/p27-final-run.txt`):
 
 ```text
-PASS  A1 <Files> AllowOverride All: vapache died rc=-6; stack-overflow abort=True; apache HTTP/1.1 500 Internal Server Error alive=True
-PASS  A2 <Files> AllowOverride AuthConfig: vapache died rc=-6; stack-overflow abort=True; apache HTTP/1.1 500 Internal Server Error alive=True
-PASS  A3 IndexIgnore AllowOverride Indexes: vapache died rc=-6; stack-overflow abort=True; apache HTTP/1.1 500 Internal Server Error alive=True
-PASS  B1 benign control: vapache HTTP/1.1 200 OK in 0.5 ms
-PASS  B2 exponential wedge: vapache TIMEOUT in 2002.1 ms for *{a*}12b vs 400 a's
+PASS  A1 <Files> AllowOverride All: httpd-rs died rc=-6; stack-overflow abort=True; apache HTTP/1.1 500 Internal Server Error alive=True
+PASS  A2 <Files> AllowOverride AuthConfig: httpd-rs died rc=-6; stack-overflow abort=True; apache HTTP/1.1 500 Internal Server Error alive=True
+PASS  A3 IndexIgnore AllowOverride Indexes: httpd-rs died rc=-6; stack-overflow abort=True; apache HTTP/1.1 500 Internal Server Error alive=True
+PASS  B1 benign control: httpd-rs HTTP/1.1 200 OK in 0.5 ms
+PASS  B2 exponential wedge: httpd-rs TIMEOUT in 2002.1 ms for *{a*}12b vs 400 a's
 PASS  B3 Apache oracle: apache HTTP/1.1 403 Forbidden in 0.4 ms
 PASS  B4 all workers exhausted: fresh client HTTP/1.1 503 Service Unavailable in 5.9 ms; threads 3->66; CPU 16.03s in 2.0s
 PASS  B5 no recovery after client close: fresh client HTTP/1.1 503 Service Unavailable in 8.0 ms; threads still 66
-PASS  C1 access-file control: vapache HTTP/1.1 200 OK in 0.3 ms
-PASS  C2 header pattern wedges: vapache TIMEOUT in 2004.4 ms for 8001-byte X-V vs 8000-byte X-P
+PASS  C1 access-file control: httpd-rs HTTP/1.1 200 OK in 0.3 ms
+PASS  C2 header pattern wedges: httpd-rs TIMEOUT in 2004.4 ms for 8001-byte X-V vs 8000-byte X-P
 PASS  C3 Apache oracle: apache HTTP/1.1 403 Forbidden in 0.6 ms alive=True
-PASS  D1 growth ladder: stars=2 vapache=404 0.4ms apache=404 0.4ms; stars=4 vapache=404 6.2ms apache=404 0.2ms;
-      stars=6 vapache=404 118.7ms apache=404 0.3ms; stars=8 vapache=404 1653.3ms apache=404 0.3ms
+PASS  D1 growth ladder: stars=2 httpd-rs=404 0.4ms apache=404 0.4ms; stars=4 httpd-rs=404 6.2ms apache=404 0.2ms;
+      stars=6 httpd-rs=404 118.7ms apache=404 0.3ms; stars=8 httpd-rs=404 1653.3ms apache=404 0.3ms
 ```
 
 ### 3.1 P27-A — one request aborts the process
@@ -155,7 +155,7 @@ fatal runtime error: stack overflow, aborting
 The waitpid status is `rc=-6` (`SIGABRT`); a client sees an empty response.
 Apache refuses the identical 40 KB `<Files>` line itself
 (`.htaccess: Error reading … at line 1: Line too long`, Apache's 8190-byte
-per-line cap) and returns `500` while staying alive. vapache has no
+per-line cap) and returns `500` while staying alive. httpd-rs has no
 per-line or pattern-length cap: the whole 1 MiB `MAX_HTACCESS` budget is
 available for one glob pattern.
 
@@ -202,7 +202,7 @@ the star count) while Apache stays at 0.2-0.4 ms on the identical file.
 
 - **Precondition:** the attacker can place or modify a `.htaccess` in a
   writable directory of a tree whose configuration enables access files
-  (`VapacheCapability AccessFiles On`) and grants the relevant override
+  (`HttpdRsCapability AccessFiles On`) and grants the relevant override
   category: `AllowOverride All` or `AuthConfig` for `<Files>`/`Require expr`,
   `Indexes` for `IndexIgnore`. This is exactly the P15-P18 upload-directory
   threat model and the project's own conformance/benchmark shape
@@ -277,8 +277,8 @@ the star count) while Apache stays at 0.2-0.4 ms on the identical file.
 ## 7. Reproduction
 
 ```sh
-cd /root/vapache
-cargo build --release -p vapached
+cd /root/httpd-rs
+cargo build --release -p httpd-rs
 python3 adversarial/p27/exploit_p27.py            # all 12 verdicts
 python3 adversarial/p27/exploit_p27.py A           # kill vectors only
 python3 adversarial/p27/exploit_p27.py B C         # wedge / header vectors
@@ -294,13 +294,13 @@ is closed.
 Minimal P27-A repro (fixture `/tmp/opencode/p27-stack`):
 
 ```sh
-# .htaccess in an AllowOverride All directory of a VapacheCapability
+# .htaccess in an AllowOverride All directory of a HttpdRsCapability
 # AccessFiles On server:
 #   <Files "********************************...">    # 40,000 stars
 #       Require all denied
 #   </Files>
 python3 /tmp/opencode/p27-glob/stackkill.py
-# -> vapache exited after one request: True (rc=-6)
+# -> httpd-rs exited after one request: True (rc=-6)
 # -> thread 'conn' (25878) has overflowed its stack
 #    fatal runtime error: stack overflow, aborting
 # -> apache on identical access file: HTTP/1.1 500, alive
@@ -310,12 +310,12 @@ Minimal P27-B repro (retained harness, group D ladder + group B wedge):
 
 ```sh
 python3 adversarial/p27/exploit_p27.py D
-# -> stars=2 vapache 404 in 0.4 ms | apache 404 in 0.4 ms
-# -> stars=4 vapache 404 in 6.2 ms | apache 404 in 0.2 ms
-# -> stars=6 vapache 404 in 118.7 ms | apache 404 in 0.3 ms
-# -> stars=8 vapache 404 in 1653.3 ms | apache 404 in 0.3 ms
+# -> stars=2 httpd-rs 404 in 0.4 ms | apache 404 in 0.4 ms
+# -> stars=4 httpd-rs 404 in 6.2 ms | apache 404 in 0.2 ms
+# -> stars=6 httpd-rs 404 in 118.7 ms | apache 404 in 0.3 ms
+# -> stars=8 httpd-rs 404 in 1653.3 ms | apache 404 in 0.3 ms
 python3 adversarial/p27/exploit_p27.py B
-# -> 12-star pattern + 400-byte basename: vapache TIMEOUT (CPU pinned)
+# -> 12-star pattern + 400-byte basename: httpd-rs TIMEOUT (CPU pinned)
 #    while apache answers 403 in 0.4 ms; 64/64 workers exhausted, no recovery
 ```
 

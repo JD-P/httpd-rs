@@ -9,7 +9,7 @@ scenario: git-cgi
 # Serve Gitweb and smart Git HTTP from a VPS
 
 This tutorial publishes Gitweb at `/gitweb` and Git smart HTTP at `/git/`
-through Vapache CGI. The example domain is `git.example.test`.
+through httpd-rs CGI. The example domain is `git.example.test`.
 
 ## What you will do
 
@@ -20,7 +20,7 @@ and test a reload.
 
 ## Before you start
 
-Complete [Prepare a Debian VPS for a Vapache
+Complete [Prepare a Debian VPS for a httpd-rs
 tutorial](prepare-debian-vps.md). Point `git.example.test` at the VPS and open
 TCP ports 80 and 443 in the provider firewall.
 
@@ -57,10 +57,10 @@ $ sudo install -d -o git -g gitwriters -m 2770 /srv/git
 $ sudo -u git git init --bare --shared=group /srv/git/example.git
 $ sudo -u git git -C /srv/git/example.git symbolic-ref HEAD refs/heads/main
 $ sudo -u git git -C /srv/git/example.git config http.receivepack true
-$ sudo install -d -o root -g www-data -m 0750 /etc/vapache/auth
-$ sudo htpasswd -B -C 12 -c /etc/vapache/auth/git.htpasswd alice
-$ sudo chown root:www-data /etc/vapache/auth/git.htpasswd
-$ sudo chmod 0640 /etc/vapache/auth/git.htpasswd
+$ sudo install -d -o root -g www-data -m 0750 /etc/httpd-rs/auth
+$ sudo htpasswd -B -C 12 -c /etc/httpd-rs/auth/git.htpasswd alice
+$ sudo chown root:www-data /etc/httpd-rs/auth/git.htpasswd
+$ sudo chmod 0640 /etc/httpd-rs/auth/git.htpasswd
 ```
 
 The `www-data` identity executes both CGI programs. Membership in `gitwriters`
@@ -86,7 +86,7 @@ $ sudo chmod 0644 /etc/gitweb.conf
 $ sudo install -d -o www-data -g www-data -m 0750 /var/cache/gitweb
 ```
 
-## 4. Configure Vapache
+## 4. Configure httpd-rs
 
 First create `/etc/apache2/sites-available/git.conf` with an HTTP-only virtual
 host that Certbot can use:
@@ -97,13 +97,13 @@ host that Certbot can use:
 </VirtualHost>
 ```
 
-Enable it, reload Vapache, and obtain the certificate through Vapache's
+Enable it, reload httpd-rs, and obtain the certificate through httpd-rs's
 Certbot control shim:
 
 ```console
 $ sudo a2ensite git.conf
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot certonly --apache --domain git.example.test
 ```
 
@@ -113,7 +113,7 @@ Replace the temporary virtual host with the following configuration. If
 
 <!-- tested-example: tutorials/git-cgi-vhost.conf -->
 ```apache
-VapacheCapability Cgi On
+HttpdRsCapability Cgi On
 
 <VirtualHost *:80>
     ServerName git.example.test
@@ -138,7 +138,7 @@ VapacheCapability Cgi On
     <Location />
         AuthType Basic
         AuthName "Git"
-        AuthUserFile /etc/vapache/auth/git.htpasswd
+        AuthUserFile /etc/httpd-rs/auth/git.htpasswd
         Require valid-user
     </Location>
 
@@ -153,11 +153,11 @@ VapacheCapability Cgi On
 </VirtualHost>
 ```
 
-Test the final configuration, reload Vapache, and test certificate renewal:
+Test the final configuration, reload httpd-rs, and test certificate renewal:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -167,15 +167,15 @@ $ sudo certbot renew --dry-run
 $ curl --fail --user alice https://git.example.test/gitweb
 $ git clone https://alice@git.example.test/git/example.git /tmp/example-clone
 $ cd /tmp/example-clone
-$ printf '%s\n' 'Vapache smart HTTP test' > README.md
+$ printf '%s\n' 'httpd-rs smart HTTP test' > README.md
 $ git add README.md
-$ git -c user.name='Vapache test' -c user.email='test@example.test' \
+$ git -c user.name='httpd-rs test' -c user.email='test@example.test' \
     commit -m 'Test smart HTTP'
 $ git push -u origin HEAD:main
-$ sudo systemctl reload vapache.service
+$ sudo systemctl reload httpd-rs.service
 $ git clone https://alice@git.example.test/git/example.git /tmp/example-check
 $ cat /tmp/example-check/README.md
-Vapache smart HTTP test
+httpd-rs smart HTTP test
 ```
 
 Enter Alice's password when Git asks for it. A successful Gitweb page alone

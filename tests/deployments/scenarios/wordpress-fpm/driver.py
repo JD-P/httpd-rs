@@ -15,13 +15,13 @@ from lib import (
     CaseContext,
     DeploymentError,
     common_apache_config,
-    common_vapache_config,
+    common_httpd_rs_config,
     differential_benchmark,
     free_port,
     request,
     require_response,
     start_apache,
-    start_vapache,
+    start_httpd_rs,
     wait_for_path,
 )
 
@@ -38,12 +38,12 @@ def install_wordpress(port: int) -> urllib.request.OpenerDirector:
         raise DeploymentError(f"WordPress installer did not load: {page[:500]!r}")
     form = urllib.parse.urlencode(
         {
-            "weblog_title": "Vapache WordPress Integration",
+            "weblog_title": "httpd-rs WordPress Integration",
             "user_name": "admin",
-            "admin_password": "vapache-integration-password-42",
-            "admin_password2": "vapache-integration-password-42",
+            "admin_password": "httpd-rs-integration-password-42",
+            "admin_password2": "httpd-rs-integration-password-42",
             "pw_weak": "on",
-            "admin_email": "integration@vapache.invalid",
+            "admin_email": "integration@httpd-rs.invalid",
             "blog_public": "0",
             "Submit": "Install WordPress",
             "language": "",
@@ -59,7 +59,7 @@ def install_wordpress(port: int) -> urllib.request.OpenerDirector:
     login = urllib.parse.urlencode(
         {
             "log": "admin",
-            "pwd": "vapache-integration-password-42",
+            "pwd": "httpd-rs-integration-password-42",
             "wp-submit": "Log In",
             "redirect_to": f"http://127.0.0.1:{port}/wp-admin/",
             "testcookie": "1",
@@ -84,18 +84,18 @@ def upload_media(port: int, opener: urllib.request.OpenerDirector) -> str:
     if match is None:
         raise DeploymentError("WordPress media page did not expose an upload nonce")
     nonce = match.group(1)
-    boundary = "vapache-wordpress-integration-boundary"
+    boundary = "httpd-rs-wordpress-integration-boundary"
     png = (
         b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
         b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDAT\x08\xd7c\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99=\x1d\x00\x00\x00\x00IEND\xaeB`\x82"
     )
     parts: list[bytes] = []
-    for name, value in (("name", "vapache-integration.png"), ("action", "upload-attachment"), ("_wpnonce", nonce)):
+    for name, value in (("name", "httpd-rs-integration.png"), ("action", "upload-attachment"), ("_wpnonce", nonce)):
         parts.append(
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode()
         )
     parts.append(
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"async-upload\"; filename=\"vapache-integration.png\"\r\nContent-Type: image/png\r\n\r\n".encode()
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"async-upload\"; filename=\"httpd-rs-integration.png\"\r\nContent-Type: image/png\r\n\r\n".encode()
         + png
         + b"\r\n"
     )
@@ -154,7 +154,7 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
     compose.exec("wordpress", ["chown", "-R", f"{os.getuid()}:{os.getgid()}", "/var/www/html"], user="0")
     htaccess = wordpress_root / ".htaccess"
     # WordPress's stock authorization rule matches every request, including
-    # static assets.  Vapache deliberately will not let a cache hit bypass a
+    # static assets.  httpd-rs deliberately will not let a cache hit bypass a
     # rewrite with environment side effects.  Attach the same forwarding
     # effect only to the two rules that actually select index.php, leaving
     # static representations safely cacheable.
@@ -194,7 +194,7 @@ CacheDefaultExpire 300
     trusted_owner = os.getuid()
     extra = f"""
 DirectoryIndex index.php
-VapacheFastCGIStablePath On unix:{socket_path} 33 33 0 {trusted_owner}
+HttpdRsFastCGIStablePath On unix:{socket_path} 33 33 0 {trusted_owner}
 ProxyPassMatch ^/(.*\\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{wordpress_root}/"
 <Directory "{wordpress_root}">
     Options FollowSymLinks
@@ -208,14 +208,14 @@ ProxyPassMatch ^/(.*\\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{wordpres
 </Directory>
 {cache}
 """
-    config, pid_file = common_vapache_config(
+    config, pid_file = common_httpd_rs_config(
         context.run_dir,
         port,
         wordpress_root,
         capabilities=("AccessFiles", "FastCgi"),
         extra=extra,
     )
-    server = start_vapache(context, config, pid_file, port)
+    server = start_httpd_rs(context, config, pid_file, port)
     opener = install_wordpress(port)
     uploaded_url = upload_media(port, opener)
     uploaded_path = urllib.parse.urlsplit(uploaded_url).path
@@ -240,7 +240,7 @@ ProxyPassMatch ^/(.*\\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{wordpres
         require_response(port, "/hello-world/", contains=b"Hello world")
     else:
         require_response(port, "/?p=1", contains=b"Hello world")
-    require_response(port, "/", contains=b"Vapache WordPress Integration")
+    require_response(port, "/", contains=b"httpd-rs WordPress Integration")
     require_response(port, "/wp-json/wp/v2/posts", contains=b"hello-world")
     source_status, source_headers, source_body = request(port, "/index.php")
     source_redirect = source_headers.get("location", "")
@@ -312,12 +312,12 @@ ProxyPassMatch ^/(.*\\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{wordpres
         )
         start_apache(context, apache_config, apache_port)
         host = f"127.0.0.1:{port}"
-        require_response(apache_port, "/", contains=b"Vapache WordPress Integration", headers={"Host": host})
+        require_response(apache_port, "/", contains=b"httpd-rs WordPress Integration", headers={"Host": host})
         differential_benchmark(
             port,
             apache_port,
             "/",
-            context.artifact_dir / "apache-vapache-benchmark.json",
+            context.artifact_dir / "apache-httpd-rs-benchmark.json",
             headers=(f"Host: {host}",),
             connections=4,
         )

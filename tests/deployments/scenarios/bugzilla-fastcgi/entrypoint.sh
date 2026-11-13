@@ -3,7 +3,7 @@ set -eu
 
 : "${BUGZILLA_ROOT:?}"
 : "${BZ_URLBASE:?}"
-: "${VAPACHE_SOCKET_GID:?}"
+: "${HTTPD_RS_SOCKET_GID:?}"
 cd "$BUGZILLA_ROOT"
 
 while ! nc -z database 3306; do
@@ -13,7 +13,7 @@ done
 answers=/tmp/checksetup_answers.txt
 sed \
   -e "s|%%BZ_URLBASE%%|$BZ_URLBASE|g" \
-  /opt/vapache/checksetup_answers.txt >"$answers"
+  /opt/httpd-rs/checksetup_answers.txt >"$answers"
 perl checksetup.pl "$answers"
 # A fresh Bugzilla checkout can add newly introduced localconfig variables and
 # deliberately stop after writing them.  The documented second pass consumes
@@ -33,4 +33,4 @@ chown root:www-data "$BUGZILLA_ROOT/localconfig"
 
 rm -f /run/bugzilla/fcgi.sock
 exec spawn-fcgi -n -s /run/bugzilla/fcgi.sock -M 0660 \
-  -U www-data -G "$VAPACHE_SOCKET_GID" -u www-data -g www-data -- /usr/sbin/fcgiwrap -f
+  -U www-data -G "$HTTPD_RS_SOCKET_GID" -u www-data -g www-data -- /usr/sbin/fcgiwrap -f

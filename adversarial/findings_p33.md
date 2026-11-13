@@ -1,18 +1,18 @@
 # Pass 33 — MultiViews selects a representation before the trailing-slash rejection and serves it without re-evaluating URL-scoped authorization (P33-A)
 
 - **Date:** 2026-11-09
-- **Subject:** HEAD `dc2d5e5` (`target/release/vapached`, rebuilt from the
+- **Subject:** HEAD `dc2d5e5` (`target/release/httpd-rs`, rebuilt from the
   checked-out tree; no product source was edited). The feature under review is
   the MultiViews support added by `fb46f2f` ("Support Debian static and
   PHP-FPM defaults"), the newest product commit before this pass.
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` + `mod_negotiation` +
   `mod_rewrite` + `mod_authz_core`, loopback only.
 - **Harness:** `adversarial/p33/exploit_p33.py` (six differential cases;
-  Apache and vapached on distinct sibling loopback ports with separate
+  Apache and httpd-rs on distinct sibling loopback ports with separate
   configs, pid files and fixtures). Retained output:
   `adversarial/p33/results_p33.txt`.
 - **Method:** source audit of the new MultiViews branch plus a live
-  Apache-versus-vapached differential across exact-`Location`,
+  Apache-versus-httpd-rs differential across exact-`Location`,
   extension-`Location`, `.htaccess` rewrite, stock-Debian alias and control
   shapes.
 - **Disposition:** confirmed and remediated on 2026-11-09. The selected
@@ -24,7 +24,7 @@
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache before fix | Remediated vapache | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs before fix | Remediated httpd-rs | Class |
 |---|---------|---------------|--------------------|-------------------|-------|
 | **P33-A** | `Options MultiViews` content negotiation runs in the `Target::NotFound` branch and maps a missing/extensionless URL to a sibling `name.ext` representation. Two independent identities stayed behind: (1) the trailing-slash static-file rejection lived only in the `Target::File` branch, so `/secret/` negotiated and served `secret.txt`; (2) URL-scoped authorization (`<Location>`/`<LocationMatch>` and per-directory `RewriteRule` subjects) was still evaluated against the pre-negotiation URL `/secret`, while Apache evaluates it against the negotiated representation `/secret.txt`. | `/secret` under `RewriteRule \.txt$ - [F]` or `<LocationMatch "\.txt$"> Require all denied` → `404`; `/secret/` under `<LocationMatch "^/secret$">` → `404`; stock alias `/js/secret/` → `404`. | `/secret` → `200` with the protected body; `/secret/` → `200` with the protected body; `/js/secret/` → `200` with the protected body. | Selected-name guards deny (`403`); trailing-slash and stock-alias spellings return `404`; no protected body is served. | protected static-file read; authority bypass |
 
@@ -111,25 +111,25 @@ retained results file now records the post-fix replay):
 
 ```text
 ## A exact Location + trailing slash
-   /secret        apache=403 vapache=403 leaked=False
-   /secret/       apache=404 vapache=200 leaked=True
+   /secret        apache=403 httpd-rs=403 leaked=False
+   /secret/       apache=404 httpd-rs=200 leaked=True
 
 ## B extension Location guard
-   /secret        apache=404 vapache=200 leaked=True
+   /secret        apache=404 httpd-rs=200 leaked=True
 
 ## C .htaccess rewrite extension guard
-   /secret        apache=404 vapache=200 leaked=True
+   /secret        apache=404 httpd-rs=200 leaked=True
 
 ## D stock-Debian alias shape
-   /js/secret     apache=403 vapache=403 leaked=False
-   /js/secret/    apache=404 vapache=200 leaked=True
+   /js/secret     apache=403 httpd-rs=403 leaked=False
+   /js/secret/    apache=404 httpd-rs=200 leaked=True
 
 ## E control: MultiViews off
-   /secret        apache=403 vapache=403 leaked=False
-   /secret/       apache=404 vapache=404 leaked=False
+   /secret        apache=403 httpd-rs=403 leaked=False
+   /secret/       apache=404 httpd-rs=404 leaked=False
 
 ## F control: Files deny is candidate-bound
-   /secret        apache=404 vapache=403 leaked=False
+   /secret        apache=404 httpd-rs=403 leaked=False
 
 PASS-33 HARNESS COMPLETE: expected divergences above are the P33-A reproducer
 ```
@@ -147,15 +147,15 @@ Case details:
   directory assertion (by ordering) and returns `P33-SECRET-CONTENT-7f3a`.
 - **B** — `<LocationMatch "\.txt$"> Require all denied` + `Options
   MultiViews`. Apache denies the negotiated `.txt` representation (`404`);
-  vapache serves it.
+  httpd-rs serves it.
 - **C** — `.htaccess` `RewriteEngine On` + `RewriteRule \.txt$ - [F]` under
   `AllowOverride FileInfo` + `Options MultiViews`. Apache's per-directory
   rewrite sees the negotiated subject and denies (`404`, and the rewrite is an
-  ordinary operator control in the deployment scenarios); vapache returns the
+  ordinary operator control in the deployment scenarios); httpd-rs returns the
   body.
 - **D** — the stock-Debian alias shape: `Alias /js <root>`, `<Directory
   "<root>"> Options FollowSymLinks MultiViews`, plus an exact
-  `<LocationMatch "^/js/secret$">` deny. `/js/secret/` leaks on vapache,
+  `<LocationMatch "^/js/secret$">` deny. `/js/secret/` leaks on httpd-rs,
   `404` on Apache. This is the configuration shape produced by Debian's
   `javascript-common.conf`.
 - **E** — the same exact-`Location` guard with `Options FollowSymLinks`
@@ -167,7 +167,7 @@ Case details:
 An additional interop check (not part of the pass) showed that MultiViews
 still refuses handler/candidate execution: a negotiated `.php` or `.txt`
 file with a `<FilesMatch>`/`<LocationMatch>` `SetHandler cgi-script` returns
-`404` on vapache instead of executing, while Apache executes the negotiated
+`404` on httpd-rs instead of executing, while Apache executes the negotiated
 handler. The divergence is therefore disclosure, not code execution, unless a
 future negotiation path arms a handler — the handler-refusal check must stay
 fail-closed when this fix lands.
@@ -270,21 +270,21 @@ fail-closed when this fix lands.
 ## 7. Reproduction
 
 ```sh
-cd /root/vapache
-cargo build --release -p vapached
+cd /root/httpd-rs
+cargo build --release -p httpd-rs
 python3 adversarial/p33/exploit_p33.py            # six remediation cases
 python3 adversarial/p33/exploit_p33.py --keep     # retain fixtures and logs
 ```
 
 The harness writes configs, fixtures and server logs under
 `/tmp/opencode/p33-harness` (`--keep` retains them), binds Apache and
-vapached to separate loopback ports in the `29100`/`29200` ranges, and uses
+httpd-rs to separate loopback ports in the `29100`/`29200` ranges, and uses
 the real `/usr/sbin/apache2` 2.4.69 oracle with `mod_negotiation`,
 `mod_rewrite` and `mod_authz_core`.
 
 ## 8. Retained files
 
-- `adversarial/p33/exploit_p33.py` — six-case Apache/vapached remediation
+- `adversarial/p33/exploit_p33.py` — six-case Apache/httpd-rs remediation
   harness; fails on any former disclosure or status regression.
 - `adversarial/p33/results_p33.txt` — retained post-fix run output.
 - `/tmp/opencode/p33-harness/` — per-case configs, fixture trees and server

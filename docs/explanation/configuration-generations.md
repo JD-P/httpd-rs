@@ -13,7 +13,7 @@ still be running, long-lived connections may still exist, caches may contain
 policy-dependent results, and background workers may be acting on the old
 world. The server must decide which world owns every new action.
 
-Vapache models reload as a transition between immutable configuration
+httpd-rs models reload as a transition between immutable configuration
 generations. This makes time part of the policy model rather than an incidental
 property of mutable global state.
 
@@ -85,7 +85,7 @@ roots can affect policy. A path that was safe at startup may be replaced before
 reload, or a service-owned parent may let the worker substitute the next
 candidate.
 
-Vapache records and revalidates the authority around administrative inputs.
+httpd-rs records and revalidates the authority around administrative inputs.
 Where a reload needs privileged file access after the service has dropped
 privilege, the design uses a narrowly constrained process-owned broker instead
 of restoring ambient privilege to the request-serving process.

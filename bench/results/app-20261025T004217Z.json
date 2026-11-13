@@ -13,7 +13,7 @@
           "p99_ms": 4.82,
           "raw": "Running 3s test @ http://127.0.0.1:19080/index.php\n  4 threads and 32 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     0.87ms    0.91ms  16.66ms   90.87%\n    Req/Sec    10.94k     1.24k   18.28k    85.25%\n  Latency Distribution\n     50%  588.00us\n     75%    0.96ms\n     90%    1.68ms\n     99%    4.82ms\n  132869 requests in 3.10s, 29.91MB read\nRequests/sec:  42866.11\nTransfer/sec:      9.65MB\n"
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 55372.66,
           "mean_ms": 0.87,
           "p99_ms": 7.65,
@@ -32,7 +32,7 @@
           "p99_ms": 12.6,
           "raw": "Running 3s test @ http://127.0.0.1:19080/app/hello\n  4 threads and 32 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     6.45ms   57.63ms   1.01s    99.08%\n    Req/Sec     5.61k   558.89     6.51k    75.83%\n  Latency Distribution\n     50%    1.28ms\n     75%    1.66ms\n     90%    2.46ms\n     99%   12.60ms\n  67075 requests in 3.00s, 12.86MB read\nRequests/sec:  22332.06\nTransfer/sec:      4.28MB\n"
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 24623.78,
           "mean_ms": 1.42,
           "p99_ms": 5.58,

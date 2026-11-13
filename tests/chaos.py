@@ -22,7 +22,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target/release/vapached"))
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target/release/httpd-rs"))
 
 
 def free_port() -> int:
@@ -46,13 +46,13 @@ def wait_for_port(port: int, process: subprocess.Popen, timeout: float = 10) -> 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError(f"vapached exited with status {process.returncode}")
+            raise RuntimeError(f"httpd-rs exited with status {process.returncode}")
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                 return
         except OSError:
             time.sleep(0.05)
-    raise RuntimeError("timed out waiting for vapached")
+    raise RuntimeError("timed out waiting for httpd-rs")
 
 
 def stop_process_group(process: subprocess.Popen) -> None:
@@ -121,7 +121,7 @@ def plain_config(base: Path, port: int) -> Path:
     config.write_text(
         f'''ServerRoot "{base}"
 Listen 127.0.0.1:{port}
-PidFile "{base}/logs/vapached.pid"
+PidFile "{base}/logs/httpd-rs.pid"
 ErrorLog "{base}/logs/error.log"
 User www-data
 Group www-data
@@ -147,10 +147,10 @@ def assert_injected(trace: Path, syscall: str) -> None:
 
 def syscall_failures() -> None:
     """Exercise actual kernel-boundary failures without production hooks."""
-    with tempfile.TemporaryDirectory(prefix="vapache-chaos-syscall-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="httpd-rs-chaos-syscall-") as temporary:
         base = Path(temporary)
         logs, www = make_tree(base)
-        body = (b"vapache-sendfile-fallback\n" * 65536)[: 1024 * 1024]
+        body = (b"httpd-rs-sendfile-fallback\n" * 65536)[: 1024 * 1024]
         (www / "index.html").write_bytes(body)
         (www / "index.html").chmod(0o644)
         port = free_port()
@@ -167,7 +167,7 @@ def syscall_failures() -> None:
                     str(trace),
                     "--trace=sendfile",
                     "--inject=sendfile:error=EIO:when=1",
-                    str(VAPACHED),
+                    str(HTTPD_RS),
                     "-f",
                     str(config),
                     "-DFOREGROUND",
@@ -204,7 +204,7 @@ def syscall_failures() -> None:
                 # The first openat2 is the intentionally optional Apache
                 # envvars lookup; fail the configuration file open itself.
                 "--inject=openat2:error=EIO:when=2",
-                str(VAPACHED),
+                str(HTTPD_RS),
                 "-t",
                 "-f",
                 str(config),
@@ -221,7 +221,7 @@ def syscall_failures() -> None:
         assert b"Syntax OK" not in injected.stdout
         assert_injected(open_trace, "openat2")
         control = subprocess.run(
-            [str(VAPACHED), "-t", "-f", str(config)],
+            [str(HTTPD_RS), "-t", "-f", str(config)],
             cwd=ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -237,7 +237,7 @@ def broker_death() -> None:
     """Kill the privileged TLS file broker and require atomic reload failure."""
     if os.geteuid() != 0:
         raise AssertionError("TLS broker death scenario must start as container root")
-    with tempfile.TemporaryDirectory(prefix="vapache-chaos-broker-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="httpd-rs-chaos-broker-") as temporary:
         base = Path(temporary)
         logs, www = make_tree(base)
         expected = b"healthy after broker death\n"
@@ -274,7 +274,7 @@ def broker_death() -> None:
         config.write_text(
             f'''ServerRoot "{base}"
 Listen 127.0.0.1:{port}
-PidFile "{logs}/vapached.pid"
+PidFile "{logs}/httpd-rs.pid"
 ErrorLog "{logs}/error.log"
 User www-data
 Group www-data
@@ -300,7 +300,7 @@ DocumentRoot "{www}"
         output_path = logs / "process.log"
         with output_path.open("wb") as output:
             process = subprocess.Popen(
-                [str(VAPACHED), "-f", str(config), "-DFOREGROUND"],
+                [str(HTTPD_RS), "-f", str(config), "-DFOREGROUND"],
                 cwd=ROOT,
                 stdout=output,
                 stderr=subprocess.STDOUT,
@@ -309,7 +309,7 @@ DocumentRoot "{www}"
             try:
                 wait_for_port(port, process)
                 assert tls_get(port) == (200, expected)
-                server_pid = int((logs / "vapached.pid").read_text().strip())
+                server_pid = int((logs / "httpd-rs.pid").read_text().strip())
                 deadline = time.monotonic() + 5
                 children: list[int] = []
                 while time.monotonic() < deadline:
@@ -327,7 +327,7 @@ DocumentRoot "{www}"
                 while time.monotonic() < deadline:
                     if not Path(f"/proc/{server_pid}").exists():
                         raise AssertionError(
-                            "vapached died after broker termination"
+                            "httpd-rs died after broker termination"
                         )
                     reload_log = (
                         error_log.read_text(errors="replace") if error_log.exists() else ""
@@ -366,7 +366,7 @@ def resource_limits() -> None:
     environment = os.environ.copy()
     environment.update(
         {
-            "VAPACHED": str(VAPACHED),
+            "HTTPD_RS": str(HTTPD_RS),
             "SOAK_SECONDS": os.environ.get("CHAOS_SOAK_SECONDS", "15"),
             # The container has one CPU. Four busy clients sustain pressure
             # without turning ephemeral-port exhaustion into the test oracle.
@@ -390,8 +390,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("resources", "syscalls", "broker"))
     args = parser.parse_args()
-    if not VAPACHED.is_file():
-        raise SystemExit(f"missing release daemon: {VAPACHED}")
+    if not HTTPD_RS.is_file():
+        raise SystemExit(f"missing release daemon: {HTTPD_RS}")
     if args.mode == "resources":
         resource_limits()
     elif args.mode == "syscalls":

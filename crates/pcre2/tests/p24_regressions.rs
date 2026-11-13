@@ -1,7 +1,7 @@
 //! Fixed regressions from adversarial pass P24.
 
-use vapache_pcre2::bytes as rust;
-use vapache_pcre2::ErrorKind;
+use httpd_rs_pcre2::bytes as rust;
+use httpd_rs_pcre2::ErrorKind;
 
 #[test]
 fn p24_b_nested_optional_repetition_is_charged_for_pike_active_paths() {

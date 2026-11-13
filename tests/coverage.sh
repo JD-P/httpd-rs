@@ -1,5 +1,5 @@
 #!/bin/sh
-# Combined line coverage for vapached: Rust unit tests plus the end-to-end
+# Combined line coverage for httpd-rs: Rust unit tests plus the end-to-end
 # conformance suite.
 #
 # The server and test binaries are built with -C instrument-coverage into
@@ -39,40 +39,48 @@ export CARGO_PROFILE_RELEASE_LTO=false
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 
 CARGO_TARGET_DIR="$COVERAGE_TARGET_DIR" RUSTFLAGS="$COVERAGE_RUSTFLAGS" \
-    cargo build --release -p vapached
+    cargo build --release -p httpd-rs
 
 CARGO_TARGET_DIR="$COVERAGE_TARGET_DIR" RUSTFLAGS="$COVERAGE_RUSTFLAGS" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/unit-%p-%m%c.profraw" \
-    cargo test -p vapached --features fault-injection -- --test-threads=1
+    cargo test -p httpd-rs --features fault-injection -- --test-threads=1
 
-VAPACHED="$COVERAGE_TARGET_DIR/release/vapached" \
-LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
+# FastCGI's transport tests share the full harness with fork- and
+# descriptor-isolation tests. Collect them once in an isolated process as well
+# so their counters do not depend on whole-suite process teardown scheduling.
+CARGO_TARGET_DIR="$COVERAGE_TARGET_DIR" RUSTFLAGS="$COVERAGE_RUSTFLAGS" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/unit-%p-%m%c.profraw" \
+    cargo test -p httpd-rs --features fault-injection \
+        fastcgi::tests:: -- --test-threads=1
+
+HTTPD_RS="$COVERAGE_TARGET_DIR/release/httpd-rs" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/httpd-rs-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/config_grammar.py
 
-VAPACHED="$COVERAGE_TARGET_DIR/release/vapached" \
-LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
+HTTPD_RS="$COVERAGE_TARGET_DIR/release/httpd-rs" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/httpd-rs-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/config_validity.py
 
-VAPACHED="$COVERAGE_TARGET_DIR/release/vapached" \
-LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
+HTTPD_RS="$COVERAGE_TARGET_DIR/release/httpd-rs" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/httpd-rs-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/config_semantics.py --random 128 --seed 2469 \
         --stateful 128 --stateful-seed 1818
 
-VAPACHED="$COVERAGE_TARGET_DIR/release/vapached" \
-LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
+HTTPD_RS="$COVERAGE_TARGET_DIR/release/httpd-rs" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/httpd-rs-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/vhost_semantics.py
 
-VAPACHED="$COVERAGE_TARGET_DIR/release/vapached" \
-LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
+HTTPD_RS="$COVERAGE_TARGET_DIR/release/httpd-rs" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/httpd-rs-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/conformance.py
 
-VAPACHED="$COVERAGE_TARGET_DIR/release/vapached" \
-LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
+HTTPD_RS="$COVERAGE_TARGET_DIR/release/httpd-rs" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/httpd-rs-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/adversarial_regressions.py
 

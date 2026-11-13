@@ -1,6 +1,6 @@
 # Process and descriptor isolation review
 
-This campaign reviewed every process Vapache creates or retains across
+This campaign reviewed every process httpd-rs creates or retains across
 requests: the main daemon, local CGI worker pool and scripts, `RewriteMap prg`
 helpers, the privileged TLS file broker, and the adjacent disposable DNS
 workers. The security objective is an explicit process tree and an explicit
@@ -33,7 +33,7 @@ pool unavailable or saturated => 503, never direct-spawn downgrade
 group cleanup => signal while direct child PID is owned and unreaped
 ```
 
-Linux `close_range(2)` supplies the atomic descriptor sweep. Vapache does not
+Linux `close_range(2)` supplies the atomic descriptor sweep. httpd-rs does not
 use a guessed upper-fd loop: failure means startup/helper failure. This makes
 Linux 5.9 the minimum supported kernel (the earlier `openat2` boundary needed
 5.6).
@@ -65,12 +65,12 @@ unsafe sites and the fork/exec probes were reviewed into
 
 ## Boundary that remains external
 
-Vapache is not a general CGI sandbox. CGI code runs as the configured service
+httpd-rs is not a general CGI sandbox. CGI code runs as the configured service
 identity and may use the syscalls available to that identity. Ordinary child
 processes remain in the per-request process group and are killed, while output
 and input ownership has an absolute deadline even if a descendant deliberately
 creates a new session. Deployments that execute mutually untrusted CGI code
 still need an OS isolation boundary (separate uid/container/cgroup). FastCGI
 and reverse-proxy application processes are separately managed services; this
-campaign isolates Vapache's sockets and request accounting but does not change
+campaign isolates httpd-rs's sockets and request accounting but does not change
 their service-manager policy.

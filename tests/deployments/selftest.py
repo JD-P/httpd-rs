@@ -118,19 +118,19 @@ class DeploymentHarnessTests(unittest.TestCase):
             self.assertTrue(callable(harness.import_driver(scenario).run))
 
     def test_benchmark_summary_aggregates_medians(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="vapache-summary-selftest-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="httpd-rs-summary-selftest-") as temporary:
             artifact_root = Path(temporary)
             case = artifact_root / "case-id"
             case.mkdir()
-            (case / "apache-vapache-benchmark.json").write_text(
+            (case / "apache-httpd-rs-benchmark.json").write_text(
                 json.dumps(
                     {
                         "path": "/health",
-                        "median_requests_per_second": {"apache": 100.0, "vapache": 90.0},
-                        "vapache_to_apache_ratio": 0.9,
+                        "median_requests_per_second": {"apache": 100.0, "httpd-rs": 90.0},
+                        "httpd_rs_to_apache_ratio": 0.9,
                         "samples": {
                             "apache": [{"p99_latency_ms": 2.0}, {"p99_latency_ms": 4.0}],
-                            "vapache": [{"p99_latency_ms": 3.0}, {"p99_latency_ms": 5.0}],
+                            "httpd-rs": [{"p99_latency_ms": 3.0}, {"p99_latency_ms": 5.0}],
                         },
                     }
                 )
@@ -140,10 +140,10 @@ class DeploymentHarnessTests(unittest.TestCase):
             )
             summary = json.loads((artifact_root / "benchmark-summary.json").read_text())
             self.assertEqual(summary["benchmarks"][0]["apache_p99_latency_ms"], 3.0)
-            self.assertEqual(summary["benchmarks"][0]["vapache_p99_latency_ms"], 4.0)
+            self.assertEqual(summary["benchmarks"][0]["httpd_rs_p99_latency_ms"], 4.0)
 
     def test_bind_mounts_are_confined_to_run_directory(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="vapache-deployment-selftest-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="httpd-rs-deployment-selftest-") as temporary:
             run_dir = Path(temporary)
             safe = run_dir / "application"
             safe.mkdir()
@@ -156,7 +156,7 @@ class DeploymentHarnessTests(unittest.TestCase):
                 validate_bind_source(Path("/tmp"), run_dir)
 
     def test_staged_builds_are_confined_and_digest_pinned(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="vapache-build-selftest-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="httpd-rs-build-selftest-") as temporary:
             run_dir = Path(temporary)
             context = run_dir / "build"
             context.mkdir()
@@ -209,7 +209,7 @@ class DeploymentHarnessTests(unittest.TestCase):
 
     def test_compose_models_enforce_container_isolation(self) -> None:
         by_id = {scenario.identifier: scenario for scenario in self.scenarios}
-        with tempfile.TemporaryDirectory(prefix="vapache-compose-selftest-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="httpd-rs-compose-selftest-") as temporary:
             run_dir = Path(temporary)
             wordpress = run_dir / "wordpress"
             php_run = run_dir / "php-run"
@@ -326,7 +326,7 @@ class DeploymentHarnessTests(unittest.TestCase):
             wagtail_media = run_dir / "wagtail-media"
             wagtail_media.mkdir()
             wagtail = by_id["wagtail-proxy"]
-            local_wagtail = "vapache-deployment-selftest-wagtail:local"
+            local_wagtail = "httpd-rs-deployment-selftest-wagtail:local"
             ComposeProject(
                 compose_file=wagtail.path / "compose.yml",
                 project="selftest_wagtail",
@@ -345,7 +345,7 @@ class DeploymentHarnessTests(unittest.TestCase):
             bugzilla_root.mkdir()
             bugzilla_run.mkdir()
             bugzilla = by_id["bugzilla-fastcgi"]
-            local_bugzilla = "vapache-deployment-selftest-bugzilla:local"
+            local_bugzilla = "httpd-rs-deployment-selftest-bugzilla:local"
             ComposeProject(
                 compose_file=bugzilla.path / "compose.yml",
                 project="selftest_bugzilla",
@@ -355,7 +355,7 @@ class DeploymentHarnessTests(unittest.TestCase):
                     "BUGZILLA_ROOT": str(bugzilla_root),
                     "BZ_URLBASE": "http://127.0.0.1:30996/",
                     "FCGI_RUN": str(bugzilla_run),
-                    "VAPACHE_SOCKET_GID": "1000",
+                    "HTTPD_RS_SOCKET_GID": "1000",
                 },
                 images=bugzilla.images + (local_bugzilla,),
                 artifact_dir=run_dir / "artifacts",

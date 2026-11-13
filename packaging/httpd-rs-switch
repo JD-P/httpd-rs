@@ -1,0 +1,411 @@
+#!/bin/sh -p
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+case "$0" in
+    /usr/sbin/*)
+        httpd_rs_switch_common=/usr/lib/httpd-rs/control-common
+        if [ -L "$httpd_rs_switch_common" ] || [ ! -f "$httpd_rs_switch_common" ] \
+            || [ "$(stat -c '%u' -- "$httpd_rs_switch_common")" != 0 ] \
+            || [ -n "$(find "$httpd_rs_switch_common" -maxdepth 0 -perm /022 -print -quit)" ]; then
+            echo "httpd-rs-switch: unsafe installed control library" >&2
+            exit 1
+        fi
+        ;;
+    *)
+    case "$0" in
+        */*) httpd_rs_switch_script_dir=${0%/*} ;;
+        *) httpd_rs_switch_script_dir=. ;;
+    esac
+        httpd_rs_switch_common=$httpd_rs_switch_script_dir/httpd-rs-control-common
+        ;;
+esac
+. "$httpd_rs_switch_common"
+
+assume_yes=false
+case "${1:-}" in
+    -y|--yes)
+        assume_yes=true
+        shift
+        ;;
+    "") ;;
+    *)
+        echo "Usage: httpd-rs-switch [--yes]" >&2
+        exit 2
+        ;;
+esac
+[ "$#" -eq 0 ] || {
+    echo "Usage: httpd-rs-switch [--yes]" >&2
+    exit 2
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "httpd-rs-switch: run this command as root" >&2
+    exit 1
+fi
+if [ -n "${HTTPD_RS_SYSTEMCTL:-}" ]; then
+    systemctl_path=$HTTPD_RS_SYSTEMCTL
+elif ! systemctl_path=$(command -v systemctl 2>/dev/null); then
+    echo "httpd-rs-switch: systemd is required" >&2
+    exit 1
+fi
+systemctl_command=$(httpd_rs_validate_command "$systemctl_path" systemctl) || {
+    echo "httpd-rs-switch: systemctl is not a controlled executable" >&2
+    exit 1
+}
+httpd_rs_control=$(httpd_rs_validate_command /usr/sbin/httpd-rsctl httpd-rsctl) || {
+    echo "httpd-rs-switch: /usr/sbin/httpd-rsctl is not a controlled executable" >&2
+    exit 1
+}
+
+httpd_rs_ensure_runtime_dir /run/httpd-rs || {
+    echo "httpd-rs-switch: /run/httpd-rs is not a controlled runtime directory" >&2
+    exit 1
+}
+switch_lock=/run/httpd-rs/switch.lock
+httpd_rs_lock_file_is_safe "$switch_lock" || {
+    echo "httpd-rs-switch: unsafe switch lock: $switch_lock" >&2
+    exit 1
+}
+exec 8>"$switch_lock"
+chmod 0600 "$switch_lock"
+httpd_rs_lock_file_is_safe "$switch_lock" || {
+    echo "httpd-rs-switch: could not secure switch lock" >&2
+    exit 1
+}
+flock -x 8
+
+certbot_shim=/usr/lib/httpd-rs/certbot-apachectl
+certbot_deploy_hook=/usr/lib/httpd-rs/certbot-deploy-hook
+certbot_cli_config=/etc/letsencrypt/cli.ini
+certbot_present=false
+certbot_cli_uses_shim=false
+certbot_renewals=0
+certbot_apache_renewals=0
+certbot_unshimmed_renewals=0
+temporary=
+transition_started=false
+transition_complete=false
+apache_service=
+apache_active=false
+apache_enabled=false
+
+restore_switch_state() {
+    httpd_rs_switch_status=$?
+    if [ -n "$temporary" ]; then
+        rm -f -- "$temporary"
+    fi
+    if [ "$transition_started" = true ] && [ "$transition_complete" != true ]; then
+        echo "httpd-rs-switch: restoring the previous web-server service state" >&2
+        "$systemctl_command" disable --now httpd-rs.service >/dev/null 2>&1 || true
+        if [ -n "$apache_service" ]; then
+            if [ "$apache_enabled" = true ]; then
+                "$systemctl_command" enable "$apache_service" >/dev/null 2>&1 || true
+            fi
+            if [ "$apache_active" = true ]; then
+                "$systemctl_command" start "$apache_service" >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+    return "$httpd_rs_switch_status"
+}
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap restore_switch_state EXIT
+
+controlled_certbot_directory() {
+    certbot_directory=$1
+    if [ -e "$certbot_directory" ] || [ -L "$certbot_directory" ]; then
+        [ -d "$certbot_directory" ] && [ ! -L "$certbot_directory" ] \
+            && httpd_rs_root_path_is_controlled "$certbot_directory"
+        return
+    fi
+    certbot_parent=${certbot_directory%/*}
+    [ -n "$certbot_parent" ] || certbot_parent=/
+    httpd_rs_root_path_is_controlled "$certbot_parent" || return 1
+    install -d -o root -g root -m 0755 -- "$certbot_directory"
+    httpd_rs_root_path_is_controlled "$certbot_directory"
+}
+
+renewal_uses_apache() {
+    grep -Eiq \
+        '^[[:space:]]*(authenticator|installer)[[:space:]]*=[[:space:]]*apache([[:space:]]*(#.*)?)?$' \
+        "$1"
+}
+
+renewal_uses_httpd_rs_shim() {
+    grep -Eiq \
+        '^[[:space:]]*apache_ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachectl[[:space:]]*$' \
+        "$1"
+}
+
+inspect_certbot() {
+    if command -v certbot >/dev/null 2>&1 || [ -d /etc/letsencrypt ]; then
+        certbot_present=true
+    fi
+    if [ -e /etc/letsencrypt ] || [ -L /etc/letsencrypt ]; then
+        controlled_certbot_directory /etc/letsencrypt || {
+            echo "httpd-rs-switch: unsafe Certbot configuration root: /etc/letsencrypt" >&2
+            exit 1
+        }
+    fi
+    if [ -e "$certbot_cli_config" ] || [ -L "$certbot_cli_config" ]; then
+        if [ -L "$certbot_cli_config" ] || [ ! -f "$certbot_cli_config" ] \
+            || ! httpd_rs_root_path_is_controlled "$certbot_cli_config"; then
+            echo "httpd-rs-switch: unsafe Certbot configuration: $certbot_cli_config" >&2
+            exit 1
+        fi
+        if grep -Ei '^[[:space:]]*apache-ctl[[:space:]]*=' "$certbot_cli_config" \
+            | grep -Eiv \
+                '^[[:space:]]*apache-ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachectl[[:space:]]*([#;].*)?$' \
+                >/dev/null; then
+            echo "httpd-rs-switch: $certbot_cli_config already has a custom apache-ctl setting" >&2
+            echo "httpd-rs-switch: remove that setting or select the httpd-rs shim yourself" >&2
+            exit 1
+        fi
+        if grep -Eiq \
+            '^[[:space:]]*apache-ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachectl[[:space:]]*([#;].*)?$' \
+            "$certbot_cli_config"; then
+            certbot_cli_uses_shim=true
+        fi
+    fi
+    [ -d /etc/letsencrypt/renewal ] || return 0
+    controlled_certbot_directory /etc/letsencrypt/renewal || {
+        echo "httpd-rs-switch: unsafe Certbot renewal directory" >&2
+        exit 1
+    }
+    for renewal in /etc/letsencrypt/renewal/*.conf; do
+        [ -e "$renewal" ] || continue
+        if [ -L "$renewal" ] || [ ! -f "$renewal" ] \
+            || ! httpd_rs_root_path_is_controlled "$renewal"; then
+            echo "httpd-rs-switch: unsafe Certbot renewal configuration: $renewal" >&2
+            exit 1
+        fi
+        certbot_renewals=$((certbot_renewals + 1))
+        if renewal_uses_apache "$renewal"; then
+            if ! grep -Eiq '^[[:space:]]*\[renewalparams\][[:space:]]*$' "$renewal"; then
+                echo "httpd-rs-switch: $renewal has no valid [renewalparams] section" >&2
+                exit 1
+            fi
+            certbot_apache_renewals=$((certbot_apache_renewals + 1))
+            if ! renewal_uses_httpd_rs_shim "$renewal"; then
+                certbot_unshimmed_renewals=$((certbot_unshimmed_renewals + 1))
+            fi
+        fi
+    done
+}
+
+set_certbot_cli_apache_control() {
+    if [ -f "$certbot_cli_config" ]; then
+        temporary=$(mktemp "$certbot_cli_config.httpd-rs.XXXXXX")
+        awk -v value="$certbot_shim" '
+            /^[[:space:]]*apache-ctl[[:space:]]*=/ {
+                if (!written) print "apache-ctl = " value
+                written = 1
+                next
+            }
+            { print }
+            END {
+                if (!written) print "apache-ctl = " value
+            }
+        ' "$certbot_cli_config" >"$temporary"
+        chown --reference="$certbot_cli_config" "$temporary"
+        chmod --reference="$certbot_cli_config" "$temporary"
+        mv -f -- "$temporary" "$certbot_cli_config"
+        temporary=
+    else
+        controlled_certbot_directory /etc/letsencrypt || {
+            echo "httpd-rs-switch: could not create a controlled Certbot configuration root" >&2
+            exit 1
+        }
+        temporary=$(mktemp "$certbot_cli_config.httpd-rs.XXXXXX")
+        printf '%s\n' "apache-ctl = $certbot_shim" >"$temporary"
+        chmod 0600 "$temporary"
+        mv -f -- "$temporary" "$certbot_cli_config"
+        temporary=
+    fi
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon "$certbot_cli_config" >/dev/null 2>&1 || true
+    fi
+}
+
+set_renewal_apache_control() {
+    renewal=$1
+    temporary=$(mktemp "$renewal.httpd-rs.XXXXXX")
+    if ! awk -v value="$certbot_shim" '
+        function renewal_section(line) {
+            line = tolower(line)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            return line == "[renewalparams]"
+        }
+        function section_header(line) {
+            return line ~ /^[[:space:]]*\[[^]]+\][[:space:]]*$/
+        }
+        function emit_value() {
+            if (inside && !written) {
+                print "apache_ctl = " value
+                written = 1
+            }
+        }
+        {
+            if (section_header($0)) {
+                emit_value()
+                inside = renewal_section($0)
+                if (inside) seen = 1
+                print
+                next
+            }
+            if (inside && $0 ~ /^[[:space:]]*apache_ctl[[:space:]]*=/) {
+                if (!written) print "apache_ctl = " value
+                written = 1
+                next
+            }
+            print
+        }
+        END {
+            emit_value()
+            if (!seen) exit 42
+        }
+    ' "$renewal" >"$temporary"; then
+        rm -f -- "$temporary"
+        echo "httpd-rs-switch: $renewal has no valid [renewalparams] section" >&2
+        exit 1
+    fi
+    chown --reference="$renewal" "$temporary"
+    chmod --reference="$renewal" "$temporary"
+    mv -f -- "$temporary" "$renewal"
+    temporary=
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon "$renewal" >/dev/null 2>&1 || true
+    fi
+}
+
+configure_certbot() {
+    [ "$certbot_present" = true ] || return 0
+    certbot_shim=$(httpd_rs_validate_command "$certbot_shim" certbot-apachectl) || {
+        echo "httpd-rs-switch: missing Certbot Apache control shim: $certbot_shim" >&2
+        exit 1
+    }
+    certbot_deploy_hook=$(httpd_rs_validate_command \
+        "$certbot_deploy_hook" certbot-deploy-hook) || {
+        echo "httpd-rs-switch: missing Certbot deploy hook: $certbot_deploy_hook" >&2
+        exit 1
+    }
+    hook=/etc/letsencrypt/renewal-hooks/deploy/httpd-rs-reload
+    if [ -e "$hook" ] || [ -L "$hook" ]; then
+        if [ ! -L "$hook" ] || [ "$(readlink -- "$hook")" != "$certbot_deploy_hook" ]; then
+            echo "httpd-rs-switch: refusing to replace existing Certbot hook: $hook" >&2
+            exit 1
+        fi
+    fi
+
+    set_certbot_cli_apache_control
+    controlled_certbot_directory /etc/letsencrypt/renewal-hooks || {
+        echo "httpd-rs-switch: unsafe Certbot renewal-hooks directory" >&2
+        exit 1
+    }
+    controlled_certbot_directory /etc/letsencrypt/renewal-hooks/deploy || {
+        echo "httpd-rs-switch: unsafe Certbot deploy-hook directory" >&2
+        exit 1
+    }
+    if [ ! -L "$hook" ]; then
+        ln -s "$certbot_deploy_hook" "$hook"
+    else
+        test "$(readlink -- "$hook")" = "$certbot_deploy_hook"
+    fi
+
+    [ "$certbot_apache_renewals" -gt 0 ] || return 0
+    for renewal in /etc/letsencrypt/renewal/*.conf; do
+        [ -f "$renewal" ] || continue
+        if renewal_uses_apache "$renewal"; then
+            set_renewal_apache_control "$renewal"
+        fi
+    done
+}
+
+inspect_certbot
+
+for candidate in apache2.service httpd.service; do
+    if "$systemctl_command" is-active --quiet "$candidate" 2>/dev/null; then
+        apache_service=$candidate
+        break
+    fi
+done
+for candidate in apache2.service httpd.service; do
+    [ -z "$apache_service" ] || break
+    if "$systemctl_command" list-unit-files "$candidate" --no-legend 2>/dev/null \
+        | grep -q "^$candidate"; then
+        apache_service=$candidate
+        break
+    fi
+done
+
+echo "Checking the existing Apache configuration with httpd-rs..."
+"$httpd_rs_control" configtest
+
+if [ -n "$apache_service" ]; then
+    "$systemctl_command" is-active --quiet "$apache_service" && apache_active=true
+    "$systemctl_command" is-enabled --quiet "$apache_service" && apache_enabled=true
+    echo "Detected $apache_service (active=$apache_active, enabled=$apache_enabled)."
+    echo "Its configuration files will not be modified."
+    echo "The switch will disable and stop $apache_service, then enable and start httpd-rs.service."
+else
+    echo "No apache2.service or httpd.service unit is installed."
+    echo "The switch will enable and start httpd-rs.service using the detected Apache configuration."
+fi
+
+if [ "$certbot_present" = true ]; then
+    echo "Detected a Certbot installation or configuration."
+    if [ "$certbot_cli_uses_shim" != true ]; then
+        echo "The switch will route Certbot's --apache control commands through httpd-rs's shim."
+    fi
+    echo "The shim continues to use Apache when httpd-rs.service is inactive."
+fi
+if [ "$certbot_renewals" -gt 0 ]; then
+    echo "Detected $certbot_renewals Certbot renewal configuration(s)."
+    echo "The switch will install a httpd-rs deploy hook for successful renewals."
+fi
+if [ "$certbot_apache_renewals" -gt 0 ]; then
+    echo "Detected $certbot_apache_renewals renewal configuration(s) using Certbot's Apache plugin."
+    if [ "$certbot_unshimmed_renewals" -gt 0 ]; then
+        echo "The switch will route those renewals through httpd-rs's Apache-control shim."
+    fi
+fi
+
+if [ "$assume_yes" != true ]; then
+    if [ ! -r /dev/tty ]; then
+        echo "httpd-rs-switch: no terminal available; pass --yes for an unattended switch" >&2
+        exit 1
+    fi
+    printf "Continue? [y/N] " >/dev/tty
+    IFS= read -r answer </dev/tty || answer=
+    case "$answer" in
+        y|Y|yes|YES|Yes) ;;
+        *)
+            echo "No changes made."
+            exit 0
+            ;;
+    esac
+fi
+
+configure_certbot
+"$systemctl_command" daemon-reload
+transition_started=true
+if [ -n "$apache_service" ]; then
+    if ! "$systemctl_command" disable --now "$apache_service"; then
+        echo "httpd-rs-switch: could not disable $apache_service" >&2
+        exit 1
+    fi
+fi
+
+if "$systemctl_command" enable --now httpd-rs.service; then
+    transition_complete=true
+    echo "httpd-rs.service is enabled and running; the Apache configuration was left unchanged."
+    exit 0
+fi
+
+echo "httpd-rs-switch: httpd-rs failed to start" >&2
+exit 1

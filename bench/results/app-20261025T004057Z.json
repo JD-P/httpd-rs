@@ -13,7 +13,7 @@
           "p99_ms": 4.83,
           "raw": "Running 3s test @ http://127.0.0.1:19080/app/hello\n  4 threads and 32 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.45ms  827.97us  17.32ms   87.27%\n    Req/Sec     5.79k     0.86k   11.66k    88.52%\n  Latency Distribution\n     50%    1.25ms\n     75%    1.54ms\n     90%    2.21ms\n     99%    4.83ms\n  70228 requests in 3.10s, 13.46MB read\nRequests/sec:  22664.02\nTransfer/sec:      4.34MB\n"
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 24348.03,
           "mean_ms": 45.3,
           "p99_ms": 899.0,

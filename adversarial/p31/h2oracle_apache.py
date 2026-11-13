@@ -2,7 +2,7 @@
 """Apache mod_http2 oracle for the P31 stream-slot hold.
 
 Same attack client, same fixture, Apache 2.4.69 + mod_http2 + mod_ssl instead
-of vapached.  Verifies whether a new client is served while 256 zero-window
+of httpd-rs.  Verifies whether a new client is served while 256 zero-window
 streams are held.
 """
 import socket, subprocess, sys, time

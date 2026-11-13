@@ -6,10 +6,10 @@
 > preserve their original UTF-8 bytes. Variable counted repetitions charge
 > their terminal path plus a conservative PikeVM active-set factor. The live
 > battery now requires four access-file `500` responses with the process still
-> alive, an ASCII `200` control, and a normal non-signal `vapached -t` failure.
+> alive, an ASCII `200` control, and a normal non-signal `httpd-rs -t` failure.
 
 - **Date:** 2026-10-30
-- **Subject:** `target/release/vapached` built at HEAD `8198410`
+- **Subject:** `target/release/httpd-rs` built at HEAD `8198410`
   (`Retain the PCRE2 fuzzer with P23 artifacts`). No product source was
   edited.
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` + `mime` + `dir` +
@@ -30,9 +30,9 @@
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
-| **P24-A** | `expr::Parser::regex()` takes the byte after `=~`/`!~` as a raw **byte** delimiter and stops the scan with `self.pos` pointing **inside** a multi-byte UTF-8 character whenever that delimiter byte reappears later as the lead byte of another character (`éé`, `éà`, `€€`, …). The next `&str` slice (`Parser::and()`, `crates/server/src/expr.rs:1344`) panics with `start byte index N is not a char boundary`. The release profile is built with `panic = "abort"` (`Cargo.toml`), so the panic kills the **whole vapached process** (SIGABRT, core dumped). Reachable per-request from an attacker-written `.htaccess` in any directory whose effective `AllowOverride` enables **any** category (`<If>`/`<ElseIf>`; `AuthConfig` for `Require expr`; `FileInfo` for `RewriteCond expr`), and at load time from the main configuration (`<If>`, `Require expr`, `RewriteCond expr`). The project's own benchmark/conformance configuration (`VapacheCapability AccessFiles On`, `AllowOverride All` on `/www/htaccess`, `.htaccess` rewrite/Header scenarios) is exactly this shape. | `.htaccess: Cannot parse condition clause: syntax error, unexpected T_ERROR, expecting T_REGEX or T_REGEX_I: Parse error near '\xc3'` → **500 for that request, server stays alive**. | First request into the directory kills the process: `thread 'conn' panicked at crates/server/src/expr.rs:1344:26: start byte index 21 is not a char boundary; it is inside 'é' (bytes 20..22 of string)`, `Aborted (core dumped)`. All later requests get connection refused. Re-triggers after every restart (the panicking parse is never cached). `vapached -t` with the main-config form exits with signal 6. | remote whole-process denial of service via the project's attacker-writable-`.htaccess` primitive (panic→abort) |
+| **P24-A** | `expr::Parser::regex()` takes the byte after `=~`/`!~` as a raw **byte** delimiter and stops the scan with `self.pos` pointing **inside** a multi-byte UTF-8 character whenever that delimiter byte reappears later as the lead byte of another character (`éé`, `éà`, `€€`, …). The next `&str` slice (`Parser::and()`, `crates/server/src/expr.rs:1344`) panics with `start byte index N is not a char boundary`. The release profile is built with `panic = "abort"` (`Cargo.toml`), so the panic kills the **whole httpd-rs process** (SIGABRT, core dumped). Reachable per-request from an attacker-written `.htaccess` in any directory whose effective `AllowOverride` enables **any** category (`<If>`/`<ElseIf>`; `AuthConfig` for `Require expr`; `FileInfo` for `RewriteCond expr`), and at load time from the main configuration (`<If>`, `Require expr`, `RewriteCond expr`). The project's own benchmark/conformance configuration (`HttpdRsCapability AccessFiles On`, `AllowOverride All` on `/www/htaccess`, `.htaccess` rewrite/Header scenarios) is exactly this shape. | `.htaccess: Cannot parse condition clause: syntax error, unexpected T_ERROR, expecting T_REGEX or T_REGEX_I: Parse error near '\xc3'` → **500 for that request, server stays alive**. | First request into the directory kills the process: `thread 'conn' panicked at crates/server/src/expr.rs:1344:26: start byte index 21 is not a char boundary; it is inside 'é' (bytes 20..22 of string)`, `Aborted (core dumped)`. All later requests get connection refused. Re-triggers after every restart (the panicking parse is never cached). `httpd-rs -t` with the main-config form exits with signal 6. | remote whole-process denial of service via the project's attacker-writable-`.htaccess` primitive (panic→abort) |
 | **P24-B** (secondary) | The P23 counted-repetition charge uses `max` per repetition, but a nested `{0,m}` expansion contributes `m+1` active paths and forces the PikeVM path: `1(?:[[:^alpha:]]{0,3}){4208}a` on a 1,328-byte subject charges 16.77 M units and costs **262 ms** cold / 292 ms warm on this host, while the flat `[[:^alpha:]]{12624}` with the same charge costs **0.7 ms**. A 30 k-pattern random sweep found admitted evaluations up to **268 ms** (vs. the ~65 ms that a 4 ns/unit reading of the gate implies). 32 concurrent `try_expensive` slots can therefore saturate every core. Requires the operator to configure a nested counted repetition; not attacker-chosen. | PCRE2 executes the same expression shapes in microseconds (auto-possessification) and `mod_reqtimeout`/`LimitRequest*` do not bound match work. | Worst admitted single evaluation 268 ms; nested `{0,m}` under a counted repetition is 4–5× the flat form at identical charge. | CPU-amplification DoS against operator regexes (bounded but miscalibrated work ceiling) |
 
 P24-A is remote, unauthenticated (beyond the file-write primitive), single
@@ -113,7 +113,7 @@ retained as `adversarial/p24/crash-input.bin`); the CI smoke gate runs only
 - The workspace release profile sets `panic = "abort"` (`Cargo.toml`), so
   the panic aborts the entire process from any thread (HTTP/1 `conn`
   threads and the HTTP/2 runtime alike). Observed: `Aborted (core dumped)`
-  and `vapached` absent from the process table.
+  and `httpd-rs` absent from the process table.
 - `.htaccess` files are parsed lazily on the first request that walks into
   their directory (`htaccess.rs::parse_cached`). The panic happens *during*
   parse, before the parse result is cached, so the file remains a permanent
@@ -141,7 +141,7 @@ errors, never panics" — as *implemented*. The H1 bounds fix
 claim is false at HEAD.
 
 The benchmark/conformance fixture is the vulnerable shape: it enables
-`VapacheCapability AccessFiles On` and `AllowOverride All` on
+`HttpdRsCapability AccessFiles On` and `AllowOverride All` on
 `/www/htaccess`, and the feature benchmark drives `.htaccess` rewrite and
 `Header` scenarios there. Any real deployment that mirrors the benchmark
 (a writable directory under an enabled `AllowOverride`, e.g. an upload
@@ -180,9 +180,9 @@ The `.htaccess` payload used by A1/A4 (36 bytes):
 
 Fixture: `www/uploads` is group/other-writable (simulating an upload
 directory), `AllowOverride AuthConfig` (A1/A2) or `FileInfo` (A3/A4), and
-`VapacheCapability AccessFiles On`. Apache is given the identical
+`HttpdRsCapability AccessFiles On`. Apache is given the identical
 `.htaccess`; it logs the parse error above, answers 500 for the request and
-keeps serving — vapache aborts the process.
+keeps serving — httpd-rs aborts the process.
 
 ### 2.5 Impact
 
@@ -193,7 +193,7 @@ keeps serving — vapache aborts the process.
   execute code (e.g. `AllowOverrideList Require` rejects `<If>`, but
   `AllowOverride AuthConfig` admits it).
 - Also turns an operator typo in the main configuration into a SIGABRT
-  (`vapached -t` exits -6) instead of a clean config error, which defeats
+  (`httpd-rs -t` exits -6) instead of a clean config error, which defeats
   fail-closed reload tooling.
 
 ### 2.6 Remediation direction
@@ -259,8 +259,8 @@ when the DFA quits, and re-run the P23 benchmark at the gate boundary.
 ## 4. Reproduction
 
 ```sh
-cd /root/vapache
-cargo build --release -p vapached
+cd /root/httpd-rs
+cargo build --release -p httpd-rs
 python3 adversarial/p24/exploit_p24.py     # 7 verdicts, loopback only
 ```
 
@@ -275,7 +275,7 @@ RUST_BACKTRACE=1 fuzz/target/x86_64-unknown-linux-gnu/release/rewrite_expr \
 Expected: `panicked at crates/server/src/expr.rs:1344:26: start byte index 11
 is not a char boundary`.
 
-Main-config reproduction: `vapached -t` with
+Main-config reproduction: `httpd-rs -t` with
 `<If "%{REQUEST_URI} =~ éé">` exits with signal 6 (SIGABRT).
 
 P24-B probe (standalone, path dependency on `crates/pcre2`):

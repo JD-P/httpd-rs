@@ -23,7 +23,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 1012.99,
           "mean_ms": 30.93,
           "p99_ms": 108.25,
@@ -43,11 +43,11 @@
   ],
   "config_test_ms": {
     "apache": 17.24547499907203,
-    "vapache": 6.7513649992179126
+    "httpd-rs": 6.7513649992179126
   },
   "config_test_errors": {
     "apache": "",
-    "vapache": ""
+    "httpd-rs": ""
   },
   "memory": {
     "apache": {
@@ -55,7 +55,7 @@
       "threads": 209,
       "pss_kb": 20189
     },
-    "vapache": {
+    "httpd-rs": {
       "processes": 17,
       "threads": 20,
       "pss_kb": 18720

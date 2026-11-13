@@ -12,13 +12,13 @@ from lib import (
     DeploymentError,
     basic_authorization,
     common_apache_config,
-    common_vapache_config,
+    common_httpd_rs_config,
     differential_benchmark,
     free_port,
     request,
     require_response,
     start_apache,
-    start_vapache,
+    start_httpd_rs,
     service_identity,
     wait_for_path,
 )
@@ -27,7 +27,7 @@ from lib import (
 HERE = Path(__file__).resolve().parent
 PHP_UID = 82
 PHP_GID = 82
-PASSWORD = "vapache-nextcloud-password-42"
+PASSWORD = "httpd-rs-nextcloud-password-42"
 
 
 def verify_installation(compose, nextcloud_root: Path, stage: str, *, occ_user: int) -> None:
@@ -142,7 +142,7 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
     port = free_port()
     extra = fr"""
 DirectoryIndex index.php
-VapacheFastCGIStablePath On unix:{socket_path} {PHP_UID} {PHP_UID} 0 {os.getuid()}
+HttpdRsFastCGIStablePath On unix:{socket_path} {PHP_UID} {PHP_UID} 0 {os.getuid()}
 ProxyPassMatch ^/(.*\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{nextcloud_root}/"
 <Directory "{nextcloud_root}">
     Options FollowSymLinks
@@ -166,23 +166,23 @@ ProxyPassMatch ^/(.*\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{nextcloud
     Require all denied
 </FilesMatch>
 """
-    config, pid_file = common_vapache_config(
+    config, pid_file = common_httpd_rs_config(
         context.run_dir,
         port,
         nextcloud_root,
         capabilities=("FastCgi",),
         extra=extra,
     )
-    server = start_vapache(context, config, pid_file, port)
+    server = start_httpd_rs(context, config, pid_file, port)
     require_response(port, "/status.php", contains=b'"installed":true')
 
     dav_root = "/remote.php/dav/files/admin"
-    directory = f"{dav_root}/vapache-integration"
+    directory = f"{dav_root}/httpd-rs-integration"
     status, _, body = dav_request(port, directory, "MKCOL")
     if status not in (201, 405):
         raise DeploymentError(f"Nextcloud MKCOL failed: {status} {body[:1000]!r}")
 
-    marker = b"nextcloud-vapache-webdav-marker\n"
+    marker = b"nextcloud-httpd-rs-webdav-marker\n"
     payload = marker + (b"0123456789abcdef" * (131072 if variant["upload"] == "large" else 4096))
     source = f"{directory}/source.bin"
     status, _, body = dav_request(
@@ -277,6 +277,6 @@ ProxyPassMatch ^/(.*\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{nextcloud
             port,
             apache_port,
             "/status.php",
-            context.artifact_dir / "apache-vapache-benchmark.json",
+            context.artifact_dir / "apache-httpd-rs-benchmark.json",
             connections=4,
         )

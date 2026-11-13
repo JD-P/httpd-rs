@@ -10,20 +10,20 @@ prose_style: discursive
 Static-file serving can keep a strong connection between authorization and the
 opened object: resolve a canonical target, authorize it, open it beneath the
 approved root, and carry the descriptor to the response sink. Dynamic systems
-are harder because Vapache eventually asks another process to act.
+are harder because httpd-rs eventually asks another process to act.
 
 CGI, FastCGI, reverse proxying, and WebSockets are therefore not merely handler
 types. Each is an authority handoff across a protocol boundary. The receiving
 process has its own parser, filesystem view, identity model, configuration, and
 bugs.
 
-## A backend receives a description, not Vapache's decision
+## A backend receives a description, not httpd-rs's decision
 
-When Vapache sends a path, method, header, or authority to a backend, the
+When httpd-rs sends a path, method, header, or authority to a backend, the
 backend interprets the bytes again. It does not receive the proof or policy
-state that led Vapache to produce them. If the two processes disagree about
+state that led httpd-rs to produce them. If the two processes disagree about
 normalization, framing, host identity, or executable path, a request can cross
-the boundary with more authority than Vapache intended.
+the boundary with more authority than httpd-rs intended.
 
 This explains the strictness around backend request construction. Ambiguous
 framing is rejected before translation. Hop-by-hop and client-supplied
@@ -33,15 +33,15 @@ Reserved CGI environment variables cannot be overwritten by general
 configuration expansion.
 
 The goal is not to make the backend trustworthy. It is to make the delegated
-request a narrow, canonical statement of what Vapache intends the backend to
+request a narrow, canonical statement of what httpd-rs intends the backend to
 do.
 
 ## FastCGI exposes the pathname gap
 
 FastCGI demonstrates the problem in its sharpest form. The protocol sends a
-`SCRIPT_FILENAME`; it does not provide a portable way to pass Vapache's
+`SCRIPT_FILENAME`; it does not provide a portable way to pass httpd-rs's
 already-authorized executable descriptor as the script identity. PHP-FPM will
-resolve the pathname in its own process after Vapache has completed its policy
+resolve the pathname in its own process after httpd-rs has completed its policy
 work.
 
 If the PHP identity can replace the script or one of its ancestors, it can
@@ -73,7 +73,7 @@ cookies, and virtual-host policy. Blindly trusting client-supplied forwarded
 headers creates the opposite problem: the attacker gets to choose the public
 identity seen by the application.
 
-Vapache therefore derives forwarding fields from the validated client peer,
+httpd-rs therefore derives forwarding fields from the validated client peer,
 actual TLS state, and validated public request authority. It strips competing
 client fields first. `ProxyPreserveHost` is an explicit choice about whether
 the backend `Host` field carries the public authority or the private endpoint
@@ -81,7 +81,7 @@ identity; it is not evidence that either value should be trusted from an
 arbitrary network peer.
 
 The backend must complete the boundary by trusting these fields only from the
-Vapache address and by having an explicit public-URL configuration where the
+httpd-rs address and by having an explicit public-URL configuration where the
 application supports one.
 
 ## CGI trades protocol ambiguity for process authority
@@ -91,7 +91,7 @@ an environment, standard streams, inherited resource limits, credentials, and
 filesystem access. Descriptor inheritance and environment construction are
 therefore part of authorization, not process-launch trivia.
 
-Vapache's CGI boundary closes unrelated descriptors, constructs reserved
+httpd-rs's CGI boundary closes unrelated descriptors, constructs reserved
 request variables separately from configurable environment values, drops to
 the intended identity, applies limits, and accounts for the child until its
 output and lifecycle are finished. A contributor adding a new convenience
@@ -100,7 +100,7 @@ proved otherwise.
 
 ## Resource ownership must cross the handoff too
 
-Delegating work does not mean the request has stopped consuming Vapache
+Delegating work does not mean the request has stopped consuming httpd-rs
 resources. A backend slot, spool file, retained response buffer, pipe,
 descriptor, or blocking read must stay charged until the underlying object is
 actually released. Releasing a request-worker slot can be correct; releasing
@@ -114,12 +114,12 @@ transition.
 
 Before adding a handler, protocol feature, or backend optimization, ask:
 
-- What exact identity does Vapache authorize, and what identity can the
+- What exact identity does httpd-rs authorize, and what identity can the
   receiver actually authenticate?
 - Which bytes will the receiver parse again under different rules?
 - Can attacker-controlled input select the transport destination or public
   authority?
-- Can the receiver replace a file or object after Vapache checks it?
+- Can the receiver replace a file or object after httpd-rs checks it?
 - Which descriptors, credentials, environment variables, and resource leases
   cross the boundary?
 - What does failure mean after part of the request has been delegated?

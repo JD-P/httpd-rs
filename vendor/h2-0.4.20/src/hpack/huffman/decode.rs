@@ -144,7 +144,7 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
 
     // Establish both bounds in the executable verified kernel before any
     // allocation or decode loop begins.
-    let bounds = vapache_verified::hpack_huffman_decode_bounds(base_len, len)
+    let bounds = httpd_rs_verified::hpack_huffman_decode_bounds(base_len, len)
         .ok_or(DecoderError::InvalidHuffmanCode)?;
     buf.resize(bounds.total_len, 0);
     let dst = &mut buf[base_len..];

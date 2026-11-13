@@ -20,12 +20,12 @@ done
 # exercise process-global caches and failpoint registries.
 if [ "${MUTATION_IN_PLACE:-1}" = 1 ]; then
     # shellcheck disable=SC2086 -- the repeated --file options are intentional.
-    cargo mutants --package vapached --in-place \
+    cargo mutants --package httpd-rs --in-place \
         --timeout "${MUTATION_TIMEOUT:-300}" $args "$@" \
         -- -- --test-threads=1
 else
     # shellcheck disable=SC2086 -- the repeated --file options are intentional.
-    cargo mutants --package vapached --jobs "${MUTATION_JOBS:-2}" \
+    cargo mutants --package httpd-rs --jobs "${MUTATION_JOBS:-2}" \
         --timeout "${MUTATION_TIMEOUT:-300}" $args "$@" \
         -- -- --test-threads=1
 fi

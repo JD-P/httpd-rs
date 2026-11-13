@@ -9,7 +9,7 @@ pub mod fuzz_logic {
 
     /// Exercise the HPACK decoder and, for valid textual methods, the encoder.
     pub fn fuzz_hpack(data_: &[u8]) {
-        // Cover both Vapache's stateless policy and the fork's largest
+        // Cover both httpd-rs's stateless policy and the fork's largest
         // explicitly supported dynamic table. This keeps the opt-in table
         // implementation under adversarial coverage even though production
         // defaults to zero.
@@ -24,7 +24,7 @@ pub mod fuzz_logic {
         // Exercise every integer prefix directly so malformed continuation
         // families cannot hide behind representation dispatch.
         for prefix in 1..=8 {
-            let _ = vapache_verified::hpack_decode_integer(data_, prefix);
+            let _ = httpd_rs_verified::hpack_decode_integer(data_, prefix);
         }
 
         if let Ok(s) = std::str::from_utf8(data_) {

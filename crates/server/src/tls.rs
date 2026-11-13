@@ -166,7 +166,7 @@ fn tls_file_specs(cfg: &Config) -> Vec<(PathBuf, u64)> {
 /// unprivileged request process can ask only for TLS paths authorized by the
 /// root-owned startup configuration, never for an arbitrary pathname.
 pub fn install_privileged_file_broker(cfg: &Config, service_uid: u32) -> Result<(), String> {
-    if vapache_os::effective_uid() != 0 {
+    if httpd_rs_os::effective_uid() != 0 {
         return Ok(());
     }
     if PRIVILEGED_FILE_BROKER.get().is_some() {
@@ -184,20 +184,20 @@ pub fn install_privileged_file_broker(cfg: &Config, service_uid: u32) -> Result<
 
     let (mut stream, child_stream) = UnixStream::pair()
         .map_err(|error| format!("cannot create privileged TLS broker socket: {error}"))?;
-    let parent_pid = vapache_os::current_pid();
+    let parent_pid = httpd_rs_os::current_pid();
     // Do not allocate from Rust's inherited heap in the post-fork child.
     let child_specs = specs.clone();
     if let Err(error) = crate::fault::hit("tls.broker.fork") {
         return Err(format!("cannot fork privileged TLS broker: {error}"));
     }
-    let child = match vapache_os::fork_single_threaded()
+    let child = match httpd_rs_os::fork_single_threaded()
         .map_err(|error| format!("cannot fork privileged TLS broker: {error}"))?
     {
-        vapache_os::ForkResult::Child => {
+        httpd_rs_os::ForkResult::Child => {
             drop(stream);
             privileged_broker_child(child_stream, parent_pid, child_specs, service_uid);
         }
-        vapache_os::ForkResult::Parent(child) => child,
+        httpd_rs_os::ForkResult::Parent(child) => child,
     };
     drop(child_stream);
     if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(5))) {
@@ -230,7 +230,7 @@ pub fn install_privileged_file_broker(cfg: &Config, service_uid: u32) -> Result<
                 .unwrap_or_else(|error| error.into_inner());
             let _ = broker.stream.write_all(&BROKER_SHUTDOWN.to_ne_bytes());
             let _ = broker.stream.shutdown(std::net::Shutdown::Both);
-            let _ = vapache_os::wait(broker.pid);
+            let _ = httpd_rs_os::wait(broker.pid);
             Err("privileged TLS broker was already installed".to_string())
         }
     }
@@ -238,8 +238,8 @@ pub fn install_privileged_file_broker(cfg: &Config, service_uid: u32) -> Result<
 
 fn terminate_failed_broker(stream: &UnixStream, child: libc::pid_t) {
     let _ = stream.shutdown(std::net::Shutdown::Both);
-    let _ = vapache_os::kill(child, libc::SIGKILL);
-    let _ = vapache_os::wait(child);
+    let _ = httpd_rs_os::kill(child, libc::SIGKILL);
+    let _ = httpd_rs_os::wait(child);
 }
 
 fn privileged_broker_child(
@@ -248,31 +248,31 @@ fn privileged_broker_child(
     specs: Vec<(PathBuf, u64)>,
     service_uid: u32,
 ) -> ! {
-    if vapache_os::set_parent_death_signal(libc::SIGTERM, parent_pid).is_err() {
-        vapache_os::exit_immediately(1);
+    if httpd_rs_os::set_parent_death_signal(libc::SIGTERM, parent_pid).is_err() {
+        httpd_rs_os::exit_immediately(1);
     }
-    let Ok(mut stream) = vapache_os::isolate_privileged_broker(stream) else {
+    let Ok(mut stream) = httpd_rs_os::isolate_privileged_broker(stream) else {
         // A bounded close loop can miss a launcher-supplied descriptor above
         // its guessed ceiling. The root broker therefore has no fallback.
-        vapache_os::exit_immediately(1);
+        httpd_rs_os::exit_immediately(1);
     };
     if harden_privileged_broker().is_err() || stream.write_all(&[1]).is_err() {
-        vapache_os::exit_immediately(1);
+        httpd_rs_os::exit_immediately(1);
     }
     privileged_broker_loop(&mut stream, &specs, service_uid);
-    vapache_os::exit_immediately(0)
+    httpd_rs_os::exit_immediately(0)
 }
 
 fn harden_privileged_broker() -> std::io::Result<()> {
-    vapache_os::harden_privileged_file_broker()
+    httpd_rs_os::harden_privileged_file_broker()
 }
 
 fn restrict_privileged_broker_process() -> std::io::Result<()> {
-    vapache_os::restrict_privileged_file_broker_process()
+    httpd_rs_os::restrict_privileged_file_broker_process()
 }
 
 fn install_broker_seccomp() -> std::io::Result<()> {
-    vapache_os::install_broker_seccomp()
+    httpd_rs_os::install_broker_seccomp()
 }
 
 fn privileged_broker_loop(stream: &mut UnixStream, specs: &[(PathBuf, u64)], service_uid: u32) {
@@ -384,7 +384,7 @@ pub fn shutdown_privileged_file_broker() {
     let mut broker = broker.lock().unwrap_or_else(|error| error.into_inner());
     let _ = broker.stream.write_all(&BROKER_SHUTDOWN.to_ne_bytes());
     let _ = broker.stream.shutdown(std::net::Shutdown::Both);
-    let _ = vapache_os::wait(broker.pid);
+    let _ = httpd_rs_os::wait(broker.pid);
 }
 
 #[derive(Debug)]
@@ -490,7 +490,7 @@ fn normalize_name(name: &str) -> String {
 }
 
 fn wildcard_name_matches(name: &str, pattern: &str) -> bool {
-    vapache_verified::host_pattern_matches(name.as_bytes(), pattern.as_bytes())
+    httpd_rs_verified::host_pattern_matches(name.as_bytes(), pattern.as_bytes())
 }
 
 impl SniResolver {
@@ -635,7 +635,7 @@ fn certbot_first_issuance_error(
     let domain = certbot_domain(server_name).or_else(|| certbot_domain(Some(lineage)));
     let Some(domain) = domain else {
         return format!(
-            "{error}\n{} is a missing Certbot live-lineage file; obtain that certificate before enabling this TLS configuration, then run `sudo vapachectl configtest` again",
+            "{error}\n{} is a missing Certbot live-lineage file; obtain that certificate before enabling this TLS configuration, then run `sudo httpd-rsctl configtest` again",
             path.display()
         );
     };
@@ -645,7 +645,7 @@ fn certbot_first_issuance_error(
         format!(" --cert-name {lineage}")
     };
     format!(
-        "{error}\n{} is a missing Certbot live-lineage file. For first issuance, obtain it before enabling this TLS configuration:\n  sudo certbot certonly --standalone{cert_name} -d {domain}\nThen run `sudo vapachectl configtest` again.",
+        "{error}\n{} is a missing Certbot live-lineage file. For first issuance, obtain it before enabling this TLS configuration:\n  sudo certbot certonly --standalone{cert_name} -d {domain}\nThen run `sudo httpd-rsctl configtest` again.",
         path.display()
     )
 }
@@ -715,7 +715,7 @@ fn load_key_with_ocsp_accounted(
         };
         let dir = cache_dir
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| std::env::temp_dir().join("vapache-ocsp-cache"));
+            .unwrap_or_else(|| std::env::temp_dir().join("httpd-rs-ocsp-cache"));
         let cache_path = crate::ocsp::cache_path(&dir, &chain, ssl.stapling_force_url.as_deref());
         let mut cached = crate::ocsp::load_cached(&cache_path, &chain);
         if let (Some(response), Some(budget)) = (&cached, resource_budget) {
@@ -753,7 +753,7 @@ fn load_key_with_ocsp_accounted(
         };
         if response.is_none() {
             eprintln!(
-                "vapache: OCSP stapling requested but no response could be fetched for {}",
+                "httpd-rs: OCSP stapling requested but no response could be fetched for {}",
                 cert_file.display()
             );
         }
@@ -975,9 +975,9 @@ fn protocol_versions(spec: Option<&str>) -> Result<Vec<&'static SupportedProtoco
     Ok(out)
 }
 
-/// Exercise the vapache-owned SNI normalization/wildcard and TLS protocol
+/// Exercise the httpd-rs-owned SNI normalization/wildcard and TLS protocol
 /// policy parsers.  rustls itself has separate cryptographic fuzzing; this
-/// target covers the configuration-to-resolver boundary specific to vapache.
+/// target covers the configuration-to-resolver boundary specific to httpd-rs.
 #[cfg(feature = "fuzzing")]
 pub fn fuzz_tls_policy(data: &[u8]) {
     let Ok(text) = std::str::from_utf8(data) else {
@@ -1214,14 +1214,14 @@ fn client_policy_key(ssl: &SslConfig) -> ClientPolicyKey {
 fn client_policy_equal(a: &ClientPolicyKey, b: &ClientPolicyKey) -> bool {
     let (a_mode, a_ca, a_revocation, a_crl) = a;
     let (b_mode, b_ca, b_revocation, b_crl) = b;
-    vapache_verified::tls_client_policy_equal(
+    httpd_rs_verified::tls_client_policy_equal(
         *a_mode,
         a_ca.is_some(),
         a_ca.as_deref().unwrap_or(&[]),
         *b_mode,
         b_ca.is_some(),
         b_ca.as_deref().unwrap_or(&[]),
-    ) && vapache_verified::tls_client_revocation_policy_equal(
+    ) && httpd_rs_verified::tls_client_revocation_policy_equal(
         *a_revocation,
         a_crl.is_some(),
         a_crl.as_deref().unwrap_or(&[]),
@@ -1304,7 +1304,7 @@ impl TlsConnectionIdentity {
             .map(|vhost| &vhost.ssl)
             .unwrap_or(&cfg.ssl);
         let certificate_present = client_certificate.is_some();
-        if !vapache_verified::tls_client_identity_admit(
+        if !httpd_rs_verified::tls_client_identity_admit(
             matches!(
                 ssl.verify_client,
                 Some(crate::config::ClientVerify::Require)
@@ -1361,7 +1361,7 @@ impl TlsConnectionIdentity {
         if self.generation != cfg.authorization_generation() {
             return Some(421);
         }
-        if !vapache_verified::tls_sni_authority_admit(self.sni.is_some(), authority.is_some()) {
+        if !httpd_rs_verified::tls_sni_authority_admit(self.sni.is_some(), authority.is_some()) {
             return Some(400);
         }
         let request_vhost = cfg
@@ -1376,7 +1376,7 @@ impl TlsConnectionIdentity {
             .and_then(|index| cfg.vhosts.get(index))
             .map(|vhost| &vhost.ssl)
             .unwrap_or(&cfg.ssl);
-        (!vapache_verified::tls_vhost_transition_admit(tls_vhost_policy_equal(
+        (!httpd_rs_verified::tls_vhost_transition_admit(tls_vhost_policy_equal(
             handshake_ssl,
             request_ssl,
         )))
@@ -1584,7 +1584,7 @@ pub(crate) fn prepare_server_config(
     // Keep privileged stapling state directly below the root-owned ServerRoot,
     // not below a legacy logs directory that older releases handed to the
     // service account.
-    let ocsp_cache_dir = cfg.server_root.join(".vapache-ocsp-cache");
+    let ocsp_cache_dir = cfg.server_root.join(".httpd-rs-ocsp-cache");
     let default_server_name = (!global_only)
         .then(|| vhosts[0].server_name.as_deref())
         .flatten();
@@ -2008,7 +2008,7 @@ mod tests {
             Some("new.example:443"),
         );
         assert!(error.contains("sudo certbot certonly --standalone -d new.example"));
-        assert!(error.contains("sudo vapachectl configtest"));
+        assert!(error.contains("sudo httpd-rsctl configtest"));
     }
 
     #[test]
@@ -2255,7 +2255,7 @@ mod tests {
     }
 
     fn tempdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("vapache-tls-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-tls-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -2323,7 +2323,7 @@ mod tests {
             "-days",
             "1",
             "-subj",
-            "/CN=vapache-test-ca",
+            "/CN=httpd-rs-test-ca",
             "-addext",
             "basicConstraints=critical,CA:TRUE",
             "-addext",
@@ -2373,7 +2373,7 @@ mod tests {
             "rsa:2048",
             "-nodes",
             "-subj",
-            "/CN=vapache-test-client",
+            "/CN=httpd-rs-test-client",
             "-keyout",
             client_key.to_str().unwrap(),
             "-out",

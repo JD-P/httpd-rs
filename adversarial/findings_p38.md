@@ -2,13 +2,13 @@
 
 - **Date:** 2026-11-12
 - **Subject:** HEAD `67ca87bdccb3932919c2efabb850d7320c2265b2`
-  (`target/release/vapached`, rebuilt from the checked-out tree; no product
+  (`target/release/httpd-rs`, rebuilt from the checked-out tree; no product
   source was edited).
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` + `mod_mime` + `mod_dir` +
   `mod_authz_core` + `mod_authz_host` + `mod_cgi` + `mod_rewrite` +
   `mod_alias`, loopback only.
 - **Harness:** `adversarial/p38/exploit_p38.py` — one `apache2 -t` join probe
-  and eight live Apache-versus-vapached cases; retained output
+  and eight live Apache-versus-httpd-rs cases; retained output
   `adversarial/p38/results_p38.txt`.
 - **Method:** source audit of the newest unreviewed commit window
   (`7ec4fa7..67ca87b`) with a focus on the shared configuration front end,
@@ -25,9 +25,9 @@
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapached at HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs at HEAD | Class |
 |---|---------|---------------|------------------|-------|
-| **P38-A** | `config_frontend::logical_lines_with_numbers` joins a backslash-continued physical line by appending `' '` and trimming the next line's leading whitespace. Apache removes the backslash and the newline and concatenates the next physical line **directly**, so `foo\` + newline + `bar` is one token `foobar` on Apache and two tokens `foo bar` on Vapache. A continuation inside a guard regex therefore silently changes its meaning, and a continuation immediately after a directive name activates a directive Apache rejects for the whole file. | `<FilesMatch "^private\` + `ate\.txt$"> Require all denied` denies (403); `SetHandler\` + `cgi-script` makes the access file invalid (500); `Require\` + `all granted` under a parent deny is invalid (500); the same `<LocationMatch>` split in main configuration denies (403). | The split guard regex becomes `^priv ate\.txt$` and does not match: `200` with the protected body. The split `SetHandler` becomes valid and executes an uploaded `.txt` as CGI. The split grant becomes valid and serves the protected file. | protected static-file read; authority bypass; remote code execution in an Apache-rejected access file |
+| **P38-A** | `config_frontend::logical_lines_with_numbers` joins a backslash-continued physical line by appending `' '` and trimming the next line's leading whitespace. Apache removes the backslash and the newline and concatenates the next physical line **directly**, so `foo\` + newline + `bar` is one token `foobar` on Apache and two tokens `foo bar` on httpd-rs. A continuation inside a guard regex therefore silently changes its meaning, and a continuation immediately after a directive name activates a directive Apache rejects for the whole file. | `<FilesMatch "^private\` + `ate\.txt$"> Require all denied` denies (403); `SetHandler\` + `cgi-script` makes the access file invalid (500); `Require\` + `all granted` under a parent deny is invalid (500); the same `<LocationMatch>` split in main configuration denies (403). | The split guard regex becomes `^priv ate\.txt$` and does not match: `200` with the protected body. The split `SetHandler` becomes valid and executes an uploaded `.txt` as CGI. The split grant becomes valid and serves the protected file. | protected static-file read; authority bypass; remote code execution in an Apache-rejected access file |
 | **P38-B** | `multi_request_state` fuzzing (added by HEAD `67ca87b`) crashes deterministically on a minimized two-step input with `assertion left == right failed: pre-sink cancellation did not suppress the dynamic effect`. The cause is the harness popping one backend exchange per execution while an idempotent balancer request can legitimately produce two upstream attempts after an ambiguous response. | n/a | n/a (test-only harness accounting) | invalid claim; no product impact |
 | **P38-C** | The new `url_policy_cache` stores a partial URL scope when a rule matcher exhausts the request-local policy budget (`conditional_error = true; break`), so later requests for the same `(vhost, fs_path, url_path)` key see `Access::Misconfigured` → 500 until eviction. Requires a configuration with tens of thousands of URL/`Location` rules to charge 16 MiB of matcher work in one request. | n/a | n/a (not reproduced) | unresolved hypothesis; tentative fail-closed DoS, low |
 | **P38-D** | `whole_request_differential` aborts on two deterministic inputs. (1) A `/balanced/` route: the fixture balancer is round-robin, so the H1 and H2 evaluations select different members and the compared exchange port differs. (2) `GET /access/guard.cgi`: the harness's extra `plan_snapshot` pass fails with `access-file parse capacity exhausted` from the process-wide expensive-parse admission while the same evaluation's dispatch succeeds and returns 200. | n/a | n/a (test-only harness artifacts) | invalid claims; no product impact |
@@ -36,7 +36,7 @@
 The controls agree on both servers: a plain `<FilesMatch "^private\.txt$">`
 denies (403), a plain `SetHandler cgi-script` executes on both, a plain
 `Require all granted` grants on both, and the same split `RewriteRule`
-continuation fails closed on Vapache (500) while Apache denies (403).
+continuation fails closed on httpd-rs (500) while Apache denies (403).
 
 ---
 
@@ -89,7 +89,7 @@ by a space. P35-A's own unit test pins the divergent join
 
 All rows are live differentials from `adversarial/p38/results_p38.txt`.
 
-| Case | Access file / configuration | Apache | Vapache |
+| Case | Access file / configuration | Apache | httpd-rs |
 |---|---|---|---|
 | A | `.htaccess`: `<FilesMatch "^priv\` + `ate\.txt$">` `Require all denied` `</FilesMatch>` | `403`, no body | `200` with `P38-SECRET-CONTENT-5a17` |
 | A-control | `.htaccess`: `<FilesMatch "^private\.txt$">` `Require all denied` | `403` | `403` |
@@ -102,7 +102,7 @@ All rows are live differentials from `adversarial/p38/results_p38.txt`.
 | F (observation) | `.htaccess`: `RewriteRule ^priv\` + `ate\.txt$ - [F]` | `403` | `500` (the joined line has the wrong argument count) |
 
 Case A is the strongest form: both servers accept the configuration without
-error, and only Vapache fails to apply the operator's deny. Case E shows the
+error, and only httpd-rs fails to apply the operator's deny. Case E shows the
 same silent guard loss in a main configuration file with no attacker-writable
 `.htaccess` at all. Cases B and C are the P35-A shape (a directive Apache
 rejects becomes active policy) through the token-join seam rather than the
@@ -116,7 +116,7 @@ comment seam.
   into an active `SetHandler cgi-script` or `Require all granted`.
 - Case E needs no attacker-writable file: any operator configuration that
   wraps a long guard regex across a backslash continuation is silently less
-  restrictive on Vapache than on Apache.
+  restrictive on httpd-rs than on Apache.
 - Case B executes an uploaded `.txt` as CGI under `www-data` where Apache
   returns `500`; case A/E return the protected body under a live deny.
 
@@ -290,8 +290,8 @@ component: charge `record_data_frame` on the three early-return paths.
 - Plain (non-continued) guards, grants and handlers agree on both servers in
   every case above.
 - The P38-A divergence is one-directional for accepted configurations:
-  Vapache always inserts at least as much whitespace as Apache, so the
-  fail-closed direction (`RewriteRule` split, case F) errors on Vapache where
+  httpd-rs always inserts at least as much whitespace as Apache, so the
+  fail-closed direction (`RewriteRule` split, case F) errors on httpd-rs where
   Apache acts. The security-relevant direction is the silent guard loss and
   the Apache-invalid directive activation.
 - The four tracked `multi_request_state` corpus seeds pass at HEAD; the
@@ -300,8 +300,8 @@ component: charge `record_data_frame` on the three early-return paths.
   proxy/FastCGI/CGI changes: every FastCGI `SCRIPT_FILENAME`/`PATH_INFO`
   spelling it tried (`/uploads/must-not-execute.php[/x.png|/|/.|//…]`,
   `//uploads/…`, `/./uploads/…`, `%2F`/`%2E`/`%00`, out-of-docroot prefixes,
-  symlinked scripts) was denied on Vapache, and Apache's `mod_proxy_fcgi`
-  actually executed one of those spellings where Vapache denied it; config-time
+  symlinked scripts) was denied on httpd-rs, and Apache's `mod_proxy_fcgi`
+  actually executed one of those spellings where httpd-rs denied it; config-time
   capture authority (`$1`/`\1`/`%1`/`%{HTTP_HOST}` in a proxy URL) fails
   configuration loading; a failover member denied by its own `<Proxy>` policy
   is never contacted; a `<Location>` deny survives a per-directory rewrite

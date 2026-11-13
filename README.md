@@ -1,13 +1,14 @@
-# vapache
+# httpd-rs
 
 A memory-safe, formally verified, drop-in-compatible Apache HTTP Server
 replacement written in Rust.
 
-The [Vapache documentation](docs/README.md) covers migration, intentional
-Apache differences, security expectations, and executable documentation
-contracts.
+The [httpd-rs documentation](https://jd-p.github.io/httpd-rs/) covers migration,
+intentional Apache differences, security expectations, and executable
+documentation contracts. Its [Markdown source](docs/README.md) is maintained
+in this repository.
 
-`vapached` reads ordinary Apache 2.4 configuration files, serves static files,
+`httpd-rs` reads ordinary Apache 2.4 configuration files, serves static files,
 runs CGI programs, and keeps the security-critical parsing kernels in
 [Verus](https://github.com/verus-lang/verus) so they can be machine-checked.
 The project targets Apache-level compatibility while hardening the historical
@@ -79,7 +80,7 @@ Implemented today:
   accepted only while the pathname still names the inode that was read. By
   default their parent chain and file must be outside the service identity's
   mutation authority; deployments that intentionally update them as the
-  service account must opt in with `VapacheCapability MutableAuthFiles On`.
+  service account must opt in with `HttpdRsCapability MutableAuthFiles On`.
   SHA/SSHA and MD5-crypt outputs are compared in constant time; bcrypt uses
   its verifier. Plaintext and unknown hash formats fail closed.
 - TLS 1.2/1.3 via Rustls with `SSLEngine`, certificate chains, SNI virtual-host
@@ -315,7 +316,7 @@ Unhandled directives are configuration errors in every mode, including
 directives that are recognized as Apache directives but not implemented.
 `--strict-config` remains accepted for deployment compatibility, but normal
 mode no longer converts an unknown or unimplemented directive into a no-op.
-Recognized directives are also rejected when Vapache cannot preserve their
+Recognized directives are also rejected when httpd-rs cannot preserve their
 Apache scope: a per-directory or per-vhost value is never written into a
 process-global field, virtual-host balancers are not exposed globally, and
 mapping directives are refused in contexts where Apache refuses them.
@@ -325,7 +326,7 @@ Security-sensitive unimplemented directives
 non-file `AuthBasicProvider` values and filter-provider/input-filter
 directives) fail closed at startup, and unimplemented `.htaccess` directives
 fail closed with a `500`. Warnings are reserved for explicitly handled forms
-whose Vapache behavior is equivalent or deliberately stricter, never for a
+whose httpd-rs behavior is equivalent or deliberately stricter, never for a
 discarded policy. `[DPI]` and `[NS]` rewrite flags fail at configuration load
 until their path-info and internal-subrequest semantics are implemented.
 
@@ -333,59 +334,59 @@ until their path-info and internal-subrequest semantics are implemented.
 
 ```sh
 export PATH="$HOME/.cargo/bin:$HOME/verus-bin:$PATH"
-cargo build --release -p vapached
+cargo build --release -p httpd-rs
 ```
 
-The binary is `target/release/vapached`.
+The binary is `target/release/httpd-rs`.
 
 ### Prebuilt Linux artifacts
 
 Each push to `main`, version tag, and manual `linux-artifacts` workflow run
 uploads five x86-64 artifacts:
 
-- the compiled `vapached` binary;
+- the compiled `httpd-rs` binary;
 - a portable tar archive;
 - a Debian/Ubuntu `.deb` package;
 - an RPM-family `.rpm` package; and
 - `SHA256SUMS` covering all four payloads.
 
 The release target is `x86_64-unknown-linux-musl`, producing a static PIE with
-no glibc version floor. Vapache remains Linux-specific and requires Linux 5.9
+no glibc version floor. httpd-rs remains Linux-specific and requires Linux 5.9
 or newer for its fail-closed `openat2` path-resolution and `close_range`
 descriptor-isolation boundaries.
 
-The packages install the server as `/usr/sbin/vapached` and service as
-`vapache.service`, but deliberately leave the existing Apache configuration
-and daemon state untouched. `vapachectl` selects `/etc/apache2/apache2.conf`
+The packages install the server as `/usr/sbin/httpd-rs` and service as
+`httpd-rs.service`, but deliberately leave the existing Apache configuration
+and daemon state untouched. `httpd-rsctl` selects `/etc/apache2/apache2.conf`
 on Debian-family systems or `/etc/httpd/conf/httpd.conf` on RPM-family
 systems. To validate the existing configuration and interactively switch the
 active daemon:
 
 ```sh
-sudo vapache-switch
+sudo httpd-rs-switch
 ```
 
 The helper shows which Apache service it found and asks before disabling it.
-If vapache fails to start, it restores Apache's previous active/enabled state.
-Set `VAPACHE_CONFDIR` and `VAPACHE_CONFIG` to select a nonstandard Apache
+If httpd-rs fails to start, it restores Apache's previous active/enabled state.
+Set `HTTPD_RS_CONFDIR` and `HTTPD_RS_CONFIG` to select a nonstandard Apache
 layout. The packaged wrapper materializes enabled-config symlinks and derives
 any capability opt-ins already implied by the Apache configuration into a
 root-controlled runtime snapshot; it never edits the source configuration.
-Set `VAPACHE_AUTO_CAPABILITIES=0` to retain the raw binary's explicit opt-in
+Set `HTTPD_RS_AUTO_CAPABILITIES=0` to retain the raw binary's explicit opt-in
 requirement. See `packaging/README.md` for the installed file layout.
 
 ### Certbot
 
-Vapache reads the usual `SSLCertificateFile` and `SSLCertificateKeyFile`
+httpd-rs reads the usual `SSLCertificateFile` and `SSLCertificateKeyFile`
 paths, including Certbot's `/etc/letsencrypt/live/...` links. A graceful reload
 atomically validates and adopts renewed certificate/key pairs while existing
 connections finish on the old TLS generation:
 
 ```sh
-sudo systemctl reload vapache.service
+sudo systemctl reload httpd-rs.service
 ```
 
-The packaged `vapache-switch` detects existing Certbot lineages, installs a
+The packaged `httpd-rs-switch` detects existing Certbot lineages, installs a
 conditional deploy hook, and routes Apache-plugin lineages through a dedicated
 control shim without replacing Apache's `apache2ctl`. It records the shim in
 Certbot's global configuration, so ordinary Apache-plugin commands work:
@@ -395,19 +396,19 @@ sudo certbot --apache -d example.com
 ```
 
 The shim retains Apache's read-only configuration discovery, requires both
-Apache and Vapache syntax checks while Vapache is active, and maps Certbot's
-reload request to a root-started `vapache.service` restart so a newly added
+Apache and httpd-rs syntax checks while httpd-rs is active, and maps Certbot's
+reload request to a root-started `httpd-rs.service` restart so a newly added
 port 443 listener can bind. Webroot and DNS authenticators remain supported.
-If `vapache-switch` has not been run, pass
-`--apache-ctl /usr/lib/vapache/certbot-apachectl` explicitly.
+If `httpd-rs-switch` has not been run, pass
+`--apache-ctl /usr/lib/httpd-rs/certbot-apachectl` explicitly.
 
 For first issuance, start with an HTTP-only virtual host and let
 `certbot --apache` add the TLS configuration after the certificate exists.
-Like Apache, Vapache rejects an enabled TLS virtual host whose certificate is
+Like Apache, httpd-rs rejects an enabled TLS virtual host whose certificate is
 missing. If that virtual host already points into a nonexistent
-`/etc/letsencrypt/live/` lineage, Vapache's configuration error prints the
+`/etc/letsencrypt/live/` lineage, httpd-rs's configuration error prints the
 literal `certbot certonly --standalone` command needed to create it before
-retrying `sudo vapachectl configtest`; the standalone authenticator requires
+retrying `sudo httpd-rsctl configtest`; the standalone authenticator requires
 port 80 to be free.
 
 ## Verify
@@ -415,7 +416,7 @@ port 80 to be free.
 The security kernels live in `crates/verified` and are checked with Verus:
 
 ```sh
-cargo verus verify -p vapache-verified
+cargo verus verify -p httpd-rs-verified
 ```
 
 Current result: **842 verified functions, 0 errors** (percent-decoding,
@@ -489,9 +490,9 @@ HTTP/2, proxy and cache paths.
 
 ### Default-off compatibility capabilities
 
-Vapache does not inherit Apache's ambient legacy surface. The following
+httpd-rs does not inherit Apache's ambient legacy surface. The following
 features are individually disabled unless the global server configuration
-opts in with `VapacheCapability <name> On`:
+opts in with `HttpdRsCapability <name> On`:
 
 | Capability | Gated surface |
 | --- | --- |
@@ -519,10 +520,10 @@ gate again.
 For example, an application that only needs CGI declares only:
 
 ```apache
-VapacheCapability Cgi On
+HttpdRsCapability Cgi On
 ```
 
-`vapached --audit-capabilities -f /path/to/httpd.conf` parses an existing main
+`httpd-rs --audit-capabilities -f /path/to/httpd.conf` parses an existing main
 configuration without auto-enabling anything and prints the declarations it
 would require. Access-file contents are intentionally checked only when read,
 so they remain unable to change the process capability set. A configuration
@@ -540,7 +541,7 @@ backend normally needs an exact global stable-path policy:
 
 ```apache
 # endpoint, PHP worker uid, Unix-socket owner uid, then trusted tree owners
-VapacheFastCGIStablePath On unix:/run/php/php8.4-fpm.sock 33 0 0 1001
+HttpdRsFastCGIStablePath On unix:/run/php/php8.4-fpm.sock 33 0 0 1001
 ```
 
 The directive is repeatable, once per backend. A FastCGI request whose exact
@@ -568,10 +569,10 @@ chrooted backend—must separately and explicitly accept the external pathname
 race:
 
 ```apache
-VapacheCapability UnstableFastCgiPaths On
+HttpdRsCapability UnstableFastCgiPaths On
 ```
 
-`VapacheFastCGIStablePath Off` or an absent policy is otherwise rejected when
+`HttpdRsFastCGIStablePath Off` or an absent policy is otherwise rejected when
 FastCGI is configured, and the runtime sink checks the same condition again.
 The unsafe capability restores only the pathname handoff; the deployment must
 then keep the complete script tree immutable to the backend and every
@@ -581,10 +582,10 @@ Aggregate dynamic-I/O limits are global directives and remain shared across a
 graceful reload:
 
 ```apache
-VapacheMaxSpoolBytes 1073741824
-VapacheMaxSpoolFiles 128
-VapacheMaxDynamicRequests 64
-VapacheMaxFastCGIOutput 67108864
+HttpdRsMaxSpoolBytes 1073741824
+HttpdRsMaxSpoolFiles 128
+HttpdRsMaxDynamicRequests 64
+HttpdRsMaxFastCGIOutput 67108864
 ```
 
 The RAII budget covers request-body spool files, FastCGI response spools and
@@ -646,12 +647,12 @@ requiring a grant. Raising a budget is a deliberate, reviewable change.
 
 ```sh
 cargo test --workspace          # Rust unit tests
-python3 tests/conformance.py    # 165 local vapached conformance tests
+python3 tests/conformance.py    # 165 local httpd-rs conformance tests
 python3 tests/conformance.py --differential  # also compare with Apache
 python3 tests/adversarial_regressions.py  # F23-P36 end-to-end replay suite
 ```
 
-The conformance suite starts a real `vapached` and covers HTTP/1.1, HTTPS,
+The conformance suite starts a real `httpd-rs` and covers HTTP/1.1, HTTPS,
 HTTP/2, CGI, conditional requests, ranges, access control and Basic auth. Use
 `--differential` when Apache is installed to start both servers and write
 `tests/differential_report.md`, comparing status codes, selected headers and
@@ -660,7 +661,7 @@ folder holds the numbered findings write-ups (passes 3–18) and the pass-11,
 pass-13 through pass-18 exploit harnesses (`adversarial/p11/exploit_p11.py`,
 `adversarial/p13/exploit_p13.py`, `adversarial/p14/exploit_p14.py` and
 `adversarial/p15/exploit_p15.py` through `adversarial/p18/exploit_p18.py`) with
-their Apache-versus-vapached case dossiers, so the exact exploit shapes are
+their Apache-versus-httpd-rs case dossiers, so the exact exploit shapes are
 documented rather than re-derived.
 
 Security-sensitive configuration semantics are checked separately:
@@ -670,7 +671,7 @@ python3 tests/config_semantics.py  # 339 fixed differential cases
 python3 tests/config_semantics.py --random 300 --seed 7  # deterministic randomized matrix
 python3 tests/config_semantics.py --stateful 256 --stateful-seed 1818
 python3 tests/vhost_semantics.py  # multi-vhost startup/reload differential matrix
-python3 tests/config_validity.py  # context acceptance matrix (Apache -t vs vapached -t)
+python3 tests/config_validity.py  # context acceptance matrix (Apache -t vs httpd-rs -t)
 python3 tests/config_grammar.py   # finite valid/invalid grammar matrix
 tests/pre_adversarial.sh         # fail-closed full gate, including real PHP-FPM
 ```
@@ -748,7 +749,7 @@ supply-chain checks and scheduled soak/performance jobs are described in
 [`docs/quality.md`](docs/quality.md).
 
 `config_grammar.py` enumerates the supported directive/context grammar and
-checks that Apache and vapached agree on acceptance and rejection.  It is the
+checks that Apache and httpd-rs agree on acceptance and rejection.  It is the
 finite executable counterpart of the “accept valid / reject invalid” proof
 obligations.
 
@@ -800,13 +801,13 @@ This is a static triage, not a claim that every CVE has a working PoC replay.
 
 The NVD histories for nginx, IIS/HTTP.sys, lighttpd, HAProxy, Tomcat/Coyote,
 Jetty, Squid, Varnish, Apache Traffic Server, LiteSpeed/OpenLiteSpeed and Envoy
-are also compared per CVE against Vapache's actual feature boundary and
+are also compared per CVE against httpd-rs's actual feature boundary and
 implementation:
 
 - **1,047 distinct CVEs** across the eleven product families,
-- **370** mapped to a concrete Vapache prevention,
+- **370** mapped to a concrete httpd-rs prevention,
 - **54** rejected by an explicit fail-closed capability boundary,
-- **580** tied to a feature or platform Vapache does not implement,
+- **580** tied to a feature or platform httpd-rs does not implement,
 - **41** deliberately left partial pending an exact trigger/invariant, and
 - **2** retained as NVD source-data conflicts with no prevention claim.
 
@@ -833,7 +834,7 @@ For a specific request, the compiled policy can be inspected without starting
 the server:
 
 ```sh
-./target/release/vapached -f /etc/apache2/apache2.conf --explain /private/file \
+./target/release/httpd-rs -f /etc/apache2/apache2.conf --explain /private/file \
   --explain-method GET --explain-header 'X-Test: yes'
 ```
 
@@ -896,12 +897,12 @@ set.
 Application containers use digest-pinned upstream images or staged builds from
 pinned source, private networks, read-only roots and staging-only mounts; a
 dedicated harness gate rejects any mount overlapping the source checkout.
-Optional workloads compare the same application through Apache and Vapache
+Optional workloads compare the same application through Apache and httpd-rs
 with alternating samples.
 
 Known, deliberate divergences from Apache (reported by the differential run):
 
-| Area | Apache | vapache | Why |
+| Area | Apache | httpd-rs | Why |
 |---|---|---|---|
 | `POST` to a static file | `200` + file body | `405` with `Allow` | Safer; matches common server policy |
 | `OPTIONS *` | omits `Allow` | sends `Allow` | RFC 9110 requires advertising methods |
@@ -923,7 +924,7 @@ python3 bench/bench.py           # 3s samples
 `ab` as a fallback. Both servers use identical configurations and access logs
 are written to `/dev/null` so the harness does not fill `/tmp`. The default
 uses eight connections because `wrk` opens its cohort simultaneously from one
-loopback client identity and Vapache deliberately limits each client to eight
+loopback client identity and httpd-rs deliberately limits each client to eight
 pending connections. Higher concurrency measures connection-admission overload
 rejection rather than successful static serving. Each round alternates which
 server runs first so shared-host drift cannot systematically favor one side.
@@ -931,14 +932,14 @@ Results are appended to `bench/RESULTS.md`. Latest full run (2026-11-05, 3s
 samples, median of three, eight connections, zero failed/non-2xx responses or
 socket errors):
 
-| scenario | Apache req/s | vapache req/s | ratio |
+| scenario | Apache req/s | httpd-rs req/s | ratio |
 |---|---:|---:|---:|
 | index.html | 41,663 | 44,075 | 1.06x |
 | hello.txt (1.1 KB) | 35,602 | 44,413 | 1.25x |
 | 10 KB file | 42,811 | 41,789 | 0.98x |
 | 1 MB file | 8,310 | 12,250 | 1.47x |
 
-On that five-vCPU host, Vapache is at parity or ahead for the three small-file
+On that five-vCPU host, httpd-rs is at parity or ahead for the three small-file
 cases and leads by 47% for the 1 MB file. Older runs used more simultaneous
 connections from one identity, sampled the servers in a fixed order, and the
 old `wrk` parser did not record its non-2xx counter. They remain in
@@ -950,7 +951,7 @@ and access-log formatting. The latest policy migration also caches
 per-directory scopes, shares parsed `.htaccess` scopes through `Arc`, indexes
 literal `<Directory>` rules, and avoids per-request ancestor sorting.
 
-`bench/feature_bench.py` runs the same Apache-versus-vapache comparison
+`bench/feature_bench.py` runs the same Apache-versus-httpd-rs comparison
 against the richer conformance configuration: static and large-file serving,
 conditional/range requests, directory handling, access policies, Basic auth,
 rewrites, `.htaccess`, CGI, proxy authorization, internal
@@ -983,14 +984,14 @@ python3 bench/cache_bench.py
 
 Latest full run (2026-10-27, 3s samples, median of three):
 
-| scenario | Apache req/s | vapache req/s | ratio |
+| scenario | Apache req/s | httpd-rs req/s | ratio |
 |---|---:|---:|---:|
 | cache HIT 1.1 KB | 86,780 | 141,844 | 1.63x |
 | cache HIT 10 KB | 80,218 | 136,152 | 1.70x |
 | cache HIT 1 MB | 8,158 | 13,140 | 1.61x |
 | static 1.1 KB baseline | 88,894 | 207,076 | 2.33x |
 
-The cache-hit path still costs vapache some of its static throughput on small
+The cache-hit path still costs httpd-rs some of its static throughput on small
 files, but large cached bodies now use the file-body/sendfile path instead of
 copying a heap buffer. Results are appended to `bench/CACHE_RESULTS.md`.
 
@@ -1009,16 +1010,16 @@ through the HTTP proxy against both front ends. The secure PHP fixture runs
 under root-owned `/run` so the same stable-path policy used in production can
 remain enabled. Latest five-sample PHP run:
 
-| scenario | Apache req/s | vapache req/s | ratio |
+| scenario | Apache req/s | httpd-rs req/s | ratio |
 |---|---:|---:|---:|
 | PHP-FPM `/index.php` | 17,424 | 11,258 | 0.65x |
 
 The handlers are intentionally trivial; these numbers isolate the front-end
-and upstream hop. Vapache's PHP result includes per-request stable-path
+and upstream hop. httpd-rs's PHP result includes per-request stable-path
 ownership/writeability/ACL checks, endpoint inode validation and peer-credential
 authentication; Apache does not make an equivalent proof. Real PHP/WSGI
 application time will usually dominate. The Gunicorn sync workers close each
-upstream connection, and vapache deliberately does not pool backend connections
+upstream connection, and httpd-rs deliberately does not pool backend connections
 without strict response-framing checks. See `bench/APP_RESULTS.md` for details.
 
 These are static-file microbenchmark numbers with a minimal Apache module set,
@@ -1033,13 +1034,13 @@ not extra parallelism.
 
 ```sh
 # Syntax check a stock Apache configuration
-./target/release/vapached -f /etc/apache2/apache2.conf -t
+./target/release/httpd-rs -f /etc/apache2/apache2.conf -t
 
 # Run in the foreground
-./target/release/vapached -f /etc/apache2/apache2.conf -DFOREGROUND
+./target/release/httpd-rs -f /etc/apache2/apache2.conf -DFOREGROUND
 
 # Strict mode: reject directives/modules we do not implement
-./target/release/vapached -f /etc/apache2/apache2.conf -t --strict-config
+./target/release/httpd-rs -f /etc/apache2/apache2.conf -t --strict-config
 ```
 
 ## Repository layout
@@ -1048,7 +1049,7 @@ not extra parallelism.
 crates/verified   Verus specifications and verified pure functions
 crates/server     HTTP/TLS/HTTP/2, config + .htaccess, pure config front-end + policy core, auth, file/CGI, daemon
 tests             Apache differential conformance suite
-bench             Apache-vs-vapache static/feature/cache/app benchmark harness and history
+bench             Apache-vs-httpd-rs static/feature/cache/app benchmark harness and history
 ```
 
 ## Roadmap

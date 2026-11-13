@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Pass-35-B regression: PCRE2 auto-possessification in ACL guards.
 
-Vapache compiles PCRE2 patterns with a non-backtracking automata engine and
+httpd-rs compiles PCRE2 patterns with a non-backtracking automata engine and
 translates `\\S*` and `\\N*` into ordinary repetitions. PCRE2 (Apache)
 auto-possessifies those repetitions when the next atom is `\\R`, `\\v` or
-`\\h`, so for certain subjects Apache finds no match while Vapache does.
+`\\h`, so for certain subjects Apache finds no match while httpd-rs does.
 
-A negated guard (`!~`) used to fail open on Vapache for a header value
+A negated guard (`!~`) used to fail open on httpd-rs for a header value
 containing the NEL byte 0x85. The compatibility layer cannot exactly model
-these PCRE2 optimizer semantics, so Vapache now rejects the unsafe four
+these PCRE2 optimizer semantics, so httpd-rs now rejects the unsafe four
 patterns at configuration load. The harness verifies that Apache accepts
-them, Vapache fails closed, and the simple `\v` control still agrees live.
+them, httpd-rs fails closed, and the simple `\v` control still agrees live.
 
 Usage:
     python3 adversarial/p35/pcre2_guard_p35.py
@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-VAPACHED = REPO / "target" / "release" / "vapached"
+HTTPD_RS = REPO / "target" / "release" / "httpd-rs"
 APACHE = os.environ.get("P35_APACHE", "/usr/sbin/apache2")
 APACHE_MODULES = Path(os.environ.get("P35_APACHE_MODULES", "/usr/lib/apache2/modules"))
 HARNESS = Path("/tmp/opencode/p35-pcre2-harness")
@@ -92,8 +92,8 @@ def stop(process) -> None:
 
 def main() -> int:
     keep = "--keep" in sys.argv
-    if not VAPACHED.exists():
-        raise SystemExit(f"missing binary: {VAPACHED} (cargo build --release -p vapached)")
+    if not HTTPD_RS.exists():
+        raise SystemExit(f"missing binary: {HTTPD_RS} (cargo build --release -p httpd-rs)")
     if HARNESS.exists():
         shutil.rmtree(HARNESS)
     HARNESS.mkdir(parents=True)
@@ -106,7 +106,7 @@ def main() -> int:
         (www / "index.html").write_text("public\n")
         os.chmod(www, 0o755)
         (case / "apache" / "logs").mkdir(parents=True)
-        (case / "vapache" / "logs").mkdir(parents=True)
+        (case / "httpd-rs" / "logs").mkdir(parents=True)
         port_a = free_port(37000)
         port_v = free_port(37700)
         guard = f'<If "%{{HTTP:X-Test}} !~ /{pattern}/">\n    Require all denied\n</If>\n'
@@ -133,14 +133,14 @@ DocumentRoot "{www}"
   Require all granted
   {guard}</Directory>
 """)
-        vapache_conf = case / "vapache.conf"
-        vapache_conf.write_text(
-            f"""ServerRoot "{case / 'vapache'}"
+        httpd_rs_conf = case / "httpd-rs.conf"
+        httpd_rs_conf.write_text(
+            f"""ServerRoot "{case / 'httpd-rs'}"
 Listen {port_v}
 User {SERVICE_USER}
 Group {SERVICE_GROUP}
-PidFile "{case / 'vapache' / 'logs' / 'vapached.pid'}"
-ErrorLog "{case / 'vapache' / 'logs' / 'error.log'}"
+PidFile "{case / 'httpd-rs' / 'logs' / 'httpd-rs.pid'}"
+ErrorLog "{case / 'httpd-rs' / 'logs' / 'error.log'}"
 ServerName p35b.test
 DocumentRoot "{www}"
 TypesConfig /etc/mime.types
@@ -152,7 +152,7 @@ TypesConfig /etc/mime.types
   {guard}</Directory>
 """)
         built = subprocess.run(
-            [str(VAPACHED), "-f", str(vapache_conf), "-t"],
+            [str(HTTPD_RS), "-f", str(httpd_rs_conf), "-t"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         apache_test = subprocess.run(
             [APACHE, "-t", "-f", str(apache_conf)],
@@ -163,23 +163,23 @@ TypesConfig /etc/mime.types
             continue
         if name in FAIL_CLOSED:
             if built.returncode == 0:
-                print(f"## {name}: Vapache accepted an unrepresentable guard")
+                print(f"## {name}: httpd-rs accepted an unrepresentable guard")
                 failures += 1
             else:
                 print(f"## {name}  pattern={pattern}")
-                print("   apache=accepted vapache=rejected (fail closed)")
+                print("   apache=accepted httpd-rs=rejected (fail closed)")
             continue
         if built.returncode != 0:
-            print(f"## {name}: vapache rejected the guard: {built.stdout.strip()[-160:]}")
+            print(f"## {name}: httpd-rs rejected the guard: {built.stdout.strip()[-160:]}")
             failures += 1
             continue
         a_log = (case / "apache.log").open("ab")
-        v_log = (case / "vapached.log").open("ab")
+        v_log = (case / "httpd-rs.log").open("ab")
         apache = subprocess.Popen(
             [APACHE, "-f", str(apache_conf), "-DFOREGROUND"],
             stdout=a_log, stderr=subprocess.STDOUT, start_new_session=True)
-        vapache = subprocess.Popen(
-            [str(VAPACHED), "-f", str(vapache_conf), "-DFOREGROUND"],
+        httpd_rs = subprocess.Popen(
+            [str(HTTPD_RS), "-f", str(httpd_rs_conf), "-DFOREGROUND"],
             stdout=v_log, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             deadline = time.monotonic() + 15
@@ -194,7 +194,7 @@ TypesConfig /etc/mime.types
             for label, value in (("plain", "plainvalue"), ("nel", "A\u0085B")):
                 a_status, _ = request(port_a, value)
                 v_status, _ = request(port_v, value)
-                print(f"   {label:5} apache={a_status} vapache={v_status}")
+                print(f"   {label:5} apache={a_status} httpd-rs={v_status}")
                 rows.append((name, label, a_status, v_status))
                 if label == "plain" and (a_status, v_status) != (403, 403):
                     print("   -> UNEXPECTED plain control")
@@ -205,7 +205,7 @@ TypesConfig /etc/mime.types
                         failures += 1
         finally:
             stop(apache)
-            stop(vapache)
+            stop(httpd_rs)
             a_log.close()
             v_log.close()
     if keep:

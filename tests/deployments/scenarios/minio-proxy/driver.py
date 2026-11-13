@@ -1,4 +1,4 @@
-"""Exercise AWS Signature V4 and aws-chunked object bodies through Vapache."""
+"""Exercise AWS Signature V4 and aws-chunked object bodies through httpd-rs."""
 
 from __future__ import annotations
 
@@ -12,20 +12,20 @@ from lib import (
     CaseContext,
     DeploymentError,
     common_apache_config,
-    common_vapache_config,
+    common_httpd_rs_config,
     differential_benchmark,
     free_port,
     request,
     require_response,
     start_apache,
-    start_vapache,
+    start_httpd_rs,
     wait_http,
 )
 
 
 HERE = Path(__file__).resolve().parent
-ACCESS_KEY = "vapache-minio-admin"
-SECRET_KEY = "vapache-minio-secret-password-42"
+ACCESS_KEY = "httpd-rs-minio-admin"
+SECRET_KEY = "httpd-rs-minio-secret-password-42"
 REGION = "us-east-1"
 SERVICE = "s3"
 STREAMING_HASH = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
@@ -190,17 +190,17 @@ ProxyPreserveHost On
 ProxyPass / {backend_route}
 ProxyPassReverse / {backend_route}
 """
-    config, pid_file = common_vapache_config(
+    config, pid_file = common_httpd_rs_config(
         context.run_dir, frontend_port, empty_docroot, extra=extra
     )
-    server = start_vapache(context, config, pid_file, frontend_port)
+    server = start_httpd_rs(context, config, pid_file, frontend_port)
     require_response(frontend_port, "/minio/health/live", contains=b"")
 
-    bucket = "vapache-integration"
+    bucket = "httpd-rs-integration"
     object_name = "signed/object.bin"
     object_path = f"/{bucket}/{object_name}"
     require_s3_status(signed_request(frontend_port, "PUT", f"/{bucket}"), (200,), "bucket creation")
-    marker = b"minio-vapache-sigv4-marker\n"
+    marker = b"minio-httpd-rs-sigv4-marker\n"
     payload = marker + bytes(range(256)) * 4096
     require_s3_status(
         signed_request(
@@ -271,6 +271,6 @@ ProxyPassReverse / {backend_route}
             frontend_port,
             apache_port,
             "/minio/health/live",
-            context.artifact_dir / "apache-vapache-benchmark.json",
+            context.artifact_dir / "apache-httpd-rs-benchmark.json",
             connections=4,
         )

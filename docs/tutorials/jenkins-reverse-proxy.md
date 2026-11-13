@@ -6,7 +6,7 @@ contracts: DOC-DEPLOY-JENKINS-001
 scenario: jenkins-proxy
 ---
 
-# Put Jenkins behind Vapache on a VPS
+# Put Jenkins behind httpd-rs on a VPS
 
 This tutorial publishes Jenkins below `/jenkins/` at
 `https://ci.example.test/jenkins/`.
@@ -14,12 +14,12 @@ This tutorial publishes Jenkins below `/jenkins/` at
 ## What you will do
 
 You will install Jenkins LTS and Java, bind Jenkins to loopback, set its context
-path, configure the Vapache route, complete the Jenkins setup, create a job,
-reload Vapache, and verify the job through the API.
+path, configure the httpd-rs route, complete the Jenkins setup, create a job,
+reload httpd-rs, and verify the job through the API.
 
 ## Before you start
 
-Complete [Prepare a Debian VPS for a Vapache
+Complete [Prepare a Debian VPS for a httpd-rs
 tutorial](prepare-debian-vps.md). Point `ci.example.test` at the VPS and open
 TCP ports 80 and 443 in the provider firewall.
 
@@ -47,7 +47,7 @@ $ sudo apt install jenkins
 $ sudo install -d -m 0755 /etc/systemd/system/jenkins.service.d
 ```
 
-Create `/etc/systemd/system/jenkins.service.d/vapache.conf`:
+Create `/etc/systemd/system/jenkins.service.d/httpd-rs.conf`:
 
 ```systemd
 [Service]
@@ -85,7 +85,7 @@ Open `http://127.0.0.1:8080/jenkins/`, enter the initial password, install the
 suggested plugins, and create the first administrator. Set the Jenkins URL to
 `https://ci.example.test/jenkins/`. Close the SSH tunnel after setup.
 
-## 4. Configure Vapache
+## 4. Configure httpd-rs
 
 Create `/etc/apache2/sites-available/jenkins.conf` with a temporary HTTP-only
 host, enable it, and obtain the certificate:
@@ -98,8 +98,8 @@ host, enable it, and obtain the certificate:
 
 ```console
 $ sudo a2ensite jenkins.conf
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot certonly --apache --domain ci.example.test
 ```
 
@@ -122,11 +122,11 @@ Replace it with the final configuration:
 </VirtualHost>
 ```
 
-Test the configuration, reload Vapache, and verify renewal:
+Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -139,7 +139,7 @@ $ curl -I https://ci.example.test/jenkins/login
 Sign in through the public URL, create a small freestyle job, and save it. This
 tests the session cookie, CSRF token, form body, and public redirects together.
 
-Reload Vapache. Open the job again and request its JSON API through the public
+Reload httpd-rs. Open the job again and request its JSON API through the public
 URL. Confirm that the session remains valid and that no redirect exposes port
 `8080`.
 

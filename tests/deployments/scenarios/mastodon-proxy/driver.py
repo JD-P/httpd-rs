@@ -18,7 +18,7 @@ from lib import (
     CaseContext,
     DeploymentError,
     common_apache_config,
-    common_vapache_config,
+    common_httpd_rs_config,
     command,
     differential_benchmark,
     free_port,
@@ -26,7 +26,7 @@ from lib import (
     require_response,
     secure_admin_file,
     start_apache,
-    start_vapache,
+    start_httpd_rs,
     wait_http,
 )
 
@@ -83,7 +83,7 @@ def open_stream(port: int, token: str, stream_name: str) -> socket.socket:
     tls_context.verify_mode = ssl.CERT_NONE
     connection = tls_context.wrap_socket(raw, server_hostname=PUBLIC_HOST)
     connection.settimeout(35)
-    key = base64.b64encode(b"vapache-mastodon").decode()
+    key = base64.b64encode(b"httpd-rs-mastodon").decode()
     handshake = (
         "GET /api/v1/streaming HTTP/1.1\r\n"
         f"Host: {PUBLIC_HOST}\r\n"
@@ -147,7 +147,7 @@ def wait_for_status(stream: socket.socket, marker: str) -> dict[str, object]:
             ) from error
         if event.get("event") == "update" and marker in str(status.get("content", "")):
             return status
-    raise DeploymentError("Mastodon did not stream the status created through Vapache")
+    raise DeploymentError("Mastodon did not stream the status created through httpd-rs")
 
 
 def create_access_token(compose) -> str:
@@ -166,7 +166,7 @@ def create_access_token(compose) -> str:
     )
     script = (
         f"user=User.find_by!(email: {ACCOUNT_EMAIL!r});"
-        "app=Doorkeeper::Application.create!(name: 'Vapache integration', "
+        "app=Doorkeeper::Application.create!(name: 'httpd-rs integration', "
         "redirect_uri: 'urn:ietf:wg:oauth:2.0:oob', scopes: 'read write');"
         "token=Doorkeeper::AccessToken.create!(application_id: app.id, "
         "resource_owner_id: user.id, scopes: 'read write');"
@@ -256,8 +256,8 @@ ProxyPass / http://{web_host}:3000/
 ProxyPassReverse / http://{web_host}:3000/
 </VirtualHost>
 """
-    config, pid_file = common_vapache_config(context.run_dir, port, document_root, extra=extra)
-    server = start_vapache(context, config, pid_file, port, tls=True)
+    config, pid_file = common_httpd_rs_config(context.run_dir, port, document_root, extra=extra)
+    server = start_httpd_rs(context, config, pid_file, port, tls=True)
     host = {"Host": PUBLIC_HOST}
     require_response(port, "/health", contains=b"OK", headers=host, tls=True)
     require_response(
@@ -286,7 +286,7 @@ ProxyPassReverse / http://{web_host}:3000/
             websocket.close()
             websocket = open_stream(port, token, stream_name)
 
-        marker = f"vapache-mastodon-{variant['workers']}-{variant['stream']}"
+        marker = f"httpd-rs-mastodon-{variant['workers']}-{variant['stream']}"
         body = urllib.parse.urlencode({"status": marker, "visibility": "public"}).encode()
         status, _, response = request(
             port,
@@ -383,7 +383,7 @@ ProxyPassReverse / http://{web_host}:3000/
             port,
             apache_port,
             "/health",
-            context.artifact_dir / "apache-vapache-benchmark.json",
+            context.artifact_dir / "apache-httpd-rs-benchmark.json",
             headers=(f"Host: {PUBLIC_HOST}",),
             tls=True,
             connections=4,

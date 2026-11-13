@@ -45,7 +45,7 @@ PY
 URL=$(read_pin archive_url)
 EXPECTED=$(read_pin archive_sha256)
 RELEASE=$(read_pin release)
-WORK=$(mktemp -d /tmp/vapache-apache-source.XXXXXX)
+WORK=$(mktemp -d /tmp/httpd-rs-apache-source.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT HUP INT TERM
 ARCHIVE=$WORK/httpd.tar.bz2
 TEST_URL=$(read_test_pin archive_url)

@@ -136,13 +136,13 @@ impl ControlFrameBudget {
         }
     }
 
-    fn consume(&mut self, event: vapache_verified::H2ControlEvent) -> bool {
+    fn consume(&mut self, event: httpd_rs_verified::H2ControlEvent) -> bool {
         self.consume_at(event, Instant::now())
     }
 
-    fn consume_at(&mut self, event: vapache_verified::H2ControlEvent, now: Instant) -> bool {
+    fn consume_at(&mut self, event: httpd_rs_verified::H2ControlEvent, now: Instant) -> bool {
         let seconds = now.saturating_duration_since(self.last_refill).as_secs();
-        let transition = vapache_verified::h2_control_event_step(
+        let transition = httpd_rs_verified::h2_control_event_step(
             self.available,
             seconds,
             event,
@@ -676,7 +676,7 @@ where
                 tracing::trace!(?frame, "recv SETTINGS");
                 if !self
                     .control_frame_budget
-                    .consume(vapache_verified::H2ControlEvent::Settings)
+                    .consume(httpd_rs_verified::H2ControlEvent::Settings)
                 {
                     return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
                 }
@@ -695,7 +695,7 @@ where
                 tracing::trace!(?frame, "recv PING");
                 if !self
                     .control_frame_budget
-                    .consume(vapache_verified::H2ControlEvent::Ping)
+                    .consume(httpd_rs_verified::H2ControlEvent::Ping)
                 {
                     return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
                 }
@@ -718,7 +718,7 @@ where
                 } else {
                     &mut *self.window_update_budget
                 };
-                if !budget.consume(vapache_verified::H2ControlEvent::WindowUpdate { increment }) {
+                if !budget.consume(httpd_rs_verified::H2ControlEvent::WindowUpdate { increment }) {
                     return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
                 }
                 self.streams.recv_window_update(frame)?;
@@ -727,7 +727,7 @@ where
                 tracing::trace!(?frame, "recv PRIORITY");
                 if !self
                     .control_frame_budget
-                    .consume(vapache_verified::H2ControlEvent::Priority)
+                    .consume(httpd_rs_verified::H2ControlEvent::Priority)
                 {
                     return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
                 }
@@ -848,23 +848,23 @@ mod tests {
         let start = Instant::now();
         let mut budget = ControlFrameBudget::new_at(start);
         for _ in 0..(CONTROL_FRAME_BURST / 16) {
-            assert!(budget.consume_at(vapache_verified::H2ControlEvent::Settings, start));
+            assert!(budget.consume_at(httpd_rs_verified::H2ControlEvent::Settings, start));
         }
-        assert!(!budget.consume_at(vapache_verified::H2ControlEvent::Ping, start));
+        assert!(!budget.consume_at(httpd_rs_verified::H2ControlEvent::Ping, start));
         assert!(budget.consume_at(
-            vapache_verified::H2ControlEvent::Ping,
+            httpd_rs_verified::H2ControlEvent::Ping,
             start + Duration::from_secs(1)
         ));
         assert!(budget.consume_at(
-            vapache_verified::H2ControlEvent::Ping,
+            httpd_rs_verified::H2ControlEvent::Ping,
             start + Duration::from_secs(1)
         ));
         assert!(!budget.consume_at(
-            vapache_verified::H2ControlEvent::Ping,
+            httpd_rs_verified::H2ControlEvent::Ping,
             start + Duration::from_secs(1)
         ));
         assert!(budget.consume_at(
-            vapache_verified::H2ControlEvent::WindowUpdate { increment: 65_535 },
+            httpd_rs_verified::H2ControlEvent::WindowUpdate { increment: 65_535 },
             start + Duration::from_secs((CONTROL_FRAME_BURST * 2) as u64)
         ));
         assert_eq!(budget.available, CONTROL_FRAME_BURST - 1);
@@ -880,16 +880,16 @@ mod tests {
         );
         for _ in 0..WINDOW_UPDATE_BURST {
             assert!(budget.consume_at(
-                vapache_verified::H2ControlEvent::WindowUpdate { increment: 16_384 },
+                httpd_rs_verified::H2ControlEvent::WindowUpdate { increment: 16_384 },
                 start,
             ));
         }
         assert!(!budget.consume_at(
-            vapache_verified::H2ControlEvent::WindowUpdate { increment: 16_384 },
+            httpd_rs_verified::H2ControlEvent::WindowUpdate { increment: 16_384 },
             start,
         ));
         assert!(budget.consume_at(
-            vapache_verified::H2ControlEvent::WindowUpdate { increment: 16_384 },
+            httpd_rs_verified::H2ControlEvent::WindowUpdate { increment: 16_384 },
             start + Duration::from_secs(1),
         ));
     }

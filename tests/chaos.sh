@@ -9,10 +9,10 @@ docker_cmd=(
     -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH
     docker --host=unix:///var/run/docker.sock
 )
-image=${VAPACHE_CHAOS_IMAGE:-vapache-chaos:local}
+image=${HTTPD_RS_CHAOS_IMAGE:-httpd-rs-chaos:local}
 
 if [[ ${CHAOS_SKIP_BUILD:-0} != 1 ]]; then
-    cargo build --locked --release -p vapached
+    cargo build --locked --release -p httpd-rs
 fi
 
 "${docker_cmd[@]}" build --file tests/chaos/Dockerfile --tag "$image" .

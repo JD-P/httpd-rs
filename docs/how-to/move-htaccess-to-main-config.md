@@ -8,7 +8,7 @@ contracts: DOC-HOWTO-HTACCESS-001
 # Move `.htaccess` policy into the main configuration
 
 Use this procedure to move `.htaccess` rules into the main configuration and
-then stop Vapache from reading access files in that document tree.
+then stop httpd-rs from reading access files in that document tree.
 
 ## Prerequisites
 
@@ -47,7 +47,7 @@ For each access file, record:
 - the permitted override category;
 - the requests that the rule permits, denies, redirects, or rewrites.
 
-Stop if the file contains a directive that Vapache rejects. Do not delete an
+Stop if the file contains a directive that httpd-rs rejects. Do not delete an
 access-control or authentication rule to make the configuration load.
 
 ## 3. Move the policy into its directory context
@@ -79,7 +79,7 @@ the target even when the regular expression is equal.
 Test the complete configuration before you change the live service:
 
 ```console
-$ sudo vapachectl configtest
+$ sudo httpd-rsctl configtest
 ```
 
 Start the staged configuration on an evaluation host. Test positive and
@@ -92,8 +92,8 @@ After all served trees use `AllowOverride None`, remove the `AccessFiles`
 capability declaration. Run:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 ```
 
 Keep the old access files until the deployment is accepted. Their presence has

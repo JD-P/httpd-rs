@@ -216,7 +216,7 @@ impl Window {
     }
 
     pub fn decrease_by(&mut self, other: WindowSize) -> Result<(), Reason> {
-        let encoded = vapache_verified::h2_signed_window_decrease(self.verified_encoding(), other)
+        let encoded = httpd_rs_verified::h2_signed_window_decrease(self.verified_encoding(), other)
             .ok_or(Reason::FLOW_CONTROL_ERROR)?;
         *self = Self::from_verified_encoding(encoded);
         Ok(())
@@ -229,7 +229,7 @@ impl Window {
     }
 
     pub fn add(&self, other: WindowSize) -> Result<Self, Reason> {
-        let encoded = vapache_verified::h2_signed_window_increase(self.verified_encoding(), other)
+        let encoded = httpd_rs_verified::h2_signed_window_increase(self.verified_encoding(), other)
             .ok_or(Reason::FLOW_CONTROL_ERROR)?;
         Ok(Self::from_verified_encoding(encoded))
     }

@@ -6,7 +6,7 @@ contracts: DOC-DEPLOY-GITEA-001
 scenario: gitea-proxy
 ---
 
-# Put Gitea behind Vapache on a VPS
+# Put Gitea behind httpd-rs on a VPS
 
 This tutorial installs Gitea and publishes it below `/gitea/` at
 `https://git.example.test/gitea/`.
@@ -14,12 +14,12 @@ This tutorial installs Gitea and publishes it below `/gitea/` at
 ## What you will do
 
 You will install Gitea with SQLite, create its systemd service, bind it to
-loopback, add the Vapache proxy route, create a repository, push a commit,
-reload Vapache, and clone it.
+loopback, add the httpd-rs proxy route, create a repository, push a commit,
+reload httpd-rs, and clone it.
 
 ## Before you start
 
-Complete [Prepare a Debian VPS for a Vapache
+Complete [Prepare a Debian VPS for a httpd-rs
 tutorial](prepare-debian-vps.md). Point `git.example.test` at the VPS and open
 TCP ports 80 and 443 in the provider firewall.
 
@@ -127,7 +127,7 @@ $ sudo chmod 0640 /etc/gitea/app.ini
 $ sudo systemctl restart gitea.service
 ```
 
-## 3. Configure Vapache
+## 3. Configure httpd-rs
 
 Create `/etc/apache2/sites-available/gitea.conf` with a temporary HTTP-only
 host, enable it, and obtain the certificate:
@@ -140,8 +140,8 @@ host, enable it, and obtain the certificate:
 
 ```console
 $ sudo a2ensite gitea.conf
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot certonly --apache --domain git.example.test
 ```
 
@@ -164,11 +164,11 @@ Replace it with the final configuration. The trailing slashes are significant:
 </VirtualHost>
 ```
 
-Test the configuration, reload Vapache, and verify renewal:
+Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -188,15 +188,15 @@ Create a repository through the Gitea interface. Then run:
 ```console
 $ git clone https://git.example.test/gitea/alice/example.git /tmp/gitea-example
 $ cd /tmp/gitea-example
-$ printf '%s\n' 'Vapache Gitea test' > vapache-test.txt
-$ git add vapache-test.txt
-$ git commit -m 'Test Gitea through Vapache'
+$ printf '%s\n' 'httpd-rs Gitea test' > httpd-rs-test.txt
+$ git add httpd-rs-test.txt
+$ git commit -m 'Test Gitea through httpd-rs'
 $ git push
-$ sudo systemctl reload vapache.service
+$ sudo systemctl reload httpd-rs.service
 $ git clone https://git.example.test/gitea/alice/example.git /tmp/gitea-check
 ```
 
-Confirm that `/tmp/gitea-check/vapache-test.txt` contains the expected text.
+Confirm that `/tmp/gitea-check/httpd-rs-test.txt` contains the expected text.
 Remove `/tmp/gitea-example` and `/tmp/gitea-check` after the test succeeds.
 
 <!--

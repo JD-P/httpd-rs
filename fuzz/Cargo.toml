@@ -1,5 +1,5 @@
 [package]
-name = "vapache-fuzz"
+name = "httpd-rs-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -9,8 +9,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-vapached = { path = "../crates/server", features = ["fuzzing"] }
-vapache-pcre2 = { path = "../crates/pcre2" }
+httpd-rs = { path = "../crates/server", features = ["fuzzing"] }
+httpd-rs-pcre2 = { path = "../crates/pcre2" }
 pcre2-c-oracle = { package = "pcre2", version = "=0.2.11" }
 pcre2-c-oracle-sys = { package = "pcre2-sys", version = "=0.2.10" }
 

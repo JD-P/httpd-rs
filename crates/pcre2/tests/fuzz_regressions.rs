@@ -1,7 +1,7 @@
 //! Regressions promoted from the continuously run PCRE2 differential fuzzer.
 
+use httpd_rs_pcre2::bytes as rust;
 use pcre2_c_oracle::bytes as oracle;
-use vapache_pcre2::bytes as rust;
 
 fn spans_rust(pattern: &str, subject: &[u8]) -> Vec<Vec<Option<(usize, usize)>>> {
     rust::Regex::new(pattern)
@@ -99,7 +99,7 @@ fn utf_and_ucp_modes_fail_closed_on_invalid_subjects_and_align_valid_offsets() {
 
     // PCRE2 validates the entire suffix even when an empty pattern could
     // otherwise succeed immediately. Its non-zero-offset window can exclude
-    // malformed prefix bytes; vapache deliberately rejects the whole subject
+    // malformed prefix bytes; httpd-rs deliberately rejects the whole subject
     // so anchors and word boundaries cannot create a false-positive window.
     let invalid_suffix = b"\x04\xAB";
     assert!(rust_empty.is_match_at(invalid_suffix, 0).is_err());
@@ -152,7 +152,7 @@ fn utf_and_ucp_modes_fail_closed_on_invalid_subjects_and_align_valid_offsets() {
 fn multiline_start_anchor_fails_closed_before_offset_apis() {
     assert_eq!(
         rust::Regex::new(r"(?m)^$").unwrap_err().kind(),
-        vapache_pcre2::ErrorKind::Unsupported,
+        httpd_rs_pcre2::ErrorKind::Unsupported,
     );
 }
 

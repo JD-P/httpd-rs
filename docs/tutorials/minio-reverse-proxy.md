@@ -6,21 +6,21 @@ contracts: DOC-DEPLOY-MINIO-001
 scenario: minio-proxy
 ---
 
-# Put MinIO behind Vapache on a VPS
+# Put MinIO behind httpd-rs on a VPS
 
 This tutorial installs MinIO and publishes it at
 `https://s3.example.test/`. MinIO verifies signatures against the public host,
-so Vapache preserves the validated `Host` field.
+so httpd-rs preserves the validated `Host` field.
 
 ## What you will do
 
 You will install MinIO and its client, create a systemd service, bind MinIO to
-loopback, configure Vapache, upload an object with a signed S3 request, reload
-Vapache, download the object, and remove the test data.
+loopback, configure httpd-rs, upload an object with a signed S3 request, reload
+httpd-rs, download the object, and remove the test data.
 
 ## Before you start
 
-Complete [Prepare a Debian VPS for a Vapache
+Complete [Prepare a Debian VPS for a httpd-rs
 tutorial](prepare-debian-vps.md). Point `s3.example.test` at the VPS and open
 TCP ports 80 and 443 in the provider firewall.
 
@@ -124,14 +124,14 @@ $ read -rsp 'MinIO root password: ' MINIO_ROOT_PASSWORD; echo
 $ read -rsp 'New test-account password: ' MINIO_TEST_PASSWORD; echo
 $ mc alias set minio-local http://127.0.0.1:9000 \
     minio-admin "$MINIO_ROOT_PASSWORD"
-$ mc admin user add minio-local vapache-test "$MINIO_TEST_PASSWORD"
-$ mc admin policy attach minio-local readwrite --user vapache-test
+$ mc admin user add minio-local httpd-rs-test "$MINIO_TEST_PASSWORD"
+$ mc admin policy attach minio-local readwrite --user httpd-rs-test
 $ unset MINIO_ROOT_PASSWORD
 ```
 
 Keep `MINIO_TEST_PASSWORD` in this shell until the final test finishes.
 
-## 3. Configure Vapache
+## 3. Configure httpd-rs
 
 Create `/etc/apache2/sites-available/minio.conf` with a temporary HTTP-only
 host, enable it, and obtain the certificate:
@@ -144,8 +144,8 @@ host, enable it, and obtain the certificate:
 
 ```console
 $ sudo a2ensite minio.conf
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot certonly --apache --domain s3.example.test
 ```
 
@@ -169,11 +169,11 @@ Replace it with the final configuration:
 </VirtualHost>
 ```
 
-Test the configuration, reload Vapache, and verify renewal:
+Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -182,25 +182,25 @@ $ sudo certbot renew --dry-run
 Use the limited test account and the password retained in the shell:
 
 ```console
-$ mc alias set vapache-test https://s3.example.test \
-    vapache-test "$MINIO_TEST_PASSWORD"
-$ mc mb vapache-test/vapache-check
-$ dd if=/dev/urandom of=/tmp/vapache-minio.bin bs=1M count=2
-$ mc cp /tmp/vapache-minio.bin vapache-test/vapache-check/object.bin
-$ sudo systemctl reload vapache.service
-$ mc cp vapache-test/vapache-check/object.bin /tmp/vapache-minio-check.bin
-$ cmp /tmp/vapache-minio.bin /tmp/vapache-minio-check.bin
-$ mc ls vapache-test/vapache-check
+$ mc alias set httpd-rs-test https://s3.example.test \
+    httpd-rs-test "$MINIO_TEST_PASSWORD"
+$ mc mb httpd-rs-test/httpd-rs-check
+$ dd if=/dev/urandom of=/tmp/httpd-rs-minio.bin bs=1M count=2
+$ mc cp /tmp/httpd-rs-minio.bin httpd-rs-test/httpd-rs-check/object.bin
+$ sudo systemctl reload httpd-rs.service
+$ mc cp httpd-rs-test/httpd-rs-check/object.bin /tmp/httpd-rs-minio-check.bin
+$ cmp /tmp/httpd-rs-minio.bin /tmp/httpd-rs-minio-check.bin
+$ mc ls httpd-rs-test/httpd-rs-check
 ```
 
 These operations test signed request identity, streamed bodies, response
 streaming, and listing. Remove the object and bucket after `cmp` succeeds:
 
 ```console
-$ mc rm vapache-test/vapache-check/object.bin
-$ mc rb vapache-test/vapache-check
-$ mc admin user remove minio-local vapache-test
-$ mc alias remove vapache-test
+$ mc rm httpd-rs-test/httpd-rs-check/object.bin
+$ mc rb httpd-rs-test/httpd-rs-check
+$ mc admin user remove minio-local httpd-rs-test
+$ mc alias remove httpd-rs-test
 $ mc alias remove minio-local
 $ unset MINIO_TEST_PASSWORD
 ```

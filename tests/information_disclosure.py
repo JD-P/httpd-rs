@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generated attacker-view noninterference campaign.
 
-Compatibility tests ask whether Vapache behaves like Apache.  This campaign
+Compatibility tests ask whether httpd-rs behaves like Apache.  This campaign
 asks a different security question: can an unauthorized client distinguish two
 server worlds that differ only in state it is not allowed to observe?
 
@@ -62,8 +62,8 @@ import transform_differential as transform
 
 
 ROOT = Path(__file__).resolve().parent.parent
-VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
-PORT = int(os.environ.get("VAPACHE_DISCLOSURE_PORT", "18320"))
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target" / "release" / "httpd-rs"))
+PORT = int(os.environ.get("HTTPD_RS_DISCLOSURE_PORT", "18320"))
 ARTIFACT_DIR = "artifacts/information-disclosure"
 WORLD_TIMES = {"a": 1_700_000_000, "b": 1_600_000_000}
 STATEFUL_SEQUENCES = (
@@ -760,7 +760,7 @@ def write_runtime_file(runtime: Runtime, key: str, data: bytes, executable: bool
 
 
 def prepare_runtime(cases: list[Case]) -> Runtime:
-    base = Path(tempfile.mkdtemp(prefix="vapache-disclosure-"))
+    base = Path(tempfile.mkdtemp(prefix="httpd-rs-disclosure-"))
     docroot = base / "www"
     aliasroot = base / "alias"
     cache_root = base / "cache"
@@ -809,14 +809,14 @@ def server_config(runtime: Runtime, cases: list[Case]) -> str:
     lines = transform.module_lines()
     lines.extend(
         [
-            "VapacheCapability AccessFiles On",
-            "VapacheCapability AutoIndex On",
-            "VapacheCapability Cgi On",
+            "HttpdRsCapability AccessFiles On",
+            "HttpdRsCapability AutoIndex On",
+            "HttpdRsCapability Cgi On",
             f'ServerRoot "{runtime.base}"',
             f"Listen {PORT}",
             f"User {transform.SERVICE_USER}",
             f"Group {transform.SERVICE_GROUP}",
-            f'PidFile "{runtime.base}/logs/vapache.pid"',
+            f'PidFile "{runtime.base}/logs/httpd-rs.pid"',
             f'ErrorLog "{runtime.base}/logs/error.log"',
             "LogLevel warn",
             "ServerName localhost",
@@ -871,18 +871,18 @@ def wait_port(timeout: float = 10.0) -> bool:
 
 
 def start_server(runtime: Runtime, world: str, config: Path) -> None:
-    log = open(runtime.base / f"logs/vapache-{world}.out", "ab")
+    log = open(runtime.base / f"logs/httpd-rs-{world}.out", "ab")
     runtime.stream = log
     runtime.process = subprocess.Popen(
-        [str(VAPACHED), "-f", str(config), "-DFOREGROUND"],
+        [str(HTTPD_RS), "-f", str(config), "-DFOREGROUND"],
         stdout=log,
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
     if not wait_port():
         log.flush()
-        output = (runtime.base / f"logs/vapache-{world}.out").read_text(errors="replace")
-        raise RuntimeError(f"Vapache world {world} failed to start\n{output[-8000:]}")
+        output = (runtime.base / f"logs/httpd-rs-{world}.out").read_text(errors="replace")
+        raise RuntimeError(f"httpd-rs world {world} failed to start\n{output[-8000:]}")
 
 
 def stop_server(runtime: Runtime) -> None:
@@ -1086,8 +1086,8 @@ def filter_cases(cases: list[Case], pattern: str, sample: int, seed: int) -> lis
 
 
 def run_live(cases: list[Case], args: argparse.Namespace) -> int:
-    if not VAPACHED.is_file():
-        raise RuntimeError(f"missing {VAPACHED}; build the release daemon first")
+    if not HTTPD_RS.is_file():
+        raise RuntimeError(f"missing {HTTPD_RS}; build the release daemon first")
     missing_modules = [
         str(transform.MODDIR / f"mod_{module.removesuffix('_module')}.so")
         for module in transform.MODULES
@@ -1098,10 +1098,10 @@ def run_live(cases: list[Case], args: argparse.Namespace) -> int:
 
     runtime = prepare_runtime(cases)
     try:
-        config = runtime.base / "vapache-httpd.conf"
+        config = runtime.base / "httpd-rs-httpd.conf"
         config.write_text(server_config(runtime, cases))
         apply_world(runtime, cases, "a")
-        run_checked([str(VAPACHED), "-t", "-f", str(config)], "Vapache configtest")
+        run_checked([str(HTTPD_RS), "-t", "-f", str(config)], "httpd-rs configtest")
         observations_a, backend_a = run_world(runtime, cases, "a", config, args.verbose)
         observations_b, backend_b = run_world(runtime, cases, "b", config, args.verbose)
 
@@ -1156,15 +1156,15 @@ def stateful_config(runtime: Runtime, deny_reloaded_targets: bool) -> str:
     lines = transform.module_lines()
     lines.extend(
         [
-            "VapacheCapability AccessFiles On",
-            "VapacheCapability AutoIndex On",
-            "VapacheCapability Cgi On",
-            "VapacheCapability MutableAuthFiles On",
+            "HttpdRsCapability AccessFiles On",
+            "HttpdRsCapability AutoIndex On",
+            "HttpdRsCapability Cgi On",
+            "HttpdRsCapability MutableAuthFiles On",
             f'ServerRoot "{runtime.base}"',
             f"Listen {PORT}",
             f"User {transform.SERVICE_USER}",
             f"Group {transform.SERVICE_GROUP}",
-            f'PidFile "{runtime.base}/logs/vapache.pid"',
+            f'PidFile "{runtime.base}/logs/httpd-rs.pid"',
             f'ErrorLog "{runtime.base}/logs/error.log"',
             "LogLevel warn",
             "ServerName localhost",
@@ -1310,9 +1310,9 @@ def run_stateful_world(world: str, verbose: bool) -> tuple[Runtime, dict[str, li
     runtime = prepare_runtime([])
     try:
         stateful_fixture(runtime, world)
-        config = runtime.base / "vapache-stateful.conf"
+        config = runtime.base / "httpd-rs-stateful.conf"
         config.write_text(stateful_config(runtime, False))
-        run_checked([str(VAPACHED), "-t", "-f", str(config)], "stateful configtest")
+        run_checked([str(HTTPD_RS), "-t", "-f", str(config)], "stateful configtest")
         start_server(runtime, f"stateful-{world}", config)
     except Exception:
         stop_runtime(runtime, True)
@@ -1484,8 +1484,8 @@ def compare_stateful_sequence(
 
 
 def run_stateful(args: argparse.Namespace) -> tuple[int, int]:
-    if not VAPACHED.is_file():
-        raise RuntimeError(f"missing {VAPACHED}; build the release daemon first")
+    if not HTTPD_RS.is_file():
+        raise RuntimeError(f"missing {HTTPD_RS}; build the release daemon first")
     runtime_a: Runtime | None = None
     runtime_b: Runtime | None = None
     try:

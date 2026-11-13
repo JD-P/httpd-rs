@@ -1038,15 +1038,15 @@ impl Recv {
     pub fn enqueue_reset_expiration(&mut self, stream: &mut store::Ptr, counts: &mut Counts) {
         if !stream.state.is_local_error()
             || stream.is_pending_reset_expiration()
-            || stream.reset_expiry_phase != vapache_verified::H2ResetExpiryPhase::Untracked
+            || stream.reset_expiry_phase != httpd_rs_verified::H2ResetExpiryPhase::Untracked
         {
             return;
         }
 
         if counts.can_inc_num_reset_streams() {
-            stream.reset_expiry_phase = vapache_verified::h2_reset_expiry_step(
+            stream.reset_expiry_phase = httpd_rs_verified::h2_reset_expiry_step(
                 stream.reset_expiry_phase,
-                vapache_verified::H2ResetExpiryEvent::Enqueue,
+                httpd_rs_verified::H2ResetExpiryEvent::Enqueue,
             )
             .expect("fresh reset expiry admission must queue");
             counts.inc_num_reset_streams();

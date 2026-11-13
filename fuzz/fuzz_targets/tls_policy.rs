@@ -3,5 +3,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    vapached::tls::fuzz_tls_policy(data);
+    httpd_rs::tls::fuzz_tls_policy(data);
 });

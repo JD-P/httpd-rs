@@ -1,4 +1,4 @@
-//! Security-critical, mechanically verified primitives used by `vapached`.
+//! Security-critical, mechanically verified primitives used by `httpd-rs`.
 //!
 //! Every function in this crate is proved with Verus.  The runtime calls these
 //! functions directly; there is no "verified model" that diverges from the
@@ -5221,7 +5221,7 @@ pub proof fn directory_index_preserves_application_request()
 }
 
 /// Apache's directory fixup admits GET and POST before selecting the index;
-/// HEAD follows GET semantics in Vapache. The selected target still applies
+/// HEAD follows GET semantics in httpd-rs. The selected target still applies
 /// its own method policy, so admitting POST here does not make static files
 /// accept it.
 pub open spec fn directory_index_method_spec(
@@ -5336,7 +5336,7 @@ pub proof fn internal_request_target_rejects_wire_ambiguity(
 }
 
 /// DirectoryIndex selection first probes a filesystem name and then maps the
-/// corresponding URL. Until Vapache implements Apache's full URI-subrequest
+/// corresponding URL. Until httpd-rs implements Apache's full URI-subrequest
 /// form, only one literal, unescaped path component can make those identities
 /// equal. Reject delimiters and percent escapes instead of opening one file
 /// and internally dispatching another.
@@ -9769,10 +9769,10 @@ fn parse_connection_options(
             }
             saw_upgrade = true;
         } else {
-            // Vapache implements only persistence, WebSocket Upgrade and TE.
+            // httpd-rs implements only persistence, WebSocket Upgrade and TE.
             // Accepting an arbitrary field nomination would let an adjacent
             // intermediary erase a security field (Authorization,
-            // X-Forwarded-*, etc.) that Vapache still interprets, or vice
+            // X-Forwarded-*, etc.) that httpd-rs still interprets, or vice
             // versa. Unknown connection extensions therefore fail closed.
             return Err(HeadError::InvalidConnection);
         }
@@ -10010,7 +10010,7 @@ pub fn parse_request_head(
 
     // RFC 9112 permits recipients to ignore one leading empty line, but that
     // tolerance is not safe at a proxy boundary: many adjacent parsers reject
-    // it or assign it to the preceding message. Vapache accepts only the
+    // it or assign it to the preceding message. httpd-rs accepts only the
     // canonical request-line-at-byte-zero representation.
     if head.len() >= 2 && head[0] == b'\r' && head[1] == b'\n' {
         return Err(HeadError::TooManyEmptyLines);
@@ -13191,7 +13191,7 @@ pub fn config_section_nesting_allowed(
 
 /// Disposition for a directive that was not handled by the parser's main
 /// match. Apache rejects an unknown directive and also rejects a directive
-/// whose implementing module is unavailable. Vapache must not turn either
+/// whose implementing module is unavailable. httpd-rs must not turn either
 /// case into an accepted no-op: doing so can erase an administrator's access,
 /// routing, response-header, logging, or resource policy.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -16920,7 +16920,7 @@ pub fn h2_flow_dequeue(f: H2Flow, amount: u64) -> (out: Option<H2Flow>)
 /// Idempotent cleanup registration, mirroring mod_http2's `add_for_purge`.
 /// A stream may be scheduled for destruction by both an early RST callback and
 /// a close callback; the second registration must be a no-op or the same
-/// object is destroyed twice.  Vapache has no C spurge array, but its adapter
+/// object is destroyed twice.  httpd-rs has no C spurge array, but its adapter
 /// uses the same identity rule for task completion/reset events.
 pub open spec fn h2_purge_contains(ids: Seq<u64>, id: u64) -> bool {
     exists|i: int| 0 <= i < ids.len() && ids[i] == id

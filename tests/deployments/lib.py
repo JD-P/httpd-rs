@@ -266,7 +266,7 @@ def wait_http(
 
 
 def service_identity() -> tuple[str, str]:
-    """Return the identity Vapache should use for a deployment test."""
+    """Return the identity httpd-rs should use for a deployment test."""
     if os.geteuid() == 0 or privilege_prefix():
         try:
             pwd.getpwnam("www-data")
@@ -290,7 +290,7 @@ def privilege_prefix() -> list[str]:
 
 
 def secure_admin_file(path: Path, mode: int) -> None:
-    """Give a generated privileged input the ownership Vapache requires."""
+    """Give a generated privileged input the ownership httpd-rs requires."""
     prefix = privilege_prefix()
     if prefix:
         command([*prefix, "chown", "0:0", os.fspath(path)], timeout=30)
@@ -300,7 +300,7 @@ def secure_admin_file(path: Path, mode: int) -> None:
 
 
 @dataclass
-class VapacheProcess:
+class HttpdRsProcess:
     binary: Path
     config: Path
     log: Path
@@ -312,7 +312,7 @@ class VapacheProcess:
         prefix = privilege_prefix()
         if prefix:
             # CI creates the per-case configuration as the unprivileged runner
-            # and then starts Vapache through passwordless sudo so it can drop
+            # and then starts httpd-rs through passwordless sudo so it can drop
             # to www-data. Mirror a real /etc/apache2 input before asking the
             # privileged parser to enforce its root-owned trust boundary.
             command([*prefix, "chown", "0:0", os.fspath(self.config)], timeout=30)
@@ -332,7 +332,7 @@ class VapacheProcess:
 
     def reload(self) -> None:
         if not self.pid_file.exists():
-            raise DeploymentError(f"Vapache did not write {self.pid_file}")
+            raise DeploymentError(f"httpd-rs did not write {self.pid_file}")
         pid = int(self.pid_file.read_text().strip())
         prefix = privilege_prefix()
         if prefix:
@@ -374,7 +374,7 @@ class VapacheProcess:
     def assert_running(self) -> None:
         if self.process is None or self.process.poll() is not None:
             tail = self.log.read_text(errors="replace")[-4000:] if self.log.exists() else ""
-            raise DeploymentError(f"Vapache exited unexpectedly\n{tail}")
+            raise DeploymentError(f"httpd-rs exited unexpectedly\n{tail}")
 
 
 @dataclass
@@ -701,7 +701,7 @@ class CaseContext:
     profile: str
     run_dir: Path
     artifact_dir: Path
-    vapached: Path
+    httpd_rs: Path
     images: tuple[str, ...]
     remove_images: bool
     benchmark: bool
@@ -726,14 +726,14 @@ class CaseContext:
         safe_case = re.sub(r"[^a-z0-9_.-]+", "-", self.case_id.lower()).strip("-.")
         if not safe_label or not safe_case:
             raise DeploymentError("staged image label is empty after normalization")
-        image = f"vapache-deployment-{safe_case}-{safe_label}:local"
+        image = f"httpd-rs-deployment-{safe_case}-{safe_label}:local"
         build = [
             "docker",
             "build",
             "--file",
             os.fspath(dockerfile),
             "--label",
-            f"org.vapache.deployment.case={self.case_id}",
+            f"org.httpd-rs.deployment.case={self.case_id}",
             "--tag",
             image,
         ]
@@ -848,7 +848,7 @@ def start_apache(
 
 
 def differential_benchmark(
-    vapache_port: int,
+    httpd_rs_port: int,
     apache_port: int,
     path: str,
     artifact: Path,
@@ -871,11 +871,11 @@ def differential_benchmark(
 
     if connections < 1:
         raise DeploymentError("differential benchmark connections must be positive")
-    for port in (vapache_port, apache_port):
+    for port in (httpd_rs_port, apache_port):
         command(wrk_command(port, "2s", min(4, connections)), timeout=20)
 
-    samples: dict[str, list[dict[str, object]]] = {"vapache": [], "apache": []}
-    order = (("vapache", vapache_port), ("apache", apache_port), ("apache", apache_port), ("vapache", vapache_port), ("vapache", vapache_port), ("apache", apache_port))
+    samples: dict[str, list[dict[str, object]]] = {"httpd-rs": [], "apache": []}
+    order = (("httpd-rs", httpd_rs_port), ("apache", apache_port), ("apache", apache_port), ("httpd-rs", httpd_rs_port), ("httpd-rs", httpd_rs_port), ("apache", apache_port))
     for server, port in order:
         output = command(wrk_command(port, "5s", connections), timeout=30).stdout
         match = re.search(r"Requests/sec:\s+([0-9.]+)", output)
@@ -914,13 +914,13 @@ def differential_benchmark(
             for name, values in samples.items()
         },
     }
-    vapache_rps = summary["median_requests_per_second"]["vapache"]
+    httpd_rs_rps = summary["median_requests_per_second"]["httpd-rs"]
     apache_rps = summary["median_requests_per_second"]["apache"]
-    summary["vapache_to_apache_ratio"] = vapache_rps / apache_rps if apache_rps else None
+    summary["httpd_rs_to_apache_ratio"] = httpd_rs_rps / apache_rps if apache_rps else None
     artifact.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
 
-def common_vapache_config(
+def common_httpd_rs_config(
     run_dir: Path,
     port: int,
     document_root: Path,
@@ -928,14 +928,14 @@ def common_vapache_config(
     capabilities: Iterable[str] = (),
     extra: str = "",
 ) -> tuple[str, Path]:
-    server_root = run_dir / "vapache"
+    server_root = run_dir / "httpd-rs"
     logs = server_root / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     os.chmod(logs, 0o777)
     document_root.mkdir(parents=True, exist_ok=True)
     user, group = service_identity()
-    pid_file = logs / "vapached.pid"
-    capability_lines = "".join(f"VapacheCapability {name} On\n" for name in capabilities)
+    pid_file = logs / "httpd-rs.pid"
+    capability_lines = "".join(f"HttpdRsCapability {name} On\n" for name in capabilities)
     config = f"""ServerRoot "{server_root}"
 Listen {port}
 User {user}
@@ -964,21 +964,21 @@ TypesConfig /etc/mime.types
     return config, pid_file
 
 
-def start_vapache(
+def start_httpd_rs(
     context: CaseContext,
     config_text: str,
     pid_file: Path,
     port: int,
     *,
     tls: bool = False,
-) -> VapacheProcess:
-    config = context.run_dir / "vapache.conf"
+) -> HttpdRsProcess:
+    config = context.run_dir / "httpd-rs.conf"
     config.write_text(config_text)
-    shutil.copy2(config, context.artifact_dir / "vapache.conf")
-    process = VapacheProcess(
-        binary=context.vapached,
+    shutil.copy2(config, context.artifact_dir / "httpd-rs.conf")
+    process = HttpdRsProcess(
+        binary=context.httpd_rs,
         config=config,
-        log=context.artifact_dir / "vapached.log",
+        log=context.artifact_dir / "httpd-rs.log",
         pid_file=pid_file,
     )
     context.add_cleanup(process.stop)

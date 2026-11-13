@@ -11,11 +11,11 @@ The normal correctness gate is:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy -p vapached --lib --bins --no-deps -- \
+cargo clippy -p httpd-rs --lib --bins --no-deps -- \
   -D clippy::correctness -D clippy::suspicious \
   -D unused_must_use -A unsafe_code
 cargo test --workspace --all-targets --all-features -- --test-threads=1
-cargo build --locked -p vapached
+cargo build --locked -p httpd-rs
 python3 tests/docs.py
 python3 tests/unsafe_inventory.py
 python3 tests/resource_inventory.py
@@ -42,19 +42,19 @@ mutable static cannot silently become a second resource ledger.
 
 ### Generated transform and secrecy campaigns
 
-`tests/transform_differential.py` generates 147 Apache/Vapache comparisons
+`tests/transform_differential.py` generates 147 Apache/httpd-rs comparisons
 across 21 transform/sink pairs, seven authorization phases, seven URL
 spellings and six terminal sinks. It targets early returns and fallback paths
 through rewrites, aliases, MultiViews, DirectoryIndex, CGI/PATH_INFO,
 ErrorDocument, proxying and cache planning. Failures retain the generated case
 and exact replay command as JSON under `artifacts/transform-differential/`.
 The comparator has one narrow security equivalence: Apache's 403 for a denied
-implicit MultiViews/CGI-PATH_INFO target may be Vapache's 404, provided neither
+implicit MultiViews/CGI-PATH_INFO target may be httpd-rs's 404, provided neither
 response contains the selected fixture. This intentionally suppresses the
 target-existence oracle and does not relax any other status comparison.
 
 `tests/information_disclosure.py` is the complementary noninterference oracle.
-One rotation has 105 cases that run Vapache in paired worlds differing only in
+One rotation has 105 cases that run httpd-rs in paired worlds differing only in
 protected existence, contents/metadata, directory state or denied backend
 output. The pre-adversarial gate runs all ten deterministic probe rotations:
 1,050 cases and 4,190 cold-state observations cover every generated
@@ -125,7 +125,7 @@ receives 1,024.
 
 ### Apache-derived warrant closure
 
-`tests/apache_warrant.py` keeps Apache observation separate from Vapache
+`tests/apache_warrant.py` keeps Apache observation separate from httpd-rs
 support policy. A checksum-pinned 2.4.69 source manifest inventories directive,
 hook, provider, filter and configuration-callback registrations, runtime source
 files, tests shipped in the source tarball, and the commit-pinned external
@@ -180,14 +180,14 @@ fails the weekly job.
 The nightly external suite enforces TLS 1.2/1.3 policy and ALPN, runs strict
 h2spec, and drives concurrent valid, malformed, fragmented and pipelined
 connections while checking liveness and RSS growth. The weekly same-host
-Apache differential benchmark rejects vapache errors and gross throughput
+Apache differential benchmark rejects httpd-rs errors and gross throughput
 regressions. A separate adversarial complexity suite bounds malformed-input
 runtime.
 
 ## Unsafe and dependency boundaries
 
 Production server code forbids `unsafe`; the only production exception is the
-small `vapache-os` crate. Its safe API accepts `BorrowedFd` for existing
+small `httpd-rs-os` crate. Its safe API accepts `BorrowedFd` for existing
 descriptors and returns owning `File`, `OwnedFd`, `UnixStream`, or
 `TcpListener` values for newly acquired descriptors. Raw descriptor numbers
 remain only where an exec boundary makes an owner impossible to carry, and
@@ -232,7 +232,7 @@ implementation; `cc` is present as its build tool. This inventory is an
 update-review ratchet, while cargo-vet supplies the source-review evidence.
 
 Production expression matching uses the in-tree, safe-Rust
-`vapache-pcre2` compatibility engine. It compiles the admitted regular PCRE2
+`httpd-rs-pcre2` compatibility engine. It compiles the admitted regular PCRE2
 subset to bounded automata, uses no recursive backtracking or executable-memory
 JIT, and applies verified pattern, subject, capture and pattern-times-subject
 work ceilings. The pull-request native-dependency gate rejects a production

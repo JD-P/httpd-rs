@@ -28,7 +28,7 @@ import h2.events
 import h2.settings
 
 ROOT = Path(__file__).resolve().parents[2]
-VAPACHED = ROOT / "target/release/vapached"
+HTTPD_RS = ROOT / "target/release/httpd-rs"
 RUN = Path("/tmp/opencode/p31-h2hold")
 TLS_PORT = 19992
 PLAIN_PORT = 19999
@@ -104,18 +104,18 @@ DocumentRoot "{RUN}/www"
 def start() -> subprocess.Popen:
     log = (RUN / "server.out").open("wb")
     p = subprocess.Popen(
-        [str(VAPACHED), "-f", str(RUN / "httpd.conf"), "-DFOREGROUND"],
+        [str(HTTPD_RS), "-f", str(RUN / "httpd.conf"), "-DFOREGROUND"],
         stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
     )
     for _ in range(200):
         if p.poll() is not None:
-            raise SystemExit(f"vapached exited: { (RUN/'server.out').read_text(errors='replace') }")
+            raise SystemExit(f"httpd-rs exited: { (RUN/'server.out').read_text(errors='replace') }")
         try:
             socket.create_connection(("127.0.0.1", PLAIN_PORT), timeout=0.3).close()
             return p
         except OSError:
             time.sleep(0.05)
-    raise SystemExit("vapached did not start")
+    raise SystemExit("httpd-rs did not start")
 
 
 def tls_socket(host: str, source: str | None = None) -> ssl.SSLSocket:

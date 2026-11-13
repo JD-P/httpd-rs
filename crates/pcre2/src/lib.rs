@@ -1,4 +1,4 @@
-//! A memory-safe, non-backtracking PCRE2 compatibility layer for vapache.
+//! A memory-safe, non-backtracking PCRE2 compatibility layer for httpd-rs.
 //!
 //! This crate intentionally mirrors the useful part of the `pcre2::bytes`
 //! API.  It compiles the regular subset of the PCRE2 10.46 pattern language
@@ -10,7 +10,7 @@
 //! The matcher is byte oriented by default, just like PCRE2's 8-bit API
 //! without `PCRE2_UTF`/`PCRE2_UCP`.  No executable memory or native code is
 //! used.  Pattern, subject, capture and pattern×subject work ceilings are
-//! checked through the verified vapache resource kernel.
+//! checked through the verified httpd-rs resource kernel.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -29,7 +29,7 @@ const DEFAULT_WORK_LIMIT: u64 = 16 * 1024 * 1024;
 const DEFAULT_CAPTURE_LIMIT: usize = 128;
 const DEFAULT_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 const DEFAULT_NEST_LIMIT: u32 = 64;
-const KEEP_PREFIX: &str = "__vapache_pcre2_keep_";
+const KEEP_PREFIX: &str = "__httpd_rs_pcre2_keep_";
 const HOT_TIER_AFTER_SEARCHES: u8 = 1;
 // A bounded optional repetition creates both take and skip states in the
 // PikeVM active set. Pass 24 measured this path at 4–5x the cost of an exact
@@ -191,12 +191,12 @@ pub mod bytes {
         }
 
         pub fn build(&self, pattern: &str) -> Result<Regex, Error> {
-            if !vapache_verified::regex_engine_mode_admit(self.config.backtracking, false) {
+            if !httpd_rs_verified::regex_engine_mode_admit(self.config.backtracking, false) {
                 return Err(Error::resource(
                     "the backtracking compatibility engine is not available",
                 ));
             }
-            if !vapache_verified::regex_compile_resource_admit(
+            if !httpd_rs_verified::regex_compile_resource_admit(
                 pattern.len() as u64,
                 self.config.pattern_limit as u64,
             ) {
@@ -268,7 +268,7 @@ pub mod bytes {
                     "capture count exceeds the configured limit",
                 ));
             }
-            if !vapache_verified::regex_capture_resource_admit(
+            if !httpd_rs_verified::regex_capture_resource_admit(
                 public_to_inner.len() as u64,
                 self.config.capture_limit as u64,
             ) {
@@ -346,7 +346,7 @@ pub mod bytes {
         }
 
         /// Backtracking is disabled by default. Enabling it fails compilation
-        /// because vapache deliberately ships no recursive fallback engine.
+        /// because httpd-rs deliberately ships no recursive fallback engine.
         pub fn backtracking(&mut self, yes: bool) -> &mut Self {
             self.config.backtracking = yes;
             self
@@ -492,7 +492,7 @@ pub mod bytes {
                     return Err(Error::syntax("invalid UTF-8 start offset in UTF mode"));
                 }
             }
-            if !vapache_verified::regex_match_resource_admit(
+            if !httpd_rs_verified::regex_match_resource_admit(
                 self.complexity,
                 subject.len().saturating_sub(start) as u64,
                 self.config.subject_limit as u64,
@@ -1041,7 +1041,7 @@ pub mod bytes {
     /// cannot reproduce their PCRE2 priority and offset semantics exactly.
     struct AdmittedPattern<'a> {
         source: &'a str,
-        certificate: vapache_verified::PcreGrammarCertificate,
+        certificate: httpd_rs_verified::PcreGrammarCertificate,
     }
 
     enum SpecialGroup {
@@ -1071,7 +1071,7 @@ pub mod bytes {
         ) -> Result<Self, Error> {
             let bytes = source.as_bytes();
             let mut grammar =
-                vapache_verified::pcre_grammar_start(initial_extended, initial_multiline);
+                httpd_rs_verified::pcre_grammar_start(initial_extended, initial_multiline);
             let mut i = 0usize;
             let mut repeatable = false;
             let mut branch_start = true;
@@ -1133,9 +1133,9 @@ pub mod bytes {
                     }
                     b'\\' => {
                         if bytes.get(i + 1) == Some(&b'R') {
-                            let denied = vapache_verified::pcre_grammar_step(
+                            let denied = httpd_rs_verified::pcre_grammar_step(
                                 grammar,
-                                vapache_verified::PcreGrammarEvent::AtomicLineEscape,
+                                httpd_rs_verified::PcreGrammarEvent::AtomicLineEscape,
                                 nest_limit,
                             );
                             debug_assert!(denied.is_none());
@@ -1158,9 +1158,9 @@ pub mod bytes {
                                 multiline: next_multiline,
                             } => {
                                 i = end;
-                                grammar = vapache_verified::pcre_grammar_step(
+                                grammar = httpd_rs_verified::pcre_grammar_step(
                                     grammar,
-                                    vapache_verified::PcreGrammarEvent::GlobalOptions {
+                                    httpd_rs_verified::PcreGrammarEvent::GlobalOptions {
                                         extended: next_extended,
                                         multiline: next_multiline,
                                     },
@@ -1175,9 +1175,9 @@ pub mod bytes {
                                 extended: next_extended,
                                 multiline: next_multiline,
                             } => {
-                                grammar = vapache_verified::pcre_grammar_step(
+                                grammar = httpd_rs_verified::pcre_grammar_step(
                                     grammar,
-                                    vapache_verified::PcreGrammarEvent::Open {
+                                    httpd_rs_verified::PcreGrammarEvent::Open {
                                         extended: next_extended,
                                         multiline: next_multiline,
                                     },
@@ -1193,9 +1193,9 @@ pub mod bytes {
                         }
                     }
                     b'(' => {
-                        grammar = vapache_verified::pcre_grammar_step(
+                        grammar = httpd_rs_verified::pcre_grammar_step(
                             grammar,
-                            vapache_verified::PcreGrammarEvent::Open {
+                            httpd_rs_verified::PcreGrammarEvent::Open {
                                 extended,
                                 multiline,
                             },
@@ -1209,9 +1209,9 @@ pub mod bytes {
                         branch_start = true;
                     }
                     b')' => {
-                        grammar = vapache_verified::pcre_grammar_step(
+                        grammar = httpd_rs_verified::pcre_grammar_step(
                             grammar,
-                            vapache_verified::PcreGrammarEvent::Close,
+                            httpd_rs_verified::PcreGrammarEvent::Close,
                             nest_limit,
                         )
                         .ok_or_else(|| Error::syntax_at(i, "unmatched closing parenthesis"))?;
@@ -1225,9 +1225,9 @@ pub mod bytes {
                         branch_start = true;
                     }
                     b'^' => {
-                        grammar = vapache_verified::pcre_grammar_step(
+                        grammar = httpd_rs_verified::pcre_grammar_step(
                             grammar,
-                            vapache_verified::PcreGrammarEvent::StartAnchor,
+                            httpd_rs_verified::PcreGrammarEvent::StartAnchor,
                             nest_limit,
                         )
                         .ok_or_else(|| Error::unsupported(i, "multiline start anchor"))?;
@@ -1301,9 +1301,10 @@ pub mod bytes {
                 }
             }
 
-            let certificate = vapache_verified::pcre_grammar_finish(grammar, source.len() as u64)
+            let certificate = httpd_rs_verified::pcre_grammar_finish(grammar, source.len() as u64)
                 .ok_or_else(|| Error::syntax("unterminated group"))?;
-            if !vapache_verified::pcre_grammar_certificate_admit(certificate, source.len() as u64) {
+            if !httpd_rs_verified::pcre_grammar_certificate_admit(certificate, source.len() as u64)
+            {
                 return Err(Error::syntax("invalid PCRE grammar certificate"));
             }
             Ok(Self {
@@ -1554,7 +1555,7 @@ pub mod bytes {
         unicode_pattern: bool,
         ucp: bool,
     ) -> Result<Translation, Error> {
-        if !vapache_verified::pcre_grammar_certificate_admit(
+        if !httpd_rs_verified::pcre_grammar_certificate_admit(
             admitted.certificate,
             admitted.source.len() as u64,
         ) {

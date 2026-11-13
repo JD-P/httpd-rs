@@ -1,8 +1,8 @@
 //! Fixed regressions from adversarial pass P35.
 
+use httpd_rs_pcre2::bytes as rust;
+use httpd_rs_pcre2::ErrorKind;
 use pcre2_c_oracle::bytes as oracle;
-use vapache_pcre2::bytes as rust;
-use vapache_pcre2::ErrorKind;
 
 #[test]
 fn p35_greedy_classes_before_line_atoms_fail_closed() {

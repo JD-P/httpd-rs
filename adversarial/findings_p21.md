@@ -8,17 +8,17 @@
 > actual-byte accounting and release behavior.
 
 - **Date:** 2026-10-30
-- **Subject:** `target/release/vapached` built at HEAD `5398493`. No product source was edited. The retained additions for this pass are `adversarial/p21/exploit_p21.py`, this write-up and the `adversarial/README.md` index entries.
+- **Subject:** `target/release/httpd-rs` built at HEAD `5398493`. No product source was edited. The retained additions for this pass are `adversarial/p21/exploit_p21.py`, this write-up and the `adversarial/README.md` index entries.
 - **Oracle:** Apache/2.4.69 (Debian), `/usr/sbin/apache2` with `mpm_event` and `mod_reqtimeout`, loopback only.
 - **Harness:** `adversarial/p21/exploit_p21.py` — **4 differential/closure verdicts** (A multi-source differential, B sustained outage, C1 trusted-proxy single client, C2 IPv6 /64 rotation), plus a cross-protocol HTTP/2 check.
 - **Retained evidence:** `/tmp/opencode/p21-harness` (fixtures, configs, per-group stdout and server logs).
-- **Method:** audit of the pass-20 remediation (`b4b9192`) for the remaining `Content-Length` reservation seams and of the new process-wide request/response resident budgets (`6d01035`), followed by live Apache-versus-vapache differentials on the project's stock static configuration.
+- **Method:** audit of the pass-20 remediation (`b4b9192`) for the remaining `Content-Length` reservation seams and of the new process-wide request/response resident budgets (`6d01035`), followed by live Apache-versus-httpd-rs differentials on the project's stock static configuration.
 
 ---
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
 | **P21-A** | The in-memory identity-body path (`Content-Length` ≤ 1 MiB) reserves the **declared** length against the process-wide `MAX_REQUEST_RESIDENT_BYTES` budget (128 MiB) **before reading a single body byte** (`http.rs:568`). A request that sends only its head and stalls holds `Content-Length + 2 × head_length` of that budget until the body deadline. **128 header-only requests (~9 KiB total, zero body bytes)** fill the budget exactly. From then on **every** request on every connection fails its first byte reservation and receives `503 Service Unavailable` — including a zero-body static GET. The outage is total, process-wide and covers HTTP/1 and HTTP/2; the attacker re-arms a wave every 12–20 s (below the 30 s `RequestReadTimeout` body deadline) for ~9 KiB per wave. | Stalled uploads only occupy their own workers: with `MaxRequestWorkers 400` and 128 stalled bodies the identical GET is served `200 OK` throughout. | `200` baseline → `503 "Request body capacity is temporarily exhausted"` for **all** requests while held → `200` immediately on release. Triggered with 128 requests from 4–6 IPv4 sources; **one** attacker behind a configured `RemoteIPTrustedProxy`; or **one** IPv6 customer rotating six /64s of a delegated prefix. An HTTP/2 GET on a sibling TLS listener is denied by the same HTTP/1 attack. | remote resource-exhaustion denial of service (total availability), incomplete P20-B closure |
 | P21-B | (supporting, same root cause) A single wave costs 128 connections × 71 bytes = **9,088 bytes** with **zero body bytes**; the hold expires with the absolute body deadline and is refreshed for another ~9 KiB. ~0.3 KiB/s keeps the server rejecting every request indefinitely. The same global-budget behaviour can also be triggered by 128 *legitimate* concurrent 1 MiB uploads (self-DoS under load). | No global declared-length reservation exists; unrelated requests are unaffected. | Outage sustained across six 10 s samples while waves are re-armed every 12 s; release → immediate `200`. | remote availability denial with negligible attacker cost |
@@ -29,14 +29,14 @@ P21-A is remote, unauthenticated, needs no body bytes, no TLS, no CGI/FastCGI/pr
 
 ## 2. Observed evidence
 
-All groups run loopback-only under `/tmp/opencode/p21-harness`; the fixture is the stock static tree (`www/index.html`) and the harness's `vapache_config()` is the `bench/bench.py` static configuration shape (`AllowOverride None`, `Require all granted`, default `MaxRequestWorkers 512`, default `RequestReadTimeout body=30`).
+All groups run loopback-only under `/tmp/opencode/p21-harness`; the fixture is the stock static tree (`www/index.html`) and the harness's `httpd_rs_config()` is the `bench/bench.py` static configuration shape (`AllowOverride None`, `Require all granted`, default `MaxRequestWorkers 512`, default `RequestReadTimeout body=30`).
 
 ### 2.1 P21-A — header-only requests deny everything, Apache does not
 
 ```
 header-only hold: Content-Length 1048434, head 71 bytes, exact charge 1048576 B; 128 holds fill 128 MiB
 PASS  P21-A header-only holds deny every request (Apache differs): 192 header-only holds;
-      vapache before/during/after = 200 / 503 / 200;
+      httpd-rs before/during/after = 200 / 503 / 200;
       apache  before/during/after = 200 / 200 / 200
 ```
 
@@ -68,7 +68,7 @@ The lease is released by the **absolute** body deadline (`http.rs:529`; the P20 
 
 ### 2.3 P21-C1 — one client behind a trusted proxy
 
-`RemoteIPHeader X-Forwarded-For` plus a trusted-proxy entry covering the transport peer is the standard reverse-proxy deployment; vapache deliberately lifts the 32-connections-per-client cap for such gateways (`server.rs:409-415`, `config.rs:13389`) so the peer can present many clients.
+`RemoteIPHeader X-Forwarded-For` plus a trusted-proxy entry covering the transport peer is the standard reverse-proxy deployment; httpd-rs deliberately lifts the 32-connections-per-client cap for such gateways (`server.rs:409-415`, `config.rs:13389`) so the peer can present many clients.
 
 ```
 PASS  P21-C1 one client behind a trusted proxy fills the budget: 160 single-source holds;
@@ -182,7 +182,7 @@ A delegated /56 or /48 yields hundreds of distinct /64s; six are enough. `exploi
 
 **Preconditions.**
 
-- Any listener and any request target; the default `MaxRequestWorkers 512`, default `VapacheMaxSpoolBytes`/`LimitRequestBody`, default `RequestReadTimeout body=30` are the worst case.
+- Any listener and any request target; the default `MaxRequestWorkers 512`, default `HttpdRsMaxSpoolBytes`/`LimitRequestBody`, default `RequestReadTimeout body=30` are the worst case.
 - 4–6 source addresses in a direct deployment; **one** source behind a trusted transport proxy; **one** IPv6 customer with a delegated prefix.
 - No authentication, TLS, h2, cache, CGI/FastCGI/proxy or upload capability is needed. A POST to any URL is enough.
 
@@ -192,7 +192,7 @@ A delegated /56 or /48 yields hundreds of distinct /64s; six are enough. `exploi
 
 ## 6. Relationship to P20 and prior findings
 
-- **P20-B** (pass 20) identified that the spooler "reserves the declared `Content-Length` from the process-global `VapacheMaxSpoolBytes` budget before reading any body bytes" and recommended "reserve what is read, not what is declared … or reserve a bounded chunk and grow the reservation". The remediation (`b4b9192`) converted the >1 MiB identity path and the chunked path to the incremental `BodyAccumulator` and made the body deadline absolute, but the ≤1 MiB branch still reserves the declaration (and the later process-wide limits commit added `MAX_REQUEST_RESIDENT_BYTES`, which turned the residual reservation into a **total** outage rather than an upload-only denial). P21-A is the incomplete closure of the same class, not a new mechanism.
+- **P20-B** (pass 20) identified that the spooler "reserves the declared `Content-Length` from the process-global `HttpdRsMaxSpoolBytes` budget before reading any body bytes" and recommended "reserve what is read, not what is declared … or reserve a bounded chunk and grow the reservation". The remediation (`b4b9192`) converted the >1 MiB identity path and the chunked path to the incremental `BodyAccumulator` and made the body deadline absolute, but the ≤1 MiB branch still reserves the declaration (and the later process-wide limits commit added `MAX_REQUEST_RESIDENT_BYTES`, which turned the residual reservation into a **total** outage rather than an upload-only denial). P21-A is the incomplete closure of the same class, not a new mechanism.
 - **P20-A** (h2 body buffering) is fixed by the incremental adapter; P21-A does not need h2. P20-B's remaining spool-file/byte budgets are lower-impact siblings; P21-A is strictly stronger because it denies all traffic.
 - **P19** (cache heap) is unrelated; P21-A holds zero bytes of body memory, so it is not a variant of it.
 
@@ -201,7 +201,7 @@ A delegated /56 or /48 yields hundreds of distinct /64s; six are enough. `exploi
 ## 7. Reproduction
 
 ```sh
-cargo build --release -p vapached
+cargo build --release -p httpd-rs
 python3 adversarial/p21/exploit_p21.py --keep        # groups A B C1 C2
 python3 adversarial/p21/exploit_p21.py A             # Apache differential only
 python3 adversarial/p21/exploit_p21.py C1 C2         # single-client variants
@@ -211,7 +211,7 @@ The final retained run produced **4/4 PASS**:
 
 ```text
 PASS  P21-A header-only holds deny every request (Apache differs): 192 header-only holds;
-      vapache before/during/after = 200 / 503 / 200; apache before/during/after = 200 / 200 / 200
+      httpd-rs before/during/after = 200 / 503 / 200; apache before/during/after = 200 / 200 / 200
 PASS  P21-B outage survives body-deadline waves for 60 s: [503, 503, 503, 503, 503, 503]; after release: 200
 PASS  P21-C1 one client behind a trusted proxy fills the budget: 160 single-source holds; 200 / 503 / 200
 PASS  P21-C2 one IPv6 customer rotating delegated /64s: 192 holds over 6 /64s; 200 / 503 / 200

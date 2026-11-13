@@ -20,10 +20,10 @@ Toolchain is pinned by `rust-toolchain.toml`. Verus is not on `PATH` by
 default; it lives in `/root/verus-bin`:
 
 ```sh
-cd /root/vapache
-PATH="/root/.cargo/bin:/root/verus-bin:$PATH" cargo verus verify -p vapache-verified   # must end: 0 errors
-cargo build --release                                  # python suites run target/release/vapached
-cargo test -p vapached
+cd /root/httpd-rs
+PATH="/root/.cargo/bin:/root/verus-bin:$PATH" cargo verus verify -p httpd-rs-verified   # must end: 0 errors
+cargo build --release                                  # python suites run target/release/httpd-rs
+cargo test -p httpd-rs
 python3 tests/verification_status.py --run-verus       # proof-debt gate: must print "gate: pass"
 python3 tests/conformance.py                           # 165 cases vs local Apache
 python3 tests/config_semantics.py                      # 235 fixed cases vs local Apache
@@ -125,7 +125,7 @@ model (F60-D built upload→RCE on `.htaccess`).
    unsupported-dialect case) must stay green.
 
 **Acceptance:** unit tests: `parse` of `"x =~"`, `"'a' !~"`, deep `"!!!!…"`
-(> cap) all return `Err` (no panic, no abort); `cargo test -p vapached`
+(> cap) all return `Err` (no panic, no abort); `cargo test -p httpd-rs`
 green; `python3 tests/config_validity.py` and `config_grammar.py` still 0
 divergence. Then move ledger obligation `expr_parser_totality` to partial.
 
@@ -142,7 +142,7 @@ remediation list); the F60 half already landed.
 `rewrite::process()` builds a filesystem override for **any** absolute
 substitution; the dispatcher then re-roots at `filesystem.parent()` and
 executes the host file. Apache maps a `[PT]` substitution back through URL
-space (the F67 repro: Apache 404, vapache RCE).
+space (the F67 repro: Apache 404, httpd-rs RCE).
 
 **Required change:** in the block at `rewrite.rs:521` that computes
 `filesystem` (`if !external && Path::new(&joined).is_absolute()`), do not
@@ -187,13 +187,13 @@ compatibility and has no effect"`.
 the existing F60-style test classes:
 * F67 shape: `RewriteRule "^/app/(.*)$" "%{DOCUMENT_ROOT}/$1" [PT,L]` with a
   `<Location "/secret"> Require all denied` and a CGI/php handler — assert
-  vapached does **not** execute the host file (expect 403/404, and the same
+  httpd-rs does **not** execute the host file (expect 403/404, and the same
   as Apache for the same config).
 * F68 shape: rule 1 absolute substitution without `[L]`, rule 2
   `"^" "/index.html" [L]` — assert the index document is served (Apache
   agrees).
 * `[UnsafePrefixStat]` config logs the warning and still loads.
-`cargo test -p vapached`, `conformance.py`, `config_semantics.py`,
+`cargo test -p httpd-rs`, `conformance.py`, `config_semantics.py`,
 `adversarial_regressions.py` all green; move ledger obligation
 `rewrite_flag_state_machine` to partial with evidence. The matching Verus
 kernels (a spec fn from `RewriteFlags` to a target-action lattice, plus the
@@ -205,10 +205,10 @@ kernels (a spec fn from `RewriteFlags` to a target-action lattice, plus the
 scope.options.push_add(o.0)` fall-through), `crates/server/src/htaccess.rs`
 `apply_options` (same shape).
 
-vapache treats `Options Indexes` as `+Indexes`. Apache **resets** the set to
+httpd-rs treats `Options Indexes` as `+Indexes`. Apache **resets** the set to
 exactly the listed options, so a child `<Directory uploads>` saying
 `Options Indexes` drops inherited `ExecCGI` — Apache 403s a `.cgi` there
-while vapache executes it. This also undercuts the F60 scope conjunction:
+while httpd-rs executes it. This also undercuts the F60 scope conjunction:
 the target-side `Options` bits are computed from a scope that failed to drop
 the parent bits.
 
@@ -329,7 +329,7 @@ section's rules on. Main config reads `args.first()`
 (`config.rs:2677` area).
 
 **Required change:** read `args[0]` only after enforcing exactly one operand.
-Vapache deliberately rejects `<IfFile a b>` rather than discarding `b`; local
+httpd-rs deliberately rejects `<IfFile a b>` rather than discarding `b`; local
 Apache 2.4.69 accepts the extra word, so the stricter behavior is recorded in
 `config_validity.py` `HARDENED_CASES`.
 

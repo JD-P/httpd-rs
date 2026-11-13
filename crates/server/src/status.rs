@@ -31,12 +31,12 @@ pub fn response(
         );
         if extended {
             body.push_str(&format!(
-                "VapacheDiskBytes: {}\nVapacheDiskByteLimit: {}\n\
-                 VapacheDiskFiles: {}\nVapacheDiskFileLimit: {}\n\
-                 VapacheDiskFilesystems: {}\nVapacheDiskMinByteHeadroom: {}\n\
-                 VapacheDiskMinFileHeadroom: {}\n\
-                 VapacheTransportBytes: {}\nVapacheTransportByteLimit: {}\n\
-                 VapacheQueuedH2Outputs: {}\nVapacheH2HpackScratchHighWater: {}\n",
+                "HttpdRsDiskBytes: {}\nHttpdRsDiskByteLimit: {}\n\
+                 HttpdRsDiskFiles: {}\nHttpdRsDiskFileLimit: {}\n\
+                 HttpdRsDiskFilesystems: {}\nHttpdRsDiskMinByteHeadroom: {}\n\
+                 HttpdRsDiskMinFileHeadroom: {}\n\
+                 HttpdRsTransportBytes: {}\nHttpdRsTransportByteLimit: {}\n\
+                 HttpdRsQueuedH2Outputs: {}\nHttpdRsH2HpackScratchHighWater: {}\n",
                 resource.disk_bytes,
                 resource.disk_byte_limit,
                 resource.disk_files,
@@ -102,6 +102,6 @@ mod tests {
         let crate::http::Body::Bytes(body) = response(true, false, &budget).body else {
             panic!("status response was not inline")
         };
-        assert!(!String::from_utf8(body).unwrap().contains("VapacheDisk"));
+        assert!(!String::from_utf8(body).unwrap().contains("HttpdRsDisk"));
     }
 }

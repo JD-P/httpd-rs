@@ -8,7 +8,7 @@
 > ordering and lease behavior.
 
 - **Date:** 2026-10-30
-- **Subject:** `target/release/vapached` built at HEAD `5398493`. No product source was edited. The retained additions for this pass are `adversarial/p22/exploit_p22.py`, this write-up and the `adversarial/README.md` index entries.
+- **Subject:** `target/release/httpd-rs` built at HEAD `5398493`. No product source was edited. The retained additions for this pass are `adversarial/p22/exploit_p22.py`, this write-up and the `adversarial/README.md` index entries.
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` with `mod_http2`, `mod_ssl` and `mod_proxy_http`, loopback only.
 - **Harness:** `adversarial/p22/exploit_p22.py` — **3 verdicts** (A1 memory differential vs the Apache oracle, A2 memory-bounded process death, B global blocking-read lease pin), plus controls for files below the offload range, HTTP/1 and post-release recovery.
 - **Retained evidence:** `/tmp/opencode/p22-harness` (fixtures, configs, TLS material, per-group stdout and server logs).
@@ -18,7 +18,7 @@
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
 | **P22-A** | `h2::send_response` materialises a file-style response body **before** it waits for flow-control capacity: for `256 KiB ≤ len ≤ 8 MiB` the complete representation is read into a `Bytes` (`h2.rs:600-648`) and then held by `send_data_bounded` while the client's stream/connection window is exhausted (`h2.rs:443-464`). That buffer is charged to **no** budget — the response-resident budget only covers `Body::Bytes`, and the body pool only bounds *free* buffers. 32 zero-window streams on **one** connection hold ~256 MiB of heap; the per-client ceiling (64 streams) holds ~512 MiB; the process-wide h2 ceiling (256 streams) holds ~2 GiB. Under an address-space bound the next 8 MiB allocation fails and `panic = "abort"` kills the whole process. | `mod_http2` streams the representation through its windowed output filter and stays flat: **+13–21 MiB** across runs over the identical 32 × 8 MiB zero-window load. | Peak RSS **+258 MiB** for 32 zero-window 8 MiB responses on one connection; 64 streams under `RLIMIT_AS=550 MiB` aborts with `memory allocation of 8388608 bytes failed`. HTTP/1, small files and > 8 MiB files are unaffected. | remote memory-exhaustion denial of service (whole-process under memory pressure) |
 | **P22-B** | A `Body::Stream` response (proxied upstream body > 256 KiB) holds a **process-wide** `try_blocking_read` lease for the entire send (`h2.rs:566`). One h2 connection with 32 zero-window streams to any proxied large response pins all 32 leases for up to `Timeout` (60 s default, refreshable). Every other h2 response whose send needs a lease — static/cached/FastCGI **file bodies in the 256 KiB…8 MiB range** and every other streamed proxy response — fails `try_blocking_read()?` (`h2.rs:603`) and the stream is **reset**. HTTP/1 and h2 responses below 256 KiB keep working, which makes the failure look like a random download corruption to clients. | `mod_proxy_http` + `mod_http2` have no global read lease; the same attack leaves the static 8 MiB download and the proxied download at full `200`/8 MiB. | During the pin: static 8 MiB h2 download = `200 0` with curl exit 92 (stream error), server log `HTTP/2 stream failed: process-wide blocking-read limit reached`; small 128 KiB h2 file = `200 131072`; HTTP/1 = `200`; release → full `200 8388608`. | remote functional denial of a common response class (global lease starvation) |
@@ -35,7 +35,7 @@ All groups run loopback-only under `/tmp/opencode/p22-harness`; fixtures are `ww
 
 ```
 PASS  P22-A1 h2 zero-window holds full response bodies uncharged:
-      32 zero-window streams of 8 MiB: vapache peak rss +258 MiB
+      32 zero-window streams of 8 MiB: httpd-rs peak rss +258 MiB
       (1 connection, ceiling ~256 MiB); apache mod_http2 +21 MiB
 ```
 
@@ -171,7 +171,7 @@ The lease pins are the same object used to keep 8 MiB offload reads off the conn
 ## 7. Reproduction
 
 ```sh
-cargo build --release -p vapached
+cargo build --release -p httpd-rs
 python3 adversarial/p22/exploit_p22.py --keep     # groups A B
 python3 adversarial/p22/exploit_p22.py A          # memory hold + RLIMIT kill
 python3 adversarial/p22/exploit_p22.py B          # lease pin + Apache oracle
@@ -181,7 +181,7 @@ The final retained run produced **3/3 PASS**:
 
 ```text
 PASS  P22-A1 h2 zero-window holds full response bodies uncharged: 32 zero-window streams of 8 MiB:
-      vapache peak rss +258 MiB (1 connection, ceiling ~256 MiB); apache mod_http2 +21 MiB
+      httpd-rs peak rss +258 MiB (1 connection, ceiling ~256 MiB); apache mod_http2 +21 MiB
 PASS  P22-A2 h2 zero-window memory-bound process death: 64 streams x 8 MiB under RLIMIT_AS=550 MiB;
       exited=True, allocator abort=True
 PASS  P22-B h2 zero-window streams pin all 32 blocking-read leases: before: static='200 8388608'

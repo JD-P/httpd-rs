@@ -30,7 +30,7 @@ attempts and therefore two recorded `proxy_exchanges` entries for one
 `execute_prepared_snapshot` call, which pops only one.
 
 Evidence for the two attempts: replaying the minimized input prints
-`vapache proxy error: ambiguous proxy response framing` exactly **2** times.
+`httpd-rs proxy error: ambiguous proxy response framing` exactly **2** times.
 If the cancelled step 1 had contacted the backend, the count would be 3; the
 production `DynamicOutcomeToken::start_backend` cancellation check
 (`crates/server/src/server.rs:4100-4114`) therefore does suppress the

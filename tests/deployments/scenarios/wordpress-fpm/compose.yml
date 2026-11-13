@@ -15,8 +15,8 @@ services:
     environment:
       MARIADB_DATABASE: wordpress
       MARIADB_USER: wordpress
-      MARIADB_PASSWORD: vapache-integration-db
-      MARIADB_ROOT_PASSWORD: vapache-integration-root
+      MARIADB_PASSWORD: httpd-rs-integration-db
+      MARIADB_ROOT_PASSWORD: httpd-rs-integration-root
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=128m
       - /run/mysqld:rw,nosuid,nodev,size=32m
@@ -47,7 +47,7 @@ services:
       WORDPRESS_DB_HOST: database
       WORDPRESS_DB_NAME: wordpress
       WORDPRESS_DB_USER: wordpress
-      WORDPRESS_DB_PASSWORD: vapache-integration-db
+      WORDPRESS_DB_PASSWORD: httpd-rs-integration-db
       WORDPRESS_TABLE_PREFIX: wp_
       WORDPRESS_DEBUG: "0"
     depends_on:
@@ -59,21 +59,21 @@ services:
       - type: bind
         source: ${WORDPRESS_ROOT:?}
         target: /var/www/html
-      # Keep SCRIPT_FILENAME identical in Vapache's and PHP-FPM's namespaces.
+      # Keep SCRIPT_FILENAME identical in httpd-rs's and PHP-FPM's namespaces.
       - type: bind
         source: ${WORDPRESS_ROOT:?}
         target: ${WORDPRESS_ROOT:?}
       - type: bind
         source: ${PHP_RUN:?}
-        target: /run/vapache-php
+        target: /run/httpd-rs-php
       - type: bind
         source: ${FPM_CONFIG:?}
-        target: /usr/local/etc/php-fpm.d/zz-vapache-integration.conf
+        target: /usr/local/etc/php-fpm.d/zz-httpd-rs-integration.conf
         read_only: true
     networks:
       - application
     healthcheck:
-      test: ["CMD-SHELL", "test -S /run/vapache-php/php-fpm.sock"]
+      test: ["CMD-SHELL", "test -S /run/httpd-rs-php/php-fpm.sock"]
       interval: 1s
       timeout: 3s
       retries: 60

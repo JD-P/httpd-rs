@@ -8,7 +8,7 @@ set -Eeuo pipefail
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
 
-NIGHTLY=${VAPACHE_NIGHTLY_TOOLCHAIN:-nightly-2026-10-29}
+NIGHTLY=${HTTPD_RS_NIGHTLY_TOOLCHAIN:-nightly-2026-10-29}
 TOTAL_SECONDS=${LONG_FUZZ_SECONDS:-28800}
 QUANTUM_SECONDS=${LONG_FUZZ_QUANTUM:-600}
 PARALLEL_JOBS=${LONG_FUZZ_JOBS:-2}
@@ -51,7 +51,7 @@ Environment equivalents: LONG_FUZZ_SECONDS, LONG_FUZZ_QUANTUM,
 LONG_FUZZ_JOBS, LONG_FUZZ_PROFILE, LONG_FUZZ_TARGETS,
 LONG_FUZZ_STATE_DIR, LONG_FUZZ_RSS_LIMIT_MB, LONG_FUZZ_MINIMIZE, and
 LONG_FUZZ_IMPORT_DIR, LONG_FUZZ_NIGHTLY_RUN, LONG_FUZZ_COVERAGE,
-LONG_FUZZ_STRICT_SEMANTIC, and VAPACHE_NIGHTLY_TOOLCHAIN.
+LONG_FUZZ_STRICT_SEMANTIC, and HTTPD_RS_NIGHTLY_TOOLCHAIN.
 
 Fuzz findings are always retained by target under
 adversarial/long_fuzz_findings. A finding does not stop the campaign.
@@ -525,7 +525,7 @@ run_report "$STATE_DIR/baseline.json" 0
 # The physical continuation state space is finite enough to enumerate. Run
 # that exact matrix before spending CPU on mutation so fuzzing is reserved for
 # unbounded composition rather than rediscovering known boundary products.
-run_printed env RUSTFLAGS=-Awarnings cargo test -p vapached --lib \
+run_printed env RUSTFLAGS=-Awarnings cargo test -p httpd-rs --lib \
     config_frontend::tests::continuation_matrix_exhausts_boundaries_chains_and_near_misses \
     -- --exact
 

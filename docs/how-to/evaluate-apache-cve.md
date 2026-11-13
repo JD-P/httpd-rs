@@ -12,11 +12,11 @@ a newly disclosed Apache HTTP Server CVE to the checked-in project review. It
 is not the operator procedure for deciding whether to migrate a site.
 
 Apache operators should use [Decide whether to replace Apache with
-Vapache](evaluate-security-driven-migration.md).
+httpd-rs](evaluate-security-driven-migration.md).
 
 ## Prerequisites
 
-Use a repository checkout for the Vapache version that you are reviewing.
+Use a repository checkout for the httpd-rs version that you are reviewing.
 Obtain the vendor advisory, affected-version statement, patch when available,
 and a configuration that reaches the affected Apache feature.
 
@@ -26,7 +26,7 @@ Record the CVE ID, affected Apache versions, required module, configuration,
 protocol, platform, and attack preconditions. Prefer the vendor advisory and
 patch over a summary headline.
 
-Do not infer Vapache exposure from an Apache version string. Vapache has an
+Do not infer httpd-rs exposure from an Apache version string. httpd-rs has an
 independent implementation, but it can still contain the same type of flaw or
 process the same input in an unsafe way.
 
@@ -38,25 +38,25 @@ Search the machine-readable Apache matrix:
 $ rg -n 'CVE-2021-41773' docs/cve/apache2-cve-matrix.json
 ```
 
-Read the row's status, affected Vapache feature (the `surface` field),
+Read the row's status, affected httpd-rs feature (the `surface` field),
 confidence, rationale, and implementation evidence. Use these meanings:
 
 | Status | Incident meaning |
 |---|---|
 | `prevented` | The implementation structure or a checked property prevents the cause described by the advisory |
-| `fail_closed` | Vapache rejects the required feature, directive, or configuration |
+| `fail_closed` | httpd-rs rejects the required feature, directive, or configuration |
 | `not_applicable` | The affected feature or platform is absent |
 | `partial` | The evidence covers some affected behavior, but not all of it |
 | `not_covered` | The affected production code is not included in the formal model |
 | `needs_review` | Available source information does not support a decision |
 
 Treat `partial`, `not_covered`, and `needs_review` as open incident work. A
-`prevented` row is not a claim that the subsystem has no independent Vapache
+`prevented` row is not a claim that the subsystem has no independent httpd-rs
 bugs.
 
-## 3. Check the Vapache implementation and test configuration
+## 3. Check the httpd-rs implementation and test configuration
 
-Confirm which Vapache code and configuration correspond to the advisory. Check
+Confirm which httpd-rs code and configuration correspond to the advisory. Check
 enabled capabilities, proxy direction, HTTP version, TLS client-certificate
 policy, CGI or FastCGI use, rewrite rules, and platform.
 

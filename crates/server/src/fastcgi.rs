@@ -289,7 +289,7 @@ fn clean_script_path(path: &Path) -> PathBuf {
 /// the `PATH_INFO` ancestor walk.  This is the verified kernel shared with
 /// alias/rewrite mapping; `/srv/www2/x.php` is not below `/srv/www`.
 fn script_under_base(script: &Path, base: &Path) -> bool {
-    vapache_verified::path_under_base(
+    httpd_rs_verified::path_under_base(
         script.as_os_str().as_encoded_bytes(),
         base.as_os_str().as_encoded_bytes(),
     )
@@ -636,7 +636,7 @@ pub(crate) fn handler_target_for_file(
         .map(|value| value.as_encoded_bytes())
         .unwrap_or(b"")
         == name;
-    if !vapache_verified::fastcgi_resolved_target_admit(
+    if !httpd_rs_verified::fastcgi_resolved_target_admit(
         name_is_lexical,
         script_filename.matches_mapping(&backend, root, rel),
         script_under_base(script_filename.as_path(), &base),
@@ -663,7 +663,7 @@ fn stable_policy_for<'a>(
     backend: &Backend,
 ) -> io::Result<Option<&'a FastCgiStablePathPolicy>> {
     let Some(policies) = &cfg.fastcgi_stable_paths else {
-        return if vapache_verified::capability_admit(
+        return if httpd_rs_verified::capability_admit(
             cfg.capability_enabled(crate::config::Capability::UnstableFastCgiPaths),
             true,
         ) {
@@ -671,7 +671,7 @@ fn stable_policy_for<'a>(
         } else {
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "FastCGI requires VapacheFastCGIStablePath; enabling UnstableFastCgiPaths explicitly accepts the external pathname race",
+                "FastCGI requires HttpdRsFastCGIStablePath; enabling UnstableFastCgiPaths explicitly accepts the external pathname race",
             ))
         };
     };
@@ -721,7 +721,7 @@ fn connect_unix_timeout(
     request_scope: Option<&crate::resource::RequestScope>,
 ) -> io::Result<UnixStream> {
     crate::fault::hit("fastcgi.unix.socket")?;
-    vapache_os::connect_unix_timeout(path, deadline, || {
+    httpd_rs_os::connect_unix_timeout(path, deadline, || {
         request_scope.is_some_and(crate::resource::RequestScope::is_cancelled)
     })
     .map_err(|error| {
@@ -735,7 +735,7 @@ fn connect_unix_timeout(
 
 #[cfg(target_os = "linux")]
 fn unix_peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    vapache_os::unix_peer_uid(stream)
+    httpd_rs_os::unix_peer_uid(stream)
 }
 
 #[cfg(target_os = "linux")]
@@ -747,7 +747,7 @@ fn authenticate_unix_peer(stream: &UnixStream, policy: &FastCgiStablePathPolicy)
             "strict FastCGI Unix policy has no endpoint owner uid",
         )
     })?;
-    if vapache_verified::fastcgi_peer_identity_admit(
+    if httpd_rs_verified::fastcgi_peer_identity_admit(
         policy.backend_uid,
         endpoint_owner_uid,
         peer_uid,
@@ -1154,9 +1154,9 @@ fn secure_temp_file_at(dir: &Path, seed: u64, start: u64) -> io::Result<File> {
     for offset in 0..32 {
         let attempt = start.saturating_add(offset);
         let name = if attempt == 0 {
-            format!("vapache-fastcgi-{pid}-{seed}.body")
+            format!("httpd-rs-fastcgi-{pid}-{seed}.body")
         } else {
-            format!("vapache-fastcgi-{pid}-{seed}-{attempt}.body")
+            format!("httpd-rs-fastcgi-{pid}-{seed}-{attempt}.body")
         };
         let path = dir.join(name);
         match OpenOptions::new()
@@ -1391,13 +1391,13 @@ fn retain_script_path_binding(target: &Target, binding: &ScriptBinding) -> io::R
         selected.dev() == binding.meta.dev() && selected.ino() == binding.meta.ino();
     let same_path =
         current_meta.dev() == binding.meta.dev() && current_meta.ino() == binding.meta.ino();
-    let lexical_inode_bound = vapache_verified::descriptor_snapshot_admit(
+    let lexical_inode_bound = httpd_rs_verified::descriptor_snapshot_admit(
         selected.is_file() && current_meta.is_file(),
         same_selected && same_path,
         true,
         true,
     );
-    if !vapache_verified::fastcgi_script_identity_admit(
+    if !httpd_rs_verified::fastcgi_script_identity_admit(
         selected.dev() == binding.meta.dev() && selected.ino() == binding.meta.ino(),
         lexical_inode_bound,
         true,
@@ -1421,7 +1421,7 @@ fn path_has_posix_acl(path: &Path) -> io::Result<bool> {
     })?;
     for name in ["system.posix_acl_access", "system.posix_acl_default"] {
         let name = std::ffi::CString::new(name).expect("static xattr name");
-        if vapache_os::path_xattr_exists(&path, &name)? {
+        if httpd_rs_os::path_xattr_exists(&path, &name)? {
             return Ok(true);
         }
     }
@@ -1445,7 +1445,7 @@ fn stable_fastcgi_component(
     let mode = meta.mode();
     let symlink = meta.file_type().is_symlink();
     let has_acl = !symlink && path_has_posix_acl(path)?;
-    let admitted = vapache_verified::fastcgi_stable_component_admit(
+    let admitted = httpd_rs_verified::fastcgi_stable_component_admit(
         policy.backend_uid == 0,
         policy.trusted_owner_uids.contains(&uid),
         uid == policy.backend_uid,
@@ -1571,7 +1571,7 @@ fn execute_inner(
     ) {
         Ok(lease) => lease,
         Err(e) => {
-            eprintln!("vapache FastCGI admission error: {e}");
+            eprintln!("httpd-rs FastCGI admission error: {e}");
             return fastcgi_error_response(base, scope, target, 503);
         }
     };
@@ -1640,7 +1640,7 @@ fn execute_inner(
         // a last-moment open of SCRIPT_FILENAME alive through the exchange.
         // A slow backend connection therefore cannot widen the check-to-send
         // window. The protocol cannot make PHP-FPM consume our fd, but this
-        // closes vapache's own select/authorize/use gap and fails if the
+        // closes httpd-rs's own select/authorize/use gap and fails if the
         // pathname changed before parameters are emitted.
         let _path_binding = if let Some(binding) = binding {
             Some(retain_script_path_binding(target, binding)?)
@@ -1666,7 +1666,7 @@ fn execute_inner(
         )?;
         if !stderr.is_empty() {
             eprintln!(
-                "vapache FastCGI stderr: {}",
+                "httpd-rs FastCGI stderr: {}",
                 String::from_utf8_lossy(&stderr).trim()
             );
         }
@@ -1685,7 +1685,7 @@ fn execute_inner(
             r
         }
         Err(e) => {
-            eprintln!("vapache FastCGI error: {e}");
+            eprintln!("httpd-rs FastCGI error: {e}");
             fastcgi_error_response(base, scope, target, 502)
         }
     }
@@ -1826,19 +1826,19 @@ mod tests {
         assert!(enforce_stable_fastcgi_path(&policy, Path::new("/tmp")).is_err());
         assert!(enforce_stable_fastcgi_path(&policy, Path::new("relative.php")).is_err());
 
-        assert!(!vapache_verified::fastcgi_stable_component_admit(
+        assert!(!httpd_rs_verified::fastcgi_stable_component_admit(
             false, true, true, false, false, false
         ));
-        assert!(!vapache_verified::fastcgi_stable_component_admit(
+        assert!(!httpd_rs_verified::fastcgi_stable_component_admit(
             false, true, false, true, false, false
         ));
-        assert!(vapache_verified::fastcgi_stable_component_admit(
+        assert!(httpd_rs_verified::fastcgi_stable_component_admit(
             false, true, false, false, false, false
         ));
-        assert!(vapache_verified::fastcgi_stable_component_admit(
+        assert!(httpd_rs_verified::fastcgi_stable_component_admit(
             false, true, true, true, true, false
         ));
-        assert!(!vapache_verified::fastcgi_stable_component_admit(
+        assert!(!httpd_rs_verified::fastcgi_stable_component_admit(
             false, true, false, false, false, true
         ));
 
@@ -1868,7 +1868,7 @@ mod tests {
     fn pathname_only_fastcgi_handoff_requires_explicit_capability() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target")
-            .join(format!("vapache-fcgi-capability-{}", std::process::id()));
+            .join(format!("httpd-rs-fcgi-capability-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let mut cfg = config(&root);
@@ -1890,7 +1890,7 @@ mod tests {
     fn strict_policy_binds_exact_endpoint_owner_and_rejects_posix_acls() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target")
-            .join(format!("vapache-fcgi-policy-{}", std::process::id()));
+            .join(format!("httpd-rs-fcgi-policy-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let dir = fs::canonicalize(&dir).unwrap();
@@ -1959,10 +1959,10 @@ mod tests {
                 "an unexpected non-root listener uid must not inherit pathname trust"
             );
         }
-        assert!(vapache_verified::fastcgi_peer_identity_admit(33, 100, 0));
-        assert!(vapache_verified::fastcgi_peer_identity_admit(33, 100, 33));
-        assert!(vapache_verified::fastcgi_peer_identity_admit(33, 100, 100));
-        assert!(!vapache_verified::fastcgi_peer_identity_admit(33, 100, 34));
+        assert!(httpd_rs_verified::fastcgi_peer_identity_admit(33, 100, 0));
+        assert!(httpd_rs_verified::fastcgi_peer_identity_admit(33, 100, 33));
+        assert!(httpd_rs_verified::fastcgi_peer_identity_admit(33, 100, 100));
+        assert!(!httpd_rs_verified::fastcgi_peer_identity_admit(33, 100, 34));
 
         let file = dir.join("script.php");
         fs::write(&file, "<?php\n").unwrap();
@@ -2011,7 +2011,7 @@ mod tests {
 
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target")
-            .join(format!("vapache-fcgi-race-{}", std::process::id()));
+            .join(format!("httpd-rs-fcgi-race-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let dir = fs::canonicalize(&dir).unwrap();
@@ -2072,12 +2072,12 @@ mod tests {
     #[test]
     fn spool_temp_file_never_follows_a_preexisting_symlink() {
         let dir =
-            std::env::temp_dir().join(format!("vapache-fcgi-spool-safe-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-fcgi-spool-safe-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let target = dir.join("overwrite-target");
         fs::write(&target, b"ORIGINAL TARGET CONTENT\n").unwrap();
-        let predicted = dir.join(format!("vapache-fastcgi-{}-0.body", std::process::id()));
+        let predicted = dir.join(format!("httpd-rs-fastcgi-{}-0.body", std::process::id()));
         std::os::unix::fs::symlink(&target, &predicted).unwrap();
         let mut file = secure_temp_file_at(&dir, 0, 0).expect("collision-safe spool");
         file.write_all(b"ATTACKER BODY").unwrap();
@@ -2100,21 +2100,23 @@ mod tests {
 
     #[test]
     fn spool_temp_file_reports_open_errors_and_collision_exhaustion() {
-        let missing =
-            std::env::temp_dir().join(format!("vapache-fcgi-spool-missing-{}", std::process::id()));
+        let missing = std::env::temp_dir().join(format!(
+            "httpd-rs-fcgi-spool-missing-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&missing);
         assert!(secure_temp_file_at(&missing, 1, 0).is_err());
 
         let dir =
-            std::env::temp_dir().join(format!("vapache-fcgi-spool-full-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-fcgi-spool-full-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let pid = std::process::id();
         for attempt in 0..32 {
             let name = if attempt == 0 {
-                format!("vapache-fastcgi-{pid}-99.body")
+                format!("httpd-rs-fastcgi-{pid}-99.body")
             } else {
-                format!("vapache-fastcgi-{pid}-99-{attempt}.body")
+                format!("httpd-rs-fastcgi-{pid}-99-{attempt}.body")
             };
             fs::write(dir.join(name), b"squatter").unwrap();
         }
@@ -2126,7 +2128,7 @@ mod tests {
     fn spool_temp_file_is_private_and_unlinked() {
         use std::os::unix::fs::PermissionsExt;
         let dir =
-            std::env::temp_dir().join(format!("vapache-fcgi-spool-mode-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-fcgi-spool-mode-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let file = secure_temp_file_at(&dir, 7, 0).unwrap();
@@ -2199,7 +2201,7 @@ mod tests {
 
     #[test]
     fn parses_and_executes_unix_fastcgi() {
-        let dir = std::env::temp_dir().join(format!("vapache-fcgi-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-fcgi-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("fcgi.sock");
@@ -2288,7 +2290,7 @@ mod tests {
 
     #[test]
     fn fastcgi_target_overrides_script_and_path_info_exactly_once() {
-        let dir = std::env::temp_dir().join(format!("vapache-fcgi-env-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-fcgi-env-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("fcgi.sock");
@@ -2355,7 +2357,7 @@ mod tests {
 
     #[test]
     fn large_fastcgi_output_uses_a_file_backed_body() {
-        let dir = std::env::temp_dir().join(format!("vapache-fcgi-large-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-fcgi-large-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("fcgi.sock");
@@ -2511,7 +2513,7 @@ mod tests {
 
     #[test]
     fn containment_and_path_info_edges() {
-        let dir = std::env::temp_dir().join(format!("vapache-fcgi-path-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-fcgi-path-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let base = dir.join("www");
         fs::create_dir_all(base.join("dir")).unwrap();
@@ -2564,7 +2566,7 @@ mod tests {
 
     #[test]
     fn match_proxy_and_handler_target_edges() {
-        let dir = std::env::temp_dir().join(format!("vapache-fcgi-match-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-fcgi-match-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let root = dir.join("www");
         let outside = dir.join("outside");
@@ -3134,7 +3136,7 @@ mod tests {
 
     #[test]
     fn execute_error_stderr_and_spooled_body_paths() {
-        let dir = std::env::temp_dir().join(format!("vapache-fcgi-exec-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-fcgi-exec-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cfg = config(&dir);
@@ -3220,7 +3222,7 @@ mod tests {
 
     #[test]
     fn fastcgi_script_targets_cannot_escape_the_configured_base() {
-        let dir = std::env::temp_dir().join(format!("vapache-fcgi-base-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-fcgi-base-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let root = dir.join("www");
         let outside = dir.join("outside");
@@ -3269,7 +3271,7 @@ mod tests {
 
     #[test]
     fn fastcgi_binding_rejects_a_swapped_script_inode() {
-        let dir = std::env::temp_dir().join(format!("vapache-fcgi-inode-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-fcgi-inode-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let script = dir.join("index.php");

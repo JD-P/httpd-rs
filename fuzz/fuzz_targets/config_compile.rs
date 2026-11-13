@@ -4,13 +4,13 @@ use libfuzzer_sys::fuzz_target;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::OnceLock;
-use vapached::config::Config;
-use vapached::config_frontend::{logical_lines_with_numbers, parse_line, ConfigLine};
+use httpd_rs::config::Config;
+use httpd_rs::config_frontend::{logical_lines_with_numbers, parse_line, ConfigLine};
 
 fn root() -> &'static std::path::Path {
     static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let root = std::env::temp_dir().join(format!("vapache-config-fuzz-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("httpd-rs-config-fuzz-{}", std::process::id()));
         fs::create_dir_all(&root).expect("create config fuzz root");
         root
     })

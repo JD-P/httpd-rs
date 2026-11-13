@@ -31,7 +31,7 @@ suite contains seven regression groups. Performance results and the
 reproducible runner are recorded in [`docs/pcre2-benchmark.md`](../docs/pcre2-benchmark.md).
 
 - **Date:** 2026-10-29
-- **Subject:** `target/release/vapached` built at HEAD `a54bcdd`. The binary
+- **Subject:** `target/release/httpd-rs` built at HEAD `a54bcdd`. The binary
   used for the live differential was rebuilt from that tree.
 - **Oracle:** PCRE2 10.46 through the `pcre2` 0.2.11 crate (`libpcre2-8`), plus
   Apache/2.4.69 (Debian) for live `<If … =~ /…/>` differentials. All live
@@ -45,7 +45,7 @@ reproducible runner are recorded in [`docs/pcre2-benchmark.md`](../docs/pcre2-be
 - **Retained evidence:** `/tmp/opencode/p23-harness` (live configs, fixtures,
   logs), `/tmp/opencode/p23-repro.log`, `/tmp/opencode/p23-clean.log`,
   `/tmp/opencode/p23-expr.log`, `/tmp/opencode/p23-accept.log`.
-- **Baseline:** `cargo test -p vapache-pcre2 --release` passes 4 unit, 2
+- **Baseline:** `cargo test -p httpd-rs-pcre2 --release` passes 4 unit, 2
   differential and 1 upstream-corpus test. The official differential fuzz
   target has no coverage instrumentation in this environment, so the retained
   deterministic grammar fuzzer was used.
@@ -54,15 +54,15 @@ reproducible runner are recorded in [`docs/pcre2-benchmark.md`](../docs/pcre2-be
 
 ## 1. Executive summary
 
-| # | Finding | Oracle / live Apache | vapache HEAD | Class |
+| # | Finding | Oracle / live Apache | httpd-rs HEAD | Class |
 |---|---------|----------------------|--------------|-------|
 | **P23-A** | Exact counted repetition expands to a large automaton, but the verified pattern×subject work bound charges only **pattern bytes**. `a{60000}` is an 8-byte pattern that the resource kernel admits for a 64 KiB subject (`8 × 65,536 = 524,288 << 16,777,216`). | Apache evaluates the live `a{8000}` guard in **0.4 ms**. | `a{60000}` on 64 KiB takes **15.8 s**; `a{8000}` on 8,190 bytes takes **~350 ms**; the live expression request takes **~363–383 ms** (≈974–1063× Apache). One request holds one of the 32 `MAX_EXPENSIVE_OPS` slots for that whole interval. | CPU denial of service; High when the pattern is attacker-influenced, Medium when only the subject is. |
 | **P23-B** | The final-newline fallback in `capture_spans` matches a **trimmed** subject and then chooses the earlier group-0 start, keeping the full-subject result on a tie. It is not equivalent to PCRE2's zero-width `$`/`\Z` positions. | `secret$\n` matches `secret\n` at `(0,7)`; `^\Z\v` matches `\n` at `(0,1)`; `^foo\z$` does **not** match `foo\n`; `\z$` matches `\n` only at `(1,1)`. | `secret$\n` and `^\Z\v` return none; `^foo\z$` falsely returns `(0,3)`; `\z$` returns `(0,0)`; lazy `\D*?$` on `abcdefghij\n` returns `(0,11)` instead of `(0,10)`; `a$|a\n` on `a\n` returns `(0,2)` instead of `(0,1)`. | Anchor/ACL semantics; High. |
-| **P23-C** | Negated POSIX classes are silently rewritten into a different class. `[[:^alpha:]]` becomes `[\x5B:^alpha:]]`; the translator does not recognise the leading `^`, escapes the inner `[`, and leaves the final `]` as a literal. | `[[:^alpha:]]` on `1` matches `(0,1)`; on `a]` PCRE2 matches only `(1,2)`. Live header `X: 123` → Apache **403**. | On `1` returns none; on `a]` returns `(0,2)`. Live header `X: 123` → vapache **200** (ACL bypass). | Silent ACL bypass; High. |
-| **P23-D** | Class hyphen/range handling escapes every `-` adjacent to another `-`, destroying ranges; the surrounding class grammar also differs for a leading `]`. | `[--1]` on `0` matches `(0,1)`; `[ --]` on `#` matches `(0,1)`; `[]-a]` on `-` does not match; `[a--]` is rejected with `range out of order`. Live header `X: 0` → Apache **403**. | `[--1]` and `[ --]` return none; `[]-a]` matches `(0,1)`; `[a--]` **compiles** and matches. Live header `X: 0` → vapache **200** (ACL bypass). All printed clean-run over-acceptances are this class; the official fuzz target would panic on its `oracle_builder.build(...).expect(...)` assumption. | Class-semantic bypass plus over-acceptance; Medium. |
+| **P23-C** | Negated POSIX classes are silently rewritten into a different class. `[[:^alpha:]]` becomes `[\x5B:^alpha:]]`; the translator does not recognise the leading `^`, escapes the inner `[`, and leaves the final `]` as a literal. | `[[:^alpha:]]` on `1` matches `(0,1)`; on `a]` PCRE2 matches only `(1,2)`. Live header `X: 123` → Apache **403**. | On `1` returns none; on `a]` returns `(0,2)`. Live header `X: 123` → httpd-rs **200** (ACL bypass). | Silent ACL bypass; High. |
+| **P23-D** | Class hyphen/range handling escapes every `-` adjacent to another `-`, destroying ranges; the surrounding class grammar also differs for a leading `]`. | `[--1]` on `0` matches `(0,1)`; `[ --]` on `#` matches `(0,1)`; `[]-a]` on `-` does not match; `[a--]` is rejected with `range out of order`. Live header `X: 0` → Apache **403**. | `[--1]` and `[ --]` return none; `[]-a]` matches `(0,1)`; `[a--]` **compiles** and matches. Live header `X: 0` → httpd-rs **200** (ACL bypass). All printed clean-run over-acceptances are this class; the official fuzz target would panic on its `oracle_builder.build(...).expect(...)` assumption. | Class-semantic bypass plus over-acceptance; Medium. |
 | **P23-E** | `\R` is lowered to ordinary alternation `(?:\r\n|[\n\v\f\r\x85])`, so CRLF is not atomic. | `\R\R` and `\R\C` on `\r\n` do **not** match; `\R+?$` on `\r\n\n` matches `(0,2)`. | `\R\R` and `\R\C` match `(0,2)`; `\R+?$` matches `(0,3)`. | Line-structure semantics; Medium. |
-| **P23-F** | Inline `(?x)` is not reflected in the translator's `extended` flag. Spaces and `#` inside `\Q...\E` and classes are handled using the builder flag, while Rust's inline extended mode applies its own rules. | `(?x)\Qa b\E` on `a b` matches `(0,3)`; on `ab` it does not match; `(?x)[ a#b ]` matches a space. Live `X: a b` → Apache **403**; `X: ab` → Apache **200**. | Same pattern on `a b` returns none; on `ab` matches `(0,2)`; the class pattern fails to compile. Live `X: a b` → vapache **200**; `X: ab` → vapache **403** (bypass in one direction, false deny in the other). | ACL bypass / false deny; Medium. |
-| **P23-G** | User capture names share the internal `__vapache_pcre2_keep_` namespace used by `\K`. A user group with that prefix is filtered out of public numbering and its start is applied as the `\K` start. | `a(?P<__vapache_pcre2_keep_0>b)` on `ab`: group 0 `(0,2)`, group 1 `(1,2)`. | Group 0 `(1,2)`, `captures_len() == 1`. | Capture/`$1` corruption; Low (requires pattern control). |
+| **P23-F** | Inline `(?x)` is not reflected in the translator's `extended` flag. Spaces and `#` inside `\Q...\E` and classes are handled using the builder flag, while Rust's inline extended mode applies its own rules. | `(?x)\Qa b\E` on `a b` matches `(0,3)`; on `ab` it does not match; `(?x)[ a#b ]` matches a space. Live `X: a b` → Apache **403**; `X: ab` → Apache **200**. | Same pattern on `a b` returns none; on `ab` matches `(0,2)`; the class pattern fails to compile. Live `X: a b` → httpd-rs **200**; `X: ab` → httpd-rs **403** (bypass in one direction, false deny in the other). | ACL bypass / false deny; Medium. |
+| **P23-G** | User capture names share the internal `__httpd_rs_pcre2_keep_` namespace used by `\K`. A user group with that prefix is filtered out of public numbering and its start is applied as the `\K` start. | `a(?P<__httpd_rs_pcre2_keep_0>b)` on `ab`: group 0 `(0,2)`, group 1 `(1,2)`. | Group 0 `(1,2)`, `captures_len() == 1`. | Capture/`$1` corruption; Low (requires pattern control). |
 | **P23-H** | Valid PCRE2 escapes and quantified escapes are over-rejected: `\101`, `\10`, `\11`, `\1234`, `\x9`, `\x{0}`, `\o{101}`, `\x{42}{2}`, `\x{42}+`. | All compile and match their PCRE2 meanings (for example `\101` matches `A`, `\x{42}{2}` matches `BB`). | All are rejected as backreference, zero-count repetition, malformed escape or misplaced quantifier. | Config compatibility / availability; Medium. |
 | **P23-I** | The `ambiguous_nested_capture_repeat` heuristic rejects any quantified capture whose body contains `* + ? {`, even for a literal `\x{42}` or `\d{2}`, and it misses zero-width alternatives. | `(\x{42})+` matches `BB` with capture `(1,2)`; `(\d{2})+` matches `1234` with capture `(2,4)`; `(\z|\C)+` leaves group 1 at `(5,5)`; `(a|\b)+` leaves it at `(2,2)`. | The first two are rejected; the accepted zero-width cases leave group 1 at `(4,5)` / `(1,2)`. | Wrong captures plus fail-closed rejection; Medium. |
 | **P23-J** | Blanket guards reject valid regular patterns: any pattern containing both `[:` and `-`, any empty alternative, and `(?J)` duplicate names. | `[[:alpha:]]-[a-z]`, `[[:space:]]*-`, `a|`, `a||b`, `|a` and `(?J)(?<n>a)(?<n>b)` compile and match. | All are rejected with `POSIX class combined with a range`, `empty alternative`, or an unrecognised flag. | Availability / portability; Low. |
@@ -73,7 +73,7 @@ reproducible runner are recorded in [`docs/pcre2-benchmark.md`](../docs/pcre2-be
 
 The four live cases in `exploit_p23.py` are the strongest evidence: negated
 POSIX, class-range and inline-`(?x)` guards deny on Apache but grant on
-vapache, and the counted-repetition case is a ~974–1063× CPU amplification with the
+httpd-rs, and the counted-repetition case is a ~974–1063× CPU amplification with the
 same `403` status on both servers.
 
 ---
@@ -83,7 +83,7 @@ same `403` status on both servers.
 ### 2.1 Differential fuzz counts
 
 The retained fuzzer is deterministic (seed `0x9E3779B97F4A7C15`) and compares
-the complete `captures_iter` span vectors of `vapache_pcre2::bytes` and
+the complete `captures_iter` span vectors of `httpd_rs_pcre2::bytes` and
 `pcre2::bytes`.
 
 ```text
@@ -115,22 +115,22 @@ The EXPR over-rejection count is dominated by the capture-history heuristic
 and by deliberately unsupported backtracking constructs; the unintentional
 subset is analysed in P23-H/I/J.
 
-### 2.2 Live Apache/vapache differential
+### 2.2 Live Apache/httpd-rs differential
 
 The live battery uses `<If "%{HTTP:X} =~ /PATTERN/"> Require all denied </If>`
 with the same configuration on both servers. It needs only `mpm_event`,
 `mime`, `dir`, `authz_core` and `authz_host`.
 
 ```text
-PASS  C1-control-false: apache=200 vapache=200
-PASS  C2-control-true:  apache=403 vapache=403
-PASS  A1-negated-posix-bypass: apache=403 vapache=200
-PASS  A1-negated-posix-control: apache=200 vapache=200
-PASS  A2-class-range-bypass: apache=403 vapache=200
-PASS  A2-class-range-control: apache=403 vapache=403
-PASS  A3-inline-x-bypass: apache=403 vapache=200
-PASS  A3-inline-x-overmatch: apache=200 vapache=403
-PASS  B1-counted-repeat-dos: apache=403 0.4ms vapache=403 363.0ms
+PASS  C1-control-false: apache=200 httpd-rs=200
+PASS  C2-control-true:  apache=403 httpd-rs=403
+PASS  A1-negated-posix-bypass: apache=403 httpd-rs=200
+PASS  A1-negated-posix-control: apache=200 httpd-rs=200
+PASS  A2-class-range-bypass: apache=403 httpd-rs=200
+PASS  A2-class-range-control: apache=403 httpd-rs=403
+PASS  A3-inline-x-bypass: apache=403 httpd-rs=200
+PASS  A3-inline-x-overmatch: apache=200 httpd-rs=403
+PASS  B1-counted-repeat-dos: apache=403 0.4ms httpd-rs=403 363.0ms
        ratio=973.6x
 verdicts: 9/9 reproduced
 ```
@@ -175,7 +175,7 @@ pub open spec fn regex_match_resource_spec(
 // crates/pcre2/src/lib.rs:381-391
 fn check_subject(&self, subject_len: usize, start: usize) -> Result<(), Error> {
     assert!(start <= subject_len, "start must be <= subject.len()");
-    if !vapache_verified::regex_match_resource_admit(
+    if !httpd_rs_verified::regex_match_resource_admit(
         self.complexity as u64,
         subject_len.saturating_sub(start) as u64,
         self.config.subject_limit as u64,
@@ -264,7 +264,7 @@ not "full-subject greedy priority." Four independent failure modes follow.
 
 **(a) A token after the anchor cannot consume the newline.**
 
-| Pattern | Subject | vapache | PCRE2 |
+| Pattern | Subject | httpd-rs | PCRE2 |
 |---|---|---|---|
 | `secret$\n` | `secret\n` | None | `(0,7)` |
 | `^\Z\v` | `\n` | None | `(0,1)` |
@@ -276,7 +276,7 @@ supposed to consume.
 
 **(b) A lazy quantifier that can consume the newline returns a longer span.**
 
-| Pattern | Subject | vapache | PCRE2 |
+| Pattern | Subject | httpd-rs | PCRE2 |
 |---|---|---|---|
 | `\D*?$` | `abcdefghij\n` | `(0,11)` | `(0,10)` |
 | `[^]]+?$` | `abcdefghij\n` | `(0,11)` | `(0,10)` |
@@ -291,7 +291,7 @@ shorter one.
 `\z` is an absolute-end assertion, but the fallback is armed whenever the
 pattern also contains `$`:
 
-| Pattern | Subject | vapache | PCRE2 |
+| Pattern | Subject | httpd-rs | PCRE2 |
 |---|---|---|---|
 | `^foo\z$` | `foo\n` | `(0,3)` | None |
 | `^\z$` | `\n` | `(0,0)` | None |
@@ -341,14 +341,14 @@ the inner `[` is escaped; the first `]` after `alpha:` closes the Rust class,
 and the final `]` is a literal. The translated pattern is
 `[\x5B:^alpha:]]`.
 
-| Pattern | Subject | vapache | PCRE2 |
+| Pattern | Subject | httpd-rs | PCRE2 |
 |---|---|---|---|
 | `[[:^alpha:]]` | `1` | None | `(0,1)` |
 | `[[:^alpha:]]` | `a]` | `(0,2)` | `(1,2)` |
 | `[[:^digit:]]` | `x` | None | `(0,1)` |
 
 The live A1 case turns this into an ACL bypass: `X: 123` is non-alpha, so
-Apache's negated class matches and denies, while vapache's rewritten class
+Apache's negated class matches and denies, while httpd-rs's rewritten class
 does not match and grants. `X: abc` is the control (both 200).
 
 **Fix direction:** parse the optional `^` before the POSIX name and emit a
@@ -375,19 +375,19 @@ if in_class
 }
 ```
 
-In PCRE2, `[--1]` is a range from `-` to `1`; in vapache both hyphens become
+In PCRE2, `[--1]` is a range from `-` to `1`; in httpd-rs both hyphens become
 literal `\x2D`, so the class is only `{-, 1}`. The same loss occurs for
 `[ --]` (space through `-`). Conversely, `[a--]` is an invalid out-of-order
-range in PCRE2 but becomes `[a\x2D\x2D]` and compiles in vapache.
+range in PCRE2 but becomes `[a\x2D\x2D]` and compiles in httpd-rs.
 
-| Pattern | Subject | vapache | PCRE2 |
+| Pattern | Subject | httpd-rs | PCRE2 |
 |---|---|---|---|
 | `[--1]` | `0` / `.` | None | `(0,1)` |
 | `[ --]` | `#` | None | `(0,1)` |
 | `[]-a]` | `-` | `(0,1)` | None |
 | `[a--]` | `a` | `(0,1)` | compile error: `range out of order` |
 
-The live A2 case uses `X: 0` and `[--1]`: Apache 403, vapache 200. `X: -` is
+The live A2 case uses `X: 0` and `[--1]`: Apache 403, httpd-rs 200. `X: -` is
 the control (both 403). The clean fuzz run's 252 over-acceptances are this
 family; the official target would panic because it asserts that every
 Rust-accepted pattern is accepted by PCRE2
@@ -415,7 +415,7 @@ The first alternative consumes CRLF, but the second can consume CR alone and
 leave LF for the next token; PCRE2 treats CRLF as one `\R` unit and does not
 allow that split.
 
-| Pattern | Subject | vapache | PCRE2 |
+| Pattern | Subject | httpd-rs | PCRE2 |
 |---|---|---|---|
 | `\R\R` | `\r\n` | `(0,2)` | None |
 | `\R\C` | `\r\n` | `(0,2)` | None |
@@ -449,7 +449,7 @@ class branch escapes whitespace/`#` only when `extended` is true
 `\Q...\E` and classes as literal, while Rust's inline extended mode ignores
 them.
 
-| Pattern | Subject | vapache | PCRE2 |
+| Pattern | Subject | httpd-rs | PCRE2 |
 |---|---|---|---|
 | `(?x)\Qa b\E` | `a b` | None | `(0,3)` |
 | `(?x)\Qa b\E` | `ab` | `(0,2)` | None |
@@ -470,7 +470,7 @@ tests for `\Q...\E`, classes and `#` comments under `(?x)`.
 
 ```rust
 // crates/pcre2/src/lib.rs:25
-const KEEP_PREFIX: &str = "__vapache_pcre2_keep_";
+const KEEP_PREFIX: &str = "__httpd_rs_pcre2_keep_";
 
 // lib.rs:220-227
 for (index, name) in inner_names.iter().enumerate().skip(1) {
@@ -482,12 +482,12 @@ for (index, name) in inner_names.iter().enumerate().skip(1) {
 }
 ```
 
-A user group named `__vapache_pcre2_keep_0` is therefore filtered out of the
+A user group named `__httpd_rs_pcre2_keep_0` is therefore filtered out of the
 public capture list and treated as an internal `\K` group:
 
 ```text
-a(?P<__vapache_pcre2_keep_0>b) on "ab"
-  vapache: group0 (1,2), captures_len 1
+a(?P<__httpd_rs_pcre2_keep_0>b) on "ab"
+  httpd-rs: group0 (1,2), captures_len 1
   PCRE2:   group0 (0,2), group1 (1,2)
 ```
 
@@ -524,7 +524,7 @@ b'{' if !in_class
   in PCRE2.
 - The zero-count check matches the `{0}` in `\x{0}` / `\o{0}`, not just a
   repetition quantifier.
-- `\o{101}` is PCRE2's octal syntax; vapache passes `\o` to Rust and gets an
+- `\o{101}` is PCRE2's octal syntax; httpd-rs passes `\o` to Rust and gets an
   unrecognised escape.
 - The possessive check at `lib.rs:1022` sees the `}` from `\x{42}` and treats
   a following `+` as a possessive quantifier.
@@ -534,7 +534,7 @@ b'{' if !in_class
   is rejected by the possessive check; `\x{42}?` happens to compile, so the
   accepted set is inconsistent as well as incomplete.
 
-| Pattern | Subject | vapache | PCRE2 |
+| Pattern | Subject | httpd-rs | PCRE2 |
 |---|---|---|---|
 | `\101` | `A` | compile error: backreference | `(0,1)` |
 | `\10` | `\x08` | compile error: backreference | `(0,1)` |
@@ -574,7 +574,7 @@ Any quantified capturing group whose body contains `*`, `+`, `?` or `{` is
 rejected. That includes literal braces from `\x{42}` and bounded repetition
 inside the group:
 
-| Pattern | Subject | vapache | PCRE2 |
+| Pattern | Subject | httpd-rs | PCRE2 |
 |---|---|---|---|
 | `(\x{42})+` | `BB` | compile error: ambiguous capture history | `(0,2),(1,2)` |
 | `(\d{2})+` | `1234` | compile error | `(0,4),(2,4)` |
@@ -614,7 +614,7 @@ b'|' if !in_class
 }
 ```
 
-| Pattern | vapache | PCRE2 |
+| Pattern | httpd-rs | PCRE2 |
 |---|---|---|
 | `[[:alpha:]]-[a-z]` | compile error: POSIX class combined with a range | compiles, matches `a-b` |
 | `[[:space:]]*-` | compile error | compiles, matches ` -` |
@@ -642,7 +642,7 @@ document it as unsupported with a precise message.
 `translate` takes `_crlf` but never uses it (`lib.rs:754`), and `\N` is always
 `[^\n]` (`lib.rs:933-935`). With `crlf(true)`:
 
-| Pattern | Subject | vapache | PCRE2 |
+| Pattern | Subject | httpd-rs | PCRE2 |
 |---|---|---|---|
 | `\N` | `\r` | `(0,1)` | None |
 | `a$` | `a\r` | None | `(0,1)` |
@@ -654,14 +654,14 @@ It should still be fixed because the builder advertises `crlf`.
 
 ### P23-L — multiline empty-match iteration differs (Low, iterator-only)
 
-`(?m)^` on `a\n` yields `[(0,0),(2,2)]` in vapache and `[(0,0)]` in PCRE2;
+`(?m)^` on `a\n` yields `[(0,0),(2,2)]` in httpd-rs and `[(0,0)]` in PCRE2;
 `(?m)^$` on `\n\n` yields an extra `(3,3)`. The first `captures()` result is
 the same, and `expr.rs` calls `captures`, not `captures_iter`, so there is no
 server impact today. A caller using `captures_iter` sees extra empty matches.
 
 ### P23-M — `\N*?\R` auto-possessification differential (Info)
 
-`\N*?\R` on the single byte `\x85` matches in vapache and not in PCRE2;
+`\N*?\R` on the single byte `\x85` matches in httpd-rs and not in PCRE2;
 `(?:\N)*?\R` matches in both. This is a PCRE2 optimizer/auto-possessification
 quirk rather than a translation error, but it is a residual differential that
 the official corpus should classify explicitly.
@@ -682,7 +682,7 @@ single-pass scan.
 - **P23-C, P23-D, P23-F** are the direct ACL findings. They need a guard whose
   pattern uses the affected construct, but that is a normal configuration
   shape (`[[:^alpha:]]`, `[--1]`, `(?x)\Q...\E`). The live battery shows
-  Apache denying and vapache granting for A1/A2/A3-bypass; A3-overmatch shows
+  Apache denying and httpd-rs granting for A1/A2/A3-bypass; A3-overmatch shows
   the opposite direction (false deny).
 - **P23-A** needs a subject large enough to reach the expanded automaton and
   either an operator pattern with a large exact repetition or attacker
@@ -731,14 +731,14 @@ single-pass scan.
 Baseline:
 
 ```sh
-cd /root/vapache
-cargo test -p vapache-pcre2 --release
+cd /root/httpd-rs
+cargo test -p httpd-rs-pcre2 --release
 ```
 
 Focused library probes (deterministic, no Apache required):
 
 ```sh
-cd /root/vapache/adversarial/p23/probe
+cd /root/httpd-rs/adversarial/p23/probe
 CARGO_TARGET_DIR=/tmp/opencode/p23-probe-target cargo run --release --bin repro
 CARGO_TARGET_DIR=/tmp/opencode/p23-probe-target cargo run --release --bin work2
 CARGO_TARGET_DIR=/tmp/opencode/p23-probe-target cargo run --release --bin work3
@@ -755,22 +755,22 @@ n=65535 compile=1.316255ms CERR Compiled regex exceeds size limit of 2097152 byt
 Fuzzing:
 
 ```sh
-cd /root/vapache/adversarial/p23/probe
+cd /root/httpd-rs/adversarial/p23/probe
 CARGO_TARGET_DIR=/tmp/opencode/p23-probe-target \
   CLEAN=1 ONLY_MATCH=1 cargo run --release --bin fuzz -- 1000000
 CARGO_TARGET_DIR=/tmp/opencode/p23-probe-target \
   EXPR=1 CLEAN=1 ONLY_MATCH=1 cargo run --release --bin fuzz -- 2000000
 ```
 
-Live Apache/vapache differential:
+Live Apache/httpd-rs differential:
 
 ```sh
-cd /root/vapache
-cargo build --release -p vapached
+cd /root/httpd-rs
+cargo build --release -p httpd-rs
 python3 adversarial/p23/exploit_p23.py
 ```
 
-The harness creates `/tmp/opencode/p23-harness/<case>/{apache,vapache}.conf`,
+The harness creates `/tmp/opencode/p23-harness/<case>/{apache,httpd-rs}.conf`,
 fixtures and logs, starts both servers on sibling loopback ports with separate
 pid files, and prints the 9 verdicts. It needs Apache's `mpm_event`, `mime`,
 `dir`, `authz_core` and `authz_host` modules; it does not need PHP or FastCGI.
@@ -793,7 +793,7 @@ pid files, and prints the 9 verdicts. It needs Apache's `mpm_event`, `mime`,
    ranges, and apply the effective `(?x)` mode to `\Q...\E` and classes.
 4. **P23-E:** make `\R` atomic across CRLF or reject the split-capable
    contexts; add `\R\R`, `\R\C` and `\R+?$` regressions.
-5. **P23-G:** remove the user-visible `__vapache_pcre2_keep_` namespace
+5. **P23-G:** remove the user-visible `__httpd_rs_pcre2_keep_` namespace
    collision; track inserted `\K` groups separately and reject reserved user
    names.
 6. **P23-H/I/J:** parse escapes and quantifiers with PCRE2's atom rules
@@ -810,7 +810,7 @@ pid files, and prints the 9 verdicts. It needs Apache's `mpm_event`, `mime`,
 
 ## 9. Retained files
 
-- `adversarial/p23/exploit_p23.py` — 9-verdict live Apache/vapache battery.
+- `adversarial/p23/exploit_p23.py` — 9-verdict live Apache/httpd-rs battery.
 - `adversarial/p23/probe/Cargo.toml`, `Cargo.lock` — standalone probe crate
   (excluded from the product workspace with `[workspace]`).
 - `adversarial/p23/probe/src/bin/repro.rs` — exact span/compile repros for

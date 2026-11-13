@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Differential benchmark: vapached vs. the real Apache httpd.
+"""Differential benchmark: httpd-rs vs. the real Apache httpd.
 
 Both servers serve the exact same DocumentRoot on the loopback interface with
 identical keep-alive settings.  Results are written to bench/results/ and a
@@ -28,9 +28,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench"
-RUN = Path("/tmp/vapache-bench")
+RUN = Path("/tmp/httpd-rs-bench")
 APACHE = os.environ.get("APACHE") or shutil.which("apache2") or "/usr/sbin/apache2"
-VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target" / "release" / "httpd-rs"))
 AB = os.environ.get("AB") or shutil.which("ab")
 WRK = os.environ.get("WRK") or shutil.which("wrk")
 APACHE_MODDIR = Path(os.environ.get("APACHE_MODDIR", "/usr/lib/apache2/modules"))
@@ -43,7 +43,7 @@ def make_tree():
     (www / "small").mkdir(parents=True, exist_ok=True)
     (www / "large").mkdir(parents=True, exist_ok=True)
     (www / "index.html").write_bytes(
-        b"<!doctype html><html><body><h1>vapache benchmark</h1></body></html>\n"
+        b"<!doctype html><html><body><h1>httpd-rs benchmark</h1></body></html>\n"
     )
     (www / "hello.txt").write_bytes(b"hello world\n" * 100)
     (www / "small" / "10k.bin").write_bytes(os.urandom(10 * 1024))
@@ -95,8 +95,8 @@ CustomLog /dev/null common
     return cfg
 
 
-def vapache_config(port):
-    d = RUN / "vapache"
+def httpd_rs_config(port):
+    d = RUN / "httpd-rs"
     (d / "logs").mkdir(parents=True, exist_ok=True)
     cfg = d / "httpd.conf"
     cfg.write_text(
@@ -252,20 +252,20 @@ def main():
     args = ap.parse_args()
     if not WRK and not AB:
         sys.exit("wrk or apache2-utils (ab) is required")
-    if not VAPACHED.exists():
-        sys.exit(f"{VAPACHED} missing; run cargo build --release first")
+    if not HTTPD_RS.exists():
+        sys.exit(f"{HTTPD_RS} missing; run cargo build --release first")
 
     make_tree()
-    apache_port, vapache_port = 8080, 8081
+    apache_port, httpd_rs_port = 8080, 8081
     acfg = apache_config(apache_port)
-    vcfg = vapache_config(vapache_port)
+    vcfg = httpd_rs_config(httpd_rs_port)
     (RUN / "logs").mkdir(exist_ok=True)
     apache, alog = start([APACHE, "-f", str(acfg), "-DFOREGROUND"], RUN / "logs" / "apache.out")
-    vap, vlog = start([str(VAPACHED), "-f", str(vcfg), "-DFOREGROUND"], RUN / "logs" / "vapache.out")
+    vap, vlog = start([str(HTTPD_RS), "-f", str(vcfg), "-DFOREGROUND"], RUN / "logs" / "httpd-rs.out")
     try:
-        if not wait_port(apache_port) or not wait_port(vapache_port):
+        if not wait_port(apache_port) or not wait_port(httpd_rs_port):
             print(open(RUN / "logs" / "apache.out").read())
-            print(open(RUN / "logs" / "vapache.out").read())
+            print(open(RUN / "logs" / "httpd-rs.out").read())
             sys.exit("server failed to start")
         scenarios = [
             ("index.html (small, keepalive)", "/index.html"),
@@ -275,7 +275,7 @@ def main():
         ]
         if args.quick:
             # wrk opens its cohort simultaneously from one loopback identity.
-            # Stay within vapache's per-client pending-connection ceiling so
+            # Stay within httpd-rs's per-client pending-connection ceiling so
             # this measures serving rather than overload rejection.
             tests = [(n, p, 3000, 8) for n, p in scenarios[:3]] + [
                 (scenarios[3][0], scenarios[3][1], 300, 8)
@@ -299,7 +299,7 @@ def main():
         print(f"{'scenario':38} {'server':10} {'req/s':>10} {'mean ms':>9} {'p99 ms':>8} {'MB/s':>8}")
         for name, path, req, conc in tests:
             row = {"name": name, "path": path, "requests": req, "concurrency": conc, "servers": {}}
-            endpoints = (("apache", apache_port), ("vapache", vapache_port))
+            endpoints = (("apache", apache_port), ("httpd-rs", httpd_rs_port))
             collected = {server: [] for server, _ in endpoints}
             duration = args.duration or (1.0 if args.quick else 3.0)
             for _, port in endpoints:
@@ -337,21 +337,21 @@ def main():
                 if any(errs.values()):
                     print(f"  !! socket errors={errs}")
             a = row["servers"]["apache"]["rps"] or 0
-            v = row["servers"]["vapache"]["rps"] or 0
+            v = row["servers"]["httpd-rs"]["rps"] or 0
             row["ratio"] = (v / a) if a else None
-            print(f"{'  vapache/apache ratio':38} {'':10} {row['ratio'] or 0:10.2f}x")
+            print(f"{'  httpd-rs/apache ratio':38} {'':10} {row['ratio'] or 0:10.2f}x")
             results["scenarios"].append(row)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         (BENCH / "results").mkdir(parents=True, exist_ok=True)
         out = BENCH / "results" / f"{stamp}.json"
         out.write_text(json.dumps(results, indent=2))
-        lines = [f"\n## {results['timestamp']}\n", "| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |", "|---|---:|---:|---:|---:|---:|"]
+        lines = [f"\n## {results['timestamp']}\n", "| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |", "|---|---:|---:|---:|---:|---:|"]
         for row in results["scenarios"]:
             a = row["servers"]["apache"]["rps"] or 0
-            v = row["servers"]["vapache"]["rps"] or 0
+            v = row["servers"]["httpd-rs"]["rps"] or 0
             lines.append(
                 f"| {row['name']} | {a:.0f} | {v:.0f} | {row['ratio'] or 0:.2f}x | "
-                f"{row['servers']['vapache']['mean_ms'] or 0:.2f} | {row['servers']['vapache']['p99_ms'] or 0:.0f} |"
+                f"{row['servers']['httpd-rs']['mean_ms'] or 0:.2f} | {row['servers']['httpd-rs']['p99_ms'] or 0:.0f} |"
             )
         with open(BENCH / "RESULTS.md", "a") as f:
             f.write("\n".join(lines) + "\n")

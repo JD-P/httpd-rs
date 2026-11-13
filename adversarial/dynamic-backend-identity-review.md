@@ -20,7 +20,7 @@ the same immutable configuration generation.
 
 ### D1 — Unix FastCGI authenticated a pathname, not the listener
 
-`VapacheFastCGIStablePath` checked the Unix socket's type, owner, ACL, device
+`HttpdRsFastCGIStablePath` checked the Unix socket's type, owner, ACL, device
 and inode before and after `connect(2)`.  It did not query the connected
 socket's peer credentials.  A socket file's uid describes the filesystem
 object; it does not prove which process created the listener.
@@ -36,7 +36,7 @@ deliberately separate checks.
 
 This does not claim that the kernel can identify the eventual PHP-FPM worker
 behind a root master.  A trusted root master can select its workers; that is
-outside Vapache's process boundary.  It does prevent an unrelated
+outside httpd-rs's process boundary.  It does prevent an unrelated
 unprivileged listener from inheriting trust merely by appearing at a pathname
 with acceptable metadata.
 
@@ -120,9 +120,9 @@ That is intentional: cleartext DNS is the only available identity for an
 HTTP/WS or TCP FastCGI target, so silently refreshing it would silently change
 the authorized service.  Operators needing transparent address churn should
 use a stable local load balancer, or HTTPS/WSS for cryptographic service
-identity, and reload Vapache when the admitted address set changes.
+identity, and reload httpd-rs when the admitted address set changes.
 
-The first answer in a generation is still trusted; Vapache cannot infer an
+The first answer in a generation is still trusted; httpd-rs cannot infer an
 operator's intended IP set from a hostname alone.  Administrators must use
 trusted DNS or literal addresses for cleartext upstreams.  The change removes
 identity drift after that trust decision rather than pretending to replace

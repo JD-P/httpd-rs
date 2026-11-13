@@ -41,7 +41,7 @@ pub fn len(name: &HeaderName, value: &HeaderValue) -> usize {
 }
 
 fn entry_size(name_len: usize, value_len: usize) -> usize {
-    vapache_verified::hpack_entry_size(name_len, value_len).unwrap_or(usize::MAX)
+    httpd_rs_verified::hpack_entry_size(name_len, value_len).unwrap_or(usize::MAX)
 }
 
 impl Header<Option<HeaderName>> {

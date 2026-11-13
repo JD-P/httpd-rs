@@ -112,7 +112,7 @@ pub fn bounded_stderr(arguments: fmt::Arguments<'_>) {
     };
     let mut message = BoundedMessage(String::new());
     let _ = fmt::write(&mut message, arguments);
-    let escaped = vapache_verified::escape_log_bytes_bounded(
+    let escaped = httpd_rs_verified::escape_log_bytes_bounded(
         message.0.as_bytes(),
         MAX_LOG_LINE_BYTES.saturating_sub(1),
     );
@@ -216,11 +216,11 @@ fn configured_user_id(user: &str) -> std::io::Result<u32> {
     }
     let user = std::ffi::CString::new(user)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid User"))?;
-    vapache_os::lookup_user_id(&user)
+    httpd_rs_os::lookup_user_id(&user)
 }
 
 fn running_privileged() -> bool {
-    vapache_os::effective_uid() == 0
+    httpd_rs_os::effective_uid() == 0
 }
 
 fn open_log(
@@ -478,7 +478,7 @@ impl Logger {
             let uid = configured_user_id(&cfg.user).ok();
             let gid = group
                 .as_deref()
-                .and_then(|value| vapache_os::lookup_group_id(value).ok());
+                .and_then(|value| httpd_rs_os::lookup_group_id(value).ok());
             let Some(uid) = uid else { return };
             let full = |path: &str| {
                 let p = PathBuf::from(path);
@@ -505,8 +505,8 @@ impl Logger {
                     continue;
                 }
                 let gid = gid.unwrap_or(u32::MAX);
-                let _ = vapache_os::fchown(file.as_fd(), uid, gid);
-                let _ = vapache_os::fchmod(file.as_fd(), 0o640); // coverage:ignore-stop
+                let _ = httpd_rs_os::fchown(file.as_fd(), uid, gid);
+                let _ = httpd_rs_os::fchmod(file.as_fd(), 0o640); // coverage:ignore-stop
             }
         }
     }
@@ -560,7 +560,7 @@ impl Logger {
         // Error-log messages can contain request-derived text.  Escape terminal
         // controls so a hostile request cannot inject escape sequences into a
         // terminal viewing the error log (CVE-2003-0020).
-        let escaped = vapache_verified::escape_log_bytes_bounded(
+        let escaped = httpd_rs_verified::escape_log_bytes_bounded(
             msg.as_bytes(),
             MAX_LOG_LINE_BYTES.saturating_sub(1024),
         );
@@ -698,13 +698,13 @@ impl Logger {
 
 #[cfg(test)]
 fn escape_log(s: &str) -> String {
-    String::from_utf8(vapache_verified::escape_log_bytes(s.as_bytes()))
+    String::from_utf8(httpd_rs_verified::escape_log_bytes(s.as_bytes()))
         .expect("valid UTF-8 remains valid after log escaping")
 }
 
 fn escape_log_into(out: &mut Vec<u8>, bytes: &[u8]) {
     let remaining = MAX_LOG_LINE_BYTES.saturating_sub(out.len());
-    out.extend_from_slice(&vapache_verified::escape_log_bytes_bounded(
+    out.extend_from_slice(&httpd_rs_verified::escape_log_bytes_bounded(
         bytes, remaining,
     ));
 }
@@ -1025,7 +1025,7 @@ mod tests {
         assert!(try_writer(&TEST_GATE).is_some());
 
         let path = std::env::temp_dir().join(format!(
-            "vapache-capped-log-{}-{:?}",
+            "httpd-rs-capped-log-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1053,11 +1053,11 @@ mod tests {
             crate::files::effective_uid()
         );
         assert!(configured_user_id("bad\0user").is_err());
-        assert!(configured_user_id("vapache-user-that-does-not-exist").is_err());
+        assert!(configured_user_id("httpd-rs-user-that-does-not-exist").is_err());
         assert!(open_log("/dev/zero", Path::new("/"), None, &budget).is_err());
 
         let dir = std::env::temp_dir().join(format!(
-            "vapache-log-errors-{}-{:?}",
+            "httpd-rs-log-errors-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1261,7 +1261,7 @@ mod tests {
             assert!(!expected.name().is_empty());
         }
 
-        let dir = std::env::temp_dir().join(format!("vapache-log-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-log-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("httpd.conf");
@@ -1392,7 +1392,7 @@ mod tests {
     fn root_managed_relative_log_symlink_is_canonicalized() {
         use std::os::unix::fs::symlink;
 
-        let base = std::env::temp_dir().join(format!("vapache-log-link-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("httpd-rs-log-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let dir = base.join("root");
         let target = base.join("target");

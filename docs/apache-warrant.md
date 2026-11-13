@@ -2,7 +2,7 @@
 
 The Apache source inventory is an evidence source, not a product roadmap.
 Finding a directive, hook, provider, filter, configuration callback, or test in
-Apache does not authorize implementing it in Vapache.
+Apache does not authorize implementing it in httpd-rs.
 
 ## The three artifacts
 
@@ -37,7 +37,7 @@ item receives one of these dispositions:
   Digest/LDAP/DBM authentication, SSI, or an unsupported proxy protocol;
 - `warrant-source-only`: relevant source that can warrant tests but makes no
   support claim;
-- `outside-claimed-surface`: observed Apache code outside Vapache's claimed
+- `outside-claimed-surface`: observed Apache code outside httpd-rs's claimed
   compatibility surface.
 
 The default is always `outside-claimed-surface`. There is no default-supported
@@ -48,11 +48,11 @@ Its accepted syntax, contexts, phase behavior, and semantics remain bounded by
 the cited repository evidence; naming `RewriteRule`, for example, is not a
 claim to every Apache rewrite feature or flag.
 
-For directives, the ledger also records the relationship with Vapache's sealed
+For directives, the ledger also records the relationship with httpd-rs's sealed
 registry: explicit compatibility claim, explicit fail-closed entry, recognized
 without a support claim, or unknown/fail-closed. Recognition is not support.
 This makes the default-deny boundary measurable: in the current pin, 331 of
-Apache's 673 unique source directives are absent from Vapache's registry and
+Apache's 673 unique source directives are absent from httpd-rs's registry and
 therefore reject as unknown; only the separately listed claims assert any
 compatible subset.
 
@@ -71,7 +71,7 @@ directive, fuzz targets without a warrant or semantic census, in-scope
 state-space families without a fuzz target, drift in the differential module
 set, and stale generated ledgers.
 
-The Vapache server is not modified by the extractor or generator. Unsupported
+The httpd-rs server is not modified by the extractor or generator. Unsupported
 Apache states must continue to reject at configuration load or at the typed
 sink boundary. This inventory must never be used to generate permissive parser
 arms, no-op directive handling, or module-loading behavior.
@@ -124,7 +124,7 @@ fails the job; the detailed uncovered-branch sample is retained as a CI
 artifact and is the queue for new semantic families.
 
 The external `apache-httpd-test` suite is inventoried, not automatically
-adopted as a VApache compatibility suite. Mapping its cases to supported,
+adopted as a httpd-rs compatibility suite. Mapping its cases to supported,
 deliberately stricter, and deliberately unsupported behavior remains an
 independent triage queue. A test's presence cannot be converted into a support
 claim or waived by increasing libFuzzer execution time.

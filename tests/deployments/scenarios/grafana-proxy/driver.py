@@ -1,4 +1,4 @@
-"""Run Grafana behind Vapache and validate HTTP plus bidirectional WebSockets."""
+"""Run Grafana behind httpd-rs and validate HTTP plus bidirectional WebSockets."""
 
 from __future__ import annotations
 
@@ -14,13 +14,13 @@ from lib import (
     CaseContext,
     DeploymentError,
     common_apache_config,
-    common_vapache_config,
+    common_httpd_rs_config,
     differential_benchmark,
     free_port,
     request,
     require_response,
     start_apache,
-    start_vapache,
+    start_httpd_rs,
 )
 
 
@@ -72,7 +72,7 @@ def read_frame(stream: socket.socket) -> tuple[int, bytes]:
 def open_websocket(port: int, path: str, *, authority_port: int | None = None) -> socket.socket:
     stream = socket.create_connection(("127.0.0.1", port), timeout=15)
     stream.settimeout(15)
-    key = base64.b64encode(b"vapache-grafana!").decode()
+    key = base64.b64encode(b"httpd-rs-grafana!").decode()
     authority_port = authority_port or port
     request = (
         f"GET {path} HTTP/1.1\r\n"
@@ -110,10 +110,10 @@ def open_websocket(port: int, path: str, *, authority_port: int | None = None) -
 
 
 def expect_pong(stream: socket.socket) -> None:
-    send_masked_frame(stream, 0x9, b"vapache-ping")
+    send_masked_frame(stream, 0x9, b"httpd-rs-ping")
     for _ in range(8):
         opcode, payload = read_frame(stream)
-        if opcode == 0xA and payload == b"vapache-ping":
+        if opcode == 0xA and payload == b"httpd-rs-ping":
             return
         if opcode == 0x9:
             send_masked_frame(stream, 0xA, payload)
@@ -158,10 +158,10 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
 ProxyPass {route} {backend_route}
 ProxyPassReverse {route} {backend_route}
 """
-    config, pid_file = common_vapache_config(
+    config, pid_file = common_httpd_rs_config(
         context.run_dir, frontend_port, empty_docroot, extra=extra
     )
-    server = start_vapache(context, config, pid_file, frontend_port)
+    server = start_httpd_rs(context, config, pid_file, frontend_port)
     require_healthy(frontend_port, f"{prefix}/api/health")
     root_status, root_headers, root_body = request(frontend_port, f"{prefix}/")
     if root_status in (301, 302, 303, 307, 308):
@@ -236,7 +236,7 @@ ProxyPassReverse {route} {backend_route}
             frontend_port,
             apache_port,
             f"{prefix}/api/health",
-            context.artifact_dir / "apache-vapache-benchmark.json",
+            context.artifact_dir / "apache-httpd-rs-benchmark.json",
             headers=(f"Host: {host}",),
             connections=4,
         )

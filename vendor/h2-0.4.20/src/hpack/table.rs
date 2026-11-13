@@ -144,19 +144,19 @@ impl Table {
     fn insert(&mut self, header: Header) {
         let incoming = header.len();
         loop {
-            match vapache_verified::hpack_table_insert_action(
+            match httpd_rs_verified::hpack_table_insert_action(
                 self.size,
                 self.max_size,
                 incoming,
                 !self.slots.is_empty(),
             ) {
-                vapache_verified::HpackTableInsertAction::Insert { new_size } => {
+                httpd_rs_verified::HpackTableInsertAction::Insert { new_size } => {
                     self.size = new_size;
                     self.slots.push_front(header);
                     return;
                 }
-                vapache_verified::HpackTableInsertAction::Evict => self.evict_oldest(),
-                vapache_verified::HpackTableInsertAction::Clear => {
+                httpd_rs_verified::HpackTableInsertAction::Evict => self.evict_oldest(),
+                httpd_rs_verified::HpackTableInsertAction::Clear => {
                     self.slots.clear();
                     self.size = 0;
                     return;
@@ -168,13 +168,13 @@ impl Table {
     pub fn resize(&mut self, size: usize) {
         self.max_size = size;
         loop {
-            match vapache_verified::hpack_table_resize_action(
+            match httpd_rs_verified::hpack_table_resize_action(
                 self.size,
                 self.max_size,
                 !self.slots.is_empty(),
             ) {
-                vapache_verified::HpackTableResizeAction::Done => break,
-                vapache_verified::HpackTableResizeAction::Evict => self.evict_oldest(),
+                httpd_rs_verified::HpackTableResizeAction::Done => break,
+                httpd_rs_verified::HpackTableResizeAction::Evict => self.evict_oldest(),
             }
         }
         debug_assert!(self.valid());
@@ -185,7 +185,7 @@ impl Table {
             .slots
             .pop_back()
             .expect("verified HPACK transition requested eviction from a non-empty table");
-        self.size = vapache_verified::hpack_table_after_evict(self.size, entry.len())
+        self.size = httpd_rs_verified::hpack_table_after_evict(self.size, entry.len())
             .expect("HPACK table accounting diverged from its entries");
     }
 
@@ -223,7 +223,7 @@ impl Index {
 }
 
 fn dynamic_index(position: usize, table_len: usize) -> usize {
-    vapache_verified::hpack_dynamic_index(position, table_len)
+    httpd_rs_verified::hpack_dynamic_index(position, table_len)
         .expect("bounded HPACK table position must have a wire index")
 }
 

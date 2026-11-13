@@ -18,7 +18,7 @@ gate.  It generates isolated cases over four axes:
 Only semantically valid transform/sink pairs are generated.  For each pair a
 Latin-square schedule crosses every policy phase with every URL spelling.  A
 generation-only check is suitable for ordinary CI; the live mode starts Apache
-and Vapache, sends the same ordered requests to both, and compares status,
+and httpd-rs, sends the same ordered requests to both, and compares status,
 selected response identity, redirects and cache disposition.  Cache cells
 warm both implementations, mutate the selected file, then repeat the request.
 
@@ -61,8 +61,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-LOCAL_SETUP = ROOT.parent / ".vapache-setup"
-VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
+LOCAL_SETUP = ROOT.parent / ".httpd-rs-setup"
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target" / "release" / "httpd-rs"))
 APACHE = os.environ.get("APACHE") or shutil.which("apache2") or str(LOCAL_SETUP / "bin/apache2")
 MODDIR = Path(
     os.environ.get(
@@ -72,8 +72,8 @@ MODDIR = Path(
         else LOCAL_SETUP / "sysroot/usr/lib/apache2/modules",
     )
 )
-AP_PORT = int(os.environ.get("VAPACHE_MATRIX_AP_PORT", "18280"))
-VP_PORT = int(os.environ.get("VAPACHE_MATRIX_VP_PORT", "18281"))
+AP_PORT = int(os.environ.get("HTTPD_RS_MATRIX_AP_PORT", "18280"))
+VP_PORT = int(os.environ.get("HTTPD_RS_MATRIX_VP_PORT", "18281"))
 SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
 SERVICE_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
 
@@ -245,7 +245,7 @@ def cgi_script(case_id: str) -> bytes:
         "printf 'Content-Type: text/plain\\r\\n'\n"
         "printf 'X-Matrix-Sink: cgi\\r\\n'\n"
         "printf '\\r\\n'\n"
-        # Vapache deliberately exposes a canonical query-free REQUEST_URI to
+        # httpd-rs deliberately exposes a canonical query-free REQUEST_URI to
         # policy and CGI, while Apache exposes the raw request target.  That
         # documented hardening boundary is not a selected-representation
         # difference, so the matrix compares the remaining CGI identities.
@@ -762,17 +762,17 @@ class Runtime:
 
 
 def prepare_runtime(cases: list[Case]) -> Runtime:
-    base = Path(tempfile.mkdtemp(prefix="vapache-transform-matrix-"))
+    base = Path(tempfile.mkdtemp(prefix="httpd-rs-transform-matrix-"))
     docroot = base / "www"
     aliasroot = base / "alias"
-    for path in (base, docroot, aliasroot, base / "logs", base / "apache", base / "cache-apache", base / "cache-vapache"):
+    for path in (base, docroot, aliasroot, base / "logs", base / "apache", base / "cache-apache", base / "cache-httpd-rs"):
         path.mkdir(parents=True, exist_ok=True)
         os.chmod(path, 0o755)
-    # Vapache refuses an administrative path whose parent the service
+    # httpd-rs refuses an administrative path whose parent the service
     # account can mutate; both servers open their logs before dropping
     # privileges, so 0755 is sufficient and keeps the startup guard intact.
     os.chmod(base / "cache-apache", 0o777)
-    os.chmod(base / "cache-vapache", 0o777)
+    os.chmod(base / "cache-httpd-rs", 0o777)
 
     backend = ThreadingHTTPServer(("127.0.0.1", 0), BackendHandler)
     threading.Thread(target=backend.serve_forever, daemon=True).start()
@@ -808,12 +808,12 @@ def server_config(runtime: Runtime, cases: list[Case], port: int, apache: bool) 
     if not apache:
         lines.extend(
             [
-                "VapacheCapability AccessFiles On",
-                "VapacheCapability AutoIndex On",
-                "VapacheCapability Cgi On",
+                "HttpdRsCapability AccessFiles On",
+                "HttpdRsCapability AutoIndex On",
+                "HttpdRsCapability Cgi On",
             ]
         )
-    cache_root = runtime.base / ("cache-apache" if apache else "cache-vapache")
+    cache_root = runtime.base / ("cache-apache" if apache else "cache-httpd-rs")
     lines.extend(
         [
             f'ServerRoot "{runtime.base}"',
@@ -949,10 +949,10 @@ def printable_observation(observation: dict) -> dict:
     }
 
 
-def compare_step(case: Case, step: RequestStep, apache: dict, vapache: dict) -> list[str]:
+def compare_step(case: Case, step: RequestStep, apache: dict, httpd_rs: dict) -> list[str]:
     problems: list[str] = []
-    if apache["status"] != vapache["status"]:
-        # Apache exposes discovery of a denied implicit target as 403. Vapache
+    if apache["status"] != httpd_rs["status"]:
+        # Apache exposes discovery of a denied implicit target as 403. httpd-rs
         # deliberately collapses it into the same 404 as failed discovery.
         # Admit only that one-way hardening difference, and only when neither
         # response contains the selected fixture marker.
@@ -961,14 +961,14 @@ def compare_step(case: Case, step: RequestStep, apache: dict, vapache: dict) -> 
             case.transform in {"multiviews", "cgi_path_info"}
             and case.policy_phase in {"files", "htaccess"}
             and apache["status"] == 403
-            and vapache["status"] == 404
+            and httpd_rs["status"] == 404
             and expected not in apache["body"]
-            and expected not in vapache["body"]
+            and expected not in httpd_rs["body"]
         )
         if concealed_implicit_deny:
             return problems
         problems.append(
-            f"{step.label}: status apache={apache['status']} vapache={vapache['status']}"
+            f"{step.label}: status apache={apache['status']} httpd-rs={httpd_rs['status']}"
         )
         return problems
 
@@ -976,36 +976,36 @@ def compare_step(case: Case, step: RequestStep, apache: dict, vapache: dict) -> 
     if step.method != "HEAD" and status in step.compare_body_statuses:
         expected = f"MATRIX:{case.id}:".encode()
         apache_selected = expected in apache["body"]
-        vapache_selected = expected in vapache["body"]
+        httpd_rs_selected = expected in httpd_rs["body"]
         # A denied ErrorDocument falls back to each server's generated HTML.
         # Compare the selected/not-selected decision, not those unrelated
         # presentation templates.  Successful terminal responses and proxy
         # bodies remain byte-for-byte comparisons.
-        if apache_selected != vapache_selected:
+        if apache_selected != httpd_rs_selected:
             problems.append(
                 f"{step.label}: selected representation differs "
-                f"apache={apache_selected} vapache={vapache_selected}"
+                f"apache={apache_selected} httpd-rs={httpd_rs_selected}"
             )
-        elif (apache_selected or case.transform != "error_document") and apache["body"] != vapache["body"]:
+        elif (apache_selected or case.transform != "error_document") and apache["body"] != httpd_rs["body"]:
             problems.append(
                 f"{step.label}: body differs "
-                f"apache={apache['body'][:160]!r} vapache={vapache['body'][:160]!r}"
+                f"apache={apache['body'][:160]!r} httpd-rs={httpd_rs['body'][:160]!r}"
             )
 
     if 300 <= status < 400:
         ap_location = normalized_location(apache["headers"].get("location"), (AP_PORT, VP_PORT))
-        vp_location = normalized_location(vapache["headers"].get("location"), (AP_PORT, VP_PORT))
+        vp_location = normalized_location(httpd_rs["headers"].get("location"), (AP_PORT, VP_PORT))
         if ap_location != vp_location:
             problems.append(
-                f"{step.label}: Location apache={ap_location!r} vapache={vp_location!r}"
+                f"{step.label}: Location apache={ap_location!r} httpd-rs={vp_location!r}"
             )
 
     if case.sink == "cache" and status == 200:
         ap_cache = cache_disposition(apache["headers"].get("x-cache"))
-        vp_cache = cache_disposition(vapache["headers"].get("x-cache"))
+        vp_cache = cache_disposition(httpd_rs["headers"].get("x-cache"))
         if ap_cache != vp_cache:
             problems.append(
-                f"{step.label}: cache disposition apache={ap_cache!r} vapache={vp_cache!r}"
+                f"{step.label}: cache disposition apache={ap_cache!r} httpd-rs={vp_cache!r}"
             )
 
     return problems
@@ -1038,23 +1038,23 @@ def run_case(runtime: Runtime, case: Case, seed: int, artifact_dir: Path, verbos
     for step in case.requests:
         try:
             apache = request(AP_PORT, step)
-            vapache = request(VP_PORT, step)
+            httpd_rs = request(VP_PORT, step)
         except Exception as error:
             problems.append(f"{step.label}: request failed: {error}")
             break
-        step_problems = compare_step(case, step, apache, vapache)
+        step_problems = compare_step(case, step, apache, httpd_rs)
         problems.extend(step_problems)
         observations.append(
             {
                 "step": dataclasses.asdict(step),
                 "apache": printable_observation(apache),
-                "vapache": printable_observation(vapache),
+                "httpd-rs": printable_observation(httpd_rs),
             }
         )
         if verbose:
             print(
                 f"    {step.method} {step.path}: "
-                f"apache={apache['status']} vapache={vapache['status']}"
+                f"apache={apache['status']} httpd-rs={httpd_rs['status']}"
             )
         if step.mutation_after is not None:
             key, body = step.mutation_after
@@ -1080,8 +1080,8 @@ def filter_cases(cases: list[Case], pattern: str, sample: int, seed: int) -> lis
 
 
 def run_live(cases: list[Case], args: argparse.Namespace) -> int:
-    if not VAPACHED.is_file():
-        raise RuntimeError(f"missing {VAPACHED}; build the release daemon first")
+    if not HTTPD_RS.is_file():
+        raise RuntimeError(f"missing {HTTPD_RS}; build the release daemon first")
     if not Path(APACHE).is_file():
         raise RuntimeError(f"missing Apache httpd at {APACHE}")
     missing_modules = [
@@ -1095,11 +1095,11 @@ def run_live(cases: list[Case], args: argparse.Namespace) -> int:
     runtime = prepare_runtime(cases)
     try:
         apache_config = runtime.base / "apache/httpd.conf"
-        vapache_config = runtime.base / "vapache-httpd.conf"
+        httpd_rs_config = runtime.base / "httpd-rs-httpd.conf"
         apache_config.write_text(server_config(runtime, cases, AP_PORT, True))
-        vapache_config.write_text(server_config(runtime, cases, VP_PORT, False))
+        httpd_rs_config.write_text(server_config(runtime, cases, VP_PORT, False))
         run_checked([APACHE, "-t", "-f", str(apache_config)], "Apache configtest")
-        run_checked([str(VAPACHED), "-t", "-f", str(vapache_config)], "Vapache configtest")
+        run_checked([str(HTTPD_RS), "-t", "-f", str(httpd_rs_config)], "httpd-rs configtest")
         start_process(
             runtime,
             [APACHE, "-f", str(apache_config), "-DFOREGROUND"],
@@ -1107,12 +1107,12 @@ def run_live(cases: list[Case], args: argparse.Namespace) -> int:
         )
         start_process(
             runtime,
-            [str(VAPACHED), "-f", str(vapache_config), "-DFOREGROUND"],
-            runtime.base / "logs/vapache.out",
+            [str(HTTPD_RS), "-f", str(httpd_rs_config), "-DFOREGROUND"],
+            runtime.base / "logs/httpd-rs.out",
         )
         if not wait_port(AP_PORT) or not wait_port(VP_PORT):
             logs = []
-            for name in ("apache", "vapache"):
+            for name in ("apache", "httpd-rs"):
                 path = runtime.base / f"logs/{name}.out"
                 if path.exists():
                     logs.append(f"== {name} ==\n{path.read_text(errors='replace')[-8000:]}")

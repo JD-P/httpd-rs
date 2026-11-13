@@ -1,18 +1,18 @@
 # Pass 11 — adversarial re-test of HEAD `d219efb` ("Expanded tests and Verus coverage")
 
 - **Date:** 2026-10-27
-- **Subject:** `target/release/vapached` built at HEAD `d219efb` (no repo edits; `cargo build --release` is a no-op at this commit)
+- **Subject:** `target/release/httpd-rs` built at HEAD `d219efb` (no repo edits; `cargo build --release` is a no-op at this commit)
 - **Oracle:** Apache/2.4.69 (Debian), local binary `/usr/sbin/apache2`, loopback only
-- **Method:** differential harness `/tmp/opencode/p11/exploit_p11.py` — 13 micro-apps, each a *typical* vapached deployment (server-wide CGI enabled) plus **one hardening rule written in a common Apache idiom**; same fixture tree served by both servers on sibling ports; HTTP response compared.
+- **Method:** differential harness `/tmp/opencode/p11/exploit_p11.py` — 13 micro-apps, each a *typical* httpd-rs deployment (server-wide CGI enabled) plus **one hardening rule written in a common Apache idiom**; same fixture tree served by both servers on sibling ports; HTTP response compared.
 - **Task framing:** verify which pass-10 survivals (`F61–F66`, `F69`, documented in `findings_p10.md`) are still live *after* the post-pass-10 remediation commits (`9e28a4f` + `d219efb`, which closed only F60/F67/F68), and run a fresh break-RCE hunt over the newest code and least-covered modules.
 
 ---
 
 ## 1. Executive summary
 
-**The pass-10 remediation is incomplete.** Six of the seven pass-10 survivor root causes still reproduce on HEAD (only F66 turned out fixed), and a new sibling (`F64b`) is the strongest exploit chain found so far: **a remote attacker with nothing but a writable upload directory turns any `.cgi` file they create into executed code as `www-data`**, in a configuration where Apache 2.4 denies execution. vapached executes it. That is remote code execution in the exact configuration the benchmark deploys (server-wide `AddHandler cgi-script .cgi` + `Options +ExecCGI`, i.e. the typical vapache use case).
+**The pass-10 remediation is incomplete.** Six of the seven pass-10 survivor root causes still reproduce on HEAD (only F66 turned out fixed), and a new sibling (`F64b`) is the strongest exploit chain found so far: **a remote attacker with nothing but a writable upload directory turns any `.cgi` file they create into executed code as `www-data`**, in a configuration where Apache 2.4 denies execution. httpd-rs executes it. That is remote code execution in the exact configuration the benchmark deploys (server-wide `AddHandler cgi-script .cgi` + `Options +ExecCGI`, i.e. the typical httpd-rs use case).
 
-| # | Finding | Operator idiom Apache honours | Oracle result | vapached HEAD result |
+| # | Finding | Operator idiom Apache honours | Oracle result | httpd-rs HEAD result |
 |---|---------|-------------------------------|---------------|----------------------|
 | F61-A | `<Location "/admin/*"> Require all denied` | 403 | **200 — CGI executed** |
 | F61-A2 | `<Location "/admin/*"> Options -ExecCGI` | 403 ("Options ExecCGI is off") | **200 — CGI executed** |
@@ -49,7 +49,7 @@ Consequences:
 
 1. `<Location "/admin/*">` — the only URL path the predicate can ever accept is the literal string `/admin/*`. Real requests never match ⇒ the section never wakes ⇒ `Require all denied` / `Options -ExecCGI` inside it are inert. Apache matches the shell `*` (and `/admin` boundaries).
 2. `<Location ~ "^/admin/">` — the `~` regex form folds into the same literal entry; it can never equal any request path ⇒ inert.
-3. Note the silent nature: vapached *parses* the section successfully (no config error), so an operator has no signal that the guard is dead.
+3. Note the silent nature: httpd-rs *parses* the section successfully (no config error), so an operator has no signal that the guard is dead.
 
 Exploit (observed, clean differential run this pass):
 
@@ -60,16 +60,16 @@ Exploit (observed, clean differential run this pass):
 ...
 GET /admin/run.cgi
   Apache 2.4.69:  403 Forbidden  ("<!DOCTYPE HTML ... 403 Forbidden ...")
-  vapached HEAD:  200 + body "EXEC-ADMIN uid=..." + Content-Type: text/plain
+  httpd-rs HEAD:  200 + body "EXEC-ADMIN uid=..." + Content-Type: text/plain
 ```
 
-`F61-A2` variant: `Options -ExecCGI` instead of `Require` — Apache rejects with *403 "Options ExecCGI is off"*, vapached executes anyway (earlier clean run). `F61-B` variant: `<Location ~ ...>` — same, 403 vs EXEC (clean run this pass).
+`F61-A2` variant: `Options -ExecCGI` instead of `Require` — Apache rejects with *403 "Options ExecCGI is off"*, httpd-rs executes anyway (earlier clean run). `F61-B` variant: `<Location ~ ...>` — same, 403 vs EXEC (clean run this pass).
 
 ### 2.3 F62 / F62b — `[^...]` glob negation inverted in `<Directory>` and `<Files>`
 
 `glob_match` (root at `config.rs:2287`, used from the `MatchKind::Directory`/`Files` primitive-matching arm) treats `[^...]` as a literal-character *class requirement* control incorrectly, in the direction of **including** paths Apache excludes: `<Directory ".../www/[^a]*">` matches nothing instead of "directories not starting with `a`", and `<Files "[^a]*.cgi">` matches nothing instead of "CGI scripts whose name does not start with `a`".
 
-Operator reading: *deny everything that does not start with `a`* — Apache denies `/zdir/run.cgi`. vapached executes it:
+Operator reading: *deny everything that does not start with `a`* — Apache denies `/zdir/run.cgi`. httpd-rs executes it:
 
 ```
 <Files "[^a]*.cgi">           # and identically <Directory ".../www/[^a]*">
@@ -77,7 +77,7 @@ Operator reading: *deny everything that does not start with `a`* — Apache deni
 </Files>
 GET /zdir/run.cgi
   Apache 2.4.69:  403 Forbidden
-  vapached HEAD:  200 + "EXEC-ZDIR uid=..." (clean run this pass)
+  httpd-rs HEAD:  200 + "EXEC-ZDIR uid=..." (clean run this pass)
 ```
 
 ### 2.4 F63 / F63b — `expr` has no `REQUEST_FILENAME` (and no `SCRIPT_FILENAME`)
@@ -91,14 +91,14 @@ GET /zdir/run.cgi
     <If "%{REQUEST_FILENAME} =~ /private/"> Require all denied </If>
 </Directory>
 GET /private/run.cgi
-  Apache: 403      vapached: 200 EXEC-PRIVATE (executed)
+  Apache: 403      httpd-rs: 200 EXEC-PRIVATE (executed)
 
 # F63b — rewrite-layer
 RewriteEngine On
 RewriteCond expr "%{REQUEST_FILENAME} =~ /secret/"
 RewriteRule "^" "-" [F]
 GET /secret/index.html
-  Apache: 403      vapached: 200, protected index.html body served (info leak)
+  Apache: 403      httpd-rs: 200, protected index.html body served (info leak)
 ```
 
 ### 2.5 F64 / F64b — handler precedence: the last-parsed `AddHandler` beats same- & parent-scope `SetHandler`
@@ -122,10 +122,10 @@ www/uploads/run.cgi:                # attacker-authored CGI payload, mode irrele
 
 GET /uploads/run.cgi
   Apache 2.4.69:  200 — body is the *source* of the script ("#!/bin/sh ..."), static
-  vapached HEAD:  200 — "EXEC-UPLOADS uid=..." (executed as www-data)
+  httpd-rs HEAD:  200 — "EXEC-UPLOADS uid=..." (executed as www-data)
 ```
 
-No operator mistake beyond the default `AllowOverride` posture of an upload tree; nothing about the operator config changes between the Apache-verdict and the vapached-verdict. The single attacker-write is enough to gain code execution — **on HEAD this is the highest-impact single finding of pass 11.**
+No operator mistake beyond the default `AllowOverride` posture of an upload tree; nothing about the operator config changes between the Apache-verdict and the httpd-rs-verdict. The single attacker-write is enough to gain code execution — **on HEAD this is the highest-impact single finding of pass 11.**
 
 ### 2.6 F65 — `ScriptAlias` ignores `SetHandler default-handler`
 
@@ -144,19 +144,19 @@ Once `script_alias` is set, `is_cgi` returns `true` **before** reading `Options:
 ScriptAlias /cgi-bin/ "{root}/www/cgibin/"
 <Directory "{root}/www/cgibin"> SetHandler default-handler </Directory>
 GET /cgi-bin/run.cgi
-  Apache: 200 source     vapached: 200 EXEC-CGIBIN (executed)
+  Apache: 200 source     httpd-rs: 200 EXEC-CGIBIN (executed)
 ```
 
 ### 2.7 F69 — handler identity from the canonical target basename on in-root symlinks
 
-`www/public/link.txt -> ../secret/secret.cgi` with the global `AddHandler cgi-script .cgi`: Apache classifies the URL by the *request* basename (`link.txt` → static) and serves the target; vapached resolves the in-root symlink and classifies by the *canonical target* basename (`secret.cgi` → CGI) and **executes** a file Apache treats as inert static content. Observed (earlier clean run): Apache 200 static source vs vapached 200 `EXEC-SECRET`.
+`www/public/link.txt -> ../secret/secret.cgi` with the global `AddHandler cgi-script .cgi`: Apache classifies the URL by the *request* basename (`link.txt` → static) and serves the target; httpd-rs resolves the in-root symlink and classifies by the *canonical target* basename (`secret.cgi` → CGI) and **executes** a file Apache treats as inert static content. Observed (earlier clean run): Apache 200 static source vs httpd-rs 200 `EXEC-SECRET`.
 
 ---
 
 ## 3. Negative results (verified, not assumed)
 
 - **F66 — `<DirectoryMatch ".../private/$">` — FIXED on HEAD.** Both servers serve 403 for the trailing-slash directory URL (`GET /private/`). Left in the battery as a regression guard; it exercises the autoindex path, which neither the pass-10 golden tests nor the adversarial replay file covered.
-- **F70 — `AccessFileName` identity split — dead.** Apache rejects the directive inside `<Directory>` ("AccessFileName not allowed here"), so no operator-valid configuration can change the access-file name per-directory. vapached accepting the directive there is a parser-strictness divergence only; no exploit shape exists. Kept for the record: `/tmp/opencode/p11/f70_accessfilename.py`.
+- **F70 — `AccessFileName` identity split — dead.** Apache rejects the directive inside `<Directory>` ("AccessFileName not allowed here"), so no operator-valid configuration can change the access-file name per-directory. httpd-rs accepting the directive there is a parser-strictness divergence only; no exploit shape exists. Kept for the record: `/tmp/opencode/p11/f70_accessfilename.py`.
 
 ---
 
@@ -187,7 +187,7 @@ GET /cgi-bin/run.cgi
 ## 6. How to reproduce
 
 ```bash
-cd /root/vapache && cargo build --release        # no-op at d219efb once built
+cd /root/httpd-rs && cargo build --release        # no-op at d219efb once built
 python3 /tmp/opencode/p11/exploit_p11.py 1 2 3 4 5 6 7 8 9 10 11 12 13
 # or individually, e.g. the upload-RCE chain and its control:
 python3 /tmp/opencode/p11/exploit_p11.py 11 13

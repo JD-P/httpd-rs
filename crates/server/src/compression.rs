@@ -300,7 +300,7 @@ fn read_body(body: Body) -> Result<Vec<u8>, Body> {
     match body {
         Body::Empty => Ok(Vec::new()),
         Body::Bytes(bytes) => {
-            if !vapache_verified::compression_body_admit(bytes.len() as u64, MAX_COMPRESS_BODY) {
+            if !httpd_rs_verified::compression_body_admit(bytes.len() as u64, MAX_COMPRESS_BODY) {
                 return Err(Body::Bytes(bytes));
             }
             Ok(bytes)
@@ -311,7 +311,7 @@ fn read_body(body: Body) -> Result<Vec<u8>, Body> {
             offset,
             len,
         } => {
-            if !vapache_verified::compression_body_admit(len, MAX_COMPRESS_BODY) {
+            if !httpd_rs_verified::compression_body_admit(len, MAX_COMPRESS_BODY) {
                 return Err(Body::File { file, offset, len });
             }
             if file.seek(SeekFrom::Start(offset)).is_err() {
@@ -871,7 +871,7 @@ mod tests {
             Err(Body::Stream { len: 6, .. })
         ));
 
-        let path = std::env::temp_dir().join(format!("vapache-compress-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("httpd-rs-compress-{}", std::process::id()));
         std::fs::write(&path, b"short").unwrap();
         let file = std::fs::File::open(&path).unwrap();
         assert!(matches!(

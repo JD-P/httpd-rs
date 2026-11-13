@@ -3,7 +3,7 @@
 
 The goal is to make the supported subset explicit: for each directive we
 support, enumerate the contexts in which Apache accepts it and compare
-`apache2 -t` with `vapached -t`.  This is the executable approximation of the
+`apache2 -t` with `httpd-rs -t`.  This is the executable approximation of the
 two acceptance/rejection obligations:
 
   * every valid Apache configuration in the supported subset is accepted;
@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target" / "release" / "httpd-rs"))
 APACHE = os.environ.get("APACHE", shutil.which("apache2") or "/usr/sbin/apache2")
 
 
@@ -110,8 +110,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
-    if not VAPACHED.exists():
-        sys.exit(f"missing {VAPACHED}")
+    if not HTTPD_RS.exists():
+        sys.exit(f"missing {HTTPD_RS}")
     try:
         DOCROOT.mkdir(parents=True, exist_ok=True)
         os.chmod(BASE, 0o755)
@@ -124,18 +124,18 @@ def main():
         def compare(name, snippet):
             nonlocal failures
             acfg = BASE / "grammar-apache.conf"
-            vcfg = BASE / "grammar-vapache.conf"
+            vcfg = BASE / "grammar-httpd-rs.conf"
             acfg.write_text(V.prefix(PORT) + snippet)
-            vcfg.write_text(V.VAPACHE_CAPABILITIES + V.prefix(PORT + 1) + snippet)
+            vcfg.write_text(V.HTTPD_RS_CAPABILITIES + V.prefix(PORT + 1) + snippet)
             a = run([APACHE, "-t", "-f", str(acfg)])
-            v = run([str(VAPACHED), "-t", "-f", str(vcfg)])
+            v = run([str(HTTPD_RS), "-t", "-f", str(vcfg)])
             aok = a.returncode == 0
             vok = v.returncode == 0
             if aok != vok:
                 failures += 1
-                print(f"DIFF {name}: apache={aok} vapache={vok}")
+                print(f"DIFF {name}: apache={aok} httpd-rs={vok}")
                 print(f"  apache: {(a.stderr or a.stdout).strip()[-500:]}")
-                print(f"  vapache: {(v.stderr or v.stdout).strip()[-500:]}")
+                print(f"  httpd-rs: {(v.stderr or v.stdout).strip()[-500:]}")
             elif args.verbose:
                 print(f"ok   {name}: {aok}")
 

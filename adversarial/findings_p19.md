@@ -1,17 +1,17 @@
 # Pass 19 — adversarial break of HEAD `07c7879` ("Require stable FastCGI paths and openat2")
 
 - **Date:** 2026-10-29
-- **Subject:** `target/release/vapached` built at HEAD `07c7879`. No product source was edited. The retained additions for this pass are `adversarial/p19/exploit_p19.py`, this write-up and the `adversarial/README.md` index entry.
+- **Subject:** `target/release/httpd-rs` built at HEAD `07c7879`. No product source was edited. The retained additions for this pass are `adversarial/p19/exploit_p19.py`, this write-up and the `adversarial/README.md` index entry.
 - **Oracle:** Apache/2.4.69 (Debian), `/usr/sbin/apache2 -X`, with `mod_cache` + `mod_cache_disk`. Loopback only.
 - **Harness:** `adversarial/p19/exploit_p19.py` — **4 differential verdicts**: query-keyed growth under a 1 MiB disk quota (A), header-keyed growth with the client resetting after the response headers (B), memory-bounded process death (C) and the Apache oracle on the identical fixture and cache policy (D).
 - **Retained evidence:** `/tmp/opencode/p19-harness` (fixtures, configs, per-group logs, the allocator-abort log).
-- **Method:** audit of the in-memory half of `crates/server/src/cache.rs` against the F44 disk-quota closure, followed by a live Apache-versus-vapache differential on the project's own `bench/cache_bench.py` cache policy.
+- **Method:** audit of the in-memory half of `crates/server/src/cache.rs` against the F44 disk-quota closure, followed by a live Apache-versus-httpd-rs differential on the project's own `bench/cache_bench.py` cache policy.
 
 ---
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
 | **P19-A** | The shared cache keeps a complete copy of every cacheable response body in a process-global `HashMap`. The map is bounded by `MAX_ENTRIES = 4096` **keys** and `CacheMaxFileSize`, but never by bytes, and `CacheMaxDiskSize` is not consulted for the in-memory copy. A remote, unauthenticated client that forces distinct cache keys (unique query strings, or — with `CacheIgnoreQueryString On` — any unique request-header value, because the policy fingerprint hashes the complete header set) retains up to **`4096 × CacheMaxFileSize`** bytes of server heap: **≈4 GiB by default**, **≈8 GiB under the repository's own cache-benchmark policy** (`CacheMaxFileSize 2097152`), and proportionally more for any deployment that raises `CacheMaxFileSize`. | `mod_cache_disk` streams the representation to disk and stays flat: **+0 MiB RSS over 500 unique-query requests**, with a working `X-Cache: HIT`. | RSS grows **≈1 MiB per request**; with a 1 MiB `CacheMaxDiskSize` the disk cache holds **zero** entries while heap grows to hundreds of MiB. Under memory pressure the process aborts (`memory allocation of 1048576 bytes failed`) because the release profile sets `panic = "abort"`. | remote memory-exhaustion denial of service (whole-process) |
 
@@ -75,7 +75,7 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 
 ```
 PASS  P19-D Apache oracle: Apache cached HIT=True, rss +0 MiB over 500
-      unique-query requests (vapache grew ~500 MiB in P19-A)
+      unique-query requests (httpd-rs grew ~500 MiB in P19-A)
 ```
 
 Apache is given the same tree, `CacheRoot`, `CacheEnable disk /cached/`, `CacheMaxFileSize 2097152`, `CacheIgnoreNoLastMod On`, `CacheDefaultExpire`/`CacheMaxExpire` and an explicit `Cache-Control` (Apache requires an explicit expiration for query-string URLs). It serves the same 1 MiB representation, reports `X-Cache: HIT` on the second request, and its RSS does not move across 500 unique-query requests.
@@ -142,7 +142,7 @@ disk_store(cfg, &key, &entry);
 1. The operator enables the documented cache subset, e.g. the repository's own benchmark policy:
 
    ```apache
-   CacheRoot "/var/cache/vapache"
+   CacheRoot "/var/cache/httpd-rs"
    CacheEnable disk /cached/
    CacheHeader On
    CacheIgnoreNoLastMod On
@@ -178,7 +178,7 @@ disk_store(cfg, &key, &entry);
 
 ## 5. Impact and preconditions
 
-**Impact.** Remote, unauthenticated whole-process denial of service on any vapache deployment that uses the documented `mod_cache` subset. The memory is retained process-wide and never released except by per-key expiry on lookup, `MAX_ENTRIES` eviction of one arbitrary key per new key, or a configuration reload. Because `panic = "abort"`, the terminal event is a full-process abort; without a supervisor the service stays down. A larger host is still degraded by a multi-GiB permanent working set, and the same `entries()` mutex that serves lookups also serializes stores.
+**Impact.** Remote, unauthenticated whole-process denial of service on any httpd-rs deployment that uses the documented `mod_cache` subset. The memory is retained process-wide and never released except by per-key expiry on lookup, `MAX_ENTRIES` eviction of one arbitrary key per new key, or a configuration reload. Because `panic = "abort"`, the terminal event is a full-process abort; without a supervisor the service stays down. A larger host is still degraded by a multi-GiB permanent working set, and the same `entries()` mutex that serves lookups also serializes stores.
 
 **Preconditions.**
 
@@ -199,7 +199,7 @@ F44 ("on-disk cache entries have no total quota or expiry cleanup; unique URLs f
 ## 7. Reproduction
 
 ```sh
-cargo build --release -p vapached
+cargo build --release -p httpd-rs
 python3 adversarial/p19/exploit_p19.py            # all four groups
 python3 adversarial/p19/exploit_p19.py A B C      # skip the Apache oracle
 python3 adversarial/p19/exploit_p19.py --keep     # retain fixtures and logs
@@ -211,7 +211,7 @@ The final retained run produced **4/4 PASS**:
 PASS  P19-A query-key memory growth: rss +504 MiB over 500 unique-query requests; disk files=0 (quota 1048576 B); ceiling = MAX_ENTRIES * CacheMaxFileSize
 PASS  P19-B header-keyed growth with reset-after-headers: rss +407 MiB over 400 header-varied requests that never received the response body
 PASS  P19-C memory-bounded process death: pid 29953 exited=True after ~672 requests under RLIMIT_AS=768 MiB; allocator abort=True
-PASS  P19-D Apache oracle: Apache cached HIT=True, rss +0 MiB over 500 unique-query requests (vapache grew ~500 MiB in P19-A)
+PASS  P19-D Apache oracle: Apache cached HIT=True, rss +0 MiB over 500 unique-query requests (httpd-rs grew ~500 MiB in P19-A)
 ```
 
 Group C applies `RLIMIT_AS` to the child only, so the harness is safe to run on a shared host; groups A/B allocate a few hundred MiB by design and release the server afterwards.

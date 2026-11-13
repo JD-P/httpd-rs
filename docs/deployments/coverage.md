@@ -1,11 +1,11 @@
 # Application coverage inventory
 
 This inventory selects applications by the server behavior visible at the
-Vapache boundary. An implementation language behind ordinary HTTP does not
-create a distinct Vapache path; body framing, rewrites, upgrades, subpath
+httpd-rs boundary. An implementation language behind ordinary HTTP does not
+create a distinct httpd-rs path; body framing, rewrites, upgrades, subpath
 routing and backend lifetime do.
 
-| Vapache surface | Real-application coverage | Remaining role of focused suites |
+| httpd-rs surface | Real-application coverage | Remaining role of focused suites |
 |---|---|---|
 | Static path resolution and directory indexes | Hugo generated pages and assets | Alias/symlink edge matrices remain in conformance tests |
 | Custom errors, ranges and validators | Hugo 404 and binary range workflow | Full conditional/range combinations remain differential |
@@ -26,7 +26,7 @@ routing and backend lifetime do.
 | Application-required TLS termination | Mastodon production HTTPS and WSS through a short-lived test certificate | SNI/mTLS/OCSP and protocol matrices remain focused TLS tests |
 | Graceful reload with active ownership | Every nightly scenario; Grafana reloads an open WebSocket | Generation race schedules remain deterministic fault tests |
 | Multi-service job and event fan-out | Mastodon API through Puma to Sidekiq/Redis and its separate streaming service | Broker failure schedules remain focused fault tests |
-| Apache-relative application performance | Optional alternating Apache/Vapache workloads | Microbenchmarks continue isolating front-end overhead |
+| Apache-relative application performance | Optional alternating Apache/httpd-rs workloads | Microbenchmarks continue isolating front-end overhead |
 
 Several surfaces should not be forced into an application merely to claim
 coverage. TLS/SNI/mTLS/OCSP, HTTP/2 framing, Certbot, hostile backend output,

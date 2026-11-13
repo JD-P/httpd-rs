@@ -1,11 +1,11 @@
-# vapache adversarial findings — Pass 4
+# httpd-rs adversarial findings — Pass 4
 
 **Target:** `HEAD 24e226d` plus the uncommitted hardening changes in the working
-tree, release binary `target/release/vapached` (built before testing; repository
+tree, release binary `target/release/httpd-rs` (built before testing; repository
 source was not modified for this pass).
 
 **Environment:** Linux, loopback only. Apache 2.4.69 (Debian) was used as a
-differential oracle where it helps distinguish a vapache bug from an
+differential oracle where it helps distinguish a httpd-rs bug from an
 Apache-compatible behaviour. Fixtures live under `/tmp/opencode`. No external
 network, IP address, or real web server was involved.
 
@@ -87,7 +87,7 @@ empty and `root` is the target file itself. Two security consequences follow:
 
 Both behaviours were reproduced against the current release binary. Apache
 returns `403` for the `.htaccess`-protected target and executes the CGI target;
-vapache returns the protected body/source with `200`. The bypass is
+httpd-rs returns the protected body/source with `200`. The bypass is
 specifically the `.htaccess` layer; a matching main-configuration `<Directory>`
 deny still applies (the PoC therefore uses `.htaccess`, which is the common
 shared-hosting control, and no broader `<Directory>` deny).
@@ -115,7 +115,7 @@ DocumentRoot "$D/www"
 Alias /wallet "/$D/private/wallet.dat"
 EOF
 
-./target/release/vapached -f "$D/httpd.conf" -X &
+./target/release/httpd-rs -f "$D/httpd.conf" -X &
 curl -i http://127.0.0.1:19115/wallet
 ```
 
@@ -161,11 +161,11 @@ Options +ExecCGI +FollowSymLinks
 Alias /run "/$D/private/secret.cgi"
 EOF
 
-./target/release/vapached -f "$D/httpd.conf" -X &
+./target/release/httpd-rs -f "$D/httpd.conf" -X &
 curl -i http://127.0.0.1:19118/run
 ```
 
-Observed from vapache:
+Observed from httpd-rs:
 
 ```text
 HTTP/1.1 200 OK
@@ -195,7 +195,7 @@ A `ScriptAlias` to a single file is affected by the same `rel` problem, but
 fails closed with `500` instead of serving source:
 
 ```text
-vapached: CGI worker failed: cannot reopen CGI script
+httpd-rs: CGI worker failed: cannot reopen CGI script
 .../private/secret.cgi/: Not a directory (os error 20)
 ```
 
@@ -319,14 +319,14 @@ AddHandler cgi-script .cgi
 </Directory>
 EOF
 
-./target/release/vapached -f "$D/httpd.conf" -X &
+./target/release/httpd-rs -f "$D/httpd.conf" -X &
 curl -i http://127.0.0.1:19123/private/script.cgi
 ```
 
-Vapache logs:
+httpd-rs logs:
 
 ```text
-vapached: ...:12: directive 'options' inside <Limit> is ignored
+httpd-rs: ...:12: directive 'options' inside <Limit> is ignored
 ```
 
 and returns:
@@ -345,18 +345,18 @@ HTTP/1.1 403 Forbidden
 
 and its CGI error log says `Options ExecCGI is off in this directory`. An
 administrator can therefore explicitly disable CGI for a directory using an
-Apache-valid configuration and vapache still executes the script.
+Apache-valid configuration and httpd-rs still executes the script.
 
 ### Impact B: `Options -Indexes` is ignored, so directory listings remain enabled
 
 With `Options +Indexes` inherited from `/www` and
-`<Limit GET> Options -Indexes </Limit>` on `/www/private`, vapache returns a
+`<Limit GET> Options -Indexes </Limit>` on `/www/private`, httpd-rs returns a
 `200` autoindex listing containing `secret.txt`; Apache returns `403` and logs
 the `Options -Indexes` denial. This discloses filenames that the administrator
 tried to hide.
 
 `Header`, `AddHandler` and `SetHandler` inside `<Limit>` are also accepted by
-Apache (`apache2 -t` says `Syntax OK` in each case) and are ignored by vapache.
+Apache (`apache2 -t` says `Syntax OK` in each case) and are ignored by httpd-rs.
 A handler directive there can turn an intended script into a source-disclosing
 static file; a `Header` directive there can silently remove a security header.
 
@@ -386,7 +386,7 @@ rejected, never warned-and-ignored.
 
 ## Impact
 
-For ordinary static files, vapache re-authorizes the **actual opened target**
+For ordinary static files, httpd-rs re-authorizes the **actual opened target**
 when it differs from the URL-mapped path:
 
 ```rust
@@ -450,7 +450,7 @@ AddHandler cgi-script .cgi
 </Files>
 EOF
 
-./target/release/vapached -f "$D/httpd.conf" -X &
+./target/release/httpd-rs -f "$D/httpd.conf" -X &
 curl -i http://127.0.0.1:19105/private/admin.cgi     # 403
 curl -i http://127.0.0.1:19105/public/link.cgi       # 200 secret
 curl -i http://127.0.0.1:19105/public/link.cgi/foo   # 200 secret
@@ -492,7 +492,7 @@ ProxyPassMatch ^/(.*\.php(/.*)?)$ "unix:$D/fcgi.sock|fcgi://localhost$D/www/"
   Require all denied
 </Directory>
 EOF
-./target/release/vapached -f "$D/httpd.conf" -X &
+./target/release/httpd-rs -f "$D/httpd.conf" -X &
 curl -i http://127.0.0.1:19104/public/link.php
 curl -i http://127.0.0.1:19104/private/secret.php
 ```
@@ -538,7 +538,7 @@ though `<Directory .../private> Require all denied` was never evaluated for it.
   `PATH_INFO`, asserting the same `403` as the static symlink case.
 
 **Caveat:** Apache 2.4.69 also executes a symlinked CGI (it returned `200` in
-the same CGI test). This finding is therefore an inconsistency in vapache's
+the same CGI test). This finding is therefore an inconsistency in httpd-rs's
 own documented symlink re-authorization model (and a real FastCGI/PHP policy
 bypass) rather than a universal Apache differential. If Apache compatibility
 is preferred, the static symlink hardening and its conformance test should be
@@ -604,7 +604,7 @@ Observed:
 ```text
 .htpasswd         -> 200 b'alice:{SHA}pXcenXUnxGz6jD4dFmSXV63E49g=\n'
 rewrite-secret.txt -> 200 b'WALLET-REWRITE-SECRET\n'
-vp.conf            -> 200 b'ServerRoot "/tmp/opencode/vapache-adversarial-..." ...'
+vp.conf            -> 200 b'ServerRoot "/tmp/opencode/httpd-rs-adversarial-..." ...'
 ```
 
 The same request in a minimal deployment also reads a `ServerRoot` secret:
@@ -621,7 +621,7 @@ ServerName localhost
 DocumentRoot "$D/www"
 AliasMatch "^/escape(.*)$" "\$1"
 EOF
-./target/release/vapached -f "$D/httpd.conf" -X &
+./target/release/httpd-rs -f "$D/httpd.conf" -X &
 curl -i "http://127.0.0.1:19100/escape$D/rootsecret.txt"
 curl -i "http://127.0.0.1:19100/escape$D/.htpasswd"
 ```
@@ -664,7 +664,7 @@ stdout above 1 MiB with:
 
 ```rust
 let path = std::env::temp_dir()
-    .join(format!("vapache-fastcgi-{}-{}.body", std::process::id(), n));
+    .join(format!("httpd-rs-fastcgi-{}-{}.body", std::process::id(), n));
 let file = OpenOptions::new()
     .create(true)
     .truncate(true)
@@ -711,10 +711,10 @@ ProxyPassMatch ^/(.*\.php)$ "unix:$D/sock|fcgi://localhost$D/www/"
 EOF
 
 python3 /tmp/opencode/fcgi-mock-large.py "$D/sock" &
-./target/release/vapached -f "$D/httpd.conf" -X &
+./target/release/httpd-rs -f "$D/httpd.conf" -X &
 PID=$!                         # server pid
 ln -s /tmp/opencode/p4-overwrite-target \
-      "/tmp/vapache-fastcgi-$PID-0.body"
+      "/tmp/httpd-rs-fastcgi-$PID-0.body"
 curl -sS -o /dev/null "http://127.0.0.1:19116/large.php"
 ```
 
@@ -735,7 +735,7 @@ trivially observable in a shared host. Without an echo endpoint the body
 content is application-controlled, but a local attacker can often find an
 endpoint that reflects a parameter or choose a file where the header prefix is
 harmless. This is a local privilege escalation from any local user to the
-vapache account, and a website compromise in multi-tenant deployments.
+httpd-rs account, and a website compromise in multi-tenant deployments.
 
 ## Remediation
 
@@ -780,7 +780,7 @@ CacheDefaultExpire 600
 </Directory>
 EOF
 chmod 777 "$D/cache"
-./target/release/vapached -f "$D/httpd.conf" -X &
+./target/release/httpd-rs -f "$D/httpd.conf" -X &
 
 for i in $(seq 1 5); do
   curl -sS -o /dev/null "http://127.0.0.1:19127/cache/file.txt?nonce=$i"
@@ -860,7 +860,7 @@ stated confinement and enables branch-oracle attacks from a writable
   (`crates/server/src/config.rs:5505`): the `negate` variable is not carried
   into `Require::ValidUser`. Apache's `not` is supposed to negate the provider.
   A configuration that relies on this form can invert its intended access
-  decision. (A quick Apache/vapache comparison showed both allow an
+  decision. (A quick Apache/httpd-rs comparison showed both allow an
   authenticated user in the tested `<RequireAll>` shape, so this was not
   promoted to a demonstrated bypass.)
 * `sanitize_header_value()` rejects only CR, LF and NUL. CGI/proxy header

@@ -8,5 +8,5 @@ edition = "2021"
 [workspace]
 
 [dependencies]
-vapache-pcre2 = { path = "../../../crates/pcre2" }
+httpd-rs-pcre2 = { path = "../../../crates/pcre2" }
 pcre2-c-oracle = { package = "pcre2", version = "0.2.11" }

@@ -95,7 +95,7 @@ pub(super) struct Stream {
     pub reset_at: Option<Instant>,
 
     /// Verified single-use lifecycle for delayed local-reset reclamation.
-    pub reset_expiry_phase: vapache_verified::H2ResetExpiryPhase,
+    pub reset_expiry_phase: httpd_rs_verified::H2ResetExpiryPhase,
 
     /// Next node in list of reset streams that should expire eventually
     pub next_reset_expire: Option<store::Key>,
@@ -190,7 +190,7 @@ impl Stream {
             next_window_update: None,
             is_pending_window_update: false,
             reset_at: None,
-            reset_expiry_phase: vapache_verified::H2ResetExpiryPhase::Untracked,
+            reset_expiry_phase: httpd_rs_verified::H2ResetExpiryPhase::Untracked,
             next_reset_expire: None,
             pending_recv: buffer::Deque::new(),
             is_recv: true,
@@ -588,14 +588,14 @@ impl store::Next for NextResetExpire {
         if val {
             assert_eq!(
                 stream.reset_expiry_phase,
-                vapache_verified::H2ResetExpiryPhase::Queued,
+                httpd_rs_verified::H2ResetExpiryPhase::Queued,
                 "reset expiry queued without verified admission"
             );
             stream.reset_at = Some(Instant::now());
         } else {
-            stream.reset_expiry_phase = vapache_verified::h2_reset_expiry_step(
+            stream.reset_expiry_phase = httpd_rs_verified::h2_reset_expiry_step(
                 stream.reset_expiry_phase,
-                vapache_verified::H2ResetExpiryEvent::Reclaim,
+                httpd_rs_verified::H2ResetExpiryEvent::Reclaim,
             )
             .expect("reset expiry reclaimed more than once");
             stream.reset_at = None;
@@ -618,9 +618,9 @@ mod verified_reset_tests {
     #[test]
     fn delayed_reset_queue_is_single_use() {
         let mut stream = Stream::new(StreamId::from(1), 65_535, 65_535);
-        stream.reset_expiry_phase = vapache_verified::h2_reset_expiry_step(
+        stream.reset_expiry_phase = httpd_rs_verified::h2_reset_expiry_step(
             stream.reset_expiry_phase,
-            vapache_verified::H2ResetExpiryEvent::Enqueue,
+            httpd_rs_verified::H2ResetExpiryEvent::Enqueue,
         )
         .unwrap();
         <NextResetExpire as store::Next>::set_queued(&mut stream, true);
@@ -630,11 +630,11 @@ mod verified_reset_tests {
         assert!(stream.reset_at.is_none());
         assert_eq!(
             stream.reset_expiry_phase,
-            vapache_verified::H2ResetExpiryPhase::Reclaimed
+            httpd_rs_verified::H2ResetExpiryPhase::Reclaimed
         );
-        assert!(vapache_verified::h2_reset_expiry_step(
+        assert!(httpd_rs_verified::h2_reset_expiry_step(
             stream.reset_expiry_phase,
-            vapache_verified::H2ResetExpiryEvent::Enqueue,
+            httpd_rs_verified::H2ResetExpiryEvent::Enqueue,
         )
         .is_none());
     }

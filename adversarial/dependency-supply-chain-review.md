@@ -4,7 +4,7 @@ Date: 2026-11-05
 
 ## Result
 
-Vapache's dependency policy now distinguishes audit evidence from temporary
+httpd-rs's dependency policy now distinguishes audit evidence from temporary
 trust explicitly. The initial `cargo vet init` state contained 146 blanket
 exemptions and no imported or project-authored audit evidence. Trusted audit
 ledgers from nine established Rust projects reduce that to 105 exemptions;
@@ -13,7 +13,7 @@ five additional crates have project-authored reviews. At the current lockfile,
 versions.
 
 An exemption means only that the dependency is currently allowed so the build
-can proceed. It is not evidence that Vapache reviewed that code. The CI policy
+can proceed. It is not evidence that httpd-rs reviewed that code. The CI policy
 therefore caps exemptions at 105 and fails if local audit evidence or trusted
 imports disappear. Removing an exemption remains monotonic progress; adding
 one requires an explicit policy change and review.
@@ -24,13 +24,13 @@ The imported ledgers are Actix, Ariel OS, Bytecode Alliance, Embark Studios,
 Fermyon, Google, ISRG, Mozilla, and Zcash. Their URLs use HTTPS and cargo-vet
 locks the fetched evidence in `supply-chain/imports.lock`.
 
-The Vapache project additionally reviewed:
+The httpd-rs project additionally reviewed:
 
 - `rustix 1.1.6`, including the Linux event, filesystem, and network syscall
   surfaces used by the server and its build-time compiler probes;
 - `linux-raw-sys 0.12.1`, the generated Linux UAPI bindings below `rustix`;
 - `smallvec 1.15.2 -> 1.16.4`, including the unsafe inline/heap storage and
-  drop paths exercised by `vapache-pcre2`;
+  drop paths exercised by `httpd-rs-pcre2`;
 - `bitflags 2.11.1 -> 2.13.2`, including its generated flag API and changes to
   unsafe implementations;
 - `webpki-roots 1.0.11`, whose published-crate delta removes two distrusted

@@ -3,9 +3,9 @@
 // Admission-focused complement to `pcre2_differential`.
 //
 // Input byte zero selects one of four independent checks:
-//   0. raw UTF-8: every vapache-accepted pattern must compile in PCRE2;
+//   0. raw UTF-8: every httpd-rs-accepted pattern must compile in PCRE2;
 //   1. generated whitelist: both engines must compile and agree on captures;
-//   2. generated exclusion: constructs outside vapache's grammar must reject;
+//   2. generated exclusion: constructs outside httpd-rs's grammar must reject;
 //   3. lexical control: excluded-looking text in literals/classes/comments
 //      must not be mistaken for active syntax.
 //
@@ -16,7 +16,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use pcre2_c_oracle::bytes as oracle;
-use vapache_pcre2::bytes as rust;
+use httpd_rs_pcre2::bytes as rust;
 
 type CaptureSpans = Vec<Option<(usize, usize)>>;
 
@@ -425,7 +425,7 @@ fuzz_target!(|data: &[u8]| {
             if let Ok(rust_regex) = configure_rust(flags).build(pattern) {
                 let oracle_regex = configure_oracle(flags).build(pattern).unwrap_or_else(|error| {
                     panic!(
-                        "vapache admitted PCRE2-rejected syntax {pattern:?}, flags={flags:#04x}, translated={:?}: {error}",
+                        "httpd-rs admitted PCRE2-rejected syntax {pattern:?}, flags={flags:#04x}, translated={:?}: {error}",
                         rust_regex.translated_pattern(),
                     )
                 });
@@ -441,7 +441,7 @@ fuzz_target!(|data: &[u8]| {
             let pattern = generated_excluded(controls, flags);
             assert!(
                 configure_rust(flags).build(pattern).is_err(),
-                "vapache admitted construct outside the whitelist: {pattern:?}, flags={flags:#04x}",
+                "httpd-rs admitted construct outside the whitelist: {pattern:?}, flags={flags:#04x}",
             );
         }
         3 => {

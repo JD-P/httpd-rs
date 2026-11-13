@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate user documentation and execute its Vapache behavior contracts."""
+"""Validate user documentation and execute its httpd-rs behavior contracts."""
 
 from __future__ import annotations
 
@@ -134,7 +134,7 @@ def check_style_and_structure() -> None:
                         f"{path.relative_to(ROOT)}: deployment tutorial must start with installation"
                     )
                 has_shared_setup = "(prepare-debian-vps.md)" in text
-                has_inline_setup = "sudo apt install /tmp/vapache.deb" in text
+                has_inline_setup = "sudo apt install /tmp/httpd-rs.deb" in text
                 if not has_shared_setup and not has_inline_setup:
                     raise DocsError(
                         f"{path.relative_to(ROOT)}: deployment tutorial omits the fresh-VPS setup"
@@ -180,7 +180,7 @@ def check_deployment_tutorial_security() -> None:
         "sha256sum --check --strict",
         "python3-certbot-apache",
         "a2dissite 000-default.conf",
-        "vapache-switch --yes",
+        "httpd-rs-switch --yes",
     ):
         if required not in shared:
             raise DocsError(f"shared VPS setup is missing {required!r}")
@@ -289,7 +289,7 @@ def check_safe_rust_claim() -> None:
             "the documented more-than-99%-safe-Rust claim no longer matches "
             f"the source inventory ({unsafe_sites} unsafe sites across {source_lines} lines)"
         )
-    claim = "More than 99% of the Vapache server source is safe Rust"
+    claim = "More than 99% of the httpd-rs server source is safe Rust"
     for relative in (
         "explanation/security-expectations.md",
         "how-to/evaluate-security-driven-migration.md",
@@ -586,19 +586,19 @@ def check_reference_evidence() -> list[str]:
     return sorted(documented)
 
 
-def vapached_binary() -> Path:
-    configured = os.environ.get("VAPACHED")
+def httpd_rs_binary() -> Path:
+    configured = os.environ.get("HTTPD_RS")
     candidates = [Path(configured)] if configured else []
     candidates.extend(
         (
-            ROOT / "target" / "debug" / "vapached",
-            ROOT / "target" / "release" / "vapached",
+            ROOT / "target" / "debug" / "httpd-rs",
+            ROOT / "target" / "release" / "httpd-rs",
         )
     )
     for candidate in candidates:
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate.resolve()
-    raise DocsError("missing vapached; run cargo build -p vapached or set VAPACHED")
+    raise DocsError("missing httpd-rs; run cargo build -p httpd-rs or set HTTPD_RS")
 
 
 def service_identity() -> tuple[str, str]:
@@ -617,7 +617,7 @@ def base_config(root: Path, listener: str, extra: str) -> str:
 Listen {listener}
 User {user}
 Group {group}
-PidFile "{root / 'vapached.pid'}"
+PidFile "{root / 'httpd-rs.pid'}"
 ErrorLog "{root / 'error.log'}"
 LogLevel warn
 ServerName docs-default.invalid
@@ -645,7 +645,7 @@ def write_config(root: Path, text: str) -> Path:
     types = root / "mime.types"
     types.write_text("text/html html\n", encoding="utf-8")
     os.chmod(types, 0o644)
-    path = root / "vapache.conf"
+    path = root / "httpd-rs.conf"
     path.write_text(text, encoding="utf-8")
     os.chmod(path, 0o644)
     return path
@@ -653,7 +653,7 @@ def write_config(root: Path, text: str) -> Path:
 
 def test_config_contract(binary: Path, contract: dict) -> None:
     source = (ROOT / contract["example"]).read_text(encoding="utf-8")
-    with tempfile.TemporaryDirectory(prefix="vapache-doc-config-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="httpd-rs-doc-config-") as temporary:
         root = Path(temporary)
         os.chmod(root, 0o755)
         cgi_root = root / "cgi-bin"
@@ -682,15 +682,15 @@ def test_config_contract(binary: Path, contract: dict) -> None:
 
 
 def test_documented_capability_names(binary: Path, capabilities: list[str]) -> None:
-    declarations = "".join(f"VapacheCapability {name} On\n" for name in capabilities)
-    with tempfile.TemporaryDirectory(prefix="vapache-doc-capabilities-") as temporary:
+    declarations = "".join(f"HttpdRsCapability {name} On\n" for name in capabilities)
+    with tempfile.TemporaryDirectory(prefix="httpd-rs-doc-capabilities-") as temporary:
         root = Path(temporary)
         os.chmod(root, 0o755)
         config = write_config(root, base_config(root, "127.0.0.1:0", declarations))
         result = run_command([str(binary), "-f", str(config), "-t", "--strict-config"])
         if result.returncode != 0 or "Syntax OK" not in result.stdout:
             raise DocsError(
-                "documented capability names are not accepted by vapached\n"
+                "documented capability names are not accepted by httpd-rs\n"
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
             )
 
@@ -718,7 +718,7 @@ def wait_for_server(process: subprocess.Popen[bytes], port: int, log: Path) -> N
     while time.monotonic() < deadline:
         if process.poll() is not None:
             output = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
-            raise DocsError(f"vapached exited during documentation test:\n{output}")
+            raise DocsError(f"httpd-rs exited during documentation test:\n{output}")
         try:
             request(port, "GET", "/")
             return
@@ -748,7 +748,7 @@ def stop_process(process: subprocess.Popen[bytes]) -> None:
 def test_runtime_contract(binary: Path, contract: dict) -> None:
     example = (ROOT / contract["example"]).read_text(encoding="utf-8")
     example_root = (ROOT / contract["example"]).parent
-    with tempfile.TemporaryDirectory(prefix="vapache-doc-runtime-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="httpd-rs-doc-runtime-") as temporary:
         root = Path(temporary)
         os.chmod(root, 0o755)
         document_root = root / "www"
@@ -799,7 +799,7 @@ def test_runtime_contract(binary: Path, contract: dict) -> None:
 
 
 def execute_contracts(contracts: list[dict], capabilities: list[str]) -> None:
-    binary = vapached_binary()
+    binary = httpd_rs_binary()
     test_documented_capability_names(binary, capabilities)
     for contract in contracts:
         if contract["kind"] in {"deployment", "evidence"}:

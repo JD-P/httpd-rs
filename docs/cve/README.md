@@ -10,7 +10,7 @@ cpe:2.3:a:apache:http_server
 ```
 
 The snapshot contains **371 CVEs**. It is a triage of whether the current
-Vapache specification and implementation boundary would prevent each CVE
+httpd-rs specification and implementation boundary would prevent each CVE
 *in principle*, not a claim that every CVE has a working replay test.
 
 ### Files
@@ -87,7 +87,7 @@ The current snapshot contains **1,047 distinct CVEs**:
 
 | classification | count |
 |---|---:|
-| prevented by Vapache's design/implementation | 370 |
+| prevented by httpd-rs's design/implementation | 370 |
 | explicitly fail closed | 54 |
 | affected feature/platform is absent | 580 |
 | partial: exact trigger or complete invariant remains unresolved | 41 |
@@ -106,7 +106,7 @@ as prevented.
 Files:
 
 - `cross-server-nvd.json` — normalized source snapshot and query provenance.
-- `cross-server-cve-matrix.json` — complete per-CVE root cause, Vapache
+- `cross-server-cve-matrix.json` — complete per-CVE root cause, httpd-rs
   comparison, implementation evidence, confidence and advisory links.
 - `cross-server-cve-matrix.csv` — the same complete ledger for review.
 - `cross-server-cve-matrix.md` — product counts and the high/critical open set.
@@ -120,5 +120,5 @@ python3 tests/cross_server_cve_matrix.py --fetch  # NVD rate limits apply
 ```
 
 This remains a static root-cause/design comparison. `prevented` means the
-specific primitive was removed or bounded; it does not mean Vapache is free
+specific primitive was removed or bounded; it does not mean httpd-rs is free
 of independent bugs in the same subsystem.

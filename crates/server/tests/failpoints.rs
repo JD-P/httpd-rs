@@ -1,9 +1,9 @@
 #![cfg(feature = "fault-injection")]
 
+use httpd_rs::files::Target;
+use httpd_rs::http::{read_request, Limits, ReadError};
 use std::collections::HashMap;
 use std::io;
-use vapached::files::Target;
-use vapached::http::{read_request, Limits, ReadError};
 
 struct Fragmented<'a> {
     input: &'a [u8],
@@ -40,15 +40,15 @@ fn with_request_context<T>(operation: impl FnOnce(&Limits) -> T) -> T {
     let context = limits
         .resource_budget
         .context(std::net::IpAddr::from([192, 0, 2, 1]));
-    vapached::resource::with_resource_context(context, || operation(&limits))
+    httpd_rs::resource::with_resource_context(context, || operation(&limits))
 }
 
 #[test]
 fn injected_header_failures_retry_eintr_and_reject_other_errors() {
-    let _fault_guard = vapached::fault::test_guard();
+    let _fault_guard = httpd_rs::fault::test_guard();
     let wire = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
 
-    vapached::fault::configure("http.head.read", 0, io::ErrorKind::Interrupted);
+    httpd_rs::fault::configure("http.head.read", 0, io::ErrorKind::Interrupted);
     let request = with_request_context(|limits| {
         read_request(
             &mut io::Cursor::new(wire.to_vec()),
@@ -61,7 +61,7 @@ fn injected_header_failures_retry_eintr_and_reject_other_errors() {
     .expect("request after EINTR");
     assert_eq!(request.target, b"/");
 
-    vapached::fault::configure("http.head.read", 0, io::ErrorKind::ConnectionReset);
+    httpd_rs::fault::configure("http.head.read", 0, io::ErrorKind::ConnectionReset);
     let result = with_request_context(|limits| {
         read_request(
             &mut io::Cursor::new(wire.to_vec()),
@@ -73,55 +73,55 @@ fn injected_header_failures_retry_eintr_and_reject_other_errors() {
     assert!(
         matches!(result, Err(ReadError::Io(error)) if error.kind() == io::ErrorKind::ConnectionReset)
     );
-    vapached::fault::clear();
+    httpd_rs::fault::clear();
 }
 
 #[test]
 fn injected_secure_open_failure_never_returns_a_file() {
-    let _fault_guard = vapached::fault::test_guard();
-    let root = std::env::temp_dir().join(format!("vapache-failpoint-open-{}", std::process::id()));
+    let _fault_guard = httpd_rs::fault::test_guard();
+    let root = std::env::temp_dir().join(format!("httpd-rs-failpoint-open-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("visible.txt"), b"secret").unwrap();
 
-    vapached::fault::configure("fs.open_beneath", 0, io::ErrorKind::PermissionDenied);
+    httpd_rs::fault::configure("fs.open_beneath", 0, io::ErrorKind::PermissionDenied);
     assert!(matches!(
-        vapached::files::resolve_target(&root, std::path::Path::new("visible.txt"), true),
+        httpd_rs::files::resolve_target(&root, std::path::Path::new("visible.txt"), true),
         Target::Forbidden | Target::NotFound
     ));
-    vapached::fault::clear();
+    httpd_rs::fault::clear();
 
-    vapached::fault::configure("fs.open_beneath", 0, io::ErrorKind::Unsupported);
-    let error = vapached::files::require_secure_path_resolution().unwrap_err();
+    httpd_rs::fault::configure("fs.open_beneath", 0, io::ErrorKind::Unsupported);
+    let error = httpd_rs::files::require_secure_path_resolution().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     assert!(error.to_string().contains("requires Linux openat2"));
-    vapached::fault::clear();
+    httpd_rs::fault::clear();
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn injected_configuration_open_failure_is_reported_without_partial_policy() {
-    let _fault_guard = vapached::fault::test_guard();
+    let _fault_guard = httpd_rs::fault::test_guard();
     let root =
-        std::env::temp_dir().join(format!("vapache-failpoint-config-{}", std::process::id()));
+        std::env::temp_dir().join(format!("httpd-rs-failpoint-config-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let config = root.join("httpd.conf");
     std::fs::write(&config, "Listen 127.0.0.1:0\n").unwrap();
 
-    vapached::fault::configure("fs.openat2", 0, io::ErrorKind::PermissionDenied);
+    httpd_rs::fault::configure("fs.openat2", 0, io::ErrorKind::PermissionDenied);
     let result =
-        vapached::config::Config::load(&config, &root, &HashMap::new(), &HashMap::new(), false);
+        httpd_rs::config::Config::load(&config, &root, &HashMap::new(), &HashMap::new(), false);
     assert!(result.is_err());
-    vapached::fault::clear();
+    httpd_rs::fault::clear();
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn injected_fixed_body_read_failure_is_propagated() {
-    let _fault_guard = vapached::fault::test_guard();
+    let _fault_guard = httpd_rs::fault::test_guard();
     let wire = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody";
-    vapached::fault::configure("http.body.read", 0, io::ErrorKind::ConnectionReset);
+    httpd_rs::fault::configure("http.body.read", 0, io::ErrorKind::ConnectionReset);
     let result = with_request_context(|limits| {
         read_request(&mut fragmented(wire), &mut Vec::new(), limits, |_| {})
     });
@@ -132,10 +132,10 @@ fn injected_fixed_body_read_failure_is_propagated() {
 
 #[test]
 fn injected_chunk_line_and_data_failures_are_propagated() {
-    let _fault_guard = vapached::fault::test_guard();
+    let _fault_guard = httpd_rs::fault::test_guard();
     let wire = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\n";
     for boundary in ["http.chunk.line", "http.chunk.read"] {
-        vapached::fault::configure(boundary, 0, io::ErrorKind::ConnectionReset);
+        httpd_rs::fault::configure(boundary, 0, io::ErrorKind::ConnectionReset);
         let result = with_request_context(|limits| {
             read_request(&mut fragmented(wire), &mut Vec::new(), limits, |_| {})
         });

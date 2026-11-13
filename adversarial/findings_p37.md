@@ -2,7 +2,7 @@
 
 - **Date:** 2026-11-11
 - **Subject:** HEAD `7ec4fa7ff2a93ee11fb188839781dd7379969e93`
-  (`target/release/vapached`, rebuilt from the checked-out tree; no product
+  (`target/release/httpd-rs`, rebuilt from the checked-out tree; no product
   source was edited).
 - **Oracle:** PCRE2 10.46 through the pinned `pcre2` 0.2.11 /
   `pcre2-sys` 0.2.10 oracle used by the crate's own `pcre2_differential`
@@ -62,7 +62,7 @@ RewriteCond %{REQUEST_URI} !\R\s
 RewriteRule ^ - [F]
 ```
 
-is accepted by `vapached -t` (retained evidence in `results_p37.txt`, `Syntax
+is accepted by `httpd-rs -t` (retained evidence in `results_p37.txt`, `Syntax
 OK`, `rc=0`) while the engine's boolean `\R\s` differs from PCRE2 for a
 CRLF+non-whitespace subject in the `[F]`-skip direction.
 

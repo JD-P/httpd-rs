@@ -1,7 +1,7 @@
 # Pass 14 — adversarial break of HEAD `ce8d800` ("Close P13 handler identity gaps")
 
 - **Date:** 2026-10-28
-- **Subject:** `target/release/vapached` built at HEAD `ce8d800` (no repo source edits; the only additions for this pass are `adversarial/p14/exploit_p14.py`, this write-up and the `adversarial/README.md` index entry)
+- **Subject:** `target/release/httpd-rs` built at HEAD `ce8d800` (no repo source edits; the only additions for this pass are `adversarial/p14/exploit_p14.py`, this write-up and the `adversarial/README.md` index entry)
 - **Oracle:** Apache/2.4.69 (Debian), `/usr/sbin/apache2 -X`, loopback only
 - **Method:** static audit of scope/phase construction, rewrite guards and request parsing, followed by a differential battery that pairs the project's own benchmark/typical postures (`Options +ExecCGI` + `AddHandler cgi-script`, `AllowOverride` on an upload tree, `RewriteRule ... [P]` routes, `.htaccess` guards) with attacker-controlled first lines of defence: an uploader-writable `.htaccess`, duplicate field lines, and a `[C]` chain head.
 - **Harness:** `adversarial/p14/exploit_p14.py` (all cases reproduce in one command; see §8). Current run: **8/8 differential verdicts**.
@@ -10,9 +10,9 @@
 
 ## 1. Executive summary
 
-Five independent findings, four of them with a remote-client trigger. The headline is P14-A: the `<Files>`/`<FilesMatch>` phase order makes any ancestor `.htaccess` outrank a deeper, root-owned main-config `<Files>` section, so the operator's post-upload `.htaccess` mitigation is exactly invertible. Apache merges per-directory (deepest wins); vapache merges all main-config files first and all access-file files second (shallower `.htaccess` wins). That single ordering defect was reproduced as four different code-execution / authorization bypasses:
+Five independent findings, four of them with a remote-client trigger. The headline is P14-A: the `<Files>`/`<FilesMatch>` phase order makes any ancestor `.htaccess` outrank a deeper, root-owned main-config `<Files>` section, so the operator's post-upload `.htaccess` mitigation is exactly invertible. Apache merges per-directory (deepest wins); httpd-rs merges all main-config files first and all access-file files second (shallower `.htaccess` wins). That single ordering defect was reproduced as four different code-execution / authorization bypasses:
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
 | **P14-A** | Shallow `.htaccess` `<Files>` beats deep config `<Files>` (`Require all denied`, Basic auth, `SetHandler default-handler`, `Options -ExecCGI`; `<Files>` and `<FilesMatch>`) | `403`/`401`/static source; `Options -ExecCGI` → `403` | `200` and **executes the CGI/uploaded file as the CGI worker user** | remote code execution / authorization bypass |
 | **P14-B** | `RewriteRule ... [P]` authority guard `proxy_template_authority_safe` rejects `$1`/`%{...}` but not `\1`/`%1`, which the runtime *does* expand as captures | `\1` expands to the literal digit `1` → `400 AH01083: error parsing URL http://1` | attacker controls the upstream `host:port` | SSRF into loopback/internal services + `<Proxy>` authorization bypass |
@@ -59,7 +59,7 @@ crate::verified::AccessStep::AccessFiles => {
 
 Because `AuthorizationPolicy::merge_child` / `MappingPolicy::merge_child` / `OptionsPolicy::merge_child` let the later rule win, **every** access-file `<Files>` section (from any walked directory, however shallow) beats **every** main-config `<Files>` section (however deep). Depth is ignored across the two sources.
 
-Apache merges in `ap_directory_walk` root→leaf: for each directory, the matching config `<Directory>`/`<Files>` configuration is merged, then that directory's `.htaccess`. The deepest matching section is therefore applied last and wins. (Same-directory config `<Files>` vs `.htaccess` agrees with vapache — see §7 controls — which is why the bug hid from the F10/F13/F50–F64 regressions: they only ever put `<Files>` sections on one side.)
+Apache merges in `ap_directory_walk` root→leaf: for each directory, the matching config `<Directory>`/`<Files>` configuration is merged, then that directory's `.htaccess`. The deepest matching section is therefore applied last and wins. (Same-directory config `<Files>` vs `.htaccess` agrees with httpd-rs — see §7 controls — which is why the bug hid from the F10/F13/F50–F64 regressions: they only ever put `<Files>` sections on one side.)
 
 ### 2.2 Exploit chain (observed)
 
@@ -97,13 +97,13 @@ Attacker writes `/srv/app/www/.htaccess` (an uploader/app write primitive that c
 Results (harness `P14-A1`/`P14-A2` and the Options control, exact output):
 
 ```
-/private/run.cgi    apache=403                      vapache=200  P14A-CGI uid=33
-/auth/secret.cgi    apache=401 (Basic auth)         vapache=200  P14A2-CGI uid=33  (anonymously)
-/private/upload.txt apache=200  "#!/bin/sh …"       vapache=200  P14A-UPLOAD uid=33 (execve)
-Options-in-<Files>  apache=403 "Options ExecCGI off" vapache=200  EXEC run.cgi uid=33
+/private/run.cgi    apache=403                      httpd-rs=200  P14A-CGI uid=33
+/auth/secret.cgi    apache=401 (Basic auth)         httpd-rs=200  P14A2-CGI uid=33  (anonymously)
+/private/upload.txt apache=200  "#!/bin/sh …"       httpd-rs=200  P14A-UPLOAD uid=33 (execve)
+Options-in-<Files>  apache=403 "Options ExecCGI off" httpd-rs=200  EXEC run.cgi uid=33
 ```
 
-The fifth variant replaces both `<Files>` with `<FilesMatch "run\.cgi">` (config and `.htaccess`): Apache `403`, vapache `200 FM-EXEC uid=33` — the defect is in the shared phase lists, not in one matcher.
+The fifth variant replaces both `<Files>` with `<FilesMatch "run\.cgi">` (config and `.htaccess`): Apache `403`, httpd-rs `200 FM-EXEC uid=33` — the defect is in the shared phase lists, not in one matcher.
 
 ### 2.3 Impact
 
@@ -166,7 +166,7 @@ RewriteEngine On
 RewriteRule "^/api/(.*)$" "http://\1/" [P,L]
 ```
 
-Accepted at load (`vapached -t` succeeds) because the authority `\1` contains no `$`/`%`. Any client:
+Accepted at load (`httpd-rs -t` succeeds) because the authority `\1` contains no `$`/`%`. Any client:
 
 ```
 GET /api/127.0.0.1:6379/CONFIG%20SET%20dir%20/var/www/html HTTP/1.1
@@ -176,8 +176,8 @@ Host: www.example.com
 The capture becomes the upstream `host:port`; `run_proxy`/`proxy_once` emits `GET /… HTTP/1.1` + `Host: 127.0.0.1:6379` and relays the response. Harness output:
 
 ```
-P14-B \1 authority SSRF   apache=400  vapache=200  "P14B-INTERNAL /secret/"
-P14-B %1 substitution SSRF apache=200 vapache=200  "P14B-INTERNAL /secret"
+P14-B \1 authority SSRF   apache=400  httpd-rs=200  "P14B-INTERNAL /secret/"
+P14-B %1 substitution SSRF apache=200 httpd-rs=200  "P14B-INTERNAL /secret"
 ```
 
 The second row is the branch-2 blind spot: the substitution *without* a scheme may consist of a condition capture, and condition captures routinely carry request data (`%{HTTP:...}`, `%{THE_REQUEST}`, `%{HTTP_HOST}`). A config the guard explicitly means to reject (`%{HTTP_HOST}` is pinned unsafe) is accepted as `%1`.
@@ -295,8 +295,8 @@ RewriteRule ^ - [F]
 ```
 
 ```
-single UA:    apache=200  vapache=200     (harness P14-D)
-duplicate UA: apache=403  vapache=200
+single UA:    apache=200  httpd-rs=200     (harness P14-D)
+duplicate UA: apache=403  httpd-rs=200
 ```
 
 by sending:
@@ -308,12 +308,12 @@ User-Agent: Mozilla/5.0
 User-Agent: sqlmap/1.7
 ```
 
-vapache evaluates `Mozilla/5.0` only; Apache evaluates `Mozilla/5.0, sqlmap/1.7` and matches.
+httpd-rs evaluates `Mozilla/5.0` only; Apache evaluates `Mozilla/5.0, sqlmap/1.7` and matches.
 
 ### 5.3 Impact
 
 - Header-denial guards (scanner/WAF-style `RewriteCond`, `SetEnvIf` + `Require not env`, `Require expr` header equality) are bypassed by prepending a benign duplicate.
-- The inverse direction is also a divergence: an allow rule that requires equality with a known value (`Require expr %{HTTP_X_API_KEY} == "known"`) grants to a request whose *merged* value is not that value (first line `known`, second line junk), so the backend/WAF and vapache disagree about the same request.
+- The inverse direction is also a divergence: an allow rule that requires equality with a known value (`Require expr %{HTTP_X_API_KEY} == "known"`) grants to a request whose *merged* value is not that value (first line `known`, second line junk), so the backend/WAF and httpd-rs disagree about the same request.
 - `RemoteIPHeader` only reads the first `X-Forwarded-For` line; with a proxy that adds a second line rather than appending, the client-supplied line wins and `Require ip`/`Require local` and `REMOTE_ADDR` are spoofable.
 
 ### 5.4 Fix
@@ -370,11 +370,11 @@ RewriteRule "^/gate/(.*)$" "/public/index.html" [PT,L]
 ```
 
 ```
-no gate header: apache=404  vapache=200 "public index"   (harness P14-E)
-with header:    apache=403  vapache=403
+no gate header: apache=404  httpd-rs=200 "public index"   (harness P14-E)
+with header:    apache=403  httpd-rs=403
 ```
 
-The gate (source/header/role condition) fails on vapache, but the chain's `[PT]` rewrite into `/public/` still runs; on Apache the whole chain is skipped and the request 404s. A `[F]` in the middle of a gate chain never fires when the head fails.
+The gate (source/header/role condition) fails on httpd-rs, but the chain's `[PT]` rewrite into `/public/` still runs; on Apache the whole chain is skipped and the request 404s. A `[F]` in the middle of a gate chain never fires when the head fails.
 
 ### 6.3 Impact
 
@@ -389,8 +389,8 @@ Track chain membership structurally instead of with a one-shot skip counter: whe
 
 ## 7. Negative results and controls (verified, not assumed)
 
-- **Same-directory `.htaccess` vs config `<Files>`** agrees on both servers (Apache `200`, vapache `200`) for `<Files>` and `<FilesMatch>`; the P14-A divergence needs the `.htaccess` section to be *shallower* than the config section.
-- **Inverse depth** (shallow `.htaccess` deny vs deep config grant): Apache `200`, vapache `403` — vapache is *stricter* here, i.e. fail-closed, not part of the finding.
+- **Same-directory `.htaccess` vs config `<Files>`** agrees on both servers (Apache `200`, httpd-rs `200`) for `<Files>` and `<FilesMatch>`; the P14-A divergence needs the `.htaccess` section to be *shallower* than the config section.
+- **Inverse depth** (shallow `.htaccess` deny vs deep config grant): Apache `200`, httpd-rs `403` — httpd-rs is *stricter* here, i.e. fail-closed, not part of the finding.
 - **`<Directory>`-level protection is not affected**: deeper `<Directory …> Require all denied` + shallow `.htaccess Require all granted` → `403` on both.
 - **P14-B**: `RewriteRule [P]` with `$1`/`%{...}` in the authority is still rejected at load (`RewriteRule [P] authority may not be derived from a request capture or variable`); `ProxyPassMatch` expands only `$1`, so `\1` there stays literal and is rejected by the host grammar.
 - **P14-C**: `file('/etc/passwd')` (absolute) and `file('../../etc/passwd')` (parent components) remain rejected (`403`) in `.htaccess`; only the implicit-root fallback is wrong.
@@ -402,8 +402,8 @@ Track chain membership structurally instead of with a one-shot skip counter: whe
 ## 8. How to reproduce
 
 ```sh
-cd /root/vapache
-cargo build --release -p vapached
+cd /root/httpd-rs
+cargo build --release -p httpd-rs
 python3 adversarial/p14/exploit_p14.py            # all cases; Apache oracle on sibling loopback ports
 python3 adversarial/p14/exploit_p14.py A B        # selected groups
 python3 adversarial/p14/exploit_p14.py --keep     # keep dossiers in /tmp/opencode/p14-harness
@@ -412,20 +412,20 @@ python3 adversarial/p14/exploit_p14.py --keep     # keep dossiers in /tmp/openco
 Expected summary (Apache 2.4.69 installed):
 
 ```
-  PASS  P14-A1 deeper <Files> Require deny vs ancestor .htaccess grant       apache=403 vapache=200
-  PASS  P14-A1 deeper <Files> SetHandler default-handler vs ancestor force   apache=200 source / vapache=200 exec
-  PASS  P14-A2 deeper <Files> Basic auth vs ancestor .htaccess grant         apache=401 vapache=200
-  PASS  P14-B  RewriteRule [P] '\1' authority SSRF                           apache=400 vapache=200
-  PASS  P14-B  RewriteRule [P] '%1' substitution SSRF                        apache=200 vapache=200
+  PASS  P14-A1 deeper <Files> Require deny vs ancestor .htaccess grant       apache=403 httpd-rs=200
+  PASS  P14-A1 deeper <Files> SetHandler default-handler vs ancestor force   apache=200 source / httpd-rs=200 exec
+  PASS  P14-A2 deeper <Files> Basic auth vs ancestor .htaccess grant         apache=401 httpd-rs=200
+  PASS  P14-B  RewriteRule [P] '\1' authority SSRF                           apache=400 httpd-rs=200
+  PASS  P14-B  RewriteRule [P] '%1' substitution SSRF                        apache=200 httpd-rs=200
   PASS  P14-C  Require expr file('etc/passwd') escapes to filesystem root
-  PASS  P14-D  duplicate User-Agent skips RewriteCond [F] guard              apache=403 vapache=200
-  PASS  P14-E  failing [C] gate does not skip the whole chain                apache=404 vapache=200
+  PASS  P14-D  duplicate User-Agent skips RewriteCond [F] guard              apache=403 httpd-rs=200
+  PASS  P14-E  failing [C] gate does not skip the whole chain                apache=404 httpd-rs=200
   8/8 differential verdicts
 ```
 
-Each case builds its own fixture tree and starts Apache (`-X`) and vapached on fresh loopback ports with separate pid files (a shared `PidFile` makes whichever server starts second abort with `httpd (pid N) already running` — the pass-11 harness hit the same trap). The harness kills its own process groups; fixtures are removed unless `--keep` is given.
+Each case builds its own fixture tree and starts Apache (`-X`) and httpd-rs on fresh loopback ports with separate pid files (a shared `PidFile` makes whichever server starts second abort with `httpd (pid N) already running` — the pass-11 harness hit the same trap). The harness kills its own process groups; fixtures are removed unless `--keep` is given.
 
-The P14-A `Options -ExecCGI` variant and the `<FilesMatch>` depth variant were verified with standalone runs during the pass (Apache `403`, vapache `200` executing) and are folded into the harness verdicts above.
+The P14-A `Options -ExecCGI` variant and the `<FilesMatch>` depth variant were verified with standalone runs during the pass (Apache `403`, httpd-rs `200` executing) and are folded into the harness verdicts above.
 
 ---
 

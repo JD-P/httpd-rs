@@ -1,4 +1,4 @@
-# vapache adversarial findings — Pass 10
+# httpd-rs adversarial findings — Pass 10
 
 **Target:** the repository commit `HEAD ebfd8a7`
 (`Patch vulnerability`). F60 was built and reproduced from this commit before
@@ -35,28 +35,28 @@ with ordinary HTTP and **no symlink, no upload, and no rewrite state**
   `Options +ExecCGI` plus `AddHandler cgi-script .cgi` then executes an
   uploaded or pre-existing executable under the protected directory.
 * **F60-A:** no `.htaccess` and no `AllowOverride` are needed. A plain
-  `<Directory>` block is enough. Apache returns `403`; vapache executes the
+  `<Directory>` block is enough. Apache returns `403`; httpd-rs executes the
   script and returns `200`.
 * **F60-E:** the mapping root need not be a deployment symlink. An
   attacker-created symlink **inside** the document root (for example from a
   ZIP/plugin/theme extraction or a file manager) to another uploaded file in
   a different in-root directory is enough. `openat2` permits the in-root
   symlink; the canonical target then loses the upload directory's
-  `<Directory> Options -ExecCGI`. Apache returns `403`; vapache executes.
+  `<Directory> Options -ExecCGI`. Apache returns `403`; httpd-rs executes.
 * **F60-B:** an `.htaccess` in an ancestor **above** the symlinked mapping
   root is read by the initial plan (`--explain` shows `Options(2)`) but lost
   by the canonical-target plan. This shows the pass-9 F59 fix is incomplete
   even for the access-file layer it was meant to repair.
 * **F60-C:** the same scope replacement drops `Options -Indexes` (directory
   listings reappear) and `RemoveHandler` (a `.cgi` file Apache serves as
-  source is executed by vapache). `Require`/authentication rules are still
+  source is executed by httpd-rs). `Require`/authentication rules are still
   enforced by the pre-resolution grant, which is why the cleanest
   differential is execution/listing policy rather than a direct `Require`
   bypass.
 * **F60-D:** the pass-9 layer walk is also fail-open for `AllowOverride`
   itself. A lexical `<Directory "/var/www/html"> AllowOverride None` on the
   URL-mapped root does not veto a canonical
-  `<Directory "/srv/app/current/public"> AllowOverride All`. Vapache reads an
+  `<Directory "/srv/app/current/public"> AllowOverride All`. httpd-rs reads an
   attacker-supplied `.htaccess` in the canonical target even though Apache
   ignores it; with `Options +ExecCGI`/`AddHandler` in that `.htaccess` and an
   uploaded executable, this becomes a pure upload-to-RCE primitive with no
@@ -86,9 +86,9 @@ conjoining it with the URL-mapped scope.
 | F61 | Critical | `<Location>` matching | shell-wildcard and `~regex` Location policies are inert; `<Location "/admin/*"> Require all denied` / `Options -ExecCGI` is bypassed; protected CGI executes | Apache-valid wildcard or regex Location used for security |
 | F62 | Critical | `<Directory>` / `<Files>` glob | `[^...]` negation is inverted (treated as literal `^`); deny/Options applies to the opposite path set; protected CGI executes | Apache-valid shell-glob rule using `[^...]` |
 | F63 | Critical | `<If>` / `RewriteCond expr` | missing `REQUEST_FILENAME`/`SCRIPT_FILENAME` variables and confined absolute file tests evaluate false; deny or `Options -ExecCGI` guarded by them is skipped; protected CGI executes | Apache-valid expression using an unimplemented variable or an absolute file test |
-| F64 | Critical | `SetHandler` vs `AddHandler` | later `AddHandler` overrides inherited `SetHandler default-handler`; Apache serves source, vapache executes CGI | same-block or child-scope AddHandler (including writable `.htaccess`) after a SetHandler deny |
-| F65 | Critical | `ScriptAlias` handler override | scoped `SetHandler default-handler` ignored for ScriptAlias targets; Apache serves source, vapache executes | ScriptAlias tree plus a per-directory/file/URL handler disable |
-| F66 | Medium | `<DirectoryMatch>` trailing slash | `"/private/$"` misses the directory request; Apache 403, vapache 200 autoindex | anchored DirectoryMatch used for directory policy |
+| F64 | Critical | `SetHandler` vs `AddHandler` | later `AddHandler` overrides inherited `SetHandler default-handler`; Apache serves source, httpd-rs executes CGI | same-block or child-scope AddHandler (including writable `.htaccess`) after a SetHandler deny |
+| F65 | Critical | `ScriptAlias` handler override | scoped `SetHandler default-handler` ignored for ScriptAlias targets; Apache serves source, httpd-rs executes | ScriptAlias tree plus a per-directory/file/URL handler disable |
+| F66 | Medium | `<DirectoryMatch>` trailing slash | `"/private/$"` misses the directory request; Apache 403, httpd-rs 200 autoindex | anchored DirectoryMatch used for directory policy |
 | F67 | Critical | `[PT]` rewrite semantics | `[PT]` parsed but ignored; absolute substitution is executed as a host file instead of URL-mapped; protected PHP/CGI executes while Apache 404s | one Apache-valid `RewriteRule ... [PT,L]` with an absolute substitution under DocumentRoot; a PHP/CGI handler |
 | F68 | Critical | rewrite filesystem override state | an earlier filesystem override is sticky across rewrite rounds; a later `[L]` URL rewrite is ignored and the earlier file executes | two rewrite rules: earlier absolute substitution with no `[L]`, later URL fallback with `[L]`; global handler |
 | F69 | Critical | handler identity vs lexical filename | handler selected from canonical symlink target basename; a non-CGI URL executes `.php`/`.cgi` target and bypasses URL policy | in-root symlink with non-script name to a script; global AddHandler |
@@ -152,7 +152,7 @@ AddHandler cgi-script .cgi
 
 No `.htaccess` file and no `AllowOverride` directive are involved. Apache
 2.4.69 reads the lexical `<Directory>` rule and refuses the request with
-`403 Options ExecCGI is off in this directory`. Vapache returns `200` and
+`403 Options ExecCGI is off in this directory`. httpd-rs returns `200` and
 executes the script.
 
 A local proof uses an exact copy of `/bin/sh` as a stand-in for any uploaded
@@ -166,20 +166,20 @@ chmod 755 /srv/app/current/public/uploads/sh.cgi
 printf "printf 'Content-Type: text/plain\r\n\r\n'; id; cat /etc/hostname\n" > /tmp/payload
 ```
 
-Observed with the equivalent Apache and vapache configurations:
+Observed with the equivalent Apache and httpd-rs configurations:
 
 ```text
 Apache : 403
-vapache: 200
+httpd-rs: 200
 uid=33(www-data) gid=33(www-data) groups=33(www-data)
 debian
 ```
 
-The diagnostic on vapache shows that the initial plan is correct and still
+The diagnostic on httpd-rs shows that the initial plan is correct and still
 contains the child rule:
 
 ```text
-$ ./target/release/vapached -f vp.conf --explain /uploads/sh.cgi --explain-method POST
+$ ./target/release/httpd-rs -f vp.conf --explain /uploads/sh.cgi --explain-method POST
   canonical_url_path: /uploads/sh.cgi
   document_root: /tmp/opencode/p10-poc/tree/www/html
   fs_path: /tmp/opencode/p10-poc/tree/www/html/uploads/sh.cgi
@@ -194,7 +194,7 @@ when the canonical target is reauthorized.
 
 A control run with the `<Directory "/var/www/html/uploads">` block removed
 returns `200` from both servers, proving the `403` differential is caused by
-the child `<Directory>` policy that vapache loses.
+the child `<Directory>` policy that httpd-rs loses.
 
 ### 2. F60-A/alias — the same bypass through a symlinked `Alias` target
 
@@ -216,7 +216,7 @@ Request `POST /up/sh.cgi` with the shell body:
 
 ```text
 Apache : 403
-vapache: 200
+httpd-rs: 200
 uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ```
 
@@ -258,7 +258,7 @@ A direct request to `/uploads/link.cgi`:
 
 ```text
 Apache : 403
-vapache: 200
+httpd-rs: 200
 INTREE-SYMLINK-RCE
 ```
 
@@ -276,7 +276,7 @@ the web tree,” which is ordinary archive-extraction behavior in many PHP and
 plugin ecosystems. The symlink target need not be attacker-uploaded either;
 a pre-existing executable elsewhere in the document root works just as well.
 For example, with `uploads/link.cgi -> ../cgi-bin/admin.cgi`, Apache returns
-`403` and vapache executes the existing administrative CGI (`200`), even
+`403` and httpd-rs executes the existing administrative CGI (`200`), even
 though the upload directory's policy forbids CGI.
 
 ### 3. F60-B — ancestor `.htaccess` above the symlinked mapping root
@@ -322,7 +322,7 @@ The request still executes:
 
 ```text
 Apache : 403
-vapache: 200
+httpd-rs: 200
 PWNED-ANCESTOR-HTCESS
 ```
 
@@ -336,9 +336,9 @@ above the root, even though the initial F50 access walk does.
 The same scope replacement also loses:
 
 * `Options -Indexes` in `<Directory "/var/www/html/list">`: Apache `403`,
-  vapache `200` with an autoindex body listing `wallet.dat`.
+  httpd-rs `200` with an autoindex body listing `wallet.dat`.
 * `RemoveHandler .cgi` in `<Directory "/var/www/html/admin">`: Apache serves
-  the script as source (`200` with `#!/bin/sh...`), vapache executes it
+  the script as source (`200` with `#!/bin/sh...`), httpd-rs executes it
   (`200` with command output).
 
 These are the same root cause; they matter because `Options -Indexes` leaks
@@ -358,7 +358,7 @@ AddHandler cgi-script .cgi
 </Directory>
 ```
 
-returns `403` from Apache and `200` with command output from vapache for a
+returns `403` from Apache and `200` with command output from httpd-rs for a
 direct request to an executable under the root. The child-directory form is
 used above only because it makes the intended “protect uploads” policy
 obvious.
@@ -400,14 +400,14 @@ printf 'Content-Type: text/plain\r\n\r\nUPLOADED-HTCESS-RCE\n'
 ```
 
 Apache applies `<Directory "/var/www/html"> AllowOverride None` to the lexical
-URL path, ignores `uploads/.htaccess`, and serves the script as source. Vapache
+URL path, ignores `uploads/.htaccess`, and serves the script as source. httpd-rs
 reads the canonical target `.htaccess`, applies `Options +ExecCGI` and
 `AddHandler`, and executes it:
 
 ```text
 Apache : 200  #!/bin/sh
          # printf 'Content-Type: text/plain\r\n\r\nUPLOADED-HTCESS-RCE\n'
-vapache: 200
+httpd-rs: 200
          UPLOADED-HTCESS-RCE
 ```
 
@@ -415,13 +415,13 @@ A control with `<Directory "/srv/app/current/public"> AllowOverride None`
 makes both servers serve the source, proving the canonical
 `AllowOverride All` is the switch that opens the fail-open branch. A second
 control with `<Directory "/var/www/html"> AllowOverride All` makes both
-servers execute, confirming that the lexical `None` is the denial vapache
+servers execute, confirming that the lexical `None` is the denial httpd-rs
 fails to enforce.
 
 The same differential works when only the upload directory is denied:
 `<Directory "/var/www/html/uploads"> AllowOverride None` with the canonical
 root still `AllowOverride All`. Apache serves the uploaded script as source;
-vapache applies the canonical root override and executes it. This is the more
+httpd-rs applies the canonical root override and executes it. This is the more
 focused hardening shape: the operator disables overrides exactly where
 attacker uploads land.
 
@@ -451,13 +451,13 @@ These were reproduced against a pristine `HEAD ebfd8a7` export/worktree with
 Apache 2.4.69 on loopback. They do not depend on the F60 patch, and most do
 not require a symlink or an upload. The exact fixtures are under
 `/tmp/opencode/`; the clean HEAD binary used for final verification is
-`/tmp/opencode/vapache-head/target/release/vapached` (SHA-256
+`/tmp/opencode/httpd-rs-head/target/release/httpd-rs` (SHA-256
 `ce9a53d905d9122675acde6fea446baec6cb9910573e62e40ae2a9d15aa1cfde`).
 
 ### F61. Critical: `<Location>` wildcards and `~regex` form are inert
 
 Apache supports shell-wildcard `<Location>` patterns and the
-`<Location ~ "regex">` form. Vapache stores the entire argument as a literal
+`<Location ~ "regex">` form. httpd-rs stores the entire argument as a literal
 prefix and never expands wildcards or parses the `~` form
 (`config.rs:4850-4863`; definition `config.rs:1319-1327`).
 
@@ -477,7 +477,7 @@ Request `GET /admin/sh.cgi`:
 
 ```text
 Apache  : 403
-vapache : 200 EXECUTED
+httpd-rs : 200 EXECUTED
 ```
 
 The same bypass works for `<Location "/admin/*"> Options -ExecCGI`,
@@ -489,7 +489,7 @@ is involved. **Confidence: high.**
 
 ### F62. Critical: shell-glob `[^...]` negation is inverted
 
-Apache treats both `[!a]` and `[^a]` as negated character classes. Vapache's
+Apache treats both `[!a]` and `[^a]` as negated character classes. httpd-rs's
 `glob_match()` only recognizes `!`; a leading `^` is treated as a literal
 class member (`config.rs:2153-2185`). `files_glob_to_regex()` explicitly
 escapes a leading `^` (`config.rs:5236-5265`), so `<Files>` is inverted too.
@@ -504,10 +504,10 @@ AddHandler cgi-script .cgi
 ```
 
 ```text
-/zdir/z.txt   Apache 403, vapache 200
-/adir/a.txt   Apache 200, vapache 403
-/zdir/sh.cgi  Apache 403, vapache 200 "Z-EXECUTED"
-/adir/sh.cgi  Apache 200, vapache 403
+/zdir/z.txt   Apache 403, httpd-rs 200
+/adir/a.txt   Apache 200, httpd-rs 403
+/zdir/sh.cgi  Apache 403, httpd-rs 200 "Z-EXECUTED"
+/adir/sh.cgi  Apache 200, httpd-rs 403
 ```
 
 `<Files "[^a]*"> Require all denied` has the same inversion. The control
@@ -534,14 +534,14 @@ AddHandler cgi-script .cgi
 ```text
 GET /private/sh.cgi
 Apache  : 403
-vapache : 200 EXECUTED
+httpd-rs : 200 EXECUTED
 ```
 
 The same is reproduced with `<If "%{REQUEST_FILENAME} =~ /private/">
 Require all denied`, top-level `SCRIPT_FILENAME`, and
 `RewriteCond expr "%{REQUEST_FILENAME} =~ /secret/"` + `[F]`. The
 main-configuration absolute test `<If "-f '/tmp/opencode/ifabs/maintenance.flag'">
-Require all denied` also fails false in vapache when the flag exists outside
+Require all denied` also fails false in httpd-rs when the flag exists outside
 DocumentRoot, while Apache honors it. `%{REQUEST_URI}` in the same position
 is enforced by both, and removing the `<If>` block restores execution.
 **Confidence: high** for the missing-variable and rewrite forms; the absolute
@@ -566,13 +566,13 @@ reverse and returns the last match (`config.rs:725-748`). Apache keeps
 ```text
 GET /uploads/sh.cgi
 Apache  : 200 source "#!/bin/sh..."
-vapache : 200 EXECUTED
+httpd-rs : 200 EXECUTED
 ```
 
 A more security-relevant variant uses a parent
 `SetHandler default-handler`, `AllowOverride FileInfo`, and an attacker
 `.htaccess` containing `AddHandler cgi-script .cgi`; Apache serves source,
-vapache executes. Removing `SetHandler` makes both execute. **Confidence:
+httpd-rs executes. Removing `SetHandler` makes both execute. **Confidence:
 high.**
 
 ### F65. Critical: `ScriptAlias` ignores scoped `SetHandler default-handler`
@@ -592,7 +592,7 @@ ScriptAlias /cgi-bin/ "/tmp/opencode/sa_seth/www/cgi-bin/"
 ```text
 GET /cgi-bin/sh.cgi
 Apache  : 200 source "#!/bin/sh..."
-vapache : 200 EXECUTED
+httpd-rs : 200 EXECUTED
 ```
 
 The same bypass works with `<Files "sh.cgi"> SetHandler default-handler` and
@@ -616,7 +616,7 @@ Options +Indexes
 ```text
 GET /private/
 Apache  : 403
-vapache : 200 autoindex listing
+httpd-rs : 200 autoindex listing
 ```
 
 The listing can expose directory contents; with `DirectoryIndex index.cgi`
@@ -650,14 +650,14 @@ Request `GET /app/secret/secret.php`:
 
 ```text
 Apache  : 404 Not Found
-vapache : 200 P11-PT-PHP-RCE uid=33
+httpd-rs : 200 P11-PT-PHP-RCE uid=33
 direct GET /secret/secret.php: 403 on both
 ```
 
 The CGI form with `Options +ExecCGI` / `AddHandler cgi-script .cgi` gives
-Apache `404`, vapache `200 P11-PT-CGI-RCE uid=33`. Apache passes the
+Apache `404`, httpd-rs `200 P11-PT-CGI-RCE uid=33`. Apache passes the
 substitution through URL mapping (`$DOCUMENT_ROOT/tmp/...`) and finds
-nothing; vapache executes the host file. No symlink or upload required.
+nothing; httpd-rs executes the host file. No symlink or upload required.
 **Confidence: high.**
 
 ### F68. Critical: filesystem override is sticky across rewrite rounds
@@ -679,12 +679,12 @@ Request `GET /app/secret/secret.php`:
 
 ```text
 Apache  : 200 INDEX-PAGE
-vapache : 200 P11-STICKY-ADD-PHP-RCE uid=33
+httpd-rs : 200 P11-STICKY-ADD-PHP-RCE uid=33
 direct GET /secret/secret.php: 403 on both
 ```
 
 The CGI variant (global `Options +ExecCGI` + `AddHandler cgi-script .cgi`)
-gives Apache `200 INDEX-PAGE`, vapache `200 DOCROOT-STICKY-RCE`. A control
+gives Apache `200 INDEX-PAGE`, httpd-rs `200 DOCROOT-STICKY-RCE`. A control
 with the second rule removed returns the script output from both servers,
 confirming the later `[L]` fallback is what should have won. No symlink or
 upload required. **Confidence: high.**
@@ -712,12 +712,12 @@ www/public/link.txt -> ../secret/secret.php
 ```text
 GET /public/link.txt
 Apache  : 200 source of secret.php
-vapache : 200 P11-B-ADD-PHP-RCE uid=33
+httpd-rs : 200 P11-B-ADD-PHP-RCE uid=33
 direct GET /secret/secret.php: 403 on both
 ```
 
 The CGI variant `public/link.txt -> ../secret/secret.cgi` with
-`AddHandler cgi-script .cgi` gives Apache source, vapache
+`AddHandler cgi-script .cgi` gives Apache source, httpd-rs
 `SYMLINK-CGI-RAN`. This requires an in-root symlink (deployment or
 attacker-created); unlike F60-E it does not depend on a `<Directory>
 Options -ExecCGI` loss: both lexical and canonical `<Directory>` scopes
@@ -987,19 +987,19 @@ Rewrite state:
 ### Regression tests to add
 
 * Symlinked `DocumentRoot` + `<Directory root/uploads> Options -ExecCGI`,
-  with **no** `.htaccess` and `AllowOverride None`; assert Apache and vapache
+  with **no** `.htaccess` and `AllowOverride None`; assert Apache and httpd-rs
   both `403`, and assert a `POST` body cannot execute.
 * Same for a symlinked `Alias`, `AliasMatch` and single-file alias target.
 * An attacker-created symlink **inside** an ordinary `DocumentRoot`
   (`uploads/link.cgi -> ../payload/sh.cgi`) with `<Directory uploads>
-  Options -ExecCGI`; assert Apache `403` and vapache does not execute.
+  Options -ExecCGI`; assert Apache `403` and httpd-rs does not execute.
 * Ancestor `.htaccess` above the symlinked mapping root with
   `Options -ExecCGI`, `RemoveHandler .cgi`, and `SetHandler none`.
 * `<Directory root/list> Options -Indexes`; assert both `403` and no listing.
 * Lexical `<Directory link> AllowOverride None` plus canonical
   `<Directory real> AllowOverride All`, with an attacker `.htaccess`
   (`Options +ExecCGI`/`AddHandler`) and an executable upload; assert Apache
-  serves source and vapache does not execute (and a control with canonical
+  serves source and httpd-rs does not execute (and a control with canonical
   `AllowOverride None` where both serve source).
 * `DirectoryIndex index.cgi` and `ErrorDocument ... /admin/err.cgi` variants
   where the index/error target is in the protected directory.
@@ -1060,7 +1060,7 @@ Rewrite state:
   During the pass a concurrent session left an in-progress F60 remediation in
   the main working tree (`git status` is dirty). Findings are against the
   pristine `HEAD ebfd8a7`, and final F61-F69 verification used the clean
-  detached worktree `/tmp/opencode/vapache-head` built at that commit
+  detached worktree `/tmp/opencode/httpd-rs-head` built at that commit
   (SHA-256 `ce9a53d905d9122675acde6fea446baec6cb9910573e62e40ae2a9d15aa1cfde`).
 * Reproduction drivers used for the F60 report:
   `/tmp/opencode/p10_poc.py` (F60-A, alias and `.htaccess` controls),
@@ -1079,7 +1079,7 @@ Rewrite state:
 * The F60 results were captured with a `HEAD ebfd8a7` release build before the
   concurrent patch landed. The F61-F69 final verification used the clean
   worktree binary listed above; the main tree's current
-  `target/release/vapached` was rebuilt by the concurrent session and is not
+  `target/release/httpd-rs` was rebuilt by the concurrent session and is not
   the binary used for the reported HEAD differentials.
 * Apache 2.4.69 was started with private loopback configurations and only the
   modules needed for `<Directory>`, `Options`, `AddHandler`, CGI,
@@ -1090,5 +1090,5 @@ Rewrite state:
   `<Directory>` policy disabled is executed in the same way without an upload.
 * The control runs remove the `<Directory>` block or the ancestor `.htaccess`
   and show both servers return `200`; the `403` differential is therefore
-  caused by the policy that vapache loses, not by an Apache/vapache
+  caused by the policy that httpd-rs loses, not by an Apache/httpd-rs
   configuration mismatch.

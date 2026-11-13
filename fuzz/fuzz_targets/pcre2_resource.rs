@@ -6,8 +6,8 @@
 // keeps production defaults active and mutates every public resource knob.
 
 use libfuzzer_sys::fuzz_target;
-use vapache_pcre2::bytes::{Regex, RegexBuilder};
-use vapache_pcre2::ErrorKind;
+use httpd_rs_pcre2::bytes::{Regex, RegexBuilder};
+use httpd_rs_pcre2::ErrorKind;
 
 type CaptureSpans = Vec<Option<(usize, usize)>>;
 

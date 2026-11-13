@@ -1,4 +1,4 @@
-//! Audited Linux process, descriptor, and syscall boundary for Vapache.
+//! Audited Linux process, descriptor, and syscall boundary for httpd-rs.
 //!
 //! This crate is the only production crate permitted to contain Rust
 //! `unsafe` blocks.  Its public API owns successful descriptors immediately,
@@ -377,7 +377,7 @@ pub fn fork_single_threaded() -> io::Result<ForkResult> {
         ));
     }
     // SAFETY[OS027]: /proc confirms this process has one task immediately
-    // before the startup-only fork; no Vapache thread creation is permitted
+    // before the startup-only fork; no httpd-rs thread creation is permitted
     // before this boundary.
     let pid = unsafe { libc::fork() };
     match pid {
@@ -1004,7 +1004,7 @@ pub fn daemonize() -> io::Result<()> {
         ));
     }
     // SAFETY[OS069]: the process has exactly one task and daemonization occurs
-    // before any Vapache background service is initialized.
+    // before any httpd-rs background service is initialized.
     let first = unsafe { libc::fork() };
     if first < 0 {
         return Err(io::Error::last_os_error());
@@ -1253,7 +1253,7 @@ mod tests {
         command
             .arg("-c")
             .arg("test -r /proc/self/fd/$1 && test ! -e /proc/self/fd/$2")
-            .arg("vapache-os-test")
+            .arg("httpd-rs-os-test")
             .arg(retained.as_raw_fd().to_string())
             .arg(unrelated.as_raw_fd().to_string())
             .stdin(Stdio::null())

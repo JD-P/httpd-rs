@@ -1,0 +1,27 @@
+:root {
+  --md-primary-fg-color: #17364a;
+  --md-primary-fg-color--light: #285b73;
+  --md-primary-fg-color--dark: #0d2635;
+  --md-accent-fg-color: #d4672f;
+  --md-text-font: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --md-code-font: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #102a3a;
+  --md-accent-fg-color: #f59a5b;
+}
+
+.md-typeset h1,
+.md-typeset h2 {
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+.md-typeset code {
+  border-radius: 0.2rem;
+}
+
+.md-header__topic:first-child {
+  font-weight: 700;
+}

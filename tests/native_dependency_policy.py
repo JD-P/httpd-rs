@@ -20,7 +20,7 @@ def fail(message: str) -> None:
 def check_source_policy() -> None:
     manifest = (ROOT / "crates" / "server" / "Cargo.toml").read_text()
     if '\npcre2 = ' in manifest or 'package = "pcre2"' in manifest:
-        fail("vapached must not have a production dependency on the C-backed pcre2 crate")
+        fail("httpd-rs must not have a production dependency on the C-backed pcre2 crate")
     engine = (ROOT / "crates" / "pcre2" / "src" / "lib.rs").read_text()
     if "unsafe {" in engine or "unsafe fn" in engine:
         fail("the in-tree regex engine must remain free of unsafe Rust")

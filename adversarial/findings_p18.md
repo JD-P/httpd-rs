@@ -1,19 +1,19 @@
 # Pass 18 — adversarial break of HEAD `b8f68b5` ("Harden policy identity and proxy byte handling")
 
 - **Date:** 2026-10-28
-- **Subject:** `target/release/vapached` built at HEAD `b8f68b5`. No product source was edited. The retained additions for this pass are `adversarial/p18/exploit_p18.py`, this write-up and the `adversarial/README.md` index entry.
+- **Subject:** `target/release/httpd-rs` built at HEAD `b8f68b5`. No product source was edited. The retained additions for this pass are `adversarial/p18/exploit_p18.py`, this write-up and the `adversarial/README.md` index entry.
 - **Oracle:** Apache/2.4.69 (Debian), `/usr/sbin/apache2 -X`, with `mod_proxy_fcgi` and `mod_cgi`; PHP-FPM 8.4.27 for the PHP cases. Loopback only.
 - **Harness:** `adversarial/p18/exploit_p18.py` — **14 differential verdicts** across a PHP-FPM chain (A) and a CGI chain (B), with scoped-target, no-access-file, plain-`Require` and `AllowOverride AuthConfig` parity controls.
 - **Retained evidence:** `/tmp/opencode/p18-harness` (fixtures, per-case Apache error logs, FPM access log and private FPM pool).
-- **Method:** targeted audit of the `AllowOverrideList` admission predicate in `htaccess.rs`, followed by a live Apache-versus-vapache differential against a file-scoped upload-execution guard.
+- **Method:** targeted audit of the `AllowOverrideList` admission predicate in `htaccess.rs`, followed by a live Apache-versus-httpd-rs differential against a file-scoped upload-execution guard.
 
 ---
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
-| **P18-A** | With `AllowOverride None` plus `AllowOverrideList Require`, an attacker-written `.htaccess` can contain a `<Files>` or `<FilesMatch>` section. Apache rejects the section itself (`500`, fail closed); vapache parses it unconditionally, permits the inner listed `Require`, and applies its file-scoped grant over the main `<FilesMatch ...> Require all denied` guard | `500`; `.htaccess: <Files not allowed here` (or `<FilesMatch not allowed here`) | `200`; uploaded PHP executes as the FPM worker (`PHPEXEC … uid=33`) or uploaded CGI executes as `www-data` (`EXEC uid=33`) | remote code execution / access-file section-gating bypass |
+| **P18-A** | With `AllowOverride None` plus `AllowOverrideList Require`, an attacker-written `.htaccess` can contain a `<Files>` or `<FilesMatch>` section. Apache rejects the section itself (`500`, fail closed); httpd-rs parses it unconditionally, permits the inner listed `Require`, and applies its file-scoped grant over the main `<FilesMatch ...> Require all denied` guard | `500`; `.htaccess: <Files not allowed here` (or `<FilesMatch not allowed here`) | `200`; uploaded PHP executes as the FPM worker (`PHPEXEC … uid=33`) or uploaded CGI executes as `www-data` (`EXEC uid=33`) | remote code execution / access-file section-gating bypass |
 
 The exploit shape is a direct upload; it needs **no symlink**, no path traversal, and no FastCGI `SCRIPT_FILENAME` trick. An attacker who can write `.htaccess` into an upload directory, and can upload a PHP/CGI script there, adds:
 
@@ -36,15 +36,15 @@ The directory's main configuration is:
 </Directory>
 ```
 
-Apache treats `AllowOverrideList Require` as permission for the **directive** `Require` only. A container section is not itself one of the listed directives, so Apache aborts the access file with `500` and never reaches the handler. Vapache's parser admits the container without consulting the list, then admits the inner `Require` because `Require` is in the list. The section's grant is scoped to `shell.php`, overrides the outer file-scoped deny, and the uploaded PHP/CGI is executed by the already-configured handler.
+Apache treats `AllowOverrideList Require` as permission for the **directive** `Require` only. A container section is not itself one of the listed directives, so Apache aborts the access file with `500` and never reaches the handler. httpd-rs's parser admits the container without consulting the list, then admits the inner `Require` because `Require` is in the list. The section's grant is scoped to `shell.php`, overrides the outer file-scoped deny, and the uploaded PHP/CGI is executed by the already-configured handler.
 
-The scoped `ok.php`/`ok.cgi` control remains `403` on vapache, so the bypass is not a blanket directory grant. Apache returns `500` for both names because the attacker's access file itself is invalid under its configuration.
+The scoped `ok.php`/`ok.cgi` control remains `403` on httpd-rs, so the bypass is not a blanket directory grant. Apache returns `500` for both names because the attacker's access file itself is invalid under its configuration.
 
 ---
 
 ## 2. Observed differential
 
-The harness uses sibling loopback instances of Apache and vapached with the same fixture. The main configuration for **A** uses a per-directory FastCGI handler (`P18-A`), a parent `<FilesMatch>` handler (`P18-A2b`), or the same outer deny with an access-file `<FilesMatch>` instead of `<Files>` (`P18-A2`). **B** uses `AddHandler cgi-script .cgi` plus `Options +ExecCGI`.
+The harness uses sibling loopback instances of Apache and httpd-rs with the same fixture. The main configuration for **A** uses a per-directory FastCGI handler (`P18-A`), a parent `<FilesMatch>` handler (`P18-A2b`), or the same outer deny with an access-file `<FilesMatch>` instead of `<Files>` (`P18-A2`). **B** uses `AddHandler cgi-script .cgi` plus `Options +ExecCGI`.
 
 ### 2.1 PHP-FPM: uploaded PHP becomes `www-data`
 
@@ -56,7 +56,7 @@ PHPEXEC who=probe uid=33 marker=S3CRET wrote=yes
 
 Observed:
 
-| Case | Apache 2.4.69 | vapache HEAD |
+| Case | Apache 2.4.69 | httpd-rs HEAD |
 |---|---|---|
 | `P18-A` `<Files "shell.php"> Require all granted`, per-directory FastCGI handler | `500`; `PWNED` absent | `200`; `PHPEXEC who=probe uid=33 marker=S3CRET wrote=yes`; `PWNED who=probe uid=33` written |
 | `P18-A` same `.htaccess`, `/uploads/ok.php` (outside the `<Files>` grant) | `500`; `PWNED` absent | `403 Forbidden`; `PWNED` absent |
@@ -75,7 +75,7 @@ The Apache error log for the exploit case contains:
 [core:alert] ... /tmp/opencode/p18-harness/P18-A-php-allowoverridelist/www/uploads/.htaccess: <Files not allowed here
 ```
 
-The FPM access log records the backend execution on vapache:
+The FPM access log records the backend execution on httpd-rs:
 
 ```text
 /tmp/opencode/p18-harness/P18-A-php-allowoverridelist/www/uploads/shell.php|/uploads/shell.php
@@ -87,7 +87,7 @@ There is no FPM line for the Apache request because Apache rejects the access fi
 
 The same access-file section against a CGI handler (`AddHandler cgi-script .cgi`, `Options +ExecCGI`, outer `<FilesMatch "\.cgi$"> Require all denied`) produces:
 
-| Case | Apache 2.4.69 | vapache HEAD |
+| Case | Apache 2.4.69 | httpd-rs HEAD |
 |---|---|---|
 | `P18-B` `<Files "shell.cgi"> Require all granted` | `500`; `PWNED` absent | `200`; `EXEC uid=33 who=probe`; `PWNED who=probe uid=33` written |
 | `P18-B` `/uploads/ok.cgi` | `500`; `PWNED` absent | `403`; `PWNED` absent |
@@ -95,14 +95,14 @@ The same access-file section against a CGI handler (`AddHandler cgi-script .cgi`
 | `P18-B3` plain top-level `Require all granted` | `403` | `403` |
 | `P18-B4` `AllowOverride AuthConfig` plus the section | `200`; `EXEC uid=33` | `200`; `EXEC uid=33` |
 
-The CGI script is a normal uploaded executable script (mode `0755`). Its output and the `pwned.txt` side effect show that vapache's handler path is not merely serving source: it runs the script as the worker user. Apache's `500` is a fail-closed response to the invalid `.htaccess`.
+The CGI script is a normal uploaded executable script (mode `0755`). Its output and the `pwned.txt` side effect show that httpd-rs's handler path is not merely serving source: it runs the script as the worker user. Apache's `500` is a fail-closed response to the invalid `.htaccess`.
 
 ### 2.3 What the controls rule out
 
 - **The outer guard is live without the access file.** `P18-A3`/`P18-B2`: both servers return `403` for the same uploaded script when no `.htaccess` is present.
 - **A plain `Require` is not enough.** `P18-A4`/`P18-B3`: a top-level `.htaccess` `Require all granted` is accepted by Apache under the allow-list, but both servers still return `403`; the main `<FilesMatch>` deny is more specific. The attacker needs a file-scoped section.
-- **The result is scoped.** The exact-name `<Files>` section grants `shell.php` only; `ok.php` remains `403` on vapache (Apache `500` for both because the access file is invalid).
-- **The section is valid under ordinary category overrides.** `P18-A5`/`P18-B4`: `AllowOverride AuthConfig` with the same section returns `200` on both servers. The bug is not “vapache allows `<Files>` sections”; it is “vapache allows the section under `AllowOverrideList` where Apache does not.”
+- **The result is scoped.** The exact-name `<Files>` section grants `shell.php` only; `ok.php` remains `403` on httpd-rs (Apache `500` for both because the access file is invalid).
+- **The section is valid under ordinary category overrides.** `P18-A5`/`P18-B4`: `AllowOverride AuthConfig` with the same section returns `200` on both servers. The bug is not “httpd-rs allows `<Files>` sections”; it is “httpd-rs allows the section under `AllowOverrideList` where Apache does not.”
 - **The FPM/CGI backend is otherwise functional.** A5/B4 parity demonstrates the handler and script; the exploit difference is the access-file admission, not a broken backend.
 
 ---
@@ -128,7 +128,7 @@ The first sentence is correct for a **directive** admitted by the list. The seco
 .htaccess: <Files not allowed here
 ```
 
-Apache's category-based `AllowOverride AuthConfig`/`FileInfo` does allow these containers (our A5/B4 controls), so the model is right for categories and wrong for the directive-only list. The practical consequence is a fail-open policy: Apache returns `500`; vapache applies the file-scoped grant and continues.
+Apache's category-based `AllowOverride AuthConfig`/`FileInfo` does allow these containers (our A5/B4 controls), so the model is right for categories and wrong for the directive-only list. The practical consequence is a fail-open policy: Apache returns `500`; httpd-rs applies the file-scoped grant and continues.
 
 ### 3.2 The parser branch
 
@@ -187,11 +187,11 @@ fn directive_allowed_list(
 
 With `AllowOverrideList Require`, the inner `Require` passes because its name is in the allow-list. The container never reaches an equivalent gate. The resulting `ScopeRule` is a file-phase rule (`MatchKind::Files`/`FilesMatch`), so it is applied to the request's basename after the main `<FilesMatch ...> Require all denied` of the uploads directory and the section-scoped grant wins for `shell.php`.
 
-In short: the code and documentation model `AllowOverrideList` as a union of individually admitted directives, but Apache also gates the **section wrapper**. Vapache applies the wrapper and the inner listed directive, turning a fail-closed Apache configuration into a fail-open vapache one.
+In short: the code and documentation model `AllowOverrideList` as a union of individually admitted directives, but Apache also gates the **section wrapper**. httpd-rs applies the wrapper and the inner listed directive, turning a fail-closed Apache configuration into a fail-open httpd-rs one.
 
 ### 3.3 Why the file-scoped wrapper matters
 
-The attacker cannot use a top-level `Require all granted` for this bypass: under the same allow-list, Apache and vapache both accept it, but the main `<FilesMatch>` deny is still more specific and both return `403` (A4/B3). The `<Files>`/`<FilesMatch>` section is the mechanism that targets the denied basename; vapache permits it, Apache rejects it. The unit of the bypass is therefore the **container**, not merely the `Require` directive.
+The attacker cannot use a top-level `Require all granted` for this bypass: under the same allow-list, Apache and httpd-rs both accept it, but the main `<FilesMatch>` deny is still more specific and both return `403` (A4/B3). The `<Files>`/`<FilesMatch>` section is the mechanism that targets the denied basename; httpd-rs permits it, Apache rejects it. The unit of the bypass is therefore the **container**, not merely the `Require` directive.
 
 ---
 
@@ -222,7 +222,7 @@ The `AllowOverrideList Require` is intended to permit small, per-directory autho
 </Directory>
 ```
 
-Both forms were tested (A and A2b); both execute on vapache and return `500` on Apache after the access-file section is added.
+Both forms were tested (A and A2b); both execute on httpd-rs and return `500` on Apache after the access-file section is added.
 
 Attacker steps:
 
@@ -239,7 +239,7 @@ Observed on the harness:
 
 ```text
 Apache:  500  <Files not allowed here (access file rejected)
-vapache: 200  PHPEXEC who=probe uid=33 marker=S3CRET wrote=yes
+httpd-rs: 200  PHPEXEC who=probe uid=33 marker=S3CRET wrote=yes
               pwned.txt: PWNED who=probe uid=33
 ```
 
@@ -269,24 +269,24 @@ With an uploaded `shell.cgi` and `.htaccess`:
 </Files>
 ```
 
-Apache returns `500` (`<Files not allowed here`); vapache returns `200` and runs the script as `www-data`:
+Apache returns `500` (`<Files not allowed here`); httpd-rs returns `200` and runs the script as `www-data`:
 
 ```text
 EXEC uid=33 who=probe
 pwned.txt: PWNED who=probe uid=33
 ```
 
-`ok.cgi` remains `403` on vapache, so the grant is scoped to the attacker's filename.
+`ok.cgi` remains `403` on httpd-rs, so the grant is scoped to the attacker's filename.
 
 ---
 
 ## 5. Impact and preconditions
 
-**Impact.** A remote attacker who can write `.htaccess` and a PHP/CGI script into an affected upload directory obtains **remote code execution as the web-worker user** on vapache. The harness demonstrates this with both a PHP-FPM backend and a POSIX CGI backend. The attacker can read files available to the worker (the harness reads a file outside the web root), write files in the upload tree, and run arbitrary commands through the executed script. Apache's response is a fail-closed `500`; the same access file does not execute there.
+**Impact.** A remote attacker who can write `.htaccess` and a PHP/CGI script into an affected upload directory obtains **remote code execution as the web-worker user** on httpd-rs. The harness demonstrates this with both a PHP-FPM backend and a POSIX CGI backend. The attacker can read files available to the worker (the harness reads a file outside the web root), write files in the upload tree, and run arbitrary commands through the executed script. Apache's response is a fail-closed `500`; the same access file does not execute there.
 
 **Preconditions.**
 
-1. **Write access to an access file and a script** in a directory served by vapache. This is the same upload/`.htaccess` primitive used by the other access-file findings; the application must permit the `.htaccess` name (directly or through a rename/upload path).
+1. **Write access to an access file and a script** in a directory served by httpd-rs. This is the same upload/`.htaccess` primitive used by the other access-file findings; the application must permit the `.htaccess` name (directly or through a rename/upload path).
 2. **A directive-only override policy**: `AllowOverride None` plus a nonempty `AllowOverrideList` containing `Require` (or an equivalent policy that admits the inner `Require` but not the section). The exact hardening posture in the fixture is `AllowOverrideList Require`. This is not the Apache default, but it is a valid least-privilege configuration.
 3. **An execution handler for the uploaded script**: a per-directory or parent FastCGI `SetHandler`, or CGI `AddHandler` with `Options +ExecCGI`. The PHP handler can be the documented FastCGI spelling.
 4. **A file-scoped authorization guard** on the upload path, e.g. `<FilesMatch "\.php$"> Require all denied` or `<Files "*.cgi"> Require all denied`, which the attacker's section can target. Without such a guard, the uploaded script may already execute on both servers and there is no differential to exploit.
@@ -302,8 +302,8 @@ A `<Location>` guard outside the file-scoped section still binds in the negative
 
 P18 is separate from P17:
 
-- **P17** is a FastCGI `SCRIPT_FILENAME` canonicalization bug. A symlink named `.txt` points at `.php`; Apache forwards the lexical `.txt` to PHP-FPM and FPM's `security.limit_extensions` refuses it, while vapache forwards the canonical `.php` and executes it. P17's differential is at the **backend script-identity** layer and requires a symlink; its Apache response is `403 Access denied.`
-- **P18** has no symlink and no canonical/lexical backend identity. Apache rejects the attacker's `.htaccess` at **access-file parse time** (`500`, `<Files not allowed here`); vapache accepts the container section and applies a file-scoped authorization grant. The upload is requested directly and executes. The two findings should not be merged: fixing P17's `SCRIPT_FILENAME` does not affect P18, and fixing P18's section gating does not affect P17.
+- **P17** is a FastCGI `SCRIPT_FILENAME` canonicalization bug. A symlink named `.txt` points at `.php`; Apache forwards the lexical `.txt` to PHP-FPM and FPM's `security.limit_extensions` refuses it, while httpd-rs forwards the canonical `.php` and executes it. P17's differential is at the **backend script-identity** layer and requires a symlink; its Apache response is `403 Access denied.`
+- **P18** has no symlink and no canonical/lexical backend identity. Apache rejects the attacker's `.htaccess` at **access-file parse time** (`500`, `<Files not allowed here`); httpd-rs accepts the container section and applies a file-scoped authorization grant. The upload is requested directly and executes. The two findings should not be merged: fixing P17's `SCRIPT_FILENAME` does not affect P18, and fixing P18's section gating does not affect P17.
 
 P18 also differs from the P14 `<Files>` phase-order and P12/P13 handler-classification findings: those involve conflicting config/access-file scopes or canonical-target classification; P18 is a section-container admission mismatch under `AllowOverrideList`, observed with both PHP-FPM and CGI and with a clean A5/B4 parity control.
 
@@ -312,7 +312,7 @@ P18 also differs from the P14 `<Files>` phase-order and P12/P13 handler-classifi
 ## 7. Reproduction
 
 ```sh
-cargo build --release -p vapached
+cargo build --release -p httpd-rs
 python3 adversarial/p18/exploit_p18.py
 # 14 verdict(s) passed
 ```
@@ -327,13 +327,13 @@ python3 adversarial/p18/exploit_p18.py --show-fpm-log
 
 The harness starts its own PHP-FPM pool under `/tmp/opencode/p18-harness/fpm` with
 `php_admin_value[security.limit_extensions] = .php .phar`, and starts Apache and
-vapached on sibling loopback ports with separate pid files. It retains:
+httpd-rs on sibling loopback ports with separate pid files. It retains:
 
 - `/tmp/opencode/p18-harness/<case>/error.log` — Apache's `<Files not allowed here` / `<FilesMatch not allowed here` evidence;
-- `/tmp/opencode/p18-harness/fpm/access.log` — the PHP-FPM request for the vapache execution;
+- `/tmp/opencode/p18-harness/fpm/access.log` — the PHP-FPM request for the httpd-rs execution;
 - `/tmp/opencode/p18-harness/<case>/www/uploads/pwned.txt` — the code-execution marker path checked per request (removed after each check); the run output records the observed `PWNED who=probe uid=33` content;
 - `/tmp/opencode/p18-final-run.txt` — the final 14-verdict harness output;
-- rewritten `apache.conf`/`vapache.conf` fixtures for each case.
+- rewritten `apache.conf`/`httpd-rs.conf` fixtures for each case.
 
 The final retained run produced **14 PASS** verdicts, including the two exploit paths and all controls. The Apache oracle runs `-X`; the harness binds loopback ports only and keeps its cleanup inside `/tmp/opencode/p18-harness`.
 
@@ -353,20 +353,20 @@ The product source was not changed for this pass. The required behavior is to ma
 # Pass 18-B — adversarial break of HEAD `07c7879` ("Require stable FastCGI paths and openat2")
 
 - **Date:** 2026-10-28
-- **Subject:** `target/release/vapached` built at HEAD `07c7879`. No product source was edited. The retained additions for this pass are `adversarial/p18/exploit_p18b.py`, this section and the `adversarial/README.md` index entry.
+- **Subject:** `target/release/httpd-rs` built at HEAD `07c7879`. No product source was edited. The retained additions for this pass are `adversarial/p18/exploit_p18b.py`, this section and the `adversarial/README.md` index entry.
 - **Oracle:** Apache/2.4.69 (Debian), `/usr/sbin/apache2 -X`, with `mod_cgi` and `mod_proxy_fcgi`; PHP-FPM 8.4.27 for the PHP cases. Loopback only.
 - **Harness:** `adversarial/p18/exploit_p18b.py` — differential battery over the `.htaccess` `<IfFile>` conditional, the access-file phase order and `ProxyPassMatch` route participation. Default groups **E, F, G, H, I, J**; groups **A–D** retain the pass-18A/P15-adjacent probes.
-- **Retained evidence:** `/tmp/opencode/p18b-harness` (fixtures, per-case Apache/vapache configs, error logs, private FPM pool and access log) and `/tmp/opencode/p18b-final-run.txt` (final battery output).
-- **Method:** targeted audit of the access-file conditional parser and Apache's `ap_if_walk`/`ap_file_walk`/`ap_location_walk` phase order, followed by a live Apache-versus-vapache differential over the upload-execution guard shapes already used by P18-A and the project's own benchmark (`bench/app_bench.py`).
+- **Retained evidence:** `/tmp/opencode/p18b-harness` (fixtures, per-case Apache/httpd-rs configs, error logs, private FPM pool and access log) and `/tmp/opencode/p18b-final-run.txt` (final battery output).
+- **Method:** targeted audit of the access-file conditional parser and Apache's `ap_if_walk`/`ap_file_walk`/`ap_location_walk` phase order, followed by a live Apache-versus-httpd-rs differential over the upload-execution guard shapes already used by P18-A and the project's own benchmark (`bench/app_bench.py`).
 
 ---
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
-| **P18-B1** | An access-file `<IfFile>` conditional is evaluated against the **DocumentRoot** instead of **ServerRoot**, and its children are applied in the **if phase** (after `<Files>`/`<Location>` sections) instead of the **directory phase**. An attacker-written `.htaccess` can therefore make the condition true on vapache and false on Apache, and the wrapped `Require all granted` then overrides the operator's upload deny | `<IfFile index.html>` resolves to `ServerRoot/index.html` (absent) → the section is skipped and the upload guard holds (`403`); even when the condition is true the wrapped grant is a directory-phase directive and still loses to the file/location deny | `DocumentRoot/index.html` (present) → the condition is true and the wrapped grant is merged in the if phase, after the upload deny → uploaded PHP-FPM/CGI executes as `www-data` (`200 PHPEXEC … uid=33`) | remote code execution / access-file authorization bypass |
-| **P18-B2** | vapache applies the mapped directory's access file (and its `<If>`/`<IfFile>` conditional grants) to **`ProxyPassMatch`-routed requests**. Apache does not run the directory/access-file walk for `proxy:` filenames, so the same access file is inert there. The conditional grant merges after the operator's `<Location>` guard | The upload `.htaccess` is not consulted for the proxied request; the `<Location>` guard holds (`403`) | The `.htaccess` is consulted; `<IfFile index.html>` (or even `<If "true">`) grants after the `<Location>` deny and the request reaches PHP-FPM (`200 PHPEXEC … uid=33`) | remote code execution / URL-guard bypass on the benchmark FastCGI route |
+| **P18-B1** | An access-file `<IfFile>` conditional is evaluated against the **DocumentRoot** instead of **ServerRoot**, and its children are applied in the **if phase** (after `<Files>`/`<Location>` sections) instead of the **directory phase**. An attacker-written `.htaccess` can therefore make the condition true on httpd-rs and false on Apache, and the wrapped `Require all granted` then overrides the operator's upload deny | `<IfFile index.html>` resolves to `ServerRoot/index.html` (absent) → the section is skipped and the upload guard holds (`403`); even when the condition is true the wrapped grant is a directory-phase directive and still loses to the file/location deny | `DocumentRoot/index.html` (present) → the condition is true and the wrapped grant is merged in the if phase, after the upload deny → uploaded PHP-FPM/CGI executes as `www-data` (`200 PHPEXEC … uid=33`) | remote code execution / access-file authorization bypass |
+| **P18-B2** | httpd-rs applies the mapped directory's access file (and its `<If>`/`<IfFile>` conditional grants) to **`ProxyPassMatch`-routed requests**. Apache does not run the directory/access-file walk for `proxy:` filenames, so the same access file is inert there. The conditional grant merges after the operator's `<Location>` guard | The upload `.htaccess` is not consulted for the proxied request; the `<Location>` guard holds (`403`) | The `.htaccess` is consulted; `<IfFile index.html>` (or even `<If "true">`) grants after the `<Location>` deny and the request reaches PHP-FPM (`200 PHPEXEC … uid=33`) | remote code execution / URL-guard bypass on the benchmark FastCGI route |
 
 Both findings execute **attacker-uploaded content as the PHP-FPM worker or CGI user**. They require an access-file write primitive plus an override policy that admits `<IfFile>` and `Require` (any category, e.g. `AllowOverride AuthConfig`, or the directive-only `AllowOverrideList "<IfFile" Require`). No symlink, path traversal or FastCGI `SCRIPT_FILENAME` trick is involved.
 
@@ -384,7 +384,7 @@ Fixture: `www/uploads` with `SetHandler "proxy:unix:…|fcgi://localhost"` (or `
 </IfFile>
 ```
 
-| Case | Access-file content | Apache 2.4.69 | vapache HEAD |
+| Case | Access-file content | Apache 2.4.69 | httpd-rs HEAD |
 |---|---|---|---|
 | `F1` PHP-FPM, `AllowOverride AuthConfig`, `<FilesMatch>` deny | `<IfFile index.html> Require all granted </IfFile>` | `403`; no marker | `200` `PHPEXEC who=probe uid=33 wrote=yes`; `pwned.txt` = `PWNED who=probe uid=33` |
 | `F4` PHP-FPM, `AllowOverride AuthConfig`, `<LocationMatch "^/uploads/.*\.php$">` deny | same | `403`; no marker | `200` PHPEXEC; marker written |
@@ -401,10 +401,10 @@ Controls (all SAME on both servers):
 | `F2`/`E7` | no `.htaccess` / `<IfFile missing.html>` | `403` on both |
 | `F3`/`E2`/`G4` | direct top-level `Require all granted` | `403` on both (the file/location deny is applied after the directory phase) |
 | `E3`/`G3` | `<If "true"> Require all granted </If>` | `200` on both (Apache's `<If>` children are merged in the if phase too) |
-| `F6`/`F7`/`F8` | `AllowOverrideList "<IfFile" Require`: direct `<Files>` grant / direct `Require` / `<If "true">` | `500` / `403` / `500` on **both** — under this policy `<IfFile>` is the only admitted construct that bypasses on vapache |
-| `H2` | `<IfFile www/index.html>` wrapping a `<Files>` grant, condition true on both | Apache `200`, vapache `403` (vapache drops non-`Always` rules nested in a conditional; Apache splices them inline and applies them in the file phase) |
+| `F6`/`F7`/`F8` | `AllowOverrideList "<IfFile" Require`: direct `<Files>` grant / direct `Require` / `<If "true">` | `500` / `403` / `500` on **both** — under this policy `<IfFile>` is the only admitted construct that bypasses on httpd-rs |
+| `H2` | `<IfFile www/index.html>` wrapping a `<Files>` grant, condition true on both | Apache `200`, httpd-rs `403` (httpd-rs drops non-`Always` rules nested in a conditional; Apache splices them inline and applies them in the file phase) |
 
-`F5` is the clean fail-open case: Apache admits every construct in the access file (`AllowOverrideList` lists `<IfFile` and `Require`), evaluates the condition against `ServerRoot/index.html` (absent), and returns `403`; vapache admits the same constructs, evaluates the condition against `DocumentRoot/index.html` (present) and executes the uploaded script. The direct alternatives are rejected/denied on both servers (`F6`/`F7`/`F8`), so the `<IfFile>` wrapper is the necessary bypass.
+`F5` is the clean fail-open case: Apache admits every construct in the access file (`AllowOverrideList` lists `<IfFile` and `Require`), evaluates the condition against `ServerRoot/index.html` (absent), and returns `403`; httpd-rs admits the same constructs, evaluates the condition against `DocumentRoot/index.html` (present) and executes the uploaded script. The direct alternatives are rejected/denied on both servers (`F6`/`F7`/`F8`), so the `<IfFile>` wrapper is the necessary bypass.
 
 ### 2.2 Benchmark `ProxyPassMatch` route
 
@@ -428,7 +428,7 @@ Attacker uploads `uploads/shell.php` and `uploads/.htaccess`:
 </IfFile>
 ```
 
-| Case | Access-file content | Apache 2.4.69 | vapache HEAD |
+| Case | Access-file content | Apache 2.4.69 | httpd-rs HEAD |
 |---|---|---|---|
 | `I1` | `<IfFile index.html> Require all granted </IfFile>` | `403`; no marker | `200` PHPEXEC `uid=33`; marker written |
 | `I2` | none | `403` | `403` |
@@ -437,7 +437,7 @@ Attacker uploads `uploads/shell.php` and `uploads/.htaccess`:
 | `J1`/`J2`/`J3` | `Require all denied` / `<Files "shell.php"> Require all denied </Files>` / `<FilesMatch "\.php$"> Require all denied </FilesMatch>` | `200` PHPEXEC (access file ignored; the proxied request is served) | `403` |
 | `J4` | `<If "false"> Require all granted </If>` | `200` | `200` |
 
-`I1`/`I4` are the executable direction: the attacker's access file overrides the operator's `<Location>` guard on vapache while Apache never reads the file for the proxied request. `J1`–`J3` are the compatibility divergence in the other direction (vapache enforces access-file denies on proxied requests where Apache does not), and `J4` shows the deny is not a blanket rule.
+`I1`/`I4` are the executable direction: the attacker's access file overrides the operator's `<Location>` guard on httpd-rs while Apache never reads the file for the proxied request. `J1`–`J3` are the compatibility divergence in the other direction (httpd-rs enforces access-file denies on proxied requests where Apache does not), and `J4` shows the deny is not a blanket rule.
 
 ---
 
@@ -492,15 +492,15 @@ Apache does neither:
 - `server/core.c:test_iffile_section` resolves the argument with `ap_server_root_relative(cmd->temp_pool, arg)`, i.e. against **ServerRoot** for relative paths (`docs/manual/mod/core.xml`: “If a relative filename is supplied, the check is ServerRoot relative”).
 - `<IfFile` is `EXEC_ON_READ`; `start_cond_section` splices the children into the parent directive list with `ap_build_cont_config`. The children are ordinary directives of the enclosing directory scope — they are walked in the **directory phase** (`ap_walk_config`), before `ap_file_walk` (`<Files>`/`<FilesMatch>`) and `ap_location_walk` (`<Location>`/`<LocationMatch>`). A wrapped top-level grant therefore loses to the operator's file/location deny (`H1`, `H2`), and a `<Files>` section nested inside `<IfFile>` is applied in the file phase (`H2`).
 
-`H1` isolates the phase difference with a condition that is true under both bases: the same access file is `403` on Apache and `200` on vapache. `E1`/`E5`/`F1`/`G1` isolate the base difference: the relative path exists below `DocumentRoot` but not below `ServerRoot`.
+`H1` isolates the phase difference with a condition that is true under both bases: the same access file is `403` on Apache and `200` on httpd-rs. `E1`/`E5`/`F1`/`G1` isolate the base difference: the relative path exists below `DocumentRoot` but not below `ServerRoot`.
 
 ### 3.2 Access files participate in `ProxyPassMatch` requests
 
-For a `ProxyPassMatch` request Apache translates the URI to `r->filename = "proxy:fcgi://…"`; `ap_directory_walk`/`ap_file_walk` then operate on the proxy URL, so the mapped directory's `.htaccess` (a `<Directory>` construct) is never read. This is why the same upload `.htaccess` is inert on Apache for `I1`–`J3` and why the operator is told to use `<Location>`/`<Proxy>` for proxied content. Vapache instead maps the URL to a file, evaluates the mapped directory scope (including access files) and re-authorizes the resolved script in `run_fastcgi`/`authorize_resolved_target`. That is stricter for denies (`J1`–`J3`) but also lets an attacker-written conditional grant (`<IfFile>` in `I1`, or `<If "true">` in `I4`) merge after the operator's `<Location>` deny.
+For a `ProxyPassMatch` request Apache translates the URI to `r->filename = "proxy:fcgi://…"`; `ap_directory_walk`/`ap_file_walk` then operate on the proxy URL, so the mapped directory's `.htaccess` (a `<Directory>` construct) is never read. This is why the same upload `.htaccess` is inert on Apache for `I1`–`J3` and why the operator is told to use `<Location>`/`<Proxy>` for proxied content. httpd-rs instead maps the URL to a file, evaluates the mapped directory scope (including access files) and re-authorizes the resolved script in `run_fastcgi`/`authorize_resolved_target`. That is stricter for denies (`J1`–`J3`) but also lets an attacker-written conditional grant (`<IfFile>` in `I1`, or `<If "true">` in `I4`) merge after the operator's `<Location>` deny.
 
 ### 3.3 Why the wrapper is the unit of the bypass
 
-The unwrapped top-level `Require all granted` is admitted by the same override policy but is applied in the directory phase, where the operator's `<FilesMatch>`/`<Location>` deny is applied later (`E2`, `G4`, `I3`, `F7`). Wrapping the grant in `<IfFile>` moves it to the if phase on vapache, after those denies. On Apache the same wrapper either is not evaluated (relative path against ServerRoot) or is evaluated in the directory phase and loses. The bypass is therefore not “vapache allows `Require`” but “vapache evaluates and phases `<IfFile>` differently from Apache”.
+The unwrapped top-level `Require all granted` is admitted by the same override policy but is applied in the directory phase, where the operator's `<FilesMatch>`/`<Location>` deny is applied later (`E2`, `G4`, `I3`, `F7`). Wrapping the grant in `<IfFile>` moves it to the if phase on httpd-rs, after those denies. On Apache the same wrapper either is not evaluated (relative path against ServerRoot) or is evaluated in the directory phase and loses. The bypass is therefore not “httpd-rs allows `Require`” but “httpd-rs evaluates and phases `<IfFile>` differently from Apache”.
 
 ---
 
@@ -526,15 +526,15 @@ The unwrapped top-level `Require all granted` is admitted by the same override p
    </IfFile>
    ```
 
-3. `GET /uploads/shell.php` returns `403` on Apache and executes on vapache:
+3. `GET /uploads/shell.php` returns `403` on Apache and executes on httpd-rs:
 
    ```text
    Apache:  403  (ServerRoot/index.html absent; guard holds)
-   vapache: 200  PHPEXEC who=probe uid=33 wrote=yes
+   httpd-rs: 200  PHPEXEC who=probe uid=33 wrote=yes
                  pwned.txt: PWNED who=probe uid=33
    ```
 
-   With the benchmark `ProxyPassMatch` route plus `<LocationMatch "^/uploads/"> Require all denied`, the same access file (`I1`), or even `<If "true"> Require all granted </If>` (`I4`), executes on vapache while Apache returns `403`.
+   With the benchmark `ProxyPassMatch` route plus `<LocationMatch "^/uploads/"> Require all denied`, the same access file (`I1`), or even `<If "true"> Require all granted </If>` (`I4`), executes on httpd-rs while Apache returns `403`.
 
 The executed process is the PHP-FPM worker (`uid=33`); the CGI variant runs as the worker user and writes the same marker. Arbitrary PHP/script code can read files available to the worker, call `system`, or modify application files.
 
@@ -546,7 +546,7 @@ The executed process is the PHP-FPM worker (`uid=33`); the CGI variant runs as t
 
 **Preconditions.**
 
-1. **Write access to an access file and a script** in a directory served by vapache (upload/rename/archive-extraction primitive).
+1. **Write access to an access file and a script** in a directory served by httpd-rs (upload/rename/archive-extraction primitive).
 2. **An override policy that admits `<IfFile>` and `Require`**: any category (`AllowOverride AuthConfig`, `FileInfo` + AuthConfig, `All`) or the directive-only `AllowOverrideList "<IfFile" Require`. With `AllowOverride AuthConfig` Apache is independently bypassable with `<If "true">` in the non-proxied shape (`E3`/`G3` are parity), so the `AllowOverrideList` case `F5` is the one where Apache has no admitted alternative; the non-proxied AuthConfig rows (`F1`, `E1`, `G1`) demonstrate the divergence on the same access file.
 3. **An execution handler** for the uploaded script: a per-directory or parent FastCGI `SetHandler`, or `AddHandler cgi-script` with `Options +ExecCGI`.
 4. **A file- or URL-scoped deny** that the wrapped grant must outrank: `<FilesMatch "\.(php|phtml)$"> Require all denied </FilesMatch>` or `<LocationMatch "^/uploads/"> Require all denied </LocationMatch>`. Without a deny there is no differential.
@@ -567,32 +567,32 @@ The executed process is the PHP-FPM worker (`uid=33`); the CGI variant runs as t
 ## 7. Reproduction
 
 ```sh
-cargo build --release -p vapached
+cargo build --release -p httpd-rs
 python3 adversarial/p18/exploit_p18b.py            # groups E F G H I J
 python3 adversarial/p18/exploit_p18b.py F          # PHP-FPM cases incl. F5 AllowOverrideList "<IfFile" Require
 python3 adversarial/p18/exploit_p18b.py I          # benchmark ProxyPassMatch shape
 python3 adversarial/p18/exploit_p18b.py J          # access-file participation probes
 ```
 
-The harness starts sibling loopback Apache and vapached instances per case and a private PHP-FPM pool under `/tmp/opencode/p18b-harness`, and retains per-case `apache.conf`/`vapache.conf`, error logs and the FPM access log. The final retained run is `/tmp/opencode/p18b-final-run.txt`.
+The harness starts sibling loopback Apache and httpd-rs instances per case and a private PHP-FPM pool under `/tmp/opencode/p18b-harness`, and retains per-case `apache.conf`/`httpd-rs.conf`, error logs and the FPM access log. The final retained run is `/tmp/opencode/p18b-final-run.txt`.
 
 Key verdicts from that run:
 
 ```text
 DIFF  F1-php-iffile-docroot-relative shell
-      apache=403 pwned='' | vapache=200 PHPEXEC who=probe uid=33 wrote=yes pwned='PWNED who=probe uid=33'
+      apache=403 pwned='' | httpd-rs=200 PHPEXEC who=probe uid=33 wrote=yes pwned='PWNED who=probe uid=33'
 DIFF  F5-php-allowoverridelist-iffile shell
-      apache=403 pwned='' | vapache=200 PHPEXEC who=probe uid=33 wrote=yes pwned='PWNED who=probe uid=33'
+      apache=403 pwned='' | httpd-rs=200 PHPEXEC who=probe uid=33 wrote=yes pwned='PWNED who=probe uid=33'
 DIFF  G1-iffile-docroot-relative shell
-      apache=403 pwned='' | vapache=200 EXEC-G uid=33 who=probe
+      apache=403 pwned='' | httpd-rs=200 EXEC-G uid=33 who=probe
 DIFF  H1-iffile-true-both shell
-      apache=403 pwned='' | vapache=200 EXEC-H uid=33 who=probe
+      apache=403 pwned='' | httpd-rs=200 EXEC-H uid=33 who=probe
 DIFF  I1-bench-iffile-docroot-relative shell
-      apache=403 pwned='' | vapache=200 PHPEXEC who=probe uid=33 wrote=yes pwned='PWNED who=probe uid=33'
+      apache=403 pwned='' | httpd-rs=200 PHPEXEC who=probe uid=33 wrote=yes pwned='PWNED who=probe uid=33'
 DIFF  I4-bench-if-true-control shell
-      apache=403 pwned='' | vapache=200 PHPEXEC who=probe uid=33 wrote=yes pwned='PWNED who=probe uid=33'
+      apache=403 pwned='' | httpd-rs=200 PHPEXEC who=probe uid=33 wrote=yes pwned='PWNED who=probe uid=33'
 DIFF  J1-top-level-deny shell
-      apache=200 PHPEXEC who=probe uid=33 wrote=yes | vapache=403 pwned=''
+      apache=200 PHPEXEC who=probe uid=33 wrote=yes | httpd-rs=403 pwned=''
 ```
 
 ---
@@ -603,5 +603,5 @@ The product source was not changed for this pass. The required behavior is to ma
 
 - **Evaluate `.htaccess` `<IfFile>` against ServerRoot**, not DocumentRoot (`ap_server_root_relative`), or reject relative `<IfFile>` arguments in access files as a configuration error. Use `Expr::IfFile` (the existing unconfined variant) rather than `Expr::FileTest("-F", …)` for the access-file section, and do not confine the operator-supplied `<IfFile>` argument to the document root.
 - **Apply `<IfFile>` children in the directory phase.** `<IfFile>` is an `EXEC_ON_READ` container on Apache: its children are ordinary directives of the enclosing scope and must be ordered before `<Files>`/`<Location>` rules. Only `<If>`/`<ElseIf>`/`<Else>` belong to the request-time if phase. Keep the existing admission gate (`htaccess_section_admit`) for the wrapper.
-- **Do not consult `<Directory>`/access-file policy for proxied requests**, or document and constrain the difference. Apache does not run the directory walk for `proxy:` filenames, so `.htaccess` grants cannot widen a proxied route; today vapache's if-phase grants (`I1`, `I4`) override `<Location>` denies that Apache enforces. If access files are intentionally applied to proxy routes, they must not be able to grant past a `<Location>` deny (order the access-file merge before the location merge and re-check it at the FastCGI/proxy sink).
+- **Do not consult `<Directory>`/access-file policy for proxied requests**, or document and constrain the difference. Apache does not run the directory walk for `proxy:` filenames, so `.htaccess` grants cannot widen a proxied route; today httpd-rs's if-phase grants (`I1`, `I4`) override `<Location>` denies that Apache enforces. If access files are intentionally applied to proxy routes, they must not be able to grant past a `<Location>` deny (order the access-file merge before the location merge and re-check it at the FastCGI/proxy sink).
 - Add Apache differential regressions for: relative `<IfFile>` with the file below DocumentRoot only (`F1`/`E1`), `<IfFile>` with the file below both roots (`H1`), `<IfFile>` nested `<Files>` (`H2`), and the `ProxyPassMatch` + `<LocationMatch>` shape with an attacker access file (`I1`/`I4`) plus the access-file deny controls (`J1`–`J3`).

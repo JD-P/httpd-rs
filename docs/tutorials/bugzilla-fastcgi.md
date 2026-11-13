@@ -20,7 +20,7 @@ reload.
 
 ## Before you start
 
-Complete [Prepare a Debian VPS for a Vapache
+Complete [Prepare a Debian VPS for a httpd-rs
 tutorial](prepare-debian-vps.md). Point `bugs.example.test` at the VPS and open
 TCP ports 80 and 443 in the provider firewall. This Debian 13 example uses
 `www-data` user ID `33`; the identity check below verifies that value.
@@ -136,7 +136,7 @@ $ sudo stat -Lc '%F %u:%g %a %n' /run/fcgiwrap/bugzilla.sock
 socket 33:33 660 /run/fcgiwrap/bugzilla.sock
 ```
 
-## 3. Configure Vapache
+## 3. Configure httpd-rs
 
 Create `/etc/apache2/sites-available/bugzilla.conf` with a temporary HTTP-only
 host, enable it, and obtain the certificate:
@@ -149,16 +149,16 @@ host, enable it, and obtain the certificate:
 
 ```console
 $ sudo a2ensite bugzilla.conf
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot certonly --apache --domain bugs.example.test
 ```
 
 Replace it with the final configuration:
 
 ```apache
-VapacheCapability FastCgi On
-VapacheFastCGIStablePath On unix:/run/fcgiwrap/bugzilla.sock 33 33 0
+HttpdRsCapability FastCgi On
+HttpdRsFastCGIStablePath On unix:/run/fcgiwrap/bugzilla.sock 33 33 0
 
 <VirtualHost *:80>
     ServerName bugs.example.test
@@ -187,11 +187,11 @@ VapacheFastCGIStablePath On unix:/run/fcgiwrap/bugzilla.sock 33 33 0
 </VirtualHost>
 ```
 
-Test the configuration, reload Vapache, and verify renewal:
+Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -204,7 +204,7 @@ $ curl -I https://bugs.example.test/localconfig
 
 The REST request must return Bugzilla version data, and the `localconfig`
 request must be denied. Sign in to Bugzilla, open an administration page, reload
-Vapache, and confirm that the same session can still open the page.
+httpd-rs, and confirm that the same session can still open the page.
 
 <!--
 Deployment contract only; not operator instructions.

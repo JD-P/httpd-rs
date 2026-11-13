@@ -23,7 +23,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 144120.2,
           "mean_ms": 1.09,
           "p99_ms": 25.58,
@@ -59,7 +59,7 @@
           ],
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 888.94,
           "mean_ms": 37.02,
           "p99_ms": 119.94,
@@ -96,7 +96,7 @@
           ],
           "raw": "starting benchmark...\nspawning thread #0: 16 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nspawning thread #1: 16 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nspawning thread #2: 16 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nspawning thread #3: 16 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nWarm-up started for thread #3.\nWarm-up started for thread #0.\nprogress: 6% of clients started\nprogress: 12% of clients started\nprogress: 18% of clients started\nprogress: 25% of clients started\nprogress: 31% of clients started\nprogress: 37% of clients started\nprogress: 43% of clients started\nprogress: 50% of clients started\nprogress: 56% of clients started\nprogress: 62% of clients started\nprogress: 68% of clients started\nprogress: 75% of clients started\nprogress: 81% of clients started\nprogress: 87% of clients started\nprogress: 93% of clients started\nprogress: 100% of clients started\nWarm-up started for thread #1.\nWarm-up started for thread #2.\nTLS Protocol: TLSv1.3\nCipher: TLS_AES_128_GCM_SHA256\nServer Temp Key: X25519 253 bits\nApplication protocol: http/1.1\nWarm-up phase is over for thread #2.\nMain benchmark duration is started for thread #2.\nWarm-up phase is over for thread #1.\nMain benchmark duration is started for thread #1.\nWarm-up phase is over for thread #3.\nMain benchmark duration is started for thread #3.\nWarm-up phase is over for thread #0.\nMain benchmark duration is started for thread #0.\nMain benchmark duration is over for thread #3. Stopping all clients.\nStopped all clients for thread #3\nMain benchmark duration is over for thread #1. Stopping all clients.\nStopped all clients for thread #1\nMain benchmark duration is over for thread #2. Stopping all clients.\nStopped all clients for thread #2\nMain benchmark duration is over for thread #0. Stopping all clients.\nStopped all clients for thread #0\n\nfinished in 2.00s, 63324.00 req/s, 15.21MB/s\nrequests: 63324 total, 63328 started, 63324 done, 63324 succeeded, 0 failed, 0 errored, 0 timeout\nstatus codes: 63324 2xx, 0 3xx, 0 4xx, 0 5xx\ntraffic: 15.21MB (15946052) total, 23.15MB (24279644) headers (space savings 0.00%), 1.42MB (1491000) data\n                     min         max         mean         sd        +/- sd\ntime for request:       64us     10.99ms       899us       720us    85.03%\ntime for connect:      610us      4.91ms      1.74ms       991us    81.03%\ntime to 1st byte:     1.32ms      8.96ms      3.12ms      1.55ms    73.21%\nreq/s           :     802.04     1322.45     1091.09      156.68    58.62%\n"
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": null,
           "mean_ms": null,
           "p99_ms": null,
@@ -134,7 +134,7 @@
           ],
           "raw": "starting benchmark...\nspawning thread #0: 16 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nspawning thread #1: 16 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nspawning thread #2: 16 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nspawning thread #3: 16 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nWarm-up started for thread #3.\nWarm-up started for thread #1.\nWarm-up started for thread #0.\nprogress: 6% of clients started\nprogress: 12% of clients started\nprogress: 18% of clients started\nprogress: 25% of clients started\nprogress: 31% of clients started\nprogress: 37% of clients started\nprogress: 43% of clients started\nprogress: 50% of clients started\nprogress: 56% of clients started\nprogress: 62% of clients started\nprogress: 68% of clients started\nprogress: 75% of clients started\nprogress: 81% of clients started\nprogress: 87% of clients started\nprogress: 93% of clients started\nprogress: 100% of clients started\nWarm-up started for thread #2.\nTLS Protocol: TLSv1.3\nCipher: TLS_AES_128_GCM_SHA256\nServer Temp Key: X25519 253 bits\nApplication protocol: h2\nWarm-up phase is over for thread #0.\nMain benchmark duration is started for thread #0.\nWarm-up phase is over for thread #3.\nMain benchmark duration is started for thread #3.\nWarm-up phase is over for thread #2.\nMain benchmark duration is started for thread #2.\nWarm-up phase is over for thread #1.\nMain benchmark duration is started for thread #1.\nMain benchmark duration is over for thread #3. Stopping all clients.\nStopped all clients for thread #3\nMain benchmark duration is over for thread #0. Stopping all clients.\nStopped all clients for thread #0\nMain benchmark duration is over for thread #1. Stopping all clients.\nStopped all clients for thread #1\nMain benchmark duration is over for thread #2. Stopping all clients.\nStopped all clients for thread #2\n\nfinished in 2.00s, 45755.00 req/s, 2.53MB/s\nrequests: 45755 total, 45755 started, 45755 done, 45755 succeeded, 0 failed, 0 errored, 0 timeout\nstatus codes: 45755 2xx, 0 3xx, 0 4xx, 0 5xx\ntraffic: 2.53MB (2655262) total, 2.39MB (2509348) headers (space savings 86.29%), 1.02MB (1071732) data\n                     min         max         mean         sd        +/- sd\ntime for request:      227us    103.01ms     22.29ms     11.64ms    72.16%\ntime for connect:        0us         0us         0us         0us     0.00%\ntime to 1st byte:        0us         0us         0us         0us     0.00%\nreq/s           :     484.49     1021.56      714.03      130.29    59.38%\n"
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": null,
           "mean_ms": null,
           "p99_ms": null,
@@ -172,7 +172,7 @@
           ],
           "raw": "starting benchmark...\nspawning thread #0: 16 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nspawning thread #1: 16 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nspawning thread #2: 16 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nspawning thread #3: 16 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nWarm-up started for thread #0.\nprogress: 6% of clients started\nprogress: 12% of clients started\nprogress: 18% of clients started\nprogress: 25% of clients started\nprogress: 31% of clients started\nprogress: 37% of clients started\nprogress: 43% of clients started\nprogress: 50% of clients started\nprogress: 56% of clients started\nprogress: 62% of clients started\nWarm-up started for thread #2.\nprogress: 68% of clients started\nprogress: 75% of clients started\nprogress: 81% of clients started\nprogress: 87% of clients started\nprogress: 93% of clients started\nprogress: 100% of clients started\nWarm-up started for thread #1.\nWarm-up started for thread #3.\nTLS Protocol: TLSv1.3\nCipher: TLS_AES_128_GCM_SHA256\nServer Temp Key: X25519 253 bits\nApplication protocol: h2\nWarm-up phase is over for thread #0.\nMain benchmark duration is started for thread #0.\nWarm-up phase is over for thread #2.\nMain benchmark duration is started for thread #2.\nWarm-up phase is over for thread #3.\nMain benchmark duration is started for thread #3.\nWarm-up phase is over for thread #1.\nMain benchmark duration is started for thread #1.\nMain benchmark duration is over for thread #3. Stopping all clients.\nStopped all clients for thread #3\nMain benchmark duration is over for thread #0. Stopping all clients.\nStopped all clients for thread #0\nMain benchmark duration is over for thread #2. Stopping all clients.\nStopped all clients for thread #2\nMain benchmark duration is over for thread #1. Stopping all clients.\nStopped all clients for thread #1\n\nfinished in 2.00s, 47545.00 req/s, 2.31MB/s\nrequests: 47545 total, 47545 started, 47545 done, 47545 succeeded, 0 failed, 0 errored, 0 timeout\nstatus codes: 47545 2xx, 0 3xx, 0 4xx, 0 5xx\ntraffic: 2.31MB (2426267) total, 2.52MB (2642064) headers (space savings 87.73%), 459.12KB (470140) data\n                     min         max         mean         sd        +/- sd\ntime for request:      222us    117.15ms     21.44ms     17.72ms    58.38%\ntime for connect:        0us         0us         0us         0us     0.00%\ntime to 1st byte:        0us         0us         0us         0us     0.00%\nreq/s           :     360.68     6468.56      742.24     1058.60    96.88%\n"
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": null,
           "mean_ms": null,
           "p99_ms": null,
@@ -210,7 +210,7 @@
           ],
           "raw": "starting benchmark...\nspawning thread #0: 8 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nspawning thread #1: 8 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nspawning thread #2: 8 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nspawning thread #3: 8 total client(s). Timing-based test with 1s of warm-up time and 1s of main duration for measurements.\nWarm-up started for thread #3.\nWarm-up started for thread #2.\nWarm-up started for thread #0.\nprogress: 12% of clients started\nprogress: 25% of clients started\nprogress: 37% of clients started\nprogress: 50% of clients started\nprogress: 62% of clients started\nprogress: 75% of clients started\nprogress: 87% of clients started\nprogress: 100% of clients started\nWarm-up started for thread #1.\nTLS Protocol: TLSv1.3\nCipher: TLS_AES_128_GCM_SHA256\nServer Temp Key: X25519 253 bits\nApplication protocol: h2\nWarm-up phase is over for thread #3.\nMain benchmark duration is started for thread #3.\nWarm-up phase is over for thread #2.\nMain benchmark duration is started for thread #2.\nWarm-up phase is over for thread #0.\nMain benchmark duration is started for thread #0.\nWarm-up phase is over for thread #1.\nMain benchmark duration is started for thread #1.\nMain benchmark duration is over for thread #2. Stopping all clients.\nStopped all clients for thread #2\nMain benchmark duration is over for thread #0. Stopping all clients.\nStopped all clients for thread #0\nMain benchmark duration is over for thread #3. Stopping all clients.\nStopped all clients for thread #3\nMain benchmark duration is over for thread #1. Stopping all clients.\nStopped all clients for thread #1\n\nfinished in 2.00s, 1322.00 req/s, 185.29KB/s\nrequests: 1322 total, 1322 started, 1322 done, 1322 succeeded, 0 failed, 0 errored, 0 timeout\nstatus codes: 1327 2xx, 0 3xx, 0 4xx, 0 5xx\ntraffic: 185.29KB (189737) total, 17.66KB (18079) headers (space savings 93.82%), 287.61KB (294515) data\n                     min         max         mean         sd        +/- sd\ntime for request:     9.17ms    993.27ms    195.30ms    205.26ms    81.01%\ntime for connect:        0us         0us         0us         0us     0.00%\ntime to 1st byte:        0us         0us         0us         0us     0.00%\nreq/s           :      12.96      158.71       41.22       42.56    81.25%\n"
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": null,
           "mean_ms": null,
           "p99_ms": null,
@@ -231,11 +231,11 @@
   ],
   "config_test_ms": {
     "apache": 17.506029000287526,
-    "vapache": 2.4702840000827564
+    "httpd-rs": 2.4702840000827564
   },
   "config_test_errors": {
     "apache": "",
-    "vapache": ""
+    "httpd-rs": ""
   },
   "memory": {
     "apache": {
@@ -243,7 +243,7 @@
       "threads": 385,
       "pss_kb": 78435
     },
-    "vapache": {
+    "httpd-rs": {
       "processes": 3,
       "threads": 33,
       "pss_kb": 21741

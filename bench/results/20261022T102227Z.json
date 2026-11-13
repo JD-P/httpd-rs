@@ -18,7 +18,7 @@
           "transferred_kbps": 17298.55,
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 84925.69,
           "mean_ms": 0.589,
           "p50_ms": 1.0,
@@ -49,7 +49,7 @@
           "transferred_kbps": 108174.51,
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 106458.48,
           "mean_ms": 0.47,
           "p50_ms": 0.0,
@@ -80,7 +80,7 @@
           "transferred_kbps": 739700.79,
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 98879.37,
           "mean_ms": 0.506,
           "p50_ms": 0.0,
@@ -111,7 +111,7 @@
           "transferred_kbps": 6642527.21,
           "raw": ""
         },
-        "vapache": {
+        "httpd-rs": {
           "rps": 5402.58,
           "mean_ms": 1.851,
           "p50_ms": 2.0,

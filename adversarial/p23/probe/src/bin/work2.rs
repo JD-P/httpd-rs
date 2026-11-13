@@ -1,5 +1,5 @@
 use std::time::Instant;
-use vapache_pcre2::bytes::RegexBuilder;
+use httpd_rs_pcre2::bytes::RegexBuilder;
 
 fn main() {
     let subject = vec![b'a'; 64 * 1024];

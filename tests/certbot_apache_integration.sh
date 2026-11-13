@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if (($# != 1)); then
-    echo "Usage: $0 VAPACHE.deb" >&2
+    echo "Usage: $0 HTTPD_RS.deb" >&2
     exit 2
 fi
 
@@ -14,13 +14,13 @@ package=$(realpath -- "$1")
 
 mounts=(-v "$(dirname -- "$package"):/release:ro")
 override=0
-if [[ -n "${VAPACHE_TEST_BINARY:-}" ]]; then
-    test_binary=$(realpath -- "$VAPACHE_TEST_BINARY")
+if [[ -n "${HTTPD_RS_TEST_BINARY:-}" ]]; then
+    test_binary=$(realpath -- "$HTTPD_RS_TEST_BINARY")
     [[ -x "$test_binary" ]] || {
-        echo "VAPACHE_TEST_BINARY is not executable: $test_binary" >&2
+        echo "HTTPD_RS_TEST_BINARY is not executable: $test_binary" >&2
         exit 1
     }
-    mounts+=(-v "$test_binary:/current/vapached:ro")
+    mounts+=(-v "$test_binary:/current/httpd-rs:ro")
     override=1
 fi
 
@@ -49,21 +49,21 @@ printf '%s\n' \
 a2ensite example.test >/dev/null
 dpkg -i "/release/$package_name" >/dev/null
 if [[ "$override" == 1 ]]; then
-    install -m 0755 /current/vapached /usr/sbin/vapached
+    install -m 0755 /current/httpd-rs /usr/sbin/httpd-rs
 fi
 
-chmod 0666 /usr/lib/vapache/control-common
-if /usr/sbin/vapachectl --help >/tmp/unsafe-common.log 2>&1; then
-    echo 'vapachectl sourced a writable privileged control library' >&2
+chmod 0666 /usr/lib/httpd-rs/control-common
+if /usr/sbin/httpd-rsctl --help >/tmp/unsafe-common.log 2>&1; then
+    echo 'httpd-rsctl sourced a writable privileged control library' >&2
     exit 1
 fi
 grep -q 'unsafe installed control library' /tmp/unsafe-common.log
-chmod 0644 /usr/lib/vapache/control-common
+chmod 0644 /usr/lib/httpd-rs/control-common
 
 # A pre-provisioned TLS vhost may name its future Certbot lineage before the
 # first certificate exists. Keep that state fail-closed, but make the recovery
 # command concrete instead of leaving the administrator in a bootstrap loop.
-cat >/etc/apache2/sites-enabled/vapache-missing-cert.conf <<'EOF'
+cat >/etc/apache2/sites-enabled/httpd-rs-missing-cert.conf <<'EOF'
 Listen 127.0.0.1:9443
 <VirtualHost 127.0.0.1:9443>
 ServerName example.test
@@ -72,8 +72,8 @@ SSLCertificateFile /etc/letsencrypt/live/example.test/fullchain.pem
 SSLCertificateKeyFile /etc/letsencrypt/live/example.test/privkey.pem
 </VirtualHost>
 EOF
-if /usr/sbin/vapachectl configtest >/tmp/missing-cert.log 2>&1; then
-    echo 'Vapache accepted a nonexistent Certbot lineage' >&2
+if /usr/sbin/httpd-rsctl configtest >/tmp/missing-cert.log 2>&1; then
+    echo 'httpd-rs accepted a nonexistent Certbot lineage' >&2
     exit 1
 fi
 grep -Fq 'sudo certbot certonly --standalone -d example.test' \
@@ -81,14 +81,14 @@ grep -Fq 'sudo certbot certonly --standalone -d example.test' \
         cat /tmp/missing-cert.log >&2
         exit 1
     }
-rm -f /etc/apache2/sites-enabled/vapache-missing-cert.conf
+rm -f /etc/apache2/sites-enabled/httpd-rs-missing-cert.conf
 
 install -d -m 0700 \
     /etc/letsencrypt/archive/example.test \
     /etc/letsencrypt/live/example.test \
     /etc/letsencrypt/renewal
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
-    -subj /CN=Vapache-Certbot-Test-CA \
+    -subj /CN=httpd-rs-Certbot-Test-CA \
     -keyout /tmp/ca.key -out /tmp/ca.pem >/dev/null 2>&1
 openssl req -newkey rsa:2048 -nodes -subj /CN=example.test \
     -keyout /etc/letsencrypt/archive/example.test/privkey1.pem \
@@ -125,8 +125,8 @@ chmod 0600 /etc/letsencrypt/renewal/example.test.conf
 printf '%s\n' 'apache-ctl = /usr/local/sbin/custom-apachectl' \
     >/etc/letsencrypt/cli.ini
 chmod 0600 /etc/letsencrypt/cli.ini
-if /usr/sbin/vapache-switch --yes >/tmp/custom-control.log 2>&1; then
-    echo 'vapache-switch unexpectedly replaced a custom Certbot control path' >&2
+if /usr/sbin/httpd-rs-switch --yes >/tmp/custom-control.log 2>&1; then
+    echo 'httpd-rs-switch unexpectedly replaced a custom Certbot control path' >&2
     exit 1
 fi
 grep -qx 'apache-ctl = /usr/local/sbin/custom-apachectl' \
@@ -138,10 +138,10 @@ rm -f /etc/letsencrypt/cli.ini
 install -d -m 0755 /tmp/switch-bin
 cat >/tmp/switch-bin/systemctl <<'EOF'
 #!/bin/sh
-printf '%s\n' "$*" >>/tmp/vapache-switch-systemctl.calls
-if [ -e /tmp/vapache-switch-interrupt ] \
+printf '%s\n' "$*" >>/tmp/httpd-rs-switch-systemctl.calls
+if [ -e /tmp/httpd-rs-switch-interrupt ] \
     && [ "$1" = disable ] && [ "${3:-}" = apache2.service ]; then
-    rm -f /tmp/vapache-switch-interrupt
+    rm -f /tmp/httpd-rs-switch-interrupt
     kill -TERM "$PPID"
     exit 1
 fi
@@ -160,33 +160,33 @@ EOF
 chmod 0755 /tmp/switch-bin/systemctl
 
 # A signal in the service-transition window must restore Apache's exact prior
-# enabled/active state and stop any partial Vapache start.
-: >/tmp/vapache-switch-systemctl.calls
-touch /tmp/vapache-switch-interrupt
-if VAPACHE_SYSTEMCTL=/tmp/switch-bin/systemctl \
-    /usr/sbin/vapache-switch --yes >/tmp/switch-interrupted.log 2>&1; then
-    echo 'interrupted vapache-switch unexpectedly succeeded' >&2
+# enabled/active state and stop any partial httpd-rs start.
+: >/tmp/httpd-rs-switch-systemctl.calls
+touch /tmp/httpd-rs-switch-interrupt
+if HTTPD_RS_SYSTEMCTL=/tmp/switch-bin/systemctl \
+    /usr/sbin/httpd-rs-switch --yes >/tmp/switch-interrupted.log 2>&1; then
+    echo 'interrupted httpd-rs-switch unexpectedly succeeded' >&2
     exit 1
 fi
-grep -qx 'disable --now apache2.service' /tmp/vapache-switch-systemctl.calls
-grep -qx 'disable --now vapache.service' /tmp/vapache-switch-systemctl.calls
-grep -qx 'enable apache2.service' /tmp/vapache-switch-systemctl.calls
-grep -qx 'start apache2.service' /tmp/vapache-switch-systemctl.calls
+grep -qx 'disable --now apache2.service' /tmp/httpd-rs-switch-systemctl.calls
+grep -qx 'disable --now httpd-rs.service' /tmp/httpd-rs-switch-systemctl.calls
+grep -qx 'enable apache2.service' /tmp/httpd-rs-switch-systemctl.calls
+grep -qx 'start apache2.service' /tmp/httpd-rs-switch-systemctl.calls
 
-: >/tmp/vapache-switch-systemctl.calls
-VAPACHE_SYSTEMCTL=/tmp/switch-bin/systemctl /usr/sbin/vapache-switch --yes \
+: >/tmp/httpd-rs-switch-systemctl.calls
+HTTPD_RS_SYSTEMCTL=/tmp/switch-bin/systemctl /usr/sbin/httpd-rs-switch --yes \
     >/tmp/switch.log 2>&1
-grep -Eq '^apache_ctl[[:space:]]*=[[:space:]]*/usr/lib/vapache/certbot-apachectl$' \
+grep -Eq '^apache_ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachectl$' \
     /etc/letsencrypt/renewal/example.test.conf
-grep -Eq '^apache-ctl[[:space:]]*=[[:space:]]*/usr/lib/vapache/certbot-apachectl$' \
+grep -Eq '^apache-ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachectl$' \
     /etc/letsencrypt/cli.ini
-test "$(readlink /etc/letsencrypt/renewal-hooks/deploy/vapache-reload)" \
-    = /usr/lib/vapache/certbot-deploy-hook
+test "$(readlink /etc/letsencrypt/renewal-hooks/deploy/httpd-rs-reload)" \
+    = /usr/lib/httpd-rs/certbot-deploy-hook
 
-/usr/sbin/vapachectl foreground >/tmp/vapache.log 2>&1 &
+/usr/sbin/httpd-rsctl foreground >/tmp/httpd-rs.log 2>&1 &
 initial_server_pid=$!
 cleanup() {
-    /usr/sbin/vapachectl stop >/dev/null 2>&1 || true
+    /usr/sbin/httpd-rsctl stop >/dev/null 2>&1 || true
     kill "$initial_server_pid" >/dev/null 2>&1 || true
     wait "$initial_server_pid" >/dev/null 2>&1 || true
 }
@@ -210,22 +210,22 @@ test "$ready" -eq 1
 cat >/tmp/systemctl <<'EOF'
 #!/bin/sh
 set -eu
-printf '%s\n' "$*" >>/tmp/vapache-systemctl.calls
+printf '%s\n' "$*" >>/tmp/httpd-rs-systemctl.calls
 case "$1" in
     is-active)
         exit 0
         ;;
     restart)
         old_pid=$(cat /run/apache2/apache2.pid)
-        /usr/sbin/vapachectl stop >/dev/null 2>&1
+        /usr/sbin/httpd-rsctl stop >/dev/null 2>&1
         for attempt in $(seq 1 100); do
             if ! kill -0 "$old_pid" 2>/dev/null; then
                 break
             fi
             sleep 0.05
         done
-        nohup /usr/sbin/vapachectl foreground \
-            >>/tmp/vapache.log 2>&1 </dev/null &
+        nohup /usr/sbin/httpd-rsctl foreground \
+            >>/tmp/httpd-rs.log 2>&1 </dev/null &
         for attempt in $(seq 1 100); do
             new_pid=$(cat /run/apache2/apache2.pid 2>/dev/null || true)
             if [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ] \
@@ -241,15 +241,15 @@ esac
 EOF
 chmod 0755 /tmp/systemctl
 
-# No --apache-ctl argument is needed: vapache-switch made ordinary
+# No --apache-ctl argument is needed: httpd-rs-switch made ordinary
 # `certbot --apache` invocations select the shim through Certbot's cli.ini.
-VAPACHE_SYSTEMCTL=/tmp/systemctl \
+HTTPD_RS_SYSTEMCTL=/tmp/systemctl \
     certbot install --cert-name example.test --apache \
         --non-interactive --no-redirect >/tmp/certbot.log 2>&1 || {
             cat /tmp/certbot.log >&2
             exit 1
         }
-grep -qx 'restart vapache.service' /tmp/vapache-systemctl.calls
+grep -qx 'restart httpd-rs.service' /tmp/httpd-rs-systemctl.calls
 grep -q 'SSLCertificateFile /etc/letsencrypt/live/example.test/fullchain.pem' \
     /etc/apache2/sites-available/example.test-le-ssl.conf
 grep -q 'Include /etc/letsencrypt/options-ssl-apache.conf' \
@@ -267,7 +267,7 @@ for attempt in $(seq 1 100); do
 done
 if [[ "$ready" != 1 ]]; then
     cat /tmp/certbot.log >&2
-    cat /tmp/vapache.log >&2
+    cat /tmp/httpd-rs.log >&2
     cat /var/log/apache2/error.log >&2
     exit 1
 fi
@@ -286,7 +286,7 @@ test "$presented_fingerprint" = "$expected_fingerprint"
 # path as well as its installer path, without contacting an ACME service.
 challenge_dir=/var/lib/letsencrypt/http_challenges
 install -d -m 0755 "$challenge_dir"
-challenge_token=VapacheCertbotToken_123-abc
+challenge_token=HttpdRsCertbotToken_123-abc
 printf '%s' 'integration-key-authorization' \
     >"$challenge_dir/$challenge_token"
 chmod 0644 "$challenge_dir/$challenge_token"
@@ -308,11 +308,11 @@ sed -i '2i Include /etc/apache2/le_http_01_challenge_pre.conf' \
     /etc/apache2/sites-available/example.test.conf
 sed -i '/<\/VirtualHost>/i Include /etc/apache2/le_http_01_challenge_post.conf' \
     /etc/apache2/sites-available/example.test.conf
-/usr/sbin/vapachectl configtest >/tmp/challenge-configtest.log 2>&1 || {
+/usr/sbin/httpd-rsctl configtest >/tmp/challenge-configtest.log 2>&1 || {
     cat /tmp/challenge-configtest.log >&2
     exit 1
 }
-/usr/sbin/vapachectl graceful >/tmp/challenge-reload.log 2>&1
+/usr/sbin/httpd-rsctl graceful >/tmp/challenge-reload.log 2>&1
 challenge_ready=0
 for attempt in $(seq 1 100); do
     if response=$(curl --noproxy '*' --max-time 2 --fail --silent \
@@ -340,17 +340,17 @@ fi
 
 # Package removal must not strand Certbot on a control command that was just
 # removed. Unrelated settings and the Apache plugin selection remain intact.
-dpkg --remove vapache >/tmp/vapache-remove.log 2>&1 || {
-    cat /tmp/vapache-remove.log >&2
+dpkg --remove httpd-rs >/tmp/httpd-rs-remove.log 2>&1 || {
+    cat /tmp/httpd-rs-remove.log >&2
     exit 1
 }
-! grep -q 'apache-ctl[[:space:]]*=[[:space:]]*/usr/lib/vapache/certbot-apachectl' \
+! grep -q 'apache-ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachectl' \
     /etc/letsencrypt/cli.ini
-! grep -q 'apache_ctl[[:space:]]*=[[:space:]]*/usr/lib/vapache/certbot-apachectl' \
+! grep -q 'apache_ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachectl' \
     /etc/letsencrypt/renewal/example.test.conf
 grep -qx 'authenticator = apache' /etc/letsencrypt/renewal/example.test.conf
-test ! -e /etc/letsencrypt/renewal-hooks/deploy/vapache-reload
-test ! -L /etc/letsencrypt/renewal-hooks/deploy/vapache-reload
+test ! -e /etc/letsencrypt/renewal-hooks/deploy/httpd-rs-reload
+test ! -L /etc/letsencrypt/renewal-hooks/deploy/httpd-rs-reload
 
 echo 'Certbot Apache installer integration: pass'
 CONTAINER

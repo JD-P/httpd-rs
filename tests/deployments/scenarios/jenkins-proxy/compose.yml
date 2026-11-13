@@ -15,7 +15,7 @@ services:
       - home:/var/jenkins_home
       - type: bind
         source: ${JENKINS_INIT:?}
-        target: /usr/share/jenkins/ref/init.groovy.d/vapache-security.groovy
+        target: /usr/share/jenkins/ref/init.groovy.d/httpd-rs-security.groovy
         read_only: true
     networks:
       - application

@@ -62,7 +62,7 @@ fn try_prg_map() -> Option<crate::resource::SlotLease> {
 }
 
 fn append_rewrite_output(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
-    if !vapache_verified::bounded_expansion_append_admit(
+    if !httpd_rs_verified::bounded_expansion_append_admit(
         out.len() as u64,
         value.len() as u64,
         MAX_REWRITE_OUTPUT_BYTES as u64,
@@ -278,7 +278,7 @@ fn escape_backref_value(value: &[u8], spec: &EscapeSpec) -> Vec<u8> {
         };
         mask[b as usize] = escaped;
     }
-    vapache_verified::percent_encode(value, &mask, !spec.no_plus)
+    httpd_rs_verified::percent_encode(value, &mask, !spec.no_plus)
 }
 
 /// Build an Apache-shaped `Set-Cookie` value for `[CO=name:value:domain:
@@ -552,13 +552,13 @@ pub enum Outcome {
 const REWRITE_RESTART_LIMIT: u64 = 10;
 
 fn rewrite_no_match_state(
-    state: vapache_verified::RewriteProgramState,
+    state: httpd_rs_verified::RewriteProgramState,
     chain_flags: &[bool],
     rule: &RewriteRule,
-) -> vapache_verified::RewriteProgramState {
-    let transition = vapache_verified::rewrite_program_step(
+) -> httpd_rs_verified::RewriteProgramState {
+    let transition = httpd_rs_verified::rewrite_program_step(
         state,
-        vapache_verified::RewriteProgramEvent::NoMatch {
+        httpd_rs_verified::RewriteProgramEvent::NoMatch {
             chain: rule.flags.chain,
         },
         chain_flags,
@@ -567,7 +567,7 @@ fn rewrite_no_match_state(
     .expect("a running rewrite machine has a current rule");
     debug_assert!(matches!(
         transition.action,
-        vapache_verified::RewriteProgramAction::Continue {
+        httpd_rs_verified::RewriteProgramAction::Continue {
             apply_query: false,
             ..
         }
@@ -612,13 +612,13 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         .iter()
         .map(|rule| rule.flags.chain)
         .collect();
-    let mut machine = vapache_verified::rewrite_program_start();
+    let mut machine = httpd_rs_verified::rewrite_program_start();
 
     while machine.index < scope.rewrite_policy.rewrite_rules.len() {
         let rule = &scope.rewrite_policy.rewrite_rules[machine.index];
         vary.clear();
         let subject = subject_for(rule, &path, ctx.fs_path);
-        if !vapache_verified::htaccess_rewrite_subject_admit(
+        if !httpd_rs_verified::htaccess_rewrite_subject_admit(
             rule.per_dir && rule.subject_dir.is_some(),
             subject.is_some(),
         ) {
@@ -723,9 +723,9 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             Err(e) => return Outcome::Error(e),
         }
 
-        let transition = vapache_verified::rewrite_program_step(
+        let transition = httpd_rs_verified::rewrite_program_step(
             machine,
-            vapache_verified::RewriteProgramEvent::Matched {
+            httpd_rs_verified::RewriteProgramEvent::Matched {
                 forbidden: rule.flags.forbidden,
                 gone: rule.flags.gone,
                 no_substitution: rule.substitution == "-",
@@ -744,27 +744,27 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         )
         .expect("a running rewrite machine has a current rule");
         match transition.action {
-            vapache_verified::RewriteProgramAction::Forbidden => return Outcome::Forbidden,
-            vapache_verified::RewriteProgramAction::Gone => return Outcome::Gone,
-            vapache_verified::RewriteProgramAction::Continue { query: action, .. }
-            | vapache_verified::RewriteProgramAction::Restart { query: action, .. }
-            | vapache_verified::RewriteProgramAction::Stop { query: action, .. } => {
-                if action == vapache_verified::RewriteQueryAction::Discard {
+            httpd_rs_verified::RewriteProgramAction::Forbidden => return Outcome::Forbidden,
+            httpd_rs_verified::RewriteProgramAction::Gone => return Outcome::Gone,
+            httpd_rs_verified::RewriteProgramAction::Continue { query: action, .. }
+            | httpd_rs_verified::RewriteProgramAction::Restart { query: action, .. }
+            | httpd_rs_verified::RewriteProgramAction::Stop { query: action, .. } => {
+                if action == httpd_rs_verified::RewriteQueryAction::Discard {
                     query.clear();
                 }
                 machine = transition.state;
                 if matches!(
                     transition.action,
-                    vapache_verified::RewriteProgramAction::Stop { .. }
+                    httpd_rs_verified::RewriteProgramAction::Stop { .. }
                 ) {
                     break;
                 }
                 continue;
             }
-            vapache_verified::RewriteProgramAction::RestartLimit => {
+            httpd_rs_verified::RewriteProgramAction::RestartLimit => {
                 return Outcome::Error("rewrite [N] loop limit exceeded".into());
             }
-            vapache_verified::RewriteProgramAction::Expand => {
+            httpd_rs_verified::RewriteProgramAction::Expand => {
                 machine = transition.state;
             }
             _ => {
@@ -812,7 +812,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         };
         let mut new_query = new_query.into_bytes();
         if rule.flags.qslast {
-            let encoded = vapache_verified::rewrite_backref_no_qmark(new_path.as_bytes());
+            let encoded = httpd_rs_verified::rewrite_backref_no_qmark(new_path.as_bytes());
             new_path = String::from_utf8_lossy(&encoded).into_owned();
         }
         if new_path.is_empty() {
@@ -837,9 +837,9 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         if joined.len() > MAX_REWRITE_OUTPUT_BYTES {
             return Outcome::Error("rewritten target exceeds 64 KiB".into());
         }
-        let transition = vapache_verified::rewrite_program_step(
+        let transition = httpd_rs_verified::rewrite_program_step(
             machine,
-            vapache_verified::RewriteProgramEvent::Expanded {
+            httpd_rs_verified::RewriteProgramEvent::Expanded {
                 external,
                 has_target_query,
                 original_query_present: !query.is_empty(),
@@ -849,12 +849,12 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         )
         .expect("a running rewrite machine has a current rule");
         let query_action = match transition.action {
-            vapache_verified::RewriteProgramAction::Continue { query, .. }
-            | vapache_verified::RewriteProgramAction::Restart { query, .. }
-            | vapache_verified::RewriteProgramAction::Stop { query, .. }
-            | vapache_verified::RewriteProgramAction::Proxy { query }
-            | vapache_verified::RewriteProgramAction::Redirect { query } => query,
-            vapache_verified::RewriteProgramAction::RestartLimit => {
+            httpd_rs_verified::RewriteProgramAction::Continue { query, .. }
+            | httpd_rs_verified::RewriteProgramAction::Restart { query, .. }
+            | httpd_rs_verified::RewriteProgramAction::Stop { query, .. }
+            | httpd_rs_verified::RewriteProgramAction::Proxy { query }
+            | httpd_rs_verified::RewriteProgramAction::Redirect { query } => query,
+            httpd_rs_verified::RewriteProgramAction::RestartLimit => {
                 return Outcome::Error("rewrite [N] loop limit exceeded".into());
             }
             _ => {
@@ -864,14 +864,14 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             }
         };
         match query_action {
-            vapache_verified::RewriteQueryAction::Append => {
+            httpd_rs_verified::RewriteQueryAction::Append => {
                 if !new_query.is_empty() {
                     if new_query.len() >= MAX_REWRITE_OUTPUT_BYTES {
                         return Outcome::Error("rewritten query exceeds 64 KiB".into());
                     }
                     new_query.push(b'&');
                 }
-                if !vapache_verified::bounded_expansion_append_admit(
+                if !httpd_rs_verified::bounded_expansion_append_admit(
                     new_query.len() as u64,
                     query.len() as u64,
                     MAX_REWRITE_OUTPUT_BYTES as u64,
@@ -880,7 +880,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                 }
                 new_query.extend_from_slice(&query);
             }
-            vapache_verified::RewriteQueryAction::Preserve => {
+            httpd_rs_verified::RewriteQueryAction::Preserve => {
                 // Apache copies the original query string when the
                 // substitution does not contain a replacement query string.
                 if query.len() > MAX_REWRITE_OUTPUT_BYTES {
@@ -888,8 +888,8 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                 }
                 new_query = query.clone();
             }
-            vapache_verified::RewriteQueryAction::Replace
-            | vapache_verified::RewriteQueryAction::Discard => {}
+            httpd_rs_verified::RewriteQueryAction::Replace
+            | httpd_rs_verified::RewriteQueryAction::Discard => {}
         }
         if new_query.iter().any(|byte| byte.is_ascii_control())
             || std::str::from_utf8(&new_query)
@@ -905,7 +905,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         // by the dispatcher next round), so it must never be promoted to a
         // filesystem target (F67). The flag stays accepted and inert-legal.
         let absolute = Path::new(&joined).is_absolute();
-        let filesystem = if vapache_verified::rewrite_filesystem_shape_admit(
+        let filesystem = if httpd_rs_verified::rewrite_filesystem_shape_admit(
             external,
             rule.flags.passthrough,
             absolute,
@@ -941,7 +941,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                         .as_ref()
                         .and_then(|(file, _)| crate::files::fd_path(file));
                     let actual_under_root = actual.as_ref().is_some_and(|actual| {
-                        vapache_verified::path_under_base(
+                        httpd_rs_verified::path_under_base(
                             actual.as_os_str().as_encoded_bytes(),
                             docroot.as_os_str().as_encoded_bytes(),
                         )
@@ -954,7 +954,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                     // and serve the result. The descriptor probe and retained
                     // relative path keep that decision attached to the same
                     // mapping root even if a content directory is renamed.
-                    if vapache_verified::rewrite_filesystem_candidate_admit(
+                    if httpd_rs_verified::rewrite_filesystem_candidate_admit(
                         external,
                         rule.flags.passthrough,
                         absolute,
@@ -963,7 +963,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                     ) {
                         let relative = relative.expect("admitted rewrite target is relative");
                         let actual = actual.expect("admitted rewrite target has a descriptor path");
-                        if !vapache_verified::rewrite_filesystem_binding_admit(true, true) {
+                        if !httpd_rs_verified::rewrite_filesystem_binding_admit(true, true) {
                             return Outcome::Error(
                                 "filesystem rewrite lost its mapping-root binding".into(),
                             );
@@ -990,7 +990,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         filesystem_override = filesystem;
 
         match transition.action {
-            vapache_verified::RewriteProgramAction::Proxy { .. } => {
+            httpd_rs_verified::RewriteProgramAction::Proxy { .. } => {
                 let mut url = joined;
                 if !new_query.is_empty() {
                     let Ok(new_query) = std::str::from_utf8(&new_query) else {
@@ -1001,7 +1001,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                 }
                 return Outcome::Proxy { url, effects };
             }
-            vapache_verified::RewriteProgramAction::Redirect { .. } => {
+            httpd_rs_verified::RewriteProgramAction::Redirect { .. } => {
                 let status = rule.flags.redirect.unwrap_or(302);
                 let mut location = joined;
                 if !new_query.is_empty() {
@@ -1028,9 +1028,9 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                     effects,
                 };
             }
-            vapache_verified::RewriteProgramAction::Continue { .. }
-            | vapache_verified::RewriteProgramAction::Restart { .. }
-            | vapache_verified::RewriteProgramAction::Stop { .. } => {}
+            httpd_rs_verified::RewriteProgramAction::Continue { .. }
+            | httpd_rs_verified::RewriteProgramAction::Restart { .. }
+            | httpd_rs_verified::RewriteProgramAction::Stop { .. } => {}
             _ => {
                 // coverage:ignore-start - excluded by the verified expanded transition
                 return Outcome::Error("invalid internal rewrite transition".into());
@@ -1043,11 +1043,11 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         changed = true;
         machine = transition.state;
         match transition.action {
-            vapache_verified::RewriteProgramAction::Continue { .. } => {}
-            vapache_verified::RewriteProgramAction::Restart { .. } => {
+            httpd_rs_verified::RewriteProgramAction::Continue { .. } => {}
+            httpd_rs_verified::RewriteProgramAction::Restart { .. } => {
                 continue;
             }
-            vapache_verified::RewriteProgramAction::Stop { .. } => {
+            httpd_rs_verified::RewriteProgramAction::Stop { .. } => {
                 break;
             }
             _ => unreachable!("terminal expanded actions returned before internal update"),
@@ -1070,7 +1070,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
 fn new_path_from_joined(joined: &str) -> String {
     // The caller re-canonicalizes this.  Keep a single leading slash and
     // preserve a meaningful trailing slash.
-    let out = vapache_verified::rewrite_internal_path(joined.as_bytes());
+    let out = httpd_rs_verified::rewrite_internal_path(joined.as_bytes());
     String::from_utf8_lossy(&out).into_owned()
 }
 
@@ -1169,7 +1169,7 @@ fn conditions_match(
         matches.push(r);
         ors.push(cond.flags.or);
     }
-    let overall = vapache_verified::cond_chain_eval(&matches, &ors);
+    let overall = httpd_rs_verified::cond_chain_eval(&matches, &ors);
     if overall {
         for name in matched_headers {
             if !vary.iter().any(|v| v.eq_ignore_ascii_case(&name)) {
@@ -1377,7 +1377,7 @@ fn append_rewrite_expansion(
     } else if allow_3f {
         append_rewrite_output(out, value)
     } else {
-        append_rewrite_output(out, &vapache_verified::rewrite_backref_no_qmark(value))
+        append_rewrite_output(out, &httpd_rs_verified::rewrite_backref_no_qmark(value))
     }
 }
 
@@ -1485,20 +1485,20 @@ fn variable_value_bytes(
     if name == "HTTP_HOST" {
         return Ok(req
             .header("host")
-            .map(vapache_verified::guard_header_bytes)
+            .map(httpd_rs_verified::guard_header_bytes)
             .unwrap_or_else(|| ctx.server_name.as_bytes().to_vec()));
     }
     if let Some(raw) = name.strip_prefix("HTTP_") {
         let header = raw.replace('_', "-").to_ascii_lowercase();
         return Ok(req
             .header(&header)
-            .map(vapache_verified::guard_header_bytes)
+            .map(httpd_rs_verified::guard_header_bytes)
             .unwrap_or_default());
     }
     if let Some(raw) = name.strip_prefix("HTTP:") {
         return Ok(req
             .header(&raw.to_ascii_lowercase())
-            .map(vapache_verified::guard_header_bytes)
+            .map(httpd_rs_verified::guard_header_bytes)
             .unwrap_or_default());
     }
     Ok(variable_value(name, req, ctx, path, query, maps, env)?.into_bytes())
@@ -1608,7 +1608,7 @@ fn int_map(function: &str, key: &str) -> String {
             for b in 0..=255u8 {
                 mask[b as usize] = !(b.is_ascii_alphanumeric() || b"-._~/".contains(&b));
             }
-            let out = vapache_verified::percent_encode(key.as_bytes(), &mask, true);
+            let out = httpd_rs_verified::percent_encode(key.as_bytes(), &mask, true);
             String::from_utf8_lossy(&out).into_owned()
         }
         "unescape" => {
@@ -1685,7 +1685,7 @@ fn run_prg_map_timeout(program: &RewriteProgram, key: &str, timeout: Duration) -
     // parent-side spawns must never inherit the retained program descriptor.
     // Mark every other descriptor CLOEXEC in the child so an accidental
     // non-CLOEXEC daemon descriptor cannot cross this boundary.
-    let mut setup = vapache_os::ChildSetup::inherited(vapache_os::current_pid());
+    let mut setup = httpd_rs_os::ChildSetup::inherited(httpd_rs_os::current_pid());
     setup.retained_fd = Some(exec_fd);
     setup.create_session = true;
     setup.umask = Some(0o077);
@@ -1694,7 +1694,7 @@ fn run_prg_map_timeout(program: &RewriteProgram, key: &str, timeout: Duration) -
     setup.cpu_seconds = Some(timeout.as_secs().max(1));
     setup.file_size = Some(1024 * 1024);
     setup.open_files = Some(64);
-    vapache_os::configure_child(&mut command, setup);
+    httpd_rs_os::configure_child(&mut command, setup);
     if crate::fault::hit("rewrite.program.spawn").is_err() {
         return String::new();
     }
@@ -1724,7 +1724,7 @@ fn finish_prg_map(
 
 fn abort_prg_map(mut child: std::process::Child) -> String {
     let pid = child.id() as i32;
-    let _ = vapache_os::kill(-pid, libc::SIGKILL);
+    let _ = httpd_rs_os::kill(-pid, libc::SIGKILL);
     let _ = child.kill();
     let _ = child.wait();
     String::new()
@@ -1736,7 +1736,7 @@ fn wait_prg_output(mut child: std::process::Child, timeout: Duration) -> String 
     };
     let (line, complete, completed_before_deadline) =
         read_prg_line_with_deadline(&mut stdout, Instant::now() + timeout);
-    let admitted = vapache_verified::rewrite_map_result_admit(
+    let admitted = httpd_rs_verified::rewrite_map_result_admit(
         completed_before_deadline,
         complete,
         line.len() as u64,
@@ -1747,7 +1747,7 @@ fn wait_prg_output(mut child: std::process::Child, timeout: Duration) -> String 
     // already produced a valid line. A successful lookup does not grant its
     // background descendants daemon lifetime. Signal before wait/reap so the
     // numeric PID cannot be recycled as an unrelated process-group id.
-    let _ = vapache_os::kill(-pid, libc::SIGKILL);
+    let _ = httpd_rs_os::kill(-pid, libc::SIGKILL);
     let _ = child.kill();
     let _ = child.wait();
     if !admitted {
@@ -1765,7 +1765,7 @@ fn read_prg_line_with_deadline(
     if crate::fault::hit("rewrite.program.read").is_err() {
         return (Vec::new(), false, false);
     }
-    if vapache_os::set_nonblocking(input.as_fd(), true).is_err() {
+    if httpd_rs_os::set_nonblocking(input.as_fd(), true).is_err() {
         return (Vec::new(), false, false);
     }
     let mut line = Vec::with_capacity(256);
@@ -1826,13 +1826,13 @@ fn expand_caps_bytes(
     let b = name.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        let token = vapache_verified::rewrite_expand_token(b, i);
-        if let vapache_verified::RewriteExpandToken::RuleCapture { index }
-        | vapache_verified::RewriteExpandToken::ConditionCapture { index } = token
+        let token = httpd_rs_verified::rewrite_expand_token(b, i);
+        if let httpd_rs_verified::RewriteExpandToken::RuleCapture { index }
+        | httpd_rs_verified::RewriteExpandToken::ConditionCapture { index } = token
         {
             let pool = if matches!(
                 token,
-                vapache_verified::RewriteExpandToken::ConditionCapture { .. }
+                httpd_rs_verified::RewriteExpandToken::ConditionCapture { .. }
             ) {
                 cond_caps
             } else {
@@ -1923,7 +1923,7 @@ fn escape_redirect_location(value: &str) -> String {
                 b'"' | b'<' | b'>' | b'\\' | b'^' | b'`' | b'{' | b'|' | b'}'
             );
     }
-    let out = vapache_verified::percent_encode(value.as_bytes(), &mask, false);
+    let out = httpd_rs_verified::percent_encode(value.as_bytes(), &mask, false);
     String::from_utf8_lossy(&out).into_owned()
 }
 
@@ -1954,7 +1954,7 @@ fn same_host_internal(ctx: &Context<'_>, req: &Request, url: &str) -> Option<Str
         crate::util::parse_http_authority(authority.as_bytes(), target_default)?;
     let (request_host, request_port) =
         crate::util::parse_http_authority(host.as_bytes(), request_default)?;
-    if vapache_verified::authority_endpoint_equal(
+    if httpd_rs_verified::authority_endpoint_equal(
         target_host.as_bytes(),
         target_port,
         target_tls,
@@ -1969,7 +1969,7 @@ fn same_host_internal(ctx: &Context<'_>, req: &Request, url: &str) -> Option<Str
 }
 
 fn is_external_url(s: &str) -> bool {
-    vapache_verified::rewrite_target_external(s.as_bytes())
+    httpd_rs_verified::rewrite_target_external(s.as_bytes())
 }
 
 #[cfg(test)]
@@ -2172,24 +2172,24 @@ mod tests {
 
     #[test]
     fn rewrite_condition_or_groups_are_folded_by_verified_chain() {
-        assert!(vapache_verified::cond_chain_eval(
+        assert!(httpd_rs_verified::cond_chain_eval(
             &[true, false, true],
             &[false, true, false]
         ));
-        assert!(!vapache_verified::cond_chain_eval(
+        assert!(!httpd_rs_verified::cond_chain_eval(
             &[true, false, false],
             &[false, true, false]
         ));
-        assert!(vapache_verified::cond_chain_eval(
+        assert!(httpd_rs_verified::cond_chain_eval(
             &[false, true, false],
             &[true, true, false]
         ));
-        assert!(vapache_verified::cond_chain_eval(&[], &[]));
+        assert!(httpd_rs_verified::cond_chain_eval(&[], &[]));
     }
 
     #[test]
     fn verified_rewrite_decisions_cover_flag_truth_tables() {
-        use vapache_verified::{
+        use httpd_rs_verified::{
             RewriteAdvance, RewriteExpandToken, RewriteMatchAction, RewriteQueryAction, RewriteSink,
         };
 
@@ -2204,7 +2204,7 @@ mod tests {
                         RewriteSink::Internal
                     };
                     assert_eq!(
-                        vapache_verified::rewrite_sink(proxy, external, redirect),
+                        httpd_rs_verified::rewrite_sink(proxy, external, redirect),
                         expected
                     );
                 }
@@ -2227,7 +2227,7 @@ mod tests {
                             RewriteQueryAction::Preserve
                         };
                         assert_eq!(
-                            vapache_verified::rewrite_query_action(
+                            httpd_rs_verified::rewrite_query_action(
                                 has_target_query,
                                 append,
                                 discard,
@@ -2246,7 +2246,7 @@ mod tests {
                     for is_file in [false, true] {
                         for under_base in [false, true] {
                             assert_eq!(
-                                vapache_verified::rewrite_filesystem_candidate_admit(
+                                httpd_rs_verified::rewrite_filesystem_candidate_admit(
                                     external,
                                     passthrough,
                                     absolute,
@@ -2263,7 +2263,7 @@ mod tests {
 
         for completed in 0..=11 {
             assert_eq!(
-                vapache_verified::rewrite_restart_admit(completed, 10),
+                httpd_rs_verified::rewrite_restart_admit(completed, 10),
                 completed < 10
             );
         }
@@ -2277,66 +2277,66 @@ mod tests {
             (b"%4", RewriteExpandToken::ConditionCapture { index: 4 }),
         ];
         for (input, expected) in token_cases {
-            assert_eq!(vapache_verified::rewrite_expand_token(input, 0), *expected);
+            assert_eq!(httpd_rs_verified::rewrite_expand_token(input, 0), *expected);
             assert_eq!(
-                vapache_verified::rewrite_template_static(input),
+                httpd_rs_verified::rewrite_template_static(input),
                 *expected == RewriteExpandToken::Literal
             );
         }
 
         let chained = [false, true, false, false];
         assert_eq!(
-            vapache_verified::rewrite_match_action(&chained, 1, false, true, true, true, true),
+            httpd_rs_verified::rewrite_match_action(&chained, 1, false, true, true, true, true),
             RewriteMatchAction::Continue { index: 3 }
         );
         assert_eq!(
-            vapache_verified::rewrite_match_action(&chained, 1, true, false, true, true, true),
+            httpd_rs_verified::rewrite_match_action(&chained, 1, true, false, true, true, true),
             RewriteMatchAction::Forbidden
         );
         assert_eq!(
-            vapache_verified::rewrite_match_action(&chained, 1, true, false, false, true, true),
+            httpd_rs_verified::rewrite_match_action(&chained, 1, true, false, false, true, true),
             RewriteMatchAction::Gone
         );
         assert_eq!(
-            vapache_verified::rewrite_match_action(&chained, 1, true, false, false, false, true),
+            httpd_rs_verified::rewrite_match_action(&chained, 1, true, false, false, false, true),
             RewriteMatchAction::NoSubstitution
         );
         assert_eq!(
-            vapache_verified::rewrite_match_action(&chained, 1, true, true, false, false, false),
+            httpd_rs_verified::rewrite_match_action(&chained, 1, true, true, false, false, false),
             RewriteMatchAction::Expand
         );
 
         assert_eq!(
-            vapache_verified::rewrite_advance(1, 4, true, 2, false, false, false, 0, 10),
+            httpd_rs_verified::rewrite_advance(1, 4, true, 2, false, false, false, 0, 10),
             RewriteAdvance::Continue { index: 3 }
         );
         assert_eq!(
-            vapache_verified::rewrite_advance(3, 4, true, usize::MAX, false, false, false, 0, 10),
+            httpd_rs_verified::rewrite_advance(3, 4, true, usize::MAX, false, false, false, 0, 10),
             RewriteAdvance::Continue { index: 4 }
         );
         assert_eq!(
-            vapache_verified::rewrite_advance(1, 4, true, 2, true, true, true, 3, 10),
+            httpd_rs_verified::rewrite_advance(1, 4, true, 2, true, true, true, 3, 10),
             RewriteAdvance::Restart { completed: 4 }
         );
         assert_eq!(
-            vapache_verified::rewrite_advance(1, 4, false, 0, true, false, false, 10, 10),
+            httpd_rs_verified::rewrite_advance(1, 4, false, 0, true, false, false, 10, 10),
             RewriteAdvance::RestartLimit
         );
         assert_eq!(
-            vapache_verified::rewrite_advance(1, 4, false, 0, false, true, true, 0, 10),
+            httpd_rs_verified::rewrite_advance(1, 4, false, 0, false, true, true, 0, 10),
             RewriteAdvance::Stop { final_pass: true }
         );
     }
 
     #[test]
     fn verified_rewrite_program_composes_control_query_and_terminal_states() {
-        use vapache_verified::{
+        use httpd_rs_verified::{
             RewriteProgramAction, RewriteProgramEvent, RewriteProgramPhase, RewriteQueryAction,
         };
 
         let chained = [true, true, false, false];
-        let transition = vapache_verified::rewrite_program_step(
-            vapache_verified::rewrite_program_start(),
+        let transition = httpd_rs_verified::rewrite_program_step(
+            httpd_rs_verified::rewrite_program_start(),
             RewriteProgramEvent::NoMatch { chain: true },
             &chained,
             10,
@@ -2352,8 +2352,8 @@ mod tests {
         );
 
         let rules = [false, false];
-        let first_restart = vapache_verified::rewrite_program_step(
-            vapache_verified::rewrite_program_start(),
+        let first_restart = httpd_rs_verified::rewrite_program_step(
+            httpd_rs_verified::rewrite_program_start(),
             RewriteProgramEvent::Matched {
                 forbidden: false,
                 gone: false,
@@ -2380,7 +2380,7 @@ mod tests {
             }
         );
         assert_eq!(first_restart.state.index, 0);
-        let exhausted = vapache_verified::rewrite_program_step(
+        let exhausted = httpd_rs_verified::rewrite_program_step(
             first_restart.state,
             RewriteProgramEvent::Matched {
                 forbidden: false,
@@ -2402,7 +2402,7 @@ mod tests {
         .unwrap();
         assert_eq!(exhausted.action, RewriteProgramAction::RestartLimit);
         assert_eq!(exhausted.state.phase, RewriteProgramPhase::Failed);
-        assert!(vapache_verified::rewrite_program_step(
+        assert!(httpd_rs_verified::rewrite_program_step(
             exhausted.state,
             RewriteProgramEvent::NoMatch { chain: false },
             &rules,
@@ -2410,8 +2410,8 @@ mod tests {
         )
         .is_none());
 
-        let selected = vapache_verified::rewrite_program_step(
-            vapache_verified::rewrite_program_start(),
+        let selected = httpd_rs_verified::rewrite_program_step(
+            httpd_rs_verified::rewrite_program_start(),
             RewriteProgramEvent::Matched {
                 forbidden: false,
                 gone: false,
@@ -2432,8 +2432,8 @@ mod tests {
         .unwrap();
         assert_eq!(selected.action, RewriteProgramAction::Expand);
         assert_eq!(selected.state.phase, RewriteProgramPhase::Expanding);
-        assert!(vapache_verified::rewrite_program_step(
-            vapache_verified::rewrite_program_start(),
+        assert!(httpd_rs_verified::rewrite_program_step(
+            httpd_rs_verified::rewrite_program_start(),
             RewriteProgramEvent::Expanded {
                 external: true,
                 has_target_query: true,
@@ -2443,14 +2443,14 @@ mod tests {
             10,
         )
         .is_none());
-        assert!(vapache_verified::rewrite_program_step(
+        assert!(httpd_rs_verified::rewrite_program_step(
             selected.state,
             RewriteProgramEvent::NoMatch { chain: false },
             &rules,
             10,
         )
         .is_none());
-        let terminal = vapache_verified::rewrite_program_step(
+        let terminal = httpd_rs_verified::rewrite_program_step(
             selected.state,
             RewriteProgramEvent::Expanded {
                 external: true,
@@ -2468,7 +2468,7 @@ mod tests {
             }
         );
         assert_eq!(terminal.state.phase, RewriteProgramPhase::Terminal);
-        assert!(vapache_verified::rewrite_program_step(
+        assert!(httpd_rs_verified::rewrite_program_step(
             terminal.state,
             RewriteProgramEvent::NoMatch { chain: false },
             &rules,
@@ -2476,8 +2476,8 @@ mod tests {
         )
         .is_none());
 
-        let stopped = vapache_verified::rewrite_program_step(
-            vapache_verified::rewrite_program_start(),
+        let stopped = httpd_rs_verified::rewrite_program_step(
+            httpd_rs_verified::rewrite_program_start(),
             RewriteProgramEvent::Matched {
                 forbidden: false,
                 gone: false,
@@ -2506,8 +2506,8 @@ mod tests {
         assert!(stopped.state.final_pass);
         assert_eq!(stopped.state.phase, RewriteProgramPhase::Stopped);
 
-        let denied = vapache_verified::rewrite_program_step(
-            vapache_verified::rewrite_program_start(),
+        let denied = httpd_rs_verified::rewrite_program_step(
+            httpd_rs_verified::rewrite_program_start(),
             RewriteProgramEvent::Matched {
                 forbidden: true,
                 gone: true,
@@ -2532,19 +2532,19 @@ mod tests {
 
     #[test]
     fn rewrite_authority_comparison_handles_case_and_ports() {
-        assert!(vapache_verified::rewrite_authority_equal(
+        assert!(httpd_rs_verified::rewrite_authority_equal(
             b"LOCALHOST:80",
             b"localhost:80"
         ));
-        assert!(!vapache_verified::rewrite_authority_equal(
+        assert!(!httpd_rs_verified::rewrite_authority_equal(
             b"localhost:80",
             b"localhost:443"
         ));
-        assert!(!vapache_verified::rewrite_authority_equal(
+        assert!(!httpd_rs_verified::rewrite_authority_equal(
             b"other.test:80",
             b"localhost:80"
         ));
-        assert!(!vapache_verified::rewrite_authority_equal(
+        assert!(!httpd_rs_verified::rewrite_authority_equal(
             b"[::1]:443",
             b"[::2]:443"
         ));
@@ -4042,7 +4042,8 @@ mod tests {
 
     #[test]
     fn condition_evaluation_and_header_extraction() {
-        let dir = std::env::temp_dir().join(format!("vapache-rewrite-cond-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("httpd-rs-rewrite-cond-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("sub")).unwrap();
         fs::write(dir.join("file.txt"), "content").unwrap();
@@ -4157,7 +4158,7 @@ mod tests {
         assert!(!file_test("../etc/passwd", &c, FileTest::Regular));
         assert!(!file_test("/etc/passwd", &c, FileTest::Regular));
         let outside = std::env::temp_dir().join(format!(
-            "vapache-rewrite-outside-{}-{}",
+            "httpd-rs-rewrite-outside-{}-{}",
             std::process::id(),
             "file_test"
         ));
@@ -4380,13 +4381,13 @@ mod tests {
             .arg("--exact")
             .arg("rewrite::tests::prg_descriptor_isolation_subprocess")
             .arg("--test-threads=1")
-            .env("VAPACHE_PRG_ISOLATION_SUBPROCESS", "1")
+            .env("HTTPD_RS_PRG_ISOLATION_SUBPROCESS", "1")
             .status()
             .unwrap();
         assert!(isolation_status.success());
 
         let timeout_script =
-            std::env::temp_dir().join(format!("vapache-prg-timeout-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-prg-timeout-{}", std::process::id()));
         fs::write(&timeout_script, "#!/bin/sh\nsleep 5\n").unwrap();
         let mut mode = fs::metadata(&timeout_script).unwrap().permissions();
         mode.set_mode(0o700);
@@ -4398,7 +4399,7 @@ mod tests {
         );
 
         let overflow_script =
-            std::env::temp_dir().join(format!("vapache-prg-overflow-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-prg-overflow-{}", std::process::id()));
         fs::write(&overflow_script, "#!/bin/sh\nprintf '%09000d' 0\n").unwrap();
         let mut mode = fs::metadata(&overflow_script).unwrap().permissions();
         mode.set_mode(0o700);
@@ -4532,7 +4533,7 @@ mod tests {
 
     #[test]
     fn prg_descriptor_isolation_subprocess() {
-        if std::env::var_os("VAPACHE_PRG_ISOLATION_SUBPROCESS").is_none() {
+        if std::env::var_os("HTTPD_RS_PRG_ISOLATION_SUBPROCESS").is_none() {
             return;
         }
         // Even if an unrelated daemon descriptor accidentally lacks CLOEXEC,
@@ -4542,7 +4543,7 @@ mod tests {
         const SENTINEL_FD: libc::c_int = 198;
         assert!(std::env::var_os("HOME").is_some());
         let isolation_script = std::env::temp_dir().join(format!(
-            "vapache-prg-descriptor-isolation-{}",
+            "httpd-rs-prg-descriptor-isolation-{}",
             std::process::id()
         ));
         fs::write(
@@ -4639,7 +4640,7 @@ mod tests {
         let _resource_context = crate::resource::enter_resource_context(
             test_budget.context(std::net::IpAddr::from([127, 0, 0, 1])),
         );
-        let dir = std::env::temp_dir().join(format!("vapache-prg-binding-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-prg-binding-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("worker");
@@ -4746,7 +4747,7 @@ mod tests {
         );
 
         let dir =
-            std::env::temp_dir().join(format!("vapache-prg-root-trust-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-prg-root-trust-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir(&dir).unwrap();
         let program = dir.join("worker");

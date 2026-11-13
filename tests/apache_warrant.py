@@ -4,8 +4,8 @@
 This tool deliberately separates observation from support policy:
 
 * the source manifest records what exists in one pinned Apache source release;
-* the policy records the narrow Vapache compatibility surface and its evidence;
-* the ledger classifies every observed source item without changing Vapache.
+* the policy records the narrow httpd-rs compatibility surface and its evidence;
+* the ledger classifies every observed source item without changing httpd-rs.
 
 An Apache item that is not named by an explicit compatibility claim remains
 outside the claimed surface.  Regenerating the source manifest changes its
@@ -259,7 +259,7 @@ def extract_external_tests(source: Path, pin: dict[str, Any]) -> tuple[list[dict
         "pin": pin,
         "files": len(files),
         "warrant": (
-            "Inventory only: every file is evidence to triage, never an implied Vapache "
+            "Inventory only: every file is evidence to triage, never an implied httpd-rs "
             "support claim. Execution and semantic mapping remain separate work."
         ),
     }
@@ -530,7 +530,7 @@ def validate_inputs(manifest: dict[str, Any], policy: dict[str, Any]) -> None:
         matched_in_scope.update(item["id"] for item in matches)
         evidence = family.get("evidence", [])
         if not evidence:
-            errors.append(f"family {family_id} has no Vapache evidence")
+            errors.append(f"family {family_id} has no httpd-rs evidence")
         for reference in evidence:
             if not evidence_exists(reference):
                 errors.append(f"family {family_id} evidence does not exist: {reference}")
@@ -762,7 +762,7 @@ def render_ledger(manifest: dict[str, Any], policy: dict[str, Any]) -> dict[str,
                 parser_relation = "recognized-without-support-claim"
             else:
                 parser_relation = "unknown-fail-closed"
-            ledger_item["vapache_parser_relation"] = parser_relation
+            ledger_item["httpd_rs_parser_relation"] = parser_relation
         ledger_items.append(ledger_item)
     ledger = {
         "schema": SCHEMA,
@@ -779,9 +779,9 @@ def render_ledger(manifest: dict[str, Any], policy: dict[str, Any]) -> dict[str,
             "source_tarball_tests": len(manifest["upstream_tests"]),
             "external_httpd_test_files": len(manifest["external_upstream_tests"]),
             "apache_unique_directives": len(apache_directives),
-            "apache_directives_recognized_by_vapache": len(apache_directives & known_directives),
+            "apache_directives_recognized_by_httpd_rs": len(apache_directives & known_directives),
             "apache_directives_unknown_and_fail_closed": len(apache_directives - known_directives),
-            "vapache_registry_names_absent_from_pinned_apache": len(known_directives - apache_directives),
+            "httpd_rs_registry_names_absent_from_pinned_apache": len(known_directives - apache_directives),
             "families": len(families),
             "explicit_compatibility_claims": len(claims),
             "fuzz_targets_with_warrants": len(

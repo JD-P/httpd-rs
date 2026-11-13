@@ -179,7 +179,7 @@
         }
       },
       "status": "pinned-inventory",
-      "warrant": "Inventory only: every file is evidence to triage, never an implied Vapache support claim. Execution and semantic mapping remain separate work."
+      "warrant": "Inventory only: every file is evidence to triage, never an implied httpd-rs support claim. Execution and semantic mapping remain separate work."
     }
   ],
   "external_upstream_tests": [
@@ -6290,7 +6290,7 @@
     }
   ],
   "extractor": "apache-warrant-v1",
-  "inventory_sha256": "d502b041d8b9b92b19330300ad5c64f886befb52f0ff2928c141b35ceb9cf5d8",
+  "inventory_sha256": "84726d4398d55ec4ce8824e348abb3ab39f58e643413f9c86a6ec977dad34e47",
   "items": [
     {
       "component": "include",

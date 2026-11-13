@@ -36,7 +36,7 @@ pub(crate) fn split_internal_request_target(url: &str) -> Option<(&str, Option<&
         .as_bytes()
         .iter()
         .any(|byte| *byte == 0x7f || *byte <= b' ' || *byte == b'\\');
-    if !vapache_verified::internal_request_target_admit(
+    if !httpd_rs_verified::internal_request_target_admit(
         path.starts_with('/'),
         !path.is_empty(),
         has_fragment,
@@ -48,7 +48,7 @@ pub(crate) fn split_internal_request_target(url: &str) -> Option<(&str, Option<&
     // the selected listener's AllowEncodedSlashes policy is still enforced by
     // the real request plan. This catches malformed escapes, encoded controls,
     // encoded backslashes and non-UTF-8 canonical paths at startup.
-    let decoded = vapache_verified::percent_decode_path(path.as_bytes(), true)?;
+    let decoded = httpd_rs_verified::percent_decode_path(path.as_bytes(), true)?;
     let normalized = crate::verified::normalize_uri_path(&decoded)?;
     std::str::from_utf8(&normalized).ok()?;
     Some((path, query))
@@ -65,7 +65,7 @@ fn next_policy_ancestor_work(
     let copied = copied
         .checked_add(path.as_os_str().as_encoded_bytes().len())
         .ok_or_else(|| "filesystem policy ancestor work overflow".to_string())?;
-    if !vapache_verified::policy_path_work_admit(
+    if !httpd_rs_verified::policy_path_work_admit(
         components as u64,
         copied as u64,
         MAX_POLICY_PATH_COMPONENTS as u64,
@@ -114,7 +114,7 @@ pub(crate) fn bounded_policy_ancestor_dirs(path: &Path) -> Result<Vec<PathBuf>, 
 
 pub fn expand_regex_captures(
     template: &str,
-    captures: &vapache_pcre2::bytes::Captures<'_>,
+    captures: &httpd_rs_pcre2::bytes::Captures<'_>,
 ) -> Option<String> {
     if template.len() > MAX_CAPTURE_EXPANSION_BYTES || captures.len() > MAX_CAPTURE_GROUPS {
         return None;
@@ -130,7 +130,7 @@ pub fn expand_regex_captures(
         if occurrences == 0 {
             continue;
         }
-        let next = vapache_verified::capture_expansion_len(
+        let next = httpd_rs_verified::capture_expansion_len(
             expanded.len() as u64,
             occurrences as u64,
             marker.len() as u64,
@@ -241,7 +241,7 @@ pub fn system_time_secs(t: SystemTime) -> i64 {
 pub fn route_prefix_suffix<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
     let exact = path == prefix;
     let rest = path.strip_prefix(prefix);
-    let admitted = vapache_verified::proxy_prefix_match_admit(
+    let admitted = httpd_rs_verified::proxy_prefix_match_admit(
         exact,
         rest.is_some(),
         prefix.ends_with('/'),
@@ -494,7 +494,7 @@ pub fn parse_hex_u64(s: &[u8]) -> Option<u64> {
 
 /// Parse a decimal `u64`, rejecting signs and overflow.
 pub fn parse_u64(s: &[u8]) -> Option<u64> {
-    vapache_verified::parse_decimal_u64(s)
+    httpd_rs_verified::parse_decimal_u64(s)
 }
 
 /// Parse an HTTP authority into one unambiguous routing identity.

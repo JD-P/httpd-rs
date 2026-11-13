@@ -183,7 +183,7 @@ impl CanonicalTarget {
             // defense in depth for non-verified callers.
             return Err(CanonicalError::Normalize); // coverage:ignore-line
         }
-        if !vapache_verified::canonical_path_text_admit(
+        if !httpd_rs_verified::canonical_path_text_admit(
             canonical,
             std::str::from_utf8(&norm).is_ok(),
         ) {
@@ -340,7 +340,7 @@ pub fn layer_url_mount(mapping_root: &Path, dir: &Path, fs_path: &Path, url_path
         end = slash;
         remaining -= 1;
     }
-    if !vapache_verified::htaccess_layer_url_base_admit(true, url_depth_sufficient) {
+    if !httpd_rs_verified::htaccess_layer_url_base_admit(true, url_depth_sufficient) {
         return crate::config::normalize_rewrite_base(&dir.to_string_lossy());
     }
     crate::config::normalize_rewrite_base(&trimmed[..end])
@@ -507,7 +507,7 @@ impl RequestPlan {
         // U+FFFD at any of those policy boundaries.
         let textual_identity =
             root.to_str().is_some() && rel.to_str().is_some() && fs_path.to_str().is_some();
-        if !vapache_verified::text_identity_admit(textual_identity) {
+        if !httpd_rs_verified::text_identity_admit(textual_identity) {
             return Err(PlanError::AccessFiles(format!(
                 "{}: non-UTF-8 filesystem policy identity",
                 fs_path.display()
@@ -540,7 +540,7 @@ impl RequestPlan {
         let layers_match_target = layers
             .iter()
             .all(|layer| fs_path.starts_with(&layer.identity.dir));
-        if !vapache_verified::explicit_target_layer_admit(true, true, layers_match_target) {
+        if !httpd_rs_verified::explicit_target_layer_admit(true, true, layers_match_target) {
             // coverage:ignore-start
             return Err(PlanError::AccessFiles(format!(
                 "{}: access layers do not belong to the explicit target",
@@ -807,7 +807,7 @@ impl RequestPlan {
         // A nonempty layer set already proves that access files apply.  Never
         // fall back to the configuration-only path merely because the target
         // path is outside the lexical `AllowOverride` prefix (F59/I60).
-        let use_layers = vapache_verified::target_layer_consume_admit(
+        let use_layers = httpd_rs_verified::target_layer_consume_admit(
             self.access_may_apply,
             !self.layers.is_empty(),
         );
@@ -1329,7 +1329,7 @@ mod tests {
             skip_url_translation: false,
         };
         let fixture =
-            std::env::temp_dir().join(format!("vapache-plan-index-fd-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-plan-index-fd-{}", std::process::id()));
         std::fs::write(&fixture, b"index").unwrap();
         let file = File::open(&fixture).unwrap();
         let meta = file.metadata().unwrap();
@@ -1366,7 +1366,7 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let cfg = load_config("Listen 127.0.0.1:0\n");
-        let root = PathBuf::from(OsString::from_vec(b"/tmp/vapache-root-\xff".to_vec()));
+        let root = PathBuf::from(OsString::from_vec(b"/tmp/httpd-rs-root-\xff".to_vec()));
         let error = RequestPlan::build_with_fs_path(
             &cfg,
             None,
@@ -1441,7 +1441,7 @@ mod tests {
         static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let fixture = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("vapache-plan-{}-{fixture}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-plan-{}-{fixture}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
@@ -1459,7 +1459,7 @@ mod tests {
     #[test]
     fn fs_target_outside_mapping_root_reads_explicit_target_layers() {
         use std::os::unix::fs::symlink;
-        let base = std::env::temp_dir().join(format!("vapache-plan-f59-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("httpd-rs-plan-f59-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let real = base.join("real").join("public");
         let admin = real.join("admin");

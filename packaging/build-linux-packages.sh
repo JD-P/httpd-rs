@@ -78,68 +78,68 @@ work_dir=$(mktemp -d)
 trap 'rm -rf -- "$work_dir"' EXIT
 
 release=1
-deb_name="vapache_${version}-${release}_amd64.deb"
+deb_name="httpd-rs_${version}-${release}_amd64.deb"
 rpm_version=${version//-/~}
-rpm_name="vapache-${rpm_version}-${release}.x86_64.rpm"
-raw_name="vapached-${version}-linux-x86_64-musl"
-archive_name="vapache-${version}-linux-x86_64-musl.tar.gz"
+rpm_name="httpd-rs-${rpm_version}-${release}.x86_64.rpm"
+raw_name="httpd-rs-${version}-linux-x86_64-musl"
+archive_name="httpd-rs-${version}-linux-x86_64-musl.tar.gz"
 
 install -m 0755 "$binary" "$output/$raw_name"
 
-archive_root="$work_dir/vapache-${version}-linux-x86_64-musl"
-install -Dm 0755 "$binary" "$archive_root/usr/sbin/vapached"
-install -Dm 0755 "$script_dir/vapachectl" "$archive_root/usr/sbin/vapachectl"
-install -Dm 0755 "$script_dir/vapache-switch" "$archive_root/usr/sbin/vapache-switch"
-install -Dm 0755 "$script_dir/vapache-certbot-apachectl" \
-    "$archive_root/usr/lib/vapache/certbot-apachectl"
-install -Dm 0755 "$script_dir/vapache-certbot-deploy-hook" \
-    "$archive_root/usr/lib/vapache/certbot-deploy-hook"
-install -Dm 0755 "$script_dir/vapache-certbot-cleanup" \
-    "$archive_root/usr/lib/vapache/certbot-cleanup"
-install -Dm 0644 "$script_dir/vapache-control-common" \
-    "$archive_root/usr/lib/vapache/control-common"
-install -Dm 0644 "$script_dir/vapache.service" \
-    "$archive_root/usr/lib/systemd/system/vapache.service"
-install -Dm 0644 "$repo_root/README.md" "$archive_root/usr/share/doc/vapache/README.md"
+archive_root="$work_dir/httpd-rs-${version}-linux-x86_64-musl"
+install -Dm 0755 "$binary" "$archive_root/usr/sbin/httpd-rs"
+install -Dm 0755 "$script_dir/httpd-rsctl" "$archive_root/usr/sbin/httpd-rsctl"
+install -Dm 0755 "$script_dir/httpd-rs-switch" "$archive_root/usr/sbin/httpd-rs-switch"
+install -Dm 0755 "$script_dir/httpd-rs-certbot-apachectl" \
+    "$archive_root/usr/lib/httpd-rs/certbot-apachectl"
+install -Dm 0755 "$script_dir/httpd-rs-certbot-deploy-hook" \
+    "$archive_root/usr/lib/httpd-rs/certbot-deploy-hook"
+install -Dm 0755 "$script_dir/httpd-rs-certbot-cleanup" \
+    "$archive_root/usr/lib/httpd-rs/certbot-cleanup"
+install -Dm 0644 "$script_dir/httpd-rs-control-common" \
+    "$archive_root/usr/lib/httpd-rs/control-common"
+install -Dm 0644 "$script_dir/httpd-rs.service" \
+    "$archive_root/usr/lib/systemd/system/httpd-rs.service"
+install -Dm 0644 "$repo_root/README.md" "$archive_root/usr/share/doc/httpd-rs/README.md"
 install -Dm 0644 "$script_dir/README.md" \
-    "$archive_root/usr/share/doc/vapache/PACKAGING.md"
-install -Dm 0644 "$repo_root/LICENSE" "$archive_root/usr/share/licenses/vapache/LICENSE"
+    "$archive_root/usr/share/doc/httpd-rs/PACKAGING.md"
+install -Dm 0644 "$repo_root/LICENSE" "$archive_root/usr/share/licenses/httpd-rs/LICENSE"
 
 tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
     -C "$work_dir" -cf - "$(basename -- "$archive_root")" \
     | gzip -n >"$output/$archive_name"
 
 deb_root="$work_dir/deb"
-install -Dm 0755 "$binary" "$deb_root/usr/sbin/vapached"
-install -Dm 0755 "$script_dir/vapachectl" "$deb_root/usr/sbin/vapachectl"
-install -Dm 0755 "$script_dir/vapache-switch" "$deb_root/usr/sbin/vapache-switch"
-install -Dm 0755 "$script_dir/vapache-certbot-apachectl" \
-    "$deb_root/usr/lib/vapache/certbot-apachectl"
-install -Dm 0755 "$script_dir/vapache-certbot-deploy-hook" \
-    "$deb_root/usr/lib/vapache/certbot-deploy-hook"
-install -Dm 0755 "$script_dir/vapache-certbot-cleanup" \
-    "$deb_root/usr/lib/vapache/certbot-cleanup"
-install -Dm 0644 "$script_dir/vapache-control-common" \
-    "$deb_root/usr/lib/vapache/control-common"
-install -Dm 0644 "$script_dir/vapache.service" \
-    "$deb_root/usr/lib/systemd/system/vapache.service"
-install -Dm 0644 "$repo_root/README.md" "$deb_root/usr/share/doc/vapache/README.md"
-install -Dm 0644 "$script_dir/README.md" "$deb_root/usr/share/doc/vapache/PACKAGING.md"
-install -Dm 0644 "$repo_root/LICENSE" "$deb_root/usr/share/doc/vapache/copyright"
+install -Dm 0755 "$binary" "$deb_root/usr/sbin/httpd-rs"
+install -Dm 0755 "$script_dir/httpd-rsctl" "$deb_root/usr/sbin/httpd-rsctl"
+install -Dm 0755 "$script_dir/httpd-rs-switch" "$deb_root/usr/sbin/httpd-rs-switch"
+install -Dm 0755 "$script_dir/httpd-rs-certbot-apachectl" \
+    "$deb_root/usr/lib/httpd-rs/certbot-apachectl"
+install -Dm 0755 "$script_dir/httpd-rs-certbot-deploy-hook" \
+    "$deb_root/usr/lib/httpd-rs/certbot-deploy-hook"
+install -Dm 0755 "$script_dir/httpd-rs-certbot-cleanup" \
+    "$deb_root/usr/lib/httpd-rs/certbot-cleanup"
+install -Dm 0644 "$script_dir/httpd-rs-control-common" \
+    "$deb_root/usr/lib/httpd-rs/control-common"
+install -Dm 0644 "$script_dir/httpd-rs.service" \
+    "$deb_root/usr/lib/systemd/system/httpd-rs.service"
+install -Dm 0644 "$repo_root/README.md" "$deb_root/usr/share/doc/httpd-rs/README.md"
+install -Dm 0644 "$script_dir/README.md" "$deb_root/usr/share/doc/httpd-rs/PACKAGING.md"
+install -Dm 0644 "$repo_root/LICENSE" "$deb_root/usr/share/doc/httpd-rs/copyright"
 install -d -m 0755 "$deb_root/DEBIAN"
 cat >"$deb_root/DEBIAN/control" <<EOF
-Package: vapache
+Package: httpd-rs
 Version: ${version}-${release}
 Section: httpd
 Priority: optional
 Architecture: amd64
-Maintainer: vapache project <noreply@github.com>
-Homepage: https://github.com/JD-P/vapache
+Maintainer: httpd-rs project <noreply@github.com>
+Homepage: https://github.com/JD-P/httpd-rs
 Suggests: apache2
 Description: Apache-compatible web server with a security-focused core
- Vapache reads an existing Apache configuration and serves it through the
- vapached daemon. This package leaves Apache configuration and service state
- untouched until the administrator explicitly runs vapache-switch.
+ httpd-rs reads an existing Apache configuration and serves it through the
+ httpd-rs daemon. This package leaves Apache configuration and service state
+ untouched until the administrator explicitly runs httpd-rs-switch.
 EOF
 cat >"$deb_root/DEBIAN/postinst" <<'EOF'
 #!/bin/sh -p
@@ -152,10 +152,10 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
 if [ -r /etc/apache2/apache2.conf ]; then
-    echo "vapache: existing /etc/apache2 configuration preserved"
-    echo "vapache: Apache service state is unchanged; 'sudo vapache-switch' will ask before replacing it"
+    echo "httpd-rs: existing /etc/apache2 configuration preserved"
+    echo "httpd-rs: Apache service state is unchanged; 'sudo httpd-rs-switch' will ask before replacing it"
 else
-    echo "vapache: no /etc/apache2/apache2.conf found; configure VAPACHE_CONFDIR and VAPACHE_CONFIG before starting"
+    echo "httpd-rs: no /etc/apache2/apache2.conf found; configure HTTPD_RS_CONFDIR and HTTPD_RS_CONFIG before starting"
 fi
 exit 0
 EOF
@@ -167,11 +167,11 @@ export PATH
 unset CDPATH ENV BASH_ENV
 umask 022
 if [ "${1:-}" = remove ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now vapache.service >/dev/null 2>&1 || true
+    systemctl disable --now httpd-rs.service >/dev/null 2>&1 || true
 fi
-if [ "${1:-}" = remove ] && [ -x /usr/lib/vapache/certbot-cleanup ]; then
-    /usr/lib/vapache/certbot-cleanup || \
-        echo "vapache: warning: could not clean Certbot integration" >&2
+if [ "${1:-}" = remove ] && [ -x /usr/lib/httpd-rs/certbot-cleanup ]; then
+    /usr/lib/httpd-rs/certbot-cleanup || \
+        echo "httpd-rs: warning: could not clean Certbot integration" >&2
 fi
 exit 0
 EOF
@@ -195,36 +195,36 @@ dpkg-deb --root-owner-group -Zxz -z9 --build "$deb_root" "$output/$deb_name"
 
 rpm_top="$work_dir/rpm"
 mkdir -p "$rpm_top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
-install -m 0755 "$binary" "$rpm_top/SOURCES/vapached"
-install -m 0755 "$script_dir/vapachectl" "$rpm_top/SOURCES/vapachectl"
-install -m 0755 "$script_dir/vapache-switch" "$rpm_top/SOURCES/vapache-switch"
-install -m 0755 "$script_dir/vapache-certbot-apachectl" \
-    "$rpm_top/SOURCES/vapache-certbot-apachectl"
-install -m 0755 "$script_dir/vapache-certbot-deploy-hook" \
-    "$rpm_top/SOURCES/vapache-certbot-deploy-hook"
-install -m 0755 "$script_dir/vapache-certbot-cleanup" \
-    "$rpm_top/SOURCES/vapache-certbot-cleanup"
-install -m 0644 "$script_dir/vapache-control-common" \
-    "$rpm_top/SOURCES/vapache-control-common"
-install -m 0644 "$script_dir/vapache.service" "$rpm_top/SOURCES/vapache.service"
+install -m 0755 "$binary" "$rpm_top/SOURCES/httpd-rs"
+install -m 0755 "$script_dir/httpd-rsctl" "$rpm_top/SOURCES/httpd-rsctl"
+install -m 0755 "$script_dir/httpd-rs-switch" "$rpm_top/SOURCES/httpd-rs-switch"
+install -m 0755 "$script_dir/httpd-rs-certbot-apachectl" \
+    "$rpm_top/SOURCES/httpd-rs-certbot-apachectl"
+install -m 0755 "$script_dir/httpd-rs-certbot-deploy-hook" \
+    "$rpm_top/SOURCES/httpd-rs-certbot-deploy-hook"
+install -m 0755 "$script_dir/httpd-rs-certbot-cleanup" \
+    "$rpm_top/SOURCES/httpd-rs-certbot-cleanup"
+install -m 0644 "$script_dir/httpd-rs-control-common" \
+    "$rpm_top/SOURCES/httpd-rs-control-common"
+install -m 0644 "$script_dir/httpd-rs.service" "$rpm_top/SOURCES/httpd-rs.service"
 install -m 0644 "$repo_root/README.md" "$rpm_top/SOURCES/README.md"
 install -m 0644 "$script_dir/README.md" "$rpm_top/SOURCES/PACKAGING.md"
 install -m 0644 "$repo_root/LICENSE" "$rpm_top/SOURCES/LICENSE"
-cat >"$rpm_top/SPECS/vapache.spec" <<EOF
-Name:           vapache
+cat >"$rpm_top/SPECS/httpd-rs.spec" <<EOF
+Name:           httpd-rs
 Version:        ${rpm_version}
 Release:        ${release}
 Summary:        Apache-compatible web server with a security-focused core
 License:        Apache-2.0
-URL:            https://github.com/JD-P/vapache
-Source0:        vapached
-Source1:        vapachectl
-Source2:        vapache-switch
-Source3:        vapache-certbot-apachectl
-Source4:        vapache-certbot-deploy-hook
-Source5:        vapache-certbot-cleanup
-Source6:        vapache-control-common
-Source7:        vapache.service
+URL:            https://github.com/JD-P/httpd-rs
+Source0:        httpd-rs
+Source1:        httpd-rsctl
+Source2:        httpd-rs-switch
+Source3:        httpd-rs-certbot-apachectl
+Source4:        httpd-rs-certbot-deploy-hook
+Source5:        httpd-rs-certbot-cleanup
+Source6:        httpd-rs-control-common
+Source7:        httpd-rs.service
 Source8:        README.md
 Source9:        PACKAGING.md
 Source10:       LICENSE
@@ -234,26 +234,26 @@ Suggests:       httpd
 %global __os_install_post %{nil}
 
 %description
-Vapache reads an existing Apache configuration and serves it through the
-vapached daemon. The package leaves Apache configuration and service state
-untouched until the administrator explicitly runs vapache-switch.
+httpd-rs reads an existing Apache configuration and serves it through the
+httpd-rs daemon. The package leaves Apache configuration and service state
+untouched until the administrator explicitly runs httpd-rs-switch.
 
 %prep
 
 %build
 
 %install
-install -Dm 0755 %{SOURCE0} %{buildroot}/usr/sbin/vapached
-install -Dm 0755 %{SOURCE1} %{buildroot}/usr/sbin/vapachectl
-install -Dm 0755 %{SOURCE2} %{buildroot}/usr/sbin/vapache-switch
-install -Dm 0755 %{SOURCE3} %{buildroot}/usr/lib/vapache/certbot-apachectl
-install -Dm 0755 %{SOURCE4} %{buildroot}/usr/lib/vapache/certbot-deploy-hook
-install -Dm 0755 %{SOURCE5} %{buildroot}/usr/lib/vapache/certbot-cleanup
-install -Dm 0644 %{SOURCE6} %{buildroot}/usr/lib/vapache/control-common
-install -Dm 0644 %{SOURCE7} %{buildroot}/usr/lib/systemd/system/vapache.service
-install -Dm 0644 %{SOURCE8} %{buildroot}/usr/share/doc/vapache/README.md
-install -Dm 0644 %{SOURCE9} %{buildroot}/usr/share/doc/vapache/PACKAGING.md
-install -Dm 0644 %{SOURCE10} %{buildroot}/usr/share/licenses/vapache/LICENSE
+install -Dm 0755 %{SOURCE0} %{buildroot}/usr/sbin/httpd-rs
+install -Dm 0755 %{SOURCE1} %{buildroot}/usr/sbin/httpd-rsctl
+install -Dm 0755 %{SOURCE2} %{buildroot}/usr/sbin/httpd-rs-switch
+install -Dm 0755 %{SOURCE3} %{buildroot}/usr/lib/httpd-rs/certbot-apachectl
+install -Dm 0755 %{SOURCE4} %{buildroot}/usr/lib/httpd-rs/certbot-deploy-hook
+install -Dm 0755 %{SOURCE5} %{buildroot}/usr/lib/httpd-rs/certbot-cleanup
+install -Dm 0644 %{SOURCE6} %{buildroot}/usr/lib/httpd-rs/control-common
+install -Dm 0644 %{SOURCE7} %{buildroot}/usr/lib/systemd/system/httpd-rs.service
+install -Dm 0644 %{SOURCE8} %{buildroot}/usr/share/doc/httpd-rs/README.md
+install -Dm 0644 %{SOURCE9} %{buildroot}/usr/share/doc/httpd-rs/PACKAGING.md
+install -Dm 0644 %{SOURCE10} %{buildroot}/usr/share/licenses/httpd-rs/LICENSE
 find %{buildroot} -depth -exec touch -h -d '@${source_date_epoch}' -- {} +
 
 %post
@@ -265,10 +265,10 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || :
 fi
 if [ -r /etc/httpd/conf/httpd.conf ]; then
-    echo "vapache: existing /etc/httpd configuration preserved"
-    echo "vapache: Apache service state is unchanged; 'sudo vapache-switch' will ask before replacing it"
+    echo "httpd-rs: existing /etc/httpd configuration preserved"
+    echo "httpd-rs: Apache service state is unchanged; 'sudo httpd-rs-switch' will ask before replacing it"
 else
-    echo "vapache: no /etc/httpd/conf/httpd.conf found; configure VAPACHE_CONFDIR and VAPACHE_CONFIG before starting"
+    echo "httpd-rs: no /etc/httpd/conf/httpd.conf found; configure HTTPD_RS_CONFDIR and HTTPD_RS_CONFIG before starting"
 fi
 
 %preun
@@ -277,11 +277,11 @@ export PATH
 unset CDPATH ENV BASH_ENV
 umask 022
 if [ \$1 -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now vapache.service >/dev/null 2>&1 || :
+    systemctl disable --now httpd-rs.service >/dev/null 2>&1 || :
 fi
-if [ \$1 -eq 0 ] && [ -x /usr/lib/vapache/certbot-cleanup ]; then
-    /usr/lib/vapache/certbot-cleanup || \
-        echo "vapache: warning: could not clean Certbot integration" >&2
+if [ \$1 -eq 0 ] && [ -x /usr/lib/httpd-rs/certbot-cleanup ]; then
+    /usr/lib/httpd-rs/certbot-cleanup || \
+        echo "httpd-rs: warning: could not clean Certbot integration" >&2
 fi
 
 %postun
@@ -294,17 +294,17 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 %files
-%attr(0755,root,root) /usr/sbin/vapached
-%attr(0755,root,root) /usr/sbin/vapachectl
-%attr(0755,root,root) /usr/sbin/vapache-switch
-%attr(0755,root,root) /usr/lib/vapache/certbot-apachectl
-%attr(0755,root,root) /usr/lib/vapache/certbot-deploy-hook
-%attr(0755,root,root) /usr/lib/vapache/certbot-cleanup
-%attr(0644,root,root) /usr/lib/vapache/control-common
-%attr(0644,root,root) /usr/lib/systemd/system/vapache.service
-%doc /usr/share/doc/vapache/README.md
-%doc /usr/share/doc/vapache/PACKAGING.md
-%license /usr/share/licenses/vapache/LICENSE
+%attr(0755,root,root) /usr/sbin/httpd-rs
+%attr(0755,root,root) /usr/sbin/httpd-rsctl
+%attr(0755,root,root) /usr/sbin/httpd-rs-switch
+%attr(0755,root,root) /usr/lib/httpd-rs/certbot-apachectl
+%attr(0755,root,root) /usr/lib/httpd-rs/certbot-deploy-hook
+%attr(0755,root,root) /usr/lib/httpd-rs/certbot-cleanup
+%attr(0644,root,root) /usr/lib/httpd-rs/control-common
+%attr(0644,root,root) /usr/lib/systemd/system/httpd-rs.service
+%doc /usr/share/doc/httpd-rs/README.md
+%doc /usr/share/doc/httpd-rs/PACKAGING.md
+%license /usr/share/licenses/httpd-rs/LICENSE
 EOF
 find "$rpm_top/SOURCES" "$rpm_top/SPECS" -depth \
     -exec touch -h -d "@$source_date_epoch" -- {} +
@@ -313,7 +313,7 @@ rpmbuild --define "_topdir $rpm_top" \
     --define "_buildhost reproducible.invalid" \
     --define "use_source_date_epoch_as_buildtime 1" \
     --define "clamp_mtime_to_source_date_epoch 1" \
-    -bb "$rpm_top/SPECS/vapache.spec"
+    -bb "$rpm_top/SPECS/httpd-rs.spec"
 rpm_path=$(find "$rpm_top/RPMS" -type f -name '*.rpm' -print -quit)
 [[ -n "$rpm_path" ]] || {
     echo "packaging: rpmbuild did not produce an RPM" >&2

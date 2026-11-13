@@ -6,15 +6,15 @@ status: draft
 
 # Choose a deployment tutorial
 
-Start with [Prepare a Debian VPS for a Vapache
-tutorial](prepare-debian-vps.md) when the host does not have Vapache and an
+Start with [Prepare a Debian VPS for a httpd-rs
+tutorial](prepare-debian-vps.md) when the host does not have httpd-rs and an
 Apache configuration layout.
 
 Choose the tutorial for your application. If the application is not listed,
 choose one that connects to the web server in the same way.
 
 Each application tutorial starts with a fresh Debian VPS. It installs one
-application, configures Vapache, and verifies one concrete deployment.
+application, configures httpd-rs, and verifies one concrete deployment.
 
 The “similar software” column lists applications that connect to the web server
 in a similar way. It does not mean that the listed software accepts the same
@@ -39,7 +39,7 @@ configuration.
 ## Ask your agent to adapt a tutorial
 
 If the application is not listed, give your coding agent the application and
-version, its deployment documentation, the closest tutorial, and the Vapache
+version, its deployment documentation, the closest tutorial, and the httpd-rs
 configuration from that tutorial.
 
 Ask it to return:

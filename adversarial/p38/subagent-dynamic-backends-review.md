@@ -1,11 +1,11 @@
-# vapache pass-38 subagent review: unreviewed dynamic-backend/proxy commits
+# httpd-rs pass-38 subagent review: unreviewed dynamic-backend/proxy commits
 
 Scope: 179b865, 75c6e5c, 05d397f, a0ac855, af736d7, 47fcb28, 1f35e19, 25c7c33, dc603b6,
 262e643, 67ca87b, with focus on proxy.rs, fastcgi.rs, cgi.rs, server.rs dynamic
 execution/terminal outcomes. HEAD 67ca87b.
 
-Method: diff reading; `cargo build --release -p vapached`; live loopback servers
-(vapached + Apache 2.4.69 mod_proxy_fcgi as oracle) against a python FastCGI
+Method: diff reading; `cargo build --release -p httpd-rs`; live loopback servers
+(httpd-rs + Apache 2.4.69 mod_proxy_fcgi as oracle) against a python FastCGI
 responder that records SCRIPT_FILENAME/SCRIPT_NAME/PATH_INFO/PATH_TRANSLATED;
 balancer failover tests with two local HTTP backends; `cargo +nightly fuzz build
 multi_request_state` and libFuzzer runs on the new corpus.
@@ -78,7 +78,7 @@ FastCGI script/authority construction (ProxyPassMatch, `UnstableFastCgiPaths On`
   with `<Directory private>` deny -> 403.
 - Apache 2.4.69 differential: Apache returns 200 and executes
   `/uploads/must-not-execute.php[/x.png]` through `mod_proxy_fcgi` because
-  `<Files>` does not apply to proxy routes; vapache returns 403. Vapache is
+  `<Files>` does not apply to proxy routes; httpd-rs returns 403. httpd-rs is
   stricter here, not weaker.
 - Config-time authority capture rejection verified (`config.rs:10669`,
   callers `config.rs:10509`, `config_payload.rs:754`): `http://$1/`,
@@ -105,7 +105,7 @@ Other:
   panic was found in proxy.rs/fastcgi.rs/cgi.rs/dynamic server paths. The new
   `DynamicOutcomeToken` machine fails closed on every invalid transition
   (verified crate: dynamic_outcome_step).
-- 72 of 799 `cargo test -p vapached --lib` tests fail with the default TMPDIR
+- 72 of 799 `cargo test -p httpd-rs --lib` tests fail with the default TMPDIR
   because `load_text*` writes configs under `/tmp`, which the new admin-path
   check rejects ("administrative path parent /tmp is writable by the service
   account"). With `TMPDIR=<private dir>` the same tests pass; environment
@@ -116,7 +116,7 @@ Other:
 - PHP-FPM itself was unavailable; a FastCGI stub recorded parameters. Execution
   semantics of a real FPM (security.limit_extensions) were not tested, but the
   request-controlled SCRIPT_FILENAME/PATH_INFO surface was.
-- Stable-path policy (`VapacheFastCGIStablePath`) was reviewed statically; live
+- Stable-path policy (`HttpdRsFastCGIStablePath`) was reviewed statically; live
   tests used `UnstableFastCgiPaths On`.
 - Another session was concurrently modifying `adversarial/` and fuzzing
   `h2_stateful` during this review; those files were not touched.

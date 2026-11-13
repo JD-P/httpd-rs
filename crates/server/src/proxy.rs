@@ -50,7 +50,7 @@ struct IdleProxyConnection {
 
 /// A deliberately connection-local upstream cache. Apache's process-wide
 /// worker pools are fast, but also let a malicious backend's surplus response
-/// bytes cross a client boundary. Vapache carries this object in request
+/// bytes cross a client boundary. httpd-rs carries this object in request
 /// metadata shared only by requests parsed from one downstream transport.
 pub(crate) struct ProxySession {
     generation: u64,
@@ -376,7 +376,7 @@ pub struct Target {
 impl Target {
     /// Exact backend/path identity used for resource binding.
     pub(crate) fn binding_key(&self) -> String {
-        let key = vapache_verified::proxy_target_key(
+        let key = httpd_rs_verified::proxy_target_key(
             self.backend.host.as_bytes(),
             self.backend.port,
             self.backend.tls,
@@ -1223,7 +1223,7 @@ fn encode_proxy_path(path: &str) -> String {
 
 /// A reverse proxy cannot infer how every upstream interprets semicolon path
 /// parameters.  Servlet containers commonly strip them from each segment,
-/// which can turn `/public/..;x/admin` into `/admin` after Vapache has already
+/// which can turn `/public/..;x/admin` into `/admin` after httpd-rs has already
 /// routed and authorized the former identity.  Refuse that ambiguous boundary
 /// instead of forwarding one byte representation under two security names.
 fn proxy_path_identity_safe(front_path: &str, upstream_path: &str) -> bool {
@@ -2089,17 +2089,17 @@ fn isolated_dns_lookup(
         ));
     }
     let current_executable = std::env::current_exe()?;
-    // Unit tests run from target/*/deps/vapached-<hash>; the sibling daemon
+    // Unit tests run from target/*/deps/httpd-rs-<hash>; the sibling daemon
     // binary still owns the hidden resolver entrypoint.
     let executable = current_executable
         .parent()
         .filter(|parent| parent.file_name().is_some_and(|name| name == "deps"))
         .and_then(Path::parent)
-        .map(|parent| parent.join("vapached"))
+        .map(|parent| parent.join("httpd-rs"))
         .filter(|candidate| candidate.is_file())
         .unwrap_or(current_executable);
     let mut child = std::process::Command::new(executable)
-        .arg("--vapache-resolver-worker")
+        .arg("--httpd-rs-resolver-worker")
         .arg(&job.host)
         .arg(job.port.to_string())
         .stdin(std::process::Stdio::null())
@@ -2270,7 +2270,7 @@ fn bind_backend_identity(
     let resolver_result_valid = !addresses.is_empty()
         && addresses.len() <= MAX_PROXY_ADDRESSES
         && addresses.iter().all(|address| address.port() == port);
-    if !vapache_verified::backend_resolution_binding_admit(
+    if !httpd_rs_verified::backend_resolution_binding_admit(
         registry.generation,
         registry.generation,
         resolver_result_valid,
@@ -2285,7 +2285,7 @@ fn bind_backend_identity(
 }
 
 fn connected_endpoint_admitted(actual: SocketAddr, selected: SocketAddr) -> bool {
-    vapache_verified::backend_connected_endpoint_admit(actual == selected, true)
+    httpd_rs_verified::backend_connected_endpoint_admit(actual == selected, true)
 }
 
 pub(crate) fn resolve_backend_addrs(
@@ -2483,7 +2483,7 @@ where
                 let retired = generation_retired
                     .as_ref()
                     .is_none_or(|state| *state.borrow());
-                if result.is_err() || !vapache_verified::configuration_generation_admit(retired) {
+                if result.is_err() || !httpd_rs_verified::configuration_generation_admit(retired) {
                     let _ = client.shutdown().await;
                     let _ = upstream.shutdown().await;
                     return Err(std::io::Error::new(
@@ -2618,10 +2618,9 @@ async fn websocket_with_identity<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if generation_retired
-        .as_ref()
-        .is_some_and(|retired| !vapache_verified::configuration_generation_admit(*retired.borrow()))
-    {
+    if generation_retired.as_ref().is_some_and(|retired| {
+        !httpd_rs_verified::configuration_generation_admit(*retired.borrow())
+    }) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Interrupted,
             "configuration generation retired",
@@ -2676,7 +2675,7 @@ where
     .and_then(|plan| {
         plan.into_outcome(
             cfg.authorization_generation(),
-            vapache_verified::TransformSink::Proxy,
+            httpd_rs_verified::TransformSink::Proxy,
         )
     }) else {
         return Err(std::io::Error::new(
@@ -2766,10 +2765,9 @@ where
         .map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "WebSocket handshake timeout")
         })??;
-    if generation_retired
-        .as_ref()
-        .is_some_and(|retired| !vapache_verified::configuration_generation_admit(*retired.borrow()))
-    {
+    if generation_retired.as_ref().is_some_and(|retired| {
+        !httpd_rs_verified::configuration_generation_admit(*retired.borrow())
+    }) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Interrupted,
             "configuration generation retired",
@@ -3383,11 +3381,11 @@ fn proxy_once_budgeted(
         };
         headers.push((name, clean));
     }
-    let connection_disposition = vapache_verified::backend_connection_disposition(
+    let connection_disposition = httpd_rs_verified::backend_connection_disposition(
         header_sanitizer.nominates_framing(),
         header_sanitizer.nominates_end_to_end(),
     );
-    if connection_disposition == vapache_verified::BackendConnectionDisposition::Reject {
+    if connection_disposition == httpd_rs_verified::BackendConnectionDisposition::Reject {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "backend Connection field nominates response framing",
@@ -3441,7 +3439,7 @@ fn proxy_once_budgeted(
                 .into_iter()
                 .map(|(n, v)| (std::borrow::Cow::Owned(n), v))
                 .collect();
-            if !vapache_verified::backend_shared_cache_admit(connection_disposition) {
+            if !httpd_rs_verified::backend_shared_cache_admit(connection_disposition) {
                 response.forbid_shared_cache();
             }
             response.body = Body::Stream {
@@ -3514,7 +3512,7 @@ fn proxy_once_budgeted(
         .into_iter()
         .map(|(n, v)| (std::borrow::Cow::Owned(n), v))
         .collect();
-    if !vapache_verified::backend_shared_cache_admit(connection_disposition) {
+    if !httpd_rs_verified::backend_shared_cache_admit(connection_disposition) {
         response.forbid_shared_cache();
     }
     response.body = collected_body.unwrap_or_else(|| {
@@ -3787,7 +3785,7 @@ fn authorize_failover(
     )?
     .into_outcome(
         cfg.authorization_generation(),
-        vapache_verified::TransformSink::Proxy,
+        httpd_rs_verified::TransformSink::Proxy,
     )
 }
 
@@ -4028,7 +4026,7 @@ fn execute_with_proxy_identity(
     .and_then(|plan| {
         plan.into_outcome(
             cfg.authorization_generation(),
-            vapache_verified::TransformSink::Proxy,
+            httpd_rs_verified::TransformSink::Proxy,
         )
     }) else {
         return error(
@@ -4146,7 +4144,7 @@ fn execute_with_proxy_identity(
                     // A complete upstream response proves the request was
                     // transmitted.  `failonstatus` must not turn POST/PATCH
                     // into implicit at-least-twice delivery.
-                    if !vapache_verified::proxy_retry_admit(
+                    if !httpd_rs_verified::proxy_retry_admit(
                         true,
                         proxy_method_is_idempotent(&req.method),
                     ) {
@@ -4280,14 +4278,14 @@ fn execute_with_proxy_identity(
                 // connection. Non-idempotent requests retain the strict
                 // no-replay behavior below.
                 if pooled_lease.take().is_some()
-                    && vapache_verified::proxy_retry_admit(
+                    && httpd_rs_verified::proxy_retry_admit(
                         true,
                         proxy_method_is_idempotent(&req.method),
                     )
                 {
                     continue;
                 }
-                eprintln!("vapache proxy error: {e}");
+                eprintln!("httpd-rs proxy error: {e}");
                 if let Some(name) = &current.balancer {
                     mark_dead(
                         cfg.generation,
@@ -4295,7 +4293,7 @@ fn execute_with_proxy_identity(
                         &format!("{}:{}", current.backend.host, current.backend.port),
                     );
                 }
-                if !vapache_verified::proxy_retry_admit(
+                if !httpd_rs_verified::proxy_retry_admit(
                     request_may_have_started,
                     proxy_method_is_idempotent(&req.method),
                 ) {
@@ -4562,7 +4560,7 @@ mod tests {
             .unwrap();
         });
 
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cfg = config(&dir);
@@ -4720,7 +4718,7 @@ mod more_tests {
             )
             .unwrap();
         });
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-more-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-more-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cfg = config(&dir);
@@ -4761,7 +4759,7 @@ mod more_tests {
 
     #[test]
     fn connection_failure_returns_502() {
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-fail-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-fail-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cfg = config(&dir);
@@ -4822,7 +4820,7 @@ mod more_tests {
 
     #[test]
     fn balancer_round_robins_between_members() {
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-bal-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-bal-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let mut cfg = config(&dir);
@@ -4915,7 +4913,7 @@ mod more_tests {
                 }
             }
         });
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-pool-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-pool-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cfg = config(&dir);
@@ -5127,8 +5125,10 @@ mod more_tests {
                 stream.write_all(response).unwrap();
             }
         });
-        let dir =
-            std::env::temp_dir().join(format!("vapache-proxy-surplus-pool-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "httpd-rs-proxy-surplus-pool-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cfg = config(&dir);
@@ -5207,7 +5207,7 @@ mod more_tests {
                 .unwrap();
         });
         let dir =
-            std::env::temp_dir().join(format!("vapache-proxy-stale-pool-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-proxy-stale-pool-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cfg = config(&dir);
@@ -5266,7 +5266,7 @@ mod more_tests {
             }
         });
         let dir =
-            std::env::temp_dir().join(format!("vapache-proxy-failover-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-proxy-failover-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let mut cfg = config(&dir);
@@ -5352,7 +5352,8 @@ mod more_tests {
             );
             let _ = s.write_all(&body);
         });
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-stream-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("httpd-rs-proxy-stream-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cfg = config(&dir);
@@ -5424,7 +5425,7 @@ mod more_tests {
                 s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
         });
         let dir =
-            std::env::temp_dir().join(format!("vapache-proxy-failstatus-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-proxy-failstatus-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let mut cfg = config(&dir);
@@ -5489,7 +5490,7 @@ mod more_tests {
                 .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         });
         let dir =
-            std::env::temp_dir().join(format!("vapache-proxy-failauth-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-proxy-failauth-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("httpd.conf");
@@ -5559,7 +5560,8 @@ mod more_tests {
 
     #[test]
     fn sticky_session_selects_route_member() {
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-sticky-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("httpd-rs-proxy-sticky-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let mut cfg = config(&dir);
@@ -5683,7 +5685,7 @@ mod more_tests {
     #[test]
     fn proxy_pass_auth_url_is_the_outbound_target() {
         let dir =
-            std::env::temp_dir().join(format!("vapache-proxy-auth-url-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-proxy-auth-url-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cfg = config(&dir);
@@ -5700,10 +5702,11 @@ mod more_tests {
             });
         let target = match_target(&cfg, &scope, "/app/x").unwrap();
         assert_eq!(target.proxy_url, "http://127.0.0.1:9000/x");
-        let expected: String = vapache_verified::proxy_target_key(b"127.0.0.1", 9000, false, b"/x")
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let expected: String =
+            httpd_rs_verified::proxy_target_key(b"127.0.0.1", 9000, false, b"/x")
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
         assert_eq!(target.binding_key(), expected);
         let other = match_target(&cfg, &scope, "/app/y").unwrap();
         assert_ne!(target.binding_key(), other.binding_key());
@@ -5712,7 +5715,7 @@ mod more_tests {
 
     #[test]
     fn regex_proxy_pass_match_targets() {
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-regex-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-regex-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cfg = config(&dir);
@@ -5734,7 +5737,7 @@ mod more_tests {
 
     #[test]
     fn prefix_and_regex_routes_share_one_configuration_order() {
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-order-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-order-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cfg = config(&dir);
@@ -5788,7 +5791,7 @@ mod more_tests {
     #[test]
     fn balancer_target_keeps_logical_and_concrete_proxy_identities() {
         let dir =
-            std::env::temp_dir().join(format!("vapache-proxy-balance-id-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-proxy-balance-id-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("httpd.conf");
@@ -5905,18 +5908,18 @@ mod more_tests {
         // preserve it while still rejecting CTLs.
         assert!(validate_proxy_head(b"GET /path HTTP/1.1\r\nX-Test: a\tb\r\n\r\n").is_ok());
         assert!(validate_proxy_head(b"GET /raw?x=\xff HTTP/1.1\r\nX-Test: a\xffb\r\n\r\n").is_ok());
-        assert!(vapache_verified::proxy_request_line_admit(
+        assert!(httpd_rs_verified::proxy_request_line_admit(
             b"GET",
             b"/path",
             b"HTTP/1.1"
         ));
-        assert!(!vapache_verified::proxy_request_line_admit(
+        assert!(!httpd_rs_verified::proxy_request_line_admit(
             b"GET",
             b"/pa th",
             b"HTTP/1.1"
         ));
-        assert!(vapache_verified::proxy_header_admit(b"X-Test", b"a\tb"));
-        assert!(!vapache_verified::proxy_header_admit(b"X-Test", b"a\rb"));
+        assert!(httpd_rs_verified::proxy_header_admit(b"X-Test", b"a\tb"));
+        assert!(!httpd_rs_verified::proxy_header_admit(b"X-Test", b"a\rb"));
     }
 
     #[test]
@@ -6467,7 +6470,7 @@ mod coverage_tests {
 
     #[test]
     fn balancer_unavailable_and_regex_targets() {
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-cov-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-cov-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("httpd.conf");
@@ -6569,7 +6572,7 @@ mod coverage_tests {
     #[test]
     fn https_health_check_rejects_a_trusted_certificate_for_the_wrong_name() {
         let dir =
-            std::env::temp_dir().join(format!("vapache-proxy-health-tls-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-proxy-health-tls-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cert = dir.join("cert.pem");
@@ -6714,15 +6717,15 @@ mod coverage_tests {
 
     #[test]
     fn proxy_framing_kernel_validates_no_body_responses_too() {
-        use vapache_verified::ProxyResponseFraming;
+        use httpd_rs_verified::ProxyResponseFraming;
 
         let length = vec![(b"content-length".to_vec(), b"12".to_vec())];
         assert_eq!(
-            vapache_verified::proxy_response_framing(false, 200, &length),
+            httpd_rs_verified::proxy_response_framing(false, 200, &length),
             Some(ProxyResponseFraming::Length(12))
         );
         assert_eq!(
-            vapache_verified::proxy_response_framing(true, 200, &length),
+            httpd_rs_verified::proxy_response_framing(true, 200, &length),
             Some(ProxyResponseFraming::NoBody)
         );
         let ambiguous = vec![
@@ -6730,34 +6733,34 @@ mod coverage_tests {
             (b"transfer-encoding".to_vec(), b"chunked".to_vec()),
         ];
         assert_eq!(
-            vapache_verified::proxy_response_framing(true, 200, &ambiguous),
+            httpd_rs_verified::proxy_response_framing(true, 200, &ambiguous),
             None
         );
         let malformed = vec![(b"content-length".to_vec(), b"12, 12".to_vec())];
         assert_eq!(
-            vapache_verified::proxy_response_framing(false, 204, &malformed),
+            httpd_rs_verified::proxy_response_framing(false, 204, &malformed),
             None
         );
         assert_eq!(
-            vapache_verified::proxy_response_framing(false, 204, &length),
+            httpd_rs_verified::proxy_response_framing(false, 204, &length),
             None
         );
         assert_eq!(
-            vapache_verified::proxy_response_framing(false, 205, &[]),
+            httpd_rs_verified::proxy_response_framing(false, 205, &[]),
             Some(ProxyResponseFraming::NoBody)
         );
         let zero = vec![(b"content-length".to_vec(), b"0".to_vec())];
         assert_eq!(
-            vapache_verified::proxy_response_framing(false, 205, &zero),
+            httpd_rs_verified::proxy_response_framing(false, 205, &zero),
             Some(ProxyResponseFraming::NoBody)
         );
         assert_eq!(
-            vapache_verified::proxy_response_framing(false, 205, &length),
+            httpd_rs_verified::proxy_response_framing(false, 205, &length),
             None
         );
         let chunked = vec![(b"transfer-encoding".to_vec(), b"chunked".to_vec())];
         assert_eq!(
-            vapache_verified::proxy_response_framing(false, 205, &chunked),
+            httpd_rs_verified::proxy_response_framing(false, 205, &chunked),
             None
         );
     }
@@ -6968,7 +6971,7 @@ mod coverage_tests {
 
     #[test]
     fn unavailable_backends_are_skipped_in_matching() {
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-skip-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-skip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
@@ -7000,7 +7003,7 @@ mod coverage_tests {
 
     #[test]
     fn execute_rejects_bad_grant_identity() {
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-grant-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-grant-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
@@ -7166,7 +7169,8 @@ mod coverage_tests {
 
     #[test]
     fn health_check_start_is_idempotent() {
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-health-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("httpd-rs-proxy-health-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
@@ -7334,8 +7338,10 @@ mod coverage_tests {
         Arc<crate::access::AccessGrant>,
         Arc<crate::access::ResourceKey>,
     ) {
-        let dir =
-            std::env::temp_dir().join(format!("vapache-proxy-wsctx-{}-{port}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "httpd-rs-proxy-wsctx-{}-{port}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
@@ -7681,7 +7687,7 @@ mod coverage_tests {
             r
         };
         let target = websocket_target();
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-ws-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-ws-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
@@ -7836,7 +7842,7 @@ mod coverage_tests {
 
     #[test]
     fn failover_authentication_is_required() {
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-auth-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-auth-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let password = dir.join("htpasswd");
@@ -7849,7 +7855,7 @@ mod coverage_tests {
         std::fs::write(
             &config_path,
             format!(
-                "VapacheCapability MutableAuthFiles On\nListen 127.0.0.1:0\n<Proxy http://127.0.0.1:{port}>\nRequire valid-user\nAuthType Basic\nAuthName test\nAuthUserFile {}\n</Proxy>\n",
+                "HttpdRsCapability MutableAuthFiles On\nListen 127.0.0.1:0\n<Proxy http://127.0.0.1:{port}>\nRequire valid-user\nAuthType Basic\nAuthName test\nAuthUserFile {}\n</Proxy>\n",
                 password.display()
             ),
         )
@@ -7910,15 +7916,17 @@ mod coverage_tests {
         assert_eq!(authorization.identity().selected_url_path(), "/ws");
         assert!(authorization.require_sink(
             cfg.authorization_generation(),
-            vapache_verified::TransformSink::Proxy,
+            httpd_rs_verified::TransformSink::Proxy,
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn failover_rebuilds_member_policy_from_pristine_route_scope() {
-        let dir =
-            std::env::temp_dir().join(format!("vapache-proxy-member-scope-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "httpd-rs-proxy-member-scope-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let first_port = 19081;
@@ -8002,7 +8010,7 @@ mod coverage_tests {
 
     #[test]
     fn failover_to_auth_required_member_returns_403() {
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-fo-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-fo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let password = dir.join("htpasswd");
@@ -8022,7 +8030,7 @@ mod coverage_tests {
         std::fs::write(
             &config_path,
             format!(
-                "VapacheCapability MutableAuthFiles On\nListen 127.0.0.1:0\n<Proxy balancer://{balancer}>\nBalancerMember http://127.0.0.1:{dead_port}\nBalancerMember http://127.0.0.1:{second_port}\n</Proxy>\n<Proxy http://127.0.0.1:{second_port}>\nRequire valid-user\nAuthType Basic\nAuthName test\nAuthUserFile {}\n</Proxy>\n",
+                "HttpdRsCapability MutableAuthFiles On\nListen 127.0.0.1:0\n<Proxy balancer://{balancer}>\nBalancerMember http://127.0.0.1:{dead_port}\nBalancerMember http://127.0.0.1:{second_port}\n</Proxy>\n<Proxy http://127.0.0.1:{second_port}>\nRequire valid-user\nAuthType Basic\nAuthName test\nAuthUserFile {}\n</Proxy>\n",
                 password.display()
             ),
         )
@@ -8087,7 +8095,7 @@ mod coverage_tests {
                 .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
         });
-        let dir = std::env::temp_dir().join(format!("vapache-proxy-fs-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-proxy-fs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let balancer = format!("failstatus-{}", std::process::id());
@@ -8153,8 +8161,10 @@ mod coverage_tests {
         let (port, upstream) = spawn_upstream(ws_101("x"), false).await;
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let r = ws_request(key);
-        let dir =
-            std::env::temp_dir().join(format!("vapache-proxy-wsbad-{}-{port}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "httpd-rs-proxy-wsbad-{}-{port}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
@@ -8223,17 +8233,17 @@ mod coverage_tests {
     fn ambiguous_failover_never_replays_unsafe_methods() {
         for method in ["POST", "PATCH", "CONNECT", "PROPFIND"] {
             assert!(!proxy_method_is_idempotent(method));
-            assert!(!vapache_verified::proxy_retry_admit(
+            assert!(!httpd_rs_verified::proxy_retry_admit(
                 true,
                 proxy_method_is_idempotent(method)
             ));
-            assert!(vapache_verified::proxy_retry_admit(
+            assert!(httpd_rs_verified::proxy_retry_admit(
                 false,
                 proxy_method_is_idempotent(method)
             ));
         }
         for method in ["GET", "HEAD", "PUT", "DELETE", "OPTIONS"] {
-            assert!(vapache_verified::proxy_retry_admit(
+            assert!(httpd_rs_verified::proxy_retry_admit(
                 true,
                 proxy_method_is_idempotent(method)
             ));
@@ -8269,7 +8279,7 @@ mod coverage_tests {
             return;
         }
         let dir =
-            std::env::temp_dir().join(format!("vapache-proxy-ca-trust-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-proxy-ca-trust-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
         let ca = dir.join("ca.pem");
@@ -8467,6 +8477,6 @@ fn resolver_daemon_is_built() -> bool {
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .filter(|parent| parent.file_name().is_some_and(|name| name == "deps"))
-        .and_then(|deps| deps.parent().map(|target| target.join("vapached")))
+        .and_then(|deps| deps.parent().map(|target| target.join("httpd-rs")))
         .is_some_and(|daemon| daemon.is_file())
 }
