@@ -7,7 +7,7 @@ This directory retains both forms of the PCRE2 differential audit:
 - `pcre2_differential_fuzzer.rs` is the coverage-guided libFuzzer target. The
   conventional entry point in `fuzz/fuzz_targets/` includes this file so the
   ordinary smoke and nightly campaigns exercise the reviewed artifact.
-- `exploit_p23.py` replays the live Apache-versus-vapache expression cases.
+- `exploit_p23.py` replays the live Apache-versus-httpd-rs expression cases.
 
 Run the coverage-guided target from the repository root:
 

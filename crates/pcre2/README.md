@@ -1,8 +1,8 @@
-# vapache PCRE2 compatibility engine
+# httpd-rs PCRE2 compatibility engine
 
-This crate replaces vapache's production dependency on the PCRE2 C library.
+This crate replaces httpd-rs's production dependency on the PCRE2 C library.
 Its `bytes` module deliberately follows the Rust `pcre2::bytes` API used by
-vapache (`RegexBuilder`, `Regex`, `Match`, `Captures`, reusable capture
+httpd-rs (`RegexBuilder`, `Regex`, `Match`, `Captures`, reusable capture
 locations, and match/capture iterators).
 
 The frontend follows the PCRE2 10.46 pattern documentation and source:
@@ -17,7 +17,7 @@ classes, a fixed set of escapes, ordinary/named/noncapturing groups, the
 It returns an unforgeable admitted-pattern witness; only that type can enter
 translation. Unknown special-group and alphanumeric-escape namespaces are
 therefore rejected even if a future backend assigns them a meaning. All
-vapached directive and expression regex surfaces enter through this frontend;
+httpd-rs directive and expression regex surfaces enter through this frontend;
 none parse configuration patterns with Rust `regex` directly.
 
 The parser's security-relevant option state is an executable Verus state
@@ -85,7 +85,7 @@ Resource policy is part of the API, not a timeout:
   active-set factor, including when a hot lazy-DFA search falls back.
 
 The corresponding admission predicates and product-bound proof are in
-`vapache-verified`: `regex_compile_resource_admit`,
+`httpd-rs-verified`: `regex_compile_resource_admit`,
 `regex_capture_resource_admit`, `regex_match_resource_admit`, and
 `regex_match_work_is_bounded`. The counted-repetition, optional-path/PikeVM and
 multipass dominance lemmas close P23-A's and P24-B's undercharges.
@@ -94,7 +94,7 @@ backtracking and executable-memory JIT.
 
 ## Conformance and fuzzing
 
-`cargo test -p vapache-pcre2` checks a committed PCRE2-derived corpus and an
+`cargo test -p httpd-rs-pcre2` checks a committed PCRE2-derived corpus and an
 exhaustive finite grammar against the actual PCRE2 10.46 C library. The latter
 enumerates 244 pattern forms against all 781 subjects of length at most four
 over its alphabet (roughly 190,000 capture-vector comparisons).
@@ -103,7 +103,7 @@ The upstream public-domain `pcre2test` data can be imported directly:
 
 ```sh
 PCRE2_TESTDATA=/path/to/pcre2-10.46/testdata \
-  cargo test -p vapache-pcre2 --test upstream_testdata -- --nocapture
+  cargo test -p httpd-rs-pcre2 --test upstream_testdata -- --nocapture
 ```
 
 The current importer checks 1,005 supported subject/capture records from
@@ -128,7 +128,7 @@ UTF behavior is differential; malformed UTF/UCP subjects exercise the
 documented whole-subject fail-closed boundary. `pcre2_resource` independently
 keeps production limits active and checks compile/match limit monotonicity. The
 nightly coverage corpora are minimized and carried forward between runs. The C
-crate is a dev/fuzz dependency only and is absent from vapached's normal Cargo
+crate is a dev/fuzz dependency only and is absent from httpd-rs's normal Cargo
 graph and release binary.
 
 The reproducible C interpreter/JIT comparison and latest measurements are in

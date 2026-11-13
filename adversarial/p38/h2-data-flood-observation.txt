@@ -1,7 +1,7 @@
 # Pass-38 HTTP/2 empty-DATA flood observation (P38-E, confirmed)
 
 Subject: HEAD `67ca87bdccb3932919c2efabb850d7320c2265b2`
-(`target/release/vapached`, rebuilt from the checked-out tree).
+(`target/release/httpd-rs`, rebuilt from the checked-out tree).
 Regression commit: `1f35e19` "Harden HTTP/2 lifecycle state handling".
 Oracle/measurement: local TLS+ALPN HTTP/2 client (`h2-data-flood/h2raw.py`)
 against the lab config `h2-data-flood/httpd.conf` (static-only vhost,

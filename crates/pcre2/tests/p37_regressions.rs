@@ -1,8 +1,8 @@
 //! Fixed regressions from adversarial pass P37.
 
+use httpd_rs_pcre2::bytes as rust;
+use httpd_rs_pcre2::ErrorKind;
 use pcre2_c_oracle::bytes as oracle;
-use vapache_pcre2::bytes as rust;
-use vapache_pcre2::ErrorKind;
 
 fn assert_unsupported(pattern: &str) {
     assert!(
@@ -107,10 +107,10 @@ fn p37_lexical_and_scoped_non_multiline_controls_remain_supported() {
 
 #[test]
 fn verified_positive_grammar_tracks_scope_and_seals_the_source() {
-    use vapache_verified::{PcreGrammarEvent, PcreGrammarOptions};
+    use httpd_rs_verified::{PcreGrammarEvent, PcreGrammarOptions};
 
-    let state = vapache_verified::pcre_grammar_start(false, false);
-    let state = vapache_verified::pcre_grammar_step(
+    let state = httpd_rs_verified::pcre_grammar_start(false, false);
+    let state = httpd_rs_verified::pcre_grammar_step(
         state,
         PcreGrammarEvent::Open {
             extended: true,
@@ -126,7 +126,7 @@ fn verified_positive_grammar_tracks_scope_and_seals_the_source() {
             multiline: true,
         }
     );
-    let state = vapache_verified::pcre_grammar_step(state, PcreGrammarEvent::Close, 2).unwrap();
+    let state = httpd_rs_verified::pcre_grammar_step(state, PcreGrammarEvent::Close, 2).unwrap();
     assert_eq!(
         state.options,
         PcreGrammarOptions {
@@ -134,28 +134,30 @@ fn verified_positive_grammar_tracks_scope_and_seals_the_source() {
             multiline: false,
         }
     );
-    let certificate = vapache_verified::pcre_grammar_finish(state, 17).unwrap();
-    assert!(vapache_verified::pcre_grammar_certificate_admit(
+    let certificate = httpd_rs_verified::pcre_grammar_finish(state, 17).unwrap();
+    assert!(httpd_rs_verified::pcre_grammar_certificate_admit(
         certificate,
         17
     ));
-    assert!(!vapache_verified::pcre_grammar_certificate_admit(
+    assert!(!httpd_rs_verified::pcre_grammar_certificate_admit(
         certificate,
         18
     ));
 
-    let state = vapache_verified::pcre_grammar_start(false, true);
-    assert!(vapache_verified::pcre_grammar_step(state, PcreGrammarEvent::StartAnchor, 0).is_none());
-    let state = vapache_verified::pcre_grammar_start(false, false);
+    let state = httpd_rs_verified::pcre_grammar_start(false, true);
     assert!(
-        vapache_verified::pcre_grammar_step(state, PcreGrammarEvent::AtomicLineEscape, 0,)
+        httpd_rs_verified::pcre_grammar_step(state, PcreGrammarEvent::StartAnchor, 0).is_none()
+    );
+    let state = httpd_rs_verified::pcre_grammar_start(false, false);
+    assert!(
+        httpd_rs_verified::pcre_grammar_step(state, PcreGrammarEvent::AtomicLineEscape, 0,)
             .is_none()
     );
-    let state = vapache_verified::pcre_grammar_start(false, false);
-    assert!(vapache_verified::pcre_grammar_step(state, PcreGrammarEvent::Close, 0).is_none());
+    let state = httpd_rs_verified::pcre_grammar_start(false, false);
+    assert!(httpd_rs_verified::pcre_grammar_step(state, PcreGrammarEvent::Close, 0).is_none());
 
-    let state = vapache_verified::pcre_grammar_start(false, false);
-    let state = vapache_verified::pcre_grammar_step(
+    let state = httpd_rs_verified::pcre_grammar_start(false, false);
+    let state = httpd_rs_verified::pcre_grammar_step(
         state,
         PcreGrammarEvent::Open {
             extended: false,
@@ -164,5 +166,5 @@ fn verified_positive_grammar_tracks_scope_and_seals_the_source() {
         1,
     )
     .unwrap();
-    assert!(vapache_verified::pcre_grammar_finish(state, 2).is_none());
+    assert!(httpd_rs_verified::pcre_grammar_finish(state, 2).is_none());
 }

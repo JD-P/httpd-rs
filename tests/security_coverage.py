@@ -121,8 +121,8 @@ def llvm_bin() -> Path:
 
 
 def coverage_objects() -> list[Path]:
-    objects = [COV_TARGET / "release" / "vapached"]
-    debug_daemon = COV_TARGET / "debug" / "vapached"
+    objects = [COV_TARGET / "release" / "httpd-rs"]
+    debug_daemon = COV_TARGET / "debug" / "httpd-rs"
     if debug_daemon.is_file() and os.access(debug_daemon, os.X_OK):
         objects.append(debug_daemon)
     for path in sorted((COV_TARGET / "debug" / "deps").iterdir()):
@@ -172,7 +172,7 @@ def object_profiles(objects: list[Path]) -> list[tuple[Path, Path]]:
 
     by_signature: dict[str, list[Path]] = {}
     for path in raw_profiles:
-        match = re.match(r"(?:unit|vapache)-\d+-(.+)_\d+\.profraw$", path.name)
+        match = re.match(r"(?:unit|httpd-rs)-\d+-(.+)_\d+\.profraw$", path.name)
         if match:
             by_signature.setdefault(match.group(1), []).append(path)
 
@@ -188,7 +188,7 @@ def object_profiles(objects: list[Path]) -> list[tuple[Path, Path]]:
             continue
         binary_id = object_binary_id(path)
         if binary_id:
-            # target/debug/vapached and its deps/ hardlink have one build id.
+            # target/debug/httpd-rs and its deps/ hardlink have one build id.
             object_by_id.setdefault(binary_id, path)
 
     pairs = []
@@ -213,7 +213,7 @@ def object_profiles(objects: list[Path]) -> list[tuple[Path, Path]]:
         )
         pairs.append((obj, merged))
     if not any(obj == objects[0] for obj, _ in pairs):
-        raise SystemExit("release vapached profile is missing from the coverage corpus")
+        raise SystemExit("release httpd-rs profile is missing from the coverage corpus")
     return pairs
 
 

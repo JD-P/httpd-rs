@@ -6,8 +6,8 @@ set -eu
 
 cd "$(dirname "$0")/.."
 REPO_ROOT=$PWD
-LOCAL_SETUP=$(dirname "$REPO_ROOT")/.vapache-setup
-NIGHTLY=${VAPACHE_NIGHTLY_TOOLCHAIN:-nightly}
+LOCAL_SETUP=$(dirname "$REPO_ROOT")/.httpd-rs-setup
+NIGHTLY=${HTTPD_RS_NIGHTLY_TOOLCHAIN:-nightly}
 
 PATH="$REPO_ROOT/../verus-bin:$REPO_ROOT/../.cargo/bin:$PATH"
 export PATH
@@ -77,12 +77,12 @@ if [ -d "$LOCAL_LIB" ]; then
     export LD_LIBRARY_PATH
 fi
 
-VAPACHED=$REPO_ROOT/target/release/vapached
-export VAPACHED
+HTTPD_RS=$REPO_ROOT/target/release/httpd-rs
+export HTTPD_RS
 export PYTHONDONTWRITEBYTECODE=1
 
 step "release build"
-cargo build --release -p vapached
+cargo build --release -p httpd-rs
 
 step "executable documentation"
 python3 tests/docs.py

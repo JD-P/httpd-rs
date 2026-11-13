@@ -88,7 +88,7 @@ There is no remaining H2 partial.
 ### CVE-2026-23918 retired from the not-covered set
 
 The Apache 2.4.66 double-free was the only H2 `not_covered` row.  It is now
-classified **prevented by construction**: Vapache uses the Rust `h2` crate,
+classified **prevented by construction**: httpd-rs uses the Rust `h2` crate,
 whose stream store is keyed by `StreamId` with an ABA guard, and has no Apache
 `spurge` array or `h2_stream_destroy` path.  The adapter additionally tracks
 stream IDs and uses verified `h2_purge_contains` / `h2_purge_add_idempotent`,
@@ -162,7 +162,7 @@ The seven auth partials were third-party providers/tools or implemented
 policies:
 
 - SMB/auth-mysql/usertrack/RSA-agent classes are not loaded or shipped;
-- htpasswd/htdigest utilities are not part of Vapache;
+- htpasswd/htdigest utilities are not part of httpd-rs;
 - legacy `Satisfy`/`Order` merging and AuthRequired-vs-Denied policy use the
   verified policy combinators and the single access evaluator.
 
@@ -237,7 +237,7 @@ not a Verus refinement; the rows are closed only at these boundaries.
 
 `CVE-2019-0215` / `CVE-2025-23048` prompted a listener-level policy
 invariant.  Rustls has one client-certificate verifier per `ServerConfig`, so
-Vapache now rejects a TLS listener whose virtual hosts disagree on
+httpd-rs now rejects a TLS listener whose virtual hosts disagree on
 `SSLVerifyClient`, `SSLCACertificateFile`, `SSLCARevocationFile` or
 `SSLCARevocationCheck`.  A single uniform policy means
 session resumption cannot cross a vhost with a different client-auth policy.
@@ -273,7 +273,7 @@ rather than being served until the configured cache interval elapses.
 
 `CVE-2004-0488` is the sole remaining `not_covered` row.  Rustls replaces the
 legacy OpenSSL parser, but the external crate is an explicit trusted
-dependency, not a Vapache formal proof.  Keeping this row honest is more
+dependency, not a httpd-rs formal proof.  Keeping this row honest is more
 useful than calling an external parser “proved”.
 
 **Strengthening:** pin and test the Rustls dependency, track its advisories,

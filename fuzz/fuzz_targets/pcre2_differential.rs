@@ -10,7 +10,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use pcre2_c_oracle::bytes as oracle;
-use vapache_pcre2::bytes as rust;
+use httpd_rs_pcre2::bytes as rust;
 
 type CaptureSpans = Vec<Option<(usize, usize)>>;
 type AllCaptureSpans = Vec<CaptureSpans>;
@@ -122,7 +122,7 @@ fn admitted_pattern(data: &[u8], flags: u8) -> String {
 }
 
 fn rust_match_span(
-    result: Result<Option<rust::Match<'_>>, vapache_pcre2::Error>,
+    result: Result<Option<rust::Match<'_>>, httpd_rs_pcre2::Error>,
 ) -> Result<Option<(usize, usize)>, ()> {
     result
         .map(|matched| matched.map(|matched| (matched.start(), matched.end())))

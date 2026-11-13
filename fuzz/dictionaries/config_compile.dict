@@ -1,5 +1,5 @@
 "Listen 127.0.0.1:0"
-"VapacheCapability AccessFiles On"
+"HttpdRsCapability AccessFiles On"
 "<VirtualHost *:80>"
 "</VirtualHost>"
 "<Directory /tmp>"

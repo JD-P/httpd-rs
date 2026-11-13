@@ -335,7 +335,7 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
         // computed from the request.  Custom non-CGI variables remain
         // available to the application.
         let key_valid = !k.is_empty() && !k.contains('=') && !k.as_bytes().contains(&0);
-        if !vapache_verified::cgi_env_entry_admit(key_valid, reserved_cgi_env(k)) {
+        if !httpd_rs_verified::cgi_env_entry_admit(key_valid, reserved_cgi_env(k)) {
             continue;
         }
         env.retain(|(n, _)| n != k.as_str());
@@ -363,7 +363,7 @@ pub fn execute(ctx: &CgiContext) -> Response {
         }
         #[cfg(not(test))]
         None => {
-            eprintln!("vapached: CGI request has no resource scope");
+            eprintln!("httpd-rs: CGI request has no resource scope");
             return cgi_status_error(ctx, 503);
         }
     };
@@ -374,7 +374,7 @@ pub fn execute(ctx: &CgiContext) -> Response {
     ) {
         Ok(lease) => lease,
         Err(e) => {
-            eprintln!("vapached: CGI admission failed: {e}");
+            eprintln!("httpd-rs: CGI admission failed: {e}");
             return cgi_status_error(ctx, 503);
         }
     };
@@ -433,7 +433,7 @@ pub fn execute(ctx: &CgiContext) -> Response {
             resource_context,
         )
     } else {
-        eprintln!("vapached: CGI worker pool is unavailable");
+        eprintln!("httpd-rs: CGI worker pool is unavailable");
         cgi_status_error(ctx, 503)
     }
 }
@@ -488,7 +488,7 @@ fn execute_direct_for_test(
             }
         }
         Err(e) => {
-            eprintln!("vapached: CGI failed: {e}");
+            eprintln!("httpd-rs: CGI failed: {e}");
             cgi_error(ctx)
         }
     }
@@ -514,13 +514,13 @@ fn execute_via_pool(
             ) {
                 Ok(lease) => lease,
                 Err(e) => {
-                    eprintln!("vapached: CGI worker spool admission failed: {e}");
+                    eprintln!("httpd-rs: CGI worker spool admission failed: {e}");
                     return cgi_status_error(ctx, 503);
                 }
             };
             if !stream_body {
                 if let Err(e) = lease.reserve(body.len()) {
-                    eprintln!("vapached: CGI worker spool admission failed: {e}");
+                    eprintln!("httpd-rs: CGI worker spool admission failed: {e}");
                     return cgi_status_error(ctx, 503);
                 }
             }
@@ -577,7 +577,7 @@ fn execute_via_pool(
         Err(e) => {
             // Do not retry locally: the script may already have run.
             worker.terminate();
-            eprintln!("vapached: CGI worker failed: {e}");
+            eprintln!("httpd-rs: CGI worker failed: {e}");
             cgi_error(ctx)
         }
     }
@@ -696,8 +696,8 @@ pub fn init_pool(cfg: &Config) -> Result<(), String> {
 
 fn worker_ids(user: &str, group: &str) -> Result<(u32, u32), String> {
     worker_ids_for(
-        vapache_os::effective_uid(),
-        vapache_os::effective_gid(),
+        httpd_rs_os::effective_uid(),
+        httpd_rs_os::effective_gid(),
         user,
         group,
     )
@@ -711,13 +711,13 @@ fn worker_ids_for(euid: u32, egid: u32, user: &str, group: &str) -> Result<(u32,
         n
     } else {
         let cuser = std::ffi::CString::new(user).map_err(|_| "invalid CGI user".to_string())?;
-        vapache_os::lookup_user_id(&cuser).map_err(|_| format!("CGI user '{user}' not found"))?
+        httpd_rs_os::lookup_user_id(&cuser).map_err(|_| format!("CGI user '{user}' not found"))?
     };
     let gid = if let Ok(n) = group.parse::<u32>() {
         n
     } else {
         let cgroup = std::ffi::CString::new(group).map_err(|_| "invalid CGI group".to_string())?;
-        vapache_os::lookup_group_id(&cgroup)
+        httpd_rs_os::lookup_group_id(&cgroup)
             .map_err(|_| format!("CGI group '{group}' not found"))?
     };
     if uid == 0 || gid == 0 {
@@ -744,7 +744,7 @@ fn start_pool_with_exe(
     user: &str,
     count: usize,
 ) -> Result<CgiPool, String> {
-    let parent_pid = vapache_os::current_pid();
+    let parent_pid = httpd_rs_os::current_pid();
     let mut workers = Vec::with_capacity(count);
     for _ in 0..count {
         match start_pool_worker(exe, uid, gid, user, parent_pid) {
@@ -798,9 +798,9 @@ fn start_pool_worker(
     }
     // Keep the descriptor across this exec (the worker needs it). The worker
     // sets FD_CLOEXEC itself before spawning scripts.
-    let mut setup = vapache_os::ChildSetup::inherited(parent_pid);
+    let mut setup = httpd_rs_os::ChildSetup::inherited(parent_pid);
     setup.duplicate_fd = Some((child_fd, WORKER_FD));
-    vapache_os::configure_child(&mut cmd, setup);
+    httpd_rs_os::configure_child(&mut cmd, setup);
     crate::fault::hit("cgi.worker.spawn").map_err(|e| format!("cannot spawn CGI worker: {e}"))?;
     let proc = cmd
         .spawn()
@@ -827,8 +827,8 @@ fn start_pool_worker(
 
 fn drop_worker_privileges(uid: u32, gid: u32, user: &str) -> bool {
     drop_worker_privileges_for(
-        vapache_os::effective_uid(),
-        vapache_os::effective_gid(),
+        httpd_rs_os::effective_uid(),
+        httpd_rs_os::effective_gid(),
         uid,
         gid,
         user,
@@ -845,28 +845,28 @@ fn drop_worker_privileges_for(euid: u32, egid: u32, uid: u32, gid: u32, user: &s
     if !init_worker_groups(user, gid) {
         return false;
     }
-    vapache_os::set_res_gid(gid).is_ok() && vapache_os::set_res_uid(uid).is_ok()
+    httpd_rs_os::set_res_gid(gid).is_ok() && httpd_rs_os::set_res_uid(uid).is_ok()
 }
 
 fn init_worker_groups(user: &str, gid: u32) -> bool {
     if user.parse::<u32>().is_ok() {
-        return vapache_os::clear_supplementary_groups().is_ok();
+        return httpd_rs_os::clear_supplementary_groups().is_ok();
     }
     let Ok(cuser) = std::ffi::CString::new(user) else {
         return false;
     };
-    vapache_os::initialize_supplementary_groups(&cuser, gid).is_ok()
+    httpd_rs_os::initialize_supplementary_groups(&cuser, gid).is_ok()
 }
 
 /// CGI worker process entry point.  It is spawned once per pool slot and is
 /// deliberately tiny and single-threaded until it has completed a request, so
 /// fork/exec avoids copying the main server's address space and TLB entries.
 pub fn worker_main(fd: i32, uid: u32, gid: u32, user: &str, parent_pid: libc::pid_t) {
-    if crate::process::bind_to_parent(parent_pid).is_err() || vapache_os::create_session().is_err()
+    if crate::process::bind_to_parent(parent_pid).is_err() || httpd_rs_os::create_session().is_err()
     {
         std::process::exit(1);
     }
-    vapache_os::set_umask(0o022);
+    httpd_rs_os::set_umask(0o022);
     if !drop_worker_privileges(uid, gid, user) {
         std::process::exit(1);
     }
@@ -892,7 +892,7 @@ pub fn worker_main(fd: i32, uid: u32, gid: u32, user: &str, parent_pid: libc::pi
 }
 
 fn stream_from_fd(fd: i32) -> Option<UnixStream> {
-    vapache_os::claim_inherited_unix_stream(fd).ok()
+    httpd_rs_os::claim_inherited_unix_stream(fd).ok()
 }
 
 fn worker_request(stream: &mut UnixStream) -> Result<bool, String> {
@@ -1191,7 +1191,7 @@ fn read_bytes_budgeted(
         Err(e) => return Err(e.to_string()),
     }
     let len = u32::from_le_bytes(len);
-    if !vapache_verified::cgi_field_len_ok(len, limit) {
+    if !httpd_rs_verified::cgi_field_len_ok(len, limit) {
         return Err("CGI worker message field too large".into());
     }
     if let Some(lease) = resident.as_mut() {
@@ -1206,7 +1206,7 @@ fn read_bytes_budgeted(
 
 fn inheritable_fd_path(file: &File) -> Result<PathBuf, String> {
     let fd = file.as_raw_fd();
-    if !vapache_os::raw_fd_is_open(fd) {
+    if !httpd_rs_os::raw_fd_is_open(fd) {
         return Err("cannot inspect CGI script descriptor".into());
     }
     Ok(PathBuf::from(format!("/proc/self/fd/{fd}")))
@@ -1338,7 +1338,7 @@ fn run_local(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut setup = vapache_os::ChildSetup::inherited(vapache_os::current_pid());
+    let mut setup = httpd_rs_os::ChildSetup::inherited(httpd_rs_os::current_pid());
     setup.retained_fd = retained_fd;
     setup.create_session = true;
     setup.umask = Some(0o022);
@@ -1347,7 +1347,7 @@ fn run_local(
     setup.cpu_seconds = Some(timeout.as_secs().max(1));
     setup.file_size = Some(MAX_OUTPUT as u64);
     setup.open_files = Some(128);
-    vapache_os::configure_child(&mut cmd, setup);
+    httpd_rs_os::configure_child(&mut cmd, setup);
     let spawn_result = crate::fault::hit("cgi.spawn")
         .map_err(|e| format!("cannot execute {}: {e}", path.display()))
         .and_then(|()| {
@@ -1419,8 +1419,8 @@ fn run_local(
 }
 
 fn kill_group(pid: i32) {
-    let _ = vapache_os::kill(-pid, libc::SIGKILL);
-    let _ = vapache_os::kill(pid, libc::SIGKILL);
+    let _ = httpd_rs_os::kill(-pid, libc::SIGKILL);
+    let _ = httpd_rs_os::kill(pid, libc::SIGKILL);
 }
 
 fn wait_with_deadline(
@@ -1512,7 +1512,7 @@ fn read_limited_with_deadline(
         }
         let remaining = deadline.saturating_duration_since(now);
         let wait = remaining.min(Duration::from_millis(100));
-        let ready = vapache_os::poll_readable_raw(fd, wait).map_err(|error| error.to_string())?;
+        let ready = httpd_rs_os::poll_readable_raw(fd, wait).map_err(|error| error.to_string())?;
         if !ready {
             continue;
         }
@@ -1559,7 +1559,7 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
             return Err(());
         }
         let value = trim_ascii(&line[colon + 1..]);
-        if !vapache_verified::proxy_response_header_admit(name, value) {
+        if !httpd_rs_verified::proxy_response_header_admit(name, value) {
             return Err(());
         }
         let lname = std::str::from_utf8(name)
@@ -1572,7 +1572,7 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
             let s = std::str::from_utf8(value).map_err(|_| ())?;
             let code = s.split_whitespace().next().ok_or(())?;
             status = code.parse().map_err(|_| ())?;
-            if !vapache_verified::cgi_response_status_admit(status) {
+            if !httpd_rs_verified::cgi_response_status_admit(status) {
                 return Err(());
             }
             saw_status = true;
@@ -1609,7 +1609,7 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
                 | "trailer"
                 | "upgrade"
         );
-        if !vapache_verified::cgi_response_header_admit(framing, hop_by_hop, false) {
+        if !httpd_rs_verified::cgi_response_header_admit(framing, hop_by_hop, false) {
             continue;
         }
         if lname == "location" {
@@ -1634,12 +1634,12 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
         )
     });
     let connection_disposition =
-        vapache_verified::backend_connection_disposition(framing_nominated, end_to_end_nominated);
-    if connection_disposition == vapache_verified::BackendConnectionDisposition::Reject {
+        httpd_rs_verified::backend_connection_disposition(framing_nominated, end_to_end_nominated);
+    if connection_disposition == httpd_rs_verified::BackendConnectionDisposition::Reject {
         return Err(());
     }
     for token in &connection_tokens {
-        if !vapache_verified::cgi_response_header_admit(false, false, true) {
+        if !httpd_rs_verified::cgi_response_header_admit(false, false, true) {
             headers.remove(token);
         }
     }
@@ -1674,7 +1674,7 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
         })
         .collect();
     r.body = crate::http::Body::Bytes(body);
-    if !vapache_verified::backend_shared_cache_admit(connection_disposition) {
+    if !httpd_rs_verified::backend_shared_cache_admit(connection_disposition) {
         r.forbid_shared_cache();
     }
     if !crate::http::response_headers_valid(&r) {
@@ -1763,11 +1763,11 @@ pub fn is_cgi(cfg: &Config, scope: &crate::config::Scope, name: &[u8], script_al
         scope.mapping_policy.set_handler,
         Some(crate::config::SetHandler::Name(_))
     );
-    debug_assert!(vapache_verified::set_handler_precedence_admit(
+    debug_assert!(httpd_rs_verified::set_handler_precedence_admit(
         forced,
         handler_bound
     ));
-    vapache_verified::cgi_exec_admit(handler_bound, handler_is_cgi, script_alias, exec_allowed)
+    httpd_rs_verified::cgi_exec_admit(handler_bound, handler_is_cgi, script_alias, exec_allowed)
 }
 #[cfg(test)]
 mod tests {
@@ -1779,7 +1779,7 @@ mod tests {
     use std::os::fd::OwnedFd;
 
     fn tempdir(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("vapache-cgi-{}-{name}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("httpd-rs-cgi-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
@@ -2365,8 +2365,8 @@ mod tests {
         if unsafe { libc::geteuid() } != 0 {
             return;
         }
-        assert!(worker_ids("no-such-vapache-user-xyz", "www-data").is_err());
-        assert!(worker_ids("www-data", "no-such-vapache-group-xyz").is_err());
+        assert!(worker_ids("no-such-httpd-rs-user-xyz", "www-data").is_err());
+        assert!(worker_ids("www-data", "no-such-httpd-rs-group-xyz").is_err());
         assert!(worker_ids("www-data", "www-data").is_ok());
         assert!(worker_ids("33", "33").is_ok());
     }
@@ -2706,12 +2706,12 @@ mod tests {
         );
         assert_eq!(worker_ids_for(0, 0, "123", "456").unwrap(), (123, 456));
         assert!(worker_ids_for(0, 0, "bad\0user", "0").is_err());
-        assert!(worker_ids_for(0, 0, "no-such-vapache-user-xyz", "0").is_err());
+        assert!(worker_ids_for(0, 0, "no-such-httpd-rs-user-xyz", "0").is_err());
         assert!(worker_ids_for(0, 0, "root", "root").is_err());
         assert!(worker_ids_for(0, 0, "0", "bad\0group").is_err());
-        assert!(worker_ids_for(0, 0, "0", "no-such-vapache-group-xyz").is_err());
+        assert!(worker_ids_for(0, 0, "0", "no-such-httpd-rs-group-xyz").is_err());
         assert!(!init_worker_groups("bad\0user", 0));
-        assert!(!init_worker_groups("no-such-vapache-user-xyz", 0));
+        assert!(!init_worker_groups("no-such-httpd-rs-user-xyz", 0));
 
         let (parent, child) = UnixStream::pair().unwrap();
         let pid = unsafe { libc::fork() };
@@ -2719,7 +2719,7 @@ mod tests {
         if pid == 0 {
             let parent_pid = unsafe { libc::getppid() };
             let ok =
-                vapache_os::prepare_inherited_worker_fd(child.as_raw_fd(), 99, parent_pid).is_ok();
+                httpd_rs_os::prepare_inherited_worker_fd(child.as_raw_fd(), 99, parent_pid).is_ok();
             unsafe { libc::_exit(if ok { 0 } else { 1 }) };
         }
         let mut status = 0;
@@ -3137,7 +3137,7 @@ mod tests {
     fn child_process_and_worker_main_paths() {
         let pid = unsafe { libc::fork() };
         if pid == 0 {
-            let mut profile = vapache_os::ChildSetup::inherited(unsafe { libc::getppid() });
+            let mut profile = httpd_rs_os::ChildSetup::inherited(unsafe { libc::getppid() });
             profile.create_session = true;
             profile.umask = Some(0o022);
             profile.no_new_privileges = true;
@@ -3145,7 +3145,7 @@ mod tests {
             profile.cpu_seconds = Some(1);
             profile.file_size = Some(MAX_OUTPUT as u64);
             profile.open_files = Some(128);
-            let setup = vapache_os::setup_current_child(profile).is_ok();
+            let setup = httpd_rs_os::setup_current_child(profile).is_ok();
             let euid = unsafe { libc::geteuid() };
             let egid = unsafe { libc::getegid() };
             let (uid, gid, user) = if euid == 0 {
@@ -3287,7 +3287,7 @@ mod pass11_kernel_tests {
 
     fn tempdir(name: &str) -> PathBuf {
         let p =
-            std::env::temp_dir().join(format!("vapache-cgi-matrix-{}-{name}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-cgi-matrix-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -3315,7 +3315,7 @@ mod pass11_kernel_tests {
             "{}Listen 127.0.0.1:0\n{text}",
             crate::config::TEST_CAPABILITIES
         );
-        let dir = std::env::temp_dir().join(format!("vapache-cgi-matrix-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-cgi-matrix-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");

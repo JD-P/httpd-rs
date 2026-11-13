@@ -3,9 +3,9 @@
 Measured 2026-10-30 after the P23/P24 remediation on Linux 6.18.55, an AMD EPYC
 9V74 worker (5 available cores), Rust 1.99.1. The benchmark is single-threaded,
 uses release builds, reports the median of seven samples, and compares the same
-`captures` API because that is what vapache expressions use.
+`captures` API because that is what httpd-rs expressions use.
 
-The “vapache” column is the safe-Rust compatibility frontend and deterministic
+The “httpd-rs” column is the safe-Rust compatibility frontend and deterministic
 automata backend guarded by the Verus-verified engine-mode and resource
 admission kernels. The engine is tiered: construction creates a bounded Pike
 VM, the first search uses it, and the second search builds a shared lazy-DFA
@@ -14,14 +14,14 @@ implementation itself is a documented proof assumption, not code translated
 from Verus.
 
 ```sh
-cargo run -p vapache-pcre2 --release --example pcre2_benchmark
+cargo run -p httpd-rs-pcre2 --release --example pcre2_benchmark
 ```
 
 The C columns use the test-only PCRE2 10.46 oracle through `pcre2` 0.2.11,
 once as the interpreter and once with JIT requested. Times are nanoseconds per
 operation; lower is better.
 
-| Case | Operation | vapache | C interpreter | C JIT | vapache / C interpreter |
+| Case | Operation | httpd-rs | C interpreter | C JIT | httpd-rs / C interpreter |
 |---|---|---:|---:|---:|---:|
 | literal anchor | compile | 3,634.1 | 511.5 | 2,498.2 | 7.104 |
 | literal anchor | compile + first captures | 4,106.6 | 666.5 | 2,618.6 | 6.162 |
@@ -57,9 +57,9 @@ Interpretation:
   capture slots and a group-zero fast path remove allocator and submatch work
   from the common no-explicit-capture case.
 - The counted-repetition row is a security-policy comparison rather than a
-  successful-match throughput comparison. Vapache rejects the request at its
+  successful-match throughput comparison. httpd-rs rejects the request at its
   verified work gate in about 0.24 µs; PCRE2 executes it. Before P23-A, the
-  vapache engine admitted this shape and the original adversarial live test
+  httpd-rs engine admitted this shape and the original adversarial live test
   measured roughly 350 ms. The checked-in row is a warmed median-of-seven;
   each C sample executes once while the much cheaper guard uses 10,000
   iterations per sample.

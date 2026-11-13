@@ -3,7 +3,7 @@
 **Derived index under `adversarial/yield-index/`.**
 Recovered from the historical OpenCode logs and retained adversarial files on
 2026-11-08. This directory is a derived analytical index only: it does not
-modify Vapache source, OpenCode logs, or any existing adversarial or findings
+modify httpd-rs source, OpenCode logs, or any existing adversarial or findings
 file, and it does not compute adversarial yield.
 
 ## Deliverables
@@ -32,7 +32,7 @@ Every row carries source references; where a fact could not be recovered it is
 - `docs/vulnerability_trends.md` — the earlier F1–P15 class-level inventory,
   effort/parts/prevalence/impact estimates and caveats; used only as a
   cross-reference for F1–F30 and impact-scale context.
-- `/root/vapache` Git history — commit list, messages, dates, and the
+- `/root/httpd-rs` Git history — commit list, messages, dates, and the
   `git log`/`git status`/`git diff` outputs captured inside each session.
 - Recovered initial `findings.md` content (F1–F5 write-ups) from the Pass-1
   session transcript (captured at `/tmp/p1_t3_write_0.md` by the recovery work).
@@ -419,7 +419,7 @@ new confirmed findings (medium, two behaviors → 5.0 points; low, two behaviors
   cached process-wide and later fails closed with 500 for that URL; not
   reproduced, requires an unusually large rule set). P38-A is a new root cause
   sibling of P35-A: a valid `<FilesMatch>` or `<LocationMatch>` guard split
-  across a continuation silently stops matching (Apache 403, vapache 200 with
+  across a continuation silently stops matching (Apache 403, httpd-rs 200 with
   the protected body), and a split `SetHandler`/`Require` that Apache rejects
   for the whole access file becomes active policy (uploaded CGI executes,
   protected file is served). Retained evidence is in `adversarial/p38/`.

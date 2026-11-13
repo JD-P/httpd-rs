@@ -51,21 +51,21 @@ enum H2TaskEvent {
 #[derive(Clone, Copy)]
 struct H2StreamRecord {
     id: u64,
-    phase: vapache_verified::H2StreamPhase,
+    phase: httpd_rs_verified::H2StreamPhase,
 }
 
 /// One adapter-side lifecycle ledger owns stream identity, phase and aggregate
 /// capacity. Transitions are computed completely before mutation, so a failed
 /// phase or budget transition cannot update only half of the accounting state.
 struct H2ConnectionLedger {
-    budget: vapache_verified::H2Budget,
+    budget: httpd_rs_verified::H2Budget,
     streams: Vec<H2StreamRecord>,
 }
 
 impl H2ConnectionLedger {
     fn new(max_active: u64, max_pending_resets: u64) -> Self {
         Self {
-            budget: vapache_verified::h2_budget_new(max_active, max_pending_resets),
+            budget: httpd_rs_verified::h2_budget_new(max_active, max_pending_resets),
             streams: Vec::new(),
         }
     }
@@ -83,12 +83,12 @@ impl H2ConnectionLedger {
         let active = self
             .streams
             .iter()
-            .filter(|stream| stream.phase == vapache_verified::H2StreamPhase::Active)
+            .filter(|stream| stream.phase == httpd_rs_verified::H2StreamPhase::Active)
             .count() as u64;
         let pending = self
             .streams
             .iter()
-            .filter(|stream| stream.phase == vapache_verified::H2StreamPhase::AwaitingReset)
+            .filter(|stream| stream.phase == httpd_rs_verified::H2StreamPhase::AwaitingReset)
             .count() as u64;
         let unique = self.streams.iter().enumerate().all(|(index, stream)| {
             self.streams[index + 1..]
@@ -107,14 +107,14 @@ impl H2ConnectionLedger {
         if self.streams.iter().any(|stream| stream.id == stream_id) {
             return false;
         }
-        let Some(phase) = vapache_verified::h2_stream_phase_step(
-            vapache_verified::H2StreamPhase::Idle,
-            vapache_verified::H2StreamEvent::Begin,
+        let Some(phase) = httpd_rs_verified::h2_stream_phase_step(
+            httpd_rs_verified::H2StreamPhase::Idle,
+            httpd_rs_verified::H2StreamEvent::Begin,
         ) else {
             return false;
         };
         let Some(budget) =
-            vapache_verified::h2_budget_step(self.budget, vapache_verified::H2BudgetEvent::Begin)
+            httpd_rs_verified::h2_budget_step(self.budget, httpd_rs_verified::H2BudgetEvent::Begin)
         else {
             return false;
         };
@@ -135,23 +135,25 @@ impl H2ConnectionLedger {
             return false;
         };
         let event = if reset {
-            vapache_verified::H2StreamEvent::Reset
+            httpd_rs_verified::H2StreamEvent::Reset
         } else {
-            vapache_verified::H2StreamEvent::Finish
+            httpd_rs_verified::H2StreamEvent::Finish
         };
-        let Some(phase) = vapache_verified::h2_stream_phase_step(self.streams[index].phase, event)
+        let Some(phase) = httpd_rs_verified::h2_stream_phase_step(self.streams[index].phase, event)
         else {
             return false;
         };
-        let Some(finished) =
-            vapache_verified::h2_budget_step(self.budget, vapache_verified::H2BudgetEvent::Finish)
-        else {
+        let Some(finished) = httpd_rs_verified::h2_budget_step(
+            self.budget,
+            httpd_rs_verified::H2BudgetEvent::Finish,
+        ) else {
             return false;
         };
         let budget = if reset {
-            let Some(reset_budget) =
-                vapache_verified::h2_budget_step(finished, vapache_verified::H2BudgetEvent::Reset)
-            else {
+            let Some(reset_budget) = httpd_rs_verified::h2_budget_step(
+                finished,
+                httpd_rs_verified::H2BudgetEvent::Reset,
+            ) else {
                 return false;
             };
             reset_budget
@@ -174,18 +176,19 @@ impl H2ConnectionLedger {
         else {
             return false;
         };
-        let Some(phase) = vapache_verified::h2_stream_phase_step(
+        let Some(phase) = httpd_rs_verified::h2_stream_phase_step(
             self.streams[index].phase,
-            vapache_verified::H2StreamEvent::Reclaim,
+            httpd_rs_verified::H2StreamEvent::Reclaim,
         ) else {
             return false;
         };
-        let Some(budget) =
-            vapache_verified::h2_budget_step(self.budget, vapache_verified::H2BudgetEvent::Reclaim)
-        else {
+        let Some(budget) = httpd_rs_verified::h2_budget_step(
+            self.budget,
+            httpd_rs_verified::H2BudgetEvent::Reclaim,
+        ) else {
             return false;
         };
-        debug_assert_eq!(phase, vapache_verified::H2StreamPhase::Closed);
+        debug_assert_eq!(phase, httpd_rs_verified::H2StreamPhase::Closed);
         self.budget = budget;
         self.streams.swap_remove(index);
         true
@@ -193,16 +196,16 @@ impl H2ConnectionLedger {
 
     fn close(&mut self) -> bool {
         if self.streams.iter().any(|stream| {
-            vapache_verified::h2_stream_phase_step(
+            httpd_rs_verified::h2_stream_phase_step(
                 stream.phase,
-                vapache_verified::H2StreamEvent::ConnectionClose,
-            ) != Some(vapache_verified::H2StreamPhase::Closed)
+                httpd_rs_verified::H2StreamEvent::ConnectionClose,
+            ) != Some(httpd_rs_verified::H2StreamPhase::Closed)
         }) {
             return false;
         }
-        let Some(budget) = vapache_verified::h2_budget_step(
+        let Some(budget) = httpd_rs_verified::h2_budget_step(
             self.budget,
-            vapache_verified::H2BudgetEvent::ConnectionClose,
+            httpd_rs_verified::H2BudgetEvent::ConnectionClose,
         ) else {
             return false;
         };
@@ -278,7 +281,7 @@ fn request_target(method: &str, uri: &http::Uri, https: bool) -> Option<Vec<u8>>
         )
         .is_some()
     });
-    let admitted = vapache_verified::h2_request_target_admit(
+    let admitted = httpd_rs_verified::h2_request_target_admit(
         method.eq_ignore_ascii_case("CONNECT"),
         parts.scheme.is_some(),
         scheme_matches,
@@ -507,17 +510,17 @@ fn bad(status: u16, message: &str) -> Response {
     Response::bytes(status, "text/html; charset=iso-8859-1", body.into_bytes())
 }
 
-fn head_error_response(decision: vapache_verified::H2HeadDecision) -> Option<Response> {
+fn head_error_response(decision: httpd_rs_verified::H2HeadDecision) -> Option<Response> {
     match decision {
-        vapache_verified::H2HeadDecision::Accept => None,
-        vapache_verified::H2HeadDecision::InvalidMethod => Some(bad(400, "invalid HTTP/2 method")),
-        vapache_verified::H2HeadDecision::TargetTooLong => {
+        httpd_rs_verified::H2HeadDecision::Accept => None,
+        httpd_rs_verified::H2HeadDecision::InvalidMethod => Some(bad(400, "invalid HTTP/2 method")),
+        httpd_rs_verified::H2HeadDecision::TargetTooLong => {
             Some(bad(414, "request target too long"))
         }
-        vapache_verified::H2HeadDecision::TooManyHeaders => {
+        httpd_rs_verified::H2HeadDecision::TooManyHeaders => {
             Some(bad(431, "too many request headers"))
         }
-        vapache_verified::H2HeadDecision::HeaderFieldTooLarge => {
+        httpd_rs_verified::H2HeadDecision::HeaderFieldTooLarge => {
             Some(bad(431, "request header field too large"))
         }
     }
@@ -534,7 +537,7 @@ fn canonicalize_content_length(headers: &mut crate::http::Headers) -> Result<Opt
             return Err(());
         }
         let value = trim_ascii(value);
-        let Some(length) = vapache_verified::parse_decimal_u64(value) else {
+        let Some(length) = httpd_rs_verified::parse_decimal_u64(value) else {
             return Err(());
         };
         declared = Some(length);
@@ -561,7 +564,7 @@ fn project_h2_target(
     field_size_limit: usize,
 ) -> Result<Vec<u8>, Response> {
     if uri.authority().is_some_and(|authority| {
-        !vapache_verified::h2_field_size_admit(
+        !httpd_rs_verified::h2_field_size_admit(
             b"host".len() as u64,
             authority.as_str().len() as u64,
             field_size_limit as u64,
@@ -593,12 +596,12 @@ fn project_h2_head(
 
     let mut headers = crate::http::Headers::default();
     let mut header_budget =
-        vapache_verified::h2_header_init(vapache_verified::h2_settings().max_header_list as u64);
+        httpd_rs_verified::h2_header_init(httpd_rs_verified::h2_settings().max_header_list as u64);
     let mut header_count = 0u64;
     let mut largest_field = 0u64;
     for (name, value) in fields.iter() {
         let field_len = name.as_str().len().saturating_add(value.as_bytes().len()) as u64;
-        let Some(next) = vapache_verified::h2_header_add(header_budget, field_len) else {
+        let Some(next) = httpd_rs_verified::h2_header_add(header_budget, field_len) else {
             return Err(bad(431, "request header list too large"));
         };
         header_budget = next;
@@ -618,7 +621,7 @@ fn project_h2_head(
     if let Some(authority) = authority {
         let value = authority.as_bytes();
         let field_len = b"host".len().saturating_add(value.len()) as u64;
-        let Some(next) = vapache_verified::h2_header_add(header_budget, field_len) else {
+        let Some(next) = httpd_rs_verified::h2_header_add(header_budget, field_len) else {
             return Err(bad(431, "request header list too large"));
         };
         header_budget = next;
@@ -628,7 +631,7 @@ fn project_h2_head(
     }
     let _ = header_budget;
 
-    if let Some(response) = head_error_response(vapache_verified::h2_head_admit(
+    if let Some(response) = head_error_response(httpd_rs_verified::h2_head_admit(
         method.as_bytes(),
         target.len() as u64,
         request_line_limit as u64,
@@ -684,8 +687,8 @@ async fn read_body(
         max_spool_files,
         Some(resource_context),
     );
-    let mut budget = vapache_verified::h2_body_init(limit);
-    let mut framing = vapache_verified::ChunkFramingState {
+    let mut budget = httpd_rs_verified::h2_body_init(limit);
+    let mut framing = httpd_rs_verified::ChunkFramingState {
         chunks: 0,
         bytes: 0,
     };
@@ -726,7 +729,7 @@ async fn read_body(
         // the nine-byte HTTP/2 frame header and one work unit per delivered
         // DATA frame, using the same verified budget shape as HTTP/1 chunks.
         let Some(next_framing) =
-            vapache_verified::chunk_framing_budget_step(framing, 5, true, 65_536, 1024 * 1024)
+            httpd_rs_verified::chunk_framing_budget_step(framing, 5, true, 65_536, 1024 * 1024)
         else {
             return Err(H2ReadFailure::Response(bad(
                 400,
@@ -734,7 +737,8 @@ async fn read_body(
             )));
         };
         framing = next_framing;
-        let Some(next_budget) = vapache_verified::h2_body_append(budget, chunk.len() as u64) else {
+        let Some(next_budget) = httpd_rs_verified::h2_body_append(budget, chunk.len() as u64)
+        else {
             return Err(H2ReadFailure::Response(bad(413, "request body too large")));
         };
         budget = next_budget;
@@ -777,8 +781,8 @@ async fn stream_body(
     min_rate: u64,
     allow_trailers: bool,
 ) -> Result<(), H2ReadFailure> {
-    let mut budget = vapache_verified::h2_body_init(limit);
-    let mut framing = vapache_verified::ChunkFramingState {
+    let mut budget = httpd_rs_verified::h2_body_init(limit);
+    let mut framing = httpd_rs_verified::ChunkFramingState {
         chunks: 0,
         bytes: 0,
     };
@@ -809,7 +813,7 @@ async fn stream_body(
             }
         };
         let Some(next_framing) =
-            vapache_verified::chunk_framing_budget_step(framing, 5, true, 65_536, 1024 * 1024)
+            httpd_rs_verified::chunk_framing_budget_step(framing, 5, true, 65_536, 1024 * 1024)
         else {
             return Err(H2ReadFailure::Response(bad(
                 400,
@@ -817,7 +821,8 @@ async fn stream_body(
             )));
         };
         framing = next_framing;
-        let Some(next_budget) = vapache_verified::h2_body_append(budget, chunk.len() as u64) else {
+        let Some(next_budget) = httpd_rs_verified::h2_body_append(budget, chunk.len() as u64)
+        else {
             return Err(H2ReadFailure::Response(bad(413, "request body too large")));
         };
         if next_budget.len > declared {
@@ -887,7 +892,7 @@ async fn read_trailers(
     let Some(trailers) = trailers else {
         return Ok(());
     };
-    if !vapache_verified::capability_admit(allow_trailers, !trailers.is_empty()) {
+    if !httpd_rs_verified::capability_admit(allow_trailers, !trailers.is_empty()) {
         return Err(H2ReadFailure::Response(bad(
             400,
             "request trailers are disabled",
@@ -1356,7 +1361,7 @@ fn admit_stream_before_spawn(
         if remoteip_header == "host" {
             if let Some(authority) = request.uri().authority() {
                 let value = authority.as_str().as_bytes();
-                quota_identity_valid = vapache_verified::h2_field_size_admit(
+                quota_identity_valid = httpd_rs_verified::h2_field_size_admit(
                     b"host".len() as u64,
                     value.len() as u64,
                     cfg.limit_request_field_size as u64,
@@ -1375,7 +1380,7 @@ fn admit_stream_before_spawn(
                     .map(|existing| existing.len().saturating_add(2))
                     .unwrap_or(0)
                     .saturating_add(value.as_bytes().len());
-                if !vapache_verified::h2_field_size_admit(
+                if !httpd_rs_verified::h2_field_size_admit(
                     name.as_str().len() as u64,
                     merged_len as u64,
                     cfg.limit_request_field_size as u64,
@@ -1637,7 +1642,7 @@ async fn handle_stream(
             .map(crate::verified::BodyFraming::Length)
             .unwrap_or(crate::verified::BodyFraming::Chunked);
     }
-    let mut phase = vapache_verified::RequestPhase::Head;
+    let mut phase = httpd_rs_verified::RequestPhase::Head;
     let mut early = None;
     let mut early_remote_user = None;
     let mut prepared_handler = None;
@@ -1650,9 +1655,9 @@ async fn handle_stream(
         } else {
             405
         };
-        phase = vapache_verified::request_phase_step(
+        phase = httpd_rs_verified::request_phase_step(
             phase,
-            vapache_verified::RequestPhaseEvent::RouteNeedsDrain,
+            httpd_rs_verified::RequestPhaseEvent::RouteNeedsDrain,
         )
         .expect("HTTP/2 static-only body-drain phase transition");
         drain_after_body = Some((
@@ -1694,9 +1699,9 @@ async fn handle_stream(
                 },
             )) => {
                 req = returned_req;
-                phase = vapache_verified::request_phase_step(
+                phase = httpd_rs_verified::request_phase_step(
                     phase,
-                    vapache_verified::RequestPhaseEvent::RouteNeedsBody,
+                    httpd_rs_verified::RequestPhaseEvent::RouteNeedsBody,
                 )
                 .expect("HTTP/2 body route phase transition");
                 prepared_handler = Some(handler);
@@ -1704,9 +1709,9 @@ async fn handle_stream(
             }
             Ok((returned_req, crate::server::BodyRouteDecision::Drain(response, remote_user))) => {
                 req = returned_req;
-                phase = vapache_verified::request_phase_step(
+                phase = httpd_rs_verified::request_phase_step(
                     phase,
-                    vapache_verified::RequestPhaseEvent::RouteNeedsDrain,
+                    httpd_rs_verified::RequestPhaseEvent::RouteNeedsDrain,
                 )
                 .expect("HTTP/2 static body-drain phase transition");
                 body_remote_user = remote_user.clone();
@@ -1717,9 +1722,9 @@ async fn handle_stream(
                 crate::server::BodyRouteDecision::Respond(response, remote_user),
             )) => {
                 req = returned_req;
-                phase = vapache_verified::request_phase_step(
+                phase = httpd_rs_verified::request_phase_step(
                     phase,
-                    vapache_verified::RequestPhaseEvent::EarlyResponse,
+                    httpd_rs_verified::RequestPhaseEvent::EarlyResponse,
                 )
                 .expect("HTTP/2 early response phase transition");
                 early = Some(response);
@@ -1766,9 +1771,9 @@ async fn handle_stream(
                 },
             )) => {
                 req = returned_req;
-                phase = vapache_verified::request_phase_step(
+                phase = httpd_rs_verified::request_phase_step(
                     phase,
-                    vapache_verified::RequestPhaseEvent::RoutePrepared,
+                    httpd_rs_verified::RequestPhaseEvent::RoutePrepared,
                 )
                 .expect("HTTP/2 prepared route phase transition");
                 prepared_handler = Some(handler);
@@ -1779,14 +1784,14 @@ async fn handle_stream(
                 crate::server::PreparedRouteDecision::Respond(response, remote_user),
             )) => {
                 req = returned_req;
-                phase = vapache_verified::request_phase_step(
+                phase = httpd_rs_verified::request_phase_step(
                     phase,
-                    vapache_verified::RequestPhaseEvent::RouteReady,
+                    httpd_rs_verified::RequestPhaseEvent::RouteReady,
                 )
                 .expect("HTTP/2 bodyless route phase transition");
-                phase = vapache_verified::request_phase_step(
+                phase = httpd_rs_verified::request_phase_step(
                     phase,
-                    vapache_verified::RequestPhaseEvent::DispatchComplete,
+                    httpd_rs_verified::RequestPhaseEvent::DispatchComplete,
                 )
                 .expect("HTTP/2 bodyless dispatch phase transition");
                 early = Some(response);
@@ -1805,9 +1810,9 @@ async fn handle_stream(
         // rejected transfer keeps general ownership long enough to send this
         // bounded overload response.
         if output_admission.enter_slow_input().is_err() {
-            phase = vapache_verified::request_phase_step(
+            phase = httpd_rs_verified::request_phase_step(
                 phase,
-                vapache_verified::RequestPhaseEvent::BodyErrorResponse,
+                httpd_rs_verified::RequestPhaseEvent::BodyErrorResponse,
             )
             .expect("HTTP/2 slow-input admission failure transition");
             early = Some(bad(503, "slow request-body capacity exhausted"));
@@ -1835,9 +1840,9 @@ async fn handle_stream(
                         .take()
                         .expect("streaming HTTP/2 body retained its resident lease"),
                 );
-                phase = vapache_verified::request_phase_step(
+                phase = httpd_rs_verified::request_phase_step(
                     phase,
-                    vapache_verified::RequestPhaseEvent::BackendStarted,
+                    httpd_rs_verified::RequestPhaseEvent::BackendStarted,
                 )
                 .expect("HTTP/2 streaming backend phase transition");
                 let mut rejected_req = req.clone();
@@ -1916,9 +1921,9 @@ async fn handle_stream(
                                 }
                                 drop(backend);
                                 rejected_req.clear_streaming_body();
-                                phase = vapache_verified::request_phase_step(
+                                phase = httpd_rs_verified::request_phase_step(
                                     phase,
-                                    vapache_verified::RequestPhaseEvent::BodyErrorResponse,
+                                    httpd_rs_verified::RequestPhaseEvent::BodyErrorResponse,
                                 )
                                 .expect("HTTP/2 streaming body error phase transition");
                                 req = rejected_req;
@@ -1934,9 +1939,9 @@ async fn handle_stream(
                         logger.error("HTTP/2 backend task failed");
                         return true;
                     };
-                    phase = vapache_verified::request_phase_step(
+                    phase = httpd_rs_verified::request_phase_step(
                         phase,
-                        vapache_verified::RequestPhaseEvent::BackendComplete,
+                        httpd_rs_verified::RequestPhaseEvent::BackendComplete,
                     )
                     .expect("HTTP/2 streaming backend completion transition");
                     streamed = Some((req, response, remote_user));
@@ -1951,9 +1956,9 @@ async fn handle_stream(
                 }
             }
             Err(_) => {
-                phase = vapache_verified::request_phase_step(
+                phase = httpd_rs_verified::request_phase_step(
                     phase,
-                    vapache_verified::RequestPhaseEvent::BodyErrorResponse,
+                    httpd_rs_verified::RequestPhaseEvent::BodyErrorResponse,
                 )
                 .expect("HTTP/2 streaming admission failure transition");
                 early = Some(bad(503, "request-body capacity exhausted"));
@@ -2030,9 +2035,9 @@ async fn handle_stream(
                     req.body = body.bytes;
                     req.body_spool = body.spool;
                     req.discard_body();
-                    phase = vapache_verified::request_phase_step(
+                    phase = httpd_rs_verified::request_phase_step(
                         phase,
-                        vapache_verified::RequestPhaseEvent::BodyDiscarded,
+                        httpd_rs_verified::RequestPhaseEvent::BodyDiscarded,
                     )
                     .expect("HTTP/2 body discard phase transition");
                     early = Some(response);
@@ -2040,9 +2045,9 @@ async fn handle_stream(
                 } else {
                     req.body = body.bytes;
                     req.body_spool = body.spool;
-                    phase = vapache_verified::request_phase_step(
+                    phase = httpd_rs_verified::request_phase_step(
                         phase,
-                        vapache_verified::RequestPhaseEvent::BodyComplete,
+                        httpd_rs_verified::RequestPhaseEvent::BodyComplete,
                     )
                     .expect("HTTP/2 body completion phase transition");
                 }
@@ -2059,9 +2064,9 @@ async fn handle_stream(
                     respond.send_reset(h2::Reason::REFUSED_STREAM);
                     return true;
                 }
-                phase = vapache_verified::request_phase_step(
+                phase = httpd_rs_verified::request_phase_step(
                     phase,
-                    vapache_verified::RequestPhaseEvent::BodyErrorResponse,
+                    httpd_rs_verified::RequestPhaseEvent::BodyErrorResponse,
                 )
                 .expect("HTTP/2 body error phase transition");
                 early = Some(response);
@@ -2120,12 +2125,12 @@ async fn handle_stream(
                     logger.error("HTTP/2 request dispatcher task failed");
                     return true;
                 };
-                phase = vapache_verified::request_phase_step(
+                phase = httpd_rs_verified::request_phase_step(
                     phase,
                     if runs_backend {
-                        vapache_verified::RequestPhaseEvent::BackendComplete
+                        httpd_rs_verified::RequestPhaseEvent::BackendComplete
                     } else {
-                        vapache_verified::RequestPhaseEvent::DispatchComplete
+                        httpd_rs_verified::RequestPhaseEvent::DispatchComplete
                     },
                 )
                 .expect("HTTP/2 backend/dispatch phase transition");
@@ -2142,24 +2147,24 @@ async fn handle_stream(
         {
             Ok(n) => n,
             Err(e) => {
-                let closed = vapache_verified::request_phase_step(
+                let closed = httpd_rs_verified::request_phase_step(
                     phase,
-                    vapache_verified::RequestPhaseEvent::Cancel,
+                    httpd_rs_verified::RequestPhaseEvent::Cancel,
                 )
                 .expect("HTTP/2 cancellation phase transition");
-                debug_assert_eq!(closed, vapache_verified::RequestPhase::Closed);
+                debug_assert_eq!(closed, httpd_rs_verified::RequestPhase::Closed);
                 // Peer-close/send failures are already exercised directly by the
                 // bounded response sender; this adapter arm only adds logging.
                 logger.error(&format!("HTTP/2 stream failed: {e}")); // coverage:ignore-line - peer timing race
                 return true; // coverage:ignore-line - peer timing race
             }
         };
-    phase = vapache_verified::request_phase_step(
+    phase = httpd_rs_verified::request_phase_step(
         phase,
-        vapache_verified::RequestPhaseEvent::OutputComplete,
+        httpd_rs_verified::RequestPhaseEvent::OutputComplete,
     )
     .expect("HTTP/2 output phase transition");
-    debug_assert_eq!(phase, vapache_verified::RequestPhase::Closed);
+    debug_assert_eq!(phase, httpd_rs_verified::RequestPhase::Closed);
     crate::status::hit(body_sent);
 
     let host = req.header_str("host").unwrap_or("");
@@ -2684,7 +2689,7 @@ where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
     F: FnOnce() -> io::Result<G>,
 {
-    let settings = vapache_verified::h2_settings();
+    let settings = httpd_rs_verified::h2_settings();
     let mut builder = h2::server::Builder::new();
     builder
         // Bound compressed/decoded header memory before HPACK allocates.
@@ -2718,7 +2723,7 @@ where
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             }
             result = retired.changed() => {
-                if result.is_err() || !vapache_verified::configuration_generation_admit(
+                if result.is_err() || !httpd_rs_verified::configuration_generation_admit(
                     *retired.borrow(),
                 ) {
                     return Ok(());
@@ -2763,7 +2768,7 @@ where
         tokio::select! {
             biased;
             result = retired.changed(), if !draining => {
-                if result.is_err() || !vapache_verified::configuration_generation_admit(
+                if result.is_err() || !httpd_rs_verified::configuration_generation_admit(
                     *retired.borrow(),
                 ) {
                     // Emit GOAWAY, refuse new streams in the h2 state machine,
@@ -2849,7 +2854,7 @@ where
                 }) {
                     Some(Ok(admission)) => admission,
                     None | Some(Err(_)) => {
-                        if !vapache_verified::configuration_generation_admit(*retired.borrow()) {
+                        if !httpd_rs_verified::configuration_generation_admit(*retired.borrow()) {
                             conn.graceful_shutdown();
                             draining = true;
                         }
@@ -2943,7 +2948,7 @@ mod tests {
         upstream: &str,
         extra: &str,
     ) -> (Arc<Config>, Arc<Logger>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("vapache-h2-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-h2-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("www")).unwrap();
         fs::write(dir.join("www/file.txt"), b"hello h2").unwrap();
@@ -4133,7 +4138,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn h2_get_with_body_bypasses_a_preexisting_cache_entry() {
         let name = "body-cache-bypass";
-        let root = std::env::temp_dir().join(format!("vapache-h2-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("httpd-rs-h2-{name}-{}", std::process::id()));
         let extra = format!(
             "CacheRoot \"{}\"\nCacheEnable disk /",
             root.join("cache").display()
@@ -4183,7 +4188,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
 
         let (cfg, logger, dir) =
-            test_config_with_extra("trailers-enabled", "VapacheCapability RequestTrailers On");
+            test_config_with_extra("trailers-enabled", "HttpdRsCapability RequestTrailers On");
         let request = http::Request::builder()
             .method("GET")
             .uri("https://localhost/file.txt")
@@ -4478,7 +4483,7 @@ mod tests {
         );
 
         // A traditional CONNECT request is valid at the h2 framing layer,
-        // but vapached does not implement tunnels and must reject the
+        // but httpd-rs does not implement tunnels and must reject the
         // authority-form target before normal request dispatch.
         let request = http::Request::builder()
             .method("CONNECT")
@@ -4600,7 +4605,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn h2_duplicate_fields_are_canonicalized_before_policy() {
         let name = "duplicate-policy";
-        let dir = std::env::temp_dir().join(format!("vapache-h2-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-h2-{name}-{}", std::process::id()));
         let directory = dir.join("www");
         let extra = format!(
             "<Directory \"{}\">\nRequire expr \"%{{HTTP:X-Gate}} == 'allow, deny'\"\n</Directory>",
@@ -5861,7 +5866,7 @@ mod tests {
 
     #[test]
     fn response_decisions_and_content_lengths_are_total() {
-        use vapache_verified::H2HeadDecision::{
+        use httpd_rs_verified::H2HeadDecision::{
             Accept, HeaderFieldTooLarge, InvalidMethod, TargetTooLong, TooManyHeaders,
         };
         assert!(head_error_response(Accept).is_none());
@@ -5921,7 +5926,7 @@ mod tests {
         let missing_authority: http::Uri = "/path".parse().unwrap();
         assert!(request_target("GET", &missing_authority, true).is_none());
         assert!(request_target("CONNECT", &good, true).is_none());
-        assert!(!vapache_verified::h2_request_target_admit(
+        assert!(!httpd_rs_verified::h2_request_target_admit(
             false, true, true, true, false, true, true, false,
         ));
         let bad_port: http::Uri = "https://example.test:99999/path".parse().unwrap();
@@ -6074,142 +6079,142 @@ mod tests {
 
     #[test]
     fn h2_admission_bounds_are_checked_without_overflow() {
-        assert!(vapache_verified::h2_body_admit(0, 10, 10));
-        assert!(!vapache_verified::h2_body_admit(10, 1, 10));
-        assert!(!vapache_verified::h2_body_admit(u64::MAX, 1, 10));
-        assert!(vapache_verified::h2_target_admit(10, 10));
-        assert!(!vapache_verified::h2_target_admit(11, 10));
-        assert!(vapache_verified::h2_header_admit(3, 10, 3, 10));
-        assert!(!vapache_verified::h2_header_admit(4, 10, 3, 10));
-        assert!(vapache_verified::h2_header_total_admit(10, 10));
-        assert!(!vapache_verified::h2_header_total_admit(11, 10));
-        let hs = vapache_verified::h2_header_init(10);
-        let hs = vapache_verified::h2_header_add(hs, 7).unwrap();
-        assert!(vapache_verified::h2_header_add(hs, 4).is_none());
-        assert_eq!(vapache_verified::h2_header_add(hs, 3).unwrap().total, 10);
+        assert!(httpd_rs_verified::h2_body_admit(0, 10, 10));
+        assert!(!httpd_rs_verified::h2_body_admit(10, 1, 10));
+        assert!(!httpd_rs_verified::h2_body_admit(u64::MAX, 1, 10));
+        assert!(httpd_rs_verified::h2_target_admit(10, 10));
+        assert!(!httpd_rs_verified::h2_target_admit(11, 10));
+        assert!(httpd_rs_verified::h2_header_admit(3, 10, 3, 10));
+        assert!(!httpd_rs_verified::h2_header_admit(4, 10, 3, 10));
+        assert!(httpd_rs_verified::h2_header_total_admit(10, 10));
+        assert!(!httpd_rs_verified::h2_header_total_admit(11, 10));
+        let hs = httpd_rs_verified::h2_header_init(10);
+        let hs = httpd_rs_verified::h2_header_add(hs, 7).unwrap();
+        assert!(httpd_rs_verified::h2_header_add(hs, 4).is_none());
+        assert_eq!(httpd_rs_verified::h2_header_add(hs, 3).unwrap().total, 10);
     }
 
     #[test]
     fn h2_head_admission_reports_the_first_failed_bound() {
-        use vapache_verified::H2HeadDecision::{
+        use httpd_rs_verified::H2HeadDecision::{
             Accept, HeaderFieldTooLarge, InvalidMethod, TargetTooLong, TooManyHeaders,
         };
-        assert!(vapache_verified::h2_method_ok(b"GET"));
-        assert!(!vapache_verified::h2_method_ok(b""));
-        assert!(!vapache_verified::h2_method_ok(b"GET SPACE"));
+        assert!(httpd_rs_verified::h2_method_ok(b"GET"));
+        assert!(!httpd_rs_verified::h2_method_ok(b""));
+        assert!(!httpd_rs_verified::h2_method_ok(b"GET SPACE"));
         let too_long = [b'A'; 65];
-        assert!(!vapache_verified::h2_method_ok(&too_long));
-        assert!(vapache_verified::h2_field_size_admit(4, 6, 10));
-        assert!(!vapache_verified::h2_field_size_admit(4, 7, 10));
-        assert!(!vapache_verified::h2_field_size_admit(11, 0, 10));
+        assert!(!httpd_rs_verified::h2_method_ok(&too_long));
+        assert!(httpd_rs_verified::h2_field_size_admit(4, 6, 10));
+        assert!(!httpd_rs_verified::h2_field_size_admit(4, 7, 10));
+        assert!(!httpd_rs_verified::h2_field_size_admit(11, 0, 10));
         assert_eq!(
-            vapache_verified::h2_head_admit(b"GET", 10, 10, 3, 3, 10, 10),
+            httpd_rs_verified::h2_head_admit(b"GET", 10, 10, 3, 3, 10, 10),
             Accept
         );
         assert_eq!(
-            vapache_verified::h2_head_admit(b"BAD\x00METHOD", 1, 10, 1, 3, 1, 10),
+            httpd_rs_verified::h2_head_admit(b"BAD\x00METHOD", 1, 10, 1, 3, 1, 10),
             InvalidMethod
         );
         assert_eq!(
-            vapache_verified::h2_head_admit(b"GET", 11, 10, 1, 3, 1, 10),
+            httpd_rs_verified::h2_head_admit(b"GET", 11, 10, 1, 3, 1, 10),
             TargetTooLong
         );
         assert_eq!(
-            vapache_verified::h2_head_admit(b"GET", 10, 10, 4, 3, 1, 10),
+            httpd_rs_verified::h2_head_admit(b"GET", 10, 10, 4, 3, 1, 10),
             TooManyHeaders
         );
         assert_eq!(
-            vapache_verified::h2_head_admit(b"GET", 10, 10, 3, 3, 11, 10),
+            httpd_rs_verified::h2_head_admit(b"GET", 10, 10, 3, 3, 11, 10),
             HeaderFieldTooLarge
         );
     }
 
     #[test]
     fn h2_body_state_never_accepts_more_than_the_limit() {
-        let state = vapache_verified::h2_body_init(10);
-        let state = vapache_verified::h2_body_append(state, 7).unwrap();
+        let state = httpd_rs_verified::h2_body_init(10);
+        let state = httpd_rs_verified::h2_body_append(state, 7).unwrap();
         assert_eq!(state.len, 7);
-        assert!(vapache_verified::h2_body_append(state, 4).is_none());
-        let state = vapache_verified::h2_body_append(state, 3).unwrap();
+        assert!(httpd_rs_verified::h2_body_append(state, 4).is_none());
+        let state = httpd_rs_verified::h2_body_append(state, 3).unwrap();
         assert_eq!(state.len, 10);
-        assert!(vapache_verified::h2_body_append(state, 1).is_none());
+        assert!(httpd_rs_verified::h2_body_append(state, 1).is_none());
     }
 
     #[test]
     fn h2_flow_model_bounds_windows_and_send_buffer() {
-        let flow = vapache_verified::h2_flow_new(1024, 256, 512);
-        let flow = vapache_verified::h2_flow_charge(flow, 200).unwrap();
+        let flow = httpd_rs_verified::h2_flow_new(1024, 256, 512);
+        let flow = httpd_rs_verified::h2_flow_charge(flow, 200).unwrap();
         assert_eq!(flow.conn_window, 824);
         assert_eq!(flow.stream_window, 56);
-        assert!(vapache_verified::h2_flow_charge(flow, 57).is_none());
-        let flow = vapache_verified::h2_flow_enqueue(flow, 512).unwrap();
-        assert!(vapache_verified::h2_flow_enqueue(flow, 1).is_none());
-        let flow = vapache_verified::h2_flow_dequeue(flow, 512).unwrap();
-        let flow = vapache_verified::h2_flow_credit(flow, u64::MAX);
+        assert!(httpd_rs_verified::h2_flow_charge(flow, 57).is_none());
+        let flow = httpd_rs_verified::h2_flow_enqueue(flow, 512).unwrap();
+        assert!(httpd_rs_verified::h2_flow_enqueue(flow, 1).is_none());
+        let flow = httpd_rs_verified::h2_flow_dequeue(flow, 512).unwrap();
+        let flow = httpd_rs_verified::h2_flow_credit(flow, u64::MAX);
         assert_eq!(flow.conn_window, 1024);
         assert_eq!(flow.stream_window, 256);
     }
 
     #[test]
     fn h2_budget_transitions_preserve_limits() {
-        use vapache_verified::{H2StreamEvent, H2StreamPhase};
+        use httpd_rs_verified::{H2StreamEvent, H2StreamPhase};
 
         let active =
-            vapache_verified::h2_stream_phase_step(H2StreamPhase::Idle, H2StreamEvent::Begin)
+            httpd_rs_verified::h2_stream_phase_step(H2StreamPhase::Idle, H2StreamEvent::Begin)
                 .unwrap();
         assert_eq!(
-            vapache_verified::h2_stream_phase_step(active, H2StreamEvent::Finish),
+            httpd_rs_verified::h2_stream_phase_step(active, H2StreamEvent::Finish),
             Some(H2StreamPhase::Closed)
         );
         let awaiting =
-            vapache_verified::h2_stream_phase_step(active, H2StreamEvent::Reset).unwrap();
+            httpd_rs_verified::h2_stream_phase_step(active, H2StreamEvent::Reset).unwrap();
         assert_eq!(awaiting, H2StreamPhase::AwaitingReset);
         assert_eq!(
-            vapache_verified::h2_stream_phase_step(awaiting, H2StreamEvent::Reclaim),
+            httpd_rs_verified::h2_stream_phase_step(awaiting, H2StreamEvent::Reclaim),
             Some(H2StreamPhase::Closed)
         );
         assert_eq!(
-            vapache_verified::h2_stream_phase_step(active, H2StreamEvent::ConnectionClose),
+            httpd_rs_verified::h2_stream_phase_step(active, H2StreamEvent::ConnectionClose),
             Some(H2StreamPhase::Closed)
         );
-        assert!(vapache_verified::h2_stream_phase_step(
+        assert!(httpd_rs_verified::h2_stream_phase_step(
             H2StreamPhase::Closed,
             H2StreamEvent::Begin
         )
         .is_none());
 
-        let budget = vapache_verified::h2_budget_new(2, 1);
-        let budget = vapache_verified::h2_budget_begin(budget).unwrap();
-        let budget = vapache_verified::h2_budget_begin(budget).unwrap();
-        assert!(vapache_verified::h2_budget_begin(budget).is_none());
-        let budget = vapache_verified::h2_budget_reset(budget).unwrap();
-        assert!(vapache_verified::h2_budget_reset(budget).is_none());
-        let budget = vapache_verified::h2_budget_reclaim(budget).unwrap();
-        assert!(vapache_verified::h2_budget_reclaim(budget).is_none());
-        let budget = vapache_verified::h2_budget_finish(budget).unwrap();
-        let budget = vapache_verified::h2_budget_finish(budget).unwrap();
-        assert!(vapache_verified::h2_budget_finish(budget).is_none());
+        let budget = httpd_rs_verified::h2_budget_new(2, 1);
+        let budget = httpd_rs_verified::h2_budget_begin(budget).unwrap();
+        let budget = httpd_rs_verified::h2_budget_begin(budget).unwrap();
+        assert!(httpd_rs_verified::h2_budget_begin(budget).is_none());
+        let budget = httpd_rs_verified::h2_budget_reset(budget).unwrap();
+        assert!(httpd_rs_verified::h2_budget_reset(budget).is_none());
+        let budget = httpd_rs_verified::h2_budget_reclaim(budget).unwrap();
+        assert!(httpd_rs_verified::h2_budget_reclaim(budget).is_none());
+        let budget = httpd_rs_verified::h2_budget_finish(budget).unwrap();
+        let budget = httpd_rs_verified::h2_budget_finish(budget).unwrap();
+        assert!(httpd_rs_verified::h2_budget_finish(budget).is_none());
 
         let budget =
-            vapache_verified::h2_budget_step(budget, vapache_verified::H2BudgetEvent::Begin)
+            httpd_rs_verified::h2_budget_step(budget, httpd_rs_verified::H2BudgetEvent::Begin)
                 .unwrap();
         assert_eq!(budget.active, 1);
         let budget =
-            vapache_verified::h2_budget_step(budget, vapache_verified::H2BudgetEvent::Finish)
+            httpd_rs_verified::h2_budget_step(budget, httpd_rs_verified::H2BudgetEvent::Finish)
                 .unwrap();
         assert_eq!(budget.active, 0);
 
-        let budget = vapache_verified::h2_budget_step(
-            vapache_verified::h2_budget_new(2, 2),
-            vapache_verified::H2BudgetEvent::Begin,
+        let budget = httpd_rs_verified::h2_budget_step(
+            httpd_rs_verified::h2_budget_new(2, 2),
+            httpd_rs_verified::H2BudgetEvent::Begin,
         )
         .unwrap();
         let budget =
-            vapache_verified::h2_budget_step(budget, vapache_verified::H2BudgetEvent::Reset)
+            httpd_rs_verified::h2_budget_step(budget, httpd_rs_verified::H2BudgetEvent::Reset)
                 .unwrap();
-        let budget = vapache_verified::h2_budget_step(
+        let budget = httpd_rs_verified::h2_budget_step(
             budget,
-            vapache_verified::H2BudgetEvent::ConnectionClose,
+            httpd_rs_verified::H2BudgetEvent::ConnectionClose,
         )
         .unwrap();
         assert_eq!(budget.active, 0);
@@ -6234,28 +6239,34 @@ mod tests {
 
     #[test]
     fn h2_control_events_assign_cost_and_refill_once() {
-        use vapache_verified::H2ControlEvent::{Ping, Priority, Settings, WindowUpdate};
+        use httpd_rs_verified::H2ControlEvent::{Ping, Priority, Settings, WindowUpdate};
 
-        let settings = vapache_verified::h2_control_event_step(256, 0, Settings, 256, 2);
+        let settings = httpd_rs_verified::h2_control_event_step(256, 0, Settings, 256, 2);
         assert_eq!(settings.cost, 16);
         assert_eq!(settings.available, 240);
         assert!(settings.admitted);
 
-        let ping = vapache_verified::h2_control_event_step(0, 1, Ping, 256, 2);
+        let ping = httpd_rs_verified::h2_control_event_step(0, 1, Ping, 256, 2);
         assert_eq!(ping.refill_seconds, 1);
         assert_eq!(ping.cost, 1);
         assert_eq!(ping.available, 1);
         assert!(ping.admitted);
-        let priority = vapache_verified::h2_control_event_step(ping.available, 0, Priority, 256, 2);
+        let priority =
+            httpd_rs_verified::h2_control_event_step(ping.available, 0, Priority, 256, 2);
         assert_eq!(priority.available, 0);
         assert!(priority.admitted);
-        assert!(!vapache_verified::h2_control_event_step(0, 0, Ping, 256, 2).admitted);
+        assert!(!httpd_rs_verified::h2_control_event_step(0, 0, Ping, 256, 2).admitted);
 
-        let tiny =
-            vapache_verified::h2_control_event_step(1, 0, WindowUpdate { increment: 1023 }, 256, 2);
+        let tiny = httpd_rs_verified::h2_control_event_step(
+            1,
+            0,
+            WindowUpdate { increment: 1023 },
+            256,
+            2,
+        );
         assert_eq!(tiny.cost, 1);
         assert_eq!(tiny.available, 0);
-        let useful = vapache_verified::h2_control_event_step(
+        let useful = httpd_rs_verified::h2_control_event_step(
             0,
             u64::MAX,
             WindowUpdate { increment: 1024 },
@@ -6271,11 +6282,11 @@ mod tests {
     fn h2_stream_admission_rejects_active_or_pending_ids() {
         let active = [1u64, 3];
         let pending = [2u64, 5];
-        assert!(vapache_verified::h2_stream_admit(&active, &pending, 4));
-        assert!(!vapache_verified::h2_stream_admit(&active, &pending, 1));
-        assert!(!vapache_verified::h2_stream_admit(&active, &pending, 3));
-        assert!(!vapache_verified::h2_stream_admit(&active, &pending, 2));
-        assert!(!vapache_verified::h2_stream_admit(&active, &pending, 5));
+        assert!(httpd_rs_verified::h2_stream_admit(&active, &pending, 4));
+        assert!(!httpd_rs_verified::h2_stream_admit(&active, &pending, 1));
+        assert!(!httpd_rs_verified::h2_stream_admit(&active, &pending, 3));
+        assert!(!httpd_rs_verified::h2_stream_admit(&active, &pending, 2));
+        assert!(!httpd_rs_verified::h2_stream_admit(&active, &pending, 5));
     }
 
     #[test]
@@ -6307,7 +6318,7 @@ mod tests {
 
     #[test]
     fn h2_settings_exchange_is_an_explicit_state_machine() {
-        use vapache_verified::{
+        use httpd_rs_verified::{
             H2LocalSettingsPhase as Local, H2SettingsSync, H2SettingsSyncEvent as Event,
         };
 
@@ -6316,63 +6327,63 @@ mod tests {
             remote_pending: false,
             remote_initial_seen: false,
         };
-        assert!(vapache_verified::h2_settings_sync_step(state, Event::QueueLocal).is_none());
-        let state = vapache_verified::h2_settings_sync_step(state, Event::ReceiveAck).unwrap();
+        assert!(httpd_rs_verified::h2_settings_sync_step(state, Event::QueueLocal).is_none());
+        let state = httpd_rs_verified::h2_settings_sync_step(state, Event::ReceiveAck).unwrap();
         assert_eq!(state.local, Local::Synced);
-        let state = vapache_verified::h2_settings_sync_step(state, Event::QueueLocal).unwrap();
+        let state = httpd_rs_verified::h2_settings_sync_step(state, Event::QueueLocal).unwrap();
         assert_eq!(state.local, Local::ToSend);
-        let state = vapache_verified::h2_settings_sync_step(state, Event::LocalSent).unwrap();
+        let state = httpd_rs_verified::h2_settings_sync_step(state, Event::LocalSent).unwrap();
         assert_eq!(state.local, Local::WaitingAck);
-        let state = vapache_verified::h2_settings_sync_step(state, Event::ReceiveRemote).unwrap();
+        let state = httpd_rs_verified::h2_settings_sync_step(state, Event::ReceiveRemote).unwrap();
         assert!(state.remote_pending);
-        assert!(vapache_verified::h2_settings_sync_step(state, Event::ReceiveRemote).is_none());
-        let state = vapache_verified::h2_settings_sync_step(state, Event::ApplyRemote).unwrap();
+        assert!(httpd_rs_verified::h2_settings_sync_step(state, Event::ReceiveRemote).is_none());
+        let state = httpd_rs_verified::h2_settings_sync_step(state, Event::ApplyRemote).unwrap();
         assert!(!state.remote_pending);
         assert!(state.remote_initial_seen);
     }
 
     #[test]
     fn h2_closed_stream_frames_use_one_classifier() {
-        use vapache_verified::{
+        use httpd_rs_verified::{
             H2PeerFrame as Frame, H2PeerFrameDecision as Decision, H2PeerStreamPhase as Phase,
         };
 
         assert_eq!(
-            vapache_verified::h2_peer_frame_decision(Phase::ClosedRemoteReset, Frame::Headers),
+            httpd_rs_verified::h2_peer_frame_decision(Phase::ClosedRemoteReset, Frame::Headers),
             Decision::StreamClosed
         );
         assert_eq!(
-            vapache_verified::h2_peer_frame_decision(Phase::ClosedEndStream, Frame::Data),
+            httpd_rs_verified::h2_peer_frame_decision(Phase::ClosedEndStream, Frame::Data),
             Decision::ConnectionStreamClosed
         );
         assert_eq!(
-            vapache_verified::h2_peer_frame_decision(Phase::ClosedLocalReset, Frame::Headers),
+            httpd_rs_verified::h2_peer_frame_decision(Phase::ClosedLocalReset, Frame::Headers),
             Decision::Ignore
         );
         assert_eq!(
-            vapache_verified::h2_peer_frame_decision(
+            httpd_rs_verified::h2_peer_frame_decision(
                 Phase::ClosedLocalReset,
                 Frame::MalformedHeaders,
             ),
             Decision::StreamProtocolError
         );
         assert_eq!(
-            vapache_verified::h2_peer_frame_decision(Phase::Idle, Frame::Data),
+            httpd_rs_verified::h2_peer_frame_decision(Phase::Idle, Frame::Data),
             Decision::ConnectionProtocolError
         );
     }
 
     #[test]
     fn batch_length_makes_progress_and_is_bounded() {
-        assert_eq!(vapache_verified::h2_batch_len(0, 1024), 0);
-        assert_eq!(vapache_verified::h2_batch_len(512, 1024), 512);
-        assert_eq!(vapache_verified::h2_batch_len(2048, 1024), 1024);
-        assert!(vapache_verified::h2_batch_len(1, 1) > 0);
+        assert_eq!(httpd_rs_verified::h2_batch_len(0, 1024), 0);
+        assert_eq!(httpd_rs_verified::h2_batch_len(512, 1024), 512);
+        assert_eq!(httpd_rs_verified::h2_batch_len(2048, 1024), 1024);
+        assert!(httpd_rs_verified::h2_batch_len(1, 1) > 0);
     }
 
     #[test]
     fn positional_read_range_does_not_depend_on_the_file_offset() {
-        let dir = std::env::temp_dir().join(format!("vapache-h2-range-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-h2-range-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("body.bin");

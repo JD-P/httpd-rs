@@ -155,6 +155,6 @@ daemon with the debug unit-test objects; line coverage is unaffected, but
 function percentages should be treated as approximate.
 
 Reproduce with `tests/coverage.sh`. The report merges profiles from the real
-`vapached` process driving the 165-test conformance suite and 36 adversarial
+`httpd-rs` process driving the 165-test conformance suite and 36 adversarial
 replays with the Rust unit test binaries (360 library tests plus 4 CLI/daemon
 tests).

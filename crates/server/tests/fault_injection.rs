@@ -1,14 +1,14 @@
+use httpd_rs::http::{read_request, Limits, ReadError};
 use std::io::{self, Read, Write};
-use vapached::http::{read_request, Limits, ReadError};
 
 fn read_accounted<R: Read + Write>(
     stream: &mut R,
-) -> Result<Option<vapached::http::Request>, ReadError> {
+) -> Result<Option<httpd_rs::http::Request>, ReadError> {
     let limits = Limits::default();
     let context = limits
         .resource_budget
         .context(std::net::IpAddr::from([192, 0, 2, 1]));
-    vapached::resource::with_resource_context(context, || {
+    httpd_rs::resource::with_resource_context(context, || {
         read_request(stream, &mut Vec::new(), &limits, |_| {})
     })
 }

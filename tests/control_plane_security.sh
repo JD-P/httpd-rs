@@ -2,28 +2,28 @@
 set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-control=$repo_root/packaging/vapachectl
-deploy_hook=$repo_root/packaging/vapache-certbot-deploy-hook
-service_unit=$repo_root/packaging/vapache.service
+control=$repo_root/packaging/httpd-rsctl
+deploy_hook=$repo_root/packaging/httpd-rs-certbot-deploy-hook
+service_unit=$repo_root/packaging/httpd-rs.service
 work=$(mktemp -d)
 trap 'rm -rf --one-file-system -- "$work"' EXIT
 
 # systemd implements RestrictSUIDSGID by making openat2 return ENOSYS. That
-# breaks Vapache's mandatory descriptor-contained resolver before configtest.
+# breaks httpd-rs's mandatory descriptor-contained resolver before configtest.
 # Keep the compatible service hardening explicit and reject the known-bad
 # combination without waiting for the slower package/systemd integration job.
 if grep -qx 'RestrictSUIDSGID=true' "$service_unit"; then
-    echo 'vapache.service blocks its own mandatory openat2 resolver' >&2
+    echo 'httpd-rs.service blocks its own mandatory openat2 resolver' >&2
     exit 1
 fi
 grep -qx 'NoNewPrivileges=true' "$service_unit"
 grep -qx 'SystemCallArchitectures=native' "$service_unit"
 
-fake_daemon=$work/vapached
+fake_daemon=$work/httpd-rs
 cat >"$fake_daemon" <<'EOF'
 #!/bin/sh
-printf '%s\n' "$*" >>"$VAPACHE_FAKE_LOG"
-sleep "${VAPACHE_FAKE_SLEEP:-0}"
+printf '%s\n' "$*" >>"$HTTPD_RS_FAKE_LOG"
+sleep "${HTTPD_RS_FAKE_SLEEP:-0}"
 exit 0
 EOF
 chmod 0755 "$fake_daemon"
@@ -32,13 +32,13 @@ run_control() {
     source_root=$1
     runtime_root=$2
     shift 2
-    VAPACHE_CONFDIR=$source_root \
-    VAPACHE_CONFIG=$source_root/apache2.conf \
-    VAPACHE_RUNTIME_DIR=$runtime_root \
-    VAPACHE_SNAPSHOT_CONFIG=1 \
-    VAPACHE_AUTO_CAPABILITIES=0 \
-    VAPACHED=$fake_daemon \
-    VAPACHE_FAKE_LOG=$work/daemon-calls \
+    HTTPD_RS_CONFDIR=$source_root \
+    HTTPD_RS_CONFIG=$source_root/apache2.conf \
+    HTTPD_RS_RUNTIME_DIR=$runtime_root \
+    HTTPD_RS_SNAPSHOT_CONFIG=1 \
+    HTTPD_RS_AUTO_CAPABILITIES=0 \
+    HTTPD_RS=$fake_daemon \
+    HTTPD_RS_FAKE_LOG=$work/daemon-calls \
         "$control" "$@"
 }
 
@@ -59,7 +59,7 @@ mkdir -m 0755 "$work/untrusted-run"
 : >"$work/daemon-calls"
 if run_control "$untrusted_root" "$work/untrusted-run" configtest \
     >"$work/untrusted.out" 2>&1; then
-    echo 'vapachectl accepted a configuration below an untrusted ancestor' >&2
+    echo 'httpd-rsctl accepted a configuration below an untrusted ancestor' >&2
     exit 1
 fi
 grep -q 'ancestor is not caller-controlled' "$work/untrusted.out"
@@ -74,7 +74,7 @@ mkdir -m 0755 "$work/special-run"
 : >"$work/daemon-calls"
 if run_control "$special_root" "$work/special-run" configtest \
     >"$work/special.out" 2>&1; then
-    echo 'vapachectl accepted a special configuration-tree entry' >&2
+    echo 'httpd-rsctl accepted a special configuration-tree entry' >&2
     exit 1
 fi
 grep -q 'special or dangling file' "$work/special.out"
@@ -89,7 +89,7 @@ mkdir -m 0755 "$work/escape-run"
 : >"$work/daemon-calls"
 if run_control "$escape_root" "$work/escape-run" configtest \
     >"$work/escape.out" 2>&1; then
-    echo 'vapachectl accepted an escaping configuration symlink' >&2
+    echo 'httpd-rsctl accepted an escaping configuration symlink' >&2
     exit 1
 fi
 grep -q 'configuration symlink escapes' "$work/escape.out"
@@ -104,7 +104,7 @@ ln -s "$work/actual-run" "$work/runtime-link"
 : >"$work/daemon-calls"
 if run_control "$safe_root" "$work/runtime-link" configtest \
     >"$work/runtime-link.out" 2>&1; then
-    echo 'vapachectl accepted a symlinked runtime directory' >&2
+    echo 'httpd-rsctl accepted a symlinked runtime directory' >&2
     exit 1
 fi
 grep -q 'runtime directory must be canonical' "$work/runtime-link.out"
@@ -113,10 +113,10 @@ test ! -s "$work/daemon-calls"
 # Two control invocations must serialize their fixed-name snapshot swap.
 mkdir -m 0755 "$work/concurrent-run"
 : >"$work/daemon-calls"
-VAPACHE_FAKE_SLEEP=0.15 run_control \
+HTTPD_RS_FAKE_SLEEP=0.15 run_control \
     "$safe_root" "$work/concurrent-run" configtest &
 first_pid=$!
-VAPACHE_FAKE_SLEEP=0.15 run_control \
+HTTPD_RS_FAKE_SLEEP=0.15 run_control \
     "$safe_root" "$work/concurrent-run" configtest &
 second_pid=$!
 wait "$first_pid"
@@ -149,19 +149,19 @@ attacker_parent=$work/attacker-bin
 mkdir -m 0755 "$attacker_parent"
 cp "$hostile/systemctl" "$attacker_parent/systemctl"
 chmod 0777 "$attacker_parent"
-if VAPACHE_SYSTEMCTL=$attacker_parent/systemctl "$deploy_hook" \
+if HTTPD_RS_SYSTEMCTL=$attacker_parent/systemctl "$deploy_hook" \
     >"$work/override.out" 2>&1; then
     echo 'deploy hook accepted a command below an untrusted ancestor' >&2
     exit 1
 fi
-grep -q 'unsafe VAPACHE_SYSTEMCTL' "$work/override.out"
+grep -q 'unsafe HTTPD_RS_SYSTEMCTL' "$work/override.out"
 test ! -e "$work/hostile-executed"
 
-if VAPACHE_SYSTEMCTL=/bin/sh "$deploy_hook" \
+if HTTPD_RS_SYSTEMCTL=/bin/sh "$deploy_hook" \
     >"$work/interpreter.out" 2>&1; then
     echo 'deploy hook accepted a general-purpose interpreter as systemctl' >&2
     exit 1
 fi
-grep -q 'unsafe VAPACHE_SYSTEMCTL' "$work/interpreter.out"
+grep -q 'unsafe HTTPD_RS_SYSTEMCTL' "$work/interpreter.out"
 
 echo 'privileged control-plane security: pass'

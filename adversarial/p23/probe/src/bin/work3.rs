@@ -1,5 +1,5 @@
 use std::time::Instant;
-use vapache_pcre2::bytes::RegexBuilder;
+use httpd_rs_pcre2::bytes::RegexBuilder;
 
 fn main() {
     for slen in [8190usize, 16384, 32768, 65536] {

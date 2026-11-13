@@ -3,5 +3,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    vapached::ocsp::fuzz_ocsp_parsers(data);
+    httpd_rs::ocsp::fuzz_ocsp_parsers(data);
 });

@@ -27,7 +27,7 @@ const MAX_EXPR_EVAL_BYTES: usize = 4 * 1024 * 1024;
 pub struct ExprRegex {
     pattern: String,
     nocase: bool,
-    compiled: vapache_pcre2::bytes::Regex,
+    compiled: httpd_rs_pcre2::bytes::Regex,
 }
 
 impl std::fmt::Debug for ExprRegex {
@@ -52,7 +52,7 @@ impl ExprRegex {
         {
             return Err("bad expression regex: pattern is too large or contains controls".into());
         }
-        let mut builder = vapache_pcre2::bytes::RegexBuilder::new();
+        let mut builder = httpd_rs_pcre2::bytes::RegexBuilder::new();
         // The engine is non-backtracking and uses no executable-memory JIT.
         // Its deterministic pattern×subject work ceiling is checked on every
         // call in addition to the server-wide expensive-work budget.
@@ -106,29 +106,32 @@ pub enum Value {
 impl Value {
     pub fn truthy(&self) -> bool {
         match self {
-            Value::Bool(b) => {
-                vapache_verified::expr_value_truthy(vapache_verified::ExprValueKind::Bool, *b, 0, 0)
-            }
-            Value::Int(i) => vapache_verified::expr_value_truthy(
-                vapache_verified::ExprValueKind::Int,
+            Value::Bool(b) => httpd_rs_verified::expr_value_truthy(
+                httpd_rs_verified::ExprValueKind::Bool,
+                *b,
+                0,
+                0,
+            ),
+            Value::Int(i) => httpd_rs_verified::expr_value_truthy(
+                httpd_rs_verified::ExprValueKind::Int,
                 false,
                 *i,
                 0,
             ),
-            Value::Str(s) => vapache_verified::expr_value_truthy(
-                vapache_verified::ExprValueKind::Str,
+            Value::Str(s) => httpd_rs_verified::expr_value_truthy(
+                httpd_rs_verified::ExprValueKind::Str,
                 false,
                 0,
                 s.len() as u64,
             ),
-            Value::Bytes(bytes) => vapache_verified::expr_value_truthy(
-                vapache_verified::ExprValueKind::Str,
+            Value::Bytes(bytes) => httpd_rs_verified::expr_value_truthy(
+                httpd_rs_verified::ExprValueKind::Str,
                 false,
                 0,
                 bytes.len() as u64,
             ),
-            Value::List(v) => vapache_verified::expr_value_truthy(
-                vapache_verified::ExprValueKind::List,
+            Value::List(v) => httpd_rs_verified::expr_value_truthy(
+                httpd_rs_verified::ExprValueKind::List,
                 false,
                 0,
                 v.len() as u64,
@@ -275,7 +278,7 @@ impl<'a> Context<'a> {
         // The constructor is the single place where expression evaluation
         // binds REQUEST_URI.  The runtime supplies the dispatcher's canonical
         // path; a raw target or query-bearing value is never accepted.
-        debug_assert!(vapache_verified::request_uri_identity_admit(
+        debug_assert!(httpd_rs_verified::request_uri_identity_admit(
             true, false, false
         ));
         Self {
@@ -355,7 +358,7 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
         return Ok(Value::Bytes(
             ctx.req
                 .header(header)
-                .map(vapache_verified::guard_header_bytes)
+                .map(httpd_rs_verified::guard_header_bytes)
                 .unwrap_or_default(),
         ));
     }
@@ -363,7 +366,7 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
         return Ok(Value::Bytes(
             ctx.req
                 .header(header)
-                .map(vapache_verified::guard_header_bytes)
+                .map(httpd_rs_verified::guard_header_bytes)
                 .unwrap_or_default(),
         ));
     }
@@ -382,7 +385,7 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
         return Ok(Value::Bytes(
             ctx.req
                 .header(&header)
-                .map(vapache_verified::guard_header_bytes)
+                .map(httpd_rs_verified::guard_header_bytes)
                 .unwrap_or_default(),
         ));
     }
@@ -456,7 +459,7 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
 /// either direction.
 pub fn validate_vars(expr: &Expr) -> Result<(), String> {
     fn var_reference_known(name: &str) -> Result<(), String> {
-        if vapache_verified::expr_var_known(name.as_bytes()) {
+        if httpd_rs_verified::expr_var_known(name.as_bytes()) {
             Ok(())
         } else {
             Err(format!("unknown expression variable '%{{{name}}}'"))
@@ -577,7 +580,7 @@ pub fn validate_vars(expr: &Expr) -> Result<(), String> {
 }
 
 fn append_expansion(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
-    if !vapache_verified::bounded_expansion_append_admit(
+    if !httpd_rs_verified::bounded_expansion_append_admit(
         out.len() as u64,
         value.len() as u64,
         MAX_EXPR_VALUE_BYTES as u64,
@@ -683,14 +686,14 @@ fn glob(pattern: &str, value: &str, path_mode: bool) -> Result<bool, String> {
     crate::glob::expr_match(pattern.as_bytes(), value.as_bytes(), path_mode).map_err(str::to_string)
 }
 
-fn compare_op(op: &str) -> Option<vapache_verified::ExprCompareOp> {
+fn compare_op(op: &str) -> Option<httpd_rs_verified::ExprCompareOp> {
     Some(match op {
-        "=" | "==" | "-eq" => vapache_verified::ExprCompareOp::Eq,
-        "!=" | "-ne" => vapache_verified::ExprCompareOp::Ne,
-        "<" | "-lt" => vapache_verified::ExprCompareOp::Lt,
-        "<=" | "-le" => vapache_verified::ExprCompareOp::Le,
-        ">" | "-gt" => vapache_verified::ExprCompareOp::Gt,
-        ">=" | "-ge" => vapache_verified::ExprCompareOp::Ge,
+        "=" | "==" | "-eq" => httpd_rs_verified::ExprCompareOp::Eq,
+        "!=" | "-ne" => httpd_rs_verified::ExprCompareOp::Ne,
+        "<" | "-lt" => httpd_rs_verified::ExprCompareOp::Lt,
+        "<=" | "-le" => httpd_rs_verified::ExprCompareOp::Le,
+        ">" | "-gt" => httpd_rs_verified::ExprCompareOp::Gt,
+        ">=" | "-ge" => httpd_rs_verified::ExprCompareOp::Ge,
         _ => return None,
     })
 }
@@ -703,7 +706,7 @@ fn cmp(left: &Value, op: &str, right: &Value) -> bool {
         && left.int().is_some()
         && right.int().is_some();
     if numeric {
-        return vapache_verified::expr_compare_ints(
+        return httpd_rs_verified::expr_compare_ints(
             kind,
             left.int().unwrap_or_default(),
             right.int().unwrap_or_default(),
@@ -711,7 +714,7 @@ fn cmp(left: &Value, op: &str, right: &Value) -> bool {
     }
     let a = left.bytes();
     let b = right.bytes();
-    vapache_verified::expr_compare_strs(kind, &a, &b)
+    httpd_rs_verified::expr_compare_strs(kind, &a, &b)
 }
 
 /// Resolve an expression file argument beneath the document root.  `.htaccess`
@@ -729,7 +732,7 @@ fn confined_expr_relative(raw: &str) -> Option<PathBuf> {
             Component::ParentDir | Component::RootDir | Component::Prefix(_)
         )
     });
-    if !vapache_verified::expr_file_test_admit(absolute, parent_relative, true) {
+    if !httpd_rs_verified::expr_file_test_admit(absolute, parent_relative, true) {
         return None;
     }
     Some(path.to_path_buf())
@@ -738,7 +741,7 @@ fn confined_expr_relative(raw: &str) -> Option<PathBuf> {
 fn read_expr_file(root: &Path, relative: &Path) -> Result<String, String> {
     let (file, metadata) =
         crate::files::open_read_beneath(root, relative).map_err(|error| error.to_string())?;
-    if !vapache_verified::expr_file_read_admit(
+    if !httpd_rs_verified::expr_file_read_admit(
         metadata.is_file(),
         metadata.len(),
         MAX_EXPR_FILE_BYTES,
@@ -747,7 +750,7 @@ fn read_expr_file(root: &Path, relative: &Path) -> Result<String, String> {
     }
     let data = read_expr_file_contents(&file, metadata.len() as usize)?;
     let after = file.metadata().map_err(|error| error.to_string())?;
-    if !vapache_verified::descriptor_snapshot_admit(
+    if !httpd_rs_verified::descriptor_snapshot_admit(
         metadata.is_file() && after.is_file(),
         metadata.dev() == after.dev() && metadata.ino() == after.ino(),
         metadata.len() == after.len()
@@ -832,7 +835,7 @@ impl Expr {
             )),
             Expr::Regex(l, regex, negate) => {
                 let text = l.eval_budgeted(ctx, budget)?.bytes();
-                if !vapache_verified::expr_regex_size_admit(
+                if !httpd_rs_verified::expr_regex_size_admit(
                     regex.pattern.len() as u64,
                     text.len() as u64,
                     MAX_EXPR_REGEX_BYTES,
@@ -853,7 +856,7 @@ impl Expr {
                 };
                 let matched = caps.is_some();
                 let result =
-                    vapache_verified::expr_regex_result(eval_error.is_none(), matched, *negate)
+                    httpd_rs_verified::expr_regex_result(eval_error.is_none(), matched, *negate)
                         .ok_or_else(|| {
                             format!(
                                 "expression regex evaluation failed: {}",
@@ -952,7 +955,7 @@ impl Expr {
                     "req" | "http" => Value::Bytes(
                         ctx.req
                             .header(&arg(0))
-                            .map(vapache_verified::guard_header_bytes)
+                            .map(httpd_rs_verified::guard_header_bytes)
                             .unwrap_or_default(),
                     ),
                     "env" => Value::Bytes(
@@ -1545,7 +1548,7 @@ mod tests {
 
     #[test]
     fn repeated_file_values_share_one_evaluation_budget() {
-        let dir = std::env::temp_dir().join(format!("vapache-expr-budget-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-expr-budget-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("big"), vec![b'x'; MAX_EXPR_FILE_BYTES as usize]).unwrap();
@@ -1589,7 +1592,7 @@ mod tests {
         assert!(expression.eval(&mut c).is_err());
 
         let path =
-            std::env::temp_dir().join(format!("vapache-expr-if-file-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-expr-if-file-{}", std::process::id()));
         std::fs::write(&path, b"present").unwrap();
         let mut c = Context::new(
             &r,
@@ -1726,8 +1729,8 @@ mod tests {
 
     #[test]
     fn verified_expression_kernels_keep_comparison_and_glob_semantics() {
-        use vapache_verified::ExprCompareOp::{Eq, Ge, Gt, Le, Ne};
-        use vapache_verified::{expr_compare_ints, expr_compare_strs, expr_glob_match};
+        use httpd_rs_verified::ExprCompareOp::{Eq, Ge, Gt, Le, Ne};
+        use httpd_rs_verified::{expr_compare_ints, expr_compare_strs, expr_glob_match};
         assert!(expr_compare_ints(Eq, 1, 1));
         assert!(expr_compare_ints(Le, -1, 1));
         assert!(expr_compare_ints(Ge, 1, 1));
@@ -1934,7 +1937,7 @@ mod tests {
         assert_eq!(base64_encode(b"abc"), "YWJj");
         assert_eq!(base64_decode("YWJj"), b"abc");
         assert_eq!(base64_decode("!!!"), Vec::<u8>::new());
-        assert_eq!(compare_op(">="), Some(vapache_verified::ExprCompareOp::Ge));
+        assert_eq!(compare_op(">="), Some(httpd_rs_verified::ExprCompareOp::Ge));
         assert!(compare_op("bogus").is_none());
         assert!(!cmp(&Value::Int(1), "bogus", &Value::Int(1)));
     }
@@ -2211,7 +2214,7 @@ mod pass11_kernel_tests {
         // The evaluator and the validator share one source of truth: a name
         // that validates must also evaluate when bound, and vice versa.
         for name in ["REQUEST_FILENAME", "SCRIPT_FILENAME", "NOSUCHVAR"] {
-            let known = vapache_verified::expr_var_known(name.as_bytes());
+            let known = httpd_rs_verified::expr_var_known(name.as_bytes());
             let expr = parse(&format!("%{{{name}}} != ''")).unwrap();
             assert_eq!(
                 validate_vars(&expr).is_ok(),

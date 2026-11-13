@@ -52,8 +52,8 @@ target_dir=$(cd -- "$target_dir" && pwd -P)
 # both project and tool-cache paths makes panic locations and other embedded
 # paths independent of the checkout and runner layout. CARGO_ENCODED_RUSTFLAGS
 # preserves paths containing spaces without relying on shell word splitting.
-encoded_rustflags="--remap-path-prefix=$repo_root=/usr/src/vapache"
-encoded_rustflags+=$'\x1f'"--remap-path-prefix=$target_dir=/usr/src/vapache/target"
+encoded_rustflags="--remap-path-prefix=$repo_root=/usr/src/httpd-rs"
+encoded_rustflags+=$'\x1f'"--remap-path-prefix=$target_dir=/usr/src/httpd-rs/target"
 if [[ -n "${CARGO_HOME:-}" ]]; then
     cargo_home=$CARGO_HOME
 elif [[ -n "${HOME:-}" ]]; then
@@ -91,6 +91,6 @@ fi
 
 cd -- "$repo_root"
 CARGO_TARGET_DIR="$target_dir" \
-    cargo build --locked --release -p vapached --target "$target"
+    cargo build --locked --release -p httpd-rs --target "$target"
 
-printf 'portable-build: wrote %s\n' "$target_dir/$target/release/vapached"
+printf 'portable-build: wrote %s\n' "$target_dir/$target/release/httpd-rs"

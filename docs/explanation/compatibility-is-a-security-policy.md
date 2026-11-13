@@ -7,7 +7,7 @@ prose_style: discursive
 
 # Compatibility is a security policy
 
-“Apache-compatible” sounds like a feature claim, but for Vapache it is also a
+“Apache-compatible” sounds like a feature claim, but for httpd-rs it is also a
 security policy. Every compatibility decision determines which operator
 intentions survive the move from Apache and which pieces of Apache's attack
 surface enter the new process.
@@ -20,8 +20,8 @@ security effect is less compatible in the dimension that matters most.
 
 For any Apache feature, three questions must be answered separately:
 
-1. Can Vapache recognize the syntax?
-2. Can Vapache preserve the relevant Apache semantics?
+1. Can httpd-rs recognize the syntax?
+2. Can httpd-rs preserve the relevant Apache semantics?
 3. Should that behavior be available in this deployment?
 
 The first question belongs to the grammar and directive registry. The second
@@ -30,7 +30,7 @@ testing. The third belongs to the capability and deployment model.
 
 Conflating these questions creates two recurring errors. One is to reject a
 safe, well-understood semantic merely because its original Apache module does
-not exist. The other is to accept a familiar spelling even though Vapache
+not exist. The other is to accept a familiar spelling even though httpd-rs
 cannot reproduce its policy effect. The directive registry exists partly to
 force an explicit disposition instead of letting parser control flow make that
 decision by accident.
@@ -38,7 +38,7 @@ decision by accident.
 ## An accepted no-op is not neutral
 
 Some directives are observational or advisory, and an accepted inert form can
-be reasonable when Vapache emits a clear warning. Policy directives are
+be reasonable when httpd-rs emits a clear warning. Policy directives are
 different. If an Apache configuration says that a request must use TLS, that a
 client certificate must satisfy a condition, or that a handler must pass
 through a filter, silently accepting the words without the effect changes the
@@ -58,7 +58,7 @@ as a substitute for making the decision explicitly.
 
 Some behaviors are implemented accurately but increase the ambient attack
 surface: CGI execution, access-file discovery, autoindex generation, legacy
-authorization, or program-backed rewrite maps. Vapache places selected
+authorization, or program-backed rewrite maps. httpd-rs places selected
 surfaces behind process-global capabilities that are off by default.
 
 The important idea is that a capability grants authority to reach a class of
@@ -73,15 +73,15 @@ and the deployment must explicitly admit the resulting authority.
 
 ## Apache remains the semantic oracle, not the architecture template
 
-Where Vapache claims compatible behavior, differential tests compare it with
+Where httpd-rs claims compatible behavior, differential tests compare it with
 a named Apache version and module set. Apache answers questions about ordering,
 context, default values, rewrite behavior, and other externally visible
 semantics that are easy to misremember.
 
-That does not mean Vapache should reproduce Apache's internal architecture.
+That does not mean httpd-rs should reproduce Apache's internal architecture.
 Apache's pools, module hooks, mutable request structures, and extension model
 are not the compatibility target. Reusing those shapes would import assumptions
-that Vapache is specifically trying to remove. The target is the documented
+that httpd-rs is specifically trying to remove. The target is the documented
 and observed behavior at the public boundary, subject to intentional
 differences that are made visible to the operator.
 
@@ -97,7 +97,7 @@ small: coerce an odd value, tolerate an unknown token, preserve a historical
 default, or accept an ignored flag. Over time, these exceptions can create a
 second, less-audited policy language.
 
-Vapache's preferred pattern is narrower. Leniency may preserve an Apache
+httpd-rs's preferred pattern is narrower. Leniency may preserve an Apache
 coercion when the resulting semantic is known and tested. It must not turn an
 unknown security effect into a successful parse. Audit mode may report missing
 capabilities, but the resulting configuration is marked non-runnable. An

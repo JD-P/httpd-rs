@@ -7,12 +7,12 @@ contracts: DOC-MIGRATE-STATIC-001
 
 # Migrate a Debian static site in an evaluation environment
 
-In this tutorial, you migrate one Apache virtual host to Vapache. The host is
+In this tutorial, you migrate one Apache virtual host to httpd-rs. The host is
 `www.example.test`. It serves an immutable static release from
 `/srv/www/example/releases/2026-11-07/public`.
 
 The tutorial keeps the existing Apache configuration. The switch tool restores
-the previous Apache service state if Vapache does not start.
+the previous Apache service state if httpd-rs does not start.
 
 Use a non-production host when possible. If you test on the current host, keep
 a second SSH session or the hosting provider's console open during the switch.
@@ -22,10 +22,10 @@ a second SSH session or the hosting provider's console open during the switch.
 You will:
 
 1. verify the existing site through Apache;
-2. test the Apache configuration with Vapache;
+2. test the Apache configuration with httpd-rs;
 3. inspect the service transition;
-4. switch the host to Vapache;
-5. verify the same site through Vapache;
+4. switch the host to httpd-rs;
+5. verify the same site through httpd-rs;
 6. restore Apache.
 
 ## Before you start
@@ -33,7 +33,7 @@ You will:
 You need:
 
 - Debian with `apache2.service` active;
-- a Vapache package that matches the checked-out source version;
+- a httpd-rs package that matches the checked-out source version;
 - root access through `sudo`;
 - a second SSH session or hosting-provider console for recovery;
 - the name or address of the evaluation host.
@@ -91,23 +91,23 @@ Send a request to the evaluation host. Replace `EVALUATION_IP` with its address.
 ```console
 $ curl --fail --show-error --resolve www.example.test:80:EVALUATION_IP \
     http://www.example.test/
-Vapache documentation example
+httpd-rs documentation example
 ```
 
 The command must return the expected page before the service transition.
 
-## 4. Test the configuration with Vapache
+## 4. Test the configuration with httpd-rs
 
-Run the packaged Vapache configuration test.
+Run the packaged httpd-rs configuration test.
 
 ```console
-$ sudo vapachectl configtest
+$ sudo httpd-rsctl configtest
 Syntax OK
 ```
 
 The command reads the complete Apache configuration without editing
 `/etc/apache2`. If the site needs a default-off capability, the command prints
-the `VapacheCapability` line that enables it.
+the `HttpdRsCapability` line that enables it.
 
 Do not continue if the command reports an unsupported directive, unsafe input,
 missing file, or invalid certificate.
@@ -117,7 +117,7 @@ missing file, or invalid certificate.
 Run the switch command without `--yes`.
 
 ```console
-$ sudo vapache-switch
+$ sudo httpd-rs-switch
 ```
 
 The command performs another configuration test. It then reports the detected
@@ -130,7 +130,7 @@ Expected final output:
 No changes made.
 ```
 
-## 6. Switch to Vapache
+## 6. Switch to httpd-rs
 
 Open a second administrative connection. Keep that connection open during the
 switch.
@@ -138,19 +138,19 @@ switch.
 Run the switch command again and answer `y` after you inspect the plan.
 
 ```console
-$ sudo vapache-switch
+$ sudo httpd-rs-switch
 ```
 
 The tool disables and stops `apache2.service`. The tool then enables and starts
-`vapache.service`. If Vapache does not start, the tool restores the recorded
+`httpd-rs.service`. If httpd-rs does not start, the tool restores the recorded
 Apache active and enabled states.
 
-## 7. Verify Vapache
+## 7. Verify httpd-rs
 
-Confirm that the Vapache service is active.
+Confirm that the httpd-rs service is active.
 
 ```console
-$ systemctl is-active vapache.service
+$ systemctl is-active httpd-rs.service
 active
 ```
 
@@ -159,7 +159,7 @@ Request the home page.
 ```console
 $ curl --fail --show-error --resolve www.example.test:80:EVALUATION_IP \
     http://www.example.test/
-Vapache documentation example
+httpd-rs documentation example
 ```
 
 Request a missing path and inspect the status and custom error body.
@@ -173,7 +173,7 @@ $ curl --silent --show-error --include \
 The response must have status `404`. The body must contain
 `The requested example page does not exist.`
 
-Vapache rejects `POST` to this static file with status `405`. Apache normally
+httpd-rs rejects `POST` to this static file with status `405`. Apache normally
 serves the file with status `200`. This difference is intentional.
 
 ```console
@@ -186,10 +186,10 @@ $ curl --silent --show-error --output /dev/null --write-out '%{http_code}\n' \
 
 ## Roll back
 
-Stop and disable Vapache.
+Stop and disable httpd-rs.
 
 ```console
-$ sudo systemctl disable --now vapache.service
+$ sudo systemctl disable --now httpd-rs.service
 ```
 
 Restore the active and enabled Apache state that you recorded in step 1. For the
@@ -206,8 +206,8 @@ $ sudo apache2ctl configtest
 Syntax OK
 $ curl --fail --show-error --resolve www.example.test:80:EVALUATION_IP \
     http://www.example.test/
-Vapache documentation example
+httpd-rs documentation example
 ```
 
-The Vapache package does not remove or edit the Apache configuration during the
+The httpd-rs package does not remove or edit the Apache configuration during the
 switch.

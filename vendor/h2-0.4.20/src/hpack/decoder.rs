@@ -400,16 +400,16 @@ impl Representation {
 }
 
 fn decode_int(buf: &mut Cursor<&mut BytesMut>, prefix_size: u8) -> Result<usize, DecoderError> {
-    match vapache_verified::hpack_decode_integer(buf.chunk(), prefix_size) {
-        vapache_verified::HpackIntegerDecode::Value { value, consumed } => {
+    match httpd_rs_verified::hpack_decode_integer(buf.chunk(), prefix_size) {
+        httpd_rs_verified::HpackIntegerDecode::Value { value, consumed } => {
             buf.advance(consumed);
             Ok(value as usize)
         }
-        vapache_verified::HpackIntegerDecode::Underflow => {
+        httpd_rs_verified::HpackIntegerDecode::Underflow => {
             Err(DecoderError::NeedMore(NeedMore::IntegerUnderflow))
         }
-        vapache_verified::HpackIntegerDecode::Overflow => Err(DecoderError::IntegerOverflow),
-        vapache_verified::HpackIntegerDecode::InvalidPrefix => {
+        httpd_rs_verified::HpackIntegerDecode::Overflow => Err(DecoderError::IntegerOverflow),
+        httpd_rs_verified::HpackIntegerDecode::InvalidPrefix => {
             Err(DecoderError::InvalidIntegerPrefix)
         }
     }
@@ -493,19 +493,19 @@ impl Table {
     fn insert(&mut self, entry: Header) {
         let incoming = entry.len();
         loop {
-            match vapache_verified::hpack_table_insert_action(
+            match httpd_rs_verified::hpack_table_insert_action(
                 self.size,
                 self.max_size,
                 incoming,
                 !self.entries.is_empty(),
             ) {
-                vapache_verified::HpackTableInsertAction::Insert { new_size } => {
+                httpd_rs_verified::HpackTableInsertAction::Insert { new_size } => {
                     self.size = new_size;
                     self.entries.push_front(entry);
                     return;
                 }
-                vapache_verified::HpackTableInsertAction::Evict => self.evict_oldest(),
-                vapache_verified::HpackTableInsertAction::Clear => {
+                httpd_rs_verified::HpackTableInsertAction::Evict => self.evict_oldest(),
+                httpd_rs_verified::HpackTableInsertAction::Clear => {
                     self.entries.clear();
                     self.size = 0;
                     return;
@@ -517,13 +517,13 @@ impl Table {
     fn set_max_size(&mut self, size: usize) {
         self.max_size = size;
         loop {
-            match vapache_verified::hpack_table_resize_action(
+            match httpd_rs_verified::hpack_table_resize_action(
                 self.size,
                 self.max_size,
                 !self.entries.is_empty(),
             ) {
-                vapache_verified::HpackTableResizeAction::Done => return,
-                vapache_verified::HpackTableResizeAction::Evict => self.evict_oldest(),
+                httpd_rs_verified::HpackTableResizeAction::Done => return,
+                httpd_rs_verified::HpackTableResizeAction::Evict => self.evict_oldest(),
             }
         }
     }
@@ -533,7 +533,7 @@ impl Table {
             .entries
             .pop_back()
             .expect("verified HPACK transition requested eviction from a non-empty table");
-        self.size = vapache_verified::hpack_table_after_evict(self.size, entry.len())
+        self.size = httpd_rs_verified::hpack_table_after_evict(self.size, entry.len())
             .expect("HPACK decoder accounting diverged from its entries");
     }
 }

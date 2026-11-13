@@ -54,14 +54,14 @@ RUN --mount=type=secret,id=proxy_ca \
     make -j2; \
     make install; \
     cd /; \
-    mkdir -p /opt/vapache; \
-    cp /tmp/build-inputs/entrypoint.sh /usr/local/bin/vapache-bugzilla-entrypoint; \
-    cp /tmp/build-inputs/checksetup_answers.txt /opt/vapache/checksetup_answers.txt; \
-    chmod 0755 /usr/local/bin/vapache-bugzilla-entrypoint; \
+    mkdir -p /opt/httpd-rs; \
+    cp /tmp/build-inputs/entrypoint.sh /usr/local/bin/httpd-rs-bugzilla-entrypoint; \
+    cp /tmp/build-inputs/checksetup_answers.txt /opt/httpd-rs/checksetup_answers.txt; \
+    chmod 0755 /usr/local/bin/httpd-rs-bugzilla-entrypoint; \
     rm -rf /tmp/DBD-MariaDB-1.24 /tmp/build-inputs; \
     apt-get purge -y --auto-remove build-essential libmariadb-dev libdevel-checklib-perl; \
     rm -rf /var/lib/apt/lists/*; \
     rm -f /tmp/build-ca.pem
 
 EXPOSE 9000
-ENTRYPOINT ["/usr/local/bin/vapache-bugzilla-entrypoint"]
+ENTRYPOINT ["/usr/local/bin/httpd-rs-bugzilla-entrypoint"]

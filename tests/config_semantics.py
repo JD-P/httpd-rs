@@ -13,7 +13,7 @@ configurations that exercise the merge rules which are easy to get wrong:
   * Directory/Location/Files precedence
   * Options +/- inheritance
 
-Both Apache httpd and vapached are started with the same configuration; every
+Both Apache httpd and httpd-rs are started with the same configuration; every
 request below is sent to both and the observable status/headers are compared.
 
 Usage:
@@ -42,20 +42,20 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target" / "release" / "httpd-rs"))
 APACHE = os.environ.get("APACHE", shutil.which("apache2") or "/usr/sbin/apache2")
 MODDIR = Path(
     os.environ.get(
         "APACHE_MODDIR",
         "/usr/lib/apache2/modules"
         if Path("/usr/lib/apache2/modules").is_dir()
-        else "/workspace/.vapache-setup/sysroot/usr/lib/apache2/modules",
+        else "/workspace/.httpd-rs-setup/sysroot/usr/lib/apache2/modules",
     )
 )
-BASE = Path(tempfile.mkdtemp(prefix="vapache-config-semantics-"))
+BASE = Path(tempfile.mkdtemp(prefix="httpd-rs-config-semantics-"))
 DOCROOT = BASE / "www"
-AP_PORT = int(os.environ.get("VAPACHE_SEM_AP_PORT", "18180"))
-VP_PORT = int(os.environ.get("VAPACHE_SEM_VP_PORT", "18181"))
+AP_PORT = int(os.environ.get("HTTPD_RS_SEM_AP_PORT", "18180"))
+VP_PORT = int(os.environ.get("HTTPD_RS_SEM_VP_PORT", "18181"))
 PROCS = []
 SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
 SERVICE_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
@@ -107,7 +107,7 @@ def make_fixture():
     (BASE / "apache" / "logs").mkdir(exist_ok=True)
     # The <IfFile> flag file must be visible from both resolution roots:
     # Apache resolves .htaccess-relative <IfFile> arguments against ServerRoot,
-    # vapached confines them against DocumentRoot (F45/I42).  A file existing
+    # httpd-rs confines them against DocumentRoot (F45/I42).  A file existing
     # under both trees lets the differential suite exercise the TRUE branch.
     write(BASE / "ifflag.txt", "flag\n")
     write(DOCROOT / "ifflag.txt", "flag\n")
@@ -161,22 +161,22 @@ def base_config(port: int, apache: bool) -> str:
         for mod in APACHE_MODULES:
             lines.append(f"LoadModule {mod} {MODDIR}/mod_{mod.replace('_module','')}.so")
     else:
-        # vapached only records module names for <IfModule>; paths are unused.
+        # httpd-rs only records module names for <IfModule>; paths are unused.
         for mod in APACHE_MODULES:
             lines.append(f"LoadModule {mod} {MODDIR}/mod_{mod.replace('_module','')}.so")
         lines += [
-            "VapacheCapability AbsoluteRequestTarget On",
-            "VapacheCapability AccessFiles On",
-            "VapacheCapability AutoIndex On",
-            "VapacheCapability Cgi On",
-            "VapacheCapability FastCgi On",
-            "VapacheCapability LegacyAuthz On",
-            "VapacheCapability RequestTrailers On",
-            "VapacheCapability RewriteProgram On",
-            "VapacheCapability ServerStatus On",
-            "VapacheCapability Trace On",
-            "VapacheCapability UnstableFastCgiPaths On",
-            "VapacheCapability MutableAuthFiles On",
+            "HttpdRsCapability AbsoluteRequestTarget On",
+            "HttpdRsCapability AccessFiles On",
+            "HttpdRsCapability AutoIndex On",
+            "HttpdRsCapability Cgi On",
+            "HttpdRsCapability FastCgi On",
+            "HttpdRsCapability LegacyAuthz On",
+            "HttpdRsCapability RequestTrailers On",
+            "HttpdRsCapability RewriteProgram On",
+            "HttpdRsCapability ServerStatus On",
+            "HttpdRsCapability Trace On",
+            "HttpdRsCapability UnstableFastCgiPaths On",
+            "HttpdRsCapability MutableAuthFiles On",
         ]
     lines += [
         f'ServerRoot "{BASE}"',
@@ -708,7 +708,7 @@ CASES = [
             "</Directory>",
         ],
         # POST is unrestricted by the access rule; Apache's core static
-        # handler answers 200 while vapached deliberately answers 405.  That
+        # handler answers 200 while httpd-rs deliberately answers 405.  That
         # method divergence is documented in README.md and is not an access
         # control difference: neither side may answer 401/403 here.
         "status_equiv": {"POST": {200, 405}},
@@ -1134,7 +1134,7 @@ CASES = [
         "dir": "ht_all_iffile_absent",
         # A .htaccess-relative <IfFile> argument neither engine resolves must
         # skip the section on both sides (Apache looks under ServerRoot,
-        # vapached under the confined DocumentRoot root), so the negative
+        # httpd-rs under the confined DocumentRoot root), so the negative
         # branch is exercised without off-policy absolute-path probing.
         "files": {
             ".htaccess": (
@@ -2373,7 +2373,7 @@ def generated_cases():
 CASES.extend(generated_cases())
 
 # Apache 2.4.69 accepts an unsupported Files section nested inside request-time
-# If, but ordinary direct requests do not evaluate the nested policy. Vapache
+# If, but ordinary direct requests do not evaluate the nested policy. httpd-rs
 # rejects that construct fail-closed; the rejection belongs to
 # config_validity.py rather than this runtime-equivalence matrix. The
 # .htaccess parser has a direct regression test for the same rule.
@@ -2961,7 +2961,7 @@ def stateful_access_cases(count: int, seed: int):
     and EOF with live entries.  The remaining states cover duplicate
     AllowOverride ordering and every Nonfatal behavior (the default None plus
     Override, Unknown and All).  Apache remains the result oracle except for
-    the documented <If><Files> policy-discard case that Vapache deliberately
+    the documented <If><Files> policy-discard case that httpd-rs deliberately
     rejects rather than accepting authorization text it would not execute.
     """
     rng = random.Random(seed)
@@ -3086,7 +3086,7 @@ def stateful_access_cases(count: int, seed: int):
         }
         if state == 0:
             case["known_divergence"] = (
-                "Vapache rejects nested Files/FilesMatch inside If because "
+                "httpd-rs rejects nested Files/FilesMatch inside If because "
                 "Apache accepts but silently discards the nested policy"
             )
         out.append(case)
@@ -3109,25 +3109,25 @@ def run_case(case: dict, verbose: bool) -> list[str]:
             continue
         if verbose:
             print(
-                f"  {method} {path} -> apache {a[0]} vapache {v[0]}"
+                f"  {method} {path} -> apache {a[0]} httpd-rs {v[0]}"
             )
             for hname in compare:
                 print(
                     f"      {hname}: apache={a[1].get(hname.lower())!r} "
-                    f"vapache={v[1].get(hname.lower())!r}"
+                    f"httpd-rs={v[1].get(hname.lower())!r}"
                 )
         if a[0] != v[0]:
             equiv = case.get("status_equiv", {}).get(method, set())
             if not ({a[0], v[0]} <= equiv):
                 problems.append(
-                    f"{method} {path}: status apache={a[0]} vapache={v[0]}"
+                    f"{method} {path}: status apache={a[0]} httpd-rs={v[0]}"
                 )
         for name, expected in compare.items():
             av = a[1].get(name.lower())
             vv = v[1].get(name.lower())
             if av != vv:
                 problems.append(
-                    f"{method} {path}: header {name} apache={av!r} vapache={vv!r}"
+                    f"{method} {path}: header {name} apache={av!r} httpd-rs={vv!r}"
                 )
             elif expected is not None and av != expected:
                 problems.append(
@@ -3152,8 +3152,8 @@ def main():
     if args.only:
         CASES[:] = [c for c in CASES if re.search(args.only, c["name"], re.I)]
 
-    if not VAPACHED.exists():
-        sys.exit(f"missing {VAPACHED}; cargo build --release first")
+    if not HTTPD_RS.exists():
+        sys.exit(f"missing {HTTPD_RS}; cargo build --release first")
     if not Path(APACHE).exists():
         sys.exit(f"missing Apache httpd at {APACHE}")
 
@@ -3166,7 +3166,7 @@ def main():
             case["config"] = expand_config(case)
 
         acfg = BASE / "apache" / "httpd.conf"
-        vcfg = BASE / "vapache-httpd.conf"
+        vcfg = BASE / "httpd-rs-httpd.conf"
         acfg.write_text(base_config(AP_PORT, True))
         vcfg.write_text(base_config(VP_PORT, False))
         start_server(
@@ -3174,12 +3174,12 @@ def main():
             BASE / "logs" / "apache.out",
         )
         start_server(
-            [str(VAPACHED), "-f", str(vcfg), "-DFOREGROUND"],
-            BASE / "logs" / "vapache.out",
+            [str(HTTPD_RS), "-f", str(vcfg), "-DFOREGROUND"],
+            BASE / "logs" / "httpd-rs.out",
         )
         if not wait_port(AP_PORT) or not wait_port(VP_PORT):
             print("server failed to start")
-            for name in ("apache", "vapache"):
+            for name in ("apache", "httpd-rs"):
                 p = BASE / "logs" / f"{name}.out"
                 if p.exists():
                     print(p.read_text()[-8000:])
@@ -3197,7 +3197,7 @@ def main():
             # The corpus intentionally creates a fresh .htaccess file for
             # almost every case.  That is useful for parser coverage, but it
             # is unlike ordinary traffic (where parsed access files are
-            # cached) and can otherwise trip Vapache's per-client expensive-
+            # cached) and can otherwise trip httpd-rs's per-client expensive-
             # operation rate limit before semantic comparison is complete.
             # Pace actual requests rather than cases because one case may
             # issue several methods, each with more than one policy matcher.

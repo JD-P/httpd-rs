@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep Vapache's cargo-vet evidence from quietly regressing."""
+"""Keep httpd-rs's cargo-vet evidence from quietly regressing."""
 
 from pathlib import Path
 import sys

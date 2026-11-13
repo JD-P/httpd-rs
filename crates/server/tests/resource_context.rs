@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use vapached::resource::{with_resource_context, ResourceBudget};
+use httpd_rs::resource::{with_resource_context, ResourceBudget};
 
 #[test]
 fn request_scoped_admission_fails_without_a_context() {

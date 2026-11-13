@@ -1,4 +1,4 @@
-# Differential report: vapached vs. Apache httpd
+# Differential report: httpd-rs vs. Apache httpd
 
 Generated: 2026-11-04 02:06:46Z
 

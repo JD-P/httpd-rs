@@ -1,6 +1,6 @@
 # Internal request transition review
 
-This campaign reviewed every place where Vapache selects a new request target
+This campaign reviewed every place where httpd-rs selects a new request target
 without parsing a new request from the client.  The boundary includes local
 `ErrorDocument`, `DirectoryIndex`, internal rewrites, CGI/FastCGI `PATH_INFO`,
 deferred handler probes, and proxy query retargeting.
@@ -68,9 +68,9 @@ that an error request at depth one cannot transition again.
    response marks itself ineligible for shared caching, so provenance travels
    through deferred execution and cannot bleed between requests.
 
-7. **POST stopped before DirectoryIndex selection.**  Vapache rejected every
+7. **POST stopped before DirectoryIndex selection.**  httpd-rs rejected every
    POST to a directory before checking its index.  Apache's `mod_dir` admits
-   GET/POST, then lets the selected target decide the method.  Vapache now
+   GET/POST, then lets the selected target decide the method.  httpd-rs now
    does the same: a CGI/FastCGI/proxy index receives POST, while a static index
    or a directory without a viable index still returns 405.
 
@@ -82,7 +82,7 @@ that an error request at depth one cannot transition again.
    projection now share one fail-closed validator backed by the verified
    percent decoder, normalizer and syntax gate.
 
-9. **DirectoryIndex probe/dispatch identity split.** Vapache probes a literal
+9. **DirectoryIndex probe/dispatch identity split.** httpd-rs probes a literal
    filename before internally dispatching its URL. A configured name such as
    `index%2ehtml` could therefore open the literal percent-named file during
    selection and then dispatch `index.html` after URL decoding; `?`, `#`, or
@@ -98,7 +98,7 @@ Apache's `ap_send_error_response` explicitly changes a local ErrorDocument to
 GET before calling `ap_internal_redirect`.  The internal redirect retains
 `the_request`, connection/client state and incoming headers, while parsing the
 new URI and query.  `mod_dir` admits GET and POST and performs an internal fast
-redirect to the selected index.  Vapache follows those method/query/wire
+redirect to the selected index.  httpd-rs follows those method/query/wire
 identity semantics, while additionally stripping body and hop metadata from
 error recovery so a bodyless GET cannot make a backend wait for or interpret
 an outer message body.

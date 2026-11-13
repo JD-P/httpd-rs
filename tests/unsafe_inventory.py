@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Enforce the exact, contract-annotated Rust unsafe boundary.
 
-Production `vapached` builds forbid unsafe code. The sole exception is the
-`vapache-os` crate, where every unsafe block has a unique SAFETY[OSnnn]
+Production `httpd-rs` builds forbid unsafe code. The sole exception is the
+`httpd-rs-os` crate, where every unsafe block has a unique SAFETY[OSnnn]
 contract. Test-only probes in the server are also hashed exactly so they
 cannot grow or change under the old line-count budget.
 """

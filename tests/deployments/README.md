@@ -1,6 +1,6 @@
 # Real-application deployment tests
 
-This suite deploys unmodified, well-known applications through Vapache. It is
+This suite deploys unmodified, well-known applications through httpd-rs. It is
 an executable compatibility and operations library, not a replacement for the
 protocol, differential, fuzz or unit suites.
 
@@ -38,7 +38,7 @@ python3 tests/deployments/harness.py \
 Run one application while developing:
 
 ```sh
-cargo build --release -p vapached
+cargo build --release -p httpd-rs
 python3 tests/deployments/harness.py \
   --profile sample --scenario grafana-proxy --sample-count 1
 ```
@@ -72,7 +72,7 @@ The harness enforces these rules twice: once against the rendered Compose
 model and again against the live container inspection.
 
 - A bind source must be under the unique scenario run directory. Privileged
-  runs default to `/run/vapache-deployments/...`, whose non-writable ancestry
+  runs default to `/run/httpd-rs-deployments/...`, whose non-writable ancestry
   also satisfies the FastCGI stable-path policy; unprivileged developer runs
   must select an equivalently stable repository-external path explicitly.
 - A bind source that contains or is contained by the repository is rejected.
@@ -99,8 +99,8 @@ state exist only in the staging directory or scenario-owned volumes.
 Each case produces:
 
 - the reproducible selection in `plan.json`;
-- the exact tested Vapache configuration;
-- Vapache and container logs;
+- the exact tested httpd-rs configuration;
+- httpd-rs and container logs;
 - an Apache configuration and differential benchmark JSON when benchmarking;
 - a final machine-readable status summary.
 
@@ -112,7 +112,7 @@ sections are the tested reference for the deployment guides under
 
 An application directory contains `scenario.toml`, `driver.py`, and optional
 Compose/configuration files. A driver must exercise a semantic workflow—not
-only check that `/` returns 200—and must justify every enabled Vapache
+only check that `/` returns 200—and must justify every enabled httpd-rs
 capability. Images without an immutable digest are rejected at discovery.
 
 Choose applications for distinct observable behavior rather than language

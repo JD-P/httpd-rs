@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Barrier};
 
-use vapache_pcre2::bytes::Regex;
+use httpd_rs_pcre2::bytes::Regex;
 
 #[test]
 fn cloned_regexes_promote_once_and_match_consistently() {

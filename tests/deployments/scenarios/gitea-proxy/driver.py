@@ -1,4 +1,4 @@
-"""Deploy Gitea and move a real Git repository through Vapache's proxy."""
+"""Deploy Gitea and move a real Git repository through httpd-rs's proxy."""
 
 from __future__ import annotations
 
@@ -14,19 +14,19 @@ from lib import (
     basic_authorization,
     command,
     common_apache_config,
-    common_vapache_config,
+    common_httpd_rs_config,
     differential_benchmark,
     free_port,
     request,
     require_response,
     start_apache,
-    start_vapache,
+    start_httpd_rs,
 )
 
 
 HERE = Path(__file__).resolve().parent
 GIT = Path("/usr/bin/git") if Path("/usr/bin/git").exists() else Path(shutil.which("git") or "git")
-PASSWORD = "vapache-gitea-integration-42"
+PASSWORD = "httpd-rs-gitea-integration-42"
 
 
 def write_identity_files(context: CaseContext) -> tuple[Path, Path]:
@@ -47,7 +47,7 @@ def write_config(data: Path, root_url: str, prefix: str) -> None:
         directory.mkdir(parents=True, exist_ok=True)
     container_data = Path("/data/gitea")
     (data / "conf/app.ini").write_text(
-        f"""APP_NAME = Vapache Gitea Integration
+        f"""APP_NAME = httpd-rs Gitea Integration
 RUN_USER = runner
 RUN_MODE = prod
 
@@ -70,7 +70,7 @@ LFS_START_SERVER = false
 
 [security]
 INSTALL_LOCK = true
-SECRET_KEY = vapache-gitea-integration-secret-key-not-for-production
+SECRET_KEY = httpd-rs-gitea-integration-secret-key-not-for-production
 
 [service]
 DISABLE_REGISTRATION = true
@@ -106,7 +106,7 @@ def create_admin(compose) -> None:
             "--password",
             PASSWORD,
             "--email",
-            "integration@vapache.invalid",
+            "integration@httpd-rs.invalid",
             "--admin",
             "--must-change-password=false",
         ],
@@ -117,7 +117,7 @@ def create_admin(compose) -> None:
 
 def create_repository(port: int, prefix: str, authorization: str) -> None:
     body = json.dumps(
-        {"name": "integration", "description": "Vapache smart HTTP integration", "private": False}
+        {"name": "integration", "description": "httpd-rs smart HTTP integration", "private": False}
     ).encode()
     status, _, response = request(
         port,
@@ -135,14 +135,14 @@ def transfer_repository(context: CaseContext, port: int, prefix: str, authorizat
     clone = context.run_dir / "gitea-clone"
     source.mkdir()
     command([GIT, "init", "--initial-branch=main"], cwd=source)
-    (source / "README.md").write_text("gitea-vapache-smart-http-marker\n")
+    (source / "README.md").write_text("gitea-httpd-rs-smart-http-marker\n")
     environment = os.environ.copy()
     environment.update(
         {
-            "GIT_AUTHOR_NAME": "Vapache Integration",
-            "GIT_AUTHOR_EMAIL": "integration@vapache.invalid",
-            "GIT_COMMITTER_NAME": "Vapache Integration",
-            "GIT_COMMITTER_EMAIL": "integration@vapache.invalid",
+            "GIT_AUTHOR_NAME": "httpd-rs Integration",
+            "GIT_AUTHOR_EMAIL": "integration@httpd-rs.invalid",
+            "GIT_COMMITTER_NAME": "httpd-rs Integration",
+            "GIT_COMMITTER_EMAIL": "integration@httpd-rs.invalid",
         }
     )
     command([GIT, "add", "README.md"], cwd=source, env=environment)
@@ -152,7 +152,7 @@ def transfer_repository(context: CaseContext, port: int, prefix: str, authorizat
     auth_option = f"http.extraHeader=Authorization: {authorization}"
     command([GIT, "-c", auth_option, "push", "origin", "main"], cwd=source, timeout=120)
     command([GIT, "-c", auth_option, "clone", repository_url, os.fspath(clone)], timeout=120)
-    if (clone / "README.md").read_text() != "gitea-vapache-smart-http-marker\n":
+    if (clone / "README.md").read_text() != "gitea-httpd-rs-smart-http-marker\n":
         raise DeploymentError("Gitea smart-HTTP clone did not reproduce the pushed repository")
 
 
@@ -192,10 +192,10 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
 ProxyPass {route} {backend_route}
 ProxyPassReverse {route} {backend_route}
 """
-    config, pid_file = common_vapache_config(
+    config, pid_file = common_httpd_rs_config(
         context.run_dir, frontend_port, empty_docroot, extra=extra
     )
-    server = start_vapache(context, config, pid_file, frontend_port)
+    server = start_httpd_rs(context, config, pid_file, frontend_port)
     require_response(frontend_port, f"{prefix}/api/v1/version", contains=b"version")
     root_status, root_headers, root_body = request(frontend_port, f"{prefix}/")
     if root_status in (301, 302, 303, 307, 308):
@@ -250,7 +250,7 @@ ProxyPassReverse {route} {backend_route}
             frontend_port,
             apache_port,
             benchmark_path,
-            context.artifact_dir / "apache-vapache-benchmark.json",
+            context.artifact_dir / "apache-httpd-rs-benchmark.json",
             headers=(f"Host: {host}", f"Authorization: {authorization}"),
             connections=4,
         )

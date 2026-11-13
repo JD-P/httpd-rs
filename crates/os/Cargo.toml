@@ -1,5 +1,5 @@
 [package]
-name = "vapache-os"
+name = "httpd-rs-os"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

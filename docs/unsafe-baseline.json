@@ -107,7 +107,7 @@
     "OS027": {
       "path": "crates/os/src/lib.rs",
       "line": 382,
-      "contract_sha256": "063763964be77dda134cdd8ca58b4f60dd7fc7eeb80d8b4f021177e91f09a4b4",
+      "contract_sha256": "b3c920610d5a7cf105edef8070de6dc1ae779394fadf3d633fe2227c09328f7f",
       "block_sha256": "6fbfa3c0f06a959778321aab74e4bb8fa362c8f6edfd202ddfb9dc5d9cc0d1a1"
     },
     "OS028": {
@@ -329,7 +329,7 @@
     "OS069": {
       "path": "crates/os/src/lib.rs",
       "line": 1008,
-      "contract_sha256": "35773103b0496cb39df36b6a0bce262b08944920953323e4d1534546e69f55ad",
+      "contract_sha256": "a647384293c6e1c69c2d25c6706dbee324b583ec08bc17f6ed6c594407acfd4f",
       "block_sha256": "6fbfa3c0f06a959778321aab74e4bb8fa362c8f6edfd202ddfb9dc5d9cc0d1a1"
     },
     "OS070": {

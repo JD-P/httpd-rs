@@ -1,10 +1,10 @@
-# Feature benchmark: vapached vs. Apache httpd
+# Feature benchmark: httpd-rs vs. Apache httpd
 
 Generated: 2026-10-23T20:10:06.817489+00:00
 
 Method: 3 x 3s samples per server after warm-up; access logs to /dev/null. `wrk` for cleartext HTTP/1.1, `ab` for HEAD/POST, `h2load` for TLS/HTTP/2 with four load-generator threads. HTTP/2 uses 64 clients x 16 streams; the 1 MB case uses 16 x 4 and CGI uses 16-32 clients.
 
-| feature | apache req/s | vapache req/s | ratio | apache mean ms | vapache mean ms |
+| feature | apache req/s | httpd-rs req/s | ratio | apache mean ms | httpd-rs mean ms |
 |---|---:|---:|---:|---:|---:|
 | static 1.1KB | 67199 | 53139 | 0.79x | 1.23 | 1.42 |
 | access allow (IP) | 66756 | 49387 | 0.74x | 1.36 | 1.44 |
@@ -12,7 +12,7 @@ Method: 3 x 3s samples per server after warm-up; access logs to /dev/null. `wrk`
 
 ## Startup checks
 
-| metric | apache | vapache |
+| metric | apache | httpd-rs |
 |---|---:|---:|
 | config test (`-t`) median | 20.2 ms | 7.0 ms |
 | processes after load | 7 | 17 |

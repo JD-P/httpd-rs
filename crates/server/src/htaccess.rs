@@ -210,7 +210,7 @@ pub fn apply_req_deferred_with_root(
             let path = dir.join(&name);
             let opened = open_access_file(&path);
             let exists = !matches!(&opened, Ok(None));
-            if !vapache_verified::access_file_candidate_admit(selected, exists) {
+            if !httpd_rs_verified::access_file_candidate_admit(selected, exists) {
                 continue;
             }
             selected = true;
@@ -229,7 +229,7 @@ pub fn apply_req_deferred_with_root(
                     parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, opened)?
                 }
             };
-            if !vapache_verified::access_program_budget_admit(
+            if !httpd_rs_verified::access_program_budget_admit(
                 access_layers as u64,
                 access_instructions as u64,
                 delta.instruction_count as u64,
@@ -500,7 +500,7 @@ fn collect_layers_with_root_inner(
             let path = dir.join(&name);
             let opened = open_access_file(&path);
             let exists = !matches!(&opened, Ok(None));
-            if !vapache_verified::access_file_candidate_admit(found, exists) {
+            if !httpd_rs_verified::access_file_candidate_admit(found, exists) {
                 continue;
             }
             let opened = match opened {
@@ -522,7 +522,7 @@ fn collect_layers_with_root_inner(
             // preserving PATH_INFO/non-directory ancestor semantics.
             debug_assert!(crate::verified::access_walk_dir_admit(true, true));
             let parsed = parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, opened)?;
-            if !vapache_verified::access_program_budget_admit(
+            if !httpd_rs_verified::access_program_budget_admit(
                 layers.len() as u64,
                 access_instructions as u64,
                 parsed.instruction_count as u64,
@@ -638,7 +638,7 @@ pub fn trace_access_files_with_root(
             let path = dir.join(&name);
             let opened = open_access_file(&path);
             let exists = !matches!(&opened, Ok(None));
-            if !vapache_verified::access_file_candidate_admit(selected, exists) {
+            if !httpd_rs_verified::access_file_candidate_admit(selected, exists) {
                 continue;
             }
             selected = true;
@@ -901,7 +901,7 @@ fn stable_access_snapshot(
     // the name now resolves to a different inode/version, parsing the opened
     // file would silently authorize a target the caller did not select.
     let current = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !vapache_verified::descriptor_snapshot_admit(
+    if !httpd_rs_verified::descriptor_snapshot_admit(
         before.is_file() && current.is_file(),
         before.dev() == current.dev() && before.ino() == current.ino(),
         same_access_file_version(&before, &current),
@@ -924,7 +924,7 @@ fn stable_access_snapshot(
         .metadata()
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let current_after = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !vapache_verified::descriptor_snapshot_admit(
+    if !httpd_rs_verified::descriptor_snapshot_admit(
         before.is_file() && after.is_file() && current_after.is_file(),
         before.dev() == after.dev()
             && before.ino() == after.ino()
@@ -976,7 +976,7 @@ fn parse_cached(
             .file
             .metadata()
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        if vapache_verified::descriptor_snapshot_admit(
+        if httpd_rs_verified::descriptor_snapshot_admit(
             meta.is_file() && after.is_file(),
             meta.dev() == after.dev() && meta.ino() == after.ino(),
             same_access_file_version(meta, &after),
@@ -1344,9 +1344,9 @@ impl AccessProgram {
                 .map_err(|error| format!("line {line_number}: {error}"))?;
             match line_ir {
                 crate::config_frontend::ConfigLine::Directive { name, args } => {
-                    depth = vapache_verified::config_program_depth_step(
+                    depth = httpd_rs_verified::config_program_depth_step(
                         depth,
-                        vapache_verified::ConfigLineKind::Directive,
+                        httpd_rs_verified::ConfigLineKind::Directive,
                     )
                     .ok_or_else(|| format!("line {line_number}: access program depth overflow"))?;
                     let spec = crate::config::directive_spec(&name);
@@ -1373,12 +1373,12 @@ impl AccessProgram {
                     });
                 }
                 crate::config_frontend::ConfigLine::SectionStart { name, args } => {
-                    depth = vapache_verified::config_program_depth_step(
+                    depth = httpd_rs_verified::config_program_depth_step(
                         depth,
-                        vapache_verified::ConfigLineKind::SectionStart,
+                        httpd_rs_verified::ConfigLineKind::SectionStart,
                     )
                     .ok_or_else(|| format!("line {line_number}: access program depth overflow"))?;
-                    if !vapache_verified::access_section_depth_admit(
+                    if !httpd_rs_verified::access_section_depth_admit(
                         depth,
                         MAX_ACCESS_SECTION_DEPTH,
                     ) {
@@ -1403,9 +1403,9 @@ impl AccessProgram {
                     stack.push((name, start));
                 }
                 crate::config_frontend::ConfigLine::SectionEnd { name } => {
-                    depth = vapache_verified::config_program_depth_step(
+                    depth = httpd_rs_verified::config_program_depth_step(
                         depth,
-                        vapache_verified::ConfigLineKind::SectionEnd,
+                        httpd_rs_verified::ConfigLineKind::SectionEnd,
                     )
                     .ok_or_else(|| format!("line {line_number}: unexpected closing </{name}>"))?;
                     let Some((open, start)) = stack.pop() else {
@@ -1453,7 +1453,7 @@ fn section_allowed_list(
     allow_list: &[String],
     section: AccessSectionKind,
 ) -> bool {
-    let category_allowed = vapache_verified::htaccess_section_category_admit(
+    let category_allowed = httpd_rs_verified::htaccess_section_category_admit(
         section as u8,
         mode.is_enabled(),
         mode.allows(OverrideCategory::AuthConfig),
@@ -1463,7 +1463,7 @@ fn section_allowed_list(
     let section_listed = allow_list
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(&command_name));
-    vapache_verified::htaccess_section_admit(category_allowed, section_listed)
+    httpd_rs_verified::htaccess_section_admit(category_allowed, section_listed)
 }
 
 fn parse_block(
@@ -1525,12 +1525,12 @@ fn parse_block(
                     // policy stage so the independent Unknown/Nonfatal gate
                     // decides whether to skip or reject them.
                     .unwrap_or(true);
-                match vapache_verified::htaccess_gate_admit(
+                match httpd_rs_verified::htaccess_gate_admit(
                     policy_allowed,
                     section.is_some(),
                     section
                         .map(|kind| {
-                            vapache_verified::htaccess_section_nonfatal_override_admit(
+                            httpd_rs_verified::htaccess_section_nonfatal_override_admit(
                                 kind as u8,
                                 nonfatal.allows_override(),
                             )
@@ -1580,7 +1580,7 @@ fn parse_block(
                         };
                         let exists = crate::files::metadata_cached(&candidate).is_ok();
                         let selected = exists != *negated;
-                        debug_assert!(vapache_verified::iffile_exec_on_read_admit(
+                        debug_assert!(httpd_rs_verified::iffile_exec_on_read_admit(
                             candidate.is_absolute(),
                             true,
                         ));
@@ -1960,7 +1960,7 @@ fn parse_block(
                 ));
                 }
                 let policy_allowed = directive_allowed_list(mode, allow_list, name, args);
-                match vapache_verified::htaccess_gate_admit(
+                match httpd_rs_verified::htaccess_gate_admit(
                     policy_allowed,
                     *known,
                     nonfatal.allows_override(),
@@ -2010,7 +2010,7 @@ fn validate_section_arity(section: AccessSectionKind, args: &[String]) -> Result
         | AccessSectionKind::Limit
         | AccessSectionKind::LimitExcept => (1, None),
     };
-    if !vapache_verified::config_argument_arity_admit(count, min, max) {
+    if !httpd_rs_verified::config_argument_arity_admit(count, min, max) {
         let requirement = match max {
             Some(max) if max == min => format!("exactly {min}"),
             Some(max) => format!("between {min} and {max}"),
@@ -3081,11 +3081,11 @@ fn apply_directive(
 }
 
 fn require_capability(cfg: &Config, capability: Capability, feature: &str) -> Result<(), String> {
-    if vapache_verified::capability_admit(cfg.capability_enabled(capability), true) {
+    if httpd_rs_verified::capability_admit(cfg.capability_enabled(capability), true) {
         Ok(())
     } else {
         Err(format!(
-            "{feature} requires global 'VapacheCapability {} On'",
+            "{feature} requires global 'HttpdRsCapability {} On'",
             capability.name()
         ))
     }
@@ -3177,7 +3177,7 @@ mod tests {
 
     fn tempdir(name: &str) -> PathBuf {
         let p =
-            std::env::temp_dir().join(format!("vapache-htaccess-{}-{name}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-htaccess-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
@@ -3323,12 +3323,12 @@ mod tests {
         );
         assert_eq!(
             p.scope.environment_policy.set_env[0].origin,
-            vapache_verified::EnvironmentOrigin::AccessFile
+            httpd_rs_verified::EnvironmentOrigin::AccessFile
         );
         assert_eq!(p.scope.environment_policy.set_env_if.len(), 1);
         assert_eq!(
             p.scope.environment_policy.set_env_if[0].origin,
-            vapache_verified::EnvironmentOrigin::AccessFile
+            httpd_rs_verified::EnvironmentOrigin::AccessFile
         );
         assert!(p.scope.rewrite_policy.rewrite_rules[0].access_file);
         let mut req = crate::http::Request {
@@ -4068,7 +4068,7 @@ mod tests {
         let file = dir.join(".htaccess");
         for line in [
             "DefinitelyNotADirective on\n",
-            "VapacheCapability Trace On\n",
+            "HttpdRsCapability Trace On\n",
             "ProxyBlock 169.254.169.254\n",
             "AcceptPathInfo Off\n",
             "SetEnvIfExpr \"true\" X=1\n",
@@ -4098,7 +4098,7 @@ mod tests {
         let conf = dir.join("httpd.conf");
         fs::write(
             &conf,
-            "VapacheCapability AccessFiles On\nListen 127.0.0.1:0\n",
+            "HttpdRsCapability AccessFiles On\nListen 127.0.0.1:0\n",
         )
         .unwrap();
         let cfg = Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
@@ -4122,7 +4122,7 @@ mod tests {
                 Err(error) => error,
             };
             assert!(
-                error.contains(&format!("VapacheCapability {capability} On")),
+                error.contains(&format!("HttpdRsCapability {capability} On")),
                 "{line:?} did not report its disabled capability: {error}"
             );
         }
@@ -4490,14 +4490,14 @@ mod tests {
         };
         assert!(error.contains("exceeds"), "{error}");
 
-        assert!(vapache_verified::access_program_budget_admit(
+        assert!(httpd_rs_verified::access_program_budget_admit(
             MAX_ACCESS_LAYERS as u64 - 1,
             MAX_ACCESS_INSTRUCTIONS_PER_REQUEST as u64 - 1,
             1,
             MAX_ACCESS_LAYERS as u64,
             MAX_ACCESS_INSTRUCTIONS_PER_REQUEST as u64,
         ));
-        assert!(!vapache_verified::access_program_budget_admit(
+        assert!(!httpd_rs_verified::access_program_budget_admit(
             MAX_ACCESS_LAYERS as u64,
             0,
             0,
@@ -5681,7 +5681,7 @@ mod compression_tests {
 
     fn tempdir(name: &str) -> PathBuf {
         let p =
-            std::env::temp_dir().join(format!("vapache-htaccess-{}-{name}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-htaccess-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p

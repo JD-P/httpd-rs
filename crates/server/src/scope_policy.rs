@@ -170,7 +170,7 @@ impl OverridePolicy {
                 Some(crate::config::OverrideMode::Categories(a)),
                 Some(crate::config::OverrideMode::Categories(b)),
             ) => Some(crate::config::OverrideMode::Categories(
-                crate::config::OverrideCategories(vapache_verified::override_categories_conjoin(
+                crate::config::OverrideCategories(httpd_rs_verified::override_categories_conjoin(
                     a.0, b.0,
                 )),
             )),
@@ -485,7 +485,7 @@ impl HeaderPolicy {
 
     pub(crate) fn within_limits(&self) -> bool {
         let (count, bytes) = self.configured_usage();
-        vapache_verified::response_header_budget_admit(
+        httpd_rs_verified::response_header_budget_admit(
             count as u64,
             bytes as u64,
             MAX_CONFIGURED_RESPONSE_HEADERS as u64,
@@ -507,7 +507,7 @@ impl HeaderPolicy {
     pub fn merge_child(&mut self, child: &HeaderPolicy) -> bool {
         let (parent_count, parent_bytes) = self.configured_usage();
         let (child_count, child_bytes) = child.configured_usage();
-        if !vapache_verified::response_header_budget_admit(
+        if !httpd_rs_verified::response_header_budget_admit(
             parent_count.saturating_add(child_count) as u64,
             parent_bytes.saturating_add(child_bytes) as u64,
             MAX_CONFIGURED_RESPONSE_HEADERS as u64,
@@ -564,7 +564,7 @@ impl HeaderPolicy {
             count = count.saturating_add(1);
             bytes = bytes.saturating_add(header_bytes(name, value));
         }
-        if !vapache_verified::response_header_budget_admit(
+        if !httpd_rs_verified::response_header_budget_admit(
             count as u64,
             bytes as u64,
             MAX_CONFIGURED_RESPONSE_HEADERS as u64,
@@ -671,21 +671,21 @@ mod header_tests {
 /// env`, `<If>` or ACL-phase `RewriteCond` decisions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Originated<T> {
-    pub origin: vapache_verified::EnvironmentOrigin,
+    pub origin: httpd_rs_verified::EnvironmentOrigin,
     pub value: T,
 }
 
 impl<T> Originated<T> {
     pub fn main(value: T) -> Self {
         Self {
-            origin: vapache_verified::EnvironmentOrigin::MainConfig,
+            origin: httpd_rs_verified::EnvironmentOrigin::MainConfig,
             value,
         }
     }
 
     pub fn access(value: T) -> Self {
         Self {
-            origin: vapache_verified::EnvironmentOrigin::AccessFile,
+            origin: httpd_rs_verified::EnvironmentOrigin::AccessFile,
             value,
         }
     }
@@ -772,7 +772,7 @@ mod environment_tests {
         );
         assert_eq!(
             parent.set_env[1].origin,
-            vapache_verified::EnvironmentOrigin::AccessFile
+            httpd_rs_verified::EnvironmentOrigin::AccessFile
         );
     }
 }
@@ -1252,7 +1252,7 @@ impl ProxyPolicy {
             let local_rank = order
                 .checked_sub(local_min)
                 .expect("local proxy route rank is bounded by its minimum");
-            *order = vapache_verified::configuration_child_merge_order(global_max, local_rank)
+            *order = httpd_rs_verified::configuration_child_merge_order(global_max, local_rank)
                 .expect("the 16 MiB aggregate configuration bound keeps route order in usize");
         }
     }

@@ -3,5 +3,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    vapached::proxy::fuzz_parse_proxy_response(data);
+    httpd_rs::proxy::fuzz_parse_proxy_response(data);
 });

@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use std::io::{self, Read, Write};
-use vapached::http::{read_request, Limits, ReadError};
+use httpd_rs::http::{read_request, Limits, ReadError};
 
 struct Fragmented<'a> {
     input: &'a [u8],

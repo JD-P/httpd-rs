@@ -78,9 +78,9 @@ build_once() {
     version=$(cargo metadata \
         --manifest-path "$source_root/Cargo.toml" \
         --locked --no-deps --format-version 1 \
-        | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "vapached"))')
+        | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "httpd-rs"))')
     "$source_root/packaging/build-linux-packages.sh" \
-        --binary "$target_root/$target/release/vapached" \
+        --binary "$target_root/$target/release/httpd-rs" \
         --version "$version" \
         --output "$artifact_root"
 }

@@ -9,7 +9,7 @@ scenario: hugo-static
 # Serve a Hugo site from a VPS
 
 This tutorial builds one Hugo site into an immutable release directory and
-serves it directly with Vapache. The example domain is `docs.example.test`.
+serves it directly with httpd-rs. The example domain is `docs.example.test`.
 
 ## What you will do
 
@@ -18,7 +18,7 @@ a custom error page and Brotli compression, and test byte ranges and reload.
 
 ## Before you start
 
-Complete [Prepare a Debian VPS for a Vapache
+Complete [Prepare a Debian VPS for a httpd-rs
 tutorial](prepare-debian-vps.md). Point `docs.example.test` at the VPS and open
 TCP ports 80 and 443 in the provider firewall. Replace the example domain and
 paths with your own values before you run the commands.
@@ -34,13 +34,13 @@ $ sudo adduser --system --group --home /srv/hugo deploy
 $ sudo -u deploy hugo new site /srv/hugo/source
 $ sudo -u deploy mkdir -p /srv/hugo/source/content /srv/hugo/source/layouts \
     /srv/hugo/source/static/assets
-$ printf '%s\n' '---' 'title: Home' '---' 'Vapache Hugo tutorial.' \
+$ printf '%s\n' '---' 'title: Home' '---' 'httpd-rs Hugo tutorial.' \
     | sudo -u deploy tee /srv/hugo/source/content/_index.md >/dev/null
 $ printf '%s\n' '<!doctype html><title>{{ .Title }}</title><main>{{ .Content }}</main>' \
     | sudo -u deploy tee /srv/hugo/source/layouts/home.html >/dev/null
 $ printf '%s\n' '<!doctype html><title>Not found</title><h1>Not found</h1>' \
     | sudo -u deploy tee /srv/hugo/source/layouts/404.html >/dev/null
-$ printf '%s\n' "console.log('Vapache Hugo tutorial');" \
+$ printf '%s\n' "console.log('httpd-rs Hugo tutorial');" \
     | sudo -u deploy tee /srv/hugo/source/static/assets/app.js >/dev/null
 ```
 
@@ -65,7 +65,7 @@ $ test -f /srv/www/hugo/releases/2026-11-08/public/404.html
 $ test -f /srv/www/hugo/releases/2026-11-08/public/assets/app.js
 ```
 
-## 3. Configure Vapache
+## 3. Configure httpd-rs
 
 Create `/etc/apache2/sites-available/hugo.conf` with this temporary HTTP-only
 virtual host:
@@ -76,12 +76,12 @@ virtual host:
 </VirtualHost>
 ```
 
-Enable it, reload Vapache, and obtain the certificate:
+Enable it, reload httpd-rs, and obtain the certificate:
 
 ```console
 $ sudo a2ensite hugo.conf
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot certonly --apache --domain docs.example.test
 ```
 
@@ -113,11 +113,11 @@ Replace the temporary host with the final HTTP redirect and HTTPS host:
 </VirtualHost>
 ```
 
-Test the configuration, reload Vapache, and verify renewal:
+Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -143,7 +143,7 @@ Replace `/assets/app.js` with a generated static asset when the site uses a
 different path. The missing page must return `404`, the response header must
 name the `br` content encoding, and the range file must contain 32 bytes.
 
-Reload Vapache once more and repeat the home-page and range requests.
+Reload httpd-rs once more and repeat the home-page and range requests.
 
 <!--
 Deployment contract only; not operator instructions.

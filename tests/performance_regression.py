@@ -15,8 +15,8 @@ def main():
     parser.add_argument(
         "--minimum-ratio",
         type=float,
-        default=float(os.environ.get("MIN_VAPACHE_APACHE_RATIO", "0.85")),
-        help="minimum vapache/Apache requests-per-second ratio per scenario",
+        default=float(os.environ.get("MIN_HTTPD_RS_APACHE_RATIO", "0.85")),
+        help="minimum httpd-rs/Apache requests-per-second ratio per scenario",
     )
     args = parser.parse_args()
     if args.result:
@@ -43,7 +43,7 @@ def main():
                 if isinstance(raw_socket_errors, dict)
                 else raw_socket_errors
             )
-            if server == "vapache" and (failed or non2xx or socket_errors):
+            if server == "httpd-rs" and (failed or non2xx or socket_errors):
                 failures.append(
                     f"{name}/{server}: failed={failed}, non2xx={non2xx}, "
                     f"socket-errors={socket_errors}"

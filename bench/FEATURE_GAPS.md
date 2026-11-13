@@ -1,11 +1,11 @@
-# Apache 2.4 capabilities vapache does not implement
+# Apache 2.4 capabilities httpd-rs does not implement
 
-Snapshot: 2026-10-22, Apache 2.4.69 (Debian) vs. vapache 0.1.0. Based on the
+Snapshot: 2026-10-22, Apache 2.4.69 (Debian) vs. httpd-rs 0.1.0. Based on the
 README, the directive dispatch in `crates/server/src/config.rs`, the module
 list in `crates/server/src/main.rs`, the installed Apache module set, and a
 trial parse of the stock Debian `/etc/apache2/apache2.conf`.
 
-Importance is from the point of view of a sysadmin deciding whether vapache can
+Importance is from the point of view of a sysadmin deciding whether httpd-rs can
 replace an existing Apache deployment:
 
 - **Blocker** - a typical deployment cannot switch without redesigning the architecture.
@@ -28,11 +28,11 @@ MPM/core tuning directives are now recognised.
 
 ## Capability gaps
 
-| Capability | Apache mechanism | vapache status | Importance | Practical workaround |
+| Capability | Apache mechanism | httpd-rs status | Importance | Practical workaround |
 |---|---|---|---|---|
 | Reverse proxy / gateway | `mod_proxy`, `mod_proxy_http`, `mod_proxy_wstunnel`, `mod_proxy_balancer`, `ProxyPass*` | HTTP/HTTPS upstreams, FastCGI, round-robin `balancer://`, active health checks, reusable upstream connections, WebSockets over TCP/TLS, and `<Proxy>`/`<ProxyMatch>` authorization are implemented; advanced balancing policies are not | **Medium** | Use a dedicated load balancer for stickiness/failonstatus |
 | Dynamic language runtimes | `mod_php`, `mod_wsgi`, `mod_perl`, `mod_lua`, `mod_jk`/AJP, SCGI/uWSGI | FastCGI/PHP-FPM and direct CGI/1.1 are implemented; in-process language modules are not | **High** for non-PHP runtimes, lower for PHP | PHP-FPM works natively; run other runtimes behind the HTTP proxy |
-| Apache module ABI / third-party modules | `LoadModule` for any `.so` (`mod_security`, `mod_pagespeed`, `mod_evasive`, `mod_wsgi`, ...) | `LoadModule` is parsed but ignored; no Apache module ABI. Configured handlers that require an unsupported module fail closed with `500` instead of serving source | **Blocker** in module-dependent environments, **High** generally | Replace each module with an external service or a native vapache feature |
+| Apache module ABI / third-party modules | `LoadModule` for any `.so` (`mod_security`, `mod_pagespeed`, `mod_evasive`, `mod_wsgi`, ...) | `LoadModule` is parsed but ignored; no Apache module ABI. Configured handlers that require an unsupported module fail closed with `500` instead of serving source | **Blocker** in module-dependent environments, **High** generally | Replace each module with an external service or a native httpd-rs feature |
 | Balancer health / failover / pooling | `hcheck`, `failonstatus`, connection pools, sticky sessions | Active GET/HEAD health checks with passes/fails, passive dead-member skipping, sticky route cookies, `failonstatus` retry and HTTP/1.1 connection reuse are implemented; advanced health templates/policies are not | **Low** | Use a dedicated load balancer only for exotic policies |
 | Apache expression engine | `Require expr`, `<If>`, `<IfFile>` | Implemented for common comparisons, boolean logic, regex captures, variables, file/IP/glob tests and string/hash/base64 functions; rare forms and `LogMessage` interpolation are missing | **Medium** | Rewrite complex expressions as supported `Require`/rewrite rules |
 | Full `mod_rewrite` | `RewriteMap` (txt/rnd/prg/dbm/int), all flags including `[B]`/`[BCTLS]`/`[CO]`/`[E]`/`[H]`/`[DPI]`, full inheritance | Core rules, maps (`txt`/`rnd`/`prg`/`int`), `[C]`/`[S]`/`[N]`/`[QSD]`/`[QSL]`, `RewriteCond expr`, `RewriteOptions Inherit`, query escaping, `[B]`/`[BNE]`/`[BCTLS]`/`[BNP]`, `[CO]`/`[E]`/`[H]`/`[T]`, `[P]`, `Vary`, `UnsafeAllow3F`, and `UnsafePrefixStat`; `dbm` maps and exact `[DPI]` path-info handling are missing | **Low** | Most CMS `.htaccess` rules and proxy/cookie rewrites now work; avoid `dbm` maps and per-directory `[DPI]` |
@@ -42,7 +42,7 @@ MPM/core tuning directives are now recognised.
 | TLS automation and advanced TLS | `mod_md`/ACME, `SSLVerifyClient`, `SSLRequire`/`SSLRequireSSL`, OCSP stapling, CRL, session cache/tickets, cipher-policy directives | mTLS, OCSP stapling from AIA or `SSLStaplingForceURL`, response refresh and warm-start persistence work; CRL, session cache/tickets, `SSLRequire*` and external ACME do not | **Medium** for ACME; **Low** for OCSP | Use external ACME/restart; use strict mode for ignored TLS directives |
 | WAF / request inspection | `mod_security` (`SecRuleEngine`, `SecRule`, ...) | Directives are recognised but ignored | **High** in PCI/regulated environments | External WAF/CDN; do not rely on compat mode |
 | Real client IP behind a proxy | `mod_remoteip`, `RemoteIPHeader`, `RemoteIPInternalProxy` | Implemented for trusted proxy addresses | Closed | — |
-| Per-user CGI | `mod_suexec`, `SuexecUserGroup` | Not implemented; CGI runs as the server user with `PR_SET_NO_NEW_PRIVS` | **High** for shared hosting, **Low** for single-site | Separate vapache instances/users, or an external CGI runner |
+| Per-user CGI | `mod_suexec`, `SuexecUserGroup` | Not implemented; CGI runs as the server user with `PR_SET_NO_NEW_PRIVS` | **High** for shared hosting, **Low** for single-site | Separate httpd-rs instances/users, or an external CGI runner |
 | `mod_expires` / cache headers | `ExpiresActive`, `ExpiresByType`, `ExpiresDefault` | Implemented, including access/modification bases and max-age | Closed | — |
 | HTTP caching | `mod_cache`, `mod_cache_disk`, `mod_cache_socache`, `mod_file_cache` | Disk/memory cache with `CacheEnable`/`CacheDisable`, expiration, size limits, `CacheHeader`, `Age`, conditional hits, warm-start metadata and invalidation; `socache` and `file_cache` are not implemented | **Low** | Use a CDN for shared cache or `mod_cache_socache` topologies |
 | Header and environment manipulation | Full `mod_headers` (`append`, `merge`, `edit`, `echo`), `RequestHeader`, `SetEnv`, `SetEnvIf`, `PassEnv`, `UnsetEnv` | `Header set/add/unset` only; environment directives are ignored | **Medium** | Limited header policy; CGI environment is intentionally minimal |
@@ -50,7 +50,7 @@ MPM/core tuning directives are now recognised.
 | Access-control expressions | `Require expr`, `Require env`, `<Limit>`/`<LimitExcept>`, `Satisfy`, `AllowMethods`, `AuthMerging`, `<Proxy>` auth | `Require ip/host/method/local/user/group`, `Require expr`, `Require env`, `RequireAll/Any/None`, method-scoped `<Limit>`/`<LimitExcept>`, legacy `Satisfy`, `AuthMerging And/Or`, `AllowMethods`, and `<Proxy>`/`<ProxyMatch>` authorization are supported | Closed | — |
 | Monitoring and introspection | `mod_status` (`/server-status`), `mod_info`, scoreboard, `ExtendedStatus` | Basic `/server-status` and `?auto` implemented; `mod_info` and scoreboard are not | **Medium** | External health checks, metrics from logs, and process monitoring |
 | MPM and server tuning | `StartServers`, `Min/MaxSpareThreads`, `ThreadsPerChild`, `MaxRequestWorkers`, `ServerLimit`, `MaxConnectionsPerChild`, `ListenBacklog`, `RLimit*` | `MaxRequestWorkers`/`ServerLimit` and `ListenBacklog` are enforced; spare-thread/MPM process tuning is irrelevant to the thread-per-connection model | **Low** | Tune OS/file-descriptor limits and `MaxRequestWorkers` |
-| DoS / request controls | `mod_reqtimeout`, `mod_ratelimit`, `mod_buffer` | `RequestReadTimeout` header/body deadlines, header `MinRate`, `MaxRequestWorkers`, header/body size limits and keep-alive limits are enforced; full body `MinRate` shaping and `mod_ratelimit` are not | **Medium** for hostile public edges | Enforce full rate shaping at the load balancer; use request limits in vapache |
+| DoS / request controls | `mod_reqtimeout`, `mod_ratelimit`, `mod_buffer` | `RequestReadTimeout` header/body deadlines, header `MinRate`, `MaxRequestWorkers`, header/body size limits and keep-alive limits are enforced; full body `MinRate` shaping and `mod_ratelimit` are not | **Medium** for hostile public edges | Enforce full rate shaping at the load balancer; use request limits in httpd-rs |
 | SPA fallback | `FallbackResource` | Recognised but not applied | **Medium** | A supported `RewriteRule` fallback or `ErrorDocument` |
 | Mass vhosts / user directories | `mod_vhost_alias`, `mod_userdir` | Not implemented | **Low-Medium** | Generate explicit vhosts; keep user content outside the docroot |
 | SSI and content negotiation | `mod_include` (`Options +Includes`), `mod_negotiation` (MultiViews, `LanguagePriority`) | SSI filters (`SetOutputFilter`/`AddOutputFilter* INCLUDES`) fail closed with `500`; `Options +Includes` alone does not process includes; MultiViews/negotiation directives are ignored | **Low-Medium** | Preprocess pages; avoid MultiViews; use a dedicated SSI step |
@@ -64,7 +64,7 @@ MPM/core tuning directives are now recognised.
 
 ## What is already strong
 
-The gap list is long, but it is not the whole story. vapache already covers the
+The gap list is long, but it is not the whole story. httpd-rs already covers the
 following well enough for a static or CGI-backed site:
 
 - gzip/Brotli compression and FastCGI/PHP-FPM, plus HTTP/HTTPS reverse
@@ -82,7 +82,7 @@ following well enough for a static or CGI-backed site:
 - Strict HTTP/1.1 parsing, keep-alive, pipelining, CGI, logging, privilege
   dropping, and a large set of Apache-compatible core directives.
 
-For a static site with simple rewrites and Basic auth, vapache is a credible
+For a static site with simple rewrites and Basic auth, httpd-rs is a credible
 faster, lower-memory replacement. It is now also a credible front door for
 PHP-FPM, HTTP/HTTPS app servers and round-robin backends, with gzip/Brotli
 compression and WebSockets over TCP/TLS. Remaining migration blockers are

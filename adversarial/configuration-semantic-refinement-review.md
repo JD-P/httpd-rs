@@ -74,7 +74,7 @@ tables, preventing schema drift between the two compilers.
 
 ## Evidence
 
-- `cargo verus verify -p vapache-verified`: 711 verified functions, 0 errors.
+- `cargo verus verify -p httpd-rs-verified`: 711 verified functions, 0 errors.
 - `tests/verification_status.py --run-verus`: proof gate passes with no proof
   escapes.
 - Unit tests cover all 46 kind tags, wrong-domain projections, malformed and
@@ -87,7 +87,7 @@ tables, preventing schema drift between the two compilers.
 ## Remaining external boundary
 
 This is an internal refinement proof, not a formal specification of the
-Apache C implementation. It proves that Vapache preserves its selected
+Apache C implementation. It proves that httpd-rs preserves its selected
 semantic domain from schema through typed IR to compiler consumption and
 mechanizes the primitive normalizers above. Complex safe-Rust constructors
 such as regular expressions, authorization expressions and rewrite syntax are

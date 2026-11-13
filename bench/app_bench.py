@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PHP-FPM and Gunicorn application benchmark against Apache and vapache.
+"""PHP-FPM and Gunicorn application benchmark against Apache and httpd-rs.
 
 This fixture exercises the production-shaped dynamic paths rather than the
 native-CGI and mock-proxy paths in feature_bench.py:
@@ -16,7 +16,7 @@ Usage:
     python3 bench/app_bench.py --only php
     python3 bench/app_bench.py --only gunicorn --keep
 
-Requires: apache2, target/release/vapached, wrk and php-fpm. Gunicorn is
+Requires: apache2, target/release/httpd-rs, wrk and php-fpm. Gunicorn is
 required only when its scenario is selected.
 """
 
@@ -37,10 +37,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench"
-DEFAULT_RUN = "/run/vapache-app-bench" if os.geteuid() == 0 else "/tmp/vapache-app-bench"
-RUN = Path(os.environ.get("VAPACHE_APP_BENCH_RUN", DEFAULT_RUN))
+DEFAULT_RUN = "/run/httpd-rs-app-bench" if os.geteuid() == 0 else "/tmp/httpd-rs-app-bench"
+RUN = Path(os.environ.get("HTTPD_RS_APP_BENCH_RUN", DEFAULT_RUN))
 APACHE = os.environ.get("APACHE") or shutil.which("apache2") or "/usr/sbin/apache2"
-VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target" / "release" / "httpd-rs"))
 WRK = os.environ.get("WRK") or shutil.which("wrk")
 GUNICORN = os.environ.get("GUNICORN") or shutil.which("gunicorn")
 PHP_FPM = os.environ.get("PHP_FPM") or shutil.which("php-fpm")
@@ -56,7 +56,7 @@ AP_PORT, VP_PORT = 19080, 19081
 GUNICORN_PORT = 19090
 
 SCENARIOS = [
-    # Vapache admits at most eight concurrent dynamic requests from one client.
+    # httpd-rs admits at most eight concurrent dynamic requests from one client.
     # Loopback is one identity, so a higher benchmark concurrency measures the
     # deliberate overload response rather than backend throughput.
     dict(name="PHP-FPM /index.php", path="/index.php", marker=b"php-fpm", conc=8),
@@ -73,8 +73,8 @@ def check_tools(needs_gunicorn):
     missing = []
     if not Path(APACHE).exists() and shutil.which(APACHE) is None:
         missing.append("apache2")
-    if not VAPACHED.exists():
-        missing.append(str(VAPACHED.relative_to(ROOT)))
+    if not HTTPD_RS.exists():
+        missing.append(str(HTTPD_RS.relative_to(ROOT)))
     if not WRK:
         missing.append("wrk")
     if not PHP_FPM:
@@ -92,7 +92,7 @@ def make_fixture():
         RUN / "wsgi",
         RUN / "fpm",
         RUN / "apache" / "logs",
-        RUN / "vapache" / "logs",
+        RUN / "httpd-rs" / "logs",
     ]:
         d.mkdir(parents=True, exist_ok=True)
     shutil.copy2(BENCH / "php-app" / "index.php", RUN / "www" / "index.php")
@@ -183,13 +183,13 @@ def common_config_lines(port, docroot, php_socket, apache):
             f"LoadModule proxy_http_module {moddir}/mod_proxy_http.so",
             f"LoadModule dir_module {moddir}/mod_dir.so",
         ]
-    vapache_security = [] if apache else [
-        "VapacheCapability FastCgi On",
-        f"VapacheFastCGIStablePath On unix:{php_socket} {BACKEND_UID} {BACKEND_UID} 0",
+    httpd_rs_security = [] if apache else [
+        "HttpdRsCapability FastCgi On",
+        f"HttpdRsFastCGIStablePath On unix:{php_socket} {BACKEND_UID} {BACKEND_UID} 0",
     ]
     return "\n".join(
         modules
-        + vapache_security
+        + httpd_rs_security
         + [
             f"Listen {port}",
             "ServerName app-bench.local",
@@ -218,7 +218,7 @@ def write_server_configs():
     docroot = str(RUN / "www")
     php_socket = str(RUN / "fpm" / "php.sock")
     apache_cfg = RUN / "apache" / "httpd.conf"
-    vapache_cfg = RUN / "vapache" / "httpd.conf"
+    httpd_rs_cfg = RUN / "httpd-rs" / "httpd.conf"
     apache_cfg.write_text(
         f"""ServerRoot "{RUN}/apache"
 PidFile "{RUN}/apache/logs/httpd.pid"
@@ -229,17 +229,17 @@ Group {BENCH_GROUP}
 """
         + common_config_lines(AP_PORT, docroot, php_socket, True)
     )
-    vapache_cfg.write_text(
-        f"""ServerRoot "{RUN}/vapache"
-PidFile "{RUN}/vapache/logs/httpd.pid"
-ErrorLog "{RUN}/vapache/logs/error.log"
+    httpd_rs_cfg.write_text(
+        f"""ServerRoot "{RUN}/httpd-rs"
+PidFile "{RUN}/httpd-rs/logs/httpd.pid"
+ErrorLog "{RUN}/httpd-rs/logs/error.log"
 LogLevel warn
 User {BENCH_USER}
 Group {BENCH_GROUP}
 """
         + common_config_lines(VP_PORT, docroot, php_socket, False)
     )
-    return apache_cfg, vapache_cfg
+    return apache_cfg, httpd_rs_cfg
 
 
 def probe(port, path, marker):
@@ -307,21 +307,21 @@ def main():
     if (
         needs_php
         and os.geteuid() != 0
-        and os.environ.get("VAPACHE_APP_BENCH_PREPARED_STABLE_PATH") != "1"
+        and os.environ.get("HTTPD_RS_APP_BENCH_PREPARED_STABLE_PATH") != "1"
     ):
         die(
             "the secure PHP benchmark must run as root so its fixture can live "
             "under root-owned /run; alternatively pre-provision a stable path and "
-            "set VAPACHE_APP_BENCH_RUN plus VAPACHE_APP_BENCH_PREPARED_STABLE_PATH=1"
+            "set HTTPD_RS_APP_BENCH_RUN plus HTTPD_RS_APP_BENCH_PREPARED_STABLE_PATH=1"
         )
     check_tools(needs_gunicorn)
 
     make_fixture()
     fpm_cfg = write_fpm_config()
-    apache_cfg, vapache_cfg = write_server_configs()
+    apache_cfg, httpd_rs_cfg = write_server_configs()
 
-    fpm = gunicorn = apache = vapache = None
-    fpm_log = gunicorn_log = apache_log = vapache_log = None
+    fpm = gunicorn = apache = httpd_rs = None
+    fpm_log = gunicorn_log = apache_log = httpd_rs_log = None
     try:
         fpm, fpm_log = start([PHP_FPM, "-F", "-y", str(fpm_cfg)], RUN / "fpm" / "stdout.log")
         if not wait_unix(RUN / "fpm" / "php.sock"):
@@ -351,25 +351,25 @@ def main():
         apache, apache_log = start(
             [APACHE, "-f", str(apache_cfg), "-DFOREGROUND"], RUN / "apache" / "stdout.log"
         )
-        vapache, vapache_log = start(
-            [str(VAPACHED), "-f", str(vapache_cfg), "-DFOREGROUND"],
-            RUN / "vapache" / "stdout.log",
+        httpd_rs, httpd_rs_log = start(
+            [str(HTTPD_RS), "-f", str(httpd_rs_cfg), "-DFOREGROUND"],
+            RUN / "httpd-rs" / "stdout.log",
         )
         if not wait_tcp(AP_PORT) or not wait_tcp(VP_PORT):
-            die("front-end server did not bind ports (see /tmp/vapache-app-bench/*/stdout.log)")
+            die("front-end server did not bind ports (see /tmp/httpd-rs-app-bench/*/stdout.log)")
 
         for sc in selected:
             a_status, _, a_marker = probe(AP_PORT, sc["path"], sc["marker"])
             v_status, _, v_marker = probe(VP_PORT, sc["path"], sc["marker"])
-            print(f"probe {sc['name']}: apache={a_status} vapache={v_status}")
+            print(f"probe {sc['name']}: apache={a_status} httpd-rs={v_status}")
             if a_status != 200 or v_status != 200 or not a_marker or not v_marker:
                 die(f"fixture probe failed for {sc['name']}")
 
         rows = []
-        print(f"\n{'scenario':30} {'apache rps':>12} {'vapache rps':>12} {'ratio':>7} {'a mean':>8} {'v mean':>8}")
+        print(f"\n{'scenario':30} {'apache rps':>12} {'httpd-rs rps':>12} {'ratio':>7} {'a mean':>8} {'v mean':>8}")
         for sc in selected:
             row = dict(name=sc["name"], path=sc["path"], servers={})
-            endpoints = (("apache", AP_PORT), ("vapache", VP_PORT))
+            endpoints = (("apache", AP_PORT), ("httpd-rs", VP_PORT))
             for _, port in endpoints:
                 measure(port, sc["path"], max(0.5, duration / 2), sc["conc"])
             collected = {server: [] for server, _ in endpoints}
@@ -388,12 +388,12 @@ def main():
                 vals.sort(key=lambda x: x["rps"] or 0)
                 row["servers"][server] = vals[len(vals) // 2]
             a = row["servers"]["apache"]["rps"] or 0
-            v = row["servers"]["vapache"]["rps"] or 0
+            v = row["servers"]["httpd-rs"]["rps"] or 0
             row["ratio"] = v / a if a else None
             rows.append(row)
             print(
                 f"{sc['name']:30} {a:12.0f} {v:12.0f} {row['ratio'] or 0:7.2f}x "
-                f"{row['servers']['apache']['mean_ms'] or 0:8.2f} {row['servers']['vapache']['mean_ms'] or 0:8.2f}",
+                f"{row['servers']['apache']['mean_ms'] or 0:8.2f} {row['servers']['httpd-rs']['mean_ms'] or 0:8.2f}",
                 flush=True,
             )
 
@@ -414,11 +414,11 @@ def main():
             f"Method: {samples} x {duration:g}s samples per server after warm-up; "
             "PHP-FPM over a Unix socket, Gunicorn with 8 sync workers behind the "
             "HTTP proxy; access logs disabled.\n\n",
-            "| scenario | apache req/s | vapache req/s | ratio | apache mean ms | vapache mean ms | apache p99 ms | vapache p99 ms |",
+            "| scenario | apache req/s | httpd-rs req/s | ratio | apache mean ms | httpd-rs mean ms | apache p99 ms | httpd-rs p99 ms |",
             "|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for row in rows:
-            a, v = row["servers"]["apache"], row["servers"]["vapache"]
+            a, v = row["servers"]["apache"], row["servers"]["httpd-rs"]
             lines.append(
                 f"| {row['name']} | {a['rps'] or 0:.0f} | {v['rps'] or 0:.0f} | "
                 f"{row['ratio'] or 0:.2f}x | {a['mean_ms'] or 0:.2f} | {v['mean_ms'] or 0:.2f} | "
@@ -428,15 +428,15 @@ def main():
             "\n## Reading the numbers\n",
             "- Both handlers are deliberately trivial; this isolates the front-end/FastCGI/proxy hop rather than application work.",
             "- PHP-FPM uses a Unix socket and is the production-shaped PHP path. Native `php-cgi` is not used here.",
-            "- Vapache's PHP result keeps its stable-path ownership, writeability, ACL, endpoint-inode and peer-credential checks enabled; Apache does not perform an equivalent per-request proof.",
-            "- Gunicorn uses eight default sync workers; vapache intentionally does not pool backend connections without strict response-framing checks. A real WSGI request with application latency will spend most of its time in the app, not this hop.",
+            "- httpd-rs's PHP result keeps its stable-path ownership, writeability, ACL, endpoint-inode and peer-credential checks enabled; Apache does not perform an equivalent per-request proof.",
+            "- Gunicorn uses eight default sync workers; httpd-rs intentionally does not pool backend connections without strict response-framing checks. A real WSGI request with application latency will spend most of its time in the app, not this hop.",
             "- Run-to-run variance is material on a shared host; the ratios are more useful than absolute req/s.",
         ]
         report.write_text("\n".join(lines) + "\n")
         print(f"\nresults: {results / f'app-{stamp}.json'}\nreport:  {report}")
     finally:
         if not args.keep:
-            stop(vapache, vapache_log)
+            stop(httpd_rs, httpd_rs_log)
             stop(apache, apache_log)
             stop(gunicorn, gunicorn_log)
             stop(fpm, fpm_log)

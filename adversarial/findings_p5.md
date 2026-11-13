@@ -1,7 +1,7 @@
-# vapache adversarial findings — Pass 5
+# httpd-rs adversarial findings — Pass 5
 
 **Target:** `HEAD 9a7809c` (`Add tests`), release binary
-`target/release/vapached` rebuilt from the checked-out tree before testing.
+`target/release/httpd-rs` rebuilt from the checked-out tree before testing.
 Repository source was not modified for this pass.
 
 **Environment:** Linux, loopback only. Apache 2.4.69 (Debian) was used as the
@@ -11,13 +11,13 @@ IP address, or real web server was involved.
 **Status of this pass:** F46, F47, F48 and F49 were reproduced end-to-end
 against the current release binary. All four are Apache differentials where the
 Apache configuration is valid (`apache2 -t` says `Syntax OK`) and Apache
-enforces a security policy that vapache does not.
+enforces a security policy that httpd-rs does not.
 
 ## Top exploit chains (wallet-shaped deployments)
 
 1. **F46 — ACL inversion.** A wallet/admin directory protects itself by
    rejecting a list of networks with Apache's documented
-   `<RequireNone>Require ip ...</RequireNone>` idiom. vapache combines the
+   `<RequireNone>Require ip ...</RequireNone>` idiom. httpd-rs combines the
    providers with AND instead of OR, so a client that matches *one* blocked
    network and misses the others is let through. Any address matching at least
    one entry in a multi-network block list (the normal case for disjoint
@@ -26,15 +26,15 @@ enforces a security policy that vapache does not.
    publishes a private wallet file, CGI, or PHP target with the valid regex
    alias form `AliasMatch "^/wallet$" "/srv/private/wallet.dat/"` (or
    `ScriptAliasMatch .../run.cgi/`). The trailing slash is the only difference
-   from an ordinary file alias; vapache skips the target directory's
+   from an ordinary file alias; httpd-rs skips the target directory's
    `.htaccess`, serves the static bytes, or executes the protected CGI.
 3. **F48 — loopback-bound admin vhost exposure.** A normal mixed virtual-host
    layout has a wildcard `Listen 80`, a public `<VirtualHost *:80>`, and an
-   administrative `<VirtualHost 127.0.0.1:80>`. vapache ignores the destination
+   administrative `<VirtualHost 127.0.0.1:80>`. httpd-rs ignores the destination
    address when selecting a virtual host. Sending `Host: admin.internal` to the
    public address selects the loopback-bound administrative document root.
 4. **F49 — IP denylist bypass on dual-stack listeners.** A server listening on
-   `[::]` sees IPv4 clients as `::ffff:a.b.c.d`. vapache's IP matcher only
+   `[::]` sees IPv4 clients as `::ffff:a.b.c.d`. httpd-rs's IP matcher only
    compares IPv4-to-IPv4 or IPv6-to-IPv6, so an IPv4 client is never seen as
    belonging to an IPv4 `Require not ip` network. A deny rule such as
    `Require not ip 127.0.0.0/8` therefore allows the very clients it is meant
@@ -56,7 +56,7 @@ enforces a security policy that vapache does not.
 ## Impact
 
 Apache's `<RequireNone>` means "fail if **any** contained provider is
-satisfied". vapache evaluates every child and feeds the results through
+satisfied". httpd-rs evaluates every child and feeds the results through
 `combine_and()` before applying `require_none_result()`. A mix of one matching
 and one non-matching child therefore becomes `Denied`, which
 `require_none_result()` turns into `Neutral` — the exact opposite of a denial.
@@ -76,7 +76,7 @@ is:
 ```
 
 A client from `10.1.2.3` satisfies the first provider but not the other two.
-Apache denies the request. vapache treats the result as Neutral and the outer
+Apache denies the request. httpd-rs treats the result as Neutral and the outer
 `RequireAll` grants access. The same is true for every individual network in
 the block list.
 
@@ -107,11 +107,11 @@ DocumentRoot "$D/www"
 </Directory>
 EOF
 
-./target/release/vapached -f "$D/vp.conf" -DFOREGROUND &
+./target/release/httpd-rs -f "$D/vp.conf" -DFOREGROUND &
 curl -i http://127.0.0.1:19223/wallet.dat
 ```
 
-Observed from vapache:
+Observed from httpd-rs:
 
 ```text
 HTTP/1.1 200 OK
@@ -122,7 +122,7 @@ WALLET-REQUIRENONE-SECRET
 
 Apache 2.4.69 with the identical section returns `403 Forbidden`. The policy
 intends to block both `10.0.0.0/8` and loopback; a loopback request matches the
-second provider, but because it does not also match the first, vapache allows
+second provider, but because it does not also match the first, httpd-rs allows
 it. A remote client in `10.0.0.0/8` is allowed by exactly the same asymmetry.
 
 ## Root cause
@@ -188,7 +188,7 @@ ScriptAliasMatch "^/run$" "/srv/private/secret.cgi/"
 ```
 
 Apache accepts both configurations (`apache2 -t` reports `Syntax OK`) and
-applies the target directory's `.htaccess`. vapache stores the regex alias base
+applies the target directory's `.htaccess`. httpd-rs stores the regex alias base
 as the file itself because `prefix.ends_with('/')` is true, `map_path()` returns
 `(file, "")`, and `access_root_for()` only converts prefix aliases to a
 parent-directory root:
@@ -224,11 +224,11 @@ DocumentRoot "$D/www"
 AliasMatch "^/wallet\$" "$D/private/wallet.dat/"
 EOF
 
-./target/release/vapached -f "$D/vp.conf" -DFOREGROUND &
+./target/release/httpd-rs -f "$D/vp.conf" -DFOREGROUND &
 curl -i http://127.0.0.1:19219/wallet
 ```
 
-Observed from vapache:
+Observed from httpd-rs:
 
 ```text
 HTTP/1.1 200 OK
@@ -264,11 +264,11 @@ DocumentRoot "$D/www"
 ScriptAliasMatch "^/run\$" "$D/private/secret.cgi/"
 EOF
 
-./target/release/vapached -f "$D/vp.conf" -DFOREGROUND &
+./target/release/httpd-rs -f "$D/vp.conf" -DFOREGROUND &
 curl -i http://127.0.0.1:19221/run
 ```
 
-Observed from vapache:
+Observed from httpd-rs:
 
 ```text
 HTTP/1.1 200 OK
@@ -329,7 +329,7 @@ It then selects from those candidates by the client-controlled `Host` header.
 The destination local address (`local_ip`) is available at every call site but
 is never passed in. Apache treats `127.0.0.1:80` and `*:80` as different
 address/port buckets; a vhost bound to loopback is not eligible for a request
-that arrived on a public interface. vapache ignores the binding and lets
+that arrived on a public interface. httpd-rs ignores the binding and lets
 `Host: admin.internal` select the loopback vhost from the wildcard listener.
 
 This defeats the common isolation pattern:
@@ -378,11 +378,11 @@ DocumentRoot "$D/public"
 </VirtualHost>
 EOF
 
-./target/release/vapached -f "$D/vp.conf" -DFOREGROUND &
+./target/release/httpd-rs -f "$D/vp.conf" -DFOREGROUND &
 curl -s -H 'Host: admin.local' http://127.0.0.2:19213/
 ```
 
-Observed from vapache:
+Observed from httpd-rs:
 
 ```text
 200
@@ -392,7 +392,7 @@ WALLET-ADMIN-SECRET
 Apache 2.4.69 with the equivalent configuration and the same request returns
 `200 WALLET-PUBLIC`: the loopback-bound vhost is not eligible on `127.0.0.2`.
 The reverse direction differs as well (Apache prefers the address-specific
-admin vhost on `127.0.0.1` even for `Host: public.local`, while vapache follows
+admin vhost on `127.0.0.1` even for `Host: public.local`, while httpd-rs follows
 the Host header), confirming that the entire address-specific selection rule
 is missing rather than just a default-host ordering issue.
 
@@ -475,11 +475,11 @@ DocumentRoot "$D/www"
 </Directory>
 EOF
 
-./target/release/vapached -f "$D/vp.conf" -DFOREGROUND &
+./target/release/httpd-rs -f "$D/vp.conf" -DFOREGROUND &
 curl -g -i http://127.0.0.1:19215/
 ```
 
-Observed from vapache:
+Observed from httpd-rs:
 
 ```text
 HTTP/1.1 200 OK

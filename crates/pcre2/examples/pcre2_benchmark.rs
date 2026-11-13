@@ -1,12 +1,12 @@
-//! Reproducible microbenchmark for the vapache compatibility engine and the
-//! PCRE2 10.46 C oracle. Run with `cargo run -p vapache-pcre2 --release
+//! Reproducible microbenchmark for the httpd-rs compatibility engine and the
+//! PCRE2 10.46 C oracle. Run with `cargo run -p httpd-rs-pcre2 --release
 //! --example pcre2_benchmark`.
 
 use std::hint::black_box;
 use std::time::Instant;
 
+use httpd_rs_pcre2::bytes as v;
 use pcre2_c_oracle::bytes as c;
-use vapache_pcre2::bytes as v;
 
 struct Case {
     name: &'static str,
@@ -72,7 +72,7 @@ fn main() {
         },
     ];
 
-    println!("case,operation,vapache_ns,c_interpreter_ns,c_jit_ns,vapache_over_c_interpreter");
+    println!("case,operation,httpd_rs_ns,c_interpreter_ns,c_jit_ns,httpd_rs_over_c_interpreter");
     for case in &cases {
         let compile_iterations = 250;
         let v_compile_ns = sample(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""External HTTP/2 and TLS protocol checks against a real vapached process."""
+"""External HTTP/2 and TLS protocol checks against a real httpd-rs process."""
 
 import argparse
 import grp
@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target/release/vapached"))
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target/release/httpd-rs"))
 SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
 SERVICE_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
 
@@ -28,20 +28,20 @@ def wait_for_port(port, process):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError(f"vapached exited with {process.returncode}")
+            raise RuntimeError(f"httpd-rs exited with {process.returncode}")
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                 return
         except OSError:
             time.sleep(0.05)
-    raise RuntimeError("timed out waiting for vapached")
+    raise RuntimeError("timed out waiting for httpd-rs")
 
 
 def start_tls_server(base, protocols="h2 http/1.1"):
     base = Path(base)
     (base / "logs").mkdir()
     (base / "www").mkdir()
-    (base / "www/index.html").write_text("vapache protocol test\n")
+    (base / "www/index.html").write_text("httpd-rs protocol test\n")
     cert = base / "cert.pem"
     key = base / "key.pem"
     subprocess.run([
@@ -53,7 +53,7 @@ def start_tls_server(base, protocols="h2 http/1.1"):
     config = base / "httpd.conf"
     config.write_text(f'''ServerRoot "{base}"
 Listen 127.0.0.1:{port}
-PidFile "{base}/logs/vapached.pid"
+PidFile "{base}/logs/httpd-rs.pid"
 ErrorLog "{base}/logs/error.log"
 User {SERVICE_USER}
 Group {SERVICE_GROUP}
@@ -76,7 +76,7 @@ DocumentRoot "{base}/www"
 ''')
     output = (base / "logs/process.log").open("wb")
     process = subprocess.Popen(
-        [str(VAPACHED), "-f", str(config), "-DFOREGROUND"],
+        [str(HTTPD_RS), "-f", str(config), "-DFOREGROUND"],
         cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
     )
     try:
@@ -133,7 +133,7 @@ def check_tls(port):
 
 
 def check_alpn_policy():
-    with tempfile.TemporaryDirectory(prefix="vapache-http1-only-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="httpd-rs-http1-only-") as temporary:
         process, output, port = start_tls_server(temporary, "http/1.1")
         try:
             with tls_connection(
@@ -144,7 +144,7 @@ def check_alpn_policy():
         finally:
             stop_tls_server(process, output)
 
-    with tempfile.TemporaryDirectory(prefix="vapache-h2-only-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="httpd-rs-h2-only-") as temporary:
         process, output, port = start_tls_server(temporary, "h2")
         try:
             with tls_connection(
@@ -175,11 +175,11 @@ def main():
     args = parser.parse_args()
     if not args.h2spec and not args.tls:
         parser.error("select --h2spec or --tls")
-    if not VAPACHED.is_file():
-        raise SystemExit(f"missing vapached binary: {VAPACHED}")
+    if not HTTPD_RS.is_file():
+        raise SystemExit(f"missing httpd-rs binary: {HTTPD_RS}")
 
     if args.tls:
-        with tempfile.TemporaryDirectory(prefix="vapache-protocol-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="httpd-rs-protocol-") as temporary:
             process, output, port = start_tls_server(temporary)
             try:
                 check_tls(port)
@@ -208,7 +208,7 @@ def main():
         # those across unrelated sections tests the production per-source
         # connection reserve instead of the protocol behavior under test.
         for group in h2spec_groups:
-            with tempfile.TemporaryDirectory(prefix="vapache-h2spec-") as temporary:
+            with tempfile.TemporaryDirectory(prefix="httpd-rs-h2spec-") as temporary:
                 process, output, port = start_tls_server(temporary)
                 try:
                     subprocess.run([

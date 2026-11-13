@@ -1,4 +1,4 @@
-VapacheCapability AccessFiles On
+HttpdRsCapability AccessFiles On
 Listen 127.0.0.1:0
 DocumentRoot /tmp
 <Directory /tmp>

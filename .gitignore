@@ -1,11 +1,12 @@
 # Cargo build output
-/target/
+**/target/
 /release/
 /fuzz/target/
 /fuzz/artifacts/
 /fuzz/coverage/
 /fuzz/semantic-*.json
 /.fuzz-long/
+/site/
 
 # LLVM raw coverage profiles from tests/coverage.sh
 *.profraw

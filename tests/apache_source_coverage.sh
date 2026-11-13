@@ -40,7 +40,7 @@ PY
 URL=$(read_pin archive_url)
 EXPECTED=$(read_pin archive_sha256)
 RELEASE=$(read_pin release)
-WORK=${APACHE_COVERAGE_WORK:-$(mktemp -d /tmp/vapache-apache-coverage.XXXXXX)}
+WORK=${APACHE_COVERAGE_WORK:-$(mktemp -d /tmp/httpd-rs-apache-coverage.XXXXXX)}
 KEEP=${APACHE_COVERAGE_KEEP:-0}
 if [[ $KEEP != 1 ]]; then
     trap 'rm -rf "$WORK"' EXIT HUP INT TERM
@@ -140,10 +140,10 @@ module_args=(
     make install
 )
 
-cargo build --locked --release -p vapached
+cargo build --locked --release -p httpd-rs
 export APACHE=$PREFIX/bin/httpd
 export APACHE_MODDIR=$PREFIX/modules
-export VAPACHED=$PWD/target/release/vapached
+export HTTPD_RS=$PWD/target/release/httpd-rs
 export PYTHONDONTWRITEBYTECODE=1
 
 python3 tests/apache_warrant.py --check-binary

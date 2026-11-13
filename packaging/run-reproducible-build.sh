@@ -21,7 +21,7 @@ source_date_epoch=${SOURCE_DATE_EPOCH:-$(git -C "$repo_root" log -1 --format=%ct
     exit 1
 }
 
-image=vapache-reproducible-builder:rust-1.99.1-debian-20261104
+image=httpd-rs-reproducible-builder:rust-1.99.1-debian-20261104
 build_secrets=()
 if [[ -n "${CODEX_PROXY_CERT:-}" && -r "$CODEX_PROXY_CERT" ]]; then
     build_secrets+=(--secret "id=proxy_ca,src=$CODEX_PROXY_CERT")
@@ -41,18 +41,18 @@ docker run --rm --network none \
     --env CARGO_NET_OFFLINE=true \
     --env HOME=/tmp \
     --env SOURCE_DATE_EPOCH="$source_date_epoch" \
-    --env VAPACHE_BUILD_UID="$(id -u)" \
-    --env VAPACHE_BUILD_GID="$(id -g)" \
+    --env HTTPD_RS_BUILD_UID="$(id -u)" \
+    --env HTTPD_RS_BUILD_GID="$(id -g)" \
     --mount "type=bind,src=$repo_root,dst=/src" \
     --workdir /src \
     "$image" \
     bash -c '
         set -euo pipefail
         cp -a /usr/local/cargo /tmp/cargo-home
-        chown -R "$VAPACHE_BUILD_UID:$VAPACHE_BUILD_GID" /tmp/cargo-home
+        chown -R "$HTTPD_RS_BUILD_UID:$HTTPD_RS_BUILD_GID" /tmp/cargo-home
         exec setpriv \
-            --reuid="$VAPACHE_BUILD_UID" \
-            --regid="$VAPACHE_BUILD_GID" \
+            --reuid="$HTTPD_RS_BUILD_UID" \
+            --regid="$HTTPD_RS_BUILD_GID" \
             --clear-groups \
             env CARGO_HOME=/tmp/cargo-home \
             /src/tests/reproducible_build.sh "$@"

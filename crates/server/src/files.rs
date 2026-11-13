@@ -42,7 +42,7 @@ fn openat2_file(dir: &File, path: &CStr, how: &OpenHow) -> io::Result<File> {
     const MAX_TRANSIENT_RETRIES: usize = 8;
     for attempt in 0..=MAX_TRANSIENT_RETRIES {
         let result = crate::fault::hit("fs.openat2").and_then(|()| {
-            vapache_os::openat2(dir.as_fd(), path, how.flags, how.mode, how.resolve)
+            httpd_rs_os::openat2(dir.as_fd(), path, how.flags, how.mode, how.resolve)
         });
         let error = match result {
             Ok(file) => return Ok(file),
@@ -63,12 +63,12 @@ pub fn make_admin_dir_root_owned(dir: &File, mode: libc::mode_t) -> io::Result<(
     if effective_uid() != 0 {
         return Ok(());
     }
-    vapache_os::fchown(dir.as_fd(), 0, 0)?;
-    vapache_os::fchmod(dir.as_fd(), mode)
+    httpd_rs_os::fchown(dir.as_fd(), 0, 0)?;
+    httpd_rs_os::fchmod(dir.as_fd(), mode)
 }
 
 pub(crate) fn effective_uid() -> u32 {
-    vapache_os::effective_uid()
+    httpd_rs_os::effective_uid()
 }
 
 /// Trust policy captured when an administrative configuration generation is
@@ -378,7 +378,7 @@ pub fn validate_service_immutable_file(path: &Path, service_uid: u32) -> io::Res
             "protected input is not a regular file",
         ));
     }
-    if !vapache_verified::auth_file_immutable_admit(
+    if !httpd_rs_verified::auth_file_immutable_admit(
         true,
         metadata.uid() == service_uid,
         metadata.mode() & 0o022 != 0,
@@ -441,7 +441,7 @@ pub fn ensure_admin_dir(path: &Path, mode: libc::mode_t) -> io::Result<File> {
         current = match open_component() {
             Ok(dir) => dir,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if let Err(create_error) = vapache_os::mkdirat(current.as_fd(), &name, mode) {
+                if let Err(create_error) = httpd_rs_os::mkdirat(current.as_fd(), &name, mode) {
                     if create_error.kind() != io::ErrorKind::AlreadyExists {
                         return Err(create_error);
                     }
@@ -694,7 +694,7 @@ pub fn multiviews_target(
         let Ok(meta) = file.metadata() else {
             continue; // coverage:ignore-line - metadata failure on an already-open regular candidate
         };
-        if !vapache_verified::multiview_candidate_admit(
+        if !httpd_rs_verified::multiview_candidate_admit(
             true,
             true,
             true,
@@ -781,7 +781,7 @@ fn with_fd_link<R>(file: &File, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
     };
     let mut component = [0u8; 24];
     let name = fd_component(fd, &mut component);
-    let n = vapache_os::readlinkat_into(dir.as_fd(), name, &mut buf)
+    let n = httpd_rs_os::readlinkat_into(dir.as_fd(), name, &mut buf)
         .ok()?
         .len();
     if n == 0 {
@@ -892,7 +892,7 @@ fn reopen_pinned_component(
 ) -> io::Result<File> {
     let file = open_component_nofollow(dir, name, flags)?;
     let reopened = file.metadata()?;
-    if !vapache_verified::owner_component_reopen_admit(
+    if !httpd_rs_verified::owner_component_reopen_admit(
         pinned.dev() == reopened.dev(),
         pinned.ino() == reopened.ino(),
     ) {
@@ -1516,7 +1516,7 @@ fn serve_file_inner(
     let size = meta.size();
     let mtime = meta.mtime();
     let etag_bits = scope.content_policy.file_etag.unwrap_or(ETAG_ALL);
-    let tag = vapache_verified::file_etag_emit_admit(etag_bits).then(|| etag(meta, etag_bits));
+    let tag = httpd_rs_verified::file_etag_emit_admit(etag_bits).then(|| etag(meta, etag_bits));
     let last_mod = http_date(mtime);
     let mime = mime_type(cfg, scope, mime_name);
     let encoding = cfg.mime.content_encoding(mime_name);
@@ -1666,7 +1666,7 @@ pub fn serve_file(
     if !grant.require_sink(
         cfg.authorization_generation(),
         resource,
-        vapache_verified::TransformSink::StaticFile,
+        httpd_rs_verified::TransformSink::StaticFile,
     ) || resource.fs_path.as_deref() != Some(fs_path)
     {
         return error_response(cfg, None, scope, 500, req, "", 0, "", peer, local_ip);
@@ -1692,7 +1692,7 @@ pub fn serve_authorized_file(
 ) -> Response {
     if !authorization.require_file_sink(
         cfg.authorization_generation(),
-        vapache_verified::TransformSink::StaticFile,
+        httpd_rs_verified::TransformSink::StaticFile,
         fs_path,
         meta,
     ) || fd_path(&file).as_deref() != Some(fs_path)
@@ -1825,7 +1825,7 @@ fn directory_action(
     if scope
         .effective_options()
         .contains(crate::config::Options::INDEXES)
-        && vapache_verified::capability_admit(
+        && httpd_rs_verified::capability_admit(
             cfg.capability_enabled(crate::config::Capability::AutoIndex),
             true,
         )
@@ -1842,7 +1842,7 @@ fn directory_action(
                 // filtered dot/backup names. Otherwise an upload directory
                 // full of hidden entries could evade the rendered-entry cap
                 // while still forcing an unbounded readdir walk.
-                if !vapache_verified::autoindex_append_admit(
+                if !httpd_rs_verified::autoindex_append_admit(
                     scanned,
                     1,
                     MAX_AUTOINDEX_ENTRIES as u64,
@@ -1879,7 +1879,7 @@ fn directory_action(
                 if name.ends_with(b"~") || name.starts_with(b"#") {
                     continue;
                 }
-                if !vapache_verified::autoindex_append_admit(
+                if !httpd_rs_verified::autoindex_append_admit(
                     entries.len() as u64,
                     1,
                     MAX_AUTOINDEX_ENTRIES as u64,
@@ -2071,7 +2071,7 @@ fn serve_directory_inner(
             let Some(authorization) = authorization.and_then(|authorization| {
                 authorization.into_internal(
                     cfg.authorization_generation(),
-                    vapache_verified::InternalRequestKind::DirectoryIndex,
+                    httpd_rs_verified::InternalRequestKind::DirectoryIndex,
                     index_target.url_path.clone(),
                 )
             }) else {
@@ -2081,7 +2081,7 @@ fn serve_directory_inner(
                 cfg,
                 req,
                 &index_url,
-                vapache_verified::InternalRequestKind::DirectoryIndex,
+                httpd_rs_verified::InternalRequestKind::DirectoryIndex,
                 authorization,
                 None,
                 vhost,
@@ -2206,7 +2206,7 @@ pub fn serve_directory(
     if !grant.require_sink(
         cfg.authorization_generation(),
         resource,
-        vapache_verified::TransformSink::Directory,
+        httpd_rs_verified::TransformSink::Directory,
     ) || resource.fs_path.as_deref() != Some(fs_path)
     {
         return error_response(
@@ -2252,7 +2252,7 @@ pub fn serve_authorized_directory(
 ) -> Response {
     if !authorization.require_file_sink(
         cfg.authorization_generation(),
-        vapache_verified::TransformSink::Directory,
+        httpd_rs_verified::TransformSink::Directory,
         fs_path,
         meta,
     ) || fd_path(&dir).as_deref() != Some(fs_path)
@@ -2428,7 +2428,7 @@ fn autoindex(
             row.push_str(&size.to_string());
         }
         row.push_str("</td></tr>\n");
-        if !vapache_verified::autoindex_append_admit(
+        if !httpd_rs_verified::autoindex_append_admit(
             body.len() as u64,
             row.len() as u64,
             MAX_AUTOINDEX_BYTES as u64,
@@ -2840,7 +2840,7 @@ mod tests {
         .and_then(|plan| {
             plan.into_outcome(
                 cfg.authorization_generation(),
-                vapache_verified::TransformSink::Directory,
+                httpd_rs_verified::TransformSink::Directory,
             )
         })
         .expect("test directory outcome")
@@ -2868,7 +2868,8 @@ mod tests {
     }
 
     fn config(name: &str) -> (PathBuf, Config) {
-        let dir = std::env::temp_dir().join(format!("vapache-files-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("httpd-rs-files-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("httpd.conf");
@@ -3059,7 +3060,7 @@ mod tests {
             MultiViewsResult::NotFound
         ));
 
-        std::fs::write(root.join("plain.unknown-vapache-type"), b"plain").unwrap();
+        std::fs::write(root.join("plain.unknown-httpd-rs-type"), b"plain").unwrap();
         assert!(matches!(
             multiviews_target(&cfg, &scope, &req, &root, Path::new("plain"), false, false),
             MultiViewsResult::NotFound
@@ -3197,7 +3198,9 @@ mod tests {
             reopen_pinned_component(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK, &pinned_meta)
                 .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
-        assert!(!vapache_verified::owner_component_reopen_admit(true, false));
+        assert!(!httpd_rs_verified::owner_component_reopen_admit(
+            true, false
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3304,7 +3307,7 @@ mod tests {
             .raw_os_error(),
             Some(libc::ENOTDIR)
         );
-        let outside_name = format!("vapache-files-outside-{}", std::process::id());
+        let outside_name = format!("httpd-rs-files-outside-{}", std::process::id());
         let outside = root.parent().unwrap().join(&outside_name);
         std::fs::write(&outside, b"outside").unwrap();
         assert_eq!(
@@ -4166,7 +4169,7 @@ mod tests {
         .and_then(|plan| {
             plan.into_outcome(
                 cfg.authorization_generation(),
-                vapache_verified::TransformSink::Directory,
+                httpd_rs_verified::TransformSink::Directory,
             )
         })
         .expect("directory outcome");
@@ -4450,7 +4453,7 @@ mod tests {
             return;
         }
         let root = PathBuf::from(format!(
-            "/run/vapache-certbot-link-test-{}",
+            "/run/httpd-rs-certbot-link-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);

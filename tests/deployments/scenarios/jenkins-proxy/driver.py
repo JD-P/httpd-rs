@@ -11,20 +11,20 @@ from lib import (
     CaseContext,
     DeploymentError,
     common_apache_config,
-    common_vapache_config,
+    common_httpd_rs_config,
     differential_benchmark,
     free_port,
     request,
     require_response,
     start_apache,
-    start_vapache,
+    start_httpd_rs,
     wait_http,
 )
 
 
 HERE = Path(__file__).resolve().parent
 AUTHORIZATION = "Basic " + base64.b64encode(
-    b"vapache:vapache-jenkins-password-42"
+    b"httpd-rs:httpd-rs-jenkins-password-42"
 ).decode("ascii")
 
 
@@ -58,7 +58,7 @@ def create_job(port: int, prefix: str) -> None:
         raise DeploymentError("Jenkins crumb response omitted its session cookie")
     job = b"""<?xml version="1.0" encoding="UTF-8"?>
 <project>
-  <description>Created through the Vapache deployment integration</description>
+  <description>Created through the httpd-rs deployment integration</description>
   <keepDependencies>false</keepDependencies>
   <properties/>
   <scm class="hudson.scm.NullSCM"/>
@@ -75,7 +75,7 @@ def create_job(port: int, prefix: str) -> None:
 """
     status, _, response = authenticated_request(
         port,
-        f"{prefix}/createItem?name=vapache-integration",
+        f"{prefix}/createItem?name=httpd-rs-integration",
         method="POST",
         headers={
             "Content-Type": "application/xml",
@@ -88,8 +88,8 @@ def create_job(port: int, prefix: str) -> None:
         raise DeploymentError(f"Jenkins job creation failed: {status} {response[:1000]!r}")
     require_response(
         port,
-        f"{prefix}/job/vapache-integration/api/json",
-        contains=b"Vapache deployment integration",
+        f"{prefix}/job/httpd-rs-integration/api/json",
+        contains=b"httpd-rs deployment integration",
         headers={"Authorization": AUTHORIZATION},
     )
 
@@ -125,10 +125,10 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
 ProxyPass {route} {backend_route}
 ProxyPassReverse {route} {backend_route}
 """
-    config, pid_file = common_vapache_config(
+    config, pid_file = common_httpd_rs_config(
         context.run_dir, frontend_port, empty_docroot, extra=extra
     )
-    server = start_vapache(context, config, pid_file, frontend_port)
+    server = start_httpd_rs(context, config, pid_file, frontend_port)
     require_response(frontend_port, f"{prefix}/login", contains=b"Jenkins")
     create_job(frontend_port, prefix)
 
@@ -136,8 +136,8 @@ ProxyPassReverse {route} {backend_route}
         server.reload()
         require_response(
             frontend_port,
-            f"{prefix}/job/vapache-integration/api/json",
-            contains=b"Vapache deployment integration",
+            f"{prefix}/job/httpd-rs-integration/api/json",
+            contains=b"httpd-rs deployment integration",
             headers={"Authorization": AUTHORIZATION},
         )
 
@@ -152,18 +152,18 @@ ProxyPassReverse {route} {backend_route}
         )
         start_apache(context, apache_config, apache_port)
         benchmark_path = (
-            f"{prefix}/job/vapache-integration/api/json"
+            f"{prefix}/job/httpd-rs-integration/api/json"
             if variant["benchmark"] == "job"
             else f"{prefix}/login"
         )
-        expected = b"Vapache deployment integration" if variant["benchmark"] == "job" else b"Jenkins"
+        expected = b"httpd-rs deployment integration" if variant["benchmark"] == "job" else b"Jenkins"
         benchmark_headers = {"Authorization": AUTHORIZATION} if variant["benchmark"] == "job" else None
         require_response(apache_port, benchmark_path, contains=expected, headers=benchmark_headers)
         differential_benchmark(
             frontend_port,
             apache_port,
             benchmark_path,
-            context.artifact_dir / "apache-vapache-benchmark.json",
+            context.artifact_dir / "apache-httpd-rs-benchmark.json",
             headers=(f"Authorization: {AUTHORIZATION}",) if benchmark_headers else (),
             connections=2,
         )

@@ -7,13 +7,13 @@ contracts: DOC-HOWTO-FCGI-SOCKET-001
 
 # Configure a protected PHP-FPM Unix socket
 
-Use this procedure to connect Vapache to one PHP-FPM pool through a protected
-Unix socket. The socket settings let Vapache reject a replaced endpoint or an
+Use this procedure to connect httpd-rs to one PHP-FPM pool through a protected
+Unix socket. The socket settings let httpd-rs reject a replaced endpoint or an
 unexpected backend process.
 
 ## Prerequisites
 
-Install Vapache and PHP-FPM on a Linux host. Create a deployment identity that
+Install httpd-rs and PHP-FPM on a Linux host. Create a deployment identity that
 does not run PHP-FPM. Obtain administrative access to both service
 configurations.
 
@@ -65,8 +65,8 @@ Use the service and version names that your distribution provides.
 Enable FastCGI and bind the socket to the expected identities:
 
 ```apache
-VapacheCapability FastCgi On
-VapacheFastCGIStablePath On unix:/run/php/example-fpm.sock 33 0 0 1001
+HttpdRsCapability FastCgi On
+HttpdRsFastCGIStablePath On unix:/run/php/example-fpm.sock 33 0 0 1001
 ```
 
 The arguments after the endpoint are the backend user ID, endpoint owner user
@@ -81,23 +81,23 @@ uploads and generated files outside that handler mapping.
 Run:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ curl --fail --show-error https://www.example.test/status.php
 ```
 
 Confirm that the response is application output and not PHP source. Remove the
 temporary status endpoint after the test.
 
-Vapache checks the Unix-socket type, owner, inode, and peer credentials. It
+httpd-rs checks the Unix-socket type, owner, inode, and peer credentials. It
 also checks the script path and its ancestors. A writable executable path,
 unexpected socket replacement, or unexpected peer identity fails closed.
 
 ## 5. Resolve a failed identity check
 
-If Vapache reports an unexpected owner or peer, compare the error with the
+If httpd-rs reports an unexpected owner or peer, compare the error with the
 `id` and `stat` output from steps 1 and 2. Correct the PHP-FPM pool or socket
-ownership. Turning off `VapacheFastCGIStablePath` removes the endpoint identity
+ownership. Turning off `HttpdRsFastCGIStablePath` removes the endpoint identity
 check rather than fixing the mismatch.
 
 Use [Replace an unsafe writable PHP layout](replace-writable-php-layout.md) if

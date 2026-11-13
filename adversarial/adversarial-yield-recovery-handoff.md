@@ -1,7 +1,7 @@
-# Reconstruct the Vapache adversarial-review dataset
+# Reconstruct the httpd-rs adversarial-review dataset
 
 Read the OpenCode logs stored on this computer and reconstruct the factual
-dataset needed to measure how Vapache's adversarial vulnerability yield changed
+dataset needed to measure how httpd-rs's adversarial vulnerability yield changed
 over the project's development.
 
 Identify every distinct vulnerability search and every vulnerability claim
@@ -13,7 +13,7 @@ produced by those searches. Recover:
 - which findings each search produced;
 - the demonstrated impact and vulnerability family of each finding;
 - how many unintended behaviors composed into each confirmed vulnerability;
-- how many conceptual parts of Vapache required remediation; and
+- how many conceptual parts of httpd-rs required remediation; and
 - the original logs, messages, adversarial files, code changes, and tests that
   support each recovered fact.
 
@@ -21,7 +21,7 @@ Write this information as a separate derived index under `adversarial/`. The
 index will later be used to calculate and graph adversarial yield by
 vulnerability family and development period.
 
-Do not calculate adversarial yield during this task. Do not modify Vapache
+Do not calculate adversarial yield during this task. Do not modify httpd-rs
 source code, the OpenCode logs, or any existing adversarial-pass or findings
 file. The historical records are the source material. The new JSONL files are
 only an index reconstructed from them.
@@ -236,7 +236,7 @@ For every finding, record:
   terminal outcome;
 - `secondary_families`: zero or more other demonstrated security failures in
   the same chain;
-- `attack_surface`: the part of Vapache involved, such as HTTP/2, rewrite,
+- `attack_surface`: the part of httpd-rs involved, such as HTTP/2, rewrite,
   CGI, TLS, or cache; and
 - `root_cause_class`: the underlying defect pattern.
 
@@ -285,7 +285,7 @@ Also record:
 - `unintended_behaviors`: each security-relevant behavior that differed from
   the intended design;
 - the expected behavior and actual behavior for each item;
-- `remediation_components`: the distinct conceptual parts of Vapache that had
+- `remediation_components`: the distinct conceptual parts of httpd-rs that had
   to be changed, constrained, or given a new invariant;
 - `composition_explanation`: how the unintended behaviors combined; and
 - `composition_confidence`: `high`, `medium`, or `low`.
@@ -324,7 +324,7 @@ Apply these examples:
   vulnerability.
 
 These fields measure how many independently wrong things had to align and how
-broadly Vapache had to change to prevent recurrence. They are not counts of
+broadly httpd-rs had to change to prevent recurrence. They are not counts of
 every subsystem on the request path.
 
 ## Produce the recovered index

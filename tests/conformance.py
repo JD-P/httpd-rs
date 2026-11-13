@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Apache-compatibility conformance suite for vapached.
+"""Apache-compatibility conformance suite for httpd-rs.
 
 Tests are ported/adapted from the behaviors exercised by httpd's own test
 suite (Apache-Test t/apache/*, t/conf/*) and the HTTP RFCs, but implemented in
 plain Python so they can run without a Perl Apache-Test harness.
 
-Both the real httpd and vapached are started with equivalent configurations.
-Every test asserts the required behavior on vapached and, when
+Both the real httpd and httpd-rs are started with equivalent configurations.
+Every test asserts the required behavior on httpd-rs and, when
 `--differential` is enabled, compares the observable response with httpd and
 records divergences for triage.
 
 Usage:
-    python3 tests/conformance.py            # run vapache assertions
+    python3 tests/conformance.py            # run httpd-rs assertions
     python3 tests/conformance.py -v         # verbose
     python3 tests/conformance.py --differential
 """
@@ -38,24 +38,24 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
-VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target" / "release" / "httpd-rs"))
 APACHE = os.environ.get("APACHE", shutil.which("apache2") or "/usr/sbin/apache2")
 MODDIR = Path(
     os.environ.get(
         "APACHE_MODDIR",
         "/usr/lib/apache2/modules"
         if Path("/usr/lib/apache2/modules").is_dir()
-        else "/workspace/.vapache-setup/sysroot/usr/lib/apache2/modules",
+        else "/workspace/.httpd-rs-setup/sysroot/usr/lib/apache2/modules",
     )
 )
-BASE = Path(tempfile.mkdtemp(prefix="vapache-tests-"))
-AP_PORT = int(os.environ.get("VAPACHE_AP_PORT", "18080"))
-VP_PORT = int(os.environ.get("VAPACHE_VP_PORT", "18081"))
-AP_TLS_PORT = int(os.environ.get("VAPACHE_AP_TLS_PORT", "18443"))
-VP_TLS_PORT = int(os.environ.get("VAPACHE_VP_TLS_PORT", "18444"))
-VP_MTLS_PORT = int(os.environ.get("VAPACHE_VP_MTLS_PORT", "18446"))
-VP_OCSP_PORT = int(os.environ.get("VAPACHE_VP_OCSP_PORT", "18447"))
-OCSP_RESPONDER_PORT = int(os.environ.get("VAPACHE_OCSP_RESPONDER_PORT", "18448"))
+BASE = Path(tempfile.mkdtemp(prefix="httpd-rs-tests-"))
+AP_PORT = int(os.environ.get("HTTPD_RS_AP_PORT", "18080"))
+VP_PORT = int(os.environ.get("HTTPD_RS_VP_PORT", "18081"))
+AP_TLS_PORT = int(os.environ.get("HTTPD_RS_AP_TLS_PORT", "18443"))
+VP_TLS_PORT = int(os.environ.get("HTTPD_RS_VP_TLS_PORT", "18444"))
+VP_MTLS_PORT = int(os.environ.get("HTTPD_RS_VP_MTLS_PORT", "18446"))
+VP_OCSP_PORT = int(os.environ.get("HTTPD_RS_VP_OCSP_PORT", "18447"))
+OCSP_RESPONDER_PORT = int(os.environ.get("HTTPD_RS_OCSP_RESPONDER_PORT", "18448"))
 OCSP_SERVER = None
 OCSP_RESPONSE = None
 OCSP_REQUESTS = 0
@@ -433,7 +433,7 @@ def tree():
     subprocess.run(
         [
             "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-            "-subj", "/CN=vapache-client-ca",
+            "-subj", "/CN=httpd-rs-client-ca",
             "-addext", "basicConstraints=critical,CA:TRUE",
             "-addext", "keyUsage=critical,keyCertSign,cRLSign",
             "-keyout", str(ca_key), "-out", str(ca_cert),
@@ -446,7 +446,7 @@ def tree():
     subprocess.run(
         [
             "openssl", "req", "-newkey", "rsa:2048", "-nodes",
-            "-subj", "/CN=vapache-client",
+            "-subj", "/CN=httpd-rs-client",
             "-keyout", str(client_key), "-out", str(client_csr),
         ],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -477,7 +477,7 @@ def tree():
     subprocess.run(
         [
             "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
-            "-subj", "/CN=vapache-ocsp-ca",
+            "-subj", "/CN=httpd-rs-ocsp-ca",
             "-addext", "basicConstraints=critical,CA:TRUE",
             "-addext", "keyUsage=critical,keyCertSign,cRLSign",
             "-keyout", str(ocsp_ca_key), "-out", str(ocsp_ca),
@@ -1184,21 +1184,21 @@ def common(port, root, apache, tls_port):
     ]
     if not apache:
         lines[0:0] = [
-            "VapacheCapability AbsoluteRequestTarget On",
-            "VapacheCapability AccessFiles On",
-            "VapacheCapability AutoIndex On",
-            "VapacheCapability Cgi On",
-            "VapacheCapability FastCgi On",
-            "VapacheCapability LegacyAuthz On",
-            "VapacheCapability RequestTrailers On",
-            "VapacheCapability RewriteProgram On",
-            "VapacheCapability ServerStatus On",
-            "VapacheCapability Trace On",
-            "VapacheCapability UnstableFastCgiPaths On",
-            "VapacheCapability MutableAuthFiles On",
+            "HttpdRsCapability AbsoluteRequestTarget On",
+            "HttpdRsCapability AccessFiles On",
+            "HttpdRsCapability AutoIndex On",
+            "HttpdRsCapability Cgi On",
+            "HttpdRsCapability FastCgi On",
+            "HttpdRsCapability LegacyAuthz On",
+            "HttpdRsCapability RequestTrailers On",
+            "HttpdRsCapability RewriteProgram On",
+            "HttpdRsCapability ServerStatus On",
+            "HttpdRsCapability Trace On",
+            "HttpdRsCapability UnstableFastCgiPaths On",
+            "HttpdRsCapability MutableAuthFiles On",
         ]
     if not apache:
-        # vapached records LoadModule names for <IfModule>; the paths are not
+        # httpd-rs records LoadModule names for <IfModule>; the paths are not
         # opened and the module code is built in.
         lines = [
             "LoadModule filter_module %s/mod_filter.so" % MODDIR,
@@ -1324,11 +1324,11 @@ def start_servers():
     start_wss_mock()
     start_ocsp_mock()
     acfg = BASE / "apache" / "httpd.conf"
-    vcfg = BASE / "vapache-httpd.conf"
+    vcfg = BASE / "httpd-rs-httpd.conf"
     acfg.write_text(common(AP_PORT, BASE / "apache", True, AP_TLS_PORT))
     vcfg.write_text(common(VP_PORT, BASE, False, VP_TLS_PORT))
     servers = [
-        ("vapache", [str(VAPACHED), "-f", str(vcfg), "-DFOREGROUND"], BASE / "logs" / "vapache.out"),
+        ("httpd-rs", [str(HTTPD_RS), "-f", str(vcfg), "-DFOREGROUND"], BASE / "logs" / "httpd-rs.out"),
     ]
     if DIFFERENTIAL:
         if not Path(APACHE).exists():
@@ -1352,7 +1352,7 @@ def start_servers():
                 time.sleep(0.05)
         else:
             print("server failed to start:")
-            for name in ("apache", "vapache"):
+            for name in ("apache", "httpd-rs"):
                 p = BASE / "logs" / f"{name}.out"
                 if p.exists():
                     print(p.read_text()[-4000:])
@@ -2142,7 +2142,7 @@ class StaticTests(Base):
 
         # Although RFC 9110 permits identical list values, accepting them at
         # a proxy boundary leaves the message length dependent on an adjacent
-        # parser's duplicate-field policy.  Vapache deliberately requires one
+        # parser's duplicate-field policy.  httpd-rs deliberately requires one
         # canonical field line.
         out = raw(
             VP_PORT,
@@ -2618,19 +2618,19 @@ class AuthTests(Base):
             + token
             + b"\r\n\r\n"
         )
-        vapache = parse_response(raw(VP_PORT, request))
-        self.assertIsNotNone(vapache)
-        self.assertEqual(vapache[0], 401)
+        httpd_rs = parse_response(raw(VP_PORT, request))
+        self.assertIsNotNone(httpd_rs)
+        self.assertEqual(httpd_rs[0], 401)
         if DIFFERENTIAL:
             apache_request = request.replace(
                 f"localhost:{VP_PORT}".encode(), f"localhost:{AP_PORT}".encode()
             )
             apache = parse_response(raw(AP_PORT, apache_request))
-            if apache is None or apache[0] != vapache[0]:
+            if apache is None or apache[0] != httpd_rs[0]:
                 DIFFS.append(
                     (
                         "Basic auth non-ASCII separator",
-                        f"status {apache[0] if apache else None} != {vapache[0]}",
+                        f"status {apache[0] if apache else None} != {httpd_rs[0]}",
                     )
                 )
     def test_basic_user_and_group_providers(self):
@@ -2932,7 +2932,7 @@ class OcspTests(Base):
         output = result.stdout + result.stderr
         self.assertIn(b"OCSP Response Status: successful", output)
         self.assertTrue(
-            list((BASE / ".vapache-ocsp-cache").glob("*.ocsp")),
+            list((BASE / ".httpd-rs-ocsp-cache").glob("*.ocsp")),
             "OCSP response was not persisted",
         )
         before = OCSP_REQUESTS
@@ -2969,13 +2969,13 @@ class ConfigTests(unittest.TestCase):
         if not cfg.exists():
             self.skipTest("no Debian apache2 config")
         r = subprocess.run(
-            [str(VAPACHED), "-f", str(cfg), "--audit-capabilities"],
+            [str(HTTPD_RS), "-f", str(cfg), "--audit-capabilities"],
             capture_output=True,
             text=True,
             timeout=30,
         )
         self.assertEqual(r.returncode, 0, r.stderr[-3000:])
-        self.assertIn("VapacheCapability AutoIndex On", r.stdout)
+        self.assertIn("HttpdRsCapability AutoIndex On", r.stdout)
 
     def test_strict_unknown_directive(self):
         p = BASE / "strict.conf"
@@ -2985,7 +2985,7 @@ class ConfigTests(unittest.TestCase):
             "TotallyMadeUpDirective on\n"
         )
         r = subprocess.run(
-            [str(VAPACHED), "-f", str(p), "-t", "--strict-config"],
+            [str(HTTPD_RS), "-f", str(p), "-t", "--strict-config"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -3005,7 +3005,7 @@ class ConfigTests(unittest.TestCase):
             "</VirtualHost>\n"
         )
         r = subprocess.run(
-            [str(VAPACHED), "-f", str(p), "-t"],
+            [str(HTTPD_RS), "-f", str(p), "-t"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -3020,7 +3020,7 @@ class ConfigTests(unittest.TestCase):
             "ErrorLog ${THIS_IS_NOT_SET}/e.log\n"
         )
         r = subprocess.run(
-            [str(VAPACHED), "-f", str(p), "-t"],
+            [str(HTTPD_RS), "-f", str(p), "-t"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -3342,8 +3342,8 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     DIFFERENTIAL = args.differential
-    if not VAPACHED.exists():
-        sys.exit(f"missing {VAPACHED}; cargo build --release first")
+    if not HTTPD_RS.exists():
+        sys.exit(f"missing {HTTPD_RS}; cargo build --release first")
     start_servers()
     try:
         loader = unittest.TestLoader()
@@ -3368,7 +3368,7 @@ def main():
         result = runner.run(suite)
         if args.differential:
             report = [
-                "# Differential report: vapached vs. Apache httpd\n",
+                "# Differential report: httpd-rs vs. Apache httpd\n",
                 f"Generated: {time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime())}\n",
             ]
             if DIFFS:

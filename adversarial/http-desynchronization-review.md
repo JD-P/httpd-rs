@@ -6,12 +6,12 @@ Baseline: `28d309e` (`origin/main` before this campaign)
 ## Scope and threat model
 
 This review treats message boundaries as a property of the complete chain, not
-only of Vapache's parser. The relevant boundaries are:
+only of httpd-rs's parser. The relevant boundaries are:
 
-1. client or front proxy to Vapache over HTTP/1;
-2. an HTTP/2 request translated into Vapache's internal request and then an
+1. client or front proxy to httpd-rs over HTTP/1;
+2. an HTTP/2 request translated into httpd-rs's internal request and then an
    HTTP/1 backend request;
-3. Vapache to a reverse-proxy backend and back;
+3. httpd-rs to a reverse-proxy backend and back;
 4. the HTTP/1 to WebSocket protocol transition; and
 5. CGI/FastCGI output translated back into an HTTP response.
 
@@ -64,7 +64,7 @@ unconsumed body framing.
 
 ### D3: ordinary proxy requests advertised reuse that never happened
 
-Vapache deliberately opens a fresh upstream connection for each ordinary
+httpd-rs deliberately opens a fresh upstream connection for each ordinary
 proxied request, but sent `Connection: keep-alive`. It now sends
 `Connection: close`, matching ownership and eliminating any possibility that
 unconsumed upstream bytes could poison a later request. Client request heads
@@ -113,7 +113,7 @@ are rejected. The declared value must still equal the received DATA length.
 ### D7: WebSocket switching was not restricted to HTTP/1.1 on both hops
 
 Upgrade is an HTTP/1.1 transition, but an otherwise valid HTTP/1.0 client or an
-HTTP/1.0 backend 101 could enter the tunnel path. Vapache now requires HTTP/1.1
+HTTP/1.0 backend 101 could enter the tunnel path. httpd-rs now requires HTTP/1.1
 on the client request and the backend switching response in addition to the
 existing exact handshake checks.
 
@@ -195,10 +195,10 @@ V6 and older disk entries are deliberately ineligible after upgrade.
 No parser can guarantee agreement with every possible third-party front end.
 Deployments should still configure a front proxy to reject, rather than
 normalize, ambiguous HTTP/1 and should avoid rewriting rejected bytes onto a
-fresh backend connection. Vapache's strict subset makes disagreement less
+fresh backend connection. httpd-rs's strict subset makes disagreement less
 likely and ensures its own outbound messages are canonical.
 
-The HTTP/2 wire codec remains dependency-owned, although Vapache independently
+The HTTP/2 wire codec remains dependency-owned, although httpd-rs independently
 checks the semantic header and body invariants at the adapter. Application
 protocols behind ordinary HTTP proxying can still assign different meanings to
 URI syntax; that is an authorization/normalization issue rather than an HTTP

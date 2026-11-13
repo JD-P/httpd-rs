@@ -1,7 +1,7 @@
-# vapache adversarial findings — Pass 6
+# httpd-rs adversarial findings — Pass 6
 
 **Target:** `HEAD 9a7809c` plus the uncommitted pass-5 fixes in the checkout
-(the tree used by `target/release/vapached`, rebuilt from the current working
+(the tree used by `target/release/httpd-rs`, rebuilt from the current working
 tree). The repository source was not modified for this pass; all fixtures were
 created under `/tmp/opencode`.
 
@@ -32,7 +32,7 @@ cross-query representation leak and a cached index that survives a new
    ```
 
    The administrator protects `/srv/wallet/.htaccess` with Basic auth (or
-   `Require all denied`). Apache applies it. vapache starts its access-file
+   `Require all denied`). Apache applies it. httpd-rs starts its access-file
    walk at `/srv/wallet/public` and never reads the parent policy. An
    unauthenticated client requests `/wallet.dat` and receives the wallet
    bytes.
@@ -50,7 +50,7 @@ cross-query representation leak and a cached index that survives a new
    `/site/assets/wallet.dat` maps through the *second* alias, but
    `access_root_for()` sees that `/srv/site/assets` is an earlier alias target
    and starts the walk there. The `/srv/site/.htaccess` policy is skipped.
-   Reordering the two aliases makes vapache return `403`, proving the root is
+   Reordering the two aliases makes httpd-rs return `403`, proving the root is
    chosen from the wrong alias. The same bug executes a protected
    `ScriptAlias` CGI.
 
@@ -60,7 +60,7 @@ cross-query representation leak and a cached index that survives a new
    `CacheIgnoreQueryString On`. A second variant serves a cached index after
    a live `.htaccess` change adds `<Files "index.html"> Require all denied`;
    Apache rejects both the directory URL and the direct index URL, while
-   vapache returns the cached `200` with `X-Cache: HIT`.
+   httpd-rs returns the cached `200` with `X-Cache: HIT`.
 
 ---
 
@@ -103,7 +103,7 @@ For a request whose resolved filename is `/srv/wallet/public/wallet.dat`,
 Apache walks the filesystem ancestors and, at each directory where
 `AllowOverride` permits it, examines `.htaccess`. This includes
 `/srv/wallet` and above. The configuration below is valid (`apache2 -t` says
-`Syntax OK`) and Apache enforces the parent policy; vapache serves the file.
+`Syntax OK`) and Apache enforces the parent policy; httpd-rs serves the file.
 
 This is a pure authorization bypass: no symlink, writable directory, proxy, or
 second bug is needed. It applies at least to static files, directory indexes
@@ -144,15 +144,15 @@ Observed:
 
 ```text
 Apache, no credentials: 401 Unauthorized
-vapache, no credentials: 200 OK
+httpd-rs, no credentials: 200 OK
 WALLET-DOCPARENT-AUTH-SECRET
 
 Apache, alice:secret:    200 OK
-vapache, alice:secret:   200 OK
+httpd-rs, alice:secret:   200 OK
 ```
 
 The equivalent `Require all denied` form produces `403` from Apache and
-`200` from vapache. The same result is obtained with
+`200` from httpd-rs. The same result is obtained with
 `<Directory /> AllowOverride All` and an `.htaccess` in an ancestor.
 
 `--explain` confirms that the policy file is not considered at all:
@@ -181,7 +181,7 @@ Alias "/site" "$D/srv/site"
 ```
 
 With `$D/srv/.htaccess` containing `Require all denied` and
-`$D/srv/site/assets/wallet.dat` existing, Apache returns `403` and vapache
+`$D/srv/site/assets/wallet.dat` existing, Apache returns `403` and httpd-rs
 returns `200 WALLET-PARENTHT-SECRET` for `/site/assets/wallet.dat`.
 
 ## Root cause
@@ -197,13 +197,13 @@ returns `200 WALLET-PARENTHT-SECRET` for `/site/assets/wallet.dat`.
 
 Apache's actual rule is directory-based: an `.htaccess` in an ancestor is
 effective when `AllowOverride` is enabled for that ancestor. The main-config
-`<Directory>` rule for the ancestor *is* applied by vapache; only the contents
+`<Directory>` rule for the ancestor *is* applied by httpd-rs; only the contents
 of that ancestor's `.htaccess` are discarded.
 
 The restriction is explicit in the project model: `docs/config-semantics.md`
 I21 says `access_walk_root = target.alias_root`, and I36 says the walk "stops
 at and includes the target directory". That model boundary is the
-vulnerability. If it is retained as a trust boundary, vapache cannot claim
+vulnerability. If it is retained as a trust boundary, httpd-rs cannot claim
 Apache compatibility for `.htaccess`; it would have to reject or warn about
 applicable ancestor access files (and ensure directories above the boundary are
 not attacker-writable) rather than silently ignore them.
@@ -310,11 +310,11 @@ Observed:
 
 ```text
 Apache, no credentials: 401 Unauthorized
-vapache, no credentials: 200 OK
+httpd-rs, no credentials: 200 OK
 WALLET-AUTH-SECRET
 
 Apache, alice:secret:    200 OK
-vapache, alice:secret:   200 OK
+httpd-rs, alice:secret:   200 OK
 ```
 
 The request is `GET /site/assets/wallet.dat`. It matches only the second
@@ -331,7 +331,7 @@ Alias "/site"   "$D/site"
 Alias "/assets" "$D/site/assets"
 ```
 
-vapache now returns `403` for the same request. The mapped file and policy are
+httpd-rs now returns `403` for the same request. The mapped file and policy are
 identical; only the alias order changed, so the wrong-root selection is the
 cause.
 
@@ -365,7 +365,7 @@ Observed for `GET /site/cgi/run.cgi`:
 
 ```text
 Apache: 403 Forbidden
-vapache: 200 OK
+httpd-rs: 200 OK
 WALLET-CGI-SECRET
 ```
 

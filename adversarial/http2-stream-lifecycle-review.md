@@ -51,12 +51,12 @@ this rule: `Read::read_exact` and `Write::write_all` automatically retry
 made the new CGI cancellation path loop indefinitely.  Cancellation now uses
 the terminal `ConnectionAborted` kind in CGI, FastCGI and proxy transports.
 
-### H2-L3: request trailers bypassed Vapache's trailer policy
+### H2-L3: request trailers bypassed httpd-rs's trailer policy
 
 The adapter stopped after the DATA stream and never called
 `RecvStream::trailers`.  An HTTP/2 peer could consequently send a trailer block
 which was neither rejected by the default-off `RequestTrailers` capability nor
-validated by Vapache's routing/framing-field policy.
+validated by httpd-rs's routing/framing-field policy.
 
 Both buffered and streamed request bodies now consume the terminal trailer
 block within the body deadline.  Non-empty trailers require the

@@ -1,6 +1,6 @@
 # Resource ownership inventory
 
-Vapache has one generation-owned `ResourceBudget`. Reloaded configurations
+httpd-rs has one generation-owned `ResourceBudget`. Reloaded configurations
 reuse it, so reload cannot reset capacity while old requests still hold
 leases. Attacker-reachable admission is hierarchical: request scope is
 charged first, then the canonical client key (IPv4 address or IPv6 `/64`),

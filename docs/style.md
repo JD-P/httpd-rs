@@ -6,7 +6,7 @@ status: normative
 
 # Documentation style
 
-Use this guide for Vapache documentation. Operator-facing procedures and
+Use this guide for httpd-rs documentation. Operator-facing procedures and
 reference pages use a controlled technical-English style that is similar to
 ASD-STE100. The project does not claim formal ASD-STE100 conformance.
 
@@ -73,17 +73,17 @@ stable terminology, and explicit assumptions still apply.
 | Term | Meaning | Do not use as a synonym |
 |---|---|---|
 | Apache | Apache HTTP Server 2.4 | httpd, Apache2, upstream server |
-| Vapache | The project or installed product | vapache server |
-| `vapached` | The server executable | Vapache binary when the executable is meant |
+| httpd-rs | The project or installed product | httpd-rs server |
+| `httpd-rs` | The server executable | httpd-rs binary when the executable is meant |
 | service identity | The operating-system user and group that run request processing | worker user, web user |
 | administrative input | Configuration, key, certificate, map, or other operator-controlled input | trusted file without a definition |
 | backend | A CGI, FastCGI, HTTP, or WebSocket service that receives a dispatched request | upstream, origin, application server unless protocol context requires it |
-| capability | A named, default-off Vapache compatibility gate | feature flag |
+| capability | A named, default-off httpd-rs compatibility gate | feature flag |
 | configuration generation | One immutable configuration used by a set of accepted requests | config version |
-| fail closed | Reject configuration or a request when Vapache cannot apply the required policy | ignore safely |
+| fail closed | Reject configuration or a request when httpd-rs cannot apply the required policy | ignore safely |
 
 Use *Apache directive* for a configuration command that Apache defines. Use
-*Vapache directive* for a command whose name starts with `Vapache`.
+*httpd-rs directive* for a command whose name starts with `httpd-rs`.
 
 ## Write procedures
 
@@ -108,7 +108,7 @@ service. Test the documented user workflow.
 Classify each concrete security claim with one of these evidence types:
 
 - machine-checked property;
-- Vapache runtime test;
+- httpd-rs runtime test;
 - Apache differential test;
 - real-application deployment test;
 - fail-closed exclusion;
@@ -124,7 +124,7 @@ what was verified and how it was verified.
 Each concrete behavior claim, command, configuration example, default, and
 compatibility claim must meet one of these conditions:
 
-- A documentation contract tests the claim through a public Vapache interface.
+- A documentation contract tests the claim through a public httpd-rs interface.
 - Authoritative implementation metadata generates the value.
 - The page links to an existing executable test and names the exact case.
 - The page identifies the statement as an assumption, rationale, or non-goal.

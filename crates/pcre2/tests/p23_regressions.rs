@@ -1,8 +1,8 @@
 //! Fixed regressions from adversarial pass P23.
 
+use httpd_rs_pcre2::bytes as rust;
+use httpd_rs_pcre2::ErrorKind;
 use pcre2_c_oracle::bytes as oracle;
-use vapache_pcre2::bytes as rust;
-use vapache_pcre2::ErrorKind;
 
 fn spans_rust(pattern: &str, subject: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
     let regex = rust::Regex::new(pattern).unwrap();
@@ -96,7 +96,7 @@ fn p23_e_i_m_unrepresentable_priority_cases_fail_closed() {
 #[test]
 fn p23_g_h_i_j_capture_escape_and_empty_alternative_compatibility() {
     for (pattern, subject) in [
-        (r"a(?P<__vapache_pcre2_keep_0>b)", b"ab".as_slice()),
+        (r"a(?P<__httpd_rs_pcre2_keep_0>b)", b"ab".as_slice()),
         (r"\101", b"A".as_slice()),
         (r"\10", b"\x08".as_slice()),
         (r"\x9", b"\t".as_slice()),

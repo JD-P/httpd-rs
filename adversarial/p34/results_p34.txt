@@ -1,29 +1,29 @@
 ## A1 decoded LocationMatch body
-   /name%20with%20space         apache=404 vapache=200 vapache_leak=True
-   /name%20with%20space.txt     apache=403 vapache=403
+   /name%20with%20space         apache=404 httpd-rs=200 httpd_rs_leak=True
+   /name%20with%20space.txt     apache=403 httpd-rs=403
 ## A2 decoded Location prefix body
-   /name%20with%20space         apache=404 vapache=200 vapache_leak=True
-   /name%20with%20space.txt     apache=403 vapache=403
+   /name%20with%20space         apache=404 httpd-rs=200 httpd_rs_leak=True
+   /name%20with%20space.txt     apache=403 httpd-rs=403
 ## A3 decoded non-ASCII LocationMatch body
-   /caf%C3%A9                   apache=404 vapache=200 vapache_leak=True
+   /caf%C3%A9                   apache=404 httpd-rs=200 httpd_rs_leak=True
 ## A4 control extension guard body
-   /name%20with%20space         apache=404 vapache=404 vapache_leak=False
-   /name%20with%20space.txt     apache=403 vapache=403
+   /name%20with%20space         apache=404 httpd-rs=404 httpd_rs_leak=False
+   /name%20with%20space.txt     apache=403 httpd-rs=403
 ## A5 control Files guard body
-   /name%20with%20space         apache=404 vapache=404 vapache_leak=False
-   /name%20with%20space.txt     apache=403 vapache=403
+   /name%20with%20space         apache=404 httpd-rs=404 httpd_rs_leak=False
+   /name%20with%20space.txt     apache=403 httpd-rs=403
 ## A6 mirror encoded LocationMatch body
-   /name%20with%20space         apache=200 vapache=404 vapache_leak=False
-   /name%20with%20space.txt     apache=200 vapache=200
+   /name%20with%20space         apache=200 httpd-rs=404 httpd_rs_leak=False
+   /name%20with%20space.txt     apache=200 httpd-rs=200
 ## A7 stock-Debian alias body
-   /js/name%20with%20space      apache=404 vapache=200 vapache_leak=True
-   /js/name%20with%20space.txt  apache=403 vapache=403
+   /js/name%20with%20space      apache=404 httpd-rs=200 httpd_rs_leak=True
+   /js/name%20with%20space.txt  apache=403 httpd-rs=403
 ## B1 decoded LocationMatch autoindex
-   /docs/ listing: apache=200 vapache=200 apache_names_denied=False vapache_names_denied=True public_on_both=True direct_apache=403 direct_vapache=403
+   /docs/ listing: apache=200 httpd-rs=200 apache_names_denied=False httpd_rs_names_denied=True public_on_both=True direct_apache=403 direct_httpd_rs=403
 ## B2 control Files autoindex
-   /docs/ listing: apache=200 vapache=200 apache_names_denied=False vapache_names_denied=False public_on_both=True direct_apache=403 direct_vapache=403
+   /docs/ listing: apache=200 httpd-rs=200 apache_names_denied=False httpd_rs_names_denied=False public_on_both=True direct_apache=403 direct_httpd_rs=403
 ## B3 control no guard autoindex
-   /docs/ listing: apache=200 vapache=200 apache_names_denied=True vapache_names_denied=True public_on_both=True direct_apache=200 direct_vapache=200
+   /docs/ listing: apache=200 httpd-rs=200 apache_names_denied=True httpd_rs_names_denied=True public_on_both=True direct_apache=200 direct_httpd_rs=200
 ## C1 access-file rewrite decoded spelling
-   /name%20with%20space         apache=404 vapache=404
+   /name%20with%20space         apache=404 httpd-rs=404
 P34-A LIVE AT HEAD: percent-encoded synthesized identities fail decoded-spelling URL policy open

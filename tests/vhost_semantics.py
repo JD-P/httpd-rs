@@ -25,19 +25,19 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target" / "release" / "httpd-rs"))
 APACHE = shutil.which("apache2") or "/usr/sbin/apache2"
 MODDIR = Path(
     os.environ.get(
         "APACHE_MODDIR",
         "/usr/lib/apache2/modules"
         if Path("/usr/lib/apache2/modules").is_dir()
-        else "/workspace/.vapache-setup/sysroot/usr/lib/apache2/modules",
+        else "/workspace/.httpd-rs-setup/sysroot/usr/lib/apache2/modules",
     )
 )
-BASE = Path(tempfile.mkdtemp(prefix="vapache-vhost-semantics-"))
-AP_PORT = int(os.environ.get("VAPACHE_VHOST_AP_PORT", "18280"))
-VP_PORT = int(os.environ.get("VAPACHE_VHOST_VP_PORT", "18281"))
+BASE = Path(tempfile.mkdtemp(prefix="httpd-rs-vhost-semantics-"))
+AP_PORT = int(os.environ.get("HTTPD_RS_VHOST_AP_PORT", "18280"))
+VP_PORT = int(os.environ.get("HTTPD_RS_VHOST_VP_PORT", "18281"))
 SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
 SERVICE_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
 PROCS = []
@@ -147,14 +147,14 @@ def vhost(port: int, name: str, root: str, body: list[str], address: str = "*") 
 
 
 def config(port: int, apache: bool, generation: int) -> str:
-    server_kind = "apache" if apache else "vapache"
+    server_kind = "apache" if apache else "httpd-rs"
     lines = []
     for module in MODULES:
         lines.append(f"LoadModule {module} {MODDIR}/mod_{module.replace('_module', '')}.so")
     if not apache:
         lines += [
-            "VapacheCapability AccessFiles On",
-            "VapacheCapability LegacyAuthz On",
+            "HttpdRsCapability AccessFiles On",
+            "HttpdRsCapability LegacyAuthz On",
         ]
     lines += [
         f"ServerRoot {q(BASE)}",
@@ -406,7 +406,7 @@ CASES = [
     ("global ErrorDocument is inherited", "tenant-two.test", "/not-found-two", 404, b"tenant-two-global-error\n", "127.0.0.1"),
     ("wildcard name", "foo.selection.test", "/", 200, b"wildcard\n", "127.0.0.1"),
     # Apache keeps the first matching wildcard when it precedes a later exact
-    # name in the same address bucket; Vapache intentionally mirrors it.
+    # name in the same address bucket; httpd-rs intentionally mirrors it.
     ("earlier wildcard precedes later exact name", "exact.selection.test", "/", 200, b"wildcard\n", "127.0.0.1"),
     # The exact destination-address bucket wins before host-name matching.
     ("exact address bucket", "foo.selection.test", "/", 200, b"exact-address\n", "127.0.0.2"),
@@ -417,21 +417,21 @@ CASES = [
 def compare_case(case, verbose: bool) -> list[str]:
     name, host, path, expected_status, expected_body, connect_host = case
     apache = request(AP_PORT, host, path, connect_host)
-    vapache = request(VP_PORT, host, path, connect_host)
+    httpd_rs = request(VP_PORT, host, path, connect_host)
     problems = []
     if apache[0] != expected_status:
         problems.append(f"Apache status {apache[0]}, expected {expected_status}")
-    if vapache[0] != apache[0]:
-        problems.append(f"status Apache={apache[0]} Vapache={vapache[0]}")
+    if httpd_rs[0] != apache[0]:
+        problems.append(f"status Apache={apache[0]} httpd-rs={httpd_rs[0]}")
     if expected_body is not None:
         if apache[2] != expected_body:
             problems.append(f"Apache body {apache[2]!r}, expected {expected_body!r}")
-        if vapache[2] != apache[2]:
-            problems.append(f"body Apache={apache[2]!r} Vapache={vapache[2]!r}")
+        if httpd_rs[2] != apache[2]:
+            problems.append(f"body Apache={apache[2]!r} httpd-rs={httpd_rs[2]!r}")
     if 300 <= apache[0] < 400:
-        if vapache[1].get("location") != apache[1].get("location"):
+        if httpd_rs[1].get("location") != apache[1].get("location"):
             problems.append(
-                f"location Apache={apache[1].get('location')!r} Vapache={vapache[1].get('location')!r}"
+                f"location Apache={apache[1].get('location')!r} httpd-rs={httpd_rs[1].get('location')!r}"
             )
     if path.endswith(".vh"):
         expected_type = (
@@ -443,19 +443,19 @@ def compare_case(case, verbose: bool) -> list[str]:
             problems.append(
                 f"Apache content-type {apache[1].get('content-type')!r}, expected {[expected_type]!r}"
             )
-        if vapache[1].get("content-type") != apache[1].get("content-type"):
+        if httpd_rs[1].get("content-type") != apache[1].get("content-type"):
             problems.append(
                 f"content-type Apache={apache[1].get('content-type')!r} "
-                f"Vapache={vapache[1].get('content-type')!r}"
+                f"httpd-rs={httpd_rs[1].get('content-type')!r}"
             )
     if host.lower().rstrip(".") in ("tenant-one.test", "tenant-two.test") and path == "/":
         for header in ("x-tenant", "x-include"):
-            if vapache[1].get(header) != apache[1].get(header):
+            if httpd_rs[1].get(header) != apache[1].get(header):
                 problems.append(
-                    f"{header} Apache={apache[1].get(header)!r} Vapache={vapache[1].get(header)!r}"
+                    f"{header} Apache={apache[1].get(header)!r} httpd-rs={httpd_rs[1].get(header)!r}"
                 )
     if verbose:
-        print(f"     Apache={apache[0]} {apache[2]!r}; Vapache={vapache[0]} {vapache[2]!r}")
+        print(f"     Apache={apache[0]} {apache[2]!r}; httpd-rs={httpd_rs[0]} {httpd_rs[2]!r}")
     return problems
 
 
@@ -499,8 +499,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
-    if not VAPACHED.exists():
-        sys.exit(f"missing {VAPACHED}; cargo build --release first")
+    if not HTTPD_RS.exists():
+        sys.exit(f"missing {HTTPD_RS}; cargo build --release first")
     if not Path(APACHE).exists():
         sys.exit(f"missing Apache httpd at {APACHE}")
     try:
@@ -508,14 +508,14 @@ def main() -> int:
         VHOST_BACKEND_PORT = start_backend("vhost-backend")
         fixture()
         apache_config = BASE / "apache" / "httpd.conf"
-        vapache_config = BASE / "vapache-httpd.conf"
+        httpd_rs_config = BASE / "httpd-rs-httpd.conf"
         write(apache_config, config(AP_PORT, True, 1))
-        write(vapache_config, config(VP_PORT, False, 1))
+        write(httpd_rs_config, config(VP_PORT, False, 1))
         apache_process = start([APACHE, "-f", str(apache_config), "-DFOREGROUND"], BASE / "logs" / "apache.out")
-        vapache_process = start([str(VAPACHED), "-f", str(vapache_config), "-DFOREGROUND"], BASE / "logs" / "vapache.out")
+        httpd_rs_process = start([str(HTTPD_RS), "-f", str(httpd_rs_config), "-DFOREGROUND"], BASE / "logs" / "httpd-rs.out")
         if not wait_port(AP_PORT) or not wait_port(VP_PORT):
             print("server failed to start")
-            for path in (BASE / "logs" / "apache.out", BASE / "logs" / "vapache.out"):
+            for path in (BASE / "logs" / "apache.out", BASE / "logs" / "httpd-rs.out"):
                 if path.exists():
                     print(path.read_text()[-8000:])
             return 1
@@ -531,7 +531,7 @@ def main() -> int:
             else:
                 print(f"ok   {case[0]}")
 
-        for server_kind in ("apache", "vapache"):
+        for server_kind in ("apache", "httpd-rs"):
             one = BASE / "logs" / f"{server_kind}-tenant-one-error.log"
             two = BASE / "logs" / f"{server_kind}-tenant-two-error.log"
             one_text = one.read_text(errors="replace") if one.exists() else ""
@@ -572,22 +572,22 @@ def main() -> int:
                 print(f"ok   {server_kind} CustomLog override isolation")
 
         before_apache = request(AP_PORT, "reload.test")
-        before_vapache = request(VP_PORT, "reload.test")
-        if before_apache[0] != 403 or before_vapache[0] != 403:
+        before_httpd_rs = request(VP_PORT, "reload.test")
+        if before_apache[0] != 403 or before_httpd_rs[0] != 403:
             failures += 1
-            print(f"FAIL reload initial policy Apache={before_apache[0]} Vapache={before_vapache[0]}")
+            print(f"FAIL reload initial policy Apache={before_apache[0]} httpd-rs={before_httpd_rs[0]}")
         write(apache_config, config(AP_PORT, True, 2))
-        write(vapache_config, config(VP_PORT, False, 2))
+        write(httpd_rs_config, config(VP_PORT, False, 2))
         os.kill(apache_process.pid, signal.SIGUSR1)
-        os.kill(vapache_process.pid, signal.SIGHUP)
+        os.kill(httpd_rs_process.pid, signal.SIGHUP)
         after_apache = wait_generation(AP_PORT, "2")
-        after_vapache = wait_generation(VP_PORT, "2")
-        if not after_apache or not after_vapache or after_apache[0] != 200 or after_vapache[0] != 200:
+        after_httpd_rs = wait_generation(VP_PORT, "2")
+        if not after_apache or not after_httpd_rs or after_apache[0] != 200 or after_httpd_rs[0] != 200:
             failures += 1
-            print(f"FAIL graceful reload Apache={after_apache!r} Vapache={after_vapache!r}")
-        elif after_apache[2] != after_vapache[2]:
+            print(f"FAIL graceful reload Apache={after_apache!r} httpd-rs={after_httpd_rs!r}")
+        elif after_apache[2] != after_httpd_rs[2]:
             failures += 1
-            print(f"FAIL graceful reload body Apache={after_apache[2]!r} Vapache={after_vapache[2]!r}")
+            print(f"FAIL graceful reload body Apache={after_apache[2]!r} httpd-rs={after_httpd_rs[2]!r}")
         else:
             print("ok   graceful reload replaces vhost authorization generation")
 

@@ -1,5 +1,5 @@
 [package]
-name = "vapache-verified"
+name = "httpd-rs-verified"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

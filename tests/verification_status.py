@@ -289,7 +289,7 @@ def run_verus(errors: list[str]) -> None:
         + env.get("PATH", "")
     )
     proc = subprocess.run(
-        ["cargo", "verus", "verify", "-p", "vapache-verified"],
+        ["cargo", "verus", "verify", "-p", "httpd-rs-verified"],
         cwd=ROOT,
         env=env,
         capture_output=True,

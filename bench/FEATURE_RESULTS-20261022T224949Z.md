@@ -1,10 +1,10 @@
-# Feature benchmark: vapached vs. Apache httpd
+# Feature benchmark: httpd-rs vs. Apache httpd
 
 Generated: 2026-10-22T22:48:38.998529+00:00
 
 Method: 3 x 2s samples per server after warm-up; access logs to /dev/null. `wrk` for cleartext HTTP/1.1, `ab` for HEAD/POST, `h2load` for TLS/HTTP/2.
 
-| feature | apache req/s | vapache req/s | ratio | apache mean ms | vapache mean ms |
+| feature | apache req/s | httpd-rs req/s | ratio | apache mean ms | httpd-rs mean ms |
 |---|---:|---:|---:|---:|---:|
 | CGI GET | 1816 | 3950 | 2.18x | 18.61 | 8.24 |
 | CGI POST | 1757 | 4932 | 2.81x | 9.11 | 3.24 |
@@ -13,7 +13,7 @@ Method: 3 x 2s samples per server after warm-up; access logs to /dev/null. `wrk`
 
 ## Startup checks
 
-| metric | apache | vapache |
+| metric | apache | httpd-rs |
 |---|---:|---:|
 | config test (`-t`) median | 15.9 ms | 3.5 ms |
 | processes after load | 1 | 17 |

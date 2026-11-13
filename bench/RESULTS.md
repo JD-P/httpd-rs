@@ -1,6 +1,6 @@
 # Benchmark history
 
-Methodology: each run starts real Apache and vapached with equivalent configs,
+Methodology: each run starts real Apache and httpd-rs with equivalent configs,
 warms up, then takes the median of three samples. Runs from
 `2026-10-22T10:46` onward use `wrk` (HTTP/1.1, full runs use 3s samples and
 access logs go to `/dev/null`). Quick `--quick` runs use 1s samples and are
@@ -18,7 +18,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T10:05:47.899796+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 64262 | 72036 | 1.12x | 0.69 | 2 |
 | hello.txt (1.1KB, keepalive) | 67505 | 96058 | 1.42x | 0.52 | 1 |
@@ -27,7 +27,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T10:22:25.706618+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 50178 | 84926 | 1.69x | 0.59 | 2 |
 | hello.txt (1.1KB, keepalive) | 74392 | 106458 | 1.43x | 0.47 | 1 |
@@ -36,7 +36,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T10:37:38.348512+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 81781 | 127350 | 1.56x | 0.79 | 2 |
 | hello.txt (1.1KB, keepalive) | 84029 | 123183 | 1.47x | 0.81 | 2 |
@@ -45,7 +45,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T10:42:02.640021+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 0 | 0 | 0.00x | 0.00 | 0 |
 | hello.txt (1.1KB, keepalive) | 0 | 0 | 0.00x | 0.00 | 0 |
@@ -54,7 +54,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T10:42:21.519638+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 0 | 0 | 0.00x | 0.00 | 0 |
 | hello.txt (1.1KB, keepalive) | 0 | 0 | 0.00x | 0.00 | 0 |
@@ -63,7 +63,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T10:42:50.387335+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 95040 | 208241 | 2.19x | 0.21 | 1 |
 | hello.txt (1.1KB, keepalive) | 95403 | 206908 | 2.17x | 0.21 | 1 |
@@ -72,7 +72,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T10:43:32.163227+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 104338 | 107037 | 1.03x | 1.43 | 8 |
 | hello.txt (1.1KB, keepalive) | 92587 | 107575 | 1.16x | 1.42 | 8 |
@@ -81,7 +81,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T10:46:09.771893+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 103276 | 203546 | 1.97x | 0.38 | 2 |
 | hello.txt (1.1KB, keepalive) | 103741 | 202971 | 1.96x | 0.39 | 2 |
@@ -90,7 +90,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T11:39:05.518796+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 108252 | 202329 | 1.87x | 0.42 | 3 |
 | hello.txt (1.1KB, keepalive) | 109487 | 200149 | 1.83x | 0.40 | 3 |
@@ -99,7 +99,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T12:35:27.690834+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 109052 | 201621 | 1.85x | 0.39 | 3 |
 | hello.txt (1.1KB, keepalive) | 108308 | 200658 | 1.85x | 0.40 | 3 |
@@ -108,7 +108,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T12:47:04.271818+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 111610 | 205343 | 1.84x | 0.38 | 2 |
 | hello.txt (1.1KB, keepalive) | 111741 | 202229 | 1.81x | 0.37 | 2 |
@@ -117,7 +117,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T19:12:45.134835+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 110740 | 197608 | 1.78x | 0.43 | 3 |
 | hello.txt (1.1KB, keepalive) | 108395 | 197591 | 1.82x | 0.39 | 2 |
@@ -126,7 +126,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T19:19:06.146433+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 104596 | 193797 | 1.85x | 0.41 | 2 |
 | hello.txt (1.1KB, keepalive) | 104482 | 193488 | 1.85x | 0.41 | 2 |
@@ -135,7 +135,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T20:07:53.803491+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 97407 | 217795 | 2.24x | 0.21 | 1 |
 | hello.txt (1.1KB, keepalive) | 101889 | 191364 | 1.88x | 0.24 | 2 |
@@ -144,7 +144,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T20:08:33.216231+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 116174 | 212525 | 1.83x | 0.37 | 2 |
 | hello.txt (1.1KB, keepalive) | 118737 | 191097 | 1.61x | 0.40 | 3 |
@@ -153,7 +153,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T20:10:02.015072+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 119892 | 208130 | 1.74x | 0.38 | 2 |
 | hello.txt (1.1KB, keepalive) | 119354 | 206093 | 1.73x | 0.38 | 2 |
@@ -162,7 +162,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T20:50:05.901136+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 100684 | 221699 | 2.20x | 0.20 | 1 |
 | hello.txt (1.1KB, keepalive) | 99848 | 216330 | 2.17x | 0.19 | 1 |
@@ -171,7 +171,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T20:57:46.730657+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 107728 | 200242 | 1.86x | 0.41 | 2 |
 | hello.txt (1.1KB, keepalive) | 108114 | 194730 | 1.80x | 0.45 | 3 |
@@ -180,7 +180,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T21:00:53.101749+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 81999 | 191733 | 2.34x | 0.22 | 1 |
 | hello.txt (1.1KB, keepalive) | 86683 | 210361 | 2.43x | 0.25 | 2 |
@@ -189,7 +189,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T21:02:05.841481+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 72155 | 202816 | 2.81x | 0.22 | 1 |
 | hello.txt (1.1KB, keepalive) | 77094 | 195553 | 2.54x | 0.23 | 1 |
@@ -198,7 +198,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T21:31:19.037941+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 109462 | 291477 | 2.66x | 0.28 | 3 |
 | hello.txt (1.1KB, keepalive) | 100623 | 256657 | 2.55x | 0.32 | 3 |
@@ -207,7 +207,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T21:34:37.984281+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 103599 | 275127 | 2.66x | 0.29 | 2 |
 | hello.txt (1.1KB, keepalive) | 103122 | 265435 | 2.57x | 0.31 | 3 |
@@ -216,7 +216,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-22T21:42:34.236544+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 111416 | 277334 | 2.49x | 0.28 | 2 |
 | hello.txt (1.1KB, keepalive) | 103789 | 269745 | 2.60x | 0.28 | 2 |
@@ -225,7 +225,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-23T20:06:53.596703+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 86733 | 220519 | 2.54x | 0.40 | 3 |
 | hello.txt (1.1KB, keepalive) | 102083 | 221694 | 2.17x | 0.37 | 2 |
@@ -234,7 +234,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-23T20:26:06.929174+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 75182 | 229260 | 3.05x | 0.20 | 1 |
 | hello.txt (1.1KB, keepalive) | 83400 | 224911 | 2.70x | 0.19 | 1 |
@@ -243,7 +243,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-23T20:37:22.666517+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 96108 | 220135 | 2.29x | 0.38 | 2 |
 | hello.txt (1.1KB, keepalive) | 95933 | 214048 | 2.23x | 0.42 | 3 |
@@ -252,7 +252,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-23T21:03:32.654955+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 77373 | 240576 | 3.11x | 0.19 | 1 |
 | hello.txt (1.1KB, keepalive) | 83654 | 236041 | 2.82x | 0.19 | 1 |
@@ -261,7 +261,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-24T00:01:54.211577+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 83609 | 228047 | 2.73x | 0.22 | 2 |
 | hello.txt (1.1KB, keepalive) | 82258 | 222800 | 2.71x | 0.22 | 2 |
@@ -270,7 +270,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-24T22:16:21.393832+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 80608 | 210731 | 2.61x | 0.21 | 1 |
 | hello.txt (1.1KB, keepalive) | 81443 | 210570 | 2.59x | 0.21 | 1 |
@@ -279,7 +279,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-24T22:19:19.241721+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 87020 | 203874 | 2.34x | 0.44 | 3 |
 | hello.txt (1.1KB, keepalive) | 93665 | 191885 | 2.05x | 0.42 | 2 |
@@ -288,7 +288,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-24T23:02:39.623586+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 101155 | 216600 | 2.14x | 0.38 | 2 |
 | hello.txt (1.1KB, keepalive) | 95172 | 193079 | 2.03x | 0.41 | 2 |
@@ -297,7 +297,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-27T00:27:19.615538+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 92792 | 205324 | 2.21x | 0.40 | 2 |
 | hello.txt (1.1KB, keepalive) | 96773 | 188648 | 1.95x | 0.47 | 3 |
@@ -306,7 +306,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-28T15:21:16.447042+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 97728 | 195297 | 2.00x | 0.42 | 2 |
 | hello.txt (1.1KB, keepalive) | 98451 | 189977 | 1.93x | 0.46 | 3 |
@@ -315,7 +315,7 @@ history but are not comparable with strict runs.
 
 ## 2026-10-28T16:20:06.696779+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 86141 | 181089 | 2.10x | 0.47 | 3 |
 | hello.txt (1.1KB, keepalive) | 88745 | 175953 | 1.98x | 0.46 | 2 |
@@ -324,7 +324,7 @@ history but are not comparable with strict runs.
 
 ## 2026-11-04T08:06:33.743651+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 39356 | 34067 | 0.87x | 0.23 | 1 |
 | hello.txt (1.1KB, keepalive) | 39762 | 33448 | 0.84x | 0.24 | 1 |
@@ -333,7 +333,7 @@ history but are not comparable with strict runs.
 
 ## 2026-11-04T09:15:10.768151+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 42636 | 37357 | 0.88x | 0.22 | 1 |
 | hello.txt (1.1KB, keepalive) | 46437 | 41187 | 0.89x | 0.19 | 1 |
@@ -342,7 +342,7 @@ history but are not comparable with strict runs.
 
 ## 2026-11-05T00:21:29.849764+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 41663 | 44075 | 1.06x | 0.18 | 1 |
 | hello.txt (1.1KB, keepalive) | 35602 | 44413 | 1.25x | 0.18 | 1 |
@@ -351,7 +351,7 @@ history but are not comparable with strict runs.
 
 ## 2026-11-05T19:59:11.491313+00:00
 
-| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | index.html (small, keepalive) | 42588 | 40727 | 0.96x | 0.20 | 1 |
 | hello.txt (1.1KB, keepalive) | 43419 | 41164 | 0.95x | 0.20 | 1 |

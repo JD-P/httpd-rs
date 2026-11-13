@@ -48,11 +48,11 @@ jobs:
           set -euo pipefail
           python3 tests/release_version.py
           version=$(cargo metadata --locked --no-deps --format-version 1 \
-            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "vapached"))')
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "httpd-rs"))')
           SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
             packaging/run-reproducible-build.sh \
               --target "$TARGET" --output release
-          binary="release/vapached-${version}-linux-x86_64-musl"
+          binary="release/httpd-rs-${version}-linux-x86_64-musl"
           file "$binary"
           if readelf -d "$binary" 2>/dev/null | grep -q '(NEEDED)'; then
             echo "portable binary unexpectedly has dynamic dependencies" >&2
@@ -102,18 +102,18 @@ jobs:
               } | sha256sum | cut -d" " -f1
             }
             before=$(config_digest)
-            dpkg -i /release/vapache_*.deb
+            dpkg -i /release/httpd-rs_*.deb
             test "$before" = "$(config_digest)"
-            test ! -e /etc/systemd/system/multi-user.target.wants/vapache.service
-            if ! /usr/sbin/vapachectl configtest >/tmp/configtest.log 2>&1; then
+            test ! -e /etc/systemd/system/multi-user.target.wants/httpd-rs.service
+            if ! /usr/sbin/httpd-rsctl configtest >/tmp/configtest.log 2>&1; then
               cat /tmp/configtest.log >&2
               exit 1
             fi
             test "$before" = "$(config_digest)"
-            test -z "$(find /run/vapache/apache-config -type l -print -quit)"
-            grep -qx "VapacheCapability AutoIndex On" \
-              /run/vapache/apache-config/.vapache-capabilities.conf
-            /usr/sbin/vapachectl foreground >/tmp/vapache.log 2>&1 &
+            test -z "$(find /run/httpd-rs/apache-config -type l -print -quit)"
+            grep -qx "HttpdRsCapability AutoIndex On" \
+              /run/httpd-rs/apache-config/.httpd-rs-capabilities.conf
+            /usr/sbin/httpd-rsctl foreground >/tmp/httpd-rs.log 2>&1 &
             server_pid=$!
             cleanup() {
               kill "$server_pid" >/dev/null 2>&1 || true
@@ -128,13 +128,13 @@ jobs:
                 break
               fi
               if ! kill -0 "$server_pid" 2>/dev/null; then
-                cat /tmp/vapache.log >&2
+                cat /tmp/httpd-rs.log >&2
                 exit 1
               fi
               sleep 0.1
             done
             if [ "$ready" -ne 1 ]; then
-              cat /tmp/vapache.log >&2
+              cat /tmp/httpd-rs.log >&2
               exit 1
             fi
             cmp /tmp/served.html /var/www/html/index.html
@@ -146,10 +146,10 @@ jobs:
               "<Location />" \
               "Require all denied" \
               "</Location>" \
-              >/etc/apache2/conf-available/vapache-reload-test.conf
-            ln -s ../conf-available/vapache-reload-test.conf \
-              /etc/apache2/conf-enabled/vapache-reload-test.conf
-            /usr/sbin/vapachectl graceful
+              >/etc/apache2/conf-available/httpd-rs-reload-test.conf
+            ln -s ../conf-available/httpd-rs-reload-test.conf \
+              /etc/apache2/conf-enabled/httpd-rs-reload-test.conf
+            /usr/sbin/httpd-rsctl graceful
             denied=0
             for attempt in $(seq 1 100); do
               status=$(curl --noproxy "*" --silent --output /dev/null \
@@ -166,8 +166,8 @@ jobs:
               "<Location />" \
               "Require all granted" \
               "</Location>" \
-              >/etc/apache2/conf-available/vapache-reload-test.conf
-            /usr/sbin/vapachectl graceful
+              >/etc/apache2/conf-available/httpd-rs-reload-test.conf
+            /usr/sbin/httpd-rsctl graceful
             granted=0
             for attempt in $(seq 1 100); do
               status=$(curl --noproxy "*" --silent --output /tmp/reloaded.html \
@@ -186,8 +186,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image=vapache-systemd-integration
-          container="vapache-systemd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          image=httpd-rs-systemd-integration
+          container="httpd-rs-systemd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cleanup() {
             docker rm --force "$container" >/dev/null 2>&1 || true
           }
@@ -208,19 +208,19 @@ jobs:
             esac
           done
           test "$ready" -eq 1
-          deb_path=(release/vapache_*.deb)
+          deb_path=(release/httpd-rs_*.deb)
           test "${#deb_path[@]}" -eq 1
           test -f "${deb_path[0]}"
           deb_name=${deb_path[0]##*/}
           docker exec "$container" dpkg -i "/release/$deb_name"
-          if docker exec "$container" systemctl is-enabled --quiet vapache.service; then
-            echo "package unexpectedly enabled vapache.service" >&2
+          if docker exec "$container" systemctl is-enabled --quiet httpd-rs.service; then
+            echo "package unexpectedly enabled httpd-rs.service" >&2
             exit 1
           fi
           docker exec "$container" systemctl daemon-reload
           docker exec "$container" systemctl stop apache2.service
-          docker exec "$container" systemctl start vapache.service
-          docker exec "$container" systemctl is-active --quiet vapache.service
+          docker exec "$container" systemctl start httpd-rs.service
+          docker exec "$container" systemctl is-active --quiet httpd-rs.service
           served=0
           for attempt in $(seq 1 100); do
             if docker exec "$container" \
@@ -258,13 +258,13 @@ jobs:
               "Require all granted" \
               "</Directory>" \
               >/etc/httpd/conf/httpd.conf
-            rpm -i /release/vapache-*.x86_64.rpm
-            test "$(stat -c %U:%G:%a /usr/lib/vapache/control-common)" \
+            rpm -i /release/httpd-rs-*.x86_64.rpm
+            test "$(stat -c %U:%G:%a /usr/lib/httpd-rs/control-common)" \
               = root:root:644
-            /usr/sbin/vapachectl configtest
-            test ! -e /run/vapache/apache-config
+            /usr/sbin/httpd-rsctl configtest
+            test ! -e /run/httpd-rs/apache-config
             grep -qx "PidFile /run/httpd/httpd.pid" \
-              /run/vapache/apache-capabilities.conf
+              /run/httpd-rs/apache-capabilities.conf
           '
 
       - name: Validate the stock Debian 13 SSL configuration
@@ -303,11 +303,11 @@ jobs:
               "Require all granted" \
               "</Directory>" \
               "</VirtualHost>" \
-              >/etc/apache2/sites-available/vapache-certbot.conf
-            a2ensite vapache-certbot >/dev/null
-            dpkg -i /release/vapache_*.deb
-            /usr/sbin/vapachectl configtest
-            /usr/sbin/vapachectl foreground >/tmp/vapache-tls.log 2>&1 &
+              >/etc/apache2/sites-available/httpd-rs-certbot.conf
+            a2ensite httpd-rs-certbot >/dev/null
+            dpkg -i /release/httpd-rs_*.deb
+            /usr/sbin/httpd-rsctl configtest
+            /usr/sbin/httpd-rsctl foreground >/tmp/httpd-rs-tls.log 2>&1 &
             server_pid=$!
             cleanup() {
               kill "$server_pid" >/dev/null 2>&1 || true
@@ -323,7 +323,7 @@ jobs:
                 break
               fi
               if ! kill -0 "$server_pid" 2>/dev/null; then
-                cat /tmp/vapache-tls.log >&2
+                cat /tmp/httpd-rs-tls.log >&2
                 exit 1
               fi
               sleep 0.1
@@ -347,7 +347,7 @@ jobs:
             expected_fingerprint=$(openssl x509 \
               -in /etc/letsencrypt/archive/example.test/fullchain2.pem \
               -noout -fingerprint -sha256)
-            /usr/sbin/vapachectl graceful
+            /usr/sbin/httpd-rsctl graceful
             rotated=0
             for attempt in $(seq 1 100); do
               presented_fingerprint=$(printf "" \
@@ -359,7 +359,7 @@ jobs:
                 break
               fi
               if ! kill -0 "$server_pid" 2>/dev/null; then
-                cat /tmp/vapache-tls.log >&2
+                cat /tmp/httpd-rs-tls.log >&2
                 exit 1
               fi
               sleep 0.1
@@ -367,9 +367,9 @@ jobs:
             test "$rotated" -eq 1
           '
 
-      - name: Validate Certbot's Apache installer against Vapache
+      - name: Validate Certbot's Apache installer against httpd-rs
         shell: bash
-        run: tests/certbot_apache_integration.sh release/vapache_*.deb
+        run: tests/certbot_apache_integration.sh release/httpd-rs_*.deb
 
       - name: Attest release provenance
         uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
@@ -379,12 +379,12 @@ jobs:
       - name: Upload binary and Linux packages
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: vapache-${{ steps.package.outputs.version }}-linux-x86_64-${{ github.sha }}
+          name: httpd-rs-${{ steps.package.outputs.version }}-linux-x86_64-${{ github.sha }}
           path: |
-            release/vapached-*-linux-x86_64-musl
-            release/vapache-*-linux-x86_64-musl.tar.gz
-            release/vapache_*.deb
-            release/vapache-*.rpm
+            release/httpd-rs-*-linux-x86_64-musl
+            release/httpd-rs-*-linux-x86_64-musl.tar.gz
+            release/httpd-rs_*.deb
+            release/httpd-rs-*.rpm
             release/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
@@ -414,10 +414,10 @@ jobs:
           fi
 
           assets=(
-            release/vapached-*-linux-x86_64-musl
-            release/vapache-*-linux-x86_64-musl.tar.gz
-            release/vapache_*.deb
-            release/vapache-*.rpm
+            release/httpd-rs-*-linux-x86_64-musl
+            release/httpd-rs-*-linux-x86_64-musl.tar.gz
+            release/httpd-rs_*.deb
+            release/httpd-rs-*.rpm
             release/SHA256SUMS
           )
           if gh release view "$tag" >/dev/null 2>&1; then
@@ -425,7 +425,7 @@ jobs:
           else
             gh release create "$tag" \
               --verify-tag \
-              --title "Vapache ${tag#v}" \
+              --title "httpd-rs ${tag#v}" \
               --generate-notes \
               "${assets[@]}"
           fi

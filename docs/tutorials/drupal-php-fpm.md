@@ -15,12 +15,12 @@ is `drupal.example.test`.
 ## What you will do
 
 You will install MariaDB, PHP-FPM, Composer, and Drupal, configure a dedicated
-PHP-FPM pool, set Drupal's trusted host, connect Vapache, check the release's
+PHP-FPM pool, set Drupal's trusted host, connect httpd-rs, check the release's
 access-file rules, and test a reload.
 
 ## Before you start
 
-Complete [Prepare a Debian VPS for a Vapache
+Complete [Prepare a Debian VPS for a httpd-rs
 tutorial](prepare-debian-vps.md). Point `drupal.example.test` at the VPS and
 open TCP ports 80 and 443 in the provider firewall. This Debian 13 example uses
 PHP-FPM user ID `33`; the identity check below verifies that value.
@@ -60,7 +60,7 @@ $ sudo -u drupal-deploy composer --working-dir=/srv/drupal/current \
 $ sudo /srv/drupal/current/vendor/bin/drush site:install standard -y \
     --root=/srv/drupal/current/web \
     --db-url='mysql://drupal:replace-database-password@localhost/drupal' \
-    --site-name='Vapache Drupal tutorial' \
+    --site-name='httpd-rs Drupal tutorial' \
     --account-name=admin --account-pass='replace-admin-password'
 $ sudo install -d -o www-data -g www-data -m 0750 \
     /srv/drupal/current/web/sites/default/files
@@ -116,7 +116,7 @@ $ sudo stat -Lc '%F %u:%g %a %n' /run/php/drupal-fpm.sock
 socket 0:33 660 /run/php/drupal-fpm.sock
 ```
 
-## 4. Configure Vapache
+## 4. Configure httpd-rs
 
 Create `/etc/apache2/sites-available/drupal.conf` with a temporary HTTP-only
 host, enable it, and obtain the certificate:
@@ -129,17 +129,17 @@ host, enable it, and obtain the certificate:
 
 ```console
 $ sudo a2ensite drupal.conf
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot certonly --apache --domain drupal.example.test
 ```
 
 Replace it with the final configuration:
 
 ```apache
-VapacheCapability AccessFiles On
-VapacheCapability FastCgi On
-VapacheFastCGIStablePath On unix:/run/php/drupal-fpm.sock 33 0 0
+HttpdRsCapability AccessFiles On
+HttpdRsCapability FastCgi On
+HttpdRsFastCGIStablePath On unix:/run/php/drupal-fpm.sock 33 0 0
 
 <VirtualHost *:80>
     ServerName drupal.example.test
@@ -166,17 +166,17 @@ VapacheFastCGIStablePath On unix:/run/php/drupal-fpm.sock 33 0 0
 
 ## 5. Check the Drupal access file
 
-Run `vapachectl configtest`. If it rejects a directive in Drupal's `.htaccess`,
+Run `httpd-rsctl configtest`. If it rejects a directive in Drupal's `.htaccess`,
 give your coding agent the exact Drupal release, the complete error, and the
 access file. Ask it to preserve each rejected rule in the main configuration
 and to provide a request that proves the replacement. Do not accept a change
 that only deletes the rule.
 
-Test the configuration, reload Vapache, and verify renewal:
+Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -189,7 +189,7 @@ $ curl -I https://drupal.example.test/.htaccess
 ```
 
 The access-file request must be denied. Also test one clean URL and one path
-that the Drupal rules protect. Reload Vapache and repeat the login-page request.
+that the Drupal rules protect. Reload httpd-rs and repeat the login-page request.
 
 <!--
 Deployment contract only; not operator instructions.

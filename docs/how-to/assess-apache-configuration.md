@@ -7,8 +7,8 @@ contracts: DOC-CAPABILITY-AUDIT-001, DOC-UNSUPPORTED-POLICY-001
 
 # Assess an Apache configuration
 
-Use this procedure before you stop Apache or start Vapache. The procedure finds
-required Vapache features, unsupported directives, configuration files with
+Use this procedure before you stop Apache or start httpd-rs. The procedure finds
+required httpd-rs features, unsupported directives, configuration files with
 unsafe ownership or permissions, and deployment changes.
 
 ## Prerequisites
@@ -35,7 +35,7 @@ $ sudo apache2ctl -t -D DUMP_VHOSTS
 $ sudo apache2ctl -t -D DUMP_RUN_CFG
 ```
 
-Save this output. You will use it to compare Apache with Vapache. The
+Save this output. You will use it to compare Apache with httpd-rs. The
 loaded-module list can reveal Apache features that are compiled into the server
 or enabled outside the site's virtual-host file.
 
@@ -44,38 +44,38 @@ reference](https://httpd.apache.org/docs/2.4/mod/quickreference.html) to identif
 the module, context, and override class for an unfamiliar directive. Use the
 [module index](https://httpd.apache.org/docs/2.4/mod/) to read the Apache
 behavior that the configuration currently requests. These references do not
-state whether Vapache implements that behavior.
+state whether httpd-rs implements that behavior.
 
-## 3. Run the packaged Vapache check
+## 3. Run the packaged httpd-rs check
 
 Run:
 
 ```console
-$ sudo vapachectl configtest
+$ sudo httpd-rsctl configtest
 ```
 
 **Nonstandard configuration location:** If your Apache configuration is not at
 `/etc/apache2/apache2.conf` on a Debian-family system or
-`/etc/httpd/conf/httpd.conf` on an RPM-family system, set `VAPACHE_CONFDIR` to
-the configuration directory and `VAPACHE_CONFIG` to the main configuration
+`/etc/httpd/conf/httpd.conf` on an RPM-family system, set `HTTPD_RS_CONFDIR` to
+the configuration directory and `HTTPD_RS_CONFIG` to the main configuration
 file before you run the check.
 
-Some features that Apache enables by default are off by default in Vapache
+Some features that Apache enables by default are off by default in httpd-rs
 because they add attack surface but are needed only by some configurations.
-Vapache calls these features *capabilities*. When the configuration needs one,
-the wrapper adds the required `VapacheCapability` line to a temporary test copy
+httpd-rs calls these features *capabilities*. When the configuration needs one,
+the wrapper adds the required `HttpdRsCapability` line to a temporary test copy
 and prints the line. It does not change the Apache configuration.
 
 ## 4. Check a copied configuration for required capabilities
 
-Skip this section if you used `sudo vapachectl configtest` above. Use
+Skip this section if you used `sudo httpd-rsctl configtest` above. Use
 `--audit-capabilities` only when you are checking a copied configuration file
-directly with `vapached -f`.
+directly with `httpd-rs -f`.
 
 Run:
 
 ```console
-$ vapached -f /path/to/copied-httpd.conf --audit-capabilities
+$ httpd-rs -f /path/to/copied-httpd.conf --audit-capabilities
 ```
 
 Replace `/path/to/copied-httpd.conf` with the path to the copied main
@@ -84,7 +84,7 @@ configuration requires without enabling them or changing the file. For each
 reported capability, confirm that the site needs the feature. If it does, add
 the printed line to the main server configuration.
 
-Audit mode cannot start a runnable server. Vapache capabilities must be enabled
+Audit mode cannot start a runnable server. httpd-rs capabilities must be enabled
 in the main server configuration. An `.htaccess` file cannot enable them.
 
 ### Example: a configuration that requires CGI
@@ -100,23 +100,23 @@ ScriptAlias "/cgi-bin/" "/srv/www/example/cgi-bin/"
 The capability audit reports this required declaration:
 
 ```text
-VapacheCapability Cgi On
+HttpdRsCapability Cgi On
 ```
 
-## 5. Resolve each Vapache error
+## 5. Resolve each httpd-rs error
 
 Use these categories:
 
 | Error category | Meaning | Action |
 |---|---|---|
-| Missing capability | The configuration requests a supported feature that Vapache disables by default | Decide whether the site needs the feature. If it does, add the reported `VapacheCapability` line to the main configuration. |
-| Recognized but unsupported directive | Vapache cannot preserve the directive effect | Change the deployment or continue to use Apache. Do not delete a policy directive only to make the test pass. |
-| Invalid or unknown directive | Vapache does not recognize a valid supported use of the directive | Correct the configuration, or continue to use Apache when Vapache lacks the feature. |
+| Missing capability | The configuration requests a supported feature that httpd-rs disables by default | Decide whether the site needs the feature. If it does, add the reported `HttpdRsCapability` line to the main configuration. |
+| Recognized but unsupported directive | httpd-rs cannot preserve the directive effect | Change the deployment or continue to use Apache. Do not delete a policy directive only to make the test pass. |
+| Invalid or unknown directive | httpd-rs does not recognize a valid supported use of the directive | Correct the configuration, or continue to use Apache when httpd-rs lacks the feature. |
 | Unsafe configuration input | The file has unsafe ownership, write access, type, symlink use, size, or path stability | Move or secure the file. Do not weaken the check without documenting who can change the file and what that access permits. |
-| Unsupported location or value | Vapache cannot give the directive the same meaning that Apache gives it in this location | Move the directive only when Apache permits the move without changing behavior. Otherwise, change the deployment. |
+| Unsupported location or value | httpd-rs cannot give the directive the same meaning that Apache gives it in this location | Move the directive only when Apache permits the move without changing behavior. Otherwise, change the deployment. |
 | Missing runtime file | A certificate, key, password file, map, MIME database, or include is absent | Supply the same file that the running deployment requires. |
 
-For example, Vapache rejects this Apache policy directive because Vapache does
+For example, httpd-rs rejects this Apache policy directive because httpd-rs does
 not implement its effect:
 
 <!-- tested-example: compatibility/unsupported-policy.conf -->
@@ -125,26 +125,26 @@ not implement its effect:
 SSLRequireSSL
 ```
 
-Vapache stops configuration loading instead of ignoring the directive.
+httpd-rs stops configuration loading instead of ignoring the directive.
 
 ## 6. Ask your agent to resolve unclear errors
 
 Give your coding agent:
 
-- the complete Vapache error;
+- the complete httpd-rs error;
 - the directive and its enclosing configuration blocks;
 - the Apache include and module dumps from step 2;
-- the Vapache source revision;
+- the httpd-rs source revision;
 - [Apache compatibility and intentional
   differences](../reference/apache-compatibility.md).
 
 Ask the agent to return:
 
 - the effect that Apache applies at that location;
-- whether Vapache supports the same effect;
+- whether httpd-rs supports the same effect;
 - the supported configuration or deployment change that preserves the effect;
 - a negative and positive request test for the result;
-- a clear statement when Vapache cannot support the site without weakening the
+- a clear statement when httpd-rs cannot support the site without weakening the
   rule.
 
 The answer must not recommend deleting an access, authentication, TLS, proxy,
@@ -168,7 +168,7 @@ Review at least these areas:
 ## 8. Verify a representative workflow
 
 Do not use a successful configuration test as the final acceptance test. Start
-Vapache on an evaluation host and test the workflows that matter to the site.
+httpd-rs on an evaluation host and test the workflows that matter to the site.
 
 For a static site, test the home page, a missing page, redirects, authentication,
 ranges, and cache policy. For a dynamic application, test login, state change,

@@ -5,7 +5,7 @@ import http.client, os, shutil, socket, subprocess, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent / "f70-scratch"
-VAPACHED = Path("/root/vapache/target/release/vapached")
+HTTPD_RS = Path("/root/httpd-rs/target/release/httpd-rs")
 APACHE = "/usr/sbin/apache2"
 MODDIR = "/usr/lib/apache2/modules"
 PORT = 41210
@@ -118,13 +118,13 @@ def run(name: str, conf: str, symlink: bool, with_htadmin: bool, url: str = "/up
     write_conf(apath, MODS + "\n" + conf, ap_port, base)
     subprocess.run(["pkill", "-9", "-f", f"{ROOT}/{name}"], capture_output=True)
     ap, apf = start([APACHE, "-f", str(apath), "-k", "start"], base / "logs/apache.out")
-    vp, vpf = start([str(VAPACHED), "-f", str(vpath), "-DFOREGROUND"], base / "logs/vapache.out")
+    vp, vpf = start([str(HTTPD_RS), "-f", str(vpath), "-DFOREGROUND"], base / "logs/httpd-rs.out")
     ok_ap, ok_vp = wait_port(ap_port), wait_port(vp_port)
     s_ap, b_ap = fetch(ap_port, url) if ok_ap else (-1, b"start failed - see logs")
     s_vp, b_vp = fetch(vp_port, url) if ok_vp else (-1, b"start failed - see logs")
     print(f"=== {name}")
     print(f"    apache  : {s_ap} {b_ap.decode('utf8', 'replace').strip().splitlines()[:1]}")
-    print(f"    vapached: {s_vp} {b_vp.decode('utf8', 'replace').strip().splitlines()[:1]}")
+    print(f"    httpd-rs: {s_vp} {b_vp.decode('utf8', 'replace').strip().splitlines()[:1]}")
     subprocess.run(["pkill", "-9", "-f", f"{ROOT}/{name}"], capture_output=True)
     if apf: apf.close()
     if vpf: vpf.close()

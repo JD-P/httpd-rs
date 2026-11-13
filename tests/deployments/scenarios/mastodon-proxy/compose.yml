@@ -5,7 +5,7 @@ x-mastodon-environment: &mastodon-environment
   DB_PORT: "5432"
   DB_NAME: mastodon
   DB_USER: mastodon
-  DB_PASS: vapache-mastodon-db
+  DB_PASS: httpd-rs-mastodon-db
   REDIS_HOST: redis
   REDIS_PORT: "6379"
   ES_ENABLED: "false"
@@ -44,7 +44,7 @@ services:
     environment:
       POSTGRES_DB: mastodon
       POSTGRES_USER: mastodon
-      POSTGRES_PASSWORD: vapache-mastodon-db
+      POSTGRES_PASSWORD: httpd-rs-mastodon-db
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=128m
       - /run/postgresql:rw,nosuid,nodev,size=32m
@@ -130,7 +130,7 @@ services:
         condition: service_healthy
     environment:
       <<: *mastodon-environment
-      MASTODON_SIDEKIQ_READY_FILENAME: vapache-sidekiq-ready
+      MASTODON_SIDEKIQ_READY_FILENAME: httpd-rs-sidekiq-ready
     command: ["bundle", "exec", "sidekiq", "-c", "5"]
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=128m,uid=991,gid=991
@@ -143,7 +143,7 @@ services:
     networks:
       - application
     healthcheck:
-      test: ["CMD", "test", "-f", "/opt/mastodon/tmp/vapache-sidekiq-ready"]
+      test: ["CMD", "test", "-f", "/opt/mastodon/tmp/httpd-rs-sidekiq-ready"]
       interval: 2s
       timeout: 5s
       retries: 90

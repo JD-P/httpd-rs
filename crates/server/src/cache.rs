@@ -241,11 +241,11 @@ fn insert_memory_into(cfg: &Config, cache: &mut MemoryCache, key: &str, entry: A
         let old = retained.remove(0);
         cache.bytes = cache.bytes.saturating_sub(memory_entry_size(key, &old));
     }
-    while (!vapache_verified::cache_memory_admit(cache.bytes, incoming, cfg.cache.max_memory_size)
+    while (!httpd_rs_verified::cache_memory_admit(cache.bytes, incoming, cfg.cache.max_memory_size)
         || cache.entries.len() >= MAX_ENTRIES)
         && evict_oldest_memory(cache)
     {}
-    if vapache_verified::cache_memory_admit(cache.bytes, incoming, cfg.cache.max_memory_size)
+    if httpd_rs_verified::cache_memory_admit(cache.bytes, incoming, cfg.cache.max_memory_size)
         && cache.entries.len() < MAX_ENTRIES
     {
         cache.bytes = cache.bytes.saturating_add(incoming);
@@ -575,7 +575,7 @@ pub struct CacheContext {
 
 impl CacheContext {
     pub(crate) fn generation_is_current(&self, cfg: &Config) -> bool {
-        vapache_verified::cache_generation_admit(self.epoch, cfg.cache_epoch())
+        httpd_rs_verified::cache_generation_admit(self.epoch, cfg.cache_epoch())
     }
 
     pub fn authorization(&self) -> &crate::access::AuthorizedOutcome {
@@ -648,7 +648,7 @@ pub fn request_scope_with_plan(
     host: &str,
     local_ip: &str,
 ) -> Option<CacheContext> {
-    if !vapache_verified::cache_lookup_request_admit(
+    if !httpd_rs_verified::cache_lookup_request_admit(
         matches!(req.method.as_str(), "GET" | "HEAD"),
         matches!(req.framing, crate::verified::BodyFraming::None),
         req.body_len() == 0,
@@ -944,7 +944,7 @@ pub fn request_scope_with_plan(
             fs_path = actual;
         }
     }
-    if !vapache_verified::cache_directory_index_bind_admit(
+    if !httpd_rs_verified::cache_directory_index_bind_admit(
         directory_target,
         index_selected,
         index_selected,
@@ -968,7 +968,7 @@ pub fn request_scope_with_plan(
         .iter()
         .any(|(_, doc)| matches!(doc, crate::config::ErrorDoc::Local(_)));
     if local_error_document && !fs_path.exists() {
-        if !vapache_verified::cache_local_error_document_admit(true, true) {
+        if !httpd_rs_verified::cache_local_error_document_admit(true, true) {
             return None;
         }
     }
@@ -1004,14 +1004,14 @@ pub fn request_scope_with_plan(
     // be shared across distinct queries. Classify every non-default handler,
     // not just the proxy forms known to `match_proxy` (F52/F54/I49/I53).
     if cfg.cache.ignore_query_string && !req.query.is_empty() {
-        if !vapache_verified::cache_dynamic_handler_admit(handler, dynamic) {
+        if !httpd_rs_verified::cache_dynamic_handler_admit(handler, dynamic) {
             // `dynamic` includes `handler` as a disjunct, so the verified
             // predicate proves that this fail-closed guard cannot reject.
             // coverage:ignore-start - verified implication
             return None;
             // coverage:ignore-stop
         }
-        if !vapache_verified::cache_ignore_query_admit(
+        if !httpd_rs_verified::cache_ignore_query_admit(
             cfg.cache.ignore_query_string,
             !req.query.is_empty(),
             dynamic,
@@ -1040,13 +1040,13 @@ pub fn request_scope_with_plan(
     };
     let resource = grant.key().clone();
     if let Some((selected_url, selected_target)) = &multiview_binding {
-        let authorization_meet = vapache_verified::multiview_authorization_meet_admit(
+        let authorization_meet = httpd_rs_verified::multiview_authorization_meet_admit(
             true,
             grant.key().url_path == *selected_url,
             true,
             true,
         );
-        if !vapache_verified::multiview_cache_binding_admit(
+        if !httpd_rs_verified::multiview_cache_binding_admit(
             true,
             authorization_meet,
             cache_url_path == *selected_url,
@@ -1092,7 +1092,7 @@ pub fn request_scope_with_plan(
     .and_then(|plan| {
         plan.into_outcome(
             cfg.authorization_generation(),
-            vapache_verified::TransformSink::Cache,
+            httpd_rs_verified::TransformSink::Cache,
         )
     })?;
     Some(CacheContext {
@@ -1160,7 +1160,7 @@ fn base_key(
 /// Lossless ASCII hex for cache-key material.  The verifier proves the
 /// encoding length; the runtime never uses a lossy string conversion here.
 fn key_component(value: &[u8]) -> String {
-    String::from_utf8(vapache_verified::cache_key_hex(value))
+    String::from_utf8(httpd_rs_verified::cache_key_hex(value))
         .expect("cache key hex encoding is ASCII")
 }
 
@@ -1247,7 +1247,7 @@ fn cache_policy_fingerprint(
     fingerprint_field(&mut material, peer.ip().to_string().as_bytes());
     fingerprint_field(
         &mut material,
-        &vapache_verified::cache_transport_identity(
+        &httpd_rs_verified::cache_transport_identity(
             match req.version {
                 crate::http::Version::Http10 => 10,
                 crate::http::Version::Http11 => 11,
@@ -1278,7 +1278,7 @@ fn cache_policy_fingerprint(
 fn fingerprint_field(out: &mut Vec<u8>, field: &[u8]) {
     // Verified four-byte big-endian framing; see
     // `cache_fingerprint_field_injective`.
-    out.extend_from_slice(&vapache_verified::cache_fingerprint_field(field));
+    out.extend_from_slice(&httpd_rs_verified::cache_fingerprint_field(field));
 }
 
 fn request_has_shared_cache_credentials(req: &Request) -> bool {
@@ -1328,7 +1328,7 @@ fn request_lookup_policy(cfg: &Config, req: &Request) -> Option<RequestCachePoli
 fn request_freshness_allows(policy: RequestCachePolicy, entry: &Entry, now: i64) -> bool {
     let current_age = u64::try_from(now.saturating_sub(entry.stored).max(0)).unwrap_or(u64::MAX);
     let remaining = u64::try_from(entry.expires.saturating_sub(now).max(0)).unwrap_or(u64::MAX);
-    vapache_verified::cache_request_freshness_admit(
+    httpd_rs_verified::cache_request_freshness_admit(
         now < entry.expires,
         current_age,
         policy.max_age,
@@ -1432,7 +1432,7 @@ pub fn lookup_authorized(
     let authorization = context.authorization();
     if !authorization.require_sink(
         cfg.authorization_generation(),
-        vapache_verified::TransformSink::Cache,
+        httpd_rs_verified::TransformSink::Cache,
     ) {
         return None;
     }
@@ -1468,7 +1468,7 @@ pub fn lookup(
     request_epoch: u64,
 ) -> Option<Response> {
     let active_epoch = cfg.cache_epoch();
-    if !vapache_verified::cache_generation_admit(request_epoch, active_epoch) {
+    if !httpd_rs_verified::cache_generation_admit(request_epoch, active_epoch) {
         return None;
     }
     let fingerprint = cache_policy_fingerprint(scope, req, peer, target, backend_transport_visible);
@@ -1476,11 +1476,11 @@ pub fn lookup(
     if !grant.require_sink(
         cfg.authorization_generation(),
         &crate::access::ResourceKey::cache_policy(vhost, req, host, &path_identity, fingerprint),
-        vapache_verified::TransformSink::Cache,
+        httpd_rs_verified::TransformSink::Cache,
     ) {
         return None;
     }
-    if !vapache_verified::cache_lookup_request_admit(
+    if !httpd_rs_verified::cache_lookup_request_admit(
         matches!(req.method.as_str(), "GET" | "HEAD"),
         matches!(req.framing, crate::verified::BodyFraming::None),
         req.body_len() == 0,
@@ -1508,7 +1508,7 @@ pub fn lookup(
                 continue;
             }
             if found.is_none()
-                && vapache_verified::cache_lookup_admit(
+                && httpd_rs_verified::cache_lookup_admit(
                     true,
                     entry.policy == fingerprint,
                     vary_matches(&entry, req),
@@ -1534,7 +1534,7 @@ pub fn lookup(
             .try_response_bytes_in(&cache_context)
             .ok()?;
         if let Some(mut loaded) = disk_load_accounted(cfg, &key, &mut load_resident) {
-            if !vapache_verified::cache_lookup_admit(
+            if !httpd_rs_verified::cache_lookup_admit(
                 true,
                 loaded.policy == fingerprint,
                 vary_matches(&loaded, req),
@@ -1740,7 +1740,7 @@ fn bounded_remaining_ttl(
     if cfg.min_expire > cfg.max_expire {
         return 0;
     }
-    let remaining = vapache_verified::cache_remaining_freshness(lifetime, current_age);
+    let remaining = httpd_rs_verified::cache_remaining_freshness(lifetime, current_age);
     if remaining == 0 {
         return 0;
     }
@@ -1751,7 +1751,7 @@ fn bounded_remaining_ttl(
         0
     };
     let max = i64::try_from(cfg.max_expire).unwrap_or(i64::MAX);
-    vapache_verified::cache_ttl_clamp(remaining, min, max)
+    httpd_rs_verified::cache_ttl_clamp(remaining, min, max)
 }
 
 fn freshness_and_age(
@@ -1842,19 +1842,19 @@ pub fn prepare_dir(cfg: &Config, dir: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::ffi::CString;
-        if vapache_os::effective_uid() == 0 {
+        if httpd_rs_os::effective_uid() == 0 {
             let user = CString::new(cfg.user.as_str()).ok(); // coverage:ignore-start - root-only ownership handoff
             let group = CString::new(cfg.group.as_str()).ok();
             let uid = user
                 .as_deref()
-                .and_then(|value| vapache_os::lookup_user_id(value).ok());
+                .and_then(|value| httpd_rs_os::lookup_user_id(value).ok());
             let gid = group
                 .as_deref()
-                .and_then(|value| vapache_os::lookup_group_id(value).ok());
+                .and_then(|value| httpd_rs_os::lookup_group_id(value).ok());
             if let Some(uid) = uid {
-                let _ = vapache_os::fchown_optional(opened.as_fd(), Some(uid), gid);
+                let _ = httpd_rs_os::fchown_optional(opened.as_fd(), Some(uid), gid);
             }
-            let _ = vapache_os::fchmod(opened.as_fd(), 0o770); // coverage:ignore-stop
+            let _ = httpd_rs_os::fchmod(opened.as_fd(), 0o770); // coverage:ignore-stop
         }
     }
 }
@@ -2017,7 +2017,7 @@ fn decode_meta_record(data: &[u8]) -> Option<(Entry, Option<Vec<u8>>)> {
         return None;
     }
     let status = status?;
-    if !vapache_verified::cache_store_status_admit(status)
+    if !httpd_rs_verified::cache_store_status_admit(status)
         || !cache_metadata_singletons_valid(&headers)
     {
         return None;
@@ -2108,7 +2108,7 @@ pub fn fuzz_cache_stateful(data: &[u8]) {
     }
 
     let root =
-        std::env::temp_dir().join(format!("vapache-cache-state-fuzz-{}", std::process::id()));
+        std::env::temp_dir().join(format!("httpd-rs-cache-state-fuzz-{}", std::process::id()));
     let old_root = root.join("old");
     let candidate_root = root.join("candidate");
     for cache_root in [&old_root, &candidate_root] {
@@ -2282,7 +2282,8 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
             .unwrap_or(0);
         let old_count = usize::from(old_size > 0);
         let old_files = usage.file_counts.get(&stem).copied().unwrap_or(0);
-        let mut projected = vapache_verified::cache_disk_projected(usage.total, old_size, incoming);
+        let mut projected =
+            httpd_rs_verified::cache_disk_projected(usage.total, old_size, incoming);
         let mut entries = usage
             .stems
             .len()
@@ -2314,7 +2315,7 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
             }
             if usage.stems.remove(&victim).is_some() {
                 usage.total = usage.total.saturating_sub(size);
-                projected = vapache_verified::cache_disk_evict(projected, size);
+                projected = httpd_rs_verified::cache_disk_evict(projected, size);
                 entries = entries.saturating_sub(1);
                 victims.push((victim.clone(), usage.leases.remove(&victim)));
             }
@@ -2485,7 +2486,7 @@ fn disk_load_accounted(
     };
     let metadata_key = decode_meta_key(&meta);
     let exact_key = metadata_key.as_deref() == Some(key.as_bytes());
-    if !vapache_verified::cache_disk_key_admit(metadata_key.is_some(), exact_key) {
+    if !httpd_rs_verified::cache_disk_key_admit(metadata_key.is_some(), exact_key) {
         remove_disk_stem(cfg, &stem);
         return None;
     }
@@ -2546,7 +2547,7 @@ pub fn store_authorized(
     let authorization = context.authorization();
     if !authorization.require_sink(
         cfg.authorization_generation(),
-        vapache_verified::TransformSink::Cache,
+        httpd_rs_verified::TransformSink::Cache,
     ) {
         return;
     }
@@ -2583,7 +2584,7 @@ pub fn store(
     backend_transport_visible: bool,
     request_epoch: u64,
 ) {
-    if !vapache_verified::cache_generation_admit(request_epoch, cfg.cache_epoch()) {
+    if !httpd_rs_verified::cache_generation_admit(request_epoch, cfg.cache_epoch()) {
         return;
     }
     if crate::fault::hit("transition.cache.store.start").is_err() {
@@ -2601,7 +2602,7 @@ pub fn store(
     if !grant.require_sink(
         cfg.authorization_generation(),
         &crate::access::ResourceKey::cache_policy(vhost, req, host, &path_identity, fingerprint),
-        vapache_verified::TransformSink::Cache,
+        httpd_rs_verified::TransformSink::Cache,
     ) {
         return;
     }
@@ -2612,7 +2613,7 @@ pub fn store(
         return;
     };
     let credential_free = !request_has_shared_cache_credentials(req);
-    if !vapache_verified::cache_store_request_admit(
+    if !httpd_rs_verified::cache_store_request_admit(
         req.method == "GET",
         matches!(req.framing, crate::verified::BodyFraming::None),
         req.body_len() == 0,
@@ -2621,7 +2622,7 @@ pub fn store(
     ) {
         return;
     }
-    if !vapache_verified::cache_store_status_admit(resp.status) {
+    if !httpd_rs_verified::cache_store_status_admit(resp.status) {
         return;
     }
     let Ok(header_sanitizer) = crate::http::ResponseHeaderSanitizer::from_response(resp) else {
@@ -2645,7 +2646,7 @@ pub fn store(
     let no_store = directives.iter().any(|d| d.name == "no-store");
     let no_cache = directives.iter().any(|d| d.name == "no-cache");
     let private = directives.iter().any(|d| d.name == "private");
-    if !vapache_verified::cache_store_control_admit(
+    if !httpd_rs_verified::cache_store_control_admit(
         no_store,
         no_cache,
         private,
@@ -2679,14 +2680,14 @@ pub fn store(
     };
     let size_ok = body.len() as u64 <= cfg.cache.max_file_size
         && (body.len() as u64) >= cfg.cache.min_file_size;
-    if !vapache_verified::cache_store_shape_admit(set_cookie, false, size_ok) {
+    if !httpd_rs_verified::cache_store_shape_admit(set_cookie, false, size_ok) {
         return;
     }
     let now = unix_now();
     let Some((ttl, response_age)) = freshness_and_age(&cfg.cache, &response_headers, now) else {
         return;
     };
-    if !vapache_verified::cache_store_ttl_admit(ttl) {
+    if !httpd_rs_verified::cache_store_ttl_admit(ttl) {
         return;
     }
     let mut headers = Vec::new();
@@ -2710,7 +2711,7 @@ pub fn store(
         body,
         body_len,
         stored: now.saturating_sub(i64::try_from(response_age).unwrap_or(i64::MAX)),
-        expires: vapache_verified::cache_expiry(now, ttl),
+        expires: httpd_rs_verified::cache_expiry(now, ttl),
         policy: fingerprint,
         // Bind the entry to the epoch authorized when this request began.
         // A concurrent reload can make it stale, but can never relabel it as
@@ -2749,7 +2750,7 @@ pub fn store(
     let _generation = generation_barrier()
         .read()
         .unwrap_or_else(|error| error.into_inner());
-    if !vapache_verified::cache_generation_admit(request_epoch, cfg.cache_epoch()) {
+    if !httpd_rs_verified::cache_generation_admit(request_epoch, cfg.cache_epoch()) {
         return;
     }
     if crate::fault::hit("transition.cache.store.commit").is_err() {
@@ -2881,7 +2882,7 @@ fn invalidate_disk_prefix(cfg: &Config, prefix: &[u8]) {
             .keys()
             .filter(|stem| {
                 let key = usage.keys.get(*stem).and_then(|key| key.as_deref());
-                vapache_verified::cache_invalidation_remove_admit(
+                httpd_rs_verified::cache_invalidation_remove_admit(
                     key.is_some(),
                     key.is_some_and(|key| key.starts_with(prefix)),
                 )
@@ -2961,7 +2962,7 @@ fn invalidation_location_path(
         let target = crate::util::parse_http_authority(authority.as_bytes(), target_default)?;
         let request = crate::util::parse_http_authority(host.as_bytes(), local_port)?;
         (
-            vapache_verified::authority_endpoint_equal(
+            httpd_rs_verified::authority_endpoint_equal(
                 target.0.as_bytes(),
                 target.1,
                 https,
@@ -2984,7 +2985,7 @@ fn invalidation_location_path(
         let target = crate::util::parse_http_authority(authority.as_bytes(), target_default)?;
         let request = crate::util::parse_http_authority(host.as_bytes(), local_port)?;
         (
-            vapache_verified::authority_endpoint_equal(
+            httpd_rs_verified::authority_endpoint_equal(
                 target.0.as_bytes(),
                 target.1,
                 target_tls,
@@ -3031,7 +3032,7 @@ fn invalidation_location_path(
         allow_encoded,
     )
     .ok()?;
-    vapache_verified::cache_invalidation_target_admit(same_origin, true)
+    httpd_rs_verified::cache_invalidation_target_admit(same_origin, true)
         .then_some(canonical.url_path.into_string())
 }
 
@@ -3132,7 +3133,7 @@ mod tests {
             grant,
             resource,
         )
-        .and_then(|plan| plan.into_outcome(generation, vapache_verified::TransformSink::Cache))
+        .and_then(|plan| plan.into_outcome(generation, httpd_rs_verified::TransformSink::Cache))
         .expect("cache outcome for the old generation");
         let key = format!("stale-authorization-{}", std::process::id());
         let context = CacheContext {
@@ -3301,7 +3302,7 @@ mod tests {
 
     #[test]
     fn disk_entries_from_an_older_generation_are_not_served() {
-        let dir = std::env::temp_dir().join(format!("vapache-cache-epoch-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-cache-epoch-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("httpd.conf");
@@ -3335,7 +3336,7 @@ mod tests {
     #[test]
     fn path_info_cache_target_is_the_actual_script() {
         let dir =
-            std::env::temp_dir().join(format!("vapache-cache-pathinfo-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-cache-pathinfo-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let cgi = dir.join("www").join("cgi");
         fs::create_dir_all(&cgi).unwrap();
@@ -3400,7 +3401,7 @@ AddHandler cgi-script .cgi\n\
 
     #[test]
     fn cache_scope_never_caches_proxy_routes() {
-        let dir = std::env::temp_dir().join(format!("vapache-cache-proxy-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-cache-proxy-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::create_dir_all(dir.join("cache")).unwrap();
@@ -3452,7 +3453,7 @@ AddHandler cgi-script .cgi\n\
 
     #[test]
     fn cache_policy_fingerprint_binds_header_driven_policy_inputs() {
-        let dir = std::env::temp_dir().join(format!("vapache-cache-fp-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-cache-fp-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("httpd.conf");
@@ -3879,7 +3880,7 @@ AddHandler cgi-script .cgi\n\
 
     #[test]
     fn cache_key_binds_every_request_and_listener_input() {
-        let dir = std::env::temp_dir().join(format!("vapache-cache-key-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-cache-key-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("httpd.conf");
@@ -4164,8 +4165,10 @@ AddHandler cgi-script .cgi\n\
 
     #[test]
     fn ignore_query_string_never_shares_dynamic_cgi_representations() {
-        let dir =
-            std::env::temp_dir().join(format!("vapache-cache-ignore-query-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "httpd-rs-cache-ignore-query-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         let cgi = dir.join("www").join("cgi");
         fs::create_dir_all(&cgi).unwrap();
@@ -4231,7 +4234,7 @@ AddHandler cgi-script .cgi\n\
     #[test]
     fn cache_key_is_injective_over_raw_bytes() {
         let dir =
-            std::env::temp_dir().join(format!("vapache-cache-key-bytes-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-cache-key-bytes-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("httpd.conf");
@@ -4275,7 +4278,7 @@ AddHandler cgi-script .cgi\n\
     #[test]
     fn cache_rejects_non_utf8_paths() {
         let dir = std::env::temp_dir().join(format!(
-            "vapache-cache-non-utf8-path-{}",
+            "httpd-rs-cache-non-utf8-path-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
@@ -4338,7 +4341,7 @@ CacheEnable disk /\n\
     fn ignore_query_string_bypasses_set_handler_and_server_status() {
         for handler in ["proxy:unix:/nonexistent|fcgi://localhost", "server-status"] {
             let dir = std::env::temp_dir().join(format!(
-                "vapache-cache-handler-{}-{}",
+                "httpd-rs-cache-handler-{}-{}",
                 handler.contains("server-status") as u8,
                 std::process::id()
             ));
@@ -4428,7 +4431,7 @@ CacheIgnoreQueryString On\n\
     #[test]
     fn local_error_document_is_never_cache_scoped() {
         let dir = std::env::temp_dir().join(format!(
-            "vapache-cache-error-document-{}",
+            "httpd-rs-cache-error-document-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
@@ -4493,7 +4496,7 @@ ErrorDocument 404 /404.html\n\
     #[test]
     fn directory_index_binds_cache_target_and_live_policy() {
         let dir =
-            std::env::temp_dir().join(format!("vapache-cache-dir-index-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-cache-dir-index-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let www = dir.join("www");
         fs::create_dir_all(www.join("dir")).unwrap();
@@ -4579,7 +4582,7 @@ CacheEnable disk /\n\
     #[test]
     fn multiviews_binds_cache_to_selected_url_target_and_live_policy() {
         let dir =
-            std::env::temp_dir().join(format!("vapache-cache-multiviews-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-cache-multiviews-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let www = dir.join("www");
         fs::create_dir_all(&www).unwrap();
@@ -4656,7 +4659,7 @@ AddType text/plain .txt\n\
         );
         assert!(context.authorization().require_sink(
             cfg.authorization_generation(),
-            vapache_verified::TransformSink::Cache,
+            httpd_rs_verified::TransformSink::Cache,
         ));
         assert!(!context.scope().conditional_error);
 
@@ -4720,8 +4723,10 @@ RewriteRule \\.txt$ - [F]\n",
 
     #[test]
     fn request_scope_covers_symlink_directory_disable_method_and_dynamic_routes() {
-        let dir =
-            std::env::temp_dir().join(format!("vapache-cache-scope-matrix-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "httpd-rs-cache-scope-matrix-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         let www = dir.join("www");
         fs::create_dir_all(www.join("empty")).unwrap();
@@ -4817,7 +4822,7 @@ CacheIgnoreQueryString On\n\
         fs::create_dir_all(www.join("fcgi")).unwrap();
         fs::write(www.join("fcgi/test.php"), b"php").unwrap();
         let fastcgi_rule = format!(
-            "ProxyPassMatch ^/fcgi/(.*\\.php)$ \"unix:/tmp/vapache-cache-missing.sock|fcgi://localhost{}/\"",
+            "ProxyPassMatch ^/fcgi/(.*\\.php)$ \"unix:/tmp/httpd-rs-cache-missing.sock|fcgi://localhost{}/\"",
             www.display()
         );
         let fastcgi_cfg = route_config("fastcgi", &fastcgi_rule);
@@ -4960,78 +4965,80 @@ CacheIgnoreQueryString On\n\
         reversed.min_expire = 60;
         reversed.max_expire = 5;
         assert_eq!(freshness(&reversed, &headers, 100), Some(0));
-        assert_eq!(vapache_verified::cache_expiry(i64::MAX - 1, 10), i64::MAX);
+        assert_eq!(httpd_rs_verified::cache_expiry(i64::MAX - 1, 10), i64::MAX);
     }
 
     #[test]
     fn verified_cache_store_and_accounting_gates_cover_edge_cases() {
-        assert!(vapache_verified::cache_store_request_admit(
+        assert!(httpd_rs_verified::cache_store_request_admit(
             true, true, true, true, true
         ));
-        assert!(!vapache_verified::cache_store_request_admit(
+        assert!(!httpd_rs_verified::cache_store_request_admit(
             false, true, true, true, true
         ));
-        assert!(!vapache_verified::cache_store_request_admit(
+        assert!(!httpd_rs_verified::cache_store_request_admit(
             true, false, true, true, true
         ));
-        assert!(!vapache_verified::cache_store_request_admit(
+        assert!(!httpd_rs_verified::cache_store_request_admit(
             true, true, false, true, true
         ));
-        assert!(!vapache_verified::cache_store_request_admit(
+        assert!(!httpd_rs_verified::cache_store_request_admit(
             true, true, true, false, true
         ));
-        assert!(!vapache_verified::cache_store_request_admit(
+        assert!(!httpd_rs_verified::cache_store_request_admit(
             true, true, true, true, false
         ));
 
-        assert!(vapache_verified::cache_store_status_admit(200));
-        assert!(vapache_verified::cache_store_status_admit(404));
-        assert!(!vapache_verified::cache_store_status_admit(500));
+        assert!(httpd_rs_verified::cache_store_status_admit(200));
+        assert!(httpd_rs_verified::cache_store_status_admit(404));
+        assert!(!httpd_rs_verified::cache_store_status_admit(500));
 
-        assert!(!vapache_verified::cache_store_control_admit(
+        assert!(!httpd_rs_verified::cache_store_control_admit(
             true, false, false, false, false, false
         ));
-        assert!(vapache_verified::cache_store_control_admit(
+        assert!(httpd_rs_verified::cache_store_control_admit(
             true, false, false, true, false, false
         ));
-        assert!(!vapache_verified::cache_store_control_admit(
+        assert!(!httpd_rs_verified::cache_store_control_admit(
             false, true, false, false, false, false
         ));
 
-        assert!(vapache_verified::cache_store_shape_admit(
+        assert!(httpd_rs_verified::cache_store_shape_admit(
             false, false, true
         ));
-        assert!(!vapache_verified::cache_store_shape_admit(
+        assert!(!httpd_rs_verified::cache_store_shape_admit(
             true, false, true
         ));
-        assert!(!vapache_verified::cache_store_shape_admit(
+        assert!(!httpd_rs_verified::cache_store_shape_admit(
             false, true, true
         ));
-        assert!(!vapache_verified::cache_store_shape_admit(
+        assert!(!httpd_rs_verified::cache_store_shape_admit(
             false, false, false
         ));
-        assert!(vapache_verified::cache_store_ttl_admit(1));
-        assert!(!vapache_verified::cache_store_ttl_admit(0));
+        assert!(httpd_rs_verified::cache_store_ttl_admit(1));
+        assert!(!httpd_rs_verified::cache_store_ttl_admit(0));
 
-        assert_eq!(vapache_verified::cache_disk_projected(10, 20, 3), 3);
-        assert_eq!(vapache_verified::cache_disk_evict(10, 20), 0);
-        assert!(vapache_verified::cache_disk_key_admit(true, true));
-        assert!(!vapache_verified::cache_disk_key_admit(false, true));
-        assert!(!vapache_verified::cache_disk_key_admit(true, false));
-        assert!(vapache_verified::cache_invalidation_remove_admit(
+        assert_eq!(httpd_rs_verified::cache_disk_projected(10, 20, 3), 3);
+        assert_eq!(httpd_rs_verified::cache_disk_evict(10, 20), 0);
+        assert!(httpd_rs_verified::cache_disk_key_admit(true, true));
+        assert!(!httpd_rs_verified::cache_disk_key_admit(false, true));
+        assert!(!httpd_rs_verified::cache_disk_key_admit(true, false));
+        assert!(httpd_rs_verified::cache_invalidation_remove_admit(
             false, false
         ));
-        assert!(vapache_verified::cache_invalidation_remove_admit(
+        assert!(httpd_rs_verified::cache_invalidation_remove_admit(
             true, true
         ));
-        assert!(!vapache_verified::cache_invalidation_remove_admit(
+        assert!(!httpd_rs_verified::cache_invalidation_remove_admit(
             true, false
         ));
     }
 
     fn disk_test_config(name: &str) -> (std::path::PathBuf, Config) {
-        let dir =
-            std::env::temp_dir().join(format!("vapache-cache-quota-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "httpd-rs-cache-quota-{}-{name}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("httpd.conf");
@@ -5440,7 +5447,7 @@ CacheIgnoreQueryString On\n\
         let mut req = test_request();
         req.headers.insert("authorization", b"Basic eA==".to_vec());
         assert!(request_has_shared_cache_credentials(&req));
-        assert!(!vapache_verified::cache_lookup_request_admit(
+        assert!(!httpd_rs_verified::cache_lookup_request_admit(
             true,
             true,
             true,
@@ -5497,7 +5504,7 @@ CacheIgnoreQueryString On\n\
         req.headers.insert("cache-control", b"no-store".to_vec());
         assert!(parsed_request_cache_policy(&req).unwrap().no_store);
         req.framing = crate::verified::BodyFraming::Length(0);
-        assert!(!vapache_verified::cache_lookup_request_admit(
+        assert!(!httpd_rs_verified::cache_lookup_request_admit(
             true,
             matches!(req.framing, crate::verified::BodyFraming::None),
             req.body_len() == 0,

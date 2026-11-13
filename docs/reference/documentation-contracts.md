@@ -7,22 +7,22 @@ status: normative
 # Executable documentation contracts
 
 A documentation contract connects a concrete documentation claim to observable
-Vapache behavior.
+httpd-rs behavior.
 
 ## Contract types
 
-A local executable contract checks a small example through a public Vapache
+A local executable contract checks a small example through a public httpd-rs
 interface. It must have:
 
 - a stable ID in the form `DOC-AREA-NNN`;
 - a documentation page that uses the claim;
 - a canonical example or generated fixture;
-- an invocation through a public Vapache interface;
+- an invocation through a public httpd-rs interface;
 - an exact expected result;
 - an evidence type;
 - cleanup that does not change the operator's system state.
 
-The contract must use the built `vapached` executable for configuration and
+The contract must use the built `httpd-rs` executable for configuration and
 HTTP behavior. An internal Rust function test can provide additional evidence,
 but it cannot replace the public-interface check.
 
@@ -58,15 +58,15 @@ Contracts are defined in `docs/contracts.toml`.
 
 | Contract | Claim | Public interface |
 |---|---|---|
-| `DOC-MIGRATE-STATIC-001` | The tutorial virtual host serves its index, uses its custom 404, and rejects static `POST` with `405` | `vapached -t`, foreground server, HTTP |
-| `DOC-CAPABILITY-AUDIT-001` | CGI configuration reports the missing `Cgi` capability and audit mode does not enable it | `vapached --audit-capabilities` and `vapached -t` |
-| `DOC-UNSUPPORTED-POLICY-001` | An unimplemented security policy is rejected | `vapached -t` |
+| `DOC-MIGRATE-STATIC-001` | The tutorial virtual host serves its index, uses its custom 404, and rejects static `POST` with `405` | `httpd-rs -t`, foreground server, HTTP |
+| `DOC-CAPABILITY-AUDIT-001` | CGI configuration reports the missing `Cgi` capability and audit mode does not enable it | `httpd-rs --audit-capabilities` and `httpd-rs -t` |
+| `DOC-UNSUPPORTED-POLICY-001` | An unimplemented security policy is rejected | `httpd-rs -t` |
 
 Each application tutorial also has a `DOC-DEPLOY-...` contract. The local
 documentation test requires exactly one tutorial for every deployment scenario,
 checks its canonical dimensions and operating modes against `scenario.toml`,
 and checks its catalog entry. The scheduled canonical application workflow then
-runs the application and its semantic workflow through Vapache.
+runs the application and its semantic workflow through httpd-rs.
 
 Each operational how-to has a `DOC-HOWTO-...` evidence binding. The local
 documentation test requires the page to link each evidence file and requires
@@ -76,11 +76,11 @@ configuration, and CVE quality gates execute the file evidence.
 
 ## Run the contracts
 
-Build Vapache and run:
+Build httpd-rs and run:
 
 ```console
-$ cargo build -p vapached
+$ cargo build -p httpd-rs
 $ python3 tests/docs.py
 ```
 
-Set `VAPACHED` to test another binary.
+Set `HTTPD_RS` to test another binary.

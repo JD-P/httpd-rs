@@ -465,9 +465,9 @@ fn start_fastcgi_backend(
 fn fixture() -> &'static Fixture {
     static FIXTURE: OnceLock<Fixture> = OnceLock::new();
     FIXTURE.get_or_init(|| {
-        vapache_os::ignore_sigpipe().expect("install whole-request fuzz SIGPIPE disposition");
+        httpd_rs_os::ignore_sigpipe().expect("install whole-request fuzz SIGPIPE disposition");
         let root =
-            std::env::temp_dir().join(format!("vapache-whole-request-fuzz-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-whole-request-fuzz-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("www/cache")).expect("create cache document root");
         std::fs::create_dir_all(root.join("www/denied")).expect("create denied document root");
@@ -563,10 +563,10 @@ fn fixture() -> &'static Fixture {
              PidFile \"{}/httpd.pid\"\n\
              ErrorLog \"{}/error.log\"\n\
              DocumentRoot \"{}/www\"\n\
-             VapacheCapability Cgi On\n\
-             VapacheCapability FastCgi On\n\
-             VapacheCapability AccessFiles On\n\
-             VapacheCapability UnstableFastCgiPaths On\n\
+             HttpdRsCapability Cgi On\n\
+             HttpdRsCapability FastCgi On\n\
+             HttpdRsCapability AccessFiles On\n\
+             HttpdRsCapability UnstableFastCgiPaths On\n\
              DirectoryIndex index.html\n\
              ErrorDocument 404 /errors/404.cgi?source=local\n\
              CacheRoot \"{}/cache\"\n\
@@ -1792,7 +1792,7 @@ mod tests {
 
     #[test]
     fn dynamic_outcome_machine_requires_every_admission_fact() {
-        use vapache_verified::{
+        use httpd_rs_verified::{
             dynamic_outcome_initial, dynamic_outcome_step, DynamicOutcomeEvent as Event,
             DynamicOutcomePhase as Phase,
         };

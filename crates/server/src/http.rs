@@ -8,6 +8,7 @@
 
 use crate::resource::{ResidentLease, ResourceBudget, SpoolLease};
 use crate::util::with_http_date_now;
+use httpd_rs_verified::{parse_request_head, HeadError, HttpVersion, ParsedHead};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -18,9 +19,8 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use vapache_verified::{parse_request_head, HeadError, HttpVersion, ParsedHead};
 
-pub use vapache_verified::BodyFraming;
+pub use httpd_rs_verified::BodyFraming;
 
 pub const DEFAULT_LIMIT_REQUEST_LINE: usize = 8190;
 pub const DEFAULT_LIMIT_REQUEST_FIELDS: usize = 100;
@@ -318,13 +318,13 @@ impl Headers {
     pub(crate) fn internal_projection_facts(
         &self,
         source: &Self,
-        kind: vapache_verified::InternalRequestKind,
+        kind: httpd_rs_verified::InternalRequestKind,
     ) -> (bool, bool) {
         let headers_projected = match kind {
-            vapache_verified::InternalRequestKind::DirectoryIndex => {
+            httpd_rs_verified::InternalRequestKind::DirectoryIndex => {
                 std::sync::Arc::ptr_eq(&self.entries, &source.entries)
             }
-            vapache_verified::InternalRequestKind::ErrorDocument => {
+            httpd_rs_verified::InternalRequestKind::ErrorDocument => {
                 let mut expected = source.clone();
                 expected.strip_internal_recovery_headers();
                 self.entries.as_ref() == expected.entries.as_ref()
@@ -346,7 +346,7 @@ impl Headers {
             _ => false,
         };
         let transition_state_matches = match kind {
-            vapache_verified::InternalRequestKind::DirectoryIndex => {
+            httpd_rs_verified::InternalRequestKind::DirectoryIndex => {
                 let streaming_matches = match (&self.streaming_body, &source.streaming_body) {
                     (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
                     (None, None) => true,
@@ -356,7 +356,7 @@ impl Headers {
                     && self.discarded_body_len == source.discarded_body_len
                     && self.error_document_depth == source.error_document_depth
             }
-            vapache_verified::InternalRequestKind::ErrorDocument => {
+            httpd_rs_verified::InternalRequestKind::ErrorDocument => {
                 self.streaming_body.is_none()
                     && self.discarded_body_len == 0
                     && self.error_document_depth == source.error_document_depth.saturating_add(1)
@@ -518,7 +518,7 @@ impl BodyAccumulator {
             .checked_add(add)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "request body overflow"))?;
         if self.file.is_none()
-            && vapache_verified::request_body_memory_admit(self.len, add, self.memory_limit)
+            && httpd_rs_verified::request_body_memory_admit(self.len, add, self.memory_limit)
         {
             if let Some(resident) = resident {
                 resident.reserve(add)?;
@@ -708,7 +708,7 @@ impl Request {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let same_identity = current.as_deref() == Some(user);
-        if !vapache_verified::request_identity_record_admit(current.is_some(), same_identity) {
+        if !httpd_rs_verified::request_identity_record_admit(current.is_some(), same_identity) {
             return false;
         }
         if current.is_none() {
@@ -781,7 +781,7 @@ impl Request {
 
     pub(crate) fn prepare_error_document_transition(&mut self) -> bool {
         let Some(depth) =
-            vapache_verified::error_document_depth_step(self.headers.error_document_depth, 1)
+            httpd_rs_verified::error_document_depth_step(self.headers.error_document_depth, 1)
         else {
             return false;
         };
@@ -1008,7 +1008,7 @@ fn validate_request_authority(req: &mut Request, limits: &Limits) -> Result<(), 
     let Some((target_tls, authority)) = absolute_target_authority(&req.target) else {
         return Ok(());
     };
-    if !vapache_verified::capability_admit(limits.allow_absolute_request_target, true) {
+    if !httpd_rs_verified::capability_admit(limits.allow_absolute_request_target, true) {
         return Err(ParseError::BadRequest(
             "absolute-form request target is disabled",
         ));
@@ -1023,7 +1023,7 @@ fn validate_request_authority(req: &mut Request, limits: &Limits) -> Result<(), 
         ));
     }
     if let Some((host, port)) = parsed_host {
-        if !vapache_verified::authority_endpoint_equal(
+        if !httpd_rs_verified::authority_endpoint_equal(
             target_host.as_bytes(),
             target_port,
             target_tls,
@@ -1046,7 +1046,7 @@ fn validate_request_authority(req: &mut Request, limits: &Limits) -> Result<(), 
 
 pub(crate) fn minimum_read_rate_ok(started: Instant, bytes: u64, min_rate: u64) -> bool {
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    vapache_verified::minimum_progress_rate_admit(bytes, elapsed_ms, min_rate, 1_000)
+    httpd_rs_verified::minimum_progress_rate_admit(bytes, elapsed_ms, min_rate, 1_000)
 }
 
 /// Read one complete request from a keep-alive connection.
@@ -1657,7 +1657,7 @@ where
                         if trailer.is_empty() {
                             break;
                         }
-                        if !vapache_verified::capability_admit(limits.allow_request_trailers, true)
+                        if !httpd_rs_verified::capability_admit(limits.allow_request_trailers, true)
                         {
                             return Err(ReadError::Parse(ParseError::BadRequest(
                                 "request trailers are disabled",
@@ -1772,7 +1772,7 @@ const SPOOL_ATTEMPTS: u64 = 16;
 
 fn spool_path(dir: &Path, counter: u64) -> PathBuf {
     dir.join(format!(
-        "vapache-request-{}-{}.body",
+        "httpd-rs-request-{}-{}.body",
         std::process::id(),
         counter
     ))
@@ -1947,7 +1947,7 @@ fn read_chunked_to_writer_budgeted<R: Read, W: Write>(
                 if t.is_empty() {
                     return Ok(total);
                 }
-                if !vapache_verified::capability_admit(allow_trailers, true) {
+                if !httpd_rs_verified::capability_admit(allow_trailers, true) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "request trailers are disabled",
@@ -2103,7 +2103,7 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
     // Apache's HTTP/1 table semantics without weakening CL/TE validation.
     let mut merged: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(headers.len());
     for (name, value) in headers {
-        if let Some(i) = vapache_verified::header_merge_index(&merged, &name) {
+        if let Some(i) = httpd_rs_verified::header_merge_index(&merged, &name) {
             merged[i].1.extend_from_slice(header_merge_separator(&name));
             merged[i].1.extend_from_slice(&value);
         } else {
@@ -2260,22 +2260,22 @@ pub(crate) struct ResponseOwnership {
     resident_lease: Option<ResidentLease>,
     queued_resident_leases: Vec<std::sync::Weak<std::sync::Mutex<ResidentLease>>>,
     slow: bool,
-    phase: vapache_verified::OutputOwnershipPhase,
+    phase: httpd_rs_verified::OutputOwnershipPhase,
 }
 
 impl ResponseOwnership {
-    fn advance(&mut self, event: vapache_verified::OutputOwnershipEvent) {
-        self.phase = vapache_verified::output_ownership_step(self.phase, event)
+    fn advance(&mut self, event: httpd_rs_verified::OutputOwnershipEvent) {
+        self.phase = httpd_rs_verified::output_ownership_step(self.phase, event)
             .expect("illegal response ownership transition");
     }
 
     pub(crate) fn begin_read(mut self) -> Self {
-        self.advance(vapache_verified::OutputOwnershipEvent::BeginRead);
+        self.advance(httpd_rs_verified::OutputOwnershipEvent::BeginRead);
         self
     }
 
     pub(crate) fn complete_read(mut self) -> Self {
-        self.advance(vapache_verified::OutputOwnershipEvent::ReadComplete);
+        self.advance(httpd_rs_verified::OutputOwnershipEvent::ReadComplete);
         self
     }
 
@@ -2341,13 +2341,13 @@ impl ResponseOwnership {
     }
 
     pub(crate) fn finish(mut self) {
-        self.advance(vapache_verified::OutputOwnershipEvent::Finish);
+        self.advance(httpd_rs_verified::OutputOwnershipEvent::Finish);
     }
 }
 
 impl Drop for ResponseOwnership {
     fn drop(&mut self) {
-        use vapache_verified::{OutputOwnershipEvent as Event, OutputOwnershipPhase as Phase};
+        use httpd_rs_verified::{OutputOwnershipEvent as Event, OutputOwnershipPhase as Phase};
 
         // The ownership value itself travels into each blocking read task. If
         // the awaiting socket future is cancelled, dropping its JoinHandle
@@ -2380,7 +2380,7 @@ pub(crate) fn response_headers_admitted(resp: &Response) -> bool {
             .saturating_add(value.len())
             .saturating_add(4)
     });
-    vapache_verified::response_header_budget_admit(
+    httpd_rs_verified::response_header_budget_admit(
         count as u64,
         bytes.saturating_add(256) as u64,
         MAX_RESPONSE_HEADERS as u64,
@@ -2710,7 +2710,7 @@ pub(crate) fn preserved_response_content_length(
             "duplicate response Content-Length",
         ));
     }
-    vapache_verified::parse_decimal_u64(value)
+    httpd_rs_verified::parse_decimal_u64(value)
         .map(Some)
         .ok_or_else(|| {
             io::Error::new(
@@ -2768,7 +2768,7 @@ impl Response {
             resident_lease: self.resident_lease.take(),
             queued_resident_leases: Vec::new(),
             slow: false,
-            phase: vapache_verified::OutputOwnershipPhase::ResponseOwned,
+            phase: httpd_rs_verified::OutputOwnershipPhase::ResponseOwned,
         }
     }
 
@@ -3087,7 +3087,7 @@ const RESPONSE_NOTSENT_LOWAT: libc::c_uint = 64 * 1024;
 
 #[cfg(target_os = "linux")]
 pub(crate) fn configure_response_progress_wakeups(fd: BorrowedFd<'_>) -> io::Result<()> {
-    vapache_os::set_tcp_notsent_lowat(fd, RESPONSE_NOTSENT_LOWAT)
+    httpd_rs_os::set_tcp_notsent_lowat(fd, RESPONSE_NOTSENT_LOWAT)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -4361,31 +4361,31 @@ mod tests {
 
     #[test]
     fn minimum_read_rate_has_a_grace_period_and_overflow_safe_boundary() {
-        assert!(vapache_verified::minimum_progress_rate_admit(
+        assert!(httpd_rs_verified::minimum_progress_rate_admit(
             0,
             999,
             u64::MAX,
             1_000
         ));
-        assert!(!vapache_verified::minimum_progress_rate_admit(
+        assert!(!httpd_rs_verified::minimum_progress_rate_admit(
             1, 2_000, 100, 1_000
         ));
-        assert!(vapache_verified::minimum_progress_rate_admit(
+        assert!(httpd_rs_verified::minimum_progress_rate_admit(
             200, 2_000, 100, 1_000
         ));
-        assert!(vapache_verified::minimum_progress_rate_admit(
+        assert!(httpd_rs_verified::minimum_progress_rate_admit(
             u64::MAX,
             u64::MAX,
             1,
             1_000,
         ));
-        assert!(!vapache_verified::minimum_progress_rate_admit(
+        assert!(!httpd_rs_verified::minimum_progress_rate_admit(
             u64::MAX,
             u64::MAX,
             u64::MAX,
             1_000,
         ));
-        assert!(vapache_verified::minimum_progress_rate_admit(
+        assert!(httpd_rs_verified::minimum_progress_rate_admit(
             0,
             u64::MAX,
             0,
@@ -4554,7 +4554,7 @@ mod tests {
 
     #[test]
     fn head_error_maps_every_parser_rejection() {
-        use vapache_verified::HeadError::*;
+        use httpd_rs_verified::HeadError::*;
         let errors = [
             NulByte,
             TooManyEmptyLines,
@@ -5219,7 +5219,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "vapache-http-test-{}-{}.body",
+            "httpd-rs-http-test-{}-{}.body",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -6198,7 +6198,7 @@ mod tests {
         use std::os::unix::fs::{symlink, PermissionsExt};
         use std::sync::atomic::AtomicU64;
 
-        let dir = std::env::temp_dir().join(format!("vapache-spool-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-spool-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let victim = dir.join("victim");
@@ -6223,7 +6223,7 @@ mod tests {
     fn spool_name_collisions_fail_closed() {
         use std::sync::atomic::AtomicU64;
 
-        let dir = std::env::temp_dir().join(format!("vapache-spool-full-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-spool-full-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for n in 0..SPOOL_ATTEMPTS {

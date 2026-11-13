@@ -10,7 +10,7 @@ runs use 1s/one sample and omit the 1 MB case.
 
 ## 2026-10-27T00:51:16.624270+00:00
 
-| scenario | Apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | Apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | cache HIT 1.1KB | 77934 | 148709 | 1.91x | 0.69 | 13.6 |
 | cache HIT 10KB | 84754 | 143945 | 1.70x | 0.40 | 2.0 |
@@ -18,7 +18,7 @@ runs use 1s/one sample and omit the 1 MB case.
 
 ## 2026-10-27T00:51:26.773783+00:00
 
-| scenario | Apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | Apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | cache HIT 1.1KB | 91023 | 143035 | 1.57x | 0.43 | 2.2 |
 | cache HIT 10KB | 85109 | 133929 | 1.57x | 0.46 | 2.4 |
@@ -27,7 +27,7 @@ runs use 1s/one sample and omit the 1 MB case.
 
 ## 2026-10-27T01:01:19.174107+00:00
 
-| scenario | Apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | Apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | cache HIT 1.1KB | 87007 | 145798 | 1.68x | 0.44 | 2.6 |
 | cache HIT 10KB | 83005 | 145949 | 1.76x | 0.42 | 2.4 |
@@ -36,7 +36,7 @@ runs use 1s/one sample and omit the 1 MB case.
 
 ## 2026-10-27T01:10:04.892417+00:00
 
-| scenario | Apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+| scenario | Apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
 |---|---:|---:|---:|---:|---:|
 | cache HIT 1.1KB | 86780 | 141844 | 1.63x | 0.44 | 2.5 |
 | cache HIT 10KB | 80218 | 136152 | 1.70x | 0.46 | 2.5 |

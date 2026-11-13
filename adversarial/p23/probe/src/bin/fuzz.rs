@@ -1,5 +1,5 @@
 use pcre2_c_oracle::bytes as oracle;
-use vapache_pcre2::bytes as rust;
+use httpd_rs_pcre2::bytes as rust;
 
 #[derive(Clone, Copy, Default, Debug)]
 struct Flags {

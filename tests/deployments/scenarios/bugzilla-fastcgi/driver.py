@@ -1,4 +1,4 @@
-"""Run the pinned Bugzilla CGI application through fcgiwrap and Vapache."""
+"""Run the pinned Bugzilla CGI application through fcgiwrap and httpd-rs."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from lib import (
     CaseContext,
     DeploymentError,
     common_apache_config,
-    common_vapache_config,
+    common_httpd_rs_config,
     differential_benchmark,
     download_verified_file,
     free_port,
@@ -24,7 +24,7 @@ from lib import (
     service_identity,
     stage_verified_tarball,
     start_apache,
-    start_vapache,
+    start_httpd_rs,
 )
 
 
@@ -35,7 +35,7 @@ SOURCE_URL = (
 )
 SOURCE_SHA256 = "d3295436a879e6f7466f67567a06b52793b450a2540e260a931564fbae05bc8d"
 ADMIN_EMAIL = "admin@deployment.test"
-ADMIN_PASSWORD = "vapache-bugzilla-password-42"
+ADMIN_PASSWORD = "httpd-rs-bugzilla-password-42"
 DBD_MARIADB_URL = "https://cpan.org/authors/id/P/PA/PALI/DBD-MariaDB-1.24.tar.gz"
 DBD_MARIADB_SHA256 = "f977a25b4116a0a95a7c8a894fd37097abe19af9a6a9ed4d800604ec17873fe4"
 TEMPLATE_URL = "https://cpan.org/authors/id/T/TO/TODDR/Template-Toolkit-3.106.tar.gz"
@@ -138,7 +138,7 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
             "BUGZILLA_ROOT": os.fspath(bugzilla_root),
             "BZ_URLBASE": f"http://127.0.0.1:{port}/",
             "FCGI_RUN": os.fspath(fcgi_run),
-            "VAPACHE_SOCKET_GID": str(socket_gid),
+            "HTTPD_RS_SOCKET_GID": str(socket_gid),
         },
         local_images=(image,),
     )
@@ -184,18 +184,18 @@ ProxyPassMatch ^/(.*\\.cgi(/.*)?)$ "unix:{socket_path}|fcgi://localhost{bugzilla
     Require all denied
 </FilesMatch>
 """
-    vapache_extra = (
-        f"VapacheFastCGIStablePath On unix:{socket_path} 33 33 {trusted_owners}\n"
+    httpd_rs_extra = (
+        f"HttpdRsFastCGIStablePath On unix:{socket_path} 33 33 {trusted_owners}\n"
         + common
     )
-    config, pid_file = common_vapache_config(
+    config, pid_file = common_httpd_rs_config(
         context.run_dir,
         port,
         bugzilla_root,
         capabilities=("FastCgi",),
-        extra=vapache_extra,
+        extra=httpd_rs_extra,
     )
-    server = start_vapache(context, config, pid_file, port)
+    server = start_httpd_rs(context, config, pid_file, port)
     require_response(port, "/", contains=b"Bugzilla")
     require_response(port, "/Bugzilla.pm", status=403)
     require_response(port, "/localconfig", status=403)
@@ -257,7 +257,7 @@ ProxyPassMatch ^/(.*\\.cgi(/.*)?)$ "unix:{socket_path}|fcgi://localhost{bugzilla
             port,
             apache_port,
             "/index.cgi",
-            context.artifact_dir / "apache-vapache-benchmark.json",
+            context.artifact_dir / "apache-httpd-rs-benchmark.json",
             headers=(f"Host: {public_host}",),
             connections=2,
         )

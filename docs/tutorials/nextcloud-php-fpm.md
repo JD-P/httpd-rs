@@ -16,11 +16,11 @@ release at `/srv/nextcloud/data`.
 
 You will install MariaDB, PHP-FPM, and Nextcloud, configure a dedicated PHP-FPM
 pool and the public URL, deny direct access to private trees, upload and move a
-WebDAV object, reload Vapache, and verify the downloaded bytes.
+WebDAV object, reload httpd-rs, and verify the downloaded bytes.
 
 ## Before you start
 
-Complete [Prepare a Debian VPS for a Vapache
+Complete [Prepare a Debian VPS for a httpd-rs
 tutorial](prepare-debian-vps.md). Point `cloud.example.test` at the VPS and open
 TCP ports 80 and 443 in the provider firewall. This Debian 13 example uses
 PHP-FPM user ID `33`; the identity check below verifies that value.
@@ -122,7 +122,7 @@ $ sudo stat -Lc '%F %u:%g %a %n' /run/php/nextcloud-fpm.sock
 socket 0:33 660 /run/php/nextcloud-fpm.sock
 ```
 
-## 4. Configure Vapache
+## 4. Configure httpd-rs
 
 Create `/etc/apache2/sites-available/nextcloud.conf` with a temporary HTTP-only
 host, enable it, and obtain the certificate:
@@ -135,16 +135,16 @@ host, enable it, and obtain the certificate:
 
 ```console
 $ sudo a2ensite nextcloud.conf
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot certonly --apache --domain cloud.example.test
 ```
 
 Replace it with the final configuration:
 
 ```apache
-VapacheCapability FastCgi On
-VapacheFastCGIStablePath On unix:/run/php/nextcloud-fpm.sock 33 0 0
+HttpdRsCapability FastCgi On
+HttpdRsFastCGIStablePath On unix:/run/php/nextcloud-fpm.sock 33 0 0
 
 <VirtualHost *:80>
     ServerName cloud.example.test
@@ -179,11 +179,11 @@ VapacheFastCGIStablePath On unix:/run/php/nextcloud-fpm.sock 33 0 0
 </VirtualHost>
 ```
 
-Test the configuration, reload Vapache, and verify renewal:
+Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -193,24 +193,24 @@ Each `curl --user admin` command prompts for the administrator password. The
 password does not appear in the command or shell history.
 
 ```console
-$ dd if=/dev/urandom of=/tmp/vapache-nextcloud.bin bs=1M count=2
+$ dd if=/dev/urandom of=/tmp/httpd-rs-nextcloud.bin bs=1M count=2
 $ curl --fail --user admin -X MKCOL \
-    https://cloud.example.test/remote.php/dav/files/admin/vapache-test
-$ curl --fail --user admin -T /tmp/vapache-nextcloud.bin \
-    https://cloud.example.test/remote.php/dav/files/admin/vapache-test/original.bin
+    https://cloud.example.test/remote.php/dav/files/admin/httpd-rs-test
+$ curl --fail --user admin -T /tmp/httpd-rs-nextcloud.bin \
+    https://cloud.example.test/remote.php/dav/files/admin/httpd-rs-test/original.bin
 $ curl --fail --user admin -X PROPFIND -H 'Depth: 1' \
-    https://cloud.example.test/remote.php/dav/files/admin/vapache-test/
+    https://cloud.example.test/remote.php/dav/files/admin/httpd-rs-test/
 $ curl --fail --user admin -X MOVE \
-    -H 'Destination: https://cloud.example.test/remote.php/dav/files/admin/vapache-test/moved.bin' \
-    https://cloud.example.test/remote.php/dav/files/admin/vapache-test/original.bin
-$ sudo systemctl reload vapache.service
-$ curl --fail --user admin -o /tmp/vapache-nextcloud-check.bin \
-    https://cloud.example.test/remote.php/dav/files/admin/vapache-test/moved.bin
-$ cmp /tmp/vapache-nextcloud.bin /tmp/vapache-nextcloud-check.bin
+    -H 'Destination: https://cloud.example.test/remote.php/dav/files/admin/httpd-rs-test/moved.bin' \
+    https://cloud.example.test/remote.php/dav/files/admin/httpd-rs-test/original.bin
+$ sudo systemctl reload httpd-rs.service
+$ curl --fail --user admin -o /tmp/httpd-rs-nextcloud-check.bin \
+    https://cloud.example.test/remote.php/dav/files/admin/httpd-rs-test/moved.bin
+$ cmp /tmp/httpd-rs-nextcloud.bin /tmp/httpd-rs-nextcloud-check.bin
 $ curl --fail --user admin -X DELETE \
-    https://cloud.example.test/remote.php/dav/files/admin/vapache-test/moved.bin
+    https://cloud.example.test/remote.php/dav/files/admin/httpd-rs-test/moved.bin
 $ curl --fail --user admin -X DELETE \
-    https://cloud.example.test/remote.php/dav/files/admin/vapache-test
+    https://cloud.example.test/remote.php/dav/files/admin/httpd-rs-test
 ```
 
 Remove the two files in `/tmp` after the final request succeeds.

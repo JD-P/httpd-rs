@@ -16,19 +16,19 @@ from lib import (
     CaseContext,
     DeploymentError,
     common_apache_config,
-    common_vapache_config,
+    common_httpd_rs_config,
     differential_benchmark,
     free_port,
     request,
     require_response,
     start_apache,
-    start_vapache,
+    start_httpd_rs,
     wait_http,
 )
 
 
 HERE = Path(__file__).resolve().parent
-TOKEN = "vapache-jupyter-integration-token"
+TOKEN = "httpd-rs-jupyter-integration-token"
 
 
 def read_exact(stream: socket.socket, count: int) -> bytes:
@@ -73,9 +73,9 @@ def read_frame(stream: socket.socket) -> tuple[int, bytes]:
 def open_websocket(port: int, path: str) -> socket.socket:
     stream = socket.create_connection(("127.0.0.1", port), timeout=30)
     stream.settimeout(30)
-    # RFC 6455 requires the decoded nonce to be exactly 16 bytes.  Vapache
+    # RFC 6455 requires the decoded nonce to be exactly 16 bytes.  httpd-rs
     # deliberately refuses to enter tunnel mode for malformed upgrade keys.
-    key = base64.b64encode(b"vapache-jupyter!").decode()
+    key = base64.b64encode(b"httpd-rs-jupyter!").decode()
     head = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: 127.0.0.1:{port}\r\n"
@@ -129,7 +129,7 @@ def execute_marker(stream: socket.socket) -> None:
     message = {
         "header": {
             "msg_id": uuid.uuid4().hex,
-            "username": "vapache",
+            "username": "httpd-rs",
             "session": session,
             "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "msg_type": "execute_request",
@@ -138,7 +138,7 @@ def execute_marker(stream: socket.socket) -> None:
         "parent_header": {},
         "metadata": {},
         "content": {
-            "code": "print('vapache-jupyter-kernel-marker')",
+            "code": "print('httpd-rs-jupyter-kernel-marker')",
             "silent": False,
             "store_history": False,
             "user_expressions": {},
@@ -156,7 +156,7 @@ def execute_marker(stream: socket.socket) -> None:
             continue
         if opcode == 0x8:
             raise DeploymentError(f"Jupyter closed the kernel WebSocket: {payload!r}")
-        if b"vapache-jupyter-kernel-marker" in payload:
+        if b"httpd-rs-jupyter-kernel-marker" in payload:
             return
     raise DeploymentError("Jupyter kernel did not return the executed marker")
 
@@ -191,10 +191,10 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
 ProxyPass {route} {backend_route}
 ProxyPassReverse {route} {backend_route}
 """
-    config, pid_file = common_vapache_config(
+    config, pid_file = common_httpd_rs_config(
         context.run_dir, frontend_port, empty_docroot, extra=extra
     )
-    server = start_vapache(context, config, pid_file, frontend_port)
+    server = start_httpd_rs(context, config, pid_file, frontend_port)
     auth = {"Authorization": f"token {TOKEN}"}
     require_response(frontend_port, f"{prefix}/api/status", contains=b"connections", headers=auth)
     require_response(frontend_port, f"{prefix}/lab?token={TOKEN}", contains=b"JupyterLab")
@@ -202,7 +202,7 @@ ProxyPassReverse {route} {backend_route}
     kernel = create_kernel(frontend_port, prefix)
     websocket = open_websocket(
         frontend_port,
-        f"{prefix}/api/kernels/{kernel}/channels?session_id=vapache-integration&token={TOKEN}",
+        f"{prefix}/api/kernels/{kernel}/channels?session_id=httpd-rs-integration&token={TOKEN}",
     )
     try:
         if variant["websocket"] == "execute":
@@ -211,13 +211,13 @@ ProxyPassReverse {route} {backend_route}
             server.reload()
             time.sleep(0.5)
             server.assert_running()
-            # Vapache deliberately retires tunnels bound to the old policy
+            # httpd-rs deliberately retires tunnels bound to the old policy
             # generation.  Reconnect under the new grant and prove that the
             # kernel survived the reload without keeping stale authority.
             websocket.close()
             websocket = open_websocket(
                 frontend_port,
-                f"{prefix}/api/kernels/{kernel}/channels?session_id=vapache-integration-reloaded&token={TOKEN}",
+                f"{prefix}/api/kernels/{kernel}/channels?session_id=httpd-rs-integration-reloaded&token={TOKEN}",
             )
             if variant["websocket"] == "execute":
                 execute_marker(websocket)
@@ -253,7 +253,7 @@ ProxyPassReverse {route} {backend_route}
             frontend_port,
             apache_port,
             f"{prefix}/api/status",
-            context.artifact_dir / "apache-vapache-benchmark.json",
+            context.artifact_dir / "apache-httpd-rs-benchmark.json",
             headers=(f"Authorization: token {TOKEN}",),
             connections=4,
         )

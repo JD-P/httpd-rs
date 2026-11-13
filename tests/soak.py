@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target/release/vapached"))
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target/release/httpd-rs"))
 DURATION = int(os.environ.get("SOAK_SECONDS", "30"))
 WORKERS = int(os.environ.get("SOAK_WORKERS", "24"))
 ATTACK_SOURCE = "127.0.0.2"
@@ -91,9 +91,9 @@ def worker(port, stop, stats, stats_lock, seed):
 
 
 def main():
-    if not VAPACHED.is_file():
-        raise SystemExit(f"missing vapached binary: {VAPACHED}")
-    with tempfile.TemporaryDirectory(prefix="vapache-soak-") as temporary:
+    if not HTTPD_RS.is_file():
+        raise SystemExit(f"missing httpd-rs binary: {HTTPD_RS}")
+    with tempfile.TemporaryDirectory(prefix="httpd-rs-soak-") as temporary:
         base = Path(temporary)
         (base / "logs").mkdir()
         (base / "www").mkdir()
@@ -105,16 +105,16 @@ def main():
         config = base / "httpd.conf"
         config.write_text(f'''ServerRoot "{base}"
 Listen 127.0.0.1:{port}
-PidFile "{base}/logs/vapached.pid"
+PidFile "{base}/logs/httpd-rs.pid"
 ErrorLog "{base}/logs/error.log"
 User {SERVICE_USER}
 Group {SERVICE_GROUP}
 ServerName localhost
 TraceEnable Off
 KeepAlive On
-VapacheMaxSpoolBytes 16777216
-VapacheMaxSpoolFiles 16
-VapacheMaxDynamicRequests 8
+HttpdRsMaxSpoolBytes 16777216
+HttpdRsMaxSpoolFiles 16
+HttpdRsMaxDynamicRequests 8
 DocumentRoot "{base}/www"
 <Directory "{base}/www">
     AllowOverride None
@@ -123,7 +123,7 @@ DocumentRoot "{base}/www"
 ''')
         with (base / "logs/process.log").open("wb") as output:
             process = subprocess.Popen(
-                [str(VAPACHED), "-f", str(config), "-DFOREGROUND"],
+                [str(HTTPD_RS), "-f", str(config), "-DFOREGROUND"],
                 cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
             )
             try:
@@ -146,7 +146,7 @@ DocumentRoot "{base}/www"
                     except OSError as error:
                         details += f"\nlast probe failed: {error}"
                     raise AssertionError(
-                        f"vapached did not become healthy (status={process.poll()}):\n{details}"
+                        f"httpd-rs did not become healthy (status={process.poll()}):\n{details}"
                     )
                 baseline = rss_kib(process.pid)
                 stop = threading.Event()
@@ -178,8 +178,8 @@ DocumentRoot "{base}/www"
                 stop.set()
                 for thread in workers:
                     thread.join(timeout=2)
-                assert process.poll() is None, "vapached died during soak"
-                assert health(port), "vapached failed post-soak health check"
+                assert process.poll() is None, "httpd-rs died during soak"
+                assert health(port), "httpd-rs failed post-soak health check"
                 assert not health_failures, (
                     "unrelated source lost availability during attack: "
                     f"{len(health_failures)} failures"

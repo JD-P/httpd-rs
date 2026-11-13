@@ -165,7 +165,7 @@ pub fn fnmatch_budgeted(
     path_mode: bool,
     budget: &crate::resource::RequestPolicyBudget,
 ) -> Result<bool, &'static str> {
-    if !vapache_verified::glob_match_resource_admit(
+    if !httpd_rs_verified::glob_match_resource_admit(
         pattern.len() as u64,
         value.len() as u64,
         MAX_PATTERN_BYTES as u64,
@@ -216,7 +216,7 @@ fn expr_tokens(pattern: &[u8], path_mode: bool) -> Vec<ExprToken> {
 /// error, never a false match: callers must fail the authorization expression
 /// closed rather than silently skipping a policy rule.
 pub fn expr_match(pattern: &[u8], value: &[u8], path_mode: bool) -> Result<bool, &'static str> {
-    if !vapache_verified::glob_match_resource_admit(
+    if !httpd_rs_verified::glob_match_resource_admit(
         pattern.len() as u64,
         value.len() as u64,
         MAX_PATTERN_BYTES as u64,
@@ -324,7 +324,7 @@ mod tests {
                 for path_mode in [false, true] {
                     assert_eq!(
                         fnmatch(pattern, value, path_mode),
-                        vapache_verified::fnmatch_match(pattern, value, path_mode),
+                        httpd_rs_verified::fnmatch_match(pattern, value, path_mode),
                         "fnmatch mismatch: pattern={pattern:?} value={value:?} path={path_mode}"
                     );
                 }
@@ -337,7 +337,9 @@ mod tests {
                 for path_mode in [false, true] {
                     assert_eq!(
                         expr_match(pattern, value, path_mode),
-                        Ok(vapache_verified::expr_glob_match(pattern, value, path_mode)),
+                        Ok(httpd_rs_verified::expr_glob_match(
+                            pattern, value, path_mode
+                        )),
                         "expr mismatch: pattern={pattern:?} value={value:?} path={path_mode}"
                     );
                 }

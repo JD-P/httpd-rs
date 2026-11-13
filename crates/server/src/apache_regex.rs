@@ -7,7 +7,7 @@
 
 #[derive(Clone, Debug)]
 pub struct Regex {
-    inner: vapache_pcre2::bytes::Regex,
+    inner: httpd_rs_pcre2::bytes::Regex,
 }
 
 impl Regex {
@@ -16,7 +16,7 @@ impl Regex {
     }
 
     pub fn compile(pattern: &str, caseless: bool) -> Result<Self, String> {
-        let mut builder = vapache_pcre2::bytes::RegexBuilder::new();
+        let mut builder = httpd_rs_pcre2::bytes::RegexBuilder::new();
         builder.caseless(caseless).utf(false).ucp(false);
         builder
             .build(pattern)
@@ -32,7 +32,7 @@ impl Regex {
         self.inner.is_match(subject).unwrap_or(false)
     }
 
-    pub fn captures<'s>(&self, subject: &'s [u8]) -> Option<vapache_pcre2::bytes::Captures<'s>> {
+    pub fn captures<'s>(&self, subject: &'s [u8]) -> Option<httpd_rs_pcre2::bytes::Captures<'s>> {
         self.inner.captures(subject).ok().flatten()
     }
 }

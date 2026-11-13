@@ -17,12 +17,12 @@ different server implementation.
 
 This user must be able to:
 
-1. Identify whether the incident affects code or semantics that Vapache uses.
-2. Identify the remaining risk in Vapache, the application, and the operating
+1. Identify whether the incident affects code or semantics that httpd-rs uses.
+2. Identify the remaining risk in httpd-rs, the application, and the operating
    environment.
 3. test the existing Apache configuration with no service change;
 4. identify unsupported behavior and required compatibility capabilities;
-5. evaluate the site through Vapache;
+5. evaluate the site through httpd-rs;
 6. switch the service with a tested rollback procedure;
 7. verify TLS, authentication, dynamic handlers, logs, and application flows.
 
@@ -30,7 +30,7 @@ Documentation for this user has the highest priority.
 
 ## Current priority two: contributor or coding agent
 
-This user changes Vapache itself. The user can be a human contributor, a
+This user changes httpd-rs itself. The user can be a human contributor, a
 maintainer returning to unfamiliar code, or an AI coding agent working from a
 bounded task.
 
@@ -52,7 +52,7 @@ used for operator procedures. Their purpose is to communicate the ideas that
 generate the architecture, including tradeoffs and rejected alternatives.
 
 The two priority audiences need different views of the same decision. The
-operator needs to know what Vapache will do and what remains at risk. The
+operator needs to know what httpd-rs will do and what remains at risk. The
 contributor needs to know why the boundary has its present shape and which
 other parts of the system depend on it.
 
@@ -66,7 +66,7 @@ This user must be able to:
 1. Select a supported static, CGI, FastCGI, or reverse-proxy topology.
 2. Separate immutable application code from writable application data.
 3. Configure the backend identity and public authority correctly.
-4. Verify a real application workflow through Vapache.
+4. Verify a real application workflow through httpd-rs.
 5. Understand behavior during reload and failure.
 
 Each tutorial for this user must use a named application and a complete

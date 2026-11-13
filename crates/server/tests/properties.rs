@@ -1,8 +1,8 @@
+use httpd_rs::config::{Options, Scope};
+use httpd_rs::http::{read_request, Limits, ReadError};
+use httpd_rs::scope_policy::OptionsPolicy;
 use proptest::prelude::*;
 use std::io::{self, Read, Write};
-use vapached::config::{Options, Scope};
-use vapached::http::{read_request, Limits, ReadError};
-use vapached::scope_policy::OptionsPolicy;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
@@ -11,8 +11,8 @@ proptest! {
     fn normalized_paths_are_idempotent(tail in prop::collection::vec(any::<u8>(), 0..512)) {
         let mut input = vec![b'/'];
         input.extend(tail);
-        if let Some(normalized) = vapached::verified::normalize_uri_path(&input) {
-            prop_assert_eq!(vapached::verified::normalize_uri_path(&normalized), Some(normalized));
+        if let Some(normalized) = httpd_rs::verified::normalize_uri_path(&input) {
+            prop_assert_eq!(httpd_rs::verified::normalize_uri_path(&normalized), Some(normalized));
         }
     }
 
@@ -21,8 +21,8 @@ proptest! {
         left in prop::collection::vec(any::<u8>(), 0..256),
         right in prop::collection::vec(any::<u8>(), 0..256),
     ) {
-        let encoded_left = vapached::verified::cache_key_hex(&left);
-        let encoded_right = vapached::verified::cache_key_hex(&right);
+        let encoded_left = httpd_rs::verified::cache_key_hex(&left);
+        let encoded_right = httpd_rs::verified::cache_key_hex(&right);
         prop_assert_eq!(encoded_left.len(), left.len() * 2);
         prop_assert!(encoded_left.iter().all(u8::is_ascii_hexdigit));
         if left != right {
@@ -32,15 +32,15 @@ proptest! {
 
     #[test]
     fn conjoining_options_never_grants(url in any::<u32>(), target in any::<u32>()) {
-        let result = vapached::verified::options_conjoin(url, target);
+        let result = httpd_rs::verified::options_conjoin(url, target);
         prop_assert_eq!(result & url, result);
         prop_assert_eq!(result & target, result);
-        prop_assert_eq!(result, vapached::verified::options_conjoin(target, url));
+        prop_assert_eq!(result, httpd_rs::verified::options_conjoin(target, url));
     }
 
     #[test]
     fn removing_options_is_monotone(bits in any::<u32>(), mask in any::<u32>()) {
-        let result = vapached::verified::options_apply(bits, 2, mask);
+        let result = httpd_rs::verified::options_apply(bits, 2, mask);
         prop_assert_eq!(result & bits, result);
         prop_assert_eq!(result & mask, 0);
     }
@@ -49,7 +49,7 @@ proptest! {
     fn aggregate_budget_admission_cannot_overflow(
         used in any::<u64>(), incoming in any::<u64>(), limit in any::<u64>(),
     ) {
-        if vapached::verified::resource_budget_admit(used, incoming, limit) {
+        if httpd_rs::verified::resource_budget_admit(used, incoming, limit) {
             prop_assert!(used.checked_add(incoming).is_some_and(|sum| sum <= limit));
         }
     }
@@ -58,7 +58,7 @@ proptest! {
     fn autoindex_admission_cannot_overflow(
         used in any::<u64>(), incoming in any::<u64>(), limit in any::<u64>(),
     ) {
-        if vapached::verified::autoindex_append_admit(used, incoming, limit) {
+        if httpd_rs::verified::autoindex_append_admit(used, incoming, limit) {
             prop_assert!(used.checked_add(incoming).is_some_and(|sum| sum <= limit));
         }
     }
@@ -67,7 +67,7 @@ proptest! {
     fn only_successful_unsafe_requests_invalidate(
         unsafe_method in any::<bool>(), status in any::<u16>(),
     ) {
-        let admitted = vapached::verified::cache_invalidation_status_admit(unsafe_method, status);
+        let admitted = httpd_rs::verified::cache_invalidation_status_admit(unsafe_method, status);
         prop_assert_eq!(admitted, unsafe_method && (200..400).contains(&status));
     }
 
@@ -76,21 +76,21 @@ proptest! {
         request_may_have_started in any::<bool>(), idempotent in any::<bool>(),
     ) {
         prop_assert_eq!(
-            vapached::verified::proxy_retry_admit(request_may_have_started, idempotent),
+            httpd_rs::verified::proxy_retry_admit(request_may_have_started, idempotent),
             !request_may_have_started || idempotent
         );
     }
 
     #[test]
     fn bcrypt_cost_is_limited_to_htpasswd_range(cost in any::<u32>()) {
-        prop_assert_eq!(vapached::verified::bcrypt_cost_admit(cost), (4..=17).contains(&cost));
+        prop_assert_eq!(httpd_rs::verified::bcrypt_cost_admit(cost), (4..=17).contains(&cost));
     }
 
     #[test]
     fn request_body_memory_admission_cannot_overflow(
         used in any::<u64>(), incoming in any::<u64>(), limit in any::<u64>(),
     ) {
-        if vapached::verified::request_body_memory_admit(used, incoming, limit) {
+        if httpd_rs::verified::request_body_memory_admit(used, incoming, limit) {
             prop_assert!(used.checked_add(incoming).is_some_and(|sum| sum <= limit));
         }
     }
@@ -99,7 +99,7 @@ proptest! {
     fn cache_memory_admission_cannot_overflow(
         used in any::<u64>(), incoming in any::<u64>(), limit in any::<u64>(),
     ) {
-        if vapached::verified::cache_memory_admit(used, incoming, limit) {
+        if httpd_rs::verified::cache_memory_admit(used, incoming, limit) {
             prop_assert!(used.checked_add(incoming).is_some_and(|sum| sum <= limit));
         }
     }
@@ -109,7 +109,7 @@ proptest! {
         proxy_selected in any::<bool>(), operator_allowed in any::<bool>(),
     ) {
         let admitted =
-            vapached::verified::proxy_operator_acl_admit(proxy_selected, operator_allowed);
+            httpd_rs::verified::proxy_operator_acl_admit(proxy_selected, operator_allowed);
         prop_assert!(!admitted || !proxy_selected || operator_allowed);
     }
 
@@ -117,14 +117,14 @@ proptest! {
     fn expression_file_read_gate_requires_regular_bounded_input(
         regular in any::<bool>(), size in any::<u64>(), limit in any::<u64>(),
     ) {
-        let admitted = vapached::verified::expr_file_read_admit(regular, size, limit);
+        let admitted = httpd_rs::verified::expr_file_read_admit(regular, size, limit);
         prop_assert_eq!(admitted, regular && size <= limit);
     }
 
     #[test]
     fn capability_disable_is_monotone(requested in any::<bool>()) {
-        let disabled = vapached::verified::capability_admit(false, requested);
-        let enabled = vapached::verified::capability_admit(true, requested);
+        let disabled = httpd_rs::verified::capability_admit(false, requested);
+        let enabled = httpd_rs::verified::capability_admit(true, requested);
         prop_assert!(!requested || !disabled);
         prop_assert!(!disabled || enabled);
         prop_assert!(enabled);
@@ -143,7 +143,7 @@ proptest! {
         resolved.restrict_policy_with(&lexical);
         prop_assert_eq!(
             resolved.effective_options().0,
-            vapached::verified::options_conjoin(url, target)
+            httpd_rs::verified::options_conjoin(url, target)
         );
     }
 
@@ -243,7 +243,7 @@ fn parse_once(wire: &[u8], chunk: usize) -> String {
     let context = limits
         .resource_budget
         .context(std::net::IpAddr::from([192, 0, 2, 1]));
-    let result = vapached::resource::with_resource_context(context, || {
+    let result = httpd_rs::resource::with_resource_context(context, || {
         read_request(&mut stream, &mut buffered, &limits, |_| {})
     });
     match result {
@@ -264,7 +264,7 @@ fn parse_once(wire: &[u8], chunk: usize) -> String {
 fn parse_two(
     wire: &[u8],
     chunk: usize,
-) -> Result<(vapached::http::Request, vapached::http::Request, Vec<u8>), TestCaseError> {
+) -> Result<(httpd_rs::http::Request, httpd_rs::http::Request, Vec<u8>), TestCaseError> {
     let mut stream = Fragmented {
         input: wire,
         offset: 0,
@@ -275,7 +275,7 @@ fn parse_two(
     let context = limits
         .resource_budget
         .context(std::net::IpAddr::from([192, 0, 2, 2]));
-    vapached::resource::with_resource_context(context, || {
+    httpd_rs::resource::with_resource_context(context, || {
         let first = read_request(&mut stream, &mut buffered, &limits, |_| {})
             .map_err(|error| TestCaseError::fail(format!("first request: {error:?}")))?
             .ok_or_else(|| TestCaseError::fail("first request: unexpected EOF"))?;

@@ -1,0 +1,130 @@
+# Shared fail-closed primitives for httpd-rs's privileged shell control plane.
+# This file is sourced from fixed /usr/lib/httpd-rs paths by installed helpers.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+LC_ALL=C
+export LC_ALL
+IFS=$(printf ' \t\n_')
+IFS=${IFS%_}
+unset CDPATH ENV BASH_ENV
+umask 022
+
+httpd_rs_path_is_plain() {
+    case "${1:-}" in
+        ""|*[!\ -~]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# Print an existing canonical path only when the supplied spelling contains no
+# symlink, dot-component, duplicate separator, or trailing separator.  Keeping
+# the checked spelling identical to the used spelling closes ancestor-swap
+# gaps in the shell wrappers.
+httpd_rs_canonical_unsymlinked() {
+    httpd_rs_cu_path=${1:-}
+    httpd_rs_path_is_plain "$httpd_rs_cu_path" || return 1
+    case "$httpd_rs_cu_path" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    httpd_rs_cu_canonical=$(readlink -e -- "$httpd_rs_cu_path") || return 1
+    [ "$httpd_rs_cu_canonical" = "$httpd_rs_cu_path" ] || return 1
+    [ ! -L "$httpd_rs_cu_path" ] || return 1
+    printf '%s\n' "$httpd_rs_cu_canonical"
+}
+
+# Root-owned ancestors and ancestors owned by the invoking identity are trust
+# anchors. Writable sticky ancestors such as /tmp are safe only as ancestors:
+# a controlled child cannot be replaced there. The target itself must never be
+# writable by group or other users.
+httpd_rs_path_is_controlled_by() (
+    httpd_rs_pcb_path=$(httpd_rs_canonical_unsymlinked "${1:-}") || exit 1
+    httpd_rs_pcb_owner=${2:-}
+    case "$httpd_rs_pcb_owner" in
+        ""|*[!0-9]*) exit 1 ;;
+    esac
+    httpd_rs_pcb_current=$httpd_rs_pcb_path
+    httpd_rs_pcb_target=1
+    while :; do
+        httpd_rs_pcb_actual_owner=$(stat -c '%u' -- "$httpd_rs_pcb_current") || exit 1
+        [ "$httpd_rs_pcb_actual_owner" = 0 ] \
+            || [ "$httpd_rs_pcb_actual_owner" = "$httpd_rs_pcb_owner" ] \
+            || exit 1
+        if [ -n "$(find "$httpd_rs_pcb_current" -maxdepth 0 -perm /022 -print -quit)" ]; then
+            if [ "$httpd_rs_pcb_target" -eq 1 ] \
+                || [ ! -d "$httpd_rs_pcb_current" ] \
+                || [ -z "$(find "$httpd_rs_pcb_current" -maxdepth 0 -perm -1000 -print -quit)" ]; then
+                exit 1
+            fi
+        fi
+        [ "$httpd_rs_pcb_current" = / ] && exit 0
+        httpd_rs_pcb_current=${httpd_rs_pcb_current%/*}
+        [ -n "$httpd_rs_pcb_current" ] || httpd_rs_pcb_current=/
+        httpd_rs_pcb_target=0
+    done
+)
+
+httpd_rs_root_path_is_controlled() {
+    httpd_rs_path_is_controlled_by "$1" 0
+}
+
+httpd_rs_user_path_is_controlled() {
+    httpd_rs_path_is_controlled_by "$1" "${2:-$(id -u)}"
+}
+
+httpd_rs_path_is_controlled() {
+    if [ "$(id -u)" -eq 0 ]; then
+        httpd_rs_root_path_is_controlled "$1"
+    else
+        httpd_rs_user_path_is_controlled "$1"
+    fi
+}
+
+# Validate command overrides rather than trusting a privileged caller's PATH
+# or environment.  The permitted basenames prevent a root-owned general-
+# purpose interpreter from being substituted for a control command.
+httpd_rs_validate_command() {
+    httpd_rs_vc_path=${1:-}
+    httpd_rs_vc_names=${2:-}
+    httpd_rs_vc_canonical=$(httpd_rs_canonical_unsymlinked "$httpd_rs_vc_path") || return 1
+    [ -f "$httpd_rs_vc_canonical" ] && [ -x "$httpd_rs_vc_canonical" ] || return 1
+    case " $httpd_rs_vc_names " in
+        *" ${httpd_rs_vc_canonical##*/} "*) ;;
+        *) return 1 ;;
+    esac
+    httpd_rs_path_is_controlled "$httpd_rs_vc_canonical" || return 1
+    printf '%s\n' "$httpd_rs_vc_canonical"
+}
+
+httpd_rs_ensure_runtime_dir() {
+    httpd_rs_erd_path=${1:-}
+    httpd_rs_path_is_plain "$httpd_rs_erd_path" || return 1
+    case "$httpd_rs_erd_path" in
+        /|"") return 1 ;;
+        /*) ;;
+        *) return 1 ;;
+    esac
+
+    if [ -e "$httpd_rs_erd_path" ] || [ -L "$httpd_rs_erd_path" ]; then
+        [ -d "$httpd_rs_erd_path" ] && [ ! -L "$httpd_rs_erd_path" ] || return 1
+    else
+        httpd_rs_erd_parent=${httpd_rs_erd_path%/*}
+        [ -n "$httpd_rs_erd_parent" ] || httpd_rs_erd_parent=/
+        if [ "$(id -u)" -eq 0 ]; then
+            httpd_rs_root_path_is_controlled "$httpd_rs_erd_parent" || return 1
+            install -d -o root -g root -m 0755 -- "$httpd_rs_erd_path" || return 1
+        else
+            install -d -m 0755 -- "$httpd_rs_erd_path" || return 1
+        fi
+    fi
+    httpd_rs_path_is_controlled "$httpd_rs_erd_path"
+}
+
+httpd_rs_lock_file_is_safe() {
+    httpd_rs_lf_path=${1:-}
+    if [ -e "$httpd_rs_lf_path" ] || [ -L "$httpd_rs_lf_path" ]; then
+        [ -f "$httpd_rs_lf_path" ] && [ ! -L "$httpd_rs_lf_path" ] || return 1
+        httpd_rs_path_is_controlled "$httpd_rs_lf_path" || return 1
+    fi
+}

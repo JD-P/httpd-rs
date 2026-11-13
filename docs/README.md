@@ -4,19 +4,19 @@ audience: apache-operator
 status: draft
 ---
 
-# Vapache documentation
+# httpd-rs documentation
 
-Vapache is an independent reimplementation of the core features of Apache HTTP
+httpd-rs is an independent reimplementation of the core features of Apache HTTP
 Server 2.4 in Rust. It reads existing Apache configuration for the features
 that it supports. It does not implement every Apache module or reproduce every
 Apache behavior.
 
 Use the Apache manual for Apache configuration syntax and standard Apache
-behavior. Use these pages to decide whether Vapache fits a site, find the
+behavior. Use these pages to decide whether httpd-rs fits a site, find the
 intentional differences, test an existing configuration, migrate, and operate
 the service.
 
-Vapache is pre-release software. Evaluate it on a test host and keep an Apache
+httpd-rs is pre-release software. Evaluate it on a test host and keep an Apache
 rollback procedure.
 
 ## For Apache administrators
@@ -25,7 +25,7 @@ Follow these pages in order when a new Apache incident or security review
 prompts an evaluation:
 
 1. [Decide whether to replace Apache with
-   Vapache](how-to/evaluate-security-driven-migration.md).
+   httpd-rs](how-to/evaluate-security-driven-migration.md).
 2. [Assess the complete Apache
    configuration](how-to/assess-apache-configuration.md) without stopping
    Apache.
@@ -46,7 +46,7 @@ remain.
 - [Deployment tutorials](tutorials/README.md)
 - [Operational how-to guides](how-to/README.md)
 - [Reload, reopen logs, stop, and diagnose
-  Vapache](how-to/operate-vapache-service.md)
+  httpd-rs](how-to/operate-httpd-rs-service.md)
 - [Migrate TLS and Certbot](how-to/migrate-tls-and-certbot.md)
 - [Roll back to Apache](how-to/roll-back-to-apache.md)
 

@@ -1,6 +1,6 @@
-# vapache adversarial findings
+# httpd-rs adversarial findings
 
-**Target:** `HEAD 24e226d` plus the uncommitted hardening changes in the working tree, release build `target/release/vapached`. Repository source was not modified for this pass. All tests are loopback-only.
+**Target:** `HEAD 24e226d` plus the uncommitted hardening changes in the working tree, release build `target/release/httpd-rs`. Repository source was not modified for this pass. All tests are loopback-only.
 
 ---
 
@@ -226,7 +226,7 @@ Validate the final serialized request line and every forwarded header value with
 "requestheader" | "addcharset" | ... => {}
 ```
 
-The comment above the arm says these directives "do not affect access decisions or response framing." That is false for `RequestHeader`. Apache's `mod_headers` runs `RequestHeader` during request processing; the resulting header is visible to `Require expr`, `SetEnvIf`, rewrite conditions and `mod_remoteip`. A `.htaccess` that uses `RequestHeader set` to force a deny trigger (for example a header consumed by a `Require not expr` rule) is therefore bypassed by vapache: the header is never set, the deny condition is false, and the protected resource is served. This is a fail-open in the `.htaccess` parser, not a benign cosmetic omission.
+The comment above the arm says these directives "do not affect access decisions or response framing." That is false for `RequestHeader`. Apache's `mod_headers` runs `RequestHeader` during request processing; the resulting header is visible to `Require expr`, `SetEnvIf`, rewrite conditions and `mod_remoteip`. A `.htaccess` that uses `RequestHeader set` to force a deny trigger (for example a header consumed by a `Require not expr` rule) is therefore bypassed by httpd-rs: the header is never set, the deny condition is false, and the protected resource is served. This is a fail-open in the `.htaccess` parser, not a benign cosmetic omission.
 
 ### Reproduction
 
@@ -264,7 +264,7 @@ GET /secret.txt                       -> 200 WALLET-REQHEADER-SECRET
 GET /secret.txt with X-Block: yes     -> 403
 ```
 
-Apache evaluates `RequestHeader set X-Block yes` first and returns 403 for both requests. Vapache only denies when the client supplies the header itself, so a client that omits it receives the protected body. The same primitive applies to `RequestHeader unset` on an allow-list header and to `RequestHeader set` of any header consumed by a `Require expr`, `SetEnvIf`, or rewrite condition.
+Apache evaluates `RequestHeader set X-Block yes` first and returns 403 for both requests. httpd-rs only denies when the client supplies the header itself, so a client that omits it receives the protected body. The same primitive applies to `RequestHeader unset` on an allow-list header and to `RequestHeader set` of any header consumed by a `Require expr`, `SetEnvIf`, or rewrite condition.
 
 ### Root cause
 

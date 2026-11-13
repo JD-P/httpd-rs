@@ -16,7 +16,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  VAPACHE_NIGHTLY_TOOLCHAIN: nightly-2026-10-29
+  HTTPD_RS_NIGHTLY_TOOLCHAIN: nightly-2026-10-29
 
 jobs:
   rust:
@@ -38,15 +38,15 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Security-focused Clippy gate
         run: >-
-          cargo clippy -p vapached --lib --bins --no-deps --
+          cargo clippy -p httpd-rs --lib --bins --no-deps --
           -D clippy::correctness -D clippy::suspicious
           -D unused_must_use -A unsafe_code
       - name: Rust and property tests
         run: cargo test --workspace --all-targets --all-features -- --test-threads=1
       - name: Pinned native dependency boundary
         run: |
-          cargo build --locked -p vapached
-          python3 tests/native_dependency_policy.py --binary target/debug/vapached
+          cargo build --locked -p httpd-rs
+          python3 tests/native_dependency_policy.py --binary target/debug/httpd-rs
       - name: Executable documentation
         run: python3 tests/docs.py
       - name: Generated transform and secrecy campaigns
@@ -55,8 +55,8 @@ jobs:
           python3 tests/information_disclosure.py --check
       - name: Packaged graceful configuration reload
         env:
-          VAPACHE_TEST_BINARY: target/debug/vapached
-        run: tests/vapachectl_reload.sh
+          HTTPD_RS_TEST_BINARY: target/debug/httpd-rs
+        run: tests/httpd-rsctl_reload.sh
       - name: Unsafe boundary budget
         run: python3 tests/unsafe_inventory.py
       - name: Resource ownership inventory
@@ -107,7 +107,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install toolchains and cargo-fuzz
         run: |
-          rustup toolchain install "$VAPACHE_NIGHTLY_TOOLCHAIN" --profile minimal
+          rustup toolchain install "$HTTPD_RS_NIGHTLY_TOOLCHAIN" --profile minimal
           cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Compile and smoke every fuzz target
         env:

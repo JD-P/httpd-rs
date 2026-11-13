@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use vapached::config_frontend::{logical_lines, logical_lines_with_numbers, parse_line, ConfigLine};
+use httpd_rs::config_frontend::{logical_lines, logical_lines_with_numbers, parse_line, ConfigLine};
 
 const MAX_SOURCE: usize = 64 * 1024;
 

@@ -95,8 +95,8 @@ application-controlled symlink as the release selector.
 Run:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 ```
 
 Test login, uploads, generated files, and application jobs. Request a test
@@ -116,7 +116,7 @@ deployment process.
 ## Roll back the release change
 
 Restore the previous versioned release path in the virtual host. Run the
-configuration test and reload Vapache. Do not restore write access to
+configuration test and reload httpd-rs. Do not restore write access to
 executable code as a rollback method.
 
 <!--

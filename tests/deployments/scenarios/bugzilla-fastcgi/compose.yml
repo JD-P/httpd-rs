@@ -15,8 +15,8 @@ services:
     environment:
       MARIADB_DATABASE: bugzilla
       MARIADB_USER: bugzilla
-      MARIADB_PASSWORD: vapache-bugzilla-db
-      MARIADB_ROOT_PASSWORD: vapache-bugzilla-root
+      MARIADB_PASSWORD: httpd-rs-bugzilla-db
+      MARIADB_ROOT_PASSWORD: httpd-rs-bugzilla-root
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=128m
       - /run/mysqld:rw,nosuid,nodev,size=32m
@@ -50,7 +50,7 @@ services:
     environment:
       BUGZILLA_ROOT: ${BUGZILLA_ROOT:?}
       BZ_URLBASE: ${BZ_URLBASE:?}
-      VAPACHE_SOCKET_GID: ${VAPACHE_SOCKET_GID:?}
+      HTTPD_RS_SOCKET_GID: ${HTTPD_RS_SOCKET_GID:?}
       NO_PROXY: "*"
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=256m

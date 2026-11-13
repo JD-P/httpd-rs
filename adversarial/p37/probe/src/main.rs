@@ -13,7 +13,7 @@
 //! ```
 
 use pcre2_c_oracle::bytes as oracle;
-use vapache_pcre2::bytes as rust;
+use httpd_rs_pcre2::bytes as rust;
 
 fn rust_regex(pattern: &str, caseless: bool, crlf: bool, multiline: bool) -> rust::Regex {
     let mut builder = rust::RegexBuilder::new();

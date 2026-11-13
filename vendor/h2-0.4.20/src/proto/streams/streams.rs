@@ -503,30 +503,30 @@ impl Inner {
                 if let Some(phase) = self.counts.forgotten_phase(id) {
                     let malformed = !frame.is_end_stream()
                         || frame.pseudo() != &frame::Pseudo::default();
-                    let kind = if phase == vapache_verified::H2PeerStreamPhase::ClosedLocalReset
+                    let kind = if phase == httpd_rs_verified::H2PeerStreamPhase::ClosedLocalReset
                         && malformed
                     {
-                        vapache_verified::H2PeerFrame::MalformedHeaders
+                        httpd_rs_verified::H2PeerFrame::MalformedHeaders
                     } else {
-                        vapache_verified::H2PeerFrame::Headers
+                        httpd_rs_verified::H2PeerFrame::Headers
                     };
-                    return match vapache_verified::h2_peer_frame_decision(phase, kind) {
-                        vapache_verified::H2PeerFrameDecision::Ignore => {
+                    return match httpd_rs_verified::h2_peer_frame_decision(phase, kind) {
+                        httpd_rs_verified::H2PeerFrameDecision::Ignore => {
                             Ok(RecvOutcome::Processed)
                         }
-                        vapache_verified::H2PeerFrameDecision::StreamClosed => {
+                        httpd_rs_verified::H2PeerFrameDecision::StreamClosed => {
                             Err(Error::library_reset(id, Reason::STREAM_CLOSED))
                         }
-                        vapache_verified::H2PeerFrameDecision::StreamProtocolError => {
+                        httpd_rs_verified::H2PeerFrameDecision::StreamProtocolError => {
                             Err(Error::library_reset(id, Reason::PROTOCOL_ERROR))
                         }
-                        vapache_verified::H2PeerFrameDecision::ConnectionProtocolError => {
+                        httpd_rs_verified::H2PeerFrameDecision::ConnectionProtocolError => {
                             Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
                         }
-                        vapache_verified::H2PeerFrameDecision::ConnectionStreamClosed => {
+                        httpd_rs_verified::H2PeerFrameDecision::ConnectionStreamClosed => {
                             Err(Error::library_go_away(Reason::STREAM_CLOSED))
                         }
-                        vapache_verified::H2PeerFrameDecision::Process => {
+                        httpd_rs_verified::H2PeerFrameDecision::Process => {
                             Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
                         }
                     };
@@ -569,19 +569,19 @@ impl Inner {
         let header_kind = if stream.state.is_local_error()
             && (!frame.is_end_stream() || frame.pseudo() != &frame::Pseudo::default())
         {
-            vapache_verified::H2PeerFrame::MalformedHeaders
+            httpd_rs_verified::H2PeerFrame::MalformedHeaders
         } else {
-            vapache_verified::H2PeerFrame::Headers
+            httpd_rs_verified::H2PeerFrame::Headers
         };
-        match vapache_verified::h2_peer_frame_decision(
+        match httpd_rs_verified::h2_peer_frame_decision(
             stream.state.peer_recv_phase(),
             header_kind,
         ) {
-            vapache_verified::H2PeerFrameDecision::Process => {}
-            vapache_verified::H2PeerFrameDecision::Ignore => {
+            httpd_rs_verified::H2PeerFrameDecision::Process => {}
+            httpd_rs_verified::H2PeerFrameDecision::Ignore => {
                 return Ok(RecvOutcome::Processed);
             }
-            vapache_verified::H2PeerFrameDecision::StreamClosed => {
+            httpd_rs_verified::H2PeerFrameDecision::StreamClosed => {
                 let actions = &mut self.actions;
                 let mut buffer = send_buffer.inner.lock().unwrap();
                 self.counts.transition(stream, |counts, stream| {
@@ -595,7 +595,7 @@ impl Inner {
                 });
                 return Ok(RecvOutcome::Processed);
             }
-            vapache_verified::H2PeerFrameDecision::StreamProtocolError => {
+            httpd_rs_verified::H2PeerFrameDecision::StreamProtocolError => {
                 let actions = &mut self.actions;
                 let mut buffer = send_buffer.inner.lock().unwrap();
                 self.counts.transition(stream, |counts, stream| {
@@ -609,10 +609,10 @@ impl Inner {
                 });
                 return Ok(RecvOutcome::Processed);
             }
-            vapache_verified::H2PeerFrameDecision::ConnectionProtocolError => {
+            httpd_rs_verified::H2PeerFrameDecision::ConnectionProtocolError => {
                 return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
             }
-            vapache_verified::H2PeerFrameDecision::ConnectionStreamClosed => {
+            httpd_rs_verified::H2PeerFrameDecision::ConnectionStreamClosed => {
                 return Err(Error::library_go_away(Reason::STREAM_CLOSED));
             }
         }
@@ -711,20 +711,20 @@ impl Inner {
                     let sz = frame.flow_controlled_len();
                     assert!(sz <= super::MAX_WINDOW_SIZE as usize);
                     self.actions.recv.ignore_data(sz as WindowSize)?;
-                    return match vapache_verified::h2_peer_frame_decision(
+                    return match httpd_rs_verified::h2_peer_frame_decision(
                         phase,
-                        vapache_verified::H2PeerFrame::Data,
+                        httpd_rs_verified::H2PeerFrame::Data,
                     ) {
-                        vapache_verified::H2PeerFrameDecision::Ignore => Ok(()),
-                        vapache_verified::H2PeerFrameDecision::StreamClosed => {
+                        httpd_rs_verified::H2PeerFrameDecision::Ignore => Ok(()),
+                        httpd_rs_verified::H2PeerFrameDecision::StreamClosed => {
                             Err(Error::library_reset(id, Reason::STREAM_CLOSED))
                         }
-                        vapache_verified::H2PeerFrameDecision::ConnectionStreamClosed => {
+                        httpd_rs_verified::H2PeerFrameDecision::ConnectionStreamClosed => {
                             Err(Error::library_go_away(Reason::STREAM_CLOSED))
                         }
-                        vapache_verified::H2PeerFrameDecision::ConnectionProtocolError
-                        | vapache_verified::H2PeerFrameDecision::StreamProtocolError
-                        | vapache_verified::H2PeerFrameDecision::Process => {
+                        httpd_rs_verified::H2PeerFrameDecision::ConnectionProtocolError
+                        | httpd_rs_verified::H2PeerFrameDecision::StreamProtocolError
+                        | httpd_rs_verified::H2PeerFrameDecision::Process => {
                             Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
                         }
                     };
@@ -743,18 +743,18 @@ impl Inner {
             }
         };
 
-        match vapache_verified::h2_peer_frame_decision(
+        match httpd_rs_verified::h2_peer_frame_decision(
             stream.state.peer_recv_phase(),
-            vapache_verified::H2PeerFrame::Data,
+            httpd_rs_verified::H2PeerFrame::Data,
         ) {
-            vapache_verified::H2PeerFrameDecision::Process => {}
-            vapache_verified::H2PeerFrameDecision::Ignore => {
+            httpd_rs_verified::H2PeerFrameDecision::Process => {}
+            httpd_rs_verified::H2PeerFrameDecision::Ignore => {
                 record_discarded_data_frame(&mut self.counts, &frame)?;
                 let sz = frame.flow_controlled_len();
                 assert!(sz <= super::MAX_WINDOW_SIZE as usize);
                 return self.actions.recv.ignore_data(sz as WindowSize);
             }
-            vapache_verified::H2PeerFrameDecision::StreamClosed => {
+            httpd_rs_verified::H2PeerFrameDecision::StreamClosed => {
                 record_discarded_data_frame(&mut self.counts, &frame)?;
                 let sz = frame.flow_controlled_len();
                 assert!(sz <= super::MAX_WINDOW_SIZE as usize);
@@ -772,13 +772,13 @@ impl Inner {
                 });
                 return Ok(());
             }
-            vapache_verified::H2PeerFrameDecision::StreamProtocolError => {
+            httpd_rs_verified::H2PeerFrameDecision::StreamProtocolError => {
                 return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
             }
-            vapache_verified::H2PeerFrameDecision::ConnectionProtocolError => {
+            httpd_rs_verified::H2PeerFrameDecision::ConnectionProtocolError => {
                 return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
             }
-            vapache_verified::H2PeerFrameDecision::ConnectionStreamClosed => {
+            httpd_rs_verified::H2PeerFrameDecision::ConnectionStreamClosed => {
                 return Err(Error::library_go_away(Reason::STREAM_CLOSED));
             }
         }

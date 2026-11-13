@@ -1,18 +1,18 @@
 //! Safe server-facing process and descriptor-isolation API.
 //!
-//! Raw syscalls live in `vapache-os`; this module preserves the original
+//! Raw syscalls live in `httpd-rs-os`; this module preserves the original
 //! domain names used by the server while keeping production code safe Rust.
 
-pub use vapache_os::close_inherited_descriptors;
-pub(crate) use vapache_os::{
+pub use httpd_rs_os::close_inherited_descriptors;
+pub(crate) use httpd_rs_os::{
     bind_to_parent, child_exited_unreaped, disable_dumping, no_new_privileges, set_limit,
 };
 #[cfg(test)]
-pub(crate) use vapache_os::{cloexec_unrelated_descriptors, RlimitResource};
+pub(crate) use httpd_rs_os::{cloexec_unrelated_descriptors, RlimitResource};
 
 #[cfg(test)]
 pub(crate) fn set_cloexec(fd: std::os::fd::RawFd, enabled: bool) -> std::io::Result<()> {
-    vapache_os::set_cloexec_raw(fd, enabled)
+    httpd_rs_os::set_cloexec_raw(fd, enabled)
 }
 
 #[cfg(test)]

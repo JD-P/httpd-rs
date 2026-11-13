@@ -1,0 +1,45 @@
+#!/bin/sh -p
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+case "$0" in
+    /usr/lib/httpd-rs/*)
+        httpd_rs_deploy_common=/usr/lib/httpd-rs/control-common
+        if [ -L "$httpd_rs_deploy_common" ] || [ ! -f "$httpd_rs_deploy_common" ] \
+            || [ "$(stat -c '%u' -- "$httpd_rs_deploy_common")" != 0 ] \
+            || [ -n "$(find "$httpd_rs_deploy_common" -maxdepth 0 -perm /022 -print -quit)" ]; then
+            echo "httpd-rs-certbot-deploy-hook: unsafe installed control library" >&2
+            exit 1
+        fi
+        ;;
+    *)
+    case "$0" in
+        */*) httpd_rs_deploy_script_dir=${0%/*} ;;
+        *) httpd_rs_deploy_script_dir=. ;;
+    esac
+        httpd_rs_deploy_common=$httpd_rs_deploy_script_dir/httpd-rs-control-common
+        ;;
+esac
+. "$httpd_rs_deploy_common"
+
+if [ -n "${HTTPD_RS_SYSTEMCTL:-}" ]; then
+    systemctl_command=$(httpd_rs_validate_command "$HTTPD_RS_SYSTEMCTL" systemctl) || {
+        echo "httpd-rs-certbot-deploy-hook: unsafe HTTPD_RS_SYSTEMCTL" >&2
+        exit 1
+    }
+elif systemctl_path=$(command -v systemctl 2>/dev/null); then
+    systemctl_command=$(httpd_rs_validate_command "$systemctl_path" systemctl) || {
+        echo "httpd-rs-certbot-deploy-hook: unsafe systemctl executable" >&2
+        exit 1
+    }
+else
+    exit 0
+fi
+
+# Certbot runs deploy hooks only after a lineage has actually changed. Do not
+# start httpd-rs or interfere with Apache when httpd-rs is not the active server.
+if "$systemctl_command" is-active --quiet httpd-rs.service 2>/dev/null; then
+    "$systemctl_command" reload httpd-rs.service
+fi

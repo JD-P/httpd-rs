@@ -6,21 +6,21 @@ contracts: DOC-DEPLOY-JUPYTERLAB-001
 scenario: jupyterlab-proxy
 ---
 
-# Put JupyterLab behind Vapache on a VPS
+# Put JupyterLab behind httpd-rs on a VPS
 
 This tutorial publishes JupyterLab below `/jupyter/` at
-`https://lab.example.test/jupyter/`. The same Vapache route carries the HTTP API
+`https://lab.example.test/jupyter/`. The same httpd-rs route carries the HTTP API
 and kernel WebSocket protocol.
 
 ## What you will do
 
 You will install JupyterLab in a dedicated Python environment, create its
-systemd service, bind it to loopback, add the Vapache route, execute code in a
-kernel, reload Vapache, reconnect, and use the same kernel.
+systemd service, bind it to loopback, add the httpd-rs route, execute code in a
+kernel, reload httpd-rs, reconnect, and use the same kernel.
 
 ## Before you start
 
-Complete [Prepare a Debian VPS for a Vapache
+Complete [Prepare a Debian VPS for a httpd-rs
 tutorial](prepare-debian-vps.md). Point `lab.example.test` at the VPS and open
 TCP ports 80 and 443 in the provider firewall.
 
@@ -96,7 +96,7 @@ $ sudo systemctl enable --now jupyterlab.service
 $ curl -I http://127.0.0.1:8888/jupyter/
 ```
 
-## 3. Configure Vapache
+## 3. Configure httpd-rs
 
 Create `/etc/apache2/sites-available/jupyterlab.conf` with a temporary
 HTTP-only host, enable it, and obtain the certificate:
@@ -109,8 +109,8 @@ HTTP-only host, enable it, and obtain the certificate:
 
 ```console
 $ sudo a2ensite jupyterlab.conf
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot certonly --apache --domain lab.example.test
 ```
 
@@ -133,19 +133,19 @@ Replace it with the final configuration:
 </VirtualHost>
 ```
 
-Test the configuration, reload Vapache, and verify renewal:
+Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
-$ sudo vapachectl configtest
-$ sudo systemctl reload vapache.service
+$ sudo httpd-rsctl configtest
+$ sudo systemctl reload httpd-rs.service
 $ sudo certbot renew --dry-run
 ```
 
 ## 4. Test a kernel and reload
 
 Open `https://lab.example.test/jupyter/`, authenticate, create a kernel, and run
-a cell that prints `Vapache Jupyter test`. Keep the kernel open and reload
-Vapache again.
+a cell that prints `httpd-rs Jupyter test`. Keep the kernel open and reload
+httpd-rs again.
 
 The current WebSocket can close during reload. Reconnect the browser and run a
 second cell in the same kernel. A successful `101 Switching Protocols` response

@@ -41,9 +41,9 @@ def metadata() -> dict[str, object]:
 
 def production_ids(data: dict[str, object]) -> set[str]:
     packages = {package["name"]: package["id"] for package in data["packages"]}
-    root = packages.get("vapached")
+    root = packages.get("httpd-rs")
     if root is None:
-        raise SystemExit("dependency-unsafe: vapached package is missing")
+        raise SystemExit("dependency-unsafe: httpd-rs package is missing")
     nodes = {node["id"]: node for node in data["resolve"]["nodes"]}
     found: set[str] = set()
     pending = [root]

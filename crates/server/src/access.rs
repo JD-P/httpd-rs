@@ -62,14 +62,14 @@ pub struct ResourceKey {
 
 #[derive(Clone, Debug)]
 struct ProxyRepresentationBinding {
-    witness: vapache_verified::ProxyRepresentationWitness,
+    witness: httpd_rs_verified::ProxyRepresentationWitness,
     backend_target: String,
 }
 
 impl ProxyRepresentationBinding {
     fn matches_stored_key(&self, key: &ResourceKey) -> bool {
         key.backend_target.as_deref() == Some(self.backend_target.as_str())
-            && vapache_verified::proxy_representation_witness_matches(
+            && httpd_rs_verified::proxy_representation_witness_matches(
                 &self.witness,
                 key.url_path.as_bytes(),
                 self.witness.upstream_path.as_slice(),
@@ -84,7 +84,7 @@ impl ProxyRepresentationBinding {
         tls: bool,
         upstream_path: &str,
     ) -> bool {
-        let target = vapache_verified::proxy_target_key(
+        let target = httpd_rs_verified::proxy_target_key(
             host.as_bytes(),
             port,
             tls,
@@ -93,7 +93,7 @@ impl ProxyRepresentationBinding {
         let target: String = target.iter().map(|byte| format!("{byte:02x}")).collect();
         target == self.backend_target
             && key.backend_target.as_deref() == Some(target.as_str())
-            && vapache_verified::proxy_representation_witness_matches(
+            && httpd_rs_verified::proxy_representation_witness_matches(
                 &self.witness,
                 key.url_path.as_bytes(),
                 upstream_path.as_bytes(),
@@ -174,7 +174,7 @@ impl ResourceKey {
 pub struct AccessGrant {
     key: ResourceKey,
     generation: crate::config::ConfigurationGeneration,
-    pipeline: vapache_verified::TransformCapability,
+    pipeline: httpd_rs_verified::TransformCapability,
     /// Exact front-end/upstream path pair witnessed when a proxy target is
     /// bound. A boolean pipeline bit alone cannot prevent reuse after a
     /// retarget, so the sink checks this concrete evidence as well.
@@ -260,7 +260,7 @@ impl AuthorizedPlan {
             .fs_path
             .as_deref()
             .is_none_or(|path| identity.resolved_fs_path() == Some(path));
-        if !vapache_verified::authorized_plan_identity_admit(
+        if !httpd_rs_verified::authorized_plan_identity_admit(
             !identity.public_url_path.is_empty(),
             identity.selected_url_path == resource.url_path,
             filesystem_identity_well_formed,
@@ -318,13 +318,13 @@ impl AuthorizedPlan {
     pub(crate) fn into_outcome(
         self,
         generation: crate::config::ConfigurationGeneration,
-        sink: vapache_verified::TransformSink,
+        sink: httpd_rs_verified::TransformSink,
     ) -> Option<AuthorizedOutcome> {
         // Redirects carry response data that must be bound at the same time as
         // the sink.  Keeping the generic constructor unavailable for that
         // variant prevents a caller from authorizing one Location/status pair
         // and emitting another.
-        if sink == vapache_verified::TransformSink::Redirect {
+        if sink == httpd_rs_verified::TransformSink::Redirect {
             return None;
         }
         if !self.grant.require_sink(generation, &self.resource, sink) {
@@ -344,9 +344,9 @@ impl AuthorizedPlan {
         status: u16,
         location: Vec<u8>,
     ) -> Option<AuthorizedOutcome> {
-        let sink = vapache_verified::TransformSink::Redirect;
+        let sink = httpd_rs_verified::TransformSink::Redirect;
         if !self.grant.require_sink(generation, &self.resource, sink)
-            || !vapache_verified::redirect_outcome_admit(
+            || !httpd_rs_verified::redirect_outcome_admit(
                 sink,
                 true,
                 true,
@@ -367,10 +367,10 @@ impl AuthorizedPlan {
     pub(crate) fn into_internal_outcome(
         self,
         generation: crate::config::ConfigurationGeneration,
-        kind: vapache_verified::InternalRequestKind,
+        kind: httpd_rs_verified::InternalRequestKind,
         target: DecodedUrlPath,
     ) -> Option<AuthorizedOutcome> {
-        let sink = vapache_verified::internal_request_sink(kind);
+        let sink = httpd_rs_verified::internal_request_sink(kind);
         let mut outcome = self.into_outcome(generation, sink)?;
         outcome.internal = Some(InternalOutcomeBinding { kind, target });
         Some(outcome)
@@ -379,7 +379,7 @@ impl AuthorizedPlan {
 
 #[derive(Debug)]
 struct InternalOutcomeBinding {
-    kind: vapache_verified::InternalRequestKind,
+    kind: httpd_rs_verified::InternalRequestKind,
     target: DecodedUrlPath,
 }
 
@@ -395,7 +395,7 @@ struct RedirectOutcomeBinding {
 #[derive(Debug)]
 pub struct AuthorizedOutcome {
     plan: AuthorizedPlan,
-    sink: vapache_verified::TransformSink,
+    sink: httpd_rs_verified::TransformSink,
     internal: Option<InternalOutcomeBinding>,
     redirect: Option<RedirectOutcomeBinding>,
 }
@@ -417,7 +417,7 @@ impl AuthorizedOutcome {
         self.plan.resource()
     }
 
-    pub fn sink(&self) -> vapache_verified::TransformSink {
+    pub fn sink(&self) -> httpd_rs_verified::TransformSink {
         self.sink
     }
 
@@ -438,7 +438,7 @@ impl AuthorizedOutcome {
     pub(crate) fn into_internal(
         self,
         generation: crate::config::ConfigurationGeneration,
-        kind: vapache_verified::InternalRequestKind,
+        kind: httpd_rs_verified::InternalRequestKind,
         target: DecodedUrlPath,
     ) -> Option<Self> {
         self.plan.into_internal_outcome(generation, kind, target)
@@ -447,7 +447,7 @@ impl AuthorizedOutcome {
     pub(crate) fn require_sink(
         &self,
         generation: crate::config::ConfigurationGeneration,
-        sink: vapache_verified::TransformSink,
+        sink: httpd_rs_verified::TransformSink,
     ) -> bool {
         self.sink == sink
             && self
@@ -459,15 +459,15 @@ impl AuthorizedOutcome {
     pub(crate) fn into_internal_request(
         self,
         generation: crate::config::ConfigurationGeneration,
-        kind: vapache_verified::InternalRequestKind,
+        kind: httpd_rs_verified::InternalRequestKind,
         target: &DecodedUrlPath,
     ) -> Option<Self> {
         let exact_target = self
             .internal
             .as_ref()
             .is_some_and(|binding| binding.kind == kind && binding.target == *target);
-        (self.require_sink(generation, vapache_verified::internal_request_sink(kind))
-            && vapache_verified::internal_request_outcome_admit(
+        (self.require_sink(generation, httpd_rs_verified::internal_request_sink(kind))
+            && httpd_rs_verified::internal_request_outcome_admit(
                 kind,
                 self.sink,
                 exact_target,
@@ -490,8 +490,8 @@ impl AuthorizedOutcome {
         };
         let status_matches = binding.status == status;
         let location_matches = binding.location == location;
-        self.require_sink(generation, vapache_verified::TransformSink::Redirect)
-            && vapache_verified::redirect_outcome_admit(
+        self.require_sink(generation, httpd_rs_verified::TransformSink::Redirect)
+            && httpd_rs_verified::redirect_outcome_admit(
                 self.sink,
                 status_matches,
                 location_matches,
@@ -507,7 +507,7 @@ impl AuthorizedOutcome {
     pub(crate) fn require_file_sink(
         &self,
         generation: crate::config::ConfigurationGeneration,
-        sink: vapache_verified::TransformSink,
+        sink: httpd_rs_verified::TransformSink,
         path: &Path,
         meta: &std::fs::Metadata,
     ) -> bool {
@@ -542,11 +542,13 @@ impl AuthorizedRecoveryRedirect {
             return None;
         };
         let response_status = 302;
-        vapache_verified::recovery_redirect_admit(true, true, true, response_status).then(|| Self {
-            generation,
-            original_status,
-            response_status,
-            location: location.as_bytes().to_vec(),
+        httpd_rs_verified::recovery_redirect_admit(true, true, true, response_status).then(|| {
+            Self {
+                generation,
+                original_status,
+                response_status,
+                location: location.as_bytes().to_vec(),
+            }
         })
     }
 
@@ -559,7 +561,7 @@ impl AuthorizedRecoveryRedirect {
             Some(ErrorDoc::External(location)) => location.as_bytes() == self.location,
             _ => false,
         };
-        vapache_verified::recovery_redirect_admit(
+        httpd_rs_verified::recovery_redirect_admit(
             self.generation == generation,
             configured,
             true,
@@ -592,16 +594,16 @@ impl AccessGrant {
         &self,
         generation: crate::config::ConfigurationGeneration,
         key: &ResourceKey,
-        sink: vapache_verified::TransformSink,
+        sink: httpd_rs_verified::TransformSink,
     ) -> bool {
-        let exact_representation = sink != vapache_verified::TransformSink::Proxy
+        let exact_representation = sink != httpd_rs_verified::TransformSink::Proxy
             || self
                 .proxy_representation
                 .as_ref()
                 .is_some_and(|binding| binding.matches_stored_key(key));
         self.generation_matches(generation)
             && exact_representation
-            && vapache_verified::transform_sink_admit(self.require(key), self.pipeline, sink)
+            && httpd_rs_verified::transform_sink_admit(self.require(key), self.pipeline, sink)
     }
 
     /// Proxy-specific final sink gate. In addition to the stored resource key,
@@ -617,7 +619,7 @@ impl AccessGrant {
         tls: bool,
         upstream_path: &str,
     ) -> bool {
-        self.require_sink(generation, key, vapache_verified::TransformSink::Proxy)
+        self.require_sink(generation, key, httpd_rs_verified::TransformSink::Proxy)
             && self
                 .proxy_representation
                 .as_ref()
@@ -639,7 +641,7 @@ impl AccessGrant {
         Some(AccessGrant {
             key,
             generation: self.generation,
-            pipeline: vapache_verified::transform_bind_backend(self.pipeline),
+            pipeline: httpd_rs_verified::transform_bind_backend(self.pipeline),
             proxy_representation: self.proxy_representation.clone(),
             wildcard: self.wildcard,
         })
@@ -659,11 +661,11 @@ impl AccessGrant {
         if !self.require(resource) {
             return None;
         }
-        let witness = vapache_verified::proxy_representation_witness(
+        let witness = httpd_rs_verified::proxy_representation_witness(
             resource.url_path.as_bytes(),
             upstream_path.as_bytes(),
         )?;
-        let target = vapache_verified::proxy_target_key(
+        let target = httpd_rs_verified::proxy_target_key(
             host.as_bytes(),
             port,
             tls,
@@ -675,8 +677,8 @@ impl AccessGrant {
         Some(AccessGrant {
             key,
             generation: self.generation,
-            pipeline: vapache_verified::transform_bind_representation(
-                vapache_verified::transform_bind_backend(self.pipeline),
+            pipeline: httpd_rs_verified::transform_bind_representation(
+                httpd_rs_verified::transform_bind_backend(self.pipeline),
             ),
             proxy_representation: Some(ProxyRepresentationBinding {
                 witness,
@@ -701,15 +703,15 @@ impl AccessGrant {
         Some(AccessGrant {
             key,
             generation: self.generation,
-            pipeline: vapache_verified::transform_bind_inode(self.pipeline),
+            pipeline: httpd_rs_verified::transform_bind_inode(self.pipeline),
             proxy_representation: self.proxy_representation.clone(),
             wildcard: self.wildcard,
         })
     }
 }
 
-fn authorized_pipeline(key: &ResourceKey) -> vapache_verified::TransformCapability {
-    vapache_verified::transform_authorize(key.policy_fingerprint.is_some())
+fn authorized_pipeline(key: &ResourceKey) -> httpd_rs_verified::TransformCapability {
+    httpd_rs_verified::transform_authorize(key.policy_fingerprint.is_some())
 }
 
 pub(crate) fn grant_if_allowed(
@@ -753,7 +755,7 @@ pub fn test_grant() -> AccessGrant {
         // Unit tests deliberately use a fully-bound wildcard capability to
         // exercise downstream protocol behavior without reproducing access
         // evaluation in every fixture.
-        pipeline: vapache_verified::TransformCapability {
+        pipeline: httpd_rs_verified::TransformCapability {
             target_bound: true,
             authorized: true,
             inode_bound: true,
@@ -799,7 +801,7 @@ pub fn check(
     if scope.conditional_error {
         return Access::Misconfigured;
     }
-    if !vapache_verified::authz_configuration_admit(
+    if !httpd_rs_verified::authz_configuration_admit(
         scope.authorization.auth_type.is_some(),
         scope.authorization.requires.is_some(),
     ) {
@@ -1082,7 +1084,7 @@ fn eval_require(
         url_path: &str,
     ) -> Result<Vec<u8>, ()> {
         fn append(out: &mut Vec<u8>, value: &[u8], req: &Request) -> Result<(), ()> {
-            if !vapache_verified::bounded_expansion_append_admit(
+            if !httpd_rs_verified::bounded_expansion_append_admit(
                 out.len() as u64,
                 value.len() as u64,
                 crate::resource::MAX_POLICY_VALUE_BYTES,
@@ -1110,14 +1112,14 @@ fn eval_require(
             let value: Vec<u8> = match upper.as_str() {
                 "HTTP_HOST" => req
                     .header("host")
-                    .map(vapache_verified::guard_header_bytes)
+                    .map(httpd_rs_verified::guard_header_bytes)
                     .unwrap_or_default(),
                 "REMOTE_ADDR" => peer.to_string().into_bytes(),
                 "REQUEST_URI" => url_path.as_bytes().to_vec(),
                 "REQUEST_METHOD" => req.method.as_bytes().to_vec(),
                 _ if upper.starts_with("HTTP:") => req
                     .header(&variable[5..].to_ascii_lowercase())
-                    .map(vapache_verified::guard_header_bytes)
+                    .map(httpd_rs_verified::guard_header_bytes)
                     .unwrap_or_default(),
                 _ if upper.starts_with("ENV:") => env
                     .iter()
@@ -1200,10 +1202,10 @@ fn eval_require(
                 return PolicyResult::Denied;
             };
             let Some(groups) = identity.groups.as_ref() else {
-                return vapache_verified::group_provider_result(false, false, *negate);
+                return httpd_rs_verified::group_provider_result(false, false, *negate);
             };
             let member = groups.iter().any(|g| names.iter().any(|n| n == g));
-            vapache_verified::group_provider_result(true, member, *negate)
+            httpd_rs_verified::group_provider_result(true, member, *negate)
         }
         Require::Env { negate, names } => {
             // mod_authz_core grants the provider when any listed variable is
@@ -1298,18 +1300,18 @@ pub fn fuzz_request_identity_environment(data: &[u8]) {
         }
     }
 
-    fn proxy_class(proxies: &[RemoteIpProxy], ip: IpAddr) -> vapache_verified::RemoteIpProxyClass {
+    fn proxy_class(proxies: &[RemoteIpProxy], ip: IpAddr) -> httpd_rs_verified::RemoteIpProxyClass {
         proxies
             .iter()
             .find(|proxy| ip_in_net(canonical_ip(ip), proxy.network, proxy.bits))
             .map(|proxy| {
                 if proxy.internal {
-                    vapache_verified::RemoteIpProxyClass::Internal
+                    httpd_rs_verified::RemoteIpProxyClass::Internal
                 } else {
-                    vapache_verified::RemoteIpProxyClass::Trusted
+                    httpd_rs_verified::RemoteIpProxyClass::Trusted
                 }
             })
-            .unwrap_or(vapache_verified::RemoteIpProxyClass::Untrusted)
+            .unwrap_or(httpd_rs_verified::RemoteIpProxyClass::Untrusted)
     }
 
     fn reference_remoteip(
@@ -1331,12 +1333,13 @@ pub fn fuzz_request_identity_environment(data: &[u8]) {
         let mut chain_internal = true;
         for part in text.split(',').rev() {
             let presenter = proxy_class(proxies, current);
-            let next_internal = vapache_verified::remoteip_next_internal(chain_internal, presenter);
+            let next_internal =
+                httpd_rs_verified::remoteip_next_internal(chain_internal, presenter);
             let Ok(candidate) = part.trim_matches(' ').parse::<IpAddr>() else {
                 break;
             };
             let candidate = canonical_ip(candidate);
-            if !vapache_verified::remoteip_candidate_admit(
+            if !httpd_rs_verified::remoteip_candidate_admit(
                 presenter,
                 next_internal,
                 true,
@@ -1359,7 +1362,7 @@ pub fn fuzz_request_identity_environment(data: &[u8]) {
     ) -> Request {
         let mut headers = Headers::default();
         headers.insert("host", b"identity.test".to_vec());
-        headers.insert("user-agent", b"vapache-fuzz".to_vec());
+        headers.insert("user-agent", b"httpd-rs-fuzz".to_vec());
         headers.insert("x-forwarded-for", value.to_vec());
         headers.bind_request_scope(RequestScope::new(budget.context(peer)));
         Request {
@@ -1529,7 +1532,7 @@ pub fn fuzz_request_identity_environment(data: &[u8]) {
 /// `Require local` see a different identity (F49/I46).
 pub fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => match vapache_verified::ipv4_mapped_to_v4(u128::from(v6)) {
+        IpAddr::V6(v6) => match httpd_rs_verified::ipv4_mapped_to_v4(u128::from(v6)) {
             Some(v4) => IpAddr::V4(Ipv4Addr::from(v4)),
             None => ip,
         },
@@ -1562,7 +1565,7 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
     #[cfg(test)]
     fn isolated_lookup(job: &DnsJob, _unreaped: &mut Vec<std::process::Child>) -> Option<String> {
         // Unit-test binaries do not expose the daemon's hidden resolver
-        // entrypoint, and Cargo does not guarantee that target/debug/vapached
+        // entrypoint, and Cargo does not guarantee that target/debug/httpd-rs
         // exists during `cargo test --lib`. Exercise the same FCrDNS decision
         // directly here; non-test builds always use the disposable process
         // implementation below.
@@ -1584,11 +1587,11 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
             .parent()
             .filter(|parent| parent.file_name().is_some_and(|name| name == "deps"))
             .and_then(Path::parent)
-            .map(|parent| parent.join("vapached"))
+            .map(|parent| parent.join("httpd-rs"))
             .filter(|candidate| candidate.is_file())
             .unwrap_or(current);
         let mut child = std::process::Command::new(executable)
-            .arg("--vapache-reverse-resolver-worker")
+            .arg("--httpd-rs-reverse-resolver-worker")
             .arg(job.ip.to_string())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -1728,7 +1731,7 @@ fn forward_dns_confirms(host: &str, ip: IpAddr) -> bool {
 }
 
 fn reverse_dns(ip: IpAddr) -> Result<String, std::io::Error> {
-    vapache_os::reverse_dns(ip)
+    httpd_rs_os::reverse_dns(ip)
 }
 
 #[cfg(test)]
@@ -2441,7 +2444,7 @@ mod tests {
         assert!(cache_plan
             .into_outcome(
                 crate::config::ConfigurationGeneration::other_for_test(),
-                vapache_verified::TransformSink::Cache,
+                httpd_rs_verified::TransformSink::Cache,
             )
             .is_none());
 
@@ -2505,9 +2508,9 @@ mod tests {
         assert!(!grant.require_sink(
             generation(),
             &key,
-            vapache_verified::TransformSink::StaticFile,
+            httpd_rs_verified::TransformSink::StaticFile,
         ));
-        assert!(!grant.require_sink(generation(), &key, vapache_verified::TransformSink::Proxy,));
+        assert!(!grant.require_sink(generation(), &key, httpd_rs_verified::TransformSink::Proxy,));
 
         let proxy_bound = grant
             .bind_proxy(&key, "backend.test", 8080, false, "/upstream.php")
@@ -2534,14 +2537,14 @@ mod tests {
         assert!(!proxy_bound.require_sink(
             generation(),
             &retargeted_front,
-            vapache_verified::TransformSink::Proxy,
+            httpd_rs_verified::TransformSink::Proxy,
         ));
         let mut retargeted_backend = proxy_key;
         retargeted_backend.backend_target = Some("different-backend".into());
         assert!(!proxy_bound.require_sink(
             generation(),
             &retargeted_backend,
-            vapache_verified::TransformSink::Proxy,
+            httpd_rs_verified::TransformSink::Proxy,
         ));
 
         let meta = std::fs::metadata("/proc/self/exe").expect("self metadata");
@@ -2550,12 +2553,12 @@ mod tests {
         assert!(file_bound.require_sink(
             generation(),
             &file_key,
-            vapache_verified::TransformSink::LocalCgi,
+            httpd_rs_verified::TransformSink::LocalCgi,
         ));
         assert!(!file_bound.require_sink(
             generation(),
             &file_key,
-            vapache_verified::TransformSink::FastCgi,
+            httpd_rs_verified::TransformSink::FastCgi,
         ));
 
         let backend_bound = file_bound
@@ -2565,7 +2568,7 @@ mod tests {
         assert!(backend_bound.require_sink(
             generation(),
             &backend_key,
-            vapache_verified::TransformSink::FastCgi,
+            httpd_rs_verified::TransformSink::FastCgi,
         ));
 
         let mut other = backend_key;
@@ -2573,7 +2576,7 @@ mod tests {
         assert!(!backend_bound.require_sink(
             generation(),
             &other,
-            vapache_verified::TransformSink::FastCgi,
+            httpd_rs_verified::TransformSink::FastCgi,
         ));
     }
 
@@ -2596,7 +2599,7 @@ mod tests {
         assert!(!plain_grant.require_sink(
             generation(),
             &plain,
-            vapache_verified::TransformSink::Cache,
+            httpd_rs_verified::TransformSink::Cache,
         ));
 
         let policy = ResourceKey::cache_policy(None, &req, "example.test", &path("/a"), [7; 32]);
@@ -2614,7 +2617,7 @@ mod tests {
         assert!(policy_grant.require_sink(
             generation(),
             &policy,
-            vapache_verified::TransformSink::Cache,
+            httpd_rs_verified::TransformSink::Cache,
         ));
     }
 
@@ -2702,7 +2705,7 @@ mod tests {
         )
         .unwrap();
         assert!(plan
-            .into_outcome(generation(), vapache_verified::TransformSink::StaticFile)
+            .into_outcome(generation(), httpd_rs_verified::TransformSink::StaticFile)
             .is_none());
 
         let file_grant = check_grant(
@@ -2730,20 +2733,20 @@ mod tests {
         )
         .and_then(|plan| plan.bind_file(&meta))
         .and_then(|plan| {
-            plan.into_outcome(generation(), vapache_verified::TransformSink::StaticFile)
+            plan.into_outcome(generation(), httpd_rs_verified::TransformSink::StaticFile)
         })
         .expect("file binding completes the static outcome");
         assert_eq!(outcome.identity().public_url_path(), "/public");
         assert_eq!(outcome.identity().selected_url_path(), "/selected");
         assert_eq!(outcome.identity().lexical_fs_path(), Some(executable));
         assert_eq!(outcome.identity().resolved_fs_path(), Some(executable));
-        assert_eq!(outcome.sink(), vapache_verified::TransformSink::StaticFile);
-        assert!(outcome.require_sink(generation(), vapache_verified::TransformSink::StaticFile,));
-        assert!(!outcome.require_sink(generation(), vapache_verified::TransformSink::LocalCgi,));
+        assert_eq!(outcome.sink(), httpd_rs_verified::TransformSink::StaticFile);
+        assert!(outcome.require_sink(generation(), httpd_rs_verified::TransformSink::StaticFile,));
+        assert!(!outcome.require_sink(generation(), httpd_rs_verified::TransformSink::LocalCgi,));
         let other_meta = std::fs::metadata("/proc/self/status").expect("other metadata");
         assert!(!outcome.require_file_sink(
             generation(),
-            vapache_verified::TransformSink::StaticFile,
+            httpd_rs_verified::TransformSink::StaticFile,
             executable,
             &other_meta,
         ));
@@ -2771,7 +2774,7 @@ mod tests {
                 .and_then(|plan| {
                     plan.into_internal_outcome(
                         generation(),
-                        vapache_verified::InternalRequestKind::ErrorDocument,
+                        httpd_rs_verified::InternalRequestKind::ErrorDocument,
                         path("/errors/404.html"),
                     )
                 })
@@ -2780,21 +2783,21 @@ mod tests {
         assert!(outcome()
             .into_internal_request(
                 generation(),
-                vapache_verified::InternalRequestKind::ErrorDocument,
+                httpd_rs_verified::InternalRequestKind::ErrorDocument,
                 &path("/errors/404.html"),
             )
             .is_some());
         assert!(outcome()
             .into_internal_request(
                 generation(),
-                vapache_verified::InternalRequestKind::ErrorDocument,
+                httpd_rs_verified::InternalRequestKind::ErrorDocument,
                 &path("/errors/403.html"),
             )
             .is_none());
         assert!(outcome()
             .into_internal_request(
                 generation(),
-                vapache_verified::InternalRequestKind::DirectoryIndex,
+                httpd_rs_verified::InternalRequestKind::DirectoryIndex,
                 &path("/errors/404.html"),
             )
             .is_none());
@@ -2825,7 +2828,7 @@ mod tests {
         // The generic terminal constructor cannot mint a redirect without
         // simultaneously binding the exact status and Location.
         assert!(plan()
-            .into_outcome(generation(), vapache_verified::TransformSink::Redirect)
+            .into_outcome(generation(), httpd_rs_verified::TransformSink::Redirect)
             .is_none());
         assert!(plan()
             .into_redirect_outcome(generation(), 200, Vec::new())
@@ -2835,7 +2838,10 @@ mod tests {
             .is_none());
 
         let unbound = plan()
-            .into_outcome(generation(), vapache_verified::TransformSink::ErrorDocument)
+            .into_outcome(
+                generation(),
+                httpd_rs_verified::TransformSink::ErrorDocument,
+            )
             .expect("non-redirect outcome");
         assert!(!unbound.require_redirect(generation(), 302, b"https://example.test/new"));
 

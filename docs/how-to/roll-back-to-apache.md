@@ -8,7 +8,7 @@ contracts: DOC-HOWTO-ROLLBACK-001
 # Roll back to Apache
 
 Use this procedure to return HTTP and HTTPS traffic to Apache after a completed
-Vapache switch.
+httpd-rs switch.
 
 ## Prerequisites
 
@@ -16,7 +16,7 @@ Keep a second SSH session or the hosting provider's console open during the
 rollback. Confirm the Apache unit name. Debian-family systems normally use
 `apache2.service`; RPM-family systems normally use `httpd.service`.
 
-The original Apache configuration remains in place after `vapache-switch`.
+The original Apache configuration remains in place after `httpd-rs-switch`.
 The switch does not rewrite it.
 
 ## 1. Test Apache without starting it
@@ -30,16 +30,16 @@ Syntax OK
 
 On an RPM-family system, use `sudo httpd -t`. Stop if the test fails.
 
-## 2. Stop Vapache
+## 2. Stop httpd-rs
 
 Run:
 
 ```console
-$ sudo systemctl disable --now vapache.service
+$ sudo systemctl disable --now httpd-rs.service
 $ sudo ss -ltnp
 ```
 
-Confirm that no Vapache process owns the HTTP or HTTPS listener.
+Confirm that no httpd-rs process owns the HTTP or HTTPS listener.
 
 ## 3. Start Apache
 
@@ -73,7 +73,7 @@ $ sudo certbot renew --dry-run
 Use the RPM-family unit name where applicable. Test login, state changes,
 uploads, proxy routes, and WebSockets that the site uses.
 
-Certbot's Apache commands control Apache again while Vapache is inactive.
+Certbot's Apache commands control Apache again while httpd-rs is inactive.
 
 ## 5. Diagnose a failed rollback
 
@@ -87,12 +87,12 @@ $ sudo ss -ltnp
 Check for another listener owner and for configuration changes made after the
 original switch. Do not start both servers on the same address and port.
 
-If `vapache-switch` failed before it reported success, it already attempts to
+If `httpd-rs-switch` failed before it reported success, it already attempts to
 restore the prior active and enabled Apache state. Inspect both service units
 before you repeat the transition.
 
 <!--
 Behavior contract evidence:
 [Switch interruption](../../tests/certbot_apache_integration.sh)
-[Switch implementation](../../packaging/vapache-switch)
+[Switch implementation](../../packaging/httpd-rs-switch)
 -->

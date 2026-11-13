@@ -1,17 +1,17 @@
 ## A-hidden-grant
-   /sub/file.txt  apache=403 vapache=200 apache_leak=False vapache_leak=True
+   /sub/file.txt  apache=403 httpd-rs=200 apache_leak=False httpd_rs_leak=True
 ## A-control-plain-grant
-   /sub/file.txt  apache=200 vapache=200 apache_leak=True vapache_leak=True
+   /sub/file.txt  apache=200 httpd-rs=200 apache_leak=True httpd_rs_leak=True
 ## A-control-comment-no-continuation
-   /sub/file.txt  apache=200 vapache=200 apache_leak=True vapache_leak=True
+   /sub/file.txt  apache=200 httpd-rs=200 apache_leak=True httpd_rs_leak=True
 ## A-chained-hidden-grant
-   /sub/file.txt  apache=403 vapache=200 apache_leak=False vapache_leak=True
+   /sub/file.txt  apache=403 httpd-rs=200 apache_leak=False httpd_rs_leak=True
 ## B-hidden-cgi
-   /sub/file.txt  apache=500 vapache=200 apache_leak=False vapache_leak=True
-   /sub/run.txt   apache=500 vapache=200 apache_exec=False vapache_exec=True
+   /sub/file.txt  apache=500 httpd-rs=200 apache_leak=False httpd_rs_leak=True
+   /sub/run.txt   apache=500 httpd-rs=200 apache_exec=False httpd_rs_exec=True
 ## B-control-plain-cgi
-   /sub/file.txt  apache=200 vapache=200 apache_leak=True vapache_leak=True
-   /sub/run.txt   apache=200 vapache=200 apache_exec=True vapache_exec=True
+   /sub/file.txt  apache=200 httpd-rs=200 apache_leak=True httpd_rs_leak=True
+   /sub/run.txt   apache=200 httpd-rs=200 apache_exec=True httpd_rs_exec=True
 ## C-hidden-grant-in-main-config
-   /sub/file.txt  apache=403 vapache=403 apache_leak=False vapache_leak=False
+   /sub/file.txt  apache=403 httpd-rs=403 apache_leak=False httpd_rs_leak=False
 P35-A LIVE: `.htaccess` comment continuation diverges from Apache

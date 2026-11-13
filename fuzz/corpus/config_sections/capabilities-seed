@@ -1,13 +1,13 @@
-VapacheCapability Trace Off
-VapacheCapability AccessFiles On
-VapacheCapability AutoIndex On
-VapacheCapability Cgi On
-VapacheCapability FastCgi On
-VapacheCapability LegacyAuthz On
-VapacheCapability RewriteProgram On
-VapacheCapability ServerStatus On
-VapacheCapability AbsoluteRequestTarget On
-VapacheCapability RequestTrailers On
+HttpdRsCapability Trace Off
+HttpdRsCapability AccessFiles On
+HttpdRsCapability AutoIndex On
+HttpdRsCapability Cgi On
+HttpdRsCapability FastCgi On
+HttpdRsCapability LegacyAuthz On
+HttpdRsCapability RewriteProgram On
+HttpdRsCapability ServerStatus On
+HttpdRsCapability AbsoluteRequestTarget On
+HttpdRsCapability RequestTrailers On
 <Directory /srv/www>
     Options +Indexes +ExecCGI
     AllowOverride AuthConfig FileInfo

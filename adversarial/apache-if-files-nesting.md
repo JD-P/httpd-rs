@@ -196,15 +196,15 @@ Implementing a second file walk after the If phase would instead create a new
 merge order and could change the meaning of existing directives. Parse-time
 rejection is smaller and matches the documented grammar.
 
-## Vapache disposition
+## httpd-rs disposition
 
-Vapache rejects non-conditional Directory/Files/Location children inside a
+httpd-rs rejects non-conditional Directory/Files/Location children inside a
 request-time `<If>`, `<ElseIf>`, or `<Else>` in both main configuration
 and `.htaccess`.
 
 It does not copy Apache's accepted no-op. It also does not attempt to execute
 the nested policy: doing so would create the opposite incompatibility, where a
-nested grant could change Apache's 403 into a Vapache 200.
+nested grant could change Apache's 403 into a httpd-rs 200.
 
 The regression is represented in:
 

@@ -22,7 +22,7 @@ lease while it performs synchronous filesystem and policy work.
 
 These are process availability limits rather than traffic-shaping promises.
 The kernel listen backlog and the configured request deadlines still determine
-how excess clients observe overload; Vapache either sends a bounded 503 on
+how excess clients observe overload; httpd-rs either sends a bounded 503 on
 cleartext HTTP/1 or closes the connection when no safe response protocol has
 yet been established.
 

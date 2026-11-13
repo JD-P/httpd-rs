@@ -2,17 +2,17 @@
 
 - **Date:** 2026-11-09
 - **Subject:** HEAD `755e81a82e4f638019e98e4e96f84f39c5a2f730`
-  (`target/release/vapached`, rebuilt from the checked-out tree; no product
+  (`target/release/httpd-rs`, rebuilt from the checked-out tree; no product
   source was edited). The mechanism under review is the P33 remediation's
   synthesized selected-representation identity (`702e042`, `a52eb76`,
   `7209f0e`) and the autoindex entry gate added by `7209f0e`.
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` + `mod_negotiation` +
   `mod_autoindex` + `mod_rewrite` + `mod_authz_core`, loopback only.
 - **Harness:** `adversarial/p34/exploit_p34.py` (eleven cases; Apache and
-  vapached on distinct sibling loopback ports with separate configs, pid files
+  httpd-rs on distinct sibling loopback ports with separate configs, pid files
   and fixtures). Retained output: `adversarial/p34/results_p34.txt`.
 - **Method:** inspection of the P33 synthesized-identity code plus a live
-  Apache-versus-vapached differential over representation names that contain
+  Apache-versus-httpd-rs differential over representation names that contain
   characters `url_encode_path` percent-encodes (space, non-ASCII, literal
   `%`), crossed with `Location`, `LocationMatch`, `Files`, autoindex and
   access-file rewrite policy.
@@ -24,12 +24,12 @@
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapached at HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs at HEAD | Class |
 |---|---------|---------------|------------------|-------|
 | **P34-A** | The synthesized policy identities for implicitly selected objects are built with `url_encode_path` (wire percent-encoding), while the request pipeline and Apache authorize URL-scoped policy against the decoded path. A decoded-spelling `<Location>`/`<LocationMatch>` rule therefore fails open for (1) the MultiViews negotiated representation and (2) autoindex directory entries. | File `name with space.txt` with `<LocationMatch "^/name with space\.txt$"> Require all denied`: `GET /name%20with%20space` → `404`; the same guard around a directory hides `name with space.txt` from the listing; the stock Debian `Alias /javascript`-style shape leaks `/js/name%20with%20space` the same way. Non-ASCII spellings and `<Location>` prefixes behave the same. | `GET /name%20with%20space` → `200` with `P34-SECRET-CONTENT-5e21`; the listing names the denied entry. The direct URL `/name%20with%20space.txt` is `403` on both servers, so a single representation is denied under one spelling and served under the negotiated spelling. | protected static-file read; authority bypass; autoindex metadata disclosure |
 
 The identity mismatch is bidirectional and pinned by controls: putting the
-percent-encoded spelling in the rule makes Apache **serve** while vapached
+percent-encoded spelling in the rule makes Apache **serve** while httpd-rs
 **denies** (`A6`), and a `\.txt$` or `<Files "name with space.txt">` guard
 denies on both servers (`A4`, `A5`, `B2`). The defect is the encoding, not
 rule semantics.
@@ -89,7 +89,7 @@ the public URL. A decoded-spelling `<LocationMatch "^/docs/name with
 space\.txt$">` never matches the encoded subject, so the entry is exposed.
 
 Apache evaluates URL-scoped policy for the negotiated file and for directory
-entries against the decoded path (`A1`/`A3`, `B1`), exactly as Vapache itself
+entries against the decoded path (`A1`/`A3`, `B1`), exactly as httpd-rs itself
 does for direct requests. Both synthesized sites are therefore using a wire
 serialization as a security identity — the same class of identity mismatch
 that F57 fixed for `%{REQUEST_URI}` and that P33-A fixed for the
@@ -104,31 +104,31 @@ run is retained in `adversarial/p34/results_p34.txt`):
 
 ```text
 ## A1 decoded LocationMatch body
-   /name%20with%20space         apache=404 vapache=200 vapache_leak=True
-   /name%20with%20space.txt     apache=403 vapache=403
+   /name%20with%20space         apache=404 httpd-rs=200 httpd_rs_leak=True
+   /name%20with%20space.txt     apache=403 httpd-rs=403
 ## A2 decoded Location prefix body
-   /name%20with%20space         apache=404 vapache=200 vapache_leak=True
-   /name%20with%20space.txt     apache=403 vapache=403
+   /name%20with%20space         apache=404 httpd-rs=200 httpd_rs_leak=True
+   /name%20with%20space.txt     apache=403 httpd-rs=403
 ## A3 decoded non-ASCII LocationMatch body
-   /caf%C3%A9                   apache=404 vapache=200 vapache_leak=True
+   /caf%C3%A9                   apache=404 httpd-rs=200 httpd_rs_leak=True
 ## A4 control extension guard body
-   /name%20with%20space         apache=404 vapache=404 vapache_leak=False
+   /name%20with%20space         apache=404 httpd-rs=404 httpd_rs_leak=False
 ## A5 control Files guard body
-   /name%20with%20space         apache=404 vapache=404 vapache_leak=False
+   /name%20with%20space         apache=404 httpd-rs=404 httpd_rs_leak=False
 ## A6 mirror encoded LocationMatch body
-   /name%20with%20space         apache=200 vapache=404 vapache_leak=False
+   /name%20with%20space         apache=200 httpd-rs=404 httpd_rs_leak=False
 ## A7 stock-Debian alias body
-   /js/name%20with%20space      apache=404 vapache=200 vapache_leak=True
-   /js/name%20with%20space.txt  apache=403 vapache=403
+   /js/name%20with%20space      apache=404 httpd-rs=200 httpd_rs_leak=True
+   /js/name%20with%20space.txt  apache=403 httpd-rs=403
 ## B1 decoded LocationMatch autoindex
-   /docs/ listing: apache=200 vapache=200 apache_names_denied=False
-   vapache_names_denied=True public_on_both=True direct_apache=403 direct_vapache=403
+   /docs/ listing: apache=200 httpd-rs=200 apache_names_denied=False
+   httpd_rs_names_denied=True public_on_both=True direct_apache=403 direct_httpd_rs=403
 ## B2 control Files autoindex
-   /docs/ listing: apache_names_denied=False vapache_names_denied=False
+   /docs/ listing: apache_names_denied=False httpd_rs_names_denied=False
 ## B3 control no guard autoindex
-   /docs/ listing: apache_names_denied=True vapache_names_denied=True
+   /docs/ listing: apache_names_denied=True httpd_rs_names_denied=True
 ## C1 access-file rewrite decoded spelling
-   /name%20with%20space         apache=404 vapache=404
+   /name%20with%20space         apache=404 httpd-rs=404
 P34-A LIVE AT HEAD: percent-encoded synthesized identities fail decoded-spelling URL policy open
 ```
 
@@ -137,26 +137,26 @@ Case detail:
 - **A1/A2** — `Options MultiViews`, file `name with space.txt`, guard
   `<LocationMatch "^/name with space\.txt$">` or
   `<Location "/name with space.txt">` (`Require all denied`). Apache denies
-  the negotiated spelling (`404`); vapached serves the protected body
+  the negotiated spelling (`404`); httpd-rs serves the protected body
   (`200`). The exact `.txt` URL stays `403` on both.
 - **A3** — `café.txt` with `<LocationMatch "^/café\.txt$">`: Apache `404`,
-  vapached `200` with the body. Any name with a character that
+  httpd-rs `200` with the body. Any name with a character that
   `url_encode_path` encodes is affected.
 - **A4/A5** — `\.txt$` `LocationMatch` and `<Files "name with space.txt">`
   controls deny on both servers.
 - **A6** — the mirror: `<LocationMatch "^/name%20with%20space\.txt$">`
-  matches on vapached (`404`) and is ignored by Apache (`200`). Together with
+  matches on httpd-rs (`404`) and is ignored by Apache (`200`). Together with
   A1 this proves the two implementations disagree about the identity, not the
   rule.
 - **A7** — the stock-Debian `Alias /js` + `<Directory ... Options MultiViews>`
   shape with a decoded-spelling deny: `/js/name%20with%20space` leaks on
-  vapached (`200`) and `404`s on Apache, while the exact `.txt` URL is `403`
+  httpd-rs (`200`) and `404`s on Apache, while the exact `.txt` URL is `403`
   on both. This is the deployment shape of Debian's
   `javascript-common.conf`.
 - **B1** — `Options +Indexes` directory `docs/` with `public.txt` and
   `name with space.txt`, guard
   `<LocationMatch "^/docs/name with space\.txt$">`. Apache omits the denied
-  entry from the listing; vapached names it. `public.txt` is visible on both,
+  entry from the listing; httpd-rs names it. `public.txt` is visible on both,
   and the direct entry URL is `403` on both — the listing is the only oracle.
 - **B2/B3** — `<Files>` hides on both; no guard lists on both.
 - **C1** — the per-directory rewrite replayed by `multiview_rewrite_outcome`
@@ -237,13 +237,13 @@ Case detail:
 ## 7. Reproduction
 
 ```sh
-cd /root/vapache
-cargo build --release -p vapached
+cd /root/httpd-rs
+cargo build --release -p httpd-rs
 python3 adversarial/p34/exploit_p34.py            # eleven cases; exits 1 if P34-A is fixed
 python3 adversarial/p34/exploit_p34.py --keep     # retain fixtures and server logs
 ```
 
-The harness binds Apache and vapached to separate loopback ports in the
+The harness binds Apache and httpd-rs to separate loopback ports in the
 `30600`/`30700` ranges, uses the real `/usr/sbin/apache2` 2.4.69 oracle, and
 removes its temp tree unless `--keep` is given.
 
@@ -252,7 +252,7 @@ removes its temp tree unless `--keep` is given.
 - **P34-O1** — the P33 access-file rewrite re-binding
   (`multiview_rewrite_outcome`) was probed with
   `RewriteRule ^name\ with\ space\.txt$ - [F]` under `AllowOverride FileInfo`
-  + `VapacheCapability AccessFiles On`: both servers return `404`. No
+  + `HttpdRsCapability AccessFiles On`: both servers return `404`. No
   divergence was established, so the replay path is not affected (case C1).
 - **P34-O2** — the WebSocket upgrade authorization added by `a52eb76` was
   probed with `<Location "/ws">` and `<LocationMatch "^/ws$">` denies around
@@ -264,7 +264,7 @@ removes its temp tree unless `--keep` is given.
 
 ## 8. Retained files
 
-- `adversarial/p34/exploit_p34.py` — eleven-case Apache/vapached reproducer;
+- `adversarial/p34/exploit_p34.py` — eleven-case Apache/httpd-rs reproducer;
   exits non-zero when the divergences are no longer present (future
   regression battery).
 - `adversarial/p34/results_p34.txt` — retained HEAD run output.

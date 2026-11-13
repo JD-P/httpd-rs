@@ -25,7 +25,7 @@ be hidden in a skipped branch or partially mutate policy before failing.
 ## Process capability boundary
 
 Compatibility features that expand parsing, filesystem discovery, generated
-content, or execution are off by default. `VapacheCapability NAME On` is valid
+content, or execution are off by default. `HttpdRsCapability NAME On` is valid
 only in global server context. The supported names are
 `AbsoluteRequestTarget`, `AccessFiles`, `AutoIndex`, `Cgi`, `FastCgi`,
 `LegacyAuthz`, `MutableAuthFiles`, `RequestTrailers`, `RewriteProgram`,
@@ -44,7 +44,7 @@ requested(feature) ==> globally_enabled(capability(feature))
 ```
 
 FastCGI has a second, independent boundary: each configured backend requires
-an exact `VapacheFastCGIStablePath On` policy. The historical pathname-only
+an exact `HttpdRsFastCGIStablePath On` policy. The historical pathname-only
 handoff is available only through the separately reviewable
 `UnstableFastCgiPaths` capability. Configuration compilation records that
 requirement and the final FastCGI sink consumes the verified capability gate
@@ -541,7 +541,7 @@ the complete descriptor range close-on-exec, then restores only the one
 capability named above. The CGI worker control socket is marked close-on-exec
 after the worker's own exec and before any script is spawned. The TLS broker
 reports readiness only after retaining fd 3 alone and installing all process
-restrictions. Vapache requires Linux `close_range`; it fails closed instead of
+restrictions. httpd-rs requires Linux `close_range`; it fails closed instead of
 guessing an upper descriptor number. Fork/exec tests deliberately inject
 non-CLOEXEC sentinels into each boundary and inspect `/proc/<pid>/fd` or the
 executed child.
@@ -1087,11 +1087,11 @@ to direct daemon-side spawning: exhausted or unavailable pool capacity returns
 `503`, and enabling CGI on reload requires a full restart.
 
 The FastCGI protocol has no descriptor-passing primitive: PHP-FPM opens
-`SCRIPT_FILENAME` after this final comparison. Vapache therefore requires the
+`SCRIPT_FILENAME` after this final comparison. httpd-rs therefore requires the
 pathname rule to be machine-enforced with repeatable global entries:
 
 ```text
-VapacheFastCGIStablePath On <unix-endpoint> <backend-uid> <endpoint-owner-uid> <trusted-owner-uid>...
+HttpdRsFastCGIStablePath On <unix-endpoint> <backend-uid> <endpoint-owner-uid> <trusted-owner-uid>...
 ```
 
 `endpoint` is an exact `unix:/path` transport identity. Every backend must
@@ -1109,14 +1109,14 @@ are rejected, and a non-symlink component cannot be owned by the backend (an
 owner could otherwise use `chmod` to regain write permission). Root backends
 and relative paths fail closed.
 
-`VapacheMaxSpoolBytes`, `VapacheMaxSpoolFiles`,
-`VapacheMaxDynamicRequests` and `VapacheMaxFastCGIOutput` provide process-wide
+`HttpdRsMaxSpoolBytes`, `HttpdRsMaxSpoolFiles`,
+`HttpdRsMaxDynamicRequests` and `HttpdRsMaxFastCGIOutput` provide process-wide
 aggregate spool/concurrency budgets plus a per-request FastCGI output bound.
 RAII reservations cover request bodies, FastCGI responses and the worker-side
 CGI body copy and are shared across graceful reloads.
 
 An absent or `Off` policy is rejected unless the process explicitly enables
-`VapacheCapability UnstableFastCgiPaths On`. That escape hatch accepts the
+`HttpdRsCapability UnstableFastCgiPaths On`. That escape hatch accepts the
 external pathname race and restores the deployment obligation: every FastCGI
 script and ancestor directory must remain non-writable by the backend and by
 every less-trusted process for the whole request lifetime. Use a read-only
@@ -1220,7 +1220,7 @@ compatibility forms whose behavior is equivalent or deliberately stricter
 (for example Rustls OS randomness in place of `SSLRandomSeed`). The
 disposition matrix asserts closed-world rejection.
 Directive context is part of that disposition. A value represented only by a
-process-global Vapache field is rejected in Apache per-vhost/per-directory
+process-global httpd-rs field is rejected in Apache per-vhost/per-directory
 forms rather than allowing the last scope to overwrite every other scope.
 Mapping, cache-route, TLS and logging directives likewise compile only in a
 context whose effect is represented exactly. `ServerRoot` is processed at
@@ -1229,7 +1229,7 @@ Apache. Unsupported section arities and virtual-host-local balancer
 definitions fail before they can acquire global meaning.
 Apache 2.4.69 also accepts the unsupported reverse nesting of a request-time
 `<If>` containing `<Files>`, but ordinary direct requests do not evaluate
-the nested file policy. Vapache rejects that construct in both main
+the nested file policy. httpd-rs rejects that construct in both main
 configuration and `.htaccess`: executing the nested grant would broaden access
 relative to Apache, while accepting it as inert would hide operator policy.
 TLS compatibility directives are validated at the same boundary: malformed
@@ -1962,7 +1962,7 @@ construction: there is no second production interleaver.
   encoded header integer. The Huffman length result refines a recursive bit-length
   specification. Encoder lookup is a bounded,
   deterministic newest-first walk rather than a truncated FNV/Robin-Hood
-  index, and Vapache configures independent zero-byte receive and send dynamic
+  index, and httpd-rs configures independent zero-byte receive and send dynamic
   table limits by default; a peer SETTINGS frame cannot raise the local send
   cap.
 
@@ -2372,7 +2372,7 @@ construction: there is no second production interleaver.
   exact, `*`, or leading `*.suffix` `ServerAlias` matching with ASCII case
   folding. A suffix wildcard requires a preceding label and therefore does not
   match its bare suffix. Values beginning with `~` remain ordinary Apache
-  names; Vapache does not invent regex virtual-host matching. Other wildcard
+  names; httpd-rs does not invent regex virtual-host matching. Other wildcard
   placements fail at startup until their semantics are implemented. First
   configured match wins at both certificate and HTTP routing boundaries.
 - `first_true_index`.  Virtual-host candidate selection uses the verified
@@ -2407,7 +2407,7 @@ backend-bound; cache grants are policy-key-bound. Apache-equivalence of the
 sealed semantic constructors, the regex engine, expression leaf evaluators
 and the standard library's concrete sorting implementation remain outside
 Verus. The external backend
-must still open `SCRIPT_FILENAME` itself. With `VapacheFastCGIStablePath On`,
+must still open `SCRIPT_FILENAME` itself. With `HttpdRsFastCGIStablePath On`,
 the verified component predicate is enforced immediately before that handoff;
 without it, FastCGI is rejected unless `UnstableFastCgiPaths` explicitly
 accepts the equivalent read-only-tree deployment assumption. Writable trees
@@ -2578,9 +2578,9 @@ ledger, not an implicit effect of adding code.
 Two finite obligations are checked explicitly:
 
 - **Acceptance:** for every configuration in the supported directive/context
-  grammar, if Apache accepts it, vapached accepts it.
+  grammar, if Apache accepts it, httpd-rs accepts it.
 - **Rejection:** every malformed/invalid configuration in that same grammar is
-  rejected by vapached.
+  rejected by httpd-rs.
 
 `tests/config_grammar.py` enumerates the grammar and currently reports **0
 divergences** against Apache.  This is exhaustive for the listed finite
@@ -2593,7 +2593,7 @@ The pre-proof suite is:
 - `tests/conformance.py` — 165 fixed Apache differential/conformance tests.
 - `tests/config_semantics.py` — 235 fixed systematic cases, plus
   `--random N --seed S` deterministic randomized cases.
-- `tests/config_validity.py` — `apache2 -t` vs `vapached -t` context matrix.
+- `tests/config_validity.py` — `apache2 -t` vs `httpd-rs -t` context matrix.
 - `tests/config_grammar.py` — finite supported directive/context grammar,
   including valid and invalid argument/section forms.
 - `tests/adversarial_regressions.py` — end-to-end F23–F38 finding replays
@@ -2690,8 +2690,8 @@ profile with its exact executable build ID before export; this avoids the Rust
   list refinement are still explicit assumptions; the cache lookup also
   requires an `AccessGrant` at runtime.
 - FastCGI cannot pass its retained script descriptor through the protocol;
-  the external backend's open of `SCRIPT_FILENAME` occurs after vapache's
-  final pathname-to-inode comparison. Exact `VapacheFastCGIStablePath`
+  the external backend's open of `SCRIPT_FILENAME` occurs after httpd-rs's
+  final pathname-to-inode comparison. Exact `HttpdRsFastCGIStablePath`
   policies enforce trusted owners and backend write exclusion by default.
   Only `UnstableFastCgiPaths` permits the equivalent read-only release-tree
   invariant to remain a deployment assumption; never map writable content to
@@ -2728,7 +2728,7 @@ for every row.
 `docs/cve/cross-server-nvd.json` snapshots the NVD histories for nginx,
 IIS/HTTP.sys, lighttpd, HAProxy, Tomcat/Coyote, Jetty, Squid, Varnish, Apache
 Traffic Server, LiteSpeed/OpenLiteSpeed and Envoy. The **1,047 distinct CVEs**
-are compared individually against Vapache's feature inventory, invariants and
+are compared individually against httpd-rs's feature inventory, invariants and
 implementation evidence in `docs/cve/cross-server-cve-matrix.json`:
 
 - 370 prevented by a concrete design/implementation property,
@@ -2746,6 +2746,6 @@ the generated JSON, CSV and high-risk report with:
 python3 tests/cross_server_cve_matrix.py --check
 ```
 
-This matrix is not a proof that Vapache cannot have an independent bug in a
+This matrix is not a proof that httpd-rs cannot have an independent bug in a
 similar subsystem. In particular, `partial` and `needs_review` make no
 prevention claim.

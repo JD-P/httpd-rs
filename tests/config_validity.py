@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Compare Apache/vapached acceptance of security-sensitive config contexts.
+"""Compare Apache/httpd-rs acceptance of security-sensitive config contexts.
 
 Many directives are accepted by one server in a context where the other
 rejects them.  A permissive parser is not automatically a vulnerability, but
 for access-control directives it is exactly the kind of surprise that turns
 into a bypass.  This harness deliberately uses `-t` only: the question is
 whether the configuration is accepted, not how it behaves after startup.
-The MALFORMED_CASES rows require Apache, normal Vapache, and strict Vapache to
+The MALFORMED_CASES rows require Apache, normal httpd-rs, and strict httpd-rs to
 reject the same malformed directive. HARDENED_CASES records legacy inputs that
-Apache 2.4 accepts through empty/default/numeric coercions but that Vapache
+Apache 2.4 accepts through empty/default/numeric coercions but that httpd-rs
 deliberately rejects rather than guessing at policy. Compatibility mode must
 never turn either class into an accepted no-op.
 """
@@ -24,17 +24,17 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target" / "release" / "httpd-rs"))
 APACHE = os.environ.get("APACHE", shutil.which("apache2") or "/usr/sbin/apache2")
 MODDIR = Path(
     os.environ.get(
         "APACHE_MODDIR",
         "/usr/lib/apache2/modules"
         if Path("/usr/lib/apache2/modules").is_dir()
-        else "/workspace/.vapache-setup/sysroot/usr/lib/apache2/modules",
+        else "/workspace/.httpd-rs-setup/sysroot/usr/lib/apache2/modules",
     )
 )
-BASE = Path(tempfile.mkdtemp(prefix="vapache-config-validity-"))
+BASE = Path(tempfile.mkdtemp(prefix="httpd-rs-config-validity-"))
 DOCROOT = BASE / "www"
 PORT = 18190
 SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
@@ -74,18 +74,18 @@ MODULES = [
     "ssl_module",
 ]
 
-VAPACHE_CAPABILITIES = """VapacheCapability AbsoluteRequestTarget On
-VapacheCapability AccessFiles On
-VapacheCapability AutoIndex On
-VapacheCapability Cgi On
-VapacheCapability FastCgi On
-VapacheCapability LegacyAuthz On
-VapacheCapability RequestTrailers On
-VapacheCapability RewriteProgram On
-VapacheCapability ServerStatus On
-VapacheCapability Trace On
-VapacheCapability UnstableFastCgiPaths On
-VapacheCapability MutableAuthFiles On
+HTTPD_RS_CAPABILITIES = """HttpdRsCapability AbsoluteRequestTarget On
+HttpdRsCapability AccessFiles On
+HttpdRsCapability AutoIndex On
+HttpdRsCapability Cgi On
+HttpdRsCapability FastCgi On
+HttpdRsCapability LegacyAuthz On
+HttpdRsCapability RequestTrailers On
+HttpdRsCapability RewriteProgram On
+HttpdRsCapability ServerStatus On
+HttpdRsCapability Trace On
+HttpdRsCapability UnstableFastCgiPaths On
+HttpdRsCapability MutableAuthFiles On
 """
 
 
@@ -305,7 +305,7 @@ CASES = [
     ),
 ]
 
-# Apache rejects each of these snippets at plain `-t`. Vapache must reject
+# Apache rejects each of these snippets at plain `-t`. httpd-rs must reject
 # them in every mode rather than discarding the malformed policy payload.
 MALFORMED_CASES = [
     ("AddType requires two args", "AddType image/png\n"),
@@ -365,7 +365,7 @@ MALFORMED_CASES = [
 ]
 
 # Apache 2.4 currently accepts these legacy coercions/presentation forms. They
-# are not compatibility requirements: Vapache treats each one as ambiguous
+# are not compatibility requirements: httpd-rs treats each one as ambiguous
 # policy and rejects it in every mode.
 HARDENED_CASES = [
     ("Options requires an operand", f'<Directory "{DOCROOT}">\nOptions\n</Directory>\n'),
@@ -409,8 +409,8 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
-    if not VAPACHED.exists():
-        sys.exit(f"missing {VAPACHED}; cargo build --release first")
+    if not HTTPD_RS.exists():
+        sys.exit(f"missing {HTTPD_RS}; cargo build --release first")
     if not Path(APACHE).exists():
         sys.exit(f"missing Apache httpd at {APACHE}")
     try:
@@ -426,29 +426,29 @@ def main():
         failures = 0
         for name, snippet in CASES:
             acfg = BASE / "apache.conf"
-            vcfg = BASE / "vapache.conf"
+            vcfg = BASE / "httpd-rs.conf"
             acfg.write_text(prefix(PORT) + snippet)
-            vcfg.write_text(VAPACHE_CAPABILITIES + prefix(PORT + 1) + snippet)
+            vcfg.write_text(HTTPD_RS_CAPABILITIES + prefix(PORT + 1) + snippet)
             a = run([APACHE, "-t", "-f", str(acfg)])
-            v = run([str(VAPACHED), "-t", "-f", str(vcfg)])
+            v = run([str(HTTPD_RS), "-t", "-f", str(vcfg)])
             aok = a.returncode == 0
             vok = v.returncode == 0
             status = "ok  " if aok == vok else "DIFF"
             if aok != vok:
                 failures += 1
-            print(f"{status} {name}: apache={aok} vapache={vok}")
+            print(f"{status} {name}: apache={aok} httpd-rs={vok}")
             if args.verbose or aok != vok:
                 print(f"  apache: {(a.stderr or a.stdout).strip()[-500:]}")
-                print(f"  vapache: {(v.stderr or v.stdout).strip()[-500:]}")
+                print(f"  httpd-rs: {(v.stderr or v.stdout).strip()[-500:]}")
         malformed_failures = 0
         for name, snippet in MALFORMED_CASES:
             acfg = BASE / "apache.conf"
-            vcfg = BASE / "vapache.conf"
+            vcfg = BASE / "httpd-rs.conf"
             acfg.write_text(prefix(PORT) + snippet)
-            vcfg.write_text(VAPACHE_CAPABILITIES + prefix(PORT + 1) + snippet)
+            vcfg.write_text(HTTPD_RS_CAPABILITIES + prefix(PORT + 1) + snippet)
             a = run([APACHE, "-t", "-f", str(acfg)])
-            v = run([str(VAPACHED), "-t", "-f", str(vcfg)])
-            s = run([str(VAPACHED), "-t", "--strict-config", "-f", str(vcfg)])
+            v = run([str(HTTPD_RS), "-t", "-f", str(vcfg)])
+            s = run([str(HTTPD_RS), "-t", "--strict-config", "-f", str(vcfg)])
             aok = a.returncode == 0
             vok = v.returncode == 0
             sok = s.returncode == 0
@@ -457,20 +457,20 @@ def main():
             status = "reject" if not bad else "MALFORMED-DIFF"
             if bad:
                 malformed_failures += 1
-            print(f"{status} {name}: apache={aok} vapache={vok} strict={sok}")
+            print(f"{status} {name}: apache={aok} httpd-rs={vok} strict={sok}")
             if args.verbose or bad:
                 print(f"  apache: {(a.stderr or a.stdout).strip()[-400:]}")
-                print(f"  vapache: {(v.stderr or v.stdout).strip()[-300:]}")
+                print(f"  httpd-rs: {(v.stderr or v.stdout).strip()[-300:]}")
                 print(f"  strict: {(s.stderr or s.stdout).strip()[-300:]}")
         hardened_failures = 0
         for name, snippet in HARDENED_CASES:
             acfg = BASE / "apache.conf"
-            vcfg = BASE / "vapache.conf"
+            vcfg = BASE / "httpd-rs.conf"
             acfg.write_text(prefix(PORT) + snippet)
-            vcfg.write_text(VAPACHE_CAPABILITIES + prefix(PORT + 1) + snippet)
+            vcfg.write_text(HTTPD_RS_CAPABILITIES + prefix(PORT + 1) + snippet)
             a = run([APACHE, "-t", "-f", str(acfg)])
-            v = run([str(VAPACHED), "-t", "-f", str(vcfg)])
-            s = run([str(VAPACHED), "-t", "--strict-config", "-f", str(vcfg)])
+            v = run([str(HTTPD_RS), "-t", "-f", str(vcfg)])
+            s = run([str(HTTPD_RS), "-t", "--strict-config", "-f", str(vcfg)])
             aok = a.returncode == 0
             vok = v.returncode == 0
             sok = s.returncode == 0
@@ -478,10 +478,10 @@ def main():
             status = "hardened" if not bad else "HARDENING-REGRESSION"
             if bad:
                 hardened_failures += 1
-            print(f"{status} {name}: apache={aok} vapache={vok} strict={sok}")
+            print(f"{status} {name}: apache={aok} httpd-rs={vok} strict={sok}")
             if args.verbose or bad:
                 print(f"  apache: {(a.stderr or a.stdout).strip()[-400:]}")
-                print(f"  vapache: {(v.stderr or v.stdout).strip()[-300:]}")
+                print(f"  httpd-rs: {(v.stderr or v.stdout).strip()[-300:]}")
                 print(f"  strict: {(s.stderr or s.stdout).strip()[-300:]}")
         print(f"\n{failures} context divergence(s)")
         print(f"{malformed_failures} malformed acceptance divergence(s)")

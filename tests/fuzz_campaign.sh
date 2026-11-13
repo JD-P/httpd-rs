@@ -4,7 +4,7 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-NIGHTLY=${VAPACHE_NIGHTLY_TOOLCHAIN:-nightly-2026-10-29}
+NIGHTLY=${HTTPD_RS_NIGHTLY_TOOLCHAIN:-nightly-2026-10-29}
 
 if ! cargo +"$NIGHTLY" fuzz --version >/dev/null 2>&1; then
     echo "fuzz-campaign: cargo-fuzz is required" >&2

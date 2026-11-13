@@ -1,25 +1,25 @@
 ## A main-config trailing-slash rewrite aborts the process
    /legacy/       apache=404 (oracle alive=True)
-   -> VULNERABLE: vapache aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
+   -> VULNERABLE: httpd-rs aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
 
 ## A2 missing target still aborts (target need not exist)
    /x             apache=404 (oracle alive=True)
-   -> VULNERABLE: vapache aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
+   -> VULNERABLE: httpd-rs aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
 
 ## A3 RewriteCond guard still reaches the abort
    /x             apache=404 (oracle alive=True)
-   -> VULNERABLE: vapache aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
+   -> VULNERABLE: httpd-rs aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
 
 ## B .htaccess per-directory trailing-slash rewrite aborts (FileInfo)
    /uploads/boom  apache=200 (oracle alive=True)
-   -> VULNERABLE: vapache aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
+   -> VULNERABLE: httpd-rs aborted (rc=-6) on one unauthenticated request (RemoteDisconnected)
 
 ## C control: no-trailing-slash rewrite survives
    /x             apache=200 (oracle alive=True)
-   -> control vapache=200 survived
+   -> control httpd-rs=200 survived
 
 ## C2 control: root rewrite survives
    /x             apache=403 (oracle alive=True)
-   -> control vapache=200 survived
+   -> control httpd-rs=200 survived
 
 PASS-36 VULNERABLE: 4 trailing-slash rewrite shapes abort the server; convert this file into a remediation regression once fixed

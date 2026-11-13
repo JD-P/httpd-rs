@@ -68,7 +68,7 @@ impl Drop for ConfigGenerationGuard {
     }
 }
 
-/// Vapache has one process-wide HTTP/1 worker pool rather than Apache's
+/// httpd-rs has one process-wide HTTP/1 worker pool rather than Apache's
 /// multi-process MPM topology.  Keep configuration compatibility within the
 /// largest pool this implementation can safely provide; accepting a larger
 /// Apache `ServerLimit` would otherwise turn a configuration value into an
@@ -138,9 +138,9 @@ fn server_software_for_tokens(tokens: ServerTokens) -> String {
             format!("{} (Linux)", crate::SERVER_SOFTWARE)
         }
         ServerTokens::Minimal => crate::SERVER_SOFTWARE.into(),
-        ServerTokens::Minor => format!("vapache/{}", version_prefix(2)),
-        ServerTokens::Major => format!("vapache/{}", version_prefix(1)),
-        ServerTokens::Prod => "vapache".into(),
+        ServerTokens::Minor => format!("httpd-rs/{}", version_prefix(2)),
+        ServerTokens::Major => format!("httpd-rs/{}", version_prefix(1)),
+        ServerTokens::Prod => "httpd-rs".into(),
     }
 }
 
@@ -287,12 +287,12 @@ impl OverrideMode {
 
     pub fn allows(self, category: OverrideCategory) -> bool {
         let (mode, categories) = self.proof_parts();
-        vapache_verified::override_mode_allows(mode, categories, category.flag())
+        httpd_rs_verified::override_mode_allows(mode, categories, category.flag())
     }
 
     pub fn allows_flag(self, flag: u32) -> bool {
         let (mode, categories) = self.proof_parts();
-        vapache_verified::override_mode_allows(mode, categories, flag)
+        httpd_rs_verified::override_mode_allows(mode, categories, flag)
     }
 
     pub fn allows_any_option(self) -> bool {
@@ -954,7 +954,7 @@ pub(crate) fn filename_extension_tokens(name: &[u8]) -> Vec<&[u8]> {
     };
     let visible = &base[first_stem..];
     let separator = visible.iter().position(|b| *b == b'.');
-    if !vapache_verified::extension_table_admit(
+    if !httpd_rs_verified::extension_table_admit(
         separator.is_some_and(|index| index > 0),
         separator.is_some(),
     ) {
@@ -1019,7 +1019,7 @@ pub(crate) fn apply_autoindex_options(
         {
             if !enabled {
                 return Err(format!(
-                    "IndexOptions -{option} is not implemented by Vapache's table renderer"
+                    "IndexOptions -{option} is not implemented by httpd-rs's table renderer"
                 ));
             }
         } else if option.eq_ignore_ascii_case("NameWidth=*")
@@ -1029,7 +1029,7 @@ pub(crate) fn apply_autoindex_options(
             if !enabled {
                 return Err(format!("IndexOptions -{option} is not meaningful"));
             }
-            // These are exact declarations of Vapache's bounded table layout:
+            // These are exact declarations of httpd-rs's bounded table layout:
             // names are not truncated, no description column is configured,
             // and generated indexes are UTF-8.
         } else {
@@ -1117,7 +1117,7 @@ pub(crate) fn effective_handler_for_ext<'a>(scope: &'a Scope, ext: &str) -> Opti
         .iter()
         .rev()
         .find(|handler| !handler.remove && handler.ext.eq_ignore_ascii_case(ext));
-    if !vapache_verified::handler_extension_admit(removed, added.is_some()) {
+    if !httpd_rs_verified::handler_extension_admit(removed, added.is_some()) {
         return None;
     }
     added.map(|handler| handler.handler.as_str())
@@ -1159,7 +1159,7 @@ fn conjoined_handlers(base: &[Handler], target: &[Handler]) -> Vec<Handler> {
             .iter()
             .rev()
             .find(|handler| !handler.remove && handler.ext.eq_ignore_ascii_case(ext));
-        if vapache_verified::handler_extension_admit(removed, added.is_some()) {
+        if httpd_rs_verified::handler_extension_admit(removed, added.is_some()) {
             if let Some(handler) = added {
                 return Some(handler.handler.as_str());
             }
@@ -1186,7 +1186,7 @@ fn conjoined_handlers(base: &[Handler], target: &[Handler]) -> Vec<Handler> {
     for ext in extensions {
         let base_handler = lookup(base, &ext);
         let target_handler = lookup(target, &ext);
-        if vapache_verified::handler_conjoin_admit(
+        if httpd_rs_verified::handler_conjoin_admit(
             base_handler.is_some(),
             target_handler.is_some(),
             same(base_handler, target_handler),
@@ -1445,8 +1445,8 @@ impl RewriteProgram {
         // later pathname check detects operator changes, while execution from
         // this immutable snapshot also closes same-inode write races between
         // the check and execve.
-        let name = CString::new("vapache-rewritemap-prg").expect("static memfd name");
-        let mut file = vapache_os::create_memfd(&name)?;
+        let name = CString::new("httpd-rs-rewritemap-prg").expect("static memfd name");
+        let mut file = httpd_rs_os::create_memfd(&name)?;
         let copied = std::io::copy(
             &mut source
                 .by_ref()
@@ -1455,7 +1455,7 @@ impl RewriteProgram {
         )?; // coverage:ignore-line -- regular-file/memfd I/O failure
         let after = source.metadata()?;
         if copied != meta.len()
-            || !vapache_verified::descriptor_snapshot_admit(
+            || !httpd_rs_verified::descriptor_snapshot_admit(
                 meta.is_file() && after.is_file(),
                 meta.dev() == after.dev() && meta.ino() == after.ino(),
                 meta.mtime() == after.mtime()
@@ -1474,8 +1474,8 @@ impl RewriteProgram {
             ));
             // coverage:ignore-stop
         }
-        vapache_os::fchmod(file.as_fd(), 0o500)?;
-        vapache_os::seal_file(file.as_fd())?;
+        httpd_rs_os::fchmod(file.as_fd(), 0o500)?;
+        httpd_rs_os::seal_file(file.as_fd())?;
         Ok(Self {
             path,
             admin_trust_path,
@@ -1520,7 +1520,7 @@ impl RewriteProgram {
             Ok(meta) => meta,
             Err(_) => return false,
         };
-        vapache_verified::descriptor_snapshot_admit(
+        httpd_rs_verified::descriptor_snapshot_admit(
             retained.is_file() && current.is_file(),
             current.dev() == self.dev && current.ino() == self.ino,
             self.metadata_matches(&current),
@@ -1912,7 +1912,7 @@ impl Scope {
         env: &mut RequestEnvironment,
     ) {
         for entry in rules {
-            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
+            if fastcgi && !httpd_rs_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let rule = &entry.value;
@@ -1928,23 +1928,23 @@ impl Scope {
                 },
                 "host" => req
                     .header("host")
-                    .map(vapache_verified::guard_header_bytes)
+                    .map(httpd_rs_verified::guard_header_bytes)
                     .unwrap_or_default(),
                 "user-agent" | "user_agent" => req
                     .header("user-agent")
-                    .map(vapache_verified::guard_header_bytes)
+                    .map(httpd_rs_verified::guard_header_bytes)
                     .unwrap_or_default(),
                 "referer" => req
                     .header("referer")
-                    .map(vapache_verified::guard_header_bytes)
+                    .map(httpd_rs_verified::guard_header_bytes)
                     .unwrap_or_default(),
                 "content-type" | "content_type" => req
                     .header("content-type")
-                    .map(vapache_verified::guard_header_bytes)
+                    .map(httpd_rs_verified::guard_header_bytes)
                     .unwrap_or_default(),
                 other => req
                     .header(other)
-                    .map(vapache_verified::guard_header_bytes)
+                    .map(httpd_rs_verified::guard_header_bytes)
                     .or_else(|| {
                         env.iter()
                             .rev()
@@ -2034,7 +2034,7 @@ impl Scope {
             &mut env,
         );
         for entry in &self.environment_policy.rewrite_env {
-            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
+            if fastcgi && !httpd_rs_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let (name, value) = &entry.value;
@@ -2042,7 +2042,7 @@ impl Scope {
             env.push((name.clone(), value.clone()));
         }
         for entry in &self.environment_policy.rewrite_unset_env {
-            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
+            if fastcgi && !httpd_rs_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let name = &entry.value;
@@ -2069,7 +2069,7 @@ impl Scope {
     ) -> RequestEnvironment {
         let mut env = self.authorization_environment(req, url_path, peer, fastcgi);
         for entry in &self.environment_policy.rewrite_late_env {
-            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
+            if fastcgi && !httpd_rs_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let (name, value) = &entry.value;
@@ -2077,14 +2077,14 @@ impl Scope {
             env.push((name.clone(), value.clone()));
         }
         for entry in &self.environment_policy.rewrite_late_unset_env {
-            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
+            if fastcgi && !httpd_rs_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let name = &entry.value;
             env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
         }
         for entry in &self.environment_policy.set_env {
-            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
+            if fastcgi && !httpd_rs_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let (name, value) = &entry.value;
@@ -2092,7 +2092,7 @@ impl Scope {
             env.push((name.clone(), value.as_bytes().to_vec()));
         }
         for entry in &self.environment_policy.pass_env {
-            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
+            if fastcgi && !httpd_rs_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let name = &entry.value;
@@ -2103,7 +2103,7 @@ impl Scope {
             env.push((name.clone(), value.as_os_str().as_bytes().to_vec()));
         }
         for entry in &self.environment_policy.unset_env {
-            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
+            if fastcgi && !httpd_rs_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let name = &entry.value;
@@ -2251,7 +2251,7 @@ impl Scope {
             Some(SetHandler::None_) | None => (false, String::new()),
         };
         let same_name = url_name.eq_ignore_ascii_case(&target_name);
-        self.mapping_policy.set_handler = match vapache_verified::set_handler_conjoin_admit(
+        self.mapping_policy.set_handler = match httpd_rs_verified::set_handler_conjoin_admit(
             url_denied,
             url_forced,
             target_forced,
@@ -2287,7 +2287,7 @@ impl Scope {
         self.conditional_error |= base.conditional_error;
         let url_options = base.options.effective_bits(Options::FOLLOW_SYMLINKS);
         let target_options = self.options.effective_bits(Options::FOLLOW_SYMLINKS);
-        let conjoined = vapache_verified::options_conjoin(url_options, target_options);
+        let conjoined = httpd_rs_verified::options_conjoin(url_options, target_options);
         self.options = crate::scope_policy::OptionsPolicy::default();
         self.options.push_set(conjoined);
 
@@ -2400,30 +2400,30 @@ pub struct ScopeRule {
 
 impl ScopeRule {
     pub fn phase(&self) -> RulePhase {
-        match vapache_verified::config_rule_phase(
+        match httpd_rs_verified::config_rule_phase(
             verified_config_rule_kind(&self.kind),
             rule_is_conditional(self),
         ) {
-            vapache_verified::ConfigRulePhase::Directory => RulePhase::Directory,
-            vapache_verified::ConfigRulePhase::Files => RulePhase::Files,
-            vapache_verified::ConfigRulePhase::Location => RulePhase::Location,
-            vapache_verified::ConfigRulePhase::Condition => RulePhase::Condition,
+            httpd_rs_verified::ConfigRulePhase::Directory => RulePhase::Directory,
+            httpd_rs_verified::ConfigRulePhase::Files => RulePhase::Files,
+            httpd_rs_verified::ConfigRulePhase::Location => RulePhase::Location,
+            httpd_rs_verified::ConfigRulePhase::Condition => RulePhase::Condition,
         }
     }
 }
 
-fn verified_config_rule_kind(kind: &MatchKind) -> vapache_verified::ConfigRuleKind {
+fn verified_config_rule_kind(kind: &MatchKind) -> httpd_rs_verified::ConfigRuleKind {
     match kind {
-        MatchKind::Always => vapache_verified::ConfigRuleKind::Always,
-        MatchKind::Directory(_) => vapache_verified::ConfigRuleKind::Directory,
-        MatchKind::DirectoryMatch(_) => vapache_verified::ConfigRuleKind::DirectoryMatch,
+        MatchKind::Always => httpd_rs_verified::ConfigRuleKind::Always,
+        MatchKind::Directory(_) => httpd_rs_verified::ConfigRuleKind::Directory,
+        MatchKind::DirectoryMatch(_) => httpd_rs_verified::ConfigRuleKind::DirectoryMatch,
         MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_) => {
-            vapache_verified::ConfigRuleKind::Files
+            httpd_rs_verified::ConfigRuleKind::Files
         }
         MatchKind::Location(_) | MatchKind::LocationGlob(_) => {
-            vapache_verified::ConfigRuleKind::Location
+            httpd_rs_verified::ConfigRuleKind::Location
         }
-        MatchKind::LocationMatch(_) => vapache_verified::ConfigRuleKind::LocationMatch,
+        MatchKind::LocationMatch(_) => httpd_rs_verified::ConfigRuleKind::LocationMatch,
     }
 }
 
@@ -2437,14 +2437,14 @@ fn defer_rule_by_verified_phase(
     locations: &mut Vec<ScopeRule>,
     conditionals: &mut Vec<ScopeRule>,
 ) {
-    match vapache_verified::config_deferred_slot(
+    match httpd_rs_verified::config_deferred_slot(
         verified_config_rule_kind(&rule.kind),
         rule_is_conditional(rule),
     ) {
-        vapache_verified::ConfigDeferredSlot::Files => files.push(rule.clone()),
-        vapache_verified::ConfigDeferredSlot::Location => locations.push(rule.clone()),
-        vapache_verified::ConfigDeferredSlot::Condition => conditionals.push(rule.clone()),
-        vapache_verified::ConfigDeferredSlot::Ignore => {}
+        httpd_rs_verified::ConfigDeferredSlot::Files => files.push(rule.clone()),
+        httpd_rs_verified::ConfigDeferredSlot::Location => locations.push(rule.clone()),
+        httpd_rs_verified::ConfigDeferredSlot::Condition => conditionals.push(rule.clone()),
+        httpd_rs_verified::ConfigDeferredSlot::Ignore => {}
     }
 }
 
@@ -2577,7 +2577,7 @@ impl VHostBucket {
         let key = bare.to_ascii_lowercase();
         let mut selected = self.exact_names.get(&key).copied();
         for (index, pattern) in &self.wildcard_names {
-            if !vapache_verified::vhost_name_candidate_precedes(selected, *index) {
+            if !httpd_rs_verified::vhost_name_candidate_precedes(selected, *index) {
                 continue;
             }
             if crate::verified::host_pattern_matches(bare.as_bytes(), pattern.as_bytes()) {
@@ -2719,7 +2719,7 @@ impl MimeMap {
         path: &Path,
         trust: crate::files::AdminFileTrust,
     ) -> Result<(), String> {
-        if !vapache_verified::text_identity_admit(path.to_str().is_some()) {
+        if !httpd_rs_verified::text_identity_admit(path.to_str().is_some()) {
             return Err("TypesConfig path is not valid UTF-8".into());
         }
         let data = crate::files::read_admin_file_with_trust(path, MAX_TYPES_CONFIG_BYTES, trust)
@@ -3212,7 +3212,7 @@ pub struct FastCgiStablePathPolicy {
 /// Individually reviewable gates for compatibility features that materially
 /// expand the request parser, filesystem walk, generated-content, or code
 /// execution surface. Every capability is off unless the global server
-/// configuration explicitly enables it with `VapacheCapability`.
+/// configuration explicitly enables it with `HttpdRsCapability`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {
     AbsoluteRequestTarget,
@@ -3278,18 +3278,18 @@ pub struct Capabilities(u64);
 
 #[cfg(test)]
 pub(crate) const TEST_CAPABILITIES: &str = "\
-VapacheCapability AbsoluteRequestTarget On\n\
-VapacheCapability AccessFiles On\n\
-VapacheCapability AutoIndex On\n\
-VapacheCapability Cgi On\n\
-VapacheCapability FastCgi On\n\
-VapacheCapability LegacyAuthz On\n\
-VapacheCapability MutableAuthFiles On\n\
-VapacheCapability RequestTrailers On\n\
-VapacheCapability RewriteProgram On\n\
-VapacheCapability ServerStatus On\n\
-VapacheCapability Trace On\n\
-VapacheCapability UnstableFastCgiPaths On\n";
+HttpdRsCapability AbsoluteRequestTarget On\n\
+HttpdRsCapability AccessFiles On\n\
+HttpdRsCapability AutoIndex On\n\
+HttpdRsCapability Cgi On\n\
+HttpdRsCapability FastCgi On\n\
+HttpdRsCapability LegacyAuthz On\n\
+HttpdRsCapability MutableAuthFiles On\n\
+HttpdRsCapability RequestTrailers On\n\
+HttpdRsCapability RewriteProgram On\n\
+HttpdRsCapability ServerStatus On\n\
+HttpdRsCapability Trace On\n\
+HttpdRsCapability UnstableFastCgiPaths On\n";
 
 impl Capabilities {
     pub fn contains(self, capability: Capability) -> bool {
@@ -3387,7 +3387,7 @@ pub struct Config {
     pub limit_request_field_size: usize,
     pub limit_request_body: u64,
     pub max_request_workers: usize,
-    /// Parsed Apache MPM topology. Vapache has one process-wide worker/admission
+    /// Parsed Apache MPM topology. httpd-rs has one process-wide worker/admission
     /// hierarchy, so these values are retained for validation while
     /// MaxRequestWorkers remains the effective concurrency ceiling.
     pub apache_mpm_tuning: ApacheMpmTuning,
@@ -3637,7 +3637,7 @@ impl Config {
             .generation_admission
             .read()
             .unwrap_or_else(|error| error.into_inner());
-        if !vapache_verified::configuration_generation_admit(*self.generation_retired.borrow()) {
+        if !httpd_rs_verified::configuration_generation_admit(*self.generation_retired.borrow()) {
             return None;
         }
         Some(work())
@@ -3903,7 +3903,7 @@ struct DirectiveIdentity {
 /// being normalized into an empty path, user, handler, or security policy.
 fn directive_arity(name: &str) -> PayloadArity {
     match name {
-        "vapachecapability" => PayloadArity {
+        "httpdrscapability" => PayloadArity {
             min: 2,
             max: Some(2),
         },
@@ -4035,10 +4035,10 @@ fn directive_arity(name: &str) -> PayloadArity {
         | "include"
         | "includeoptional"
         | "undefine"
-        | "vapachemaxspoolbytes"
-        | "vapachemaxspoolfiles"
-        | "vapachemaxdynamicrequests"
-        | "vapachemaxfastcgioutput"
+        | "httpdrsmaxspoolbytes"
+        | "httpdrsmaxspoolfiles"
+        | "httpdrsmaxdynamicrequests"
+        | "httpdrsmaxfastcgioutput"
         | "proxypreservehost"
         | "proxystatus"
         | "cgipassauth"
@@ -4062,7 +4062,7 @@ fn directive_arity(name: &str) -> PayloadArity {
         | "balancermember"
         | "proxyset"
         | "proxyhctemplate"
-        | "vapachefastcgistablepath"
+        | "httpdrsfastcgistablepath"
         | "sslrandomseed"
         | "sslpassphrasedialog"
         | "sslsessioncache" => PayloadArity::at_least(1),
@@ -4073,7 +4073,7 @@ fn directive_arity(name: &str) -> PayloadArity {
         "proxypass" | "addoutputfilter" | "addoutputfilterbytype" => PayloadArity::at_least(2),
         "proxypassreverse" | "proxypassmatch" => PayloadArity::TWO,
         "cacheenable" => PayloadArity::between(1, 2),
-        // Vapache currently supports named LogFormat definitions and
+        // httpd-rs currently supports named LogFormat definitions and
         // unconditional CustomLog sinks. Refuse the otherwise-valid Apache
         // variants until their effects are implemented; accepting them as
         // no-ops or unconditional logs changes the audit policy.
@@ -4113,8 +4113,8 @@ fn directive_rejects_empty(name: &str) -> bool {
             | "authuserfile"
             | "authgroupfile"
             | "authbasicprovider"
-            | "vapachecapability"
-            | "vapachefastcgistablepath"
+            | "httpdrscapability"
+            | "httpdrsfastcgistablepath"
             | "serveralias"
             | "allowoverride"
             | "allowoverridelist"
@@ -4211,10 +4211,10 @@ fn build_directive_payload_schema(name: &str) -> PayloadSchema {
         | "proxypreservehost"
         | "proxystatus"
         | "cgipassauth" => PayloadValueSchema::OnOff,
-        "vapachemaxspoolbytes"
-        | "vapachemaxspoolfiles"
-        | "vapachemaxdynamicrequests"
-        | "vapachemaxfastcgioutput" => PayloadValueSchema::Unsigned {
+        "httpdrsmaxspoolbytes"
+        | "httpdrsmaxspoolfiles"
+        | "httpdrsmaxdynamicrequests"
+        | "httpdrsmaxfastcgioutput" => PayloadValueSchema::Unsigned {
             min: 1,
             max: u64::MAX,
         },
@@ -4281,8 +4281,8 @@ fn build_directive_payload_schema(name: &str) -> PayloadSchema {
         "proxypass" => PayloadValueSchema::ProxyPass,
         "proxypassreverse" => PayloadValueSchema::ProxyPassReverse,
         "proxypassmatch" => PayloadValueSchema::ProxyPassMatch,
-        "vapachecapability" => PayloadValueSchema::Validated(PayloadValidation::Capability),
-        "vapachefastcgistablepath" => {
+        "httpdrscapability" => PayloadValueSchema::Validated(PayloadValidation::Capability),
+        "httpdrsfastcgistablepath" => {
             PayloadValueSchema::Validated(PayloadValidation::FastCgiStablePath)
         }
         "serveralias" => PayloadValueSchema::Validated(PayloadValidation::ServerAliases),
@@ -4472,7 +4472,7 @@ fn validate_config_section_arity(name: &str, args: &[String]) -> Result<(), Stri
         "virtualhost" | "limit" | "limitexcept" | "if" | "elseif" => (1, None),
         _ => return Ok(()),
     };
-    if !vapache_verified::config_argument_arity_admit(args.len(), min, max) {
+    if !httpd_rs_verified::config_argument_arity_admit(args.len(), min, max) {
         let requirement = match max {
             Some(max) if max == min => format!("exactly {min}"),
             Some(max) => format!("between {min} and {max}"),
@@ -4628,9 +4628,9 @@ impl ConfigProgram {
         for event in events {
             match event {
                 Event::Directive { name, args, loc } => {
-                    depth = vapache_verified::config_program_depth_step(
+                    depth = httpd_rs_verified::config_program_depth_step(
                         depth,
-                        vapache_verified::ConfigLineKind::Directive,
+                        httpd_rs_verified::ConfigLineKind::Directive,
                     )
                     .ok_or("configuration program depth overflow")?;
                     let identity = DirectiveIdentity::new(name);
@@ -4650,12 +4650,12 @@ impl ConfigProgram {
                     active,
                     transparent,
                 } => {
-                    depth = vapache_verified::config_program_depth_step(
+                    depth = httpd_rs_verified::config_program_depth_step(
                         depth,
-                        vapache_verified::ConfigLineKind::SectionStart,
+                        httpd_rs_verified::ConfigLineKind::SectionStart,
                     )
                     .ok_or("configuration program depth overflow")?;
-                    if !vapache_verified::config_section_depth_admit(
+                    if !httpd_rs_verified::config_section_depth_admit(
                         depth,
                         MAX_CONFIG_SECTION_DEPTH,
                     ) {
@@ -4679,9 +4679,9 @@ impl ConfigProgram {
                     stack.push(start);
                 }
                 Event::SectionEnd { loc: _ } => {
-                    depth = vapache_verified::config_program_depth_step(
+                    depth = httpd_rs_verified::config_program_depth_step(
                         depth,
-                        vapache_verified::ConfigLineKind::SectionEnd,
+                        httpd_rs_verified::ConfigLineKind::SectionEnd,
                     )
                     .ok_or("configuration program contains an unmatched closing section")?;
                     let start = stack
@@ -4813,12 +4813,12 @@ fn core_directive_exists(name: &str) -> bool {
             | "undefine"
             | "usecanonicalname"
             | "usecanonicalphysicalport"
-            | "vapachefastcgistablepath"
-            | "vapachecapability"
-            | "vapachemaxdynamicrequests"
-            | "vapachemaxfastcgioutput"
-            | "vapachemaxspoolbytes"
-            | "vapachemaxspoolfiles"
+            | "httpdrsfastcgistablepath"
+            | "httpdrscapability"
+            | "httpdrsmaxdynamicrequests"
+            | "httpdrsmaxfastcgioutput"
+            | "httpdrsmaxspoolbytes"
+            | "httpdrsmaxspoolfiles"
     )
 }
 
@@ -5031,7 +5031,7 @@ impl ParserState {
         if !self.register_admin_input(path, &path_loc) {
             return;
         }
-        if !vapache_verified::text_identity_admit(path.to_str().is_some()) {
+        if !httpd_rs_verified::text_identity_admit(path.to_str().is_some()) {
             let loc = SourceLoc {
                 file: path.display().to_string(),
                 line: 0,
@@ -5277,7 +5277,7 @@ impl ParserState {
         };
         let has_glob = s.contains('*') || s.contains('?') || s.contains('[');
         let trust_target = if !has_glob && full.is_dir() {
-            full.join(".vapache-include-entry")
+            full.join(".httpd-rs-include-entry")
         } else {
             full.clone()
         };
@@ -5480,23 +5480,23 @@ fn section_kind(class: ProgramSectionClass) -> Option<SectionKind> {
 /// Apache rejects most cross-section nesting outright.  Keeping these checks
 /// in the compiler means a configuration that Apache refuses cannot silently
 /// acquire a different meaning here.
-fn section_kind_model(kind: SectionKind) -> vapache_verified::ConfigSectionKind {
+fn section_kind_model(kind: SectionKind) -> httpd_rs_verified::ConfigSectionKind {
     use SectionKind::*;
     match kind {
-        Server => vapache_verified::ConfigSectionKind::Server,
-        VirtualHost => vapache_verified::ConfigSectionKind::VirtualHost,
-        Directory => vapache_verified::ConfigSectionKind::Directory,
-        DirectoryMatch => vapache_verified::ConfigSectionKind::DirectoryMatch,
-        Location => vapache_verified::ConfigSectionKind::Location,
-        Files => vapache_verified::ConfigSectionKind::Files,
-        Proxy => vapache_verified::ConfigSectionKind::Proxy,
-        Require => vapache_verified::ConfigSectionKind::Require,
-        Conditional => vapache_verified::ConfigSectionKind::Conditional,
+        Server => httpd_rs_verified::ConfigSectionKind::Server,
+        VirtualHost => httpd_rs_verified::ConfigSectionKind::VirtualHost,
+        Directory => httpd_rs_verified::ConfigSectionKind::Directory,
+        DirectoryMatch => httpd_rs_verified::ConfigSectionKind::DirectoryMatch,
+        Location => httpd_rs_verified::ConfigSectionKind::Location,
+        Files => httpd_rs_verified::ConfigSectionKind::Files,
+        Proxy => httpd_rs_verified::ConfigSectionKind::Proxy,
+        Require => httpd_rs_verified::ConfigSectionKind::Require,
+        Conditional => httpd_rs_verified::ConfigSectionKind::Conditional,
     }
 }
 
 fn structural_section_allowed(parent: SectionKind, child: SectionKind) -> bool {
-    vapache_verified::config_section_nesting_allowed(
+    httpd_rs_verified::config_section_nesting_allowed(
         section_kind_model(parent),
         section_kind_model(child),
     )
@@ -5705,7 +5705,7 @@ impl Compile {
         // FastCGI normally requires a strict endpoint/path policy.  Retaining
         // the historical pathname-only handoff is a separate, explicit
         // process-wide capability because the external backend reopens
-        // SCRIPT_FILENAME after vapache's final inode check.
+        // SCRIPT_FILENAME after httpd-rs's final inode check.
         if self.cfg.fastcgi_stable_paths.is_none() {
             let unstable: Vec<_> = self
                 .required_capabilities
@@ -5715,7 +5715,7 @@ impl Compile {
                     (
                         Capability::UnstableFastCgiPaths,
                         loc.clone(),
-                        format!("{feature} without VapacheFastCGIStablePath"),
+                        format!("{feature} without HttpdRsFastCGIStablePath"),
                     )
                 })
                 .collect();
@@ -5730,7 +5730,7 @@ impl Compile {
                     file: loc.file.clone(),
                     line: loc.line,
                     msg: format!(
-                        "{feature} requires 'VapacheCapability {} On' in global server context",
+                        "{feature} requires 'HttpdRsCapability {} On' in global server context",
                         capability.name()
                     ),
                 });
@@ -6503,8 +6503,8 @@ impl Compile {
     fn directive_disposition(
         &self,
         identity: &DirectiveIdentity,
-    ) -> vapache_verified::DirectiveDisposition {
-        vapache_verified::directive_disposition(
+    ) -> httpd_rs_verified::DirectiveDisposition {
+        httpd_rs_verified::directive_disposition(
             identity.spec.security_sensitive,
             identity.spec.apache_known,
             self.strict,
@@ -6532,7 +6532,7 @@ impl Compile {
             return;
         }
         // Some Apache directives are scoped per-vhost or per-directory, but
-        // Vapache currently stores their value in the process-wide Config.
+        // httpd-rs currently stores their value in the process-wide Config.
         // Accepting those forms would let the last unrelated scope overwrite
         // every other scope. Until the storage is scoped, admit only the
         // global form rather than silently broadening its effect.
@@ -6611,7 +6611,7 @@ impl Compile {
             return;
         }
         if matches!(name, "cacheenable" | "cachedisable")
-            && !vapache_verified::cache_base_scope_admit(matches!(
+            && !httpd_rs_verified::cache_base_scope_admit(matches!(
                 section,
                 SectionKind::Server | SectionKind::VirtualHost
             ))
@@ -6714,18 +6714,18 @@ impl Compile {
         let first = || args.first().cloned().unwrap_or_default();
         let joined = || args.join(" ");
         match name {
-            "vapachecapability" => {
+            "httpdrscapability" => {
                 if section != SectionKind::Server || inside_vhost {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
-                        msg: "VapacheCapability is only allowed in global server context".into(),
+                        msg: "HttpdRsCapability is only allowed in global server context".into(),
                     });
                     return;
                 }
                 let (capability, enabled) = payload
                     .capability()
-                    .expect("VapacheCapability is compiled while sealing");
+                    .expect("HttpdRsCapability is compiled while sealing");
                 self.cfg.capabilities.set(capability, enabled);
             }
             "serverroot" => {
@@ -6733,19 +6733,19 @@ impl Compile {
                     self.cfg.server_root = PathBuf::from(a);
                 }
             }
-            "vapachefastcgistablepath" => {
+            "httpdrsfastcgistablepath" => {
                 if section != SectionKind::Server || inside_vhost {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
-                        msg: "VapacheFastCGIStablePath is only allowed in global server context"
+                        msg: "HttpdRsFastCGIStablePath is only allowed in global server context"
                             .into(),
                     });
                     return;
                 }
                 let policy = payload
                     .fastcgi_stable_path()
-                    .expect("VapacheFastCGIStablePath is compiled while sealing")
+                    .expect("HttpdRsFastCGIStablePath is compiled while sealing")
                     .clone();
                 let Some(policy) = policy else {
                     self.cfg.fastcgi_stable_paths = None;
@@ -6765,10 +6765,10 @@ impl Compile {
                 }
                 policies.push(policy);
             }
-            "vapachemaxspoolbytes"
-            | "vapachemaxspoolfiles"
-            | "vapachemaxdynamicrequests"
-            | "vapachemaxfastcgioutput" => {
+            "httpdrsmaxspoolbytes"
+            | "httpdrsmaxspoolfiles"
+            | "httpdrsmaxdynamicrequests"
+            | "httpdrsmaxfastcgioutput" => {
                 if section != SectionKind::Server || inside_vhost {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
@@ -6781,10 +6781,10 @@ impl Compile {
                     .unsigned()
                     .expect("resource limits are typed while sealing");
                 match name {
-                    "vapachemaxspoolbytes" => self.cfg.max_spool_bytes = value,
-                    "vapachemaxspoolfiles" => self.cfg.max_spool_files = value,
-                    "vapachemaxdynamicrequests" => self.cfg.max_dynamic_requests = value,
-                    "vapachemaxfastcgioutput" => self.cfg.max_fastcgi_output = value,
+                    "httpdrsmaxspoolbytes" => self.cfg.max_spool_bytes = value,
+                    "httpdrsmaxspoolfiles" => self.cfg.max_spool_files = value,
+                    "httpdrsmaxdynamicrequests" => self.cfg.max_dynamic_requests = value,
+                    "httpdrsmaxfastcgioutput" => self.cfg.max_fastcgi_output = value,
                     _ => unreachable!(),
                 }
             }
@@ -7402,7 +7402,7 @@ impl Compile {
                 }
             }
             "defaultruntime" => self.warn(format!(
-                "{}:{}: DefaultRuntime is accepted for compatibility and has no Vapache effect",
+                "{}:{}: DefaultRuntime is accepted for compatibility and has no httpd-rs effect",
                 loc.file, loc.line
             )),
             "fileetag" => {
@@ -7962,7 +7962,7 @@ impl Compile {
                     .expect("ProxyStatus is typed while sealing")
                 {
                     self.warn(format!(
-                        "{}:{}: ProxyStatus is accepted for Debian mod_status compatibility; Vapache's bounded status page omits proxy-worker details",
+                        "{}:{}: ProxyStatus is accepted for Debian mod_status compatibility; httpd-rs's bounded status page omits proxy-worker details",
                         loc.file, loc.line,
                     ));
                 }
@@ -8023,7 +8023,7 @@ impl Compile {
                 if value != 0 {
                     self.directive_error(
                         loc,
-                        "nonzero MaxConnectionsPerChild is not implemented for Vapache's single-process runtime",
+                        "nonzero MaxConnectionsPerChild is not implemented for httpd-rs's single-process runtime",
                     );
                 }
             }
@@ -8196,7 +8196,7 @@ impl Compile {
                 }
             }
             "defaultruntimedir" => self.warn(format!(
-                "{}:{}: DefaultRuntimeDir is accepted for Apache layout compatibility; Vapache runtime paths are compiled separately",
+                "{}:{}: DefaultRuntimeDir is accepted for Apache layout compatibility; httpd-rs runtime paths are compiled separately",
                 loc.file, loc.line
             )),
             "sslrandomseed" => {
@@ -8263,7 +8263,7 @@ impl Compile {
             }
             "ssloptions" => {
                 // StrictRequire changes how mod_ssl's legacy SSLRequire
-                // access check interacts with Satisfy. Vapache rejects both
+                // access check interacts with Satisfy. httpd-rs rejects both
                 // directives instead of approximating them. Sealing accepts
                 // only +StrictRequire, so the compatibility no-op cannot
                 // weaken request policy.
@@ -8365,14 +8365,14 @@ impl Compile {
                 target.stapling_return_responder_errors = enabled;
                 if enabled {
                     self.warn(format!(
-                        "{}:{}: Vapache staples only successful, signed OCSP responses even when SSLStaplingReturnResponderErrors is On",
+                        "{}:{}: httpd-rs staples only successful, signed OCSP responses even when SSLStaplingReturnResponderErrors is On",
                         loc.file, loc.line
                     ));
                 }
             }
             "sslstaplingcache" => {
                 self.warn(format!(
-                    "{}:{}: SSLStaplingCache uses Vapache's bounded in-process OCSP cache; the Apache provider path is ignored",
+                    "{}:{}: SSLStaplingCache uses httpd-rs's bounded in-process OCSP cache; the Apache provider path is ignored",
                     loc.file, loc.line
                 ));
             }
@@ -8614,7 +8614,7 @@ impl Compile {
             }
             "defaulttype" => { /* removed in 2.4; accepted for compat */ }
             _ => match self.directive_disposition(identity) {
-                vapache_verified::DirectiveDisposition::FailClosedSecurity => {
+                httpd_rs_verified::DirectiveDisposition::FailClosedSecurity => {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
@@ -8623,7 +8623,7 @@ impl Compile {
                         ),
                     });
                 }
-                vapache_verified::DirectiveDisposition::FailClosedKnown => {
+                httpd_rs_verified::DirectiveDisposition::FailClosedKnown => {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
@@ -8632,7 +8632,7 @@ impl Compile {
                         ),
                     });
                 }
-                vapache_verified::DirectiveDisposition::FailClosedUnknown => {
+                httpd_rs_verified::DirectiveDisposition::FailClosedUnknown => {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
@@ -9454,7 +9454,7 @@ pub fn apply_deferred_req(
         ) {
             Ok(matched) => matched,
             Err(error) => {
-                eprintln!("vapached: conditional expression failed closed: {error}");
+                eprintln!("httpd-rs: conditional expression failed closed: {error}");
                 s.conditional_error = true;
                 continue;
             }
@@ -9536,7 +9536,7 @@ fn sort_rules(rules: &mut [ScopeRule]) {
                 _ => 0,
             }
         };
-        let ab = vapache_verified::config_rule_precedes(
+        let ab = httpd_rs_verified::config_rule_precedes(
             verified_config_rule_kind(&a.kind),
             rule_is_conditional(a),
             specificity(a),
@@ -9546,7 +9546,7 @@ fn sort_rules(rules: &mut [ScopeRule]) {
             specificity(b),
             b.order,
         );
-        let ba = vapache_verified::config_rule_precedes(
+        let ba = httpd_rs_verified::config_rule_precedes(
             verified_config_rule_kind(&b.kind),
             rule_is_conditional(b),
             specificity(b),
@@ -9579,7 +9579,7 @@ fn merge_virtual_host_rules(global: &[ScopeRule], local: &[ScopeRule]) -> Vec<Sc
             .order
             .checked_sub(local_min)
             .expect("local rule rank is bounded by its minimum");
-        rule.order = vapache_verified::configuration_child_merge_order(global_max, local_rank)
+        rule.order = httpd_rs_verified::configuration_child_merge_order(global_max, local_rank)
             .expect("the 16 MiB aggregate configuration bound keeps rule order in usize");
         rule
     }));
@@ -9663,7 +9663,7 @@ pub(crate) fn compile_location_pattern(args: &[String]) -> Result<MatchKind, Str
         // (`LocationGlob`).  Falling back to a literal `MatchKind::Location`
         // would silently disable every guard inside the section; the kernel
         // records the admission invariant.
-        debug_assert!(vapache_verified::location_wildcard_compiled_admit(
+        debug_assert!(httpd_rs_verified::location_wildcard_compiled_admit(
             true, true
         ));
         return Ok(MatchKind::LocationGlob(pattern));
@@ -9886,7 +9886,7 @@ pub(crate) fn parse_require(args: &[String]) -> Require {
         }
         "method" => {
             let methods: Vec<String> = rest.to_vec();
-            if !vapache_verified::require_method_operand_admit(
+            if !httpd_rs_verified::require_method_operand_admit(
                 !methods.is_empty(),
                 methods.iter().all(|method| known_http_method(method)),
             ) {
@@ -9902,7 +9902,7 @@ pub(crate) fn parse_require(args: &[String]) -> Require {
             for item in rest {
                 let has_equals = item.contains('=');
                 let name = item.split_once('=').map(|(name, _)| name).unwrap_or(item);
-                if !vapache_verified::require_env_operand_admit(!name.is_empty(), has_equals) {
+                if !httpd_rs_verified::require_env_operand_admit(!name.is_empty(), has_equals) {
                     if has_equals {
                         return Require::Unsupported(
                             "Require env does not support NAME=VALUE comparisons".into(),
@@ -10375,7 +10375,7 @@ pub(crate) fn parse_rewrite_flags(args: &[String]) -> Result<RewriteFlags, Strin
         }
     }
     out.escape_backrefs =
-        vapache_verified::rewrite_backref_escape_admit(out.escape_backrefs, out.noescape_backrefs);
+        httpd_rs_verified::rewrite_backref_escape_admit(out.escape_backrefs, out.noescape_backrefs);
     Ok(out)
 }
 
@@ -11270,12 +11270,12 @@ fn known_directives() -> Vec<&'static str> {
         "user",
         "userdir",
         "userdirnegotiation",
-        "vapachefastcgistablepath",
-        "vapachemaxdynamicrequests",
-        "vapachemaxfastcgioutput",
-        "vapachemaxspoolbytes",
-        "vapachemaxspoolfiles",
-        "vapachecapability",
+        "httpdrsfastcgistablepath",
+        "httpdrsmaxdynamicrequests",
+        "httpdrsmaxfastcgioutput",
+        "httpdrsmaxspoolbytes",
+        "httpdrsmaxspoolfiles",
+        "httpdrscapability",
         "variantname",
         "virtualhost",
         "xml2encalias",
@@ -11458,7 +11458,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "vapache-config-test-{}-{}.conf",
+            "httpd-rs-config-test-{}-{}.conf",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -11528,7 +11528,7 @@ mod tests {
     #[test]
     fn serverroot_is_execute_on_read_for_relative_includes() {
         let dir = std::env::temp_dir().join(format!(
-            "vapache-serverroot-exec-on-read-{}",
+            "httpd-rs-serverroot-exec-on-read-{}",
             std::process::id()
         ));
         let root = dir.join("root");
@@ -11677,11 +11677,11 @@ mod tests {
         assert!(ConfigProgram::seal(nested_program(MAX_CONFIG_SECTION_DEPTH)).is_ok());
         let error = ConfigProgram::seal(nested_program(MAX_CONFIG_SECTION_DEPTH + 1)).unwrap_err();
         assert!(error.contains("section nesting exceeds"), "{error}");
-        assert!(vapache_verified::config_section_depth_admit(
+        assert!(httpd_rs_verified::config_section_depth_admit(
             MAX_CONFIG_SECTION_DEPTH,
             MAX_CONFIG_SECTION_DEPTH,
         ));
-        assert!(!vapache_verified::config_section_depth_admit(
+        assert!(!httpd_rs_verified::config_section_depth_admit(
             MAX_CONFIG_SECTION_DEPTH + 1,
             MAX_CONFIG_SECTION_DEPTH,
         ));
@@ -11690,7 +11690,7 @@ mod tests {
     #[test]
     fn cache_enable_is_rejected_in_rule_producing_sections() {
         let errors = load_text(
-            "CacheRoot /tmp/vapache-cache-prefilter\n\
+            "CacheRoot /tmp/httpd-rs-cache-prefilter\n\
              <Directory /tmp>\n\
              <If \"true\">\n\
              CacheEnable disk /nested\n\
@@ -11706,7 +11706,7 @@ mod tests {
         }));
 
         let cfg = load_text(
-            "CacheRoot /tmp/vapache-cache-prefilter\nCacheEnable disk /cache\n",
+            "CacheRoot /tmp/httpd-rs-cache-prefilter\nCacheEnable disk /cache\n",
             false,
         )
         .unwrap();
@@ -11718,10 +11718,10 @@ mod tests {
 
     #[test]
     fn relative_pid_file_is_resolved_below_server_root() {
-        let config = load_text("Listen 127.0.0.1:0\nPidFile run/vapached.pid\n", false).unwrap();
+        let config = load_text("Listen 127.0.0.1:0\nPidFile run/httpd-rs.pid\n", false).unwrap();
         assert_eq!(
             config.pid_file,
-            std::env::temp_dir().join("run/vapached.pid")
+            std::env::temp_dir().join("run/httpd-rs.pid")
         );
 
         let config = load_text(
@@ -11738,7 +11738,7 @@ mod tests {
         for capability in Capability::ALL {
             assert!(!defaults.capability_enabled(capability));
             let cfg = load_text_default(&format!(
-                "VapacheCapability {} On\nListen 127.0.0.1:0\n",
+                "HttpdRsCapability {} On\nListen 127.0.0.1:0\n",
                 capability.name()
             ))
             .unwrap();
@@ -11797,14 +11797,14 @@ mod tests {
             assert!(
                 errors
                     .iter()
-                    .any(|error| error.msg.contains(&format!("VapacheCapability {name} On"))),
+                    .any(|error| error.msg.contains(&format!("HttpdRsCapability {name} On"))),
                 "missing {name} rejection: {errors:?}"
             );
             let prelude = if name == "FastCgi" {
-                "VapacheCapability FastCgi On\nVapacheCapability UnstableFastCgiPaths On\n"
+                "HttpdRsCapability FastCgi On\nHttpdRsCapability UnstableFastCgiPaths On\n"
                     .to_string()
             } else {
-                format!("VapacheCapability {name} On\n")
+                format!("HttpdRsCapability {name} On\n")
             };
             assert!(
                 load_text_with_prelude(&prelude, text, false, false).is_ok(),
@@ -11815,20 +11815,20 @@ mod tests {
         // Declarations are process-global, order independent, and final: a
         // later Off cannot leave an earlier feature enabled by accident.
         assert!(load_text_default(
-            "Listen 127.0.0.1:0\nTraceEnable On\nVapacheCapability Trace On\n"
+            "Listen 127.0.0.1:0\nTraceEnable On\nHttpdRsCapability Trace On\n"
         )
         .is_ok());
         assert!(load_text_default(
-            "Listen 127.0.0.1:0\nVapacheCapability Trace On\nTraceEnable On\nVapacheCapability Trace Off\n"
+            "Listen 127.0.0.1:0\nHttpdRsCapability Trace On\nTraceEnable On\nHttpdRsCapability Trace Off\n"
         )
         .is_err());
 
         for text in [
-            "Listen 127.0.0.1:0\nVapacheCapability Unknown On\n",
-            "Listen 127.0.0.1:0\nVapacheCapability Trace Maybe\n",
-            "Listen 127.0.0.1:0\n<Directory /srv>\nVapacheCapability Trace On\n</Directory>\n",
-            "Listen 127.0.0.1:0\n<VirtualHost *:80>\nVapacheCapability Trace On\n</VirtualHost>\n",
-            "Listen 127.0.0.1:0\n<If true>\nVapacheCapability Trace On\n</If>\n",
+            "Listen 127.0.0.1:0\nHttpdRsCapability Unknown On\n",
+            "Listen 127.0.0.1:0\nHttpdRsCapability Trace Maybe\n",
+            "Listen 127.0.0.1:0\n<Directory /srv>\nHttpdRsCapability Trace On\n</Directory>\n",
+            "Listen 127.0.0.1:0\n<VirtualHost *:80>\nHttpdRsCapability Trace On\n</VirtualHost>\n",
+            "Listen 127.0.0.1:0\n<If true>\nHttpdRsCapability Trace On\n</If>\n",
             "Listen 127.0.0.1:0\nTraceEnable Maybe\n",
             "Listen 127.0.0.1:0\nTraceEnable\n",
             "Listen 127.0.0.1:0\nTraceEnable On Off\n",
@@ -11836,7 +11836,7 @@ mod tests {
             assert!(load_text_default(text).is_err(), "accepted: {text}");
         }
         assert!(load_text_default(
-            "VapacheCapability Trace On\nListen 127.0.0.1:0\nTraceEnable Extended\n"
+            "HttpdRsCapability Trace On\nListen 127.0.0.1:0\nTraceEnable Extended\n"
         )
         .is_ok());
     }
@@ -11859,7 +11859,7 @@ mod tests {
     #[test]
     fn mutable_authentication_databases_require_the_global_capability() {
         let auth_file =
-            std::env::temp_dir().join(format!("vapache-mutable-auth-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-mutable-auth-{}", std::process::id()));
         std::fs::write(&auth_file, "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n").unwrap();
         let body = format!(
             "Listen 127.0.0.1:0\n<Directory /srv>\nAuthType Basic\nAuthUserFile {}\nRequire valid-user\n</Directory>\n",
@@ -11869,7 +11869,7 @@ mod tests {
         let strict = load_text_default(&body).unwrap();
         assert!(strict.validate_auth_files(service_uid).is_err());
         let mutable = load_text_with_prelude(
-            "VapacheCapability MutableAuthFiles On\n",
+            "HttpdRsCapability MutableAuthFiles On\n",
             &body,
             false,
             false,
@@ -11886,21 +11886,21 @@ mod tests {
     fn fastcgi_requires_stable_paths_or_an_explicit_unsafe_capability() {
         let route =
             "Listen 127.0.0.1:0\nProxyPassMatch ^/(.*\\.php)$ unix:/run/php.sock|fcgi://localhost/srv/\n";
-        let errors = load_text_with_prelude("VapacheCapability FastCgi On\n", route, false, false)
+        let errors = load_text_with_prelude("HttpdRsCapability FastCgi On\n", route, false, false)
             .unwrap_err();
         assert!(errors.iter().any(|error| error
             .msg
-            .contains("VapacheCapability UnstableFastCgiPaths On")));
+            .contains("HttpdRsCapability UnstableFastCgiPaths On")));
 
         assert!(load_text_with_prelude(
-            "VapacheCapability FastCgi On\nVapacheCapability UnstableFastCgiPaths On\n",
+            "HttpdRsCapability FastCgi On\nHttpdRsCapability UnstableFastCgiPaths On\n",
             route,
             false,
             false,
         )
         .is_ok());
         assert!(load_text_with_prelude(
-            "VapacheCapability FastCgi On\nVapacheFastCGIStablePath On unix:/run/php.sock 33 0 0\n",
+            "HttpdRsCapability FastCgi On\nHttpdRsFastCGIStablePath On unix:/run/php.sock 33 0 0\n",
             route,
             false,
             false,
@@ -11919,7 +11919,7 @@ mod tests {
     #[test]
     fn configuration_and_types_files_reject_invalid_utf8() {
         let dir = std::env::temp_dir().join(format!(
-            "vapache-invalid-config-utf8-{}",
+            "httpd-rs-invalid-config-utf8-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -12116,7 +12116,7 @@ mod tests {
         scope
             .environment_policy
             .pass_env
-            .push(Originated::main("VAPACHE_TEST_MISSING_ENV".into()));
+            .push(Originated::main("HTTPD_RS_TEST_MISSING_ENV".into()));
         scope
             .environment_policy
             .unset_env
@@ -12131,13 +12131,13 @@ mod tests {
     fn coverable_directive_rejection_matrix_is_executed() {
         let oversized_glob = "x".repeat(crate::glob::MAX_PATTERN_BYTES + 1);
         let cases = [
-            ("VapacheCapability Cgi\n".to_string(), "capability arity"),
+            ("HttpdRsCapability Cgi\n".to_string(), "capability arity"),
             (
-                "VapacheMaxSpoolBytes 1 2\n".to_string(),
+                "HttpdRsMaxSpoolBytes 1 2\n".to_string(),
                 "resource-limit arity",
             ),
             (
-                "VapacheFastCGIStablePath On unix:/run/php/test.sock 33 0 nope\n".to_string(),
+                "HttpdRsFastCGIStablePath On unix:/run/php/test.sock 33 0 nope\n".to_string(),
                 "trusted FastCGI owner uid",
             ),
             (
@@ -12257,7 +12257,7 @@ mod tests {
     #[test]
     fn rewritemap_loading_fails_closed() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("vapache-rewritemap-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-rewritemap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("good.txt"), "alpha one\n# comment\n\nbeta two\n").unwrap();
@@ -12412,10 +12412,11 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
     #[test]
     fn missing_certbot_parent_validation_is_deferred_only_for_tls_bootstrap_inputs() {
         let cert = Path::new(
-            "/etc/letsencrypt/live/vapache-bootstrap-does-not-exist.invalid/fullchain.pem",
+            "/etc/letsencrypt/live/httpd-rs-bootstrap-does-not-exist.invalid/fullchain.pem",
         );
-        let key =
-            Path::new("/etc/letsencrypt/live/vapache-bootstrap-does-not-exist.invalid/privkey.pem");
+        let key = Path::new(
+            "/etc/letsencrypt/live/httpd-rs-bootstrap-does-not-exist.invalid/privkey.pem",
+        );
         let cfg = load_text(
             &format!(
                 "Listen 127.0.0.1:0\nSSLCertificateFile {}\nSSLCertificateKeyFile {}\n",
@@ -12428,10 +12429,10 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
         assert!(cfg.missing_certbot_bootstrap_input(cert));
         assert!(cfg.missing_certbot_bootstrap_input(key));
         assert!(!cfg.missing_certbot_bootstrap_input(Path::new(
-            "/etc/letsencrypt/live/vapache-bootstrap-does-not-exist.invalid/unrelated.pem"
+            "/etc/letsencrypt/live/httpd-rs-bootstrap-does-not-exist.invalid/unrelated.pem"
         )));
         assert!(!cfg.missing_certbot_bootstrap_input(Path::new(
-            "/tmp/vapache-bootstrap-does-not-exist.pem"
+            "/tmp/httpd-rs-bootstrap-does-not-exist.pem"
         )));
     }
 
@@ -13468,7 +13469,7 @@ SSLOptions +StrictRequire\n";
         }
 
         // Presentation and module directives are effectful too. Refuse to
-        // claim they were applied when Vapache has no implementation.
+        // claim they were applied when httpd-rs has no implementation.
         for directive in [
             "AddDescription \"x\" .txt",
             "UserDir public_html",
@@ -13768,7 +13769,7 @@ SSLOptions +StrictRequire\n";
 
     #[test]
     fn iffile_section_is_frozen_when_configuration_is_read() {
-        let file = std::env::temp_dir().join(format!("vapache-iffile-{}", std::process::id()));
+        let file = std::env::temp_dir().join(format!("httpd-rs-iffile-{}", std::process::id()));
         std::fs::write(&file, "x").unwrap();
         let cfg = format!(
             "Listen 127.0.0.1:0\n<IfFile \"{}\" >\nHeader set X-IfFile yes\n</IfFile>\n",
@@ -14452,7 +14453,7 @@ ServerName localhost\n\
         assert_eq!(mime.content_type(b"name.txt"), None);
         assert_eq!(mime.content_type(b"name.gz"), None);
 
-        let dir = std::env::temp_dir().join(format!("vapache-types-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-types-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let types = dir.join("mime.types");
@@ -14537,7 +14538,7 @@ ServerName localhost\n\
         scope
             .environment_policy
             .pass_env
-            .push(Originated::main("VAPACHE_TEST_ENV".into()));
+            .push(Originated::main("HTTPD_RS_TEST_ENV".into()));
         scope
             .environment_policy
             .unset_env
@@ -14546,7 +14547,7 @@ ServerName localhost\n\
             .environment_policy
             .set_env
             .push(Originated::main(("DROP".into(), "x".into())));
-        std::env::set_var("VAPACHE_TEST_ENV", "passed");
+        std::env::set_var("HTTPD_RS_TEST_ENV", "passed");
         let mut req = test_request("GET");
         req.target = b"/x?q=1".to_vec();
         req.headers.insert("content-type", b"text/plain".to_vec());
@@ -14556,15 +14557,15 @@ ServerName localhost\n\
         assert!(auth_env.contains(&("SERVER_REWRITE".into(), b"early".to_vec())));
         assert!(!auth_env.iter().any(|(k, _)| k == "DIRECTORY_REWRITE"));
         assert!(!auth_env.iter().any(|(k, _)| k == "BASE"));
-        assert!(!auth_env.iter().any(|(k, _)| k == "VAPACHE_TEST_ENV"));
+        assert!(!auth_env.iter().any(|(k, _)| k == "HTTPD_RS_TEST_ENV"));
         let env = scope.request_env(&req, "/x", peer);
         assert!(env.contains(&("HIT".into(), b"yes".to_vec())));
         assert!(env.contains(&("SERVER_REWRITE".into(), b"early".to_vec())));
         assert!(env.contains(&("DIRECTORY_REWRITE".into(), b"late".to_vec())));
         assert!(env.contains(&("BASE".into(), b"1".to_vec())));
-        assert!(env.contains(&("VAPACHE_TEST_ENV".into(), b"passed".to_vec())));
+        assert!(env.contains(&("HTTPD_RS_TEST_ENV".into(), b"passed".to_vec())));
         assert!(!env.iter().any(|(k, _)| k == "DROP"));
-        std::env::remove_var("VAPACHE_TEST_ENV");
+        std::env::remove_var("HTTPD_RS_TEST_ENV");
     }
 
     #[test]
@@ -14954,7 +14955,7 @@ ServerName localhost\n\
             Path::new("/srv/site/child")
         ));
 
-        let dir = std::env::temp_dir().join(format!("vapache-rule-path-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-rule-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("file"), "x").unwrap();
@@ -14988,7 +14989,7 @@ ServerName localhost\n\
             "file"
         ));
         assert!(rule_kind_matches(
-            &MatchKind::DirectoryMatch(compile_regex("vapache-rule-path").unwrap()),
+            &MatchKind::DirectoryMatch(compile_regex("httpd-rs-rule-path").unwrap()),
             &dir.join("file"),
             "/file",
             "file"
@@ -15157,7 +15158,7 @@ ServerName localhost\n\
     #[test]
     fn configuration_inputs_enforce_per_file_and_aggregate_limits() {
         let root =
-            std::env::temp_dir().join(format!("vapache-config-limits-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-config-limits-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let oversized = root.join("oversized.conf");
@@ -15184,7 +15185,7 @@ ServerName localhost\n\
     #[test]
     fn coverage_parser_state_and_sections() {
         let root =
-            std::env::temp_dir().join(format!("vapache-parser-state-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-parser-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let loc = SourceLoc {
@@ -15267,7 +15268,7 @@ ServerName localhost\n\
         assert_eq!(p.include_count, 5);
         let saved_root = p.server_root.clone();
         p.server_root = PathBuf::new();
-        p.include_pattern("*.vapache-none", true, &loc);
+        p.include_pattern("*.httpd-rs-none", true, &loc);
         p.include_pattern(&root.join("incdir").to_string_lossy(), true, &loc);
         p.server_root = saved_root;
         p.depth = 33;
@@ -15340,7 +15341,7 @@ ServerName localhost\n\
     #[test]
     fn empty_optional_include_parent_is_part_of_the_trust_manifest() {
         let root = std::env::temp_dir().join(format!(
-            "vapache-config-empty-include-{}",
+            "httpd-rs-config-empty-include-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -15424,11 +15425,11 @@ ServerName localhost\n\
         assert!(glob_match(b"*", b""));
         assert_eq!(
             section_kind_model(SectionKind::Require),
-            vapache_verified::ConfigSectionKind::Require
+            httpd_rs_verified::ConfigSectionKind::Require
         );
         assert_eq!(
             section_kind_model(SectionKind::Conditional),
-            vapache_verified::ConfigSectionKind::Conditional
+            httpd_rs_verified::ConfigSectionKind::Conditional
         );
         for section in [
             SectionKind::Server,
@@ -15816,7 +15817,7 @@ ServerName localhost\n\
 
     #[test]
     fn coverage_directive_matrix() {
-        let dir = std::env::temp_dir().join(format!("vapache-directives-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-directives-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -15941,7 +15942,7 @@ RewriteOptions Inherit\n"
         assert_eq!(c.server_name.as_deref(), Some("www.example.test"));
         assert_eq!(c.server_admin, "admin@example.test");
         assert_eq!(c.server_tokens, ServerTokens::Prod);
-        assert_eq!(c.server_software, "vapache");
+        assert_eq!(c.server_software, "httpd-rs");
         assert_eq!(c.server_signature, ServerSignature::Email);
         assert!(!c.trace_enable);
         assert_eq!(c.limit_request_line, 1000);
@@ -16177,7 +16178,7 @@ ServerName plain.test\n\
     #[test]
     fn coverage_directive_edge_paths() {
         let dir =
-            std::env::temp_dir().join(format!("vapache-directive-edges-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-directive-edges-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(dir.join("rel")).unwrap();
@@ -16305,10 +16306,10 @@ Require all granted\n\
             Some(ClientRevocationCheck::Leaf)
         );
 
-        let full = format!("vapache/{} (Linux)", crate::VERSION);
-        let minimal = format!("vapache/{}", crate::VERSION);
-        let minor = format!("vapache/{}", version_prefix(2));
-        let major = format!("vapache/{}", version_prefix(1));
+        let full = format!("httpd-rs/{} (Linux)", crate::VERSION);
+        let minimal = format!("httpd-rs/{}", crate::VERSION);
+        let minor = format!("httpd-rs/{}", version_prefix(2));
+        let major = format!("httpd-rs/{}", version_prefix(1));
         let defaults = load_text("Listen 127.0.0.1:0\n", false).unwrap();
         assert_eq!(defaults.server_tokens, ServerTokens::Full);
         assert_eq!(defaults.server_software, full);
@@ -16318,7 +16319,7 @@ Require all granted\n\
             ("Minimal", minimal.as_str()),
             ("Minor", minor.as_str()),
             ("Major", major.as_str()),
-            ("Prod", "vapache"),
+            ("Prod", "httpd-rs"),
         ] {
             let cfg = format!("Listen 127.0.0.1:0\nServerTokens {value}\n");
             let c = load_text(&cfg, false).unwrap();
@@ -17123,26 +17124,26 @@ fn authority_host(host: &str) -> &str {
 impl Config {
     /// Select the virtual host for a connection.  `host` is the Host header
     /// value (possibly with port), `port` the local listening port.
-    fn remoteip_proxy_class(&self, ip: IpAddr) -> vapache_verified::RemoteIpProxyClass {
+    fn remoteip_proxy_class(&self, ip: IpAddr) -> httpd_rs_verified::RemoteIpProxyClass {
         let ip = crate::access::canonical_ip(ip);
         self.remoteip_proxies
             .iter()
             .find(|proxy| crate::access::ip_in_net(ip, proxy.network, proxy.bits))
             .map(|proxy| {
                 if proxy.internal {
-                    vapache_verified::RemoteIpProxyClass::Internal
+                    httpd_rs_verified::RemoteIpProxyClass::Internal
                 } else {
-                    vapache_verified::RemoteIpProxyClass::Trusted
+                    httpd_rs_verified::RemoteIpProxyClass::Trusted
                 }
             })
-            .unwrap_or(vapache_verified::RemoteIpProxyClass::Untrusted)
+            .unwrap_or(httpd_rs_verified::RemoteIpProxyClass::Untrusted)
     }
 
     /// Transport peers explicitly trusted to present RemoteIP identities are
     /// gateways for many clients, not one client for fairness accounting.
     pub fn transport_peer_is_trusted_proxy(&self, ip: IpAddr) -> bool {
         self.remoteip_header.is_some()
-            && self.remoteip_proxy_class(ip) != vapache_verified::RemoteIpProxyClass::Untrusted
+            && self.remoteip_proxy_class(ip) != httpd_rs_verified::RemoteIpProxyClass::Untrusted
     }
 
     /// Apache 2.4.69's exact external-chain address rule from
@@ -17164,7 +17165,7 @@ impl Config {
 
     /// Apply Apache `mod_remoteip` client-address rewriting. The immediate
     /// peer must be configured as an internal or trusted proxy; this retains
-    /// vapache's fail-closed behavior for `RemoteIPHeader` without a trust
+    /// httpd-rs's fail-closed behavior for `RemoteIPHeader` without a trust
     /// list while matching Apache once a list is present.
     pub fn client_addr(
         &self,
@@ -17920,7 +17921,7 @@ impl Config {
             .unwrap_or_default();
         let mut conditionals = Vec::new();
         for rule in rules {
-            if !vapache_verified::url_translation_rule_admit(
+            if !httpd_rs_verified::url_translation_rule_admit(
                 verified_config_rule_kind(&rule.kind),
                 rule_is_conditional(rule),
             ) {
@@ -18705,7 +18706,7 @@ mod pass11_kernel_tests {
         static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let fixture = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("vapache-pass11-{}-{fixture}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-pass11-{}-{fixture}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
         std::fs::write(&path, format!("{}{text}", TEST_CAPABILITIES)).unwrap();
@@ -18715,7 +18716,7 @@ mod pass11_kernel_tests {
     #[test]
     fn fastcgi_stable_path_policy_is_explicit_global_and_fail_closed() {
         let cfg = load_text_direct(
-            "Listen 127.0.0.1:0\nVapacheFastCGIStablePath On unix:/run/php/a.sock 33 0 0 1001 0\nVapacheFastCGIStablePath On unix:/run/php/b.sock 34 0 0\n",
+            "Listen 127.0.0.1:0\nHttpdRsFastCGIStablePath On unix:/run/php/a.sock 33 0 0 1001 0\nHttpdRsFastCGIStablePath On unix:/run/php/b.sock 34 0 0\n",
         );
         assert_eq!(
             cfg.fastcgi_stable_paths,
@@ -18735,27 +18736,27 @@ mod pass11_kernel_tests {
             ])
         );
         let cfg = load_text_direct(
-            "Listen 127.0.0.1:0\nVapacheFastCGIStablePath On unix:/run/php/a.sock 33 0 0\nVapacheFastCGIStablePath Off\n",
+            "Listen 127.0.0.1:0\nHttpdRsFastCGIStablePath On unix:/run/php/a.sock 33 0 0\nHttpdRsFastCGIStablePath Off\n",
         );
         assert_eq!(cfg.fastcgi_stable_paths, None);
 
         let dir = std::env::temp_dir().join(format!(
-            "vapache-fastcgi-stable-config-{}",
+            "httpd-rs-fastcgi-stable-config-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for (i, text) in [
-            "VapacheFastCGIStablePath On unix:/run/php/a.sock 0 0 0\n",
-            "VapacheFastCGIStablePath On unix:/run/php/a.sock nope 0 0\n",
-            "VapacheFastCGIStablePath On unix:relative.sock 33 0 0\n",
-            "VapacheFastCGIStablePath On unix:/run/php/a.sock 33 - 0\n",
-            "VapacheFastCGIStablePath On fcgi://127.0.0.1:9000 33 - 0\n",
-            "VapacheFastCGIStablePath On fcgi://127.0.0.1:9000 33 0 0\n",
-            "VapacheFastCGIStablePath On unix:/run/php/a.sock 33 0 0\nVapacheFastCGIStablePath On unix:/run/php/a.sock 34 0 0\n",
-            "VapacheFastCGIStablePath Off 33\n",
-            "<Directory /srv>\nVapacheFastCGIStablePath On unix:/run/php/a.sock 33 0 0\n</Directory>\n",
-            "<VirtualHost *:80>\nVapacheFastCGIStablePath On unix:/run/php/a.sock 33 0 0\n</VirtualHost>\n",
+            "HttpdRsFastCGIStablePath On unix:/run/php/a.sock 0 0 0\n",
+            "HttpdRsFastCGIStablePath On unix:/run/php/a.sock nope 0 0\n",
+            "HttpdRsFastCGIStablePath On unix:relative.sock 33 0 0\n",
+            "HttpdRsFastCGIStablePath On unix:/run/php/a.sock 33 - 0\n",
+            "HttpdRsFastCGIStablePath On fcgi://127.0.0.1:9000 33 - 0\n",
+            "HttpdRsFastCGIStablePath On fcgi://127.0.0.1:9000 33 0 0\n",
+            "HttpdRsFastCGIStablePath On unix:/run/php/a.sock 33 0 0\nHttpdRsFastCGIStablePath On unix:/run/php/a.sock 34 0 0\n",
+            "HttpdRsFastCGIStablePath Off 33\n",
+            "<Directory /srv>\nHttpdRsFastCGIStablePath On unix:/run/php/a.sock 33 0 0\n</Directory>\n",
+            "<VirtualHost *:80>\nHttpdRsFastCGIStablePath On unix:/run/php/a.sock 33 0 0\n</VirtualHost>\n",
         ]
         .into_iter()
         .enumerate()
@@ -18773,20 +18774,20 @@ mod pass11_kernel_tests {
     #[test]
     fn aggregate_resource_limits_are_positive_and_global() {
         let cfg = load_text_direct(
-            "Listen 127.0.0.1:0\nVapacheMaxSpoolBytes 4096\nVapacheMaxSpoolFiles 3\nVapacheMaxDynamicRequests 2\nVapacheMaxFastCGIOutput 1024\n",
+            "Listen 127.0.0.1:0\nHttpdRsMaxSpoolBytes 4096\nHttpdRsMaxSpoolFiles 3\nHttpdRsMaxDynamicRequests 2\nHttpdRsMaxFastCGIOutput 1024\n",
         );
         assert_eq!(cfg.max_spool_bytes, 4096);
         assert_eq!(cfg.max_spool_files, 3);
         assert_eq!(cfg.max_dynamic_requests, 2);
         assert_eq!(cfg.max_fastcgi_output, 1024);
         for text in [
-            "VapacheMaxSpoolBytes 0\n",
-            "VapacheMaxSpoolFiles nope\n",
-            "VapacheMaxDynamicRequests 1 2\n",
-            "<VirtualHost *:80>\nVapacheMaxFastCGIOutput 1\n</VirtualHost>\n",
+            "HttpdRsMaxSpoolBytes 0\n",
+            "HttpdRsMaxSpoolFiles nope\n",
+            "HttpdRsMaxDynamicRequests 1 2\n",
+            "<VirtualHost *:80>\nHttpdRsMaxFastCGIOutput 1\n</VirtualHost>\n",
         ] {
             let dir = std::env::temp_dir()
-                .join(format!("vapache-resource-config-{}", std::process::id()));
+                .join(format!("httpd-rs-resource-config-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("invalid.conf");
@@ -18813,7 +18814,7 @@ mod pass11_kernel_tests {
             ),
         ] {
             let dir = std::env::temp_dir().join(format!(
-                "vapache-worker-ceiling-{}-{}",
+                "httpd-rs-worker-ceiling-{}-{}",
                 std::process::id(),
                 text.len()
             ));

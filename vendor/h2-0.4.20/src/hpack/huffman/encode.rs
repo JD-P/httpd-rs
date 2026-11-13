@@ -3,7 +3,7 @@ use crate::hpack::huffman::table::{ENCODE_CODES, ENCODE_CODE_LENGTHS};
 use bytes::{BufMut, BytesMut};
 
 pub fn encoded_len(src: &[u8]) -> usize {
-    vapache_verified::hpack_huffman_encoded_len(src, &ENCODE_CODE_LENGTHS)
+    httpd_rs_verified::hpack_huffman_encoded_len(src, &ENCODE_CODE_LENGTHS)
         // Overflow means the Huffman representation cannot be materialized;
         // the caller treats this sentinel as a request to emit raw bytes.
         .unwrap_or(usize::MAX)

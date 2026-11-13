@@ -1,0 +1,339 @@
+#!/bin/sh -p
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV
+case "$0" in
+    /usr/sbin/*)
+        httpd_rsctl_common=/usr/lib/httpd-rs/control-common
+        if [ -L "$httpd_rsctl_common" ] || [ ! -f "$httpd_rsctl_common" ] \
+            || [ "$(stat -c '%u' -- "$httpd_rsctl_common")" != 0 ] \
+            || [ -n "$(find "$httpd_rsctl_common" -maxdepth 0 -perm /022 -print -quit)" ]; then
+            echo "httpd-rsctl: unsafe installed control library" >&2
+            exit 1
+        fi
+        ;;
+    *)
+    case "$0" in
+        */*) httpd_rsctl_script_dir=${0%/*} ;;
+        *) httpd_rsctl_script_dir=. ;;
+    esac
+        httpd_rsctl_common=$httpd_rsctl_script_dir/httpd-rs-control-common
+        ;;
+esac
+. "$httpd_rsctl_common"
+
+httpd_rsctl_die() {
+    echo "httpd-rsctl: $*" >&2
+    exit 1
+}
+
+staging=
+temporary=
+httpd_rsctl_cleanup() {
+    httpd_rsctl_cleanup_status=$?
+    if [ -n "$temporary" ]; then
+        rm -f -- "$temporary"
+    fi
+    if [ -n "$staging" ]; then
+        rm -rf --one-file-system -- "$staging"
+    fi
+    return "$httpd_rsctl_cleanup_status"
+}
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap httpd_rsctl_cleanup EXIT
+
+find_configuration() {
+    if [ -n "${HTTPD_RS_CONFIG:-}" ]; then
+        if [ -z "${HTTPD_RS_CONFDIR:-}" ]; then
+            echo "httpd-rsctl: HTTPD_RS_CONFDIR is required with HTTPD_RS_CONFIG" >&2
+            exit 1
+        fi
+        server_root=$HTTPD_RS_CONFDIR
+        config_file=$HTTPD_RS_CONFIG
+    elif [ -n "${HTTPD_RS_CONFDIR:-}" ]; then
+        server_root=$HTTPD_RS_CONFDIR
+        if [ -r "$server_root/apache2.conf" ]; then
+            config_file=$server_root/apache2.conf
+        elif [ -r "$server_root/conf/httpd.conf" ]; then
+            config_file=$server_root/conf/httpd.conf
+        else
+            echo "httpd-rsctl: no Apache configuration below $server_root" >&2
+            exit 1
+        fi
+    elif [ -r /etc/apache2/apache2.conf ]; then
+        server_root=/etc/apache2
+        config_file=/etc/apache2/apache2.conf
+    elif [ -r /etc/httpd/conf/httpd.conf ]; then
+        server_root=/etc/httpd
+        config_file=/etc/httpd/conf/httpd.conf
+    else
+        echo "httpd-rsctl: no Apache configuration found" >&2
+        echo "set HTTPD_RS_CONFDIR and HTTPD_RS_CONFIG to select one explicitly" >&2
+        exit 1
+    fi
+}
+
+command=${1:-start}
+case "$command" in
+    help|-h|--help)
+        cat <<'EOF'
+Usage: httpd-rsctl [start|stop|restart|graceful|graceful-stop|status|configtest|foreground]
+
+The existing Apache configuration is selected in this order:
+  1. HTTPD_RS_CONFDIR and HTTPD_RS_CONFIG
+  2. HTTPD_RS_CONFDIR with apache2.conf or conf/httpd.conf below it
+  3. /etc/apache2/apache2.conf
+  4. /etc/httpd/conf/httpd.conf
+
+The packaged wrapper materializes Apache's enabled-config symlinks in a
+root-controlled snapshot under /run, then derives missing HttpdRsCapability
+declarations there. It never edits the Apache configuration. Set
+HTTPD_RS_AUTO_CAPABILITIES=0 to require declarations in the source config.
+EOF
+        exit 0
+        ;;
+esac
+
+find_configuration
+daemon=$(httpd_rs_validate_command "${HTTPD_RS:-/usr/sbin/httpd-rs}" httpd-rs) \
+    || httpd_rsctl_die "httpd-rs must be an unsymlinked, controlled executable named httpd-rs"
+snapshot_active=0
+snapshot_requested=0
+compatibility_directives=
+case "${HTTPD_RS_AUTO_CAPABILITIES:-1}" in
+    0|1) ;;
+    *) httpd_rsctl_die "HTTPD_RS_AUTO_CAPABILITIES must be 0 or 1" ;;
+esac
+if [ "$server_root" = /etc/httpd ]; then
+    # RHEL's httpd build supplies this as a compiled-in default rather than a
+    # directive in httpd.conf. httpd-rs's raw default follows Debian instead.
+    compatibility_directives='PidFile /run/httpd/httpd.pid'
+fi
+
+normalize_and_validate_configuration() {
+    case "$server_root" in
+        /*) ;;
+        *) httpd_rsctl_die "HTTPD_RS_CONFDIR must be an absolute path" ;;
+    esac
+    [ "$server_root" != / ] || httpd_rsctl_die "refusing to use / as HTTPD_RS_CONFDIR"
+    server_root=$(httpd_rs_canonical_unsymlinked "$server_root") \
+        || httpd_rsctl_die "HTTPD_RS_CONFDIR must be an existing unsymlinked canonical directory"
+    [ -d "$server_root" ] || httpd_rsctl_die "HTTPD_RS_CONFDIR is not a directory: $server_root"
+
+    case "$config_file" in
+        /*) ;;
+        *) config_file=$server_root/$config_file ;;
+    esac
+    config_file=$(httpd_rs_canonical_unsymlinked "$config_file") \
+        || httpd_rsctl_die "configuration must be an existing unsymlinked canonical file"
+    [ -f "$config_file" ] || httpd_rsctl_die "configuration is not a regular file: $config_file"
+    case "$config_file" in
+        "$server_root"/*) relative_config=${config_file#"$server_root"/} ;;
+        *) httpd_rsctl_die "configuration must be below HTTPD_RS_CONFDIR" ;;
+    esac
+
+    case "${HTTPD_RS_SNAPSHOT_CONFIG:-auto}" in
+        0) snapshot_requested=0 ;;
+        1) snapshot_requested=1 ;;
+        auto)
+            if [ -d "$server_root/mods-enabled" ] \
+                || [ -d "$server_root/conf-enabled" ] \
+                || [ -d "$server_root/sites-enabled" ]; then
+                snapshot_requested=1
+            fi
+            ;;
+        *) httpd_rsctl_die "HTTPD_RS_SNAPSHOT_CONFIG must be auto, 0, or 1" ;;
+    esac
+
+    configuration_owner=$(id -u)
+    httpd_rs_path_is_controlled "$server_root" \
+        || httpd_rsctl_die "configuration root or an ancestor is not caller-controlled: $server_root"
+    httpd_rs_path_is_controlled "$config_file" \
+        || httpd_rsctl_die "configuration file is not caller-controlled: $config_file"
+    [ "$snapshot_requested" -eq 1 ] || return 0
+
+    # Prove every link is contained before using find -L below; otherwise an
+    # administrative link to /proc or a large mount could expand the audit
+    # outside the selected tree before containment was checked.
+    if ! find "$server_root" -type l -exec sh -c '
+        root=$1
+        shift
+        for link do
+            target=$(readlink -e -- "$link") || exit 1
+            case "$target" in
+                "$root"/*) ;;
+                *)
+                    echo "httpd-rsctl: configuration symlink escapes $root: $link" >&2
+                    exit 1
+                    ;;
+            esac
+        done
+    ' sh "$server_root" {} +; then
+        exit 1
+    fi
+    unsafe=$(find -L "$server_root" \( -type d -o -type f \) \
+        \( \( ! -uid "$configuration_owner" -a ! -uid 0 \) -o -perm /022 \) \
+        -print -quit)
+    if [ -n "$unsafe" ]; then
+        httpd_rsctl_die "Apache configuration is not caller-controlled: $unsafe"
+    fi
+    if ! special=$(find -L "$server_root" ! \( -type d -o -type f \) -print -quit); then
+        httpd_rsctl_die "could not inspect the complete Apache configuration tree"
+    fi
+    if [ -n "$special" ]; then
+        httpd_rsctl_die "Apache configuration contains a special or dangling file: $special"
+    fi
+}
+
+normalize_and_validate_configuration
+
+runtime_dir=${HTTPD_RS_RUNTIME_DIR:-/run/httpd-rs}
+httpd_rs_ensure_runtime_dir "$runtime_dir" \
+    || httpd_rsctl_die "runtime directory must be canonical, controlled, and unsymlinked: $runtime_dir"
+runtime_dir=$(httpd_rs_canonical_unsymlinked "$runtime_dir")
+control_lock=$runtime_dir/control.lock
+httpd_rs_lock_file_is_safe "$control_lock" \
+    || httpd_rsctl_die "unsafe control lock: $control_lock"
+exec 9>"$control_lock"
+chmod 0600 "$control_lock"
+httpd_rs_lock_file_is_safe "$control_lock" \
+    || httpd_rsctl_die "could not secure control lock: $control_lock"
+flock -x 9
+
+snapshot_configuration() {
+    [ "$snapshot_requested" -eq 1 ] || return 0
+
+    staging=$(mktemp -d "$runtime_dir/.apache-config.XXXXXX")
+    if ! cp -RL -- "$server_root/." "$staging/"; then
+        exit 1
+    fi
+    # The daemon loads this snapshot once as root, then must traverse it again
+    # after dropping privileges for a graceful reload. Keep it root-owned and
+    # non-writable while allowing the service identity to reach readable
+    # configuration files below it.
+    chmod 0755 "$staging"
+    chmod -R go-w "$staging"
+    if [ ! -f "$staging/$relative_config" ]; then
+        echo "httpd-rsctl: configuration snapshot is missing $relative_config" >&2
+        exit 1
+    fi
+
+    mirror=$runtime_dir/apache-config
+    previous=$runtime_dir/.apache-config.previous
+    rm -rf --one-file-system -- "$previous"
+    had_previous=0
+    if [ -e "$mirror" ] || [ -L "$mirror" ]; then
+        if [ -L "$mirror" ] || [ ! -d "$mirror" ]; then
+            httpd_rsctl_die "unsafe existing configuration snapshot: $mirror"
+        fi
+        mv -- "$mirror" "$previous"
+        had_previous=1
+    fi
+    if ! mv -- "$staging" "$mirror"; then
+        if [ "$had_previous" -eq 1 ]; then
+            mv -- "$previous" "$mirror"
+        fi
+        exit 1
+    fi
+    staging=
+    rm -rf --one-file-system -- "$previous"
+
+    server_root=$mirror
+    config_file=$mirror/$relative_config
+    snapshot_active=1
+}
+
+snapshot_configuration
+
+prepare_runtime_configuration() {
+    capabilities=
+    if [ "${HTTPD_RS_AUTO_CAPABILITIES:-1}" != 0 ]; then
+        audit_output=$(
+            "$daemon" -d "$server_root" -f "$config_file" --audit-capabilities
+        )
+        capabilities=$(
+            printf '%s\n' "$audit_output" \
+                | sed -n 's/^[[:space:]]*\(HttpdRsCapability [A-Za-z][A-Za-z0-9]* On\)$/\1/p' \
+                | sort -u
+        )
+    fi
+    [ -n "$capabilities$compatibility_directives" ] || return 0
+
+    case "$config_file" in
+        *\"*|*\\*)
+            echo "httpd-rsctl: Apache configuration path contains an unsupported quote or backslash" >&2
+            exit 1
+            ;;
+    esac
+
+    if [ "$snapshot_active" -eq 1 ]; then
+        generated=$server_root/.httpd-rs-capabilities.conf
+        temporary=$(mktemp "$server_root/.httpd-rs-capabilities.XXXXXX")
+    else
+        generated=$runtime_dir/apache-capabilities.conf
+        temporary=$(mktemp "$runtime_dir/.apache-capabilities.XXXXXX")
+    fi
+    if ! {
+        printf '# Generated by httpd-rsctl; the Apache configuration is not modified.\n'
+        if [ -n "$compatibility_directives" ]; then
+            printf '%s\n' "$compatibility_directives"
+        fi
+        printf '%s\n' "$capabilities"
+        printf 'Include "%s"\n' "$config_file"
+    } >"$temporary"; then
+        rm -f -- "$temporary"
+        exit 1
+    fi
+    chmod 0644 "$temporary"
+    mv -f -- "$temporary" "$generated"
+    temporary=
+    config_file=$generated
+
+    if [ -n "$capabilities" ]; then
+        echo "httpd-rsctl: enabling capabilities requested by the Apache configuration:" >&2
+        printf '  %s\n' "$capabilities" >&2
+    fi
+}
+
+prepare_runtime_configuration
+
+case "$command" in
+    configtest)
+        shift || true
+        set -- -t "$@"
+        ;;
+    foreground)
+        shift || true
+        set -- -DFOREGROUND "$@"
+        ;;
+    restart)
+        # httpd-rs reloads configuration and listeners on SIGHUP.
+        shift || true
+        set -- -k graceful "$@"
+        ;;
+    start|stop|graceful|graceful-stop|status)
+        shift || true
+        set -- -k "$command" "$@"
+        ;;
+    *)
+        # Preserve httpd-rs's native command-line interface.
+        ;;
+esac
+
+if [ "$command" = foreground ]; then
+    flock -u 9
+    exec 9>&-
+    exec "$daemon" -d "$server_root" -f "$config_file" "$@"
+fi
+
+set +e
+"$daemon" -d "$server_root" -f "$config_file" "$@"
+httpd_rsctl_status=$?
+set -e
+flock -u 9
+exec 9>&-
+exit "$httpd_rsctl_status"

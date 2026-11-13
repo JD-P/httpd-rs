@@ -97,7 +97,7 @@ pub(super) struct Counts {
     /// distinguish a genuinely closed stream from a skipped lower ID. Without
     /// this, both cases collapse into `id < next_id` even though RFC 9113
     /// requires STREAM_CLOSED for the former and PROTOCOL_ERROR for the latter.
-    forgotten: VecDeque<(StreamId, vapache_verified::H2PeerStreamPhase)>,
+    forgotten: VecDeque<(StreamId, httpd_rs_verified::H2PeerStreamPhase)>,
     max_forgotten: usize,
 }
 
@@ -131,7 +131,7 @@ impl Counts {
     pub fn forgotten_phase(
         &self,
         id: StreamId,
-    ) -> Option<vapache_verified::H2PeerStreamPhase> {
+    ) -> Option<httpd_rs_verified::H2PeerStreamPhase> {
         self.forgotten
             .iter()
             .rev()
@@ -142,9 +142,9 @@ impl Counts {
         let phase = stream.state.peer_recv_phase();
         debug_assert!(matches!(
             phase,
-            vapache_verified::H2PeerStreamPhase::ClosedRemoteReset
-                | vapache_verified::H2PeerStreamPhase::ClosedEndStream
-                | vapache_verified::H2PeerStreamPhase::ClosedLocalReset
+            httpd_rs_verified::H2PeerStreamPhase::ClosedRemoteReset
+                | httpd_rs_verified::H2PeerStreamPhase::ClosedEndStream
+                | httpd_rs_verified::H2PeerStreamPhase::ClosedLocalReset
         ));
         if self.forgotten.len() == self.max_forgotten {
             self.forgotten.pop_front();

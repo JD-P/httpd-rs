@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Differential cache-hit benchmark: vapached vs. Apache mod_cache.
+"""Differential cache-hit benchmark: httpd-rs vs. Apache mod_cache.
 
 Both servers serve the same tree, warm the same `/cached/` entries, and are
 verified to return a cache HIT before timing.  The harness also measures a
 non-cached static file as the per-request baseline.
 
 Usage:
-    cargo build --release -p vapached
+    cargo build --release -p httpd-rs
     python3 bench/cache_bench.py --quick
     python3 bench/cache_bench.py
 
@@ -31,9 +31,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench"
-RUN = Path("/tmp/vapache-cache-bench")
+RUN = Path("/tmp/httpd-rs-cache-bench")
 APACHE = shutil.which("apache2") or "/usr/sbin/apache2"
-VAPACHED = ROOT / "target" / "release" / "vapached"
+HTTPD_RS = ROOT / "target" / "release" / "httpd-rs"
 WRK = shutil.which("wrk")
 MODULES = Path("/usr/lib/apache2/modules")
 
@@ -59,7 +59,7 @@ def make_tree() -> None:
         os.chmod(path, 0o644 if path.is_file() else 0o755)
     os.chmod(www, 0o755)
     os.chmod(RUN / "logs", 0o777)
-    for name in ("apache", "vapache", "apache-cache", "vapache-cache"):
+    for name in ("apache", "httpd-rs", "apache-cache", "httpd-rs-cache"):
         (RUN / name).mkdir()
         os.chmod(RUN / name, 0o777)
 
@@ -118,16 +118,16 @@ def apache_config(port: int) -> Path:
         modules
         + "\n"
         + common_server_config(port, RUN / "apache", RUN / "apache-cache")
-        + '<Directory "/tmp/vapache-cache-bench/www">\n'
+        + '<Directory "/tmp/httpd-rs-cache-bench/www">\n'
         + '    Header set Cache-Control "max-age=600"\n'
         + "</Directory>\n"
     )
     return path
 
 
-def vapache_config(port: int) -> Path:
-    path = RUN / f"vapache-{port}.conf"
-    path.write_text(common_server_config(port, RUN, RUN / "vapache-cache"))
+def httpd_rs_config(port: int) -> Path:
+    path = RUN / f"httpd-rs-{port}.conf"
+    path.write_text(common_server_config(port, RUN, RUN / "httpd-rs-cache"))
     return path
 
 
@@ -239,8 +239,8 @@ def main() -> None:
 
     if not WRK:
         raise SystemExit("wrk is required")
-    if not VAPACHED.exists():
-        raise SystemExit(f"{VAPACHED} missing; run cargo build --release first")
+    if not HTTPD_RS.exists():
+        raise SystemExit(f"{HTTPD_RS} missing; run cargo build --release first")
     if not APACHE or not MODULES.exists():
         raise SystemExit("apache2 and its module directory are required")
 
@@ -254,9 +254,9 @@ def main() -> None:
         [APACHE, "-f", str(apache_config(AP_PORT)), "-DFOREGROUND"],
         RUN / "logs" / "apache.out",
     )
-    vapache, vapache_log = start(
-        [str(VAPACHED), "-f", str(vapache_config(VP_PORT)), "-DFOREGROUND"],
-        RUN / "logs" / "vapache.out",
+    httpd_rs, httpd_rs_log = start(
+        [str(HTTPD_RS), "-f", str(httpd_rs_config(VP_PORT)), "-DFOREGROUND"],
+        RUN / "logs" / "httpd-rs.out",
     )
     results = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -268,7 +268,7 @@ def main() -> None:
     try:
         if not wait_port(AP_PORT) or not wait_port(VP_PORT):
             print((RUN / "logs" / "apache.out").read_text()[-4000:])
-            print((RUN / "logs" / "vapache.out").read_text()[-4000:])
+            print((RUN / "logs" / "httpd-rs.out").read_text()[-4000:])
             raise SystemExit("server failed to start")
 
         print(
@@ -283,7 +283,7 @@ def main() -> None:
                 "concurrency": concurrency,
                 "servers": {},
             }
-            for server, port in (("apache", AP_PORT), ("vapache", VP_PORT)):
+            for server, port in (("apache", AP_PORT), ("httpd-rs", VP_PORT)):
                 if cached:
                     warm_cache(port, path, f"{server} {label}")
                 url = f"http://127.0.0.1:{port}{path}"
@@ -302,9 +302,9 @@ def main() -> None:
                 if best["raw"]:
                     print(f"  !! {server} {label}:\n{best['raw'][-1500:]}")
             apache_rps = row["servers"]["apache"]["rps"] or 0
-            vapache_rps = row["servers"]["vapache"]["rps"] or 0
-            row["ratio"] = vapache_rps / apache_rps if apache_rps else None
-            print(f"{'  vapache/apache ratio':24} {'':9} {row['ratio'] or 0:10.2f}x")
+            httpd_rs_rps = row["servers"]["httpd-rs"]["rps"] or 0
+            row["ratio"] = httpd_rs_rps / apache_rps if apache_rps else None
+            print(f"{'  httpd-rs/apache ratio':24} {'':9} {row['ratio'] or 0:10.2f}x")
             results["scenarios"].append(row)
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -314,26 +314,26 @@ def main() -> None:
         )
         lines = [
             f"\n## {results['timestamp']}\n",
-            "| scenario | Apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |",
+            "| scenario | Apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |",
             "|---|---:|---:|---:|---:|---:|",
         ]
         for row in results["scenarios"]:
             apache_rps = row["servers"]["apache"]["rps"] or 0
-            vapache_rps = row["servers"]["vapache"]["rps"] or 0
+            httpd_rs_rps = row["servers"]["httpd-rs"]["rps"] or 0
             lines.append(
-                f"| {row['name']} | {apache_rps:.0f} | {vapache_rps:.0f} | "
+                f"| {row['name']} | {apache_rps:.0f} | {httpd_rs_rps:.0f} | "
                 f"{row['ratio'] or 0:.2f}x | "
-                f"{row['servers']['vapache']['mean_ms'] or 0:.2f} | "
-                f"{row['servers']['vapache']['p99_ms'] or 0:.1f} |"
+                f"{row['servers']['httpd-rs']['mean_ms'] or 0:.2f} | "
+                f"{row['servers']['httpd-rs']['p99_ms'] or 0:.1f} |"
             )
         with open(BENCH / "CACHE_RESULTS.md", "a") as handle:
             handle.write("\n".join(lines) + "\n")
         print(f"\nresults: {BENCH / 'results' / f'cache-{stamp}.json'}")
     finally:
-        stop(vapache)
+        stop(httpd_rs)
         stop(apache)
         apache_log.close()
-        vapache_log.close()
+        httpd_rs_log.close()
 
 
 if __name__ == "__main__":

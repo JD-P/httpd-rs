@@ -5,14 +5,14 @@ id = "DOC-MIGRATE-STATIC-001"
 kind = "runtime"
 document = "docs/tutorials/migrate-debian-static-site.md"
 example = "docs/examples/migrate-debian-static-site/vhost.conf"
-evidence = "Vapache runtime test and existing Apache differential test"
+evidence = "httpd-rs runtime test and existing Apache differential test"
 apache_test = "tests/conformance.py:Conformance.test_post_static"
 
 [[contract.request]]
 method = "GET"
 path = "/"
 status = 200
-body = "Vapache documentation example\n"
+body = "httpd-rs documentation example\n"
 
 [[contract.request]]
 method = "GET"
@@ -31,8 +31,8 @@ id = "DOC-CAPABILITY-AUDIT-001"
 kind = "capability-audit"
 document = "docs/how-to/assess-apache-configuration.md"
 example = "docs/examples/compatibility/capability-cgi.conf"
-evidence = "Vapache command-line behavior"
-output = "VapacheCapability Cgi On"
+evidence = "httpd-rs command-line behavior"
+output = "HttpdRsCapability Cgi On"
 
 [[contract]]
 id = "DOC-UNSUPPORTED-POLICY-001"
@@ -54,8 +54,8 @@ evidence_paths = [
 ]
 evidence_markers = [
     "tests/certbot_apache_integration.sh::sudo certbot certonly --standalone -d example.test",
-    "tests/certbot_apache_shim.sh::SHIM_TEST_VAPACHE_ACTIVE=1 VAPACHE_CERTBOT_TARGET=auto run_shim graceful",
-    ".github/workflows/artifacts.yml::tests/certbot_apache_integration.sh release/vapache_*.deb",
+    "tests/certbot_apache_shim.sh::SHIM_TEST_HTTPD_RS_ACTIVE=1 HTTPD_RS_CERTBOT_TARGET=auto run_shim graceful",
+    ".github/workflows/artifacts.yml::tests/certbot_apache_integration.sh release/httpd-rs_*.deb",
 ]
 
 [[contract]]
@@ -98,19 +98,19 @@ scenarios = ["wagtail-proxy", "minio-proxy", "mastodon-proxy"]
 [[contract]]
 id = "DOC-HOWTO-SERVICE-001"
 kind = "evidence"
-document = "docs/how-to/operate-vapache-service.md"
+document = "docs/how-to/operate-httpd-rs-service.md"
 evidence = "Packaged systemd control and reload behavior"
 evidence_paths = [
-    "tests/vapachectl_reload.sh",
+    "tests/httpd-rsctl_reload.sh",
     "tests/control_plane_security.sh",
-    "packaging/vapache.service",
+    "packaging/httpd-rs.service",
     "crates/server/tests/cli_lifecycle.rs",
     "crates/server/src/config.rs",
 ]
 evidence_markers = [
-    "tests/vapachectl_reload.sh::run_control graceful",
+    "tests/httpd-rsctl_reload.sh::run_control graceful",
     "tests/control_plane_security.sh::deploy hook accepted a command below an untrusted ancestor",
-    "packaging/vapache.service::ExecReload=/usr/sbin/vapachectl graceful",
+    "packaging/httpd-rs.service::ExecReload=/usr/sbin/httpd-rsctl graceful",
     "crates/server/tests/cli_lifecycle.rs::fn foreground_reload_reopen_bind_and_actions()",
     "crates/server/src/config.rs::pub fn validate_reload_from(&self, previous: &Config)",
 ]
@@ -149,11 +149,11 @@ document = "docs/how-to/roll-back-to-apache.md"
 evidence = "Packaged switch interruption and service restoration behavior"
 evidence_paths = [
     "tests/certbot_apache_integration.sh",
-    "packaging/vapache-switch",
+    "packaging/httpd-rs-switch",
 ]
 evidence_markers = [
     "tests/certbot_apache_integration.sh::restore Apache's exact prior",
-    "packaging/vapache-switch::restore_switch_state()",
+    "packaging/httpd-rs-switch::restore_switch_state()",
 ]
 
 [[contract]]

@@ -19,7 +19,7 @@ def main():
     # Release-mode property/fault tests exercise long malformed byte streams,
     # regex expressions and every read split without debug-build noise.
     command = [
-        "cargo", "test", "--release", "-p", "vapached",
+        "cargo", "test", "--release", "-p", "httpd-rs",
         "--test", "properties", "--test", "fault_injection",
     ]
     # Compile outside the time budget so a cold CI cache cannot look like an

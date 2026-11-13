@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Feature-level differential benchmark: vapached vs. Apache httpd.
+"""Feature-level differential benchmark: httpd-rs vs. Apache httpd.
 
 Unlike bench.py (which measures only static-file throughput), this harness
 reuses the Apache-conformance fixture tree and configuration so that each
@@ -37,9 +37,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench"
-RUN = Path("/tmp/vapache-feature-bench")
+RUN = Path("/tmp/httpd-rs-feature-bench")
 APACHE = shutil.which("apache2") or "/usr/sbin/apache2"
-VAPACHED = ROOT / "target" / "release" / "vapached"
+HTTPD_RS = ROOT / "target" / "release" / "httpd-rs"
 WRK = shutil.which("wrk")
 AB = shutil.which("ab")
 H2LOAD = shutil.which("h2load")
@@ -116,7 +116,7 @@ SCENARIOS = [
 
 def load_conformance():
     path = ROOT / "tests" / "conformance.py"
-    spec = importlib.util.spec_from_file_location("vapache_conformance", path)
+    spec = importlib.util.spec_from_file_location("httpd_rs_conformance", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -154,7 +154,7 @@ def write_configs(conf):
     acfg = re.sub(r"^CustomLog .* common$", "CustomLog /dev/null common", acfg, flags=re.M)
     vcfg = re.sub(r"^CustomLog .* common$", "CustomLog /dev/null common", vcfg, flags=re.M)
     apath = RUN / "apache" / "httpd.conf"
-    vpath = RUN / "vapache-httpd.conf"
+    vpath = RUN / "httpd-rs-httpd.conf"
     apath.write_text(acfg)
     vpath.write_text(vcfg)
     return apath, vpath
@@ -335,7 +335,7 @@ def url_for(port, path, tls=False, host=None):
 
 
 def benchmark_concurrency(sc):
-    """Keep one-host cohorts inside Vapache's source-keyed admission limits."""
+    """Keep one-host cohorts inside httpd-rs's source-keyed admission limits."""
     requested = sc["conc"]
     if sc["proto"] == "tls-h2":
         # The narrowest useful-work pool exercised by this feature-rich
@@ -480,7 +480,7 @@ def main():
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
 
-    for tool, path in (("apache2", APACHE), ("vapached", VAPACHED), ("wrk", WRK), ("ab", AB), ("h2load", H2LOAD)):
+    for tool, path in (("apache2", APACHE), ("httpd-rs", HTTPD_RS), ("wrk", WRK), ("ab", AB), ("h2load", H2LOAD)):
         if not path or not Path(path).exists():
             sys.exit(f"{tool} missing ({path})")
 
@@ -494,7 +494,7 @@ def main():
     conf = load_conformance()
     conf.start_http_mock()
     make_fixture(conf)
-    # Apache ignores an If-Modified-Since date in the future, while vapache
+    # Apache ignores an If-Modified-Since date in the future, while httpd-rs
     # evaluates it.  Use the representation's actual Last-Modified value so
     # both servers exercise the 304 path identically.
     lm = formatdate(int((RUN / "www" / "hello.txt").stat().st_mtime), usegmt=True)
@@ -504,9 +504,9 @@ def main():
     acfg, vcfg = write_configs(conf)
 
     apache_log = RUN / "logs" / "apache.out"
-    vapache_log = RUN / "logs" / "vapache.out"
+    httpd_rs_log = RUN / "logs" / "httpd-rs.out"
     apache, alog = start([APACHE, "-f", str(acfg), "-DFOREGROUND"], apache_log)
-    vap, vlog = start([str(VAPACHED), "-f", str(vcfg), "-DFOREGROUND"], vapache_log)
+    vap, vlog = start([str(HTTPD_RS), "-f", str(vcfg), "-DFOREGROUND"], httpd_rs_log)
 
     results = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -519,7 +519,7 @@ def main():
         for port in (AP_PORT, VP_PORT, AP_TLS_PORT, VP_TLS_PORT):
             if not wait_port(port):
                 print(apache_log.read_text()[-4000:])
-                print(vapache_log.read_text()[-4000:])
+                print(httpd_rs_log.read_text()[-4000:])
                 raise SystemExit(f"server failed to start on port {port}")
 
         # Validate every URL on both servers before timing anything.  For the
@@ -530,15 +530,15 @@ def main():
             v, ve = http_probe(VP_PORT if sc["proto"] not in ("tls-h1", "tls-h2") else VP_TLS_PORT, sc)
             expect = sc.get("expect", 200)
             if a is None or v is None or a[0] != expect or v[0] != expect:
-                print(f"  probe FAIL {sc['name']}: apache={a} {ae}; vapache={v} {ve}; expected {expect}")
+                print(f"  probe FAIL {sc['name']}: apache={a} {ae}; httpd-rs={v} {ve}; expected {expect}")
                 raise SystemExit("probe failed; refusing to benchmark a broken scenario")
             print(f"  ok {sc['name']}: {a[0]} HTTP/{a[1]}", flush=True)
 
-        print(f"\n{'feature':30} {'apache rps':>12} {'vapache rps':>12} {'ratio':>7} {'a mean':>8} {'v mean':>8}")
+        print(f"\n{'feature':30} {'apache rps':>12} {'httpd-rs rps':>12} {'ratio':>7} {'a mean':>8} {'v mean':>8}")
         for sc in selected:
             row = dict(name=sc["name"], proto=sc["proto"], path=sc["path"], servers={})
             for server, port in (("apache", AP_PORT if sc["proto"] not in ("tls-h1", "tls-h2") else AP_TLS_PORT),
-                                 ("vapache", VP_PORT if sc["proto"] not in ("tls-h1", "tls-h2") else VP_TLS_PORT)):
+                                 ("httpd-rs", VP_PORT if sc["proto"] not in ("tls-h1", "tls-h2") else VP_TLS_PORT)):
                 if sc["proto"] in ("http", "tls-h1", "tls-h2"):
                     # discard one short run for warm-up
                     measure(port, sc, max(0.5, duration / 2))
@@ -559,21 +559,21 @@ def main():
                         f"non2xx={best['non2xx']} socket-errors={socket_errors}"
                     )
             a = row["servers"]["apache"]["rps"] or 0
-            v = row["servers"]["vapache"]["rps"] or 0
+            v = row["servers"]["httpd-rs"]["rps"] or 0
             row["ratio"] = v / a if a else None
             print(
                 f"{sc['name']:30} {a:12.0f} {v:12.0f} {row['ratio'] or 0:7.2f}x "
-                f"{row['servers']['apache']['mean_ms'] or 0:8.2f} {row['servers']['vapache']['mean_ms'] or 0:8.2f}",
+                f"{row['servers']['apache']['mean_ms'] or 0:8.2f} {row['servers']['httpd-rs']['mean_ms'] or 0:8.2f}",
                 flush=True,
             )
             results["scenarios"].append(row)
 
         # Startup/config-test and memory footprint are useful switching costs.
         a_test, aerr = config_test([APACHE, "-f", str(acfg), "-t"])
-        v_test, verr = config_test([str(VAPACHED), "-f", str(vcfg), "-t"])
-        results["config_test_ms"] = {"apache": a_test, "vapache": v_test}
-        results["config_test_errors"] = {"apache": aerr, "vapache": verr}
-        results["memory"] = {"apache": rss_snapshot(apache.pid), "vapache": rss_snapshot(vap.pid)}
+        v_test, verr = config_test([str(HTTPD_RS), "-f", str(vcfg), "-t"])
+        results["config_test_ms"] = {"apache": a_test, "httpd-rs": v_test}
+        results["config_test_errors"] = {"apache": aerr, "httpd-rs": verr}
+        results["memory"] = {"apache": rss_snapshot(apache.pid), "httpd-rs": rss_snapshot(vap.pid)}
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         (BENCH / "results").mkdir(exist_ok=True)
@@ -586,19 +586,19 @@ def main():
         )
 
         lines = [
-            f"# Feature benchmark: vapached vs. Apache httpd\n",
+            f"# Feature benchmark: httpd-rs vs. Apache httpd\n",
             f"Generated: {results['timestamp']}\n",
             f"Method: {samples} x {duration:g}s samples per server after warm-up; access logs to /dev/null. "
             "`wrk` for cleartext HTTP/1.1, `ab` for HEAD/POST, `h2load` for TLS/HTTP/2 with four load-generator threads. "
             "Loopback concurrency is capped at eight connections and HTTP/2 cohorts stay within "
             "the 64-stream per-client admission budget, so the run measures serving rather than "
             "intentional overload rejection.\n",
-            "| feature | apache req/s | vapache req/s | ratio | apache mean ms | vapache mean ms |",
+            "| feature | apache req/s | httpd-rs req/s | ratio | apache mean ms | httpd-rs mean ms |",
             "|---|---:|---:|---:|---:|---:|",
         ]
         for row in results["scenarios"]:
             a = row["servers"]["apache"]
-            v = row["servers"]["vapache"]
+            v = row["servers"]["httpd-rs"]
             lines.append(
                 f"| {row['name']} | {a['rps'] or 0:.0f} | {v['rps'] or 0:.0f} | "
                 f"{row['ratio'] or 0:.2f}x | {a['mean_ms'] or 0:.2f} | {v['mean_ms'] or 0:.2f} |"
@@ -606,12 +606,12 @@ def main():
         if a_test is not None and v_test is not None:
             lines += [
                 "\n## Startup checks\n",
-                "| metric | apache | vapache |",
+                "| metric | apache | httpd-rs |",
                 "|---|---:|---:|",
                 f"| config test (`-t`) median | {a_test:.1f} ms | {v_test:.1f} ms |",
-                f"| processes after load | {results['memory']['apache']['processes']} | {results['memory']['vapache']['processes']} |",
-                f"| threads after load | {results['memory']['apache']['threads']} | {results['memory']['vapache']['threads']} |",
-                f"| PSS after load | {results['memory']['apache']['pss_kb']/1024:.1f} MiB | {results['memory']['vapache']['pss_kb']/1024:.1f} MiB |",
+                f"| processes after load | {results['memory']['apache']['processes']} | {results['memory']['httpd-rs']['processes']} |",
+                f"| threads after load | {results['memory']['apache']['threads']} | {results['memory']['httpd-rs']['threads']} |",
+                f"| PSS after load | {results['memory']['apache']['pss_kb']/1024:.1f} MiB | {results['memory']['httpd-rs']['pss_kb']/1024:.1f} MiB |",
             ]
         # A filtered run must not clobber the full comparison report.
         lines += [
@@ -632,8 +632,8 @@ def main():
         report = BENCH / ("FEATURE_RESULTS.md" if not args.only else f"FEATURE_RESULTS-{stamp}.md")
         report.write_text("\n".join(lines) + "\n")
         print(f"\nresults: {out}\nreport:  {report}")
-        print(f"config test: apache {a_test} ms, vapache {v_test} ms")
-        print(f"memory after load: apache {results['memory']['apache']}, vapache {results['memory']['vapache']}")
+        print(f"config test: apache {a_test} ms, httpd-rs {v_test} ms")
+        print(f"memory after load: apache {results['memory']['apache']}, httpd-rs {results['memory']['httpd-rs']}")
     finally:
         conf.stop_http_mock()
         if not args.keep:

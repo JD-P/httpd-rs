@@ -2,11 +2,11 @@
 //!
 //! The table below is a Rust port of representative regular-language cases
 //! from upstream `testdata/testinput1`, plus cases for the PCRE extensions
-//! translated by vapache. Backtracking-only constructs have separate
+//! translated by httpd-rs. Backtracking-only constructs have separate
 //! fail-closed tests in the library.
 
+use httpd_rs_pcre2::bytes as rust;
 use pcre2_c_oracle::bytes as oracle;
-use vapache_pcre2::bytes as rust;
 
 #[derive(Clone, Copy)]
 struct Case {

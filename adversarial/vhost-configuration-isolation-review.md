@@ -10,7 +10,7 @@ or lose authorization, select another tenant's filesystem mapping, or reach a
 different backend merely because a main-server directive occurs before or
 after a `<VirtualHost>` block in the source text.
 
-`tests/vhost_semantics.py` builds equivalent Apache and Vapache
+`tests/vhost_semantics.py` builds equivalent Apache and httpd-rs
 configurations, starts both servers, and compares two named tenants plus
 wildcard-name and exact-address buckets.  Its matrix covers:
 
@@ -27,7 +27,7 @@ wildcard-name and exact-address buckets.  Its matrix covers:
 
 ### VHOST-1: lexical order crossed the server/vhost policy boundary
 
-Vapache cloned the main-server rule vector, appended vhost rules, and then
+httpd-rs cloned the main-server rule vector, appended vhost rules, and then
 sorted the combined vector using each rule's original source position.  If a
 main-server section appeared after a `<VirtualHost>` block, equal-path
 `<Directory>` and `<Location>` rules ran after the vhost rule.  Apache instead
@@ -36,9 +36,9 @@ their lexical placement.
 
 Both security directions were observed:
 
-- Apache `200`, Vapache `403` when a vhost grant was followed lexically by a
+- Apache `200`, httpd-rs `403` when a vhost grant was followed lexically by a
   global deny; and
-- Apache `403`, Vapache `200` when a vhost deny was followed lexically by a
+- Apache `403`, httpd-rs `200` when a vhost deny was followed lexically by a
   global grant.
 
 The second form is a cross-tenant authorization bypass for configurations
@@ -56,7 +56,7 @@ preserving local order.
 entries, while both dispatchers select the first match.  Apache gives a
 vhost's alias/redirect table priority over the main-server table.  An identical
 vhost path therefore served the global filesystem object or global redirect
-target on Vapache.
+target on httpd-rs.
 
 The server-to-vhost merge now rotates only these first-match tables to
 `vhost -> main`.  Handler extensions remain `main -> vhost` because their
@@ -66,10 +66,10 @@ was the architectural error.
 ### VHOST-3: proxy precedence depended on lexical placement
 
 Apache's proxy table has the opposite hierarchy from Alias/Redirect: global
-`ProxyPass`/`ProxyPassMatch` entries precede vhost entries.  Vapache stored a
+`ProxyPass`/`ProxyPassMatch` entries precede vhost entries.  httpd-rs stored a
 single parser-wide `route_order`, so a vhost route won if its block appeared
 first and lost if it appeared second.  Moving an otherwise identical global
-directive across the block changed the upstream selected by Vapache but not
+directive across the block changed the upstream selected by httpd-rs but not
 Apache.
 
 The compiler now rebases vhost proxy routes after the maximum global route
@@ -97,7 +97,7 @@ separation and the CGI environment value.
 ### VHOST-5: a vhost CustomLog supplemented instead of replacing global logs
 
 Apache inherits main-server `CustomLog` directives only into virtual hosts
-that have no `CustomLog` of their own. Vapache treated the main-server entries
+that have no `CustomLog` of their own. httpd-rs treated the main-server entries
 as unconditional and wrote a vhost with a local access log to both files. That
 can disclose one tenant's request targets into a log with different ownership,
 retention, or audit consumers.
@@ -126,7 +126,7 @@ exact destination-address bucket wins before name matching.
 The campaign reduces the server/vhost merge boundary to explicit per-table
 laws, but it is not a proof of Apache itself.  Exact semantic construction of
 all directive payloads, standard-library sorting, module-specific directives
-not implemented by Vapache, and filesystem contents remain outside the Verus
+not implemented by httpd-rs, and filesystem contents remain outside the Verus
 model.  New ordered directive families must declare whether they are
 first-match or last-match and whether their server/vhost hierarchy is
 `main -> vhost` or `vhost -> main`; they must not inherit a generic vector

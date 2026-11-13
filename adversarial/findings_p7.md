@@ -1,7 +1,7 @@
-# vapache adversarial findings — Pass 7
+# httpd-rs adversarial findings — Pass 7
 
 **Target:** the current working tree (`HEAD 9a7809c` plus the uncommitted
-pass-6 fixes), rebuilt with `cargo build --release -p vapached`. The repository
+pass-6 fixes), rebuilt with `cargo build --release -p httpd-rs`. The repository
 source was not modified for this pass; all fixtures live under `/tmp/opencode`.
 
 **Environment:** Linux, loopback only. Apache 2.4.69 (Debian) was used as the
@@ -13,7 +13,7 @@ reproduction. No external network, IP address, or real web server was involved.
 * **F53 (Critical):** an anchored `RewriteRule` in a `.htaccess` file inside an
   `Alias`/`AliasMatch`/`ScriptAlias` tree is matched against the wrong
   per-directory URL base. An `.htaccess` deny rule (`RewriteRule ^private/ -
-  [F]`) is silently skipped: Apache returns `403`, vapache serves the protected
+  [F]`) is silently skipped: Apache returns `403`, httpd-rs serves the protected
   file or executes the protected CGI.
 * **F54 (High):** the cache dynamic-target check does not recognize
   `SetHandler "proxy:…|fcgi://…"`. With `CacheIgnoreQueryString On`, a PHP-FPM
@@ -47,7 +47,7 @@ reproduction. No external network, IP address, or real web server was involved.
    RewriteRule ^(?:\.git|\.env|wallet\.dat|backups/) - [F,L,NC]
    ```
 
-   Apache returns `403`; vapache returns `200` and serves `.env`, `.git/config`,
+   Apache returns `403`; httpd-rs returns `200` and serves `.env`, `.git/config`,
    `backups/wallet.dat` or whatever else the rule was meant to protect. The
    same primitive executes a CGI/PHP script that the `.htaccess` rule denies.
 
@@ -121,7 +121,7 @@ anchored pattern         ^private/            -> no match
 
 Apache's per-directory context for `/srv/site/.htaccess` is `/site/`, so its
 subject is `private/wallet.dat` and the rule fires. The same failure happens
-for a `.htaccess` in `/srv/site/private`: vapache gives it `/private/` while
+for a `.htaccess` in `/srv/site/private`: httpd-rs gives it `/private/` while
 the request URL is `/site/private/...`, so `subject_for()` cannot even strip a
 prefix and the rule is skipped.
 
@@ -152,7 +152,7 @@ DocumentRoot "$D/www"
 Alias /site "$D/site"
 EOF
 
-./target/release/vapached -f "$D/vp.conf" -DFOREGROUND &
+./target/release/httpd-rs -f "$D/vp.conf" -DFOREGROUND &
 curl -i http://127.0.0.1:19340/site/private/wallet.dat
 ```
 
@@ -184,7 +184,7 @@ curl http://127.0.0.1:19340/site/.env
 Observed:
 
 ```text
-vapache: 200 WALLET_SEED=correct-horse-battery-staple
+httpd-rs: 200 WALLET_SEED=correct-horse-battery-staple
 Apache : 403 Forbidden
 ```
 
@@ -198,7 +198,7 @@ printf 'RewriteEngine On\nRewriteRule ^wallet\\.dat$ - [F]\n' \
 Request `/site/private/wallet.dat`:
 
 ```text
-vapache: 200 WALLET-F53-STATIC-SECRET
+httpd-rs: 200 WALLET-F53-STATIC-SECRET
 Apache : 403 Forbidden
 ```
 
@@ -226,11 +226,11 @@ the results are:
 
 ```text
 GET /m/private/wallet.dat
-vapache: 200 WALLET-F53-STATIC-SECRET
+httpd-rs: 200 WALLET-F53-STATIC-SECRET
 Apache : 403 Forbidden
 
 GET /cgi/run.cgi
-vapache: 200 WALLET-F53-CGI-SECRET
+httpd-rs: 200 WALLET-F53-CGI-SECRET
 Apache : 403 Forbidden
 ```
 
@@ -251,7 +251,7 @@ RewriteRule ^base/secret\.txt$ - [F]
 Observed for `/site/base/secret.txt`:
 
 ```text
-vapache: 200 WALLET-BASE-SECRET
+httpd-rs: 200 WALLET-BASE-SECRET
 Apache : 403 Forbidden
 ```
 
@@ -261,7 +261,7 @@ parser, but not `rule.match_base`, and the latter is what `subject_for()` uses.
 ## Control: the same rule works under `DocumentRoot`
 
 With `DocumentRoot /srv/site` (no alias), the same root `.htaccess` and the
-same request `/private/wallet.dat` return `403` from vapache. This confirms the
+same request `/private/wallet.dat` return `403` from httpd-rs. This confirms the
 failure is specific to the alias URL mount, not to `[F]` parsing.
 
 ## Root cause
@@ -440,7 +440,7 @@ This is the exact class F52/I49 was intended to close: a dynamic
 query-specific representation is shared across queries. Here the leak survives
 the F52 fix because the dynamic classification, not the index binding, is
 incomplete. As with any shared cache, the response must be cacheable and must
-not set a cookie (vapache deliberately refuses to store `Set-Cookie`
+not set a cookie (httpd-rs deliberately refuses to store `Set-Cookie`
 responses); sessionless APIs and export/download endpoints are the common
 targets.
 
@@ -483,7 +483,7 @@ for q in alpha beta gamma; do
 done
 ```
 
-Observed from vapache:
+Observed from httpd-rs:
 
 ```text
 HTTP/1.1 200 OK
@@ -523,7 +523,7 @@ if cfg.cache.ignore_query_string && !req.query.is_empty() {
         || crate::cgi::is_cgi(cfg, &scope, name, false)
         || crate::fastcgi::match_proxy(&scope, &cache_url_path, &root).is_some()
         || crate::proxy::matches_route(&scope, &cache_url_path);
-    if !vapache_verified::cache_ignore_query_admit(
+    if !httpd_rs_verified::cache_ignore_query_admit(
         cfg.cache.ignore_query_string,
         !req.query.is_empty(),
         dynamic,
@@ -791,8 +791,8 @@ to full wallet-shaped findings in this pass:
 
 * All fixtures are under `/tmp/opencode/p7-*`; the repository source was not
   edited.
-* `target/release/vapached` was rebuilt from the current working tree before
-  the pass (`cargo build --release -p vapached`).
+* `target/release/httpd-rs` was rebuilt from the current working tree before
+  the pass (`cargo build --release -p httpd-rs`).
 * Apache 2.4.69 was started with a private config on high loopback ports with
   only the modules needed for `Alias`/`ScriptAlias`/`mod_rewrite`/`mod_cgi`/
   `mod_proxy_fcgi`/`mod_cache_disk`.

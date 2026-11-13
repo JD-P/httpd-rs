@@ -119,8 +119,8 @@ while the canonical source is the manifest identity.
 - The configured document/alias root and its parent deployment machinery are
   operator-controlled. Replacing that root is treated as an intentional site
   deployment change; content writers below the root do not gain that power.
-- FastCGI/PHP receives a pathname rather than Vapache's descriptor. Safe use
-  therefore still requires `VapacheFastCGIStablePath`; the explicit unstable
+- FastCGI/PHP receives a pathname rather than httpd-rs's descriptor. Safe use
+  therefore still requires `HttpdRsFastCGIStablePath`; the explicit unstable
   capability accepts that external boundary.
 - Kernel `openat2`, descriptor identity, procfs descriptor paths, filesystem
   ownership, and rename semantics are refinement assumptions below the Verus

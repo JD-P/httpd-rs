@@ -8,7 +8,7 @@ HEAD `67ca87b` (h2.rs and vendor byte-identical to `1f35e19`; later commits
 touched only `verified/lib.rs` and `http.rs`).
 
 Method: full diff reading; pre-commit source comparison (`git show 1f35e19^:`);
-release build (`target/release/vapached`, panic=abort); live TLS+ALPN h2 probes
+release build (`target/release/httpd-rs`, panic=abort); live TLS+ALPN h2 probes
 with a raw frame/hyper-hpack client; `h2spec 2.6.0` (all 36 selected groups,
 fresh server per group); libFuzzer `h2_frames`/`h2_stateful` (~7M runs, no
 crash); 49 h2 unit tests; a Python stateful random frame tester (4,000

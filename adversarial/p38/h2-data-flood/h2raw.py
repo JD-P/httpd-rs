@@ -1,4 +1,4 @@
-"""Minimal raw HTTP/2 client over TLS with ALPN for vapache h2 testing."""
+"""Minimal raw HTTP/2 client over TLS with ALPN for httpd-rs h2 testing."""
 import socket
 import ssl
 import struct

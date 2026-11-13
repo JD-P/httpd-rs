@@ -15,7 +15,7 @@ RewriteRule ^ - [F]
 <Directory "/tmp/opencode/p37-conf/www">
 Require all granted
 </Directory>
---- vapached -t ---
+--- httpd-rs -t ---
 Syntax OK
 rc=0
 

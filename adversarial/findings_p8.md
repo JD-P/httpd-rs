@@ -1,8 +1,8 @@
-# vapache adversarial findings — Pass 8
+# httpd-rs adversarial findings — Pass 8
 
 **Target:** the current working tree at `HEAD 1f530df` (`Fix vulnerabilities,
 expand Verus coverage and tests, still not ready`), rebuilt from source with
-`cargo build --release -p vapached`. The repository source was not modified for
+`cargo build --release -p httpd-rs`. The repository source was not modified for
 this pass; every fixture lives under `/tmp/opencode/p8-*`.
 
 **Environment:** Linux, loopback only. Apache 2.4.69 (Debian) was used as a
@@ -18,17 +18,17 @@ replay tests all pass; neither suite covers the two shapes below.
   canonicalization. A `Require expr`, `<If>`, `SetEnvIf Request_URI`, or
   `RewriteCond %{REQUEST_URI}` path policy can therefore be bypassed with a
   query suffix (`/.env?x=1`), percent-encoding (`/%2eenv`), or dot segments
-  (`/api/../secret`). Apache returns `403`; vapache returns the protected file.
+  (`/api/../secret`). Apache returns `403`; httpd-rs returns the protected file.
 * **F58 (Critical):** per-directory rewrite rules in an access file *above the
   alias mapping root* are silently skipped. This includes the ordinary
   `DocumentRoot/.htaccess` when a URL is served through an `Alias` whose target
   is inside the document root, and an ancestor `.htaccess` above
   `DocumentRoot`. A parent `.env` / `.git` / `wallet.dat` denylist is enforced
-  by Apache and ignored by vapache.
+  by Apache and ignored by httpd-rs.
 
 Both findings were reproduced with a wallet-shaped fixture: a `.env` containing
 `WALLET_SEED=correct-horse-battery-staple` and a `wallet.dat` containing a
-private balance/seed record. In both cases Apache returned `403` and vapache
+private balance/seed record. In both cases Apache returned `403` and httpd-rs
 returned `200` with the secret body.
 
 ---
@@ -47,7 +47,7 @@ in a directory scope:
 ```
 
 Apache sees the normalized URI `/.env` or `/wallet.dat`, the expression is
-false, and the request is denied. Vapache evaluates `%{REQUEST_URI}` from
+false, and the request is denied. httpd-rs evaluates `%{REQUEST_URI}` from
 `req.target` — the raw request line target, including the query string and
 without decoding — so:
 
@@ -57,7 +57,7 @@ GET /%2eenv            -> raw expression sees "/%2eenv", does not contain ".env"
 GET /wallet%2edat?dl=1 -> raw expression sees "/wallet%2edat?dl=1"
 ```
 
-All three are `403` from Apache and `200` from vapache, with the `.env` or
+All three are `403` from Apache and `200` from httpd-rs, with the `.env` or
 `wallet.dat` body. The attacker only needs one request; no upload, local
 account, race, or cache interaction is involved.
 
@@ -74,7 +74,7 @@ The same primitive defeats an allow-list gate:
 
 `GET /api/../private/wallet.dat` is normalized by Apache to
 `/private/wallet.dat` before the `<If>` runs, so the grant does not apply.
-Vapache evaluates the raw target, sees `api`, grants access, then normalizes to
+httpd-rs evaluates the raw target, sees `api`, grants access, then normalizes to
 `/private/wallet.dat` and serves it.
 
 ### 2. F58 — the document-root `.htaccess` denylist is skipped for alias URLs
@@ -97,14 +97,14 @@ RewriteRule (^|/)wallet\.dat$ - [F,L]
 ```
 
 Apache applies the document-root `.htaccess` to `/wallet/...` URLs as well,
-using subject `wallet/current/.env`. Vapache reads the access file (a
+using subject `wallet/current/.env`. httpd-rs reads the access file (a
 `Header set X-Htaccess-Read yes` directive is applied) but computes the rewrite
 base as `/wallet/.env/`, so `subject_for()` strips nothing and every
 per-directory rewrite rule in that layer is skipped:
 
 ```text
-GET /wallet/.env       -> Apache 403, vapache 200 "WALLET-...-ENV"
-GET /wallet/wallet.dat -> Apache 403, vapache 200 "WALLET-...-DB"
+GET /wallet/.env       -> Apache 403, httpd-rs 200 "WALLET-...-ENV"
+GET /wallet/wallet.dat -> Apache 403, httpd-rs 200 "WALLET-...-DB"
 ```
 
 The same failure occurs one level higher, with the `.htaccess` above
@@ -127,7 +127,7 @@ layer never participate.
 
 ## Impact
 
-Vapache exposes several different implementations of `%{REQUEST_URI}`:
+httpd-rs exposes several different implementations of `%{REQUEST_URI}`:
 
 ```rust
 // crates/server/src/expr.rs:269
@@ -186,7 +186,7 @@ rm -rf "$D"; mkdir -p "$D/www" "$D/logs"
 printf 'WALLET_SEED=correct-horse-battery-staple\n' > "$D/www/.env"
 printf 'WALLET-DB=secret\n'                         > "$D/www/wallet.dat"
 
-# Apache and vapache use the same security policy.
+# Apache and httpd-rs use the same security policy.
 cat > "$D/apache.conf" <<EOF
 ServerRoot "/etc/apache2"
 LoadModule mpm_event_module  /usr/lib/apache2/modules/mod_mpm_event.so
@@ -210,13 +210,13 @@ DocumentRoot "$D/www"
 EOF
 ```
 
-Run Apache on `:19368` and vapache on `:19369` with the same file (only the
+Run Apache on `:19368` and httpd-rs on `:19369` with the same file (only the
 listener, pid file and log change), then:
 
 ```text
-GET /.env            -> Apache 403, vapache 403       (control)
-GET /.env?x=1        -> Apache 403, vapache 200       WALLET_SEED=...
-GET /wallet.dat?dl=1 -> Apache 403, vapache 200       WALLET-DB=...
+GET /.env            -> Apache 403, httpd-rs 403       (control)
+GET /.env?x=1        -> Apache 403, httpd-rs 200       WALLET_SEED=...
+GET /wallet.dat?dl=1 -> Apache 403, httpd-rs 200       WALLET-DB=...
 ```
 
 The query string is not part of the resource identity on the resolved path,
@@ -227,11 +227,11 @@ but it is enough to make the raw-target regex fail.
 With the same fixture:
 
 ```text
-GET /%2eenv          -> Apache 403, vapache 200       WALLET_SEED=...
-GET /wallet%2edat    -> Apache 403, vapache 200       WALLET-DB=...
+GET /%2eenv          -> Apache 403, httpd-rs 200       WALLET_SEED=...
+GET /wallet%2edat    -> Apache 403, httpd-rs 200       WALLET-DB=...
 ```
 
-Apache decodes `%2e` before the expression; vapache matches the undecoded
+Apache decodes `%2e` before the expression; httpd-rs matches the undecoded
 `%2eenv` / `wallet%2edat` spelling and lets dispatch decode it into the
 protected file afterward. This bypass works even when the deny pattern is not
 `$`-anchored and does not depend on the query string.
@@ -252,14 +252,14 @@ Fixture files: `/api/public.json` is public, `/secret.json` is the wallet
 record.
 
 ```text
-GET /api/public.json          -> Apache 200, vapache 200
-GET /api/../secret.json       -> Apache 403, vapache 200  WALLET-IF-SECRET
-GET /api/%2e%2e/secret.json   -> Apache 403, vapache 200  WALLET-IF-SECRET
+GET /api/public.json          -> Apache 200, httpd-rs 200
+GET /api/../secret.json       -> Apache 403, httpd-rs 200  WALLET-IF-SECRET
+GET /api/%2e%2e/secret.json   -> Apache 403, httpd-rs 200  WALLET-IF-SECRET
 ```
 
-Apache normalizes the URI before evaluating `<If>`; vapache sees `api` in the
+Apache normalizes the URI before evaluating `<If>`; httpd-rs sees `api` in the
 raw target, grants the request, then normalizes to `/secret.json` and serves it.
-`<If>` is applied last in vapache's merge order, so this also bypasses a
+`<If>` is applied last in httpd-rs's merge order, so this also bypasses a
 base `Require all denied`.
 
 ## Reproduction D: `RewriteCond %{REQUEST_URI}` query-suffix bypass
@@ -274,8 +274,8 @@ RewriteRule ^ - [F,L]
 With `.env` present:
 
 ```text
-GET /.env       -> Apache 403, vapache 403       (both deny)
-GET /.env?x=1   -> Apache 403, vapache 200       WALLET-RC-ENV
+GET /.env       -> Apache 403, httpd-rs 403       (both deny)
+GET /.env?x=1   -> Apache 403, httpd-rs 200       WALLET-RC-ENV
 ```
 
 The rewrite implementation appends the query to the condition value. Apache's
@@ -349,7 +349,7 @@ the filesystem target.
 The existing `config_semantics.py` matrix covers `<If>` branch interaction but
 not the URI variable's byte identity, so it did not exercise this class.
 `tests/adversarial_regressions.py` should replay F57 against both Apache and
-vapache, not only against vapache's expected status.
+httpd-rs, not only against httpd-rs's expected status.
 
 ---
 
@@ -387,7 +387,7 @@ RewriteRule (^|/)wallet\.dat$ - [F,L]
 Header set X-Htaccess-Read yes
 EOF
 
-# Apache config; vapache uses the same body on a different loopback port.
+# Apache config; httpd-rs uses the same body on a different loopback port.
 cat > "$D/apache.conf" <<EOF
 ServerRoot "/etc/apache2"
 LoadModule mpm_event_module  /usr/lib/apache2/modules/mod_mpm_event.so
@@ -415,11 +415,11 @@ EOF
 Observed:
 
 ```text
-GET /wallet/.env       -> Apache 403, vapache 200  WALLET-DOCROOT-ALIAS-ENV
-GET /wallet/wallet.dat -> Apache 403, vapache 200  WALLET-DOCROOT-ALIAS-DB
+GET /wallet/.env       -> Apache 403, httpd-rs 200  WALLET-DOCROOT-ALIAS-ENV
+GET /wallet/wallet.dat -> Apache 403, httpd-rs 200  WALLET-DOCROOT-ALIAS-DB
 ```
 
-The vapache response contains `X-Htaccess-Read: yes`, proving that
+The httpd-rs response contains `X-Htaccess-Read: yes`, proving that
 `/www/.htaccess` was loaded and its `Header` effect applied. Only the
 per-directory rewrite subject was wrong.
 
@@ -435,11 +435,11 @@ Alias /wallet "$D/storage/current/public"
 # RewriteEngine On
 # RewriteRule ^current/public/private/ - [F,L]
 
-GET /wallet/private/wallet.dat -> Apache 403, vapache 200 WALLET-ANCESTOR-SECRET
+GET /wallet/private/wallet.dat -> Apache 403, httpd-rs 200 WALLET-ANCESTOR-SECRET
 ```
 
 Apache's per-directory subject for `/storage/.htaccess` is
-`current/public/private/wallet.dat`; vapache's base calculation sees three
+`current/public/private/wallet.dat`; httpd-rs's base calculation sees three
 filesystem components but only two URL components and falls back to the full
 URL path, after which `subject_for()` strips nothing.
 
@@ -456,7 +456,7 @@ request `/wallet/.env`:
 env$                   -> 403
 ```
 
-Vapache never gets far enough to match any of them.
+httpd-rs never gets far enough to match any of them.
 
 ## Root cause
 
@@ -469,7 +469,7 @@ fn dir_url_base(root: &Path, dir: &Path, fs_path: &Path, url_path: &str) -> Stri
     let depth = rel.components().count();
     let trimmed = url_path.trim_end_matches('/');
     // strip `depth` URL components ...
-    if !vapache_verified::htaccess_layer_url_base_admit(true, url_depth_sufficient) {
+    if !httpd_rs_verified::htaccess_layer_url_base_admit(true, url_depth_sufficient) {
         return normalize_rewrite_base(url_path);
     }
     normalize_rewrite_base(&trimmed[..end])
@@ -570,13 +570,13 @@ layer remains bypassed.
 
 * All fixtures are under `/tmp/opencode/p8-*`; repository source was not
   edited.
-* `target/release/vapached` was rebuilt from the current working tree
-  (`cargo build --release -p vapached`) before the pass.
+* `target/release/httpd-rs` was rebuilt from the current working tree
+  (`cargo build --release -p httpd-rs`) before the pass.
 * Apache 2.4.69 was started with private loopback configs and only the modules
   needed for `Alias`, `mod_rewrite`, `mod_headers`, `mod_authz_core`,
   `mod_authz_host`, `mod_dir`, and `mod_mime`.
 * Requests that needed raw dot segments or percent escapes were sent with
   `curl --path-as-is`.
 * The Apache differential used the same `DocumentRoot`, `Directory`, `Alias`,
-  `.htaccess`, authentication policy, and body files as vapache; only the
+  `.htaccess`, authentication policy, and body files as httpd-rs; only the
   listener ports, pid files and log paths differed.

@@ -2,7 +2,7 @@
 
 - **Date:** 2026-11-09
 - **Subject:** HEAD `3310fe390fae9552c4fc86c523ed69ea6d5a5d52`
-  (`target/release/vapached`, rebuilt from the checked-out tree; no product
+  (`target/release/httpd-rs`, rebuilt from the checked-out tree; no product
   source was edited).
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` + `mod_authz_core` +
   `mod_cgi` + `mod_mime`, loopback only.
@@ -12,7 +12,7 @@
   - `adversarial/p35/pcre2_guard_p35.py` — five guarded-regex cases; retained
     output `adversarial/p35/results_p35_pcre2.txt`.
 - **Method:** source audit of the access-file front end and the PCRE2
-  compatibility translation, followed by live Apache-versus-vapached
+  compatibility translation, followed by live Apache-versus-httpd-rs
   differentials over attacker-written `.htaccess` files and ACL guards.
 - **Disposition:** **both confirmed and unfixed at HEAD.** P35-A is a
   fail-open configuration-parser differential; P35-B is a regex-engine
@@ -22,10 +22,10 @@
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapached at HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs at HEAD | Class |
 |---|---------|---------------|------------------|-------|
-| **P35-A** | Apache treats a trailing backslash as line continuation **before** comment handling, so `#\` swallows the next physical line. Vapache's `.htaccess` front end drops the comment line first and then parses the next line as an active directive. An attacker-written access file can therefore activate a grant Apache ignores, or can hide a handler section whose unmatched remainder makes Apache reject the whole file with `500`. | `#\` + `Require all granted` under a live `Require all denied`: `403`, no body. `#\` + `<Files "run.txt"> SetHandler cgi-script </Files>`: `500` for both the protected file and the script; no execution. | `200` with `P35-SECRET-CONTENT-9c41`; the hidden CGI executes and returns `P35-CGI-EXECUTED-9c41`. | authority bypass / protected read; hidden CGI execution where Apache rejects the access file |
-| **P35-B** | The PCRE2 compatibility translation keeps greedy class repetitions backtrackable, while PCRE2 (Apache) auto-possessifies `\S*`/`\S+`/`\N+` before `\R`/`\v`. For a subject containing the obs-text NEL byte `0x85`, a negated guard that should deny becomes fail-open on vapache. | `!~ /\S*\v/` with `X-Test: A\x85B` → `403`; `!~ /\S*\R/`, `!~ /\N+\R/`, `!~ /\S+\R/` behave the same. | `200` for all four patterns; the same request is denied by Apache. | ACL guard bypass / regex parser differential |
+| **P35-A** | Apache treats a trailing backslash as line continuation **before** comment handling, so `#\` swallows the next physical line. httpd-rs's `.htaccess` front end drops the comment line first and then parses the next line as an active directive. An attacker-written access file can therefore activate a grant Apache ignores, or can hide a handler section whose unmatched remainder makes Apache reject the whole file with `500`. | `#\` + `Require all granted` under a live `Require all denied`: `403`, no body. `#\` + `<Files "run.txt"> SetHandler cgi-script </Files>`: `500` for both the protected file and the script; no execution. | `200` with `P35-SECRET-CONTENT-9c41`; the hidden CGI executes and returns `P35-CGI-EXECUTED-9c41`. | authority bypass / protected read; hidden CGI execution where Apache rejects the access file |
+| **P35-B** | The PCRE2 compatibility translation keeps greedy class repetitions backtrackable, while PCRE2 (Apache) auto-possessifies `\S*`/`\S+`/`\N+` before `\R`/`\v`. For a subject containing the obs-text NEL byte `0x85`, a negated guard that should deny becomes fail-open on httpd-rs. | `!~ /\S*\v/` with `X-Test: A\x85B` → `403`; `!~ /\S*\R/`, `!~ /\N+\R/`, `!~ /\S+\R/` behave the same. | `200` for all four patterns; the same request is denied by Apache. | ACL guard bypass / regex parser differential |
 
 P35-A is the stronger finding: the access file is attacker-written under the
 project's established writable-`.htaccess` threat model, and the differential
@@ -67,7 +67,7 @@ Apache assembles continued lines first (`ap_cfg_getline` removes the
 backslash/newline and appends the next line) and only then decides whether the
 assembled line is a comment. A physical line ending in `\` therefore continues
 a comment: the next line is part of the comment and is never parsed as a
-directive. Vapache has already discarded the comment, so the next line is
+directive. httpd-rs has already discarded the comment, so the next line is
 parsed normally.
 
 The main-configuration path uses `logical_lines_with_numbers()`, which *does*
@@ -93,26 +93,26 @@ Require all granted
 ```
 
 Apache: the `#\` comment continues into the `Require` line, so the parent
-`Require all denied` remains live (`403`). Vapache: the comment is dropped and
+`Require all denied` remains live (`403`). httpd-rs: the comment is dropped and
 `Require all granted` is active (`200`, protected body).
 
 Live output (`adversarial/p35/results_p35.txt`):
 
 ```text
 ## A-hidden-grant
-   /sub/file.txt  apache=403 vapache=200 apache_leak=False vapache_leak=True
+   /sub/file.txt  apache=403 httpd-rs=200 apache_leak=False httpd_rs_leak=True
 ## A-control-plain-grant
-   /sub/file.txt  apache=200 vapache=200 apache_leak=True vapache_leak=True
+   /sub/file.txt  apache=200 httpd-rs=200 apache_leak=True httpd_rs_leak=True
 ## A-control-comment-no-continuation
-   /sub/file.txt  apache=200 vapache=200 apache_leak=True vapache_leak=True
+   /sub/file.txt  apache=200 httpd-rs=200 apache_leak=True httpd_rs_leak=True
 ## A-chained-hidden-grant
-   /sub/file.txt  apache=403 vapache=200 apache_leak=False vapache_leak=True
+   /sub/file.txt  apache=403 httpd-rs=200 apache_leak=False httpd_rs_leak=True
 ```
 
 Controls pin the mechanism: without the trailing backslash Apache also sees
 the grant (`A-control-comment-no-continuation`, `200/200`), and a plain grant
 is permitted by both (`A-control-plain-grant`). Chaining `#\` lines hides
-several physical lines from Apache while vapache still activates the final
+several physical lines from Apache while httpd-rs still activates the final
 directive (`A-chained-hidden-grant`).
 
 ### 2.3 Exploit B — hidden handler section executes where Apache rejects the file
@@ -130,7 +130,7 @@ SetHandler cgi-script
 Apache: the first comment continues into the `<Files>` line, so the
 `SetHandler` line is active at top level and the later `</Files>` is an
 unmatched close. Apache rejects every request in that directory with `500`;
-the CGI never runs. Vapache: the hidden `<Files>` section is active, the
+the CGI never runs. httpd-rs: the hidden `<Files>` section is active, the
 uploaded `run.txt` is classified as `cgi-script`, and the CGI executes as
 `www-data`.
 
@@ -138,18 +138,18 @@ Live output:
 
 ```text
 ## B-hidden-cgi
-   /sub/file.txt  apache=500 vapache=200 apache_leak=False vapache_leak=True
-   /sub/run.txt   apache=500 vapache=200 apache_exec=False vapache_exec=True
+   /sub/file.txt  apache=500 httpd-rs=200 apache_leak=False httpd_rs_leak=True
+   /sub/run.txt   apache=500 httpd-rs=200 apache_exec=False httpd_rs_exec=True
 ## B-control-plain-cgi
-   /sub/file.txt  apache=200 vapache=200 apache_leak=True vapache_leak=True
-   /sub/run.txt   apache=200 vapache=200 apache_exec=True vapache_exec=True
+   /sub/file.txt  apache=200 httpd-rs=200 apache_leak=True httpd_rs_leak=True
+   /sub/run.txt   apache=200 httpd-rs=200 apache_exec=True httpd_rs_exec=True
 ```
 
 The plain control shows that the handler override itself is permitted by the
 tested `AllowOverride FileInfo`/`Options +ExecCGI` posture; the differential is
-that Apache's parser rejects the *written* access file while vapache silently
+that Apache's parser rejects the *written* access file while httpd-rs silently
 activates the hidden section. This is the same class as P18-A: an access file
-Apache refuses is accepted and executed by vapache.
+Apache refuses is accepted and executed by httpd-rs.
 
 ### 2.4 Main-configuration control
 
@@ -164,14 +164,14 @@ and the fix belongs in the `.htaccess` line assembler.
 - Attacker can write an access file in a served directory. This is the
   established threat model of P14-A, F60-D, P18-A and P33/P34: an upload,
   avatar, cache, or application-writable directory with `AllowOverride`
-  enabled and `VapacheCapability AccessFiles On`.
+  enabled and `HttpdRsCapability AccessFiles On`.
 - Case A needs `AllowOverride` to permit `Require` (for example
   `AllowOverride AuthConfig` or `All`). Case B needs the handler directive's
   category (`FileInfo`) and the directory's `Options +ExecCGI`.
 - **Blast radius:** the hidden directive can be any access-file policy:
   `Require`, `<Files>` handlers, `RewriteRule`, `Header`, `Options`,
   `DirectoryIndex`, `ErrorDocument`, MIME/handler directives, etc. The
-  attacker can make vapache enforce a different policy than the file's Apache
+  attacker can make httpd-rs enforce a different policy than the file's Apache
   meaning, and can make Apache-invalid access files executable.
 - **Attacker cost:** one uploaded file. No body, no credential, and no
   configuration write beyond the access file.
@@ -199,7 +199,7 @@ The compatibility engine translates a PCRE2 pattern into a non-backtracking
 automata pattern. For `\S*`/`\S+`/`\N+` immediately followed by `\R` or `\v`,
 PCRE2's optimiser auto-possessifies the repetition; the same accepted pattern
 then fails to match a subject where the repeated class and the line-break atom
-overlap on the NEL byte `0x85`. Vapache's translation keeps the repetition
+overlap on the NEL byte `0x85`. httpd-rs's translation keeps the repetition
 backtrackable, so it finds a match.
 
 The existing `validate_line_constructs()` already special-cases
@@ -222,26 +222,26 @@ Configuration:
 
 The `!~` guard denies values that do **not** contain the pattern. On Apache the
 pattern does not match `A\x85B`, so `!~` is true and the request is denied; on
-vapache the pattern matches, so `!~` is false and the request is allowed.
+httpd-rs the pattern matches, so `!~` is false and the request is allowed.
 
 Live output (`adversarial/p35/results_p35_pcre2.txt`):
 
 ```text
 ## S-star-v  pattern=\S*\v
-   plain apache=403 vapache=403
-   nel   apache=403 vapache=200
+   plain apache=403 httpd-rs=403
+   nel   apache=403 httpd-rs=200
 ## S-star-R  pattern=\S*\R
-   plain apache=403 vapache=403
-   nel   apache=403 vapache=200
+   plain apache=403 httpd-rs=403
+   nel   apache=403 httpd-rs=200
 ## N-plus-R  pattern=\N+\R
-   plain apache=403 vapache=403
-   nel   apache=403 vapache=200
+   plain apache=403 httpd-rs=403
+   nel   apache=403 httpd-rs=200
 ## S-plus-R  pattern=\S+\R
-   plain apache=403 vapache=403
-   nel   apache=403 vapache=200
+   plain apache=403 httpd-rs=403
+   nel   apache=403 httpd-rs=200
 ## plain-v-control  pattern=\v
-   plain apache=403 vapache=403
-   nel   apache=200 vapache=200
+   plain apache=403 httpd-rs=403
+   nel   apache=200 httpd-rs=200
 ```
 
 The plain-value controls agree (`403/403`), and the simple `\v` control agrees
@@ -261,7 +261,7 @@ than claims. The four patterns above were all reproduced live.
 - The guarded subject must contain `0x85` (NEL), which is permitted as
   obs-text in HTTP header values and can be carried in a request header.
 - The guard is an access-control rule; the demonstrated result is that Apache
-  denies and vapache allows. No authentication or body is required.
+  denies and httpd-rs allows. No authentication or body is required.
 - Because the pattern shape and the `!~` polarity are both needed, this is a
   medium-impact, narrow-precondition finding rather than a general bypass.
 
@@ -310,7 +310,7 @@ semantics but not the `\S`/`\N` plus `\R`/`\v` match-truth difference.
 
 ## 6. Retained files
 
-- `adversarial/p35/exploit_p35.py` — seven-case Apache/vapached access-file
+- `adversarial/p35/exploit_p35.py` — seven-case Apache/httpd-rs access-file
   differential; exits non-zero if either P35-A divergence disappears.
 - `adversarial/p35/results_p35.txt` — retained HEAD run output.
 - `adversarial/p35/pcre2_guard_p35.py` — five-case guarded-regex differential.

@@ -1,14 +1,18 @@
-//! `vapached` command line, daemon lifecycle and privilege handling.
+//! `httpd-rs` command line, daemon lifecycle and privilege handling.
 
 #![forbid(unsafe_code)]
 
-// musl's allocator serializes Vapache's allocation-heavy policy path under
+// musl's allocator serializes httpd-rs's allocation-heavy policy path under
 // concurrent static requests. Keep the portable static build, but give it the
 // same scalable allocation behavior as the native glibc build.
 #[cfg(target_env = "musl")]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use httpd_rs::config::{Config, EncodedSlashes};
+use httpd_rs::http::{BodyFraming, Headers, Request, Version};
+use httpd_rs::log::Logger;
+use httpd_rs::server::{self, Server};
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -17,10 +21,6 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use vapached::config::{Config, EncodedSlashes};
-use vapached::http::{BodyFraming, Headers, Request, Version};
-use vapached::log::Logger;
-use vapached::server::{self, Server};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
@@ -63,7 +63,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: vapached [-d serverroot] [-f config] [-D name] [-k start|stop|restart|graceful|status]\n\
+        "Usage: httpd-rs [-d serverroot] [-f config] [-D name] [-k start|stop|restart|graceful|status]\n\
          \x20                [-t] [-T] [-M] [-S] [-v] [-V] [-l] [-X] [--strict-config]\n\
          \x20                [--audit-capabilities]\n\
          \x20                [--explain PATH [--explain-method M] [--explain-host H] [--explain-port P]\n\
@@ -193,7 +193,7 @@ fn parse_args_from(args: &[String], default_server_root: PathBuf) -> Result<Args
                 i += 1;
                 args.get(i)
                     .ok_or_else(|| format!("{arg} requires an argument"))?;
-                eprintln!("vapached: warning: {arg} is accepted but not applied");
+                eprintln!("httpd-rs: warning: {arg} is accepted but not applied");
             }
             "-e" | "-E" => {
                 i += 1;
@@ -209,7 +209,7 @@ fn parse_args_from(args: &[String], default_server_root: PathBuf) -> Result<Args
 }
 
 fn parse_args() -> Args {
-    let server_root = std::env::var("VAPACHE_SERVER_ROOT")
+    let server_root = std::env::var("HTTPD_RS_SERVER_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/etc/apache2"));
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -217,7 +217,7 @@ fn parse_args() -> Args {
         Ok(args) => args,
         Err(error) => {
             if !error.is_empty() {
-                eprintln!("vapached: {error}");
+                eprintln!("httpd-rs: {error}");
             }
             usage();
         }
@@ -271,7 +271,7 @@ fn expand_env(value: &str, vars: &HashMap<String, String>) -> String {
 fn load_envvars(path: &Path) -> HashMap<String, String> {
     const MAX_ENVVARS_BYTES: u64 = 1024 * 1024;
     let mut vars: HashMap<String, String> = std::env::vars().collect();
-    let Ok(data) = vapached::files::read_admin_file(path, MAX_ENVVARS_BYTES) else {
+    let Ok(data) = httpd_rs::files::read_admin_file(path, MAX_ENVVARS_BYTES) else {
         return vars;
     };
     let Ok(data) = String::from_utf8(data) else {
@@ -312,18 +312,18 @@ fn user_ids(user: &str, group: &str) -> Result<(libc::uid_t, libc::gid_t, CStrin
     let uid = if let Ok(n) = user.parse::<u32>() {
         n
     } else {
-        vapache_os::lookup_user_id(&cuser).map_err(|_| format!("user '{user}' not found"))?
+        httpd_rs_os::lookup_user_id(&cuser).map_err(|_| format!("user '{user}' not found"))?
     };
     let gid = if let Ok(n) = group.parse::<u32>() {
         n
     } else {
-        vapache_os::lookup_group_id(&cgroup).map_err(|_| format!("group '{group}' not found"))?
+        httpd_rs_os::lookup_group_id(&cgroup).map_err(|_| format!("group '{group}' not found"))?
     };
     Ok((uid, gid, cuser))
 }
 
 fn effective_ids() -> (u32, u32) {
-    (vapache_os::effective_uid(), vapache_os::effective_gid())
+    (httpd_rs_os::effective_uid(), httpd_rs_os::effective_gid())
 }
 
 fn effective_uid() -> u32 {
@@ -331,7 +331,7 @@ fn effective_uid() -> u32 {
 }
 
 fn validate_service_identity(euid: u32, egid: u32, uid: u32, gid: u32) -> Result<(), String> {
-    if !vapache_verified::service_identity_admit(euid, egid, uid, gid) {
+    if !httpd_rs_verified::service_identity_admit(euid, egid, uid, gid) {
         if uid == 0 || gid == 0 {
             return Err("refusing to run the request-serving process as root user/group".into());
         }
@@ -347,27 +347,28 @@ fn drop_privileges(user: &str, group: &str) -> Result<(), String> {
     let (euid, egid) = effective_ids();
     validate_service_identity(euid, egid, uid, gid)?;
     if euid != 0 {
-        if let Err(error) = vapache_os::no_new_privileges() {
+        if let Err(error) = httpd_rs_os::no_new_privileges() {
             return Err(format!("cannot set no_new_privs: {error}"));
         }
         return Ok(());
     }
     // coverage:ignore-start - privileged syscall failures
     if user.parse::<u32>().is_ok() {
-        vapache_os::clear_supplementary_groups()
+        httpd_rs_os::clear_supplementary_groups()
     } else {
-        vapache_os::initialize_supplementary_groups(&cuser, gid)
+        httpd_rs_os::initialize_supplementary_groups(&cuser, gid)
     }
     .map_err(|error| format!("initgroups failed: {error}"))?;
-    vapache_os::set_res_gid(gid).map_err(|error| format!("setresgid failed: {error}"))?;
-    vapache_os::set_res_uid(uid).map_err(|error| format!("setresuid failed: {error}"))?;
-    vapache_os::no_new_privileges().map_err(|error| format!("cannot set no_new_privs: {error}"))?;
+    httpd_rs_os::set_res_gid(gid).map_err(|error| format!("setresgid failed: {error}"))?;
+    httpd_rs_os::set_res_uid(uid).map_err(|error| format!("setresuid failed: {error}"))?;
+    httpd_rs_os::no_new_privileges()
+        .map_err(|error| format!("cannot set no_new_privs: {error}"))?;
     // coverage:ignore-stop
     Ok(()) // coverage:ignore-line - root-only successful privilege drop
 }
 
 fn daemonize() -> Result<(), String> {
-    vapache_os::daemonize().map_err(|error| format!("daemonization failed: {error}"))
+    httpd_rs_os::daemonize().map_err(|error| format!("daemonization failed: {error}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -424,7 +425,7 @@ impl Drop for PidFileGuard {
 
 fn pid_identity_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
-    name.push(".vapache-identity");
+    name.push(".httpd-rs-identity");
     PathBuf::from(name)
 }
 
@@ -543,14 +544,14 @@ fn open_pid_output(
     service_uid: Option<u32>,
 ) -> Result<std::fs::File, String> {
     if let Some(parent) = path.parent() {
-        vapached::files::ensure_admin_dir(parent, 0o755)
+        httpd_rs::files::ensure_admin_dir(parent, 0o755)
             .map_err(|e| format!("cannot prepare PidFile directory {}: {e}", parent.display()))?;
     }
     if let Some(service_uid) = service_uid {
-        vapached::files::validate_admin_parents(path, service_uid)
+        httpd_rs::files::validate_admin_parents(path, service_uid)
             .map_err(|e| format!("insecure PidFile path {}: {e}", path.display()))?;
     }
-    let file = vapached::files::open_admin_path(
+    let file = httpd_rs::files::open_admin_path(
         path,
         libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK,
         mode,
@@ -605,10 +606,10 @@ fn write_pid(path: &Path, service_uid: Option<u32>) -> Result<PidFileGuard, Stri
 
 fn read_pid_record(path: &Path, service_uid: Option<u32>) -> Result<ProcessIdentity, String> {
     if let Some(service_uid) = service_uid {
-        vapached::files::validate_admin_parents(path, service_uid)
+        httpd_rs::files::validate_admin_parents(path, service_uid)
             .map_err(|e| format!("insecure PidFile path {}: {e}", path.display()))?;
     }
-    let pid_bytes = vapached::files::read_admin_file(path, 64)
+    let pid_bytes = httpd_rs::files::read_admin_file(path, 64)
         .map_err(|error| format!("cannot read PidFile {}: {error}", path.display()))?;
     let pid_text = std::str::from_utf8(&pid_bytes)
         .map_err(|_| format!("invalid pid in {}", path.display()))?;
@@ -621,7 +622,7 @@ fn read_pid_record(path: &Path, service_uid: Option<u32>) -> Result<ProcessIdent
     }
     let identity_path = pid_identity_path(path);
     if let Some(service_uid) = service_uid {
-        vapached::files::validate_admin_parents(&identity_path, service_uid).map_err(|error| {
+        httpd_rs::files::validate_admin_parents(&identity_path, service_uid).map_err(|error| {
             format!(
                 "insecure PID identity path {}: {error}",
                 identity_path.display()
@@ -629,7 +630,7 @@ fn read_pid_record(path: &Path, service_uid: Option<u32>) -> Result<ProcessIdent
         })?;
     }
     let identity_bytes =
-        vapached::files::read_admin_file(&identity_path, 512).map_err(|error| {
+        httpd_rs::files::read_admin_file(&identity_path, 512).map_err(|error| {
             format!(
                 "cannot read PID identity {}: {error}",
                 identity_path.display()
@@ -650,13 +651,13 @@ fn open_verified_pid(
     service_uid: Option<u32>,
 ) -> Result<(std::fs::File, ProcessIdentity), String> {
     let expected = read_pid_record(path, service_uid)?;
-    let pidfd = vapache_os::pidfd_open(expected.pid)
+    let pidfd = httpd_rs_os::pidfd_open(expected.pid)
         .map_err(|error| format!("pidfd_open({}) failed: {error}", expected.pid))?;
     let actual = process_identity_with_executable_fallback(
         expected.pid,
         Some((expected.executable_dev, expected.executable_ino)),
     )?;
-    if !vapache_verified::pid_control_admit(
+    if !httpd_rs_verified::pid_control_admit(
         expected.pid as i64,
         actual.pid as i64,
         expected.uid,
@@ -684,7 +685,7 @@ fn read_pid(path: &Path, service_uid: Option<u32>) -> Result<i32, String> {
 
 fn kill_action(path: &Path, service_uid: Option<u32>, sig: libc::c_int) -> Result<i32, String> {
     let (pidfd, identity) = open_verified_pid(path, service_uid)?;
-    if let Err(error) = vapache_os::pidfd_send_signal(pidfd.as_fd(), sig) {
+    if let Err(error) = httpd_rs_os::pidfd_send_signal(pidfd.as_fd(), sig) {
         return Err(format!(
             "pidfd_send_signal({}) failed: {error}",
             identity.pid
@@ -737,13 +738,13 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
     };
     let peer = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
     let resource_context = cfg.resource_budget.context(peer);
-    vapached::resource::with_resource_context(resource_context, || {
-        let target = vapached::request_plan::CanonicalTarget::from_raw_path(
-            vapached::request_plan::WireUrlPath::new(raw_path.as_bytes()),
+    httpd_rs::resource::with_resource_context(resource_context, || {
+        let target = httpd_rs::request_plan::CanonicalTarget::from_raw_path(
+            httpd_rs::request_plan::WireUrlPath::new(raw_path.as_bytes()),
             allow_encoded,
         )
         .map_err(|e| format!("invalid request path '{raw_path}': {e:?}"))?;
-        let plan = vapached::request_plan::RequestPlan::resolve(cfg, vhost, target)
+        let plan = httpd_rs::request_plan::RequestPlan::resolve(cfg, vhost, target)
             .map_err(|e| format!("mapping failed for '{path}': {e:?}"))?;
         let root = plan.root();
         let fs_path = plan.fs_path();
@@ -783,7 +784,7 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
             println!("    {rule}");
         }
         println!("  access_file_trace:");
-        for file in vapached::htaccess::trace_access_files_with_root(
+        for file in httpd_rs::htaccess::trace_access_files_with_root(
             cfg,
             vhost,
             &fs_path,
@@ -824,9 +825,9 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
 fn main() {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     if raw_args.get(1).map(OsString::as_os_str)
-        == Some(OsStr::new("--vapache-reverse-resolver-worker"))
+        == Some(OsStr::new("--httpd-rs-reverse-resolver-worker"))
     {
-        if vapached::process::close_inherited_descriptors().is_err() {
+        if httpd_rs::process::close_inherited_descriptors().is_err() {
             std::process::exit(1);
         }
         let result = raw_args
@@ -836,7 +837,7 @@ fn main() {
             .filter(|_| raw_args.len() == 3)
             .ok_or_else(|| "invalid reverse resolver worker arguments".to_string())
             .and_then(|ip| {
-                vapached::access::reverse_resolver_worker_main(ip)
+                httpd_rs::access::reverse_resolver_worker_main(ip)
                     .map_err(|error| error.to_string())
             });
         if result.is_err() {
@@ -844,8 +845,8 @@ fn main() {
         }
         return;
     }
-    if raw_args.get(1).map(OsString::as_os_str) == Some(OsStr::new("--vapache-resolver-worker")) {
-        if vapached::process::close_inherited_descriptors().is_err() {
+    if raw_args.get(1).map(OsString::as_os_str) == Some(OsStr::new("--httpd-rs-resolver-worker")) {
+        if httpd_rs::process::close_inherited_descriptors().is_err() {
             std::process::exit(1);
         }
         let result = raw_args
@@ -860,7 +861,7 @@ fn main() {
             .filter(|_| raw_args.len() == 4)
             .ok_or_else(|| "invalid resolver worker arguments".to_string())
             .and_then(|(host, port)| {
-                vapached::proxy::resolver_worker_main(host, port).map_err(|error| error.to_string())
+                httpd_rs::proxy::resolver_worker_main(host, port).map_err(|error| error.to_string())
             });
         if result.is_err() {
             std::process::exit(1);
@@ -891,18 +892,18 @@ fn main() {
         let Some((((uid, gid), user), parent_pid)) = worker else {
             std::process::exit(1);
         };
-        vapached::cgi::worker_main(3, uid, gid, user, parent_pid);
+        httpd_rs::cgi::worker_main(3, uid, gid, user, parent_pid);
         return;
     }
-    if let Err(error) = vapached::process::close_inherited_descriptors() {
-        eprintln!("vapached: cannot close inherited descriptors: {error}");
+    if let Err(error) = httpd_rs::process::close_inherited_descriptors() {
+        eprintln!("httpd-rs: cannot close inherited descriptors: {error}");
         std::process::exit(1);
     }
     let args = parse_args();
     if args.show_version {
         println!(
-            "vapached/{} (Apache/2.4 configuration compatible)",
-            vapached::VERSION
+            "httpd-rs/{} (Apache/2.4 configuration compatible)",
+            httpd_rs::VERSION
         );
         return;
     }
@@ -972,14 +973,14 @@ fn main() {
             for e in errors {
                 eprintln!("{e}");
             }
-            eprintln!("vapached: configuration test failed");
+            eprintln!("httpd-rs: configuration test failed");
             std::process::exit(1);
         }
     };
     for warning in &cfg.warnings {
         // Exercised by cli_lifecycle's instrumented subprocess; llvm-cov does
         // not merge that child record into the unit-test binary's main.rs map.
-        eprintln!("vapached: {warning}"); // coverage:ignore-line
+        eprintln!("httpd-rs: {warning}"); // coverage:ignore-line
     }
 
     if args.audit_capabilities {
@@ -1004,7 +1005,7 @@ fn main() {
         } else {
             println!("  missing opt-ins:");
             for capability in missing {
-                println!("    VapacheCapability {} On", capability.name());
+                println!("    HttpdRsCapability {} On", capability.name());
             }
         }
         println!(
@@ -1047,7 +1048,7 @@ fn main() {
 
     if let Some(_) = &args.explain {
         if let Err(e) = explain_config(&cfg, &args) {
-            eprintln!("vapached: explain: {e}");
+            eprintln!("httpd-rs: explain: {e}");
             std::process::exit(1);
         }
         return;
@@ -1056,21 +1057,21 @@ fn main() {
     let (service_uid, service_gid) = match user_ids(&cfg.user, &cfg.group) {
         Ok((uid, gid, _)) => (uid, gid),
         Err(error) => {
-            eprintln!("vapached: {error}");
+            eprintln!("httpd-rs: {error}");
             std::process::exit(1);
         }
     };
     let (euid, egid) = effective_ids();
     if let Err(error) = validate_service_identity(euid, egid, service_uid, service_gid) {
-        eprintln!("vapached: {error}");
+        eprintln!("httpd-rs: {error}");
         std::process::exit(1);
     }
     if let Err(error) = cfg.validate_admin_input_parents(service_uid) {
-        eprintln!("vapached: {error}");
+        eprintln!("httpd-rs: {error}");
         std::process::exit(1);
     }
     if let Err(error) = cfg.validate_auth_files(service_uid) {
-        eprintln!("vapached: {error}");
+        eprintln!("httpd-rs: {error}");
         std::process::exit(1);
     }
     let admin_service_uid = (effective_uid() == 0).then_some(service_uid);
@@ -1078,46 +1079,46 @@ fn main() {
     match args.action.as_deref() {
         Some("stop") => {
             if let Err(e) = kill_action(&cfg.pid_file, admin_service_uid, libc::SIGTERM) {
-                eprintln!("vapached: {e}");
+                eprintln!("httpd-rs: {e}");
                 std::process::exit(1);
             }
             return;
         }
         Some("graceful") => {
             if let Err(e) = kill_action(&cfg.pid_file, admin_service_uid, libc::SIGHUP) {
-                eprintln!("vapached: {e}");
+                eprintln!("httpd-rs: {e}");
                 std::process::exit(1);
             }
             return;
         }
         Some("graceful-stop") => {
             if let Err(e) = kill_action(&cfg.pid_file, admin_service_uid, libc::SIGTERM) {
-                eprintln!("vapached: {e}");
+                eprintln!("httpd-rs: {e}");
                 std::process::exit(1);
             }
             return;
         }
         Some("status") => match kill_action(&cfg.pid_file, admin_service_uid, 0) {
             Ok(pid) => {
-                println!("vapached is running (pid {pid})");
+                println!("httpd-rs is running (pid {pid})");
                 return;
             }
             _ => {
-                eprintln!("vapached is not running");
+                eprintln!("httpd-rs is not running");
                 std::process::exit(3);
             }
         },
         Some("start") | Some("restart") | None => {}
         Some(other) => {
-            eprintln!("vapached: unsupported -k action '{other}'");
+            eprintln!("httpd-rs: unsupported -k action '{other}'");
             std::process::exit(1);
         }
     }
 
     if args.test {
-        if let Err(e) = vapached::files::require_secure_path_resolution() {
-            eprintln!("vapached: {e}");
-            eprintln!("vapached: configuration test failed");
+        if let Err(e) = httpd_rs::files::require_secure_path_resolution() {
+            eprintln!("httpd-rs: {e}");
+            eprintln!("httpd-rs: configuration test failed");
             std::process::exit(1);
         }
         // Apache's configtest also validates SSL certificate/key material.
@@ -1129,11 +1130,11 @@ fn main() {
                 .parse::<std::net::IpAddr>()
                 .ok()
                 .filter(|ip| !ip.is_unspecified())
-                .map(vapached::access::canonical_ip);
-            if let Err(e) = vapached::tls::validate_listener_configs(&cfg, listener.port, local_ip)
+                .map(httpd_rs::access::canonical_ip);
+            if let Err(e) = httpd_rs::tls::validate_listener_configs(&cfg, listener.port, local_ip)
             {
-                eprintln!("vapached: SSL configuration error: {e}");
-                eprintln!("vapached: configuration test failed");
+                eprintln!("httpd-rs: SSL configuration error: {e}");
+                eprintln!("httpd-rs: configuration test failed");
                 std::process::exit(1);
             }
         }
@@ -1144,73 +1145,73 @@ fn main() {
     let mut bound = match server::bind(&cfg) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("vapached: cannot bind listener: {e}");
+            eprintln!("httpd-rs: cannot bind listener: {e}");
             std::process::exit(1);
         }
     };
     let mut logger = match Logger::new(&cfg) {
         Ok(l) => Arc::new(l),
         Err(e) => {
-            eprintln!("vapached: cannot open logs: {e}");
+            eprintln!("httpd-rs: cannot open logs: {e}");
             std::process::exit(1);
         }
     };
     if !args.foreground {
         if let Err(e) = daemonize() {
-            eprintln!("vapached: {e}");
+            eprintln!("httpd-rs: {e}");
             std::process::exit(1);
         }
     }
-    if let Err(e) = vapached::tls::install_privileged_file_broker(&cfg, service_uid) {
-        eprintln!("vapached: cannot start privileged TLS broker: {e}");
+    if let Err(e) = httpd_rs::tls::install_privileged_file_broker(&cfg, service_uid) {
+        eprintln!("httpd-rs: cannot start privileged TLS broker: {e}");
         std::process::exit(1);
     }
     // Finish every privileged, process-creating startup action before any
     // background thread exists. Forking a multithreaded root process risks
     // copied locks and gives the new thread a window to perform work as root.
-    vapached::cache::prepare(&cfg);
+    httpd_rs::cache::prepare(&cfg);
     if cfg.has_cgi() {
-        if let Err(e) = vapached::cgi::init_pool(&cfg) {
-            eprintln!("vapached: cannot start isolated CGI worker pool: {e}");
-            vapached::tls::shutdown_privileged_file_broker();
+        if let Err(e) = httpd_rs::cgi::init_pool(&cfg) {
+            eprintln!("httpd-rs: cannot start isolated CGI worker pool: {e}");
+            httpd_rs::tls::shutdown_privileged_file_broker();
             std::process::exit(1);
         }
     }
     let mut pid_guard = match write_pid(&cfg.pid_file, admin_service_uid) {
         Ok(guard) => guard,
         Err(e) => {
-            eprintln!("vapached: {e}");
-            vapached::cgi::shutdown_pool();
-            vapached::tls::shutdown_privileged_file_broker();
+            eprintln!("httpd-rs: {e}");
+            httpd_rs::cgi::shutdown_pool();
+            httpd_rs::tls::shutdown_privileged_file_broker();
             std::process::exit(1);
         }
     };
     logger.prepare_permissions(&cfg);
     if let Err(e) = drop_privileges(&cfg.user, &cfg.group) {
-        eprintln!("vapached: {e}");
+        eprintln!("httpd-rs: {e}");
         pid_guard.clear();
-        vapached::cgi::shutdown_pool();
-        vapached::tls::shutdown_privileged_file_broker();
+        httpd_rs::cgi::shutdown_pool();
+        httpd_rs::tls::shutdown_privileged_file_broker();
         std::process::exit(1);
     }
     if let Err(e) = pid_guard.refresh_identity() {
-        eprintln!("vapached: {e}");
+        eprintln!("httpd-rs: {e}");
         pid_guard.clear();
-        vapached::cgi::shutdown_pool();
-        vapached::tls::shutdown_privileged_file_broker();
+        httpd_rs::cgi::shutdown_pool();
+        httpd_rs::tls::shutdown_privileged_file_broker();
         std::process::exit(1);
     }
     if let Err(e) = server::activate_background(&cfg, &mut bound) {
-        eprintln!("vapached: cannot start background services: {e}");
+        eprintln!("httpd-rs: cannot start background services: {e}");
         pid_guard.clear();
-        vapached::cgi::shutdown_pool();
-        vapached::tls::shutdown_privileged_file_broker();
+        httpd_rs::cgi::shutdown_pool();
+        httpd_rs::tls::shutdown_privileged_file_broker();
         std::process::exit(1);
     }
-    vapache_os::install_signal_handlers(on_signal, on_reload, on_reopen);
+    httpd_rs_os::install_signal_handlers(on_signal, on_reload, on_reopen);
     logger.info(&format!(
-        "vapached/{} started, listening on {} socket(s)",
-        vapached::VERSION,
+        "httpd-rs/{} started, listening on {} socket(s)",
+        httpd_rs::VERSION,
         bound.len()
     ));
 
@@ -1334,14 +1335,14 @@ fn main() {
         // generation connection. In-flight old requests retain immutable
         // policy and may finish, but cannot publish into this generation.
         srv.retire_generation();
-        vapached::cache::clear_reload(&cfg, &new_cfg);
+        httpd_rs::cache::clear_reload(&cfg, &new_cfg);
         cfg = new_cfg;
         bound = new_bound;
         logger = new_logger;
         logger.info("configuration reloaded; cache generation invalidated");
     }
-    vapached::cgi::shutdown_pool();
-    vapached::tls::shutdown_privileged_file_broker();
+    httpd_rs::cgi::shutdown_pool();
+    httpd_rs::tls::shutdown_privileged_file_broker();
     pid_guard.clear();
     let _ = std::io::stderr().flush();
 }
@@ -1351,7 +1352,7 @@ mod tests {
     use super::*;
 
     fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("vapache-main-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-main-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         dir.join(name)
     }
@@ -1405,11 +1406,11 @@ mod tests {
         let scope = cfg.effective_scope(None, &policy_path.join("file.txt"), "/file.txt");
         assert!(matches!(
             scope.authorization.requires,
-            Some(vapached::config::AuthPolicy::List(ref entries))
+            Some(httpd_rs::config::AuthPolicy::List(ref entries))
                 if entries.iter().any(|entry| matches!(
                     entry.node,
-                    vapached::config::RequireNode::Provider(
-                        vapached::config::Require::AllDenied
+                    httpd_rs::config::RequireNode::Provider(
+                        httpd_rs::config::Require::AllDenied
                     )
                 ))
         ));
@@ -1634,7 +1635,7 @@ mod tests {
         std::fs::write(
             &conf,
             format!(
-                "VapacheCapability AccessFiles On\nListen 127.0.0.1:8080\nServerName example.test\nDocumentRoot {}\nAlias /alias {}\n<Directory {}>\nAllowOverride All\nRequire all granted\n</Directory>\n",
+                "HttpdRsCapability AccessFiles On\nListen 127.0.0.1:8080\nServerName example.test\nDocumentRoot {}\nAlias /alias {}\n<Directory {}>\nAllowOverride All\nRequire all granted\n</Directory>\n",
                 dir.join("www").display(),
                 alias_root.display(),
                 alias_root.display(),
@@ -1650,7 +1651,7 @@ mod tests {
         std::fs::write(
             &conf,
             format!(
-                "VapacheCapability AccessFiles On\nListen 127.0.0.1:8080\nDocumentRoot {}\n<Directory {}>\nAllowOverride All\n</Directory>\n",
+                "HttpdRsCapability AccessFiles On\nListen 127.0.0.1:8080\nDocumentRoot {}\n<Directory {}>\nAllowOverride All\n</Directory>\n",
                 dir.join("www").display(),
                 unrelated.display(),
             ),

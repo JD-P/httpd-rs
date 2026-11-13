@@ -1,7 +1,7 @@
 # Pass 28 — unbounded rewrite, expression and section-nesting work aborts the process
 
 - **Date:** 2026-11-01
-- **Subject:** HEAD `5b5dbb7` (`target/release/vapached`; no product source was
+- **Subject:** HEAD `5b5dbb7` (`target/release/httpd-rs`; no product source was
   edited).
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` (+ `authz_core`,
   `authz_host`, `mime`, `dir`, `rewrite`), loopback only.
@@ -15,22 +15,22 @@
 - **Method:** audit of the three attacker-influenced evaluators that sit
   behind an upload directory's `.htaccess` (rewrite substitution expansion,
   `ap_expr` value construction, recursive access-file section parsing), then
-  live Apache-versus-vapached differentials on the project's own
+  live Apache-versus-httpd-rs differentials on the project's own
   conformance/benchmark override shapes.
 
 ---
 
 ## 1. Executive summary
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
-| **P28-A** | `RewriteRule ^(.*)$ $1$1…$1 [L]` is re-applied by the dispatcher to its own output for up to 10 rounds. The substitution has no length cap, so the URI grows by `k^10` per request (a 100-byte rule and a 1-byte path reach 10^10×). One request raised vapache RSS to 1.07 GB in 6 s in the retained harness (3.2 GB in the longer probe) and the allocator aborts the process under a 512 MiB address-space limit (`memory allocation of 100000000 bytes failed`, `SIGABRT`). | `403` in 13.6 ms, 1.9 MB RSS, alive | multi-GB allocation, worker pinned, `SIGABRT` under a memory bound | remote one-request denial of service (rewrite amplification) |
+| **P28-A** | `RewriteRule ^(.*)$ $1$1…$1 [L]` is re-applied by the dispatcher to its own output for up to 10 rounds. The substitution has no length cap, so the URI grows by `k^10` per request (a 100-byte rule and a 1-byte path reach 10^10×). One request raised httpd-rs RSS to 1.07 GB in 6 s in the retained harness (3.2 GB in the longer probe) and the allocator aborts the process under a 512 MiB address-space limit (`memory allocation of 100000000 bytes failed`, `SIGABRT`). | `403` in 13.6 ms, 1.9 MB RSS, alive | multi-GB allocation, worker pinned, `SIGABRT` under a memory bound | remote one-request denial of service (rewrite amplification) |
 | **P28-B** | `Require expr` value construction is unbounded: a quoted expression concatenates `%{HTTP:…}` expansions or `file()` contents with no per-request size or work budget. A 102 KB access file of `file('prot/big')` calls (64 KiB file) materializes >500 MB per request (`memory allocation of 536870912 bytes failed`, `SIGABRT` under 512 MiB); the header form needs only a 1 KB access file and an 8 KB request header to build 7.8 MB per request. | `500` in <1 ms, flat RSS, alive | hundreds of MB per request; abort under a memory bound | remote one-request denial of service (expression expansion) |
 | **P28-C** | `parse_block()` recurses once per nested `.htaccess` section with no depth cap. 1,000 nested `<RequireAll>` wrappers (a 27 KB access file) overflow the default 2 MiB connection stack on the first request; `panic = "abort"` turns it into `thread 'conn' has overflowed its stack / fatal runtime error: stack overflow, aborting` (`SIGABRT`). 5,000 nested `<If>` wrappers (90 KB) behave the same. | `200` in 2-87 ms, alive | `SIGABRT` on the first request | remote one-request whole-process denial of service (parser recursion) |
 
 All three are remote, unauthenticated and reachable from a single
 attacker-written `.htaccess` in the access-file shape the project benchmarks
-and tests (`VapacheCapability AccessFiles On` plus `AllowOverride FileInfo`
+and tests (`HttpdRsCapability AccessFiles On` plus `AllowOverride FileInfo`
 or `All` for P28-A, `AuthConfig` for P28-B, any override admitting sections
 for P28-C). Apache answers the identical access files and requests in
 milliseconds and never grows or dies.
@@ -49,7 +49,7 @@ let expanded = match expand_backrefs(&rule.substitution, ...) { ... };   // 582
 ...
 path = new_path_from_joined(&joined);                                    // 745
 changed = true;
-match vapache_verified::rewrite_advance(..., loops, 10) {                // 748
+match httpd_rs_verified::rewrite_advance(..., loops, 10) {                // 748
     RewriteAdvance::Restart { completed } => { loops = completed; idx = 0; continue; }
     RewriteAdvance::RestartLimit => return Outcome::Error("rewrite [N] loop limit exceeded".into()),
     ...
@@ -130,14 +130,14 @@ comparable cap.)
 `/tmp/opencode/p28-final-run.txt`):
 
 ```text
-PASS  A1 rewrite growth: vapache TIMEOUT in 6014 ms rss 6964->1121520 KiB (Apache oracle next)
+PASS  A1 rewrite growth: httpd-rs TIMEOUT in 6014 ms rss 6964->1121520 KiB (Apache oracle next)
 PASS  A2 Apache oracle: apache HTTP/1.1 403 Forbidden in 13.6 ms rss=1892 KiB alive
 PASS  A3 bounded abort: rc=-6; memory allocation of 100000000 bytes failed | note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-PASS  B1 header expansion: vapache HTTP/1.1 200 OK in 23 ms
+PASS  B1 header expansion: httpd-rs HTTP/1.1 200 OK in 23 ms
 PASS  B2 Apache oracle: apache HTTP/1.1 500 Internal Server Error in 0.6 ms alive
 PASS  B3 bounded abort: access file 102015 B; rc=-6; memory allocation of 536870912 bytes failed | note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-PASS  C1 RequireAll x1000: access file 27020 B; vapache rc=-6 stack-overflow=True; apache HTTP/1.1 200 OK in 2 ms alive=True
-PASS  C2 <If> x5000: access file 90020 B; vapache rc=-6 stack-overflow=True; apache HTTP/1.1 200 OK in 87 ms alive=True
+PASS  C1 RequireAll x1000: access file 27020 B; httpd-rs rc=-6 stack-overflow=True; apache HTTP/1.1 200 OK in 2 ms alive=True
+PASS  C2 <If> x5000: access file 90020 B; httpd-rs rc=-6 stack-overflow=True; apache HTTP/1.1 200 OK in 87 ms alive=True
 ```
 
 ### 3.1 P28-A — rewrite growth
@@ -145,7 +145,7 @@ PASS  C2 <If> x5000: access file 90020 B; vapache rc=-6 stack-overflow=True; apa
 Fixture: `AllowOverride FileInfo`, `.htaccess` with
 `RewriteRule ^(.*)$ $1$1$1$1$1 [L]`, request `/rw/` + 50 `a`s.
 
-- Natural run: vapache did not answer within 6 s and grew from 7 MB to
+- Natural run: httpd-rs did not answer within 6 s and grew from 7 MB to
   **1.07 GB RSS**; the longer probe (`/tmp/opencode/p28-rewrite2`) reached
   **3.2 GB** and the request stayed pinned.
 - Bounded run: with `RLIMIT_AS = 512 MiB` and a ten-`$1` rule, a 1-byte path
@@ -171,19 +171,19 @@ access file with 50 repetitions requests `50^10 × L` bytes.
 
 ### 3.3 P28-C — section nesting
 
-- 1,000 nested `<RequireAll>` wrappers (27,020-byte access file): vapache
+- 1,000 nested `<RequireAll>` wrappers (27,020-byte access file): httpd-rs
   aborts with `thread 'conn' has overflowed its stack`; Apache `200` in
   2 ms.
 - 5,000 nested `<If "true">` wrappers (90,020 bytes): same abort; Apache
   `200` in 87 ms.
-- 20,000-level forms also abort vapache while Apache stays alive.
+- 20,000-level forms also abort httpd-rs while Apache stays alive.
 
 ---
 
 ## 4. Reachability and threat model
 
 - **Precondition:** one attacker-written `.htaccess` in a writable directory
-  of a tree that enables access files (`VapacheCapability AccessFiles On`)
+  of a tree that enables access files (`HttpdRsCapability AccessFiles On`)
   with the relevant override category:
   - P28-A: `AllowOverride FileInfo` or `All` (tested with `FileInfo`; the
     project's conformance tree has `www/htaccess/cat-fileinfo` and the
@@ -255,8 +255,8 @@ access file with 50 repetitions requests `50^10 × L` bytes.
 ## 7. Reproduction
 
 ```sh
-cd /root/vapache
-cargo build --release -p vapached
+cd /root/httpd-rs
+cargo build --release -p httpd-rs
 python3 adversarial/p28/exploit_p28.py            # all 8 verdicts
 python3 adversarial/p28/exploit_p28.py A           # rewrite growth
 python3 adversarial/p28/exploit_p28.py B C         # expression / nesting
@@ -270,12 +270,12 @@ Expected: `8/8 verdicts passed`; the `*-kill.log` files contain
 
 Minimal P28-A repro: `.htaccess` with
 `RewriteEngine On` / `RewriteRule ^(.*)$ $1$1$1$1$1$1$1$1$1$1 [L]` under
-`AllowOverride FileInfo` + `VapacheCapability AccessFiles On`; request
-`/rw/a`. Under `RLIMIT_AS=512 MiB` vapache aborts in ~0.5 s; Apache answers
+`AllowOverride FileInfo` + `HttpdRsCapability AccessFiles On`; request
+`/rw/a`. Under `RLIMIT_AS=512 MiB` httpd-rs aborts in ~0.5 s; Apache answers
 `403` in ~1 ms.
 
 Minimal P28-C repro: a 27 KB `.htaccess` of 1,000 nested `<RequireAll>`
-wrappers around `Require all granted`; one request aborts vapache, Apache
+wrappers around `Require all granted`; one request aborts httpd-rs, Apache
 returns `200`.
 
 ---

@@ -106,7 +106,7 @@ fn basic_token(header: &[u8]) -> Option<&[u8]> {
         && header[token_start..end]
             .iter()
             .all(|byte| !byte.is_ascii_whitespace());
-    if !vapache_verified::basic_authorization_shape_admit(
+    if !httpd_rs_verified::basic_authorization_shape_admit(
         scheme_basic,
         separator,
         token_nonempty,
@@ -268,7 +268,7 @@ fn path_names_key(path: &Path, key: &AuthFileKey) -> bool {
     let Ok(meta) = crate::fault::hit("auth.path.metadata").and_then(|()| file.metadata()) else {
         return false;
     };
-    vapache_verified::auth_cache_snapshot_admit(meta.is_file(), auth_key(path, &meta) == *key)
+    httpd_rs_verified::auth_cache_snapshot_admit(meta.is_file(), auth_key(path, &meta) == *key)
 }
 
 fn read_bounded(reader: impl Read) -> Option<String> {
@@ -433,7 +433,7 @@ fn verify_password(password: &[u8], stored: &str) -> bool {
             .nth(2)
             .and_then(|cost| cost.parse::<u32>().ok())
             .unwrap_or(u32::MAX);
-        if !vapache_verified::bcrypt_cost_admit(cost) {
+        if !httpd_rs_verified::bcrypt_cost_admit(cost) {
             return false;
         }
         let Some(_expensive) = crate::resource::try_expensive() else {
@@ -542,7 +542,7 @@ mod tests {
 
     fn temp_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "vapache-auth-{label}-{}-{}",
+            "httpd-rs-auth-{label}-{}-{}",
             std::process::id(),
             NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
         ))

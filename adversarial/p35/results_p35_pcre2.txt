@@ -1,16 +1,16 @@
 ## S-star-v  pattern=\S*\v
-   plain apache=403 vapache=403
-   nel   apache=403 vapache=200
+   plain apache=403 httpd-rs=403
+   nel   apache=403 httpd-rs=200
 ## S-star-R  pattern=\S*\R
-   plain apache=403 vapache=403
-   nel   apache=403 vapache=200
+   plain apache=403 httpd-rs=403
+   nel   apache=403 httpd-rs=200
 ## N-plus-R  pattern=\N+\R
-   plain apache=403 vapache=403
-   nel   apache=403 vapache=200
+   plain apache=403 httpd-rs=403
+   nel   apache=403 httpd-rs=200
 ## S-plus-R  pattern=\S+\R
-   plain apache=403 vapache=403
-   nel   apache=403 vapache=200
+   plain apache=403 httpd-rs=403
+   nel   apache=403 httpd-rs=200
 ## plain-v-control  pattern=\v
-   plain apache=403 vapache=403
-   nel   apache=200 vapache=200
-P35-B LIVE: PCRE2 auto-possessification over-matches on vapache
+   plain apache=403 httpd-rs=403
+   nel   apache=200 httpd-rs=200
+P35-B LIVE: PCRE2 auto-possessification over-matches on httpd-rs

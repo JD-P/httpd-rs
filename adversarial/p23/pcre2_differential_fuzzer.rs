@@ -7,7 +7,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use pcre2_c_oracle::bytes as oracle;
-use vapache_pcre2::bytes as rust;
+use httpd_rs_pcre2::bytes as rust;
 
 fn rust_spans(regex: &rust::Regex, subject: &[u8]) -> Result<Vec<Vec<Option<(usize, usize)>>>, ()> {
     regex

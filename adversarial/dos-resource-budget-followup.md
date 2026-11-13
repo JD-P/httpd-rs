@@ -75,7 +75,7 @@ operations do not partially mutate policy or write response bytes.
 
 ## Residual availability boundary
 
-These changes bound attacker-controlled work that is amplified by Vapache's
+These changes bound attacker-controlled work that is amplified by httpd-rs's
 configuration engine. They do not claim that one admitted request has zero
 cost: TLS handshakes, bounded compression, filesystem latency and upstream
 service latency remain volumetric resources. Those paths retain their existing

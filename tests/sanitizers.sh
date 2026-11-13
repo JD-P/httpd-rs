@@ -2,7 +2,7 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-NIGHTLY=${VAPACHE_NIGHTLY_TOOLCHAIN:-nightly}
+NIGHTLY=${HTTPD_RS_NIGHTLY_TOOLCHAIN:-nightly}
 sanitizer=${1:-address}
 case "$sanitizer" in
     address|leak|thread) ;;
@@ -19,13 +19,13 @@ case "$sanitizer" in
     address)
         # First exercise every audited syscall wrapper with the smallest
         # possible instrumented binary, then the server's composed paths.
-        cargo +"$NIGHTLY" test -p vapache-os \
+        cargo +"$NIGHTLY" test -p httpd-rs-os \
             --target x86_64-unknown-linux-gnu -- --test-threads=1
         # ASan's runtime is not fork-safe and its overhead intentionally
         # violates one wall-clock progress test. Exclude only those probes;
         # their syscall cores run in the dedicated crate above and in the
         # ordinary/weekly suites.
-        cargo +"$NIGHTLY" test -p vapached --lib --all-features \
+        cargo +"$NIGHTLY" test -p httpd-rs --lib --all-features \
             --target x86_64-unknown-linux-gnu -- --test-threads=1 \
             --skip cgi::tests::child_process_and_worker_main_paths \
             --skip h2::tests::progressing_h2_response_outlives_the_idle_and_send_intervals \
@@ -36,19 +36,19 @@ case "$sanitizer" in
     leak)
         # The unit-test binary intentionally owns process-global regex and
         # Loom state. Standalone integration binaries give LSan a clean exit.
-        cargo +"$NIGHTLY" test -p vapache-os \
+        cargo +"$NIGHTLY" test -p httpd-rs-os \
             --target x86_64-unknown-linux-gnu -- --test-threads=1
-        cargo +"$NIGHTLY" test -p vapached --all-features \
+        cargo +"$NIGHTLY" test -p httpd-rs --all-features \
             --test properties --test failpoints --test fault_injection \
             --target x86_64-unknown-linux-gnu -- --test-threads=1
         ;;
     thread)
         # TSan needs an instrumented standard library and is aimed at the
         # real multi-threaded admission path; Loom explores the model space.
-        cargo +"$NIGHTLY" test -Zbuild-std -p vapached --lib \
+        cargo +"$NIGHTLY" test -Zbuild-std -p httpd-rs --lib \
             resource::tests::concurrent_dynamic_admission_never_exceeds_the_limit \
             --target x86_64-unknown-linux-gnu -- --exact --test-threads=1
-        cargo +"$NIGHTLY" test -Zbuild-std -p vapache-pcre2 \
+        cargo +"$NIGHTLY" test -Zbuild-std -p httpd-rs-pcre2 \
             --test concurrency --target x86_64-unknown-linux-gnu -- \
             --test-threads=1
         ;;

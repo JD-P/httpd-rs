@@ -1,7 +1,7 @@
 # Pass 13 — adversarial break of HEAD `cce35eb` ("Harden rewrite and configuration security invariants")
 
 - **Date:** 2026-10-27
-- **Subject:** `target/release/vapached` built at HEAD `cce35eb` (no repo source edits; the only additions for this pass are `adversarial/p13/exploit_p13.py`, this write-up and the `adversarial/README.md` index entry)
+- **Subject:** `target/release/httpd-rs` built at HEAD `cce35eb` (no repo source edits; the only additions for this pass are `adversarial/p13/exploit_p13.py`, this write-up and the `adversarial/README.md` index entry)
 - **Oracle:** Apache/2.4.69 (Debian), `/usr/sbin/apache2 -X`, loopback only; PHP-FPM 8.4 with both the Debian `security.limit_extensions` default and the (Docker) empty value
 - **Method:** static audit of every handler-classification site followed by a differential battery that pairs the project's *own* benchmark/typical postures (global `Options +ExecCGI +FollowSymLinks` + `AddHandler cgi-script .cgi`, per-directory `<FilesMatch "\.cgi$"> SetHandler cgi-script`, and the documented `SetHandler "proxy:unix:…|fcgi://…"` FastCGI form) with one common real-world object: an in-root symlink whose filename does not carry the script extension.
 - **Harness:** `adversarial/p13/exploit_p13.py` (all cases below reproduce in one command; see §7).
@@ -12,7 +12,7 @@
 
 Three remotely triggerable code-execution findings on HEAD. All are faces of the same root cause: the F69 "handler identity binds to the lexical request-mapped basename" rule was applied only to the **extension-table lookup** of one dispatch path. Two other paths still classify by the **canonical symlink-target basename**, and a third lets a canonical-scoped `<Files>`/`<FilesMatch>` `SetHandler` **force** override the lexical name entirely. Every one of them turns a request Apache serves as static content (or rejects) into an `execve`/PHP-FPM execution.
 
-| # | Finding | Apache 2.4.69 | vapache HEAD | Class |
+| # | Finding | Apache 2.4.69 | httpd-rs HEAD | Class |
 |---|---------|---------------|--------------|-------|
 | **P13-A** | `SetHandler "proxy:…|fcgi://…"` (documented FastCGI form) classifies the handler from `actual_path.file_name()` — a symlink `pub/link.txt -> secret/app.php` is executed by PHP-FPM on `GET /pub/link.txt` | serves the symlink target as **static source** (200 `<?php …`) | **runs `app.php` in PHP-FPM as `www-data`** (200 `PHP-EXEC …`); a `<Location "/secret/">` `Require valid-user` guard on the script is skipped, so it runs **anonymously** | remote code execution / authentication bypass |
 | **P13-B** | The CGI `PATH_INFO` branch classifies from `fd_path()` (canonical) — `GET /pub/link.txt/x` **execve()s** `secret/run.cgi` | **404** (static file + `PATH_INFO` is rejected for non-CGI handlers) | **200 `PWNED-CGI uid=33`**; a `<Location "/secret/">` `Require all denied` guard on the script is bypassed | remote code execution / authorization bypass |
@@ -64,9 +64,9 @@ pub(crate) fn handler_target_for_file(
 
 For `GET /pub/link.txt` with `pub/link.txt -> ../secret/app.php`, `actual_path` is `/…/secret/app.php`, so `effective_handler` sees `app.php` and the `proxy:` handler. `run_fastcgi` then re-authorizes `target.script_filename` (the canonical target) and sends `SCRIPT_FILENAME=/…/secret/app.php` to PHP-FPM. Apache classifies by the *filename the request resolved to* (`…/pub/link.txt`) — the `\.php$` handler never matches, and `default_handler` serves the target bytes as text.
 
-The authorization that vapache runs for the target is `scope(fs=/…/secret/app.php) ∧ scope(url=/pub/link.txt)` (`authorize_resolved_target`, `server.rs:1530-1621`). It never evaluates `scope(url=/secret/app.php)`, so **URL-scoped guards on the script's own URL are skipped**:
+The authorization that httpd-rs runs for the target is `scope(fs=/…/secret/app.php) ∧ scope(url=/pub/link.txt)` (`authorize_resolved_target`, `server.rs:1530-1621`). It never evaluates `scope(url=/secret/app.php)`, so **URL-scoped guards on the script's own URL are skipped**:
 
-- `<Location "/secret/"> Require valid-user` → direct `/secret/app.php` is 401 on both servers; `/pub/link.txt` is 200 PHP execution with no credentials on vapache and static source on Apache.
+- `<Location "/secret/"> Require valid-user` → direct `/secret/app.php` is 401 on both servers; `/pub/link.txt` is 200 PHP execution with no credentials on httpd-rs and static source on Apache.
 - `<Location "/secret/"> Require all denied` behaves the same way.
 
 `<Directory>`/`<Files>` guards that match the canonical path are still applied (verified negative result, §6), so the bypass is specific to `<Location>`/`<LocationMatch>`/URL-scope policy — which is exactly the policy Apache applies to the URL that the attacker is *not* using.
@@ -102,12 +102,12 @@ Tree:
 Observed against real PHP-FPM 8.4 (harness output, `p13a2`):
 
 ```
-guard control direct /secret/app.php:            apache=401   vapache=401
+guard control direct /secret/app.php:            apache=401   httpd-rs=401
 GET /pub/link.txt            Apache: 200  "<?php echo 'PHP-EXEC ' . __FILE__ …"
-                             vapache: 200  "PHP-EXEC /…/secret/app.php uid=33"
+                             httpd-rs: 200  "PHP-EXEC /…/secret/app.php uid=33"
 ```
 
-Same result for any lexical name (`photo.png`, `download.php.txt`, …); only the canonical basename matters. Without the `<Location>` guard (case `p13a1`) Apache still serves PHP **source** while vapache executes it.
+Same result for any lexical name (`photo.png`, `download.php.txt`, …); only the canonical basename matters. Without the `<Location>` guard (case `p13a1`) Apache still serves PHP **source** while httpd-rs executes it.
 
 Prerequisite only: the symlink. With an archive-extraction endpoint that preserves entries such as `pub/link.txt -> ../secret/app.php` (the classic zip/tar symlink upload), the entire chain is attacker-supplied.
 
@@ -115,7 +115,7 @@ Prerequisite only: the symlink. With an archive-extraction endpoint that preserv
 
 - **Remote code execution as the FPM worker user** (`www-data`): the request dispatches a PHP script through PHP-FPM that Apache never dispatches.
 - **Authentication/authorization bypass**: `<Location>` is the documented way to scope guards to a URL; the script's own URL guard is not evaluated when the script is reached through the symlink name.
-- **Source-disclosure inversion**: routes where Apache leaks PHP source (misconfiguration) are turned into execution on vapache.
+- **Source-disclosure inversion**: routes where Apache leaks PHP source (misconfiguration) are turned into execution on httpd-rs.
 
 ### 2.4 Fix
 
@@ -125,7 +125,7 @@ Prerequisite only: the symlink. With an archive-extraction endpoint that preserv
 let name = rel.file_name()               // lexical request basename
     .or_else(|| actual_path.file_name())
     …
-debug_assert!(vapache_verified::handler_identity_lexical_admit(
+debug_assert!(httpd_rs_verified::handler_identity_lexical_admit(
     actual_path != fs_path_used_by_caller,
     name == rel.file_name()…,
 ));
@@ -193,12 +193,12 @@ Tree:
 Observed (harness output, `p13b2`):
 
 ```
-guard control direct /secret/run.cgi:   apache=403   vapache=403
+guard control direct /secret/run.cgi:   apache=403   httpd-rs=403
 GET /pub/link.txt/x          Apache: 404
-                             vapache: 200 "PWNED-CGI uid=33"
+                             httpd-rs: 200 "PWNED-CGI uid=33"
 ```
 
-The `Location: deny` variant was used above; the Basic-auth variant was also run manually and executes anonymously (`PWNED uid=33`, marker file written). Any non-empty suffix triggers it (`/pub/link.txt/x`, `/pub/link.txt/.cgi`, …). Case `p13b1` shows the unguarded divergence: Apache 404, vapache executes.
+The `Location: deny` variant was used above; the Basic-auth variant was also run manually and executes anonymously (`PWNED uid=33`, marker file written). Any non-empty suffix triggers it (`/pub/link.txt/x`, `/pub/link.txt/.cgi`, …). Case `p13b1` shows the unguarded divergence: Apache 404, httpd-rs executes.
 
 ### 3.3 Impact
 
@@ -261,9 +261,9 @@ Tree: `secret/run.cgi` (executable), `pub/link.txt -> ../secret/run.cgi`.
 Observed (harness cases `p13c1`/`p13c2`):
 
 ```
-GET /secret/run.cgi          Apache: 403        vapache: 403
+GET /secret/run.cgi          Apache: 403        httpd-rs: 403
 GET /pub/link.txt            Apache: 200 "#!/bin/sh …"   (source)
-                             vapache: 200 "PWNED-CGI uid=33"   (execve)
+                             httpd-rs: 200 "PWNED-CGI uid=33"   (execve)
 ```
 
 `<Files "run.cgi"> SetHandler cgi-script` behaves identically. The `AddHandler`-free posture matters: an operator who enables CGI with per-directory `<FilesMatch …> SetHandler cgi-script` (the standard way to scope CGI to a tree) is affected without any global `/cgi-bin` configuration.
@@ -292,11 +292,11 @@ A force produced by a `<Files>`/`<FilesMatch>` section that matched the **canoni
 - Control `GET /secret/run.cgi` (CGI cases) executes on **both** servers (200 executed); control `GET /pub/link.txt` serves source on **both** (200 `#!/bin/sh …`). The fixture is viable and the F69 direct-path fix holds for the `AddHandler` posture.
 - Control `GET /secret/app.php` (FastCGI case) is 401 anonymous and 200 executed with valid credentials on **both** servers; the `<Location>` guard itself is live.
 - `<Files "link.txt"> Require all denied` and `<FilesMatch "^link\.txt$"> Require all denied` on the symlink URL deny on both servers (403) — the divergence is not "any guard bypass".
-- `<Directory "/…/secret"> Require all denied` and `<Files "run.cgi"> Require all denied` deny the symlink request on vapache (403, no execution) — *access* rules on the canonical target are still evaluated. Only the Files-scoped *handler force* leaks (P13-C).
+- `<Directory "/…/secret"> Require all denied` and `<Files "run.cgi"> Require all denied` deny the symlink request on httpd-rs (403, no execution) — *access* rules on the canonical target are still evaluated. Only the Files-scoped *handler force* leaks (P13-C).
 - `Options -ExecCGI` on the canonical target directory blocks P13-B/P13-C (no execution) and P13-A (source/static) — the exploit needs the project's benchmark `ExecCGI` posture, which the README/benchmarks use.
 - `<Location "/pub/"> Require all denied` on the symlink URL itself denies both servers (403).
 - A no-handler control (symlink, `Options +ExecCGI`, no `AddHandler`/`SetHandler`) serves source on both servers — classification alone never executes.
-- PHP-FPM `fix_pathinfo` exercises (`/uploads/avatar.txt/x.php` with the Docker-style empty `security.limit_extensions`) execute on **both** Apache and vapache; that is upstream PHP behaviour, not a vapache divergence. The P13-A divergence is handler selection before the backend is involved.
+- PHP-FPM `fix_pathinfo` exercises (`/uploads/avatar.txt/x.php` with the Docker-style empty `security.limit_extensions`) execute on **both** Apache and httpd-rs; that is upstream PHP behaviour, not a httpd-rs divergence. The P13-A divergence is handler selection before the backend is involved.
 - With PHP-FPM's default `security.limit_extensions`, symlink targets that are not `.php*` are refused by FPM; the demonstrated target is a real `.php` script.
 
 ---
@@ -304,13 +304,13 @@ A force produced by a `<Files>`/`<FilesMatch>` section that matched the **canoni
 ## 7. How to reproduce
 
 ```sh
-cd /root/vapache
-cargo build --release -p vapached
+cd /root/httpd-rs
+cargo build --release -p httpd-rs
 python3 adversarial/p13/exploit_p13.py            # A+B, Apache oracle on sibling ports
 python3 adversarial/p13/exploit_p13.py A B --keep # keep dossiers in /tmp/opencode/p13-harness
 ```
 
-Each case builds its own fixture tree and starts Apache (`-X`) and vapached on loopback ports with separate pid/error files. Group A needs `php-fpm8.4`/`php-fpm` for the execution oracle; if neither is installed the harness substitutes a private fake FastCGI responder that echoes the `SCRIPT_FILENAME` vapache sends, which still proves Apache never dispatches the request while vapache does. Group B has no external dependency.
+Each case builds its own fixture tree and starts Apache (`-X`) and httpd-rs on loopback ports with separate pid/error files. Group A needs `php-fpm8.4`/`php-fpm` for the execution oracle; if neither is installed the harness substitutes a private fake FastCGI responder that echoes the `SCRIPT_FILENAME` httpd-rs sends, which still proves Apache never dispatches the request while httpd-rs does. Group B has no external dependency.
 
 Expected summary:
 

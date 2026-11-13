@@ -11,7 +11,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  VAPACHE_NIGHTLY_TOOLCHAIN: nightly-2026-10-29
+  HTTPD_RS_NIGHTLY_TOOLCHAIN: nightly-2026-10-29
 
 jobs:
   apache-source-warrant:
@@ -63,15 +63,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: |
-          rustup toolchain install "$VAPACHE_NIGHTLY_TOOLCHAIN" \
+          rustup toolchain install "$HTTPD_RS_NIGHTLY_TOOLCHAIN" \
             --profile minimal --component miri --component rust-src
           cargo install cargo-careful --version 0.4.10 --locked
       - name: Standard-library precondition checks
         run: tests/careful.sh
       - name: Miri on pure parser and budget tests
         run: |
-          cargo +"$VAPACHE_NIGHTLY_TOOLCHAIN" miri test -p vapached --lib resource::tests::aggregate_spool_and_dynamic_limits_release_on_drop -- --exact
-          cargo +"$VAPACHE_NIGHTLY_TOOLCHAIN" miri test -p vapached --lib http::tests::parse_basic -- --exact
+          cargo +"$HTTPD_RS_NIGHTLY_TOOLCHAIN" miri test -p httpd-rs --lib resource::tests::aggregate_spool_and_dynamic_limits_release_on_drop -- --exact
+          cargo +"$HTTPD_RS_NIGHTLY_TOOLCHAIN" miri test -p httpd-rs --lib http::tests::parse_basic -- --exact
 
   packaging:
     runs-on: ubuntu-24.04
@@ -121,7 +121,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y apache2 apache2-utils
-      - run: cargo build --locked --release -p vapached
+      - run: cargo build --locked --release -p httpd-rs
       - name: Same-host differential throughput benchmark
         run: |
           python3 bench/bench.py --quick

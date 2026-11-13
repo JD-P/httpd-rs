@@ -1,6 +1,6 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
-//! vapached: an Apache HTTPD-compatible web server with a Verus-verified
+//! httpd-rs: an Apache HTTPD-compatible web server with a Verus-verified
 //! security core.
 //!
 //! Module layering:
@@ -67,7 +67,7 @@ pub mod util;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod whole_request_fuzz;
 
-pub use vapache_verified as verified;
+pub use httpd_rs_verified as verified;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SERVER_SOFTWARE: &str = concat!("vapache/", env!("CARGO_PKG_VERSION"));
+pub const SERVER_SOFTWARE: &str = concat!("httpd-rs/", env!("CARGO_PKG_VERSION"));

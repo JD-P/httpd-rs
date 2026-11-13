@@ -1,4 +1,4 @@
-"""Build the pinned Bakery Demo and exercise Gunicorn through Vapache."""
+"""Build the pinned Bakery Demo and exercise Gunicorn through httpd-rs."""
 
 from __future__ import annotations
 
@@ -14,14 +14,14 @@ from lib import (
     CaseContext,
     DeploymentError,
     common_apache_config,
-    common_vapache_config,
+    common_httpd_rs_config,
     differential_benchmark,
     free_port,
     request,
     require_response,
     stage_verified_tarball,
     start_apache,
-    start_vapache,
+    start_httpd_rs,
     wait_http,
 )
 
@@ -32,7 +32,7 @@ SOURCE_URL = (
     "890285b95dcf980215ab9e9942d64ed2b47c48c3"
 )
 SOURCE_SHA256 = "7f9aaff37ff240df20f0a14d5d084f49026b62aaca5d0440decff265c14e3e0a"
-ADMIN_PASSWORD = "vapache-wagtail-password-42"
+ADMIN_PASSWORD = "httpd-rs-wagtail-password-42"
 
 
 def cookie_value(header: str, name: str) -> str:
@@ -103,7 +103,7 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
     backend_host = compose.service_ip("wagtail")
     # A direct probe uses the private container IP as Host; Django correctly
     # rejects that untrusted name with 400 once the application is ready. The
-    # Vapache-facing checks below use an allowed public Host and must be 200.
+    # httpd-rs-facing checks below use an allowed public Host and must be 200.
     wait_http(8000, "/", timeout=240, host=backend_host, statuses=(200, 400))
 
     document_root = context.run_dir / "empty"
@@ -117,8 +117,8 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
         f"ProxyPass / {backend}\n"
         f"ProxyPassReverse / {backend}\n"
     )
-    config, pid_file = common_vapache_config(context.run_dir, port, document_root, extra=extra)
-    server = start_vapache(context, config, pid_file, port)
+    config, pid_file = common_httpd_rs_config(context.run_dir, port, document_root, extra=extra)
+    server = start_httpd_rs(context, config, pid_file, port)
     require_response(port, "/", contains=b"The Wagtail Bakery")
 
     status, _, api_body = request(port, "/api/v2/pages/?limit=2")
@@ -157,6 +157,6 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
             port,
             apache_port,
             "/",
-            context.artifact_dir / "apache-vapache-benchmark.json",
+            context.artifact_dir / "apache-httpd-rs-benchmark.json",
             connections=2,
         )

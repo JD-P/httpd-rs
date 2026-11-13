@@ -11,13 +11,13 @@ from lib import (
     DeploymentError,
     command,
     common_apache_config,
-    common_vapache_config,
+    common_httpd_rs_config,
     differential_benchmark,
     free_port,
     request,
     require_response,
     start_apache,
-    start_vapache,
+    start_httpd_rs,
     service_identity,
     validate_bind_source,
     wait_for_path,
@@ -151,9 +151,9 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
             "install",
             variant["profile"],
             "--site-name",
-            "Vapache Drupal Integration",
+            "httpd-rs Drupal Integration",
             "--password",
-            "vapache-drupal-password-42",
+            "httpd-rs-drupal-password-42",
             "--no-interaction",
         ],
         user=f"{PHP_UID}:{PHP_GID}",
@@ -168,14 +168,14 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
     document_root = drupal_root / "web"
     port = free_port()
     extra = fr"""
-LoadModule authz_core_module /vapache/builtin/mod_authz_core.so
-LoadModule rewrite_module /vapache/builtin/mod_rewrite.so
-LoadModule headers_module /vapache/builtin/mod_headers.so
-LoadModule expires_module /vapache/builtin/mod_expires.so
-LoadModule mime_module /vapache/builtin/mod_mime.so
+LoadModule authz_core_module /httpd-rs/builtin/mod_authz_core.so
+LoadModule rewrite_module /httpd-rs/builtin/mod_rewrite.so
+LoadModule headers_module /httpd-rs/builtin/mod_headers.so
+LoadModule expires_module /httpd-rs/builtin/mod_expires.so
+LoadModule mime_module /httpd-rs/builtin/mod_mime.so
 AddEncoding gzip svgz
 DirectoryIndex index.php
-VapacheFastCGIStablePath On unix:{socket_path} {PHP_UID} {PHP_UID} 0 {os.getuid()}
+HttpdRsFastCGIStablePath On unix:{socket_path} {PHP_UID} {PHP_UID} 0 {os.getuid()}
 ProxyPassMatch ^/(.*\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{document_root}/"
 <Directory "{document_root}">
     Options FollowSymLinks
@@ -183,15 +183,15 @@ ProxyPassMatch ^/(.*\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{document_
     Require all granted
 </Directory>
 """
-    config, pid_file = common_vapache_config(
+    config, pid_file = common_httpd_rs_config(
         context.run_dir,
         port,
         document_root,
         capabilities=("AccessFiles", "FastCgi"),
         extra=extra,
     )
-    server = start_vapache(context, config, pid_file, port)
-    require_response(port, "/", contains=b"Vapache Drupal Integration")
+    server = start_httpd_rs(context, config, pid_file, port)
+    require_response(port, "/", contains=b"httpd-rs Drupal Integration")
     require_response(port, "/user/login", contains=b"Log in")
     # Drupal deliberately leaves core/install.php reachable after installation;
     # exercise the shipped FilesMatch denial with a genuinely private file.
@@ -236,11 +236,11 @@ ProxyPassMatch ^/(.*\.php(/.*)?)$ "unix:{socket_path}|fcgi://localhost{document_
         )
         start_apache(context, apache_config, apache_port)
         path = "/user/login" if variant["benchmark"] == "clean-url" else "/"
-        require_response(apache_port, path, contains=b"Log in" if path != "/" else b"Vapache Drupal Integration")
+        require_response(apache_port, path, contains=b"Log in" if path != "/" else b"httpd-rs Drupal Integration")
         differential_benchmark(
             port,
             apache_port,
             path,
-            context.artifact_dir / "apache-vapache-benchmark.json",
+            context.artifact_dir / "apache-httpd-rs-benchmark.json",
             connections=4,
         )

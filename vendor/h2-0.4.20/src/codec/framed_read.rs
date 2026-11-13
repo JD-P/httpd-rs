@@ -74,7 +74,7 @@ impl Decoder for WireFrameCodec {
         }
         let payload_len = ((src[0] as u32) << 16) | ((src[1] as u32) << 8) | src[2] as u32;
         let stream_id = u32::from_be_bytes([src[5], src[6], src[7], src[8]]) & 0x7fff_ffff;
-        let decision = vapache_verified::h2_frame_header_admit(
+        let decision = httpd_rs_verified::h2_frame_header_admit(
             src[3],
             src[4],
             stream_id,
@@ -82,11 +82,11 @@ impl Decoder for WireFrameCodec {
             self.max_frame_length() as u32,
         );
         let reason = match decision {
-            vapache_verified::H2FrameHeaderDecision::Accept => None,
-            vapache_verified::H2FrameHeaderDecision::FrameSizeError => {
+            httpd_rs_verified::H2FrameHeaderDecision::Accept => None,
+            httpd_rs_verified::H2FrameHeaderDecision::FrameSizeError => {
                 Some(Reason::FRAME_SIZE_ERROR)
             }
-            vapache_verified::H2FrameHeaderDecision::ProtocolError => Some(Reason::PROTOCOL_ERROR),
+            httpd_rs_verified::H2FrameHeaderDecision::ProtocolError => Some(Reason::PROTOCOL_ERROR),
         };
         if let Some(reason) = reason {
             return Err(io::Error::new(
@@ -112,10 +112,10 @@ impl FrameWorkBudget {
         }
     }
 
-    fn consume(&mut self, kind: vapache_verified::H2WireFrameKind, payload_len: u32) -> bool {
+    fn consume(&mut self, kind: httpd_rs_verified::H2WireFrameKind, payload_len: u32) -> bool {
         let now = Instant::now();
         let seconds = now.saturating_duration_since(self.last_refill).as_secs();
-        let transition = vapache_verified::h2_frame_work_step(
+        let transition = httpd_rs_verified::h2_frame_work_step(
             self.available,
             seconds,
             kind,
@@ -165,7 +165,7 @@ struct Partial {
     buf: BytesMut,
 
     /// Verified cumulative sequencing/size state for this partial block.
-    header_block_state: vapache_verified::H2HeaderBlockState,
+    header_block_state: httpd_rs_verified::H2HeaderBlockState,
 }
 
 #[derive(Debug)]
@@ -276,13 +276,13 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
     let head = frame::Head::parse(&bytes);
     let kind = head.kind();
     let payload_len = (bytes.len() - frame::HEADER_LEN) as u32;
-    let wire_kind = vapache_verified::h2_wire_frame_kind(bytes[3]);
+    let wire_kind = httpd_rs_verified::h2_wire_frame_kind(bytes[3]);
     if !decoder.frame_work_budget.consume(wire_kind, payload_len) {
         proto_err!(conn: "HTTP/2 frame work budget exhausted");
         return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
     }
 
-    let idle_header_block = vapache_verified::H2HeaderBlockState {
+    let idle_header_block = httpd_rs_verified::H2HeaderBlockState {
         stream_id: 0,
         encoded_bytes: 0,
         continuation_frames: 0,
@@ -295,7 +295,7 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
     let max_continuations = u32::try_from(decoder.max_continuation_frames)
         .unwrap_or(u32::MAX)
         .saturating_add(1);
-    let next_header_block = match vapache_verified::h2_header_block_step(
+    let next_header_block = match httpd_rs_verified::h2_header_block_step(
         current_header_block,
         bytes[3],
         bytes[4],
@@ -304,12 +304,12 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
         decoder.max_header_list_size as u64,
         max_continuations,
     ) {
-        vapache_verified::H2HeaderBlockDecision::Accept(next) => next,
-        vapache_verified::H2HeaderBlockDecision::SequenceError => {
+        httpd_rs_verified::H2HeaderBlockDecision::Accept(next) => next,
+        httpd_rs_verified::H2HeaderBlockDecision::SequenceError => {
             proto_err!(conn: "invalid HEADERS/CONTINUATION sequence");
             return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
         }
-        vapache_verified::H2HeaderBlockDecision::SizeError => {
+        httpd_rs_verified::H2HeaderBlockDecision::SizeError => {
             proto_err!(conn: "encoded header block exceeded its frame/byte budget");
             return Err(Error::library_go_away_data(
                 Reason::ENHANCE_YOUR_CALM,
@@ -634,7 +634,7 @@ mod tests {
             available: 1,
             last_refill: Instant::now(),
         };
-        assert!(!budget.consume(vapache_verified::H2WireFrameKind::Unknown, 0));
+        assert!(!budget.consume(httpd_rs_verified::H2WireFrameKind::Unknown, 0));
         assert_eq!(budget.available, 1);
     }
 
@@ -655,27 +655,27 @@ mod tests {
 
     #[test]
     fn verified_continuation_state_bounds_sequence_and_bytes() {
-        let idle = vapache_verified::H2HeaderBlockState {
+        let idle = httpd_rs_verified::H2HeaderBlockState {
             stream_id: 0,
             encoded_bytes: 0,
             continuation_frames: 0,
         };
-        let started = match vapache_verified::h2_header_block_step(idle, 1, 0, 1, 8, 16, 2) {
-            vapache_verified::H2HeaderBlockDecision::Accept(next) => next,
+        let started = match httpd_rs_verified::h2_header_block_step(idle, 1, 0, 1, 8, 16, 2) {
+            httpd_rs_verified::H2HeaderBlockDecision::Accept(next) => next,
             other => panic!("unexpected transition: {other:?}"),
         };
         assert_eq!(started.stream_id, 1);
         assert!(matches!(
-            vapache_verified::h2_header_block_step(started, 9, 4, 3, 1, 16, 2),
-            vapache_verified::H2HeaderBlockDecision::SequenceError
+            httpd_rs_verified::h2_header_block_step(started, 9, 4, 3, 1, 16, 2),
+            httpd_rs_verified::H2HeaderBlockDecision::SequenceError
         ));
         assert!(matches!(
-            vapache_verified::h2_header_block_step(started, 9, 4, 1, 9, 16, 2),
-            vapache_verified::H2HeaderBlockDecision::SizeError
+            httpd_rs_verified::h2_header_block_step(started, 9, 4, 1, 9, 16, 2),
+            httpd_rs_verified::H2HeaderBlockDecision::SizeError
         ));
         assert!(matches!(
-            vapache_verified::h2_header_block_step(started, 9, 4, 1, 8, 16, 2),
-            vapache_verified::H2HeaderBlockDecision::Accept(vapache_verified::H2HeaderBlockState {
+            httpd_rs_verified::h2_header_block_step(started, 9, 4, 1, 8, 16, 2),
+            httpd_rs_verified::H2HeaderBlockDecision::Accept(httpd_rs_verified::H2HeaderBlockState {
                 stream_id: 0,
                 ..
             })

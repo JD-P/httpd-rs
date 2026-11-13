@@ -75,7 +75,7 @@ fn first_resolved_addr(mut addrs: impl Iterator<Item = SocketAddr>) -> io::Resul
 pub fn bind(cfg: &Config) -> io::Result<Vec<Bound>> {
     crate::files::require_secure_path_resolution()?;
     crate::cache::prepare(cfg);
-    crate::ocsp::prepare_cache_dir(&cfg.server_root.join(".vapache-ocsp-cache"))?;
+    crate::ocsp::prepare_cache_dir(&cfg.server_root.join(".httpd-rs-ocsp-cache"))?;
     let mut out = Vec::new();
     for l in &cfg.listeners {
         let addr_str = if l.addr == "*" { "0.0.0.0" } else { &l.addr };
@@ -219,7 +219,7 @@ fn finish_listener(fd: libc::c_int, backlog: i32) -> io::Result<TcpListener> {
 }
 
 fn bind_reuse(addr: SocketAddr, backlog: i32) -> io::Result<TcpListener> {
-    vapache_os::bind_tcp_listener(addr, backlog)
+    httpd_rs_os::bind_tcp_listener(addr, backlog)
 }
 
 #[cfg(test)]
@@ -315,7 +315,7 @@ fn try_borrow_inline_dynamic_worker(
 ) -> Option<InlineDynamicWorker<'_>> {
     count
         .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            vapache_verified::inline_dynamic_worker_admit(current, limit, pool_threads)
+            httpd_rs_verified::inline_dynamic_worker_admit(current, limit, pool_threads)
                 .then_some(current + 1)
         })
         .ok()
@@ -361,7 +361,7 @@ fn admission_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
         // TLS, dynamic backends and HTTP/2 retain Tokio's blocking pool. The
         // ordinary HTTP/1 filesystem phase uses its smaller fixed pool below.
         .max_blocking_threads(MAX_IMPLEMENTED_REQUEST_WORKERS + 64)
-        .thread_name("vapache-io")
+        .thread_name("httpd-rs-io")
         .enable_io()
         .enable_time()
         .build()?;
@@ -382,7 +382,7 @@ fn connection_work_pool() -> io::Result<&'static ConnectionWorkPool> {
         for index in 0..CONNECTION_WORK_THREADS {
             let shared = shared.clone();
             std::thread::Builder::new()
-                .name(format!("vapache-request-{index}"))
+                .name(format!("httpd-rs-request-{index}"))
                 .spawn(move || loop {
                     let job = {
                         let mut queue = shared
@@ -640,7 +640,7 @@ fn pending_connection_limit(worker_limit: usize) -> usize {
 }
 
 fn generation_accepts_new_work(retired: &tokio::sync::watch::Receiver<bool>) -> bool {
-    vapache_verified::configuration_generation_admit(*retired.borrow())
+    httpd_rs_verified::configuration_generation_admit(*retired.borrow())
 }
 
 fn body_worker_limit(worker_limit: usize) -> usize {
@@ -1174,7 +1174,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
             };
             let norm = match normalize_uri_path(&decoded) {
                 Some(n)
-                    if vapache_verified::canonical_path_text_admit(
+                    if httpd_rs_verified::canonical_path_text_admit(
                         is_canonical_path(&n),
                         std::str::from_utf8(&n).is_ok(),
                     ) =>
@@ -1248,7 +1248,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                     return Ok(false);
                 }
                 crate::rewrite::Outcome::Error(error) => {
-                    eprintln!("vapached: websocket URL rewrite error: {error}");
+                    eprintln!("httpd-rs: websocket URL rewrite error: {error}");
                     let _ = write_ws_error(stream, &cfg, 500, b"rewrite error");
                     return Ok(false);
                 }
@@ -1296,7 +1296,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                         ) {
                             Ok(value) => value,
                             Err(error) => {
-                                eprintln!("vapached: .htaccess error: {error}");
+                                eprintln!("httpd-rs: .htaccess error: {error}");
                                 let _ = write_ws_error(stream, &cfg, 500, b"access-file error");
                                 return Ok(false);
                             }
@@ -1313,7 +1313,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                         peer.ip(),
                     );
                     scope.rewrite_policy.rewrite_rules.retain(|rule| {
-                        vapache_verified::filesystem_rewrite_rule_admit(rule.filesystem_context)
+                        httpd_rs_verified::filesystem_rewrite_rule_admit(rule.filesystem_context)
                     });
                     let rewrite_ctx = crate::rewrite::Context {
                         url_path: &url_path,
@@ -1337,7 +1337,7 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                             return Ok(false);
                         }
                         crate::rewrite::Outcome::Error(error) => {
-                            eprintln!("vapached: websocket filesystem rewrite error: {error}");
+                            eprintln!("httpd-rs: websocket filesystem rewrite error: {error}");
                             let _ = write_ws_error(stream, &cfg, 500, b"rewrite error");
                             return Ok(false);
                         }
@@ -1961,18 +1961,18 @@ struct H1DeferredResponse {
 
 #[derive(Clone, Copy, Debug)]
 struct RequestPhaseToken {
-    phase: vapache_verified::RequestPhase,
+    phase: httpd_rs_verified::RequestPhase,
 }
 
 impl RequestPhaseToken {
     fn head() -> Self {
         Self {
-            phase: vapache_verified::RequestPhase::Head,
+            phase: httpd_rs_verified::RequestPhase::Head,
         }
     }
 
-    fn advance(&mut self, event: vapache_verified::RequestPhaseEvent) {
-        self.phase = vapache_verified::request_phase_step(self.phase, event)
+    fn advance(&mut self, event: httpd_rs_verified::RequestPhaseEvent) {
+        self.phase = httpd_rs_verified::request_phase_step(self.phase, event)
             .expect("illegal request phase transition");
     }
 }
@@ -1985,11 +1985,11 @@ async fn reject_h1_body_phase<S>(
 ) where
     S: tokio::io::AsyncWrite + Unpin,
 {
-    phase.advance(vapache_verified::RequestPhaseEvent::BodyErrorResponse);
+    phase.advance(httpd_rs_verified::RequestPhaseEvent::BodyErrorResponse);
     let event = if try_reject_h1_async(stream, cfg, status).await.is_ok() {
-        vapache_verified::RequestPhaseEvent::OutputComplete
+        httpd_rs_verified::RequestPhaseEvent::OutputComplete
     } else {
-        vapache_verified::RequestPhaseEvent::Cancel
+        httpd_rs_verified::RequestPhaseEvent::Cancel
     };
     phase.advance(event);
 }
@@ -2134,7 +2134,7 @@ fn process_h1_request_phase<C: Read + Write>(
                         "request body capacity unavailable",
                     )));
                 };
-                phase.advance(vapache_verified::RequestPhaseEvent::RouteNeedsBody);
+                phase.advance(httpd_rs_verified::RequestPhaseEvent::RouteNeedsBody);
                 return Ok(H1WorkerPhase::NeedBody {
                     head,
                     body_guard,
@@ -2152,7 +2152,7 @@ fn process_h1_request_phase<C: Read + Write>(
                         "request body capacity unavailable",
                     )));
                 };
-                phase.advance(vapache_verified::RequestPhaseEvent::RouteNeedsDrain);
+                phase.advance(httpd_rs_verified::RequestPhaseEvent::RouteNeedsDrain);
                 return Ok(H1WorkerPhase::DrainBody {
                     head,
                     body_guard,
@@ -2164,7 +2164,7 @@ fn process_h1_request_phase<C: Read + Write>(
                 });
             }
             BodyRouteDecision::Respond(response, remote_user) => {
-                phase.advance(vapache_verified::RequestPhaseEvent::EarlyResponse);
+                phase.advance(httpd_rs_verified::RequestPhaseEvent::EarlyResponse);
                 let request = head.finish_without_body();
                 return Ok(H1WorkerPhase::Response(finish_h1_response(
                     cfg,
@@ -2189,7 +2189,7 @@ fn process_h1_request_phase<C: Read + Write>(
             handler,
             remote_user,
         } => {
-            phase.advance(vapache_verified::RequestPhaseEvent::RoutePrepared);
+            phase.advance(httpd_rs_verified::RequestPhaseEvent::RoutePrepared);
             Ok(H1WorkerPhase::Backend {
                 request,
                 handler,
@@ -2200,8 +2200,8 @@ fn process_h1_request_phase<C: Read + Write>(
             })
         }
         PreparedRouteDecision::Respond(response, remote_user) => {
-            phase.advance(vapache_verified::RequestPhaseEvent::RouteReady);
-            phase.advance(vapache_verified::RequestPhaseEvent::DispatchComplete);
+            phase.advance(httpd_rs_verified::RequestPhaseEvent::RouteReady);
+            phase.advance(httpd_rs_verified::RequestPhaseEvent::DispatchComplete);
             Ok(H1WorkerPhase::Response(finish_h1_response(
                 cfg,
                 request,
@@ -2233,11 +2233,11 @@ fn dispatch_h1_backend_phase(
     scope_guard: Option<crate::resource::RequestScopeGuard>,
     mut phase: RequestPhaseToken,
 ) -> H1DeferredResponse {
-    if phase.phase == vapache_verified::RequestPhase::Body {
-        phase.advance(vapache_verified::RequestPhaseEvent::BodyComplete);
+    if phase.phase == httpd_rs_verified::RequestPhase::Body {
+        phase.advance(httpd_rs_verified::RequestPhaseEvent::BodyComplete);
     }
     let response = execute_prepared_handler(cfg, &mut request, peer, local_port, tls, handler);
-    phase.advance(vapache_verified::RequestPhaseEvent::BackendComplete);
+    phase.advance(httpd_rs_verified::RequestPhaseEvent::BackendComplete);
     finish_h1_response(
         cfg,
         request,
@@ -2316,7 +2316,7 @@ fn finish_h1_drained_body(
     mut phase: RequestPhaseToken,
 ) -> H1DeferredResponse {
     request.discard_body();
-    phase.advance(vapache_verified::RequestPhaseEvent::BodyDiscarded);
+    phase.advance(httpd_rs_verified::RequestPhaseEvent::BodyDiscarded);
     finish_h1_response(
         cfg,
         request,
@@ -2362,7 +2362,7 @@ where
             Ok(None)
         }
         Err(ReadError::Io(error)) => {
-            phase.advance(vapache_verified::RequestPhaseEvent::Cancel);
+            phase.advance(httpd_rs_verified::RequestPhaseEvent::Cancel);
             Err(error)
         }
     }
@@ -2400,7 +2400,7 @@ where
             } else {
                 400
             };
-            phase.advance(vapache_verified::RequestPhaseEvent::BodyErrorResponse);
+            phase.advance(httpd_rs_verified::RequestPhaseEvent::BodyErrorResponse);
             drop(body_guard);
             return Ok(finish_h1_response(
                 cfg,
@@ -2421,7 +2421,7 @@ where
         }
     };
     let mut rejected_request = request.clone();
-    phase.advance(vapache_verified::RequestPhaseEvent::BackendStarted);
+    phase.advance(httpd_rs_verified::RequestPhaseEvent::BackendStarted);
     let cfg_worker = cfg.clone();
     let mut backend = spawn_connection_worker(move || {
         let mut request = request;
@@ -2471,7 +2471,7 @@ where
                         "text/plain; charset=UTF-8",
                         b"Request body could not be consumed\n".to_vec(),
                     );
-                    phase.advance(vapache_verified::RequestPhaseEvent::BodyErrorResponse);
+                    phase.advance(httpd_rs_verified::RequestPhaseEvent::BodyErrorResponse);
                     drop(body_guard);
                     return Ok(finish_h1_response(
                         cfg,
@@ -2490,7 +2490,7 @@ where
         }
     };
     drop(body_guard);
-    phase.advance(vapache_verified::RequestPhaseEvent::BackendComplete);
+    phase.advance(httpd_rs_verified::RequestPhaseEvent::BackendComplete);
     Ok(finish_h1_response(
         cfg,
         request,
@@ -2618,14 +2618,14 @@ where
         Ok(sent) => {
             deferred
                 .phase
-                .advance(vapache_verified::RequestPhaseEvent::OutputComplete);
+                .advance(httpd_rs_verified::RequestPhaseEvent::OutputComplete);
             log_h1_response(cfg, logger, local_ip, local_port, deferred, sent);
             Ok((sent, was_slow))
         }
         Err(error) => {
             deferred
                 .phase
-                .advance(vapache_verified::RequestPhaseEvent::Cancel);
+                .advance(httpd_rs_verified::RequestPhaseEvent::Cancel);
             if let Some(scope) = scope {
                 scope.cancel();
             }
@@ -2675,14 +2675,14 @@ async fn send_h1_response_plain(
         Ok(sent) => {
             deferred
                 .phase
-                .advance(vapache_verified::RequestPhaseEvent::OutputComplete);
+                .advance(httpd_rs_verified::RequestPhaseEvent::OutputComplete);
             log_h1_response(cfg, logger, local_ip, local_port, deferred, sent);
             Ok((sent, was_slow))
         }
         Err(error) => {
             deferred
                 .phase
-                .advance(vapache_verified::RequestPhaseEvent::Cancel);
+                .advance(httpd_rs_verified::RequestPhaseEvent::Cancel);
             if let Some(scope) = scope {
                 scope.cancel();
             }
@@ -2989,7 +2989,7 @@ async fn admit_plain_connection(
                             return Ok(());
                         }
                         Err(ReadError::Io(error)) => {
-                            phase.advance(vapache_verified::RequestPhaseEvent::Cancel);
+                            phase.advance(httpd_rs_verified::RequestPhaseEvent::Cancel);
                             return Err(error);
                         }
                     };
@@ -3456,7 +3456,7 @@ async fn admit_tls_connection(
                             return Ok(());
                         }
                         Err(ReadError::Io(error)) => {
-                            phase.advance(vapache_verified::RequestPhaseEvent::Cancel);
+                            phase.advance(httpd_rs_verified::RequestPhaseEvent::Cancel);
                             return Err(error);
                         }
                     };
@@ -3980,7 +3980,7 @@ pub(crate) enum PreparedHandler {
     FinalizeInternalRequest {
         handler: Box<PreparedHandler>,
         authorization: access::AuthorizedOutcome,
-        kind: vapache_verified::InternalRequestKind,
+        kind: httpd_rs_verified::InternalRequestKind,
         internal_target: String,
     },
     Proxy {
@@ -4043,7 +4043,7 @@ struct DynamicOutcomeRequirements {
 }
 
 struct DynamicOutcomeToken {
-    state: vapache_verified::DynamicOutcomeState,
+    state: httpd_rs_verified::DynamicOutcomeState,
 }
 
 impl DynamicOutcomeToken {
@@ -4051,7 +4051,7 @@ impl DynamicOutcomeToken {
         let mut requirements = DynamicOutcomeRequirements::default();
         handler.collect_outcome_requirements(&mut requirements);
         Self {
-            state: vapache_verified::dynamic_outcome_initial(
+            state: httpd_rs_verified::dynamic_outcome_initial(
                 requirements.internal_projection,
                 requirements.error_finalizer,
                 requirements.dispatch_finalizer,
@@ -4061,7 +4061,7 @@ impl DynamicOutcomeToken {
 
     fn advance(
         &mut self,
-        event: vapache_verified::DynamicOutcomeEvent,
+        event: httpd_rs_verified::DynamicOutcomeEvent,
         authorized: bool,
         backend_bound: bool,
         response_valid: bool,
@@ -4073,7 +4073,7 @@ impl DynamicOutcomeToken {
         if crate::fault::hit("transition.dynamic.outcome").is_err() {
             return false;
         }
-        let Some(next) = vapache_verified::dynamic_outcome_step(
+        let Some(next) = httpd_rs_verified::dynamic_outcome_step(
             self.state,
             event,
             authorized,
@@ -4089,7 +4089,7 @@ impl DynamicOutcomeToken {
 
     fn complete_internal_projection(&mut self) -> bool {
         self.advance(
-            vapache_verified::DynamicOutcomeEvent::CompleteInternalProjection,
+            httpd_rs_verified::DynamicOutcomeEvent::CompleteInternalProjection,
             false,
             false,
             false,
@@ -4105,7 +4105,7 @@ impl DynamicOutcomeToken {
             return false;
         }
         self.advance(
-            vapache_verified::DynamicOutcomeEvent::StartBackend,
+            httpd_rs_verified::DynamicOutcomeEvent::StartBackend,
             true,
             true,
             false,
@@ -4115,7 +4115,7 @@ impl DynamicOutcomeToken {
 
     fn complete_backend(&mut self, response: &Response) -> bool {
         self.advance(
-            vapache_verified::DynamicOutcomeEvent::BackendComplete,
+            httpd_rs_verified::DynamicOutcomeEvent::BackendComplete,
             false,
             false,
             crate::http::response_headers_valid(response),
@@ -4125,7 +4125,7 @@ impl DynamicOutcomeToken {
 
     fn apply_error_finalizer(&mut self) -> bool {
         self.advance(
-            vapache_verified::DynamicOutcomeEvent::ApplyErrorFinalizer,
+            httpd_rs_verified::DynamicOutcomeEvent::ApplyErrorFinalizer,
             false,
             false,
             false,
@@ -4135,7 +4135,7 @@ impl DynamicOutcomeToken {
 
     fn begin_dispatch_finalizer(&mut self) -> bool {
         self.advance(
-            vapache_verified::DynamicOutcomeEvent::BeginDispatchFinalizer,
+            httpd_rs_verified::DynamicOutcomeEvent::BeginDispatchFinalizer,
             false,
             false,
             false,
@@ -4145,7 +4145,7 @@ impl DynamicOutcomeToken {
 
     fn consider_cache(&mut self, generation_current: bool) -> bool {
         self.advance(
-            vapache_verified::DynamicOutcomeEvent::ConsiderCache,
+            httpd_rs_verified::DynamicOutcomeEvent::ConsiderCache,
             false,
             false,
             false,
@@ -4155,7 +4155,7 @@ impl DynamicOutcomeToken {
 
     fn complete_dispatch_finalizer(&mut self) -> bool {
         self.advance(
-            vapache_verified::DynamicOutcomeEvent::CompleteDispatchFinalizer,
+            httpd_rs_verified::DynamicOutcomeEvent::CompleteDispatchFinalizer,
             false,
             false,
             false,
@@ -4165,7 +4165,7 @@ impl DynamicOutcomeToken {
 
     fn admit_output(&mut self, response: &Response) -> bool {
         self.advance(
-            vapache_verified::DynamicOutcomeEvent::AdmitOutput,
+            httpd_rs_verified::DynamicOutcomeEvent::AdmitOutput,
             false,
             false,
             crate::http::response_headers_valid(response),
@@ -4175,7 +4175,7 @@ impl DynamicOutcomeToken {
 
     fn abort(&mut self) {
         let _ = self.advance(
-            vapache_verified::DynamicOutcomeEvent::Abort,
+            httpd_rs_verified::DynamicOutcomeEvent::Abort,
             false,
             false,
             false,
@@ -4214,14 +4214,14 @@ impl PreparedHandler {
         }
     }
 
-    fn kind(&self) -> vapache_verified::PreparedHandlerKind {
+    fn kind(&self) -> httpd_rs_verified::PreparedHandlerKind {
         match self {
             PreparedHandler::FinalizeDispatch { handler, .. }
             | PreparedHandler::FinalizeErrorDocument { handler, .. }
             | PreparedHandler::FinalizeInternalRequest { handler, .. } => handler.kind(),
-            PreparedHandler::Proxy { .. } => vapache_verified::PreparedHandlerKind::Proxy,
-            PreparedHandler::FastCgi { .. } => vapache_verified::PreparedHandlerKind::FastCgi,
-            PreparedHandler::Cgi { .. } => vapache_verified::PreparedHandlerKind::Cgi,
+            PreparedHandler::Proxy { .. } => httpd_rs_verified::PreparedHandlerKind::Proxy,
+            PreparedHandler::FastCgi { .. } => httpd_rs_verified::PreparedHandlerKind::FastCgi,
+            PreparedHandler::Cgi { .. } => httpd_rs_verified::PreparedHandlerKind::Cgi,
         }
     }
 
@@ -4250,7 +4250,7 @@ impl PreparedHandler {
                 let vhost = vhost_index.and_then(|index| cfg.vhosts.get(index));
                 let unsafe_method =
                     !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
-                let must_invalidate = vapache_verified::cache_invalidation_status_admit(
+                let must_invalidate = httpd_rs_verified::cache_invalidation_status_admit(
                     unsafe_method,
                     response.status,
                 );
@@ -4544,7 +4544,7 @@ pub(crate) fn execute_prepared_handler(
     tls: bool,
     handler: PreparedHandler,
 ) -> Response {
-    debug_assert!(vapache_verified::prepared_handler_needs_dynamic_lease(
+    debug_assert!(httpd_rs_verified::prepared_handler_needs_dynamic_lease(
         handler.kind()
     ));
     if crate::fault::hit("transition.backend.start").is_err() {
@@ -4675,7 +4675,7 @@ fn dispatch_inner_request(
         let trailing_slash = plan.url_path().len() > 1 && plan.url_path().ends_with('/');
         let same_representation_path = cache_ctx.path() == plan.url_path();
         let regular_file = cache_ctx.target().is_file();
-        if !vapache_verified::cache_trailing_slash_target_admit(
+        if !httpd_rs_verified::cache_trailing_slash_target_admit(
             trailing_slash,
             same_representation_path,
             regular_file,
@@ -4724,7 +4724,7 @@ fn dispatch_inner_request(
             crate::cache::store_authorized(cfg, vhost, req, host, peer, &mut resp, &cache_ctx);
         }
         let unsafe_method = !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
-        if vapache_verified::cache_invalidation_status_admit(unsafe_method, resp.status) {
+        if httpd_rs_verified::cache_invalidation_status_admit(unsafe_method, resp.status) {
             crate::cache::invalidate_unsafe_response(
                 cfg,
                 host,
@@ -4744,7 +4744,7 @@ fn dispatch_inner_request(
 /// its plan, but cannot construct or mutate this witness directly.
 struct ProjectedInternalRequest {
     request: Request,
-    kind: vapache_verified::InternalRequestKind,
+    kind: httpd_rs_verified::InternalRequestKind,
     target: CanonicalTarget,
 }
 
@@ -4771,11 +4771,11 @@ impl ProjectedInternalRequest {
 fn project_internal_request(
     req: &Request,
     url: &str,
-    kind: vapache_verified::InternalRequestKind,
+    kind: httpd_rs_verified::InternalRequestKind,
     allow_encoded_slashes: bool,
 ) -> Option<ProjectedInternalRequest> {
     let (path, target_query) = crate::util::split_internal_request_target(url)?;
-    let projection = vapache_verified::internal_request_projection(kind);
+    let projection = httpd_rs_verified::internal_request_projection(kind);
     debug_assert!(projection.preserve_wire_target);
     debug_assert!(projection.preserve_wire_method);
     debug_assert!(projection.preserve_wire_version);
@@ -4818,11 +4818,11 @@ fn internal_request_refinement_target(
     source: &Request,
     internal: &Request,
     url: &str,
-    kind: vapache_verified::InternalRequestKind,
+    kind: httpd_rs_verified::InternalRequestKind,
     allow_encoded_slashes: bool,
 ) -> Option<CanonicalTarget> {
     let (path, target_query) = crate::util::split_internal_request_target(url)?;
-    let projection = vapache_verified::internal_request_projection(kind);
+    let projection = httpd_rs_verified::internal_request_projection(kind);
     let method_projected = if projection.preserve_method {
         internal.method == source.method
     } else {
@@ -4855,7 +4855,7 @@ fn internal_request_refinement_target(
         .headers
         .internal_projection_facts(&source.headers, kind);
     let target = CanonicalTarget::from_request(&internal, allow_encoded_slashes).ok()?;
-    if !vapache_verified::internal_request_runtime_refines(
+    if !httpd_rs_verified::internal_request_runtime_refines(
         internal.raw_path == path.as_bytes(),
         internal.target == source.target,
         internal.version == source.version,
@@ -4891,7 +4891,7 @@ pub(crate) fn dispatch_local_error_document(
     let Some(projected) = project_internal_request(
         req,
         url,
-        vapache_verified::InternalRequestKind::ErrorDocument,
+        httpd_rs_verified::InternalRequestKind::ErrorDocument,
         cfg.encoded_slashes == EncodedSlashes::On,
     ) else {
         return Response::policy_error();
@@ -4932,7 +4932,7 @@ pub(crate) fn dispatch_local_error_document(
             .and_then(|plan| {
                 plan.into_internal_outcome(
                     cfg.authorization_generation(),
-                    vapache_verified::InternalRequestKind::ErrorDocument,
+                    httpd_rs_verified::InternalRequestKind::ErrorDocument,
                     target.url_path.clone(),
                 )
             })
@@ -4957,7 +4957,7 @@ pub(crate) fn internal_dispatch(
     cfg: &Config,
     req: &Request,
     url: &str,
-    kind: vapache_verified::InternalRequestKind,
+    kind: httpd_rs_verified::InternalRequestKind,
     authorization: access::AuthorizedOutcome,
     initial_plan: Option<RequestPlan>,
     vhost: Option<&VHost>,
@@ -5231,7 +5231,7 @@ fn bind_target_grant(
     ) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("vapached: target scope error: {e}");
+            eprintln!("httpd-rs: target scope error: {e}");
             return Err(error_response(
                 cfg,
                 vhost,
@@ -5282,7 +5282,7 @@ fn bind_target_grant(
         &lexical_name,
     );
     replace_handler_policy(&mut target_scope, &handler_scope.scope);
-    debug_assert!(vapache_verified::handler_scope_lexical_admit(
+    debug_assert!(httpd_rs_verified::handler_scope_lexical_admit(
         actual_path != fs_path, // coverage:ignore-line -- assertion-only invariant input
         true,
     ));
@@ -5476,7 +5476,7 @@ pub(crate) fn multiview_rewrite_outcome(
     selected_rewrite_scope
         .rewrite_policy
         .rewrite_rules
-        .retain(|rule| vapache_verified::filesystem_rewrite_rule_admit(rule.filesystem_context));
+        .retain(|rule| httpd_rs_verified::filesystem_rewrite_rule_admit(rule.filesystem_context));
     let selected_rewrite_ctx = crate::rewrite::Context {
         url_path: selected_url_path,
         fs_path: candidate_fs,
@@ -5533,7 +5533,7 @@ fn bind_multiview_grant(
         rewrite_effects,
     )
     .map_err(|error| {
-        eprintln!("vapached: negotiated target scope error: {error}");
+        eprintln!("httpd-rs: negotiated target scope error: {error}");
         error_response(
             cfg,
             vhost,
@@ -5596,7 +5596,7 @@ fn bind_multiview_grant(
             ));
         }
         crate::rewrite::Outcome::Error(error) => {
-            eprintln!("vapached: negotiated representation rewrite error: {error}");
+            eprintln!("httpd-rs: negotiated representation rewrite error: {error}");
             return Err(error_response(
                 cfg,
                 vhost,
@@ -5709,7 +5709,7 @@ fn bind_multiview_grant(
     };
     // coverage:ignore-stop
     let key = bound.key().clone();
-    if !vapache_verified::multiview_authorization_meet_admit(
+    if !httpd_rs_verified::multiview_authorization_meet_admit(
         public_grant.key().url_path == public_url_path,
         key.url_path == selected_url_path,
         key.fs_path.as_deref() == Some(actual_path)
@@ -5801,7 +5801,7 @@ fn authorize_resolved_target(
         Ok(plan) => plan,
         // coverage:ignore-start
         Err(e) => {
-            eprintln!("vapached: target URL scope error: {e}");
+            eprintln!("httpd-rs: target URL scope error: {e}");
             return Err(error_response(
                 cfg,
                 vhost,
@@ -5829,7 +5829,7 @@ fn authorize_resolved_target(
     ) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("vapached: target scope error: {e}");
+            eprintln!("httpd-rs: target scope error: {e}");
             return Err(error_response(
                 cfg,
                 vhost,
@@ -5877,7 +5877,7 @@ fn authorize_resolved_target(
             &lexical_name,
         );
         replace_handler_policy(&mut target_scope, &handler_scope.scope);
-        debug_assert!(vapache_verified::handler_scope_lexical_admit(
+        debug_assert!(httpd_rs_verified::handler_scope_lexical_admit(
             lexical_differs, // coverage:ignore-line -- assertion-only invariant input
             true,
         ));
@@ -6099,7 +6099,7 @@ fn authorize_original_request(
         match evaluate_scope_for_path(cfg, vhost, fs_path, url_path, req, peer.ip(), mapping_root) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("vapached: original URL scope error after rewrite: {e}");
+                eprintln!("httpd-rs: original URL scope error after rewrite: {e}");
                 return Err(error_response(
                     cfg,
                     vhost,
@@ -6745,7 +6745,7 @@ fn run_url_translation_phase(
                     ));
                 }
                 crate::rewrite::Outcome::Error(error) => {
-                    eprintln!("vapached: URL-translation rewrite error: {error}");
+                    eprintln!("httpd-rs: URL-translation rewrite error: {error}");
                     return UrlPhaseResult::Terminal(error_response(
                         cfg,
                         vhost,
@@ -7205,7 +7205,7 @@ fn dispatch_inner(
     }
 
     if req.method == "TRACE" {
-        if !vapache_verified::capability_admit(cfg.capability_enabled(Capability::Trace), true)
+        if !httpd_rs_verified::capability_admit(cfg.capability_enabled(Capability::Trace), true)
             || !cfg.trace_enable
         {
             let mut r = error_response(
@@ -7340,7 +7340,7 @@ fn dispatch_inner(
                 )
             }
             Err(crate::request_plan::PlanError::AccessFiles(e)) => {
-                eprintln!("vapached: .htaccess error: {e}");
+                eprintln!("httpd-rs: .htaccess error: {e}");
                 return error_response(
                     cfg,
                     vhost,
@@ -7355,7 +7355,7 @@ fn dispatch_inner(
                 );
             }
             Err(crate::request_plan::PlanError::PolicyLimit(e)) => {
-                eprintln!("vapached: request policy path limit: {e}");
+                eprintln!("httpd-rs: request policy path limit: {e}");
                 return error_response(
                     cfg,
                     vhost,
@@ -7416,7 +7416,7 @@ fn dispatch_inner(
         // filesystem fixup pass; replaying URL rules here made local policy
         // capable of changing or vetoing an already-selected proxy route.
         evaluated.scope.rewrite_policy.rewrite_rules.retain(|rule| {
-            vapache_verified::filesystem_rewrite_rule_admit(rule.filesystem_context)
+            httpd_rs_verified::filesystem_rewrite_rule_admit(rule.filesystem_context)
         });
         scope = evaluated.scope;
         if stop_rewriting {
@@ -7463,7 +7463,7 @@ fn dispatch_inner(
                 )
             }
             crate::rewrite::Outcome::Error(e) => {
-                eprintln!("vapached: rewrite error: {e}");
+                eprintln!("httpd-rs: rewrite error: {e}");
                 return error_response(
                     cfg,
                     vhost,
@@ -7915,7 +7915,7 @@ fn dispatch_inner(
                         )
                     }
                     Err(crate::request_plan::PlanError::AccessFiles(e)) => {
-                        eprintln!("vapached: .htaccess error: {e}");
+                        eprintln!("httpd-rs: .htaccess error: {e}");
                         return error_response(
                             cfg,
                             vhost,
@@ -7930,7 +7930,7 @@ fn dispatch_inner(
                         );
                     }
                     Err(crate::request_plan::PlanError::PolicyLimit(e)) => {
-                        eprintln!("vapached: rewritten policy path limit: {e}");
+                        eprintln!("httpd-rs: rewritten policy path limit: {e}");
                         return error_response(
                             cfg,
                             vhost,
@@ -7992,7 +7992,7 @@ fn dispatch_inner(
                 scope = target_scope;
             }
             Err(e) => {
-                eprintln!("vapached: target scope error after rewrite: {e}");
+                eprintln!("httpd-rs: target scope error after rewrite: {e}");
                 return error_response(
                     cfg,
                     vhost,
@@ -8255,7 +8255,7 @@ fn dispatch_inner(
             .iter()
             .any(|h| h.handler.eq_ignore_ascii_case("server-status"))
     {
-        if !vapache_verified::capability_admit(
+        if !httpd_rs_verified::capability_admit(
             cfg.capability_enabled(Capability::ServerStatus),
             true,
         ) {
@@ -8451,7 +8451,7 @@ fn dispatch_inner(
                     .file_name()
                     .map(|n| n.as_encoded_bytes())
                     .unwrap_or(b"");
-            debug_assert!(vapache_verified::handler_identity_lexical_admit(
+            debug_assert!(httpd_rs_verified::handler_identity_lexical_admit(
                 actual_path.as_ref() != fs_path.as_path(),
                 name_is_lexical,
             ));
@@ -8477,7 +8477,7 @@ fn dispatch_inner(
             }
             if !unsupported_filters.is_empty() {
                 eprintln!(
-                    "vapached: unsupported output filter(s) {:?} for {}",
+                    "httpd-rs: unsupported output filter(s) {:?} for {}",
                     unsupported_filters, url_path
                 );
                 return error_response(
@@ -8584,7 +8584,7 @@ fn dispatch_inner(
                 let authorization = target_authorization
                     .into_outcome(
                         cfg.authorization_generation(),
-                        vapache_verified::TransformSink::LocalCgi,
+                        httpd_rs_verified::TransformSink::LocalCgi,
                     )
                     .expect("CGI target retained its inode-bound authorization");
                 if req.handler_probe() {
@@ -8655,7 +8655,7 @@ fn dispatch_inner(
                     && !handler.eq_ignore_ascii_case("none")
                 {
                     eprintln!(
-                        "vapached: unsupported handler '{}' for {}",
+                        "httpd-rs: unsupported handler '{}' for {}",
                         handler, url_path
                     );
                     return error_response(
@@ -8711,7 +8711,7 @@ fn dispatch_inner(
             let authorization = target_authorization
                 .into_outcome(
                     cfg.authorization_generation(),
-                    vapache_verified::TransformSink::StaticFile,
+                    httpd_rs_verified::TransformSink::StaticFile,
                 )
                 .expect("static target retained its inode-bound authorization");
             crate::files::serve_authorized_file(
@@ -8735,7 +8735,7 @@ fn dispatch_inner(
             // is meaningful (CGI/FastCGI/proxy may consume it; a static index
             // returns 405). Rejecting here made the internal transition
             // impossible for application indexes.
-            if !vapache_verified::directory_index_method_admit(
+            if !httpd_rs_verified::directory_index_method_admit(
                 req.method == "GET",
                 req.method == "HEAD",
                 req.method == "POST",
@@ -8846,7 +8846,7 @@ fn dispatch_inner(
                 let internal_authorization = target_authorization
                     .into_internal_outcome(
                         cfg.authorization_generation(),
-                        vapache_verified::InternalRequestKind::DirectoryIndex,
+                        httpd_rs_verified::InternalRequestKind::DirectoryIndex,
                         index_target.url_path.clone(),
                     )
                     .expect("DirectoryIndex retained its inode-bound source authorization");
@@ -8865,7 +8865,7 @@ fn dispatch_inner(
                     cfg,
                     req,
                     &index_url,
-                    vapache_verified::InternalRequestKind::DirectoryIndex,
+                    httpd_rs_verified::InternalRequestKind::DirectoryIndex,
                     internal_authorization,
                     index_plan,
                     vhost,
@@ -8895,7 +8895,7 @@ fn dispatch_inner(
             let authorization = target_authorization
                 .into_outcome(
                     cfg.authorization_generation(),
-                    vapache_verified::TransformSink::Directory,
+                    httpd_rs_verified::TransformSink::Directory,
                 )
                 .expect("directory target retained its inode-bound authorization");
             crate::files::serve_authorized_directory(
@@ -9090,7 +9090,7 @@ fn dispatch_inner(
                         let authorization = target_authorization
                             .into_outcome(
                                 cfg.authorization_generation(),
-                                vapache_verified::TransformSink::StaticFile,
+                                httpd_rs_verified::TransformSink::StaticFile,
                             )
                             .expect("MultiViews target retained its inode-bound authorization");
                         let mut response = crate::files::serve_authorized_file(
@@ -9185,7 +9185,7 @@ fn dispatch_inner(
                     .or_else(|| actual_path.file_name())
                     .map(|n| n.as_encoded_bytes())
                     .unwrap_or(b"");
-                debug_assert!(vapache_verified::handler_identity_lexical_admit(
+                debug_assert!(httpd_rs_verified::handler_identity_lexical_admit(
                     actual_path.as_ref() != lexical_script.as_path(),
                     actual_name
                         == st
@@ -9252,7 +9252,7 @@ fn dispatch_inner(
                             .and_then(|plan| {
                                 plan.into_outcome(
                                     cfg.authorization_generation(),
-                                    vapache_verified::TransformSink::LocalCgi,
+                                    httpd_rs_verified::TransformSink::LocalCgi,
                                 )
                             })
                             .expect("PATH_INFO CGI retained one inode-bound authorization");
@@ -9610,7 +9610,7 @@ fn run_fastcgi_with_public_url(
     _resource: &crate::access::ResourceKey,
     mapping_root: &Path,
 ) -> Response {
-    if !vapache_verified::capability_admit(cfg.capability_enabled(Capability::FastCgi), true) {
+    if !httpd_rs_verified::capability_admit(cfg.capability_enabled(Capability::FastCgi), true) {
         return error_response(
             cfg,
             vhost,
@@ -9722,7 +9722,7 @@ fn run_fastcgi_with_public_url(
         .and_then(|plan| {
             plan.into_outcome(
                 cfg.authorization_generation(),
-                vapache_verified::TransformSink::FastCgi,
+                httpd_rs_verified::TransformSink::FastCgi,
             )
         })
     else {
@@ -9739,7 +9739,7 @@ fn run_fastcgi_with_public_url(
             local_ip,
         );
     };
-    if !vapache_verified::fastcgi_script_identity_admit(
+    if !httpd_rs_verified::fastcgi_script_identity_admit(
         authorization.resource().fs_path.as_deref() == Some(authorized_path.as_path()),
         script_binding.meta.dev() == authorization.resource().file_dev.unwrap_or_default()
             && script_binding.meta.ino() == authorization.resource().file_ino.unwrap_or_default(),
@@ -9881,7 +9881,7 @@ fn run_authorized_cgi(
         || authorization.identity().selected_url_path() != script_name
         || !authorization.require_file_sink(
             cfg.authorization_generation(),
-            vapache_verified::TransformSink::LocalCgi,
+            httpd_rs_verified::TransformSink::LocalCgi,
             resolved_path,
             &opened_meta,
         )
@@ -9934,7 +9934,7 @@ fn run_cgi(
     script_file: Option<&std::fs::File>,
     script_meta: Option<&std::fs::Metadata>,
 ) -> Response {
-    if !vapache_verified::capability_admit(cfg.capability_enabled(Capability::Cgi), true) {
+    if !httpd_rs_verified::capability_admit(cfg.capability_enabled(Capability::Cgi), true) {
         return error_response(
             cfg,
             vhost,
@@ -9986,7 +9986,7 @@ fn run_cgi(
     if !bound.require_sink(
         cfg.authorization_generation(),
         &expected,
-        vapache_verified::TransformSink::LocalCgi,
+        httpd_rs_verified::TransformSink::LocalCgi,
     ) {
         return error_response(
             cfg,
@@ -10160,27 +10160,27 @@ mod tests {
 
     #[test]
     fn verified_path_containment_uses_component_boundaries() {
-        assert!(vapache_verified::path_under_base(
+        assert!(httpd_rs_verified::path_under_base(
             b"/srv/www/a.txt",
             b"/srv/www"
         ));
-        assert!(vapache_verified::path_under_base(b"/srv/www", b"/srv/www"));
-        assert!(vapache_verified::path_under_base(
+        assert!(httpd_rs_verified::path_under_base(b"/srv/www", b"/srv/www"));
+        assert!(httpd_rs_verified::path_under_base(
             b"/srv/www/a.txt",
             b"/srv/www/"
         ));
-        assert!(vapache_verified::path_under_base(b"/etc/passwd", b"/"));
-        assert!(!vapache_verified::path_under_base(
+        assert!(httpd_rs_verified::path_under_base(b"/etc/passwd", b"/"));
+        assert!(!httpd_rs_verified::path_under_base(
             b"/srv/www2/a.txt",
             b"/srv/www"
         ));
-        assert!(!vapache_verified::path_under_base(b"/srv/w", b"/srv/www"));
-        assert!(!vapache_verified::path_under_base(b"/srv/www", b""));
+        assert!(!httpd_rs_verified::path_under_base(b"/srv/w", b"/srv/www"));
+        assert!(!httpd_rs_verified::path_under_base(b"/srv/www", b""));
     }
 
     #[test]
     fn regex_alias_and_redirect_expand_captures() {
-        let dir = std::env::temp_dir().join(format!("vapache-server-map-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("httpd-rs-server-map-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("httpd.conf");
@@ -10213,7 +10213,7 @@ mod tests {
     #[test]
     fn single_file_prefix_aliases_split_parent_and_basename() {
         let dir =
-            std::env::temp_dir().join(format!("vapache-server-file-alias-{}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-server-file-alias-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("private")).unwrap();
         let file = dir.join("private").join("secret.cgi");
@@ -10250,7 +10250,7 @@ mod tests {
     #[test]
     fn regex_alias_file_targets_split_even_with_trailing_slash() {
         let dir = std::env::temp_dir().join(format!(
-            "vapache-server-regex-file-alias-{}",
+            "httpd-rs-server-regex-file-alias-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -10295,7 +10295,7 @@ mod tests {
     #[test]
     fn regex_alias_cannot_re_root_outside_its_configured_base() {
         let dir = std::env::temp_dir().join(format!(
-            "vapache-server-alias-escape-{}",
+            "httpd-rs-server-alias-escape-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -10336,7 +10336,7 @@ mod tests {
 
     fn cov_dir(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("vapache-server-cov-{}-{name}", std::process::id()));
+            std::env::temp_dir().join(format!("httpd-rs-server-cov-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("www")).unwrap();
         dir
@@ -10493,7 +10493,7 @@ mod tests {
         let index = project_internal_request(
             &outer,
             "/dir/index.php",
-            vapache_verified::InternalRequestKind::DirectoryIndex,
+            httpd_rs_verified::InternalRequestKind::DirectoryIndex,
             false,
         )
         .unwrap();
@@ -10512,7 +10512,7 @@ mod tests {
                 &outer,
                 candidate,
                 "/dir/index.php",
-                vapache_verified::InternalRequestKind::DirectoryIndex,
+                httpd_rs_verified::InternalRequestKind::DirectoryIndex,
                 false,
             )
             .is_none());
@@ -10545,7 +10545,7 @@ mod tests {
         let error = project_internal_request(
             &outer,
             "/errors/show.php?status=404?detail=missing",
-            vapache_verified::InternalRequestKind::ErrorDocument,
+            httpd_rs_verified::InternalRequestKind::ErrorDocument,
             false,
         )
         .unwrap();
@@ -10584,7 +10584,7 @@ mod tests {
         let inherited_query = project_internal_request(
             &outer,
             "/errors/show.php",
-            vapache_verified::InternalRequestKind::ErrorDocument,
+            httpd_rs_verified::InternalRequestKind::ErrorDocument,
             false,
         )
         .unwrap();
@@ -10593,7 +10593,7 @@ mod tests {
         assert!(project_internal_request(
             &error,
             "/errors/again",
-            vapache_verified::InternalRequestKind::ErrorDocument,
+            httpd_rs_verified::InternalRequestKind::ErrorDocument,
             false,
         )
         .is_none());
@@ -10610,7 +10610,7 @@ mod tests {
             assert!(project_internal_request(
                 &outer,
                 invalid,
-                vapache_verified::InternalRequestKind::ErrorDocument,
+                httpd_rs_verified::InternalRequestKind::ErrorDocument,
                 false,
             )
             .is_none());
@@ -10790,16 +10790,16 @@ mod tests {
             &dir,
             &format!(
                 "ProxyPass /proxy http://127.0.0.1:9/\n\
-                 ProxyPassMatch ^/(.*\\.php)$ \"unix:/tmp/vapache-missing-outcome.sock|fcgi://localhost{}/www/\"\n",
+                 ProxyPassMatch ^/(.*\\.php)$ \"unix:/tmp/httpd-rs-missing-outcome.sock|fcgi://localhost{}/www/\"\n",
                 dir.display(),
             ),
         );
 
         for (path, expected) in [
-            ("/proxy", vapache_verified::PreparedHandlerKind::Proxy),
+            ("/proxy", httpd_rs_verified::PreparedHandlerKind::Proxy),
             (
                 "/script.php",
-                vapache_verified::PreparedHandlerKind::FastCgi,
+                httpd_rs_verified::PreparedHandlerKind::FastCgi,
             ),
         ] {
             crate::fault::clear();
@@ -12366,7 +12366,7 @@ mod tests {
                  <Location /status>\nSetHandler server-status\n</Location>\n\
                  <Directory \"{}/www/listing\">\nOptions Indexes\n</Directory>\n\
                  ScriptAlias /cgi-bin/ \"{}/cgi-bin/\"\n\
-                 ProxyPassMatch ^/(.*\\.php)$ \"unix:/tmp/vapache-missing.sock|fcgi://localhost{}/www/\"\n",
+                 ProxyPassMatch ^/(.*\\.php)$ \"unix:/tmp/httpd-rs-missing.sock|fcgi://localhost{}/www/\"\n",
                 dir.display(),
                 dir.display(),
                 dir.display(),
@@ -13815,7 +13815,7 @@ mod tests {
         let fastcgi_cfg = cov_config(
             &dir,
             &format!(
-                "ProxyPassMatch ^/(.*\\.php(/.*)?)$ \"unix:/tmp/vapache-missing.sock|fcgi://localhost{}/www/\"\n",
+                "ProxyPassMatch ^/(.*\\.php(/.*)?)$ \"unix:/tmp/httpd-rs-missing.sock|fcgi://localhost{}/www/\"\n",
                 dir.display()
             ),
         );
@@ -13832,7 +13832,7 @@ mod tests {
             &dir,
             &format!(
                 "ProxyPass /script.php http://127.0.0.1:9/\n\
-                 ProxyPassMatch ^/(.*\\.php(/.*)?)$ \"unix:/tmp/vapache-missing.sock|fcgi://localhost{}/www/\"\n",
+                 ProxyPassMatch ^/(.*\\.php(/.*)?)$ \"unix:/tmp/httpd-rs-missing.sock|fcgi://localhost{}/www/\"\n",
                 dir.display()
             ),
         );
@@ -14055,7 +14055,7 @@ mod tests {
                  Require valid-user\n\
                  Options -FollowSymLinks +SymLinksIfOwnerMatch\n\
                  </Directory>\n\
-                 ProxyPassMatch ^/(.*\\.php(/.*)?)$ \"unix:/tmp/vapache-missing.sock|fcgi://localhost{}/www/\"\n",
+                 ProxyPassMatch ^/(.*\\.php(/.*)?)$ \"unix:/tmp/httpd-rs-missing.sock|fcgi://localhost{}/www/\"\n",
                 dir.display(),
                 htpasswd.display(),
                 dir.display()
@@ -14150,7 +14150,7 @@ mod tests {
             &format!(
                 "<Directory \"{}/www\">\nAllowOverride AuthConfig\n</Directory>\n\
                  <Location \"/script.php\">\nRequire all denied\n</Location>\n\
-                 ProxyPassMatch ^/(.*\\.php)$ \"unix:/tmp/vapache-missing.sock|fcgi://localhost{}/www/\"\n",
+                 ProxyPassMatch ^/(.*\\.php)$ \"unix:/tmp/httpd-rs-missing.sock|fcgi://localhost{}/www/\"\n",
                 dir.display(),
                 dir.display(),
             ),
@@ -14367,7 +14367,7 @@ mod tests {
             &dir,
             &format!(
                 "<Directory \"{}/www\">\nRequire all denied\n</Directory>\n\
-                 ProxyPassMatch ^/(.*\\.php)$ \"unix:/tmp/vapache-missing-phase.sock|fcgi://localhost{}/www/\"\n",
+                 ProxyPassMatch ^/(.*\\.php)$ \"unix:/tmp/httpd-rs-missing-phase.sock|fcgi://localhost{}/www/\"\n",
                 dir.display(),
                 dir.display(),
             ),
@@ -14431,7 +14431,7 @@ mod tests {
             &format!(
                 "<Directory \"{}/www\">\n\
                  Require all denied\n\
-                 SetHandler \"proxy:unix:/tmp/vapache-missing-handler.sock|fcgi://localhost\"\n\
+                 SetHandler \"proxy:unix:/tmp/httpd-rs-missing-handler.sock|fcgi://localhost\"\n\
                  </Directory>\n",
                 dir.display(),
             ),

@@ -14,7 +14,7 @@ from h2raw import *
 import hpack
 
 PORT = int(open("/tmp/opencode/h2lab/port.env").read().strip().split("=")[1])
-PID = int(open("/tmp/opencode/h2lab/logs/vapached.pid").read().strip())
+PID = int(open("/tmp/opencode/h2lab/logs/httpd-rs.pid").read().strip())
 
 
 def enc(hs):

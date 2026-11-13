@@ -1,16 +1,16 @@
 # Apache access-control parity
 
-VApache treats Apache as an executable compatibility oracle for the supported
+httpd-rs treats Apache as an executable compatibility oracle for the supported
 configuration surface.  This is stronger than waiting for an adversarial pass
 to discover a semantic mismatch: every security-sensitive compatibility change
 should add both a source-derived model and a differential case that runs the
-same configuration and request against Apache and VApache.
+same configuration and request against Apache and httpd-rs.
 
 ## The refinement rule
 
-For every supported configuration and request, VApache must not reach a
+For every supported configuration and request, httpd-rs must not reach a
 protected sink when Apache denies, challenges, or rejects that request.  Exact
-status and selected identity parity is the default test.  A deliberate VApache
+status and selected identity parity is the default test.  A deliberate httpd-rs
 divergence is allowed only when it is documented and is a security refinement,
 such as refusing to trust `RemoteIPHeader` when no proxy trust list exists.
 
@@ -22,7 +22,7 @@ authorization scope.
 
 ## Current gate
 
-`tests/config_semantics.py` is the live oracle.  It starts Apache and VApache
+`tests/config_semantics.py` is the live oracle.  It starts Apache and httpd-rs
 with paired configurations, sends the same requests, and compares outcomes.
 `tests/coverage.sh` runs its fixed corpus plus 128 deterministic generated ACL
 cases. P15 adds PCRE expression and `mod_remoteip` chain cases; P18 adds the
@@ -121,13 +121,13 @@ system. `docs/apache-warrant-policy.json` is the only place that may make a
 narrow compatibility claim, every such claim requires repository evidence,
 and the default classification is `outside-claimed-surface`. Therefore a newly
 observed Apache feature can create a review or test obligation but cannot make
-VApache accept that feature.
+httpd-rs accept that feature.
 
 A future source-derived transition system, SMT model, or Lean embedding could
 cover combinations that the registration inventory and hand-maintained
 differential corpus miss. Such an artifact must still be pinned, validated
 against the Apache binary, restricted to the explicitly supported subset, and
-checked against VApache's request-to-sink state. Unsupported Apache states must
+checked against httpd-rs's request-to-sink state. Unsupported Apache states must
 reject at configuration load rather than disappear from the model. The live
 differential gate remains an independent check of any semantic extractor and
-of VApache's runtime wiring.
+of httpd-rs's runtime wiring.

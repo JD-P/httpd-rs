@@ -570,7 +570,7 @@ pub fn client_quota_key(client: IpAddr) -> IpAddr {
     match crate::access::canonical_ip(client) {
         IpAddr::V4(ip) => IpAddr::V4(ip),
         IpAddr::V6(ip) => IpAddr::V6(std::net::Ipv6Addr::from(
-            vapache_verified::client_quota_ipv6_key(u128::from(ip)),
+            httpd_rs_verified::client_quota_ipv6_key(u128::from(ip)),
         )),
     }
 }
@@ -825,7 +825,7 @@ impl BudgetCounter for loom::sync::atomic::AtomicU64 {
 fn try_add_counter<C: BudgetCounter>(counter: &C, amount: u64, limit: u64) -> bool {
     let mut current = counter.load_value(Ordering::Acquire);
     loop {
-        if !vapache_verified::hierarchical_resource_admit(current, amount, limit) {
+        if !httpd_rs_verified::hierarchical_resource_admit(current, amount, limit) {
             return false;
         }
         let Some(next) = current.checked_add(amount) else {
@@ -1052,7 +1052,7 @@ impl SlotLease {
             true
         } else if let (Some(client), Some(limit)) = (context.client, self.client_limit) {
             let usage = clients.entry(client).or_insert([0; SlotKind::COUNT]);
-            if !vapache_verified::hierarchical_resource_admit(usage[index], self.amount, limit) {
+            if !httpd_rs_verified::hierarchical_resource_admit(usage[index], self.amount, limit) {
                 if usage.iter().all(|value| *value == 0) {
                     clients.remove(&client);
                 }
@@ -1172,7 +1172,7 @@ impl ByteLease {
         let charged_client =
             if let (Some(client), Some(limit)) = (self.context.client, self.client_limit) {
                 let usage = clients.entry(client).or_insert([0; ByteKind::COUNT]);
-                if !vapache_verified::hierarchical_resource_admit(usage[index], amount, limit) {
+                if !httpd_rs_verified::hierarchical_resource_admit(usage[index], amount, limit) {
                     if usage.iter().all(|value| *value == 0) {
                         clients.remove(&client);
                     }
@@ -1276,23 +1276,24 @@ impl ByteLease {
             .byte_clients
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let charged_client =
-            if let (Some(client), Some(limit)) = (self.context.client, client_limit) {
-                let usage = clients.entry(client).or_insert([0; ByteKind::COUNT]);
-                if !vapache_verified::hierarchical_resource_admit(usage[new_index], amount, limit) {
-                    if usage.iter().all(|value| *value == 0) {
-                        clients.remove(&client);
-                    }
-                    if charged_request {
-                        self.context.local.bytes[new_index].fetch_sub(amount, Ordering::AcqRel);
-                    }
-                    return Err(io::Error::new(io::ErrorKind::OutOfMemory, message));
+        let charged_client = if let (Some(client), Some(limit)) =
+            (self.context.client, client_limit)
+        {
+            let usage = clients.entry(client).or_insert([0; ByteKind::COUNT]);
+            if !httpd_rs_verified::hierarchical_resource_admit(usage[new_index], amount, limit) {
+                if usage.iter().all(|value| *value == 0) {
+                    clients.remove(&client);
                 }
-                usage[new_index] += amount;
-                true
-            } else {
-                false
-            };
+                if charged_request {
+                    self.context.local.bytes[new_index].fetch_sub(amount, Ordering::AcqRel);
+                }
+                return Err(io::Error::new(io::ErrorKind::OutOfMemory, message));
+            }
+            usage[new_index] += amount;
+            true
+        } else {
+            false
+        };
         if !try_add(
             &self.context.budget.byte_process[new_index],
             amount,
@@ -1396,7 +1397,8 @@ impl ByteLease {
         if !unchanged_client {
             if let (Some(client), Some(limit)) = (context.client, self.client_limit) {
                 let usage = clients.entry(client).or_insert([0; ByteKind::COUNT]);
-                if !vapache_verified::hierarchical_resource_admit(usage[index], self.bytes, limit) {
+                if !httpd_rs_verified::hierarchical_resource_admit(usage[index], self.bytes, limit)
+                {
                     if usage.iter().all(|value| *value == 0) {
                         clients.remove(&client);
                     }
@@ -1720,7 +1722,7 @@ impl ResourceBudget {
             .unwrap_or_else(|error| error.into_inner());
         let charged_client = if let (Some(client), Some(limit)) = (context.client, client_limit) {
             let usage = clients.entry(client).or_insert([0; SlotKind::COUNT]);
-            if !vapache_verified::hierarchical_resource_admit(usage[index], 1, limit) {
+            if !httpd_rs_verified::hierarchical_resource_admit(usage[index], 1, limit) {
                 if usage.iter().all(|value| *value == 0) {
                     clients.remove(&client);
                 }
@@ -1738,7 +1740,7 @@ impl ResourceBudget {
         // Request and client scopes are admitted before process scope. A
         // rejection can therefore never retain scarce global capacity while
         // it reports a lower-level quota failure.
-        if !vapache_verified::hierarchical_acquisition_order_admit(
+        if !httpd_rs_verified::hierarchical_acquisition_order_admit(
             !charged_request || request_limit.is_some(),
             !charged_client || client_limit.is_some(),
         ) || !try_add(&self.slot_process[index], 1, process_limit)
@@ -1814,7 +1816,7 @@ impl ResourceBudget {
         let client_used = client
             .and_then(|client| window.clients.get(&client).copied())
             .unwrap_or(0);
-        if !vapache_verified::hierarchical_weighted_rate_admit(
+        if !httpd_rs_verified::hierarchical_weighted_rate_admit(
             window.total,
             client_used,
             amount,
@@ -2241,8 +2243,8 @@ impl ResourceBudget {
         context: &ResourceContext,
     ) -> io::Result<ResponseBodyReadLease> {
         self.validate_context(context)?;
-        debug_assert!(vapache_verified::response_body_read_lease_admit(
-            vapache_verified::ResponseWorkPhase::DescriptorRead,
+        debug_assert!(httpd_rs_verified::response_body_read_lease_admit(
+            httpd_rs_verified::ResponseWorkPhase::DescriptorRead,
         ));
         Ok(ResponseBodyReadLease {
             _slot: context.slot(
@@ -2791,8 +2793,8 @@ pub(crate) struct SlowOutputAdmission {
     general: Option<GeneralOutputLease>,
     slow_input: Option<SlowInputLease>,
     slow: Option<SlowOutputLease>,
-    input_phase: Option<vapache_verified::H2InputPhase>,
-    phase: vapache_verified::SlowOutputPhase,
+    input_phase: Option<httpd_rs_verified::H2InputPhase>,
+    phase: httpd_rs_verified::SlowOutputPhase,
 }
 
 impl SlowOutputAdmission {
@@ -2803,7 +2805,7 @@ impl SlowOutputAdmission {
             slow_input: None,
             slow: None,
             input_phase: None,
-            phase: vapache_verified::SlowOutputPhase::General,
+            phase: httpd_rs_verified::SlowOutputPhase::General,
         }
     }
 
@@ -2813,8 +2815,8 @@ impl SlowOutputAdmission {
             general: Some(GeneralOutputLease::H2 { _lease: general }),
             slow_input: None,
             slow: None,
-            input_phase: Some(vapache_verified::H2InputPhase::GeneralBeforeBody),
-            phase: vapache_verified::SlowOutputPhase::General,
+            input_phase: Some(httpd_rs_verified::H2InputPhase::GeneralBeforeBody),
+            phase: httpd_rs_verified::SlowOutputPhase::General,
         }
     }
 
@@ -2825,12 +2827,12 @@ impl SlowOutputAdmission {
             slow_input: None,
             slow: None,
             input_phase: None,
-            phase: vapache_verified::SlowOutputPhase::General,
+            phase: httpd_rs_verified::SlowOutputPhase::General,
         }
     }
 
     pub(crate) fn is_slow(&self) -> bool {
-        self.phase == vapache_verified::SlowOutputPhase::Slow
+        self.phase == httpd_rs_verified::SlowOutputPhase::Slow
     }
 
     pub(crate) fn client(&self) -> IpAddr {
@@ -2840,7 +2842,7 @@ impl SlowOutputAdmission {
     }
 
     pub(crate) fn is_slow_input(&self) -> bool {
-        self.input_phase == Some(vapache_verified::H2InputPhase::SlowInput)
+        self.input_phase == Some(httpd_rs_verified::H2InputPhase::SlowInput)
     }
 
     /// Transfer the current HTTP/2 output admission into transport-owned
@@ -2902,9 +2904,11 @@ impl SlowOutputAdmission {
         let phase = self
             .input_phase
             .ok_or_else(|| io::Error::other("slow input requires HTTP/2 ownership"))?;
-        let next =
-            vapache_verified::h2_input_phase_step(phase, vapache_verified::H2InputEvent::BodyWait)
-                .ok_or_else(|| io::Error::other("HTTP/2 input ownership cannot enter body wait"))?;
+        let next = httpd_rs_verified::h2_input_phase_step(
+            phase,
+            httpd_rs_verified::H2InputEvent::BodyWait,
+        )
+        .ok_or_else(|| io::Error::other("HTTP/2 input ownership cannot enter body wait"))?;
         if !matches!(self.general, Some(GeneralOutputLease::H2 { .. })) {
             return Err(io::Error::other("HTTP/2 input lost general ownership"));
         }
@@ -2930,9 +2934,9 @@ impl SlowOutputAdmission {
             return Ok(());
         }
         crate::fault::hit("transition.h2.slow-input-reacquire")?;
-        let next = vapache_verified::h2_input_phase_step(
-            vapache_verified::H2InputPhase::SlowInput,
-            vapache_verified::H2InputEvent::BodyComplete,
+        let next = httpd_rs_verified::h2_input_phase_step(
+            httpd_rs_verified::H2InputPhase::SlowInput,
+            httpd_rs_verified::H2InputEvent::BodyComplete,
         )
         .expect("verified slow-input completion transition");
         let general = self
@@ -2971,9 +2975,9 @@ impl SlowOutputAdmission {
                 "output cannot start while HTTP/2 request input is pending",
             ));
         }
-        let next = vapache_verified::slow_output_phase_step(
+        let next = httpd_rs_verified::slow_output_phase_step(
             self.phase,
-            vapache_verified::SlowOutputEvent::DownstreamStall,
+            httpd_rs_verified::SlowOutputEvent::DownstreamStall,
         )
         .ok_or_else(|| io::Error::other("output ownership is closed"))?;
         let slow = self
@@ -2992,15 +2996,16 @@ impl SlowOutputAdmission {
 
     fn finish(&mut self) {
         if let Some(phase) = self.input_phase {
-            if let Some(next) =
-                vapache_verified::h2_input_phase_step(phase, vapache_verified::H2InputEvent::Finish)
-            {
+            if let Some(next) = httpd_rs_verified::h2_input_phase_step(
+                phase,
+                httpd_rs_verified::H2InputEvent::Finish,
+            ) {
                 self.input_phase = Some(next);
             }
         }
-        if let Some(next) = vapache_verified::slow_output_phase_step(
+        if let Some(next) = httpd_rs_verified::slow_output_phase_step(
             self.phase,
-            vapache_verified::SlowOutputEvent::Finish,
+            httpd_rs_verified::SlowOutputEvent::Finish,
         ) {
             self.phase = next;
         }
@@ -3090,7 +3095,7 @@ impl SlowOutputProgress {
         let elapsed_ms =
             u64::try_from(now.duration_since(self.started).as_millis()).unwrap_or(u64::MAX);
         let grace_ms = u64::try_from(self.interval.as_millis()).unwrap_or(u64::MAX);
-        if !vapache_verified::minimum_progress_rate_admit(
+        if !httpd_rs_verified::minimum_progress_rate_admit(
             self.delivered,
             elapsed_ms,
             SLOW_OUTPUT_MIN_RATE,

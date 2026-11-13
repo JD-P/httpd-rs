@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end regressions for the pass-2 through pass-38 findings (F23-P38).
 
-The suite starts fresh vapached instances in temporary trees and exercises
+The suite starts fresh httpd-rs instances in temporary trees and exercises
 the exploit shapes from adversarial/findings.md: terminal rewrite/proxy authorization,
 cache generations and CGI PATH_INFO, relative and capture-only regex aliases,
 autoindex links, negated/environment Require providers, IndexIgnore,
@@ -17,7 +17,7 @@ access-layer binding for symlinked mapping roots, and the pass-10
 resolved-target/rewrite scope conjunction.
 
 Usage:
-    cargo build --release -p vapached
+    cargo build --release -p httpd-rs
     python3 tests/adversarial_regressions.py -v
 """
 
@@ -42,28 +42,28 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target" / "release" / "httpd-rs"))
 # Use the platform temporary directory by default.  Environments whose system
 # temp mount is noexec can select an executable scratch mount explicitly.
-TEST_TMPDIR = os.environ.get("VAPACHE_TEST_TMPDIR")
+TEST_TMPDIR = os.environ.get("HTTPD_RS_TEST_TMPDIR")
 
 SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
 SERVICE_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
 
-VAPACHE_CAPABILITIES = f"""User {SERVICE_USER}
+HTTPD_RS_CAPABILITIES = f"""User {SERVICE_USER}
 Group {SERVICE_GROUP}
-VapacheCapability AbsoluteRequestTarget On
-VapacheCapability AccessFiles On
-VapacheCapability AutoIndex On
-VapacheCapability Cgi On
-VapacheCapability FastCgi On
-VapacheCapability LegacyAuthz On
-VapacheCapability RequestTrailers On
-VapacheCapability RewriteProgram On
-VapacheCapability ServerStatus On
-VapacheCapability Trace On
-VapacheCapability UnstableFastCgiPaths On
-VapacheCapability MutableAuthFiles On
+HttpdRsCapability AbsoluteRequestTarget On
+HttpdRsCapability AccessFiles On
+HttpdRsCapability AutoIndex On
+HttpdRsCapability Cgi On
+HttpdRsCapability FastCgi On
+HttpdRsCapability LegacyAuthz On
+HttpdRsCapability RequestTrailers On
+HttpdRsCapability RewriteProgram On
+HttpdRsCapability ServerStatus On
+HttpdRsCapability Trace On
+HttpdRsCapability UnstableFastCgiPaths On
+HttpdRsCapability MutableAuthFiles On
 """
 
 
@@ -93,13 +93,13 @@ class Backend(BaseHTTPRequestHandler):
         pass
 
 
-def start_vapached(base: Path, config: str, server_root: Path | None = None):
+def start_httpd_rs(base: Path, config: str, server_root: Path | None = None):
     logs = base / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     logs.chmod(0o777)
     config_path = base / "vp.conf"
-    config_path.write_text(VAPACHE_CAPABILITIES + config)
-    command = [str(VAPACHED)]
+    config_path.write_text(HTTPD_RS_CAPABILITIES + config)
+    command = [str(HTTPD_RS)]
     if server_root is not None:
         command.extend(["-d", str(server_root)])
     command.extend(["-f", str(config_path), "-DFOREGROUND"])
@@ -125,11 +125,11 @@ def start_vapached(base: Path, config: str, server_root: Path | None = None):
     if proc.stdout:
         output = proc.stdout.read()
     raise RuntimeError(
-        f"vapached failed to start:\n{output.decode(errors='replace')}"
+        f"httpd-rs failed to start:\n{output.decode(errors='replace')}"
     )
 
 
-def stop_vapached(proc) -> None:
+def stop_httpd_rs(proc) -> None:
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -267,7 +267,7 @@ class TcpFastCgiMock(FastCgiMock):
     """TCP variant of the parameter-reflecting FastCGI oracle."""
 
     def __init__(self, port: int):
-        super().__init__(Path("/nonexistent-vapache-tcp-fastcgi-socket"))
+        super().__init__(Path("/nonexistent-httpd-rs-tcp-fastcgi-socket"))
         self.port = port
 
     def start(self) -> None:
@@ -340,9 +340,9 @@ def request_to(
 class F23ToF38Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-adversarial-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-adversarial-", dir=TEST_TMPDIR))
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
         cls.cache = cls.base / "cache"
@@ -478,7 +478,7 @@ class F23ToF38Tests(unittest.TestCase):
         # F31: an absolute target outside ServerRoot.  The capture-only alias
         # must fail instead of re-rooting at the file's parent directory.
         cls.alias_dir = Path(
-            tempfile.mkdtemp(prefix="vapache-alias-escape-", dir=TEST_TMPDIR)
+            tempfile.mkdtemp(prefix="httpd-rs-alias-escape-", dir=TEST_TMPDIR)
         )
         cls.alias_secret = cls.alias_dir / "secret.txt"
         cls.alias_secret.write_text("WALLET-ALIAS-SECRET\n")
@@ -520,7 +520,7 @@ class F23ToF38Tests(unittest.TestCase):
         cls.config = cls.base / "vp.conf"
         cls.write_config()
         cls.proc = subprocess.Popen(
-            [str(VAPACHED), "-f", str(cls.config), "-DFOREGROUND"],
+            [str(HTTPD_RS), "-f", str(cls.config), "-DFOREGROUND"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -535,12 +535,12 @@ class F23ToF38Tests(unittest.TestCase):
         output = b""
         if cls.proc.stdout:
             output = cls.proc.stdout.read()
-        raise RuntimeError(f"vapached failed to start:\n{output.decode(errors='replace')}")
+        raise RuntimeError(f"httpd-rs failed to start:\n{output.decode(errors='replace')}")
 
     @classmethod
     def write_config(cls, extra: str = ""):
         cls.config.write_text(
-            VAPACHE_CAPABILITIES
+            HTTPD_RS_CAPABILITIES
             + f"""ServerRoot "{cls.base}"
 Listen 127.0.0.1:{cls.port}
 ServerName localhost
@@ -945,9 +945,9 @@ AliasMatch "^/escape(.*)$" "$1"
 class F48AddressBoundVhostTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-vhost-ip-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-vhost-ip-", dir=TEST_TMPDIR))
         cls.public = cls.base / "public"
         cls.admin = cls.base / "admin"
         cls.logs = cls.base / "logs"
@@ -980,7 +980,7 @@ DocumentRoot "{cls.public}"
 """
         )
         cls.proc = subprocess.Popen(
-            [str(VAPACHED), "-f", str(cls.config), "-DFOREGROUND"],
+            [str(HTTPD_RS), "-f", str(cls.config), "-DFOREGROUND"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -995,7 +995,7 @@ DocumentRoot "{cls.public}"
         output = b""
         if cls.proc.stdout:
             output = cls.proc.stdout.read()
-        raise RuntimeError(f"vapached failed to start:\n{output.decode(errors='replace')}")
+        raise RuntimeError(f"httpd-rs failed to start:\n{output.decode(errors='replace')}")
 
     @classmethod
     def tearDownClass(cls):
@@ -1043,11 +1043,11 @@ DocumentRoot "{cls.public}"
 class F49IPv4MappedPeerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
         if not socket.has_ipv6:
             raise unittest.SkipTest("IPv6 unavailable")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-ipmapped-", dir=TEST_TMPDIR))
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-ipmapped-", dir=TEST_TMPDIR))
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
         cls.base.chmod(0o755)
@@ -1087,7 +1087,7 @@ DocumentRoot "{cls.www}"
 """
         )
         cls.proc = subprocess.Popen(
-            [str(VAPACHED), "-f", str(cls.config), "-DFOREGROUND"],
+            [str(HTTPD_RS), "-f", str(cls.config), "-DFOREGROUND"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -1149,9 +1149,9 @@ class F50AncestorAccessFileTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f50-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f50-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.app = cls.base / "app"
         cls.www = cls.app / "public"
@@ -1217,11 +1217,11 @@ DirectoryIndex index.html
 </Directory>
 Alias "/site" "{cls.srv}/site"
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "base", None):
             shutil.rmtree(cls.base, ignore_errors=True)
 
@@ -1256,7 +1256,7 @@ Alias "/site" "{cls.srv}/site"
 
     def test_f50_explain_reports_the_parent_access_file(self):
         result = subprocess.run(
-            [str(VAPACHED), "-f", str(self.config), "--explain", "/wallet.dat"],
+            [str(HTTPD_RS), "-f", str(self.config), "--explain", "/wallet.dat"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1272,9 +1272,9 @@ class F51OverlappingAliasAccessRootTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f51-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f51-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.site = cls.base / "site"
@@ -1321,22 +1321,22 @@ Alias "/assets" "{cls.site}/assets"
 ScriptAlias "/scripts" "{cls.site}"
 ScriptAlias "/cgia" "{cls.site}/cgi"
 """
-        cls.proc, cls.config = start_vapached(
+        cls.proc, cls.config = start_httpd_rs(
             cls.base,
             config_prefix.format(port=cls.port) + narrow_first,
         )
         swapped_dir = cls.base / "swapped"
         swapped_dir.mkdir(exist_ok=True)
         swapped_dir.chmod(0o755)
-        cls.proc_swapped, _ = start_vapached(
+        cls.proc_swapped, _ = start_httpd_rs(
             swapped_dir,
             config_prefix.format(port=cls.port_swapped) + broad_first,
         )
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
-        stop_vapached(getattr(cls, "proc_swapped", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc_swapped", None))
         if getattr(cls, "base", None):
             shutil.rmtree(cls.base, ignore_errors=True)
 
@@ -1366,9 +1366,9 @@ class F52DirectoryIndexCacheTargetTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f52-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f52-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.cache = cls.base / "cache"
@@ -1415,11 +1415,11 @@ DirectoryIndex index.html
     DirectoryIndex index.cgi
 </Directory>
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "base", None):
             shutil.rmtree(cls.base, ignore_errors=True)
 
@@ -1457,9 +1457,9 @@ class F53AliasRewriteBaseTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f53-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f53-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.site = cls.base / "site"
@@ -1528,11 +1528,11 @@ Alias /site "{cls.site}"
 AliasMatch "^/m/(.*)$" "{cls.site}/$1"
 ScriptAlias /cgi "{cls.site}/cgi"
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "base", None):
             shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
 
@@ -1579,9 +1579,9 @@ class F57RequestUriIdentityTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f57-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f57-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
@@ -1632,11 +1632,11 @@ SetEnvIf Request_URI "\\.env$" F57_BLOCKED=1
     Require all granted
 </If>
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "base", None):
             shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
 
@@ -1699,9 +1699,9 @@ class F58ParentRewriteSubjectTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f58-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f58-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.ancestor = cls.base / "ancestor"
         cls.www = cls.ancestor / "public"
@@ -1795,11 +1795,11 @@ AliasMatch "^/mwallet/(.*)$" "{cls.app}/$1"
 ScriptAlias /swallet "{cls.app}/cgi"
 Alias /storage "{cls.storage_app}"
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "base", None):
             shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
 
@@ -1854,9 +1854,9 @@ class F59ExplicitTargetAccessLayerTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f59-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f59-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.real = cls.base / "real" / "public"
         cls.root = cls.base / "www" / "html"
@@ -1928,11 +1928,11 @@ DirectoryIndex index.html index.cgi
 </Directory>
 Alias /aliased "{cls.alias_link}"
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "base", None):
             shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
 
@@ -1974,9 +1974,9 @@ class F60ResolvedTargetScopeTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f60-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f60-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.real = cls.base / "real" / "public"
         cls.root = cls.base / "www" / "html"
@@ -2134,11 +2134,11 @@ Alias /ancestor-sethandler "{cls.anc_set_root}"
     Require all granted
 </Directory>
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "base", None):
             shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
 
@@ -2203,9 +2203,9 @@ class F60AllowOverrideDenyTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f60-override-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f60-override-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.real = cls.base / "real" / "public"
         cls.root = cls.base / "www" / "html"
@@ -2251,11 +2251,11 @@ Alias /control "{cls.control}"
     Require all granted
 </Directory>
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "base", None):
             shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
 
@@ -2276,9 +2276,9 @@ class F54SetHandlerCacheTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f54-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f54-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.cache = cls.base / "cache"
@@ -2316,11 +2316,11 @@ DirectoryIndex index.php
     Require all granted
 </Directory>
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "mock", None):
             cls.mock.stop()
         if getattr(cls, "base", None):
@@ -2348,9 +2348,9 @@ class F55CacheKeyBytesTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f55-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f55-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.cache = cls.base / "cache"
@@ -2382,11 +2382,11 @@ CacheMaxExpire 3600
     Require all granted
 </Directory>
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "mock", None):
             cls.mock.stop()
         if getattr(cls, "base", None):
@@ -2425,9 +2425,9 @@ class F56ErrorDocumentCacheTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f56-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f56-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.cache = cls.base / "cache"
@@ -2461,11 +2461,11 @@ ErrorDocument 404 /err.php
     Require all granted
 </Directory>
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "mock", None):
             cls.mock.stop()
         if getattr(cls, "base", None):
@@ -2490,9 +2490,9 @@ class F67PassthroughTargetTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f67-pt-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f67-pt-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
@@ -2525,11 +2525,11 @@ RewriteRule "^/app/(.*)$" "%{{DOCUMENT_ROOT}}/$1" [PT,L]
     Require all granted
 </Directory>
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "base", None):
             shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
 
@@ -2550,9 +2550,9 @@ class F68StickyFilesystemOverrideTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f68-sticky-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f68-sticky-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
@@ -2585,11 +2585,11 @@ RewriteRule "^" "/index.html" [L]
     Require all granted
 </Directory>
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
         # Capability server: no rewrites at all, so the sticky assertion can
         # be compared against the real behaviour of the same .cgi target.
         cls.control_port = free_port()
-        cls.control_proc, _ = start_vapached(
+        cls.control_proc, _ = start_httpd_rs(
             cls.base,
             f"""ServerRoot "{cls.base}"
 Listen 127.0.0.1:{cls.control_port}
@@ -2608,8 +2608,8 @@ AddHandler cgi-script .cgi
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
-        stop_vapached(getattr(cls, "control_proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "control_proc", None))
         if getattr(cls, "base", None):
             shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
 
@@ -2634,9 +2634,9 @@ class UnsafePrefixStatWarningTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f32-warn-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-f32-warn-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
@@ -2657,18 +2657,18 @@ RewriteRule "^/unsafe/(.*)$" "{cls.base}/$1" [L,UnsafePrefixStat]
     Require all granted
 </Directory>
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "base", None):
             shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
 
     def test_flag_is_parsed_with_a_load_time_warning(self):
         # The server loaded (setUpClass succeeded); stop it first so the
         # buffered startup output can be drained from the pipe.
-        stop_vapached(self.proc)
+        stop_httpd_rs(self.proc)
         assert self.proc.stdout is not None
         output = self.proc.stdout.read().decode(errors="replace")
         self.assertIn("[UnsafePrefixStat]", output)
@@ -2699,9 +2699,9 @@ class F61ToF69Pass11Tests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-pass11-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-pass11-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
@@ -2829,11 +2829,11 @@ RewriteEngine On
 RewriteCond expr "%{{REQUEST_FILENAME}} =~ /secret/"
 RewriteRule "^" "-" [F]
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "base", None):
             shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
 
@@ -2922,9 +2922,9 @@ class P13LexicalHandlerIdentityTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p13-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-p13-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
@@ -2992,11 +2992,11 @@ AddHandler cgi-script .run
     Require all denied
 </Location>
 """
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "mock", None):
             cls.mock.stop()
         if getattr(cls, "base", None):
@@ -3033,9 +3033,9 @@ class P14ConfigRewriteHardeningTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p14-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-p14-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "htdocs"  # Exercise the implicit DocumentRoot.
         cls.logs = cls.base / "logs"
@@ -3170,13 +3170,13 @@ RewriteRule "^/chain$" "-" [C]
 RewriteRule "^/chain$" "-" [C]
 RewriteRule "^/chain$" "/public.txt" [PT,L]
 '''
-        cls.proc, cls.config = start_vapached(
+        cls.proc, cls.config = start_httpd_rs(
             cls.base, cls.config_text, server_root=cls.base
         )
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "base", None):
             shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
 
@@ -3254,9 +3254,9 @@ class P15ApacheParityHardeningTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p15-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-p15-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.logs = cls.base / "logs"
@@ -3409,11 +3409,11 @@ RewriteEngine On
 RewriteCond expr "%{{REQUEST_URI}} =~ /\\Qexpr-rewrite\\E/"
 RewriteRule "^/expr-rewrite/secret\\.txt$" "-" [F,L]
 '''
-        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        cls.proc, cls.config = start_httpd_rs(cls.base, cls.config_text)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         if getattr(cls, "mock", None):
             cls.mock.stop()
         if getattr(cls, "tcp_mock", None):
@@ -3524,9 +3524,9 @@ class P36TrailingSlashRewriteTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p36-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-p36-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         for directory in (
@@ -3545,7 +3545,7 @@ class P36TrailingSlashRewriteTests(unittest.TestCase):
         cls.port = free_port()
         config = f"""ServerRoot "{cls.base}"
 Listen 127.0.0.1:{cls.port}
-PidFile "{cls.base / 'vapached.pid'}"
+PidFile "{cls.base / 'httpd-rs.pid'}"
 ErrorLog "{cls.base / 'error.log'}"
 DocumentRoot "{cls.www}"
 RewriteEngine On
@@ -3562,17 +3562,17 @@ RewriteRule ^/guarded$ /guarded/ [L]
     Require all granted
 </Directory>
 """
-        cls.proc, _ = start_vapached(cls.base, config)
+        cls.proc, _ = start_httpd_rs(cls.base, config)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         shutil.rmtree(getattr(cls, "base", Path("/nonexistent")), ignore_errors=True)
 
     def assert_live_response(self, path: str, expected_status: int) -> bytes:
         status, _, body = request(self.port, path)
         self.assertEqual(status, expected_status, (path, body[:300]))
-        self.assertIsNone(self.proc.poll(), f"vapached exited after {path}")
+        self.assertIsNone(self.proc.poll(), f"httpd-rs exited after {path}")
         return body
 
     def test_main_and_access_file_trailing_slash_rewrites_stay_live(self):
@@ -3587,9 +3587,9 @@ class P38ContinuationJoinTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p38-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-p38-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         for name in (
@@ -3647,7 +3647,7 @@ class P38ContinuationJoinTests(unittest.TestCase):
         cls.port = free_port()
         config = f'''ServerRoot "{cls.base}"
 Listen 127.0.0.1:{cls.port}
-PidFile "{cls.base / 'vapached.pid'}"
+PidFile "{cls.base / 'httpd-rs.pid'}"
 ErrorLog "{cls.base / 'error.log'}"
 DocumentRoot "{cls.www}"
 <LocationMatch "^/main/private[.]txt\\
@@ -3686,11 +3686,11 @@ $">
     Options +FollowSymLinks
 </Directory>
 '''
-        cls.proc, _ = start_vapached(cls.base, config)
+        cls.proc, _ = start_httpd_rs(cls.base, config)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         shutil.rmtree(getattr(cls, "base", Path("/nonexistent")), ignore_errors=True)
 
     def assert_closed(self, path: str, status: int):
@@ -3698,7 +3698,7 @@ $">
         self.assertEqual(actual, status, (path, body[:300]))
         self.assertNotIn(b"P38-SECRET", body)
         self.assertNotIn(b"P38-CGI-MUST-NOT-RUN", body)
-        self.assertIsNone(self.proc.poll(), f"vapached exited after {path}")
+        self.assertIsNone(self.proc.poll(), f"httpd-rs exited after {path}")
 
     def test_continued_guards_keep_their_exact_regex(self):
         self.assert_closed("/files/private.txt", 403)
@@ -3718,9 +3718,9 @@ class PcreInlineOptionAdmissionTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not VAPACHED.exists():
-            raise unittest.SkipTest(f"missing {VAPACHED}")
-        cls.base = Path(tempfile.mkdtemp(prefix="vapache-pcre-inline-", dir=TEST_TMPDIR))
+        if not HTTPD_RS.exists():
+            raise unittest.SkipTest(f"missing {HTTPD_RS}")
+        cls.base = Path(tempfile.mkdtemp(prefix="httpd-rs-pcre-inline-", dir=TEST_TMPDIR))
         cls.base.chmod(0o755)
         cls.www = cls.base / "www"
         cls.www.mkdir()
@@ -3777,7 +3777,7 @@ class PcreInlineOptionAdmissionTests(unittest.TestCase):
         cls.port = free_port()
         config = f'''ServerRoot "{cls.base}"
 Listen 127.0.0.1:{cls.port}
-PidFile "{cls.base / 'vapached.pid'}"
+PidFile "{cls.base / 'httpd-rs.pid'}"
 ErrorLog "{cls.base / 'error.log'}"
 DocumentRoot "{cls.www}"
 <Directory />
@@ -3789,11 +3789,11 @@ DocumentRoot "{cls.www}"
     Require all denied
 </Directory>
 '''
-        cls.proc, _ = start_vapached(cls.base, config)
+        cls.proc, _ = start_httpd_rs(cls.base, config)
 
     @classmethod
     def tearDownClass(cls):
-        stop_vapached(getattr(cls, "proc", None))
+        stop_httpd_rs(getattr(cls, "proc", None))
         shutil.rmtree(getattr(cls, "base", Path("/nonexistent")), ignore_errors=True)
 
     def test_rust_only_syntax_cannot_activate_access_file_grants(self):
@@ -3806,7 +3806,7 @@ DocumentRoot "{cls.www}"
                 )
                 self.assertEqual(status, 500, (name, body[:300]))
                 self.assertNotIn(b"INLINE-OPTION-SECRET", body)
-                self.assertIsNone(self.proc.poll(), f"vapached exited after {name}")
+                self.assertIsNone(self.proc.poll(), f"httpd-rs exited after {name}")
 
     def test_pcre2_ungreedy_option_remains_supported(self):
         status, _, body = request(
