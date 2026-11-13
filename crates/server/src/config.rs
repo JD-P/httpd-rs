@@ -4359,7 +4359,10 @@ fn build_directive_payload_schema(name: &str) -> PayloadSchema {
             max: u64::MAX,
         },
         "deflatecompressionlevel" => PayloadValueSchema::Unsigned { min: 0, max: 9 },
-        "brotlicompressionquality" => PayloadValueSchema::Unsigned { min: 0, max: 11 },
+        // Qualities 10/11 enter Brotli's long non-interruptible Zopfli path.
+        // Request-time compression is deliberately limited to the bounded,
+        // progress-coupled encoder profiles.
+        "brotlicompressionquality" => PayloadValueSchema::Unsigned { min: 0, max: 9 },
         "timeout"
         | "keepalivetimeout"
         | "maxkeepaliverequests"
@@ -16060,7 +16063,7 @@ AddOutputFilterByType DEFLATE text/html\n\
 SetInputFilter INCLUDES\n\
 AddInputFilter INCLUDES .shtml\n\
 DeflateCompressionLevel 9\n\
-BrotliCompressionQuality 11\n\
+BrotliCompressionQuality 9\n\
 DeflateAlterETag AddSuffix\n\
 BrotliAlterETag Remove\n\
 BrotliCompressionAlterETag NoChange\n\
@@ -16138,7 +16141,7 @@ RewriteOptions Inherit\n"
         assert_eq!(s.proxy_policy.proxy_reverses.len(), 1);
         assert_eq!(s.compression_policy.compression_rules.len(), 3);
         assert_eq!(s.compression_policy.deflate_level, Some(9));
-        assert_eq!(s.compression_policy.brotli_quality, Some(11));
+        assert_eq!(s.compression_policy.brotli_quality, Some(9));
         assert_eq!(
             s.compression_policy.deflate_alter_etag,
             Some(AlterEtag::AddSuffix)
@@ -16674,7 +16677,7 @@ Require all granted\n\
             .any(|w| w.contains("useless use of AllowOverrideList")));
         err("AllowEncodedSlashes maybe\n");
         err("DeflateCompressionLevel 10\n");
-        err("BrotliCompressionQuality 12\n");
+        err("BrotliCompressionQuality 10\n");
     }
 
     #[test]

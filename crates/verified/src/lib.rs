@@ -10465,9 +10465,251 @@ pub fn mmap_read_allowed(
     requested <= file_len && mode & 0o222 == 0
 }
 
-/// A response body is compressed only while it stays within the fixed
-/// in-memory compression cap.  Larger bodies are passed through unchanged,
-/// which removes the "compress forever after disconnect" resource class.
+/// The request-time encoders supported by the output filter.  This is kept
+/// separate from configuration's representation enum so the resource proof
+/// cannot accidentally acquire an unbounded algorithm when configuration
+/// grows a new encoding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DynamicCompressionKind {
+    Gzip,
+    Brotli,
+}
+
+/// Complete reservation required before request-time compression begins.
+/// `workspace_bytes` covers encoder-owned allocations, `work_units` is the
+/// weighted CPU charge, and `transient_bytes` also covers the input body and
+/// one bounded transport/output scratch buffer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DynamicCompressionBudget {
+    pub workspace_bytes: u64,
+    pub work_units: u64,
+    pub transient_bytes: u64,
+}
+
+pub open spec fn dynamic_compression_workspace_spec(
+    kind: DynamicCompressionKind,
+    quality: u32,
+) -> Option<u64> {
+    match kind {
+        DynamicCompressionKind::Gzip => {
+            if quality <= 9 { Some(2_097_152u64) } else { None }
+        },
+        DynamicCompressionKind::Brotli => {
+            if quality <= 5 {
+                Some(16_777_216u64)
+            } else if quality <= 7 {
+                Some(33_554_432u64)
+            } else if quality <= 9 {
+                Some(67_108_864u64)
+            } else {
+                None
+            }
+        },
+    }
+}
+
+pub open spec fn dynamic_compression_weight_spec(
+    kind: DynamicCompressionKind,
+    quality: u32,
+) -> Option<u64> {
+    match kind {
+        DynamicCompressionKind::Gzip => {
+            if quality <= 5 {
+                Some(1)
+            } else if quality <= 7 {
+                Some(2)
+            } else if quality <= 9 {
+                Some(4)
+            } else {
+                None
+            }
+        },
+        DynamicCompressionKind::Brotli => {
+            if quality <= 5 {
+                Some(1)
+            } else if quality == 6 {
+                Some(2)
+            } else if quality == 7 {
+                Some(4)
+            } else if quality == 8 {
+                Some(8)
+            } else if quality == 9 {
+                Some(16)
+            } else {
+                None
+            }
+        },
+    }
+}
+
+pub open spec fn dynamic_compression_budget_spec(
+    kind: DynamicCompressionKind,
+    quality: u32,
+    input_len: u64,
+) -> Option<DynamicCompressionBudget> {
+    if input_len == 0 || input_len > 8_388_608u64 {
+        None
+    } else {
+        match (
+            dynamic_compression_workspace_spec(kind, quality),
+            dynamic_compression_weight_spec(kind, quality),
+        ) {
+            (Some(workspace_bytes), Some(weight)) => {
+                let blocks = ((input_len as int + 262_143) / 262_144) as u64;
+                Some(DynamicCompressionBudget {
+                    workspace_bytes,
+                    work_units: (blocks * weight) as u64,
+                    transient_bytes: (input_len + workspace_bytes + 131_072) as u64,
+                })
+            },
+            _ => None,
+        }
+    }
+}
+
+/// Executable P41 profile consumed directly by the output filter.  Successful
+/// admission is bounded to 8 MiB input, 64 MiB encoder workspace, 512 weighted
+/// work units, and 72.125 MiB total transient memory.  Brotli's quality-10/11
+/// search modes therefore have no admitted runtime profile.
+pub fn dynamic_compression_budget(
+    kind: DynamicCompressionKind,
+    quality: u32,
+    input_len: u64,
+) -> (out: Option<DynamicCompressionBudget>)
+    ensures
+        out == dynamic_compression_budget_spec(kind, quality, input_len),
+        match out {
+            Some(profile) => {
+                &&& input_len > 0
+                &&& input_len <= 8 * 1024 * 1024
+                &&& quality <= 9
+                &&& profile.workspace_bytes <= 64 * 1024 * 1024
+                &&& profile.work_units > 0
+                &&& profile.work_units <= 512
+                &&& profile.transient_bytes
+                    == input_len + profile.workspace_bytes + 128 * 1024
+                &&& profile.transient_bytes <= 72 * 1024 * 1024 + 128 * 1024
+            },
+            None => true,
+        },
+        kind == DynamicCompressionKind::Brotli && quality >= 10 ==> out.is_none(),
+{
+    if input_len == 0 || input_len > 8 * 1024 * 1024 {
+        return None;
+    }
+    let (workspace_bytes, weight) = match kind {
+        DynamicCompressionKind::Gzip => {
+            if quality <= 5 {
+                (2 * 1024 * 1024, 1)
+            } else if quality <= 7 {
+                (2 * 1024 * 1024, 2)
+            } else if quality <= 9 {
+                (2 * 1024 * 1024, 4)
+            } else {
+                return None;
+            }
+        },
+        DynamicCompressionKind::Brotli => {
+            if quality <= 5 {
+                (16 * 1024 * 1024, 1)
+            } else if quality == 6 {
+                (32 * 1024 * 1024, 2)
+            } else if quality == 7 {
+                (32 * 1024 * 1024, 4)
+            } else if quality == 8 {
+                (64 * 1024 * 1024, 8)
+            } else if quality == 9 {
+                (64 * 1024 * 1024, 16)
+            } else {
+                return None;
+            }
+        },
+    };
+    assert(workspace_bytes <= 64 * 1024 * 1024);
+    assert(weight > 0 && weight <= 16);
+    assert(weight == 1 || weight == 2 || weight == 4 || weight == 8 || weight == 16);
+    let numerator = input_len + (256 * 1024 - 1);
+    assert(262_144 <= numerator);
+    assert(numerator <= 8 * 1024 * 1024 + (256 * 1024 - 1));
+    proof {
+        vstd::arithmetic::div_mod::lemma_div_is_ordered(
+            262_144int,
+            numerator as int,
+            262_144int,
+        );
+        vstd::arithmetic::div_mod::lemma_div_is_ordered(
+            numerator as int,
+            8_650_751int,
+            262_144int,
+        );
+    }
+    assert(262_144int / 262_144int == 1) by (compute);
+    assert(8_650_751int / 262_144int == 32) by (compute);
+    let blocks = numerator / (256 * 1024);
+    assert(blocks > 0 && blocks <= 32);
+    let work_units = if weight == 1 {
+        blocks
+    } else if weight == 2 {
+        blocks * 2
+    } else if weight == 4 {
+        blocks * 4
+    } else if weight == 8 {
+        blocks * 8
+    } else {
+        assert(weight == 16);
+        blocks * 16
+    };
+    assert(work_units == blocks * weight);
+    assert(work_units <= 512);
+    assert(input_len + workspace_bytes + 128 * 1024 <= 72 * 1024 * 1024 + 128 * 1024);
+    Some(DynamicCompressionBudget {
+        workspace_bytes,
+        work_units,
+        transient_bytes: input_len + workspace_bytes + 128 * 1024,
+    })
+}
+
+pub proof fn dynamic_brotli_high_quality_has_no_budget(quality: u32, input_len: u64)
+    requires quality >= 10,
+    ensures
+        dynamic_compression_budget_spec(
+            DynamicCompressionKind::Brotli,
+            quality,
+            input_len,
+        ).is_none(),
+{
+}
+
+/// One encoder read is permitted only after the protocol adapter has made
+/// downstream progress (HTTP/1 completed the head/previous write; HTTP/2 has
+/// assigned positive flow-control capacity) and only for one bounded chunk.
+pub open spec fn compression_stream_read_spec(
+    downstream_progress: bool,
+    requested: u64,
+    chunk_limit: u64,
+) -> bool {
+    downstream_progress && requested > 0 && requested <= chunk_limit
+}
+
+pub fn compression_stream_read_admit(
+    downstream_progress: bool,
+    requested: u64,
+    chunk_limit: u64,
+) -> (ok: bool)
+    ensures ok == compression_stream_read_spec(downstream_progress, requested, chunk_limit),
+{
+    downstream_progress && requested > 0 && requested <= chunk_limit
+}
+
+pub proof fn compression_read_requires_downstream_progress(requested: u64, chunk_limit: u64)
+    ensures !compression_stream_read_spec(false, requested, chunk_limit),
+{
+}
+
+/// A response body is compressed only while it stays within the fixed input
+/// cap.  The full quality-dependent decision is made by
+/// `dynamic_compression_budget`; this predicate remains the shared early gate
+/// for body readers.
 pub fn compression_body_admit(len: u64, limit: u64) -> (ok: bool)
     ensures ok == (len <= limit),
 {

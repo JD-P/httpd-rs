@@ -2230,6 +2230,24 @@ pub enum Body {
         reader: Box<dyn Read + Send>,
         len: u64,
     },
+    /// A transform whose encoded length is not known until the downstream
+    /// progress path consumes it. `max_len` is a hard representation ceiling,
+    /// not a value that may be emitted as Content-Length.
+    UnknownLengthStream {
+        reader: Box<dyn Read + Send>,
+        max_len: u64,
+    },
+}
+
+impl Body {
+    pub(crate) fn known_len(&self) -> Option<u64> {
+        match self {
+            Self::Empty => Some(0),
+            Self::Bytes(bytes) => Some(bytes.len() as u64),
+            Self::File { len, .. } | Self::Stream { len, .. } => Some(*len),
+            Self::UnknownLengthStream { .. } => None,
+        }
+    }
 }
 
 pub struct Response {
@@ -2819,12 +2837,7 @@ impl Response {
     }
 
     pub fn body_len(&self) -> u64 {
-        match &self.body {
-            Body::Empty => 0,
-            Body::Bytes(b) => b.len() as u64,
-            Body::File { len, .. } => *len,
-            Body::Stream { len, .. } => *len,
-        }
+        self.body.known_len().unwrap_or(0)
     }
 
     pub(crate) fn forbid_shared_cache(&mut self) {
@@ -2877,7 +2890,10 @@ impl Response {
         });
         let body_bytes = match &self.body {
             Body::Bytes(bytes) => bytes.len() as u64,
-            Body::Empty | Body::File { .. } | Body::Stream { .. } => 0,
+            Body::Empty
+            | Body::File { .. }
+            | Body::Stream { .. }
+            | Body::UnknownLengthStream { .. } => 0,
         };
         let amount = header_bytes.saturating_add(body_bytes);
         if let Some(lease) = &mut self.resident_lease {
@@ -3194,7 +3210,7 @@ fn sendfile_until(
 fn serialize_response_head(
     resp: &mut Response,
     opts: &ResponseOptions,
-) -> io::Result<(Vec<u8>, bool, u64)> {
+) -> io::Result<(Vec<u8>, bool, Option<u64>, bool)> {
     if !response_headers_valid(resp) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -3202,7 +3218,7 @@ fn serialize_response_head(
         ));
     }
     let header_sanitizer = ResponseHeaderSanitizer::from_response(resp)?;
-    let body_len = resp.body_len();
+    let body_len = resp.body.known_len();
     let status = resp.status;
     let mut have_date = false;
     let mut have_server = false;
@@ -3218,6 +3234,10 @@ fn serialize_response_head(
     }
     let no_body_status =
         status == 204 || status == 205 || status == 304 || (100..200).contains(&status);
+    let chunked = body_len.is_none()
+        && !opts.head_only
+        && !no_body_status
+        && opts.protocol != Version::Http10;
     // HEAD and 304 may advertise a selected representation length. The
     // shared helper validates and canonicalizes exactly one such field; 1xx
     // and 204 always strip it as RFC 9110 requires.
@@ -3271,12 +3291,16 @@ fn serialize_response_head(
         head.extend_from_slice(b"Content-Length: ");
         push_decimal(&mut head, length);
         head.extend_from_slice(b"\r\n");
-    } else if !no_body_status {
+    } else if let Some(body_len) = body_len.filter(|_| !no_body_status) {
         head.extend_from_slice(b"Content-Length: ");
         push_decimal(&mut head, body_len);
         head.extend_from_slice(b"\r\n");
+    } else if chunked {
+        head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
     }
-    let close = !opts.keep_alive || !opts.request_keep_alive;
+    let close = !opts.keep_alive
+        || !opts.request_keep_alive
+        || (body_len.is_none() && opts.protocol == Version::Http10);
     if close {
         head.extend_from_slice(b"Connection: close\r\n");
     } else if opts.protocol == Version::Http10 {
@@ -3284,7 +3308,7 @@ fn serialize_response_head(
     }
     head.extend_from_slice(b"\r\n");
 
-    Ok((head, no_body_status, body_len))
+    Ok((head, no_body_status, body_len, chunked))
 }
 
 /// Serialize a response and send its body.  Returns the number of body bytes
@@ -3294,7 +3318,7 @@ pub fn write_response<W: ResponseWrite>(
     resp: &mut Response,
     opts: &ResponseOptions,
 ) -> io::Result<u64> {
-    let (mut head, no_body_status, body_len) = serialize_response_head(resp, opts)?;
+    let (mut head, no_body_status, body_len, chunked) = serialize_response_head(resp, opts)?;
     // Coalesce the response head with small bodies into one write.  For static
     // files this avoids a separate header packet/syscall; larger files still
     // use sendfile.  The limits keep CGI/error bodies from being double-buffered
@@ -3304,9 +3328,9 @@ pub fn write_response<W: ResponseWrite>(
     let inline_body = !opts.head_only
         && !no_body_status
         && match &resp.body {
-            Body::Bytes(_) => body_len <= INLINE_BYTES_LIMIT,
+            Body::Bytes(_) => body_len.is_some_and(|len| len <= INLINE_BYTES_LIMIT),
             Body::File { len, .. } => *len > 0 && *len <= INLINE_FILE_LIMIT,
-            Body::Empty | Body::Stream { .. } => false,
+            Body::Empty | Body::Stream { .. } | Body::UnknownLengthStream { .. } => false,
         };
 
     if inline_body {
@@ -3354,6 +3378,44 @@ pub fn write_response<W: ResponseWrite>(
                 write_all_until(stream, &tmp[..got], opts.write_timeout)?;
                 sent += got as u64;
                 remaining -= got as u64;
+            }
+        }
+        Body::UnknownLengthStream { reader, max_len } => {
+            let mut tmp = vec![0u8; 64 * 1024];
+            let mut remaining = *max_len;
+            loop {
+                if !httpd_rs_verified::compression_stream_read_admit(
+                    true,
+                    tmp.len() as u64,
+                    64 * 1024,
+                ) {
+                    return Err(io::Error::other(
+                        "encoded response read lacks downstream progress",
+                    ));
+                }
+                let got = reader.read(&mut tmp)?;
+                if got == 0 {
+                    break;
+                }
+                if got as u64 > remaining {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "encoded response exceeded its admitted maximum",
+                    ));
+                }
+                if chunked {
+                    let prefix = format!("{got:x}\r\n");
+                    write_all_until(stream, prefix.as_bytes(), opts.write_timeout)?;
+                    write_all_until(stream, &tmp[..got], opts.write_timeout)?;
+                    write_all_until(stream, b"\r\n", opts.write_timeout)?;
+                } else {
+                    write_all_until(stream, &tmp[..got], opts.write_timeout)?;
+                }
+                sent += got as u64;
+                remaining -= got as u64;
+            }
+            if chunked {
+                write_all_until(stream, b"0\r\n\r\n", opts.write_timeout)?;
             }
         }
         Body::File { file, offset, len } => {
@@ -3612,7 +3674,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     crate::fault::hit("transition.h1.output.start")?;
-    let (head, no_body_status, _) = serialize_response_head(resp, opts)?;
+    let (head, no_body_status, _, chunked) = serialize_response_head(resp, opts)?;
     let mut progress =
         crate::resource::SlowOutputProgress::new(opts.write_timeout.max(H1_OUTPUT_FLOOR));
     // Ownership is detached from the response before the first wire wait, so
@@ -3699,6 +3761,84 @@ where
                 len -= read as u64;
             }
         }
+        Body::UnknownLengthStream {
+            mut reader,
+            max_len,
+        } => {
+            let context = scope.map(|scope| scope.context().clone());
+            let mut remaining = max_len;
+            loop {
+                if scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "request scope cancelled",
+                    ));
+                }
+                let want = if remaining == 0 {
+                    1
+                } else {
+                    remaining.min(64 * 1024) as usize
+                };
+                // The response head, and then each preceding body chunk, has
+                // completed its downstream write before another encoder read.
+                if !httpd_rs_verified::compression_stream_read_admit(true, want as u64, 64 * 1024) {
+                    return Err(io::Error::other(
+                        "encoded response read lacks downstream progress",
+                    ));
+                }
+                let (next_reader, bytes, read, next_ownership) =
+                    async_read_stream_chunk(reader, want, context.clone(), ownership).await?;
+                reader = next_reader;
+                ownership = next_ownership;
+                if read == 0 {
+                    break;
+                }
+                if read as u64 > remaining {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "encoded response exceeded its admitted maximum",
+                    ));
+                }
+                if chunked {
+                    let prefix = format!("{read:x}\r\n");
+                    async_write_progress(
+                        stream,
+                        prefix.as_bytes(),
+                        scope,
+                        output,
+                        &mut progress,
+                        &mut ownership,
+                    )
+                    .await?;
+                }
+                async_write_progress(stream, &bytes, scope, output, &mut progress, &mut ownership)
+                    .await?;
+                if chunked {
+                    async_write_progress(
+                        stream,
+                        b"\r\n",
+                        scope,
+                        output,
+                        &mut progress,
+                        &mut ownership,
+                    )
+                    .await?;
+                }
+                sent += read as u64;
+                remaining -= read as u64;
+            }
+            if chunked {
+                async_write_progress(
+                    stream,
+                    b"0\r\n\r\n",
+                    scope,
+                    output,
+                    &mut progress,
+                    &mut ownership,
+                )
+                .await?;
+            }
+        }
     }
     async_flush_progress(stream, output, &mut progress, &mut ownership).await?;
     ownership.finish();
@@ -3721,7 +3861,7 @@ pub(crate) async fn write_response_async_plain(
         return write_response_async(stream, resp, opts, scope, output).await;
     }
 
-    let (head, no_body_status, _) = serialize_response_head(resp, opts)?;
+    let (head, no_body_status, _, _) = serialize_response_head(resp, opts)?;
     let mut progress =
         crate::resource::SlowOutputProgress::new(opts.write_timeout.max(H1_OUTPUT_FLOOR));
     let mut ownership = resp.take_retained_output_ownership();
@@ -4801,6 +4941,40 @@ mod tests {
         assert_eq!(&wire[split..], vec![b'x'; expected]);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_output_pump_frames_unknown_length_bodies() {
+        let (mut server, mut client) = tokio::io::duplex(8 * 1024);
+        let writer = tokio::spawn(async move {
+            let mut response = Response::new(200);
+            response.body = Body::UnknownLengthStream {
+                reader: Box::new(std::io::Cursor::new(b"encoded".to_vec())),
+                max_len: 64,
+            };
+            let budget = std::sync::Arc::new(ResourceBudget::default());
+            let mut output = crate::resource::SlowOutputAdmission::detached(
+                budget.context("127.0.0.1".parse().unwrap()),
+            );
+            write_response_async(
+                &mut server,
+                &mut response,
+                &response_options(),
+                None,
+                &mut output,
+            )
+            .await
+            .unwrap()
+        });
+        let mut wire = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(writer.await.unwrap(), 7);
+        assert!(wire
+            .windows(b"Transfer-Encoding: chunked\r\n".len())
+            .any(|window| window == b"Transfer-Encoding: chunked\r\n"));
+        assert!(wire.ends_with(b"7\r\nencoded\r\n0\r\n\r\n"));
+    }
+
     #[cfg(feature = "fault-injection")]
     #[tokio::test(flavor = "current_thread")]
     async fn transition_campaign_releases_h1_output_ownership_at_every_checkpoint() {
@@ -5491,6 +5665,72 @@ mod tests {
         assert!(stream.raw_fd().is_some());
         drop(stream);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn unknown_length_response_is_chunked_and_not_read_after_head_failure() {
+        struct CountedReader {
+            bytes: std::io::Cursor<Vec<u8>>,
+            reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        }
+
+        impl Read for CountedReader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                self.bytes.read(output)
+            }
+        }
+
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut response = Response::new(200);
+        response.body = Body::UnknownLengthStream {
+            reader: Box::new(CountedReader {
+                bytes: std::io::Cursor::new(b"abc".to_vec()),
+                reads: std::sync::Arc::clone(&reads),
+            }),
+            max_len: 8,
+        };
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        assert_eq!(
+            write_response(&mut writer, &mut response, &response_options()).unwrap(),
+            3
+        );
+        assert!(writer
+            .data
+            .windows(b"Transfer-Encoding: chunked\r\n".len())
+            .any(|window| window == b"Transfer-Encoding: chunked\r\n"));
+        assert!(!writer
+            .data
+            .windows(b"Content-Length:".len())
+            .any(|window| window == b"Content-Length:"));
+        assert!(writer.data.ends_with(b"3\r\nabc\r\n0\r\n\r\n"));
+        assert!(reads.load(std::sync::atomic::Ordering::Acquire) >= 1);
+
+        struct FailedHead;
+        impl Write for FailedHead {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed peer"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl ResponseWrite for FailedHead {}
+
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut response = Response::new(200);
+        response.body = Body::UnknownLengthStream {
+            reader: Box::new(CountedReader {
+                bytes: std::io::Cursor::new(b"never encoded".to_vec()),
+                reads: std::sync::Arc::clone(&reads),
+            }),
+            max_len: 64,
+        };
+        assert!(write_response(&mut FailedHead, &mut response, &response_options()).is_err());
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 
     struct SlowReader {

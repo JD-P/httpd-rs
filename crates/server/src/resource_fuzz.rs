@@ -26,6 +26,7 @@ const SLOT_KINDS: [SlotKind; SlotKind::COUNT] = [
     SlotKind::SlowSpoolFile,
     SlotKind::FilesystemWork,
     SlotKind::BcryptCpu,
+    SlotKind::CompressionCpu,
 ];
 const BYTE_KINDS: [ByteKind; ByteKind::COUNT] = [
     ByteKind::Spool,
@@ -35,6 +36,7 @@ const BYTE_KINDS: [ByteKind; ByteKind::COUNT] = [
     ByteKind::SlowResponseResident,
     ByteKind::PolicyExpansion,
     ByteKind::CacheResident,
+    ByteKind::CompressionTransient,
 ];
 
 #[derive(Default)]
@@ -46,6 +48,7 @@ struct CampaignState {
     queued_h2_outputs: Vec<(ResourceContext, QueuedH2TransportLease)>,
     reads: Vec<ResponseBodyReadLease>,
     websockets: Vec<WebsocketLease>,
+    compressions: Vec<CompressionLease>,
 }
 
 impl CampaignState {
@@ -54,6 +57,7 @@ impl CampaignState {
         self.queued_h2_outputs.clear();
         self.reads.clear();
         self.websockets.clear();
+        self.compressions.clear();
         self.dynamics.clear();
         self.spools.clear();
         self.residents.clear();
@@ -93,6 +97,11 @@ impl CampaignState {
             self.websockets
                 .iter()
                 .map(|lease| lease._slot.context.clone()),
+        );
+        contexts.extend(
+            self.compressions
+                .iter()
+                .map(|lease| lease._work.context.clone()),
         );
         contexts
     }
@@ -202,6 +211,7 @@ fn slot_process_limit(kind: SlotKind) -> u64 {
         SlotKind::H1Connection => FUZZ_H1_LIMIT,
         SlotKind::SpoolFile => FUZZ_SPOOL_FILES,
         SlotKind::SlowSpoolFile => (FUZZ_SPOOL_FILES + 3) / 4,
+        SlotKind::CompressionCpu => MAX_COMPRESSION_WORK_UNITS,
         _ => 0,
     }
 }
@@ -216,6 +226,7 @@ fn slot_client_limit(kind: SlotKind) -> u64 {
         SlotKind::Websocket => MAX_WEBSOCKETS_PER_CLIENT,
         SlotKind::H1Connection => FUZZ_H1_CLIENT_LIMIT,
         SlotKind::SpoolFile | SlotKind::SlowSpoolFile => (FUZZ_SPOOL_FILES + 3) / 4,
+        SlotKind::CompressionCpu => MAX_COMPRESSION_WORK_UNITS_PER_CLIENT,
         _ => 0,
     }
 }
@@ -226,6 +237,7 @@ fn byte_process_limit(kind: ByteKind) -> u64 {
         ByteKind::SlowSpool => (FUZZ_SPOOL_BYTES + 3) / 4,
         ByteKind::RequestResident => MAX_REQUEST_RESIDENT_BYTES,
         ByteKind::ResponseResident | ByteKind::SlowResponseResident => MAX_RESPONSE_RESIDENT_BYTES,
+        ByteKind::CompressionTransient => MAX_COMPRESSION_TRANSIENT_BYTES,
         ByteKind::PolicyExpansion | ByteKind::CacheResident => 0,
     }
 }
@@ -237,6 +249,7 @@ fn byte_client_limit(kind: ByteKind) -> u64 {
         ByteKind::ResponseResident | ByteKind::SlowResponseResident => {
             MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT
         }
+        ByteKind::CompressionTransient => MAX_COMPRESSION_TRANSIENT_BYTES_PER_CLIENT,
         ByteKind::PolicyExpansion | ByteKind::CacheResident => 0,
     }
 }
@@ -637,14 +650,23 @@ pub(super) fn run(data: &[u8]) {
             }
             27 | 31 => state.clear_and_assert_scopes(),
             28 => {
-                for iteration in 0..batch_count(magnitude) {
-                    let context =
-                        batch_context(&budget, &contexts, &clients, client_selector, iteration);
-                    insert_bounded(
-                        &mut state.outputs,
-                        SlowOutputAdmission::detached(context),
-                        selector,
-                    );
+                if magnitude & 1 == 0 {
+                    for iteration in 0..batch_count(magnitude) {
+                        let context =
+                            batch_context(&budget, &contexts, &clients, client_selector, iteration);
+                        insert_bounded(
+                            &mut state.outputs,
+                            SlowOutputAdmission::detached(context),
+                            selector,
+                        );
+                    }
+                } else {
+                    let context = sticky_context(&contexts, client_selector);
+                    let work_units = u64::from((magnitude >> 1).max(1));
+                    let transient_bytes = boundary_amount(magnitude).max(1);
+                    if let Some(lease) = try_compression_in(&context, work_units, transient_bytes) {
+                        insert_bounded(&mut state.compressions, lease, selector);
+                    }
                 }
             }
             29 => {

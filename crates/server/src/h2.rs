@@ -958,6 +958,14 @@ async fn send_capacity(
     ownership: &mut crate::http::ResponseOwnership,
 ) -> io::Result<usize> {
     crate::fault::hit("transition.h2.output.capacity-await")?;
+    // A reader may legally return a short chunk without reaching EOF.  In
+    // that case the stream still owns part of the capacity assigned for the
+    // previous read. `poll_capacity` reports newly assigned capacity, not a
+    // replay of that remainder, so waiting again can deadlock forever.
+    let assigned = send.capacity().min(remaining);
+    if assigned > 0 {
+        return Ok(assigned);
+    }
     send.reserve_capacity(remaining);
     if !output.is_slow() {
         let remaining_grace = progress.remaining_classification_grace(H2_SLOW_CLASSIFY_GRACE);
@@ -1052,8 +1060,8 @@ async fn send_response_with_admission(
         || status == StatusCode::RESET_CONTENT
         || status == StatusCode::NOT_MODIFIED
         || head_only;
-    let body_len = resp.body_len();
-    let end = no_body || body_len == 0;
+    let body_len = resp.body.known_len();
+    let end = no_body || body_len == Some(0);
     let preserved_content_length =
         crate::http::preserved_response_content_length(&resp, head_only)?;
     let header_sanitizer = crate::http::ResponseHeaderSanitizer::from_response(&resp)?;
@@ -1117,11 +1125,12 @@ async fn send_response_with_admission(
                 response_header_value(length.to_string().into_bytes(), &mut queued_head_ownership)
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad length"))?,
             );
-        } else if !status.is_informational()
-            && status != StatusCode::NO_CONTENT
-            && status != StatusCode::RESET_CONTENT
-            && status != StatusCode::NOT_MODIFIED
-        {
+        } else if let Some(body_len) = body_len.filter(|_| {
+            !status.is_informational()
+                && status != StatusCode::NO_CONTENT
+                && status != StatusCode::RESET_CONTENT
+                && status != StatusCode::NOT_MODIFIED
+        }) {
             // Body-bearing responses and HEAD responses without an explicit
             // representation length use the actual selected body length.
             headers.append(
@@ -1257,6 +1266,83 @@ async fn send_response_with_admission(
                     _transport: transport.clone(),
                 });
                 send.send_data(data, left == 0).map_err(send_io_error)?;
+                progress.record(n);
+            }
+        }
+        Body::UnknownLengthStream {
+            mut reader,
+            max_len,
+        } => {
+            let mut remaining = max_len;
+            loop {
+                let want = if remaining == 0 {
+                    1
+                } else {
+                    remaining.min(64 * 1024) as usize
+                };
+                let capacity =
+                    send_capacity(&mut send, want, output, &mut progress, &mut ownership)
+                        .await?
+                        .min(want);
+                if !httpd_rs_verified::compression_stream_read_admit(
+                    capacity > 0,
+                    capacity as u64,
+                    64 * 1024,
+                ) {
+                    return Err(io::Error::other(
+                        "encoded response read lacks downstream capacity",
+                    ));
+                }
+                let resident = response_chunk_lease(&cfg.resource_budget, client, capacity)?;
+                let resident = ownership.track_resident(resident)?;
+                let blocking_read = cfg.resource_budget.try_response_body_read_for(client)?;
+                let read_ownership = ownership.begin_read();
+                let (next_reader, mut buf, resident, result, next_ownership) =
+                    crate::fault::spawn_blocking(move || {
+                        let _blocking_read = blocking_read;
+                        let mut buf = take_body_buffer(capacity);
+                        buf.resize(capacity, 0);
+                        let result = crate::fault::hit("transition.h2.output.encoded-read")
+                            .and_then(|()| reader.read(&mut buf[..capacity]));
+                        (
+                            reader,
+                            buf,
+                            resident,
+                            result,
+                            read_ownership.complete_read(),
+                        )
+                    })
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+                reader = next_reader;
+                ownership = next_ownership;
+                let n = result.map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+                if n == 0 {
+                    send.send_data(queued_h2_transport_marker(&transport), true)
+                        .map_err(send_io_error)?;
+                    retain_queued_h2_transport(output, &transport)?;
+                    ownership.finish();
+                    output.finish_response();
+                    return Ok(sent);
+                }
+                if n as u64 > remaining {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "encoded response exceeded its admitted maximum",
+                    ));
+                }
+                if output.is_slow() {
+                    progress.validate(Instant::now())?;
+                }
+                buf.truncate(n);
+                remaining -= n as u64;
+                sent += n as u64;
+                let data = Bytes::from_owner(PooledBuffer {
+                    buf: Some(buf),
+                    _resident: resident,
+                    _transport: transport.clone(),
+                });
+                send.send_data(data, false).map_err(send_io_error)?;
                 progress.record(n);
             }
         }
@@ -5549,6 +5635,21 @@ mod tests {
         assert_eq!(result.unwrap(), 11);
         assert_eq!(status, 200);
         assert_eq!(body, b"stream body");
+
+        let mut unknown = Response::new(200);
+        unknown.body = Body::UnknownLengthStream {
+            reader: Box::new(&b"encoded body"[..]),
+            max_len: 64,
+        };
+        let (result, status, headers, body) =
+            response_round_trip(cfg.clone(), unknown, false).await;
+        assert_eq!(result.unwrap(), 12);
+        assert_eq!(status, 200);
+        assert_eq!(body, b"encoded body");
+        assert!(
+            !headers.contains_key("content-length"),
+            "unknown-length H2 response acquired a false Content-Length"
+        );
 
         let mut reset = Response::bytes(205, "text/plain", b"must not escape".to_vec());
         reset

@@ -9,13 +9,217 @@
 
 use crate::config::{AlterEtag, CompressionKind, CompressionRule, Scope, UnsupportedFilterRule};
 use crate::http::{Body, Request, Response};
+use brotli::enc::cluster::HistogramPair;
+use brotli::enc::command::Command;
+use brotli::enc::entropy_encode::HuffmanTree;
+use brotli::enc::histogram::{ContextType, HistogramCommand, HistogramDistance, HistogramLiteral};
+use brotli::enc::{
+    floatX, s16, v8, CombiningAllocator, StandardAlloc, StaticCommand, ZopfliNode, PDF,
+};
+use brotli::{Allocator, SliceWrapper, SliceWrapperMut};
 use std::borrow::Cow;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::marker::PhantomData;
+use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 const MAX_COMPRESS_BODY: u64 = 8 * 1024 * 1024;
 const DEFAULT_DEFLATE_LEVEL: u32 = 6;
 const DEFAULT_BROTLI_QUALITY: u32 = 5;
+const ENCODER_INPUT_BUFFER: usize = 64 * 1024;
+
+#[derive(Debug)]
+struct AllocationMeter {
+    current: AtomicU64,
+    peak: AtomicU64,
+    limit: u64,
+    exceeded: AtomicBool,
+}
+
+impl AllocationMeter {
+    fn new(limit: u64) -> Self {
+        Self {
+            current: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            limit,
+            exceeded: AtomicBool::new(false),
+        }
+    }
+
+    fn allocate(&self, bytes: u64) {
+        let current = self
+            .current
+            .fetch_add(bytes, Ordering::AcqRel)
+            .saturating_add(bytes);
+        self.peak.fetch_max(current, Ordering::AcqRel);
+        if current > self.limit {
+            self.exceeded.store(true, Ordering::Release);
+        }
+    }
+
+    fn release(&self, bytes: u64) {
+        self.current.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self.exceeded.load(Ordering::Acquire) {
+            Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "Brotli workspace exceeded its admitted bound",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Acquire)
+    }
+}
+
+type StandardMemory<T> = <StandardAlloc as Allocator<T>>::AllocatedMemory;
+
+struct MeteredMemory<T>
+where
+    T: Clone + Default,
+    StandardAlloc: Allocator<T>,
+{
+    inner: StandardMemory<T>,
+    bytes: u64,
+    meter: Option<Arc<AllocationMeter>>,
+}
+
+impl<T> Default for MeteredMemory<T>
+where
+    T: Clone + Default,
+    StandardAlloc: Allocator<T>,
+{
+    fn default() -> Self {
+        Self {
+            inner: StandardMemory::<T>::default(),
+            bytes: 0,
+            meter: None,
+        }
+    }
+}
+
+impl<T> SliceWrapper<T> for MeteredMemory<T>
+where
+    T: Clone + Default,
+    StandardAlloc: Allocator<T>,
+{
+    fn slice(&self) -> &[T] {
+        self.inner.slice()
+    }
+}
+
+impl<T> SliceWrapperMut<T> for MeteredMemory<T>
+where
+    T: Clone + Default,
+    StandardAlloc: Allocator<T>,
+{
+    fn slice_mut(&mut self) -> &mut [T] {
+        self.inner.slice_mut()
+    }
+}
+
+impl<T> Drop for MeteredMemory<T>
+where
+    T: Clone + Default,
+    StandardAlloc: Allocator<T>,
+{
+    fn drop(&mut self) {
+        if let Some(meter) = &self.meter {
+            meter.release(self.bytes);
+        }
+    }
+}
+
+struct MeteredAllocator<T> {
+    standard: StandardAlloc,
+    meter: Arc<AllocationMeter>,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T> MeteredAllocator<T> {
+    fn new(meter: Arc<AllocationMeter>) -> Self {
+        Self {
+            standard: StandardAlloc::default(),
+            meter,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T> Allocator<T> for MeteredAllocator<T>
+where
+    T: Clone + Default,
+    StandardAlloc: Allocator<T>,
+{
+    type AllocatedMemory = MeteredMemory<T>;
+
+    fn alloc_cell(&mut self, len: usize) -> Self::AllocatedMemory {
+        let bytes = u64::try_from(len)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(size_of::<T>()).unwrap_or(u64::MAX));
+        self.meter.allocate(bytes);
+        MeteredMemory {
+            inner: self.standard.alloc_cell(len),
+            bytes,
+            meter: Some(Arc::clone(&self.meter)),
+        }
+    }
+
+    fn free_cell(&mut self, data: Self::AllocatedMemory) {
+        drop(data);
+    }
+}
+
+type BrotliMeteredAllocator = CombiningAllocator<
+    MeteredAllocator<u8>,
+    MeteredAllocator<u16>,
+    MeteredAllocator<i32>,
+    MeteredAllocator<u32>,
+    MeteredAllocator<u64>,
+    MeteredAllocator<Command>,
+    MeteredAllocator<floatX>,
+    MeteredAllocator<v8>,
+    MeteredAllocator<s16>,
+    MeteredAllocator<PDF>,
+    MeteredAllocator<StaticCommand>,
+    MeteredAllocator<HistogramLiteral>,
+    MeteredAllocator<HistogramCommand>,
+    MeteredAllocator<HistogramDistance>,
+    MeteredAllocator<HistogramPair>,
+    MeteredAllocator<ContextType>,
+    MeteredAllocator<HuffmanTree>,
+    MeteredAllocator<ZopfliNode>,
+>;
+
+fn brotli_allocator(meter: &Arc<AllocationMeter>) -> BrotliMeteredAllocator {
+    CombiningAllocator::new(
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+        MeteredAllocator::new(Arc::clone(meter)),
+    )
+}
 
 fn header<'a>(resp: &'a Response, name: &str) -> Option<&'a [u8]> {
     resp.headers
@@ -296,16 +500,44 @@ pub(crate) fn conditional_static_etag(
     header_str(&selected, "etag")
 }
 
-fn read_body(body: Body) -> Result<Vec<u8>, Body> {
-    match body {
-        Body::Empty => Ok(Vec::new()),
-        Body::Bytes(bytes) => {
-            if !httpd_rs_verified::compression_body_admit(bytes.len() as u64, MAX_COMPRESS_BODY) {
-                return Err(Body::Bytes(bytes));
-            }
-            Ok(bytes)
+struct ExactReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for ExactReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || output.is_empty() {
+            return Ok(0);
         }
+        let want = output
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let read = self.inner.read(&mut output[..want])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short compression source",
+            ));
+        }
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
+fn take_body_reader(body: Body) -> Result<(Box<dyn Read + Send>, u64), Body> {
+    match body {
+        Body::Empty => Ok((Box::new(Cursor::new(Vec::new())), 0)),
+        Body::Bytes(bytes) => match u64::try_from(bytes.len()) {
+            Ok(len) if httpd_rs_verified::compression_body_admit(len, MAX_COMPRESS_BODY) => {
+                Ok((Box::new(Cursor::new(bytes)), len))
+            }
+            _ => Err(Body::Bytes(bytes)),
+        },
         Body::Stream { reader, len } => Err(Body::Stream { reader, len }),
+        Body::UnknownLengthStream { reader, max_len } => {
+            Err(Body::UnknownLengthStream { reader, max_len })
+        }
         Body::File {
             mut file,
             offset,
@@ -317,39 +549,85 @@ fn read_body(body: Body) -> Result<Vec<u8>, Body> {
             if file.seek(SeekFrom::Start(offset)).is_err() {
                 return Err(Body::File { file, offset, len });
             }
-            let mut bytes = vec![0u8; len as usize];
-            if file.read_exact(&mut bytes).is_err() {
-                return Err(Body::File { file, offset, len });
-            }
-            Ok(bytes)
+            Ok((
+                Box::new(ExactReader {
+                    inner: file,
+                    remaining: len,
+                }),
+                len,
+            ))
         }
     }
 }
 
-fn gzip(data: &[u8], level: u32) -> Vec<u8> {
-    let mut encoder =
-        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level.min(9)));
-    encoder
-        .write_all(data)
-        .expect("writing compressed bytes to Vec is infallible");
-    encoder
-        .finish()
-        .expect("finishing compressed bytes in Vec is infallible")
+fn max_encoded_len(kind: CompressionKind, input_len: u64) -> u64 {
+    match kind {
+        CompressionKind::Gzip => input_len.saturating_mul(2).saturating_add(64 * 1024),
+        CompressionKind::Brotli => usize::try_from(input_len)
+            .ok()
+            .map(brotli::enc::BrotliEncoderMaxCompressedSize)
+            .and_then(|len| u64::try_from(len).ok())
+            .unwrap_or_else(|| input_len.saturating_mul(2).saturating_add(64 * 1024)),
+    }
 }
 
-fn brotli(data: &[u8], quality: u32) -> Vec<u8> {
-    let mut out = Vec::new();
-    {
-        let mut encoder = brotli::CompressorWriter::new(&mut out, 4096, quality.min(11), 22);
-        encoder
-            .write_all(data)
-            .expect("writing compressed bytes to Vec is infallible");
-        encoder
-            .flush()
-            .expect("flushing compressed bytes to Vec is infallible");
-        encoder.into_inner();
+struct AdmittedEncoder {
+    inner: Box<dyn Read + Send>,
+    meter: Option<Arc<AllocationMeter>>,
+    _lease: crate::resource::CompressionLease,
+}
+
+impl Read for AdmittedEncoder {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if let Some(meter) = &self.meter {
+            meter.validate()?;
+        }
+        let read = self.inner.read(output)?;
+        if let Some(meter) = &self.meter {
+            meter.validate()?;
+        }
+        Ok(read)
     }
-    out
+}
+
+fn encoded_body(
+    kind: CompressionKind,
+    quality: u32,
+    input: Box<dyn Read + Send>,
+    input_len: u64,
+    lease: crate::resource::CompressionLease,
+    workspace_bound: u64,
+) -> Body {
+    let (inner, meter): (Box<dyn Read + Send>, Option<Arc<AllocationMeter>>) = match kind {
+        CompressionKind::Gzip => (
+            Box::new(flate2::read::GzEncoder::new(
+                input,
+                flate2::Compression::new(quality.min(9)),
+            )),
+            None,
+        ),
+        CompressionKind::Brotli => {
+            let meter = Arc::new(AllocationMeter::new(workspace_bound));
+            let mut buffer_allocator = MeteredAllocator::<u8>::new(Arc::clone(&meter));
+            let buffer = buffer_allocator.alloc_cell(ENCODER_INPUT_BUFFER);
+            let encoder = brotli::enc::reader::CompressorReaderCustomAlloc::new(
+                input,
+                buffer,
+                brotli_allocator(&meter),
+                quality,
+                22,
+            );
+            (Box::new(encoder), Some(meter))
+        }
+    };
+    Body::UnknownLengthStream {
+        reader: Box::new(AdmittedEncoder {
+            inner,
+            meter,
+            _lease: lease,
+        }),
+        max_len: max_encoded_len(kind, input_len),
+    }
 }
 
 /// Apply the configured output filter to a response.
@@ -397,7 +675,7 @@ fn finalize_inner(
     req: &Request,
     resp: &mut Response,
     path: &[u8],
-    budget: Option<&Arc<crate::resource::ResourceBudget>>,
+    _budget: Option<&Arc<crate::resource::ResourceBudget>>,
 ) {
     finalize_metadata(scope, resp);
     if resp.status == 204 || resp.status == 205 || (100..200).contains(&resp.status) {
@@ -455,70 +733,64 @@ fn finalize_inner(
         #[cfg(not(test))]
         None => return,
     };
-    let Some(_expensive) = crate::resource::try_expensive_in(resource_context) else {
-        // Compression is optional. Under CPU pressure preserve and send the
-        // identity representation instead of queueing more expensive work.
+    let quality = match kind {
+        CompressionKind::Gzip => scope
+            .compression_policy
+            .deflate_level
+            .unwrap_or(DEFAULT_DEFLATE_LEVEL),
+        CompressionKind::Brotli => scope
+            .compression_policy
+            .brotli_quality
+            .unwrap_or(DEFAULT_BROTLI_QUALITY),
+    };
+    let verified_kind = match kind {
+        CompressionKind::Gzip => httpd_rs_verified::DynamicCompressionKind::Gzip,
+        CompressionKind::Brotli => httpd_rs_verified::DynamicCompressionKind::Brotli,
+    };
+    let Some(input_len) = resp.body.known_len() else {
         return;
     };
-    let mut compression_lease = budget.map(|budget| {
-        let mut lease = budget.try_response_bytes_in(resource_context)?;
-        let peak = resp.body_len().saturating_mul(2).saturating_add(64 * 1024);
-        lease.reserve(peak).map(|()| lease)
-    });
-    if compression_lease.as_ref().is_some_and(Result::is_err) {
-        // Compression is optional; preserve the identity representation when
-        // admitting its transient working set would exceed the process cap.
+    let Some(profile) =
+        httpd_rs_verified::dynamic_compression_budget(verified_kind, quality, input_len)
+    else {
+        // Qualities 10/11 perform a long, non-interruptible Zopfli search in
+        // the dependency. They are intentionally unavailable for request-time
+        // encoding; operators can precompress immutable assets instead.
         return;
-    }
+    };
+    let Some(compression_lease) = crate::resource::try_compression_in(
+        resource_context,
+        profile.work_units,
+        profile.transient_bytes,
+    ) else {
+        // Compression is optional. Preserve the identity representation under
+        // CPU or memory pressure instead of queueing transformation work.
+        return;
+    };
     let body = std::mem::replace(&mut resp.body, Body::Empty);
-    let raw = match read_body(body) {
-        Ok(v) => v,
+    let (input, _) = match take_body_reader(body) {
+        Ok(value) => value,
         Err(body) => {
             resp.body = body;
             return;
         }
     };
-    if raw.is_empty() {
-        resp.body = Body::Bytes(raw);
-        return;
-    }
-    let encoded = match kind {
-        CompressionKind::Gzip => gzip(
-            &raw,
-            scope
-                .compression_policy
-                .deflate_level
-                .unwrap_or(DEFAULT_DEFLATE_LEVEL),
-        ),
-        CompressionKind::Brotli => brotli(
-            &raw,
-            scope
-                .compression_policy
-                .brotli_quality
-                .unwrap_or(DEFAULT_BROTLI_QUALITY),
-        ),
-    };
-    // Compression admission covers the identity and encoded buffers at their
-    // simultaneous peak. Retire the identity allocation before converting
-    // that peak lease into the retained encoded-response lease below.
-    drop(raw);
-    let len = encoded.len();
-    resp.body = Body::Bytes(encoded);
+    resp.body = encoded_body(
+        kind,
+        quality,
+        input,
+        input_len,
+        compression_lease,
+        profile.workspace_bytes,
+    );
     set_header(
         resp,
         "Content-Encoding",
         kind.encoding().as_bytes().to_vec(),
     );
-    set_header(resp, "Content-Length", len.to_string().into_bytes());
+    remove_header(resp, "Content-Length");
     set_header(resp, "Accept-Ranges", b"none".to_vec());
     alter_etag(resp, kind, scope);
-    if let Some(Ok(mut lease)) = compression_lease.take() {
-        // The 2x reservation covers the simultaneous identity and encoded
-        // working set only. Retain accounting for the encoded representation,
-        // not the transient peak, while a downstream client consumes it.
-        lease.release(lease.bytes().saturating_sub(len as u64));
-        resp.hold_resident(lease);
-    }
 }
 
 #[cfg(test)]
@@ -566,6 +838,19 @@ mod tests {
         request
     }
 
+    fn take_body_bytes(response: &mut Response) -> io::Result<Vec<u8>> {
+        match std::mem::replace(&mut response.body, Body::Empty) {
+            Body::Empty => Ok(Vec::new()),
+            Body::Bytes(bytes) => Ok(bytes),
+            Body::UnknownLengthStream { mut reader, .. } | Body::Stream { mut reader, len: _ } => {
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes)?;
+                Ok(bytes)
+            }
+            Body::File { .. } => Err(io::Error::other("unexpected file body")),
+        }
+    }
+
     #[test]
     fn gzip_and_brotli_are_negotiated_and_vary_is_added() {
         let mut scope = Scope::default();
@@ -588,16 +873,25 @@ mod tests {
         finalize(&scope, &request("gzip, br"), &mut r, b"/index.html");
         assert_eq!(header_str(&r, "content-encoding").as_deref(), Some("br"));
         assert_eq!(header_str(&r, "vary").as_deref(), Some("Accept-Encoding"));
-        assert_eq!(
-            header_str(&r, "content-length").unwrap(),
-            r.body_len().to_string()
-        );
+        assert!(header(&r, "content-length").is_none());
         assert!(header_str(&r, "etag").unwrap().ends_with("-br\""));
+        let encoded = take_body_bytes(&mut r).unwrap();
+        let mut decoded = Vec::new();
+        brotli::Decompressor::new(Cursor::new(encoded), 4096)
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, b"hello hello hello");
 
         let mut r = response(b"hello hello hello", "text/html");
         finalize(&scope, &request("gzip"), &mut r, b"/index.html");
         assert_eq!(header_str(&r, "content-encoding").as_deref(), Some("gzip"));
         assert!(header_str(&r, "etag").unwrap().ends_with("-gzip\""));
+        let encoded = take_body_bytes(&mut r).unwrap();
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(Cursor::new(encoded))
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, b"hello hello hello");
     }
 
     #[test]
@@ -732,9 +1026,12 @@ mod tests {
         let expensive_budget = Arc::new(ResourceBudget::default());
         let expensive_request = request_in_budget("gzip", &expensive_budget, client);
         let context = expensive_request.resource_context().unwrap();
-        let _expensive = (0..crate::resource::MAX_EXPENSIVE_OPS_PER_CLIENT)
-            .map(|_| crate::resource::try_expensive_in(context).unwrap())
-            .collect::<Vec<_>>();
+        let _expensive = crate::resource::try_compression_in(
+            context,
+            crate::resource::MAX_COMPRESSION_WORK_UNITS_PER_CLIENT,
+            1,
+        )
+        .unwrap();
         let mut under_cpu_pressure = response(b"identity", "text/plain");
         finalize_budgeted(
             &scope,
@@ -747,11 +1044,13 @@ mod tests {
         assert!(header(&under_cpu_pressure, "content-encoding").is_none());
 
         let resident_budget = Arc::new(ResourceBudget::default());
-        let mut occupied = resident_budget.try_response_bytes_for(client);
-        occupied
-            .reserve(crate::resource::MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT)
-            .unwrap();
         let resident_request = request_in_budget("gzip", &resident_budget, client);
+        let _occupied = crate::resource::try_compression_in(
+            resident_request.resource_context().unwrap(),
+            1,
+            crate::resource::MAX_COMPRESSION_TRANSIENT_BYTES_PER_CLIENT,
+        )
+        .unwrap();
         let mut under_memory_pressure = response(b"identity", "text/plain");
         finalize_budgeted(
             &scope,
@@ -786,6 +1085,128 @@ mod tests {
         let mut r = response(b"body", "application/octet-stream");
         finalize(&scope, &request("gzip"), &mut r, b"/x.bin");
         assert_eq!(header_str(&r, "content-encoding").as_deref(), Some("gzip"));
+    }
+
+    #[test]
+    fn verified_compression_profile_is_the_runtime_budget_source() {
+        use httpd_rs_verified::{dynamic_compression_budget, DynamicCompressionKind as Kind};
+
+        let largest = dynamic_compression_budget(Kind::Brotli, 9, MAX_COMPRESS_BODY).unwrap();
+        assert_eq!(largest.workspace_bytes, 64 * 1024 * 1024);
+        assert_eq!(largest.work_units, 512);
+        assert_eq!(
+            largest.transient_bytes,
+            MAX_COMPRESS_BODY + 64 * 1024 * 1024 + 128 * 1024
+        );
+        assert!(dynamic_compression_budget(Kind::Brotli, 10, 1).is_none());
+        assert!(dynamic_compression_budget(Kind::Brotli, 11, MAX_COMPRESS_BODY).is_none());
+        assert!(dynamic_compression_budget(Kind::Gzip, 10, 1).is_none());
+        assert!(dynamic_compression_budget(Kind::Gzip, 6, 0).is_none());
+        assert!(dynamic_compression_budget(Kind::Gzip, 6, MAX_COMPRESS_BODY + 1).is_none());
+    }
+
+    #[test]
+    fn dynamic_brotli_is_metered_cancellable_and_excludes_zopfli_qualities() {
+        let mut scope = Scope::default();
+        scope
+            .compression_policy
+            .compression_rules
+            .push(CompressionRule::Set(vec![CompressionKind::Brotli]));
+        let client = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44));
+
+        // Configuration rejects this too, but the execution boundary remains
+        // fail-closed if a synthetic Scope bypasses the parser.
+        scope.compression_policy.brotli_quality = Some(10);
+        let mut rejected = response(&vec![b'x'; 1024], "text/plain");
+        finalize(&scope, &request("br"), &mut rejected, b"/x.txt");
+        assert!(header(&rejected, "content-encoding").is_none());
+        assert!(matches!(rejected.body, Body::Bytes(_)));
+
+        let budget = Arc::new(ResourceBudget::default());
+        let request = request_in_budget("br", &budget, client);
+        scope.compression_policy.brotli_quality = Some(9);
+        let mut encoded = response(&vec![b'a'; 1024 * 1024], "text/plain");
+        finalize_budgeted(&scope, &request, &mut encoded, b"/x.txt", &budget);
+        assert_eq!(
+            header_str(&encoded, "content-encoding").as_deref(),
+            Some("br")
+        );
+        assert!(!budget.transition_usage_is_zero());
+
+        let Body::UnknownLengthStream { mut reader, .. } =
+            std::mem::replace(&mut encoded.body, Body::Empty)
+        else {
+            panic!("Brotli response was not deferred into the output path");
+        };
+        let mut first_chunk = [0u8; 4096];
+        assert!(reader.read(&mut first_chunk).unwrap() > 0);
+        drop(reader);
+        drop(encoded);
+        assert!(budget.transition_usage_is_zero());
+    }
+
+    #[test]
+    fn metered_brotli_allocator_tracks_and_releases_real_workspace() {
+        let meter = Arc::new(AllocationMeter::new(1024));
+        let mut allocator = MeteredAllocator::<u64>::new(Arc::clone(&meter));
+        let memory = allocator.alloc_cell(16);
+        assert_eq!(meter.peak(), 128);
+        meter.validate().unwrap();
+        allocator.free_cell(memory);
+        assert_eq!(meter.current.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn supported_brotli_profiles_stay_inside_admitted_workspace_bounds() {
+        fn patterned_bytes(len: usize) -> Vec<u8> {
+            let mut state = 0x6a09_e667_f3bc_c909u64;
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect()
+        }
+
+        let supported_profiles = (0..=9)
+            .map(|quality| (quality, 256 * 1024))
+            .chain([(5, 8 * 1024 * 1024), (9, 1024 * 1024)]);
+        for (quality, input_len) in supported_profiles {
+            let bound = httpd_rs_verified::dynamic_compression_budget(
+                httpd_rs_verified::DynamicCompressionKind::Brotli,
+                quality,
+                input_len as u64,
+            )
+            .unwrap()
+            .workspace_bytes;
+            let meter = Arc::new(AllocationMeter::new(bound));
+            let mut buffer_allocator = MeteredAllocator::<u8>::new(Arc::clone(&meter));
+            let buffer = buffer_allocator.alloc_cell(ENCODER_INPUT_BUFFER);
+            let mut encoder = brotli::enc::reader::CompressorReaderCustomAlloc::new(
+                Cursor::new(patterned_bytes(input_len)),
+                buffer,
+                brotli_allocator(&meter),
+                quality,
+                22,
+            );
+            let mut output = Vec::new();
+            encoder.read_to_end(&mut output).unwrap();
+            assert!(!output.is_empty());
+            meter.validate().unwrap();
+            assert!(
+                meter.peak() <= bound,
+                "quality {quality} used {} bytes beyond its {bound}-byte workspace admission",
+                meter.peak()
+            );
+            drop(encoder);
+            assert_eq!(
+                meter.current.load(Ordering::Acquire),
+                0,
+                "quality {quality} retained allocator-owned memory"
+            );
+        }
     }
 
     #[test]
@@ -862,9 +1283,9 @@ mod tests {
 
     #[test]
     fn body_reader_and_finalize_bypass_edges() {
-        assert!(matches!(read_body(Body::Empty), Ok(bytes) if bytes.is_empty()));
+        assert!(matches!(take_body_reader(Body::Empty), Ok((_, 0))));
         assert!(matches!(
-            read_body(Body::Stream {
+            take_body_reader(Body::Stream {
                 reader: Box::new(std::io::Cursor::new(b"stream".to_vec())),
                 len: 6,
             }),
@@ -875,7 +1296,7 @@ mod tests {
         std::fs::write(&path, b"short").unwrap();
         let file = std::fs::File::open(&path).unwrap();
         assert!(matches!(
-            read_body(Body::File {
+            take_body_reader(Body::File {
                 file,
                 offset: 0,
                 len: MAX_COMPRESS_BODY + 1,
@@ -883,27 +1304,31 @@ mod tests {
             Err(Body::File { .. })
         ));
         let file = std::fs::File::open(&path).unwrap();
-        assert!(matches!(
-            read_body(Body::File {
-                file,
-                offset: 0,
-                len: 20,
-            }),
-            Err(Body::File { .. })
-        ));
+        let Ok((mut short, len)) = take_body_reader(Body::File {
+            file,
+            offset: 0,
+            len: 20,
+        }) else {
+            panic!("bounded file body was rejected")
+        };
+        assert_eq!(len, 20);
+        assert!(io::copy(&mut short, &mut io::sink()).is_err());
         let file = std::fs::File::open(&path).unwrap();
-        assert!(matches!(
-            read_body(Body::File {
-                file,
-                offset: 0,
-                len: 5,
-            }),
-            Ok(bytes) if bytes == b"short"
-        ));
+        let Ok((mut exact, len)) = take_body_reader(Body::File {
+            file,
+            offset: 0,
+            len: 5,
+        }) else {
+            panic!("exact file body was rejected")
+        };
+        assert_eq!(len, 5);
+        let mut exact_bytes = Vec::new();
+        exact.read_to_end(&mut exact_bytes).unwrap();
+        assert_eq!(exact_bytes, b"short");
         let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let file = std::fs::File::from(std::os::fd::OwnedFd::from(stream));
         assert!(matches!(
-            read_body(Body::File {
+            take_body_reader(Body::File {
                 file,
                 offset: 1,
                 len: 1,

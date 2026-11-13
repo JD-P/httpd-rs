@@ -13,11 +13,11 @@ EXPECTED_SLOTS = {
     "ExpensiveCpu", "PendingConnection", "H1Connection", "RequestWorker",
     "RequestBodyWorker", "H2Connection", "TlsHandshake",
     "RewriteProgram", "SpoolFile", "SlowSpoolFile",
-    "FilesystemWork", "BcryptCpu",
+    "FilesystemWork", "BcryptCpu", "CompressionCpu",
 }
 EXPECTED_BYTES = {
     "Spool", "SlowSpool", "RequestResident", "ResponseResident",
-    "SlowResponseResident", "PolicyExpansion", "CacheResident",
+    "SlowResponseResident", "PolicyExpansion", "CacheResident", "CompressionTransient",
 }
 EXPECTED_PHYSICAL = {"FileDescriptor", "Task", "ResidentMemory"}
 
@@ -119,7 +119,7 @@ def main() -> int:
     for required in (
         "with_resource_context(context", "try_dynamic_in", "try_h2_stream_in",
         "try_slow_input_in", "try_slow_output_in",
-        "try_filesystem_work_in", "try_disk", "try_transport_buffers",
+        "try_filesystem_work_in", "try_compression_in", "try_disk", "try_transport_buffers",
         "try_tls_handshake", "try_rewrite_program",
         "attribute_context(resource_context", "enter_resource_context(resource_context",
     ):

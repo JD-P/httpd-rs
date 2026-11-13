@@ -1294,12 +1294,12 @@ mod final_policy_tests {
         compression.deflate_level = Some(1);
         let child = CompressionPolicy {
             deflate_level: Some(9),
-            brotli_quality: Some(11),
+            brotli_quality: Some(9),
             ..CompressionPolicy::default()
         };
         compression.merge_child(&child);
         assert_eq!(compression.deflate_level, Some(9));
-        assert_eq!(compression.brotli_quality, Some(11));
+        assert_eq!(compression.brotli_quality, Some(9));
 
         let mut proxy = ProxyPolicy::default();
         proxy.proxy_ca_file = Some("/old-ca.pem".into());

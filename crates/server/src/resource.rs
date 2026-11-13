@@ -43,10 +43,13 @@ pub(crate) enum SlotKind {
     /// still caps operation count; this weighted ledger prevents high-cost
     /// hashes from consuming the same allowance as low-cost hashes.
     BcryptCpu,
+    /// Relative response-compression CPU work, weighted by representation
+    /// size, algorithm and configured quality.
+    CompressionCpu,
 }
 
 impl SlotKind {
-    const COUNT: usize = 18;
+    const COUNT: usize = 19;
 
     const fn index(self) -> usize {
         self as usize
@@ -63,6 +66,9 @@ enum ByteKind {
     SlowResponseResident,
     PolicyExpansion,
     CacheResident,
+    /// Source bytes, codec state and bounded output scratch retained while a
+    /// response is encoded in the downstream progress path.
+    CompressionTransient,
 }
 
 /// Typed leases ultimately consume a smaller set of operating-system
@@ -86,7 +92,7 @@ impl PhysicalKind {
 }
 
 impl ByteKind {
-    const COUNT: usize = 7;
+    const COUNT: usize = 8;
 
     const fn index(self) -> usize {
         self as usize
@@ -125,6 +131,7 @@ struct RateLedger {
     request: RateWindow,
     expensive: RateWindow,
     bcrypt: RateWindow,
+    compression: RateWindow,
     cache_write: RateWindow,
     log_bytes: RateWindow,
 }
@@ -237,6 +244,12 @@ pub const MAX_EXPENSIVE_OPS_PER_CLIENT: u64 = 8;
 /// lease independently caps cheap checks at 32 process-wide and 8 per client.
 pub const MAX_BCRYPT_WORK_UNITS: u64 = 4_096;
 pub const MAX_BCRYPT_WORK_UNITS_PER_CLIENT: u64 = 4_096;
+pub const MAX_COMPRESSION_WORK_UNITS: u64 = 512;
+pub const MAX_COMPRESSION_WORK_UNITS_PER_CLIENT: u64 = 128;
+pub const MAX_COMPRESSION_WORK_UNITS_PER_REQUEST: u64 = 256;
+pub const MAX_COMPRESSION_TRANSIENT_BYTES: u64 = 192 * 1024 * 1024;
+pub const MAX_COMPRESSION_TRANSIENT_BYTES_PER_CLIENT: u64 = 80 * 1024 * 1024;
+pub const MAX_COMPRESSION_TRANSIENT_BYTES_PER_REQUEST: u64 = 80 * 1024 * 1024;
 pub const MAX_DYNAMIC_REQUESTS_PER_CLIENT: u64 = 8;
 pub const MAX_RESPONSE_BODY_READS: u64 = 32;
 pub const MAX_RESPONSE_BODY_READS_PER_CLIENT: u64 = 8;
@@ -286,6 +299,8 @@ pub const MAX_EXPENSIVE_OPS_PER_SECOND: u64 = 256;
 pub const MAX_EXPENSIVE_OPS_PER_CLIENT_PER_SECOND: u64 = 64;
 pub const MAX_BCRYPT_WORK_UNITS_PER_SECOND: u64 = 4_096;
 pub const MAX_BCRYPT_WORK_UNITS_PER_CLIENT_PER_SECOND: u64 = 4_096;
+pub const MAX_COMPRESSION_WORK_UNITS_PER_SECOND: u64 = 2_048;
+pub const MAX_COMPRESSION_WORK_UNITS_PER_CLIENT_PER_SECOND: u64 = 512;
 pub const MAX_CACHE_WRITE_UNITS_PER_SECOND: u64 = 64 * 1024 * 1024;
 pub const MAX_CACHE_WRITE_UNITS_PER_CLIENT_PER_SECOND: u64 = 16 * 1024 * 1024;
 pub const MAX_LOG_BYTES_PER_SECOND: u64 = 16 * 1024 * 1024;
@@ -428,7 +443,7 @@ const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
         DynamicBackend => [0, 2, 256 * 1024],
         Websocket => [1, 0, 64 * 1024],
         RewriteProgram => [3, 1, 128 * 1024],
-        SpoolFile | SlowSpoolFile | FilesystemWork | BcryptCpu => [0, 0, 0],
+        SpoolFile | SlowSpoolFile | FilesystemWork | BcryptCpu | CompressionCpu => [0, 0, 0],
         TlsHandshake => [0, 0, 128 * 1024],
         RequestBodyWorker | ExpensiveCpu => [0, 0, 0],
     }
@@ -440,7 +455,8 @@ const fn byte_physical_kind(kind: ByteKind) -> Option<PhysicalKind> {
         | ByteKind::ResponseResident
         | ByteKind::SlowResponseResident
         | ByteKind::PolicyExpansion
-        | ByteKind::CacheResident => Some(PhysicalKind::ResidentMemory),
+        | ByteKind::CacheResident
+        | ByteKind::CompressionTransient => Some(PhysicalKind::ResidentMemory),
         ByteKind::Spool | ByteKind::SlowSpool => None,
     }
 }
@@ -2703,6 +2719,15 @@ pub(crate) struct BcryptLease {
     _work: SlotLease,
 }
 
+/// Owns the complete in-flight compression reservation. The lease is moved
+/// into the encoded body reader, so cancellation or a failed downstream write
+/// releases CPU and memory admission when that reader is dropped.
+#[derive(Debug)]
+pub(crate) struct CompressionLease {
+    _work: SlotLease,
+    _memory: ByteLease,
+}
+
 pub fn try_expensive() -> Option<ExpensiveLease> {
     #[cfg(test)]
     let context = current_or_test_context();
@@ -2785,6 +2810,60 @@ pub(crate) fn try_bcrypt(cost: u32) -> Option<BcryptLease> {
     Some(BcryptLease {
         _operation: operation,
         _work: work,
+    })
+}
+
+pub(crate) fn try_compression_in(
+    context: &ResourceContext,
+    work_units: u64,
+    transient_bytes: u64,
+) -> Option<CompressionLease> {
+    if work_units == 0 || transient_bytes == 0 {
+        return None;
+    }
+    let work = context
+        .slot_amount(
+            SlotKind::CompressionCpu,
+            work_units,
+            MAX_COMPRESSION_WORK_UNITS,
+            Some(MAX_COMPRESSION_WORK_UNITS_PER_CLIENT),
+            Some(MAX_COMPRESSION_WORK_UNITS_PER_REQUEST),
+            "compression CPU-work limit reached",
+        )
+        .ok()?;
+    let mut memory = ByteLease::new(
+        context.clone(),
+        ByteKind::CompressionTransient,
+        MAX_COMPRESSION_TRANSIENT_BYTES,
+        Some(MAX_COMPRESSION_TRANSIENT_BYTES_PER_CLIENT),
+        Some(MAX_COMPRESSION_TRANSIENT_BYTES_PER_REQUEST),
+    );
+    memory
+        .reserve(
+            transient_bytes,
+            "compression transient-memory limit reached",
+        )
+        .ok()?;
+    let mut rates = context
+        .budget
+        .rates
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !ResourceBudget::admit_rate_amount(
+        &mut rates.compression,
+        context.client,
+        std::time::Instant::now(),
+        work_units,
+        MAX_COMPRESSION_WORK_UNITS_PER_SECOND,
+        MAX_COMPRESSION_WORK_UNITS_PER_CLIENT_PER_SECOND,
+    ) {
+        drop(rates);
+        return None;
+    }
+    drop(rates);
+    Some(CompressionLease {
+        _work: work,
+        _memory: memory,
     })
 }
 
@@ -3982,6 +4061,32 @@ mod tests {
             assert_eq!(budget.slot_usage(SlotKind::BcryptCpu), 0);
             assert!(try_bcrypt(3).is_none());
             assert!(try_bcrypt(18).is_none());
+        });
+    }
+
+    #[test]
+    fn compression_admission_composes_weighted_cpu_and_transient_memory() {
+        let budget = Arc::new(ResourceBudget::default());
+        let context = budget.context("192.0.2.56".parse().unwrap());
+        with_resource_context(context.clone(), || {
+            let lease =
+                try_compression_in(&context, MAX_COMPRESSION_WORK_UNITS_PER_CLIENT, 1024 * 1024)
+                    .expect("one source-sized compression reservation");
+            assert_eq!(
+                budget.slot_usage(SlotKind::CompressionCpu),
+                MAX_COMPRESSION_WORK_UNITS_PER_CLIENT
+            );
+            assert_eq!(
+                budget.byte_process[ByteKind::CompressionTransient.index()].load(Ordering::Acquire),
+                1024 * 1024
+            );
+            assert!(try_compression_in(&context, 1, 1).is_none());
+            drop(lease);
+            assert_eq!(budget.slot_usage(SlotKind::CompressionCpu), 0);
+            assert_eq!(
+                budget.byte_process[ByteKind::CompressionTransient.index()].load(Ordering::Acquire),
+                0
+            );
         });
     }
 

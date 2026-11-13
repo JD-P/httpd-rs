@@ -2668,7 +2668,10 @@ pub(crate) fn access_directive_schema(name: &str) -> PayloadSchema {
             PayloadValueSchema::OnOff
         }
         "deflatecompressionlevel" => PayloadValueSchema::Unsigned { min: 0, max: 9 },
-        "brotlicompressionquality" => PayloadValueSchema::Unsigned { min: 0, max: 11 },
+        // Qualities 10/11 enter Brotli's long non-interruptible Zopfli path.
+        // Keep access-file policy within the same bounded request-time domain
+        // as the main configuration grammar.
+        "brotlicompressionquality" => PayloadValueSchema::Unsigned { min: 0, max: 9 },
         "deflatealteretag" | "brotlialteretag" | "brotlicompressionalteretag" => {
             PayloadValueSchema::Keyword(&["AddSuffix", "NoChange", "Remove"])
         }
@@ -5664,6 +5667,8 @@ mod tests {
             ("AddOutputFilterByType DEFLATE\n", false),
             ("AddOutputFilter DEFLATE .html\n", true),
             ("AddOutputFilter DEFLATE\n", false),
+            ("BrotliCompressionQuality 9\n", true),
+            ("BrotliCompressionQuality 10\n", false),
             ("coverage-reject anything\n", false),
             ("coverage-unhandled anything\n", false),
         ] {
@@ -5711,7 +5716,6 @@ mod tests {
 #[cfg(test)]
 mod compression_tests {
     use super::*;
-    use crate::config::OverrideCategories;
     use std::collections::HashMap;
 
     fn tempdir(name: &str) -> PathBuf {
@@ -5740,7 +5744,7 @@ mod compression_tests {
                 "AddOutputFilter BROTLI_COMPRESS .html\n",
                 "SetOutputFilter DEFLATE\n",
                 "DeflateCompressionLevel 9\n",
-                "BrotliCompressionQuality 11\n",
+                "BrotliCompressionQuality 9\n",
                 "DeflateAlterETag Remove\n",
                 "BrotliAlterETag NoChange\n",
             ),
@@ -5749,7 +5753,7 @@ mod compression_tests {
         let p = parse_file(&cfg, &file, OverrideMode::All, "/").unwrap();
         assert_eq!(p.scope.compression_policy.compression_rules.len(), 3);
         assert_eq!(p.scope.compression_policy.deflate_level, Some(9));
-        assert_eq!(p.scope.compression_policy.brotli_quality, Some(11));
+        assert_eq!(p.scope.compression_policy.brotli_quality, Some(9));
         assert_eq!(
             p.scope.compression_policy.deflate_alter_etag,
             Some(crate::config::AlterEtag::Remove)

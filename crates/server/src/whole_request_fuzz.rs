@@ -1018,6 +1018,19 @@ fn response_snapshot(response: Response) -> ResponseSnapshot {
             assert_eq!(body.len() as u64, len);
             body
         }
+        Body::UnknownLengthStream { reader, max_len } => {
+            assert!(
+                max_len <= 2 * 1024 * 1024 + 64 * 1024,
+                "differential encoded response is bounded"
+            );
+            let mut body = Vec::new();
+            reader
+                .take(max_len.saturating_add(1))
+                .read_to_end(&mut body)
+                .expect("read differential encoded response");
+            assert!(body.len() as u64 <= max_len);
+            body
+        }
     };
     ResponseSnapshot::Complete {
         status,

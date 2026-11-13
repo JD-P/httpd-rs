@@ -28,12 +28,25 @@ slow-input and slow-output class, dynamic backend requests, blocking response re
 WebSocket tunnels, expensive CPU operations, `RewriteMap prg` helpers, and
 general/slow spool files. Bcrypt additionally holds a weighted CPU lease whose
 charge doubles with each configured cost step; the ordinary expensive-work
-lease still caps cheap hashes by operation count. Filesystem lookup/cache work has a separate
+lease still caps cheap hashes by operation count. Dynamic response compression
+has a separate CPU lease weighted by input size, codec, and quality, plus a
+transient-memory lease covering the source, a conservative codec-workspace
+bound, and output scratch. Filesystem lookup/cache work has a separate
 64-process/8-source phase, so a stalled mount cannot occupy every request
 worker or any dynamic-backend slot. The adjustable byte ledger covers request memory,
 general/slow response memory, general/slow request/backend/proxy spools, and
-retained policy expansions and retained memory-cache entries. Fixed-window
-rates use the same canonical client identity and process ledger.
+retained policy expansions, retained memory-cache entries, and compression
+workspaces. Fixed-window rates use the same canonical client identity and
+process ledger.
+
+Compression is produced only as the downstream writer asks for data: HTTP/1
+writes the response head before starting the encoder, and HTTP/2 waits for
+flow-control capacity before each bounded read. Cancellation drops the encoder
+and both leases. Brotli's public custom allocator is metered against the
+admitted workspace bound. Request-time Brotli qualities 10 and 11 are rejected
+by both main and access-file configuration grammars because they enter a long,
+non-interruptible Zopfli search; immutable assets that require those profiles
+must be precompressed. Admission failure preserves the identity response.
 
 HTTP/1 socket backpressure and HTTP/2 flow-control backpressure use one
 irreversible `General -> Slow -> Closed` ownership transition. The slow lease

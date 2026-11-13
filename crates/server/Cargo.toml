@@ -31,7 +31,10 @@ md-5 = "0.11"
 base64 = "0.22"
 bcrypt = "0.19"
 flate2 = "1"
-brotli = "8"
+# The admitted workspace profiles and allocation-meter regression are audited
+# against this exact encoder implementation. Re-audit the bounds before an
+# upgrade; a semver-compatible allocator-layout change is security-relevant.
+brotli = "=8.0.4"
 webpki-roots = "1"
 webpki = { package = "rustls-webpki", version = "0.103", features = ["ring", "std"] }
 

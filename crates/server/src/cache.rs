@@ -1823,7 +1823,7 @@ fn response_body_bytes(
             file.read_exact(&mut bytes).ok()?;
             Some(bytes)
         }
-        Body::Stream { .. } => None,
+        Body::Stream { .. } | Body::UnknownLengthStream { .. } => None,
     }
 }
 
@@ -5801,6 +5801,11 @@ CacheIgnoreQueryString On\n\
             len: 6,
         };
         assert!(response_body_bytes(&mut stream, &mut resident).is_none());
+        let mut encoded = Body::UnknownLengthStream {
+            reader: Box::new(&b"encoded"[..]),
+            max_len: 64,
+        };
+        assert!(response_body_bytes(&mut encoded, &mut resident).is_none());
 
         let rnd = crate::config::RewriteMap::Rnd(HashMap::from([
             ("b".into(), vec!["2".into()]),
