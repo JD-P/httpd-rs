@@ -1,0 +1,64 @@
+Pass 41 retained release-binary measurements
+============================================
+
+Subject commit:
+  67f9691ec8a8a44aeaff21cad974fa4781770e77
+
+The release build check completed at that commit. The existing release artifact
+was reusable because 3b9620a..67f9691 changes only adversarial evidence files;
+there is no product-source difference in that interval.
+
+1. Single-source exploit (default harness invocation)
+
+Command:
+  python3 adversarial/p41/compression_probe.py
+
+Output:
+  binary=/workspace/vapache/target/release/httpd-rs
+  body_bytes=2097152 clients=8 quality=11 abort_after_head=true
+  baseline_rss_kib=7520 peak_rss_kib=283020 delta_rss_kib=275500
+  server_cpu_seconds=15.750
+  wall_seconds=5.117 server_exit=None
+
+All eight clients bind the same source address, send only an 84-byte request
+head for one valid 2 MiB JavaScript representation, and close immediately.
+
+2. Process-ceiling exploit
+
+Command:
+  P41_CLIENTS=32 P41_MULTI_SOURCE=1 python3 adversarial/p41/compression_probe.py
+
+Output:
+  binary=/workspace/vapache/target/release/httpd-rs
+  body_bytes=2097152 clients=32 quality=11 abort_after_head=true
+  baseline_rss_kib=7408 peak_rss_kib=1413528 delta_rss_kib=1406120
+  server_cpu_seconds=77.350
+  wall_seconds=20.416 server_exit=None
+
+The process-wide response-resident cap is 131072 KiB. Observed transient RSS
+growth was 1406120 KiB (10.73 times that cap) because Brotli's internal encoder
+workspace is not represented by the byte lease.
+
+3. Lower-quality control
+
+Command:
+  P41_QUALITY=5 P41_ABORT_CLIENTS=0 python3 adversarial/p41/compression_probe.py
+
+Output:
+  binary=/workspace/vapache/target/release/httpd-rs
+  body_bytes=2097152 clients=8 quality=5 abort_after_head=false
+  baseline_rss_kib=7408 peak_rss_kib=67832 delta_rss_kib=60424
+  server_exit=None
+  request_0=status:200 encoded_bytes:1577231 seconds:0.134
+  request_1=status:200 encoded_bytes:1577231 seconds:0.068
+  request_2=status:200 encoded_bytes:1577231 seconds:0.073
+  request_3=status:200 encoded_bytes:1577231 seconds:0.088
+  request_4=status:200 encoded_bytes:1577231 seconds:0.135
+  request_5=status:200 encoded_bytes:2097152 seconds:0.015
+  request_6=status:200 encoded_bytes:1577231 seconds:0.094
+  request_7=status:200 encoded_bytes:1577231 seconds:0.084
+
+This is a configuration-sensitive resource amplification, not a claim that
+every Brotli response is comparably expensive. Quality 5 completed each
+admitted response in at most 135 ms; quality 11 is the vulnerable supported
+configuration retained above.
