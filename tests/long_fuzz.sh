@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Resumable local fuzz campaign for security-sensitive composed behavior.
-# Corpora and artifacts live outside the committed seed tree so Ctrl-C and
-# repeated runs preserve coverage without dirtying the checkout.
+# Corpora and logs live in resumable local state. Findings are retained under
+# adversarial/long_fuzz_findings so a completed campaign leaves every crash,
+# timeout and OOM visible for triage.
 set -Eeuo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -12,6 +13,7 @@ TOTAL_SECONDS=${LONG_FUZZ_SECONDS:-28800}
 QUANTUM_SECONDS=${LONG_FUZZ_QUANTUM:-600}
 PARALLEL_JOBS=${LONG_FUZZ_JOBS:-2}
 STATE_DIR=${LONG_FUZZ_STATE_DIR:-$REPO_ROOT/.fuzz-long}
+FINDINGS_DIR=$REPO_ROOT/adversarial/long_fuzz_findings
 PROFILE=${LONG_FUZZ_PROFILE:-full}
 TARGET_OVERRIDE=${LONG_FUZZ_TARGETS:-}
 RSS_LIMIT_MB=${LONG_FUZZ_RSS_LIMIT_MB:-4096}
@@ -36,7 +38,7 @@ Usage: tests/long_fuzz.sh [options]
   --jobs N           targets to run concurrently (default: 2)
   --profile NAME     continuation, adversarial, or full/all (default: full)
   --targets "A B"    explicit space-separated target list
-  --state DIR        persistent corpus/artifact/log directory
+  --state DIR        persistent corpus/log directory
   --import DIR       merge a downloaded fuzz artifact tree; may be repeated
   --nightly RUN      import fuzz artifacts from a GitHub run ID, or "latest"
   --minimize         minimize each accumulated corpus after a clean run
@@ -50,6 +52,9 @@ LONG_FUZZ_JOBS, LONG_FUZZ_PROFILE, LONG_FUZZ_TARGETS,
 LONG_FUZZ_STATE_DIR, LONG_FUZZ_RSS_LIMIT_MB, LONG_FUZZ_MINIMIZE, and
 LONG_FUZZ_IMPORT_DIR, LONG_FUZZ_NIGHTLY_RUN, LONG_FUZZ_COVERAGE,
 LONG_FUZZ_STRICT_SEMANTIC, and VAPACHE_NIGHTLY_TOOLCHAIN.
+
+Fuzz findings are always retained by target under
+adversarial/long_fuzz_findings. A finding does not stop the campaign.
 
 Examples:
   tests/long_fuzz.sh --hours 12 --jobs 4
@@ -256,7 +261,7 @@ run_printed() {
 
 import_seeds() {
     local target=$1 destination=$STATE_DIR/corpus/$target seed digest
-    mkdir -p "$destination" "$STATE_DIR/artifacts/$target" "$STATE_DIR/logs/$target"
+    mkdir -p "$destination" "$FINDINGS_DIR/$target" "$STATE_DIR/logs/$target"
     shopt -s nullglob
     for seed in "fuzz/corpus/$target"/*; do
         [[ -f $seed ]] || continue
@@ -289,10 +294,12 @@ import_tree() {
             \( -path "*/fuzz/corpus/$target/*" -o -path "*/corpus/$target/*" \) \
             -print0 2>/dev/null)
         while IFS= read -r -d '' source; do
-            copy_content_addressed "$source" "$STATE_DIR/artifacts/$target"
+            copy_content_addressed "$source" "$FINDINGS_DIR/$target"
             imported=$((imported + 1))
         done < <(find "$root" -type f ! -type l \
-            \( -path "*/fuzz/artifacts/$target/*" -o -path "*/artifacts/$target/*" \) \
+            \( -path "*/fuzz/artifacts/$target/*" \
+                -o -path "*/artifacts/$target/*" \
+                -o -path "*/long_fuzz_findings/$target/*" \) \
             -print0 2>/dev/null)
     done
     echo "long-fuzz: considered $imported imported corpus/artifact files"
@@ -392,9 +399,39 @@ run_coverage_reports() {
     echo "long-fuzz: LLVM coverage reports retained at $report_dir"
 }
 
+archive_artifact() {
+    local source=$1 target=$2 destination digest
+    [[ -f $source && ! -L $source ]] || return 0
+    mkdir -p "$FINDINGS_DIR/$target"
+    destination=$FINDINGS_DIR/$target/$(basename "$source")
+    if [[ -e $destination ]]; then
+        if cmp -s "$source" "$destination"; then
+            rm "$source"
+            return 0
+        fi
+        digest=$(sha256sum "$source" | awk '{print $1}')
+        destination=$FINDINGS_DIR/$target/$(basename "$source")-$digest
+    fi
+    mv "$source" "$destination"
+    echo "long-fuzz: migrated retained finding to $destination"
+}
+
+migrate_artifact_tree() {
+    local root=$1 artifact target
+    [[ -d $root ]] || return 0
+    while IFS= read -r -d '' artifact; do
+        target=$(basename "$(dirname "$artifact")")
+        archive_artifact "$artifact" "$target"
+    done < <(find "$root" -mindepth 2 -maxdepth 2 -type f ! -type l -print0)
+    find "$root" -depth -type d -empty -delete 2>/dev/null || true
+}
+
+declare -A REPORTED_ARTIFACTS=()
 report_artifacts() {
     local artifact target digest size
     while IFS= read -r -d '' artifact; do
+        [[ -z ${REPORTED_ARTIFACTS[$artifact]:-} ]] || continue
+        REPORTED_ARTIFACTS[$artifact]=1
         target=$(basename "$(dirname "$artifact")")
         digest=$(sha256sum "$artifact" | awk '{print $1}')
         size=$(wc -c <"$artifact" | tr -d ' ')
@@ -402,7 +439,7 @@ report_artifacts() {
             "$target" "$size" "$digest" "$artifact" >&2
         printf '  replay: cargo +%q fuzz run %q %q -- -runs=1\n' \
             "$NIGHTLY" "$target" "$artifact" >&2
-    done < <(find "$STATE_DIR/artifacts" -type f -print0 2>/dev/null)
+    done < <(find "$FINDINGS_DIR" -mindepth 2 -type f -print0 2>/dev/null)
     return 0
 }
 
@@ -413,7 +450,7 @@ replay_artifacts() {
         max_len=$(target_max_len "$target")
         dictionary=$(target_dictionary "$target")
         shopt -s nullglob
-        for artifact in "$STATE_DIR/artifacts/$target"/*; do
+        for artifact in "$FINDINGS_DIR/$target"/*; do
             [[ -f $artifact ]] || continue
             log=$STATE_DIR/logs/$target/replay-$(basename "$artifact").log
             command=(cargo +"$NIGHTLY" fuzz run "$target" "$artifact" --
@@ -424,9 +461,9 @@ replay_artifacts() {
             [[ -z $dictionary ]] || command+=("-dict=$dictionary")
             echo "long-fuzz: replaying $artifact"
             if ! "${command[@]}" >"$log" 2>&1; then
-                echo "long-fuzz: retained artifact still fails: $artifact" >&2
-                report_artifacts
-                return 1
+                echo "long-fuzz: retained finding still fails (campaign will continue): $artifact" >&2
+            else
+                echo "long-fuzz: retained finding no longer fails: $artifact"
             fi
         done
         shopt -u nullglob
@@ -451,11 +488,12 @@ interrupt_campaign() {
 }
 trap interrupt_campaign INT TERM
 
-mkdir -p "$STATE_DIR/corpus" "$STATE_DIR/artifacts" "$STATE_DIR/logs"
+mkdir -p "$STATE_DIR/corpus" "$STATE_DIR/logs" "$FINDINGS_DIR"
 STATE_DIR=$(cd "$STATE_DIR" && pwd)
 
 echo "long-fuzz: profile=$PROFILE duration=${TOTAL_SECONDS}s quantum=${QUANTUM_SECONDS}s jobs=$PARALLEL_JOBS"
 echo "long-fuzz: state=$STATE_DIR"
+echo "long-fuzz: findings=$FINDINGS_DIR"
 echo "long-fuzz: targets=${TARGETS[*]}"
 echo "long-fuzz: weighted-slots=${#SCHEDULE_TARGETS[@]} schedule=${SCHEDULE_TARGETS[*]}"
 
@@ -472,6 +510,10 @@ fi
 for target in "${TARGETS[@]}"; do
     import_seeds "$target"
 done
+if ((DRY_RUN == 0)); then
+    migrate_artifact_tree "$STATE_DIR/artifacts"
+    migrate_artifact_tree "$REPO_ROOT/fuzz/artifacts"
+fi
 seed_semantic_matrix
 
 download_nightly "$NIGHTLY_IMPORT"
@@ -518,7 +560,7 @@ while (( $(date +%s) < deadline )); do
         target=${SCHEDULE_TARGETS[$cursor]}
         cursor=$(((cursor + 1) % ${#SCHEDULE_TARGETS[@]}))
         corpus=$STATE_DIR/corpus/$target
-        artifacts=$STATE_DIR/artifacts/$target/
+        artifacts=$FINDINGS_DIR/$target/
         log=$STATE_DIR/logs/$target/cycle-$cycle.log
         max_len=$(target_max_len "$target")
         dictionary=$(target_dictionary "$target")
@@ -526,6 +568,10 @@ while (( $(date +%s) < deadline )); do
         echo "long-fuzz: cycle=$cycle target=$target slice=${slice}s log=$log"
         command=(cargo +"$NIGHTLY" fuzz run "$target" "$corpus" --
             -max_total_time="$slice"
+            -fork=1
+            -ignore_crashes=1
+            -ignore_timeouts=1
+            -ignore_ooms=1
             -timeout=10
             -rss_limit_mb="$RSS_LIMIT_MB"
             -max_len="$max_len"
@@ -548,12 +594,16 @@ while (( $(date +%s) < deadline )); do
     done
     CHILDREN=()
     if ((failed)); then
-        echo "long-fuzz: target failed: $failed_target" >&2
+        # Fork mode turns target crashes, timeouts and OOMs into retained
+        # findings and continues. A non-zero command here is therefore an
+        # infrastructure failure rather than an ordinary fuzz finding.
+        echo "long-fuzz: fuzzer infrastructure failed: $failed_target" >&2
         report_artifacts || true
         run_report "$STATE_DIR/summary-failed.json" 0 || true
         echo "long-fuzz: logs and resumable state: $STATE_DIR" >&2
         exit 1
     fi
+    report_artifacts || true
 done
 
 if ((MINIMIZE)); then
@@ -577,7 +627,8 @@ seed_semantic_matrix
 run_coverage_reports
 
 elapsed=$(( $(date +%s) - started ))
-echo "long-fuzz: completed cleanly after ${elapsed}s"
-echo "long-fuzz: corpora, artifacts, and logs retained at $STATE_DIR"
+echo "long-fuzz: completed campaign after ${elapsed}s"
+echo "long-fuzz: corpora and logs retained at $STATE_DIR"
+echo "long-fuzz: findings retained at $FINDINGS_DIR"
 report_artifacts || true
 run_report "$STATE_DIR/summary.json" "$STRICT_SEMANTIC"
