@@ -45,6 +45,14 @@ CARGO_TARGET_DIR="$COVERAGE_TARGET_DIR" RUSTFLAGS="$COVERAGE_RUSTFLAGS" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/unit-%p-%m%c.profraw" \
     cargo test -p httpd-rs --features fault-injection -- --test-threads=1
 
+# FastCGI's transport tests share the full harness with fork- and
+# descriptor-isolation tests. Collect them once in an isolated process as well
+# so their counters do not depend on whole-suite process teardown scheduling.
+CARGO_TARGET_DIR="$COVERAGE_TARGET_DIR" RUSTFLAGS="$COVERAGE_RUSTFLAGS" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/unit-%p-%m%c.profraw" \
+    cargo test -p httpd-rs --features fault-injection \
+        fastcgi::tests:: -- --test-threads=1
+
 HTTPD_RS="$COVERAGE_TARGET_DIR/release/httpd-rs" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/httpd-rs-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \

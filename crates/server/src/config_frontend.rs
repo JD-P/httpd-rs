@@ -326,6 +326,10 @@ mod tests {
             vec![(1, "SetHandler\\   ".into()), (2, "cgi-script".into())]
         );
         assert_eq!(logical_lines("value\\"), vec!["value\\"]);
+        assert_eq!(
+            logical_lines_with_numbers("value\\\n"),
+            vec![(1, "value".into())]
+        );
         assert!(tokenize("\"closed\"suffix").is_err());
         let too_many = std::iter::repeat_n("x", 257).collect::<Vec<_>>().join(" ");
         assert!(tokenize(&too_many).is_err());
