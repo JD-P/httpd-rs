@@ -79,7 +79,7 @@ jobs:
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ runner.os }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: fuzz-${{ matrix.target }}
@@ -181,7 +181,7 @@ jobs:
           cargo +"$HTTPD_RS_NIGHTLY_TOOLCHAIN" llvm-cov
           --workspace --all-features --branch --lcov
           --output-path branch-coverage.lcov -- --test-threads=1
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: branch-coverage
           path: branch-coverage.lcov
