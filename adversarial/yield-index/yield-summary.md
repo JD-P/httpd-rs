@@ -35,11 +35,34 @@ number but not the trend.
 
 | Search hours | Searches | Confirmed findings | Findings/hour | Raw impact points | Composition-adjusted points | Adversarial yield |
 |---:|---:|---:|---:|---:|---:|---:|
-| 16.219 | 42 | 134 | 8.26 | 57554.0 | 15969.5 | **984.62** |
+| 17.876 | 45 | 139 | 7.78 | 58765.0 | 17125.0 | **957.99** |
 
-Impact tiers: critical 52, high 53, medium 25, low 4.
+Impact tiers: critical 53, high 55, medium 26, low 5.
 
-Recovered unintended-behavior counts: 1 behaviors: 1 findings, 2 behaviors: 73 findings, 3 behaviors: 37 findings, 4 behaviors: 23 findings.
+Recovered unintended-behavior counts: 1 behaviors: 3 findings, 2 behaviors: 76 findings, 3 behaviors: 37 findings, 4 behaviors: 23 findings.
+
+## Trend graphs
+
+The blocks are chronological groups of ten logical searches; the final
+block contains the remaining searches. The campaign changed focus over
+time, so these graphs describe the review workload and must not be read as
+a controlled estimate of vulnerabilities remaining.
+
+```mermaid
+xychart-beta
+    title "Confirmed findings per search-hour"
+    x-axis ["S01-S10", "S11-S20", "S21-S30", "S31-S40", "S41-S45"]
+    y-axis "Findings/hour" 0 --> 30
+    line [25.67, 10.40, 6.95, 3.71, 2.45]
+```
+
+```mermaid
+xychart-beta
+    title "Severity/composition-adjusted yield per search-hour"
+    x-axis ["S01-S10", "S11-S20", "S21-S30", "S31-S40", "S41-S45"]
+    y-axis "Adjusted points/hour" 0 --> 2000
+    line [1854.04, 1627.05, 527.95, 808.22, 387.64]
+```
 
 ### Contribution by primary family
 
@@ -48,14 +71,14 @@ convergence because the time was not allocated uniformly across families.
 
 | Primary family | Confirmed findings | Adjusted points | Share of points | Points per whole-history hour |
 |---|---:|---:|---:|---:|
-| `authority_bypass` | 20 | 662.5 | 4.1% | 40.85 |
-| `code_execution` | 42 | 8112.5 | 50.8% | 500.19 |
-| `denial_of_service` | 28 | 4360.0 | 27.3% | 268.82 |
-| `information_disclosure` | 25 | 2643.5 | 16.6% | 162.99 |
-| `integrity_violation` | 10 | 70.0 | 0.4% | 4.32 |
-| `protocol_confusion` | 1 | 5.0 | 0.0% | 0.31 |
-| `server_request_abuse` | 3 | 100.0 | 0.6% | 6.17 |
-| `unclassified` | 5 | 16.0 | 0.1% | 0.99 |
+| `authority_bypass` | 20 | 662.5 | 3.9% | 37.06 |
+| `code_execution` | 43 | 8162.5 | 47.7% | 456.62 |
+| `denial_of_service` | 30 | 5460.0 | 31.9% | 305.44 |
+| `information_disclosure` | 25 | 2643.5 | 15.4% | 147.88 |
+| `integrity_violation` | 10 | 70.0 | 0.4% | 3.92 |
+| `protocol_confusion` | 1 | 5.0 | 0.0% | 0.28 |
+| `server_request_abuse` | 3 | 100.0 | 0.6% | 5.59 |
+| `unclassified` | 7 | 21.5 | 0.1% | 1.20 |
 
 ## Within-family result
 
@@ -117,7 +140,7 @@ because the campaign changed families.
 | S11–S20 | 4.038 | 42 | 10.40 | 29 | 9 | 4 | 0 | 6570.0 | 1627.05 |
 | S21–S30 | 3.743 | 26 | 6.95 | 6 | 13 | 5 | 2 | 1976.0 | 527.95 |
 | S31–S40 | 5.116 | 19 | 3.71 | 8 | 9 | 2 | 0 | 4135.0 | 808.22 |
-| S41–S42 | 1.608 | 3 | 1.87 | 0 | 2 | 1 | 0 | 110.0 | 68.42 |
+| S41–S45 | 3.265 | 8 | 2.45 | 1 | 4 | 2 | 1 | 1265.5 | 387.64 |
 
 ## Interpretation and limits
 

@@ -17,6 +17,7 @@ import collections
 import csv
 import datetime as dt
 import json
+import math
 import os
 from pathlib import Path
 from typing import Callable, Iterable
@@ -166,7 +167,7 @@ def write_search_csv(
         "adversarial_yield_per_hour",
     ]
     with path.open("w", encoding="utf-8", newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         for order, search_id in enumerate(ordered_search_ids, 1):
             search = search_rows[search_id]
@@ -227,6 +228,13 @@ def write_summary(
     behavior_counts = collections.Counter(
         finding["composition"]["unintended_behavior_count"]
         for finding in all_findings
+    )
+    block_labels = [f"{block[0]}-{block[-1]}" for block in blocks]
+    findings_axis_max = max(
+        5, math.ceil(max(summary["findings_per_hour"] for summary in block_summaries) / 5) * 5
+    )
+    yield_axis_max = max(
+        250, math.ceil(max(summary["yield"] for summary in block_summaries) / 250) * 250
     )
     family_names = sorted({finding["primary_family"] for finding in all_findings})
 
@@ -323,6 +331,31 @@ def write_summary(
             for count, number in sorted(behavior_counts.items())
         )
         + ".",
+        "",
+        "## Trend graphs",
+        "",
+        "The blocks are chronological groups of ten logical searches; the final",
+        "block contains the remaining searches. The campaign changed focus over",
+        "time, so these graphs describe the review workload and must not be read as",
+        "a controlled estimate of vulnerabilities remaining.",
+        "",
+        "```mermaid",
+        "xychart-beta",
+        "    title \"Confirmed findings per search-hour\"",
+        "    x-axis [" + ", ".join(json.dumps(label) for label in block_labels) + "]",
+        f"    y-axis \"Findings/hour\" 0 --> {findings_axis_max}",
+        "    line ["
+        + ", ".join(fmt(summary["findings_per_hour"]) for summary in block_summaries)
+        + "]",
+        "```",
+        "",
+        "```mermaid",
+        "xychart-beta",
+        "    title \"Severity/composition-adjusted yield per search-hour\"",
+        "    x-axis [" + ", ".join(json.dumps(label) for label in block_labels) + "]",
+        f"    y-axis \"Adjusted points/hour\" 0 --> {yield_axis_max}",
+        "    line [" + ", ".join(fmt(summary["yield"]) for summary in block_summaries) + "]",
+        "```",
         "",
         "### Contribution by primary family",
         "",
