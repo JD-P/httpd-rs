@@ -28,7 +28,7 @@ sha1 = "0.11"
 subtle = "2.6"
 ring = "0.17"
 md-5 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 bcrypt = "0.19"
 flate2 = "1"
 # The admitted workspace profiles and allocation-meter regression are audited
