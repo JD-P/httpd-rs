@@ -1167,10 +1167,17 @@ fn execute_prepared_snapshot(
         ),
         SinkSnapshot::None | SinkSnapshot::StaticFile | SinkSnapshot::Redirect => unreachable!(),
     };
-    assert_eq!(
-        backend_effect, !cancel_before_sink,
-        "pre-sink cancellation did not suppress the dynamic effect"
-    );
+    if cancel_before_sink {
+        assert!(
+            !backend_effect,
+            "pre-sink cancellation did not suppress the dynamic effect"
+        );
+    } else if !backend_effect {
+        assert!(
+            response.status >= 500,
+            "an admitted dynamic sink disappeared without a backend effect or error"
+        );
+    }
     RouteSnapshot {
         authorization: AuthorizationSnapshot::Granted,
         sink,
@@ -1983,6 +1990,15 @@ mod tests {
             let result = compare_protocols(cancelled);
             assert!(!result.backend_effect);
             assert!(result.backend_exchanges.is_empty());
+        }
+
+        // A backend may fail before producing an observable exchange. This is
+        // an error outcome, not evidence that cancellation suppressed a
+        // successful sink. Retain the minimized fuzz-smoke regression input.
+        let failed_before_effect = compare_protocols(b"400");
+        if !failed_before_effect.backend_effect {
+            let ResponseSnapshot::Complete { status, .. } = failed_before_effect.response;
+            assert!(status >= 500);
         }
     }
 
