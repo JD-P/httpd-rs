@@ -1,0 +1,41 @@
+httpd-rs adversarial Pass 43, 2026-11-14
+Reviewed release binary at 1c94f127992345d4017fd2d404a4e60a3b45f6c1
+Loopback-only reverse proxy; 64 requests, concurrency 8, one client source.
+
+Each adversarial backend leaf proves possession of its own P-384 key but
+falsely names the ordinary trusted intermediate as its issuer. The backend
+repeats that one public intermediate certificate on the wire. It does not
+possess the root or intermediate private key. Every request correctly fails
+closed with 502 after certificate verification.
+
+8 repeated issuer candidates (6,457-byte PEM chain)
+control:     64/64 status 200, wall_s=0.057089, cpu_s=0.06
+adversarial: 64/64 status 502, wall_s=0.240203, cpu_s=0.84
+cpu_ratio=14.00x cpu_per_request_ms=13.12 server_exit=None
+
+32 repeated issuer candidates (23,441-byte PEM chain)
+control:     64/64 status 200, wall_s=0.053092, cpu_s=0.05
+adversarial: 64/64 status 502, wall_s=0.873785, cpu_s=3.25
+cpu_ratio=65.00x cpu_per_request_ms=50.78 server_exit=None
+
+64 repeated issuer candidates (about 46 KiB PEM / 31.5k DER bytes on wire)
+control:     64/64 status 200, wall_s=0.053387, cpu_s=0.04
+adversarial: 64/64 status 502, wall_s=1.357967, cpu_s=5.22
+cpu_ratio=130.50x cpu_per_request_ms=81.56 server_exit=None
+control_rss_peak_delta_kib=9276
+adversarial_rss_peak_delta_kib=12584
+
+Independent 64-candidate run
+control:     64/64 status 200, wall_s=0.060383, cpu_s=0.08
+adversarial: 64/64 status 502, wall_s=1.475539, cpu_s=5.69
+cpu_ratio=71.12x cpu_per_request_ms=88.91 server_exit=None
+
+Independent finalized OpenSSL-only 64-candidate run
+control:     64/64 status 200, wall_s=0.056898, cpu_s=0.07
+adversarial: 64/64 status 502, wall_s=1.493891, cpu_s=5.80
+cpu_ratio=82.86x cpu_per_request_ms=90.63 server_exit=None
+
+The 64-candidate case reaches rustls-webpki's fixed 100-signature defensive
+budget. The daemon's application-level proxy dependency assertion declares
+one work unit regardless of certificate count, chain bytes, signature
+algorithm or verifier outcome, and acquires no weighted TLS CPU/rate lease.

@@ -472,7 +472,7 @@ def write_summary(
             "## Cross-family workload history",
             "",
             "For completeness, this is the combined yield in fixed groups of ten",
-            "chronological searches (the last has nine). It describes what the review",
+            f"chronological searches (the last has {len(blocks[-1])}). It describes what the review",
             "process found over time, but **must not be read as a convergence series**",
             "because the campaign changed families.",
             "",
