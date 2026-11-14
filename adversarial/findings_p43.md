@@ -12,7 +12,8 @@
   trust boundary, then varied a backend certificate chain's repeated issuer
   count while holding requests, concurrency, source identity, algorithm and
   response behavior fixed.
-- **Disposition:** **P43-A confirmed and unfixed at HEAD.**
+- **Disposition:** **P43-A confirmed at the reviewed HEAD and remediated in
+  the product tree on 2026-11-14.**
 
 ---
 
@@ -156,6 +157,33 @@ trust behavior does not make the resource escape harmless.
 5. Reusing already-validated HTTPS upstream connections under the existing
    exact backend/generation/request identity is useful defense in depth, but
    must not substitute for bounding a first or failed handshake.
+
+### 2.6 Remediation status
+
+The outbound verifier now enforces the same proved shape envelope before
+webpki that the inbound mTLS boundary uses: at most eight total certificates
+and 65,535 aggregate DER bytes, with duplicates counting independently. An
+admitted chain costs one work unit per certificate plus one per 8 KiB of DER,
+up to a Verus-proved sixteen-unit maximum. The verifier acquires the shared
+process/source TLS concurrency, rate and dependency-workspace owner before
+delegating to webpki and retains it through signature verification and
+handshake completion.
+
+The owner is scoped to each synchronous proxy/health handshake or asynchronous
+WSS task while the verifier itself remains generation-cached. That distinction
+preserves rustls session resumption: rustls intentionally disables resumption
+when successive connections install different verifier `Arc`s. Active health
+checks use a process-only context, so they share the process ceiling without
+inventing a downstream source identity.
+
+The original release harness now reports 64/64 successful `200` control
+requests in 0.057 seconds and 0.06 daemon CPU-seconds, matching the pre-fix
+0.04–0.07 CPU-second range. The 64-candidate attack is rejected 64/64 with
+`502` in 0.110 seconds and 0.06 CPU-seconds, down from 5.22–5.80 CPU-seconds.
+The largest admitted adversarial shape (seven repeated intermediates plus the
+leaf) consumed 0.25 CPU-seconds for the 64-request wave; shape-weighted source
+admission allowed only the bounded prefix to enter webpki. Retained output is
+in `adversarial/p43/results_p43_remediation.txt`.
 
 ---
 

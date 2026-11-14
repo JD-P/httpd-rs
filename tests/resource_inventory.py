@@ -64,7 +64,7 @@ VARIABLE_DEPENDENCY_NAMESPACES = {
     ("crates/server/src/h2.rs", "tokio_rustls"): 1,
     ("crates/server/src/ocsp.rs", "rustls"): 1,
     ("crates/server/src/ocsp.rs", "webpki"): 5,
-    ("crates/server/src/proxy.rs", "rustls"): 7,
+    ("crates/server/src/proxy.rs", "rustls"): 9,
     ("crates/server/src/proxy.rs", "tokio_rustls"): 1,
     ("crates/server/src/resource.rs", "h2"): 1,
     ("crates/server/src/scope_policy.rs", "rustls"): 3,
@@ -123,7 +123,9 @@ DEPENDENCY_BOUNDARY_CONTRACTS = {
     ),
     ("crates/server/src/proxy.rs", "fn admit_proxy_tls_dependency("): (
         ("crates/server/src/proxy.rs", "dependency_call_admit"),
-        ("crates/server/src/proxy.rs", "TRANSPORT_BUFFER_CHARGE"),
+        ("crates/server/src/proxy.rs", "BoundedServerCertVerifier"),
+        ("crates/server/src/resource.rs", "try_profiled_outbound_tls_handshake"),
+        ("crates/verified/src/lib.rs", "outbound_tls_dependency_budget"),
         ("crates/server/src/proxy.rs", "TLS handshake timeout"),
     ),
     ("crates/server/src/ocsp.rs", "fn valid_response_until("): (
@@ -183,6 +185,8 @@ ALLOWED_MUTABLE_STATICS = {
     ("proxy.rs", "DEAD"), ("proxy.rs", "HEALTH"),
     ("proxy.rs", "GENERATION"), ("proxy.rs", "COUNTERS"),
     ("proxy.rs", "DNS"),
+    ("proxy.rs", "ASYNC_OUTBOUND_TLS_ADMISSION"),
+    ("proxy.rs", "SYNC_OUTBOUND_TLS_ADMISSION"),
     ("proxy.rs", "TEST_BUDGET"),
     ("request_plan.rs", "NEXT_FIXTURE"),
     ("resource.rs", "CURRENT_CONTEXT"), ("resource.rs", "CURRENT_REQUEST_SCOPE"),

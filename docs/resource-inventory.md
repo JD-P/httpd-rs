@@ -179,6 +179,20 @@ by `adversarial/tls_dependency_profile.py` across ambiguous issuers, dense name
 constraints and every ring/webpki signature family, including P-384 and
 RSA-8192 extrema.
 
+Outbound rustls verification shares the same 64-process/32-source weighted
+concurrency and dependency-workspace ledgers. A generation-cached verifier
+uses a handshake-scoped request/health owner and first rejects backend chains
+above eight total certificates or 65,535 aggregate DER bytes, counting
+duplicates, before webpki path construction. Admitted chains
+cost one unit per certificate plus one unit per 8 KiB of DER, up to the proved
+sixteen-unit envelope; the lease is acquired immediately before webpki and is
+retained through synchronous proxy, asynchronous WSS, or process-owned health-
+check handshake completion. The outbound rate envelope is 512 process and 256
+source work units per second: an ordinary two-certificate chain costs three
+units and preserves measured proxy bursts, while a maximal admitted chain
+costs at least nine. Health checks have no downstream source identity but use
+the same process rate and concurrency ledger.
+
 Extended status also exports current use, monotonic high-water, the observed
 hard limit, a reporting-only shadow candidate and rejection count for every
 slot, byte and physical-parent ledger. `tests/resource_budget_sweep.py` varies

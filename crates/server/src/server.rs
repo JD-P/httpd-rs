@@ -308,10 +308,17 @@ const MAX_PENDING_CONNECTIONS: usize = 2_048;
 const MAX_PENDING_PER_CLIENT: usize = 8;
 const MAX_PENDING_PER_TRUSTED_PROXY: usize = 32;
 const ACCEPT_BATCH: usize = 64;
-const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 64;
-const MAX_CONCURRENT_TLS_HANDSHAKE_WORK_PER_CLIENT: usize = 32;
-const MAX_TLS_HANDSHAKES_PER_SECOND: usize = 128;
-const MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND: usize = 64;
+#[cfg(test)]
+const MAX_CONCURRENT_TLS_HANDSHAKES: usize = crate::resource::MAX_TLS_HANDSHAKE_WORK as usize;
+#[cfg(test)]
+const MAX_CONCURRENT_TLS_HANDSHAKE_WORK_PER_CLIENT: usize =
+    crate::resource::MAX_TLS_HANDSHAKE_WORK_PER_CLIENT as usize;
+#[cfg(test)]
+const MAX_TLS_HANDSHAKES_PER_SECOND: usize =
+    crate::resource::MAX_TLS_HANDSHAKE_WORK_PER_SECOND as usize;
+#[cfg(test)]
+const MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND: usize =
+    crate::resource::MAX_TLS_HANDSHAKE_WORK_PER_CLIENT_PER_SECOND as usize;
 const CONNECTION_WORK_THREADS: usize = 64;
 const CONNECTION_WORK_QUEUE: usize = 1024;
 /// Let ordinary bodyless dynamic requests keep their current policy worker
@@ -752,6 +759,7 @@ fn try_reserve_h1_connection(
     )
 }
 
+#[cfg(test)]
 fn tls_handshake_limit() -> usize {
     // Waiting handshakes are asynchronous, so this ceiling primarily bounds
     // their state. CPU work is independently bounded by the rate gate below.
@@ -766,14 +774,10 @@ fn try_reserve_tls_handshake(
 ) -> Option<crate::resource::TlsHandshakeLease> {
     context
         .budget()
-        .try_tls_handshake(
+        .try_profiled_tls_handshake(
             context,
             dependency.verification_work_units,
             dependency.workspace_bytes,
-            tls_handshake_limit() as u64,
-            MAX_CONCURRENT_TLS_HANDSHAKE_WORK_PER_CLIENT as u64,
-            MAX_TLS_HANDSHAKES_PER_SECOND as u64,
-            MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND as u64,
         )
         .ok()
 }

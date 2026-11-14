@@ -41,8 +41,7 @@ const DEFAULT_SESSION_CACHE_TIMEOUT: Duration = Duration::from_secs(300);
 #[derive(Debug)]
 struct BoundedClientCertVerifier {
     inner: Arc<dyn ClientCertVerifier>,
-    max_certificates: usize,
-    max_certificate_bytes: usize,
+    budget: httpd_rs_verified::TlsDependencyBudget,
 }
 
 impl BoundedClientCertVerifier {
@@ -50,11 +49,7 @@ impl BoundedClientCertVerifier {
         inner: Arc<dyn ClientCertVerifier>,
         budget: httpd_rs_verified::TlsDependencyBudget,
     ) -> Self {
-        Self {
-            inner,
-            max_certificates: budget.max_presented_certificates as usize,
-            max_certificate_bytes: budget.max_presented_certificate_bytes as usize,
-        }
+        Self { inner, budget }
     }
 }
 
@@ -83,9 +78,9 @@ impl ClientCertVerifier for BoundedClientCertVerifier {
             .try_fold(end_entity.as_ref().len(), |total, cert| {
                 total.checked_add(cert.as_ref().len())
             });
-        if count > self.max_certificates
-            || bytes.is_none_or(|bytes| bytes > self.max_certificate_bytes)
-        {
+        if bytes.is_none_or(|bytes| {
+            !httpd_rs_verified::tls_certificate_shape_admit(count as u64, bytes as u64, self.budget)
+        }) {
             return Err(RustlsError::General(
                 "client certificate chain exceeds the verified TLS resource profile".into(),
             ));

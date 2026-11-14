@@ -448,6 +448,21 @@ pub const MAX_CACHE_WRITE_UNITS_PER_SECOND: u64 = 64 * 1024 * 1024;
 pub const MAX_CACHE_WRITE_UNITS_PER_CLIENT_PER_SECOND: u64 = 16 * 1024 * 1024;
 pub const MAX_LOG_BYTES_PER_SECOND: u64 = 16 * 1024 * 1024;
 pub const MAX_LOG_BYTES_PER_CLIENT_PER_SECOND: u64 = 2 * 1024 * 1024;
+/// Shared weighted admission for inbound and outbound TLS dependency work.
+/// A unit is one conservative certificate-verification work quantum, not one
+/// socket.  Both directions consume the same process ledger so individually
+/// bounded handshakes cannot compose into CPU exhaustion.
+pub(crate) const MAX_TLS_HANDSHAKE_WORK: u64 = 64;
+pub(crate) const MAX_TLS_HANDSHAKE_WORK_PER_CLIENT: u64 = 32;
+pub(crate) const MAX_TLS_HANDSHAKE_WORK_PER_SECOND: u64 = 128;
+pub(crate) const MAX_TLS_HANDSHAKE_WORK_PER_CLIENT_PER_SECOND: u64 = 64;
+// Outbound chains are first capped at eight certificates/65,535 DER bytes.
+// The larger rate envelope preserves ordinary HTTPS proxy bursts (a typical
+// two-certificate chain costs three units), while a maximal admitted shape
+// costs at least nine units and remains bounded by both this rate and the
+// shared 64/32-unit concurrency ledger.
+pub(crate) const MAX_OUTBOUND_TLS_HANDSHAKE_WORK_PER_SECOND: u64 = 512;
+pub(crate) const MAX_OUTBOUND_TLS_HANDSHAKE_WORK_PER_CLIENT_PER_SECOND: u64 = 256;
 const CACHE_WRITE_MIN_CHARGE: u64 = 64 * 1024;
 const DEFAULT_TASK_BUDGET: u64 = 1_024;
 const DEFAULT_RESIDENT_BUDGET: u64 = 256 * 1024 * 1024;
@@ -2035,6 +2050,13 @@ impl ResourceBudget {
         ResourceContext::for_client(self, client)
     }
 
+    /// Process-owned work such as active backend health checks has no remote
+    /// downstream identity, but it must still consume process concurrency,
+    /// rate and workspace budgets.
+    pub(crate) fn process_context(self: &Arc<Self>) -> ResourceContext {
+        ResourceContext::process_only(self)
+    }
+
     fn current_context_for(self: &Arc<Self>) -> io::Result<ResourceContext> {
         if let Some(context) = current_context() {
             if Arc::ptr_eq(&context.budget, self) {
@@ -3055,6 +3077,40 @@ impl ResourceBudget {
             _slot: slot,
             _workspace: workspace,
         })
+    }
+
+    pub(crate) fn try_profiled_tls_handshake(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+        work_units: u64,
+        workspace_bytes: u64,
+    ) -> io::Result<TlsHandshakeLease> {
+        self.try_tls_handshake(
+            context,
+            work_units,
+            workspace_bytes,
+            MAX_TLS_HANDSHAKE_WORK,
+            MAX_TLS_HANDSHAKE_WORK_PER_CLIENT,
+            MAX_TLS_HANDSHAKE_WORK_PER_SECOND,
+            MAX_TLS_HANDSHAKE_WORK_PER_CLIENT_PER_SECOND,
+        )
+    }
+
+    pub(crate) fn try_profiled_outbound_tls_handshake(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+        work_units: u64,
+        workspace_bytes: u64,
+    ) -> io::Result<TlsHandshakeLease> {
+        self.try_tls_handshake(
+            context,
+            work_units,
+            workspace_bytes,
+            MAX_TLS_HANDSHAKE_WORK,
+            MAX_TLS_HANDSHAKE_WORK_PER_CLIENT,
+            MAX_OUTBOUND_TLS_HANDSHAKE_WORK_PER_SECOND,
+            MAX_OUTBOUND_TLS_HANDSHAKE_WORK_PER_CLIENT_PER_SECOND,
+        )
     }
 
     pub(crate) fn try_rewrite_program(

@@ -4053,12 +4053,107 @@ pub fn tls_dependency_budget(client_auth: bool) -> (budget: TlsDependencyBudget)
     }
 }
 
+/// Complete pre-admission shape for outbound rustls verification.  Unlike an
+/// inbound handshake without client authentication, every HTTPS backend can
+/// select certificate-path work.  The runtime verifier rejects shapes outside
+/// this envelope before delegating to webpki.
+pub open spec fn outbound_tls_dependency_budget_spec() -> TlsDependencyBudget {
+    TlsDependencyBudget {
+        peer_handshake_bytes: 65_535,
+        verification_work_units: 16,
+        workspace_bytes: 262_144,
+        max_presented_certificates: 8,
+        max_presented_certificate_bytes: 65_535,
+    }
+}
+
+pub fn outbound_tls_dependency_budget() -> (budget: TlsDependencyBudget)
+    ensures
+        budget == outbound_tls_dependency_budget_spec(),
+        budget.peer_handshake_bytes == 65_535,
+        budget.verification_work_units == 16,
+        budget.workspace_bytes == 262_144,
+        budget.max_presented_certificates == 8,
+        budget.max_presented_certificate_bytes == 65_535,
+{
+    TlsDependencyBudget {
+        peer_handshake_bytes: 65_535,
+        verification_work_units: 16,
+        workspace_bytes: 262_144,
+        max_presented_certificates: 8,
+        max_presented_certificate_bytes: 65_535,
+    }
+}
+
+pub open spec fn tls_certificate_shape_spec(
+    count: u64,
+    bytes: u64,
+    budget: TlsDependencyBudget,
+) -> bool {
+    count >= 1
+        && count <= budget.max_presented_certificates
+        && bytes <= budget.max_presented_certificate_bytes
+}
+
+pub fn tls_certificate_shape_admit(
+    count: u64,
+    bytes: u64,
+    budget: TlsDependencyBudget,
+) -> (admit: bool)
+    ensures admit == tls_certificate_shape_spec(count, bytes, budget),
+{
+    count >= 1
+        && count <= budget.max_presented_certificates
+        && bytes <= budget.max_presented_certificate_bytes
+}
+
+/// Price one admitted outbound verification by both candidate cardinality and
+/// aggregate DER.  One work unit covers one candidate or one 8 KiB input
+/// quantum.  The eight-certificate/65,535-byte shape therefore fits the
+/// verified sixteen-unit ceiling while ordinary short chains pay less than the
+/// worst case.
+pub fn outbound_tls_verification_work_units(
+    count: u64,
+    bytes: u64,
+) -> (work: Option<u64>)
+    ensures
+        work.is_some() == tls_certificate_shape_spec(
+            count,
+            bytes,
+            outbound_tls_dependency_budget_spec(),
+        ),
+        work.is_some() ==> work.unwrap() >= 1,
+        work.is_some() ==> work.unwrap() <= 16,
+{
+    let budget = outbound_tls_dependency_budget();
+    if !tls_certificate_shape_admit(count, bytes, budget) {
+        return None;
+    }
+    let byte_units = if bytes == 0 {
+        0
+    } else {
+        // The shape proof above bounds bytes at 65,535 for the outbound
+        // profile, so the addition cannot overflow and the quotient is <= 8.
+        (bytes + 8_191) / 8_192
+    };
+    Some(count + byte_units)
+}
+
 pub proof fn mtls_dependency_shape_is_bounded()
     ensures
         tls_dependency_budget_spec(true).max_presented_certificates <= 8,
         tls_dependency_budget_spec(true).max_presented_certificate_bytes <= 65_535,
         tls_dependency_budget_spec(true).verification_work_units <= 16,
         tls_dependency_budget_spec(true).workspace_bytes <= 262_144,
+{
+}
+
+pub proof fn outbound_tls_dependency_shape_is_bounded()
+    ensures
+        outbound_tls_dependency_budget_spec().max_presented_certificates <= 8,
+        outbound_tls_dependency_budget_spec().max_presented_certificate_bytes <= 65_535,
+        outbound_tls_dependency_budget_spec().verification_work_units <= 16,
+        outbound_tls_dependency_budget_spec().workspace_bytes <= 262_144,
 {
 }
 

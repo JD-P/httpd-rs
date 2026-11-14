@@ -12,9 +12,14 @@ use crate::config::{
 use crate::http::{Body, Request, Response, Version};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, ServerName};
-use rustls::{ClientConnection, RootCertStore, StreamOwned};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConnection, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+    StreamOwned,
+};
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -44,22 +49,211 @@ const MAX_PROXY_SESSION_BACKENDS: usize = 4;
 const MAX_PROXY_GENERATION_STATE: usize = 4096;
 const PROXY_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn admit_proxy_tls_dependency(host: &str) -> std::io::Result<()> {
-    if httpd_rs_verified::dependency_call_admit(
-        true,
-        host.len() as u64,
-        MAX_TLS_SERVER_NAME_BYTES,
-        1,
-        1,
-        crate::resource::TRANSPORT_BUFFER_CHARGE,
-        crate::resource::TRANSPORT_BUFFER_CHARGE,
-    ) {
-        Ok(())
+fn admit_proxy_tls_dependency(
+    host: &str,
+) -> std::io::Result<httpd_rs_verified::TlsDependencyBudget> {
+    let budget = httpd_rs_verified::outbound_tls_dependency_budget();
+    if host.len() <= MAX_TLS_SERVER_NAME_BYTES as usize
+        && httpd_rs_verified::dependency_call_admit(
+            true,
+            budget.peer_handshake_bytes,
+            65_535,
+            budget.verification_work_units,
+            16,
+            budget.workspace_bytes,
+            262_144,
+        )
+    {
+        Ok(budget)
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "upstream TLS dependency boundary rejected",
         ))
+    }
+}
+
+#[derive(Debug)]
+struct OutboundTlsAdmission {
+    context: crate::resource::ResourceContext,
+    lease: Mutex<Option<crate::resource::TlsHandshakeLease>>,
+}
+
+impl OutboundTlsAdmission {
+    fn new(context: crate::resource::ResourceContext) -> Self {
+        Self {
+            context,
+            lease: Mutex::new(None),
+        }
+    }
+
+    fn acquire(&self, work_units: u64, workspace_bytes: u64) -> Result<(), RustlsError> {
+        let mut owner = self.lease.lock().unwrap_or_else(|error| error.into_inner());
+        if owner.is_some() {
+            return Err(RustlsError::General(
+                "upstream TLS verifier attempted duplicate admission".into(),
+            ));
+        }
+        *owner = Some(
+            self.context
+                .budget()
+                .try_profiled_outbound_tls_handshake(&self.context, work_units, workspace_bytes)
+                .map_err(|_| {
+                    RustlsError::General("upstream TLS verification capacity exhausted".into())
+                })?,
+        );
+        Ok(())
+    }
+
+    fn release(&self) {
+        self.lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+}
+
+thread_local! {
+    static SYNC_OUTBOUND_TLS_ADMISSION: std::cell::RefCell<Option<Arc<OutboundTlsAdmission>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+tokio::task_local! {
+    static ASYNC_OUTBOUND_TLS_ADMISSION: Arc<OutboundTlsAdmission>;
+}
+
+struct SyncOutboundTlsAdmissionGuard {
+    previous: Option<Arc<OutboundTlsAdmission>>,
+}
+
+impl Drop for SyncOutboundTlsAdmissionGuard {
+    fn drop(&mut self) {
+        SYNC_OUTBOUND_TLS_ADMISSION.with(|current| {
+            current.replace(self.previous.take());
+        });
+    }
+}
+
+fn enter_sync_outbound_tls_admission(
+    admission: Arc<OutboundTlsAdmission>,
+) -> SyncOutboundTlsAdmissionGuard {
+    let previous = SYNC_OUTBOUND_TLS_ADMISSION.with(|current| current.replace(Some(admission)));
+    SyncOutboundTlsAdmissionGuard { previous }
+}
+
+fn current_outbound_tls_admission() -> Option<Arc<OutboundTlsAdmission>> {
+    ASYNC_OUTBOUND_TLS_ADMISSION
+        .try_with(Arc::clone)
+        .ok()
+        .or_else(|| {
+            SYNC_OUTBOUND_TLS_ADMISSION.with(|current| current.borrow().as_ref().map(Arc::clone))
+        })
+}
+
+/// Reject server-certificate multiplicity before webpki path construction,
+/// then retain a shape-weighted CPU/rate/workspace owner through the rest of
+/// the handshake. Duplicate certificates deliberately count independently.
+#[derive(Debug)]
+struct BoundedServerCertVerifier {
+    inner: Arc<dyn ServerCertVerifier>,
+    budget: httpd_rs_verified::TlsDependencyBudget,
+}
+
+impl BoundedServerCertVerifier {
+    fn new(inner: Arc<dyn ServerCertVerifier>) -> Self {
+        Self {
+            inner,
+            budget: httpd_rs_verified::outbound_tls_dependency_budget(),
+        }
+    }
+
+    fn verification_failed<T>(&self, result: Result<T, RustlsError>) -> Result<T, RustlsError> {
+        if result.is_err() {
+            if let Some(admission) = current_outbound_tls_admission() {
+                admission.release();
+            }
+        }
+        result
+    }
+}
+
+impl ServerCertVerifier for BoundedServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        let count = intermediates.len().checked_add(1).ok_or_else(|| {
+            RustlsError::General(
+                "server certificate chain exceeds the verified TLS resource profile".into(),
+            )
+        })?;
+        if count as u64 > self.budget.max_presented_certificates {
+            return Err(RustlsError::General(
+                "server certificate chain exceeds the verified TLS resource profile".into(),
+            ));
+        }
+        let bytes = intermediates
+            .iter()
+            .try_fold(end_entity.as_ref().len(), |total, cert| {
+                total.checked_add(cert.as_ref().len())
+            })
+            .ok_or_else(|| {
+                RustlsError::General(
+                    "server certificate chain exceeds the verified TLS resource profile".into(),
+                )
+            })?;
+        let Some(work_units) =
+            httpd_rs_verified::outbound_tls_verification_work_units(count as u64, bytes as u64)
+        else {
+            return Err(RustlsError::General(
+                "server certificate chain exceeds the verified TLS resource profile".into(),
+            ));
+        };
+        debug_assert!(httpd_rs_verified::tls_certificate_shape_admit(
+            count as u64,
+            bytes as u64,
+            self.budget,
+        ));
+        let admission = current_outbound_tls_admission().ok_or_else(|| {
+            RustlsError::General("upstream TLS verification has no resource owner".into())
+        })?;
+        admission.acquire(work_units, self.budget.workspace_bytes)?;
+        let result = self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        );
+        self.verification_failed(result)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        let result = self.inner.verify_tls12_signature(message, cert, dss);
+        self.verification_failed(result)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        let result = self.inner.verify_tls13_signature(message, cert, dss);
+        self.verification_failed(result)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
     }
 }
 
@@ -555,6 +749,7 @@ struct MemberHealth {
 #[derive(Clone)]
 struct HealthSpec {
     backend_identities: Arc<BackendIdentityRegistry>,
+    resource_budget: Arc<crate::resource::ResourceBudget>,
     key: String,
     url: String,
     method: String,
@@ -714,6 +909,7 @@ fn balancer_specs(cfg: &Config, balancer: &Balancer) -> Vec<HealthSpec> {
         let fails = member.hcfails.or(health.fails).unwrap_or(1);
         out.push(HealthSpec {
             backend_identities: Arc::clone(&cfg.backend_identities),
+            resource_budget: Arc::clone(&cfg.resource_budget),
             key: health_key(cfg.generation, &balancer.name, &member.url),
             url: member.url.clone(),
             method,
@@ -825,7 +1021,15 @@ fn check_health(spec: &HealthSpec) -> bool {
     scope.proxy_policy.proxy_ca_file = spec.ca_file.clone();
     scope.proxy_policy.proxy_ca_trust = spec.ca_trust;
     let timeout = Duration::from_secs(5);
-    let Ok(stream) = connect(&backend, &scope, &spec.backend_identities, timeout, None) else {
+    let context = spec.resource_budget.process_context();
+    let Ok(stream) = connect(
+        &backend,
+        &scope,
+        &spec.backend_identities,
+        timeout,
+        None,
+        &context,
+    ) else {
         return false;
     };
     check_health_stream(stream, spec, &backend)
@@ -2527,6 +2731,7 @@ async fn connect_async(
     backend_identities: &BackendIdentityRegistry,
     timeout: Duration,
     request_scope: Option<&crate::resource::RequestScope>,
+    resource_context: &crate::resource::ResourceContext,
 ) -> std::io::Result<Box<dyn AsyncReadWrite>> {
     let deadline = Instant::now() + timeout;
     let mut stream = None;
@@ -2559,7 +2764,7 @@ async fn connect_async(
     if !backend.tls {
         return Ok(Box::new(stream));
     }
-    admit_proxy_tls_dependency(&backend.host)?;
+    let _dependency = admit_proxy_tls_dependency(&backend.host)?;
     let name = tls_server_name(&backend.host)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad TLS host"))?;
     let connector = tokio_rustls::TlsConnector::from(client_config(scope)?);
@@ -2570,11 +2775,16 @@ async fn connect_async(
             "proxy connection timeout",
         ));
     }
-    let tls = tokio::time::timeout(remaining, connector.connect(name, stream))
-        .await
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timeout")
-        })??;
+    let admission = Arc::new(OutboundTlsAdmission::new(resource_context.clone()));
+    let result = ASYNC_OUTBOUND_TLS_ADMISSION
+        .scope(Arc::clone(&admission), async move {
+            tokio::time::timeout(remaining, connector.connect(name, stream)).await
+        })
+        .await;
+    admission.release();
+    let tls = result.map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timeout")
+    })??;
     Ok(Box::new(tls))
 }
 
@@ -2799,6 +3009,23 @@ where
     let client_ip = crate::access::canonical_ip(peer.ip());
     let _websocket_lease = cfg.resource_budget.try_websocket_for(client_ip)?;
     drop(general_connection);
+    #[cfg(test)]
+    let fallback_context;
+    let resource_context = match req.resource_context() {
+        Some(context) => context,
+        #[cfg(test)]
+        None => {
+            fallback_context = cfg.resource_budget.context(client_ip);
+            &fallback_context
+        }
+        #[cfg(not(test))]
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "websocket request has no resource owner",
+            ));
+        }
+    };
     let timeout = cfg.timeout.max(Duration::from_secs(5));
     let mut upstream = connect_async(
         &target.backend,
@@ -2806,6 +3033,7 @@ where
         &cfg.backend_identities,
         timeout,
         req.request_scope(),
+        resource_context,
     )
     .await?;
     // `Target::path` is the decoded authorization identity. Re-encode bytes
@@ -3029,9 +3257,15 @@ fn build_client_config(scope: &Scope) -> Result<Arc<rustls::ClientConfig>, Strin
     } else {
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
+    let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|error| format!("cannot build proxy TLS verifier: {error}"))?;
     let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
+        .with_webpki_verifier(Arc::clone(&verifier))
         .with_no_client_auth();
+    config
+        .dangerous()
+        .set_certificate_verifier(Arc::new(BoundedServerCertVerifier::new(verifier)));
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     config.enable_early_data = false;
     config.enable_secret_extraction = false;
@@ -3132,17 +3366,59 @@ fn connect(
     backend_identities: &BackendIdentityRegistry,
     timeout: Duration,
     request_scope: Option<&crate::resource::RequestScope>,
+    resource_context: &crate::resource::ResourceContext,
 ) -> std::io::Result<Box<dyn ReadWrite>> {
+    let deadline = Instant::now() + timeout;
     let tcp = connect_tcp(backend, backend_identities, timeout, request_scope)?;
     let inner: Box<dyn ReadWrite> = if !backend.tls {
         Box::new(tcp)
     } else {
-        admit_proxy_tls_dependency(&backend.host)?;
+        let _dependency = admit_proxy_tls_dependency(&backend.host)?;
         let name = tls_server_name(&backend.host)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad TLS host"))?;
-        let conn = ClientConnection::new(client_config(scope)?, name)
+        let mut conn = ClientConnection::new(client_config(scope)?, name)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Box::new(StreamOwned::new(conn, tcp))
+        let mut tcp = tcp;
+        let admission = Arc::new(OutboundTlsAdmission::new(resource_context.clone()));
+        let _admission_guard = enter_sync_outbound_tls_admission(Arc::clone(&admission));
+        let handshake = (|| {
+            while conn.is_handshaking() {
+                if request_scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "proxy request scope cancelled during TLS handshake",
+                    ));
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "TLS handshake timeout",
+                    ));
+                }
+                let quantum = remaining.min(Duration::from_secs(1));
+                tcp.set_read_timeout(Some(quantum))?;
+                tcp.set_write_timeout(Some(quantum))?;
+                match conn.complete_io(&mut tcp) {
+                    Ok((0, 0)) if conn.is_handshaking() => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "upstream closed during TLS handshake",
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) && Instant::now() < deadline => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(StreamOwned::new(conn, tcp))
+        })();
+        admission.release();
+        Box::new(handshake?)
     };
     Ok(inner)
 }
@@ -4217,6 +4493,7 @@ fn execute_with_proxy_identity(
                 &cfg.backend_identities,
                 remaining,
                 req.request_scope(),
+                resource_context,
             ) {
                 Ok(stream) => (Some(stream), None, true, None),
                 Err(error) => (None, None, false, Some(error)),
@@ -4470,6 +4747,98 @@ mod tests {
     use super::*;
     use crate::http::{Headers, Version};
     use std::path::Path;
+
+    #[derive(Debug)]
+    struct ObservingServerVerifier {
+        budget: Arc<crate::resource::ResourceBudget>,
+        observed_work: std::sync::atomic::AtomicU64,
+    }
+
+    impl ServerCertVerifier for ObservingServerVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, RustlsError> {
+            self.observed_work.store(
+                self.budget
+                    .slot_usage(crate::resource::SlotKind::TlsHandshake),
+                Ordering::Release,
+            );
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, RustlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, RustlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![SignatureScheme::ECDSA_NISTP256_SHA256]
+        }
+    }
+
+    #[test]
+    fn outbound_tls_shape_is_bounded_and_owned_before_webpki() {
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let context = budget.context("192.0.2.10".parse().unwrap());
+        let inner = Arc::new(ObservingServerVerifier {
+            budget: Arc::clone(&budget),
+            observed_work: std::sync::atomic::AtomicU64::new(0),
+        });
+        let verifier = BoundedServerCertVerifier::new(inner.clone());
+        let admission = Arc::new(OutboundTlsAdmission::new(context));
+        let _guard = enter_sync_outbound_tls_admission(Arc::clone(&admission));
+        let leaf = CertificateDer::from(vec![0u8; 1024]);
+        let intermediate = CertificateDer::from(vec![0u8; 1024]);
+        let name = ServerName::try_from("localhost").unwrap();
+        verifier
+            .verify_server_cert(&leaf, &[intermediate], &name, &[], UnixTime::now())
+            .unwrap();
+        // Two certificates plus one 8-KiB input quantum.
+        assert_eq!(inner.observed_work.load(Ordering::Acquire), 3);
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::TlsHandshake),
+            3
+        );
+        admission.release();
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::TlsHandshake),
+            0
+        );
+
+        let rejected_inner = Arc::new(ObservingServerVerifier {
+            budget: Arc::clone(&budget),
+            observed_work: std::sync::atomic::AtomicU64::new(0),
+        });
+        let rejected = BoundedServerCertVerifier::new(rejected_inner.clone());
+        let too_many: Vec<_> = (0..8).map(|_| CertificateDer::from(vec![0u8; 1])).collect();
+        assert!(matches!(
+            rejected.verify_server_cert(&leaf, &too_many, &name, &[], UnixTime::now()),
+            Err(RustlsError::General(message)) if message.contains("resource profile")
+        ));
+        assert_eq!(rejected_inner.observed_work.load(Ordering::Acquire), 0);
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::TlsHandshake),
+            0
+        );
+    }
 
     fn policy_path(value: &str) -> crate::request_plan::DecodedUrlPath {
         crate::request_plan::DecodedUrlPath::from_canonical(value)
@@ -6684,6 +7053,7 @@ mod coverage_tests {
     fn health_check_invalid_and_eof() {
         let spec = HealthSpec {
             backend_identities: Arc::new(test_backend_identities()),
+            resource_budget: Arc::new(crate::resource::ResourceBudget::default()),
             key: "k".into(),
             url: "ftp://invalid".into(),
             method: "GET".into(),
@@ -6766,6 +7136,7 @@ mod coverage_tests {
         });
         let spec = HealthSpec {
             backend_identities: Arc::new(test_backend_identities()),
+            resource_budget: Arc::new(crate::resource::ResourceBudget::default()),
             key: "tls-name".into(),
             url: format!("https://127.0.0.1:{port}/health"),
             method: "GET".into(),
@@ -7243,6 +7614,7 @@ mod coverage_tests {
     fn health_spec() -> HealthSpec {
         HealthSpec {
             backend_identities: Arc::new(test_backend_identities()),
+            resource_budget: Arc::new(crate::resource::ResourceBudget::default()),
             key: "k".into(),
             url: "http://127.0.0.1:1/health".into(),
             method: "HEAD".into(),
@@ -7369,12 +7741,15 @@ mod coverage_tests {
             base: "/".into(),
             tls: false,
         };
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let context = budget.context("127.0.0.1".parse().unwrap());
         let err = match connect_async(
             &backend,
             &Scope::default(),
             &test_backend_identities(),
             Duration::from_millis(100),
             None,
+            &context,
         )
         .await
         {
@@ -7398,12 +7773,15 @@ mod coverage_tests {
             base: "/".into(),
             tls: true,
         };
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let context = budget.context("127.0.0.1".parse().unwrap());
         let err = match connect_async(
             &backend,
             &Scope::default(),
             &test_backend_identities(),
             Duration::from_millis(50),
             None,
+            &context,
         )
         .await
         {
@@ -7412,6 +7790,89 @@ mod coverage_tests {
         };
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_tls_handshake_retains_and_releases_verification_owner() {
+        let dir =
+            std::env::temp_dir().join(format!("httpd-rs-proxy-async-tls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let status = std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=127.0.0.1",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1",
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
+                "-keyout",
+                key.to_str().unwrap(),
+                "-out",
+                cert.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("openssl");
+        assert!(status.success());
+
+        let chain = CertificateDer::pem_file_iter(&cert)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key_der = rustls::pki_types::PrivateKeyDer::from_pem_file(&key).unwrap();
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(chain, key_der)
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let connection = rustls::ServerConnection::new(server_config).unwrap();
+            let mut stream = rustls::StreamOwned::new(connection, tcp);
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte);
+        });
+        let backend = HttpBackend {
+            host: "127.0.0.1".into(),
+            port,
+            base: "/".into(),
+            tls: true,
+        };
+        let mut scope = Scope::default();
+        scope.proxy_policy.proxy_ca_file = Some(cert);
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let context = budget.context("192.0.2.10".parse().unwrap());
+        let stream = connect_async(
+            &backend,
+            &scope,
+            &test_backend_identities(),
+            Duration::from_secs(2),
+            None,
+            &context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            budget.slot_usage(crate::resource::SlotKind::TlsHandshake),
+            0
+        );
+        drop(stream);
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn websocket_target() -> Target {

@@ -1,0 +1,36 @@
+P43-A remediation replay
+date=2026-11-14
+binary=target/release/httpd-rs
+command=python3 adversarial/p43/exploit_p43.py
+requests=64 concurrency=8 sources=1
+control_status_counts={200: 64}
+control_wall_s=0.056531
+control_cpu_s=0.06
+attack_candidates=64
+attack_presented_der_bytes=31455
+attack_status_counts={502: 64}
+attack_wall_s=0.110090
+attack_cpu_s=0.06
+attack_cpu_per_request_ms=0.94
+server_exit=None
+
+Largest admitted shape replay
+command=P43_CANDIDATES=7 python3 adversarial/p43/exploit_p43.py
+requests=64 concurrency=8 sources=1
+control_status_counts={200: 64}
+control_wall_s=0.057798
+control_cpu_s=0.06
+attack_candidates=7
+attack_total_certificates=8
+attack_presented_der_bytes=3859
+attack_status_counts={502: 64}
+attack_wall_s=0.105412
+attack_cpu_s=0.25
+attack_cpu_per_request_ms=3.91
+server_exit=None
+
+Interpretation: the over-limit chain is rejected before webpki and consumes
+the same daemon CPU as the valid control. The largest admitted shape remains
+under the shape-weighted concurrency/rate owner. The valid control preserves
+the original retained 0.04-0.07 CPU-second behavior because the cached verifier
+identity continues to permit rustls session resumption.
