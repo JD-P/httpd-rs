@@ -1,0 +1,163 @@
+Pass 42 retained measurements
+=============================
+
+Reviewed source
+---------------
+
+HEAD and origin/main:
+  c73ec3b652b01696f8bb87a9abebaf0d1f49e5ea
+
+The release server was rebuilt before these runs:
+  cargo build --release -p httpd-rs
+
+The live harness uses loopback only. It enables the supported access-file
+capability, writes one `Require expr` rule under `AllowOverride AuthConfig`,
+and sends a 32-byte `X-P42` value that does not match. Every successful
+request therefore fails closed with 403.
+
+
+Live capture-count control
+--------------------------
+
+$ P42_ACCESS_FILE=1 P42_CAPTURES=0 P42_CLIENTS=4 \
+    python3 adversarial/p42/exploit_p42.py
+binary=/workspace/vapache/target/release/httpd-rs
+clients=4 requests_per_client=1
+address_space_limit_mib=none
+configuration_source=access-file
+pattern_bytes=29 captures=0 subject_bytes=32
+single_statuses=[403]
+concurrent_status_counts={403: 4, other: 0}
+client_errors=[]
+baseline_rss_kib=7028
+after_one_rss_kib=14412
+peak_rss_kib=19848
+after_concurrent_rss_kib=19856
+retained_growth_kib=5444
+elapsed_seconds=0.021
+server_exit=None
+
+$ P42_ACCESS_FILE=1 P42_CAPTURES=32 P42_CLIENTS=4 \
+    python3 adversarial/p42/exploit_p42.py
+binary=/workspace/vapache/target/release/httpd-rs
+clients=4 requests_per_client=1
+address_space_limit_mib=none
+configuration_source=access-file
+pattern_bytes=157 captures=32 subject_bytes=32
+single_statuses=[403]
+concurrent_status_counts={403: 4, other: 0}
+client_errors=[]
+baseline_rss_kib=7160
+after_one_rss_kib=40820
+peak_rss_kib=147876
+after_concurrent_rss_kib=147876
+retained_growth_kib=107056
+elapsed_seconds=0.168
+server_exit=None
+
+$ P42_ACCESS_FILE=1 python3 adversarial/p42/exploit_p42.py
+binary=/workspace/vapache/target/release/httpd-rs
+clients=4 requests_per_client=1
+address_space_limit_mib=none
+configuration_source=access-file
+pattern_bytes=509 captures=120 subject_bytes=32
+single_statuses=[403]
+concurrent_status_counts={403: 4, other: 0}
+client_errors=[]
+baseline_rss_kib=7100
+after_one_rss_kib=111952
+peak_rss_kib=503660
+after_concurrent_rss_kib=503664
+retained_growth_kib=391712
+elapsed_seconds=0.492
+server_exit=None
+
+The last run retains 496,564 KiB above the pre-request baseline. The one-cache
+warm request alone retains 104,852 KiB; four additional requests retain
+another 391,712 KiB. The process remains alive only because this run did not
+impose a memory ceiling.
+
+
+Sequential connection control
+-----------------------------
+
+$ P42_ACCESS_FILE=1 P42_CLIENTS=1 P42_REQUESTS_PER_CLIENT=8 \
+    python3 adversarial/p42/exploit_p42.py
+binary=/workspace/vapache/target/release/httpd-rs
+clients=1 requests_per_client=8
+address_space_limit_mib=none
+configuration_source=access-file
+pattern_bytes=509 captures=120 subject_bytes=32
+single_statuses=[403, 403, 403, 403, 403, 403, 403, 403]
+concurrent_status_counts={403: 8, other: 0}
+client_errors=[]
+baseline_rss_kib=7028
+after_one_rss_kib=503896
+peak_rss_kib=504960
+after_concurrent_rss_kib=504960
+retained_growth_kib=1064
+elapsed_seconds=1.156
+server_exit=None
+
+The first eight sequential connections are enough to populate the retained
+pool/shards to roughly the same 500 MiB high-water mark; parallel clients are
+not required for retention after the daemon distributes connections.
+
+
+Bounded-process outcome
+-----------------------
+
+$ P42_ACCESS_FILE=1 P42_AS_LIMIT_MIB=2700 P42_CLIENTS=1 \
+    python3 adversarial/p42/exploit_p42.py
+binary=/workspace/vapache/target/release/httpd-rs
+clients=1 requests_per_client=1
+address_space_limit_mib=2700
+configuration_source=access-file
+pattern_bytes=509 captures=120 subject_bytes=32
+single_statuses=[403]
+concurrent_status_counts={403: 0, other: 0}
+client_errors=['RemoteDisconnected: Remote end closed connection without response']
+baseline_rss_kib=7092
+after_one_rss_kib=111704
+peak_rss_kib=160824
+after_concurrent_rss_kib=0
+retained_growth_kib=-111704
+elapsed_seconds=0.056
+server_exit=-6
+server_output=memory allocation of 49824896 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+RLIMIT_AS is used only to turn the otherwise measured resident amplification
+into a deterministic allocator failure. The daemon needs unusually large
+virtual address headroom for its worker stacks, so 2.7 GiB is not an RSS
+claim. The security-relevant measurements are the `/proc` RSS deltas above;
+the bounded run confirms the release profile's allocation-failure outcome is
+whole-process SIGABRT rather than a fail-closed request error.
+
+
+Direct wrapper scaling probe
+----------------------------
+
+The small Rust probe shares one compiled httpd-rs PCRE2 wrapper across search
+threads. With one earlier search already retained, one additional search slot
+adds the following RSS as capture count rises (32-byte subject):
+
+  captures  pattern bytes  retained growth from one additional cache
+         0             29                                      1,272 KiB
+         1             33                                      2,060 KiB
+         8             61                                      7,604 KiB
+        16             93                                     13,940 KiB
+        32            157                                     26,672 KiB
+        64            285                                     52,316 KiB
+       120            509                                     97,820 KiB
+
+Invocation example:
+
+  P42_CAPTURES=120 P42_SUBJECT_BYTES=32 P42_THREADS=1 \
+    P42_ITERATIONS=1 cargo run --release \
+    --manifest-path adversarial/p42/regex_pool_probe/Cargo.toml
+
+The wrapper's declared default bounds are 5,718,016 bytes (5.453125 MiB) for
+`dependency_workspace_bound()` and 4,456,448 bytes (4.25 MiB) for a match.
+The measured 97,820 KiB additional cache is about 22.5 times the match-time
+claim before retained-pool multiplicity.

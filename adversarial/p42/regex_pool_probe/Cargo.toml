@@ -1,0 +1,9 @@
+[package]
+name = "p42-regex-pool-probe"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+httpd-rs-pcre2 = { path = "../../../crates/pcre2" }
+
+[workspace]
