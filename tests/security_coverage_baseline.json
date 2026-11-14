@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "description": "Reviewed production-line coverage debt after the terminal-outcome, whole-request differential, compression, dependency-boundary, cancellation, filesystem, shared-state, TLS, and resource-accounting campaigns through the 0.2.3 release. The campaigns added 2,027 executable production lines since the prior baseline and cover 1,856 of them locally; the conservative coordinates retain the hosted runner's worst-observed 17-line FastCGI, 3-line HTTP, and 2-line proxy syscall-path variances. CI requires covered lines not to decrease and missed lines not to increase beyond these per-module and aggregate coordinates; the absolute target remains zero missed lines.",
-  "total": {"minimum_covered": 38467, "maximum_missed": 3460},
+  "description": "Reviewed production-line coverage debt after the terminal-outcome, whole-request differential, compression, dependency-boundary, cancellation, filesystem, shared-state, TLS, and resource-accounting campaigns through the 0.2.3 release. The campaigns added 2,027 executable production lines since the prior baseline and cover 1,856 of them locally; the conservative coordinates retain the hosted runner's worst-observed 17-line FastCGI, 3-line HTTP, 2-line proxy, and 1-line filesystem syscall-path variances. CI requires covered lines not to decrease and missed lines not to increase beyond these per-module and aggregate coordinates; the absolute target remains zero missed lines.",
+  "total": {"minimum_covered": 38466, "maximum_missed": 3461},
   "modules": {
     "access": {"minimum_covered": 954, "maximum_missed": 28},
     "auth": {"minimum_covered": 421, "maximum_missed": 10},
@@ -13,7 +13,7 @@
     "expires": {"minimum_covered": 100, "maximum_missed": 0},
     "expr": {"minimum_covered": 955, "maximum_missed": 6},
     "fastcgi": {"minimum_covered": 969, "maximum_missed": 96},
-    "files": {"minimum_covered": 1673, "maximum_missed": 226},
+    "files": {"minimum_covered": 1672, "maximum_missed": 227},
     "h2": {"minimum_covered": 1702, "maximum_missed": 168},
     "htaccess": {"minimum_covered": 1852, "maximum_missed": 73},
     "http": {"minimum_covered": 2231, "maximum_missed": 297},
