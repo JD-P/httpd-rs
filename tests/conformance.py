@@ -3178,7 +3178,16 @@ class TlsTests(unittest.TestCase):
             if with_cert:
                 ctx.load_cert_chain(str(BASE / "client.pem"), str(BASE / "client.key"))
             sock = ctx.wrap_socket(
-                socket.create_connection(("127.0.0.1", VP_MTLS_PORT), timeout=5),
+                # mTLS carries the verified worst-case weight (16 units) in
+                # the source-fair handshake ledger. Keep its three-case
+                # matrix on a distinct loopback source so it verifies mTLS
+                # without consuming the ordinary-TLS matrix's 64-unit source
+                # window. Both sources still share the 128-unit process gate.
+                socket.create_connection(
+                    ("127.0.0.1", VP_MTLS_PORT),
+                    timeout=5,
+                    source_address=("127.0.0.2", 0),
+                ),
                 server_hostname="localhost",
             )
             try:

@@ -116,7 +116,20 @@ jobs:
       - name: Compile and smoke every fuzz target
         env:
           FUZZ_SMOKE_RUNS: 128
-        run: tests/fuzz_smoke.sh
+          FUZZ_SMOKE_SEED: 246813579
+        run: |
+          set -o pipefail
+          tests/fuzz_smoke.sh 2>&1 | tee fuzz-smoke.log
+      - name: Retain fuzz-smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-smoke-findings-${{ github.run_id }}
+          path: |
+            fuzz-smoke.log
+            fuzz/artifacts/
+          if-no-files-found: warn
+          retention-days: 14
 
   supply-chain:
     runs-on: ubuntu-24.04

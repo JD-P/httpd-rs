@@ -5059,6 +5059,42 @@
         "glob_match_resource_admit",
         "bounded_expansion_append_admit"
       ],
+      "code": "for cache in &self.0.caches {",
+      "effect": "cpu-iteration",
+      "function": "for_search",
+      "id": "6e49556e698e3ddc11fc",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": ".lock()",
+      "effect": "synchronization",
+      "function": "for_search",
+      "id": "852aac1defe3340feee3",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
       "code": "let close = bytes[start + 2..].iter().position(|&byte| byte == b')')? + start + 2;",
       "effect": "cpu-iteration",
       "function": "global_option_group_end",
@@ -5434,10 +5470,46 @@
         "glob_match_resource_admit",
         "bounded_expansion_append_admit"
       ],
-      "code": "Self(Arc::new(BoundedEngineInner { engine }))",
+      "code": "Self(Arc::new(BoundedEngineInner {",
       "effect": "heap-allocation",
       "function": "new",
-      "id": "10d27ec430a07ebc1531",
+      "id": "1d9787d1704cc331f421",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": ".collect();",
+      "effect": "heap-allocation",
+      "function": "new",
+      "id": "89ea0c604959839ab90b",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": ".map(|_| Mutex::new(engine.create_cache()))",
+      "effect": "synchronization",
+      "function": "new",
+      "id": "2497a12fba31e6f67734",
       "path": "crates/pcre2/src/lib.rs",
       "status": "review-required"
     },
@@ -51667,6 +51739,25 @@
     },
     {
       "accounting_evidence": [
+        "reserve",
+        "limit"
+      ],
+      "closure_contract": "inferred-audited-gateway",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (reserve, limit)",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "request_resource_effect_closure"
+      ],
+      "code": ".reserve(additional, \"dependency workspace limit reached\")",
+      "effect": "data-growth",
+      "function": "reserve_more",
+      "id": "ee4d9a73425c4b3c443c",
+      "path": "crates/server/src/resource.rs",
+      "status": "audited-gateway"
+    },
+    {
+      "accounting_evidence": [
         "limit"
       ],
       "closure_contract": "inferred-audited-gateway",
@@ -65559,33 +65650,33 @@
       "status": "external-source-inventory"
     }
   ],
-  "source_sha256": "ba27d1b10c1a104ddd4c44a7813964bc0f2de373b1f3f69b536f28151b3a6a3c",
+  "source_sha256": "651e7e97169563a987ee96f784d57f5497210ecc12f4f0de46a7ae5f325c5753",
   "summary": {
     "by_closure_disposition": {
       "external-assumption": 448,
-      "proved-constant-bound": 667,
-      "typed-lease": 2240
+      "proved-constant-bound": 671,
+      "typed-lease": 2241
     },
     "by_effect": {
       "compression-regex-crypto": 69,
-      "cpu-iteration": 921,
-      "data-growth": 440,
+      "cpu-iteration": 922,
+      "data-growth": 441,
       "filesystem": 135,
-      "heap-allocation": 1069,
+      "heap-allocation": 1070,
       "network": 35,
-      "synchronization": 279,
+      "synchronization": 281,
       "task-process": 46,
       "unsafe-ffi-syscall": 361
     },
     "by_status": {
       "accounted-context": 700,
       "accounting-boundary": 63,
-      "audited-gateway": 324,
+      "audited-gateway": 325,
       "external-source-inventory": 196,
       "local-bound-candidate": 14,
-      "review-required": 2058
+      "review-required": 2062
     },
-    "effect_sites": 3355,
+    "effect_sites": 3360,
     "files": 56,
     "unclassified_effect_sites": 0
   }

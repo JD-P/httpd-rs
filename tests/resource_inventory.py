@@ -102,8 +102,9 @@ DEPENDENCY_BOUNDARY_CONTRACTS = {
         ("crates/pcre2/src/lib.rs", "regex_match_resource_admit"),
         ("crates/pcre2/src/lib.rs", "checked_mul"),
     ),
-    ("crates/server/src/htaccess.rs", "with_compile_budget("): (
+    ("crates/server/src/htaccess.rs", "with_accounted_compile_budget("): (
         ("crates/server/src/apache_regex.rs", "dependency_workspace_bound"),
+        ("crates/server/src/apache_regex.rs", "reserve_more"),
         ("crates/server/src/htaccess.rs", "dependency_bytes"),
         ("crates/server/src/htaccess.rs", "try_dependency_workspace"),
         ("crates/server/src/htaccess.rs", "MAX_ACCESS_CACHE_BYTES"),

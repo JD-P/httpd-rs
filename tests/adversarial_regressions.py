@@ -395,15 +395,17 @@ class F23ToF38Tests(unittest.TestCase):
         )
         (cls.www / "map-helper.cgi").chmod(0o755)
         (cls.www / "admin.include").write_text("# P39-INCLUDED-CONFIG-SECRET\n")
-        (cls.www / "public.htpasswd").write_text("alice:{SHA}placeholder\n")
+        valid_sha = base64.b64encode(hashlib.sha1(b"publicpw").digest()).decode()
+        valid_password_line = f"alice:{{SHA}}{valid_sha}\n"
+        (cls.www / "public.htpasswd").write_text(valid_password_line)
         (cls.www / "public.htgroup").write_text("admins: alice\n")
-        (cls.www / "admin-fastcgi.php").write_text("alice:{SHA}placeholder\n")
+        (cls.www / "admin-fastcgi.php").write_text(valid_password_line)
         (cls.www / "admin-index" / ".htaccess").write_text(
             "# P39-DIRECTORY-INDEX-SECRET\n"
         )
         (cls.www / "access-link").symlink_to(".htaccess")
         os.link(cls.www / ".htaccess", cls.www / "access-hardlink")
-        (cls.www / "access-users.db").write_text("alice:{SHA}placeholder\n")
+        (cls.www / "access-users.db").write_text(valid_password_line)
         (cls.www / "access-auth" / "protected.txt").write_text("protected\n")
         (cls.www / "access-auth" / ".htaccess").write_text(
             "AuthType Basic\n"
@@ -411,9 +413,7 @@ class F23ToF38Tests(unittest.TestCase):
             f'AuthUserFile "{cls.www / "access-users.db"}"\n'
             "Require valid-user\n"
         )
-        (cls.www / "access-local" / "local-users.db").write_text(
-            "alice:{SHA}placeholder\n"
-        )
+        (cls.www / "access-local" / "local-users.db").write_text(valid_password_line)
         (cls.www / "access-local" / "protected.txt").write_text("protected\n")
         (cls.www / "access-local" / ".htaccess").write_text(
             "AuthType Basic\n"

@@ -13,9 +13,9 @@ name = "httpd-rs"
 path = "src/main.rs"
 
 [dependencies]
-httpd-rs-os = { path = "../os", version = "0.2.2" }
-httpd-rs-verified = { path = "../verified", version = "0.2.2" }
-httpd-rs-pcre2 = { path = "../pcre2", version = "0.2.2" }
+httpd-rs-os = { path = "../os", version = "0.2.3" }
+httpd-rs-verified = { path = "../verified", version = "0.2.3" }
+httpd-rs-pcre2 = { path = "../pcre2", version = "0.2.3" }
 libc = "0.2"
 rustix = { version = "1", features = ["event", "fs", "net"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

@@ -1114,17 +1114,16 @@ fn parse_access_bytes(
     nonfatal: NonfatalMode,
     identity: &crate::request_plan::LayerIdentity,
 ) -> Result<Parsed, String> {
-    let mut dependency_lease = cfg
+    let dependency_lease = cfg
         .resource_budget
-        .try_dependency_workspace(MAX_ACCESS_CACHE_BYTES as u64)
+        .try_dependency_workspace(0)
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    let (mut parsed, dependency_bytes) =
-        crate::apache_regex::with_compile_budget(MAX_ACCESS_CACHE_BYTES, || {
-            parse_access_bytes_inner(cfg, path, data, mode, allow_list, nonfatal, identity)
-        })?;
-    dependency_lease
-        .shrink_to(dependency_bytes as u64)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let (mut parsed, dependency_bytes, dependency_lease) =
+        crate::apache_regex::with_accounted_compile_budget(
+            MAX_ACCESS_CACHE_BYTES,
+            dependency_lease,
+            || parse_access_bytes_inner(cfg, path, data, mode, allow_list, nonfatal, identity),
+        )?;
     parsed.dependency_bytes = dependency_bytes;
     parsed._dependency_lease = Some(dependency_lease);
     Ok(parsed)

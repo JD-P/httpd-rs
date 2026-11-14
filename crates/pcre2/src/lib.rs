@@ -15,10 +15,13 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Index;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use regex_automata::{
-    meta::Regex as AutomataRegex, util::primitives::NonMaxUsize, Input, MatchKind, PatternID,
+    meta::{Cache as AutomataCache, Regex as AutomataRegex},
+    util::primitives::NonMaxUsize,
+    Input, MatchKind, PatternID,
 };
 use smallvec::SmallVec;
 
@@ -29,6 +32,7 @@ const DEFAULT_CAPTURE_LIMIT: usize = 128;
 const DEFAULT_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 const DEFAULT_NEST_LIMIT: u32 = 64;
 const HYBRID_CACHE_CAPACITY: usize = 256 * 1024;
+const SEARCH_CACHE_POOL_CAPACITY: usize = 4;
 const DEPENDENCY_FIXED_OVERHEAD: usize = 64 * 1024;
 const DEPENDENCY_PATTERN_EXPANSION_FACTOR: usize = 18;
 const DEPENDENCY_CAPTURE_OVERHEAD: usize = 128;
@@ -270,6 +274,46 @@ pub mod bytes {
                 .pattern_names(PatternID::ZERO)
                 .map(|name| name.map(ToOwned::to_owned))
                 .collect();
+            // `memory_usage` covers the immutable automata. Searches may also
+            // populate one bounded lazy-DFA cache, while the compatibility
+            // wrapper retains the original and translated patterns plus
+            // capture metadata. Keep this per-program bound separate from the
+            // builder's deliberately pessimistic pre-compilation ceiling so a
+            // layered configuration is charged for what it actually retains.
+            let retained_workspace_bound = engine
+                .memory_usage()
+                .checked_add(
+                    engine
+                        .create_cache()
+                        .memory_usage()
+                        .checked_add(HYBRID_CACHE_CAPACITY)
+                        .and_then(|bytes| bytes.checked_mul(SEARCH_CACHE_POOL_CAPACITY))
+                        .ok_or_else(|| {
+                            Error::resource("regex search-cache workspace bound overflow")
+                        })?,
+                )
+                .and_then(|bytes| {
+                    pattern
+                        .len()
+                        .checked_add(translation.pattern.len())
+                        .and_then(|pattern_bytes| {
+                            pattern_bytes.checked_mul(DEPENDENCY_PATTERN_EXPANSION_FACTOR)
+                        })
+                        .and_then(|pattern_bytes| bytes.checked_add(pattern_bytes))
+                })
+                .and_then(|bytes| {
+                    inner_names
+                        .len()
+                        .checked_mul(DEPENDENCY_CAPTURE_OVERHEAD)
+                        .and_then(|capture_bytes| bytes.checked_add(capture_bytes))
+                })
+                .and_then(|bytes| bytes.checked_add(DEPENDENCY_FIXED_OVERHEAD))
+                .ok_or_else(|| Error::resource("regex retained workspace bound overflow"))?;
+            if retained_workspace_bound > workspace_bound {
+                return Err(Error::resource(
+                    "regex retained workspace exceeds its compilation boundary",
+                ));
+            }
             let mut public_to_inner = vec![0];
             let mut keep_groups = Vec::new();
             let mut capture_names = vec![None];
@@ -306,6 +350,7 @@ pub mod bytes {
                 pattern: pattern.to_owned(),
                 translated_pattern: translation.pattern,
                 complexity,
+                retained_workspace_bound,
                 final_newline_fallback: translation.final_newline_fallback,
                 inner: BoundedEngine::new(engine),
                 public_to_inner: Arc::new(public_to_inner),
@@ -419,7 +464,13 @@ pub mod bytes {
             self.config
                 .size_limit
                 .checked_mul(2)?
-                .checked_add(HYBRID_CACHE_CAPACITY)?
+                .checked_add(
+                    self.config
+                        .size_limit
+                        .checked_mul(2)?
+                        .checked_add(HYBRID_CACHE_CAPACITY)?
+                        .checked_mul(SEARCH_CACHE_POOL_CAPACITY)?,
+                )?
                 .checked_add(
                     self.config
                         .pattern_limit
@@ -462,6 +513,7 @@ pub mod bytes {
         pattern: String,
         translated_pattern: String,
         complexity: u64,
+        retained_workspace_bound: usize,
         final_newline_fallback: bool,
         inner: BoundedEngine,
         public_to_inner: Arc<Vec<usize>>,
@@ -480,15 +532,53 @@ pub mod bytes {
 
     struct BoundedEngineInner {
         engine: AutomataRegex,
+        caches: Vec<Mutex<AutomataCache>>,
+        next_cache: AtomicUsize,
+    }
+
+    struct BoundedSearch<'a> {
+        engine: &'a AutomataRegex,
+        cache: MutexGuard<'a, AutomataCache>,
     }
 
     impl BoundedEngine {
         fn new(engine: AutomataRegex) -> Self {
-            Self(Arc::new(BoundedEngineInner { engine }))
+            let caches = (0..SEARCH_CACHE_POOL_CAPACITY)
+                .map(|_| Mutex::new(engine.create_cache()))
+                .collect();
+            Self(Arc::new(BoundedEngineInner {
+                engine,
+                caches,
+                next_cache: AtomicUsize::new(0),
+            }))
         }
 
-        fn for_search(&self) -> &AutomataRegex {
-            &self.0.engine
+        fn for_search(&self) -> BoundedSearch<'_> {
+            for cache in &self.0.caches {
+                match cache.try_lock() {
+                    Ok(cache) => {
+                        return BoundedSearch {
+                            engine: &self.0.engine,
+                            cache,
+                        }
+                    }
+                    Err(TryLockError::Poisoned(error)) => {
+                        return BoundedSearch {
+                            engine: &self.0.engine,
+                            cache: error.into_inner(),
+                        }
+                    }
+                    Err(TryLockError::WouldBlock) => {}
+                }
+            }
+            let index = self.0.next_cache.fetch_add(1, Ordering::Relaxed) % self.0.caches.len();
+            let cache = self.0.caches[index]
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            BoundedSearch {
+                engine: &self.0.engine,
+                cache,
+            }
         }
     }
 
@@ -501,6 +591,12 @@ pub mod bytes {
     impl Regex {
         pub fn new(pattern: &str) -> Result<Self, Error> {
             RegexBuilder::new().build(pattern)
+        }
+
+        /// Conservative heap/cache bytes retained by this compiled program.
+        /// This is always no larger than the builder's pre-entry ceiling.
+        pub fn dependency_workspace_bound(&self) -> usize {
+            self.retained_workspace_bound
         }
 
         fn check_subject(&self, subject: &[u8], start: usize) -> Result<(), Error> {
@@ -622,11 +718,11 @@ pub mod bytes {
         ) -> Result<Option<CaptureSpans>, Error> {
             self.check_subject(subject, start)?;
             let start = self.normalized_search_start(subject, start);
-            let engine = self.inner.for_search();
+            let BoundedSearch { engine, mut cache } = self.inner.for_search();
             if self.public_to_inner.len() == 1 && self.keep_groups.is_empty() {
-                return Ok(self.group_zero_spans(engine, subject, start));
+                return Ok(self.group_zero_spans(engine, &mut cache, subject, start));
             }
-            let full = Self::engine_captures_at(engine, subject, start);
+            let full = Self::engine_captures_at(engine, &mut cache, subject, start);
             let mut trimmed = None;
             if self.final_newline_fallback {
                 let trim = if self.config.crlf && subject.ends_with(b"\r\n") {
@@ -638,8 +734,12 @@ pub mod bytes {
                     0
                 };
                 if trim > 0 && start <= subject.len() - trim {
-                    trimmed =
-                        Self::engine_captures_at(engine, &subject[..subject.len() - trim], start);
+                    trimmed = Self::engine_captures_at(
+                        engine,
+                        &mut cache,
+                        &subject[..subject.len() - trim],
+                        start,
+                    );
                 }
             }
             // PCRE2 exposes both end-of-subject and pre-final-newline anchor
@@ -687,11 +787,12 @@ pub mod bytes {
         fn group_zero_spans(
             &self,
             engine: &AutomataRegex,
+            cache: &mut AutomataCache,
             subject: &[u8],
             start: usize,
         ) -> Option<CaptureSpans> {
             let full = engine
-                .search(&Input::new(subject).span(start..subject.len()))
+                .search_with(cache, &Input::new(subject).span(start..subject.len()))
                 .map(|matched| (matched.start(), matched.end()));
             let mut trimmed = None;
             if self.final_newline_fallback {
@@ -705,7 +806,8 @@ pub mod bytes {
                 };
                 if trim > 0 && start <= subject.len() - trim {
                     trimmed = engine
-                        .search(
+                        .search_with(
+                            cache,
                             &Input::new(&subject[..subject.len() - trim])
                                 .span(start..subject.len() - trim),
                         )
@@ -738,11 +840,16 @@ pub mod bytes {
 
         fn engine_captures_at(
             engine: &AutomataRegex,
+            cache: &mut AutomataCache,
             subject: &[u8],
             start: usize,
         ) -> Option<EngineSlots> {
             let mut slots = EngineSlots::from_elem(None, engine.group_info().slot_len());
-            engine.search_slots(&Input::new(subject).span(start..subject.len()), &mut slots)?;
+            engine.search_slots_with(
+                cache,
+                &Input::new(subject).span(start..subject.len()),
+                &mut slots,
+            )?;
             Some(slots)
         }
 
@@ -3333,6 +3440,16 @@ mod tests {
             regex.is_match(b"aaaa").unwrap_err().kind(),
             ErrorKind::ResourceLimit
         );
+    }
+
+    #[test]
+    fn retained_workspace_is_bounded_below_the_precompile_ceiling() {
+        let mut builder = RegexBuilder::new();
+        builder.max_pattern_size(8190).size_limit(256 * 1024);
+        let precompile = builder.dependency_workspace_bound().unwrap();
+        let regex = builder.build(r"^(?<name>[a-z]+)\.txt$").unwrap();
+        assert!(regex.dependency_workspace_bound() <= precompile);
+        assert!(regex.dependency_workspace_bound() < precompile / 2);
     }
 
     #[test]

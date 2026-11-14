@@ -3369,6 +3369,11 @@ pub(crate) struct TlsHandshakeLease {
 }
 
 impl DependencyWorkspaceLease {
+    pub(crate) fn reserve_more(&mut self, additional: u64) -> io::Result<()> {
+        self.bytes
+            .reserve(additional, "dependency workspace limit reached")
+    }
+
     pub(crate) fn shrink_to(&mut self, retained: u64) -> io::Result<()> {
         if retained > self.bytes.bytes {
             return Err(io::Error::new(

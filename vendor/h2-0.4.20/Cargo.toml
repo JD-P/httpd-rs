@@ -114,7 +114,7 @@ features = ["std"]
 default-features = false
 
 [dependencies.httpd-rs-verified]
-version = "0.2.2"
+version = "0.2.3"
 path = "../../crates/verified"
 
 [dev-dependencies.env_logger]

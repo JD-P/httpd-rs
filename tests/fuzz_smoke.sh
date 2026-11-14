@@ -11,6 +11,10 @@ cargo +"$NIGHTLY" --version >/dev/null
 cargo check --manifest-path fuzz/Cargo.toml
 
 runs=${FUZZ_SMOKE_RUNS:-64}
+# Keep the presubmit campaign reproducible. Sustained nightly and long-fuzz
+# campaigns deliberately vary their seeds; this gate should replay the same
+# mutation schedule so a failure can be reproduced from the Actions command.
+seed=${FUZZ_SMOKE_SEED:-246813579}
 # The P24-A UTF-8 boundary crash took a sustained campaign to discover. Keep
 # its artifact in the corpus and give the expression parser enough mutations
 # to exercise adjacent delimiter/string shapes in the ordinary smoke gate.
@@ -58,6 +62,8 @@ for target in $targets; do
             target_max_len=96
             ;;
     esac
+    echo "fuzz-smoke: target=$target seed=$seed runs=$target_runs max_len=$target_max_len"
     cargo +"$NIGHTLY" fuzz run "$target" "$corpus_root/$target" -- \
-        -runs="$target_runs" -timeout=5 -max_len="$target_max_len" $dictionary
+        -seed="$seed" -runs="$target_runs" -timeout=5 \
+        -max_len="$target_max_len" $dictionary
 done

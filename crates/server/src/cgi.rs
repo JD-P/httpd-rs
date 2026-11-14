@@ -2875,6 +2875,18 @@ mod tests {
         };
         shutdown_pool_inner(&pool);
         assert!(pool.workers.lock().unwrap().is_empty());
+
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let child = Command::new("/bin/true").spawn().unwrap();
+        let no_factory = CgiPool {
+            workers: Mutex::new(Vec::new()),
+            ready: Condvar::new(),
+            closed: AtomicBool::new(false),
+            factory: None,
+            replacement: Mutex::new(()),
+        };
+        no_factory.retire(CgiWorker { stream, child });
+        assert!(no_factory.workers.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2894,7 +2906,26 @@ mod tests {
             1,
             "retiring a desynchronized worker must replenish the pool"
         );
+
+        #[cfg(feature = "fault-injection")]
+        {
+            let worker = pool.take().expect("replacement worker disappeared");
+            crate::fault::configure("cgi.worker.spawn", 0, std::io::ErrorKind::PermissionDenied);
+            pool.retire(worker);
+            crate::fault::clear();
+            assert!(
+                pool.workers.lock().unwrap().is_empty(),
+                "a failed replacement must not retain a dead worker"
+            );
+        }
         shutdown_pool_inner(&pool);
+
+        let closing = start_pool_with_exe(&good, 0, 0, "root", 1).unwrap();
+        let worker = closing.take().expect("started pool lost its worker");
+        closing.closed.store(true, Ordering::Release);
+        closing.retire(worker);
+        assert!(closing.workers.lock().unwrap().is_empty());
+        shutdown_pool_inner(&closing);
 
         let bad = script(&dir, "worker-bad.sh", "#!/bin/sh\nprintf '\\2' >&3\n");
         assert!(start_pool_with_exe(&bad, 0, 0, "root", 1).is_err());
@@ -2931,6 +2962,26 @@ mod tests {
             replacement: Mutex::new(()),
         };
         let resource_context = cfg.resource_budget.context("127.0.0.1".parse().unwrap());
+
+        let unrelated_budget = std::sync::Arc::new(crate::resource::ResourceBudget::default());
+        let unrelated_context = unrelated_budget.context("127.0.0.1".parse().unwrap());
+        let resp = execute_via_pool(
+            &pool,
+            &ctx,
+            &path,
+            &dir,
+            &[],
+            &BodySource::Bytes(Vec::new()),
+            None,
+            &unrelated_context,
+        );
+        assert_eq!(resp.status, 503);
+        assert_eq!(
+            pool.workers.lock().unwrap().len(),
+            1,
+            "pre-exchange admission failure must return the synchronized worker"
+        );
+
         let resp = execute_via_pool(
             &pool,
             &ctx,

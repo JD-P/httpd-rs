@@ -4334,6 +4334,24 @@ mod tests {
     }
 
     #[test]
+    fn directory_index_policy_budget_failure_is_terminal() {
+        let (root, mut cfg) = config("directory-index-policy-budget");
+        cfg.directory_index = vec!["index.html".into()];
+        let scope = Scope::default();
+        let req = request("GET", b"/");
+        req.charge_policy_work(crate::resource::MAX_POLICY_WORK_UNITS)
+            .unwrap();
+        let dir = File::open(&root).unwrap();
+
+        assert!(configured_directory_index(&cfg, &scope, &req, &dir, true, false).is_err());
+        assert!(matches!(
+            directory_action(&cfg, &scope, &req, &dir, "/", b"/", true, false),
+            DirAction::Overloaded
+        ));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn autoindex_does_not_follow_disallowed_symlink_for_metadata() {
         let (root, cfg) = config("autoindex-symlink-metadata");
         let listed = root.join("listed");

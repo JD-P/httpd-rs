@@ -10,10 +10,10 @@ use std::cell::RefCell;
 const APACHE_REGEX_PATTERN_LIMIT: usize = 8190;
 const APACHE_REGEX_AUTOMATA_LIMIT: usize = 256 * 1024;
 
-#[derive(Clone, Copy)]
 struct CompileBudget {
     limit: usize,
     used: usize,
+    dependency_lease: Option<crate::resource::DependencyWorkspaceLease>,
 }
 
 thread_local! {
@@ -32,12 +32,41 @@ impl Drop for CompileBudgetScope {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn with_compile_budget<T>(
     limit: usize,
     operation: impl FnOnce() -> Result<T, String>,
 ) -> Result<(T, usize), String> {
-    let previous =
-        COMPILE_BUDGET.with(|budget| budget.replace(Some(CompileBudget { limit, used: 0 })));
+    let (value, used, _) = with_compile_budget_inner(limit, None, operation)?;
+    Ok((value, used))
+}
+
+pub(crate) fn with_accounted_compile_budget<T>(
+    limit: usize,
+    dependency_lease: crate::resource::DependencyWorkspaceLease,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, usize, crate::resource::DependencyWorkspaceLease), String> {
+    let (value, used, dependency_lease) =
+        with_compile_budget_inner(limit, Some(dependency_lease), operation)?;
+    Ok((
+        value,
+        used,
+        dependency_lease.expect("accounted compile scope retains its lease"),
+    ))
+}
+
+fn with_compile_budget_inner<T>(
+    limit: usize,
+    dependency_lease: Option<crate::resource::DependencyWorkspaceLease>,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, usize, Option<crate::resource::DependencyWorkspaceLease>), String> {
+    let previous = COMPILE_BUDGET.with(|budget| {
+        budget.replace(Some(CompileBudget {
+            limit,
+            used: 0,
+            dependency_lease,
+        }))
+    });
     if previous.is_some() {
         COMPILE_BUDGET.with(|budget| {
             budget.replace(previous);
@@ -45,26 +74,32 @@ pub(crate) fn with_compile_budget<T>(
         return Err("nested regex dependency compilation boundary".into());
     }
     let scope = CompileBudgetScope { previous: None };
-    let value = operation()?;
-    let used = COMPILE_BUDGET.with(|budget| budget.borrow().as_ref().map_or(0, |b| b.used));
+    let value = operation();
+    let current = COMPILE_BUDGET.with(|budget| budget.replace(None));
     drop(scope);
-    Ok((value, used))
+    let current = current.expect("compile budget scope remains installed");
+    Ok((value?, current.used, current.dependency_lease))
 }
 
-fn reserve_compile_workspace(bytes: usize) -> bool {
+fn reserve_compile_workspace(bytes: usize) -> Result<(), String> {
     COMPILE_BUDGET.with(|budget| {
         let mut budget = budget.borrow_mut();
         let Some(budget) = budget.as_mut() else {
-            return true;
+            return Ok(());
         };
         let Some(next) = budget.used.checked_add(bytes) else {
-            return false;
+            return Err("aggregate regex dependency workspace overflow".into());
         };
         if next > budget.limit {
-            return false;
+            return Err("aggregate regex dependency workspace limit reached".into());
+        }
+        if let Some(lease) = budget.dependency_lease.as_mut() {
+            lease
+                .reserve_more(bytes as u64)
+                .map_err(|error| error.to_string())?;
         }
         budget.used = next;
-        true
+        Ok(())
     })
 }
 
@@ -72,6 +107,11 @@ fn release_compile_workspace(bytes: usize) {
     COMPILE_BUDGET.with(|budget| {
         if let Some(budget) = budget.borrow_mut().as_mut() {
             budget.used = budget.used.saturating_sub(bytes);
+            if let Some(lease) = budget.dependency_lease.as_mut() {
+                lease
+                    .shrink_to(budget.used as u64)
+                    .expect("compile workspace release only shrinks its lease");
+            }
         }
     });
 }
@@ -97,11 +137,17 @@ impl Regex {
         let workspace = builder
             .dependency_workspace_bound()
             .ok_or_else(|| "regex dependency workspace bound overflow".to_string())?;
-        if !reserve_compile_workspace(workspace) {
-            return Err("aggregate regex dependency workspace limit reached".into());
-        }
+        reserve_compile_workspace(workspace)?;
         match builder.build(pattern) {
-            Ok(inner) => Ok(Self { inner }),
+            Ok(inner) => {
+                let retained = inner.dependency_workspace_bound();
+                if retained > workspace {
+                    release_compile_workspace(workspace);
+                    return Err("regex retained workspace exceeds compilation boundary".into());
+                }
+                release_compile_workspace(workspace - retained);
+                Ok(Self { inner })
+            }
             Err(error) => {
                 release_compile_workspace(workspace);
                 Err(error.to_string())
