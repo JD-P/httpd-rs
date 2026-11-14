@@ -74,6 +74,16 @@ MODULES = [
 ENFORCED = {name for name, _, _ in MODULES}
 
 
+def github_error(message: str) -> None:
+    """Expose ratchet details through the Checks API as well as job logs."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    escaped = (
+        message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    )
+    print(f"::error title=Production coverage ratchet::{escaped}")
+
+
 def load_baseline() -> tuple[dict[str, dict[str, int]], dict[str, int]]:
     try:
         document = json.loads(BASELINE.read_text())
@@ -340,6 +350,8 @@ def main() -> int:
         record = next((v for k, v in data.items() if k.endswith(suffix)), None)
         if record is None:
             print(f"{name:12} {'-':>7} {'-':>7} {'-':>8}   missing from profile")
+            if args.check or args.strict:
+                github_error(f"{name}: production module is missing from the profile")
             failed = failed or name in ENFORCED
             continue
         total, missed = production_lines(source, record)
@@ -359,11 +371,20 @@ def main() -> int:
         if args.strict and cover < required:
             status = "FAIL strict"
             failed = True
+            github_error(
+                f"{name}: {covered}/{total} production lines covered; "
+                f"strict coverage requires {required:.2f}%"
+            )
         elif args.check and regressed:
             missed_delta = missed - limits["maximum_missed"]
             covered_delta = covered - limits["minimum_covered"]
             status = f"FAIL debt {missed_delta:+d}, covered {covered_delta:+d}"
             failed = True
+            github_error(
+                f"{name}: {covered} covered and {missed} missed; baseline requires "
+                f">= {limits['minimum_covered']} covered and "
+                f"<= {limits['maximum_missed']} missed"
+            )
         elif improved:
             status = "improved"
         elif missed == 0:
@@ -380,11 +401,20 @@ def main() -> int:
     )
     if args.strict and total_missed:
         total_status = "FAIL strict"
+        github_error(
+            f"aggregate: {total_covered}/{total_lines} production lines covered; "
+            "strict coverage requires 100%"
+        )
     elif args.check and total_regressed:
         missed_delta = total_missed - aggregate_baseline["maximum_missed"]
         covered_delta = total_covered - aggregate_baseline["minimum_covered"]
         total_status = f"FAIL debt {missed_delta:+d}, covered {covered_delta:+d}"
         failed = True
+        github_error(
+            f"aggregate: {total_covered} covered and {total_missed} missed; "
+            f"baseline requires >= {aggregate_baseline['minimum_covered']} covered "
+            f"and <= {aggregate_baseline['maximum_missed']} missed"
+        )
     elif (
         total_missed < aggregate_baseline["maximum_missed"]
         or total_covered > aggregate_baseline["minimum_covered"]
