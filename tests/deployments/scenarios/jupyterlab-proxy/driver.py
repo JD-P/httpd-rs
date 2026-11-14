@@ -75,7 +75,7 @@ def open_websocket(port: int, path: str) -> socket.socket:
     stream.settimeout(30)
     # RFC 6455 requires the decoded nonce to be exactly 16 bytes.  httpd-rs
     # deliberately refuses to enter tunnel mode for malformed upgrade keys.
-    key = base64.b64encode(b"httpd-rs-jupyter!").decode()
+    key = base64.b64encode(b"httpd-rs-jupyter").decode()
     head = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: 127.0.0.1:{port}\r\n"
@@ -149,16 +149,26 @@ def execute_marker(stream: socket.socket) -> None:
         "buffers": [],
     }
     send_frame(stream, 0x1, json.dumps(message, separators=(",", ":")).encode())
-    for _ in range(100):
-        opcode, payload = read_frame(stream)
+    deadline = time.monotonic() + 30
+    observed: list[tuple[int, bytes]] = []
+    while time.monotonic() < deadline and len(observed) < 100:
+        stream.settimeout(max(0.1, deadline - time.monotonic()))
+        try:
+            opcode, payload = read_frame(stream)
+        except TimeoutError:
+            break
+        observed.append((opcode, payload[:160]))
         if opcode == 0x9:
             send_frame(stream, 0xA, payload)
             continue
         if opcode == 0x8:
             raise DeploymentError(f"Jupyter closed the kernel WebSocket: {payload!r}")
         if b"httpd-rs-jupyter-kernel-marker" in payload:
+            stream.settimeout(30)
             return
-    raise DeploymentError("Jupyter kernel did not return the executed marker")
+    raise DeploymentError(
+        f"Jupyter kernel did not return the executed marker; frames={observed!r}"
+    )
 
 
 def run(context: CaseContext, variant: dict[str, str]) -> None:

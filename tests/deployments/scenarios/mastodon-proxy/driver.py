@@ -83,7 +83,8 @@ def open_stream(port: int, token: str, stream_name: str) -> socket.socket:
     tls_context.verify_mode = ssl.CERT_NONE
     connection = tls_context.wrap_socket(raw, server_hostname=PUBLIC_HOST)
     connection.settimeout(35)
-    key = base64.b64encode(b"httpd-rs-mastodon").decode()
+    # RFC 6455 requires the decoded nonce to be exactly 16 bytes.
+    key = base64.b64encode(b"httpd-rs-stream!").decode()
     handshake = (
         "GET /api/v1/streaming HTTP/1.1\r\n"
         f"Host: {PUBLIC_HOST}\r\n"
