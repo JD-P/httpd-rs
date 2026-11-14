@@ -67,7 +67,7 @@ Every site also has one independent closure disposition:
 `closure_contracts` in the policy supply module-level evidence where a local
 expression does not itself name the owning lease. CI requires exactly one
 disposition for every effect and fails if `unclassified_effect_sites` is not
-zero. The current closure is 2,223 typed-lease sites, 665 constant-bound sites
+zero. The current closure is 2,225 typed-lease sites, 665 constant-bound sites
 and 443 external/kernel sites. Classification closes discovery debt; it does
 not promote a partial dominance or cost-refinement proof to mechanized status.
 
@@ -249,6 +249,17 @@ TLS/H2/proxy calls retain their concurrency/transport owners and deadlines,
 and OCSP validation retains its complete response bound. The dependency gate
 prevents a call from documenting only its CPU cost while silently omitting
 workspace.
+
+The inbound TLS boundary no longer supplies one fixed self-asserted workspace
+constant. `tls_dependency_budget` selects a proved ordinary/mTLS profile;
+weighted CPU and typed dependency-workspace leases are acquired together
+before rustls and released after the handshake. Rustls's 65,535-byte reassembly
+limit is dependency-derived, while a local verifier wrapper enforces eight
+presented certificates before webpki. The remaining 1/16-unit CPU and 128/256
+KiB workspace envelopes come from the retained adversarial calibration across
+chain ambiguity, name constraints and P-256, P-384, Ed25519 and RSA signatures
+through webpki's 8192-bit maximum. Dependency
+upgrades must rerun that matrix.
 
 The first application found regex tier construction occurring on the second
 request rather than at configuration compilation. Both tiers now compile at

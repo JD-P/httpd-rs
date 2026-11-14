@@ -764,7 +764,9 @@ pub(super) fn run(data: &[u8]) {
                     budget.try_dependency_workspace(1)
                 })
                 .is_err());
-                assert!(budget.try_tls_handshake(&context, 1, 1, 1).is_err());
+                assert!(budget
+                    .try_tls_handshake(&context, 1, 1, 1, 1, 1, 1)
+                    .is_err());
                 assert!(budget.try_rewrite_program(&context, 1, 1, 1, 1).is_err());
                 assert!(budget
                     .try_slot(

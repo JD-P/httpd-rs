@@ -6,12 +6,17 @@
 //! offered even if an old configuration mentions SSLv3/TLSv1.0.
 
 use crate::config::{vhost_port, ClientRevocationCheck, Config, HttpProtocol, SslConfig, VHost};
+use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::{ring, CryptoProvider};
 use rustls::pki_types::pem::{Error as PemError, PemObject};
-use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
-use rustls::{RootCertStore, ServerConfig, SupportedProtocolVersion};
+use rustls::{
+    DigitallySignedStruct, DistinguishedName, Error as RustlsError, RootCertStore, ServerConfig,
+    SignatureScheme, SupportedProtocolVersion,
+};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::IpAddr;
@@ -28,6 +33,93 @@ const MAX_TLS_CRL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_BROKER_ERROR_BYTES: u64 = 1024;
 const BROKER_SHUTDOWN: u32 = u32::MAX;
 const DEFAULT_SESSION_CACHE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Reject attacker-selected client-certificate shapes before webpki performs
+/// path construction. Rustls already caps a reassembled handshake message at
+/// 65,535 bytes; the explicit count bound prevents many tiny, same-subject CA
+/// candidates from converting that byte ceiling into path-building work.
+#[derive(Debug)]
+struct BoundedClientCertVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    max_certificates: usize,
+    max_certificate_bytes: usize,
+}
+
+impl BoundedClientCertVerifier {
+    fn new(
+        inner: Arc<dyn ClientCertVerifier>,
+        budget: httpd_rs_verified::TlsDependencyBudget,
+    ) -> Self {
+        Self {
+            inner,
+            max_certificates: budget.max_presented_certificates as usize,
+            max_certificate_bytes: budget.max_presented_certificate_bytes as usize,
+        }
+    }
+}
+
+impl ClientCertVerifier for BoundedClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, RustlsError> {
+        let count = intermediates.len().saturating_add(1);
+        let bytes = intermediates
+            .iter()
+            .try_fold(end_entity.as_ref().len(), |total, cert| {
+                total.checked_add(cert.as_ref().len())
+            });
+        if count > self.max_certificates
+            || bytes.is_none_or(|bytes| bytes > self.max_certificate_bytes)
+        {
+            return Err(RustlsError::General(
+                "client certificate chain exceeds the verified TLS resource profile".into(),
+            ));
+        }
+        self.inner
+            .verify_client_cert(end_entity, intermediates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.inner.requires_raw_public_keys()
+    }
+}
 
 struct PrivilegedFileBroker {
     stream: UnixStream,
@@ -438,6 +530,7 @@ struct OcspRefresh {
 /// giving it any process-wide side effects.
 pub(crate) struct PreparedServerConfig {
     config: Option<Arc<ServerConfig>>,
+    dependency_budget: Option<httpd_rs_verified::TlsDependencyBudget>,
     refreshes: Vec<OcspRefresh>,
 }
 
@@ -453,6 +546,10 @@ pub(crate) struct PreparedListenerConfigs {
 impl PreparedServerConfig {
     pub(crate) fn config(&self) -> Option<Arc<ServerConfig>> {
         self.config.clone()
+    }
+
+    pub(crate) fn dependency_budget(&self) -> Option<httpd_rs_verified::TlsDependencyBudget> {
+        self.dependency_budget
     }
 
     pub(crate) fn activate(&mut self) {
@@ -475,6 +572,20 @@ impl PreparedListenerConfigs {
             .map(|(address, prepared)| (*address, prepared.config()))
             .collect();
         (self.default.config(), exact)
+    }
+
+    pub(crate) fn dependency_budgets(
+        &self,
+    ) -> (
+        Option<httpd_rs_verified::TlsDependencyBudget>,
+        HashMap<IpAddr, Option<httpd_rs_verified::TlsDependencyBudget>>,
+    ) {
+        let exact = self
+            .exact
+            .iter()
+            .map(|(address, prepared)| (*address, prepared.dependency_budget()))
+            .collect();
+        (self.default.dependency_budget(), exact)
     }
 
     pub(crate) fn activate(&mut self) {
@@ -1560,6 +1671,7 @@ pub(crate) fn prepare_server_config(
     if !global_only && !applicable_vhosts.iter().any(|v| v.ssl.engine) {
         return Ok(PreparedServerConfig {
             config: None,
+            dependency_budget: None,
             refreshes: Vec::new(),
         });
     }
@@ -1666,7 +1778,9 @@ pub(crate) fn prepare_server_config(
                 .into(),
         );
     }
-    let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> = match default_ssl
+    let client_auth = client_policy_mode(default_ssl) != 0;
+    let dependency_budget = httpd_rs_verified::tls_dependency_budget(client_auth);
+    let verifier: Arc<dyn ClientCertVerifier> = match default_ssl
         .verify_client
         .unwrap_or(crate::config::ClientVerify::None)
     {
@@ -1706,9 +1820,10 @@ pub(crate) fn prepare_server_config(
             } else {
                 builder
             };
-            builder
+            let verifier = builder
                 .build()
-                .map_err(|e| format!("invalid client certificate verifier: {e}"))?
+                .map_err(|e| format!("invalid client certificate verifier: {e}"))?;
+            Arc::new(BoundedClientCertVerifier::new(verifier, dependency_budget))
         }
     };
     let mut config = ServerConfig::builder_with_provider(provider)
@@ -1746,6 +1861,7 @@ pub(crate) fn prepare_server_config(
         .collect();
     Ok(PreparedServerConfig {
         config: Some(Arc::new(config)),
+        dependency_budget: Some(dependency_budget),
         refreshes,
     })
 }
@@ -1758,6 +1874,27 @@ mod tests {
     use rustls::{ClientConfig, ClientConnection, HandshakeKind, ServerConnection};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn client_certificate_shape_is_rejected_before_webpki() {
+        let budget = httpd_rs_verified::tls_dependency_budget(true);
+        assert_eq!(budget.max_presented_certificates, 8);
+        assert_eq!(budget.max_presented_certificate_bytes, 65_535);
+        let verifier =
+            BoundedClientCertVerifier::new(Arc::new(rustls::server::NoClientAuth), budget);
+        let leaf = CertificateDer::from(vec![0u8; 1]);
+        let too_many: Vec<_> = (0..8).map(|_| CertificateDer::from(vec![0u8; 1])).collect();
+        assert!(matches!(
+            verifier.verify_client_cert(&leaf, &too_many, UnixTime::now()),
+            Err(RustlsError::General(message))
+                if message.contains("resource profile")
+        ));
+
+        let oversized = CertificateDer::from(vec![0u8; 65_536]);
+        assert!(verifier
+            .verify_client_cert(&oversized, &[], UnixTime::now())
+            .is_err());
+    }
     use std::os::unix::fs::PermissionsExt;
 
     #[test]

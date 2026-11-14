@@ -380,7 +380,6 @@ pub const MAX_COMPRESSION_TRANSIENT_BYTES_PER_REQUEST: u64 = 80 * 1024 * 1024;
 pub(crate) const MAX_DEPENDENCY_WORKSPACE_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const MAX_DEPENDENCY_WORKSPACE_BYTES_PER_CLIENT: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_DEPENDENCY_WORKSPACE_BYTES_PER_REQUEST: u64 = 32 * 1024 * 1024;
-pub(crate) const TLS_HANDSHAKE_DEPENDENCY_WORKSPACE_BYTES: u64 = 128 * 1024;
 pub const MAX_DYNAMIC_REQUESTS_PER_CLIENT: u64 = 8;
 pub const MAX_RESPONSE_BODY_READS: u64 = 32;
 pub const MAX_RESPONSE_BODY_READS_PER_CLIENT: u64 = 8;
@@ -594,7 +593,9 @@ const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
         // Queue residence reserves the task/memory which the closure will
         // consume before the worker is allowed to begin it.
         AsyncRequestWork => [0, 1, 64 * 1024],
-        TlsHandshake => [0, 0, TLS_HANDSHAKE_DEPENDENCY_WORKSPACE_BYTES],
+        // TLS dependency memory has a shape-specific byte lease which
+        // outlives this weighted CPU slot, so it must not be counted twice.
+        TlsHandshake => [0, 0, 0],
         RequestBodyWorker | ExpensiveCpu => [0, 0, 0],
     }
 }
@@ -2638,8 +2639,17 @@ impl ResourceBudget {
         bytes: u64,
     ) -> io::Result<DependencyWorkspaceLease> {
         let context = self.current_context_for()?;
+        self.try_dependency_workspace_in(&context, bytes)
+    }
+
+    pub(crate) fn try_dependency_workspace_in(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+        bytes: u64,
+    ) -> io::Result<DependencyWorkspaceLease> {
+        self.validate_context(context)?;
         let mut lease = ByteLease::new(
-            context,
+            context.clone(),
             ByteKind::DependencyWorkspace,
             MAX_DEPENDENCY_WORKSPACE_BYTES,
             Some(MAX_DEPENDENCY_WORKSPACE_BYTES_PER_CLIENT),
@@ -3002,33 +3012,49 @@ impl ResourceBudget {
     pub(crate) fn try_tls_handshake(
         self: &Arc<Self>,
         context: &ResourceContext,
+        work_units: u64,
+        workspace_bytes: u64,
         concurrency_limit: u64,
+        client_concurrency_limit: u64,
         process_rate_limit: u64,
         client_rate_limit: u64,
-    ) -> io::Result<SlotLease> {
+    ) -> io::Result<TlsHandshakeLease> {
         self.validate_context(context)?;
-        let slot = context.slot(
+        if work_units == 0 || workspace_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TLS handshake resource profile must be nonzero",
+            ));
+        }
+        let slot = context.slot_amount(
             SlotKind::TlsHandshake,
+            work_units,
             concurrency_limit,
-            Some(concurrency_limit),
-            Some(1),
+            Some(client_concurrency_limit),
+            Some(work_units),
             "TLS handshake concurrency limit reached",
         )?;
+        let workspace = self.try_dependency_workspace_in(context, workspace_bytes)?;
         let mut rates = self.rates.lock().unwrap_or_else(|error| error.into_inner());
-        if !Self::admit_rate(
+        if !Self::admit_rate_amount(
             &mut rates.tls,
             context.client,
             std::time::Instant::now(),
+            work_units,
             process_rate_limit,
             client_rate_limit,
         ) {
+            drop(workspace);
             drop(slot);
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "TLS handshake rate limit reached",
             ));
         }
-        Ok(slot)
+        Ok(TlsHandshakeLease {
+            _slot: slot,
+            _workspace: workspace,
+        })
     }
 
     pub(crate) fn try_rewrite_program(
@@ -3247,6 +3273,12 @@ pub(crate) struct CacheResidentLease {
 #[derive(Debug)]
 pub(crate) struct DependencyWorkspaceLease {
     bytes: ByteLease,
+}
+
+#[derive(Debug)]
+pub(crate) struct TlsHandshakeLease {
+    _slot: SlotLease,
+    _workspace: DependencyWorkspaceLease,
 }
 
 impl DependencyWorkspaceLease {

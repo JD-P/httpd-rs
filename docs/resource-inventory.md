@@ -167,6 +167,18 @@ scratch high-water, the number of discovered writable filesystems, and the
 most constrained filesystem's remaining byte and inode headroom are exported
 by `server-status?auto`.
 
+Inbound rustls work has an additional shape-specific owner selected before the
+dependency is entered. Ordinary TLS reserves one work unit and 128 KiB of
+dependency workspace; mTLS reserves sixteen units and 256 KiB. The shared
+handshake pool admits 64 work units process-wide and 32 per source, while its
+rate gate admits 128 and 64 work units per second respectively. A verifier
+wrapper rejects client chains above eight total certificates or 65,535 DER
+bytes before webpki path construction. The byte ceiling is inherited from the
+rustls handshake-message bound; the count, CPU and workspace bounds are pinned
+by `adversarial/tls_dependency_profile.py` across ambiguous issuers, dense name
+constraints and every ring/webpki signature family, including P-384 and
+RSA-8192 extrema.
+
 Extended status also exports current use, monotonic high-water, the observed
 hard limit, a reporting-only shadow candidate and rejection count for every
 slot, byte and physical-parent ledger. `tests/resource_budget_sweep.py` varies

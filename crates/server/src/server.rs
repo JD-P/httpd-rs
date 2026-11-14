@@ -42,16 +42,30 @@ pub struct Bound {
     pub addr: String,
     pub tls: Option<Arc<rustls::ServerConfig>>,
     tls_by_local_ip: HashMap<IpAddr, Option<Arc<rustls::ServerConfig>>>,
+    tls_dependency_budget: Option<httpd_rs_verified::TlsDependencyBudget>,
+    tls_dependency_budget_by_local_ip:
+        HashMap<IpAddr, Option<httpd_rs_verified::TlsDependencyBudget>>,
     pending_tls: Option<crate::tls::PreparedListenerConfigs>,
 }
 
 impl Bound {
-    fn tls_for(&self, local_ip: Option<IpAddr>) -> Option<Arc<rustls::ServerConfig>> {
-        local_ip
-            .map(access::canonical_ip)
+    fn tls_for(
+        &self,
+        local_ip: Option<IpAddr>,
+    ) -> Option<(
+        Arc<rustls::ServerConfig>,
+        httpd_rs_verified::TlsDependencyBudget,
+    )> {
+        let local_ip = local_ip.map(access::canonical_ip);
+        let config = local_ip
             .and_then(|address| self.tls_by_local_ip.get(&address))
             .cloned()
-            .unwrap_or_else(|| self.tls.clone())
+            .unwrap_or_else(|| self.tls.clone());
+        let budget = local_ip
+            .and_then(|address| self.tls_dependency_budget_by_local_ip.get(&address))
+            .copied()
+            .unwrap_or(self.tls_dependency_budget);
+        config.zip(budget)
     }
 }
 
@@ -89,6 +103,8 @@ pub fn bind(cfg: &Config) -> io::Result<Vec<Bound>> {
         let pending_tls = crate::tls::prepare_listener_configs(cfg, l.port, listener_local_ip(l))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let (tls, tls_by_local_ip) = pending_tls.configs();
+        let (tls_dependency_budget, tls_dependency_budget_by_local_ip) =
+            pending_tls.dependency_budgets();
         let listener = bind_reuse(sock_addr, cfg.listen_backlog)?;
         out.push(Bound {
             listener,
@@ -96,6 +112,8 @@ pub fn bind(cfg: &Config) -> io::Result<Vec<Bound>> {
             addr: l.addr.clone(),
             tls,
             tls_by_local_ip,
+            tls_dependency_budget,
+            tls_dependency_budget_by_local_ip,
             pending_tls: Some(pending_tls),
         });
     }
@@ -159,12 +177,16 @@ pub fn rebind(cfg: &Config, previous: &[Bound]) -> io::Result<Vec<Bound>> {
         let pending_tls = crate::tls::prepare_listener_configs(cfg, l.port, listener_local_ip(l))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let (tls, tls_by_local_ip) = pending_tls.configs();
+        let (tls_dependency_budget, tls_dependency_budget_by_local_ip) =
+            pending_tls.dependency_budgets();
         out.push(Bound {
             listener,
             port: l.port,
             addr: l.addr.clone(),
             tls,
             tls_by_local_ip,
+            tls_dependency_budget,
+            tls_dependency_budget_by_local_ip,
             pending_tls: Some(pending_tls),
         });
     }
@@ -287,6 +309,7 @@ const MAX_PENDING_PER_CLIENT: usize = 8;
 const MAX_PENDING_PER_TRUSTED_PROXY: usize = 32;
 const ACCEPT_BATCH: usize = 64;
 const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 64;
+const MAX_CONCURRENT_TLS_HANDSHAKE_WORK_PER_CLIENT: usize = 32;
 const MAX_TLS_HANDSHAKES_PER_SECOND: usize = 128;
 const MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND: usize = 64;
 const CONNECTION_WORK_THREADS: usize = 64;
@@ -739,12 +762,16 @@ fn tls_handshake_limit() -> usize {
 
 fn try_reserve_tls_handshake(
     context: &crate::resource::ResourceContext,
-) -> Option<crate::resource::SlotLease> {
+    dependency: httpd_rs_verified::TlsDependencyBudget,
+) -> Option<crate::resource::TlsHandshakeLease> {
     context
         .budget()
         .try_tls_handshake(
             context,
+            dependency.verification_work_units,
+            dependency.workspace_bytes,
             tls_handshake_limit() as u64,
+            MAX_CONCURRENT_TLS_HANDSHAKE_WORK_PER_CLIENT as u64,
             MAX_TLS_HANDSHAKES_PER_SECOND as u64,
             MAX_TLS_HANDSHAKES_PER_CLIENT_PER_SECOND as u64,
         )
@@ -3131,6 +3158,7 @@ async fn admit_tls_connection(
     local_ip: String,
     local_port: u16,
     tls_config: Arc<rustls::ServerConfig>,
+    tls_dependency: httpd_rs_verified::TlsDependencyBudget,
     pending_guard: crate::resource::SlotLease,
     lifetime_guard: ConnectionLifetimeGuard,
     descriptor_guard: crate::resource::DescriptorLease,
@@ -3138,20 +3166,21 @@ async fn admit_tls_connection(
 ) -> io::Result<()> {
     let _descriptor_guard = descriptor_guard;
     let transport_context = cfg.resource_budget.context(peer.ip());
-    let handshake_guard = try_reserve_tls_handshake(&transport_context).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "TLS handshake capacity exhausted",
-        )
-    })?;
+    let handshake_guard = try_reserve_tls_handshake(&transport_context, tls_dependency)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "TLS handshake capacity exhausted",
+            )
+        })?;
     if !httpd_rs_verified::dependency_call_admit(
         true,
-        1,
-        1,
-        1,
-        1,
-        crate::resource::TLS_HANDSHAKE_DEPENDENCY_WORKSPACE_BYTES,
-        crate::resource::TLS_HANDSHAKE_DEPENDENCY_WORKSPACE_BYTES,
+        tls_dependency.peer_handshake_bytes,
+        65_535,
+        tls_dependency.verification_work_units,
+        16,
+        tls_dependency.workspace_bytes,
+        262_144,
     ) {
         return Err(io::Error::other("TLS dependency boundary rejected"));
     }
@@ -3618,13 +3647,16 @@ async fn admit_connection(
     peer: SocketAddr,
     local_ip: String,
     local_port: u16,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
+    tls_config: Option<(
+        Arc<rustls::ServerConfig>,
+        httpd_rs_verified::TlsDependencyBudget,
+    )>,
     pending_guard: crate::resource::SlotLease,
     lifetime_guard: ConnectionLifetimeGuard,
     descriptor_guard: crate::resource::DescriptorLease,
     retired: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
-    if let Some(tls_config) = tls_config {
+    if let Some((tls_config, tls_dependency)) = tls_config {
         admit_tls_connection(
             cfg,
             logger,
@@ -3633,6 +3665,7 @@ async fn admit_connection(
             local_ip,
             local_port,
             tls_config,
+            tls_dependency,
             pending_guard,
             lifetime_guard,
             descriptor_guard,
@@ -11649,6 +11682,32 @@ mod tests {
         assert_eq!(ACCEPT_BATCH, 64);
 
         assert_eq!(tls_handshake_limit(), MAX_CONCURRENT_TLS_HANDSHAKES);
+        let mtls = httpd_rs_verified::tls_dependency_budget(true);
+        assert_eq!(mtls.verification_work_units, 16);
+        let weighted_budget = Arc::new(crate::resource::ResourceBudget::default());
+        let weighted_before = weighted_budget.transition_snapshot();
+        let weighted_client = IpAddr::from([192, 0, 2, 99]);
+        let weighted: Vec<_> = (0..2)
+            .map(|_| {
+                try_reserve_tls_handshake(&weighted_budget.context(weighted_client), mtls).unwrap()
+            })
+            .collect();
+        assert!(
+            try_reserve_tls_handshake(&weighted_budget.context(weighted_client), mtls).is_none()
+        );
+        assert_eq!(
+            weighted_budget.slot_usage(crate::resource::SlotKind::TlsHandshake),
+            MAX_CONCURRENT_TLS_HANDSHAKE_WORK_PER_CLIENT as u64
+        );
+        drop(weighted);
+        assert_eq!(weighted_budget.transition_snapshot(), weighted_before);
+        assert_eq!(
+            weighted_budget.slot_usage(crate::resource::SlotKind::TlsHandshake),
+            0
+        );
+        assert!(
+            try_reserve_tls_handshake(&weighted_budget.context(weighted_client), mtls).is_some()
+        );
         let now = Instant::now();
         let client = IpAddr::from([192, 0, 2, 1]);
         let other = IpAddr::from([192, 0, 2, 2]);
@@ -13300,6 +13359,8 @@ mod tests {
             addr: "127.0.0.1".into(),
             tls: None,
             tls_by_local_ip: HashMap::new(),
+            tls_dependency_budget: None,
+            tls_dependency_budget_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -13348,6 +13409,8 @@ mod tests {
             addr: "127.0.0.1".into(),
             tls: None,
             tls_by_local_ip: HashMap::new(),
+            tls_dependency_budget: None,
+            tls_dependency_budget_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -13418,6 +13481,8 @@ mod tests {
             addr: "127.0.0.1".into(),
             tls: None,
             tls_by_local_ip: HashMap::new(),
+            tls_dependency_budget: None,
+            tls_dependency_budget_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -13495,6 +13560,8 @@ mod tests {
             addr: "127.0.0.1".into(),
             tls: None,
             tls_by_local_ip: HashMap::new(),
+            tls_dependency_budget: None,
+            tls_dependency_budget_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -13539,6 +13606,8 @@ mod tests {
             addr: "127.0.0.1".into(),
             tls: None,
             tls_by_local_ip: HashMap::new(),
+            tls_dependency_budget: None,
+            tls_dependency_budget_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -13619,6 +13688,8 @@ mod tests {
             addr: "127.0.0.1".into(),
             tls: None,
             tls_by_local_ip: HashMap::new(),
+            tls_dependency_budget: None,
+            tls_dependency_budget_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -13710,6 +13781,8 @@ mod tests {
             addr: "127.0.0.1".into(),
             tls: None,
             tls_by_local_ip: HashMap::new(),
+            tls_dependency_budget: None,
+            tls_dependency_budget_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
@@ -13779,6 +13852,8 @@ mod tests {
             addr: "127.0.0.1".into(),
             tls: None,
             tls_by_local_ip: HashMap::new(),
+            tls_dependency_budget: None,
+            tls_dependency_budget_by_local_ip: HashMap::new(),
             pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));

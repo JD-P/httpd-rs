@@ -1,0 +1,47 @@
+httpd-rs TLS dependency calibration, 2026-11-14, release build
+
+signature_algorithm=p256 name_constraints_and_sans=128 handshakes=64 concurrency=8
+ordinary-tls: success=64 wall_s=0.396809 cpu_s=0.110000 rss_delta_kib=7536
+mtls-chain-1: success=64 wall_s=0.384342 cpu_s=0.140000 rss_delta_kib=7668
+mtls-chain-4: success=64 wall_s=0.375642 cpu_s=0.150000 rss_delta_kib=8456
+mtls-chain-8: success=64 wall_s=0.381985 cpu_s=0.200000 rss_delta_kib=8756
+mtls-chain-16: success=64 wall_s=0.434475 cpu_s=0.270000 rss_delta_kib=8668
+mtls-chain-32: success=0 wall_s=0.028382 cpu_s=0.020000 rss_delta_kib=768
+
+signature_algorithm=rsa2048 name_constraints_and_sans=0 handshakes=64 concurrency=8
+ordinary-tls: success=64 wall_s=0.378551 cpu_s=0.090000 rss_delta_kib=8144
+mtls-chain-1: success=64 wall_s=0.332344 cpu_s=0.080000 rss_delta_kib=8708
+mtls-chain-4: success=64 wall_s=0.382467 cpu_s=0.090000 rss_delta_kib=8580
+mtls-chain-8: success=64 wall_s=0.379374 cpu_s=0.100000 rss_delta_kib=8248
+
+signature_algorithm=rsa4096 name_constraints_and_sans=0 handshakes=32 concurrency=8
+ordinary-tls: success=32 wall_s=0.233174 cpu_s=0.160000 rss_delta_kib=4340
+mtls-chain-1: success=32 wall_s=0.228063 cpu_s=0.170000 rss_delta_kib=5180
+mtls-chain-4: success=32 wall_s=0.234407 cpu_s=0.210000 rss_delta_kib=5508
+
+signature_algorithm=p384 name_constraints_and_sans=128 handshakes=16 concurrency=8
+ordinary-tls: success=16 wall_s=0.110050 cpu_s=0.030000 rss_delta_kib=2832
+mtls-chain-1: success=16 wall_s=0.114427 cpu_s=0.080000 rss_delta_kib=3208
+mtls-chain-4: success=16 wall_s=0.148560 cpu_s=0.210000 rss_delta_kib=3508
+mtls-chain-7: success=16 wall_s=0.169717 cpu_s=0.260000 rss_delta_kib=3772
+
+signature_algorithm=ed25519 name_constraints_and_sans=0 handshakes=16 concurrency=8
+ordinary-tls: success=16 wall_s=0.110397 cpu_s=0.030000 rss_delta_kib=3304
+mtls-chain-1: success=16 wall_s=0.101801 cpu_s=0.020000 rss_delta_kib=3460
+mtls-chain-4: success=16 wall_s=0.094152 cpu_s=0.030000 rss_delta_kib=3488
+mtls-chain-7: success=16 wall_s=0.093393 cpu_s=0.020000 rss_delta_kib=3196
+
+signature_algorithm=rsa8192 name_constraints_and_sans=0 handshakes=16 concurrency=8
+ordinary-p256-server-control: success=16 wall_s=0.108694 cpu_s=0.030000 rss_delta_kib=2480
+mtls-chain-1: success=16 wall_s=0.211428 cpu_s=0.040000 rss_delta_kib=3136
+
+post-enforcement boundary, p256, 128 names, handshakes=8 concurrency=4
+mtls-chain-7 (8 total certificates): success=8 cpu_s=0.040000 rss_delta_kib=2284
+mtls-chain-8 (9 total certificates): success=0 cpu_s=0.010000 rss_delta_kib=824
+
+final sixteen-unit profile, p384, 128 names, handshakes=4 concurrency=4
+ordinary-tls: success=4 wall_s=0.056422 cpu_s=0.000000 rss_delta_kib=1604
+mtls-chain-1: success=4 wall_s=0.059638 cpu_s=0.020000 rss_delta_kib=1768
+mtls-chain-4: success=4 wall_s=0.059249 cpu_s=0.070000 rss_delta_kib=1732
+mtls-chain-7 (8 total certificates): success=4 wall_s=0.104434 cpu_s=0.090000 rss_delta_kib=2036
+mtls-chain-8 (9 total certificates): success=0 wall_s=0.050157 cpu_s=0.000000 rss_delta_kib=1004

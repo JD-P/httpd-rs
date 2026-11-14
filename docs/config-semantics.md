@@ -643,7 +643,7 @@ proxy chunk arithmetic          : checked_add and MAX_PROXY_BODY
 proxy DNS / TLS CA              : bounded queue/deadline; first address set and CA parsed state are generation-bound
 pre-request sockets              : async bounded pool; header/TLS/H2-preface deadline and per-transport cap
 client/upstream transport buffers: 128 KiB requested send/receive queues; 512 KiB accounting lease under a shared 256 MiB process parent
-TLS handshakes                   : 64 concurrent, 4/source, 128/second and 64/source/second
+TLS handshakes                   : 64 weighted units concurrent, 32/source, 128 units/second and 64/source/second; mTLS costs 16 units, ordinary TLS 1
 HTTP/1 blocking workers          : reusable pool; MaxRequestWorkers/effective-client caps; configuration ceiling 512
 filesystem/cache lookup phase    : 64 process slots, 8/source; cache stripe/cold-scan contention bypasses instead of queues
 slow request bodies              : every keep-alive request enters a one-quarter-worker reserve with a one-quarter per-effective-client share
@@ -2385,7 +2385,11 @@ construction: there is no second production interleaver.
   omitted and explicit `none` are equivalent, while active CA/CRL identities
   must match. Per-location client authentication is
   rejected because Rustls verifies the connection, not an individual request;
-  Rustls chain validation itself remains an external TLS assumption.
+  Rustls chain validation itself remains an external TLS assumption. Before
+  entering webpki, httpd-rs limits a presented client chain to eight total
+  certificates and 65,535 aggregate DER bytes. Deployments whose client PKI
+  genuinely needs a longer chain must shorten it; the limit is an intentional
+  resource-security boundary rather than a configurable compatibility knob.
 - `tls_vhost_transition_admit`, `tls_sni_authority_admit` and
   `tls_client_identity_admit`. A completed TLS handshake records immutable SNI,
   destination, selected TLS-vhost policy and verified client-leaf identity.

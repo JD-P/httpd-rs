@@ -3988,6 +3988,80 @@ pub proof fn ownerless_dependency_call_is_rejected(
 {
 }
 
+/// Complete pre-admission shape for one inbound rustls handshake.  Rustls
+/// rejects a reassembled handshake message above 65,535 bytes; httpd-rs's
+/// client-verifier wrapper independently caps the presented certificate
+/// count/DER bytes before webpki path construction.  The work and workspace
+/// weights are conservative envelopes measured by
+/// `adversarial/tls_dependency_profile.py` and are acquired before rustls is
+/// entered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TlsDependencyBudget {
+    pub peer_handshake_bytes: u64,
+    pub verification_work_units: u64,
+    pub workspace_bytes: u64,
+    pub max_presented_certificates: u64,
+    pub max_presented_certificate_bytes: u64,
+}
+
+pub open spec fn tls_dependency_budget_spec(client_auth: bool) -> TlsDependencyBudget {
+    if client_auth {
+        TlsDependencyBudget {
+            peer_handshake_bytes: 65_535,
+            verification_work_units: 16,
+            workspace_bytes: 262_144,
+            max_presented_certificates: 8,
+            max_presented_certificate_bytes: 65_535,
+        }
+    } else {
+        TlsDependencyBudget {
+            peer_handshake_bytes: 65_535,
+            verification_work_units: 1,
+            workspace_bytes: 131_072,
+            max_presented_certificates: 0,
+            max_presented_certificate_bytes: 0,
+        }
+    }
+}
+
+pub fn tls_dependency_budget(client_auth: bool) -> (budget: TlsDependencyBudget)
+    ensures
+        budget == tls_dependency_budget_spec(client_auth),
+        budget.peer_handshake_bytes == 65_535,
+        budget.verification_work_units >= 1,
+        budget.verification_work_units <= 16,
+        budget.workspace_bytes <= 262_144,
+        client_auth ==> budget.max_presented_certificates == 8,
+        !client_auth ==> budget.max_presented_certificates == 0,
+{
+    if client_auth {
+        TlsDependencyBudget {
+            peer_handshake_bytes: 65_535,
+            verification_work_units: 16,
+            workspace_bytes: 262_144,
+            max_presented_certificates: 8,
+            max_presented_certificate_bytes: 65_535,
+        }
+    } else {
+        TlsDependencyBudget {
+            peer_handshake_bytes: 65_535,
+            verification_work_units: 1,
+            workspace_bytes: 131_072,
+            max_presented_certificates: 0,
+            max_presented_certificate_bytes: 0,
+        }
+    }
+}
+
+pub proof fn mtls_dependency_shape_is_bounded()
+    ensures
+        tls_dependency_budget_spec(true).max_presented_certificates <= 8,
+        tls_dependency_budget_spec(true).max_presented_certificate_bytes <= 65_535,
+        tls_dependency_budget_spec(true).verification_work_units <= 16,
+        tls_dependency_budget_spec(true).workspace_bytes <= 262_144,
+{
+}
+
 /// Overflow-free aggregate admission used by spool-byte, spool-file and
 /// dynamic-backend counters.  The caller commits the exact addition with an
 /// atomic compare/exchange, retrying this predicate if the observed value

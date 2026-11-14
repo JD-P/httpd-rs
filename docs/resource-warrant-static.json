@@ -51663,8 +51663,8 @@
       ],
       "code": "lease.reserve(bytes, \"dependency workspace limit reached\")?;",
       "effect": "data-growth",
-      "function": "try_dependency_workspace",
-      "id": "d39f9797daf1bddfa95b",
+      "function": "try_dependency_workspace_in",
+      "id": "95de80a0904f88b61438",
       "path": "crates/server/src/resource.rs",
       "status": "audited-gateway"
     },
@@ -51801,12 +51801,11 @@
     },
     {
       "accounting_evidence": [
-        "SlotLease",
         "limit"
       ],
       "closure_contract": "inferred-audited-gateway",
       "closure_disposition": "typed-lease",
-      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (SlotLease, limit)",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (limit)",
       "closure_verification_targets": [
         "resource_budget_admit",
         "request_resource_effect_closure"
@@ -55391,28 +55390,6 @@
         "request_resource_effect_closure",
         "terminal_sink_gate"
       ],
-      "code": "fn tls_for(&self, local_ip: Option<IpAddr>) -> Option<Arc<rustls::ServerConfig>> {",
-      "effect": "compression-regex-crypto",
-      "function": "<module>",
-      "id": "5a6037befa6bc710b6e5",
-      "path": "crates/server/src/server.rs",
-      "status": "review-required"
-    },
-    {
-      "accounting_evidence": [],
-      "closure_contract": "request-runtime-typed-leases",
-      "closure_disposition": "typed-lease",
-      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
-      "closure_verification_targets": [
-        "resource_budget_admit",
-        "shared_map_insert_admit",
-        "shared_queue_push_admit",
-        "dependency_call_admit",
-        "async_work_handoff_admit",
-        "blocking_io_start_admit",
-        "request_resource_effect_closure",
-        "terminal_sink_gate"
-      ],
       "code": "tls_by_local_ip: HashMap<IpAddr, Option<Arc<rustls::ServerConfig>>>,",
       "effect": "compression-regex-crypto",
       "function": "<module>",
@@ -55501,10 +55478,10 @@
         "request_resource_effect_closure",
         "terminal_sink_gate"
       ],
-      "code": "tls_config: Option<Arc<rustls::ServerConfig>>,",
+      "code": "Arc<rustls::ServerConfig>,",
       "effect": "compression-regex-crypto",
       "function": "admit_connection",
-      "id": "44b63d361b97cafe8934",
+      "id": "10b1f75837a4c62cc10c",
       "path": "crates/server/src/server.rs",
       "status": "review-required"
     },
@@ -55591,36 +55568,33 @@
       "status": "accounted-context"
     },
     {
-      "accounting_evidence": [],
-      "closure_contract": "request-runtime-typed-leases",
+      "accounting_evidence": [
+        "work_units"
+      ],
+      "closure_contract": "inferred-accounted-context",
       "closure_disposition": "typed-lease",
-      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (work_units)",
       "closure_verification_targets": [
         "resource_budget_admit",
-        "shared_map_insert_admit",
-        "shared_queue_push_admit",
-        "dependency_call_admit",
-        "async_work_handoff_admit",
-        "blocking_io_start_admit",
-        "request_resource_effect_closure",
-        "terminal_sink_gate"
+        "request_resource_effect_closure"
       ],
       "code": "tls_config: Arc<rustls::ServerConfig>,",
       "effect": "compression-regex-crypto",
       "function": "admit_tls_connection",
       "id": "a746955617382af54488",
       "path": "crates/server/src/server.rs",
-      "status": "review-required"
+      "status": "accounted-context"
     },
     {
       "accounting_evidence": [
+        "work_units",
         "MAX_",
         "limit",
         "admit"
       ],
       "closure_contract": "inferred-accounted-context",
       "closure_disposition": "typed-lease",
-      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (MAX_, limit, admit)",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (work_units, MAX_, limit, admit)",
       "closure_verification_targets": [
         "resource_budget_admit",
         "request_resource_effect_closure"
@@ -58598,6 +58572,28 @@
         "request_resource_effect_closure",
         "terminal_sink_gate"
       ],
+      "code": "Arc<rustls::ServerConfig>,",
+      "effect": "compression-regex-crypto",
+      "function": "tls_for",
+      "id": "abec5fb1e4b8079e02e1",
+      "path": "crates/server/src/server.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "request-runtime-typed-leases",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "shared_map_insert_admit",
+        "shared_queue_push_admit",
+        "dependency_call_admit",
+        "async_work_handoff_admit",
+        "blocking_io_start_admit",
+        "request_resource_effect_closure",
+        "terminal_sink_gate"
+      ],
       "code": "stream.write_all(response.as_bytes()).await?;",
       "effect": "data-growth",
       "function": "try_reject_h1_async",
@@ -59276,6 +59272,28 @@
         "request_resource_effect_closure",
         "terminal_sink_gate"
       ],
+      "code": ".collect();",
+      "effect": "heap-allocation",
+      "function": "dependency_budgets",
+      "id": "c32c35c7b769cc27a921",
+      "path": "crates/server/src/tls.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "request-runtime-typed-leases",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "shared_map_insert_admit",
+        "shared_queue_push_admit",
+        "dependency_call_admit",
+        "async_work_handoff_admit",
+        "blocking_io_start_admit",
+        "request_resource_effect_closure",
+        "terminal_sink_gate"
+      ],
       "code": "for protocols in policies.iter().skip(1) {",
       "effect": "cpu-iteration",
       "function": "ensure_uniform_application_protocols",
@@ -59914,28 +59932,6 @@
         "request_resource_effect_closure",
         "terminal_sink_gate"
       ],
-      "code": "let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> = match default_ssl",
-      "effect": "compression-regex-crypto",
-      "function": "prepare_server_config",
-      "id": "3d43ba50ef9d70091de1",
-      "path": "crates/server/src/tls.rs",
-      "status": "review-required"
-    },
-    {
-      "accounting_evidence": [],
-      "closure_contract": "request-runtime-typed-leases",
-      "closure_disposition": "typed-lease",
-      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
-      "closure_verification_targets": [
-        "resource_budget_admit",
-        "shared_map_insert_admit",
-        "shared_queue_push_admit",
-        "dependency_call_admit",
-        "async_work_handoff_admit",
-        "blocking_io_start_admit",
-        "request_resource_effect_closure",
-        "terminal_sink_gate"
-      ],
       "code": "let provider = Arc::new(ring::default_provider());",
       "effect": "compression-regex-crypto",
       "function": "prepare_server_config",
@@ -60160,6 +60156,28 @@
       "effect": "heap-allocation",
       "function": "prepare_server_config",
       "id": "3cbfd7e8dbf9db839e8a",
+      "path": "crates/server/src/tls.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "request-runtime-typed-leases",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "shared_map_insert_admit",
+        "shared_queue_push_admit",
+        "dependency_call_admit",
+        "async_work_handoff_admit",
+        "blocking_io_start_admit",
+        "request_resource_effect_closure",
+        "terminal_sink_gate"
+      ],
+      "code": "Arc::new(BoundedClientCertVerifier::new(verifier, dependency_budget))",
+      "effect": "heap-allocation",
+      "function": "prepare_server_config",
+      "id": "3f65f8cafbcabbfe2edd",
       "path": "crates/server/src/tls.rs",
       "status": "review-required"
     },
@@ -61028,6 +61046,28 @@
       "effect": "heap-allocation",
       "function": "tls_file_specs",
       "id": "fd755b2a90c3cfec31b2",
+      "path": "crates/server/src/tls.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "request-runtime-typed-leases",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "shared_map_insert_admit",
+        "shared_queue_push_admit",
+        "dependency_call_admit",
+        "async_work_handoff_admit",
+        "blocking_io_start_admit",
+        "request_resource_effect_closure",
+        "terminal_sink_gate"
+      ],
+      "code": ".try_fold(end_entity.as_ref().len(), |total, cert| {",
+      "effect": "cpu-iteration",
+      "function": "verify_client_cert",
+      "id": "cd58230b31b653b2a164",
       "path": "crates/server/src/tls.rs",
       "status": "review-required"
     },
@@ -65089,33 +65129,33 @@
       "status": "external-source-inventory"
     }
   ],
-  "source_sha256": "1e2bb184bee9a8aa03c38cc74b9429fe96adaecc44a617f5f8992a9166813b90",
+  "source_sha256": "79200ed6d3d28e3434588ac87fbe2be5cef32e6524f6f249efc08cb5e0877ba3",
   "summary": {
     "by_closure_disposition": {
       "external-assumption": 443,
       "proved-constant-bound": 665,
-      "typed-lease": 2223
+      "typed-lease": 2225
     },
     "by_effect": {
-      "compression-regex-crypto": 70,
-      "cpu-iteration": 912,
+      "compression-regex-crypto": 69,
+      "cpu-iteration": 913,
       "data-growth": 440,
       "filesystem": 134,
-      "heap-allocation": 1061,
+      "heap-allocation": 1063,
       "network": 35,
       "synchronization": 273,
       "task-process": 46,
       "unsafe-ffi-syscall": 360
     },
     "by_status": {
-      "accounted-context": 696,
+      "accounted-context": 697,
       "accounting-boundary": 63,
       "audited-gateway": 323,
       "external-source-inventory": 191,
       "local-bound-candidate": 14,
-      "review-required": 2044
+      "review-required": 2045
     },
-    "effect_sites": 3331,
+    "effect_sites": 3333,
     "files": 56,
     "unclassified_effect_sites": 0
   }

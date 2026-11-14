@@ -71,7 +71,7 @@ VARIABLE_DEPENDENCY_NAMESPACES = {
     ("crates/server/src/server.rs", "h2"): 1,
     ("crates/server/src/server.rs", "rustls"): 5,
     ("crates/server/src/server.rs", "tokio_rustls"): 5,
-    ("crates/server/src/tls.rs", "rustls"): 13,
+    ("crates/server/src/tls.rs", "rustls"): 14,
     ("crates/server/src/whole_request_fuzz.rs", "h2"): 2,
     ("crates/pcre2/src/lib.rs", "regex_automata"): 1,
     ("crates/pcre2/src/lib.rs", "regex_syntax"): 6,
@@ -111,6 +111,9 @@ DEPENDENCY_BOUNDARY_CONTRACTS = {
     ("crates/server/src/server.rs", "acceptor.accept(tcp)"): (
         ("crates/server/src/server.rs", "dependency_call_admit"),
         ("crates/server/src/server.rs", "try_reserve_tls_handshake"),
+        ("crates/server/src/resource.rs", "TlsHandshakeLease"),
+        ("crates/server/src/tls.rs", "BoundedClientCertVerifier"),
+        ("crates/verified/src/lib.rs", "tls_dependency_budget"),
         ("crates/server/src/server.rs", "TLS handshake timed out"),
     ),
     ("crates/server/src/h2.rs", "builder.handshake(io)"): (
