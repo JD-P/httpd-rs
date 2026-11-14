@@ -1796,6 +1796,37 @@ fn version_name_cmp(left: &[u8], right: &[u8]) -> CmpOrdering {
     left.len().cmp(&right.len()).then_with(|| left.cmp(right))
 }
 
+fn configured_directory_index(
+    cfg: &Config,
+    scope: &Scope,
+    req: &Request,
+    dir: &File,
+    follow_symlinks: bool,
+    owner_match_only: bool,
+) -> Result<Option<(File, Metadata, Vec<u8>)>, ()> {
+    for name in cfg.directory_index_for(scope) {
+        if req
+            .charge_policy_work((name.len() as u64).saturating_add(1))
+            .is_err()
+        {
+            return Err(());
+        }
+        if name.contains('/') || name == ".." || name == "." || name.is_empty() {
+            continue;
+        }
+        if let Ok(f) =
+            open_at_with_symlink_policy(dir, name.as_bytes(), follow_symlinks, owner_match_only)
+        {
+            if let Ok(m) = f.metadata() {
+                if m.is_file() {
+                    return Ok(Some((f, m, name.into_bytes())));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn directory_action(
     cfg: &Config,
     scope: &Scope,
@@ -1817,25 +1848,10 @@ fn directory_action(
         }
         return DirAction::Redirect(loc);
     }
-    for name in cfg.directory_index_for(scope) {
-        if req
-            .charge_policy_work((name.len() as u64).saturating_add(1))
-            .is_err()
-        {
-            return DirAction::Overloaded;
-        }
-        if name.contains('/') || name == ".." || name == "." || name.is_empty() {
-            continue;
-        }
-        if let Ok(f) =
-            open_at_with_symlink_policy(dir, name.as_bytes(), follow_symlinks, owner_match_only)
-        {
-            if let Ok(m) = f.metadata() {
-                if m.is_file() {
-                    return DirAction::Index(f, m, name.into_bytes());
-                }
-            }
-        }
+    match configured_directory_index(cfg, scope, req, dir, follow_symlinks, owner_match_only) {
+        Ok(Some((file, meta, name))) => return DirAction::Index(file, meta, name),
+        Ok(None) => {}
+        Err(()) => return DirAction::Overloaded,
     }
     if scope
         .effective_options()
@@ -1944,23 +1960,20 @@ pub fn directory_index_target(
     req: &Request,
     dir: &File,
     url_path: &str,
-    raw_path: &[u8],
+    _raw_path: &[u8],
 ) -> Option<DirectoryIndex> {
+    if !url_path.ends_with('/') && scope.content_policy.directory_slash.unwrap_or(true) {
+        // The redirect owns this request. Selecting an index here would let
+        // planning internally dispatch `/dir/index.html` and bypass the
+        // canonical `/dir` -> `/dir/` response.
+        return None;
+    }
     let options = scope.effective_options();
     let follow_symlinks = options.contains(crate::config::Options::FOLLOW_SYMLINKS);
     let owner_match_only =
         !follow_symlinks && options.contains(crate::config::Options::SYMLINKS_IF_OWNER_MATCH);
-    match directory_action(
-        cfg,
-        scope,
-        req,
-        dir,
-        url_path,
-        raw_path,
-        follow_symlinks,
-        owner_match_only,
-    ) {
-        DirAction::Index(file, meta, name) => Some(DirectoryIndex { name, file, meta }),
+    match configured_directory_index(cfg, scope, req, dir, follow_symlinks, owner_match_only) {
+        Ok(Some((file, meta, name))) => Some(DirectoryIndex { name, file, meta }),
         _ => None,
     }
 }
@@ -4248,6 +4261,75 @@ mod tests {
             None,
         );
         assert_eq!(response.status, 503);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn directory_index_preflight_does_not_scan_or_charge_autoindex() {
+        let (root, mut cfg) = config("directory-index-preflight");
+        cfg.directory_index = vec!["missing.html".into()];
+        std::fs::write(root.join("visible"), b"entry").unwrap();
+        let mut scope = Scope::default();
+        scope.options.push_add(crate::config::Options::INDEXES);
+        let req = request("GET", b"/");
+        let budget = std::sync::Arc::new(crate::resource::ResourceBudget::default());
+        let context = budget.context(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        crate::resource::with_resource_context(context, || {
+            // Planning may ask for the selected DirectoryIndex repeatedly,
+            // but a miss must not consume the autoindex operation that only
+            // the terminal directory response owns.
+            for _ in 0..crate::resource::MAX_EXPENSIVE_OPS_PER_CLIENT_PER_SECOND {
+                assert!(directory_index_target(
+                    &cfg,
+                    &scope,
+                    &req,
+                    &File::open(&root).unwrap(),
+                    "/",
+                    b"/",
+                )
+                .is_none());
+            }
+            let mut redirect_cfg = cfg.clone();
+            redirect_cfg.directory_index = vec!["visible".into()];
+            assert!(directory_index_target(
+                &redirect_cfg,
+                &scope,
+                &req,
+                &File::open(&root).unwrap(),
+                "/without-slash",
+                b"/without-slash",
+            )
+            .is_none());
+            for _ in 0..crate::resource::MAX_EXPENSIVE_OPS_PER_CLIENT_PER_SECOND {
+                assert!(matches!(
+                    directory_action(
+                        &cfg,
+                        &scope,
+                        &req,
+                        &File::open(&root).unwrap(),
+                        "/",
+                        b"/",
+                        true,
+                        false,
+                    ),
+                    DirAction::List(_)
+                ));
+            }
+            assert!(matches!(
+                directory_action(
+                    &cfg,
+                    &scope,
+                    &req,
+                    &File::open(&root).unwrap(),
+                    "/",
+                    b"/",
+                    true,
+                    false,
+                ),
+                DirAction::Overloaded
+            ));
+        });
         std::fs::remove_dir_all(&root).unwrap();
     }
 

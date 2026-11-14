@@ -95,7 +95,7 @@ DEPENDENCY_BOUNDARY_CONTRACTS = {
     ("crates/pcre2/src/lib.rs", "fn build_automata("): (
         ("crates/pcre2/src/lib.rs", "dependency_call_admit"),
         ("crates/pcre2/src/lib.rs", "regex_compile_resource_admit"),
-        ("crates/pcre2/src/lib.rs", "let hot = build_automata"),
+        ("crates/pcre2/src/lib.rs", "let engine = build_automata"),
     ),
     ("crates/pcre2/src/lib.rs", "fn check_subject("): (
         ("crates/pcre2/src/lib.rs", "dependency_call_admit"),

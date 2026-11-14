@@ -14,7 +14,7 @@ use crate::verified::valid_token;
 use std::ffi::OsString;
 use std::fs::{File, Metadata};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
@@ -538,7 +538,10 @@ fn execute_via_pool(
     {
         Ok(lease) => lease,
         Err(_) => {
-            worker.terminate();
+            // No bytes have been sent to this worker, so its protocol is
+            // still synchronized. Return it instead of permanently shrinking
+            // the pool under response-memory pressure.
+            pool.put(worker);
             return cgi_status_error(ctx, 503);
         }
     };
@@ -576,7 +579,10 @@ fn execute_via_pool(
         }
         Err(e) => {
             // Do not retry locally: the script may already have run.
-            worker.terminate();
+            // The control protocol may be mid-message, so this worker cannot
+            // safely be reused. Replace it one-for-one; otherwise repeated
+            // client cancellation can drain the pre-forked pool permanently.
+            pool.retire(worker);
             eprintln!("httpd-rs: CGI worker failed: {e}");
             cgi_error(ctx)
         }
@@ -628,6 +634,18 @@ struct CgiPool {
     workers: Mutex<Vec<CgiWorker>>,
     ready: Condvar,
     closed: AtomicBool,
+    factory: Option<CgiWorkerFactory>,
+    replacement: Mutex<()>,
+}
+
+struct CgiWorkerFactory {
+    /// Opened while startup still has authority to traverse the installation
+    /// path. Replacements exec through this descriptor after privilege drop.
+    exe: File,
+    uid: u32,
+    gid: u32,
+    user: String,
+    parent_pid: libc::pid_t,
 }
 
 static POOL: OnceLock<CgiPool> = OnceLock::new();
@@ -657,6 +675,37 @@ impl CgiPool {
         }
         guard.push(worker);
         self.ready.notify_one();
+    }
+
+    /// Destroy a worker whose control stream may be desynchronized and put a
+    /// fresh isolated worker in its place. Replacement is serialized so an
+    /// adversarial cancellation burst cannot amplify one retired process into
+    /// multiple concurrent spawns.
+    fn retire(&self, worker: CgiWorker) {
+        worker.terminate();
+        let Some(factory) = self.factory.as_ref() else {
+            return;
+        };
+        let _replacement = self
+            .replacement
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let exe_fd = factory.exe.as_raw_fd();
+        let exe = PathBuf::from(format!("/proc/self/fd/{exe_fd}"));
+        match start_pool_worker(
+            &exe,
+            factory.uid,
+            factory.gid,
+            &factory.user,
+            factory.parent_pid,
+            Some(exe_fd),
+        ) {
+            Ok(worker) => self.put(worker),
+            Err(error) => eprintln!("httpd-rs: cannot replace CGI worker: {error}"),
+        }
     }
 }
 
@@ -745,9 +794,18 @@ fn start_pool_with_exe(
     count: usize,
 ) -> Result<CgiPool, String> {
     let parent_pid = httpd_rs_os::current_pid();
+    let opened_exe =
+        File::open(exe).map_err(|error| format!("cannot retain CGI worker executable: {error}"))?;
+    // Keep a duplicate rather than the first opened descriptor. WORKER_FD is
+    // descriptor 3; if the executable itself occupied 3, the child socket's
+    // dup2 would replace it immediately before exec.
+    let replacement_exe = opened_exe
+        .try_clone()
+        .map_err(|error| format!("cannot retain CGI worker executable: {error}"))?;
+    drop(opened_exe);
     let mut workers = Vec::with_capacity(count);
     for _ in 0..count {
-        match start_pool_worker(exe, uid, gid, user, parent_pid) {
+        match start_pool_worker(exe, uid, gid, user, parent_pid, None) {
             Ok(worker) => workers.push(worker),
             Err(error) => {
                 for worker in workers {
@@ -761,6 +819,14 @@ fn start_pool_with_exe(
         workers: Mutex::new(workers),
         ready: Condvar::new(),
         closed: AtomicBool::new(false),
+        factory: Some(CgiWorkerFactory {
+            exe: replacement_exe,
+            uid,
+            gid,
+            user: user.to_string(),
+            parent_pid,
+        }),
+        replacement: Mutex::new(()),
     })
 }
 
@@ -770,6 +836,7 @@ fn start_pool_worker(
     gid: u32,
     user: &str,
     parent_pid: libc::pid_t,
+    retained_exe: Option<RawFd>,
 ) -> Result<CgiWorker, String> {
     let (parent, child) =
         UnixStream::pair().map_err(|e| format!("cannot create CGI worker socket: {e}"))?;
@@ -786,6 +853,7 @@ fn start_pool_worker(
         .arg(gid.to_string())
         .arg(user)
         .arg(parent_pid.to_string())
+        .arg(retained_exe.unwrap_or(-1).to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -800,6 +868,7 @@ fn start_pool_worker(
     // sets FD_CLOEXEC itself before spawning scripts.
     let mut setup = httpd_rs_os::ChildSetup::inherited(parent_pid);
     setup.duplicate_fd = Some((child_fd, WORKER_FD));
+    setup.retained_fd = retained_exe;
     httpd_rs_os::configure_child(&mut cmd, setup);
     crate::fault::hit("cgi.worker.spawn").map_err(|e| format!("cannot spawn CGI worker: {e}"))?;
     let proc = cmd
@@ -861,9 +930,23 @@ fn init_worker_groups(user: &str, gid: u32) -> bool {
 /// CGI worker process entry point.  It is spawned once per pool slot and is
 /// deliberately tiny and single-threaded until it has completed a request, so
 /// fork/exec avoids copying the main server's address space and TLB entries.
-pub fn worker_main(fd: i32, uid: u32, gid: u32, user: &str, parent_pid: libc::pid_t) {
+pub fn worker_main(
+    fd: i32,
+    uid: u32,
+    gid: u32,
+    user: &str,
+    parent_pid: libc::pid_t,
+    retained_exe: Option<RawFd>,
+) {
     if crate::process::bind_to_parent(parent_pid).is_err() || httpd_rs_os::create_session().is_err()
     {
+        std::process::exit(1);
+    }
+    // A replacement needed this descriptor to exec through a startup-opened
+    // root-only binary. The worker no longer needs to execute itself; keep the
+    // bounded descriptor until worker exit but prevent CGI children from
+    // inheriting its authority.
+    if retained_exe.is_some_and(|fd| httpd_rs_os::set_cloexec_raw(fd, true).is_err()) {
         std::process::exit(1);
     }
     httpd_rs_os::set_umask(0o022);
@@ -2237,6 +2320,7 @@ mod tests {
             unsafe { libc::getegid() },
             "nobody",
             unsafe { libc::getpid() },
+            None,
         )
         .err()
         .expect("worker spawn failpoint was ignored");
@@ -2733,6 +2817,8 @@ mod tests {
             workers: Mutex::new(Vec::new()),
             ready: Condvar::new(),
             closed: AtomicBool::new(true),
+            factory: None,
+            replacement: Mutex::new(()),
         };
         assert!(empty.take().is_none());
 
@@ -2740,6 +2826,8 @@ mod tests {
             workers: Mutex::new(Vec::new()),
             ready: Condvar::new(),
             closed: AtomicBool::new(false),
+            factory: None,
+            replacement: Mutex::new(()),
         };
         assert!(waiting.take().is_none());
 
@@ -2768,6 +2856,8 @@ mod tests {
             workers: Mutex::new(Vec::new()),
             ready: Condvar::new(),
             closed: AtomicBool::new(true),
+            factory: None,
+            replacement: Mutex::new(()),
         };
         let (stream, _peer) = UnixStream::pair().unwrap();
         let mut child = Command::new("/bin/true").spawn().unwrap();
@@ -2780,6 +2870,8 @@ mod tests {
             workers: Mutex::new(vec![CgiWorker { stream, child }]),
             ready: Condvar::new(),
             closed: AtomicBool::new(false),
+            factory: None,
+            replacement: Mutex::new(()),
         };
         shutdown_pool_inner(&pool);
         assert!(pool.workers.lock().unwrap().is_empty());
@@ -2795,6 +2887,13 @@ mod tests {
             "#!/bin/sh\nprintf '\\1' >&3\ncat <&3 >/dev/null\n",
         );
         let pool = start_pool_with_exe(&good, 0, 0, "root", 1).unwrap();
+        let worker = pool.take().expect("started pool lost its worker");
+        pool.retire(worker);
+        assert_eq!(
+            pool.workers.lock().unwrap().len(),
+            1,
+            "retiring a desynchronized worker must replenish the pool"
+        );
         shutdown_pool_inner(&pool);
 
         let bad = script(&dir, "worker-bad.sh", "#!/bin/sh\nprintf '\\2' >&3\n");
@@ -2828,6 +2927,8 @@ mod tests {
             }]),
             ready: Condvar::new(),
             closed: AtomicBool::new(false),
+            factory: None,
+            replacement: Mutex::new(()),
         };
         let resource_context = cfg.resource_budget.context("127.0.0.1".parse().unwrap());
         let resp = execute_via_pool(
@@ -2865,6 +2966,8 @@ mod tests {
             workers: Mutex::new(Vec::new()),
             ready: Condvar::new(),
             closed: AtomicBool::new(true),
+            factory: None,
+            replacement: Mutex::new(()),
         });
         assert!(init_pool(&cfg).is_ok());
         shutdown_pool();
@@ -3217,6 +3320,7 @@ mod tests {
                 worker_gid,
                 worker_user,
                 owner,
+                None,
             );
             std::process::exit(0);
         }
@@ -3243,6 +3347,7 @@ mod tests {
                 worker_gid,
                 worker_user,
                 owner,
+                None,
             );
             std::process::exit(0);
         }
@@ -3257,7 +3362,7 @@ mod tests {
         // An invalid control fd returns cleanly after privilege setup.
         let pid = unsafe { libc::fork() };
         if pid == 0 {
-            worker_main(-1, worker_uid, worker_gid, worker_user, owner);
+            worker_main(-1, worker_uid, worker_gid, worker_user, owner, None);
             std::process::exit(0);
         }
         let mut status = 0;
@@ -3269,7 +3374,7 @@ mod tests {
         // Privilege failure exits the worker process with status 1.
         let pid = unsafe { libc::fork() };
         if pid == 0 {
-            worker_main(-1, u32::MAX, u32::MAX, "no-such-user", owner);
+            worker_main(-1, u32::MAX, u32::MAX, "no-such-user", owner, None);
             std::process::exit(0);
         }
         let mut status = 0;

@@ -256,14 +256,16 @@ pub mod bytes {
                 ));
             }
 
-            let cold = build_automata(&hir, self.config.size_limit, false)?;
-            // Build the bounded lazy-DFA tier at the compile boundary.  The
-            // old on-second-search promotion performed dependency allocation
-            // and NFA construction on an arbitrary request, outside the
-            // configuration/access-file compilation owner.
-            let hot = build_automata(&hir, self.config.size_limit, true).ok();
+            // Construct one bounded hybrid engine at the compile boundary.
+            // regex-automata's hybrid meta engine already contains its PikeVM
+            // fallback, so separately building a second Pike-only meta engine
+            // duplicated NFA construction and retained state without serving
+            // any request. Fall back to Pike-only only when hybrid construction
+            // itself is unavailable for an otherwise admitted expression.
+            let engine = build_automata(&hir, self.config.size_limit, true)
+                .or_else(|_| build_automata(&hir, self.config.size_limit, false))?;
 
-            let inner_names: Vec<Option<String>> = cold
+            let inner_names: Vec<Option<String>> = engine
                 .group_info()
                 .pattern_names(PatternID::ZERO)
                 .map(|name| name.map(ToOwned::to_owned))
@@ -305,7 +307,7 @@ pub mod bytes {
                 translated_pattern: translation.pattern,
                 complexity,
                 final_newline_fallback: translation.final_newline_fallback,
-                inner: TieredEngine::new(cold, hot),
+                inner: BoundedEngine::new(engine),
                 public_to_inner: Arc::new(public_to_inner),
                 keep_groups: Arc::new(keep_groups),
                 capture_names: Arc::new(capture_names),
@@ -406,10 +408,13 @@ pub mod bytes {
             self
         }
 
-        /// Conservative retained/per-search workspace ceiling for both
-        /// automata tiers, the lazy-DFA cache, translated pattern storage and
-        /// capture metadata. Server-side access-file parsing reserves this
-        /// amount before entering the dependency compiler.
+        /// Conservative retained/per-search workspace ceiling for the hybrid
+        /// engine and its PikeVM fallback, lazy-DFA cache, translated pattern
+        /// storage and capture metadata. Server-side access-file parsing
+        /// reserves this amount before entering the dependency compiler. The
+        /// doubled NFA ceiling remains conservative for the dependency's
+        /// internal forward/reverse strategies; it no longer represents two
+        /// separately retained meta engines.
         pub fn dependency_workspace_bound(&self) -> Option<usize> {
             self.config
                 .size_limit
@@ -458,32 +463,32 @@ pub mod bytes {
         translated_pattern: String,
         complexity: u64,
         final_newline_fallback: bool,
-        inner: TieredEngine,
+        inner: BoundedEngine,
         public_to_inner: Arc<Vec<usize>>,
         keep_groups: Arc<Vec<usize>>,
         capture_names: Arc<Vec<Option<String>>>,
         capture_names_idx: Arc<HashMap<String, usize>>,
     }
 
-    /// A bounded Pike VM and optional lazy DFA are both built at the compile
-    /// boundary and shared by every clone. Request-time matching therefore
-    /// cannot unexpectedly enter the regex-automata compiler or allocate a
-    /// per-pattern DFA cache. Neither tier permits bounded backtracking.
+    /// One bounded hybrid engine is built at the compile boundary and shared
+    /// by every clone. Its internal PikeVM fallback preserves deterministic
+    /// matching when the lazy DFA cannot handle a search. Request-time
+    /// matching cannot enter the regex-automata compiler or allocate a new
+    /// per-pattern cache, and bounded backtracking remains disabled.
     #[derive(Clone)]
-    struct TieredEngine(Arc<TieredEngineInner>);
+    struct BoundedEngine(Arc<BoundedEngineInner>);
 
-    struct TieredEngineInner {
-        cold: AutomataRegex,
-        hot: Option<AutomataRegex>,
+    struct BoundedEngineInner {
+        engine: AutomataRegex,
     }
 
-    impl TieredEngine {
-        fn new(cold: AutomataRegex, hot: Option<AutomataRegex>) -> Self {
-            Self(Arc::new(TieredEngineInner { cold, hot }))
+    impl BoundedEngine {
+        fn new(engine: AutomataRegex) -> Self {
+            Self(Arc::new(BoundedEngineInner { engine }))
         }
 
         fn for_search(&self) -> &AutomataRegex {
-            self.0.hot.as_ref().unwrap_or(&self.0.cold)
+            &self.0.engine
         }
     }
 
@@ -1612,9 +1617,9 @@ pub mod bytes {
         }
         let pattern = admitted.source;
         let quantifier_extended = extended || inline_option_may_enable(pattern, b'x');
-        let invalid_quantifier = invalid_quantifier_placement(pattern, false, crlf).or_else(|| {
+        let invalid_quantifier = invalid_quantifier_placement(pattern, false).or_else(|| {
             quantifier_extended
-                .then(|| invalid_quantifier_placement(pattern, true, crlf))
+                .then(|| invalid_quantifier_placement(pattern, true))
                 .flatten()
         });
         if let Some(offset) = invalid_quantifier {
@@ -1623,7 +1628,7 @@ pub mod bytes {
                 "quantifier does not follow a repeatable item",
             ));
         }
-        if let Some(offset) = ambiguous_nested_capture_repeat(pattern, crlf) {
+        if let Some(offset) = ambiguous_nested_capture_repeat(pattern) {
             return Err(Error::unsupported(
                 offset,
                 "quantified capture with ambiguous capture history",
@@ -1641,9 +1646,9 @@ pub mod bytes {
         )?;
 
         let bytes = pattern.as_bytes();
-        let captures = capture_count(pattern, crlf, effective_extended);
+        let captures = capture_count(pattern, effective_extended);
         let keep_prefix = choose_keep_prefix(pattern);
-        let absolute_end = contains_escape(pattern, b'z', crlf, effective_extended);
+        let absolute_end = contains_escape(pattern, b'z', effective_extended);
         let mut out = Vec::with_capacity(bytes.len());
         let mut i = 0;
         let mut keep_count = 0;
@@ -1696,13 +1701,11 @@ pub mod bytes {
                             "POSIX named class must be nested in a character class",
                         ));
                     }
-                    let class_end = byte_class_end(pattern, i, crlf)?;
-                    if unicode_pattern && unicode_class_requires_fallback(bytes, i, class_end, ucp)
-                    {
-                        return Err(Error::unsupported(i, "Unicode-sensitive character class"));
-                    }
                     let (class, end) =
                         translate_byte_class_caseless(pattern, i, crlf, effective_caseless)?;
+                    if unicode_pattern && unicode_class_requires_fallback(bytes, i, end, ucp) {
+                        return Err(Error::unsupported(i, "Unicode-sensitive character class"));
+                    }
                     out.extend_from_slice(class.as_bytes());
                     i = end;
                 }
@@ -2221,7 +2224,7 @@ pub mod bytes {
                         .map_or(bytes.len(), |relative| i + relative + 1);
                 }
                 b'[' => {
-                    let end = byte_class_end(pattern, i, false)?;
+                    let end = validated_byte_class_end(pattern, i);
                     if crlf && crlf_ambiguous_search_class(&bytes[i..end]) {
                         return Err(Error::unsupported(i, "CRLF search-start character class"));
                     }
@@ -2400,7 +2403,7 @@ pub mod bytes {
         }
     }
 
-    fn contains_escape(pattern: &str, wanted: u8, crlf: bool, extended: bool) -> bool {
+    fn contains_escape(pattern: &str, wanted: u8, extended: bool) -> bool {
         let bytes = pattern.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
@@ -2416,10 +2419,8 @@ pub mod bytes {
                 continue;
             }
             if bytes[i] == b'[' {
-                if let Ok(end) = byte_class_end(pattern, i, crlf) {
-                    i = end;
-                    continue;
-                }
+                i = validated_byte_class_end(pattern, i);
+                continue;
             }
             if bytes[i] == b'\\' {
                 if bytes.get(i + 1) == Some(&wanted) {
@@ -2433,7 +2434,7 @@ pub mod bytes {
         false
     }
 
-    fn capture_count(pattern: &str, crlf: bool, extended: bool) -> usize {
+    fn capture_count(pattern: &str, extended: bool) -> usize {
         let bytes = pattern.as_bytes();
         let mut count = 0;
         let mut i = 0;
@@ -2450,10 +2451,8 @@ pub mod bytes {
                 continue;
             }
             if bytes[i] == b'[' {
-                if let Ok(end) = byte_class_end(pattern, i, crlf) {
-                    i = end;
-                    continue;
-                }
+                i = validated_byte_class_end(pattern, i);
+                continue;
             }
             if bytes[i] == b'\\' {
                 i = escape_atom_end(bytes, i);
@@ -2609,6 +2608,40 @@ pub mod bytes {
 
     fn byte_class_end(pattern: &str, start: usize, crlf: bool) -> Result<usize, Error> {
         parse_byte_class(pattern, start, crlf, false).map(|(_, end)| end)
+    }
+
+    /// Locate the end of a class after `AdmittedPattern::parse` has already
+    /// validated its complete grammar. Post-admission semantic passes only
+    /// need to skip the class; rebuilding its 256-bit set in every pass made
+    /// POSIX-heavy configuration compilation needlessly expensive.
+    fn validated_byte_class_end(pattern: &str, start: usize) -> usize {
+        let bytes = pattern.as_bytes();
+        let mut i = start.saturating_add(1);
+        if bytes.get(i) == Some(&b'^') {
+            i += 1;
+        }
+        let mut first = true;
+        while i < bytes.len() {
+            if bytes[i] == b']' && !first {
+                return i + 1;
+            }
+            first = false;
+            if bytes.get(i..i + 2) == Some(b"[:") {
+                if let Some(close) = bytes[i + 2..].windows(2).position(|pair| pair == b":]") {
+                    i += close + 4;
+                    continue;
+                }
+            }
+            if bytes[i] == b'\\' {
+                i = escape_atom_end(bytes, i);
+            } else {
+                i += 1;
+            }
+        }
+        // The closed grammar made this path unreachable. Returning the end is
+        // defensive and keeps all post-admission scans monotonic if an earlier
+        // validation bug is ever introduced.
+        bytes.len()
     }
 
     fn unicode_class_requires_fallback(bytes: &[u8], start: usize, end: usize, ucp: bool) -> bool {
@@ -2927,7 +2960,7 @@ pub mod bytes {
 
     /// PCRE2 diagnoses a quantifier without a preceding repeatable atom.
     /// Rust regex accepts some of these metacharacters as literals.
-    fn invalid_quantifier_placement(pattern: &str, extended: bool, crlf: bool) -> Option<usize> {
+    fn invalid_quantifier_placement(pattern: &str, extended: bool) -> Option<usize> {
         let bytes = pattern.as_bytes();
         let mut i = 0;
         let mut repeatable = false;
@@ -2945,9 +2978,7 @@ pub mod bytes {
             }
             match bytes[i] {
                 b'[' => {
-                    let Ok(end) = byte_class_end(pattern, i, crlf) else {
-                        return None;
-                    };
+                    let end = validated_byte_class_end(pattern, i);
                     repeatable = true;
                     i = end;
                 }
@@ -3065,16 +3096,14 @@ pub mod bytes {
         zero_width: bool,
     }
 
-    fn ambiguous_nested_capture_repeat(pattern: &str, crlf: bool) -> Option<usize> {
+    fn ambiguous_nested_capture_repeat(pattern: &str) -> Option<usize> {
         let bytes = pattern.as_bytes();
         let mut stack: Vec<CaptureFrame> = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'[' {
-                if let Ok(end) = byte_class_end(pattern, i, crlf) {
-                    i = end;
-                    continue;
-                }
+                i = validated_byte_class_end(pattern, i);
+                continue;
             }
             if bytes[i] == b'\\' {
                 if matches!(

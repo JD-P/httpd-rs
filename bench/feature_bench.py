@@ -68,7 +68,11 @@ SCENARIOS = [
     dict(name="empty file", path="/empty", proto="http", conc=64),
     # --- path / directory handling ---
     dict(name="directory index", path="/dir/", proto="http", conc=64),
-    dict(name="autoindex", path="/list/", proto="http", conc=64),
+    # Autoindex deliberately consumes the expensive-operation budget (64
+    # operations/source/second).  Exercise one admitted burst per fixed
+    # window; an unconstrained wrk run mostly benchmarks intentional 503s.
+    dict(name="autoindex", path="/list/", proto="http", conc=64,
+         budgeted_requests=60),
     dict(name="directory redirect", path="/dir", proto="http", conc=64, expect=301),
     dict(name="301 redirect", path="/old", proto="http", conc=64, expect=301),
     dict(name="alias", path="/alias/aliased.txt", proto="http", conc=64),
@@ -85,22 +89,25 @@ SCENARIOS = [
     dict(name="AuthMerging Or", path="/access/authmerge-or/child/x.txt", proto="http", conc=64),
     dict(name="AuthMerging And 403", path="/access/authmerge-and/child/x.txt", headers=[AUTH], proto="http", conc=64, expect=403),
     dict(name="ElseIf header", path="/access/elseif/x.txt", headers=["X-Branch: a"], proto="http", conc=64),
-    dict(name="DirectoryIndex CGI", path="/dir-cgi/", proto="http", conc=32),
-    dict(name="ErrorDocument CGI", path="/errorcgi/missing", proto="http", conc=32, expect=404),
+    dict(name="DirectoryIndex CGI", path="/dir-cgi/", proto="http", conc=32, dynamic=True),
+    dict(name="ErrorDocument CGI", path="/errorcgi/missing", proto="http", conc=32, expect=404,
+         dynamic=True),
     dict(name="Basic auth 200", path="/auth/protected.txt", headers=[AUTH], proto="http", conc=64),
     dict(name="Basic auth 401", path="/auth/protected.txt", proto="http", conc=64, expect=401),
     # --- proxy / proxy authorization ---
-    dict(name="proxy static", path="/app/foo", proto="http", conc=32),
+    dict(name="proxy static", path="/app/foo", proto="http", conc=32, dynamic=True),
     dict(name="<Proxy> deny", path="/proxy-acl/foo", proto="http", conc=64, expect=403),
-    dict(name="<ProxyMatch> allow", path="/proxy-acl-re/abc/x", proto="http", conc=32),
+    dict(name="<ProxyMatch> allow", path="/proxy-acl-re/abc/x", proto="http", conc=32,
+         dynamic=True),
     # --- rewrite / htaccess / vhost ---
     dict(name="rewrite (server)", path="/from-config", proto="http", conc=64),
     dict(name="rewrite (.htaccess)", path="/htaccess/rewrite/old.html", proto="http", conc=64),
     dict(name="Header (.htaccess)", path="/htaccess/header/hello.txt", proto="http", conc=64),
     dict(name="name-based vhost", path="/", headers=["Host: vhost.test"], proto="http", conc=64),
     # --- CGI ---
-    dict(name="CGI GET", path="/cgi-bin/env.sh", proto="http", conc=32),
-    dict(name="CGI POST", path="/cgi-bin/env.sh", proto="ab-post", conc=16, requests=5000),
+    dict(name="CGI GET", path="/cgi-bin/env.sh", proto="http", conc=32, dynamic=True),
+    dict(name="CGI POST", path="/cgi-bin/env.sh", proto="ab-post", conc=16, requests=5000,
+         dynamic=True),
     # --- TLS / HTTP/2 ---
     dict(name="HTTPS/1.1 static", path="/hello.txt", proto="tls-h1", conc=64),
     dict(name="HTTP/2 static", path="/hello.txt", proto="tls-h2", conc=64, streams=16),
@@ -109,8 +116,10 @@ SCENARIOS = [
     dict(name="HTTP/2 range", path="/hello.txt", headers=["Range: bytes=0-4"], proto="tls-h2", conc=64, streams=16, expect=206),
     dict(name="HTTP/2 Basic auth", path="/auth/protected.txt", headers=[AUTH], proto="tls-h2", conc=64, streams=16),
     dict(name="HTTP/2 vhost (SNI)", path="/", host="vhost.test", proto="tls-h2", conc=64, streams=16),
-    dict(name="HTTP/2 CGI GET", path="/cgi-bin/env.sh", proto="tls-h2", conc=32, streams=8),
-    dict(name="HTTP/2 CGI POST", path="/cgi-bin/env.sh", data=True, proto="tls-h2", conc=16, streams=4),
+    dict(name="HTTP/2 CGI GET", path="/cgi-bin/env.sh", proto="tls-h2", conc=32, streams=8,
+         dynamic=True),
+    dict(name="HTTP/2 CGI POST", path="/cgi-bin/env.sh", data=True, proto="tls-h2", conc=16,
+         streams=4, dynamic=True),
 ]
 
 
@@ -337,14 +346,15 @@ def url_for(port, path, tls=False, host=None):
 def benchmark_concurrency(sc):
     """Keep one-host cohorts inside httpd-rs's source-keyed admission limits."""
     requested = sc["conc"]
+    useful_work = 4 if sc.get("dynamic") else 8
     if sc["proto"] == "tls-h2":
         # The narrowest useful-work pool exercised by this feature-rich
-        # configuration is eight per source (filesystem and dynamic backend).
-        # Keep the complete H2 cohort within it instead of timing intentional
-        # 503 overload responses from one loopback identity.
-        return min(requested, 8, max(1, 8 // benchmark_streams(sc)))
+        # configuration is eight per source. Dynamic cohorts deliberately use
+        # half of that allowance, leaving room for cancelled streams from the
+        # preceding load-generator process to observe cancellation and retire.
+        return min(requested, useful_work, max(1, useful_work // benchmark_streams(sc)))
     # Pending HTTP/1/TLS connection admission is capped at eight per source.
-    return min(requested, 8)
+    return min(requested, useful_work)
 
 
 def benchmark_streams(sc):
@@ -353,13 +363,24 @@ def benchmark_streams(sc):
     return min(streams, 4) if sc["proto"] == "tls-h2" else streams
 
 
+def cohort_drain(sc):
+    """Allow abandoned dynamic work to observe cancellation between tools."""
+    return 1.05 if sc.get("dynamic") or sc.get("budgeted_requests") else 0.25
+
+
 def curl_probe(port, sc, tls=False, h2=False):
     path = sc["path"]
     host = sc.get("host")
     scheme = "https" if tls else "http"
     h = host or "127.0.0.1"
     url = f"{scheme}://{h}:{port}{path}"
-    cmd = ["curl", "-sS", "--max-time", "10", "-o", "/dev/null", "-w", "%{http_code} %{http_version}"]
+    # Every benchmark endpoint is resolved to loopback.  Ignore ambient
+    # HTTP(S)_PROXY settings so synthetic vhost names cannot escape through a
+    # developer or CI proxy during the correctness gate.
+    cmd = [
+        "curl", "--noproxy", "*", "-sS", "--max-time", "10",
+        "-o", "/dev/null", "-w", "%{http_code} %{http_version}",
+    ]
     if tls:
         cmd += ["--insecure", "--resolve", f"{h}:{port}:127.0.0.1"]
         cmd += ["--http2"] if h2 else ["--http1.1"]
@@ -394,6 +415,10 @@ def measure(port, sc, duration):
     conc = benchmark_concurrency(sc)
     headers = list(sc.get("headers", []))
     host = sc.get("host")
+    if requests := sc.get("budgeted_requests"):
+        if headers:
+            raise SystemExit("budgeted ab scenarios do not support request headers")
+        return run_ab(url_for(port, sc["path"]), conc, requests)
     if proto == "http":
         url = url_for(port, sc["path"])
         return run_wrk(url, headers, conc, duration)
@@ -413,6 +438,34 @@ def measure(port, sc, duration):
             data_file=(RUN / "post-body.txt") if sc.get("data") else None,
         )
     raise SystemExit(f"unknown proto {proto}")
+
+
+def sample_error(sc, result):
+    if result.get("rps") is None:
+        detail = (result.get("raw") or "benchmark tool produced no throughput").strip()
+        return f"no-throughput: {detail[-500:]}"
+    socket_errors = sum(result.get("socket_errors") or [])
+    if result.get("failed") or socket_errors:
+        return (
+            f"failed={result.get('failed', 0)} "
+            f"socket-errors={socket_errors}"
+        )
+    # wrk reports every non-2xx/3xx status as one aggregate. For successful
+    # scenarios none are permissible; non-success scenarios are pinned by the
+    # correctness probe immediately before timing.
+    expected = sc.get("expect", 200)
+    if 200 <= expected < 300 and result.get("non2xx"):
+        return f"unexpected-non2xx={result['non2xx']}"
+    statuses = result.get("statuses")
+    if statuses:
+        expected_class = f"{expected // 100}xx"
+        unexpected = sum(
+            count for status_class, count in statuses.items()
+            if status_class != expected_class
+        )
+        if unexpected:
+            return f"unexpected-status-class={unexpected} statuses={statuses}"
+    return None
 
 
 def read_pss_kb(pid):
@@ -480,20 +533,31 @@ def main():
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
 
-    for tool, path in (("apache2", APACHE), ("httpd-rs", HTTPD_RS), ("wrk", WRK), ("ab", AB), ("h2load", H2LOAD)):
-        if not path or not Path(path).exists():
-            sys.exit(f"{tool} missing ({path})")
-
     duration = args.duration or (1.0 if args.quick else 2.0)
     samples = 1 if args.quick else args.samples
     selected = [s for s in SCENARIOS if re.search(args.only, s["name"], re.I)] if args.only else SCENARIOS
     if not selected:
         sys.exit("no scenarios matched --only")
+    required = [("apache2", APACHE), ("httpd-rs", HTTPD_RS)]
+    if any(sc["proto"] == "http" and not sc.get("budgeted_requests") for sc in selected):
+        required.append(("wrk", WRK))
+    if any(sc["proto"] in ("ab-head", "ab-post") or sc.get("budgeted_requests") for sc in selected):
+        required.append(("ab", AB))
+    if any(sc["proto"] in ("tls-h1", "tls-h2") for sc in selected):
+        required.append(("h2load", H2LOAD))
+    for tool, path in required:
+        if not path or not Path(path).exists():
+            sys.exit(f"{tool} missing ({path})")
 
     print("preparing Apache-conformance fixture tree...", flush=True)
     conf = load_conformance()
     conf.start_http_mock()
     make_fixture(conf)
+    # common() includes the conformance fixture's stapled-certificate virtual
+    # host. Keep its responder live while the benchmark servers start; httpd-rs
+    # deliberately refuses to serve a stapling-enabled host when no response
+    # can be fetched.
+    conf.start_ocsp_mock()
     # Apache ignores an If-Modified-Since date in the future, while httpd-rs
     # evaluates it.  Use the representation's actual Last-Modified value so
     # both servers exercise the 304 path identically.
@@ -539,25 +603,33 @@ def main():
             row = dict(name=sc["name"], proto=sc["proto"], path=sc["path"], servers={})
             for server, port in (("apache", AP_PORT if sc["proto"] not in ("tls-h1", "tls-h2") else AP_TLS_PORT),
                                  ("httpd-rs", VP_PORT if sc["proto"] not in ("tls-h1", "tls-h2") else VP_TLS_PORT)):
+                if sc.get("budgeted_requests"):
+                    # Align every protected burst to a fresh one-second rate
+                    # window.  The correctness probe and prior server's
+                    # sample must not consume this server's timed allowance.
+                    time.sleep(1.05)
                 if sc["proto"] in ("http", "tls-h1", "tls-h2"):
                     # discard one short run for warm-up
                     measure(port, sc, max(0.5, duration / 2))
+                    # Let the server observe EOF/RST and retire every lease
+                    # owned by the old load-generator cohort before a new
+                    # cohort arrives at the exact per-source ceiling.
+                    time.sleep(cohort_drain(sc))
                 best = None
                 vals = []
                 for _ in range(samples):
                     r = measure(port, sc, duration)
+                    if error := sample_error(sc, r):
+                        raise SystemExit(
+                            f"invalid {server} sample for {sc['name']}: {error}"
+                        )
                     vals.append(r)
+                    time.sleep(cohort_drain(sc))
                 vals.sort(key=lambda x: x["rps"] or 0)
                 best = vals[len(vals) // 2]
                 row["servers"][server] = best
                 if best["raw"]:
                     print(f"  !! {server} {sc['name']} output:\n{best['raw'][-2000:]}")
-                socket_errors = sum(best.get("socket_errors") or [])
-                if best["failed"] or best["non2xx"] or socket_errors:
-                    print(
-                        f"  !! {server} {sc['name']} failed={best['failed']} "
-                        f"non2xx={best['non2xx']} socket-errors={socket_errors}"
-                    )
             a = row["servers"]["apache"]["rps"] or 0
             v = row["servers"]["httpd-rs"]["rps"] or 0
             row["ratio"] = v / a if a else None
@@ -590,9 +662,11 @@ def main():
             f"Generated: {results['timestamp']}\n",
             f"Method: {samples} x {duration:g}s samples per server after warm-up; access logs to /dev/null. "
             "`wrk` for cleartext HTTP/1.1, `ab` for HEAD/POST, `h2load` for TLS/HTTP/2 with four load-generator threads. "
-            "Loopback concurrency is capped at eight connections and HTTP/2 cohorts stay within "
-            "the 64-stream per-client admission budget, so the run measures serving rather than "
-            "intentional overload rejection.\n",
+            "Loopback concurrency is capped at eight connections; dynamic-backend cohorts use "
+            "four outstanding requests with a one-second retirement interval, and HTTP/2 cohorts "
+            "stay within the 64-stream per-client admission budget. Thus the run measures serving "
+            "rather than intentional overload rejection. Autoindex is sampled as 60-request "
+            "bursts aligned to fresh one-second expensive-operation windows.\n",
             "| feature | apache req/s | httpd-rs req/s | ratio | apache mean ms | httpd-rs mean ms |",
             "|---|---:|---:|---:|---:|---:|",
         ]
@@ -618,7 +692,7 @@ def main():
             "\n## Reading the numbers\n",
             *(
                 [
-                    f"- {below_count} scenario(s) were below Apache in this run; see the table (proxy/rewrite/CGI long-tail scenarios are the usual remaining cases).",
+                    f"- {below_count} scenario(s) were below Apache in this run; see the table (tiny, metadata-heavy HTTP/1 paths are the usual remaining cases).",
                     "- The feature-rich conformance configuration adds conditional rules, cache lookups, `.htaccess` candidates, vhost selection and proxy matching to every request; compare these ratios with the static `bench.py` results rather than treating them as a core-server regression.",
                 ]
                 if below_count
@@ -635,6 +709,7 @@ def main():
         print(f"config test: apache {a_test} ms, httpd-rs {v_test} ms")
         print(f"memory after load: apache {results['memory']['apache']}, httpd-rs {results['memory']['httpd-rs']}")
     finally:
+        conf.stop_ocsp_mock()
         conf.stop_http_mock()
         if not args.keep:
             stop(vap)

@@ -42,3 +42,12 @@ runs use 1s/one sample and omit the 1 MB case.
 | cache HIT 10KB | 80218 | 136152 | 1.70x | 0.46 | 2.5 |
 | cache HIT 1MB | 8158 | 13140 | 1.61x | 0.86 | 2.6 |
 | static 1.1KB | 88894 | 207076 | 2.33x | 0.26 | 1.3 |
+
+## 2026-11-14T12:51:55.139947+00:00
+
+| scenario | Apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |
+|---|---:|---:|---:|---:|---:|
+| cache HIT 1.1KB | 48064 | 61515 | 1.28x | 1.75 | 15.0 |
+| cache HIT 10KB | 44153 | 54800 | 1.24x | 1.97 | 16.5 |
+| cache HIT 1MB | 6740 | 9894 | 1.47x | 1.54 | 5.2 |
+| static 1.1KB | 49491 | 61957 | 1.25x | 1.85 | 16.6 |

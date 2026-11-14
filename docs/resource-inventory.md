@@ -299,10 +299,13 @@ workspace bounds.
 
 This audit found a real lifetime seam in the regex dependency. Its bounded
 lazy-DFA tier used to be constructed on the second search, so compilation and
-cache allocation occurred on whichever request happened to arrive next.
-Both automata tiers are now constructed at the configuration/access-file
-compile boundary. The Apache-facing builder has explicit pattern, automata and
-hybrid-cache ceilings; access-file parsing reserves the complete conservative
+cache allocation occurred on whichever request happened to arrive next. One
+hybrid engine, including its bounded PikeVM fallback and lazy-DFA cache, is now
+constructed at the configuration/access-file compile boundary. A separate
+Pike-only meta engine was removed after profiling showed that it duplicated
+NFA construction and retained state already present in the hybrid engine. The
+Apache-facing builder has explicit pattern, automata and hybrid-cache ceilings;
+access-file parsing reserves the complete conservative
 dependency workspace in a typed byte lease before each compile, caps the
 aggregate at 32 MiB, charges the resident-memory parent, shrinks to the
 retained amount and includes that charge in the access-cache weight. Many

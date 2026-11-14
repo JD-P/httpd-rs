@@ -886,13 +886,31 @@ fn main() {
                     .and_then(|value| value.to_str())
                     .and_then(|value| value.parse::<libc::pid_t>().ok()),
             )
-            .filter(|(((uid, gid), user), parent)| {
-                raw_args.len() == 6 && *uid != 0 && *gid != 0 && !user.is_empty() && *parent > 1
+            .zip(
+                raw_args
+                    .get(6)
+                    .and_then(|value| value.to_str())
+                    .and_then(|value| value.parse::<i32>().ok()),
+            )
+            .filter(|((((uid, gid), user), parent), retained_exe)| {
+                raw_args.len() == 7
+                    && *uid != 0
+                    && *gid != 0
+                    && !user.is_empty()
+                    && *parent > 1
+                    && (*retained_exe == -1 || *retained_exe > 3)
             });
-        let Some((((uid, gid), user), parent_pid)) = worker else {
+        let Some(((((uid, gid), user), parent_pid), retained_exe)) = worker else {
             std::process::exit(1);
         };
-        httpd_rs::cgi::worker_main(3, uid, gid, user, parent_pid);
+        httpd_rs::cgi::worker_main(
+            3,
+            uid,
+            gid,
+            user,
+            parent_pid,
+            (retained_exe >= 0).then_some(retained_exe),
+        );
         return;
     }
     if let Err(error) = httpd_rs::process::close_inherited_descriptors() {

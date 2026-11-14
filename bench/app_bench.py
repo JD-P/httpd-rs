@@ -375,6 +375,7 @@ def main():
             endpoints = (("apache", AP_PORT), ("httpd-rs", VP_PORT))
             for _, port in endpoints:
                 measure(port, sc["path"], max(0.5, duration / 2), sc["conc"])
+                time.sleep(0.25)
             collected = {server: [] for server, _ in endpoints}
             for sample in range(samples):
                 order = endpoints if sample % 2 == 0 else tuple(reversed(endpoints))
@@ -386,6 +387,7 @@ def main():
                             f"non2xx={value['non2xx']} socket_errors={value['socket_errors']}"
                         )
                     collected[server].append(value)
+                    time.sleep(0.25)
             for server, _ in endpoints:
                 vals = collected[server]
                 vals.sort(key=lambda x: x["rps"] or 0)
@@ -410,7 +412,13 @@ def main():
         results = BENCH / "results"
         results.mkdir(exist_ok=True)
         (results / f"app-{stamp}.json").write_text(json.dumps(out, indent=2))
-        report = BENCH / "APP_RESULTS.md"
+        # A filtered diagnostic run must not replace the canonical full
+        # application comparison.
+        report = (
+            BENCH / "APP_RESULTS.md"
+            if not args.only
+            else results / f"app-{stamp}.md"
+        )
         lines = [
             "# PHP-FPM and Gunicorn application benchmark\n\n",
             f"Generated: {out['timestamp']}\n\n",
