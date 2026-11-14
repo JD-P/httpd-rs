@@ -438,6 +438,16 @@ pub const MAX_REQUESTS_PER_SECOND: u64 = 2_000_000;
 pub const MAX_REQUESTS_PER_CLIENT_PER_SECOND: u64 = 500_000;
 pub const MAX_REQUEST_HEADS_PER_SECOND: u64 = 2_000_000;
 pub const MAX_REQUEST_HEADS_PER_CLIENT_PER_SECOND: u64 = 500_000;
+/// Distinct source identities retained by any one fixed-window rate class.
+///
+/// The numeric rate ceilings are deliberately above benchmark throughput,
+/// so they are not a useful memory bound for a distributed source set. Keep
+/// map cardinality independent of those ceilings and discard the allocation
+/// on every rotation. A conservative 128-byte charge covers the fixed
+/// `IpAddr`/counter entry, hash-table control bytes and growth slack.
+pub const MAX_RATE_CLIENT_ENTRIES: usize = 16 * 1024;
+pub const RATE_CLIENT_ENTRY_BYTES: u64 = 128;
+pub const MAX_RATE_CLIENT_BYTES: u64 = MAX_RATE_CLIENT_ENTRIES as u64 * RATE_CLIENT_ENTRY_BYTES;
 pub const MAX_EXPENSIVE_OPS_PER_SECOND: u64 = 256;
 pub const MAX_EXPENSIVE_OPS_PER_CLIENT_PER_SECOND: u64 = 64;
 pub const MAX_BCRYPT_WORK_UNITS_PER_SECOND: u64 = 4_096;
@@ -2510,7 +2520,12 @@ impl ResourceBudget {
         }) {
             window.started = Some(now);
             window.total = 0;
-            window.clients.clear();
+            // `HashMap::clear` retains the attacker's high-water allocation.
+            // Replacing the map makes the window's lifetime its allocation
+            // lifetime as well; allocator retention is then covered by the
+            // process memory/cgroup backstop rather than live application
+            // state.
+            window.clients = HashMap::new();
         }
         let client_used = client
             .and_then(|client| window.clients.get(&client).copied())
@@ -2524,6 +2539,22 @@ impl ResourceBudget {
             client.is_some(),
         ) {
             return false;
+        }
+        if let Some(client) = client {
+            if !window.clients.contains_key(&client) {
+                let entries = window.clients.len() as u64;
+                let bytes = entries.saturating_mul(RATE_CLIENT_ENTRY_BYTES);
+                if !httpd_rs_verified::shared_map_insert_admit(
+                    entries,
+                    MAX_RATE_CLIENT_ENTRIES as u64,
+                    bytes,
+                    RATE_CLIENT_ENTRY_BYTES,
+                    MAX_RATE_CLIENT_BYTES,
+                ) || window.clients.try_reserve(1).is_err()
+                {
+                    return false;
+                }
+            }
         }
         window.total += amount;
         if let Some(client) = client {
@@ -5209,6 +5240,60 @@ mod tests {
             10,
             8,
         ));
+    }
+
+    #[test]
+    fn rate_window_bounds_distinct_clients_and_drops_rotated_capacity() {
+        let mut window = RateWindow::default();
+        let now = std::time::Instant::now();
+        let process_limit = MAX_RATE_CLIENT_ENTRIES as u64 + 10;
+        for index in 0..MAX_RATE_CLIENT_ENTRIES {
+            assert!(ResourceBudget::admit_rate_amount(
+                &mut window,
+                Some(IpAddr::V6(std::net::Ipv6Addr::from(index as u128 + 1))),
+                now,
+                1,
+                process_limit,
+                2,
+            ));
+        }
+        assert_eq!(window.clients.len(), MAX_RATE_CLIENT_ENTRIES);
+        let retained_capacity = window.clients.capacity();
+        assert!(retained_capacity >= MAX_RATE_CLIENT_ENTRIES);
+
+        // Existing identities retain their exact weighted allowance, but a
+        // new identity cannot turn the high throughput ceiling into a map
+        // cardinality or allocation ceiling.
+        assert!(ResourceBudget::admit_rate_amount(
+            &mut window,
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(1u128))),
+            now,
+            1,
+            process_limit,
+            2,
+        ));
+        assert!(!ResourceBudget::admit_rate_amount(
+            &mut window,
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(
+                MAX_RATE_CLIENT_ENTRIES as u128 + 1,
+            ))),
+            now,
+            1,
+            process_limit,
+            2,
+        ));
+
+        let rotated = now + std::time::Duration::from_secs(1);
+        assert!(ResourceBudget::admit_rate_amount(
+            &mut window,
+            Some(IpAddr::from([198, 51, 100, 1])),
+            rotated,
+            1,
+            process_limit,
+            2,
+        ));
+        assert_eq!(window.clients.len(), 1);
+        assert!(window.clients.capacity() < retained_capacity);
     }
 
     #[test]

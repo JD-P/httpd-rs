@@ -273,7 +273,8 @@ OWNED_SHARED_CONTRACTS = {
         "MAX_BACKEND_IDENTITIES", "shared_map_insert_admit", "generation",
     ),
     ("resource.rs", "struct RateWindow"): (
-        "MAX_REQUESTS_PER_SECOND", "clients.clear", "hierarchical_weighted_rate_admit",
+        "MAX_RATE_CLIENT_ENTRIES", "MAX_RATE_CLIENT_BYTES", "shared_map_insert_admit",
+        "window.clients = HashMap::new()", "hierarchical_weighted_rate_admit",
     ),
     ("resource.rs", "struct DiskLedgers"): ("DiskLease", "DEFAULT_DISK_FILE_BUDGET"),
     ("server.rs", "struct ConnectionWorkState"): (

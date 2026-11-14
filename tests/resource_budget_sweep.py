@@ -14,6 +14,7 @@ import concurrent.futures
 import grp
 import http.client
 import http.server
+import itertools
 import json
 import os
 import pwd
@@ -356,9 +357,12 @@ def make_fixture(run: Path) -> tuple[Path, dict[int, str]]:
     for depth in range(1, 33):
         current /= f"d{depth:02d}"
         current.mkdir()
-        (current / ".htaccess").write_text(
-            f'SetEnvIf Request_URI "^/d" resource_depth_{depth}=1\n'
+        directive = (
+            'SetEnvIf Request_URI "^/d" resource_depth_1=1\n'
+            if depth == 1
+            else f"SetEnv resource_depth_{depth} 1\n"
         )
+        (current / ".htaccess").write_text(directive)
         os.chmod(current / ".htaccess", 0o644)
         if depth in {1, 4, 16, 32}:
             (current / "index.txt").write_text("depth calibration\n")
@@ -441,7 +445,7 @@ DocumentRoot "{document_root}"
     Require all granted
 </Location>
 RewriteEngine On
-RewriteRule ^a{{0,8000}}z$ - [L]
+RewriteRule ^a+z$ - [L]
 ProxyPass /calibration-backend http://127.0.0.1:{backend_port}/
 ProxyPassReverse /calibration-backend http://127.0.0.1:{backend_port}/
 Listen 127.0.0.1:{tls_port}
@@ -690,7 +694,7 @@ def main() -> int:
     parser.add_argument("--quick", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--axes",
-        default="response-bytes,header-bytes,request-body-bytes,chunked-request-body-bytes,path-depth,regex-subject-bytes,concurrency,cache,authentication,protocol,compression",
+        default="response-bytes,header-bytes,request-body-bytes,chunked-request-body-bytes,path-depth,path-churn,regex-subject-bytes,concurrency,cache,authentication,protocol,compression",
         help="comma-separated axes or all",
     )
     parser.add_argument("--keep", action="store_true")
@@ -703,6 +707,7 @@ def main() -> int:
         "request-body-bytes",
         "chunked-request-body-bytes",
         "path-depth",
+        "path-churn",
         "regex-subject-bytes",
         "concurrency",
         "cache",
@@ -805,6 +810,35 @@ def main() -> int:
                             ),
                         )
                     )
+            if "path-churn" in selected:
+                churn_requests = 1024 if args.quick else 32 * 1024
+                churn_sequence = itertools.count()
+                points.append(
+                    exercise(
+                        server,
+                        axis="path-churn-control",
+                        value=churn_requests,
+                        requests=churn_requests,
+                        concurrency=16,
+                        operation=lambda: request(
+                            server.port, "GET", "/missing-resource-profile-control"
+                        ),
+                    )
+                )
+                points.append(
+                    exercise(
+                        server,
+                        axis="path-churn",
+                        value=churn_requests,
+                        requests=churn_requests,
+                        concurrency=16,
+                        operation=lambda: request(
+                            server.port,
+                            "GET",
+                            f"/missing-resource-profile-{next(churn_sequence):08x}",
+                        ),
+                    )
+                )
             if "regex-subject-bytes" in selected:
                 for size in (16, 256, 2048, 7000):
                     target = "/" + "a" * size + "y"
@@ -943,8 +977,17 @@ def main() -> int:
             + ", ".join(document["unobserved_ledgers"])
         )
     for point in points:
-        allowed = {"404"} if point["axis"] == "regex-subject-bytes" else {"200"}
+        allowed = (
+            {"404"}
+            if point["axis"]
+            in {"regex-subject-bytes", "path-churn", "path-churn-control"}
+            else {"200"}
+        )
         if point["axis"] == "concurrency":
+            allowed.add("503")
+        if point["axis"] in {"path-churn", "path-churn-control"}:
+            # The churn case deliberately keeps sixteen fresh transports in
+            # flight; bounded pending/filesystem admission may shed a prefix.
             allowed.add("503")
         unexpected = set(point["statuses"]) - allowed
         if point["errors"] or unexpected:

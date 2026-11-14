@@ -14,6 +14,13 @@ success/failure while varying:
 - P-256, P-384, Ed25519, RSA-2048, RSA-4096 and the webpki maximum RSA-8192
   signatures.
 
+The same harness constructs raw ClientHellos at the 65,535-byte dependency
+ceiling. It independently maximizes cipher suites, unknown extensions,
+signature algorithms, supported groups, key shares and PSK identities/binders,
+then fragments the maximal extension shape across 4,096 TLS records. Every
+shape retains a late semantic rejection so the complete bounded structure is
+decoded without requiring a valid or trusted client.
+
 The source-derived outer bound is rustls 0.23.46's 65,535-byte handshake
 reassembly ceiling.  webpki 0.103.16 additionally has internal budgets of 100
 signature checks, 200,000 path-building calls and 250,000 name-constraint
@@ -71,6 +78,15 @@ A post-enforcement replay at the exact boundary accepted 8/8 chains with one
 leaf plus seven intermediates and rejected 8/8 attempts with one leaf plus
 eight intermediates. The rejected shape consumed 0.01 seconds of daemon CPU
 and never entered webpki path construction.
+
+The post-P43 ClientHello calibration ran 128 fresh connections per shape at
+concurrency 16. Maximal 65,535-byte cipher, extension, signature, group,
+key-share and PSK messages consumed 0.00--0.02 daemon CPU-seconds per wave;
+the 4,096-record fragmentation case consumed 0.03 seconds. Peak RSS growth was
+at most 1,364 KiB and every connection terminated promptly. This is below the
+ordinary one-unit envelope at the enforced 128-unit process and 64-unit source
+rates, so no larger ordinary TLS charge is warranted. Complete retained output
+is in `tls_clienthello_profile_results.txt`.
 
 Run the matrix after a rustls, webpki or ring upgrade:
 

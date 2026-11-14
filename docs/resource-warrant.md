@@ -67,8 +67,8 @@ Every site also has one independent closure disposition:
 `closure_contracts` in the policy supply module-level evidence where a local
 expression does not itself name the owning lease. CI requires exactly one
 disposition for every effect and fails if `unclassified_effect_sites` is not
-zero. The current closure is 2,225 typed-lease sites, 665 constant-bound sites
-and 443 external/kernel sites. Classification closes discovery debt; it does
+zero. The current closure is 2,236 typed-lease sites, 665 constant-bound sites
+and 448 external/kernel sites. Classification closes discovery debt; it does
 not promote a partial dominance or cost-refinement proof to mechanized status.
 
 ## Dynamic collection

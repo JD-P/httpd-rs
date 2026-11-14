@@ -131,7 +131,9 @@ terminal stream's exact close cause is retained in a FIFO tombstone set bounded
 by the configured reset limits and an absolute 1,024-entry ceiling. That bound
 lets the codec distinguish a closed lower stream (STREAM_CLOSED) from an ID the
 peer skipped (PROTOCOL_ERROR) without turning historical stream IDs into an
-unbounded connection-lifetime map. Repeated error resets replace queued
+unbounded connection-lifetime map. FIFO eviction is paired with an exact,
+preallocated sorted index, so attacker-selected old stream IDs require at most
+seven comparisons rather than a linear tombstone scan. Repeated error resets replace queued
 application output and reclaim its flow capacity; they do not reopen or change
 the retained terminal cause.
 
@@ -177,7 +179,10 @@ bytes before webpki path construction. The byte ceiling is inherited from the
 rustls handshake-message bound; the count, CPU and workspace bounds are pinned
 by `adversarial/tls_dependency_profile.py` across ambiguous issuers, dense name
 constraints and every ring/webpki signature family, including P-384 and
-RSA-8192 extrema.
+RSA-8192 extrema. The same harness maximizes ClientHello cipher, extension,
+signature, group, key-share and PSK cardinality at the rustls message ceiling
+and fragments it across 4,096 records; the retained 128-connection waves stay
+within the ordinary one-unit CPU/workspace profile.
 
 Outbound rustls verification shares the same 64-process/32-source weighted
 concurrency and dependency-workspace ledgers. A generation-cached verifier
@@ -202,11 +207,23 @@ is executable Verus code and can only produce a value between the observed
 peak and the enforced hard ceiling; it is calibration evidence, never an
 automatic limit increase.
 
+The sweep also compares 32,768 repeated missing-path requests with 32,768
+unique basenames. The unique-name wave added 14.3% CPU and 4 MiB process RSS
+after the repeated-name allocator warm-up, remained linear, and exercised the
+bounded pending/filesystem rejection path. The profiler continues to sample
+cgroup slab/dentry memory because kernel namespace-cache retention is an
+external assumption; the measured application behavior does not justify a
+new path-name cache or a throughput-reducing filesystem rate gate.
+
 Fixed-window process/source gates bound valid requests, malformed HTTP/1 head
 parsing, expensive operations, cache writes, and log bytes. HTTP/2 acquires
 its source/process stream lease and request-rate admission before spawning a
-stream task. Request-scoped resource APIs reject absent or mismatched contexts
-instead of falling back to an unattributed process-only charge.
+stream task. Every rate class retains at most 16,384 distinct canonical client
+identities (a conservative two-MiB fixed map envelope), grows fallibly, and
+drops rather than clears its map on one-second rotation so an identity burst
+cannot become persistent application-owned capacity. Request-scoped resource
+APIs reject absent or mismatched contexts instead of falling back to an
+unattributed process-only charge.
 
 `ResourceContext` is attached to parsed HTTP/1 and HTTP/2 requests after the
 effective RemoteIP-aware address is validated. It is shared by request clones,

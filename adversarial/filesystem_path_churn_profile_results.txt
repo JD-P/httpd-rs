@@ -1,0 +1,18 @@
+httpd-rs unique-missing-path resource profile
+Date: 2026-11-14
+Binary: target/release/httpd-rs at the post-P43 remediation worktree
+Command: python3 tests/resource_profile.py run ... tests/resource_budget_sweep.py --no-quick --axes path-churn
+
+Both waves used 32,768 fresh HTTP/1 connections at concurrency 16. The control
+requested one already-warm missing name; the churn wave used a different
+missing basename for every request. Expected 503s are bounded pending or
+filesystem admission, not crashes.
+
+case=path-churn-control wall_s=9.163 cpu_s=6.01 status_404=30331 status_503=2437 rss_before_kib=9316 rss_after_kib=19416 private_before_kib=8800 private_after_kib=18612 pending_rejections=2437
+case=path-churn-unique wall_s=9.001 cpu_s=6.87 status_404=30360 status_503=2408 rss_before_kib=19416 rss_after_kib=23512 private_before_kib=18612 private_after_kib=22884 pending_rejections=2388 filesystem_rejections=20
+
+The unique-name axis added 0.86 CPU-seconds (14.3%) and 4,096 KiB RSS over the
+already-warmed repeated-name wave. Cost remained linear and bounded admission
+shed overload. The profiler's cgroup is shared with unrelated workspace
+processes, so its slab counters are retained only as an independent deployment
+backstop observation and are not attributed to this wave.

@@ -1,0 +1,17 @@
+httpd-rs hostile ClientHello dependency profile
+Date: 2026-11-14
+Binary: target/release/httpd-rs at the post-P43 remediation worktree
+Command: python3 adversarial/tls_dependency_profile.py --max-chain 1 --handshakes 128 --concurrency 16
+
+All raw shapes use an unsupported cipher suite for a deterministic late
+rejection after bounded message decoding. `terminal=128` means every socket
+reached an alert/reset/EOF without a timeout or daemon exit.
+
+case=minimal-reject wire_bytes=1461 records=1 handshakes=128 concurrency=16 terminal=128 wall_s=0.028858 cpu_s=0.010000 rss_delta_kib=796 server_exit=None
+case=cipher-suite-cardinality wire_bytes=65554 records=4 handshakes=128 concurrency=16 terminal=128 wall_s=0.022935 cpu_s=0.010000 rss_delta_kib=1200 server_exit=None
+case=unknown-extension-cardinality wire_bytes=65552 records=4 handshakes=128 concurrency=16 terminal=128 wall_s=0.020291 cpu_s=0.000000 rss_delta_kib=1192 server_exit=None
+case=signature-algorithm-cardinality wire_bytes=65554 records=4 handshakes=128 concurrency=16 terminal=128 wall_s=0.017426 cpu_s=0.010000 rss_delta_kib=1224 server_exit=None
+case=supported-group-cardinality wire_bytes=65554 records=4 handshakes=128 concurrency=16 terminal=128 wall_s=0.018112 cpu_s=0.010000 rss_delta_kib=1112 server_exit=None
+case=key-share-cardinality wire_bytes=65555 records=4 handshakes=128 concurrency=16 terminal=128 wall_s=0.022456 cpu_s=0.020000 rss_delta_kib=1076 server_exit=None
+case=psk-cardinality wire_bytes=65555 records=4 handshakes=128 concurrency=16 terminal=128 wall_s=0.021283 cpu_s=0.010000 rss_delta_kib=1132 server_exit=None
+case=fragmented-unknown-extensions wire_bytes=86012 records=4096 handshakes=128 concurrency=16 terminal=128 wall_s=0.020242 cpu_s=0.030000 rss_delta_kib=1364 server_exit=None

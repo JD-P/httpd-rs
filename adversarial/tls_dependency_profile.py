@@ -5,7 +5,10 @@ The harness is entirely loopback-local. It creates a root, server identity and
 same-subject client intermediates. A leaf is signed by the final intermediate,
 while preceding certificates are valid CA certificates with the same subject
 but different keys. Presenting the real signer last makes webpki explore the
-issuer candidates without relying on malformed DER or an untrusted chain.
+issuer candidates without relying on malformed DER or an untrusted chain. It
+also generates structurally bounded hostile ClientHellos at the rustls message
+ceiling to exercise cipher, extension, signature, group, key-share and PSK
+cardinality plus record fragmentation independently of certificate work.
 """
 
 from __future__ import annotations
@@ -108,6 +111,294 @@ class Fixture:
             + b"".join(certificate.read_bytes() for certificate in chosen)
         )
         return path
+
+
+@dataclass
+class ClientHelloTemplate:
+    record_version: bytes
+    legacy_version: bytes
+    random: bytes
+    session_id: bytes
+    cipher_suites: bytes
+    compression_methods: bytes
+    extensions: list[tuple[int, bytes]]
+
+
+TLS_RECORD_PLAINTEXT_MAX = 16 * 1024
+TLS_HANDSHAKE_MESSAGE_MAX = 65_535
+
+
+def generated_client_hello() -> bytes:
+    """Return CPython/OpenSSL's initial TLS 1.3 ClientHello records."""
+
+    ctx = context(None, None)
+    incoming = ssl.MemoryBIO()
+    outgoing = ssl.MemoryBIO()
+    client = ctx.wrap_bio(incoming, outgoing, server_side=False, server_hostname="localhost")
+    try:
+        client.do_handshake()
+    except ssl.SSLWantReadError:
+        pass
+    chunks = []
+    while outgoing.pending:
+        chunks.append(outgoing.read())
+    return b"".join(chunks)
+
+
+def parse_client_hello(records: bytes) -> ClientHelloTemplate:
+    pos = 0
+    handshake = bytearray()
+    record_version = b"\x03\x01"
+    while pos < len(records):
+        if pos + 5 > len(records):
+            raise ValueError("truncated TLS record")
+        kind = records[pos]
+        record_version = records[pos + 1 : pos + 3]
+        length = int.from_bytes(records[pos + 3 : pos + 5], "big")
+        pos += 5
+        if pos + length > len(records) or kind != 22:
+            raise ValueError("unexpected initial TLS record")
+        handshake.extend(records[pos : pos + length])
+        pos += length
+    if len(handshake) < 4 or handshake[0] != 1:
+        raise ValueError("initial handshake is not ClientHello")
+    declared = int.from_bytes(handshake[1:4], "big")
+    if declared != len(handshake) - 4:
+        raise ValueError("ClientHello length mismatch")
+    body = bytes(handshake[4:])
+    cursor = 0
+    legacy_version = body[cursor : cursor + 2]
+    cursor += 2
+    random = body[cursor : cursor + 32]
+    cursor += 32
+    session_len = body[cursor]
+    cursor += 1
+    session_id = body[cursor : cursor + session_len]
+    cursor += session_len
+    cipher_len = int.from_bytes(body[cursor : cursor + 2], "big")
+    cursor += 2
+    cipher_suites = body[cursor : cursor + cipher_len]
+    cursor += cipher_len
+    compression_len = body[cursor]
+    cursor += 1
+    compression_methods = body[cursor : cursor + compression_len]
+    cursor += compression_len
+    extensions_len = int.from_bytes(body[cursor : cursor + 2], "big")
+    cursor += 2
+    extensions_end = cursor + extensions_len
+    if extensions_end != len(body):
+        raise ValueError("ClientHello extension length mismatch")
+    extensions = []
+    while cursor < extensions_end:
+        if cursor + 4 > extensions_end:
+            raise ValueError("truncated ClientHello extension")
+        kind = int.from_bytes(body[cursor : cursor + 2], "big")
+        length = int.from_bytes(body[cursor + 2 : cursor + 4], "big")
+        cursor += 4
+        if cursor + length > extensions_end:
+            raise ValueError("truncated ClientHello extension value")
+        extensions.append((kind, body[cursor : cursor + length]))
+        cursor += length
+    return ClientHelloTemplate(
+        record_version=record_version,
+        legacy_version=legacy_version,
+        random=random,
+        session_id=session_id,
+        cipher_suites=cipher_suites,
+        compression_methods=compression_methods,
+        extensions=extensions,
+    )
+
+
+def client_hello_body(
+    template: ClientHelloTemplate,
+    *,
+    cipher_suites: bytes,
+    extensions: list[tuple[int, bytes]],
+) -> bytes:
+    encoded_extensions = b"".join(
+        kind.to_bytes(2, "big") + len(value).to_bytes(2, "big") + value
+        for kind, value in extensions
+    )
+    return (
+        template.legacy_version
+        + template.random
+        + bytes([len(template.session_id)])
+        + template.session_id
+        + len(cipher_suites).to_bytes(2, "big")
+        + cipher_suites
+        + bytes([len(template.compression_methods)])
+        + template.compression_methods
+        + len(encoded_extensions).to_bytes(2, "big")
+        + encoded_extensions
+    )
+
+
+def encode_client_hello(
+    template: ClientHelloTemplate,
+    *,
+    cipher_suites: bytes,
+    extensions: list[tuple[int, bytes]],
+    fragment: int = TLS_RECORD_PLAINTEXT_MAX,
+) -> bytes:
+    body = client_hello_body(template, cipher_suites=cipher_suites, extensions=extensions)
+    handshake = b"\x01" + len(body).to_bytes(3, "big") + body
+    if len(handshake) > TLS_HANDSHAKE_MESSAGE_MAX:
+        raise ValueError(f"ClientHello exceeds {TLS_HANDSHAKE_MESSAGE_MAX} bytes")
+    records = []
+    for start in range(0, len(handshake), fragment):
+        part = handshake[start : start + fragment]
+        records.append(
+            b"\x16"
+            + template.record_version
+            + len(part).to_bytes(2, "big")
+            + part
+        )
+    return b"".join(records)
+
+
+def replace_extension(
+    extensions: list[tuple[int, bytes]], kind: int, value: bytes
+) -> list[tuple[int, bytes]]:
+    return [(current, data) for current, data in extensions if current != kind] + [
+        (kind, value)
+    ]
+
+
+def unknown_u16_values(count: int, *, start: int = 0x4000) -> bytes:
+    values = []
+    candidate = start
+    while len(values) < count:
+        value = candidate & 0xFFFF
+        candidate += 1
+        if value not in {0x1301, 0x1302, 0x1303}:
+            values.append(value.to_bytes(2, "big"))
+    return b"".join(values)
+
+
+def maximal_vector_extension(
+    template: ClientHelloTemplate, kind: int
+) -> list[tuple[int, bytes]]:
+    base = replace_extension(template.extensions, kind, b"\x00\x00")
+    fixed = len(
+        client_hello_body(template, cipher_suites=b"\x0a\x0a", extensions=base)
+    )
+    count = max(1, (TLS_HANDSHAKE_MESSAGE_MAX - 4 - fixed) // 2)
+    values = unknown_u16_values(count)
+    return replace_extension(template.extensions, kind, len(values).to_bytes(2, "big") + values)
+
+
+def client_hello_shapes() -> dict[str, bytes]:
+    template = parse_client_hello(generated_client_hello())
+    unknown_cipher = b"\x0a\x0a"
+    max_body = TLS_HANDSHAKE_MESSAGE_MAX - 4
+
+    fixed_cipher_body = len(
+        client_hello_body(
+            template,
+            cipher_suites=b"",
+            extensions=template.extensions,
+        )
+    )
+    cipher_bytes = max(2, ((max_body - fixed_cipher_body) // 2) * 2)
+    cipher_values = unknown_u16_values(cipher_bytes // 2)
+
+    base_unknown_extensions = list(template.extensions)
+    fixed_extension_body = len(
+        client_hello_body(
+            template,
+            cipher_suites=unknown_cipher,
+            extensions=base_unknown_extensions,
+        )
+    )
+    extension_count = max(1, (max_body - fixed_extension_body) // 4)
+    used_kinds = {kind for kind, _ in base_unknown_extensions}
+    unknown_extensions = []
+    candidate = 0x4000
+    while len(unknown_extensions) < extension_count:
+        kind = candidate & 0xFFFF
+        candidate += 1
+        if kind not in used_kinds:
+            unknown_extensions.append((kind, b""))
+
+    key_share_base = replace_extension(template.extensions, 51, b"\x00\x00")
+    key_share_fixed = len(
+        client_hello_body(
+            template,
+            cipher_suites=unknown_cipher,
+            extensions=key_share_base,
+        )
+    )
+    key_share_count = max(1, (max_body - key_share_fixed) // 5)
+    key_shares = b"".join(
+        ((0x4000 + index) & 0xFFFF).to_bytes(2, "big") + b"\x00\x01\x00"
+        for index in range(key_share_count)
+    )
+    key_share_extensions = replace_extension(
+        template.extensions, 51, len(key_shares).to_bytes(2, "big") + key_shares
+    )
+
+    psk_base = replace_extension(template.extensions, 41, b"\x00\x00\x00\x00")
+    psk_fixed = len(
+        client_hello_body(
+            template,
+            cipher_suites=unknown_cipher,
+            extensions=psk_base,
+        )
+    )
+    psk_count = max(1, (max_body - psk_fixed) // 9)
+    identities = b"\x00\x01x\x00\x00\x00\x00" * psk_count
+    binders = b"\x01x" * psk_count
+    psk_value = (
+        len(identities).to_bytes(2, "big")
+        + identities
+        + len(binders).to_bytes(2, "big")
+        + binders
+    )
+    # pre_shared_key must be the final extension in a conforming ClientHello.
+    psk_extensions = [(kind, value) for kind, value in template.extensions if kind != 41]
+    psk_extensions.append((41, psk_value))
+
+    shapes = {
+        "minimal-reject": encode_client_hello(
+            template, cipher_suites=unknown_cipher, extensions=template.extensions
+        ),
+        "cipher-suite-cardinality": encode_client_hello(
+            template, cipher_suites=cipher_values, extensions=template.extensions
+        ),
+        "unknown-extension-cardinality": encode_client_hello(
+            template,
+            cipher_suites=unknown_cipher,
+            extensions=base_unknown_extensions + unknown_extensions,
+        ),
+        "signature-algorithm-cardinality": encode_client_hello(
+            template,
+            cipher_suites=unknown_cipher,
+            extensions=maximal_vector_extension(template, 13),
+        ),
+        "supported-group-cardinality": encode_client_hello(
+            template,
+            cipher_suites=unknown_cipher,
+            extensions=maximal_vector_extension(template, 10),
+        ),
+        "key-share-cardinality": encode_client_hello(
+            template,
+            cipher_suites=unknown_cipher,
+            extensions=key_share_extensions,
+        ),
+        "psk-cardinality": encode_client_hello(
+            template,
+            cipher_suites=unknown_cipher,
+            extensions=psk_extensions,
+        ),
+    }
+    shapes["fragmented-unknown-extensions"] = encode_client_hello(
+        template,
+        cipher_suites=unknown_cipher,
+        extensions=base_unknown_extensions + unknown_extensions,
+        fragment=16,
+    )
+    return shapes
 
 
 def make_fixture(root: Path, intermediates: int, names: int, algorithm: str) -> Fixture:
@@ -337,6 +628,28 @@ def one_handshake(port: int, ctx: ssl.SSLContext, source: str) -> bool:
         return False
 
 
+def one_raw_client_hello(port: int, payload: bytes, source: str) -> bool:
+    """Send one hostile ClientHello and report prompt terminal handling."""
+
+    raw = socket.socket()
+    raw.settimeout(5)
+    raw.bind((source, 0))
+    try:
+        raw.connect(("127.0.0.1", port))
+        raw.sendall(payload)
+        raw.shutdown(socket.SHUT_WR)
+        while raw.recv(4096):
+            pass
+        return True
+    except TimeoutError:
+        return False
+    except (ConnectionError, OSError):
+        # An alert followed by reset is also a prompt terminal rejection.
+        return True
+    finally:
+        raw.close()
+
+
 def measure(
     fixture: Fixture,
     label: str,
@@ -383,6 +696,56 @@ def measure(
         stop(process)
 
 
+def measure_client_hello(
+    fixture: Fixture,
+    label: str,
+    payload: bytes,
+    handshakes: int,
+    concurrency: int,
+) -> None:
+    process, port, _ = start_server(fixture, f"clienthello-{label}", False)
+    try:
+        baseline_rss = proc_value(process.pid, "VmRSS")
+        baseline_hwm = proc_value(process.pid, "VmHWM")
+        baseline_cpu = cpu_seconds(process.pid)
+        started = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [
+                pool.submit(
+                    one_raw_client_hello,
+                    port,
+                    payload,
+                    f"127.0.0.{2 + (index % 200)}",
+                )
+                for index in range(handshakes)
+            ]
+            peak_rss = baseline_rss
+            while not all(future.done() for future in futures):
+                peak_rss = max(peak_rss, proc_value(process.pid, "VmRSS"))
+                time.sleep(0.001)
+            results = [future.result() for future in futures]
+        elapsed = time.perf_counter() - started
+        final_hwm = proc_value(process.pid, "VmHWM")
+        peak_rss = max(peak_rss, final_hwm)
+        record_count = 0
+        cursor = 0
+        while cursor + 5 <= len(payload):
+            length = int.from_bytes(payload[cursor + 3 : cursor + 5], "big")
+            cursor += 5 + length
+            record_count += 1
+        print(
+            f"case=clienthello-{label} wire_bytes={len(payload)} records={record_count} "
+            f"handshakes={handshakes} concurrency={concurrency} terminal={sum(results)} "
+            f"wall_s={time.perf_counter() - started:.6f} "
+            f"cpu_s={cpu_seconds(process.pid) - baseline_cpu:.6f} "
+            f"rss_before_kib={baseline_rss} rss_after_kib={proc_value(process.pid, 'VmRSS')} "
+            f"rss_peak_kib={peak_rss} rss_delta_kib={max(0, final_hwm - baseline_hwm)} "
+            f"server_exit={process.poll()}"
+        )
+    finally:
+        stop(process)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -399,6 +762,11 @@ def main() -> int:
     )
     parser.add_argument("--handshakes", type=int, default=32)
     parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument(
+        "--skip-clienthello",
+        action="store_true",
+        help="skip hostile ClientHello cardinality/fragmentation profiles",
+    )
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
     if args.max_chain < 1 or args.max_chain > 64:
@@ -423,6 +791,15 @@ def main() -> int:
                 args.handshakes,
                 args.concurrency,
             )
+        if not args.skip_clienthello:
+            for label, payload in client_hello_shapes().items():
+                measure_client_hello(
+                    fixture,
+                    label,
+                    payload,
+                    args.handshakes,
+                    args.concurrency,
+                )
         return 0
     finally:
         if args.keep:

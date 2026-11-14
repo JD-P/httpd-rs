@@ -97,13 +97,22 @@ pub(super) struct Counts {
     /// distinguish a genuinely closed stream from a skipped lower ID. Without
     /// this, both cases collapse into `id < next_id` even though RFC 9113
     /// requires STREAM_CLOSED for the former and PROTOCOL_ERROR for the latter.
-    forgotten: VecDeque<(StreamId, httpd_rs_verified::H2PeerStreamPhase)>,
+    forgotten_order: VecDeque<StreamId>,
+    /// Sorted, preallocated index for deterministic logarithmic lookup. The
+    /// configured production bound is 100, so lookup requires at most seven
+    /// key comparisons without a hash/collision assumption.
+    forgotten_index: Vec<(StreamId, httpd_rs_verified::H2PeerStreamPhase)>,
     max_forgotten: usize,
 }
 
 impl Counts {
     /// Create a new `Counts` using the provided configuration values.
     pub fn new(peer: peer::Dyn, config: &Config) -> Self {
+        let max_forgotten = config
+            .local_reset_max
+            .max(config.remote_reset_max)
+            .max(1)
+            .min(MAX_FORGOTTEN_STREAMS);
         Counts {
             peer,
             max_send_streams: config.initial_max_send_streams,
@@ -119,12 +128,9 @@ impl Counts {
             data_frame_budget: Budget::new(config.data_frame_budget.resolve(None)),
             data_frame_budget_is_auto: config.data_frame_budget.is_auto(),
             num_recv_empty_data_frames: 0,
-            forgotten: VecDeque::new(),
-            max_forgotten: config
-                .local_reset_max
-                .max(config.remote_reset_max)
-                .max(1)
-                .min(MAX_FORGOTTEN_STREAMS),
+            forgotten_order: VecDeque::with_capacity(max_forgotten),
+            forgotten_index: Vec::with_capacity(max_forgotten),
+            max_forgotten,
         }
     }
 
@@ -132,10 +138,44 @@ impl Counts {
         &self,
         id: StreamId,
     ) -> Option<httpd_rs_verified::H2PeerStreamPhase> {
-        self.forgotten
-            .iter()
-            .rev()
-            .find_map(|(forgotten, phase)| (*forgotten == id).then_some(*phase))
+        self.forgotten_index
+            .binary_search_by_key(&id, |(stream, _)| *stream)
+            .ok()
+            .map(|index| self.forgotten_index[index].1)
+    }
+
+    fn remember_forgotten(
+        &mut self,
+        id: StreamId,
+        phase: httpd_rs_verified::H2PeerStreamPhase,
+    ) {
+        // A stream is normally released exactly once. If a future state-machine
+        // change reports it twice, update the existing cause without creating
+        // a duplicate FIFO entry that could later evict the live index value.
+        if let Ok(index) = self
+            .forgotten_index
+            .binary_search_by_key(&id, |(stream, _)| *stream)
+        {
+            self.forgotten_index[index].1 = phase;
+            return;
+        }
+        if self.forgotten_order.len() == self.max_forgotten {
+            if let Some(oldest) = self.forgotten_order.pop_front() {
+                let index = self
+                    .forgotten_index
+                    .binary_search_by_key(&oldest, |(stream, _)| *stream)
+                    .expect("forgotten FIFO/index divergence");
+                self.forgotten_index.remove(index);
+            }
+        }
+        self.forgotten_order.push_back(id);
+        let index = self
+            .forgotten_index
+            .binary_search_by_key(&id, |(stream, _)| *stream)
+            .unwrap_err();
+        self.forgotten_index.insert(index, (id, phase));
+        debug_assert_eq!(self.forgotten_order.len(), self.forgotten_index.len());
+        debug_assert!(self.forgotten_order.len() <= self.max_forgotten);
     }
 
     fn remember_released(&mut self, stream: &Stream) {
@@ -146,10 +186,7 @@ impl Counts {
                 | httpd_rs_verified::H2PeerStreamPhase::ClosedEndStream
                 | httpd_rs_verified::H2PeerStreamPhase::ClosedLocalReset
         ));
-        if self.forgotten.len() == self.max_forgotten {
-            self.forgotten.pop_front();
-        }
-        self.forgotten.push_back((stream.id, phase));
+        self.remember_forgotten(stream.id, phase);
     }
 
     pub fn set_target_connection_window_size(&mut self, size: WindowSize) {
@@ -548,5 +585,40 @@ mod tests {
                 .unwrap();
         }
         assert!(counts.record_data_frame(0).is_err());
+    }
+
+    #[test]
+    fn forgotten_stream_index_is_bounded_and_evicts_in_fifo_order() {
+        use httpd_rs_verified::H2PeerStreamPhase::{
+            ClosedEndStream, ClosedLocalReset, ClosedRemoteReset,
+        };
+
+        let mut counts = Counts::new(
+            peer::Dyn::Server,
+            &Config {
+                local_reset_max: 3,
+                ..counts_config()
+            },
+        );
+        counts.remember_forgotten(1.into(), ClosedEndStream);
+        counts.remember_forgotten(3.into(), ClosedRemoteReset);
+        counts.remember_forgotten(5.into(), ClosedLocalReset);
+        assert_eq!(counts.forgotten_order.len(), 3);
+        assert_eq!(counts.forgotten_index.len(), 3);
+        assert_eq!(counts.forgotten_phase(1.into()), Some(ClosedEndStream));
+
+        counts.remember_forgotten(7.into(), ClosedEndStream);
+        assert_eq!(counts.forgotten_phase(1.into()), None);
+        assert_eq!(counts.forgotten_phase(3.into()), Some(ClosedRemoteReset));
+        assert_eq!(counts.forgotten_phase(7.into()), Some(ClosedEndStream));
+        assert_eq!(counts.forgotten_order.len(), 3);
+        assert_eq!(counts.forgotten_index.len(), 3);
+
+        // Duplicate terminal notification updates the exact cause without
+        // creating a second FIFO cell or weakening the cardinality bound.
+        counts.remember_forgotten(5.into(), ClosedRemoteReset);
+        assert_eq!(counts.forgotten_phase(5.into()), Some(ClosedRemoteReset));
+        assert_eq!(counts.forgotten_order.len(), 3);
+        assert_eq!(counts.forgotten_index.len(), 3);
     }
 }

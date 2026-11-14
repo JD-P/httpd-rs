@@ -50860,6 +50860,22 @@
       "status": "audited-gateway"
     },
     {
+      "accounting_evidence": [],
+      "closure_contract": "inferred-audited-gateway",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "request_resource_effect_closure"
+      ],
+      "code": "window.clients = HashMap::new();",
+      "effect": "heap-allocation",
+      "function": "admit_rate_amount",
+      "id": "6a3a49fd6e025b2f3321",
+      "path": "crates/server/src/resource.rs",
+      "status": "audited-gateway"
+    },
+    {
       "accounting_evidence": [
         "limit"
       ],
@@ -63511,10 +63527,95 @@
       "closure_verification_targets": [
         "request_resource_effect_closure"
       ],
-      "code": "forgotten: VecDeque::new(),",
+      "code": ".binary_search_by_key(&id, |(stream, _)| *stream)",
+      "effect": "cpu-iteration",
+      "function": "forgotten_phase",
+      "id": "95210e0c83dc29d45cdb",
+      "path": "vendor/h2-0.4.20/src/proto/streams/counts.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "forgotten_order: VecDeque::with_capacity(max_forgotten),",
       "effect": "heap-allocation",
       "function": "new",
-      "id": "704cb41d6fd55e5f8a5c",
+      "id": "dc3bf50422f086eaa96a",
+      "path": "vendor/h2-0.4.20/src/proto/streams/counts.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "forgotten_index: Vec::with_capacity(max_forgotten),",
+      "effect": "heap-allocation",
+      "function": "new",
+      "id": "e883820d94800f6bcf5c",
+      "path": "vendor/h2-0.4.20/src/proto/streams/counts.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": ".binary_search_by_key(&id, |(stream, _)| *stream)",
+      "effect": "cpu-iteration",
+      "function": "remember_forgotten",
+      "id": "3e6511c57cadbadde125",
+      "path": "vendor/h2-0.4.20/src/proto/streams/counts.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": ".binary_search_by_key(&id, |(stream, _)| *stream)",
+      "effect": "cpu-iteration",
+      "function": "remember_forgotten",
+      "id": "9ee4289d72c93760a9c1",
+      "path": "vendor/h2-0.4.20/src/proto/streams/counts.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": ".binary_search_by_key(&oldest, |(stream, _)| *stream)",
+      "effect": "cpu-iteration",
+      "function": "remember_forgotten",
+      "id": "fbb7917b9967dbfe436a",
       "path": "vendor/h2-0.4.20/src/proto/streams/counts.rs",
       "status": "external-source-inventory"
     },
@@ -65338,19 +65439,19 @@
       "status": "external-source-inventory"
     }
   ],
-  "source_sha256": "522d75fdf0e841f2fecc3142c39e96b3fae840756435217b60a521b6a7c26e7b",
+  "source_sha256": "883a0e077f90db709fbc85a30c2777401f7adf6aa1733c24b32c83d90ca31254",
   "summary": {
     "by_closure_disposition": {
-      "external-assumption": 443,
+      "external-assumption": 448,
       "proved-constant-bound": 665,
-      "typed-lease": 2235
+      "typed-lease": 2236
     },
     "by_effect": {
       "compression-regex-crypto": 69,
-      "cpu-iteration": 915,
+      "cpu-iteration": 919,
       "data-growth": 440,
       "filesystem": 134,
-      "heap-allocation": 1067,
+      "heap-allocation": 1069,
       "network": 35,
       "synchronization": 277,
       "task-process": 46,
@@ -65359,12 +65460,12 @@
     "by_status": {
       "accounted-context": 700,
       "accounting-boundary": 63,
-      "audited-gateway": 323,
-      "external-source-inventory": 191,
+      "audited-gateway": 324,
+      "external-source-inventory": 196,
       "local-bound-candidate": 14,
       "review-required": 2052
     },
-    "effect_sites": 3343,
+    "effect_sites": 3349,
     "files": 56,
     "unclassified_effect_sites": 0
   }
