@@ -739,6 +739,7 @@ fn confined_expr_relative(raw: &str) -> Option<PathBuf> {
 }
 
 fn read_expr_file(root: &Path, relative: &Path) -> Result<String, String> {
+    let _blocking_io = crate::resource::begin_blocking_io().map_err(|error| error.to_string())?;
     let (file, metadata) =
         crate::files::open_read_beneath(root, relative).map_err(|error| error.to_string())?;
     if !httpd_rs_verified::expr_file_read_admit(

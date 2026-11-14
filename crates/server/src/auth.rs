@@ -375,6 +375,7 @@ fn read_small_uncached(
     mutable: bool,
     service_uid: u32,
 ) -> Option<Arc<ParsedAuthFile>> {
+    let _blocking_io = crate::resource::begin_blocking_io().ok()?;
     // O_NONBLOCK is security-significant: opening an attacker-selected FIFO
     // must not park a request worker before the regular-file check runs.
     let file = if mutable {

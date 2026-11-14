@@ -910,6 +910,14 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             rule.flags.passthrough,
             absolute,
         ) {
+            let _blocking_io = match crate::resource::begin_blocking_io() {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return Outcome::Error(format!(
+                        "filesystem rewrite capacity unavailable: {error}"
+                    ));
+                }
+            };
             // Most absolute substitutions are URL paths (for example
             // `/index.html`), not literal filesystem names.  Do not resolve
             // the document root unless the substitution itself names an

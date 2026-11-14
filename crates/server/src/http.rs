@@ -527,6 +527,11 @@ impl BodyAccumulator {
             self.len = next;
             return Ok(());
         }
+        // Disk transition and every later spool write are potentially
+        // blocking even with O_NONBLOCK (regular files ignore it). Retain one
+        // request/client/process blocking-I/O owner for the complete open +
+        // write operation; nested secure-open helpers reuse this guard.
+        let _blocking_io = crate::resource::begin_blocking_io_in(self.resource_context.as_ref())?;
         if self.file.is_none() {
             let mut lease = match self.resource_context.as_ref() {
                 Some(context) => self.resource_budget.try_spool_in(
@@ -1367,6 +1372,10 @@ pub(crate) fn read_request_body<R: Read + Write>(
     head: ParsedRequestHead,
 ) -> Result<Request, ReadError> {
     let (mut req, mut request_resident) = head.into_parts();
+    let _request_scope = req
+        .request_scope()
+        .cloned()
+        .map(crate::resource::enter_current_request_scope);
     let framing = req.framing;
     let spool_context = req.resource_context().cloned();
 
@@ -1484,18 +1493,31 @@ pub(crate) fn read_request_body<R: Read + Write>(
     Ok(req)
 }
 
-fn push_body_without_blocking_runtime(
+pub(crate) fn push_body_without_blocking_runtime(
     body: &mut BodyAccumulator,
     resident: &mut ResidentLease,
     bytes: &[u8],
+    scope: Option<&crate::resource::RequestScope>,
 ) -> io::Result<()> {
+    if scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "request scope cancelled before body spool write",
+        ));
+    }
+    let mut operation = || {
+        let _scope = scope
+            .cloned()
+            .map(crate::resource::enter_current_request_scope);
+        body.push_with_resident(bytes, resident)
+    };
     if matches!(
         tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
         Ok(tokio::runtime::RuntimeFlavor::MultiThread)
     ) {
-        tokio::task::block_in_place(|| body.push_with_resident(bytes, resident))
+        tokio::task::block_in_place(operation)
     } else {
-        body.push_with_resident(bytes, resident)
+        operation()
     }
 }
 
@@ -1597,7 +1619,12 @@ where
         BodyFraming::None => {}
         BodyFraming::Length(length) => {
             let take = usize::try_from(length.min(buf.len() as u64)).unwrap_or(buf.len());
-            push_body_without_blocking_runtime(&mut body, &mut request_resident, &buf[..take])?;
+            push_body_without_blocking_runtime(
+                &mut body,
+                &mut request_resident,
+                &buf[..take],
+                scope.as_ref(),
+            )?;
             buf.drain(..take);
             let mut remaining = length.saturating_sub(take as u64);
             let mut chunk = vec![0u8; 64 * 1024];
@@ -1621,6 +1648,7 @@ where
                     &mut body,
                     &mut request_resident,
                     &chunk[..read],
+                    scope.as_ref(),
                 )?;
                 remaining -= read as u64;
                 if !minimum_read_rate_ok(
@@ -1692,6 +1720,7 @@ where
                             &mut body,
                             &mut request_resident,
                             &buf[..take],
+                            scope.as_ref(),
                         )?;
                         buf.drain(..take);
                         remaining -= take as u64;
@@ -1713,6 +1742,7 @@ where
                             &mut body,
                             &mut request_resident,
                             &chunk[..read],
+                            scope.as_ref(),
                         )?;
                         remaining -= read as u64;
                         total += read as u64;
@@ -4389,6 +4419,27 @@ mod tests {
             .unwrap();
         assert_eq!(budget.usage(), (REQUEST_BODY_SPOOL_PREFIX + 1, 1, 0));
         drop(real_upload);
+        assert_eq!(budget.usage(), (0, 0, 0));
+    }
+
+    #[test]
+    fn request_body_spool_write_owns_and_releases_blocking_io() {
+        let budget = std::sync::Arc::new(ResourceBudget::default());
+        let context = budget.context("192.0.2.96".parse().unwrap());
+        let scope = crate::resource::RequestScope::new(context.clone());
+        let mut body = BodyAccumulator::new_in(4, budget.clone(), 64, 4, Some(context));
+        body.push(b"abcd").unwrap();
+        crate::resource::with_request_scope(scope, || body.push(b"e")).unwrap();
+
+        let gauge = budget
+            .telemetry()
+            .gauges
+            .into_iter()
+            .find(|gauge| gauge.name == "blocking-io")
+            .unwrap();
+        assert_eq!(gauge.current, 0);
+        assert_eq!(gauge.high_water, 1);
+        drop(body);
         assert_eq!(budget.usage(), (0, 0, 0));
     }
 

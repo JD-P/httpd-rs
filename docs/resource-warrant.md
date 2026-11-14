@@ -67,7 +67,7 @@ Every site also has one independent closure disposition:
 `closure_contracts` in the policy supply module-level evidence where a local
 expression does not itself name the owning lease. CI requires exactly one
 disposition for every effect and fails if `unclassified_effect_sites` is not
-zero. The current closure is 2,221 typed-lease sites, 663 constant-bound sites
+zero. The current closure is 2,223 typed-lease sites, 664 constant-bound sites
 and 443 external/kernel sites. Classification closes discovery debt; it does
 not promote a partial dominance or cost-refinement proof to mechanized status.
 
@@ -206,6 +206,39 @@ their pending/connection/stream ownership into the spawned future. The Verus
 predicate `async_work_handoff_admit` proves the admission race, while detach,
 queue-cancellation, exact-ceiling, and terminal-zero regressions exercise the
 Rust ownership half.
+
+## Filesystem and blocking-I/O closure
+
+Request-time filesystem and dependency calls have a distinct move-only
+`BlockingIoLease` with 48-process, 8-canonical-client and 1-request ceilings.
+It charges the task and conservative resident-memory physical parents before
+the call starts. The process ceiling is below the fixed 64-thread connection
+pool, so filesystem stalls cannot consume that entire scheduling class.
+
+The synchronous gateway is re-entrant and request-lineage aware. The local
+filesystem phase acquires one outer `FilesystemPhaseLease`; secure path walks,
+metadata calls, descriptor-link reads and bounded file reads reuse that owner
+instead of double charging. URL-space authentication, expression and rewrite
+file probes acquire the same guard before they reach local dispatch, and body
+spool open/write operations acquire it independently. A nested call must carry
+the exact same budget and request scope. Each entry samples cancellation, so
+new I/O is rejected after request cancellation while an admitted in-flight
+call remains charged until its guard drops.
+
+HTTP/2 body spool writes use `block_in_place` on the production multi-thread
+runtime, preventing regular-file writes from parking a Tokio scheduler worker.
+HTTP/1 is already isolated in the fixed connection work pool. Response-body
+reads, dynamic backends, DNS, CGI/FastCGI, RewriteMap helpers and log writers
+retain their narrower existing leases, queues, deadlines or nonblocking gates;
+the general blocking-I/O slot is the fallback ownership boundary rather than a
+replacement for those more precise contracts.
+
+The executable Verus predicate `blocking_io_start_admit` models the
+before/acquire/after cancellation race. Unit tests cover exact per-request
+saturation, nested reuse, cross-context rejection, cancellation and terminal
+zero; the resource-transition fuzzer mutates blocking owners alongside every
+other lease class. The live budget sweep must observe the new ledger and all
+current counts must return to zero.
 
 ## Reconciliation
 

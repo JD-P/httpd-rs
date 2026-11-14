@@ -3869,6 +3869,40 @@ pub proof fn cancelled_async_work_is_never_admitted(
 {
 }
 
+/// A request-controlled synchronous call may enter a potentially blocking
+/// kernel/dependency operation only while it owns the blocking-I/O slot and
+/// its shared cancellation lineage remained live across slot acquisition.
+pub open spec fn blocking_io_start_spec(
+    cancelled_before: bool,
+    slot_acquired: bool,
+    cancelled_after: bool,
+) -> bool {
+    !cancelled_before && slot_acquired && !cancelled_after
+}
+
+pub fn blocking_io_start_admit(
+    cancelled_before: bool,
+    slot_acquired: bool,
+    cancelled_after: bool,
+) -> (admit: bool)
+    ensures admit == blocking_io_start_spec(
+        cancelled_before,
+        slot_acquired,
+        cancelled_after,
+    ),
+{
+    !cancelled_before && slot_acquired && !cancelled_after
+}
+
+pub proof fn cancelled_blocking_io_is_never_started(
+    cancelled_before: bool,
+    cancelled_after: bool,
+)
+    requires cancelled_before || cancelled_after,
+    ensures !blocking_io_start_spec(cancelled_before, true, cancelled_after),
+{
+}
+
 /// A calibration candidate is a reporting threshold beneath the enforced
 /// security ceiling, never a replacement for that ceiling.  It leaves the
 /// larger of one observed peak or a fixed reserve as headroom (roughly 2x for

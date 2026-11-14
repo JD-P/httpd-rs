@@ -39,6 +39,11 @@ pub(crate) enum SlotKind {
     SpoolFile,
     SlowSpoolFile,
     FilesystemWork,
+    /// A request-controlled operation currently inside a potentially blocking
+    /// filesystem or dependency call.  This is distinct from FilesystemWork:
+    /// the latter bounds the complete local-routing phase, while this slot
+    /// also covers URL-space authentication/rewrite probes and body spooling.
+    BlockingIo,
     /// Relative bcrypt CPU work. A separate ordinary `ExpensiveCpu` lease
     /// still caps operation count; this weighted ledger prevents high-cost
     /// hashes from consuming the same allowance as low-cost hashes.
@@ -54,7 +59,7 @@ pub(crate) enum SlotKind {
 }
 
 impl SlotKind {
-    const COUNT: usize = 20;
+    const COUNT: usize = 21;
     const ALL: [Self; Self::COUNT] = [
         Self::DynamicBackend,
         Self::H2Stream,
@@ -73,6 +78,7 @@ impl SlotKind {
         Self::SpoolFile,
         Self::SlowSpoolFile,
         Self::FilesystemWork,
+        Self::BlockingIo,
         Self::BcryptCpu,
         Self::CompressionCpu,
         Self::AsyncRequestWork,
@@ -101,6 +107,7 @@ impl SlotKind {
             Self::SpoolFile => "spool-file",
             Self::SlowSpoolFile => "slow-spool-file",
             Self::FilesystemWork => "filesystem-work",
+            Self::BlockingIo => "blocking-io",
             Self::BcryptCpu => "bcrypt-cpu",
             Self::CompressionCpu => "compression-cpu",
             Self::AsyncRequestWork => "async-request-work",
@@ -376,6 +383,12 @@ pub const MAX_H2_STREAMS_PER_CLIENT: u64 = 64;
 pub const MAX_ASYNC_REQUEST_WORK: u64 = 512;
 pub const MAX_ASYNC_REQUEST_WORK_PER_CLIENT: u64 = 64;
 pub const MAX_ASYNC_REQUEST_WORK_PER_REQUEST: u64 = 4;
+/// Potentially blocking request I/O is deliberately smaller than the worker
+/// pools it runs on. A stalled filesystem/dependency can retain this reserve,
+/// but cannot occupy every request or Tokio blocking worker.
+pub const MAX_BLOCKING_IO: u64 = 48;
+pub const MAX_BLOCKING_IO_PER_CLIENT: u64 = 8;
+pub const MAX_BLOCKING_IO_PER_REQUEST: u64 = 1;
 /// Request-body-blocked HTTP/2 streams leave the general dispatch pool and
 /// enter this smaller source-fair pool. A peer that withholds DATA can retain
 /// only this reserve, rather than every stream needed by unrelated clients.
@@ -565,6 +578,9 @@ const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
         Websocket => [1, 0, 64 * 1024],
         RewriteProgram => [3, 1, 128 * 1024],
         SpoolFile | SlowSpoolFile | FilesystemWork | BcryptCpu | CompressionCpu => [0, 0, 0],
+        // A synchronous call occupies either a fixed request worker or a
+        // replacement blocking thread until the kernel/dependency returns.
+        BlockingIo => [0, 1, 64 * 1024],
         // Queue residence reserves the task/memory which the closure will
         // consume before the worker is allowed to begin it.
         AsyncRequestWork => [0, 1, 64 * 1024],
@@ -882,6 +898,39 @@ impl RequestScope {
             scope: self.clone(),
         })
     }
+
+    /// Start one synchronous operation which may block in the kernel or a
+    /// dependency. The cancellation race is linearized exactly like an async
+    /// handoff: pre-cancelled work never starts, while an operation admitted
+    /// just before cancellation retains its lease until the call returns.
+    pub(crate) fn try_blocking_io(&self) -> io::Result<BlockingIoLease> {
+        let cancelled_before = self.is_cancelled();
+        if cancelled_before {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "request scope cancelled before blocking I/O",
+            ));
+        }
+        let slot = self.context.slot(
+            SlotKind::BlockingIo,
+            MAX_BLOCKING_IO,
+            Some(MAX_BLOCKING_IO_PER_CLIENT),
+            Some(MAX_BLOCKING_IO_PER_REQUEST),
+            "blocking I/O limit reached",
+        )?;
+        let cancelled_after = self.is_cancelled();
+        if !httpd_rs_verified::blocking_io_start_admit(cancelled_before, true, cancelled_after) {
+            drop(slot);
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "request scope cancelled during blocking I/O admission",
+            ));
+        }
+        Ok(BlockingIoLease {
+            _slot: slot,
+            _scope: Some(self.clone()),
+        })
+    }
 }
 
 /// Cancels child work on every request exit, including parse/dispatch/write
@@ -906,6 +955,20 @@ impl AsyncWorkLease {
     }
 }
 
+/// Move-only ownership of one potentially blocking synchronous call.
+#[derive(Debug)]
+pub(crate) struct BlockingIoLease {
+    _slot: SlotLease,
+    _scope: Option<RequestScope>,
+}
+
+impl BlockingIoLease {
+    #[cfg(test)]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self._scope.as_ref().is_some_and(RequestScope::is_cancelled)
+    }
+}
+
 impl Drop for RequestScopeGuard {
     fn drop(&mut self) {
         self.scope.cancel();
@@ -914,6 +977,8 @@ impl Drop for RequestScopeGuard {
 
 thread_local! {
     static CURRENT_CONTEXT: RefCell<Option<ResourceContext>> = const { RefCell::new(None) };
+    static CURRENT_REQUEST_SCOPE: RefCell<Option<RequestScope>> = const { RefCell::new(None) };
+    static BLOCKING_IO_OWNER: RefCell<Option<std::rc::Weak<BlockingIoOwner>>> = const { RefCell::new(None) };
 }
 
 /// Thread-bound scope guard for synchronous protocol paths that need to make
@@ -921,6 +986,22 @@ thread_local! {
 pub(crate) struct ResourceContextGuard {
     previous: Option<ResourceContext>,
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+/// Thread-bound projection of the request cancellation lineage into
+/// synchronous policy/backend code. It does not own cancellation; the outer
+/// RequestScopeGuard remains the unique lifetime authority.
+pub(crate) struct CurrentRequestScopeGuard {
+    previous: Option<RequestScope>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for CurrentRequestScopeGuard {
+    fn drop(&mut self) {
+        CURRENT_REQUEST_SCOPE.with(|current| {
+            current.replace(self.previous.take());
+        });
+    }
 }
 
 impl Drop for ResourceContextGuard {
@@ -939,13 +1020,176 @@ pub(crate) fn enter_resource_context(context: ResourceContext) -> ResourceContex
     }
 }
 
+pub(crate) fn enter_current_request_scope(scope: RequestScope) -> CurrentRequestScopeGuard {
+    let previous = CURRENT_REQUEST_SCOPE.with(|current| current.replace(Some(scope)));
+    CurrentRequestScopeGuard {
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
 pub fn with_resource_context<T>(context: ResourceContext, operation: impl FnOnce() -> T) -> T {
     let _guard = enter_resource_context(context);
     operation()
 }
 
+pub(crate) fn with_request_scope<T>(scope: RequestScope, operation: impl FnOnce() -> T) -> T {
+    let _context = enter_resource_context(scope.context().clone());
+    let _scope = enter_current_request_scope(scope);
+    operation()
+}
+
 pub(crate) fn current_context() -> Option<ResourceContext> {
     CURRENT_CONTEXT.with(|current| current.borrow().clone())
+}
+
+fn current_request_scope() -> Option<RequestScope> {
+    CURRENT_REQUEST_SCOPE.with(|current| current.borrow().clone())
+}
+
+/// Thread-bound, re-entrant ownership for synchronous filesystem/dependency
+/// calls. A complete filesystem phase holds one outer guard; nested secure
+/// open/metadata/read helpers reuse it but still reject a newly-started call
+/// after request cancellation.
+pub(crate) struct BlockingIoGuard {
+    owner: std::rc::Rc<BlockingIoOwner>,
+}
+
+struct BlockingIoOwner {
+    _lease: Option<BlockingIoLease>,
+    context: Option<ResourceContext>,
+}
+
+pub(crate) struct FilesystemPhaseLease {
+    _phase: SlotLease,
+    _io: BlockingIoGuard,
+}
+
+impl Drop for BlockingIoGuard {
+    fn drop(&mut self) {
+        if std::rc::Rc::strong_count(&self.owner) == 1 {
+            BLOCKING_IO_OWNER.with(|current| {
+                let matches = current.borrow().as_ref().is_some_and(|owner| {
+                    std::rc::Weak::ptr_eq(owner, &std::rc::Rc::downgrade(&self.owner))
+                });
+                if matches {
+                    current.replace(None);
+                }
+            });
+        }
+    }
+}
+
+impl BlockingIoGuard {
+    #[cfg(test)]
+    fn is_cancelled(&self) -> bool {
+        self.owner
+            ._lease
+            .as_ref()
+            .is_some_and(BlockingIoLease::is_cancelled)
+    }
+}
+
+fn same_blocking_io_context(
+    owner: Option<&ResourceContext>,
+    context: Option<&ResourceContext>,
+) -> bool {
+    match (owner, context) {
+        (Some(owner), Some(context)) => {
+            owner.scope_id == context.scope_id && Arc::ptr_eq(owner.budget(), context.budget())
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn active_blocking_io_owner() -> Option<std::rc::Rc<BlockingIoOwner>> {
+    BLOCKING_IO_OWNER.with(|current| {
+        let owner = current.borrow().as_ref().and_then(std::rc::Weak::upgrade);
+        if owner.is_none() {
+            current.replace(None);
+        }
+        owner
+    })
+}
+
+fn install_blocking_io_owner(owner: &std::rc::Rc<BlockingIoOwner>) {
+    BLOCKING_IO_OWNER.with(|current| {
+        let previous = current.replace(Some(std::rc::Rc::downgrade(owner)));
+        debug_assert!(
+            previous.and_then(|owner| owner.upgrade()).is_none(),
+            "blocking I/O owner replaced while still active"
+        );
+    });
+}
+
+fn matching_request_scope(
+    scope: Option<RequestScope>,
+    context: Option<&ResourceContext>,
+) -> io::Result<Option<RequestScope>> {
+    match (scope, context) {
+        (Some(scope), Some(context))
+            if scope.context().scope_id == context.scope_id
+                && Arc::ptr_eq(scope.context().budget(), context.budget()) =>
+        {
+            Ok(Some(scope))
+        }
+        (Some(_), _) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "blocking I/O context does not match request scope",
+        )),
+        (None, _) => Ok(None),
+    }
+}
+
+fn request_blocking_io_guard(
+    scope: Option<RequestScope>,
+    context: Option<ResourceContext>,
+) -> io::Result<BlockingIoGuard> {
+    if scope.as_ref().is_some_and(RequestScope::is_cancelled) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "request scope cancelled before blocking I/O",
+        ));
+    }
+    if let Some(owner) = active_blocking_io_owner() {
+        if !same_blocking_io_context(owner.context.as_ref(), context.as_ref()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "nested blocking I/O crossed request contexts",
+            ));
+        }
+        return Ok(BlockingIoGuard { owner });
+    }
+
+    let lease = if let Some(scope) = matching_request_scope(scope, context.as_ref())? {
+        Some(scope.try_blocking_io()?)
+    } else if let Some(context) = context.as_ref() {
+        Some(context.budget.try_blocking_io_in(context)?)
+    } else {
+        // Startup/reload administrative I/O has no attacker request lineage;
+        // its fixed configuration bounds and service watchdog remain the
+        // explicit external assumption.
+        None
+    };
+    let owner = std::rc::Rc::new(BlockingIoOwner {
+        _lease: lease,
+        context,
+    });
+    install_blocking_io_owner(&owner);
+    Ok(BlockingIoGuard { owner })
+}
+
+pub(crate) fn begin_blocking_io() -> io::Result<BlockingIoGuard> {
+    begin_blocking_io_in(None)
+}
+
+pub(crate) fn begin_blocking_io_in(
+    explicit_context: Option<&ResourceContext>,
+) -> io::Result<BlockingIoGuard> {
+    let scope = current_request_scope();
+    let context = explicit_context.cloned().or_else(current_context);
+    request_blocking_io_guard(scope, context)
 }
 
 #[cfg(test)]
@@ -2396,6 +2640,39 @@ impl ResourceBudget {
         )
     }
 
+    pub(crate) fn try_blocking_io_in(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+    ) -> io::Result<BlockingIoLease> {
+        self.validate_context(context)?;
+        let slot = context.slot(
+            SlotKind::BlockingIo,
+            MAX_BLOCKING_IO,
+            Some(MAX_BLOCKING_IO_PER_CLIENT),
+            Some(MAX_BLOCKING_IO_PER_REQUEST),
+            "blocking I/O limit reached",
+        )?;
+        Ok(BlockingIoLease {
+            _slot: slot,
+            _scope: None,
+        })
+    }
+
+    /// Admit the full local filesystem phase and keep one re-entrant blocking
+    /// I/O owner active for every nested path walk, metadata call and bounded
+    /// read performed by that phase.
+    pub(crate) fn try_filesystem_phase_in(
+        self: &Arc<Self>,
+        context: &ResourceContext,
+    ) -> io::Result<FilesystemPhaseLease> {
+        let phase = self.try_filesystem_work_in(context)?;
+        let io = begin_blocking_io_in(Some(context))?;
+        Ok(FilesystemPhaseLease {
+            _phase: phase,
+            _io: io,
+        })
+    }
+
     pub fn try_spool(self: &Arc<Self>, max_bytes: u64, max_files: u64) -> io::Result<SpoolLease> {
         let context = self.current_context_for()?;
         self.try_spool_inner(max_bytes, max_files, &context)
@@ -3821,6 +4098,73 @@ mod tests {
         assert!(scope.try_async_work().is_err());
         drop(work);
         assert!(scope.try_async_work().is_ok());
+    }
+
+    #[test]
+    fn blocking_io_is_reentrant_cancellation_aware_and_exact() {
+        let budget = Arc::new(ResourceBudget::default());
+        let scope = RequestScope::new(budget.context(IpAddr::from([192, 0, 2, 94])));
+
+        with_request_scope(scope.clone(), || {
+            let outer = begin_blocking_io().unwrap();
+            assert_eq!(budget.slot_usage(SlotKind::BlockingIo), 1);
+            let nested = begin_blocking_io().unwrap();
+            assert_eq!(
+                budget.slot_usage(SlotKind::BlockingIo),
+                1,
+                "nested filesystem helpers must reuse the request's blocking-I/O owner"
+            );
+
+            scope.cancel();
+            assert!(outer.is_cancelled());
+            let error = begin_blocking_io().err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert_eq!(budget.slot_usage(SlotKind::BlockingIo), 1);
+
+            drop(outer);
+            assert_eq!(
+                budget.slot_usage(SlotKind::BlockingIo),
+                1,
+                "the shared owner must survive non-LIFO guard destruction"
+            );
+            drop(nested);
+            assert_eq!(budget.slot_usage(SlotKind::BlockingIo), 0);
+        });
+
+        let gauge = budget
+            .telemetry()
+            .gauges
+            .into_iter()
+            .find(|gauge| gauge.name == "blocking-io")
+            .unwrap();
+        assert_eq!(gauge.current, 0);
+        assert_eq!(gauge.high_water, 1);
+    }
+
+    #[test]
+    fn blocking_io_rejects_context_crossing_and_second_request_owner() {
+        let budget = Arc::new(ResourceBudget::default());
+        let first = RequestScope::new(budget.context(IpAddr::from([192, 0, 2, 95])));
+        let second = RequestScope::new(budget.context(IpAddr::from([192, 0, 2, 95])));
+        let owner = first.try_blocking_io().unwrap();
+        assert!(first.try_blocking_io().is_err());
+        drop(owner);
+        assert!(first.try_blocking_io().is_ok());
+
+        with_request_scope(first.clone(), || {
+            let error = begin_blocking_io_in(Some(second.context())).err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(budget.slot_usage(SlotKind::BlockingIo), 0);
+        });
+
+        with_request_scope(first, || {
+            let outer = begin_blocking_io().unwrap();
+            let error = begin_blocking_io_in(Some(second.context())).err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(budget.slot_usage(SlotKind::BlockingIo), 1);
+            drop(outer);
+        });
+        assert_eq!(budget.slot_usage(SlotKind::BlockingIo), 0);
     }
 
     #[test]

@@ -674,6 +674,7 @@ async fn read_body(
     max_spool_bytes: u64,
     max_spool_files: u64,
     resource_context: crate::resource::ResourceContext,
+    request_scope: &crate::resource::RequestScope,
     resident: &mut crate::resource::ResidentLease,
     allow_trailers: bool,
 ) -> Result<H2RequestBody, H2ReadFailure> {
@@ -742,7 +743,12 @@ async fn read_body(
             return Err(H2ReadFailure::Response(bad(413, "request body too large")));
         };
         budget = next_budget;
-        if let Err(error) = body.push_with_resident(&chunk, resident) {
+        if let Err(error) = crate::http::push_body_without_blocking_runtime(
+            &mut body,
+            resident,
+            &chunk,
+            Some(request_scope),
+        ) {
             let response = if matches!(
                 error.kind(),
                 io::ErrorKind::StorageFull | io::ErrorKind::OutOfMemory
@@ -2106,6 +2112,7 @@ async fn handle_stream(
                 req.resource_context()
                     .expect("HTTP/2 request scope was bound")
                     .clone(),
+                &request_scope,
                 request_resident
                     .as_mut()
                     .expect("buffered HTTP/2 body retained its resident lease"),
@@ -2486,6 +2493,10 @@ pub(crate) fn differential_decode_request(
         projected
             .headers
             .bind_request_scope(crate::resource::RequestScope::new(context.clone()));
+        let request_scope = projected
+            .request_scope()
+            .expect("fuzz request scope was bound")
+            .clone();
 
         let has_body = declared.unwrap_or(0) > 0 || !recv.is_end_stream();
         if has_body {
@@ -2501,6 +2512,7 @@ pub(crate) fn differential_decode_request(
                 cfg.max_spool_bytes,
                 cfg.max_spool_files,
                 context,
+                &request_scope,
                 &mut resident,
                 false,
             )

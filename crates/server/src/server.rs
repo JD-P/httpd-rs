@@ -1171,6 +1171,10 @@ fn handle_connection_inner<C: Conn + ResponseWrite>(
                 .cloned()
                 .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
             let _resource_context_guard = crate::resource::enter_resource_context(resource_context);
+            let _request_scope_context = req
+                .request_scope()
+                .cloned()
+                .map(crate::resource::enter_current_request_scope);
             let host = host_header(&req).unwrap_or("");
             let vhost = cfg.select_vhost(
                 local_ip.parse().ok(),
@@ -3951,11 +3955,15 @@ pub(crate) fn dispatch_with_scheme_and_identity(
         .resource_context()
         .cloned()
         .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
-    let response = crate::resource::with_resource_context(context, || {
+    let dispatch = || {
         crate::expr::with_connection(tls, local_port, || {
             dispatch_inner_request(cfg, req, peer, local_ip, local_port)
         })
-    });
+    };
+    let response = match req.request_scope().cloned() {
+        Some(scope) => crate::resource::with_request_scope(scope, dispatch),
+        None => crate::resource::with_resource_context(context, dispatch),
+    };
     // Logging receives a snapshot. The request-owned binding remains live for
     // deferred CGI/FastCGI execution and any internal request it produces.
     let remote_user = req.authenticated_identity();
@@ -4289,8 +4297,10 @@ impl PreparedHandler {
                 let context = req
                     .resource_context()
                     .cloned()
+                    .or_else(crate::resource::current_context)
                     .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
-                if let Ok(_filesystem_work) = cfg.resource_budget.try_filesystem_work_in(&context) {
+                if let Ok(_filesystem_work) = cfg.resource_budget.try_filesystem_phase_in(&context)
+                {
                     if let Some(cache) = cache {
                         if cache.generation_is_current(cfg) {
                             if !outcome.consider_cache(true) {
@@ -4589,9 +4599,14 @@ pub(crate) fn execute_prepared_handler(
         .resource_context()
         .cloned()
         .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
-    let response = crate::resource::with_resource_context(context, || {
+    let request_scope = req.request_scope().cloned();
+    let execute = || {
         crate::expr::with_connection(tls, local_port, || handler.execute(cfg, req, &mut outcome))
-    });
+    };
+    let response = match request_scope {
+        Some(scope) => crate::resource::with_request_scope(scope, execute),
+        None => crate::resource::with_resource_context(context, execute),
+    };
     if outcome.admit_output(&response) {
         response
     } else {
@@ -4614,6 +4629,7 @@ fn dispatch_inner_request(
     let filesystem_context = req
         .resource_context()
         .cloned()
+        .or_else(crate::resource::current_context)
         .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
     // Memoize repeated metadata probes for this request only.  The guard drops
     // on every return path, so the next request cannot observe stale state.
@@ -4645,7 +4661,7 @@ fn dispatch_inner_request(
     } else {
         match cfg
             .resource_budget
-            .try_filesystem_work_in(&filesystem_context)
+            .try_filesystem_phase_in(&filesystem_context)
         {
             Ok(lease) => Some(lease),
             Err(_) => {
@@ -7280,13 +7296,14 @@ fn dispatch_inner(
     let filesystem_context = req
         .resource_context()
         .cloned()
+        .or_else(crate::resource::current_context)
         .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
     let _filesystem_work = if filesystem_admitted {
         None
     } else {
         match cfg
             .resource_budget
-            .try_filesystem_work_in(&filesystem_context)
+            .try_filesystem_phase_in(&filesystem_context)
         {
             Ok(lease) => Some(lease),
             Err(_) => {

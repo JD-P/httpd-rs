@@ -31,7 +31,8 @@
       "disk/memory cache lookup cardinality",
       "bcrypt authentication work",
       "TLS and HTTP/2 protocol state",
-      "compression input bytes and quality"
+      "compression input bytes and quality",
+      "filesystem operation concurrency and request-body spool writes"
     ],
     "runtime_evidence": [
       "process CPU ticks",
@@ -81,8 +82,8 @@
         "crates/server/src/tls.rs",
         "crates/server/src/util.rs"
       ],
-      "evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; bounded pure projections remain covered by that owning request phase",
-      "verification_targets": ["resource_budget_admit", "async_work_handoff_admit", "request_resource_effect_closure", "terminal_sink_gate"]
+      "evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; bounded pure projections remain covered by that owning request phase",
+      "verification_targets": ["resource_budget_admit", "async_work_handoff_admit", "blocking_io_start_admit", "request_resource_effect_closure", "terminal_sink_gate"]
     },
     {
       "id": "closed-input-grammar-bounds",
@@ -106,7 +107,7 @@
         "crates/server/src/main.rs",
         "crates/server/src/status.rs"
       ],
-      "evidence": "administrative parsing is capped by fixed file/argument limits and status rendering iterates only the closed 20-slot/8-byte/3-physical enum sets",
+      "evidence": "administrative parsing is capped by fixed file/argument limits and status rendering iterates only the closed 21-slot/8-byte/3-physical enum sets",
       "verification_targets": ["service_identity_admit", "resource_shadow_budget_candidate"]
     },
     {
@@ -149,8 +150,8 @@
       "id": "tasks",
       "attacker_axes": ["connection concurrency", "stream concurrency", "backend concurrency", "blocking operations"],
       "dynamic_measurements": ["process count", "thread count", "cgroup pids.current/pids.peak"],
-      "accounting_apis": ["TaskLease", "RequestWorkerLease", "DynamicLease", "H2StreamLease"],
-      "verus_targets": ["resource_budget_admit", "h2_process_slot_admit", "request_worker_lend_admit"],
+      "accounting_apis": ["TaskLease", "RequestWorkerLease", "DynamicLease", "H2StreamLease", "BlockingIoLease"],
+      "verus_targets": ["resource_budget_admit", "h2_process_slot_admit", "request_worker_lend_admit", "blocking_io_start_admit"],
       "os_backstop": "cgroup pids.max and fixed worker pools"
     },
     {
@@ -181,8 +182,8 @@
       "id": "filesystem-io",
       "attacker_axes": ["path depth", "access-file depth", "cache operations", "response bytes", "log bytes"],
       "dynamic_measurements": ["procfs read/write bytes and syscall counts", "optional syscall trace"],
-      "accounting_apis": ["FilesystemWorkLease", "DiskLease", "SpoolLease", "ResponseBodyReadLease"],
-      "verus_targets": ["policy_path_work_admit", "response_body_read_lease_admit", "cache_invalidation_remove_admit"],
+      "accounting_apis": ["FilesystemPhaseLease", "BlockingIoLease", "DiskLease", "SpoolLease", "ResponseBodyReadLease"],
+      "verus_targets": ["blocking_io_start_admit", "policy_path_work_admit", "response_body_read_lease_admit", "cache_invalidation_remove_admit"],
       "os_backstop": "filesystem quotas, cgroup io.max and bounded worker pools"
     },
     {
@@ -197,8 +198,8 @@
       "id": "wall-time",
       "attacker_axes": ["slow input", "slow output", "backend latency", "filesystem latency", "algorithm quality"],
       "dynamic_measurements": ["monotonic request/workload duration", "scheduler running/waiting time", "timeout and cancellation outcomes"],
-      "accounting_apis": ["SlowInputLease", "SlowOutputLease", "DynamicLease", "FilesystemWorkLease", "AsyncWorkLease"],
-      "verus_targets": ["minimum_progress_rate_admit", "slow_output_phase_step", "h2_input_phase_step", "async_work_handoff_admit"],
+      "accounting_apis": ["SlowInputLease", "SlowOutputLease", "DynamicLease", "FilesystemPhaseLease", "BlockingIoLease", "AsyncWorkLease"],
+      "verus_targets": ["minimum_progress_rate_admit", "slow_output_phase_step", "h2_input_phase_step", "async_work_handoff_admit", "blocking_io_start_admit"],
       "os_backstop": "absolute protocol/backend timeouts, cgroup CPU quota and service watchdog"
     },
     {
@@ -264,13 +265,13 @@
     {
       "id": "task-process",
       "resources": ["tasks", "file-descriptors", "pipes", "resident-memory", "kernel-memory", "queue-occupancy"],
-      "accounting_markers": ["TaskLease", "DynamicLease", "AsyncWorkLease", "RewriteProgramLease", "try_task", "try_dynamic", "try_async_work", "spawn_request_worker", "spawn_request_blocking", "worker"],
+      "accounting_markers": ["TaskLease", "DynamicLease", "AsyncWorkLease", "BlockingIoLease", "RewriteProgramLease", "try_task", "try_dynamic", "try_async_work", "try_blocking_io", "spawn_request_worker", "spawn_request_blocking", "worker"],
       "description": "Thread, task, blocking job, subprocess and bounded-channel creation."
     },
     {
       "id": "filesystem",
       "resources": ["filesystem-io", "file-descriptors", "cpu-time", "resident-memory", "disk-capacity", "filesystem-inodes", "wall-time"],
-      "accounting_markers": ["FilesystemWorkLease", "DescriptorLease", "DiskLease", "SpoolLease", "try_filesystem", "try_disk"],
+      "accounting_markers": ["FilesystemPhaseLease", "BlockingIoLease", "DescriptorLease", "DiskLease", "SpoolLease", "try_filesystem", "begin_blocking_io", "try_blocking_io", "try_disk"],
       "description": "Filesystem lookup, directory traversal, metadata, open, read, write, rename and removal."
     },
     {
@@ -282,7 +283,7 @@
     {
       "id": "synchronization",
       "resources": ["cpu-time", "tasks", "resident-memory", "queue-occupancy", "lock-occupancy", "wall-time"],
-      "accounting_markers": ["SlotLease", "AsyncWorkLease", "try_async_work", "Semaphore", "bounded", "sync_channel", "MAX_", "limit"],
+      "accounting_markers": ["SlotLease", "AsyncWorkLease", "BlockingIoLease", "try_async_work", "try_blocking_io", "Semaphore", "bounded", "sync_channel", "MAX_", "limit"],
       "description": "Locks, channels, semaphores and waits that can retain tasks or create queues."
     },
     {

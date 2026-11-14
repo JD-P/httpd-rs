@@ -13,7 +13,7 @@ EXPECTED_SLOTS = {
     "ExpensiveCpu", "PendingConnection", "H1Connection", "RequestWorker",
     "RequestBodyWorker", "H2Connection", "TlsHandshake",
     "RewriteProgram", "SpoolFile", "SlowSpoolFile",
-    "FilesystemWork", "BcryptCpu", "CompressionCpu", "AsyncRequestWork",
+    "FilesystemWork", "BlockingIo", "BcryptCpu", "CompressionCpu", "AsyncRequestWork",
 }
 EXPECTED_BYTES = {
     "Spool", "SlowSpool", "RequestResident", "ResponseResident",
@@ -58,7 +58,9 @@ ALLOWED_MUTABLE_STATICS = {
     ("proxy.rs", "DNS"),
     ("proxy.rs", "TEST_BUDGET"),
     ("request_plan.rs", "NEXT_FIXTURE"),
-    ("resource.rs", "CURRENT_CONTEXT"), ("resource.rs", "BUDGET"),
+    ("resource.rs", "CURRENT_CONTEXT"), ("resource.rs", "CURRENT_REQUEST_SCOPE"),
+    ("resource.rs", "BLOCKING_IO_OWNER"),
+    ("resource.rs", "BUDGET"),
     ("server.rs", "ACTIVE_CONNECTIONS"),
     ("server.rs", "ADMISSION_RUNTIME"),
     ("server.rs", "CONNECTION_WORK_POOL"),
@@ -119,7 +121,8 @@ def main() -> int:
     for required in (
         "with_resource_context(context", "try_dynamic_in", "try_h2_stream_in",
         "try_slow_input_in", "try_slow_output_in",
-        "try_filesystem_work_in", "try_compression_in", "try_async_work", "try_disk", "try_transport_buffers",
+        "try_filesystem_work_in", "try_blocking_io_in", "begin_blocking_io",
+        "try_compression_in", "try_async_work", "try_disk", "try_transport_buffers",
         "try_tls_handshake", "try_rewrite_program",
         "attribute_context(resource_context", "enter_resource_context(resource_context",
     ):

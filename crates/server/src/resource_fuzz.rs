@@ -25,6 +25,7 @@ const SLOT_KINDS: [SlotKind; SlotKind::COUNT] = [
     SlotKind::SpoolFile,
     SlotKind::SlowSpoolFile,
     SlotKind::FilesystemWork,
+    SlotKind::BlockingIo,
     SlotKind::BcryptCpu,
     SlotKind::CompressionCpu,
     SlotKind::AsyncRequestWork,
@@ -51,6 +52,7 @@ struct CampaignState {
     websockets: Vec<WebsocketLease>,
     compressions: Vec<CompressionLease>,
     async_work: Vec<AsyncWorkLease>,
+    blocking_io: Vec<BlockingIoLease>,
 }
 
 impl CampaignState {
@@ -61,6 +63,7 @@ impl CampaignState {
         self.websockets.clear();
         self.compressions.clear();
         self.async_work.clear();
+        self.blocking_io.clear();
         self.dynamics.clear();
         self.spools.clear();
         self.residents.clear();
@@ -108,6 +111,11 @@ impl CampaignState {
         );
         contexts.extend(
             self.async_work
+                .iter()
+                .map(|lease| lease._slot.context.clone()),
+        );
+        contexts.extend(
+            self.blocking_io
                 .iter()
                 .map(|lease| lease._slot.context.clone()),
         );
@@ -221,6 +229,7 @@ fn slot_process_limit(kind: SlotKind) -> u64 {
         SlotKind::SlowSpoolFile => (FUZZ_SPOOL_FILES + 3) / 4,
         SlotKind::CompressionCpu => MAX_COMPRESSION_WORK_UNITS,
         SlotKind::AsyncRequestWork => MAX_ASYNC_REQUEST_WORK,
+        SlotKind::BlockingIo => MAX_BLOCKING_IO,
         _ => 0,
     }
 }
@@ -237,6 +246,7 @@ fn slot_client_limit(kind: SlotKind) -> u64 {
         SlotKind::SpoolFile | SlotKind::SlowSpoolFile => (FUZZ_SPOOL_FILES + 3) / 4,
         SlotKind::CompressionCpu => MAX_COMPRESSION_WORK_UNITS_PER_CLIENT,
         SlotKind::AsyncRequestWork => MAX_ASYNC_REQUEST_WORK_PER_CLIENT,
+        SlotKind::BlockingIo => MAX_BLOCKING_IO_PER_CLIENT,
         _ => 0,
     }
 }
@@ -706,6 +716,7 @@ pub(super) fn run(data: &[u8]) {
                 let before = budget.transition_snapshot();
                 let foreign_before = foreign.transition_snapshot();
                 assert!(budget.try_filesystem_work_in(&context).is_err());
+                assert!(budget.try_blocking_io_in(&context).is_err());
                 assert!(budget
                     .try_spool_in(FUZZ_SPOOL_BYTES, FUZZ_SPOOL_FILES, &context)
                     .is_err());
@@ -721,14 +732,6 @@ pub(super) fn run(data: &[u8]) {
                 assert!(budget.try_cache_resident(&context, 1, 1).is_err());
                 assert!(budget.try_tls_handshake(&context, 1, 1, 1).is_err());
                 assert!(budget.try_rewrite_program(&context, 1, 1, 1, 1).is_err());
-                assert_eq!(before, budget.transition_snapshot());
-                assert_eq!(foreign_before, foreign.transition_snapshot());
-            }
-            30 => {
-                // Direct slot admission has its own identity guard; retain it
-                // as a separate oracle from the higher-level helpers above.
-                let context = foreign.context(client);
-                let before = budget.transition_snapshot();
                 assert!(budget
                     .try_slot(
                         &context,
@@ -740,6 +743,26 @@ pub(super) fn run(data: &[u8]) {
                     )
                     .is_err());
                 assert_eq!(before, budget.transition_snapshot());
+                assert_eq!(foreign_before, foreign.transition_snapshot());
+            }
+            30 => {
+                if selector & 1 == 0 {
+                    for iteration in 0..batch_count(magnitude) {
+                        let context =
+                            batch_context(&budget, &contexts, &clients, client_selector, iteration);
+                        let scope = RequestScope::new(context);
+                        let before = budget.transition_snapshot();
+                        if magnitude & 0x80 != 0 {
+                            scope.cancel();
+                        }
+                        match scope.try_blocking_io() {
+                            Ok(lease) => insert_bounded(&mut state.blocking_io, lease, selector),
+                            Err(_) => assert_eq!(before, budget.transition_snapshot()),
+                        }
+                    }
+                } else if let Some(index) = selected(&state.blocking_io, selector) {
+                    drop(state.blocking_io.swap_remove(index));
+                }
             }
             _ => unreachable!(),
         }

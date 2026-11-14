@@ -24,16 +24,21 @@ response construction.
 
 The slot ledger covers pending connections, HTTP/1 workers, slow-body workers,
 TLS handshakes, HTTP/2 connections, ordinary streams and a shared source-fair
-slow-input and slow-output class, dynamic backend requests, blocking response reads,
-WebSocket tunnels, expensive CPU operations, `RewriteMap prg` helpers, and
-general/slow spool files. Bcrypt additionally holds a weighted CPU lease whose
+slow-input and slow-output class, dynamic backend requests, blocking response
+reads, synchronous blocking I/O, WebSocket tunnels, expensive CPU operations,
+`RewriteMap prg` helpers, and general/slow spool files. Bcrypt additionally
+holds a weighted CPU lease whose
 charge doubles with each configured cost step; the ordinary expensive-work
 lease still caps cheap hashes by operation count. Dynamic response compression
 has a separate CPU lease weighted by input size, codec, and quality, plus a
 transient-memory lease covering the source, a conservative codec-workspace
 bound, and output scratch. Filesystem lookup/cache work has a separate
-64-process/8-source phase, so a stalled mount cannot occupy every request
-worker or any dynamic-backend slot. The adjustable byte ledger covers request memory,
+64-process/8-source phase. Local policy/path and body-spool calls not already
+owned by a narrower response/backend/helper contract additionally hold a
+48-process/8-source/1-request `BlockingIoLease`, so
+nested path, metadata and descriptor helpers cannot multiply one request's
+charge and at least sixteen of the fixed 64 connection workers remain outside
+this class. The adjustable byte ledger covers request memory,
 general/slow response memory, general/slow request/backend/proxy spools, and
 retained policy expansions, retained memory-cache entries, and compression
 workspaces. Fixed-window rates use the same canonical client identity and
@@ -51,6 +56,17 @@ The process/client/request ceilings are 512/64/4. HTTP/1 backend/dispatch
 handoffs, HTTP/2 policy/backend blocking work, proxy DNS, and `Require host`
 reverse DNS use this boundary. Response file/stream reads retain their more
 specific move-only `ResponseBodyReadLease` and output-ownership state instead.
+
+Synchronous filesystem ownership is projected through the same request scope.
+The complete local filesystem phase acquires one re-entrant guard; URL-space
+authentication, expression and rewrite probes acquire it at their individual
+gateways, and request-body spool open/write operations use it even before
+local routing. Nested helpers reuse the outer slot but recheck cancellation
+and exact context identity on every entry. A pre-cancelled request therefore
+cannot start another kernel/dependency call, a cancelled in-flight call remains
+charged until it returns, and a helper cannot hide work under another
+request's owner. HTTP/2 spool writes leave the Tokio scheduler through
+`block_in_place`; HTTP/1 already runs on the fixed connection pool.
 
 Compression is produced only as the downstream writer asks for data: HTTP/1
 writes the response head before starting the encoder, and HTTP/2 waits for

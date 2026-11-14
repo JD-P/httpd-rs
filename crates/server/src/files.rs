@@ -39,6 +39,7 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 
 fn openat2_file(dir: &File, path: &CStr, how: &OpenHow) -> io::Result<File> {
+    let _blocking_io = crate::resource::begin_blocking_io()?;
     const MAX_TRANSIENT_RETRIES: usize = 8;
     for attempt in 0..=MAX_TRANSIENT_RETRIES {
         let result = crate::fault::hit("fs.openat2").and_then(|()| {
@@ -627,6 +628,9 @@ pub fn multiviews_target(
     if requested_name.is_empty() || requested_name == b"." || requested_name == b".." {
         return MultiViewsResult::NotFound; // coverage:ignore-line - Path::file_name excludes these terminal components
     }
+    let Ok(_blocking_io) = crate::resource::begin_blocking_io() else {
+        return MultiViewsResult::Overloaded;
+    };
     let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
     let Target::Directory { file: parent, .. } =
         resolve_target_checked(root, parent_rel, follow_symlinks, owner_match_only)
@@ -772,6 +776,7 @@ fn fd_component(fd: libc::c_int, buf: &mut [u8; 24]) -> &CStr {
 /// bytes to `f`.  Keeping the buffer local lets callers compare the resolved
 /// path with the lexical target without allocating.
 fn with_fd_link<R>(file: &File, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    let _blocking_io = crate::resource::begin_blocking_io().ok()?;
     let mut buf = [0u8; 4096];
     let fd = file.as_raw_fd();
     let Some(dir) = proc_fd_dir() else {
@@ -1053,6 +1058,9 @@ pub fn resolve_target_checked(
     follow_symlinks: bool,
     owner_match_only: bool,
 ) -> Target {
+    let Ok(_blocking_io) = crate::resource::begin_blocking_io() else {
+        return Target::NotFound;
+    };
     let mut flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64;
     if rel.as_os_str().is_empty() {
         flags |= libc::O_DIRECTORY as u64;
@@ -1141,10 +1149,12 @@ pub(crate) fn metadata_cached(path: &Path) -> io::Result<Metadata> {
             if let Some(meta) = map.get(path) {
                 return Ok(meta.clone());
             }
+            let _blocking_io = crate::resource::begin_blocking_io()?;
             let meta = std::fs::metadata(path)?;
             map.insert(path.to_path_buf(), meta.clone());
             return Ok(meta);
         }
+        let _blocking_io = crate::resource::begin_blocking_io()?;
         std::fs::metadata(path)
     })
 }
@@ -1157,10 +1167,12 @@ pub(crate) fn symlink_metadata_cached(path: &Path) -> io::Result<Metadata> {
             if let Some(meta) = map.get(path) {
                 return Ok(meta.clone());
             }
+            let _blocking_io = crate::resource::begin_blocking_io()?;
             let meta = std::fs::symlink_metadata(path)?;
             map.insert(path.to_path_buf(), meta.clone());
             return Ok(meta);
         }
+        let _blocking_io = crate::resource::begin_blocking_io()?;
         std::fs::symlink_metadata(path)
     })
 }
@@ -1172,6 +1184,7 @@ pub(crate) fn is_dir_cached(path: &Path) -> bool {
 }
 
 fn root_file(root: &Path) -> io::Result<Arc<File>> {
+    let _blocking_io = crate::resource::begin_blocking_io()?;
     // A pathname can be atomically rebound to another directory between
     // requests (the common `current -> release-N` deployment shape).  Caching
     // this descriptor by pathname across requests would keep a connection
@@ -1221,6 +1234,7 @@ pub(crate) fn probe_beneath(
     rel: &Path,
     nofollow: bool,
 ) -> io::Result<(File, Metadata)> {
+    let _blocking_io = crate::resource::begin_blocking_io()?;
     if rel.as_os_str().is_empty() {
         if nofollow {
             return Err(io::Error::from_raw_os_error(libc::ELOOP));
@@ -1244,6 +1258,7 @@ pub(crate) fn probe_beneath(
 /// without re-walking an already-canonicalized pathname. The caller still
 /// validates the descriptor type, size and version around the read.
 pub(crate) fn open_read_beneath(root: &Path, rel: &Path) -> io::Result<(File, Metadata)> {
+    let _blocking_io = crate::resource::begin_blocking_io()?;
     if rel.as_os_str().is_empty() {
         let file = root_file(root)?.try_clone()?;
         let metadata = file.metadata()?;
