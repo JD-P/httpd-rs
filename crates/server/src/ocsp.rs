@@ -1046,6 +1046,17 @@ fn valid_response_until(
     response: &[u8],
     now: i64,
 ) -> Option<i64> {
+    if !httpd_rs_verified::dependency_call_admit(
+        true,
+        response.len() as u64,
+        MAX_OCSP_RESPONSE,
+        response.len() as u64,
+        MAX_OCSP_RESPONSE,
+        response.len() as u64,
+        MAX_OCSP_RESPONSE,
+    ) {
+        return None;
+    }
     if chain.len() < 2 {
         return None;
     }

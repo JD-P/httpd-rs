@@ -82,8 +82,8 @@
         "crates/server/src/tls.rs",
         "crates/server/src/util.rs"
       ],
-      "evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate, queues are physically bounded and ownership-carrying, and tests/resource_inventory.py rejects an unbounded production channel or a shared-state contract which loses its source evidence; bounded pure projections remain covered by that owning request phase",
-      "verification_targets": ["resource_budget_admit", "shared_map_insert_admit", "shared_queue_push_admit", "async_work_handoff_admit", "blocking_io_start_admit", "request_resource_effect_closure", "terminal_sink_gate"]
+      "evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
+      "verification_targets": ["resource_budget_admit", "shared_map_insert_admit", "shared_queue_push_admit", "dependency_call_admit", "async_work_handoff_admit", "blocking_io_start_admit", "request_resource_effect_closure", "terminal_sink_gate"]
     },
     {
       "id": "closed-input-grammar-bounds",
@@ -107,7 +107,7 @@
         "crates/server/src/main.rs",
         "crates/server/src/status.rs"
       ],
-      "evidence": "administrative parsing is capped by fixed file/argument limits and status rendering iterates only the closed 21-slot/8-byte/3-physical enum sets",
+      "evidence": "administrative parsing is capped by fixed file/argument limits and status rendering iterates only the closed 21-slot/9-byte/3-physical enum sets",
       "verification_targets": ["service_identity_admit", "resource_shadow_budget_candidate"]
     },
     {
@@ -314,6 +314,11 @@
       "component": "vendored h2 0.4.20 fork",
       "resource": "stream/HPACK/codec CPU and memory",
       "warrant": "source is included in static closure; adapter and fork limits are typed and fuzzed; transport buffers retain a physical-parent lease"
+    },
+    {
+      "component": "Cargo.lock third-party graph",
+      "resource": "codec, regex, cryptographic and runtime CPU/workspace",
+      "warrant": "all 23 direct dependencies have an executable manifest classification; nine variable-cost entry boundaries bind input, work and workspace to a live typed owner; exact namespace counts make a new call site a CI review action; cgroup CPU/memory and protocol deadlines remain independent backstops"
     },
     {
       "component": "Rust allocator and standard library",

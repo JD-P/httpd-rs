@@ -5,6 +5,77 @@
 //! non-match here because directive regexes frequently guard authorization and
 //! routing decisions.
 
+use std::cell::RefCell;
+
+const APACHE_REGEX_PATTERN_LIMIT: usize = 8190;
+const APACHE_REGEX_AUTOMATA_LIMIT: usize = 256 * 1024;
+
+#[derive(Clone, Copy)]
+struct CompileBudget {
+    limit: usize,
+    used: usize,
+}
+
+thread_local! {
+    static COMPILE_BUDGET: RefCell<Option<CompileBudget>> = const { RefCell::new(None) };
+}
+
+struct CompileBudgetScope {
+    previous: Option<CompileBudget>,
+}
+
+impl Drop for CompileBudgetScope {
+    fn drop(&mut self) {
+        COMPILE_BUDGET.with(|budget| {
+            budget.replace(self.previous.take());
+        });
+    }
+}
+
+pub(crate) fn with_compile_budget<T>(
+    limit: usize,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, usize), String> {
+    let previous =
+        COMPILE_BUDGET.with(|budget| budget.replace(Some(CompileBudget { limit, used: 0 })));
+    if previous.is_some() {
+        COMPILE_BUDGET.with(|budget| {
+            budget.replace(previous);
+        });
+        return Err("nested regex dependency compilation boundary".into());
+    }
+    let scope = CompileBudgetScope { previous: None };
+    let value = operation()?;
+    let used = COMPILE_BUDGET.with(|budget| budget.borrow().as_ref().map_or(0, |b| b.used));
+    drop(scope);
+    Ok((value, used))
+}
+
+fn reserve_compile_workspace(bytes: usize) -> bool {
+    COMPILE_BUDGET.with(|budget| {
+        let mut budget = budget.borrow_mut();
+        let Some(budget) = budget.as_mut() else {
+            return true;
+        };
+        let Some(next) = budget.used.checked_add(bytes) else {
+            return false;
+        };
+        if next > budget.limit {
+            return false;
+        }
+        budget.used = next;
+        true
+    })
+}
+
+fn release_compile_workspace(bytes: usize) {
+    COMPILE_BUDGET.with(|budget| {
+        if let Some(budget) = budget.borrow_mut().as_mut() {
+            budget.used = budget.used.saturating_sub(bytes);
+        }
+    });
+}
+
 #[derive(Clone, Debug)]
 pub struct Regex {
     inner: httpd_rs_pcre2::bytes::Regex,
@@ -17,11 +88,25 @@ impl Regex {
 
     pub fn compile(pattern: &str, caseless: bool) -> Result<Self, String> {
         let mut builder = httpd_rs_pcre2::bytes::RegexBuilder::new();
-        builder.caseless(caseless).utf(false).ucp(false);
         builder
-            .build(pattern)
-            .map(|inner| Self { inner })
-            .map_err(|error| error.to_string())
+            .caseless(caseless)
+            .utf(false)
+            .ucp(false)
+            .max_pattern_size(APACHE_REGEX_PATTERN_LIMIT)
+            .size_limit(APACHE_REGEX_AUTOMATA_LIMIT);
+        let workspace = builder
+            .dependency_workspace_bound()
+            .ok_or_else(|| "regex dependency workspace bound overflow".to_string())?;
+        if !reserve_compile_workspace(workspace) {
+            return Err("aggregate regex dependency workspace limit reached".into());
+        }
+        match builder.build(pattern) {
+            Ok(inner) => Ok(Self { inner }),
+            Err(error) => {
+                release_compile_workspace(workspace);
+                Err(error.to_string())
+            }
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -39,7 +124,7 @@ impl Regex {
 
 #[cfg(test)]
 mod tests {
-    use super::Regex;
+    use super::{with_compile_budget, Regex};
 
     #[test]
     fn directive_boundary_uses_the_closed_pcre_grammar() {
@@ -85,5 +170,15 @@ mod tests {
         assert!(!left.is_match(b"word"));
         assert!(right.is_match(b">"));
         assert!(!right.is_match(b"word"));
+    }
+
+    #[test]
+    fn aggregate_compile_budget_rejects_before_dependency_entry() {
+        let error = with_compile_budget(1, || Regex::new("literal")).unwrap_err();
+        assert!(error.contains("aggregate regex dependency workspace"));
+
+        let (_, used) = with_compile_budget(8 * 1024 * 1024, || Regex::new("literal")).unwrap();
+        assert!(used > 0);
+        assert!(Regex::new("after").is_ok());
     }
 }

@@ -699,6 +699,8 @@ struct Parsed {
     scope: Arc<Scope>,
     rules: Vec<ScopeRule>,
     instruction_count: usize,
+    dependency_bytes: usize,
+    _dependency_lease: Option<crate::resource::DependencyWorkspaceLease>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -791,11 +793,12 @@ struct AccessFileCache {
 }
 
 impl AccessFileCache {
-    fn weight(key: &CacheKey) -> usize {
+    fn weight(key: &CacheKey, parsed: &Parsed) -> usize {
         (key.size.min(usize::MAX as u64) as usize)
             .saturating_add(key.path.as_os_str().as_encoded_bytes().len())
             .saturating_add(key.server_root.as_os_str().as_encoded_bytes().len())
             .saturating_add(key.allow_list.iter().map(String::len).sum::<usize>())
+            .saturating_add(parsed.dependency_bytes)
             .saturating_add(4096)
     }
 
@@ -804,7 +807,7 @@ impl AccessFileCache {
     }
 
     fn insert(&mut self, key: CacheKey, parsed: Arc<Parsed>) {
-        let weight = Self::weight(&key);
+        let weight = Self::weight(&key, &parsed);
         if weight > MAX_ACCESS_CACHE_BYTES {
             return;
         }
@@ -1111,6 +1114,32 @@ fn parse_access_bytes(
     nonfatal: NonfatalMode,
     identity: &crate::request_plan::LayerIdentity,
 ) -> Result<Parsed, String> {
+    let mut dependency_lease = cfg
+        .resource_budget
+        .try_dependency_workspace(MAX_ACCESS_CACHE_BYTES as u64)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let (mut parsed, dependency_bytes) =
+        crate::apache_regex::with_compile_budget(MAX_ACCESS_CACHE_BYTES, || {
+            parse_access_bytes_inner(cfg, path, data, mode, allow_list, nonfatal, identity)
+        })?;
+    dependency_lease
+        .shrink_to(dependency_bytes as u64)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    parsed.dependency_bytes = dependency_bytes;
+    parsed._dependency_lease = Some(dependency_lease);
+    Ok(parsed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_access_bytes_inner(
+    cfg: &Config,
+    path: &Path,
+    data: &[u8],
+    mode: OverrideMode,
+    allow_list: &[String],
+    nonfatal: NonfatalMode,
+    identity: &crate::request_plan::LayerIdentity,
+) -> Result<Parsed, String> {
     let text = std::str::from_utf8(data)
         .map_err(|_| format!("{}: access file is not valid UTF-8", path.display()))?;
     let lines = logical_lines(text);
@@ -1162,6 +1191,8 @@ fn parse_access_bytes(
         scope: Arc::new(scope),
         rules,
         instruction_count,
+        dependency_bytes: 0,
+        _dependency_lease: None,
     })
 }
 

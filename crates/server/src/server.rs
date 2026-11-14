@@ -3144,6 +3144,17 @@ async fn admit_tls_connection(
             "TLS handshake capacity exhausted",
         )
     })?;
+    if !httpd_rs_verified::dependency_call_admit(
+        true,
+        1,
+        1,
+        1,
+        1,
+        crate::resource::TLS_HANDSHAKE_DEPENDENCY_WORKSPACE_BYTES,
+        crate::resource::TLS_HANDSHAKE_DEPENDENCY_WORKSPACE_BYTES,
+    ) {
+        return Err(io::Error::other("TLS dependency boundary rejected"));
+    }
     let allows_h2 = tls_config
         .alpn_protocols
         .iter()

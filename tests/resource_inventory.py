@@ -10,6 +10,126 @@ from resource_warrant import mask_non_code, strip_test_modules
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "crates" / "server" / "src"
 
+# Every direct runtime/proof dependency is assigned one resource-review class.
+# Comparing this table with each Cargo manifest means adding a crate cannot
+# silently bypass the request-resource inventory.
+DEPENDENCY_CLASSES = {
+    "base64": "bounded-linear-transform",
+    "bcrypt": "variable-cost-crypto",
+    "brotli": "variable-cost-codec",
+    "bytes": "protocol-storage",
+    "flate2": "variable-cost-codec",
+    "h2": "vendored-protocol-state-machine",
+    "http": "protocol-types",
+    "libc": "audited-os-boundary",
+    "md-5": "bounded-linear-crypto",
+    "mimalloc": "process-allocator-backstop",
+    "regex-automata": "bounded-automata-engine",
+    "regex-syntax": "bounded-parser",
+    "ring": "bounded-crypto",
+    "rustix": "audited-os-boundary",
+    "rustls": "bounded-crypto-protocol",
+    "sha1": "bounded-linear-crypto",
+    "smallvec": "bounded-protocol-storage",
+    "subtle": "constant-time-primitive",
+    "tokio": "bounded-runtime",
+    "tokio-rustls": "bounded-crypto-protocol",
+    "vstd": "proof-runtime",
+    "webpki": "bounded-certificate-validation",
+    "webpki-roots": "immutable-trust-store",
+}
+
+EXPECTED_MANIFEST_DEPENDENCIES = {
+    "crates/os/Cargo.toml": {"libc", "rustix"},
+    "crates/verified/Cargo.toml": {"vstd"},
+    "crates/pcre2/Cargo.toml": {
+        "httpd-rs-verified", "regex-automata", "regex-syntax", "smallvec",
+    },
+    "crates/server/Cargo.toml": {
+        "httpd-rs-os", "httpd-rs-verified", "httpd-rs-pcre2", "libc", "rustix",
+        "rustls", "tokio", "tokio-rustls", "h2", "bytes", "http", "sha1",
+        "subtle", "ring", "md-5", "base64", "bcrypt", "flate2", "brotli",
+        "webpki-roots", "webpki", "mimalloc",
+    },
+}
+
+# Exact namespace occurrence counts make a new entry into a variable-cost
+# third-party family a CI-visible review action, including additions inside a
+# file which already uses that crate. Test-only modules are stripped first.
+VARIABLE_DEPENDENCY_NAMESPACES = {
+    ("crates/server/src/auth.rs", "bcrypt"): 2,
+    ("crates/server/src/compression.rs", "brotli"): 9,
+    ("crates/server/src/compression.rs", "flate2"): 2,
+    ("crates/server/src/h2.rs", "h2"): 40,
+    ("crates/server/src/h2.rs", "tokio_rustls"): 1,
+    ("crates/server/src/ocsp.rs", "rustls"): 1,
+    ("crates/server/src/ocsp.rs", "webpki"): 5,
+    ("crates/server/src/proxy.rs", "rustls"): 7,
+    ("crates/server/src/proxy.rs", "tokio_rustls"): 1,
+    ("crates/server/src/resource.rs", "h2"): 1,
+    ("crates/server/src/scope_policy.rs", "rustls"): 3,
+    ("crates/server/src/server.rs", "h2"): 1,
+    ("crates/server/src/server.rs", "rustls"): 5,
+    ("crates/server/src/server.rs", "tokio_rustls"): 5,
+    ("crates/server/src/tls.rs", "rustls"): 13,
+    ("crates/server/src/whole_request_fuzz.rs", "h2"): 2,
+    ("crates/pcre2/src/lib.rs", "regex_automata"): 1,
+    ("crates/pcre2/src/lib.rs", "regex_syntax"): 6,
+    ("crates/pcre2/src/lib.rs", "smallvec"): 1,
+}
+
+# Each remotely or backend influenced variable-cost library entry point names
+# the source anchor and concrete bound/owner evidence which must remain in the
+# implementation. Evidence may live in the central resource ledger.
+DEPENDENCY_BOUNDARY_CONTRACTS = {
+    ("crates/server/src/auth.rs", "bcrypt::verify("): (
+        ("crates/server/src/auth.rs", "try_bcrypt(*cost, password.len() as u64)"),
+        ("crates/server/src/resource.rs", "dependency_call_admit"),
+        ("crates/server/src/resource.rs", "MAX_BCRYPT_INPUT_BYTES"),
+    ),
+    ("crates/server/src/compression.rs", "fn encoded_body("): (
+        ("crates/server/src/compression.rs", "dependency_call_admit"),
+        ("crates/server/src/compression.rs", "CompressionLease"),
+        ("crates/server/src/compression.rs", "AllocationMeter"),
+    ),
+    ("crates/pcre2/src/lib.rs", "fn build_automata("): (
+        ("crates/pcre2/src/lib.rs", "dependency_call_admit"),
+        ("crates/pcre2/src/lib.rs", "regex_compile_resource_admit"),
+        ("crates/pcre2/src/lib.rs", "let hot = build_automata"),
+    ),
+    ("crates/pcre2/src/lib.rs", "fn check_subject("): (
+        ("crates/pcre2/src/lib.rs", "dependency_call_admit"),
+        ("crates/pcre2/src/lib.rs", "regex_match_resource_admit"),
+        ("crates/pcre2/src/lib.rs", "checked_mul"),
+    ),
+    ("crates/server/src/htaccess.rs", "with_compile_budget("): (
+        ("crates/server/src/apache_regex.rs", "dependency_workspace_bound"),
+        ("crates/server/src/htaccess.rs", "dependency_bytes"),
+        ("crates/server/src/htaccess.rs", "try_dependency_workspace"),
+        ("crates/server/src/htaccess.rs", "MAX_ACCESS_CACHE_BYTES"),
+    ),
+    ("crates/server/src/server.rs", "acceptor.accept(tcp)"): (
+        ("crates/server/src/server.rs", "dependency_call_admit"),
+        ("crates/server/src/server.rs", "try_reserve_tls_handshake"),
+        ("crates/server/src/server.rs", "TLS handshake timed out"),
+    ),
+    ("crates/server/src/h2.rs", "builder.handshake(io)"): (
+        ("crates/server/src/h2.rs", "dependency_call_admit"),
+        ("crates/server/src/h2.rs", "h2_settings"),
+        ("crates/server/src/h2.rs", "HTTP/2 preface timed out"),
+    ),
+    ("crates/server/src/proxy.rs", "fn admit_proxy_tls_dependency("): (
+        ("crates/server/src/proxy.rs", "dependency_call_admit"),
+        ("crates/server/src/proxy.rs", "TRANSPORT_BUFFER_CHARGE"),
+        ("crates/server/src/proxy.rs", "TLS handshake timeout"),
+    ),
+    ("crates/server/src/ocsp.rs", "fn valid_response_until("): (
+        ("crates/server/src/ocsp.rs", "dependency_call_admit"),
+        ("crates/server/src/ocsp.rs", "MAX_OCSP_RESPONSE"),
+        ("crates/server/src/ocsp.rs", "verify_signature"),
+    ),
+}
+
 EXPECTED_SLOTS = {
     "DynamicBackend", "H2Stream", "SlowInput", "SlowOutput", "ResponseBodyRead", "Websocket",
     "ExpensiveCpu", "PendingConnection", "H1Connection", "RequestWorker",
@@ -20,6 +140,7 @@ EXPECTED_SLOTS = {
 EXPECTED_BYTES = {
     "Spool", "SlowSpool", "RequestResident", "ResponseResident",
     "SlowResponseResident", "PolicyExpansion", "CacheResident", "CompressionTransient",
+    "DependencyWorkspace",
 }
 EXPECTED_PHYSICAL = {"FileDescriptor", "Task", "ResidentMemory"}
 
@@ -29,6 +150,7 @@ EXPECTED_PHYSICAL = {"FileDescriptor", "Task", "ResidentMemory"}
 # docs/resource-inventory.md.
 ALLOWED_MUTABLE_STATICS = {
     ("access.rs", "SENDER"),
+    ("apache_regex.rs", "COMPILE_BUDGET"),
     ("auth.rs", "CACHE"), ("auth.rs", "NEXT_TEMP"),
     ("auth.rs", "PASSWORD_VERIFY_CALLS"),
     ("cache.rs", "CACHE_EPOCH"), ("cache.rs", "BARRIER"),
@@ -102,6 +224,7 @@ SHARED_STATIC_CONTRACTS = {
     ("h2.rs", "POOL"): ("POOL_MAX_ENTRIES", "POOL_MAX_TOTAL"),
     ("htaccess.rs", "CACHE"): (
         "MAX_ACCESS_CACHE_ENTRIES", "MAX_ACCESS_CACHE_BYTES", "shared_map_insert_admit",
+        "DependencyWorkspaceLease",
     ),
     ("ocsp.rs", "CACHE"): (
         "MAX_OCSP_MEMORY_CACHE_ENTRIES", "MAX_OCSP_MEMORY_CACHE_BYTES",
@@ -162,6 +285,24 @@ def enum_variants(text: str, name: str) -> set[str]:
     return set(re.findall(r"^\s*([A-Z][A-Za-z0-9_]*)\s*,", match["body"], re.M))
 
 
+def manifest_dependencies(path: Path) -> set[str]:
+    dependencies: set[str] = set()
+    in_dependencies = False
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if line.startswith("["):
+            in_dependencies = line == "[dependencies]" or (
+                line.startswith("[target.") and line.endswith(".dependencies]")
+            )
+            continue
+        if not in_dependencies or not line or line.startswith("#"):
+            continue
+        match = re.match(r'([A-Za-z0-9_-]+)\s*=', line)
+        if match:
+            dependencies.add(match.group(1))
+    return dependencies
+
+
 def main() -> int:
     resource = (SRC / "resource.rs").read_text()
     errors: list[str] = []
@@ -171,6 +312,65 @@ def main() -> int:
         errors.append("ByteKind changed without updating the resource inventory")
     if enum_variants(resource, "PhysicalKind") != EXPECTED_PHYSICAL:
         errors.append("PhysicalKind changed without updating the resource inventory")
+
+    observed_dependencies: set[str] = set()
+    for relative, expected in EXPECTED_MANIFEST_DEPENDENCIES.items():
+        observed_manifest = manifest_dependencies(ROOT / relative)
+        if observed_manifest != expected:
+            errors.append(
+                f"direct dependencies changed in {relative}: "
+                f"expected={sorted(expected)} observed={sorted(observed_manifest)}"
+            )
+        observed_dependencies.update(
+            dependency
+            for dependency in observed_manifest
+            if not dependency.startswith("httpd-rs-")
+        )
+    unclassified_dependencies = observed_dependencies - DEPENDENCY_CLASSES.keys()
+    stale_dependency_classes = DEPENDENCY_CLASSES.keys() - observed_dependencies
+    if unclassified_dependencies:
+        errors.append(f"unclassified direct dependencies: {sorted(unclassified_dependencies)}")
+    if stale_dependency_classes:
+        errors.append(f"stale direct-dependency classes: {sorted(stale_dependency_classes)}")
+
+    contract_paths = {
+        relative for relative, _ in VARIABLE_DEPENDENCY_NAMESPACES
+    } | {
+        relative for relative, _ in DEPENDENCY_BOUNDARY_CONTRACTS
+    } | {
+        relative
+        for evidence in DEPENDENCY_BOUNDARY_CONTRACTS.values()
+        for relative, _ in evidence
+    }
+    contract_sources: dict[str, tuple[str, str]] = {}
+    for relative in sorted(contract_paths):
+        raw = (ROOT / relative).read_text()
+        _, production = strip_test_modules(raw, mask_non_code(raw))
+        contract_sources[relative] = (raw, production)
+    for (relative, namespace), expected_count in VARIABLE_DEPENDENCY_NAMESPACES.items():
+        production = contract_sources[relative][1]
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_])(?:::)?{re.escape(namespace)}\s*::"
+        )
+        observed_count = len(pattern.findall(production))
+        if observed_count != expected_count:
+            errors.append(
+                f"dependency namespace changed for {(relative, namespace)}: "
+                f"expected={expected_count} observed={observed_count}"
+            )
+    for (relative, anchor), evidence in DEPENDENCY_BOUNDARY_CONTRACTS.items():
+        production = contract_sources[relative][1]
+        if production.count(anchor) != 1:
+            errors.append(f"dependency boundary anchor must occur once: {(relative, anchor)}")
+        missing_evidence = [
+            (evidence_path, token)
+            for evidence_path, token in evidence
+            if token not in contract_sources[evidence_path][0]
+        ]
+        if missing_evidence:
+            errors.append(
+                f"dependency boundary {(relative, anchor)} lost evidence: {missing_evidence}"
+            )
 
     observed: set[tuple[str, str]] = set()
     sources: dict[str, str] = {}
@@ -245,7 +445,9 @@ def main() -> int:
         f"resource inventory: {len(EXPECTED_SLOTS)} slot classes, "
         f"{len(EXPECTED_BYTES)} byte classes, {len(EXPECTED_PHYSICAL)} physical classes, "
         f"{len(observed)} reviewed statics, "
-        f"{len(SHARED_STATIC_CONTRACTS) + len(OWNED_SHARED_CONTRACTS)} shared-state contracts"
+        f"{len(SHARED_STATIC_CONTRACTS) + len(OWNED_SHARED_CONTRACTS)} shared-state contracts, "
+        f"{len(observed_dependencies)} direct dependencies, "
+        f"{len(DEPENDENCY_BOUNDARY_CONTRACTS)} dependency boundaries"
     )
     return 0
 

@@ -39,6 +39,7 @@ const BYTE_KINDS: [ByteKind; ByteKind::COUNT] = [
     ByteKind::PolicyExpansion,
     ByteKind::CacheResident,
     ByteKind::CompressionTransient,
+    ByteKind::DependencyWorkspace,
 ];
 
 #[derive(Default)]
@@ -51,6 +52,7 @@ struct CampaignState {
     reads: Vec<ResponseBodyReadLease>,
     websockets: Vec<WebsocketLease>,
     compressions: Vec<CompressionLease>,
+    dependencies: Vec<DependencyWorkspaceLease>,
     async_work: Vec<AsyncWorkLease>,
     blocking_io: Vec<BlockingIoLease>,
 }
@@ -62,6 +64,7 @@ impl CampaignState {
         self.reads.clear();
         self.websockets.clear();
         self.compressions.clear();
+        self.dependencies.clear();
         self.async_work.clear();
         self.blocking_io.clear();
         self.dynamics.clear();
@@ -108,6 +111,11 @@ impl CampaignState {
             self.compressions
                 .iter()
                 .map(|lease| lease._work.context.clone()),
+        );
+        contexts.extend(
+            self.dependencies
+                .iter()
+                .map(|lease| lease.bytes.context.clone()),
         );
         contexts.extend(
             self.async_work
@@ -258,6 +266,7 @@ fn byte_process_limit(kind: ByteKind) -> u64 {
         ByteKind::RequestResident => MAX_REQUEST_RESIDENT_BYTES,
         ByteKind::ResponseResident | ByteKind::SlowResponseResident => MAX_RESPONSE_RESIDENT_BYTES,
         ByteKind::CompressionTransient => MAX_COMPRESSION_TRANSIENT_BYTES,
+        ByteKind::DependencyWorkspace => MAX_DEPENDENCY_WORKSPACE_BYTES,
         ByteKind::PolicyExpansion | ByteKind::CacheResident => 0,
     }
 }
@@ -270,6 +279,7 @@ fn byte_client_limit(kind: ByteKind) -> u64 {
             MAX_RESPONSE_RESIDENT_BYTES_PER_CLIENT
         }
         ByteKind::CompressionTransient => MAX_COMPRESSION_TRANSIENT_BYTES_PER_CLIENT,
+        ByteKind::DependencyWorkspace => MAX_DEPENDENCY_WORKSPACE_BYTES_PER_CLIENT,
         ByteKind::PolicyExpansion | ByteKind::CacheResident => 0,
     }
 }
@@ -689,7 +699,7 @@ pub(super) fn run(data: &[u8]) {
             }
             31 => state.clear_and_assert_scopes(),
             28 => {
-                if magnitude & 1 == 0 {
+                if selector & 3 == 0 {
                     for iteration in 0..batch_count(magnitude) {
                         let context =
                             batch_context(&budget, &contexts, &clients, client_selector, iteration);
@@ -699,13 +709,33 @@ pub(super) fn run(data: &[u8]) {
                             selector,
                         );
                     }
-                } else {
+                } else if selector & 3 == 1 {
                     let context = sticky_context(&contexts, client_selector);
                     let work_units = u64::from((magnitude >> 1).max(1));
                     let transient_bytes = boundary_amount(magnitude).max(1);
                     if let Some(lease) = try_compression_in(&context, work_units, transient_bytes) {
                         insert_bounded(&mut state.compressions, lease, selector);
                     }
+                } else if selector & 3 == 2 {
+                    let context = sticky_context(&contexts, client_selector);
+                    let before = budget.transition_snapshot();
+                    let result = with_resource_context(context, || {
+                        budget.try_dependency_workspace(boundary_amount(magnitude))
+                    });
+                    match result {
+                        Ok(mut lease) => {
+                            if magnitude & 0x80 != 0 {
+                                let retained = lease.bytes.bytes / 2;
+                                lease
+                                    .shrink_to(retained)
+                                    .expect("dependency workspace shrink rejected");
+                            }
+                            insert_bounded(&mut state.dependencies, lease, selector);
+                        }
+                        Err(_) => assert_eq!(before, budget.transition_snapshot()),
+                    }
+                } else if let Some(index) = selected(&state.dependencies, magnitude) {
+                    drop(state.dependencies.swap_remove(index));
                 }
             }
             29 => {
@@ -730,6 +760,10 @@ pub(super) fn run(data: &[u8]) {
                 assert!(budget.try_request_rate(&context).is_err());
                 assert!(budget.try_cache_write(&context, 1).is_err());
                 assert!(budget.try_cache_resident(&context, 1, 1).is_err());
+                assert!(with_resource_context(context.clone(), || {
+                    budget.try_dependency_workspace(1)
+                })
+                .is_err());
                 assert!(budget.try_tls_handshake(&context, 1, 1, 1).is_err());
                 assert!(budget.try_rewrite_program(&context, 1, 1, 1, 1).is_err());
                 assert!(budget
@@ -792,6 +826,8 @@ mod tests {
                 operation,
             ]);
         }
+        seed.extend_from_slice(&[28, 2, 0, 8]);
+        seed.extend_from_slice(&[28, 3, 0, 0]);
         run(&seed);
     }
 }

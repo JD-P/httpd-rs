@@ -33,6 +33,7 @@ const MAX_WEBSOCKET_NEGOTIATION_ITEMS: usize = 64;
 const MAX_WEBSOCKET_EXTENSION_PARAMS: usize = 32;
 const MAX_PROXY_CA_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PROXY_ADDRESSES: usize = 32;
+const MAX_TLS_SERVER_NAME_BYTES: u64 = 253;
 const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// A backend name is resolved once for each immutable configuration
 /// generation. DNS remains an input to configuration, not a mutable routing
@@ -42,6 +43,25 @@ const MAX_BACKEND_IDENTITIES: usize = 1024;
 const MAX_PROXY_SESSION_BACKENDS: usize = 4;
 const MAX_PROXY_GENERATION_STATE: usize = 4096;
 const PROXY_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn admit_proxy_tls_dependency(host: &str) -> std::io::Result<()> {
+    if httpd_rs_verified::dependency_call_admit(
+        true,
+        host.len() as u64,
+        MAX_TLS_SERVER_NAME_BYTES,
+        1,
+        1,
+        crate::resource::TRANSPORT_BUFFER_CHARGE,
+        crate::resource::TRANSPORT_BUFFER_CHARGE,
+    ) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "upstream TLS dependency boundary rejected",
+        ))
+    }
+}
 
 struct IdleProxyConnection {
     stream: Box<dyn ReadWrite>,
@@ -2539,6 +2559,7 @@ async fn connect_async(
     if !backend.tls {
         return Ok(Box::new(stream));
     }
+    admit_proxy_tls_dependency(&backend.host)?;
     let name = tls_server_name(&backend.host)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad TLS host"))?;
     let connector = tokio_rustls::TlsConnector::from(client_config(scope)?);
@@ -3116,6 +3137,7 @@ fn connect(
     let inner: Box<dyn ReadWrite> = if !backend.tls {
         Box::new(tcp)
     } else {
+        admit_proxy_tls_dependency(&backend.host)?;
         let name = tls_server_name(&backend.host)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad TLS host"))?;
         let conn = ClientConnection::new(client_config(scope)?, name)

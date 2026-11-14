@@ -128,6 +128,9 @@ enum ByteKind {
     /// Source bytes, codec state and bounded output scratch retained while a
     /// response is encoded in the downstream progress path.
     CompressionTransient,
+    /// Retained and transient workspace owned by variable-cost third-party
+    /// compilers/codecs outside their payload vectors.
+    DependencyWorkspace,
 }
 
 /// Typed leases ultimately consume a smaller set of operating-system
@@ -160,7 +163,7 @@ impl PhysicalKind {
 }
 
 impl ByteKind {
-    const COUNT: usize = 8;
+    const COUNT: usize = 9;
     const ALL: [Self; Self::COUNT] = [
         Self::Spool,
         Self::SlowSpool,
@@ -170,6 +173,7 @@ impl ByteKind {
         Self::PolicyExpansion,
         Self::CacheResident,
         Self::CompressionTransient,
+        Self::DependencyWorkspace,
     ];
 
     const fn index(self) -> usize {
@@ -186,6 +190,7 @@ impl ByteKind {
             Self::PolicyExpansion => "policy-expansion-bytes",
             Self::CacheResident => "cache-resident-bytes",
             Self::CompressionTransient => "compression-transient-bytes",
+            Self::DependencyWorkspace => "dependency-workspace-bytes",
         }
     }
 }
@@ -365,12 +370,17 @@ pub const MAX_EXPENSIVE_OPS_PER_CLIENT: u64 = 8;
 /// lease independently caps cheap checks at 32 process-wide and 8 per client.
 pub const MAX_BCRYPT_WORK_UNITS: u64 = 4_096;
 pub const MAX_BCRYPT_WORK_UNITS_PER_CLIENT: u64 = 4_096;
+pub(crate) const MAX_BCRYPT_INPUT_BYTES: u64 = 4_096;
 pub const MAX_COMPRESSION_WORK_UNITS: u64 = 512;
 pub const MAX_COMPRESSION_WORK_UNITS_PER_CLIENT: u64 = 128;
 pub const MAX_COMPRESSION_WORK_UNITS_PER_REQUEST: u64 = 256;
 pub const MAX_COMPRESSION_TRANSIENT_BYTES: u64 = 192 * 1024 * 1024;
 pub const MAX_COMPRESSION_TRANSIENT_BYTES_PER_CLIENT: u64 = 80 * 1024 * 1024;
 pub const MAX_COMPRESSION_TRANSIENT_BYTES_PER_REQUEST: u64 = 80 * 1024 * 1024;
+pub(crate) const MAX_DEPENDENCY_WORKSPACE_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_DEPENDENCY_WORKSPACE_BYTES_PER_CLIENT: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_DEPENDENCY_WORKSPACE_BYTES_PER_REQUEST: u64 = 32 * 1024 * 1024;
+pub(crate) const TLS_HANDSHAKE_DEPENDENCY_WORKSPACE_BYTES: u64 = 128 * 1024;
 pub const MAX_DYNAMIC_REQUESTS_PER_CLIENT: u64 = 8;
 pub const MAX_RESPONSE_BODY_READS: u64 = 32;
 pub const MAX_RESPONSE_BODY_READS_PER_CLIENT: u64 = 8;
@@ -584,7 +594,7 @@ const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
         // Queue residence reserves the task/memory which the closure will
         // consume before the worker is allowed to begin it.
         AsyncRequestWork => [0, 1, 64 * 1024],
-        TlsHandshake => [0, 0, 128 * 1024],
+        TlsHandshake => [0, 0, TLS_HANDSHAKE_DEPENDENCY_WORKSPACE_BYTES],
         RequestBodyWorker | ExpensiveCpu => [0, 0, 0],
     }
 }
@@ -596,7 +606,8 @@ const fn byte_physical_kind(kind: ByteKind) -> Option<PhysicalKind> {
         | ByteKind::SlowResponseResident
         | ByteKind::PolicyExpansion
         | ByteKind::CacheResident
-        | ByteKind::CompressionTransient => Some(PhysicalKind::ResidentMemory),
+        | ByteKind::CompressionTransient
+        | ByteKind::DependencyWorkspace => Some(PhysicalKind::ResidentMemory),
         ByteKind::Spool | ByteKind::SlowSpool => None,
     }
 }
@@ -2024,10 +2035,14 @@ impl ResourceBudget {
     }
 
     fn current_context_for(self: &Arc<Self>) -> io::Result<ResourceContext> {
-        if let Some(context) =
-            current_context().filter(|context| Arc::ptr_eq(&context.budget, self))
-        {
-            return Ok(context);
+        if let Some(context) = current_context() {
+            if Arc::ptr_eq(&context.budget, self) {
+                return Ok(context);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request resource context belongs to another process ledger",
+            ));
         }
         #[cfg(test)]
         {
@@ -2612,6 +2627,26 @@ impl ResourceBudget {
         );
         lease.reserve(bytes, "hierarchical memory-cache limit reached")?;
         Ok(CacheResidentLease { bytes: lease })
+    }
+
+    /// Reserve dependency-owned memory before a request-triggered compiler or
+    /// codec is entered. Access-file regex compilation initially reserves its
+    /// complete aggregate ceiling, then shrinks the lease to the conservative
+    /// retained automata/cache charge.
+    pub(crate) fn try_dependency_workspace(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> io::Result<DependencyWorkspaceLease> {
+        let context = self.current_context_for()?;
+        let mut lease = ByteLease::new(
+            context,
+            ByteKind::DependencyWorkspace,
+            MAX_DEPENDENCY_WORKSPACE_BYTES,
+            Some(MAX_DEPENDENCY_WORKSPACE_BYTES_PER_CLIENT),
+            Some(MAX_DEPENDENCY_WORKSPACE_BYTES_PER_REQUEST),
+        );
+        lease.reserve(bytes, "dependency workspace limit reached")?;
+        Ok(DependencyWorkspaceLease { bytes: lease })
     }
 
     pub(crate) fn try_log_bytes(&self, client: Option<IpAddr>, bytes: u64) -> bool {
@@ -3209,6 +3244,29 @@ pub(crate) struct CacheResidentLease {
     bytes: ByteLease,
 }
 
+#[derive(Debug)]
+pub(crate) struct DependencyWorkspaceLease {
+    bytes: ByteLease,
+}
+
+impl DependencyWorkspaceLease {
+    pub(crate) fn shrink_to(&mut self, retained: u64) -> io::Result<()> {
+        if retained > self.bytes.bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dependency workspace cannot grow after compilation",
+            ));
+        }
+        self.bytes.release(self.bytes.bytes - retained);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn bytes(&self) -> u64 {
+        self.bytes.bytes
+    }
+}
+
 impl CacheResidentLease {
     #[cfg(test)]
     fn bytes(&self) -> u64 {
@@ -3398,7 +3456,7 @@ pub(crate) fn try_expensive_in(context: &ResourceContext) -> Option<ExpensiveLea
 /// factor. Cost 5 is one unit; every additional cost bit doubles the charge.
 /// Unknown and known Basic-auth users call this same gate after selecting a
 /// real or dummy verifier with the file's uniform cost.
-pub(crate) fn try_bcrypt(cost: u32) -> Option<BcryptLease> {
+pub(crate) fn try_bcrypt(cost: u32, password_bytes: u64) -> Option<BcryptLease> {
     if !httpd_rs_verified::bcrypt_cost_admit(cost) {
         return None;
     }
@@ -3435,6 +3493,17 @@ pub(crate) fn try_bcrypt(cost: u32) -> Option<BcryptLease> {
         return None;
     }
     drop(rates);
+    if !httpd_rs_verified::dependency_call_admit(
+        true,
+        password_bytes,
+        MAX_BCRYPT_INPUT_BYTES,
+        units,
+        MAX_BCRYPT_WORK_UNITS,
+        0,
+        0,
+    ) {
+        return None;
+    }
     Some(BcryptLease {
         _operation: operation,
         _work: work,
@@ -4900,15 +4969,16 @@ mod tests {
         let budget = Arc::new(ResourceBudget::default());
         let context = budget.context("192.0.2.55".parse().unwrap());
         with_resource_context(context, || {
-            let lease = try_bcrypt(17).expect("one maximum-cost verifier");
+            let lease = try_bcrypt(17, MAX_BCRYPT_INPUT_BYTES).expect("one maximum-cost verifier");
             assert_eq!(budget.slot_usage(SlotKind::ExpensiveCpu), 1);
             assert_eq!(budget.slot_usage(SlotKind::BcryptCpu), 4_096);
-            assert!(try_bcrypt(4).is_none());
+            assert!(try_bcrypt(4, 1).is_none());
             drop(lease);
             assert_eq!(budget.slot_usage(SlotKind::ExpensiveCpu), 0);
             assert_eq!(budget.slot_usage(SlotKind::BcryptCpu), 0);
-            assert!(try_bcrypt(3).is_none());
-            assert!(try_bcrypt(18).is_none());
+            assert!(try_bcrypt(3, 1).is_none());
+            assert!(try_bcrypt(18, 1).is_none());
+            assert!(try_bcrypt(5, MAX_BCRYPT_INPUT_BYTES + 1).is_none());
         });
     }
 
@@ -4933,6 +5003,32 @@ mod tests {
             assert_eq!(budget.slot_usage(SlotKind::CompressionCpu), 0);
             assert_eq!(
                 budget.byte_process[ByteKind::CompressionTransient.index()].load(Ordering::Acquire),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn dependency_workspace_is_reserved_before_entry_and_shrinks_to_retained_bytes() {
+        let budget = Arc::new(ResourceBudget::default());
+        let context = budget.context("192.0.2.57".parse().unwrap());
+        with_resource_context(context, || {
+            assert!(budget
+                .try_dependency_workspace(MAX_DEPENDENCY_WORKSPACE_BYTES_PER_REQUEST + 1)
+                .is_err());
+            let mut lease = budget
+                .try_dependency_workspace(MAX_DEPENDENCY_WORKSPACE_BYTES_PER_REQUEST)
+                .unwrap();
+            assert_eq!(lease.bytes(), MAX_DEPENDENCY_WORKSPACE_BYTES_PER_REQUEST);
+            assert_eq!(
+                budget.byte_process[ByteKind::DependencyWorkspace.index()].load(Ordering::Acquire),
+                MAX_DEPENDENCY_WORKSPACE_BYTES_PER_REQUEST
+            );
+            lease.shrink_to(1024 * 1024).unwrap();
+            assert_eq!(lease.bytes(), 1024 * 1024);
+            drop(lease);
+            assert_eq!(
+                budget.byte_process[ByteKind::DependencyWorkspace.index()].load(Ordering::Acquire),
                 0
             );
         });

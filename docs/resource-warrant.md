@@ -67,7 +67,7 @@ Every site also has one independent closure disposition:
 `closure_contracts` in the policy supply module-level evidence where a local
 expression does not itself name the owning lease. CI requires exactly one
 disposition for every effect and fails if `unclassified_effect_sites` is not
-zero. The current closure is 2,223 typed-lease sites, 664 constant-bound sites
+zero. The current closure is 2,223 typed-lease sites, 665 constant-bound sites
 and 443 external/kernel sites. Classification closes discovery debt; it does
 not promote a partial dominance or cost-refinement proof to mechanized status.
 
@@ -232,6 +232,32 @@ reads, dynamic backends, DNS, CGI/FastCGI, RewriteMap helpers and log writers
 retain their narrower existing leases, queues, deadlines or nonblocking gates;
 the general blocking-I/O slot is the fallback ownership boundary rather than a
 replacement for those more precise contracts.
+
+## Dependency-call closure
+
+The Cargo manifests form the discovery root: every one of the 23 direct
+dependencies has exactly one resource-review class, and manifest drift fails
+CI. Exact namespace counts then make additions to variable-cost families a
+review event even in a file which already imports that dependency. Nine
+source-backed boundary contracts cover the request/backend-influenced bcrypt,
+compression, regex, TLS, H2 and OCSP/webpki entry points.
+
+`dependency_call_admit` binds input bytes, abstract work and dependency-owned
+workspace to the surrounding live owner in one predicate. Specialized owners
+remain authoritative: bcrypt and compression keep their weighted leases,
+TLS/H2/proxy calls retain their concurrency/transport owners and deadlines,
+and OCSP validation retains its complete response bound. The dependency gate
+prevents a call from documenting only its CPU cost while silently omitting
+workspace.
+
+The first application found regex tier construction occurring on the second
+request rather than at configuration compilation. Both tiers now compile at
+the declared boundary. Access-file parsing reserves a typed dependency-byte
+lease for the conservative aggregate automata/cache workspace before any
+pattern is compiled. The lease has 256 MiB process, 64 MiB client and 32 MiB
+request ceilings, consumes the resident-memory parent, shrinks to the retained
+charge and is included in the 32 MiB cache weight, closing the
+many-small-pattern multiplier.
 
 The executable Verus predicate `blocking_io_start_admit` models the
 before/acquire/after cancellation race. Unit tests cover exact per-request

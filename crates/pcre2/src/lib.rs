@@ -15,8 +15,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Index;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use regex_automata::{
     meta::Regex as AutomataRegex, util::primitives::NonMaxUsize, Input, MatchKind, PatternID,
@@ -29,8 +28,11 @@ const DEFAULT_WORK_LIMIT: u64 = 16 * 1024 * 1024;
 const DEFAULT_CAPTURE_LIMIT: usize = 128;
 const DEFAULT_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 const DEFAULT_NEST_LIMIT: u32 = 64;
+const HYBRID_CACHE_CAPACITY: usize = 256 * 1024;
+const DEPENDENCY_FIXED_OVERHEAD: usize = 64 * 1024;
+const DEPENDENCY_PATTERN_EXPANSION_FACTOR: usize = 18;
+const DEPENDENCY_CAPTURE_OVERHEAD: usize = 128;
 const KEEP_PREFIX: &str = "__httpd_rs_pcre2_keep_";
-const HOT_TIER_AFTER_SEARCHES: u8 = 1;
 // A bounded optional repetition creates both take and skip states in the
 // PikeVM active set. Pass 24 measured this path at 4–5x the cost of an exact
 // repetition with the same old structural charge. Charge the conservative
@@ -237,7 +239,29 @@ pub mod bytes {
                     1
                 });
 
+            let workspace_bound = self
+                .dependency_workspace_bound()
+                .ok_or_else(|| Error::resource("regex dependency workspace bound overflow"))?;
+            if !httpd_rs_verified::dependency_call_admit(
+                true,
+                pattern.len() as u64,
+                self.config.pattern_limit as u64,
+                complexity,
+                self.config.work_limit,
+                workspace_bound as u64,
+                workspace_bound as u64,
+            ) {
+                return Err(Error::resource(
+                    "regex dependency compile cost exceeds the configured boundary",
+                ));
+            }
+
             let cold = build_automata(&hir, self.config.size_limit, false)?;
+            // Build the bounded lazy-DFA tier at the compile boundary.  The
+            // old on-second-search promotion performed dependency allocation
+            // and NFA construction on an arbitrary request, outside the
+            // configuration/access-file compilation owner.
+            let hot = build_automata(&hir, self.config.size_limit, true).ok();
 
             let inner_names: Vec<Option<String>> = cold
                 .group_info()
@@ -281,7 +305,7 @@ pub mod bytes {
                 translated_pattern: translation.pattern,
                 complexity,
                 final_newline_fallback: translation.final_newline_fallback,
-                inner: TieredEngine::new(cold, hir, self.config.size_limit),
+                inner: TieredEngine::new(cold, hot),
                 public_to_inner: Arc::new(public_to_inner),
                 keep_groups: Arc::new(keep_groups),
                 capture_names: Arc::new(capture_names),
@@ -381,6 +405,28 @@ pub mod bytes {
             self.config.nest_limit = depth;
             self
         }
+
+        /// Conservative retained/per-search workspace ceiling for both
+        /// automata tiers, the lazy-DFA cache, translated pattern storage and
+        /// capture metadata. Server-side access-file parsing reserves this
+        /// amount before entering the dependency compiler.
+        pub fn dependency_workspace_bound(&self) -> Option<usize> {
+            self.config
+                .size_limit
+                .checked_mul(2)?
+                .checked_add(HYBRID_CACHE_CAPACITY)?
+                .checked_add(
+                    self.config
+                        .pattern_limit
+                        .checked_mul(DEPENDENCY_PATTERN_EXPANSION_FACTOR)?,
+                )?
+                .checked_add(
+                    self.config
+                        .capture_limit
+                        .checked_mul(DEPENDENCY_CAPTURE_OVERHEAD)?,
+                )?
+                .checked_add(DEPENDENCY_FIXED_OVERHEAD)
+        }
     }
 
     fn build_automata(
@@ -394,7 +440,7 @@ pub mod bytes {
                     .match_kind(MatchKind::LeftmostFirst)
                     .utf8_empty(false)
                     .nfa_size_limit(Some(size_limit))
-                    .hybrid_cache_capacity(2 * 1024 * 1024)
+                    .hybrid_cache_capacity(HYBRID_CACHE_CAPACITY)
                     .hybrid(hybrid)
                     .dfa(false)
                     .onepass(false)
@@ -419,45 +465,25 @@ pub mod bytes {
         capture_names_idx: Arc<HashMap<String, usize>>,
     }
 
-    /// A bounded Pike VM provides low cold-start latency. After the first
-    /// search, a lazy DFA tier is built once and shared by every clone. Both
-    /// tiers use the same HIR and Thompson-NFA size ceiling; neither permits
-    /// the bounded-backtracking fallback.
+    /// A bounded Pike VM and optional lazy DFA are both built at the compile
+    /// boundary and shared by every clone. Request-time matching therefore
+    /// cannot unexpectedly enter the regex-automata compiler or allocate a
+    /// per-pattern DFA cache. Neither tier permits bounded backtracking.
     #[derive(Clone)]
     struct TieredEngine(Arc<TieredEngineInner>);
 
     struct TieredEngineInner {
         cold: AutomataRegex,
-        hot: OnceLock<Option<AutomataRegex>>,
-        hir: regex_syntax::hir::Hir,
-        size_limit: usize,
-        searches: AtomicU8,
+        hot: Option<AutomataRegex>,
     }
 
     impl TieredEngine {
-        fn new(cold: AutomataRegex, hir: regex_syntax::hir::Hir, size_limit: usize) -> Self {
-            Self(Arc::new(TieredEngineInner {
-                cold,
-                hot: OnceLock::new(),
-                hir,
-                size_limit,
-                searches: AtomicU8::new(0),
-            }))
+        fn new(cold: AutomataRegex, hot: Option<AutomataRegex>) -> Self {
+            Self(Arc::new(TieredEngineInner { cold, hot }))
         }
 
         fn for_search(&self) -> &AutomataRegex {
-            if let Some(hot) = self.0.hot.get() {
-                return hot.as_ref().unwrap_or(&self.0.cold);
-            }
-            let searches = self.0.searches.fetch_add(1, Ordering::Relaxed);
-            if searches < HOT_TIER_AFTER_SEARCHES {
-                return &self.0.cold;
-            }
-            self.0
-                .hot
-                .get_or_init(|| build_automata(&self.0.hir, self.0.size_limit, true).ok())
-                .as_ref()
-                .unwrap_or(&self.0.cold)
+            self.0.hot.as_ref().unwrap_or(&self.0.cold)
         }
     }
 
@@ -500,6 +526,29 @@ pub mod bytes {
             ) {
                 return Err(Error::resource(
                     "subject or deterministic pattern×subject work exceeds the configured limit",
+                ));
+            }
+            let subject_work = self
+                .complexity
+                .checked_mul(subject.len().saturating_sub(start).max(1) as u64)
+                .ok_or_else(|| Error::resource("regex dependency work arithmetic overflow"))?;
+            if !httpd_rs_verified::dependency_call_admit(
+                true,
+                subject.len().saturating_sub(start) as u64,
+                self.config.subject_limit as u64,
+                subject_work,
+                self.config.work_limit,
+                self.config
+                    .size_limit
+                    .saturating_mul(2)
+                    .saturating_add(HYBRID_CACHE_CAPACITY) as u64,
+                self.config
+                    .size_limit
+                    .saturating_mul(2)
+                    .saturating_add(HYBRID_CACHE_CAPACITY) as u64,
+            ) {
+                return Err(Error::resource(
+                    "regex dependency match cost exceeds the configured boundary",
                 ));
             }
             Ok(())

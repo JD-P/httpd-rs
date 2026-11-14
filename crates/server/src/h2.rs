@@ -2845,6 +2845,17 @@ where
     let preface_timeout = cfg
         .request_header_timeout
         .max(std::time::Duration::from_secs(1));
+    if !httpd_rs_verified::dependency_call_admit(
+        true,
+        settings.max_frame as u64,
+        settings.max_frame as u64,
+        settings.max_concurrent_streams as u64,
+        settings.max_concurrent_streams as u64,
+        settings.max_send_buffer as u64,
+        settings.max_send_buffer as u64,
+    ) {
+        return Err(io::Error::other("HTTP/2 dependency boundary rejected"));
+    }
     let handshake = tokio::time::timeout(preface_timeout, builder.handshake(io));
     tokio::pin!(handshake);
     let mut conn = loop {

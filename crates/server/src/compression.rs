@@ -767,6 +767,19 @@ fn finalize_inner(
         // CPU or memory pressure instead of queueing transformation work.
         return;
     };
+    if !httpd_rs_verified::dependency_call_admit(
+        true,
+        input_len,
+        MAX_COMPRESS_BODY,
+        profile.work_units,
+        crate::resource::MAX_COMPRESSION_WORK_UNITS_PER_REQUEST,
+        profile.transient_bytes,
+        crate::resource::MAX_COMPRESSION_TRANSIENT_BYTES_PER_REQUEST,
+    ) {
+        // Keep the identity representation if the dependency profile ever
+        // diverges from the typed CPU/memory owner selected above.
+        return;
+    }
     let body = std::mem::replace(&mut resp.body, Body::Empty);
     let (input, _) = match take_body_reader(body) {
         Ok(value) => value,

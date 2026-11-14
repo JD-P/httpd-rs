@@ -52,7 +52,7 @@ pub fn authenticate(scope: &Scope, req: &Request, mutable_auth_files: bool) -> O
     if user.is_empty()
         || user.chars().any(|c| c.is_control())
         || user.contains(':')
-        || password.len() > 4096
+        || password.len() as u64 > crate::resource::MAX_BCRYPT_INPUT_BYTES
     {
         return None;
     }
@@ -272,7 +272,8 @@ impl PasswordVerifier {
                 bool::from(computed.as_bytes().ct_eq(stored.as_bytes()))
             }
             Self::Bcrypt { stored, cost } => {
-                let Some(_expensive) = crate::resource::try_bcrypt(*cost) else {
+                let Some(_expensive) = crate::resource::try_bcrypt(*cost, password.len() as u64)
+                else {
                     return false;
                 };
                 bcrypt::verify(password, stored.as_ref()).unwrap_or(false)

@@ -3897,6 +3897,97 @@ pub proof fn ownerless_shared_queue_item_is_rejected(queued: u64, capacity: u64)
 {
 }
 
+/// A variable-cost dependency may be entered only while its surrounding
+/// typed owner is live and each attacker-influenced cost dimension is below
+/// the bound selected by that owner.  Keeping input, work and workspace in a
+/// single predicate prevents a call site from accounting for CPU while
+/// silently omitting dependency-owned memory (or vice versa).
+pub open spec fn dependency_call_spec(
+    owner_live: bool,
+    input: u64,
+    input_limit: u64,
+    work: u64,
+    work_limit: u64,
+    workspace: u64,
+    workspace_limit: u64,
+) -> bool {
+    owner_live
+        && input <= input_limit
+        && work <= work_limit
+        && workspace <= workspace_limit
+}
+
+pub fn dependency_call_admit(
+    owner_live: bool,
+    input: u64,
+    input_limit: u64,
+    work: u64,
+    work_limit: u64,
+    workspace: u64,
+    workspace_limit: u64,
+) -> (admit: bool)
+    ensures admit == dependency_call_spec(
+        owner_live,
+        input,
+        input_limit,
+        work,
+        work_limit,
+        workspace,
+        workspace_limit,
+    ),
+{
+    owner_live
+        && input <= input_limit
+        && work <= work_limit
+        && workspace <= workspace_limit
+}
+
+pub proof fn dependency_call_success_is_bounded(
+    owner_live: bool,
+    input: u64,
+    input_limit: u64,
+    work: u64,
+    work_limit: u64,
+    workspace: u64,
+    workspace_limit: u64,
+)
+    requires dependency_call_spec(
+        owner_live,
+        input,
+        input_limit,
+        work,
+        work_limit,
+        workspace,
+        workspace_limit,
+    ),
+    ensures
+        owner_live,
+        input <= input_limit,
+        work <= work_limit,
+        workspace <= workspace_limit,
+{
+}
+
+pub proof fn ownerless_dependency_call_is_rejected(
+    input: u64,
+    input_limit: u64,
+    work: u64,
+    work_limit: u64,
+    workspace: u64,
+    workspace_limit: u64,
+)
+    ensures !dependency_call_spec(
+        false,
+        input,
+        input_limit,
+        work,
+        work_limit,
+        workspace,
+        workspace_limit,
+    ),
+{
+}
+
 /// Overflow-free aggregate admission used by spool-byte, spool-file and
 /// dynamic-backend counters.  The caller commits the exact addition with an
 /// atomic compare/exchange, retrying this predicate if the observed value

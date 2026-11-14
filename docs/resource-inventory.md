@@ -41,8 +41,10 @@ charge and at least sixteen of the fixed 64 connection workers remain outside
 this class. The adjustable byte ledger covers request memory,
 general/slow response memory, general/slow request/backend/proxy spools, and
 retained policy expansions, retained memory-cache entries, and compression
-workspaces. Fixed-window rates use the same canonical client identity and
-process ledger.
+workspaces. A ninth byte class reserves third-party compiler/codec workspace
+before dependency entry; access-file regex compilation uses 256 MiB process,
+64 MiB source and 32 MiB request ceilings. Fixed-window rates use the same
+canonical client identity and process ledger.
 
 Request-controlled work which crosses a blocking-pool or DNS-queue boundary
 first acquires an `AsyncWorkLease`. The move-only lease is transferred into
@@ -240,6 +242,29 @@ test-only modules and rejects any production `mpsc::channel()` or
 whose bound or ownership evidence disappears. The OCSP in-memory staple cache,
 which formerly capped each response but not their aggregate, is independently
 limited to 256 entries and 64 MiB.
+
+Third-party calls have a separate closed boundary inventory. All 23 direct
+dependencies in the OS, proof, PCRE2 and server manifests are assigned one
+resource-review class; changing a manifest or adding another occurrence of a
+variable-cost namespace fails `tests/resource_inventory.py`. Nine concrete
+request/backend-influenced entry points cover bcrypt, gzip/Brotli, regex
+compile and match, access-file aggregate regex compilation, rustls listener
+and proxy handshakes, the vendored h2 handshake/codec and webpki OCSP
+validation. Each consumes the executable Verus `dependency_call_admit`
+predicate, which jointly requires a live surrounding owner and input, work and
+workspace bounds.
+
+This audit found a real lifetime seam in the regex dependency. Its bounded
+lazy-DFA tier used to be constructed on the second search, so compilation and
+cache allocation occurred on whichever request happened to arrive next.
+Both automata tiers are now constructed at the configuration/access-file
+compile boundary. The Apache-facing builder has explicit pattern, automata and
+hybrid-cache ceilings; access-file parsing reserves the complete conservative
+dependency workspace in a typed byte lease before each compile, caps the
+aggregate at 32 MiB, charges the resident-memory parent, shrinks to the
+retained amount and includes that charge in the access-cache weight. Many
+individually valid patterns therefore cannot multiply dependency-owned memory
+outside the cache bound.
 
 The enum/static inventory is complemented by the hybrid request-resource
 warrant described in `docs/resource-warrant.md`. Its static scanner inventories

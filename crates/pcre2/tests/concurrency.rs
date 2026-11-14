@@ -1,11 +1,11 @@
-//! Shared-engine regressions for concurrent cold-to-hot tier promotion.
+//! Shared precompiled-engine regressions under concurrent matching.
 
 use std::sync::{Arc, Barrier};
 
 use httpd_rs_pcre2::bytes::Regex;
 
 #[test]
-fn cloned_regexes_promote_once_and_match_consistently() {
+fn cloned_regexes_share_precompiled_tiers_and_match_consistently() {
     const THREADS: usize = 8;
     const ITERATIONS: usize = 128;
     const SUBJECT: &[u8] = b"aaaaabbb";
