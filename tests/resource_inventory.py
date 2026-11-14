@@ -5,6 +5,8 @@ from pathlib import Path
 import re
 import sys
 
+from resource_warrant import mask_non_code, strip_test_modules
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "crates" / "server" / "src"
 
@@ -79,6 +81,79 @@ FORBIDDEN_SPLIT_LEDGERS = {
     "EXPENSIVE_OPS", "POLICY_RESIDENT_BYTES",
 }
 
+# Request-reachable process/generation collections must carry a locally
+# checkable cardinality/byte/ownership contract. The ordinary mutable-static
+# allowlist above answers "was this reviewed?"; this table additionally
+# answers "what keeps it finite?". Evidence tokens are intentionally source
+# names rather than prose so renaming/removing a bound fails CI.
+SHARED_STATIC_CONTRACTS = {
+    ("access.rs", "SENDER"): ("DNS_QUEUE", "sync_channel", "AsyncWorkLease"),
+    ("auth.rs", "CACHE"): (
+        "MAX_AUTH_CACHE_ENTRIES", "MAX_AUTH_CACHE_BYTES", "shared_map_insert_admit",
+    ),
+    ("cache.rs", "CACHE"): (
+        "MAX_ENTRIES", "max_memory_size", "CacheResidentLease", "shared_map_insert_admit",
+    ),
+    ("cache.rs", "USAGE"): ("MAX_DISK_ENTRIES", "max_disk_size", "DiskLease"),
+    ("cache.rs", "SCAN"): ("try_lock", "MAX_DISK_SCAN_RECORDS"),
+    ("cache.rs", "LOCKS"): ("STRIPES", "disk_io_locks"),
+    ("cgi.rs", "POOL"): ("clamp(8, 64)", "wait_timeout", "CgiWorker"),
+    ("config.rs", "REGISTRY"): ("OnceLock", "known_directives"),
+    ("h2.rs", "POOL"): ("POOL_MAX_ENTRIES", "POOL_MAX_TOTAL"),
+    ("htaccess.rs", "CACHE"): (
+        "MAX_ACCESS_CACHE_ENTRIES", "MAX_ACCESS_CACHE_BYTES", "shared_map_insert_admit",
+    ),
+    ("ocsp.rs", "CACHE"): (
+        "MAX_OCSP_MEMORY_CACHE_ENTRIES", "MAX_OCSP_MEMORY_CACHE_BYTES",
+        "shared_map_insert_admit",
+    ),
+    ("ocsp.rs", "DISK"): ("DiskLease", "try_disk_at"),
+    ("proxy.rs", "DEAD"): ("MAX_PROXY_GENERATION_STATE", "drop_generation_state"),
+    ("proxy.rs", "HEALTH"): ("MAX_PROXY_GENERATION_STATE", "drop_generation_state"),
+    ("proxy.rs", "COUNTERS"): ("MAX_PROXY_GENERATION_STATE", "drop_generation_state"),
+    ("proxy.rs", "DNS"): ("sync_channel", "AsyncWorkLease"),
+    ("resource.rs", "BUDGET"): ("ResourceBudget", "try_slot", "release_physical"),
+    ("server.rs", "CONNECTION_WORK_POOL"): (
+        "CONNECTION_WORK_QUEUE", "shared_queue_push_admit", "VecDeque",
+    ),
+    ("tls.rs", "PRIVILEGED_FILE_BROKER"): ("tls_file_specs", "HashMap"),
+}
+
+# Shared collections owned by a Config/connection rather than a static still
+# need explicit structural bounds. Anchors are unique type declarations; the
+# listed evidence must stay in the same source file.
+OWNED_SHARED_CONTRACTS = {
+    ("cache.rs", "struct MemoryCache"): ("MAX_ENTRIES", "CacheResidentLease"),
+    ("config.rs", "struct BoundedPolicyCache"): (
+        "POLICY_CACHE_MAX_ENTRIES", "POLICY_CACHE_MAX_BYTES", "shared_map_insert_admit",
+    ),
+    ("config.rs", "struct BoundedLayeredPolicyCache"): (
+        "POLICY_CACHE_MAX_ENTRIES", "POLICY_CACHE_MAX_BYTES", "shared_map_insert_admit",
+    ),
+    ("h2.rs", "struct H2ConnectionLedger"): (
+        "max_concurrent_streams", "mpsc::channel", "H2TaskEventGuard",
+    ),
+    ("http.rs", "struct StreamingBody {"): (
+        "STREAMING_BODY_CHANNEL_CHUNKS", "mpsc::Receiver", "ResidentLease",
+    ),
+    ("proxy.rs", "struct ProxySession"): (
+        "MAX_PROXY_SESSION_BACKENDS", "shared_map_insert_admit", "DynamicLease",
+    ),
+    ("proxy.rs", "struct BackendIdentityRegistry"): (
+        "MAX_BACKEND_IDENTITIES", "shared_map_insert_admit", "generation",
+    ),
+    ("resource.rs", "struct RateWindow"): (
+        "MAX_REQUESTS_PER_SECOND", "clients.clear", "hierarchical_weighted_rate_admit",
+    ),
+    ("resource.rs", "struct DiskLedgers"): ("DiskLease", "DEFAULT_DISK_FILE_BUDGET"),
+    ("server.rs", "struct ConnectionWorkState"): (
+        "CONNECTION_WORK_QUEUE", "shared_queue_push_admit", "VecDeque",
+    ),
+    ("tls.rs", "struct ExpiringSessionCache"): (
+        "capacity", "shared_map_insert_admit", "prune_expired",
+    ),
+}
+
 
 def enum_variants(text: str, name: str) -> set[str]:
     match = re.search(rf"enum\s+{name}\s*\{{(?P<body>.*?)\n\}}", text, re.S)
@@ -98,10 +173,12 @@ def main() -> int:
         errors.append("PhysicalKind changed without updating the resource inventory")
 
     observed: set[tuple[str, str]] = set()
+    sources: dict[str, str] = {}
     static_pattern = re.compile(r"\bstatic\s+([A-Z][A-Z0-9_]*)\s*:")
     all_source = ""
     for path in sorted(SRC.glob("*.rs")):
         text = path.read_text()
+        sources[path.name] = text
         all_source += text
         observed.update((path.name, name) for name in static_pattern.findall(text))
     unknown = observed - ALLOWED_MUTABLE_STATICS
@@ -117,6 +194,37 @@ def main() -> int:
     )
     if leaked:
         errors.append(f"standalone attacker resource ledgers returned: {leaked}")
+
+    for key, evidence in SHARED_STATIC_CONTRACTS.items():
+        if key not in observed:
+            errors.append(f"shared-state contract has no static: {key}")
+            continue
+        text = sources[key[0]]
+        missing_evidence = [token for token in evidence if token not in text]
+        if missing_evidence:
+            errors.append(f"shared-state contract {key} lost evidence: {missing_evidence}")
+    for (filename, anchor), evidence in OWNED_SHARED_CONTRACTS.items():
+        text = sources.get(filename, "")
+        if text.count(anchor) != 1:
+            errors.append(f"owned shared-state anchor must occur once: {(filename, anchor)}")
+        missing_evidence = [token for token in evidence if token not in text]
+        if missing_evidence:
+            errors.append(
+                f"owned shared-state contract {(filename, anchor)} lost evidence: "
+                f"{missing_evidence}"
+            )
+
+    # There is no acceptable production use of a conventionally one-message
+    # unbounded channel. Use oneshot/sync_channel/bounded Tokio mpsc, or add a
+    # real capacity tied to an ownership ceiling. Test modules are excluded.
+    unbounded = re.compile(r"\b(?:std::sync::)?mpsc::(?:unbounded_channel|channel)\s*\(\s*\)")
+    for filename, raw in sources.items():
+        masked = mask_non_code(raw)
+        production, production_masked = strip_test_modules(raw, masked)
+        del production
+        for match in unbounded.finditer(production_masked):
+            line = production_masked.count("\n", 0, match.start()) + 1
+            errors.append(f"unbounded production channel: {filename}:{line}")
 
     for required in (
         "with_resource_context(context", "try_dynamic_in", "try_h2_stream_in",
@@ -136,7 +244,8 @@ def main() -> int:
     print(
         f"resource inventory: {len(EXPECTED_SLOTS)} slot classes, "
         f"{len(EXPECTED_BYTES)} byte classes, {len(EXPECTED_PHYSICAL)} physical classes, "
-        f"{len(observed)} reviewed statics"
+        f"{len(observed)} reviewed statics, "
+        f"{len(SHARED_STATIC_CONTRACTS) + len(OWNED_SHARED_CONTRACTS)} shared-state contracts"
     )
     return 0
 

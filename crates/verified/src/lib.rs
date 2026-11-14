@@ -3808,6 +3808,95 @@ pub proof fn cache_memory_admission_is_bounded(used: u64, incoming: u64, limit: 
 {
 }
 
+/// Common admission rule for process- and generation-owned maps/caches.  The
+/// caller removes any replaced entry before evaluating this predicate, so a
+/// successful insertion increases both cardinality and retained bytes by one
+/// exact step. Keeping the two limits in one predicate prevents a cache from
+/// accidentally enforcing only its cheaper dimension.
+pub open spec fn shared_map_insert_spec(
+    entries: u64,
+    entry_limit: u64,
+    bytes: u64,
+    incoming_bytes: u64,
+    byte_limit: u64,
+) -> bool {
+    entries < entry_limit && bytes <= byte_limit && incoming_bytes <= byte_limit - bytes
+}
+
+pub fn shared_map_insert_admit(
+    entries: u64,
+    entry_limit: u64,
+    bytes: u64,
+    incoming_bytes: u64,
+    byte_limit: u64,
+) -> (admit: bool)
+    ensures admit == shared_map_insert_spec(
+        entries,
+        entry_limit,
+        bytes,
+        incoming_bytes,
+        byte_limit,
+    ),
+{
+    entries < entry_limit && bytes <= byte_limit && incoming_bytes <= byte_limit - bytes
+}
+
+pub proof fn shared_map_success_is_bounded(
+    entries: u64,
+    entry_limit: u64,
+    bytes: u64,
+    incoming_bytes: u64,
+    byte_limit: u64,
+)
+    requires shared_map_insert_spec(
+        entries,
+        entry_limit,
+        bytes,
+        incoming_bytes,
+        byte_limit,
+    ),
+    ensures
+        entries + 1 <= entry_limit,
+        bytes + incoming_bytes <= byte_limit,
+{
+}
+
+/// A bounded queue accepts a request-controlled item only while an owning
+/// lease/guard is live and an actual slot remains. Queue capacity and work
+/// ownership therefore cannot diverge on the handoff boundary.
+pub open spec fn shared_queue_push_spec(
+    queued: u64,
+    capacity: u64,
+    owner_live: bool,
+) -> bool {
+    owner_live && queued < capacity
+}
+
+pub fn shared_queue_push_admit(
+    queued: u64,
+    capacity: u64,
+    owner_live: bool,
+) -> (admit: bool)
+    ensures admit == shared_queue_push_spec(queued, capacity, owner_live),
+{
+    owner_live && queued < capacity
+}
+
+pub proof fn shared_queue_success_is_bounded(
+    queued: u64,
+    capacity: u64,
+    owner_live: bool,
+)
+    requires shared_queue_push_spec(queued, capacity, owner_live),
+    ensures queued + 1 <= capacity,
+{
+}
+
+pub proof fn ownerless_shared_queue_item_is_rejected(queued: u64, capacity: u64)
+    ensures !shared_queue_push_spec(queued, capacity, false),
+{
+}
+
 /// Overflow-free aggregate admission used by spool-byte, spool-file and
 /// dynamic-backend counters.  The caller commits the exact addition with an
 /// atomic compare/exchange, retrying this predicate if the observed value

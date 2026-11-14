@@ -40,6 +40,7 @@ const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// second, cryptographic identity check but consumes the same bound transport.
 const MAX_BACKEND_IDENTITIES: usize = 1024;
 const MAX_PROXY_SESSION_BACKENDS: usize = 4;
+const MAX_PROXY_GENERATION_STATE: usize = 4096;
 const PROXY_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct IdleProxyConnection {
@@ -89,7 +90,15 @@ impl ProxySession {
         }
         let mut idle = self.idle.lock().unwrap_or_else(|error| error.into_inner());
         idle.retain(|_, connection| connection.idle_since.elapsed() <= PROXY_SESSION_IDLE_TIMEOUT);
-        if !idle.contains_key(&key) && idle.len() >= MAX_PROXY_SESSION_BACKENDS {
+        if !idle.contains_key(&key)
+            && !httpd_rs_verified::shared_map_insert_admit(
+                idle.len() as u64,
+                MAX_PROXY_SESSION_BACKENDS as u64,
+                0,
+                0,
+                0,
+            )
+        {
             return;
         }
         idle.insert(key, connection);
@@ -491,10 +500,18 @@ fn dead_map() -> &'static Mutex<HashMap<String, std::time::Instant>> {
 
 fn mark_dead(generation: u64, name: &str, member: &str) {
     let mut guard = dead_map().lock().unwrap_or_else(|e| e.into_inner());
-    guard.insert(
-        format!("{generation}|{name}|{member}"),
-        std::time::Instant::now(),
-    );
+    let key = format!("{generation}|{name}|{member}");
+    if guard.contains_key(&key)
+        || httpd_rs_verified::shared_map_insert_admit(
+            guard.len() as u64,
+            MAX_PROXY_GENERATION_STATE as u64,
+            0,
+            0,
+            0,
+        )
+    {
+        guard.insert(key, std::time::Instant::now());
+    }
 }
 
 fn is_dead(generation: u64, name: &str, member: &str) -> bool {
@@ -591,6 +608,17 @@ fn member_is_healthy(generation: u64, name: &str, member: &str) -> bool {
 
 fn update_health(spec: &HealthSpec, ok: bool) {
     let mut guard = health_map().lock().unwrap_or_else(|e| e.into_inner());
+    if !guard.contains_key(&spec.key)
+        && !httpd_rs_verified::shared_map_insert_admit(
+            guard.len() as u64,
+            MAX_PROXY_GENERATION_STATE as u64,
+            0,
+            0,
+            0,
+        )
+    {
+        return;
+    }
     let entry = guard
         .entry(spec.key.clone())
         .or_insert_with(|| MemberHealth {
@@ -910,6 +938,17 @@ fn next_balancer_member(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let counter_key = format!("{generation}|{}", balancer.name);
+    if !guard.contains_key(&counter_key)
+        && !httpd_rs_verified::shared_map_insert_admit(
+            guard.len() as u64,
+            MAX_PROXY_GENERATION_STATE as u64,
+            0,
+            0,
+            0,
+        )
+    {
+        return parse_http_url(&viable[0].url);
+    }
     let start = *guard.entry(counter_key.clone()).or_insert(0);
     let index = start % viable.len();
     *guard.entry(counter_key).or_insert(0) = start.wrapping_add(1);
@@ -2064,7 +2103,7 @@ struct DnsJob {
     host: String,
     port: u16,
     deadline: Instant,
-    reply: mpsc::Sender<std::io::Result<Vec<SocketAddr>>>,
+    reply: mpsc::SyncSender<std::io::Result<Vec<SocketAddr>>>,
     /// Request jobs own this from queue admission through helper exit.  A
     /// caller may drop its receiver on cancellation, but that cannot release
     /// the queued/running work reservation prematurely.
@@ -2234,7 +2273,9 @@ fn submit_dns(
     let async_work = request_scope
         .map(crate::resource::RequestScope::try_async_work)
         .transpose()?;
-    let (reply, rx) = mpsc::channel();
+    // A DNS job has exactly one terminal result. Keep that ownership bound in
+    // the channel type instead of relying on the worker's send convention.
+    let (reply, rx) = mpsc::sync_channel(1);
     dns_sender()
         .try_send(DnsJob {
             host: host.to_string(),
@@ -2289,7 +2330,13 @@ fn bind_backend_identity(
     if let Some(bound) = identities.get(&key) {
         return Ok(bound.clone());
     }
-    if identities.len() >= MAX_BACKEND_IDENTITIES {
+    if !httpd_rs_verified::shared_map_insert_admit(
+        identities.len() as u64,
+        MAX_BACKEND_IDENTITIES as u64,
+        0,
+        0,
+        0,
+    ) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "backend identity table is full",
@@ -4511,7 +4558,7 @@ mod tests {
             budget.context(std::net::IpAddr::from([127, 0, 0, 2])),
         );
         let async_work = scope.try_async_work().unwrap();
-        let (reply, _receiver) = mpsc::channel();
+        let (reply, _receiver) = mpsc::sync_channel(1);
         let job = DnsJob {
             host: "cancelled.invalid".into(),
             port: 80,
@@ -8443,7 +8490,7 @@ mod coverage_tests {
         assert!(addresses.iter().all(|address| address.port() == 8080));
         assert!(resolver_worker_main("bad host", 8080).is_err());
 
-        let (reply, _rx) = mpsc::channel();
+        let (reply, _rx) = mpsc::sync_channel(1);
         let expired = DnsJob {
             host: "localhost".into(),
             port: 8080,
@@ -8463,7 +8510,7 @@ mod coverage_tests {
 
         // `ip6-localhost` bypasses the literal localhost fast path while still
         // resolving entirely through the host's local resolver configuration.
-        let (reply, _rx) = mpsc::channel();
+        let (reply, _rx) = mpsc::sync_channel(1);
         let local_dns = DnsJob {
             host: "ip6-localhost".into(),
             port: 8081,

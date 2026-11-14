@@ -94,7 +94,15 @@ impl rustls::server::StoresServerSessions for ExpiringSessionCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         Self::prune_expired(&mut entries, now);
-        if !entries.contains_key(&key) && entries.len() >= self.capacity {
+        if !entries.contains_key(&key)
+            && !httpd_rs_verified::shared_map_insert_admit(
+                entries.len() as u64,
+                self.capacity as u64,
+                0,
+                0,
+                0,
+            )
+        {
             if let Some(oldest) = entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.expires)

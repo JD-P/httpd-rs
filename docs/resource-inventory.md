@@ -218,6 +218,29 @@ until this inventory and its allowlist are reviewed. It also rejects the old
 standalone worker, TLS, H2, rewrite-helper, expensive-operation, and policy
 resident ledgers.
 
+Shared maps, caches and queues have a second, narrower closure gate. Thirty
+process-, generation-, connection- and configuration-owned structures name
+their source-level entry/byte capacity, lifetime cleanup and (where work
+crosses a task boundary) move-only owner. Authentication, access-file,
+compiled-policy, response-memory, OCSP, TLS-session, proxy-session,
+backend-identity and generation-state insertions consume the executable Verus
+`shared_map_insert_admit` predicate after replacement/eviction. Its proof
+establishes that a successful insertion preserves both cardinality and byte
+ceilings; a cache cannot accidentally keep only one dimension of its bound.
+
+Every production channel is physically bounded. The fixed connection work
+queue consumes `shared_queue_push_admit`; both DNS pools have 64 work slots,
+one-slot replies and an `AsyncWorkLease` in every queued job; streaming bodies
+have four resource-accounted chunks. The H2 lifecycle queue is sized to the
+per-connection stream ceiling, and each stream's move-only drop guard can emit
+exactly one terminal event. The connection loop gives those events priority
+before another stream admission. `tests/resource_inventory.py` strips
+test-only modules and rejects any production `mpsc::channel()` or
+`unbounded_channel()` constructor, as well as a declared shared-state contract
+whose bound or ownership evidence disappears. The OCSP in-memory staple cache,
+which formerly capped each response but not their aggregate, is independently
+limited to 256 entries and 64 MiB.
+
 The enum/static inventory is complemented by the hybrid request-resource
 warrant described in `docs/resource-warrant.md`. Its static scanner inventories
 allocation, growth, CPU iteration, task/process, filesystem, network,

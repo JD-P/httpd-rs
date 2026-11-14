@@ -360,7 +360,13 @@ fn read_small(path: &Path, mutable: bool) -> Option<Arc<ParsedAuthFile>> {
         let mut cache = auth_file_cache()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if cache.failures.len() >= MAX_AUTH_CACHE_ENTRIES {
+        if !httpd_rs_verified::shared_map_insert_admit(
+            cache.failures.len() as u64,
+            MAX_AUTH_CACHE_ENTRIES as u64,
+            0,
+            0,
+            0,
+        ) {
             if let Some(victim) = cache.failures.keys().next().cloned() {
                 cache.failures.remove(&victim);
             }
@@ -427,9 +433,13 @@ fn read_small_uncached(
                 cache.bytes = cache.bytes.saturating_sub(old_weight);
             }
         }
-        while cache.entries.len() >= MAX_AUTH_CACHE_ENTRIES
-            || cache.bytes.saturating_add(weight) > MAX_AUTH_CACHE_BYTES
-        {
+        while !httpd_rs_verified::shared_map_insert_admit(
+            cache.entries.len() as u64,
+            MAX_AUTH_CACHE_ENTRIES as u64,
+            cache.bytes as u64,
+            weight as u64,
+            MAX_AUTH_CACHE_BYTES as u64,
+        ) {
             let Some(victim) = cache.entries.keys().next().cloned() else {
                 break;
             };
@@ -437,8 +447,16 @@ fn read_small_uncached(
                 cache.bytes = cache.bytes.saturating_sub(old_weight);
             }
         }
-        cache.bytes = cache.bytes.saturating_add(weight);
-        cache.entries.insert(key, (Arc::clone(&data), weight));
+        if httpd_rs_verified::shared_map_insert_admit(
+            cache.entries.len() as u64,
+            MAX_AUTH_CACHE_ENTRIES as u64,
+            cache.bytes as u64,
+            weight as u64,
+            MAX_AUTH_CACHE_BYTES as u64,
+        ) {
+            cache.bytes = cache.bytes.saturating_add(weight);
+            cache.entries.insert(key, (Arc::clone(&data), weight));
+        }
     }
     Some(data)
 }

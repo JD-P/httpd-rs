@@ -813,9 +813,13 @@ impl AccessFileCache {
         if let Some((_, old_weight)) = self.entries.remove(&key) {
             self.bytes = self.bytes.saturating_sub(old_weight);
         }
-        while self.entries.len() >= MAX_ACCESS_CACHE_ENTRIES
-            || self.bytes.saturating_add(weight) > MAX_ACCESS_CACHE_BYTES
-        {
+        while !httpd_rs_verified::shared_map_insert_admit(
+            self.entries.len() as u64,
+            MAX_ACCESS_CACHE_ENTRIES as u64,
+            self.bytes as u64,
+            weight as u64,
+            MAX_ACCESS_CACHE_BYTES as u64,
+        ) {
             let Some(victim) = self.entries.keys().next().cloned() else {
                 break;
             };
@@ -823,9 +827,17 @@ impl AccessFileCache {
                 self.bytes = self.bytes.saturating_sub(old_weight);
             }
         }
-        self.bytes = self.bytes.saturating_add(weight);
-        self.last = Some((key.clone(), Arc::clone(&parsed)));
-        self.entries.insert(key, (parsed, weight));
+        if httpd_rs_verified::shared_map_insert_admit(
+            self.entries.len() as u64,
+            MAX_ACCESS_CACHE_ENTRIES as u64,
+            self.bytes as u64,
+            weight as u64,
+            MAX_ACCESS_CACHE_BYTES as u64,
+        ) {
+            self.bytes = self.bytes.saturating_add(weight);
+            self.last = Some((key.clone(), Arc::clone(&parsed)));
+            self.entries.insert(key, (parsed, weight));
+        }
     }
 }
 

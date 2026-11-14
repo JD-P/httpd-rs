@@ -241,13 +241,21 @@ fn insert_memory_into(cfg: &Config, cache: &mut MemoryCache, key: &str, entry: A
         let old = retained.remove(0);
         cache.bytes = cache.bytes.saturating_sub(memory_entry_size(key, &old));
     }
-    while (!httpd_rs_verified::cache_memory_admit(cache.bytes, incoming, cfg.cache.max_memory_size)
-        || cache.entries.len() >= MAX_ENTRIES)
-        && evict_oldest_memory(cache)
+    while !httpd_rs_verified::shared_map_insert_admit(
+        cache.entries.len() as u64,
+        MAX_ENTRIES as u64,
+        cache.bytes,
+        incoming,
+        cfg.cache.max_memory_size,
+    ) && evict_oldest_memory(cache)
     {}
-    if httpd_rs_verified::cache_memory_admit(cache.bytes, incoming, cfg.cache.max_memory_size)
-        && cache.entries.len() < MAX_ENTRIES
-    {
+    if httpd_rs_verified::shared_map_insert_admit(
+        cache.entries.len() as u64,
+        MAX_ENTRIES as u64,
+        cache.bytes,
+        incoming,
+        cfg.cache.max_memory_size,
+    ) {
         cache.bytes = cache.bytes.saturating_add(incoming);
         retained.push(entry);
     }

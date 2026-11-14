@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 const MAX_OCSP_HTTP_LINE: usize = 16 * 1024;
 const MAX_OCSP_HTTP_HEAD: usize = 64 * 1024;
 const MAX_OCSP_RESPONSE: u64 = 2 * 1024 * 1024;
+const MAX_OCSP_MEMORY_CACHE_ENTRIES: usize = 256;
+const MAX_OCSP_MEMORY_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const OCSP_CLOCK_SKEW_SECS: i64 = 300;
 const MAX_OCSP_AGE_WITHOUT_NEXT_UPDATE_SECS: i64 = 24 * 60 * 60;
 const OCSP_SIGNING_EKU: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09];
@@ -1301,9 +1303,60 @@ pub fn fuzz_ocsp_parsers(data: &[u8]) {
     }
 }
 
-fn cache() -> &'static Mutex<HashMap<Vec<u8>, Vec<u8>>> {
-    static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Vec<u8>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Default)]
+struct OcspMemoryCache {
+    entries: HashMap<Vec<u8>, Vec<u8>>,
+    bytes: u64,
+}
+
+impl OcspMemoryCache {
+    fn weight(key: &[u8], response: &[u8]) -> u64 {
+        (key.len() as u64)
+            .saturating_add(response.len() as u64)
+            // Conservatively include Vec allocations and HashMap bookkeeping.
+            .saturating_add(256)
+    }
+
+    fn remove(&mut self, key: &[u8]) {
+        if let Some(response) = self.entries.remove(key) {
+            self.bytes = self.bytes.saturating_sub(Self::weight(key, &response));
+        }
+    }
+
+    fn insert(&mut self, key: Vec<u8>, response: Vec<u8>) {
+        self.remove(&key);
+        let incoming = Self::weight(&key, &response);
+        if incoming > MAX_OCSP_MEMORY_CACHE_BYTES {
+            return;
+        }
+        while !httpd_rs_verified::shared_map_insert_admit(
+            self.entries.len() as u64,
+            MAX_OCSP_MEMORY_CACHE_ENTRIES as u64,
+            self.bytes,
+            incoming,
+            MAX_OCSP_MEMORY_CACHE_BYTES,
+        ) {
+            let Some(victim) = self.entries.keys().next().cloned() else {
+                break;
+            };
+            self.remove(&victim);
+        }
+        if httpd_rs_verified::shared_map_insert_admit(
+            self.entries.len() as u64,
+            MAX_OCSP_MEMORY_CACHE_ENTRIES as u64,
+            self.bytes,
+            incoming,
+            MAX_OCSP_MEMORY_CACHE_BYTES,
+        ) {
+            self.bytes = self.bytes.saturating_add(incoming);
+            self.entries.insert(key, response);
+        }
+    }
+}
+
+fn cache() -> &'static Mutex<OcspMemoryCache> {
+    static CACHE: OnceLock<Mutex<OcspMemoryCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(OcspMemoryCache::default()))
 }
 
 fn disk_leases() -> &'static Mutex<HashMap<std::path::PathBuf, crate::resource::DiskLease>> {
@@ -1511,6 +1564,7 @@ pub(crate) fn staple_response(
     if let Some(cached) = cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+        .entries
         .get(&key)
         .cloned()
     {
@@ -1536,6 +1590,25 @@ pub(crate) fn staple_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_cache_preserves_entry_and_byte_bounds() {
+        let mut cache = OcspMemoryCache::default();
+        for index in 0..=MAX_OCSP_MEMORY_CACHE_ENTRIES {
+            cache.insert(index.to_be_bytes().to_vec(), vec![index as u8]);
+        }
+        assert!(cache.entries.len() <= MAX_OCSP_MEMORY_CACHE_ENTRIES);
+        assert!(cache.bytes <= MAX_OCSP_MEMORY_CACHE_BYTES);
+
+        // A corrupted/restored counter cannot make checked subtraction wrap
+        // and admit another entry. The cache fails closed until eviction can
+        // reconcile real entries with the retained-byte count.
+        cache.entries.clear();
+        cache.bytes = MAX_OCSP_MEMORY_CACHE_BYTES;
+        cache.insert(vec![1], vec![2]);
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, MAX_OCSP_MEMORY_CACHE_BYTES);
+    }
 
     fn minimal_cert(url: Option<&str>) -> Vec<u8> {
         let algorithm = der(0x30, &der(0x06, &[0x2a]));

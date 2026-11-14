@@ -82,8 +82,8 @@
         "crates/server/src/tls.rs",
         "crates/server/src/util.rs"
       ],
-      "evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; bounded pure projections remain covered by that owning request phase",
-      "verification_targets": ["resource_budget_admit", "async_work_handoff_admit", "blocking_io_start_admit", "request_resource_effect_closure", "terminal_sink_gate"]
+      "evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate, queues are physically bounded and ownership-carrying, and tests/resource_inventory.py rejects an unbounded production channel or a shared-state contract which loses its source evidence; bounded pure projections remain covered by that owning request phase",
+      "verification_targets": ["resource_budget_admit", "shared_map_insert_admit", "shared_queue_push_admit", "async_work_handoff_admit", "blocking_io_start_admit", "request_resource_effect_closure", "terminal_sink_gate"]
     },
     {
       "id": "closed-input-grammar-bounds",
@@ -231,7 +231,7 @@
       "attacker_axes": ["accepted connections", "blocking jobs", "DNS work", "backend work", "HTTP/2 streams", "queued output"],
       "dynamic_measurements": ["thread wait channels", "runnable process count", "typed slot and queued-H2 high-water"],
       "accounting_apis": ["SlotLease", "TaskLease", "AsyncWorkLease", "bounded channels", "QueuedH2TransportLease"],
-      "verus_targets": ["resource_budget_admit", "request_worker_lend_admit", "h2_process_slot_admit", "async_work_handoff_admit"],
+      "verus_targets": ["resource_budget_admit", "shared_queue_push_admit", "request_worker_lend_admit", "h2_process_slot_admit", "async_work_handoff_admit"],
       "os_backstop": "fixed worker pools, bounded channels, listen backlog and cgroup pids.max"
     },
     {
@@ -239,7 +239,7 @@
       "attacker_axes": ["cache key contention", "configuration reload", "log serialization", "shared ledger contention"],
       "dynamic_measurements": ["per-thread futex/rwsem/mutex wait channels", "context switches", "optional perf lock contention"],
       "accounting_apis": ["bounded critical sections", "striped cache locks", "nonblocking contention fallbacks"],
-      "verus_targets": ["cache_publication_step", "configuration_generation_admit"],
+      "verus_targets": ["shared_map_insert_admit", "cache_publication_step", "configuration_generation_admit"],
       "os_backstop": "bounded lock scope, timeout/nonblocking fallbacks and cgroup CPU quota"
     }
   ],

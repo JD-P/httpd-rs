@@ -806,7 +806,11 @@ where
             .queue
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if queue.len() >= CONNECTION_WORK_QUEUE {
+        if !httpd_rs_verified::shared_queue_push_admit(
+            queue.len() as u64,
+            CONNECTION_WORK_QUEUE as u64,
+            true,
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "connection worker queue is full",

@@ -3164,9 +3164,13 @@ impl<V> BoundedPolicyCache<V> {
         if let Some((_, old_weight)) = self.entries.remove(&key) {
             self.bytes = self.bytes.saturating_sub(old_weight);
         }
-        while self.entries.len() >= POLICY_CACHE_MAX_ENTRIES
-            || self.bytes.saturating_add(weight) > POLICY_CACHE_MAX_BYTES
-        {
+        while !httpd_rs_verified::shared_map_insert_admit(
+            self.entries.len() as u64,
+            POLICY_CACHE_MAX_ENTRIES as u64,
+            self.bytes as u64,
+            weight as u64,
+            POLICY_CACHE_MAX_BYTES as u64,
+        ) {
             let Some(victim) = self.entries.keys().next().cloned() else {
                 break;
             };
@@ -3174,8 +3178,16 @@ impl<V> BoundedPolicyCache<V> {
                 self.bytes = self.bytes.saturating_sub(old_weight);
             }
         }
-        self.bytes = self.bytes.saturating_add(weight);
-        self.entries.insert(key, (value, weight));
+        if httpd_rs_verified::shared_map_insert_admit(
+            self.entries.len() as u64,
+            POLICY_CACHE_MAX_ENTRIES as u64,
+            self.bytes as u64,
+            weight as u64,
+            POLICY_CACHE_MAX_BYTES as u64,
+        ) {
+            self.bytes = self.bytes.saturating_add(weight);
+            self.entries.insert(key, (value, weight));
+        }
     }
 }
 
@@ -3214,9 +3226,13 @@ impl BoundedLayeredPolicyCache {
         if let Some((_, old_weight)) = self.entries.remove(&key) {
             self.bytes = self.bytes.saturating_sub(old_weight);
         }
-        while self.entries.len() >= POLICY_CACHE_MAX_ENTRIES
-            || self.bytes.saturating_add(weight) > POLICY_CACHE_MAX_BYTES
-        {
+        while !httpd_rs_verified::shared_map_insert_admit(
+            self.entries.len() as u64,
+            POLICY_CACHE_MAX_ENTRIES as u64,
+            self.bytes as u64,
+            weight as u64,
+            POLICY_CACHE_MAX_BYTES as u64,
+        ) {
             let Some(victim) = self.entries.keys().next().cloned() else {
                 break;
             };
@@ -3224,8 +3240,16 @@ impl BoundedLayeredPolicyCache {
                 self.bytes = self.bytes.saturating_sub(old_weight);
             }
         }
-        self.bytes = self.bytes.saturating_add(weight);
-        self.entries.insert(key, (value, weight));
+        if httpd_rs_verified::shared_map_insert_admit(
+            self.entries.len() as u64,
+            POLICY_CACHE_MAX_ENTRIES as u64,
+            self.bytes as u64,
+            weight as u64,
+            POLICY_CACHE_MAX_BYTES as u64,
+        ) {
+            self.bytes = self.bytes.saturating_add(weight);
+            self.entries.insert(key, (value, weight));
+        }
     }
 }
 

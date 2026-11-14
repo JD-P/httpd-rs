@@ -220,7 +220,7 @@ impl H2ConnectionLedger {
 /// conservatively reports a reset so the connection fails closed rather than
 /// leaking capacity.
 struct H2TaskEventGuard {
-    tx: mpsc::UnboundedSender<H2TaskEvent>,
+    tx: mpsc::Sender<H2TaskEvent>,
     stream_id: u64,
     reset: bool,
 }
@@ -241,7 +241,11 @@ impl Drop for H2RequestCancelGuard {
 
 impl Drop for H2TaskEventGuard {
     fn drop(&mut self) {
-        let _ = self.tx.send(H2TaskEvent::Ended {
+        // Capacity equals the maximum admitted stream count and each guard
+        // emits once. The connection loop prioritizes these events before
+        // accepting another stream, so a live connection cannot overflow the
+        // terminal queue; teardown may only observe a closed receiver.
+        let _ = self.tx.try_send(H2TaskEvent::Ended {
             stream_id: self.stream_id,
             reset: self.reset,
         });
@@ -2879,7 +2883,7 @@ where
         settings.max_concurrent_streams as u64,
         settings.max_reset_streams as u64,
     );
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (events_tx, mut events_rx) = mpsc::channel(settings.max_concurrent_streams as usize);
     let mut tasks = tokio::task::JoinSet::new();
     let mut reset_reclaims: BinaryHeap<Reverse<(Instant, u64)>> = BinaryHeap::new();
     let idle_timeout = cfg.timeout.max(cfg.keep_alive_timeout).max(H2_IDLE_FLOOR);
@@ -6364,7 +6368,7 @@ mod tests {
         assert_eq!(budget.active, 0);
         assert_eq!(budget.pending_resets, 0);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1);
         {
             let _guard = H2TaskEventGuard {
                 tx,
