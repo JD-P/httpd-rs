@@ -2065,6 +2065,18 @@ struct DnsJob {
     port: u16,
     deadline: Instant,
     reply: mpsc::Sender<std::io::Result<Vec<SocketAddr>>>,
+    /// Request jobs own this from queue admission through helper exit.  A
+    /// caller may drop its receiver on cancellation, but that cannot release
+    /// the queued/running work reservation prematurely.
+    async_work: Option<crate::resource::AsyncWorkLease>,
+}
+
+impl DnsJob {
+    fn is_cancelled(&self) -> bool {
+        self.async_work
+            .as_ref()
+            .is_some_and(crate::resource::AsyncWorkLease::is_cancelled)
+    }
 }
 
 fn isolated_dns_lookup(
@@ -2079,6 +2091,12 @@ fn isolated_dns_lookup(
         return Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "too many unreaped resolver helpers",
+        ));
+    }
+    if job.is_cancelled() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "proxy DNS request cancelled in queue",
         ));
     }
     let remaining = job.deadline.saturating_duration_since(Instant::now());
@@ -2143,7 +2161,8 @@ fn isolated_dns_lookup(
             }
             return Ok(addresses);
         }
-        if Instant::now() >= job.deadline {
+        let cancelled = job.is_cancelled();
+        if cancelled || Instant::now() >= job.deadline {
             let _ = child.kill();
             // Never block the fixed worker waiting for a wedged system
             // resolver. Reap immediately when possible; otherwise retain a
@@ -2151,10 +2170,14 @@ fn isolated_dns_lookup(
             if !child.try_wait().is_ok_and(|status| status.is_some()) {
                 unreaped.push(child);
             }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "proxy DNS timeout",
-            ));
+            return Err(if cancelled {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "proxy DNS request scope cancelled",
+                )
+            } else {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy DNS timeout")
+            });
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -2206,7 +2229,11 @@ fn submit_dns(
     host: &str,
     port: u16,
     timeout: Duration,
+    request_scope: Option<&crate::resource::RequestScope>,
 ) -> std::io::Result<Receiver<std::io::Result<Vec<SocketAddr>>>> {
+    let async_work = request_scope
+        .map(crate::resource::RequestScope::try_async_work)
+        .transpose()?;
     let (reply, rx) = mpsc::channel();
     dns_sender()
         .try_send(DnsJob {
@@ -2214,6 +2241,7 @@ fn submit_dns(
             port,
             deadline: Instant::now() + timeout,
             reply,
+            async_work,
         })
         .map_err(|error| match error {
             TrySendError::Full(_) => {
@@ -2316,7 +2344,7 @@ pub(crate) fn resolve_backend_addrs_cancellable(
     if let Some(addresses) = bound_backend_identity(registry, host, port) {
         return Ok(addresses);
     }
-    let rx = submit_dns(host, port, timeout)?;
+    let rx = submit_dns(host, port, timeout, request_scope)?;
     let deadline = Instant::now() + timeout;
     let addresses = loop {
         if request_scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
@@ -2351,16 +2379,29 @@ async fn resolve_backend_addrs_async(
     host: &str,
     port: u16,
     timeout: Duration,
+    request_scope: Option<&crate::resource::RequestScope>,
 ) -> std::io::Result<Vec<SocketAddr>> {
+    if request_scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "proxy request scope cancelled",
+        ));
+    }
     if let Some(addresses) = literal_backend_addrs(host, port) {
         return Ok(addresses);
     }
     if let Some(addresses) = bound_backend_identity(registry, host, port) {
         return Ok(addresses);
     }
-    let rx = submit_dns(host, port, timeout)?;
+    let rx = submit_dns(host, port, timeout, request_scope)?;
     let deadline = Instant::now() + timeout;
     loop {
+        if request_scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "proxy request scope cancelled",
+            ));
+        }
         match rx.try_recv() {
             Ok(result) => {
                 let addresses = result?;
@@ -2418,12 +2459,18 @@ async fn connect_async(
     scope: &Scope,
     backend_identities: &BackendIdentityRegistry,
     timeout: Duration,
+    request_scope: Option<&crate::resource::RequestScope>,
 ) -> std::io::Result<Box<dyn AsyncReadWrite>> {
     let deadline = Instant::now() + timeout;
     let mut stream = None;
-    for addr in
-        resolve_backend_addrs_async(backend_identities, &backend.host, backend.port, timeout)
-            .await?
+    for addr in resolve_backend_addrs_async(
+        backend_identities,
+        &backend.host,
+        backend.port,
+        timeout,
+        request_scope,
+    )
+    .await?
     {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -2685,8 +2732,14 @@ where
     let _websocket_lease = cfg.resource_budget.try_websocket_for(client_ip)?;
     drop(general_connection);
     let timeout = cfg.timeout.max(Duration::from_secs(5));
-    let mut upstream =
-        connect_async(&target.backend, scope, &cfg.backend_identities, timeout).await?;
+    let mut upstream = connect_async(
+        &target.backend,
+        scope,
+        &cfg.backend_identities,
+        timeout,
+        req.request_scope(),
+    )
+    .await?;
     // `Target::path` is the decoded authorization identity. Re-encode bytes
     // that could be interpreted as delimiters or a second escape by the
     // upstream, exactly as the ordinary reverse-proxy path does.
@@ -4449,6 +4502,39 @@ mod tests {
             .kind(),
             std::io::ErrorKind::ConnectionAborted
         );
+    }
+
+    #[test]
+    fn cancelled_dns_job_keeps_async_accounting_until_worker_discards_it() {
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let scope = crate::resource::RequestScope::new(
+            budget.context(std::net::IpAddr::from([127, 0, 0, 2])),
+        );
+        let async_work = scope.try_async_work().unwrap();
+        let (reply, _receiver) = mpsc::channel();
+        let job = DnsJob {
+            host: "cancelled.invalid".into(),
+            port: 80,
+            deadline: Instant::now() + Duration::from_secs(1),
+            reply,
+            async_work: Some(async_work),
+        };
+        scope.cancel();
+
+        let error = isolated_dns_lookup(&job, &mut Vec::new()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        let current = || {
+            budget
+                .telemetry()
+                .gauges
+                .into_iter()
+                .find(|gauge| gauge.name == "async-request-work")
+                .unwrap()
+                .current
+        };
+        assert_eq!(current(), 1, "queued DNS work released its lease early");
+        drop(job);
+        assert_eq!(current(), 0);
     }
 
     #[cfg(feature = "fault-injection")]
@@ -7219,6 +7305,7 @@ mod coverage_tests {
             &Scope::default(),
             &test_backend_identities(),
             Duration::from_millis(100),
+            None,
         )
         .await
         {
@@ -7247,6 +7334,7 @@ mod coverage_tests {
             &Scope::default(),
             &test_backend_identities(),
             Duration::from_millis(50),
+            None,
         )
         .await
         {
@@ -8361,6 +8449,7 @@ mod coverage_tests {
             port: 8080,
             deadline: Instant::now() - Duration::from_millis(1),
             reply,
+            async_work: None,
         };
         assert_eq!(
             isolated_dns_lookup(&expired, &mut Vec::new())
@@ -8380,6 +8469,7 @@ mod coverage_tests {
             port: 8081,
             deadline: Instant::now() + Duration::from_secs(2),
             reply,
+            async_work: None,
         };
         let resolved = isolated_dns_lookup(&local_dns, &mut Vec::new()).unwrap();
         assert!(!resolved.is_empty());
@@ -8403,10 +8493,15 @@ mod coverage_tests {
             return;
         }
         let identities = BackendIdentityRegistry::new(92);
-        let first =
-            resolve_backend_addrs_async(&identities, "ip6-localhost", 8083, Duration::from_secs(2))
-                .await
-                .unwrap();
+        let first = resolve_backend_addrs_async(
+            &identities,
+            "ip6-localhost",
+            8083,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(!first.is_empty());
         assert!(first.iter().all(|address| address.port() == 8083));
         assert_eq!(
@@ -8415,9 +8510,10 @@ mod coverage_tests {
                 "IP6-LOCALHOST",
                 8083,
                 Duration::from_secs(2),
+                None,
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
             first
         );
     }

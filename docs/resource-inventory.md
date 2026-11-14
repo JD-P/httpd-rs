@@ -39,6 +39,19 @@ retained policy expansions, retained memory-cache entries, and compression
 workspaces. Fixed-window rates use the same canonical client identity and
 process ledger.
 
+Request-controlled work which crosses a blocking-pool or DNS-queue boundary
+first acquires an `AsyncWorkLease`. The move-only lease is transferred into
+the queued closure/job rather than retained by the awaiting future, so
+aborting or dropping the waiter cannot release queue, task, or conservative
+resident-memory accounting while the child still exists. Admission samples
+the shared `RequestScope` cancellation bit before and after hierarchical slot
+acquisition; work which races with cancellation is rejected before handoff,
+while already-admitted work retains the same cancellation lineage until exit.
+The process/client/request ceilings are 512/64/4. HTTP/1 backend/dispatch
+handoffs, HTTP/2 policy/backend blocking work, proxy DNS, and `Require host`
+reverse DNS use this boundary. Response file/stream reads retain their more
+specific move-only `ResponseBodyReadLease` and output-ownership state instead.
+
 Compression is produced only as the downstream writer asks for data: HTTP/1
 writes the response head before starting the encoder, and HTTP/2 waits for
 flow-control capacity before each bounded read. Cancellation drops the encoder
@@ -136,6 +149,15 @@ scratch high-water, the number of discovered writable filesystems, and the
 most constrained filesystem's remaining byte and inode headroom are exported
 by `server-status?auto`.
 
+Extended status also exports current use, monotonic high-water, the observed
+hard limit, a reporting-only shadow candidate and rejection count for every
+slot, byte and physical-parent ledger. `tests/resource_budget_sweep.py` varies
+one attacker-controlled request axis at a time while recording those gauges
+and process CPU, memory, task and descriptor measurements. The shadow formula
+is executable Verus code and can only produce a value between the observed
+peak and the enforced hard ceiling; it is calibration evidence, never an
+automatic limit increase.
+
 Fixed-window process/source gates bound valid requests, malformed HTTP/1 head
 parsing, expensive operations, cache writes, and log bytes. HTTP/2 acquires
 its source/process stream lease and request-rate admission before spawning a
@@ -191,3 +213,14 @@ checked inventory is deliberately regenerated; dynamic absence never removes a
 static obligation. Each site remains proof debt until its cost and lifetime are
 refined to a typed lease or constant bound, or documented as a pinned external
 assumption with an independent OS backstop.
+
+The reviewed resource ontology is wider than process CPU/RSS: it explicitly
+includes network bandwidth, elapsed occupancy, cgroup kernel/socket/slab/page-
+table memory, disk bytes, filesystem inodes, queue occupancy and lock waiters.
+The profiler samples network namespaces, statvfs headroom, scheduler wait time,
+thread wait channels and cgroup `memory.stat` alongside its original process
+counters. Static closure assigns every effect exactly one typed-lease,
+proved-constant-bound or external-assumption disposition; the generated
+inventory currently has zero unclassified sites. That classification is a
+discovery invariant, while per-call dominance and cost refinement remain the
+separate Verus proof obligation.

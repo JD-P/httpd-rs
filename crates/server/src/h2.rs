@@ -1502,6 +1502,21 @@ fn admit_stream_before_spawn(
 /// reset-observable. A peer reset cancels the shared request scope before the
 /// async owner drops its JoinHandle; synchronous backend code therefore sees
 /// cancellation at its next bounded I/O checkpoint.
+fn spawn_request_blocking<F, T>(
+    scope: &crate::resource::RequestScope,
+    work: F,
+) -> io::Result<tokio::task::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let async_work = scope.try_async_work()?;
+    Ok(crate::fault::spawn_blocking(move || {
+        let _async_work = async_work;
+        work()
+    }))
+}
+
 async fn blocking_task_or_reset<T>(
     respond: &mut h2::server::SendResponse<Bytes>,
     task: &mut tokio::task::JoinHandle<T>,
@@ -1761,7 +1776,7 @@ async fn handle_stream(
         let probe_cfg = cfg.clone();
         let probe_local_ip = local_ip.clone();
         let mut probe_req = req;
-        let mut probed = crate::fault::spawn_blocking(move || {
+        let Ok(mut probed) = spawn_request_blocking(&request_scope, move || {
             let decision = crate::server::probe_request_body(
                 &probe_cfg,
                 &mut probe_req,
@@ -1771,7 +1786,11 @@ async fn handle_stream(
                 true,
             );
             (probe_req, decision)
-        });
+        }) else {
+            request_scope.cancel();
+            respond.send_reset(h2::Reason::REFUSED_STREAM);
+            return true;
+        };
         let Some(probed) = blocking_task_or_reset(&mut respond, &mut probed, &request_scope).await
         else {
             return true;
@@ -1833,7 +1852,7 @@ async fn handle_stream(
         let probe_cfg = cfg.clone();
         let probe_local_ip = local_ip.clone();
         let mut probe_req = req;
-        let mut probed = crate::fault::spawn_blocking(move || {
+        let Ok(mut probed) = spawn_request_blocking(&request_scope, move || {
             let decision = crate::server::probe_prepared_handler(
                 &probe_cfg,
                 &mut probe_req,
@@ -1843,7 +1862,11 @@ async fn handle_stream(
                 true,
             );
             (probe_req, decision)
-        });
+        }) else {
+            request_scope.cancel();
+            respond.send_reset(h2::Reason::REFUSED_STREAM);
+            return true;
+        };
         let Some(probed) = blocking_task_or_reset(&mut respond, &mut probed, &request_scope).await
         else {
             return true;
@@ -1938,7 +1961,7 @@ async fn handle_stream(
                     .expect("streaming route retained its prepared handler");
                 let remote_user = body_remote_user.take();
                 let backend_req = req.clone();
-                let mut backend = crate::fault::spawn_blocking(move || {
+                let Ok(mut backend) = spawn_request_blocking(&request_scope, move || {
                     let mut req = backend_req;
                     let response = crate::server::execute_prepared_handler(
                         &dispatch_cfg,
@@ -1949,7 +1972,11 @@ async fn handle_stream(
                         handler,
                     );
                     (req, response)
-                });
+                }) else {
+                    request_scope.cancel();
+                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    return true;
+                };
                 let body_timeout = cfg
                     .request_body_timeout
                     .max(std::time::Duration::from_secs(1));
@@ -2177,7 +2204,7 @@ async fn handle_stream(
                 let dispatch_cfg = cfg.clone();
                 let dispatch_local_ip = local_ip.clone();
                 let runs_backend = prepared_handler.is_some();
-                let mut dispatched = crate::fault::spawn_blocking(move || {
+                let Ok(mut dispatched) = spawn_request_blocking(&request_scope, move || {
                     let mut req = req;
                     let (resp, remote_user) = match prepared_handler {
                         Some(handler) => (
@@ -2201,7 +2228,11 @@ async fn handle_stream(
                         ),
                     };
                     (req, resp, remote_user)
-                });
+                }) else {
+                    request_scope.cancel();
+                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    return true;
+                };
                 let Some(dispatched) =
                     blocking_task_or_reset(&mut respond, &mut dispatched, &request_scope).await
                 else {

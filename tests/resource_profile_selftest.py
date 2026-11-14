@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 import resource_profile
+import resource_budget_sweep
 
 
 def main() -> int:
@@ -48,9 +49,37 @@ def main() -> int:
         assert persisted["observed_resources"]["resident-memory"]
         assert persisted["observed_resources"]["tasks"]
         assert persisted["observed_resources"]["file-descriptors"]
+        assert persisted["observed_resources"]["wall-time"]
+        assert persisted["observed_resources"]["disk-capacity"]
+        assert persisted["observed_resources"]["filesystem-inodes"]
+        assert persisted["filesystems"]
+        assert persisted["network_namespaces"]
+        policy = json.loads((Path(__file__).parents[1] / "docs/resource-warrant-policy.json").read_text())
+        assert set(persisted["observed_resources"]) == {
+            resource["id"] for resource in policy["resources"]
+        }
         if resource_profile.cgroup_v2_path(os.getpid()) is not None:
             assert persisted["collector"]["cgroup_v2"]
             assert persisted["cgroups"]
+    markdown = resource_budget_sweep.render_markdown(
+        {
+            "git_revision": "selftest",
+            "points": [
+                {
+                    "axis": "bytes",
+                    "value": 1,
+                    "requests": 1,
+                    "concurrency": 1,
+                    "cpu_ticks_delta": 0,
+                    "statuses": {"200": 1},
+                    "process_after": {"resident_bytes": 1024 * 1024},
+                    "rejection_delta": {},
+                }
+            ],
+        }
+    )
+    assert "| bytes | 1 |" in markdown
+    assert "reporting-only" in markdown
     print("resource-profile: procfs collector self-test passed")
     return 0
 

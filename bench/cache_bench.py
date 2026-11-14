@@ -17,9 +17,11 @@ bench/CACHE_RESULTS.md.
 from __future__ import annotations
 
 import argparse
+import grp
 import http.client
 import json
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -32,10 +34,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench"
 RUN = Path("/tmp/httpd-rs-cache-bench")
-APACHE = shutil.which("apache2") or "/usr/sbin/apache2"
-HTTPD_RS = ROOT / "target" / "release" / "httpd-rs"
+APACHE = os.environ.get("APACHE") or shutil.which("apache2") or "/usr/sbin/apache2"
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target" / "release" / "httpd-rs"))
 WRK = shutil.which("wrk")
-MODULES = Path("/usr/lib/apache2/modules")
+MODULES = Path(os.environ.get("APACHE_MODDIR", "/usr/lib/apache2/modules"))
+BENCH_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
+BENCH_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
 
 AP_PORT, VP_PORT = 18082, 18083
 SCENARIOS = [
@@ -67,8 +71,8 @@ def make_tree() -> None:
 def common_server_config(port: int, server_root: Path, cache_root: Path) -> str:
     return f"""ServerRoot "{server_root}"
 Listen {port}
-User www-data
-Group www-data
+User {BENCH_USER}
+Group {BENCH_GROUP}
 PidFile "{RUN}/logs/pid-{port}"
 ErrorLog "{RUN}/logs/error-{port}.log"
 LogLevel warn

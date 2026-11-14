@@ -1376,9 +1376,11 @@ mod tests {
                 .collect()
         }
 
-        let supported_profiles = (0..=9)
-            .map(|quality| (quality, 256 * 1024))
-            .chain([(5, 8 * 1024 * 1024), (9, 1024 * 1024)]);
+        let supported_profiles = (0..=9).map(|quality| (quality, 256 * 1024)).chain(
+            (5..=8)
+                .map(|quality| (quality, 8 * 1024 * 1024))
+                .chain([(9, 1024 * 1024)]),
+        );
         for (quality, input_len) in supported_profiles {
             let bound = httpd_rs_verified::dynamic_compression_budget(
                 httpd_rs_verified::DynamicCompressionKind::Brotli,
@@ -1412,6 +1414,38 @@ mod tests {
                 0,
                 "quality {quality} retained allocator-owned memory"
             );
+
+            if input_len >= 1024 * 1024 {
+                let meter = Arc::new(AllocationMeter::new(bound));
+                let mut buffer_allocator = MeteredAllocator::<u8>::new(Arc::clone(&meter));
+                let buffer = buffer_allocator.alloc_cell(ENCODER_INPUT_BUFFER);
+                let mut encoder = brotli::enc::reader::CompressorReaderCustomAlloc::new(
+                    Cursor::new(vec![b'x'; input_len]),
+                    buffer,
+                    brotli_allocator(&meter),
+                    quality,
+                    22,
+                );
+                let mut output = Vec::new();
+                encoder.read_to_end(&mut output).unwrap();
+                meter.validate().unwrap_or_else(|error| {
+                    panic!(
+                        "quality {quality} compressible input used {} bytes beyond its {bound}-byte workspace admission: {error}",
+                        meter.peak()
+                    )
+                });
+                assert!(
+                    meter.peak() <= bound,
+                    "quality {quality} compressible input used {} bytes beyond its {bound}-byte workspace admission",
+                    meter.peak()
+                );
+                drop(encoder);
+                assert_eq!(
+                    meter.current.load(Ordering::Acquire),
+                    0,
+                    "quality {quality} compressible input retained allocator-owned memory"
+                );
+            }
         }
     }
 

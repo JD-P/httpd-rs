@@ -69,7 +69,7 @@ def die(msg):
     raise SystemExit(2)
 
 
-def check_tools(needs_gunicorn):
+def check_tools(needs_gunicorn, needs_php):
     missing = []
     if not Path(APACHE).exists() and shutil.which(APACHE) is None:
         missing.append("apache2")
@@ -77,7 +77,7 @@ def check_tools(needs_gunicorn):
         missing.append(str(HTTPD_RS.relative_to(ROOT)))
     if not WRK:
         missing.append("wrk")
-    if not PHP_FPM:
+    if needs_php and not PHP_FPM:
         missing.append("php-fpm")
     if needs_gunicorn and not GUNICORN:
         missing.append("gunicorn")
@@ -314,18 +314,21 @@ def main():
             "under root-owned /run; alternatively pre-provision a stable path and "
             "set HTTPD_RS_APP_BENCH_RUN plus HTTPD_RS_APP_BENCH_PREPARED_STABLE_PATH=1"
         )
-    check_tools(needs_gunicorn)
+    check_tools(needs_gunicorn, needs_php)
 
     make_fixture()
-    fpm_cfg = write_fpm_config()
+    fpm_cfg = write_fpm_config() if needs_php else None
     apache_cfg, httpd_rs_cfg = write_server_configs()
 
     fpm = gunicorn = apache = httpd_rs = None
     fpm_log = gunicorn_log = apache_log = httpd_rs_log = None
     try:
-        fpm, fpm_log = start([PHP_FPM, "-F", "-y", str(fpm_cfg)], RUN / "fpm" / "stdout.log")
-        if not wait_unix(RUN / "fpm" / "php.sock"):
-            die("PHP-FPM did not create its socket")
+        if needs_php:
+            fpm, fpm_log = start(
+                [PHP_FPM, "-F", "-y", str(fpm_cfg)], RUN / "fpm" / "stdout.log"
+            )
+            if not wait_unix(RUN / "fpm" / "php.sock"):
+                die("PHP-FPM did not create its socket")
 
         if needs_gunicorn:
             gunicorn, gunicorn_log = start(

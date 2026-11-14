@@ -1239,7 +1239,10 @@ fn eval_require(
             let Ok(names) = expanded_words(names, req, env, peer, url_path) else {
                 return PolicyResult::Denied;
             };
-            decide(reverse_dns_matches(peer, &names), *negate)
+            decide(
+                reverse_dns_matches_cancellable(peer, &names, req.request_scope()),
+                *negate,
+            )
         }
         Require::Method { negate, methods } => {
             decide(methods.iter().any(|m| same_method(m, &req.method)), *negate)
@@ -1624,7 +1627,16 @@ pub fn ip_in_net(ip: IpAddr, net: IpAddr, bits: u8) -> bool {
     }
 }
 
+#[cfg(test)]
 fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
+    reverse_dns_matches_cancellable(ip, names, None)
+}
+
+fn reverse_dns_matches_cancellable(
+    ip: IpAddr,
+    names: &[String],
+    request_scope: Option<&crate::resource::RequestScope>,
+) -> bool {
     const MAX_DNS_REQUIRE_NAMES: usize = 256;
     const MAX_DNS_REQUIRE_BYTES: usize = 64 * 1024;
 
@@ -1632,6 +1644,15 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
         ip: IpAddr,
         deadline: Instant,
         reply: mpsc::SyncSender<Option<String>>,
+        async_work: Option<crate::resource::AsyncWorkLease>,
+    }
+
+    impl DnsJob {
+        fn is_cancelled(&self) -> bool {
+            self.async_work
+                .as_ref()
+                .is_some_and(crate::resource::AsyncWorkLease::is_cancelled)
+        }
     }
 
     #[cfg(test)]
@@ -1641,7 +1662,13 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
         // exists during `cargo test --lib`. Exercise the same FCrDNS decision
         // directly here; non-test builds always use the disposable process
         // implementation below.
+        if job.is_cancelled() {
+            return None;
+        }
         let host = reverse_dns(canonical_ip(job.ip)).ok()?;
+        if job.is_cancelled() {
+            return None;
+        }
         forward_dns_confirms(&host, canonical_ip(job.ip)).then_some(host)
     }
 
@@ -1651,7 +1678,7 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
             Ok(Some(_)) => false,
             Ok(None) | Err(_) => true,
         });
-        if unreaped.len() >= 2 || Instant::now() >= job.deadline {
+        if unreaped.len() >= 2 || job.is_cancelled() || Instant::now() >= job.deadline {
             return None;
         }
         let current = std::env::current_exe().ok()?;
@@ -1693,7 +1720,7 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
                 Ok(None) => {}
                 Err(_) => return None,
             }
-            if Instant::now() >= job.deadline {
+            if job.is_cancelled() || Instant::now() >= job.deadline {
                 let _ = child.kill();
                 if !child.try_wait().is_ok_and(|status| status.is_some()) {
                     unreaped.push(child);
@@ -1745,21 +1772,43 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
     let Some(_expensive) = crate::resource::try_expensive() else {
         return false;
     };
+    let async_work = match request_scope
+        .map(crate::resource::RequestScope::try_async_work)
+        .transpose()
+    {
+        Ok(work) => work,
+        Err(_) => return false,
+    };
 
     let (reply, result) = mpsc::sync_channel(1);
+    let deadline = Instant::now() + Duration::from_secs(2);
     let job = DnsJob {
         ip: canonical_ip(ip),
-        deadline: Instant::now() + Duration::from_secs(2),
+        deadline,
         reply,
+        async_work,
     };
     if sender().try_send(job).is_err() {
         return false;
     }
-    result
-        .recv_timeout(Duration::from_secs(2))
-        .ok()
-        .flatten()
-        .is_some_and(|host| names.iter().any(|domain| hostname_in_domain(domain, &host)))
+    loop {
+        if request_scope.is_some_and(crate::resource::RequestScope::is_cancelled) {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match result.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(host) => {
+                return host.is_some_and(|host| {
+                    names.iter().any(|domain| hostname_in_domain(domain, &host))
+                })
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
 }
 
 /// Hidden disposable-process entrypoint for `Require host`. Both PTR and
@@ -2185,6 +2234,28 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(!reverse_dns_matches(peer, &["localhost".into()]));
         });
+    }
+
+    #[test]
+    fn cancelled_require_host_never_enters_the_resolver_queue() {
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let peer = IpAddr::from([192, 0, 2, 95]);
+        let context = budget.context(peer);
+        let request_scope = crate::resource::RequestScope::new(context.clone());
+        request_scope.cancel();
+
+        let matched = crate::resource::with_resource_context(context, || {
+            reverse_dns_matches_cancellable(peer, &["example.invalid".into()], Some(&request_scope))
+        });
+        assert!(!matched);
+        let async_work = budget
+            .telemetry()
+            .gauges
+            .into_iter()
+            .find(|gauge| gauge.name == "async-request-work")
+            .unwrap();
+        assert_eq!(async_work.current, 0);
+        assert_eq!(async_work.high_water, 0);
     }
 
     #[test]

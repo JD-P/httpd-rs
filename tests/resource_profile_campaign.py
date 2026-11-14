@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PROFILER = ROOT / "tests" / "resource_profile.py"
 WARRANT = ROOT / "tests" / "resource_warrant.py"
+BUDGET_SWEEP = ROOT / "tests" / "resource_budget_sweep.py"
 BENCHMARKS = {
     "core": [sys.executable, "bench/bench.py"],
     "features": [sys.executable, "bench/feature_bench.py"],
@@ -38,6 +39,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=lambda value: int(value, 0), default=0x52534F55524345)
     parser.add_argument("--quick", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--perf", choices=("none", "stat", "record"), default="none")
+    parser.add_argument(
+        "--budget-sweep",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="run the targeted live request-axis calibration after profiling",
+    )
+    parser.add_argument(
+        "--allow-same-identity",
+        action="store_true",
+        help="developer-only: run deployment cases without root/sudo identity separation",
+    )
     parser.add_argument("--keep-going", action="store_true")
     return parser.parse_args()
 
@@ -93,10 +105,27 @@ def main() -> int:
             "--artifacts",
             str(args.output / "deployments"),
         ]
+        if args.allow_same_identity:
+            workload.append("--allow-same-identity")
         returncode = run_profile(
             f"deployments-{args.deployments}", workload, args.output, args.perf
         )
         results.append({"label": f"deployments-{args.deployments}", "returncode": returncode})
+
+    budget_sweep_returncode = None
+    if args.budget_sweep and (args.keep_going or not any(item["returncode"] for item in results)):
+        budget_command = [
+            sys.executable,
+            str(BUDGET_SWEEP),
+            "--output",
+            str(args.output / "budget-calibration.json"),
+        ]
+        if not args.quick:
+            budget_command.append("--no-quick")
+        print("+ " + " ".join(budget_command), flush=True)
+        budget_sweep_returncode = subprocess.run(
+            budget_command, cwd=ROOT, check=False
+        ).returncode
 
     report = args.output / "request-resource-warrant.json"
     reconcile = [
@@ -113,6 +142,7 @@ def main() -> int:
     summary = {
         "schema": 1,
         "workloads": results,
+        "budget_sweep_returncode": budget_sweep_returncode,
         "reconciliation_returncode": reconcile_result,
         "report": str(report),
     }
@@ -126,7 +156,7 @@ def main() -> int:
             + ", ".join(str(item["label"]) for item in failed),
             file=sys.stderr,
         )
-    return 1 if failed or reconcile_result else 0
+    return 1 if failed or budget_sweep_returncode or reconcile_result else 0
 
 
 if __name__ == "__main__":

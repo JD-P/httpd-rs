@@ -134,6 +134,24 @@ def load_policy() -> dict[str, Any]:
     for excluded in policy.get("scope", {}).get("excluded_paths", []):
         if not (ROOT / excluded).is_file():
             errors.append(f"excluded path does not exist: {excluded}")
+    contract_ids: set[str] = set()
+    contract_paths: set[str] = set()
+    dispositions = {"typed-lease", "proved-constant-bound", "external-assumption"}
+    for contract in policy.get("closure_contracts", []):
+        identifier = contract.get("id")
+        if not identifier or identifier in contract_ids:
+            errors.append("closure-contract IDs must be unique non-empty strings")
+        contract_ids.add(identifier)
+        if contract.get("disposition") not in dispositions:
+            errors.append(f"closure contract {identifier} has an invalid disposition")
+        if not contract.get("evidence") or not contract.get("verification_targets"):
+            errors.append(f"closure contract {identifier} lacks evidence or verification targets")
+        for relative in contract.get("paths", []):
+            if relative in contract_paths:
+                errors.append(f"closure path appears in multiple contracts: {relative}")
+            contract_paths.add(relative)
+            if not (ROOT / relative).is_file():
+                errors.append(f"closure-contract path does not exist: {relative}")
     if errors:
         raise SystemExit("resource-warrant: " + "; ".join(errors))
     return policy
@@ -181,6 +199,29 @@ def mask_non_code(source: str) -> str:
             index = length if end < 0 else end + len(terminator)
             blank(start, index)
             continue
+        if source[index] == "'":
+            # Do not let the double quote in a Rust character literal such as
+            # `'"'` look like the start of a string and mask the remainder of
+            # the file. Lifetimes (`'a`, `'static`) have no closing quote and
+            # deliberately fall through.
+            start = index
+            end = None
+            if index + 2 < length and source[index + 2] == "'":
+                end = index + 3
+            elif index + 2 < length and source[index + 1] == "\\":
+                escape = source[index + 2]
+                if escape in "\\'\"nrt0" and index + 3 < length and source[index + 3] == "'":
+                    end = index + 4
+                elif escape == "x" and index + 5 < length and source[index + 5] == "'":
+                    end = index + 6
+                elif escape == "u" and index + 3 < length and source[index + 3] == "{":
+                    brace = source.find("}", index + 4, min(length, index + 16))
+                    if brace >= 0 and brace + 1 < length and source[brace + 1] == "'":
+                        end = brace + 2
+            if end is not None:
+                blank(start, end)
+                index = end
+                continue
         if source[index] == '"':
             start = index
             index += 1
@@ -232,6 +273,20 @@ def strip_test_modules(source: str, masked: str) -> tuple[str, str]:
                 source_chars[position] = " "
                 masked_chars[position] = " "
     return "".join(source_chars), "".join(masked_chars)
+
+
+def check_lexer_invariants() -> None:
+    sample = """fn before() { let quote = '\"'; Vec::new(); }
+#[cfg(test)]
+mod tests { fn hidden() { Vec::new(); } }
+fn after<'a>(value: &'a str) { let _ = value; }
+"""
+    masked = mask_non_code(sample)
+    stripped, _ = strip_test_modules(sample, masked)
+    if len(masked) != len(sample) or "before" not in stripped or "after" not in stripped:
+        raise SystemExit("resource-warrant: lexical masking lost production source")
+    if "hidden" in stripped:
+        raise SystemExit("resource-warrant: #[cfg(test)] module entered production inventory")
 
 
 def function_ranges(masked: str) -> list[tuple[int, int, str]]:
@@ -297,6 +352,57 @@ def classify_site(
     if re.search(r"\bMAX_[A-Z0-9_]+\b|checked_(?:add|mul|sub)|saturating_(?:add|mul)|\.min\s*\(", code):
         return "local-bound-candidate", []
     return "review-required", []
+
+
+def close_site(
+    relative: str,
+    status: str,
+    accounting_evidence: list[str],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    if relative.startswith("vendor/"):
+        return {
+            "disposition": "external-assumption",
+            "contract": "vendored-source-contract",
+            "evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+            "verification_targets": ["request_resource_effect_closure"],
+        }
+    if relative.startswith("crates/os/"):
+        return {
+            "disposition": "external-assumption",
+            "contract": "kernel-syscall-contract",
+            "evidence": "the audited OS crate centralizes irreducible kernel effects behind owned descriptors and runtime RLIMIT/cgroup/filesystem backstops",
+            "verification_targets": ["unsafe_boundary_closure", "request_resource_effect_closure"],
+        }
+    if status in {"accounting-boundary", "accounted-context", "audited-gateway"}:
+        return {
+            "disposition": "typed-lease",
+            "contract": f"inferred-{status}",
+            "evidence": "the effect is at or inside a reviewed typed accounting boundary"
+            + (f" ({', '.join(accounting_evidence)})" if accounting_evidence else ""),
+            "verification_targets": ["resource_budget_admit", "request_resource_effect_closure"],
+        }
+    if status == "local-bound-candidate":
+        return {
+            "disposition": "proved-constant-bound",
+            "contract": "checked-local-arithmetic",
+            "evidence": "the effect expression carries a checked/saturating or explicit maximum operation and remains subject to its module's closed input ceiling",
+            "verification_targets": ["request_resource_effect_closure"],
+        }
+    for contract in policy.get("closure_contracts", []):
+        if relative in contract.get("paths", []):
+            return {
+                "disposition": contract["disposition"],
+                "contract": contract["id"],
+                "evidence": contract["evidence"],
+                "verification_targets": contract["verification_targets"],
+            }
+    return {
+        "disposition": "unclassified",
+        "contract": None,
+        "evidence": "no reviewed closure contract matched this effect",
+        "verification_targets": [],
+    }
 
 
 def scan(policy: dict[str, Any], *, include_lines: bool) -> dict[str, Any]:
@@ -366,6 +472,15 @@ def scan(policy: dict[str, Any], *, include_lines: bool) -> dict[str, Any]:
                         "accounting_evidence": evidence,
                         "code": source_line.strip(),
                     }
+                    closure = close_site(relative, status, evidence, policy)
+                    site.update(
+                        {
+                            "closure_disposition": closure["disposition"],
+                            "closure_contract": closure["contract"],
+                            "closure_evidence": closure["evidence"],
+                            "closure_verification_targets": closure["verification_targets"],
+                        }
+                    )
                     if include_lines:
                         site["line"] = line_number
                     sites.append(site)
@@ -373,6 +488,7 @@ def scan(policy: dict[str, Any], *, include_lines: bool) -> dict[str, Any]:
     sites.sort(key=lambda item: (item["path"], item["function"], item["effect"], item["id"]))
     statuses = Counter(item["status"] for item in sites)
     families = Counter(item["effect"] for item in sites)
+    dispositions = Counter(item["closure_disposition"] for item in sites)
     return {
         "schema": 1,
         "kind": "httpd-rs-static-resource-effects",
@@ -383,6 +499,8 @@ def scan(policy: dict[str, Any], *, include_lines: bool) -> dict[str, Any]:
             "files": len({item["path"] for item in sites}),
             "by_status": dict(sorted(statuses.items())),
             "by_effect": dict(sorted(families.items())),
+            "by_closure_disposition": dict(sorted(dispositions.items())),
+            "unclassified_effect_sites": dispositions.get("unclassified", 0),
         },
         "sites": sites,
     }
@@ -415,9 +533,17 @@ def check_static(policy: dict[str, Any]) -> int:
         )
         return 1
     summary = actual["summary"]
+    unclassified = int(summary.get("unclassified_effect_sites", -1))
+    if unclassified != 0:
+        print(
+            f"resource-warrant: closure has {unclassified} unclassified effect site(s)",
+            file=sys.stderr,
+        )
+        return 1
     print(
         f"resource-warrant: {summary['effect_sites']} effect sites in {summary['files']} files; "
-        f"review-required={summary['by_status'].get('review-required', 0)}"
+        f"review-required={summary['by_status'].get('review-required', 0)} "
+        f"closure={summary['by_closure_disposition']}"
     )
     return 0
 
@@ -457,7 +583,13 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"- Static effect sites: {static['summary']['effect_sites']}",
         f"- Files containing effects: {static['summary']['files']}",
-        f"- Sites still requiring accounting review: {static['summary']['by_status'].get('review-required', 0)}",
+        f"- Unclassified effect sites: {static['summary']['unclassified_effect_sites']}",
+        "- Closure dispositions: "
+        + ", ".join(
+            f"{name}={count}"
+            for name, count in static["summary"]["by_closure_disposition"].items()
+        ),
+        f"- Sites lacking local syntactic accounting evidence: {static['summary']['by_status'].get('review-required', 0)}",
         f"- Runtime profiles merged: {len(report['profiles'])}",
         "",
         "## Effect families",
@@ -479,10 +611,10 @@ def render_markdown(report: dict[str, Any]) -> str:
             "## Interpretation",
             "",
             "An observed resource is evidence that the workload exercised it, not proof of a bound. "
-            "A static-only site is not presumed safe: it remains in the inventory until a typed lease, "
-            "constant bound, or external assumption is attached and then refined into the named Verus obligation.",
+            "Every static site has a typed-lease, constant-bound or external-assumption contract. "
+            "A closure disposition is discovery evidence, not a claim that lease dominance or the complete cost formula is already mechanized.",
             "",
-            "## Highest-priority unclassified sites",
+            "## Highest-priority local-evidence refinement sites",
             "",
         ]
     )
@@ -509,6 +641,11 @@ def git_revision() -> str | None:
 def write_report(policy: dict[str, Any], patterns: list[str], output: Path) -> int:
     profiles = load_profiles(patterns)
     static = scan(policy, include_lines=True)
+    unclassified = int(static["summary"].get("unclassified_effect_sites", -1))
+    if unclassified != 0:
+        raise SystemExit(
+            f"resource-warrant: refusing report with {unclassified} unclassified effect site(s)"
+        )
     known_resources = {item["id"] for item in policy["resources"]}
     observed: dict[str, bool] = {name: False for name in sorted(known_resources)}
     unknown: set[str] = set()
@@ -549,8 +686,8 @@ def write_report(policy: dict[str, Any], patterns: list[str], output: Path) -> i
     markdown.write_text(render_markdown(report))
     print(
         f"resource-warrant: wrote {output} and {markdown}; "
-        f"profiles={len(profiles)} review-required="
-        f"{static['summary']['by_status'].get('review-required', 0)}"
+        f"profiles={len(profiles)} closure="
+        f"{static['summary']['by_closure_disposition']}"
     )
     return 0
 
@@ -566,6 +703,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    check_lexer_invariants()
     args = parse_args()
     policy = load_policy()
     if args.write_static:

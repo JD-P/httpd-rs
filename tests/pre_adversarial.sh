@@ -102,6 +102,7 @@ step "Verus proof and verification-ledger gate"
 python3 tests/resource_inventory.py
 python3 tests/resource_warrant.py
 python3 tests/resource_profile_selftest.py
+python3 tests/resource_budget_sweep.py --quick
 python3 tests/verification_status.py --run-verus
 
 step "configuration grammar and validity differentials"

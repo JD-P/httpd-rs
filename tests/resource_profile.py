@@ -66,6 +66,18 @@ SMAPS_BYTES = {
 IO_FIELDS = {"rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes"}
 CGROUP_GAUGES = {"memory.current", "memory.peak", "pids.current", "pids.peak"}
 CGROUP_COUNTER_PREFIXES = ("cpu.", "io.")
+CGROUP_MEMORY_STAT_GAUGES = {
+    "anon",
+    "file",
+    "kernel",
+    "kernel_stack",
+    "pagetables",
+    "percpu",
+    "sock",
+    "slab",
+    "slab_reclaimable",
+    "slab_unreclaimable",
+}
 
 
 def git_revision() -> str | None:
@@ -151,6 +163,19 @@ def sample_cgroup(pid: int) -> dict[str, Any] | None:
                 values[f"{prefix}.{fields[0]}"] = int(fields[1])
             except ValueError:
                 pass
+
+    try:
+        memory_lines = (root / "memory.stat").read_text().splitlines()
+    except OSError:
+        memory_lines = []
+    for line in memory_lines:
+        fields = line.split()
+        if len(fields) != 2 or fields[0] not in CGROUP_MEMORY_STAT_GAUGES:
+            continue
+        try:
+            values[f"memory.stat.{fields[0]}"] = int(fields[1])
+        except ValueError:
+            pass
 
     io_totals: dict[str, int] = {}
     try:
@@ -249,6 +274,83 @@ def fd_classes(pid: int) -> dict[str, int]:
     return counts
 
 
+def sample_network_namespace(pid: int) -> dict[str, Any] | None:
+    root = Path("/proc") / str(pid)
+    try:
+        namespace = os.readlink(root / "ns" / "net")
+        lines = (root / "net" / "dev").read_text().splitlines()[2:]
+    except OSError:
+        return None
+    receive_bytes = 0
+    transmit_bytes = 0
+    interfaces = 0
+    for line in lines:
+        _, separator, counters = line.partition(":")
+        if not separator:
+            continue
+        fields = counters.split()
+        if len(fields) < 9:
+            continue
+        try:
+            receive_bytes += int(fields[0])
+            transmit_bytes += int(fields[8])
+            interfaces += 1
+        except ValueError:
+            continue
+    return {
+        "namespace": namespace,
+        "receive_bytes": receive_bytes,
+        "transmit_bytes": transmit_bytes,
+        "interfaces": interfaces,
+    }
+
+
+def sample_filesystems(pid: int) -> list[dict[str, int]]:
+    root = Path("/proc") / str(pid)
+    candidates = [root / "root"]
+    try:
+        # Stat the procfs descriptor links themselves.  Resolving their text
+        # and then opening that absolute path in the profiler's mount
+        # namespace can name a different filesystem from the target process.
+        candidates.extend((root / "fd").iterdir())
+    except OSError:
+        pass
+    filesystems: dict[int, dict[str, int]] = {}
+    for path in candidates:
+        try:
+            stat = os.stat(path)
+            values = os.statvfs(path)
+        except OSError:
+            continue
+        filesystems[stat.st_dev] = {
+            "device": int(stat.st_dev),
+            "total_bytes": int(values.f_blocks * values.f_frsize),
+            "free_bytes": int(values.f_bavail * values.f_frsize),
+            "total_files": int(values.f_files),
+            "free_files": int(values.f_favail),
+        }
+    return list(filesystems.values())
+
+
+def task_wait_channels(pid: int) -> dict[str, int]:
+    result = {"threads_sampled": 0, "waiting_threads": 0, "futex_waiters": 0}
+    try:
+        tasks = list((Path("/proc") / str(pid) / "task").iterdir())
+    except OSError:
+        return result
+    for task in tasks:
+        try:
+            channel = (task / "wchan").read_text().strip().lower()
+        except OSError:
+            continue
+        result["threads_sampled"] += 1
+        if channel and channel != "0":
+            result["waiting_threads"] += 1
+        if "futex" in channel or "rwsem" in channel or "mutex" in channel:
+            result["futex_waiters"] += 1
+    return result
+
+
 def sample_process(pid: int) -> dict[str, Any] | None:
     root = Path("/proc") / str(pid)
     try:
@@ -256,6 +358,7 @@ def sample_process(pid: int) -> dict[str, Any] | None:
         close = raw_stat.rfind(")")
         fields = raw_stat[close + 2 :].split()
         stat = {
+            "state": fields[0],
             "ppid": int(fields[1]),
             "minor_faults": int(fields[7]),
             "major_faults": int(fields[9]),
@@ -278,6 +381,15 @@ def sample_process(pid: int) -> dict[str, Any] | None:
     )
     smaps = parse_key_values(root / "smaps_rollup", SMAPS_BYTES, kib=True)
     io = parse_key_values(root / "io", IO_FIELDS)
+    try:
+        sched_fields = (root / "schedstat").read_text().split()
+        scheduler = {
+            "running_ns": int(sched_fields[0]),
+            "waiting_ns": int(sched_fields[1]),
+            "timeslices": int(sched_fields[2]),
+        }
+    except (OSError, ValueError, IndexError):
+        scheduler = {}
     return {
         "pid": pid,
         "command": command,
@@ -287,6 +399,9 @@ def sample_process(pid: int) -> dict[str, Any] | None:
         "smaps": smaps,
         "io": io,
         "fds": fd_classes(pid),
+        "scheduler": scheduler,
+        "wait_channels": task_wait_channels(pid),
+        "filesystems": sample_filesystems(pid),
     }
 
 
@@ -317,6 +432,14 @@ def aggregate_sample(samples: list[dict[str, Any]], elapsed: float) -> dict[str,
         "write_characters": sum_nested(samples, "io", "wchar"),
         "read_syscalls": sum_nested(samples, "io", "syscr"),
         "write_syscalls": sum_nested(samples, "io", "syscw"),
+        "scheduler_running_ns": sum_nested(samples, "scheduler", "running_ns"),
+        "scheduler_waiting_ns": sum_nested(samples, "scheduler", "waiting_ns"),
+        "scheduler_timeslices": sum_nested(samples, "scheduler", "timeslices"),
+        "waiting_threads": sum_nested(samples, "wait_channels", "waiting_threads"),
+        "futex_waiters": sum_nested(samples, "wait_channels", "futex_waiters"),
+        "runnable_processes": sum(
+            1 for sample in samples if sample.get("stat", {}).get("state") == "R"
+        ),
         "minor_faults": sum_nested(samples, "stat", "minor_faults"),
         "major_faults": sum_nested(samples, "stat", "major_faults"),
         "voluntary_context_switches": sum_nested(samples, "status", "voluntary_ctxt_switches"),
@@ -367,6 +490,8 @@ class ProcessLifetime:
             "write_bytes": delta("io", "write_bytes"),
             "read_syscalls": delta("io", "syscr"),
             "write_syscalls": delta("io", "syscw"),
+            "scheduler_running_seconds": round(delta("scheduler", "running_ns") / 1e9, 6),
+            "scheduler_waiting_seconds": round(delta("scheduler", "waiting_ns") / 1e9, 6),
             "minor_faults": delta("stat", "minor_faults"),
             "major_faults": delta("stat", "major_faults"),
             "peaks": self.peaks,
@@ -470,6 +595,8 @@ class Profiler:
         self.timeline: list[dict[str, Any]] = []
         self.perf_sessions: dict[int, PerfSession] = {}
         self.cgroups: dict[str, dict[str, Any]] = {}
+        self.network_namespaces: dict[str, dict[str, Any]] = {}
+        self.filesystems: dict[int, dict[str, int]] = {}
 
     def select(self, table: dict[int, tuple[int, str, str]]) -> set[int]:
         if self.attached_pid is not None:
@@ -542,6 +669,66 @@ class Profiler:
             )
         return sorted(documents, key=lambda item: item["path"])
 
+    def update_network_namespace(self, sample: dict[str, Any], elapsed: float) -> None:
+        namespace = str(sample["namespace"])
+        state = self.network_namespaces.get(namespace)
+        counters = {
+            "receive_bytes": int(sample["receive_bytes"]),
+            "transmit_bytes": int(sample["transmit_bytes"]),
+        }
+        if state is None:
+            self.network_namespaces[namespace] = {
+                "namespace": namespace,
+                "first_elapsed_seconds": elapsed,
+                "last_elapsed_seconds": elapsed,
+                "first": counters,
+                "last": counters,
+                "interfaces": int(sample["interfaces"]),
+            }
+            return
+        state["last_elapsed_seconds"] = elapsed
+        state["last"] = counters
+        state["interfaces"] = int(sample["interfaces"])
+
+    def network_documents(self) -> list[dict[str, Any]]:
+        documents = []
+        for state in self.network_namespaces.values():
+            documents.append(
+                {
+                    **state,
+                    "receive_bytes_delta": max(
+                        0, state["last"]["receive_bytes"] - state["first"]["receive_bytes"]
+                    ),
+                    "transmit_bytes_delta": max(
+                        0, state["last"]["transmit_bytes"] - state["first"]["transmit_bytes"]
+                    ),
+                    "scope_note": (
+                        "network counters cover the complete network namespace and are a "
+                        "containment view, not exclusive per-process attribution"
+                    ),
+                }
+            )
+        return sorted(documents, key=lambda item: item["namespace"])
+
+    def update_filesystems(self, samples: list[dict[str, Any]]) -> None:
+        for sample in samples:
+            for filesystem in sample.get("filesystems", []):
+                device = int(filesystem["device"])
+                state = self.filesystems.get(device)
+                if state is None:
+                    self.filesystems[device] = dict(filesystem)
+                    self.filesystems[device]["min_free_bytes"] = int(filesystem["free_bytes"])
+                    self.filesystems[device]["min_free_files"] = int(filesystem["free_files"])
+                    continue
+                state["free_bytes"] = int(filesystem["free_bytes"])
+                state["free_files"] = int(filesystem["free_files"])
+                state["min_free_bytes"] = min(
+                    int(state["min_free_bytes"]), int(filesystem["free_bytes"])
+                )
+                state["min_free_files"] = min(
+                    int(state["min_free_files"]), int(filesystem["free_files"])
+                )
+
     def sample(self) -> None:
         elapsed = time.monotonic() - self.started
         table = process_table()
@@ -549,12 +736,18 @@ class Profiler:
         for pid in sorted(self.direct_roots & selected):
             self.start_perf(pid)
         sampled_cgroups: set[str] = set()
+        sampled_network_namespaces: set[str] = set()
         for pid in sorted(selected):
             cgroup = sample_cgroup(pid)
             if cgroup is not None and cgroup["path"] not in sampled_cgroups:
                 sampled_cgroups.add(cgroup["path"])
                 self.update_cgroup(cgroup, elapsed)
+            network = sample_network_namespace(pid)
+            if network is not None and network["namespace"] not in sampled_network_namespaces:
+                sampled_network_namespaces.add(network["namespace"])
+                self.update_network_namespace(network, elapsed)
         samples = [sample for pid in sorted(selected) if (sample := sample_process(pid))]
+        self.update_filesystems(samples)
         for sample in samples:
             key = (sample["pid"], int(sample["stat"]["start_ticks"]))
             lifetime = self.lifetimes.get(key)
@@ -592,6 +785,9 @@ class Profiler:
             "socket_fds",
             "pipe_fds",
             "file_fds",
+            "waiting_threads",
+            "futex_waiters",
+            "runnable_processes",
         )
         peaks = {
             field: max((int(sample.get(field, 0)) for sample in self.timeline), default=0)
@@ -602,6 +798,19 @@ class Profiler:
             name: sum(int(item[name]) for item in lifetime_docs)
             for name in ("read_bytes", "write_bytes", "read_syscalls", "write_syscalls")
         }
+        cgroup_documents = self.cgroup_documents()
+        network_documents = self.network_documents()
+        kernel_memory_peak = max(
+            (
+                int(document.get("peaks", {}).get("memory.stat.kernel", 0))
+                for document in cgroup_documents
+            ),
+            default=0,
+        )
+        network_bytes = sum(
+            int(document["receive_bytes_delta"]) + int(document["transmit_bytes_delta"])
+            for document in network_documents
+        )
         observed = {
             "cpu-time": cpu_seconds > 0,
             "resident-memory": peaks["resident_bytes"] > 0,
@@ -611,6 +820,14 @@ class Profiler:
             "sockets": peaks["socket_fds"] > 0,
             "pipes": peaks["pipe_fds"] > 0,
             "filesystem-io": io_totals["read_bytes"] > 0 or io_totals["write_bytes"] > 0,
+            "network-bandwidth": network_bytes > 0,
+            "wall-time": bool(lifetime_docs),
+            "kernel-memory": kernel_memory_peak > 0,
+            "disk-capacity": bool(self.filesystems),
+            "filesystem-inodes": bool(self.filesystems),
+            "queue-occupancy": peaks["waiting_threads"] > 0
+            or peaks["runnable_processes"] > 0,
+            "lock-occupancy": peaks["futex_waiters"] > 0,
         }
         document = {
             "schema": 1,
@@ -641,7 +858,9 @@ class Profiler:
             "io_totals": io_totals,
             "observed_resources": observed,
             "processes": sorted(lifetime_docs, key=lambda item: (item["first_elapsed_seconds"], item["pid"])),
-            "cgroups": self.cgroup_documents(),
+            "cgroups": cgroup_documents,
+            "network_namespaces": network_documents,
+            "filesystems": sorted(self.filesystems.values(), key=lambda item: item["device"]),
             "timeline": self.timeline,
             "perf_sessions": perf,
         }

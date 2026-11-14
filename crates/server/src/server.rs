@@ -773,6 +773,25 @@ where
     Ok(handle.spawn_blocking(crate::fault::inherited(work)))
 }
 
+/// Cross the fixed blocking-pool boundary with request ownership attached.
+/// The async-work lease is acquired before Tokio can queue the closure and is
+/// moved into that closure, so aborting/dropping the JoinHandle cannot release
+/// accounting while queued or already-running work still owns request state.
+fn spawn_request_worker<F, T>(
+    scope: &crate::resource::RequestScope,
+    work: F,
+) -> io::Result<tokio::task::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let async_work = scope.try_async_work()?;
+    spawn_connection_worker(move || {
+        let _async_work = async_work;
+        work()
+    })
+}
+
 async fn run_connection_work<F, T>(work: F) -> io::Result<T>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -2416,9 +2435,13 @@ where
         }
     };
     let mut rejected_request = request.clone();
+    let request_scope = request
+        .request_scope()
+        .cloned()
+        .ok_or_else(|| io::Error::other("streaming backend lost its request scope"))?;
     phase.advance(httpd_rs_verified::RequestPhaseEvent::BackendStarted);
     let cfg_worker = cfg.clone();
-    let mut backend = spawn_connection_worker(move || {
+    let mut backend = spawn_request_worker(&request_scope, move || {
         let mut request = request;
         let response =
             execute_prepared_handler(&cfg_worker, &mut request, peer, local_port, tls, handler);
@@ -2873,9 +2896,13 @@ async fn admit_plain_connection(
                 started,
                 phase,
             }) => {
+                let request_scope = request
+                    .request_scope()
+                    .cloned()
+                    .ok_or_else(|| io::Error::other("HTTP/1 backend lost its request scope"))?;
                 let cfg_worker = cfg.clone();
                 let local_ip_worker = local_ip.clone();
-                spawn_connection_worker(move || {
+                spawn_request_worker(&request_scope, move || {
                     dispatch_h1_backend_phase(
                         &cfg_worker,
                         request,
@@ -2989,9 +3016,12 @@ async fn admit_plain_connection(
                         }
                     };
                     drop(body_guard);
+                    let request_scope = request.request_scope().cloned().ok_or_else(|| {
+                        io::Error::other("HTTP/1 dispatch lost its request scope")
+                    })?;
                     let cfg_worker = cfg.clone();
                     let local_ip_worker = local_ip.clone();
-                    spawn_connection_worker(move || {
+                    spawn_request_worker(&request_scope, move || {
                         dispatch_h1_backend_phase(
                             &cfg_worker,
                             request,
@@ -3341,9 +3371,13 @@ async fn admit_tls_connection(
                 started,
                 phase,
             }) => {
+                let request_scope = request
+                    .request_scope()
+                    .cloned()
+                    .ok_or_else(|| io::Error::other("TLS HTTP/1 backend lost its request scope"))?;
                 let cfg_worker = cfg.clone();
                 let local_ip_worker = local_ip.clone();
-                spawn_connection_worker(move || {
+                spawn_request_worker(&request_scope, move || {
                     dispatch_h1_backend_phase(
                         &cfg_worker,
                         request,
@@ -3456,9 +3490,12 @@ async fn admit_tls_connection(
                         }
                     };
                     drop(body_guard);
+                    let request_scope = request.request_scope().cloned().ok_or_else(|| {
+                        io::Error::other("TLS HTTP/1 dispatch lost its request scope")
+                    })?;
                     let cfg_worker = cfg.clone();
                     let local_ip_worker = local_ip.clone();
-                    spawn_connection_worker(move || {
+                    spawn_request_worker(&request_scope, move || {
                         dispatch_h1_backend_phase(
                             &cfg_worker,
                             request,
@@ -11362,6 +11399,46 @@ mod tests {
             before
         );
         crate::fault::clear();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_request_handoff_stays_accounted_until_worker_exit() {
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let scope =
+            crate::resource::RequestScope::new(budget.context(IpAddr::from([192, 0, 2, 94])));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let handle = spawn_request_worker(&scope, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        })
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        scope.cancel();
+        drop(handle); // Detach the already-running blocking task.
+
+        let current = || {
+            budget
+                .telemetry()
+                .gauges
+                .into_iter()
+                .find(|gauge| gauge.name == "async-request-work")
+                .unwrap()
+                .current
+        };
+        assert_eq!(
+            current(),
+            1,
+            "dropping the waiter released running child accounting"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while current() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[cfg(feature = "fault-injection")]

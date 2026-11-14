@@ -46,13 +46,65 @@ pub(crate) enum SlotKind {
     /// Relative response-compression CPU work, weighted by representation
     /// size, algorithm and configured quality.
     CompressionCpu,
+    /// Work which has left its request task but has not yet completed.  The
+    /// lease is acquired before a queue/spawn handoff and moves into the
+    /// queued closure, so dropping the awaiting future cannot make detached
+    /// work disappear from resource accounting.
+    AsyncRequestWork,
 }
 
 impl SlotKind {
-    const COUNT: usize = 19;
+    const COUNT: usize = 20;
+    const ALL: [Self; Self::COUNT] = [
+        Self::DynamicBackend,
+        Self::H2Stream,
+        Self::SlowInput,
+        Self::SlowOutput,
+        Self::ResponseBodyRead,
+        Self::Websocket,
+        Self::ExpensiveCpu,
+        Self::PendingConnection,
+        Self::H1Connection,
+        Self::RequestWorker,
+        Self::RequestBodyWorker,
+        Self::H2Connection,
+        Self::TlsHandshake,
+        Self::RewriteProgram,
+        Self::SpoolFile,
+        Self::SlowSpoolFile,
+        Self::FilesystemWork,
+        Self::BcryptCpu,
+        Self::CompressionCpu,
+        Self::AsyncRequestWork,
+    ];
 
     const fn index(self) -> usize {
         self as usize
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::DynamicBackend => "dynamic-backend",
+            Self::H2Stream => "h2-stream",
+            Self::SlowInput => "slow-input",
+            Self::SlowOutput => "slow-output",
+            Self::ResponseBodyRead => "response-body-read",
+            Self::Websocket => "websocket",
+            Self::ExpensiveCpu => "expensive-cpu",
+            Self::PendingConnection => "pending-connection",
+            Self::H1Connection => "h1-connection",
+            Self::RequestWorker => "request-worker",
+            Self::RequestBodyWorker => "request-body-worker",
+            Self::H2Connection => "h2-connection",
+            Self::TlsHandshake => "tls-handshake",
+            Self::RewriteProgram => "rewrite-program",
+            Self::SpoolFile => "spool-file",
+            Self::SlowSpoolFile => "slow-spool-file",
+            Self::FilesystemWork => "filesystem-work",
+            Self::BcryptCpu => "bcrypt-cpu",
+            Self::CompressionCpu => "compression-cpu",
+            Self::AsyncRequestWork => "async-request-work",
+        }
     }
 }
 
@@ -85,17 +137,49 @@ enum PhysicalKind {
 
 impl PhysicalKind {
     const COUNT: usize = 3;
+    const ALL: [Self; Self::COUNT] = [Self::FileDescriptor, Self::Task, Self::ResidentMemory];
 
     const fn index(self) -> usize {
         self as usize
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::FileDescriptor => "physical-file-descriptor",
+            Self::Task => "physical-task",
+            Self::ResidentMemory => "physical-resident-memory",
+        }
     }
 }
 
 impl ByteKind {
     const COUNT: usize = 8;
+    const ALL: [Self; Self::COUNT] = [
+        Self::Spool,
+        Self::SlowSpool,
+        Self::RequestResident,
+        Self::ResponseResident,
+        Self::SlowResponseResident,
+        Self::PolicyExpansion,
+        Self::CacheResident,
+        Self::CompressionTransient,
+    ];
 
     const fn index(self) -> usize {
         self as usize
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Spool => "spool-bytes",
+            Self::SlowSpool => "slow-spool-bytes",
+            Self::RequestResident => "request-resident-bytes",
+            Self::ResponseResident => "response-resident-bytes",
+            Self::SlowResponseResident => "slow-response-resident-bytes",
+            Self::PolicyExpansion => "policy-expansion-bytes",
+            Self::CacheResident => "cache-resident-bytes",
+            Self::CompressionTransient => "compression-transient-bytes",
+        }
     }
 }
 
@@ -173,19 +257,34 @@ struct DiskLedgers {
 #[derive(Debug)]
 pub struct ResourceBudget {
     slot_process: [AtomicU64; SlotKind::COUNT],
+    slot_high_water: [AtomicU64; SlotKind::COUNT],
+    slot_limits: [AtomicU64; SlotKind::COUNT],
+    slot_rejections: [AtomicU64; SlotKind::COUNT],
     slot_clients: Mutex<HashMap<IpAddr, [u64; SlotKind::COUNT]>>,
     byte_process: [AtomicU64; ByteKind::COUNT],
+    byte_high_water: [AtomicU64; ByteKind::COUNT],
+    byte_limits: [AtomicU64; ByteKind::COUNT],
+    byte_rejections: [AtomicU64; ByteKind::COUNT],
     byte_clients: Mutex<HashMap<IpAddr, [u64; ByteKind::COUNT]>>,
     physical_process: [AtomicU64; PhysicalKind::COUNT],
+    physical_high_water: [AtomicU64; PhysicalKind::COUNT],
+    physical_rejections: [AtomicU64; PhysicalKind::COUNT],
     physical_limits: [u64; PhysicalKind::COUNT],
     disk_bytes: AtomicU64,
     disk_files: AtomicU64,
+    disk_byte_high_water: AtomicU64,
+    disk_file_high_water: AtomicU64,
+    disk_byte_rejections: AtomicU64,
+    disk_file_rejections: AtomicU64,
     disk_byte_limit: u64,
     disk_file_limit: u64,
     disk_ledgers: Mutex<DiskLedgers>,
     transport_bytes: AtomicU64,
+    transport_high_water: AtomicU64,
+    transport_rejections: AtomicU64,
     transport_byte_limit: u64,
     queued_h2_outputs: AtomicU64,
+    queued_h2_outputs_high_water: AtomicU64,
     rates: Mutex<RateLedger>,
     next_scope: AtomicU64,
 }
@@ -214,19 +313,34 @@ impl Default for ResourceBudget {
         let physical_limits = detected_physical_limits();
         Self {
             slot_process: std::array::from_fn(|_| AtomicU64::new(0)),
+            slot_high_water: std::array::from_fn(|_| AtomicU64::new(0)),
+            slot_limits: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
+            slot_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
             slot_clients: Mutex::new(HashMap::new()),
             byte_process: std::array::from_fn(|_| AtomicU64::new(0)),
+            byte_high_water: std::array::from_fn(|_| AtomicU64::new(0)),
+            byte_limits: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
+            byte_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
             byte_clients: Mutex::new(HashMap::new()),
             physical_process: std::array::from_fn(|_| AtomicU64::new(0)),
+            physical_high_water: std::array::from_fn(|_| AtomicU64::new(0)),
+            physical_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
             physical_limits,
             disk_bytes: AtomicU64::new(0),
             disk_files: AtomicU64::new(0),
+            disk_byte_high_water: AtomicU64::new(0),
+            disk_file_high_water: AtomicU64::new(0),
+            disk_byte_rejections: AtomicU64::new(0),
+            disk_file_rejections: AtomicU64::new(0),
             disk_byte_limit: DEFAULT_DISK_BYTE_BUDGET,
             disk_file_limit: DEFAULT_DISK_FILE_BUDGET,
             disk_ledgers: Mutex::new(DiskLedgers::default()),
             transport_bytes: AtomicU64::new(0),
+            transport_high_water: AtomicU64::new(0),
+            transport_rejections: AtomicU64::new(0),
             transport_byte_limit: DEFAULT_TRANSPORT_BUFFER_BUDGET,
             queued_h2_outputs: AtomicU64::new(0),
+            queued_h2_outputs_high_water: AtomicU64::new(0),
             rates: Mutex::new(RateLedger::default()),
             next_scope: AtomicU64::new(1),
         }
@@ -255,6 +369,13 @@ pub const MAX_RESPONSE_BODY_READS: u64 = 32;
 pub const MAX_RESPONSE_BODY_READS_PER_CLIENT: u64 = 8;
 pub const MAX_H2_STREAMS: u64 = 256;
 pub const MAX_H2_STREAMS_PER_CLIENT: u64 = 64;
+/// A single request needs at most a stream task, one blocking policy/backend
+/// handoff and one dependency helper at the same time.  A little headroom
+/// keeps the invariant compositional while the process/source ceilings stop
+/// cancellation-resistant queued work from multiplying across requests.
+pub const MAX_ASYNC_REQUEST_WORK: u64 = 512;
+pub const MAX_ASYNC_REQUEST_WORK_PER_CLIENT: u64 = 64;
+pub const MAX_ASYNC_REQUEST_WORK_PER_REQUEST: u64 = 4;
 /// Request-body-blocked HTTP/2 streams leave the general dispatch pool and
 /// enter this smaller source-fair pool. A peer that withholds DATA can retain
 /// only this reserve, rather than every stream needed by unrelated clients.
@@ -444,6 +565,9 @@ const fn slot_physical_charge(kind: SlotKind) -> [u64; PhysicalKind::COUNT] {
         Websocket => [1, 0, 64 * 1024],
         RewriteProgram => [3, 1, 128 * 1024],
         SpoolFile | SlowSpoolFile | FilesystemWork | BcryptCpu | CompressionCpu => [0, 0, 0],
+        // Queue residence reserves the task/memory which the closure will
+        // consume before the worker is allowed to begin it.
+        AsyncRequestWork => [0, 1, 64 * 1024],
         TlsHandshake => [0, 0, 128 * 1024],
         RequestBodyWorker | ExpensiveCpu => [0, 0, 0],
     }
@@ -724,12 +848,62 @@ impl RequestScope {
             scope: self.clone(),
         }
     }
+
+    /// Reserve ownership before a request-controlled closure crosses an
+    /// asynchronous queue or task boundary.  Cancellation is sampled on both
+    /// sides of the atomic slot acquisition: work linearized before cancel
+    /// retains the move-only lease and observes the shared cancellation bit;
+    /// work linearized after cancel is rejected without being queued.
+    pub(crate) fn try_async_work(&self) -> io::Result<AsyncWorkLease> {
+        let cancelled_before = self.is_cancelled();
+        if cancelled_before {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "request scope cancelled before async handoff",
+            ));
+        }
+        let slot = self.context.slot(
+            SlotKind::AsyncRequestWork,
+            MAX_ASYNC_REQUEST_WORK,
+            Some(MAX_ASYNC_REQUEST_WORK_PER_CLIENT),
+            Some(MAX_ASYNC_REQUEST_WORK_PER_REQUEST),
+            "async request-work limit reached",
+        )?;
+        let cancelled_after = self.is_cancelled();
+        if !httpd_rs_verified::async_work_handoff_admit(cancelled_before, true, cancelled_after) {
+            drop(slot);
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "request scope cancelled during async handoff",
+            ));
+        }
+        Ok(AsyncWorkLease {
+            _slot: slot,
+            scope: self.clone(),
+        })
+    }
 }
 
 /// Cancels child work on every request exit, including parse/dispatch/write
 /// errors. Resource leases remain ordinary RAII values owned by the request.
 pub(crate) struct RequestScopeGuard {
     scope: RequestScope,
+}
+
+/// Move-only ownership of one queued or running request child.  Keeping the
+/// request scope beside the slot makes cancellation lineage available to the
+/// worker without a second lookup and prevents a queued job from outliving
+/// both its accounting and its cancellation authority.
+#[derive(Debug)]
+pub(crate) struct AsyncWorkLease {
+    _slot: SlotLease,
+    scope: RequestScope,
+}
+
+impl AsyncWorkLease {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.scope.is_cancelled()
+    }
 }
 
 impl Drop for RequestScopeGuard {
@@ -814,6 +988,19 @@ pub(crate) fn current_expensive_client() -> Option<IpAddr> {
 
 fn try_add(counter: &AtomicU64, amount: u64, limit: u64) -> bool {
     try_add_counter(counter, amount, limit)
+}
+
+fn observe_high_water(counter: &AtomicU64, observed: u64) {
+    counter.fetch_max(observed, Ordering::AcqRel);
+}
+
+fn observe_limit(counter: &AtomicU64, limit: u64) {
+    counter.fetch_min(limit, Ordering::AcqRel);
+}
+
+fn shadow_candidate(observed: u64, fixed_headroom: u64, hard_limit: u64) -> u64 {
+    httpd_rs_verified::resource_shadow_budget_candidate(observed, fixed_headroom, hard_limit)
+        .unwrap_or(0)
 }
 
 /// Small abstraction over the atomic operation used by the production
@@ -918,12 +1105,18 @@ impl DiskLease {
                 add_bytes,
                 self.budget.disk_byte_limit,
             ) {
+                self.budget
+                    .disk_byte_rejections
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(io::Error::new(
                     io::ErrorKind::StorageFull,
                     "aggregate writable-disk byte limit reached",
                 ));
             }
             if !try_add(&self.ledger.bytes, add_bytes, self.ledger.byte_limit) {
+                self.budget
+                    .disk_byte_rejections
+                    .fetch_add(1, Ordering::Relaxed);
                 self.budget
                     .disk_bytes
                     .fetch_sub(add_bytes, Ordering::AcqRel);
@@ -942,6 +1135,9 @@ impl DiskLease {
                 add_files,
                 self.budget.disk_file_limit,
             ) {
+                self.budget
+                    .disk_file_rejections
+                    .fetch_add(1, Ordering::Relaxed);
                 if add_bytes > 0 {
                     self.ledger.bytes.fetch_sub(add_bytes, Ordering::AcqRel);
                     self.budget
@@ -954,6 +1150,9 @@ impl DiskLease {
                 ));
             }
             if !try_add(&self.ledger.files, add_files, self.ledger.file_limit) {
+                self.budget
+                    .disk_file_rejections
+                    .fetch_add(1, Ordering::Relaxed);
                 self.budget
                     .disk_files
                     .fetch_sub(add_files, Ordering::AcqRel);
@@ -990,6 +1189,14 @@ impl DiskLease {
         }
         self.bytes = bytes;
         self.files = files;
+        observe_high_water(
+            &self.budget.disk_byte_high_water,
+            self.budget.disk_bytes.load(Ordering::Acquire),
+        );
+        observe_high_water(
+            &self.budget.disk_file_high_water,
+            self.budget.disk_files.load(Ordering::Acquire),
+        );
         Ok(())
     }
 }
@@ -1021,19 +1228,41 @@ impl Drop for TransportBufferLease {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResourceGaugeTelemetry {
+    pub name: &'static str,
+    pub observed: bool,
+    pub current: u64,
+    pub high_water: u64,
+    pub limit: u64,
+    pub shadow_candidate: u64,
+    pub rejections: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResourceTelemetry {
     pub disk_bytes: u64,
     pub disk_byte_limit: u64,
+    pub disk_byte_high_water: u64,
+    pub disk_byte_shadow_candidate: u64,
+    pub disk_byte_rejections: u64,
     pub disk_files: u64,
     pub disk_file_limit: u64,
+    pub disk_file_high_water: u64,
+    pub disk_file_shadow_candidate: u64,
+    pub disk_file_rejections: u64,
     pub disk_filesystems: u64,
     pub disk_min_byte_headroom: u64,
     pub disk_min_file_headroom: u64,
     pub transport_bytes: u64,
     pub transport_byte_limit: u64,
+    pub transport_high_water: u64,
+    pub transport_shadow_candidate: u64,
+    pub transport_rejections: u64,
     pub queued_h2_outputs: u64,
+    pub queued_h2_outputs_high_water: u64,
     pub h2_hpack_scratch_high_water: u64,
+    pub gauges: Vec<ResourceGaugeTelemetry>,
 }
 
 impl Drop for DescriptorLease {
@@ -1195,8 +1424,10 @@ impl ByteLease {
             return Ok(());
         }
         let index = self.kind.index();
+        observe_limit(&self.context.budget.byte_limits[index], self.process_limit);
         let charged_request = if let Some(limit) = self.request_limit {
             if !try_add(&self.context.local.bytes[index], amount, limit) {
+                self.context.budget.byte_rejections[index].fetch_add(1, Ordering::Relaxed);
                 return Err(io::Error::new(io::ErrorKind::OutOfMemory, message));
             }
             true
@@ -1214,6 +1445,7 @@ impl ByteLease {
             if let (Some(client), Some(limit)) = (self.context.client, self.client_limit) {
                 let usage = clients.entry(client).or_insert([0; ByteKind::COUNT]);
                 if !httpd_rs_verified::hierarchical_resource_admit(usage[index], amount, limit) {
+                    self.context.budget.byte_rejections[index].fetch_add(1, Ordering::Relaxed);
                     if usage.iter().all(|value| *value == 0) {
                         clients.remove(&client);
                     }
@@ -1233,6 +1465,7 @@ impl ByteLease {
             amount,
             self.process_limit,
         ) {
+            self.context.budget.byte_rejections[index].fetch_add(1, Ordering::Relaxed);
             if charged_client {
                 if let Some(client) = self.context.client {
                     if let Some(usage) = clients.get_mut(&client) {
@@ -1251,6 +1484,7 @@ impl ByteLease {
         }
         if let Some(kind) = byte_physical_kind(self.kind) {
             if !self.context.budget.try_physical_one(kind, amount) {
+                self.context.budget.byte_rejections[index].fetch_add(1, Ordering::Relaxed);
                 self.context.budget.byte_process[index].fetch_sub(amount, Ordering::AcqRel);
                 if charged_client {
                     if let Some(client) = self.context.client {
@@ -1274,6 +1508,10 @@ impl ByteLease {
         }
         drop(clients);
         self.bytes += amount;
+        observe_high_water(
+            &self.context.budget.byte_high_water[index],
+            self.context.budget.byte_process[index].load(Ordering::Acquire),
+        );
         Ok(())
     }
 
@@ -1302,8 +1540,10 @@ impl ByteLease {
         }
         let old_index = self.kind.index();
         let new_index = kind.index();
+        observe_limit(&self.context.budget.byte_limits[new_index], process_limit);
         let charged_request = if let Some(limit) = request_limit {
             if !try_add(&self.context.local.bytes[new_index], amount, limit) {
+                self.context.budget.byte_rejections[new_index].fetch_add(1, Ordering::Relaxed);
                 return Err(io::Error::new(io::ErrorKind::OutOfMemory, message));
             }
             true
@@ -1322,6 +1562,7 @@ impl ByteLease {
         {
             let usage = clients.entry(client).or_insert([0; ByteKind::COUNT]);
             if !httpd_rs_verified::hierarchical_resource_admit(usage[new_index], amount, limit) {
+                self.context.budget.byte_rejections[new_index].fetch_add(1, Ordering::Relaxed);
                 if usage.iter().all(|value| *value == 0) {
                     clients.remove(&client);
                 }
@@ -1340,6 +1581,7 @@ impl ByteLease {
             amount,
             process_limit,
         ) {
+            self.context.budget.byte_rejections[new_index].fetch_add(1, Ordering::Relaxed);
             if charged_client {
                 if let Some(client) = self.context.client {
                     if let Some(usage) = clients.get_mut(&client) {
@@ -1370,6 +1612,10 @@ impl ByteLease {
         self.process_limit = process_limit;
         self.client_limit = client_limit;
         self.request_limit = request_limit;
+        observe_high_water(
+            &self.context.budget.byte_high_water[new_index],
+            self.context.budget.byte_process[new_index].load(Ordering::Acquire),
+        );
         Ok(())
     }
 
@@ -1551,11 +1797,20 @@ impl ResourceBudget {
     }
 
     fn try_physical_one(&self, kind: PhysicalKind, amount: u64) -> bool {
-        try_add(
-            &self.physical_process[kind.index()],
+        let index = kind.index();
+        if !try_add(
+            &self.physical_process[index],
             amount,
-            self.physical_limits[kind.index()],
-        )
+            self.physical_limits[index],
+        ) {
+            self.physical_rejections[index].fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        observe_high_water(
+            &self.physical_high_water[index],
+            self.physical_process[index].load(Ordering::Acquire),
+        );
+        true
     }
 
     pub(crate) fn try_descriptor(self: &Arc<Self>) -> io::Result<DescriptorLease> {
@@ -1603,11 +1858,16 @@ impl ResourceBudget {
         bytes: u64,
     ) -> io::Result<TransportBufferLease> {
         if !try_add(&self.transport_bytes, bytes, self.transport_byte_limit) {
+            self.transport_rejections.fetch_add(1, Ordering::Relaxed);
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "aggregate transport-buffer limit reached",
             ));
         }
+        observe_high_water(
+            &self.transport_high_water,
+            self.transport_bytes.load(Ordering::Acquire),
+        );
         Ok(TransportBufferLease {
             budget: self.clone(),
             bytes,
@@ -1639,18 +1899,106 @@ impl ResourceBudget {
             })
             .min()
             .unwrap_or(self.disk_file_limit);
+        let mut gauges =
+            Vec::with_capacity(SlotKind::COUNT + ByteKind::COUNT + PhysicalKind::COUNT);
+        gauges.extend(SlotKind::ALL.into_iter().map(|kind| {
+            let index = kind.index();
+            let limit = self.slot_limits[index].load(Ordering::Acquire);
+            let high_water = self.slot_high_water[index].load(Ordering::Acquire);
+            let observed = limit != u64::MAX;
+            ResourceGaugeTelemetry {
+                name: kind.name(),
+                observed,
+                current: self.slot_process[index].load(Ordering::Acquire),
+                high_water,
+                limit: if limit == u64::MAX { 0 } else { limit },
+                shadow_candidate: if observed {
+                    shadow_candidate(high_water, 1, limit)
+                } else {
+                    0
+                },
+                rejections: self.slot_rejections[index].load(Ordering::Acquire),
+            }
+        }));
+        gauges.extend(ByteKind::ALL.into_iter().map(|kind| {
+            let index = kind.index();
+            let limit = self.byte_limits[index].load(Ordering::Acquire);
+            let high_water = self.byte_high_water[index].load(Ordering::Acquire);
+            let observed = limit != u64::MAX;
+            ResourceGaugeTelemetry {
+                name: kind.name(),
+                observed,
+                current: self.byte_process[index].load(Ordering::Acquire),
+                high_water,
+                limit: if limit == u64::MAX { 0 } else { limit },
+                shadow_candidate: if observed {
+                    shadow_candidate(high_water, 64 * 1024, limit)
+                } else {
+                    0
+                },
+                rejections: self.byte_rejections[index].load(Ordering::Acquire),
+            }
+        }));
+        gauges.extend(PhysicalKind::ALL.into_iter().map(|kind| {
+            let index = kind.index();
+            let high_water = self.physical_high_water[index].load(Ordering::Acquire);
+            let fixed_headroom = match kind {
+                PhysicalKind::FileDescriptor => 16,
+                PhysicalKind::Task => 8,
+                PhysicalKind::ResidentMemory => 16 * 1024 * 1024,
+            };
+            ResourceGaugeTelemetry {
+                name: kind.name(),
+                observed: true,
+                current: self.physical_process[index].load(Ordering::Acquire),
+                high_water,
+                limit: self.physical_limits[index],
+                shadow_candidate: shadow_candidate(
+                    high_water,
+                    fixed_headroom,
+                    self.physical_limits[index],
+                ),
+                rejections: self.physical_rejections[index].load(Ordering::Acquire),
+            }
+        }));
+        let disk_byte_high_water = self.disk_byte_high_water.load(Ordering::Acquire);
+        let disk_file_high_water = self.disk_file_high_water.load(Ordering::Acquire);
+        let transport_high_water = self.transport_high_water.load(Ordering::Acquire);
         ResourceTelemetry {
             disk_bytes: self.disk_bytes.load(Ordering::Acquire),
             disk_byte_limit: self.disk_byte_limit,
+            disk_byte_high_water,
+            disk_byte_shadow_candidate: shadow_candidate(
+                disk_byte_high_water,
+                64 * 1024 * 1024,
+                self.disk_byte_limit,
+            ),
+            disk_byte_rejections: self.disk_byte_rejections.load(Ordering::Acquire),
             disk_files: self.disk_files.load(Ordering::Acquire),
             disk_file_limit: self.disk_file_limit,
+            disk_file_high_water,
+            disk_file_shadow_candidate: shadow_candidate(
+                disk_file_high_water,
+                64,
+                self.disk_file_limit,
+            ),
+            disk_file_rejections: self.disk_file_rejections.load(Ordering::Acquire),
             disk_filesystems: ledgers.devices.len() as u64,
             disk_min_byte_headroom,
             disk_min_file_headroom,
             transport_bytes: self.transport_bytes.load(Ordering::Acquire),
             transport_byte_limit: self.transport_byte_limit,
+            transport_high_water,
+            transport_shadow_candidate: shadow_candidate(
+                transport_high_water,
+                16 * 1024 * 1024,
+                self.transport_byte_limit,
+            ),
+            transport_rejections: self.transport_rejections.load(Ordering::Acquire),
             queued_h2_outputs: self.queued_h2_outputs.load(Ordering::Acquire),
+            queued_h2_outputs_high_water: self.queued_h2_outputs_high_water.load(Ordering::Acquire),
             h2_hpack_scratch_high_water: ::h2::hpack_scratch_high_water() as u64,
+            gauges,
         }
     }
 
@@ -1704,13 +2052,7 @@ impl ResourceBudget {
         let mut admitted = 0usize;
         while admitted < PhysicalKind::COUNT {
             let amount = charge[admitted];
-            if amount > 0
-                && !try_add(
-                    &self.physical_process[admitted],
-                    amount,
-                    self.physical_limits[admitted],
-                )
-            {
+            if amount > 0 && !self.try_physical_one(PhysicalKind::ALL[admitted], amount) {
                 for rollback in 0..admitted {
                     if charge[rollback] > 0 {
                         self.physical_process[rollback]
@@ -1763,18 +2105,20 @@ impl ResourceBudget {
         request_limit: Option<u64>,
         message: &'static str,
     ) -> io::Result<SlotLease> {
+        let index = kind.index();
         if !Arc::ptr_eq(self, &context.budget) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "resource context belongs to another process ledger",
             ));
         }
-        let index = kind.index();
         if amount == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
         }
+        observe_limit(&self.slot_limits[index], process_limit);
         let charged_request = if let Some(limit) = request_limit {
             if !try_add(&context.local.slots[index], amount, limit) {
+                self.slot_rejections[index].fetch_add(1, Ordering::Relaxed);
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
             }
             true
@@ -1789,6 +2133,7 @@ impl ResourceBudget {
         let charged_client = if let (Some(client), Some(limit)) = (context.client, client_limit) {
             let usage = clients.entry(client).or_insert([0; SlotKind::COUNT]);
             if !httpd_rs_verified::hierarchical_resource_admit(usage[index], amount, limit) {
+                self.slot_rejections[index].fetch_add(1, Ordering::Relaxed);
                 if usage.iter().all(|value| *value == 0) {
                     clients.remove(&client);
                 }
@@ -1811,6 +2156,7 @@ impl ResourceBudget {
             !charged_client || client_limit.is_some(),
         ) || !try_add(&self.slot_process[index], amount, process_limit)
         {
+            self.slot_rejections[index].fetch_add(1, Ordering::Relaxed);
             if charged_client {
                 if let Some(client) = context.client {
                     if let Some(usage) = clients.get_mut(&client) {
@@ -1829,6 +2175,7 @@ impl ResourceBudget {
         }
         let physical = slot_physical_charge(kind).map(|charge| charge.saturating_mul(amount));
         if !self.try_physical(physical) {
+            self.slot_rejections[index].fetch_add(1, Ordering::Relaxed);
             self.slot_process[index].fetch_sub(amount, Ordering::AcqRel);
             if charged_client {
                 if let Some(client) = context.client {
@@ -1850,6 +2197,10 @@ impl ResourceBudget {
             ));
         }
         drop(clients);
+        observe_high_water(
+            &self.slot_high_water[index],
+            self.slot_process[index].load(Ordering::Acquire),
+        );
         Ok(SlotLease {
             context: context.clone(),
             kind,
@@ -3065,10 +3416,13 @@ impl SlowOutputAdmission {
                 }
             }
         };
-        self.context
+        let queued = self
+            .context
             .budget
             .queued_h2_outputs
-            .fetch_add(1, Ordering::AcqRel);
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        observe_high_water(&self.context.budget.queued_h2_outputs_high_water, queued);
         Ok(Some(QueuedH2TransportLease {
             budget: self.context.budget.clone(),
             _admission: admission,
@@ -3368,6 +3722,156 @@ mod tests {
             budget.physical_process[PhysicalKind::FileDescriptor.index()].load(Ordering::Acquire),
             0
         );
+    }
+
+    #[test]
+    fn calibration_telemetry_is_monotonic_and_never_weakens_hard_limits() {
+        let budget = Arc::new(ResourceBudget {
+            physical_limits: [32, 64, 64 * 1024 * 1024],
+            ..ResourceBudget::default()
+        });
+        let client = IpAddr::from([192, 0, 2, 90]);
+        let context = budget.context(client);
+        let dynamic = budget.try_dynamic_in(&context, 4).unwrap();
+        let mut resident = budget.try_request_bytes_in(&context).unwrap();
+        resident.reserve(128 * 1024).unwrap();
+
+        let active = budget.telemetry();
+        let dynamic_gauge = active
+            .gauges
+            .iter()
+            .find(|gauge| gauge.name == "dynamic-backend")
+            .unwrap();
+        assert!(dynamic_gauge.observed);
+        assert_eq!(dynamic_gauge.current, 1);
+        assert_eq!(dynamic_gauge.high_water, 1);
+        assert_eq!(dynamic_gauge.limit, 4);
+        assert!(dynamic_gauge.shadow_candidate >= dynamic_gauge.high_water);
+        assert!(dynamic_gauge.shadow_candidate <= dynamic_gauge.limit);
+
+        let resident_gauge = active
+            .gauges
+            .iter()
+            .find(|gauge| gauge.name == "request-resident-bytes")
+            .unwrap();
+        assert_eq!(resident_gauge.high_water, 128 * 1024);
+        assert!(resident_gauge.shadow_candidate >= resident_gauge.high_water);
+        assert!(resident_gauge.shadow_candidate <= resident_gauge.limit);
+
+        drop((dynamic, resident));
+        let released = budget.telemetry();
+        let dynamic_gauge = released
+            .gauges
+            .iter()
+            .find(|gauge| gauge.name == "dynamic-backend")
+            .unwrap();
+        assert_eq!(dynamic_gauge.current, 0);
+        assert_eq!(dynamic_gauge.high_water, 1);
+    }
+
+    #[test]
+    fn async_handoff_lease_survives_cancellation_until_child_exit() {
+        let budget = Arc::new(ResourceBudget::default());
+        let context = budget.context(IpAddr::from([192, 0, 2, 92]));
+        let scope = RequestScope::new(context);
+        let work = scope.try_async_work().unwrap();
+
+        let active = budget.telemetry();
+        let gauge = active
+            .gauges
+            .iter()
+            .find(|gauge| gauge.name == "async-request-work")
+            .unwrap();
+        assert_eq!(gauge.current, 1);
+        assert_eq!(gauge.high_water, 1);
+
+        scope.cancel();
+        assert!(work.is_cancelled());
+        assert!(scope.try_async_work().is_err());
+        assert_eq!(
+            budget
+                .telemetry()
+                .gauges
+                .iter()
+                .find(|gauge| gauge.name == "async-request-work")
+                .unwrap()
+                .current,
+            1,
+            "parent cancellation released child accounting before child exit"
+        );
+
+        drop(work);
+        let released = budget.telemetry();
+        let gauge = released
+            .gauges
+            .iter()
+            .find(|gauge| gauge.name == "async-request-work")
+            .unwrap();
+        assert_eq!(gauge.current, 0);
+        assert_eq!(gauge.high_water, 1);
+    }
+
+    #[test]
+    fn async_handoff_has_an_exact_per_request_ceiling() {
+        let budget = Arc::new(ResourceBudget::default());
+        let scope = RequestScope::new(budget.context(IpAddr::from([192, 0, 2, 93])));
+        let work: Vec<_> = (0..MAX_ASYNC_REQUEST_WORK_PER_REQUEST)
+            .map(|_| scope.try_async_work().unwrap())
+            .collect();
+        assert!(scope.try_async_work().is_err());
+        drop(work);
+        assert!(scope.try_async_work().is_ok());
+    }
+
+    #[test]
+    fn specialized_ledger_calibration_paths_are_observed_and_released() {
+        let budget = Arc::new(ResourceBudget::default());
+        let client = IpAddr::from([192, 0, 2, 91]);
+        let context = budget.context(client);
+
+        let slow_input = budget.try_slow_input_in(&context).unwrap();
+        let slow_output = budget.try_slow_output_in(&context).unwrap();
+        let websocket = budget.try_websocket_for(client).unwrap();
+        let rewrite = budget.try_rewrite_program(&context, 8, 2, 64, 16).unwrap();
+        let mut resident = budget.try_response_bytes_for(client);
+        resident.reserve(4096).unwrap();
+        resident.enter_slow_output().unwrap();
+        let mut spool = budget.try_spool_in(8192, 2, &context).unwrap();
+        spool.reserve(1024).unwrap();
+        spool.enter_slow().unwrap();
+
+        let specialized = [
+            "rewrite-program",
+            "slow-input",
+            "slow-output",
+            "slow-response-resident-bytes",
+            "slow-spool-bytes",
+            "slow-spool-file",
+            "websocket",
+        ];
+        let active = budget.telemetry();
+        for name in specialized {
+            let gauge = active
+                .gauges
+                .iter()
+                .find(|gauge| gauge.name == name)
+                .unwrap_or_else(|| panic!("missing specialized calibration gauge {name}"));
+            assert!(gauge.observed, "{name} did not record its hard limit");
+            assert!(gauge.current > 0, "{name} was not exercised");
+            assert!(gauge.high_water >= gauge.current);
+        }
+
+        drop((slow_input, slow_output, websocket, rewrite, resident, spool));
+        let released = budget.telemetry();
+        for name in specialized {
+            let gauge = released
+                .gauges
+                .iter()
+                .find(|gauge| gauge.name == name)
+                .unwrap();
+            assert_eq!(gauge.current, 0, "{name} leaked after calibration");
+            assert!(gauge.high_water > 0, "{name} lost its high-water evidence");
+        }
     }
 
     #[test]

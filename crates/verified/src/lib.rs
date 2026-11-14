@@ -3834,6 +3834,80 @@ pub proof fn resource_budget_rejects_exhausted(used: u64, incoming: u64)
 {
 }
 
+/// A request-controlled closure may cross a queue/task boundary only when it
+/// acquired its move-only slot while the shared cancellation lineage remained
+/// live.  Cancellation after this admission is expected: the child retains
+/// both the slot and the cancellation bit until it actually exits.
+pub open spec fn async_work_handoff_spec(
+    cancelled_before: bool,
+    slot_acquired: bool,
+    cancelled_after: bool,
+) -> bool {
+    !cancelled_before && slot_acquired && !cancelled_after
+}
+
+pub fn async_work_handoff_admit(
+    cancelled_before: bool,
+    slot_acquired: bool,
+    cancelled_after: bool,
+) -> (admit: bool)
+    ensures admit == async_work_handoff_spec(
+        cancelled_before,
+        slot_acquired,
+        cancelled_after,
+    ),
+{
+    !cancelled_before && slot_acquired && !cancelled_after
+}
+
+pub proof fn cancelled_async_work_is_never_admitted(
+    cancelled_before: bool,
+    cancelled_after: bool,
+)
+    requires cancelled_before || cancelled_after,
+    ensures !async_work_handoff_spec(cancelled_before, true, cancelled_after),
+{
+}
+
+/// A calibration candidate is a reporting threshold beneath the enforced
+/// security ceiling, never a replacement for that ceiling.  It leaves the
+/// larger of one observed peak or a fixed reserve as headroom (roughly 2x for
+/// non-trivial observations), clamps arithmetic overflow to the hard limit,
+/// and refuses observations that already exceed the enforced boundary.
+pub fn resource_shadow_budget_candidate(
+    observed: u64,
+    fixed_headroom: u64,
+    hard_limit: u64,
+) -> (out: Option<u64>)
+    ensures
+        observed <= hard_limit ==> out.is_some(),
+        observed > hard_limit ==> out.is_none(),
+        match out {
+            Some(candidate) => observed <= candidate && candidate <= hard_limit,
+            None => true,
+        },
+{
+    if observed > hard_limit {
+        return None;
+    }
+    let headroom = if observed > fixed_headroom {
+        observed
+    } else {
+        fixed_headroom
+    };
+    let desired = match observed.checked_add(headroom) {
+        Some(value) => value,
+        None => hard_limit,
+    };
+    let candidate = if desired > hard_limit {
+        hard_limit
+    } else {
+        desired
+    };
+    assert(candidate >= observed);
+    Some(candidate)
+}
+
 /// One tier of the unified request -> client -> process admission hierarchy.
 /// Every runtime slot acquisition uses this predicate at each applicable
 /// scope, rather than maintaining feature-specific overflow and boundary
@@ -10496,9 +10570,9 @@ pub open spec fn dynamic_compression_workspace_spec(
         },
         DynamicCompressionKind::Brotli => {
             if quality <= 5 {
-                Some(16_777_216u64)
-            } else if quality <= 7 {
                 Some(33_554_432u64)
+            } else if quality <= 7 {
+                Some(50_331_648u64)
             } else if quality <= 9 {
                 Some(67_108_864u64)
             } else {
@@ -10611,11 +10685,11 @@ pub fn dynamic_compression_budget(
         },
         DynamicCompressionKind::Brotli => {
             if quality <= 5 {
-                (16 * 1024 * 1024, 1)
+                (32 * 1024 * 1024, 1)
             } else if quality == 6 {
-                (32 * 1024 * 1024, 2)
+                (48 * 1024 * 1024, 2)
             } else if quality == 7 {
-                (32 * 1024 * 1024, 4)
+                (48 * 1024 * 1024, 4)
             } else if quality == 8 {
                 (64 * 1024 * 1024, 8)
             } else if quality == 9 {

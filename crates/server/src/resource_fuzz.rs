@@ -27,6 +27,7 @@ const SLOT_KINDS: [SlotKind; SlotKind::COUNT] = [
     SlotKind::FilesystemWork,
     SlotKind::BcryptCpu,
     SlotKind::CompressionCpu,
+    SlotKind::AsyncRequestWork,
 ];
 const BYTE_KINDS: [ByteKind; ByteKind::COUNT] = [
     ByteKind::Spool,
@@ -49,6 +50,7 @@ struct CampaignState {
     reads: Vec<ResponseBodyReadLease>,
     websockets: Vec<WebsocketLease>,
     compressions: Vec<CompressionLease>,
+    async_work: Vec<AsyncWorkLease>,
 }
 
 impl CampaignState {
@@ -58,6 +60,7 @@ impl CampaignState {
         self.reads.clear();
         self.websockets.clear();
         self.compressions.clear();
+        self.async_work.clear();
         self.dynamics.clear();
         self.spools.clear();
         self.residents.clear();
@@ -102,6 +105,11 @@ impl CampaignState {
             self.compressions
                 .iter()
                 .map(|lease| lease._work.context.clone()),
+        );
+        contexts.extend(
+            self.async_work
+                .iter()
+                .map(|lease| lease._slot.context.clone()),
         );
         contexts
     }
@@ -212,6 +220,7 @@ fn slot_process_limit(kind: SlotKind) -> u64 {
         SlotKind::SpoolFile => FUZZ_SPOOL_FILES,
         SlotKind::SlowSpoolFile => (FUZZ_SPOOL_FILES + 3) / 4,
         SlotKind::CompressionCpu => MAX_COMPRESSION_WORK_UNITS,
+        SlotKind::AsyncRequestWork => MAX_ASYNC_REQUEST_WORK,
         _ => 0,
     }
 }
@@ -227,6 +236,7 @@ fn slot_client_limit(kind: SlotKind) -> u64 {
         SlotKind::H1Connection => FUZZ_H1_CLIENT_LIMIT,
         SlotKind::SpoolFile | SlotKind::SlowSpoolFile => (FUZZ_SPOOL_FILES + 3) / 4,
         SlotKind::CompressionCpu => MAX_COMPRESSION_WORK_UNITS_PER_CLIENT,
+        SlotKind::AsyncRequestWork => MAX_ASYNC_REQUEST_WORK_PER_CLIENT,
         _ => 0,
     }
 }
@@ -648,7 +658,26 @@ pub(super) fn run(data: &[u8]) {
                 assert_eq!(before, budget.transition_snapshot());
                 assert_eq!(foreign_before, foreign.transition_snapshot());
             }
-            27 | 31 => state.clear_and_assert_scopes(),
+            27 => {
+                if selector & 1 == 0 {
+                    for iteration in 0..batch_count(magnitude) {
+                        let context =
+                            batch_context(&budget, &contexts, &clients, client_selector, iteration);
+                        let scope = RequestScope::new(context);
+                        let before = budget.transition_snapshot();
+                        if magnitude & 1 != 0 {
+                            scope.cancel();
+                        }
+                        match scope.try_async_work() {
+                            Ok(lease) => insert_bounded(&mut state.async_work, lease, selector),
+                            Err(_) => assert_eq!(before, budget.transition_snapshot()),
+                        }
+                    }
+                } else if let Some(index) = selected(&state.async_work, selector) {
+                    drop(state.async_work.swap_remove(index));
+                }
+            }
+            31 => state.clear_and_assert_scopes(),
             28 => {
                 if magnitude & 1 == 0 {
                     for iteration in 0..batch_count(magnitude) {

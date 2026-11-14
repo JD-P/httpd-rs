@@ -38,8 +38,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench"
 RUN = Path("/tmp/httpd-rs-feature-bench")
-APACHE = shutil.which("apache2") or "/usr/sbin/apache2"
-HTTPD_RS = ROOT / "target" / "release" / "httpd-rs"
+APACHE = os.environ.get("APACHE") or shutil.which("apache2") or "/usr/sbin/apache2"
+HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target" / "release" / "httpd-rs"))
 WRK = shutil.which("wrk")
 AB = shutil.which("ab")
 H2LOAD = shutil.which("h2load")

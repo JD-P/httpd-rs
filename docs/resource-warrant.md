@@ -55,6 +55,22 @@ unsafe/FFI/syscall boundaries. Its status labels mean:
 These labels are triage, not proofs. In particular, `accounted-context` does
 not establish dominance, release on cancellation, or a correct cost formula.
 
+Every site also has one independent closure disposition:
+
+- `typed-lease`: the site is owned by a reviewed slot, byte, disk, transport,
+  rate or physical-parent contract;
+- `proved-constant-bound`: its accepted input/cardinality is closed by an
+  executable checked bound and named verification target;
+- `external-assumption`: the effect crosses into pinned dependency or kernel
+  behavior with an explicit runtime backstop.
+
+`closure_contracts` in the policy supply module-level evidence where a local
+expression does not itself name the owning lease. CI requires exactly one
+disposition for every effect and fails if `unclassified_effect_sites` is not
+zero. The current closure is 2,221 typed-lease sites, 663 constant-bound sites
+and 443 external/kernel sites. Classification closes discovery debt; it does
+not promote a partial dominance or cost-refinement proof to mechanized status.
+
 ## Dynamic collection
 
 The profiler wraps an existing workload and discovers only executable names
@@ -68,8 +84,15 @@ independently started application backends are excluded. It samples:
 - process and thread cardinality;
 - descriptors classified as sockets, pipes, files and anonymous kernel
   objects;
-- procfs read/write bytes, characters and syscall counts.
-- cgroup-v2 CPU, I/O, memory and PID counters plus the configured hard limits.
+- procfs read/write bytes, characters and syscall counts;
+- scheduler running/waiting time plus per-thread wait channels, including
+  futex/rwsem/mutex waiters;
+- network-namespace ingress/egress deltas, explicitly scoped as containment
+  rather than exclusive process attribution;
+- statvfs byte/inode capacity and minimum free headroom for every filesystem
+  visible through the process root or an open descriptor;
+- cgroup-v2 CPU, I/O, PID and memory counters, including kernel, socket, slab,
+  page-table and kernel-stack memory, plus configured hard limits.
 
 Process-tree values are the attribution view. Cgroup values are a separate
 containment view: when the test runner shares the server's cgroup they may
@@ -110,6 +133,79 @@ python3 tests/resource_profile_campaign.py \
 Individual workloads may be selected with `--benchmarks`; deployments may be
 `nightly`, `canonical`, `sample`, `full` or `none`. Missing workload
 dependencies are reported as failures rather than silently changing coverage.
+On an unprivileged developer machine without passwordless sudo,
+`--allow-same-identity` forwards the deployment harness's explicit
+developer-only compatibility mode; CI and release evidence must omit it so
+the service-identity boundary remains exercised. That mode enables
+`MutableAuthFiles` and `UnstableFastCgiPaths` and omits exact stable-path
+declarations because an operator and daemon sharing one unprivileged identity
+cannot establish either invariant. Its results are functional/profile evidence,
+not evidence for those two security boundaries.
+
+## Budget calibration
+
+The broad profiler answers which physical resources a workload exercised.
+`tests/resource_budget_sweep.py` answers how those resources and the typed
+ledgers move as one attacker-controlled axis grows. It drives a live release
+server through static output, request headers, known-length and chunked proxy
+uploads, access-file depth, regex subject length, overlapping proxy requests,
+cache population, bcrypt authentication, TLS/HTTP/2, and every representative
+request-time Brotli quality:
+
+```sh
+cargo build --release -p httpd-rs
+python3 tests/resource_budget_sweep.py --quick
+python3 tests/resource_budget_sweep.py --no-quick \
+  --output artifacts/resource-warrant/budget-calibration.json
+```
+
+Each point snapshots process CPU/RSS/private memory/thread/descriptor use and
+the extended resource ledger before and after the workload. `server-status`
+exports current use, monotonic high-water, the smallest observed hard limit,
+admission rejections and a shadow candidate for every slot, byte and physical
+parent. Writable-disk and transport parents expose the same information.
+
+Shadow candidates are deliberately reporting-only. The executable Verus
+function `resource_shadow_budget_candidate` proves that a candidate is never
+below its observation and never above its enforced hard ceiling. A candidate
+uses the larger of one additional observed peak or a resource-specific fixed
+reserve, then clamps to the hard ceiling. It may support a reviewed tightening
+after representative deployment and adversarial runs; one machine or workload
+can never automatically weaken a security limit.
+
+The JSON and Markdown reports separately enumerate ledgers exercised by the
+live protocol sweep and by deterministic state-machine calibration. The latter
+acquires RewriteMap, slow-input, slow-output, slow resident/spool and WebSocket
+ownership, checks current/high-water telemetry, drops every lease and requires
+all current counters to return to zero. A live absence is never converted into
+evidence that the resource does not exist.
+
+The campaign runner executes this targeted sweep by default after its broader
+profiles. `--no-budget-sweep` is available when only inventory evidence is
+needed. The first calibration caught a data-shape-dependent Brotli workspace
+underestimate that ordinary benchmark input did not expose, which is why both
+high-entropy and highly compressible maximum-size inputs remain regression
+cases for every runtime-admissible quality.
+
+## Async lifetime closure
+
+Request cancellation and resource release are deliberately separate events.
+Before request-controlled work enters a blocking pool or DNS queue it acquires
+a move-only `AsyncWorkLease` under process, canonical-client, and request
+ceilings. The child owns that lease and a clone of the shared cancellation
+lineage. Dropping an awaiter therefore requests cancellation but cannot make a
+queued or running child disappear from accounting; the slot releases only when
+the child exits. Admission samples cancellation on both sides of slot
+acquisition, rejecting a handoff which races with cancellation.
+
+This boundary covers HTTP/1 backend/dispatch jobs, HTTP/2 policy/backend jobs,
+proxy forward DNS, and `Require host` reverse DNS. Blocking response-body reads
+already use the narrower `ResponseBodyReadLease` and transfer output ownership
+into the read closure. Connection tasks and H2 stream tasks similarly move
+their pending/connection/stream ownership into the spawned future. The Verus
+predicate `async_work_handoff_admit` proves the admission race, while detach,
+queue-cancellation, exact-ceiling, and terminal-zero regressions exercise the
+Rust ownership half.
 
 ## Reconciliation
 
@@ -139,7 +235,8 @@ The intended proof progression for each site is:
    below Rust or inside pinned dependencies.
 
 The `request_resource_effect_closure` verification obligation tracks this
-progress. The warrant is complete only when every `review-required` site has
-been promoted to an accounting boundary, a proved hard bound, or an explicit
-external assumption and the composed request lifecycle proves all leases
-return to zero.
+progress. Discovery closure requires zero unclassified sites and is now a CI
+invariant. Full proof closure additionally requires each typed-lease contract
+to prove dominance/release, each constant-bound contract to prove its complete
+cost formula, every external assumption to retain its independent backstop,
+and the composed request lifecycle to return all leases to zero.

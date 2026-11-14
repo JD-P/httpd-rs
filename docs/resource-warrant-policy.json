@@ -18,6 +18,108 @@
       "startup-only effects remain inventoried unless they are lexically test-only"
     ]
   },
+  "calibration": {
+    "tool": "tests/resource_budget_sweep.py",
+    "attacker_axes": [
+      "response bytes",
+      "header bytes",
+      "request body bytes",
+      "unknown-length chunked request body bytes",
+      "path/access-file depth",
+      "regex subject bytes",
+      "overlapping backend concurrency",
+      "disk/memory cache lookup cardinality",
+      "bcrypt authentication work",
+      "TLS and HTTP/2 protocol state",
+      "compression input bytes and quality"
+    ],
+    "runtime_evidence": [
+      "process CPU ticks",
+      "resident and private memory",
+      "threads",
+      "descriptor classes",
+      "cgroup kernel, socket, slab and page-table memory",
+      "network-namespace receive/transmit byte deltas",
+      "statvfs byte and inode headroom for process-visible filesystems",
+      "scheduler running/waiting time and per-thread wait channels",
+      "per-ledger current/high-water/limit/rejection counters"
+    ],
+    "shadow_candidate": "max(2 * observed high-water, observed high-water + fixed resource reserve), clamped to the enforced hard limit",
+    "enforcement": "reporting-only; calibration can tighten a reviewed hard limit but cannot automatically weaken or replace it",
+    "promotion_requirements": [
+      "repeat across representative deployment and adversarial workloads",
+      "retain overload and rejection observations",
+      "review monotonic cost curves and unexpected transport failures",
+      "prove the selected candidate remains at or below its hard security ceiling"
+    ]
+  },
+  "closure_contracts": [
+    {
+      "id": "request-runtime-typed-leases",
+      "disposition": "typed-lease",
+      "paths": [
+        "crates/server/src/access.rs",
+        "crates/server/src/apache_regex.rs",
+        "crates/server/src/auth.rs",
+        "crates/server/src/cache.rs",
+        "crates/server/src/cgi.rs",
+        "crates/server/src/compression.rs",
+        "crates/server/src/expr.rs",
+        "crates/server/src/expires.rs",
+        "crates/server/src/fastcgi.rs",
+        "crates/server/src/files.rs",
+        "crates/server/src/h2.rs",
+        "crates/server/src/htaccess.rs",
+        "crates/server/src/http.rs",
+        "crates/server/src/log.rs",
+        "crates/server/src/ocsp.rs",
+        "crates/server/src/policy_ref.rs",
+        "crates/server/src/proxy.rs",
+        "crates/server/src/request_plan.rs",
+        "crates/server/src/rewrite.rs",
+        "crates/server/src/server.rs",
+        "crates/server/src/tls.rs",
+        "crates/server/src/util.rs"
+      ],
+      "evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; bounded pure projections remain covered by that owning request phase",
+      "verification_targets": ["resource_budget_admit", "async_work_handoff_admit", "request_resource_effect_closure", "terminal_sink_gate"]
+    },
+    {
+      "id": "closed-input-grammar-bounds",
+      "disposition": "proved-constant-bound",
+      "paths": [
+        "crates/pcre2/src/lib.rs",
+        "crates/server/src/config.rs",
+        "crates/server/src/config_frontend.rs",
+        "crates/server/src/config_payload.rs",
+        "crates/server/src/glob.rs",
+        "crates/server/src/http_fields.rs",
+        "crates/server/src/scope_policy.rs"
+      ],
+      "evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "verification_targets": ["configuration_payload_refinement", "pcre2_grammar_refinement", "glob_match_resource_admit", "bounded_expansion_append_admit"]
+    },
+    {
+      "id": "fixed-cardinality-administration",
+      "disposition": "proved-constant-bound",
+      "paths": [
+        "crates/server/src/main.rs",
+        "crates/server/src/status.rs"
+      ],
+      "evidence": "administrative parsing is capped by fixed file/argument limits and status rendering iterates only the closed 20-slot/8-byte/3-physical enum sets",
+      "verification_targets": ["service_identity_admit", "resource_shadow_budget_candidate"]
+    },
+    {
+      "id": "bounded-fault-and-fuzz-machines",
+      "disposition": "proved-constant-bound",
+      "paths": [
+        "crates/server/src/fault.rs",
+        "crates/server/src/resource_fuzz.rs"
+      ],
+      "evidence": "these helpers are absent from ordinary release builds or consume fixed-size fuzz inputs and closed resource enums; deterministic terminal checks require every synthetic lease to return to zero",
+      "verification_targets": ["resource_budget_admit", "slow_output_phase_step", "h2_input_phase_step"]
+    }
+  ],
   "resources": [
     {
       "id": "cpu-time",
@@ -82,60 +184,116 @@
       "accounting_apis": ["FilesystemWorkLease", "DiskLease", "SpoolLease", "ResponseBodyReadLease"],
       "verus_targets": ["policy_path_work_admit", "response_body_read_lease_admit", "cache_invalidation_remove_admit"],
       "os_backstop": "filesystem quotas, cgroup io.max and bounded worker pools"
+    },
+    {
+      "id": "network-bandwidth",
+      "attacker_axes": ["request bytes", "response bytes", "proxy retries", "connection concurrency", "compression ratio"],
+      "dynamic_measurements": ["network-namespace receive/transmit byte deltas", "response byte counters", "transport-buffer high-water"],
+      "accounting_apis": ["TransportBufferLease", "ResidentLease", "minimum_progress_rate_admit", "request rate ledgers"],
+      "verus_targets": ["minimum_progress_rate_admit", "compression_stream_read_admit", "h2_control_event_step"],
+      "os_backstop": "traffic control/cgroup BPF byte policy, connection rate limits and upstream quotas"
+    },
+    {
+      "id": "wall-time",
+      "attacker_axes": ["slow input", "slow output", "backend latency", "filesystem latency", "algorithm quality"],
+      "dynamic_measurements": ["monotonic request/workload duration", "scheduler running/waiting time", "timeout and cancellation outcomes"],
+      "accounting_apis": ["SlowInputLease", "SlowOutputLease", "DynamicLease", "FilesystemWorkLease", "AsyncWorkLease"],
+      "verus_targets": ["minimum_progress_rate_admit", "slow_output_phase_step", "h2_input_phase_step", "async_work_handoff_admit"],
+      "os_backstop": "absolute protocol/backend timeouts, cgroup CPU quota and service watchdog"
+    },
+    {
+      "id": "kernel-memory",
+      "attacker_axes": ["socket count", "socket buffer size", "task count", "page tables", "filesystem metadata"],
+      "dynamic_measurements": ["cgroup memory.stat kernel/sock/slab/pagetables", "socket/task/descriptor counts"],
+      "accounting_apis": ["TransportBufferLease", "DescriptorLease", "TaskLease"],
+      "verus_targets": ["resource_budget_admit", "connection_admit"],
+      "os_backstop": "cgroup memory.max, pids.max, RLIMIT_NOFILE and configured socket-buffer ceilings"
+    },
+    {
+      "id": "disk-capacity",
+      "attacker_axes": ["spool bytes", "cache bytes", "log bytes", "OCSP cache bytes", "temporary replacement peaks"],
+      "dynamic_measurements": ["statvfs total/free/min-free bytes for process-visible filesystems", "disk-ledger high-water and rejections"],
+      "accounting_apis": ["DiskLease", "SpoolLease", "cache/log byte rate ledgers"],
+      "verus_targets": ["resource_budget_admit", "cache_invalidation_remove_admit"],
+      "os_backstop": "filesystem/project quota and per-filesystem retained-free-space ledger"
+    },
+    {
+      "id": "filesystem-inodes",
+      "attacker_axes": ["spool files", "cache entries", "temporary replacements", "log files", "directory cardinality"],
+      "dynamic_measurements": ["statvfs total/free/min-free inode counts", "disk-file high-water and rejections"],
+      "accounting_apis": ["DiskLease", "SpoolLease", "cache entry ceilings"],
+      "verus_targets": ["resource_budget_admit", "autoindex_scan_admit"],
+      "os_backstop": "filesystem/project inode quota and per-filesystem retained-free-inode ledger"
+    },
+    {
+      "id": "queue-occupancy",
+      "attacker_axes": ["accepted connections", "blocking jobs", "DNS work", "backend work", "HTTP/2 streams", "queued output"],
+      "dynamic_measurements": ["thread wait channels", "runnable process count", "typed slot and queued-H2 high-water"],
+      "accounting_apis": ["SlotLease", "TaskLease", "AsyncWorkLease", "bounded channels", "QueuedH2TransportLease"],
+      "verus_targets": ["resource_budget_admit", "request_worker_lend_admit", "h2_process_slot_admit", "async_work_handoff_admit"],
+      "os_backstop": "fixed worker pools, bounded channels, listen backlog and cgroup pids.max"
+    },
+    {
+      "id": "lock-occupancy",
+      "attacker_axes": ["cache key contention", "configuration reload", "log serialization", "shared ledger contention"],
+      "dynamic_measurements": ["per-thread futex/rwsem/mutex wait channels", "context switches", "optional perf lock contention"],
+      "accounting_apis": ["bounded critical sections", "striped cache locks", "nonblocking contention fallbacks"],
+      "verus_targets": ["cache_publication_step", "configuration_generation_admit"],
+      "os_backstop": "bounded lock scope, timeout/nonblocking fallbacks and cgroup CPU quota"
     }
   ],
   "effect_families": [
     {
       "id": "heap-allocation",
-      "resources": ["resident-memory", "private-memory", "cpu-time"],
+      "resources": ["resident-memory", "private-memory", "cpu-time", "wall-time"],
       "accounting_markers": ["ResidentLease", "ByteLease", "reserve_resident", "admit_resident", "charge_expansion", "CompressionLease"],
       "description": "Heap allocation, collection capacity growth, cloning into owned storage and whole-input collection."
     },
     {
       "id": "data-growth",
-      "resources": ["resident-memory", "private-memory", "cpu-time", "filesystem-io"],
+      "resources": ["resident-memory", "private-memory", "cpu-time", "filesystem-io", "network-bandwidth", "disk-capacity", "filesystem-inodes"],
       "accounting_markers": ["reserve", "charge", "MAX_", "limit", "admit", "SpoolLease", "DiskLease"],
       "description": "Incremental growth or whole-stream reads/writes whose cost can scale with input."
     },
     {
       "id": "cpu-iteration",
-      "resources": ["cpu-time"],
+      "resources": ["cpu-time", "wall-time"],
       "accounting_markers": ["work_units", "try_expensive", "try_filesystem_work", "policy_budget", "MAX_", "limit", "admit"],
       "description": "Loops and iterator exhaustions that may scale with attacker-selected cardinality."
     },
     {
       "id": "task-process",
-      "resources": ["tasks", "file-descriptors", "pipes", "resident-memory"],
-      "accounting_markers": ["TaskLease", "DynamicLease", "RewriteProgramLease", "try_task", "try_dynamic", "worker"],
+      "resources": ["tasks", "file-descriptors", "pipes", "resident-memory", "kernel-memory", "queue-occupancy"],
+      "accounting_markers": ["TaskLease", "DynamicLease", "AsyncWorkLease", "RewriteProgramLease", "try_task", "try_dynamic", "try_async_work", "spawn_request_worker", "spawn_request_blocking", "worker"],
       "description": "Thread, task, blocking job, subprocess and bounded-channel creation."
     },
     {
       "id": "filesystem",
-      "resources": ["filesystem-io", "file-descriptors", "cpu-time", "resident-memory"],
+      "resources": ["filesystem-io", "file-descriptors", "cpu-time", "resident-memory", "disk-capacity", "filesystem-inodes", "wall-time"],
       "accounting_markers": ["FilesystemWorkLease", "DescriptorLease", "DiskLease", "SpoolLease", "try_filesystem", "try_disk"],
       "description": "Filesystem lookup, directory traversal, metadata, open, read, write, rename and removal."
     },
     {
       "id": "network",
-      "resources": ["sockets", "file-descriptors", "resident-memory", "cpu-time"],
+      "resources": ["sockets", "file-descriptors", "resident-memory", "cpu-time", "network-bandwidth", "kernel-memory", "wall-time"],
       "accounting_markers": ["TransportBufferLease", "DynamicLease", "WebsocketLease", "DescriptorLease", "try_transport", "try_dynamic"],
       "description": "Listener, accepted transport, outbound connection and socket I/O."
     },
     {
       "id": "synchronization",
-      "resources": ["cpu-time", "tasks", "resident-memory"],
-      "accounting_markers": ["SlotLease", "Semaphore", "bounded", "sync_channel", "MAX_", "limit"],
+      "resources": ["cpu-time", "tasks", "resident-memory", "queue-occupancy", "lock-occupancy", "wall-time"],
+      "accounting_markers": ["SlotLease", "AsyncWorkLease", "try_async_work", "Semaphore", "bounded", "sync_channel", "MAX_", "limit"],
       "description": "Locks, channels, semaphores and waits that can retain tasks or create queues."
     },
     {
       "id": "compression-regex-crypto",
-      "resources": ["cpu-time", "resident-memory", "private-memory"],
+      "resources": ["cpu-time", "resident-memory", "private-memory", "wall-time"],
       "accounting_markers": ["CompressionLease", "BcryptLease", "ExpensiveLease", "RegexLease", "resource_admit", "work_units"],
       "description": "Variable-cost algorithms and dependency workspaces."
     },
     {
       "id": "unsafe-ffi-syscall",
-      "resources": ["cpu-time", "resident-memory", "file-descriptors", "filesystem-io", "sockets", "tasks"],
+      "resources": ["cpu-time", "resident-memory", "file-descriptors", "filesystem-io", "sockets", "tasks", "network-bandwidth", "kernel-memory", "disk-capacity", "filesystem-inodes", "queue-occupancy", "lock-occupancy", "wall-time"],
       "accounting_markers": ["httpd_rs_os", "DescriptorLease", "TaskLease", "DiskLease", "TransportBufferLease"],
       "description": "FFI, raw descriptor construction and direct syscalls whose resource effects are not visible to Rust's type system."
     }
@@ -163,8 +321,8 @@
     },
     {
       "component": "Linux kernel and filesystems",
-      "resource": "socket buffers, page cache, dentries, descriptors, task and disk accounting",
-      "warrant": "procfs/cgroup observations, RLIMITs, filesystem child ledgers and service-level cgroup backstops"
+      "resource": "socket buffers, page cache, dentries, descriptors, tasks, scheduler/lock occupancy, network bytes, disk bytes and inodes",
+      "warrant": "procfs scheduler/wait-channel and network-namespace observations, cgroup memory.stat, statvfs headroom, RLIMITs, filesystem child ledgers, quotas and service-level cgroup backstops; counters are observational assumptions rather than application-level attribution proofs"
     }
   ]
 }
