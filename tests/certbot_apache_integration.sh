@@ -131,7 +131,16 @@ if /usr/sbin/httpd-rs-switch --yes >/tmp/custom-control.log 2>&1; then
 fi
 grep -qx 'apache-ctl = /usr/local/sbin/custom-apachectl' \
     /etc/letsencrypt/cli.ini
-rm -f /etc/letsencrypt/cli.ini
+
+# A pre-rename installation wrote these exact Vapache-owned paths. They are
+# project state, not administrator customization, and must migrate in place.
+printf '%s\n' 'apache-ctl = /usr/lib/vapache/certbot-apachectl' \
+    >/etc/letsencrypt/cli.ini
+sed -i '/^key_type = rsa$/a apache_ctl = /usr/lib/vapache/certbot-apachectl' \
+    /etc/letsencrypt/renewal/example.test.conf
+install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+ln -s /usr/lib/vapache/certbot-deploy-hook \
+    /etc/letsencrypt/renewal-hooks/deploy/vapache-reload
 
 # Exercise the switch's persistent renewal migration and hook installation
 # without starting an init system inside this test container.
@@ -172,10 +181,32 @@ grep -qx 'disable --now apache2.service' /tmp/httpd-rs-switch-systemctl.calls
 grep -qx 'disable --now httpd-rs.service' /tmp/httpd-rs-switch-systemctl.calls
 grep -qx 'enable apache2.service' /tmp/httpd-rs-switch-systemctl.calls
 grep -qx 'start apache2.service' /tmp/httpd-rs-switch-systemctl.calls
+test ! -e /etc/systemd/system/httpd.service
+test ! -L /etc/systemd/system/httpd.service
+grep -Eq '^apache-ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachectl$' \
+    /etc/letsencrypt/cli.ini
+grep -Eq '^apache_ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachectl$' \
+    /etc/letsencrypt/renewal/example.test.conf
+test ! -e /etc/letsencrypt/renewal-hooks/deploy/vapache-reload
+test ! -L /etc/letsencrypt/renewal-hooks/deploy/vapache-reload
+
+# Concurrent mode preserves Apache and uses the collision-free project name.
+: >/tmp/httpd-rs-switch-systemctl.calls
+HTTPD_RS_SYSTEMCTL=/tmp/switch-bin/systemctl \
+    /usr/sbin/httpd-rs-switch --yes --concurrent >/tmp/switch-concurrent.log 2>&1
+! grep -qx 'disable --now apache2.service' /tmp/httpd-rs-switch-systemctl.calls
+grep -qx 'enable --now httpd-rs.service' /tmp/httpd-rs-switch-systemctl.calls
+test ! -e /etc/systemd/system/httpd.service
+test ! -L /etc/systemd/system/httpd.service
 
 : >/tmp/httpd-rs-switch-systemctl.calls
 HTTPD_RS_SYSTEMCTL=/tmp/switch-bin/systemctl /usr/sbin/httpd-rs-switch --yes \
     >/tmp/switch.log 2>&1
+grep -qx 'disable --now apache2.service' /tmp/httpd-rs-switch-systemctl.calls
+grep -qx 'enable httpd-rs.service' /tmp/httpd-rs-switch-systemctl.calls
+grep -qx 'start httpd.service' /tmp/httpd-rs-switch-systemctl.calls
+test "$(readlink /etc/systemd/system/httpd.service)" \
+    = /usr/lib/systemd/system/httpd-rs.service
 grep -Eq '^apache_ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachectl$' \
     /etc/letsencrypt/renewal/example.test.conf
 grep -Eq '^apache-ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachectl$' \
@@ -249,7 +280,7 @@ HTTPD_RS_SYSTEMCTL=/tmp/systemctl \
             cat /tmp/certbot.log >&2
             exit 1
         }
-grep -qx 'restart httpd-rs.service' /tmp/httpd-rs-systemctl.calls
+grep -qx 'restart httpd.service' /tmp/httpd-rs-systemctl.calls
 grep -q 'SSLCertificateFile /etc/letsencrypt/live/example.test/fullchain.pem' \
     /etc/apache2/sites-available/example.test-le-ssl.conf
 grep -q 'Include /etc/letsencrypt/options-ssl-apache.conf' \
@@ -351,6 +382,8 @@ dpkg --remove httpd-rs >/tmp/httpd-rs-remove.log 2>&1 || {
 grep -qx 'authenticator = apache' /etc/letsencrypt/renewal/example.test.conf
 test ! -e /etc/letsencrypt/renewal-hooks/deploy/httpd-rs-reload
 test ! -L /etc/letsencrypt/renewal-hooks/deploy/httpd-rs-reload
+test ! -e /etc/systemd/system/httpd.service
+test ! -L /etc/systemd/system/httpd.service
 
 echo 'Certbot Apache installer integration: pass'
 CONTAINER

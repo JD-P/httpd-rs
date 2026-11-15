@@ -99,7 +99,7 @@ host, enable it, and obtain the certificate:
 ```console
 $ sudo a2ensite jenkins.conf
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ sudo certbot certonly --apache --domain ci.example.test
 ```
 
@@ -126,7 +126,7 @@ Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ sudo certbot renew --dry-run
 ```
 

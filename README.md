@@ -360,9 +360,11 @@ no glibc version floor. httpd-rs remains Linux-specific and requires Linux 5.9
 or newer for its fail-closed `openat2` path-resolution and `close_range`
 descriptor-isolation boundaries.
 
-The packages install the server as `/usr/sbin/httpd-rs` and service as
-`httpd-rs.service`, but deliberately leave the existing Apache configuration
-and daemon state untouched. `httpd-rsctl` selects `/etc/apache2/apache2.conf`
+The packages install the server as `/usr/sbin/httpd-rs` and a collision-free
+vendor unit named `httpd-rs.service`, but deliberately leave the existing
+Apache configuration and daemon state untouched. The normal replacement
+switch exposes that unit under the conventional `httpd.service` name without
+overwriting Apache's packaged unit. `httpd-rsctl` selects `/etc/apache2/apache2.conf`
 on Debian-family systems or `/etc/httpd/conf/httpd.conf` on RPM-family
 systems. To validate the existing configuration and interactively switch the
 active daemon:
@@ -371,8 +373,12 @@ active daemon:
 sudo httpd-rs-switch
 ```
 
-The helper shows which Apache service it found and asks before disabling it.
-If httpd-rs fails to start, it restores Apache's previous active/enabled state.
+The helper shows which Apache service it found and asks whether to replace it
+as `httpd.service` (the default) or retain it and run httpd-rs concurrently as
+`httpd-rs.service`. Concurrent configurations must use distinct listener
+addresses or ports; use `--concurrent` for an unattended concurrent switch.
+If httpd-rs fails to start, the helper restores Apache's previous
+active/enabled state.
 Set `HTTPD_RS_CONFDIR` and `HTTPD_RS_CONFIG` to select a nonstandard Apache
 layout. The packaged wrapper materializes enabled-config symlinks and derives
 any capability opt-ins already implied by the Apache configuration into a
@@ -388,7 +394,7 @@ atomically validates and adopts renewed certificate/key pairs while existing
 connections finish on the old TLS generation:
 
 ```sh
-sudo systemctl reload httpd-rs.service
+sudo systemctl reload httpd.service
 ```
 
 The packaged `httpd-rs-switch` detects existing Certbot lineages, installs a
@@ -402,8 +408,9 @@ sudo certbot --apache -d example.com
 
 The shim retains Apache's read-only configuration discovery, requires both
 Apache and httpd-rs syntax checks while httpd-rs is active, and maps Certbot's
-reload request to a root-started `httpd-rs.service` restart so a newly added
-port 443 listener can bind. Webroot and DNS authenticators remain supported.
+reload request to the selected `httpd.service` or `httpd-rs.service` instance
+so a newly added port 443 listener can bind. Webroot and DNS authenticators
+remain supported.
 If `httpd-rs-switch` has not been run, pass
 `--apache-ctl /usr/lib/httpd-rs/certbot-apachectl` explicitly.
 
@@ -424,7 +431,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p httpd-rs-verified
 ```
 
-Current result: **864 verified functions, 0 errors** (percent-decoding,
+Current result: **886 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output

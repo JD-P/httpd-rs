@@ -150,7 +150,7 @@ host, enable it, and obtain the certificate:
 ```console
 $ sudo a2ensite bugzilla.conf
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ sudo certbot certonly --apache --domain bugs.example.test
 ```
 
@@ -191,7 +191,7 @@ Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ sudo certbot renew --dry-run
 ```
 

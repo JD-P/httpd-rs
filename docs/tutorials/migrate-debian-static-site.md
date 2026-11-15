@@ -141,16 +141,18 @@ Run the switch command again and answer `y` after you inspect the plan.
 $ sudo httpd-rs-switch
 ```
 
-The tool disables and stops `apache2.service`. The tool then enables and starts
-`httpd-rs.service`. If httpd-rs does not start, the tool restores the recorded
-Apache active and enabled states.
+Choose the default replacement mode. The tool disables and stops
+`apache2.service`, exposes httpd-rs as `httpd.service`, and starts it. If
+httpd-rs does not start, the tool restores the recorded Apache active and
+enabled states. The alternative concurrent mode uses `httpd-rs.service` and
+requires non-conflicting listeners.
 
 ## 7. Verify httpd-rs
 
 Confirm that the httpd-rs service is active.
 
 ```console
-$ systemctl is-active httpd-rs.service
+$ systemctl is-active httpd.service
 active
 ```
 
@@ -186,11 +188,8 @@ $ curl --silent --show-error --output /dev/null --write-out '%{http_code}\n' \
 
 ## Roll back
 
-Stop and disable httpd-rs.
-
-```console
-$ sudo systemctl disable --now httpd-rs.service
-```
+Follow [Roll back to Apache](../how-to/roll-back-to-apache.md) to stop
+httpd-rs and safely remove only the project-managed `httpd.service` alias.
 
 Restore the active and enabled Apache state that you recorded in step 1. For the
 example state, run:

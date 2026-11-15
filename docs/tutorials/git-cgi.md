@@ -103,7 +103,7 @@ Certbot control shim:
 ```console
 $ sudo a2ensite git.conf
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ sudo certbot certonly --apache --domain git.example.test
 ```
 
@@ -157,7 +157,7 @@ Test the final configuration, reload httpd-rs, and test certificate renewal:
 
 ```console
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -172,7 +172,7 @@ $ git add README.md
 $ git -c user.name='httpd-rs test' -c user.email='test@example.test' \
     commit -m 'Test smart HTTP'
 $ git push -u origin HEAD:main
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ git clone https://alice@git.example.test/git/example.git /tmp/example-check
 $ cat /tmp/example-check/README.md
 httpd-rs smart HTTP test

@@ -30,14 +30,23 @@ Syntax OK
 
 On an RPM-family system, use `sudo httpd -t`. Stop if the test fails.
 
-## 2. Stop httpd-rs
+## 2. Stop httpd-rs and release the default service name
 
-Run:
+For the default replacement mode, run:
 
 ```console
-$ sudo systemctl disable --now httpd-rs.service
+$ sudo systemctl stop httpd.service
+$ test "$(readlink /etc/systemd/system/httpd.service)" = /usr/lib/systemd/system/httpd-rs.service
+$ sudo rm /etc/systemd/system/httpd.service
+$ sudo systemctl daemon-reload
+$ sudo systemctl disable httpd-rs.service
 $ sudo ss -ltnp
 ```
+
+The `test` command must succeed before removing the alias; otherwise stop and
+inspect the administrator-provided `httpd.service`. If the switch used
+`--concurrent`, Apache was never stopped and there is no alias to remove; run
+`sudo systemctl disable --now httpd-rs.service` instead.
 
 Confirm that no httpd-rs process owns the HTTP or HTTPS listener.
 

@@ -37,9 +37,10 @@ elif systemctl_path=$(command -v systemctl 2>/dev/null); then
 else
     exit 0
 fi
+service_name=$(httpd_rs_service_name)
 
 # Certbot runs deploy hooks only after a lineage has actually changed. Do not
 # start httpd-rs or interfere with Apache when httpd-rs is not the active server.
-if "$systemctl_command" is-active --quiet httpd-rs.service 2>/dev/null; then
-    "$systemctl_command" reload httpd-rs.service
+if "$systemctl_command" is-active --quiet "$service_name" 2>/dev/null; then
+    "$systemctl_command" reload "$service_name"
 fi

@@ -136,7 +136,7 @@ host, enable it, and obtain the certificate:
 ```console
 $ sudo a2ensite nextcloud.conf
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ sudo certbot certonly --apache --domain cloud.example.test
 ```
 
@@ -183,7 +183,7 @@ Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -203,7 +203,7 @@ $ curl --fail --user admin -X PROPFIND -H 'Depth: 1' \
 $ curl --fail --user admin -X MOVE \
     -H 'Destination: https://cloud.example.test/remote.php/dav/files/admin/httpd-rs-test/moved.bin' \
     https://cloud.example.test/remote.php/dav/files/admin/httpd-rs-test/original.bin
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ curl --fail --user admin -o /tmp/httpd-rs-nextcloud-check.bin \
     https://cloud.example.test/remote.php/dav/files/admin/httpd-rs-test/moved.bin
 $ cmp /tmp/httpd-rs-nextcloud.bin /tmp/httpd-rs-nextcloud-check.bin

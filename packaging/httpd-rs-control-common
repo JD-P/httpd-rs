@@ -128,3 +128,22 @@ httpd_rs_lock_file_is_safe() {
         httpd_rs_path_is_controlled "$httpd_rs_lf_path" || return 1
     fi
 }
+
+# The package keeps a collision-free vendor unit so it can coexist with an
+# installed Apache package.  Replacement mode installs this exact root-owned
+# alias, giving the active web server the conventional Fedora-style
+# `httpd.service` name without overwriting Apache's vendor unit.  Concurrent
+# mode deliberately leaves the alias absent and uses `httpd-rs.service`.
+httpd_rs_managed_httpd_alias() {
+    httpd_rs_mha_alias=/etc/systemd/system/httpd.service
+    [ -L "$httpd_rs_mha_alias" ] \
+        && [ "$(readlink -- "$httpd_rs_mha_alias")" = /usr/lib/systemd/system/httpd-rs.service ]
+}
+
+httpd_rs_service_name() {
+    if httpd_rs_managed_httpd_alias; then
+        printf '%s\n' httpd.service
+    else
+        printf '%s\n' httpd-rs.service
+    fi
+}

@@ -145,7 +145,7 @@ host, enable it, and obtain the certificate:
 ```console
 $ sudo a2ensite minio.conf
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ sudo certbot certonly --apache --domain s3.example.test
 ```
 
@@ -173,7 +173,7 @@ Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -187,7 +187,7 @@ $ mc alias set httpd-rs-test https://s3.example.test \
 $ mc mb httpd-rs-test/httpd-rs-check
 $ dd if=/dev/urandom of=/tmp/httpd-rs-minio.bin bs=1M count=2
 $ mc cp /tmp/httpd-rs-minio.bin httpd-rs-test/httpd-rs-check/object.bin
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ mc cp httpd-rs-test/httpd-rs-check/object.bin /tmp/httpd-rs-minio-check.bin
 $ cmp /tmp/httpd-rs-minio.bin /tmp/httpd-rs-minio-check.bin
 $ mc ls httpd-rs-test/httpd-rs-check

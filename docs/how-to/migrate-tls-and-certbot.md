@@ -73,7 +73,9 @@ $ sudo httpd-rs-switch
 
 The command shows the Apache service that it found, the number of Certbot
 renewal configurations, and the changes that it will make. Review the plan and
-confirm the switch.
+choose the default replacement as `httpd.service`, or select concurrent mode
+to keep Apache active and use `httpd-rs.service`. Concurrent mode requires
+non-conflicting listener addresses and ports.
 
 The switch makes two Certbot changes:
 
@@ -143,11 +145,11 @@ service interruption.
 Replace the example domain in the printed command, then run:
 
 ```console
-$ sudo systemctl stop httpd-rs.service
+$ sudo systemctl stop httpd.service
 $ sudo certbot certonly --standalone -d www.example.test
 $ sudo httpd-rsctl configtest
 Syntax OK
-$ sudo systemctl start httpd-rs.service
+$ sudo systemctl start httpd.service
 ```
 
 ## 5. How do I verify future renewals?
@@ -156,9 +158,9 @@ Run one renewal test after the switch or after you issue a new certificate:
 
 ```console
 $ sudo certbot renew --dry-run
-$ sudo systemctl is-active httpd-rs.service
+$ sudo systemctl is-active httpd.service
 active
-$ sudo journalctl -u httpd-rs.service --since today
+$ sudo journalctl -u httpd.service --since today
 ```
 
 The renewal test must succeed, and httpd-rs must remain active. After a real

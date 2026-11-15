@@ -217,10 +217,15 @@ jobs:
             echo "package unexpectedly enabled httpd-rs.service" >&2
             exit 1
           fi
-          docker exec "$container" systemctl daemon-reload
-          docker exec "$container" systemctl stop apache2.service
-          docker exec "$container" systemctl start httpd-rs.service
-          docker exec "$container" systemctl is-active --quiet httpd-rs.service
+          docker exec "$container" httpd-rs-switch --yes
+          docker exec "$container" systemctl is-active --quiet httpd.service
+          docker exec "$container" systemctl is-enabled --quiet httpd.service
+          if docker exec "$container" systemctl is-active --quiet apache2.service; then
+            echo "httpd-rs-switch left apache2.service active in replacement mode" >&2
+            exit 1
+          fi
+          test "$(docker exec "$container" readlink /etc/systemd/system/httpd.service)" \
+            = /usr/lib/systemd/system/httpd-rs.service
           served=0
           for attempt in $(seq 1 100); do
             if docker exec "$container" \

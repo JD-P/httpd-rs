@@ -25,21 +25,36 @@ esac
 . "$httpd_rs_switch_common"
 
 assume_yes=false
-case "${1:-}" in
-    -y|--yes)
-        assume_yes=true
-        shift
-        ;;
-    "") ;;
-    *)
-        echo "Usage: httpd-rs-switch [--yes]" >&2
-        exit 2
-        ;;
-esac
-[ "$#" -eq 0 ] || {
-    echo "Usage: httpd-rs-switch [--yes]" >&2
-    exit 2
-}
+run_mode=replace
+run_mode_set=false
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -y|--yes)
+            assume_yes=true
+            ;;
+        --replace)
+            if [ "$run_mode_set" = true ] && [ "$run_mode" != replace ]; then
+                echo "httpd-rs-switch: --replace and --concurrent are mutually exclusive" >&2
+                exit 2
+            fi
+            run_mode=replace
+            run_mode_set=true
+            ;;
+        --concurrent)
+            if [ "$run_mode_set" = true ] && [ "$run_mode" != concurrent ]; then
+                echo "httpd-rs-switch: --replace and --concurrent are mutually exclusive" >&2
+                exit 2
+            fi
+            run_mode=concurrent
+            run_mode_set=true
+            ;;
+        *)
+            echo "Usage: httpd-rs-switch [--yes] [--replace|--concurrent]" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "httpd-rs-switch: run this command as root" >&2
@@ -91,6 +106,13 @@ transition_complete=false
 apache_service=
 apache_active=false
 apache_enabled=false
+legacy_service=vapache.service
+legacy_active=false
+legacy_enabled=false
+service_name=httpd.service
+service_alias=/etc/systemd/system/httpd.service
+service_alias_target=/usr/lib/systemd/system/httpd-rs.service
+service_alias_created=false
 
 restore_switch_state() {
     httpd_rs_switch_status=$?
@@ -100,6 +122,12 @@ restore_switch_state() {
     if [ "$transition_started" = true ] && [ "$transition_complete" != true ]; then
         echo "httpd-rs-switch: restoring the previous web-server service state" >&2
         "$systemctl_command" disable --now httpd-rs.service >/dev/null 2>&1 || true
+        if [ "$service_alias_created" = true ] \
+            && [ -L "$service_alias" ] \
+            && [ "$(readlink -- "$service_alias")" = "$service_alias_target" ]; then
+            rm -f -- "$service_alias"
+            "$systemctl_command" daemon-reload >/dev/null 2>&1 || true
+        fi
         if [ -n "$apache_service" ]; then
             if [ "$apache_enabled" = true ]; then
                 "$systemctl_command" enable "$apache_service" >/dev/null 2>&1 || true
@@ -107,6 +135,12 @@ restore_switch_state() {
             if [ "$apache_active" = true ]; then
                 "$systemctl_command" start "$apache_service" >/dev/null 2>&1 || true
             fi
+        fi
+        if [ "$legacy_enabled" = true ]; then
+            "$systemctl_command" enable "$legacy_service" >/dev/null 2>&1 || true
+        fi
+        if [ "$legacy_active" = true ]; then
+            "$systemctl_command" start "$legacy_service" >/dev/null 2>&1 || true
         fi
     fi
     return "$httpd_rs_switch_status"
@@ -130,6 +164,29 @@ controlled_certbot_directory() {
     httpd_rs_root_path_is_controlled "$certbot_directory"
 }
 
+install_httpd_service_alias() {
+    if [ ! -f "$service_alias_target" ] || [ -L "$service_alias_target" ] \
+        || ! httpd_rs_root_path_is_controlled "$service_alias_target"; then
+        echo "httpd-rs-switch: missing or unsafe service unit: $service_alias_target" >&2
+        exit 1
+    fi
+    if [ -e "$service_alias" ] || [ -L "$service_alias" ]; then
+        if [ -L "$service_alias" ] \
+            && [ "$(readlink -- "$service_alias")" = "$service_alias_target" ]; then
+            return 0
+        fi
+        echo "httpd-rs-switch: refusing to replace custom systemd unit: $service_alias" >&2
+        exit 1
+    fi
+    if [ ! -d /etc/systemd/system ] || [ -L /etc/systemd/system ] \
+        || ! httpd_rs_root_path_is_controlled /etc/systemd/system; then
+        echo "httpd-rs-switch: unsafe systemd configuration directory" >&2
+        exit 1
+    fi
+    ln -s "$service_alias_target" "$service_alias"
+    service_alias_created=true
+}
+
 renewal_uses_apache() {
     grep -Eiq \
         '^[[:space:]]*(authenticator|installer)[[:space:]]*=[[:space:]]*apache([[:space:]]*(#.*)?)?$' \
@@ -138,7 +195,7 @@ renewal_uses_apache() {
 
 renewal_uses_httpd_rs_shim() {
     grep -Eiq \
-        '^[[:space:]]*apache_ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachectl[[:space:]]*$' \
+        '^[[:space:]]*apache_ctl[[:space:]]*=[[:space:]]*/usr/lib/(httpd-rs|vapache)/certbot-apachectl[[:space:]]*$' \
         "$1"
 }
 
@@ -160,7 +217,7 @@ inspect_certbot() {
         fi
         if grep -Ei '^[[:space:]]*apache-ctl[[:space:]]*=' "$certbot_cli_config" \
             | grep -Eiv \
-                '^[[:space:]]*apache-ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachectl[[:space:]]*([#;].*)?$' \
+                '^[[:space:]]*apache-ctl[[:space:]]*=[[:space:]]*/usr/lib/(httpd-rs|vapache)/certbot-apachectl[[:space:]]*([#;].*)?$' \
                 >/dev/null; then
             echo "httpd-rs-switch: $certbot_cli_config already has a custom apache-ctl setting" >&2
             echo "httpd-rs-switch: remove that setting or select the httpd-rs shim yourself" >&2
@@ -294,6 +351,13 @@ configure_certbot() {
         echo "httpd-rs-switch: missing Certbot deploy hook: $certbot_deploy_hook" >&2
         exit 1
     }
+    legacy_hook=/etc/letsencrypt/renewal-hooks/deploy/vapache-reload
+    if [ -L "$legacy_hook" ] \
+        && [ "$(readlink -- "$legacy_hook")" = /usr/lib/vapache/certbot-deploy-hook ]; then
+        rm -f -- "$legacy_hook"
+    elif [ -e "$legacy_hook" ] || [ -L "$legacy_hook" ]; then
+        echo "httpd-rs-switch: leaving non-project legacy Certbot hook untouched: $legacy_hook" >&2
+    fi
     hook=/etc/letsencrypt/renewal-hooks/deploy/httpd-rs-reload
     if [ -e "$hook" ] || [ -L "$hook" ]; then
         if [ ! -L "$hook" ] || [ "$(readlink -- "$hook")" != "$certbot_deploy_hook" ]; then
@@ -328,7 +392,14 @@ configure_certbot() {
 
 inspect_certbot
 
+managed_httpd_alias=false
+if httpd_rs_managed_httpd_alias; then
+    managed_httpd_alias=true
+fi
 for candidate in apache2.service httpd.service; do
+    if [ "$candidate" = httpd.service ] && [ "$managed_httpd_alias" = true ]; then
+        continue
+    fi
     if "$systemctl_command" is-active --quiet "$candidate" 2>/dev/null; then
         apache_service=$candidate
         break
@@ -336,12 +407,46 @@ for candidate in apache2.service httpd.service; do
 done
 for candidate in apache2.service httpd.service; do
     [ -z "$apache_service" ] || break
+    if [ "$candidate" = httpd.service ] && [ "$managed_httpd_alias" = true ]; then
+        continue
+    fi
     if "$systemctl_command" list-unit-files "$candidate" --no-legend 2>/dev/null \
         | grep -q "^$candidate"; then
         apache_service=$candidate
         break
     fi
 done
+
+"$systemctl_command" is-active --quiet "$legacy_service" 2>/dev/null \
+    && legacy_active=true
+"$systemctl_command" is-enabled --quiet "$legacy_service" 2>/dev/null \
+    && legacy_enabled=true
+
+if [ -n "$apache_service" ] && [ "$run_mode_set" != true ] \
+    && [ "$assume_yes" != true ]; then
+    if [ ! -r /dev/tty ]; then
+        echo "httpd-rs-switch: no terminal available; pass --yes or select --replace/--concurrent" >&2
+        exit 1
+    fi
+    echo "Choose how httpd-rs should coexist with the detected Apache service:"
+    echo "  1) Replace Apache and use the conventional httpd.service name (default)."
+    echo "  2) Keep Apache running and use httpd-rs.service concurrently."
+    printf "Mode [1/2, default 1]: " >/dev/tty
+    IFS= read -r mode_answer </dev/tty || mode_answer=
+    case "$mode_answer" in
+        ""|1) run_mode=replace ;;
+        2) run_mode=concurrent ;;
+        *)
+            echo "httpd-rs-switch: invalid mode selection" >&2
+            exit 2
+            ;;
+    esac
+fi
+
+case "$run_mode" in
+    replace) service_name=httpd.service ;;
+    concurrent) service_name=httpd-rs.service ;;
+esac
 
 echo "Checking the existing Apache configuration with httpd-rs..."
 "$httpd_rs_control" configtest
@@ -351,10 +456,23 @@ if [ -n "$apache_service" ]; then
     "$systemctl_command" is-enabled --quiet "$apache_service" && apache_enabled=true
     echo "Detected $apache_service (active=$apache_active, enabled=$apache_enabled)."
     echo "Its configuration files will not be modified."
-    echo "The switch will disable and stop $apache_service, then enable and start httpd-rs.service."
+    if [ "$run_mode" = replace ]; then
+        echo "The switch will disable and stop $apache_service, then expose httpd-rs as httpd.service."
+    else
+        echo "Concurrent mode will leave $apache_service unchanged and start httpd-rs.service."
+        echo "The configurations must use non-conflicting Listen addresses and ports."
+    fi
 else
     echo "No apache2.service or httpd.service unit is installed."
-    echo "The switch will enable and start httpd-rs.service using the detected Apache configuration."
+    if [ "$run_mode" = replace ]; then
+        echo "The switch will expose httpd-rs as httpd.service using the detected Apache configuration."
+    else
+        echo "The switch will enable and start httpd-rs.service."
+    fi
+fi
+if [ "$legacy_active" = true ] || [ "$legacy_enabled" = true ]; then
+    echo "Detected the pre-rename vapache.service (active=$legacy_active, enabled=$legacy_enabled)."
+    echo "The switch will retire that legacy service after validating the replacement."
 fi
 
 if [ "$certbot_present" = true ]; then
@@ -362,7 +480,7 @@ if [ "$certbot_present" = true ]; then
     if [ "$certbot_cli_uses_shim" != true ]; then
         echo "The switch will route Certbot's --apache control commands through httpd-rs's shim."
     fi
-    echo "The shim continues to use Apache when httpd-rs.service is inactive."
+    echo "The shim continues to use Apache when $service_name is inactive."
 fi
 if [ "$certbot_renewals" -gt 0 ]; then
     echo "Detected $certbot_renewals Certbot renewal configuration(s)."
@@ -394,17 +512,37 @@ fi
 configure_certbot
 "$systemctl_command" daemon-reload
 transition_started=true
-if [ -n "$apache_service" ]; then
+if [ "$run_mode" = replace ] && [ -n "$apache_service" ]; then
     if ! "$systemctl_command" disable --now "$apache_service"; then
         echo "httpd-rs-switch: could not disable $apache_service" >&2
         exit 1
     fi
 fi
+if [ "$legacy_active" = true ] || [ "$legacy_enabled" = true ]; then
+    if ! "$systemctl_command" disable --now "$legacy_service"; then
+        echo "httpd-rs-switch: could not retire $legacy_service" >&2
+        exit 1
+    fi
+fi
 
-if "$systemctl_command" enable --now httpd-rs.service; then
-    transition_complete=true
-    echo "httpd-rs.service is enabled and running; the Apache configuration was left unchanged."
-    exit 0
+if [ "$run_mode" = replace ]; then
+    install_httpd_service_alias
+    "$systemctl_command" daemon-reload
+    if ! "$systemctl_command" enable httpd-rs.service; then
+        echo "httpd-rs-switch: could not enable the httpd-rs service unit" >&2
+        exit 1
+    fi
+    if "$systemctl_command" start httpd.service; then
+        transition_complete=true
+        echo "httpd.service is enabled and running httpd-rs; the Apache configuration was left unchanged."
+        exit 0
+    fi
+else
+    if "$systemctl_command" enable --now httpd-rs.service; then
+        transition_complete=true
+        echo "httpd-rs.service is enabled and running concurrently; the Apache service was left unchanged."
+        exit 0
+    fi
 fi
 
 echo "httpd-rs-switch: httpd-rs failed to start" >&2

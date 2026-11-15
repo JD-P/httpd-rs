@@ -44,6 +44,7 @@ elif systemctl_path=$(command -v systemctl 2>/dev/null); then
 else
     systemctl_command=
 fi
+service_name=$(httpd_rs_service_name)
 
 find_apache_control() {
     if [ -n "${HTTPD_RS_APACHECTL_DISCOVERY:-}" ]; then
@@ -74,7 +75,7 @@ require_apache_control() {
 
 httpd_rs_is_active() {
     [ -n "$systemctl_command" ] \
-        && "$systemctl_command" is-active --quiet httpd-rs.service 2>/dev/null
+        && "$systemctl_command" is-active --quiet "$service_name" 2>/dev/null
 }
 
 select_lifecycle_control() {
@@ -111,10 +112,10 @@ run_lifecycle() {
         # listener. A post-drop graceful reload cannot bind that listener, so
         # use the service manager to create a fresh root-started generation.
         case "$action" in
-            graceful|restart) exec "$systemctl_command" restart httpd-rs.service ;;
-            graceful-stop|stop) exec "$systemctl_command" stop httpd-rs.service ;;
-            start) exec "$systemctl_command" start httpd-rs.service ;;
-            status) exec "$systemctl_command" status httpd-rs.service ;;
+            graceful|restart) exec "$systemctl_command" restart "$service_name" ;;
+            graceful-stop|stop) exec "$systemctl_command" stop "$service_name" ;;
+            start) exec "$systemctl_command" start "$service_name" ;;
+            status) exec "$systemctl_command" status "$service_name" ;;
         esac
     fi
     exec "$httpd_rs_control" "$action"

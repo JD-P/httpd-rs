@@ -136,6 +136,9 @@ Architecture: amd64
 Maintainer: httpd-rs project <noreply@github.com>
 Homepage: https://github.com/JD-P/httpd-rs
 Suggests: apache2
+Provides: vapache
+Conflicts: vapache
+Replaces: vapache
 Description: Apache-compatible web server with a security-focused core
  httpd-rs reads an existing Apache configuration and serves it through the
  httpd-rs daemon. This package leaves Apache configuration and service state
@@ -166,8 +169,17 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset CDPATH ENV BASH_ENV
 umask 022
-if [ "${1:-}" = remove ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now httpd-rs.service >/dev/null 2>&1 || true
+if [ "${1:-}" = remove ]; then
+    if [ -L /etc/systemd/system/httpd.service ] \
+        && [ "$(readlink -- /etc/systemd/system/httpd.service)" = /usr/lib/systemd/system/httpd-rs.service ]; then
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop httpd.service >/dev/null 2>&1 || true
+        fi
+        rm -f -- /etc/systemd/system/httpd.service
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now httpd-rs.service >/dev/null 2>&1 || true
+    fi
 fi
 if [ "${1:-}" = remove ] && [ -x /usr/lib/httpd-rs/certbot-cleanup ]; then
     /usr/lib/httpd-rs/certbot-cleanup || \
@@ -231,6 +243,8 @@ Source10:       LICENSE
 BuildArch:      x86_64
 AutoReqProv:    no
 Suggests:       httpd
+Provides:       vapache
+Obsoletes:      vapache < %{version}-%{release}
 %global __os_install_post %{nil}
 
 %description
@@ -276,8 +290,17 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset CDPATH ENV BASH_ENV
 umask 022
-if [ \$1 -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now httpd-rs.service >/dev/null 2>&1 || :
+if [ \$1 -eq 0 ]; then
+    if [ -L /etc/systemd/system/httpd.service ] \
+        && [ "\$(readlink -- /etc/systemd/system/httpd.service)" = /usr/lib/systemd/system/httpd-rs.service ]; then
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop httpd.service >/dev/null 2>&1 || :
+        fi
+        rm -f -- /etc/systemd/system/httpd.service
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now httpd-rs.service >/dev/null 2>&1 || :
+    fi
 fi
 if [ \$1 -eq 0 ] && [ -x /usr/lib/httpd-rs/certbot-cleanup ]; then
     /usr/lib/httpd-rs/certbot-cleanup || \

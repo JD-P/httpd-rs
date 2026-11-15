@@ -93,7 +93,7 @@ capability declaration. Run:
 
 ```console
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 ```
 
 Keep the old access files until the deployment is accepted. Their presence has

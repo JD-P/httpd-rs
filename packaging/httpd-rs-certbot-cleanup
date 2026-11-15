@@ -26,6 +26,7 @@ esac
 
 config_root=${HTTPD_RS_CERTBOT_CONFIG_ROOT:-/etc/letsencrypt}
 shim=/usr/lib/httpd-rs/certbot-apachectl
+legacy_shim=/usr/lib/vapache/certbot-apachectl
 owner=$(id -u)
 temporary=
 
@@ -75,14 +76,16 @@ clean_file() {
     temporary=$(mktemp "$file.httpd-rs-remove.XXXXXX")
     case "$kind" in
         cli)
-            awk -v value="$shim" '
+            awk -v value="$shim" -v legacy="$legacy_shim" '
                 $0 ~ "^[[:space:]]*apache-ctl[[:space:]]*=[[:space:]]*" value "[[:space:]]*([#;].*)?$" { next }
+                $0 ~ "^[[:space:]]*apache-ctl[[:space:]]*=[[:space:]]*" legacy "[[:space:]]*([#;].*)?$" { next }
                 { print }
             ' "$file" >"$temporary"
             ;;
         renewal)
-            awk -v value="$shim" '
+            awk -v value="$shim" -v legacy="$legacy_shim" '
                 $0 ~ "^[[:space:]]*apache_ctl[[:space:]]*=[[:space:]]*" value "[[:space:]]*$" { next }
+                $0 ~ "^[[:space:]]*apache_ctl[[:space:]]*=[[:space:]]*" legacy "[[:space:]]*$" { next }
                 { print }
             ' "$file" >"$temporary"
             ;;
@@ -120,4 +123,12 @@ elif [ -L "$hook" ] && [ "$(readlink -- "$hook")" = /usr/lib/httpd-rs/certbot-de
     rm -f -- "$hook"
 elif [ -e "$hook" ] || [ -L "$hook" ]; then
     echo "httpd-rs: leaving non-httpd-rs Certbot hook untouched: $hook" >&2
+fi
+
+legacy_hook=$config_root/renewal-hooks/deploy/vapache-reload
+if [ -L "$legacy_hook" ] \
+    && [ "$(readlink -- "$legacy_hook")" = /usr/lib/vapache/certbot-deploy-hook ]; then
+    rm -f -- "$legacy_hook"
+elif [ -e "$legacy_hook" ] || [ -L "$legacy_hook" ]; then
+    echo "httpd-rs: leaving non-project legacy Certbot hook untouched: $legacy_hook" >&2
 fi

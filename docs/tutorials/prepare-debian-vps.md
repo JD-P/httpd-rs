@@ -65,9 +65,9 @@ $ systemctl is-enabled apache2.service
 disabled
 $ systemctl is-active apache2.service
 inactive
-$ systemctl is-enabled httpd-rs.service
+$ systemctl is-enabled httpd.service
 enabled
-$ systemctl is-active httpd-rs.service
+$ systemctl is-active httpd.service
 active
 ```
 

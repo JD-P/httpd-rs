@@ -141,7 +141,7 @@ host, enable it, and obtain the certificate:
 ```console
 $ sudo a2ensite gitea.conf
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ sudo certbot certonly --apache --domain git.example.test
 ```
 
@@ -168,7 +168,7 @@ Test the configuration, reload httpd-rs, and verify renewal:
 
 ```console
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ sudo certbot renew --dry-run
 ```
 
@@ -192,7 +192,7 @@ $ printf '%s\n' 'httpd-rs Gitea test' > httpd-rs-test.txt
 $ git add httpd-rs-test.txt
 $ git commit -m 'Test Gitea through httpd-rs'
 $ git push
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ git clone https://git.example.test/gitea/alice/example.git /tmp/gitea-check
 ```
 

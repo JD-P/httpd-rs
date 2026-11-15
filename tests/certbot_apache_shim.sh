@@ -112,14 +112,18 @@ mkdir -p "$config_root/renewal" "$config_root/renewal-hooks/deploy"
 cat >"$config_root/cli.ini" <<'EOF'
 email = admin@example.test
 apache-ctl = /usr/lib/httpd-rs/certbot-apachectl
+apache-ctl = /usr/lib/vapache/certbot-apachectl
 EOF
 cat >"$config_root/renewal/example.test.conf" <<'EOF'
 [renewalparams]
 authenticator = apache
 apache_ctl = /usr/lib/httpd-rs/certbot-apachectl
+apache_ctl = /usr/lib/vapache/certbot-apachectl
 EOF
 ln -s /usr/lib/httpd-rs/certbot-deploy-hook \
     "$config_root/renewal-hooks/deploy/httpd-rs-reload"
+ln -s /usr/lib/vapache/certbot-deploy-hook \
+    "$config_root/renewal-hooks/deploy/vapache-reload"
 HTTPD_RS_CERTBOT_CONFIG_ROOT=$config_root "$cleanup_helper"
 grep -qx 'email = admin@example.test' "$config_root/cli.ini"
 ! grep -q 'apache-ctl' "$config_root/cli.ini"
@@ -127,5 +131,7 @@ grep -qx 'authenticator = apache' "$config_root/renewal/example.test.conf"
 ! grep -q 'apache_ctl' "$config_root/renewal/example.test.conf"
 [ ! -e "$config_root/renewal-hooks/deploy/httpd-rs-reload" ]
 [ ! -L "$config_root/renewal-hooks/deploy/httpd-rs-reload" ]
+[ ! -e "$config_root/renewal-hooks/deploy/vapache-reload" ]
+[ ! -L "$config_root/renewal-hooks/deploy/vapache-reload" ]
 
 echo 'certbot Apache control shim: pass'

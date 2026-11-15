@@ -91,7 +91,7 @@ Run:
 
 ```console
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 $ curl --fail --show-error --head https://app.example.test/
 ```
 

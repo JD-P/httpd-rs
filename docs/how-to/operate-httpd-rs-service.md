@@ -9,6 +9,10 @@ contracts: DOC-HOWTO-SERVICE-001
 
 Use this procedure for the packaged systemd service.
 
+The normal replacement switch uses `httpd.service`. If you selected
+`httpd-rs-switch --concurrent`, substitute `httpd-rs.service` in every command
+below.
+
 ## Prerequisites
 
 Install the httpd-rs package and use a systemd-based host. Obtain administrative
@@ -19,16 +23,16 @@ access and the configured error-log path.
 Run:
 
 ```console
-$ sudo systemctl status httpd-rs.service
+$ sudo systemctl status httpd.service
 $ sudo httpd-rsctl status
-$ sudo journalctl -u httpd-rs.service --since today
+$ sudo journalctl -u httpd.service --since today
 ```
 
 If the service is inactive, run the configuration test before you start it:
 
 ```console
 $ sudo httpd-rsctl configtest
-$ sudo systemctl start httpd-rs.service
+$ sudo systemctl start httpd.service
 ```
 
 ## Reload configuration
@@ -37,7 +41,7 @@ Run the test and reload:
 
 ```console
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 ```
 
 Existing accepted connections can complete with the configuration that
@@ -48,7 +52,7 @@ file, server root, listen backlog, and CGI execution policy. When the
 diagnostic requires a restart, run:
 
 ```console
-$ sudo systemctl restart httpd-rs.service
+$ sudo systemctl restart httpd.service
 ```
 
 Plan the restart as a listener interruption.
@@ -58,7 +62,7 @@ Plan the restart as a listener interruption.
 Rotate configured log files. Then signal only the service main process:
 
 ```console
-$ sudo systemctl kill --kill-who=main --signal=USR1 httpd-rs.service
+$ sudo systemctl kill --kill-who=main --signal=USR1 httpd.service
 ```
 
 httpd-rs reopens its configured logs after `SIGUSR1`. Confirm that new requests
@@ -69,7 +73,7 @@ write to the new file. Do not use a process-name pattern to send the signal.
 For a managed service, run:
 
 ```console
-$ sudo systemctl stop httpd-rs.service
+$ sudo systemctl stop httpd.service
 ```
 
 For direct control outside systemd, use `sudo httpd-rsctl graceful-stop`.
@@ -82,8 +86,8 @@ Run these checks in order:
 
 ```console
 $ sudo httpd-rsctl configtest
-$ sudo systemctl status httpd-rs.service
-$ sudo journalctl -u httpd-rs.service -b --no-pager
+$ sudo systemctl status httpd.service
+$ sudo journalctl -u httpd.service -b --no-pager
 $ sudo ss -ltnp
 ```
 

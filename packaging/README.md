@@ -33,9 +33,12 @@ present as a directive in `httpd.conf`.
 
 Installation does not enable or start httpd-rs and does not stop Apache. Run
 `sudo httpd-rs-switch` when ready. The helper validates the configuration,
-shows which Apache service it found, asks for confirmation, and only then
-disables/stops Apache and enables/starts httpd-rs. If httpd-rs fails to start,
-the helper restores Apache's previous active/enabled state.
+shows which Apache service it found, and offers two modes. The default disables
+Apache and exposes the packaged unit as `httpd.service`; concurrent mode keeps
+Apache running and uses `httpd-rs.service`, requiring non-conflicting listener
+addresses or ports. Use `--yes` for an unattended default replacement or
+`--yes --concurrent` for an unattended concurrent start. If httpd-rs fails to
+start, the helper restores Apache's previous active/enabled state.
 
 The service retains systemd's namespace, privilege, kernel, and filesystem
 hardening, but deliberately does not set `RestrictSUIDSGID=true`: systemd
@@ -45,7 +48,7 @@ package workflow boots Debian 13 under systemd and serves a real request so
 the unit's syscall policy is tested rather than merely syntax-checked.
 
 When a Certbot installation or configuration exists, `httpd-rs-switch` installs
-a deploy hook that reloads httpd-rs only while `httpd-rs.service` is active.
+a deploy hook that reloads httpd-rs only while its selected service is active.
 Renewal configurations using `authenticator = apache` or `installer = apache`
 are updated to select `/usr/lib/httpd-rs/certbot-apachectl`. The same path is set
 in Certbot's `cli.ini`, so new `certbot --apache` commands select it too. The shim
@@ -73,6 +76,11 @@ Without first running `httpd-rs-switch`, pass
 `--apache-ctl /usr/lib/httpd-rs/certbot-apachectl` explicitly.
 Package removal deletes only these exact httpd-rs settings and hook from
 Certbot's configuration, so it does not leave a dangling control path.
+
+Upgrades from the former `vapache` package are recognized explicitly. The
+switch migrates its exact Certbot control paths and deploy-hook symlink instead
+of treating them as administrator customizations, retires `vapache.service`,
+and the Debian/RPM metadata replaces or obsoletes the old package name.
 
 The release binary targets `x86_64-unknown-linux-musl` and is a static PIE. It
 therefore has no glibc version floor. httpd-rs still requires Linux 5.9 or newer

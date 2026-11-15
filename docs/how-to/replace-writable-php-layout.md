@@ -96,7 +96,7 @@ Run:
 
 ```console
 $ sudo httpd-rsctl configtest
-$ sudo systemctl reload httpd-rs.service
+$ sudo systemctl reload httpd.service
 ```
 
 Test login, uploads, generated files, and application jobs. Request a test
