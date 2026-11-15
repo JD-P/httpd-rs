@@ -33,12 +33,14 @@ present as a directive in `httpd.conf`.
 
 Installation does not enable or start httpd-rs and does not stop Apache. Run
 `sudo httpd-rs-switch` when ready. The helper validates the configuration,
-shows which Apache service it found, and offers two modes. The default disables
-Apache and exposes the packaged unit as `httpd.service`; concurrent mode keeps
-Apache running and uses `httpd-rs.service`, requiring non-conflicting listener
-addresses or ports. Use `--yes` for an unattended default replacement or
-`--yes --concurrent` for an unattended concurrent start. If httpd-rs fails to
-start, the helper restores Apache's previous active/enabled state.
+shows which Apache service it found, and uses `httpd.service` whenever that
+systemd name is free. An existing `httpd.service` triggers a choice between
+replacing it under that name or retaining it and using `httpd-rs.service`.
+Thus Debian's differently named `apache2.service` does not trigger the naming
+question. Concurrent mode keeps Apache running and requires non-conflicting
+listener addresses or ports. Use `--yes` for an unattended default replacement
+or `--yes --concurrent` for an unattended concurrent start. If httpd-rs fails
+to start, the helper restores Apache's previous active/enabled state.
 
 The service retains systemd's namespace, privilege, kernel, and filesystem
 hardening, but deliberately does not set `RestrictSUIDSGID=true`: systemd

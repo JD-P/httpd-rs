@@ -373,9 +373,11 @@ active daemon:
 sudo httpd-rs-switch
 ```
 
-The helper shows which Apache service it found and asks whether to replace it
-as `httpd.service` (the default) or retain it and run httpd-rs concurrently as
-`httpd-rs.service`. Concurrent configurations must use distinct listener
+The helper uses `httpd.service` automatically when that systemd name is free.
+Only an existing `httpd.service` causes a naming choice: replace it under the
+conventional name (the default), or retain it and run httpd-rs concurrently as
+`httpd-rs.service`. Debian's `apache2.service` therefore does not cause a
+service-name prompt. Concurrent configurations must use distinct listener
 addresses or ports; use `--concurrent` for an unattended concurrent switch.
 If httpd-rs fails to start, the helper restores Apache's previous
 active/enabled state.

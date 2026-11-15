@@ -156,10 +156,18 @@ if [ -e /tmp/httpd-rs-switch-interrupt ] \
 fi
 case "$1" in
     is-active|is-enabled)
-        [ "${3:-}" = apache2.service ]
+        if [ -e /tmp/httpd-rs-switch-httpd-present ]; then
+            [ "${3:-}" = httpd.service ]
+        else
+            [ "${3:-}" = apache2.service ]
+        fi
         ;;
     list-unit-files)
-        [ "${2:-}" = apache2.service ] && echo 'apache2.service enabled'
+        if [ -e /tmp/httpd-rs-switch-httpd-present ]; then
+            [ "${2:-}" = httpd.service ] && echo 'httpd.service enabled'
+        else
+            [ "${2:-}" = apache2.service ] && echo 'apache2.service enabled'
+        fi
         exit 0
         ;;
     daemon-reload|disable|enable|start|stop|restart) exit 0 ;;
@@ -190,14 +198,40 @@ grep -Eq '^apache_ctl[[:space:]]*=[[:space:]]*/usr/lib/httpd-rs/certbot-apachect
 test ! -e /etc/letsencrypt/renewal-hooks/deploy/vapache-reload
 test ! -L /etc/letsencrypt/renewal-hooks/deploy/vapache-reload
 
-# Concurrent mode preserves Apache and uses the collision-free project name.
+# With no name collision, concurrent mode preserves Apache while retaining the
+# conventional httpd.service name for httpd-rs.
 : >/tmp/httpd-rs-switch-systemctl.calls
 HTTPD_RS_SYSTEMCTL=/tmp/switch-bin/systemctl \
     /usr/sbin/httpd-rs-switch --yes --concurrent >/tmp/switch-concurrent.log 2>&1
 ! grep -qx 'disable --now apache2.service' /tmp/httpd-rs-switch-systemctl.calls
+grep -qx 'enable httpd-rs.service' /tmp/httpd-rs-switch-systemctl.calls
+grep -qx 'start httpd.service' /tmp/httpd-rs-switch-systemctl.calls
+test "$(readlink /etc/systemd/system/httpd.service)" \
+    = /usr/lib/systemd/system/httpd-rs.service
+
+# An actual httpd.service collision is the condition that moves a concurrent
+# httpd-rs daemon to the project-specific service name.
+rm -f /etc/systemd/system/httpd.service
+touch /tmp/httpd-rs-switch-httpd-present
+: >/tmp/httpd-rs-switch-systemctl.calls
+HTTPD_RS_SYSTEMCTL=/tmp/switch-bin/systemctl \
+    /usr/sbin/httpd-rs-switch --yes --concurrent >/tmp/switch-httpd-collision.log 2>&1
+! grep -qx 'disable --now httpd.service' /tmp/httpd-rs-switch-systemctl.calls
 grep -qx 'enable --now httpd-rs.service' /tmp/httpd-rs-switch-systemctl.calls
 test ! -e /etc/systemd/system/httpd.service
 test ! -L /etc/systemd/system/httpd.service
+
+# Replacement mode deliberately takes over an occupied vendor name.
+: >/tmp/httpd-rs-switch-systemctl.calls
+HTTPD_RS_SYSTEMCTL=/tmp/switch-bin/systemctl \
+    /usr/sbin/httpd-rs-switch --yes --replace >/tmp/switch-httpd-replace.log 2>&1
+grep -qx 'disable --now httpd.service' /tmp/httpd-rs-switch-systemctl.calls
+grep -qx 'enable httpd-rs.service' /tmp/httpd-rs-switch-systemctl.calls
+grep -qx 'start httpd.service' /tmp/httpd-rs-switch-systemctl.calls
+test "$(readlink /etc/systemd/system/httpd.service)" \
+    = /usr/lib/systemd/system/httpd-rs.service
+rm -f /etc/systemd/system/httpd.service
+rm -f /tmp/httpd-rs-switch-httpd-present
 
 : >/tmp/httpd-rs-switch-systemctl.calls
 HTTPD_RS_SYSTEMCTL=/tmp/switch-bin/systemctl /usr/sbin/httpd-rs-switch --yes \

@@ -144,8 +144,9 @@ $ sudo httpd-rs-switch
 Choose the default replacement mode. The tool disables and stops
 `apache2.service`, exposes httpd-rs as `httpd.service`, and starts it. If
 httpd-rs does not start, the tool restores the recorded Apache active and
-enabled states. The alternative concurrent mode uses `httpd-rs.service` and
-requires non-conflicting listeners.
+enabled states. Because Debian leaves `httpd.service` free, the alternative
+concurrent mode retains that name for httpd-rs and requires non-conflicting
+listeners.
 
 ## 7. Verify httpd-rs
 

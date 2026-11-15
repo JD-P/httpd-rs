@@ -130,10 +130,10 @@ httpd_rs_lock_file_is_safe() {
 }
 
 # The package keeps a collision-free vendor unit so it can coexist with an
-# installed Apache package.  Replacement mode installs this exact root-owned
-# alias, giving the active web server the conventional Fedora-style
-# `httpd.service` name without overwriting Apache's vendor unit.  Concurrent
-# mode deliberately leaves the alias absent and uses `httpd-rs.service`.
+# installed Apache package. This exact root-owned alias gives the Rust daemon
+# the conventional Fedora-style `httpd.service` name without overwriting an
+# Apache vendor unit. Concurrent mode uses it too when the name is free, and
+# falls back to `httpd-rs.service` only to preserve an existing `httpd.service`.
 httpd_rs_managed_httpd_alias() {
     httpd_rs_mha_alias=/etc/systemd/system/httpd.service
     [ -L "$httpd_rs_mha_alias" ] \

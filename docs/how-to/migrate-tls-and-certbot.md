@@ -72,10 +72,10 @@ $ sudo httpd-rs-switch
 ```
 
 The command shows the Apache service that it found, the number of Certbot
-renewal configurations, and the changes that it will make. Review the plan and
-choose the default replacement as `httpd.service`, or select concurrent mode
-to keep Apache active and use `httpd-rs.service`. Concurrent mode requires
-non-conflicting listener addresses and ports.
+renewal configurations, and the changes that it will make. It selects
+`httpd.service` automatically when that name is free. Only a pre-existing
+`httpd.service` prompts you to replace it or preserve it and use
+`httpd-rs.service` concurrently. Concurrent listeners must not conflict.
 
 The switch makes two Certbot changes:
 

@@ -113,6 +113,8 @@ service_name=httpd.service
 service_alias=/etc/systemd/system/httpd.service
 service_alias_target=/usr/lib/systemd/system/httpd-rs.service
 service_alias_created=false
+httpd_name_occupied=false
+use_httpd_alias=true
 
 restore_switch_state() {
     httpd_rs_switch_status=$?
@@ -396,6 +398,13 @@ managed_httpd_alias=false
 if httpd_rs_managed_httpd_alias; then
     managed_httpd_alias=true
 fi
+if [ "$managed_httpd_alias" != true ]; then
+    if "$systemctl_command" is-active --quiet httpd.service 2>/dev/null \
+        || "$systemctl_command" list-unit-files httpd.service --no-legend 2>/dev/null \
+            | grep -q '^httpd\.service'; then
+        httpd_name_occupied=true
+    fi
+fi
 for candidate in apache2.service httpd.service; do
     if [ "$candidate" = httpd.service ] && [ "$managed_httpd_alias" = true ]; then
         continue
@@ -422,15 +431,16 @@ done
 "$systemctl_command" is-enabled --quiet "$legacy_service" 2>/dev/null \
     && legacy_enabled=true
 
-if [ -n "$apache_service" ] && [ "$run_mode_set" != true ] \
+if [ "$httpd_name_occupied" = true ] && [ "$run_mode_set" != true ] \
     && [ "$assume_yes" != true ]; then
     if [ ! -r /dev/tty ]; then
         echo "httpd-rs-switch: no terminal available; pass --yes or select --replace/--concurrent" >&2
         exit 1
     fi
-    echo "Choose how httpd-rs should coexist with the detected Apache service:"
-    echo "  1) Replace Apache and use the conventional httpd.service name (default)."
-    echo "  2) Keep Apache running and use httpd-rs.service concurrently."
+    echo "The systemd name httpd.service is already occupied."
+    echo "Choose how httpd-rs should use that service name:"
+    echo "  1) Replace the existing service and use httpd.service (default)."
+    echo "  2) Preserve it and use httpd-rs.service concurrently."
     printf "Mode [1/2, default 1]: " >/dev/tty
     IFS= read -r mode_answer </dev/tty || mode_answer=
     case "$mode_answer" in
@@ -443,10 +453,10 @@ if [ -n "$apache_service" ] && [ "$run_mode_set" != true ] \
     esac
 fi
 
-case "$run_mode" in
-    replace) service_name=httpd.service ;;
-    concurrent) service_name=httpd-rs.service ;;
-esac
+if [ "$httpd_name_occupied" = true ] && [ "$run_mode" = concurrent ]; then
+    use_httpd_alias=false
+    service_name=httpd-rs.service
+fi
 
 echo "Checking the existing Apache configuration with httpd-rs..."
 "$httpd_rs_control" configtest
@@ -459,7 +469,7 @@ if [ -n "$apache_service" ]; then
     if [ "$run_mode" = replace ]; then
         echo "The switch will disable and stop $apache_service, then expose httpd-rs as httpd.service."
     else
-        echo "Concurrent mode will leave $apache_service unchanged and start httpd-rs.service."
+        echo "Concurrent mode will leave $apache_service unchanged and start $service_name."
         echo "The configurations must use non-conflicting Listen addresses and ports."
     fi
 else
@@ -467,7 +477,7 @@ else
     if [ "$run_mode" = replace ]; then
         echo "The switch will expose httpd-rs as httpd.service using the detected Apache configuration."
     else
-        echo "The switch will enable and start httpd-rs.service."
+        echo "The switch will enable and start $service_name."
     fi
 fi
 if [ "$legacy_active" = true ] || [ "$legacy_enabled" = true ]; then
@@ -525,7 +535,7 @@ if [ "$legacy_active" = true ] || [ "$legacy_enabled" = true ]; then
     fi
 fi
 
-if [ "$run_mode" = replace ]; then
+if [ "$use_httpd_alias" = true ]; then
     install_httpd_service_alias
     "$systemctl_command" daemon-reload
     if ! "$systemctl_command" enable httpd-rs.service; then
@@ -534,7 +544,11 @@ if [ "$run_mode" = replace ]; then
     fi
     if "$systemctl_command" start httpd.service; then
         transition_complete=true
-        echo "httpd.service is enabled and running httpd-rs; the Apache configuration was left unchanged."
+        if [ "$run_mode" = concurrent ]; then
+            echo "httpd.service is enabled and running httpd-rs concurrently; the Apache service was left unchanged."
+        else
+            echo "httpd.service is enabled and running httpd-rs; the Apache configuration was left unchanged."
+        fi
         exit 0
     fi
 else

@@ -9,9 +9,9 @@ contracts: DOC-HOWTO-SERVICE-001
 
 Use this procedure for the packaged systemd service.
 
-The normal replacement switch uses `httpd.service`. If you selected
-`httpd-rs-switch --concurrent`, substitute `httpd-rs.service` in every command
-below.
+The switch normally uses `httpd.service`, including concurrent mode on systems
+where that name is free. If concurrent mode preserved a pre-existing
+`httpd.service`, substitute `httpd-rs.service` in every command below.
 
 ## Prerequisites
 

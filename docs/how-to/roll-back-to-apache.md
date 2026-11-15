@@ -43,10 +43,12 @@ $ sudo systemctl disable httpd-rs.service
 $ sudo ss -ltnp
 ```
 
-The `test` command must succeed before removing the alias; otherwise stop and
-inspect the administrator-provided `httpd.service`. If the switch used
-`--concurrent`, Apache was never stopped and there is no alias to remove; run
-`sudo systemctl disable --now httpd-rs.service` instead.
+The `test` command must succeed before removing the alias; otherwise do not
+remove `httpd.service`. A concurrent switch uses this same alias when the name
+was free. Only collision-preserving concurrent mode uses `httpd-rs.service`;
+in that case Apache was never stopped, so run
+`sudo systemctl disable --now httpd-rs.service` and leave the pre-existing
+`httpd.service` untouched.
 
 Confirm that no httpd-rs process owns the HTTP or HTTPS listener.
 
