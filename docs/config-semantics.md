@@ -2309,8 +2309,13 @@ construction: there is no second production interleaver.
   count and rendered-byte growth, so checked subtraction establishes the
   configured ceiling before allocation.
 - `bcrypt_cost_admit` rejects bcrypt costs outside 4..=17 before invoking the
-  password library. SHA/SSHA and MD5-crypt verification compares the complete
-  fixed representation in constant time, while bcrypt uses its verifier.
+  password library. The SSHA parser caps the encoded record before decoding,
+  and `ssha_salt_admit` caps the decoded salt at 64 bytes during both startup
+  and mutable-file validation. The operator-controlled suffix rehashed by
+  every remote attempt is therefore a proved constant rather than inheriting
+  the 4 MiB authentication-file ceiling. SHA/SSHA and MD5-crypt verification
+  compares the complete fixed representation in constant time, while bcrypt
+  uses its verifier.
   Password files are typed and validated once, require a uniform verifier
   profile, and select a generation-local real or dummy record before entering
   the common verification boundary. Bcrypt's CPU ledger charges `2^(cost-5)`

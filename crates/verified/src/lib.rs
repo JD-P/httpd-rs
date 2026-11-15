@@ -2818,6 +2818,27 @@ pub proof fn bcrypt_extreme_cost_rejected(cost: u32)
 {
 }
 
+/// RFC 2307 does not assign a useful upper bound to the bytes following an
+/// SSHA digest, but the complete suffix is hashed for every authentication
+/// attempt. Keep that operator-controlled input small enough to be a proved
+/// constant-cost verifier rather than inheriting the multi-megabyte password
+/// file ceiling as remote request work.
+pub open spec fn ssha_salt_spec(salt_bytes: u64, limit: u64) -> bool {
+    salt_bytes <= limit
+}
+
+pub fn ssha_salt_admit(salt_bytes: u64, limit: u64) -> (ok: bool)
+    ensures ok == ssha_salt_spec(salt_bytes, limit),
+{
+    salt_bytes <= limit
+}
+
+pub proof fn ssha_oversize_salt_rejected(salt_bytes: u64, limit: u64)
+    requires salt_bytes > limit,
+    ensures !ssha_salt_spec(salt_bytes, limit),
+{
+}
+
 /// PCRE compatibility is retained only for bounded patterns and subjects.
 /// This bounds per-match allocation independently of the global CPU-work
 /// admission gate.

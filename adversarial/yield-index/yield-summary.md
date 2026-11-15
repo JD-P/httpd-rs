@@ -35,11 +35,11 @@ number but not the trend.
 
 | Search hours | Searches | Confirmed findings | Findings/hour | Raw impact points | Composition-adjusted points | Adversarial yield |
 |---:|---:|---:|---:|---:|---:|---:|
-| 19.504 | 50 | 144 | 7.38 | 59076.0 | 17331.0 | **888.60** |
+| 19.626 | 51 | 145 | 7.39 | 59077.0 | 17332.0 | **883.12** |
 
-Impact tiers: critical 53, high 58, medium 27, low 6.
+Impact tiers: critical 53, high 58, medium 27, low 7.
 
-Recovered unintended-behavior counts: 1 behaviors: 5 findings, 2 behaviors: 79 findings, 3 behaviors: 37 findings, 4 behaviors: 23 findings.
+Recovered unintended-behavior counts: 1 behaviors: 6 findings, 2 behaviors: 79 findings, 3 behaviors: 37 findings, 4 behaviors: 23 findings.
 
 ## Trend graphs
 
@@ -51,17 +51,17 @@ a controlled estimate of vulnerabilities remaining.
 ```mermaid
 xychart-beta
     title "Confirmed findings per search-hour"
-    x-axis ["S01-S10", "S11-S20", "S21-S30", "S31-S40", "S41-S50"]
+    x-axis ["S01-S10", "S11-S20", "S21-S30", "S31-S40", "S41-S50", "S51-S51"]
     y-axis "Findings/hour" 0 --> 30
-    line [25.67, 10.40, 6.95, 3.71, 2.66]
+    line [25.67, 10.40, 6.95, 3.71, 2.66, 8.18]
 ```
 
 ```mermaid
 xychart-beta
     title "Severity/composition-adjusted yield per search-hour"
-    x-axis ["S01-S10", "S11-S20", "S21-S30", "S31-S40", "S41-S50"]
+    x-axis ["S01-S10", "S11-S20", "S21-S30", "S31-S40", "S41-S50", "S51-S51"]
     y-axis "Adjusted points/hour" 0 --> 2000
-    line [1854.04, 1627.05, 527.95, 808.22, 300.78]
+    line [1854.04, 1627.05, 527.95, 808.22, 300.78, 8.18]
 ```
 
 ### Contribution by primary family
@@ -71,13 +71,13 @@ convergence because the time was not allocated uniformly across families.
 
 | Primary family | Confirmed findings | Adjusted points | Share of points | Points per whole-history hour |
 |---|---:|---:|---:|---:|
-| `authority_bypass` | 20 | 662.5 | 3.8% | 33.97 |
-| `code_execution` | 43 | 8162.5 | 47.1% | 418.51 |
-| `denial_of_service` | 33 | 5565.0 | 32.1% | 285.33 |
-| `information_disclosure` | 27 | 2744.5 | 15.8% | 140.72 |
-| `integrity_violation` | 10 | 70.0 | 0.4% | 3.59 |
-| `protocol_confusion` | 1 | 5.0 | 0.0% | 0.26 |
-| `server_request_abuse` | 3 | 100.0 | 0.6% | 5.13 |
+| `authority_bypass` | 20 | 662.5 | 3.8% | 33.76 |
+| `code_execution` | 43 | 8162.5 | 47.1% | 415.91 |
+| `denial_of_service` | 34 | 5566.0 | 32.1% | 283.61 |
+| `information_disclosure` | 27 | 2744.5 | 15.8% | 139.84 |
+| `integrity_violation` | 10 | 70.0 | 0.4% | 3.57 |
+| `protocol_confusion` | 1 | 5.0 | 0.0% | 0.25 |
+| `server_request_abuse` | 3 | 100.0 | 0.6% | 5.10 |
 | `unclassified` | 7 | 21.5 | 0.1% | 1.10 |
 
 ## Within-family result
@@ -130,7 +130,7 @@ composition rule.
 ## Cross-family workload history
 
 For completeness, this is the combined yield in fixed groups of ten
-chronological searches (the last has 10). It describes what the review
+chronological searches (the last has 1). It describes what the review
 process found over time, but **must not be read as a convergence series**
 because the campaign changed families.
 
@@ -141,6 +141,7 @@ because the campaign changed families.
 | S21–S30 | 3.743 | 26 | 6.95 | 6 | 13 | 5 | 2 | 1976.0 | 527.95 |
 | S31–S40 | 5.116 | 19 | 3.71 | 8 | 9 | 2 | 0 | 4135.0 | 808.22 |
 | S41–S50 | 4.892 | 13 | 2.66 | 1 | 7 | 3 | 2 | 1471.5 | 300.78 |
+| S51–S51 | 0.122 | 1 | 8.18 | 0 | 0 | 0 | 1 | 1.0 | 8.18 |
 
 ## Interpretation and limits
 

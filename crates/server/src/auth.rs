@@ -24,6 +24,12 @@ use subtle::ConstantTimeEq;
 const MAX_PASSWORD_FILE: u64 = 4 * 1024 * 1024;
 const MAX_AUTH_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_AUTH_CACHE_ENTRIES: usize = 128;
+/// Conventional SSHA records use a short random salt. The complete suffix is
+/// rehashed for every credential attempt, so it must have its own semantic
+/// bound rather than inheriting the multi-megabyte AuthUserFile byte limit.
+const SSHA_DIGEST_BYTES: usize = 20;
+const MAX_SSHA_SALT_BYTES: usize = 64;
+const MAX_SSHA_ENCODED_BYTES: usize = (SSHA_DIGEST_BYTES + MAX_SSHA_SALT_BYTES + 2) / 3 * 4;
 const AUTH_FAILURE_CACHE_TTL: Duration = Duration::from_millis(250);
 
 const CRYPT_ALPHABET: &[u8; 64] =
@@ -183,15 +189,25 @@ impl PasswordVerifier {
             return Some((PasswordProfile::Sha, Self::Sha(digest)));
         }
         if let Some(encoded) = stored.strip_prefix("{SSHA}") {
+            if encoded.len() > MAX_SSHA_ENCODED_BYTES {
+                return None;
+            }
             let decoded = STANDARD
                 .decode(encoded)
                 .or_else(|_| STANDARD_NO_PAD.decode(encoded))
                 .ok()?;
-            if decoded.len() < 20 {
+            if decoded.len() < SSHA_DIGEST_BYTES {
                 return None;
             }
-            let digest = <[u8; 20]>::try_from(&decoded[..20]).ok()?;
-            let salt = Box::<[u8]>::from(&decoded[20..]);
+            let salt_len = u64::try_from(decoded.len().checked_sub(SSHA_DIGEST_BYTES)?).ok()?;
+            if !httpd_rs_verified::ssha_salt_admit(
+                salt_len,
+                u64::try_from(MAX_SSHA_SALT_BYTES).ok()?,
+            ) {
+                return None;
+            }
+            let digest = <[u8; SSHA_DIGEST_BYTES]>::try_from(&decoded[..SSHA_DIGEST_BYTES]).ok()?;
+            let salt = Box::<[u8]>::from(&decoded[SSHA_DIGEST_BYTES..]);
             return Some((
                 PasswordProfile::SaltedSha {
                     salt_len: salt.len(),
@@ -1162,6 +1178,37 @@ mod tests {
         let encoded = STANDARD.encode(raw);
         assert!(verify_password(b"password", &format!("{{SSHA}}{encoded}")));
         assert!(!verify_password(b"nope", &format!("{{SSHA}}{encoded}")));
+    }
+
+    #[test]
+    fn ssha_salt_is_bounded_before_request_reachability() {
+        fn record(password: &[u8], salt: &[u8]) -> String {
+            let mut raw = Sha1::digest([password, salt].concat()).to_vec();
+            raw.extend_from_slice(salt);
+            format!("{{SSHA}}{}", STANDARD.encode(raw))
+        }
+
+        let maximum = vec![b's'; MAX_SSHA_SALT_BYTES];
+        let admitted = record(b"password", &maximum);
+        assert!(verify_password(b"password", &admitted));
+        assert!(!verify_password(b"wrong", &admitted));
+
+        let oversized = vec![b's'; MAX_SSHA_SALT_BYTES + 1];
+        let rejected = record(b"password", &oversized);
+        assert!(PasswordVerifier::parse(&rejected).is_none());
+        assert!(PasswordVerifier::parse(&format!(
+            "{{SSHA}}{}",
+            "A".repeat(MAX_SSHA_ENCODED_BYTES + 1)
+        ))
+        .is_none());
+
+        let users = temp_path("ssha-salt-bound");
+        std::fs::write(&users, format!("alice:{rejected}\n")).unwrap();
+        assert!(validate_auth_user_file(&users, true, 0).is_err());
+        assert!(
+            read_small_uncached(&users, true, 0).is_some_and(|parsed| parsed.passwords.is_none())
+        );
+        std::fs::remove_file(users).unwrap();
     }
 
     #[test]

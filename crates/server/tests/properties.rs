@@ -87,6 +87,14 @@ proptest! {
     }
 
     #[test]
+    fn ssha_salt_admission_is_exact(salt_bytes in any::<u64>(), limit in any::<u64>()) {
+        prop_assert_eq!(
+            httpd_rs::verified::ssha_salt_admit(salt_bytes, limit),
+            salt_bytes <= limit
+        );
+    }
+
+    #[test]
     fn request_body_memory_admission_cannot_overflow(
         used in any::<u64>(), incoming in any::<u64>(), limit in any::<u64>(),
     ) {

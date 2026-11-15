@@ -1,0 +1,10 @@
+Pass 44 remediation replay against the rebuilt release binary
+Date: 2026-11-15
+
+binary=/workspace/vapache/target/release/httpd-rs
+requests=2048 concurrency=8 source=127.0.0.2
+control_salt_bytes=8 request_wire_bytes=110 statuses={401: 2048} errors=0 cpu_seconds=0.330 wall_seconds=0.362 server_exit=None
+large_salt_bytes=3100000 startup_rejected=true
+startup_error=httpd-rs exited during startup: httpd-rs: AuthUserFile <temporary fixture>/users.htpasswd must contain unique, valid password records with one uniform hash scheme, cost, and salt shape
+
+RESULT: REMEDIATED - oversized SSHA salt rejected before serving

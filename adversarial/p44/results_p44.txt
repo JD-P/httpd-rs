@@ -1,0 +1,74 @@
+Pass 44 retained release-binary reproduction
+============================================
+
+Reviewed subject:
+  35b12a59e9cbceaf4fd5e29dc0ba2acdcd4ec7b6 (tag v0.2.3)
+  cargo build --release -p httpd-rs completed from the clean product tree
+  before the finalized measurement.
+
+Command:
+  python3 adversarial/p44/exploit_p44.py
+
+Run 1:
+
+binary=/workspace/vapache/target/release/httpd-rs
+requests=2048 concurrency=8 source=127.0.0.2
+control_salt_bytes=8 request_wire_bytes=110 statuses={401: 2048} errors=0 cpu_seconds=0.410 wall_seconds=0.382 server_exit=None
+large_salt_salt_bytes=3100000 request_wire_bytes=110 statuses={401: 2048} errors=0 cpu_seconds=4.060 wall_seconds=1.259 server_exit=None
+large_to_control_cpu_ratio=9.90x
+configured_bytes_hashed=6348800000
+request_to_hash_byte_amplification=28181.8x
+RESULT: measured large-salt SSHA request-path work outside auth CPU admission
+
+Run 2:
+
+binary=/workspace/vapache/target/release/httpd-rs
+requests=2048 concurrency=8 source=127.0.0.2
+control_salt_bytes=8 request_wire_bytes=110 statuses={401: 2048} errors=0 cpu_seconds=0.320 wall_seconds=0.324 server_exit=None
+large_salt_salt_bytes=3100000 request_wire_bytes=110 statuses={401: 2048} errors=0 cpu_seconds=4.090 wall_seconds=1.282 server_exit=None
+large_to_control_cpu_ratio=12.78x
+configured_bytes_hashed=6348800000
+request_to_hash_byte_amplification=28181.8x
+RESULT: measured large-salt SSHA request-path work outside auth CPU admission
+
+Final run after the explicit release rebuild:
+
+binary=/workspace/vapache/target/release/httpd-rs
+requests=2048 concurrency=8 source=127.0.0.2
+control_salt_bytes=8 request_wire_bytes=110 statuses={401: 2048} errors=0 cpu_seconds=0.350 wall_seconds=0.393 server_exit=None
+large_salt_salt_bytes=3100000 request_wire_bytes=110 statuses={401: 2048} errors=0 cpu_seconds=4.050 wall_seconds=1.320 server_exit=None
+large_to_control_cpu_ratio=11.57x
+configured_bytes_hashed=6348800000
+request_to_hash_byte_amplification=28181.8x
+RESULT: measured large-salt SSHA request-path work outside auth CPU admission
+
+Interpretation:
+
+The only variable between each control and candidate was the configured SSHA
+salt length. Both records used the same parser/verifier family, one account,
+one source address, eight clients and exact 110-byte raw HTTP requests for a
+missing username. The P40 uniform-dummy behavior therefore selected the same
+configured verifier on every request. All 12,288 measured requests returned
+the ordinary 401 and both daemon instances remained alive.
+
+The 3,100,000-byte salt is a syntactically valid record in a 4,133,373-byte
+AuthUserFile, below the product's 4 MiB file ceiling. The candidate wave made
+the verifier hash 6.3488 GB from 225,280 request bytes. It consumed 4.05-4.09
+daemon CPU-seconds in 1.259-1.320 wall-seconds, versus 0.32-0.41 CPU-seconds
+for the eight-byte salt. Thus one unauthenticated source used approximately
+three cores at roughly 1,550-1,627 requests/second and about 170-179 KiB/s of
+request traffic. The work never calls try_expensive or try_bcrypt; the latter
+branches have concurrency/rate admission while SHA/SSHA do not.
+
+Rejected candidates and controls:
+
+- Vendored h2 HEADERS/CONTINUATION accumulation is already bounded by encoded
+  bytes, continuation count, decoded list size and the connection frame-work
+  budget. It was not retained as a finding.
+- Plain {SHA} has no variable configured suffix. APR1 and Unix MD5 explicitly
+  cap salts at eight bytes, and bcrypt verifies a parsed cost under weighted
+  operation, work and rate leases. The unpriced multi-megabyte input is
+  specific to {SSHA}.
+- Auth-file read size, parsed-cache cardinality and parsed-cache bytes are
+  separately bounded. No retained-memory escape, authentication bypass or
+  response differential is claimed here.
