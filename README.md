@@ -1,12 +1,12 @@
 # httpd-rs
 
-A memory-safe, formally verified, drop-in-compatible Apache HTTP Server
-replacement written in Rust.
+A memory-safe, (partially) formally verified, drop-in-compatible Apache HTTP Server
+replacement written in Rust. `httpd-rs` is **not** endorsed by the Apache Software
+Foundation and will eventually support nginx configuration too.
 
 The [httpd-rs documentation](https://jd-p.github.io/httpd-rs/) covers migration,
-intentional Apache differences, security expectations, and executable
-documentation contracts. Its [Markdown source](docs/README.md) is maintained
-in this repository.
+intentional Apache differences, security expectations, and contributor guidelines.
+Its [Markdown source](docs/README.md) is maintained in this repository.
 
 `httpd-rs` reads ordinary Apache 2.4 configuration files, serves static files,
 runs CGI programs, and keeps the security-critical parsing kernels in
@@ -14,6 +14,56 @@ runs CGI programs, and keeps the security-critical parsing kernels in
 The project targets Apache-level compatibility while hardening the historical
 CVE hotspots: request smuggling, path traversal, response splitting, range
 amplification, CGI environment injection and descriptor leaks.
+
+## Development and Epistemic Status
+
+"Merely agricultural nations do not enjoy the same degree of wealth for their
+population as those that adopt both manufacturing and agriculture."
+
+- Alexander Hamilton (paraphrased)
+
+I have a confession to make:
+
+I haven't read a single line of
+Rust in this code base. In fact I
+couldn't read this code if I wanted
+to because I don't know Rust.
+
+But that's not the confession.
+
+It's that I don't feel bad about
+it. We are early enough in the
+adoption curve for agentic coding that people feel the need to defend the time
+they invested in learning to write code, and to distinguish themselves from
+a wave of new unprincipled practitioners by insisting that they are above
+"vibe coding" and that *they* at least still read their code. That they only
+use a little AI, that they ask LLMs for advice and then write the code themselves.
+This is vanity and ego set to be washed away by raw efficiency and the coming
+flood of AI driven software exploitation. I have not read a line of this code
+and yet I am certain I would not do better given three years to write it by
+hand. I suspect it is already comparable in its security to mature offerings,
+and will only become more so as it is subject to real 3rd party review and
+adversarial pressure. At the time of writing I expect this to sound like an
+extraordinary claim to most readers, almost trollish. You probably think I
+have lost my mind or that I am an idiot who believes you can get perfect software
+by just telling ChatGPT to write an HTTP daemon and make no mistakes.
+
+But I have not and I am not. In fact by the time you finish reading this you will
+likely agree with me. Because what I have actually done is build a thorough scaffold
+around my Rust reimplementation of apache2 to extensively test and fuzz it while
+applying adversarial pressure to the whole software by asking DeepSeek 4.1 Flash
+and ChatGPT Daybreak Blue to find vulnerabilities in it. I have taken every found
+flaw as an opportunity to make broader security changes [and kept detailed
+statistics](adversarial/README.md) to make sure that security flaws are getting harder to
+find per hour spent on review as the project progresses. I expect to gain
+familiarity with the code base over time as I review pull requests and maintain
+it.
+
+### Development Process
+
+### Security - Adversarial Yield
+
+### Security - Supply Chain
 
 ## Status
 
