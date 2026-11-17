@@ -433,6 +433,11 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p httpd-rs-verified
 ```
 
+The [proof-strategy inventory](docs/proof-strategies.md) lists every explicit
+theorem and lemma, its claimed property, its actual epistemic basis and a
+skeptical adversarial-review rating. Its generated table is checked against
+the crate so additions and removals cannot silently leave the inventory stale.
+
 Current result: **886 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
