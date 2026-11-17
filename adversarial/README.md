@@ -5,13 +5,106 @@ finding write-ups from every adversarial pass, plus the retained exploit and
 remediation harnesses. Keeping the exact exploit shapes here
 prevents re-deriving them from scratch.
 
+## Current adversarial-yield snapshot
+
+The recovered index currently covers reviews through **Pass 44**: 51 logical
+searches, 19.626 active search-hours and 145 unique confirmed findings. Those
+findings contribute 17,332.0 severity/composition-adjusted points, or **883.12
+adjusted points per search-hour** over the complete historical workload.
+
+![Adversarial yield by primary vulnerability family](yield-index/yield-by-family.png)
+
+The whole-history score decomposes by primary outcome family as follows. The
+denominator is all recorded search time, so these values add to the overall
+883.12 points/hour. They measure contribution to observed historical yield,
+not the efficiency of a dedicated search for that family.
+
+| Primary family | Confirmed findings | Adjusted points | Share | Adjusted points/all search-hours |
+|---|---:|---:|---:|---:|
+| `code_execution` | 43 | 8,162.5 | 47.1% | 415.91 |
+| `denial_of_service` | 34 | 5,566.0 | 32.1% | 283.61 |
+| `information_disclosure` | 27 | 2,744.5 | 15.8% | 139.84 |
+| `authority_bypass` | 20 | 662.5 | 3.8% | 33.76 |
+| `server_request_abuse` | 3 | 100.0 | 0.6% | 5.10 |
+| `integrity_violation` | 10 | 70.0 | 0.4% | 3.57 |
+| `protocol_confusion` | 1 | 5.0 | less than 0.1% | 0.25 |
+| `cryptographic_trust_failure` | 0 | 0.0 | 0.0% | 0.00 |
+| `memory_safety` | 0 | 0.0 | 0.0% | 0.00 |
+| `unclassified` escape hatch | 7 | 21.5 | 0.1% | 1.10 |
+
+Only the primary family enters these non-overlapping totals. Secondary
+families still describe complete exploit chains in `findings.jsonl`. Zero
+primary findings in cryptographic-trust or memory-safety do not prove that
+those bug classes are absent; neither family has received a dedicated search
+in the recovered index. `unclassified` is an escape hatch, not a tenth tracked
+family.
+
+### Current trend
+
+For an equal-sized rolling comparison, the first ten searches (S01–S10)
+returned 25.67 confirmed findings/hour and 1,854.04 adjusted points/hour. The
+latest ten (S42–S51) returned 3.13 findings/hour and 342.00 adjusted
+points/hour. That is an **87.8% decline in finding frequency** and an **81.6%
+decline in severity/composition-adjusted yield**.
+
+The fixed non-overlapping S01–S10 versus S41–S50 blocks still show the earlier
+89.6% and 83.8% declines. S51 is currently a one-search trailing block, so its
+standalone rates (8.18 findings/hour and 8.18 adjusted points/hour) are too
+volatile to use as the headline comparison. More importantly, campaign focus
+changed over time: the chronological graph is workload history, not a
+controlled estimate of vulnerabilities remaining. Within-family convergence
+and its composition-discount sensitivity are reported in
+[`yield-index/yield-summary.md`](yield-index/yield-summary.md).
+
+## Yield index, graphs and tables
+
+The yield index is designed so every number and plotted point can be traced
+back to a logical search and a confirmed finding:
+
+| Path | Purpose |
+|---|---|
+| `yield-index/searches.jsonl` | Logical searches and their active segments, prompts, reviewed commits, requested focus and finding IDs |
+| `yield-index/findings.jsonl` | Every recovered claim, disposition, primary/secondary families, severity, composition count, evidence and remediation |
+| `yield-index/validate_index.py` | Cross-index schema, referential-integrity, timestamp, provenance and summary validation |
+| `yield-index/compute_yield.py` | Deterministic per-search and historical yield calculation |
+| `yield-index/yield-by-search.csv` | Machine-readable duration, finding, severity, point and yield values for every logical search |
+| `yield-index/yield-summary.md` | Formula, overall history, fixed-block trend, focused-family convergence and sensitivity tables |
+| `yield-index/plot_family_yield.py` | Matplotlib renderer and family/block table generator |
+| `yield-index/yield-by-family.png` | Raster family-yield graph for Markdown and ordinary web rendering |
+| `yield-index/yield-by-family.svg` | Scalable family-yield graph for publication and detailed inspection |
+| `yield-index/yield-by-family.md` | Whole-history family table, severity table, dedicated-search context and chronological block table |
+| `yield-index/yield-by-family.csv` | Machine-readable whole-history and dedicated-search family statistics |
+| `yield-index/yield-by-family-block.csv` | Long-form data behind the chronological stacked graph |
+| `yield-index/recovery-report.md` | Recovery completeness, provenance limitations and reconstruction notes |
+
+Adversarial yield uses impact weights low `1`, medium `10`, high `100`,
+critical `1000` and catastrophic `10000`. If `b` independently wrong
+behaviors must compose, a finding contributes `impact weight × 2^(1-b)`
+points. Only unique confirmed findings enter the numerator; every completed
+logical search, including a zero-finding search, enters the time denominator.
+The full classification and scoring contract is in
+[`vulnerability-families.md`](vulnerability-families.md).
+
+Validate and regenerate all reports from the repository root:
+
+```sh
+python3 adversarial/yield-index/validate_index.py \
+  --dir adversarial/yield-index
+python3 adversarial/yield-index/compute_yield.py
+python3 adversarial/yield-index/plot_family_yield.py
+```
+
+The plot command requires Matplotlib and emits deterministic PNG/SVG files and
+matching Markdown/CSV tables. Neither reporting script changes the source
+JSONL indexes.
+
 ## Layout
 
 | Path | Contents |
 |---|---|
 | `adversarial-yield-recovery-handoff.md` | Agent handoff for reconstructing logical vulnerability searches and confirmed findings from the retained OpenCode logs, including commit provenance, the fixed vulnerability-family ontology and composition measures |
 | `vulnerability-families.md` | Reference definitions and classification boundaries for the nine vulnerability families used by adversarial findings and yield reports |
-| `yield-index/` | Recovered logical searches and findings, validation tooling, and the reproducible adversarial-yield calculation and report |
+| `yield-index/` | Recovered logical searches and findings, validation tooling, the reproducible adversarial-yield calculation, and Matplotlib family-yield charts with matching Markdown/CSV tables |
 | `configuration-semantic-refinement-review.md` | Configuration compiler campaign: closed schema/IR/consumer semantic domains, executable Verus refinement certificates, verified primitive normalizers, single-pass effectful payload compilation, and main/access schema-drift tests |
 | `dynamic-backend-identity-review.md` | Backend identity campaign: generation-pinned DNS shared by proxy/WebSocket/health/FastCGI/OCSP, exact connected-peer checks, and Linux `SO_PEERCRED` authentication for strict Unix FastCGI |
 | `privileged-control-plane-review.md` | Root tooling/package campaign: fixed execution environments, canonical trusted path chains, serialized configuration snapshots, special-file rejection, transactional service rollback, controlled Certbot edits, and real-package interruption tests |
@@ -25,6 +118,13 @@ prevents re-deriving them from scratch.
 | `http-desynchronization-review.md` | Cross-hop HTTP/1 framing and protocol-transition review: strict verified request metadata, exact fragmented pipeline properties, canonical single-use proxying, and reconstructed WebSocket 101 responses |
 | `internal-request-transition-review.md` | Synthetic request campaign: typed DirectoryIndex/ErrorDocument projections, immutable wire identity, body/query/hop-state isolation, request-owned recursion, response-owned cache provenance, and deferred CGI execution regressions |
 | `tls-mtls-state-review.md` | TLS/mTLS state campaign: immutable negotiated identity, SNI/Host policy binding, resolver parity, resumed client identity, expiring sessions, CRL-backed revocation, validity-driven OCSP staples, strict responder URLs and HTTPS proxy verification |
+| `filesystem-identity-review.md` | Complete request-reachable filesystem/TOCTOU review: descriptor-relative resolution, object-identity revalidation, final-target authorization and privileged administrative-input trust |
+| `deterministic-transition-fault-campaign.md` | Test-only cross-task/thread/process transition fault injection and exhaustive replay of authorization, generation, cache and resource-release checkpoints |
+| `dependency-supply-chain-review.md` | Imported and project-authored `cargo vet` evidence, explicit exemption accounting and CI ratchets for dependency review coverage |
+| `post-p31-slow-output-generalization.md` | Generalization of P31 from HTTP/2 flow control to shared HTTP/1/H2/WebSocket slow-output phase ownership and progress/lifetime bounds |
+| `tls-dependency-resource-profile.md` | Source-derived and measured TLS/mTLS dependency input, work and workspace bounds across chain ambiguity, constraints, signature algorithms and maximal ClientHello shapes |
+| `tls_dependency_profile.py`, `tls_dependency_profile_results.txt`, `tls_clienthello_profile_results.txt` | Reproducible local TLS dependency profiler and retained calibration measurements |
+| `filesystem_path_churn_profile_results.txt` | Retained missing-path/filesystem metadata churn calibration used by the resource inventory |
 | `apache-if-files-nesting.md` | Apache 2.4.69 configuration-validation bug: unsupported `<Files>`/request-time `<If>` nesting passes configtest but its policy is not evaluated on ordinary requests; source analysis, impact, reproduction, and httpd-rs disposition |
 | `findings.md` | Pass 3 write-ups (F31–F36, F38) |
 | `findings_p4.md` … `findings_p9.md` | Pass 4–9 write-ups |
@@ -76,6 +176,7 @@ prevents re-deriving them from scratch.
 | `findings_p30.md` | Pass-30 write-up (P30-A/A′): one HTTP/1 client exhausts the 32 process-wide blocking-I/O leases with stalled >64 KiB requests, denying every >64 KiB response process-wide and all HTTP/2 requests through the shared dispatch lease |
 | `p31/h2hold.py`, `p31/h2hold404.py`, `p31/h2oracle_apache.py` | Pass-31 differential and remediation harness (P31-A): eight source addresses try to hold all 256 process-wide HTTP/2 stream leases with zero-window bodies and one-byte WINDOW_UPDATE trickles; the victim must remain served, matching the Apache `mod_http2` oracle |
 | `findings_p31.md` | Pass-31 write-up (**P31-A**, now remediated): flow-control-progress send-deadline renewal made the 256-stream global lease hold permanent; slow outputs now transfer into a smaller source-fair pool governed by anchored minimum-rate and absolute-lifetime bounds |
+| `findings_p32.md`, `p32/` | Pass-32 write-up and retained HTTP/2 partial-request-body harness: rolling replacement across eight sources held the process-wide dispatch pool and denied unrelated streams; remediation transfers waiters into a bounded source-fair slow-input state |
 | `dos-resource-budget-followup.md` | Post-P28 DoS review: CVE-2011-4415-style `SetEnvIf` amplification, request-wide matcher/policy work and expansion budgets, access-program breadth limits, and generated-response-header admission |
 | `dos-connection-admission-followup.md` | Post-P28 connection DoS follow-up: asynchronous first-head admission, H2 preface deadline, worker/source reserves, fair listener batches, and complete control-frame charging |
 | `findings_p33.md` | Pass-33 write-up (**P33-A**, now remediated): `Options MultiViews` selected a sibling representation before the trailing-slash rejection and served it under the pre-negotiation URL identity, bypassing exact/extension `Location` and `.htaccess` rewrite guards; negotiation now rejects slash spellings, conjoins public, selected-URL and selected-file policy, binds shared-cache identity to the selected representation, and preserves the dynamic-handler refusal |
@@ -96,6 +197,13 @@ prevents re-deriving them from scratch.
 | `p37/probe/` | Pass-37 standalone differential probe (path dependency on `crates/pcre2`, oracle `pcre2` 0.2.11): reproduces both retained crash inputs and the offset-0 acceptance cases, with request-byte controls that agree |
 | `p37/results_p37.txt` | Pass-37 retained run output: production config acceptance (`httpd-rs -t` Syntax OK for `!\R\s`), artifact bytes and the standing probe verdicts |
 | `p37/crash-pcre2-crlf-multiline.bin`, `p37/crash-pcre2-crlf-multiline-at-offset.bin` | Pass-37 retained `pcre2_differential` crash artifacts (`(?m)^` crlf offset 3; `\r^` crlf+multiline offset 2) |
+| `findings_p38.md`, `p38/` | Pass-38 configuration-continuation differential and HTTP/2 empty-DATA accounting finding, plus retained whole-request/multi-request fuzz artifacts with invalid and unresolved dispositions preserved |
+| `findings_p39.md`, `p39/` | Pass-39 terminal-sink finding and harness: active access-policy and authentication database files could also reach the public static-file sink |
+| `findings_p40.md`, `p40/` | Pass-40 Basic-auth timing finding and measurements: absent users skipped adaptive verification and exposed a stable username-enumeration oracle |
+| `findings_p41.md`, `p41/` | Pass-41 Brotli quality-11 resource finding and profiler: dependency CPU/workspace escaped the visible response-byte budget |
+| `findings_p42.md`, `p42/` | Pass-42 PCRE2-wrapper resource finding and probes: PikeVM capture-state cache pools multiplied states by capture slots outside the declared dependency workspace bound |
+| `findings_p43.md`, `p43/` | Pass-43 outbound TLS resource finding, remediation and retained measurements: backend certificate multiplicity was priced as constant handshake work |
+| `findings_p44.md`, `p44/` | Pass-44 SSHA configured-input amplification finding, remediation and retained measurements: multi-megabyte salts were rehashed without an owned CPU-work bound |
 
 ## Pre-adversarial gate
 

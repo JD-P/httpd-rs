@@ -80,6 +80,9 @@ convergence because the time was not allocated uniformly across families.
 | `server_request_abuse` | 3 | 100.0 | 0.6% | 5.10 |
 | `unclassified` | 7 | 21.5 | 0.1% | 1.10 |
 
+The detailed Matplotlib family graph, severity table, dedicated-search
+context and chronological family table are in `yield-by-family.md`.
+
 ## Within-family result
 
 The reviews deliberately changed vulnerability families over time. A simple
@@ -165,8 +168,9 @@ score evidence about this review process within its tested threat model,
 not proof that the software is secure.
 
 Per-search inputs and results are in `yield-by-search.csv`. Regenerate
-both files with:
+the yield reports with:
 
 ```sh
 python3 adversarial/yield-index/compute_yield.py
+python3 adversarial/yield-index/plot_family_yield.py
 ```

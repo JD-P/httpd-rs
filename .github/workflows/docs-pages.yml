@@ -8,6 +8,7 @@ on:
       - "mkdocs.yml"
       - "tests/docs.py"
       - "tests/mkdocs_hooks.py"
+      - "tests/proof_strategies.py"
       - ".github/workflows/docs-pages.yml"
   pull_request:
     paths:
@@ -15,6 +16,7 @@ on:
       - "mkdocs.yml"
       - "tests/docs.py"
       - "tests/mkdocs_hooks.py"
+      - "tests/proof_strategies.py"
       - ".github/workflows/docs-pages.yml"
   workflow_dispatch:
 
@@ -40,7 +42,9 @@ jobs:
       - name: Build httpd-rs for executable documentation contracts
         run: cargo build --locked -p httpd-rs
       - name: Validate documentation contracts
-        run: python3 tests/docs.py
+        run: |
+          python3 tests/docs.py
+          python3 tests/proof_strategies.py --check
       - name: Build static documentation
         run: mkdocs build --strict
       - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4

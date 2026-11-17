@@ -380,6 +380,9 @@ def write_summary(
     lines.extend(
         [
         "",
+        "The detailed Matplotlib family graph, severity table, dedicated-search",
+        "context and chronological family table are in `yield-by-family.md`.",
+        "",
         "## Within-family result",
         "",
         "The reviews deliberately changed vulnerability families over time. A simple",
@@ -514,10 +517,11 @@ def write_summary(
             "not proof that the software is secure.",
             "",
             "Per-search inputs and results are in `yield-by-search.csv`. Regenerate",
-            "both files with:",
+            "the yield reports with:",
             "",
             "```sh",
             "python3 adversarial/yield-index/compute_yield.py",
+            "python3 adversarial/yield-index/plot_family_yield.py",
             "```",
             "",
         ]
