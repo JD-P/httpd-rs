@@ -23,9 +23,7 @@ section very often. -->
 ## Development and Epistemic Status
 
 "Merely agricultural nations do not enjoy the same degree of wealth for their
-population as those that adopt both manufacturing and agriculture."
-
-- Alexander Hamilton (paraphrased)
+population as those that adopt both manufacturing and agriculture." &mdash; Alexander Hamilton (paraphrased)
 
 I have a confession to make:
 
