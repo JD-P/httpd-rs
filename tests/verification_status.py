@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 LEDGER = ROOT / "docs" / "verification-status.json"
 CVE_MATRIX = ROOT / "docs" / "cve" / "apache2-cve-matrix.json"
 VERIFIED_SRC = ROOT / "crates" / "verified" / "src"
+PROOF_STRATEGY_CHECK = ROOT / "tests" / "proof_strategies.py"
 STATUS_WEIGHTS = {"mechanized": 1.0, "partial": 0.5, "open": 0.0}
 FORBIDDEN_VERUS = re.compile(r"\bassume(?:_specification)?\b|\bexternal_body\b")
 
@@ -299,6 +300,21 @@ def run_verus(errors: list[str]) -> None:
         fail(errors, "cargo verus verify failed:\n" + (proc.stdout + proc.stderr)[-3000:])
 
 
+def check_proof_strategy_inventory(errors: list[str]) -> None:
+    proc = subprocess.run(
+        [sys.executable, str(PROOF_STRATEGY_CHECK), "--check"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        fail(
+            errors,
+            "explicit Verus proof-strategy inventory is stale:\n"
+            + (proc.stdout + proc.stderr)[-3000:],
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-verus", action="store_true", help="run cargo verus verify as part of the gate")
@@ -322,6 +338,7 @@ def main() -> int:
     debt_total, debt_budget = proof_debt(data, errors)
     sinks = check_sinks(data, errors)
     escapes = check_verus_source(errors)
+    check_proof_strategy_inventory(errors)
     replay_failures = check_replay(data, errors)
     verus = data.get("verus", {})
     if verus.get("errors") != 0:
