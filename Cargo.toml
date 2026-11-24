@@ -6,13 +6,14 @@ members = [
     "crates/pcre2",
     "crates/server",
 ]
-exclude = ["fuzz", "vendor/h2-0.4.20"]
+exclude = ["fuzz", "vendor/httpd-rs-h2-0.4.20"]
 
 [workspace.package]
 version = "0.2.3"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.99.1"
+repository = "https://github.com/JD-P/httpd-rs/"
 
 [profile.release]
 opt-level = 3
@@ -29,4 +30,4 @@ codegen-units = 1
 [patch.crates-io]
 # The public h2 server adapter otherwise normalizes an absent `:path` to `/`
 # and truncates a fragment before httpd-rs can validate either pseudo-header.
-h2 = { path = "vendor/h2-0.4.20" }
+# h2 = { package = "httpd-rs-h2", version = "=0.4.20-httpdrs.1" }

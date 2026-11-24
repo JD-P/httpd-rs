@@ -12,11 +12,12 @@
 [package]
 edition = "2021"
 rust-version = "1.63"
-name = "h2"
+name = "httpd-rs-h2"
 version = "0.4.20"
 authors = [
-    "Carl Lerche <me@carllerche.com>",
+    "Carl Lerche <me@carllerche.com>", 
     "Sean McArthur <sean@seanmonstar.com>",
+    "John David Pressman <jd@jdpressman.com>",
 ]
 build = false
 exclude = [
@@ -28,9 +29,9 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "An HTTP/2 client and server"
+description = "httpd-rs fork of an HTTP/2 client and server with Verus Rust kernels"
 documentation = "https://docs.rs/h2"
-readme = "README.md"
+#readme = "README.md"
 keywords = [
     "http",
     "async",

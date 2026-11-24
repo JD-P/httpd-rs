@@ -1,8 +1,11 @@
 [package]
 name = "httpd-rs-os"
+author = [ "John David Pressman <jd@jdpressman.com>" ]
+description = "Unsafe Linux syscall boundary for httpd-rs."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 libc = "0.2"

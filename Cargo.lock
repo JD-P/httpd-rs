@@ -367,23 +367,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "h2"
-version = "0.4.20"
-dependencies = [
- "atomic-waker",
- "bytes",
- "futures-core",
- "futures-sink",
- "http",
- "httpd-rs-verified",
- "indexmap",
- "slab",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -408,8 +391,8 @@ dependencies = [
  "brotli",
  "bytes",
  "flate2",
- "h2",
  "http",
+ "httpd-rs-h2",
  "httpd-rs-os",
  "httpd-rs-pcre2",
  "httpd-rs-verified",
@@ -427,6 +410,23 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "webpki-roots",
+]
+
+[[package]]
+name = "httpd-rs-h2"
+version = "0.4.20"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "httpd-rs-verified",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
