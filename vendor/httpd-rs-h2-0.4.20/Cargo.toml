@@ -31,7 +31,7 @@ autotests = false
 autobenches = false
 description = "httpd-rs fork of an HTTP/2 client and server with Verus Rust kernels"
 documentation = "https://docs.rs/h2"
-readme = "README.md"
+#readme = "README.md"
 keywords = [
     "http",
     "async",
