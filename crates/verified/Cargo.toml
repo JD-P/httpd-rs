@@ -1,5 +1,8 @@
 [package]
 name = "httpd-rs-verified"
+authors = [ "John David Pressman <jd@jdpressman.com>" ]
+description = "Verus kernels for httpd-rs"
+repository = "https://github.com/JD-P/httpd-rs/"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
