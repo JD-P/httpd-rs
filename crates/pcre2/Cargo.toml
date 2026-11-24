@@ -1,8 +1,10 @@
 [package]
 name = "httpd-rs-pcre2"
+description = "PCRE2 compatibility wrapper for httpd-rs."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 regex-automata = "0.4"
