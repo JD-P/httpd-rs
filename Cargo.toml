@@ -13,6 +13,7 @@ version = "0.2.3"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.99.1"
+repository = "https://github.com/JD-P/httpd-rs/"
 
 [profile.release]
 opt-level = 3
