@@ -2,7 +2,7 @@
 # Python 3.13 virtual environment when updating MkDocs Material.
 babel==2.18.0
 backrefs==8.3
-certifi==2026.10.23
+certifi==2026.11.20
 charset-normalizer==3.5.2
 click==8.5.1
 colorama==0.4.6
