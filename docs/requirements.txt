@@ -28,4 +28,4 @@ pyyaml_env_tag==1.1
 requests==2.34.2
 tzdata==2026.6
 urllib3==2.8.0
-watchdog==7.1.0
+watchdog==7.1.1
