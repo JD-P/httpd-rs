@@ -33,7 +33,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: rust-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: rust-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'vendor/httpd-rs-h2-0.4.20/Cargo.lock', 'rust-toolchain.toml') }}
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Security-focused Clippy gate
@@ -43,6 +43,8 @@ jobs:
           -D unused_must_use -A unsafe_code
       - name: Rust and property tests
         run: cargo test --workspace --all-targets --all-features -- --test-threads=1
+      - name: Pinned HPACK interoperability corpus
+        run: python3 tests/h2_hpack_fixtures.py
       - name: Pinned native dependency boundary
         run: |
           cargo build --locked -p httpd-rs
@@ -79,6 +81,20 @@ jobs:
         run: tests/control_plane_security.sh
       - name: Real-application deployment harness invariants
         run: python3 tests/deployments/selftest.py
+
+  nginx-differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install stock nginx oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nginx
+      - name: Build the shared runtime
+        run: cargo build --locked -p httpd-rs --bin httpd-rs
+      - name: Compare nginx location and response semantics
+        run: python3 tests/nginx_differential.py
 
   production-coverage:
     runs-on: ubuntu-24.04

@@ -61,23 +61,6 @@ unstable = []
 name = "h2"
 path = "src/lib.rs"
 
-[[example]]
-name = "akamai"
-path = "examples/akamai.rs"
-
-[[example]]
-name = "client"
-path = "examples/client.rs"
-
-[[example]]
-name = "server"
-path = "examples/server.rs"
-
-[[bench]]
-name = "main"
-path = "benches/main.rs"
-harness = false
-
 [dependencies.atomic-waker]
 version = "1.0.0"
 

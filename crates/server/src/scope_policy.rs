@@ -982,6 +982,7 @@ mod content_mapping_tests {
             from: "/same".into(),
             to: "https://global.example/".into(),
             regex: None,
+            projection: crate::config::RedirectProjection::Apache,
         });
         let mut child = MappingPolicy::default();
         child.aliases.push(crate::config::Alias::prefix(
@@ -994,6 +995,7 @@ mod content_mapping_tests {
             from: "/same".into(),
             to: "https://vhost.example/".into(),
             regex: None,
+            projection: crate::config::RedirectProjection::Apache,
         });
         policy.merge_child(&child);
         policy.prefer_virtual_host_routes(1, 1);
@@ -1187,6 +1189,14 @@ pub struct ProxyPolicy {
     /// Preserve the validated client authority in the upstream Host field.
     /// `None` inherits; Apache's effective default is `Off`.
     pub preserve_host: Option<bool>,
+    /// nginx-style request metadata transformations. `None` inherits; the
+    /// first declaration in a child scope replaces the inherited list, which
+    /// is nginx's array-directive inheritance rule.
+    pub request_headers: Option<Vec<crate::config_ir::ProxyHeaderTransform>>,
+    /// FastCGI parameter declarations use the same replace-on-child rule.
+    /// Protected script/framing identities are rechecked against the
+    /// authorized runtime target before emission.
+    pub fastcgi_params: Option<Vec<crate::config_ir::FastCgiParamTransform>>,
     pub proxy_ca_file: Option<std::path::PathBuf>,
     pub(crate) proxy_ca_trust: crate::files::AdminFileTrust,
     pub(crate) tls_config_cache: std::sync::Arc<ProxyTlsConfigCache>,
@@ -1199,6 +1209,12 @@ impl ProxyPolicy {
         crate::verified::append_vec(&mut self.proxy_reverses, &child.proxy_reverses);
         if child.preserve_host.is_some() {
             self.preserve_host = child.preserve_host;
+        }
+        if child.request_headers.is_some() {
+            self.request_headers = child.request_headers.clone();
+        }
+        if child.fastcgi_params.is_some() {
+            self.fastcgi_params = child.fastcgi_params.clone();
         }
         if child.proxy_ca_file.is_some() {
             self.proxy_ca_file = child.proxy_ca_file.clone();

@@ -20,7 +20,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 #[cfg(test)]
 use std::os::unix::net::UnixListener;
@@ -1028,6 +1028,122 @@ fn env_from_base(base: &CgiContext) -> Vec<(OsString, OsString)> {
     cgi::build_env(base)
 }
 
+fn apply_configured_params(
+    env: &mut Vec<(OsString, OsString)>,
+    base: &CgiContext,
+    scope: &Scope,
+    target: &Target,
+) -> io::Result<()> {
+    let Some(transforms) = scope.proxy_policy.fastcgi_params.as_ref() else {
+        return Ok(());
+    };
+    let peer = base
+        .remote_ip
+        .parse()
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let request_host = crate::util::parse_http_authority(base.host.as_bytes(), base.local_port)
+        .map(|(host, _)| host)
+        .unwrap_or_else(|| base.server_name.to_string());
+    let mut transformed_bytes = 0usize;
+    for transform in transforms {
+        let value = transform
+            .value
+            .evaluate(|variable| {
+                use crate::config_ir::ValueVariable;
+                let contextual = match variable {
+                    ValueVariable::RequestUri => env.iter().find_map(|(name, value)| {
+                        (name == "REQUEST_URI").then(|| value.as_os_str().as_bytes().to_vec())
+                    }),
+                    ValueVariable::Uri | ValueVariable::DocumentUri => {
+                        Some(base.request_uri.as_bytes().to_vec())
+                    }
+                    ValueVariable::DocumentRoot | ValueVariable::RealPathRoot => {
+                        Some(base.docroot.as_os_str().as_bytes().to_vec())
+                    }
+                    ValueVariable::FastCgiScriptName => {
+                        Some(target.script_name.as_bytes().to_vec())
+                    }
+                    ValueVariable::FastCgiPathInfo => Some(target.path_info.as_bytes().to_vec()),
+                    ValueVariable::RequestFilename => {
+                        Some(target.script_filename().as_os_str().as_bytes().to_vec())
+                    }
+                    ValueVariable::ServerProtocol => {
+                        Some(base.req.version.as_str().as_bytes().to_vec())
+                    }
+                    ValueVariable::Https => Some(if base.https {
+                        b"on".to_vec()
+                    } else {
+                        Vec::new()
+                    }),
+                    ValueVariable::RemotePort => Some(base.remote_port.to_string().into_bytes()),
+                    ValueVariable::ServerAddr => Some(base.local_ip.as_bytes().to_vec()),
+                    ValueVariable::GatewayInterface => Some(b"CGI/1.1".to_vec()),
+                    ValueVariable::ServerSoftware => Some(base.cfg.server_header().into_bytes()),
+                    _ => None,
+                };
+                contextual.or_else(|| {
+                    crate::config_ir::request_value(
+                        variable,
+                        base.req,
+                        peer,
+                        base.https,
+                        &request_host,
+                        base.server_name,
+                        base.local_port,
+                    )
+                })
+            })
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        if transform.only_if_not_empty && value.is_empty() {
+            continue;
+        }
+        transformed_bytes = transformed_bytes
+            .checked_add(transform.name.len())
+            .and_then(|total| total.checked_add(value.len()))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "FastCGI parameter size overflow",
+                )
+            })?;
+        if transformed_bytes > 64 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "configured FastCGI parameters exceed 64 KiB",
+            ));
+        }
+        let existing = env.iter().find_map(|(name, existing)| {
+            (name.as_os_str().as_bytes() == transform.name.as_bytes())
+                .then_some(existing.as_os_str().as_bytes())
+        });
+        // Every standard CGI identity is authoritative. The nginx frontend may
+        // restate it using the closed variable grammar, but cannot change it.
+        // Custom parameters remain available for application configuration.
+        if existing.is_some_and(|existing| existing != value.as_slice()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "FastCGI parameter {} disagrees with the authorized request identity",
+                    transform.name
+                ),
+            ));
+        }
+        if existing.is_none() && crate::cgi::reserved_cgi_env(&transform.name) && !value.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "FastCGI parameter {} would create an unauthorized request identity",
+                    transform.name
+                ),
+            ));
+        }
+        env.retain(|(name, _)| name.as_os_str().as_bytes() != transform.name.as_bytes());
+        env.push((OsString::from(&transform.name), OsString::from_vec(value)));
+    }
+    Ok(())
+}
+
 fn build_params(env: &[(OsString, OsString)]) -> Vec<u8> {
     let mut params = Vec::new();
     for (k, v) in env {
@@ -1609,6 +1725,10 @@ fn execute_inner(
             ),
         ));
     }
+    if let Err(error) = apply_configured_params(&mut env, base, scope, target) {
+        eprintln!("httpd-rs FastCGI parameter error: {error}");
+        return fastcgi_error_response(base, scope, target, 500);
+    }
     let result = (|| -> io::Result<Response> {
         let timeout = base.cfg.timeout.max(Duration::from_secs(5));
         let policy = stable_policy_for(base.cfg, &target.backend)?;
@@ -2152,6 +2272,98 @@ mod tests {
             expect_continue: false,
             framing: crate::verified::BodyFraming::None,
         }
+    }
+
+    #[test]
+    fn configured_fastcgi_params_cannot_replace_authoritative_identity() {
+        let dir =
+            std::env::temp_dir().join(format!("httpd-rs-fcgi-param-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = config(&dir);
+        let mut req = request("/index.php");
+        req.headers
+            .insert("authorization", b"Basic dXNlcjpwYXNz".to_vec());
+        let target = Target {
+            backend: parse_backend("fcgi://127.0.0.1:9000/").unwrap(),
+            script_filename: LexicalScriptPath::for_test(dir.join("index.php")),
+            script_name: "/index.php".into(),
+            path_info: String::new(),
+            route_order: 0,
+            origin: RouteOrigin::FilesystemHandler,
+            logical_url: None,
+        };
+        let ctx = CgiContext {
+            cfg: &cfg,
+            vhost: None,
+            req: &req,
+            root: &dir,
+            script_rel: Path::new("index.php"),
+            request_uri: "/index.php",
+            script_name: "/index.php",
+            path_info: "",
+            docroot: &dir,
+            remote_ip: "192.0.2.9",
+            remote_port: 12345,
+            local_ip: "127.0.0.1",
+            local_port: 8080,
+            https: false,
+            server_name: "example.test",
+            host: "example.test",
+            follow_symlinks: false,
+            env: &[],
+            remote_user: None,
+            auth_type: None,
+            pass_authorization: false,
+            script_file: None,
+        };
+
+        let mut scope = cfg.global.clone();
+        scope.proxy_policy.fastcgi_params = Some(vec![
+            crate::config_ir::FastCgiParamTransform::new(
+                "REQUEST_METHOD",
+                "$request_method",
+                false,
+            )
+            .unwrap(),
+            crate::config_ir::FastCgiParamTransform::new("APP_ENV", "production", false).unwrap(),
+        ]);
+        let mut env = env_from_base(&ctx);
+        apply_configured_params(&mut env, &ctx, &scope, &target).unwrap();
+        assert!(env.iter().any(|(name, value)| {
+            name == "APP_ENV" && value.as_os_str().as_bytes() == b"production"
+        }));
+
+        scope.proxy_policy.fastcgi_params =
+            Some(vec![crate::config_ir::FastCgiParamTransform::new(
+                "REQUEST_METHOD",
+                "POST",
+                false,
+            )
+            .unwrap()]);
+        let mut env = env_from_base(&ctx);
+        assert_eq!(
+            apply_configured_params(&mut env, &ctx, &scope, &target)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        scope.proxy_policy.fastcgi_params =
+            Some(vec![crate::config_ir::FastCgiParamTransform::new(
+                "HTTP_AUTHORIZATION",
+                "$http_authorization",
+                false,
+            )
+            .unwrap()]);
+        let mut env = env_from_base(&ctx);
+        assert_eq!(
+            apply_configured_params(&mut env, &ctx, &scope, &target)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn mock_fastcgi(

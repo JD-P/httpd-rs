@@ -1,4 +1,3 @@
-use crate::tracing;
 use super::recv::RecvHeaderBlockError;
 use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
@@ -11,6 +10,7 @@ use crate::codec::{Codec, UserError};
 use crate::ext::Protocol;
 use crate::frame::{self, Frame, Reason};
 use crate::proto::{peer, Error, Initiator, Open, Peer, WindowSize};
+use crate::tracing;
 use crate::{proto, server};
 
 use bytes::{Buf, Bytes};
@@ -116,10 +116,12 @@ struct Actions {
 /// before `Counts::record_data_frame` would let empty/small-frame floods evade
 /// the connection's hard framing-overhead limit.
 fn record_discarded_data_frame(counts: &mut Counts, frame: &frame::Data) -> Result<(), Error> {
-    counts.record_data_frame(frame.payload().len()).map_err(|_| {
-        tracing::debug!("too many small DATA frames on a terminal stream");
-        Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_data_frames")
-    })
+    counts
+        .record_data_frame(frame.payload().len())
+        .map_err(|_| {
+            tracing::debug!("too many small DATA frames on a terminal stream");
+            Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_data_frames")
+        })
 }
 
 /// Contains the buffer of frames to be written to the wire.
@@ -511,8 +513,8 @@ impl Inner {
             Entry::Occupied(e) => e.key(),
             Entry::Vacant(e) => {
                 if let Some(phase) = self.counts.forgotten_phase(id) {
-                    let malformed = !frame.is_end_stream()
-                        || frame.pseudo() != &frame::Pseudo::default();
+                    let malformed =
+                        !frame.is_end_stream() || frame.pseudo() != &frame::Pseudo::default();
                     let kind = if phase == httpd_rs_verified::H2PeerStreamPhase::ClosedLocalReset
                         && malformed
                     {
@@ -583,10 +585,8 @@ impl Inner {
         } else {
             httpd_rs_verified::H2PeerFrame::Headers
         };
-        match httpd_rs_verified::h2_peer_frame_decision(
-            stream.state.peer_recv_phase(),
-            header_kind,
-        ) {
+        match httpd_rs_verified::h2_peer_frame_decision(stream.state.peer_recv_phase(), header_kind)
+        {
             httpd_rs_verified::H2PeerFrameDecision::Process => {}
             httpd_rs_verified::H2PeerFrameDecision::Ignore => {
                 return Ok(RecvOutcome::Processed);
@@ -1961,13 +1961,8 @@ impl Actions {
                 // suppresses double resets, so terminal streams use the
                 // cause-preserving repeat path.
                 if stream.state.is_reset() {
-                    self.send.send_repeat_reset(
-                        buffer,
-                        stream,
-                        reason,
-                        counts,
-                        &mut self.task,
-                    );
+                    self.send
+                        .send_repeat_reset(buffer, stream, reason, counts, &mut self.task);
                 } else {
                     self.send
                         .send_reset(reason, initiator, buffer, stream, counts, &mut self.task);

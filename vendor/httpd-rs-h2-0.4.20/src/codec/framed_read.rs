@@ -1,9 +1,9 @@
-use crate::tracing;
 use crate::frame::{self, Frame, Kind, Reason};
 use crate::frame::{
     DEFAULT_MAX_FRAME_SIZE, DEFAULT_SETTINGS_HEADER_TABLE_SIZE, MAX_MAX_FRAME_SIZE,
 };
 use crate::proto::Error;
+use crate::tracing;
 
 use crate::hpack;
 
@@ -676,10 +676,9 @@ mod tests {
         ));
         assert!(matches!(
             httpd_rs_verified::h2_header_block_step(started, 9, 4, 1, 8, 16, 2),
-            httpd_rs_verified::H2HeaderBlockDecision::Accept(httpd_rs_verified::H2HeaderBlockState {
-                stream_id: 0,
-                ..
-            })
+            httpd_rs_verified::H2HeaderBlockDecision::Accept(
+                httpd_rs_verified::H2HeaderBlockState { stream_id: 0, .. }
+            )
         ));
     }
 }

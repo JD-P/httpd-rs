@@ -788,6 +788,18 @@ pub struct Redirect {
     /// `RedirectMatch`: match the full URL path with this regex and expand
     /// `$1`..`$9` captures in `to`.
     pub regex: Option<Arc<Regex>>,
+    /// Apache redirects project the unmatched path suffix and preserve an
+    /// original query when the target has none. nginx `return code URL` is a
+    /// terminal literal value: neither operation is implicit. Keeping that
+    /// distinction typed prevents a frontend from approximating one with the
+    /// other at the terminal sink boundary.
+    pub projection: RedirectProjection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectProjection {
+    Apache,
+    Exact,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3477,6 +3489,10 @@ pub struct Config {
     vhost_index: Arc<VHostIndex>,
     pub global: Scope,
     pub global_rules: Vec<ScopeRule>,
+    /// Source-neutral route program. Apache retains its existing phased rule
+    /// evaluator; nginx configurations use the explicit winner-selection
+    /// machine and merge exactly one selected location policy.
+    pub(crate) route_program: crate::config_ir::RouteProgram<Scope>,
     pub global_directory_index: DirectoryRuleIndex,
     pub proxy_containers: Vec<ProxyContainer>,
     pub mime: MimeMap,
@@ -3658,6 +3674,7 @@ impl Config {
         self.override_enabled
             || scope_may_consume(&self.global)
             || rules_may_consume(&self.global_rules)
+            || self.route_program.policies().any(scope_may_consume)
             || self.vhosts.iter().any(|vhost| {
                 scope_may_consume(&vhost.scope)
                     || scope_may_consume(&vhost.delta)
@@ -3707,6 +3724,7 @@ impl Config {
         self.override_enabled
             || scope_may_dispatch_cgi(&self.global)
             || rules_may_dispatch_cgi(&self.global_rules)
+            || self.route_program.policies().any(scope_may_dispatch_cgi)
             || self.vhosts.iter().any(|vhost| {
                 scope_may_dispatch_cgi(&vhost.scope)
                     || scope_may_dispatch_cgi(&vhost.delta)
@@ -3853,6 +3871,31 @@ impl Config {
         )
     }
 
+    /// Load either supported configuration language into the shared typed IR.
+    /// The Apache entry point above remains source-compatible for embedders.
+    pub fn load_format(
+        format: crate::config_ir::ConfigFormat,
+        path: &Path,
+        server_root: &Path,
+        env: &HashMap<String, String>,
+        defines: &HashMap<String, String>,
+        strict: bool,
+    ) -> Result<Config, Vec<ConfigError>> {
+        match format {
+            crate::config_ir::ConfigFormat::Apache => {
+                Self::load(path, server_root, env, defines, strict)
+            }
+            crate::config_ir::ConfigFormat::Nginx => Self::load_nginx_mode(
+                path,
+                server_root,
+                strict,
+                false,
+                crate::files::AdminFileTrust::for_current_process(),
+                None,
+            ),
+        }
+    }
+
     /// Reload while retaining the trust boundary captured by the original
     /// configuration generation. `service_uid` is the identity of the
     /// request process, not the euid performing this parse.
@@ -3875,6 +3918,37 @@ impl Config {
             previous.admin_file_trust,
             Some(service_uid),
         )
+    }
+
+    pub fn load_for_reload_format(
+        format: crate::config_ir::ConfigFormat,
+        path: &Path,
+        server_root: &Path,
+        env: &HashMap<String, String>,
+        defines: &HashMap<String, String>,
+        strict: bool,
+        previous: &Config,
+        service_uid: u32,
+    ) -> Result<Config, Vec<ConfigError>> {
+        match format {
+            crate::config_ir::ConfigFormat::Apache => Self::load_for_reload(
+                path,
+                server_root,
+                env,
+                defines,
+                strict,
+                previous,
+                service_uid,
+            ),
+            crate::config_ir::ConfigFormat::Nginx => Self::load_nginx_mode(
+                path,
+                server_root,
+                strict,
+                false,
+                previous.admin_file_trust,
+                Some(service_uid),
+            ),
+        }
     }
 
     /// Validate paths discovered before the configured service identity was
@@ -3949,6 +4023,134 @@ impl Config {
         )
     }
 
+    pub fn load_capability_audit_format(
+        format: crate::config_ir::ConfigFormat,
+        path: &Path,
+        server_root: &Path,
+        env: &HashMap<String, String>,
+        defines: &HashMap<String, String>,
+        strict: bool,
+    ) -> Result<Config, Vec<ConfigError>> {
+        match format {
+            crate::config_ir::ConfigFormat::Apache => {
+                Self::load_capability_audit(path, server_root, env, defines, strict)
+            }
+            crate::config_ir::ConfigFormat::Nginx => Self::load_nginx_mode(
+                path,
+                server_root,
+                strict,
+                true,
+                crate::files::AdminFileTrust::for_current_process(),
+                None,
+            ),
+        }
+    }
+
+    fn load_nginx_mode(
+        path: &Path,
+        server_root: &Path,
+        strict: bool,
+        capability_audit: bool,
+        admin_file_trust: crate::files::AdminFileTrust,
+        admin_service_uid: Option<u32>,
+    ) -> Result<Config, Vec<ConfigError>> {
+        let lowered =
+            crate::nginx_frontend::load(path, server_root, admin_file_trust, admin_service_uid)
+                .map_err(|errors| {
+                    errors
+                        .into_iter()
+                        .map(|error| ConfigError {
+                            file: error.file,
+                            line: error.line,
+                            msg: error.message,
+                        })
+                        .collect::<Vec<_>>()
+                })?;
+        let mut parser = ParserState {
+            events: lowered.events,
+            section_stack: Vec::new(),
+            modules: HashSet::new(),
+            module_names: prelinked_module_names(),
+            defines: HashMap::new(),
+            env: HashMap::new(),
+            depth: 0,
+            warnings: lowered.warnings,
+            errors: Vec::new(),
+            initial_server_root: server_root.to_path_buf(),
+            server_root: server_root.to_path_buf(),
+            include_count: 0,
+            config_bytes: 0,
+            admin_file_trust,
+            admin_service_uid,
+            admin_input_targets: lowered.admin_inputs,
+        };
+        let program = ConfigProgram::seal(std::mem::take(&mut parser.events)).map_err(|msg| {
+            vec![ConfigError {
+                file: path.display().to_string(),
+                line: 0,
+                msg,
+            }]
+        })?;
+        let mut config = Compile::new(parser, program, strict, capability_audit)
+            .compile()
+            .map_err(|error| vec![error])?;
+        if config.vhosts.len() != lowered.routes.len() {
+            return Err(vec![ConfigError {
+                file: path.display().to_string(),
+                line: 0,
+                msg: "nginx frontend/compiler server cardinality mismatch".into(),
+            }]);
+        }
+        let mut servers = Vec::with_capacity(config.vhosts.len());
+        for (vhost, matchers) in config.vhosts.iter_mut().zip(lowered.routes) {
+            let mut deltas = Vec::new();
+            vhost.rules.retain(|rule| {
+                if matches!(
+                    rule.kind,
+                    MatchKind::Location(_) | MatchKind::LocationMatch(_)
+                ) {
+                    // Apache stores containers in merge-phase order. The
+                    // nginx winner machine pairs policies with source order.
+                    deltas.push((rule.order, rule.delta.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+            deltas.sort_by_key(|(order, _)| *order);
+            if deltas.len() != matchers.len() {
+                return Err(vec![ConfigError {
+                    file: path.display().to_string(),
+                    line: 0,
+                    msg: "nginx frontend/compiler location cardinality mismatch".into(),
+                }]);
+            }
+            vhost.directory_index = DirectoryRuleIndex::build(&vhost.rules);
+            servers.push(
+                matchers
+                    .into_iter()
+                    .zip(deltas.into_iter().map(|(_, delta)| delta))
+                    .enumerate()
+                    .map(
+                        |(declaration_order, (matcher, policy))| crate::config_ir::Route {
+                            matcher,
+                            policy,
+                            declaration_order,
+                        },
+                    )
+                    .collect(),
+            );
+        }
+        let ir = crate::config_ir::ConfigIr::nginx(config, servers).map_err(|msg| {
+            vec![ConfigError {
+                file: path.display().to_string(),
+                line: 0,
+                msg,
+            }]
+        })?;
+        Ok(ir.finalize())
+    }
+
     fn load_mode(
         path: &Path,
         server_root: &Path,
@@ -4000,18 +4202,26 @@ impl Config {
                 }]);
             }
         };
-        match Compile::new(p, program, strict, capability_audit).compile() {
-            Ok(mut c) => {
-                c.override_enabled = c.override_scan();
-                let (prefixes, anywhere) = c.override_paths();
-                c.override_prefixes = prefixes;
-                c.override_anywhere = anywhere;
-                c.body_handlers_possible = c.compute_body_handlers_possible();
-                c.cgi_path_info_possible = c.compute_cgi_path_info_possible();
-                Ok(c)
-            }
+        match Compile::new(p, program, strict, capability_audit).compile_ir() {
+            Ok(ir) => Ok(ir.finalize()),
             Err(e) => Err(vec![e]),
         }
+    }
+}
+
+impl crate::config_ir::ConfigIr {
+    /// Shared source-neutral finalization.  Keeping these derived facts here
+    /// prevents a frontend from forgetting a conservative request-body, CGI,
+    /// access-file, or route-policy bit.
+    fn finalize(mut self) -> Config {
+        self.config.route_program = self.routes;
+        self.config.override_enabled = self.config.override_scan();
+        let (prefixes, anywhere) = self.config.override_paths();
+        self.config.override_prefixes = prefixes;
+        self.config.override_anywhere = anywhere;
+        self.config.body_handlers_possible = self.config.compute_body_handlers_possible();
+        self.config.cgi_path_info_possible = self.config.compute_cgi_path_info_possible();
+        self.config
     }
 }
 
@@ -4059,6 +4269,12 @@ fn directive_arity(name: &str) -> PayloadArity {
             min: 2,
             max: Some(2),
         },
+        "httpdrsproxysetheader" => PayloadArity::TWO,
+        "httpdrsfastcgiparam" => PayloadArity::between(2, 3),
+        "httpdrsscopedroot" => PayloadArity::ONE,
+        "httpdrsnginxreturn" => PayloadArity::between(2, 3),
+        "httpdrsrouteproxypass" => PayloadArity::at_least(2),
+        "httpdrsrouteproxypassreverse" => PayloadArity::TWO,
         "require"
         | "allowoverride"
         | "allowoverridelist"
@@ -4267,6 +4483,7 @@ fn directive_rejects_empty(name: &str) -> bool {
             | "authbasicprovider"
             | "httpdrscapability"
             | "httpdrsfastcgistablepath"
+            | "httpdrsscopedroot"
             | "serveralias"
             | "allowoverride"
             | "allowoverridelist"
@@ -4311,7 +4528,7 @@ fn build_directive_payload_schema(name: &str) -> PayloadSchema {
         "errordocument" => PayloadValueSchema::ErrorDocument,
         "directoryindex" => PayloadValueSchema::DirectoryIndex,
         "header" => PayloadValueSchema::Header,
-        "redirect" => PayloadValueSchema::Redirect {
+        "redirect" | "httpdrsnginxreturn" => PayloadValueSchema::Redirect {
             forced_status: None,
             regex: false,
         },
@@ -4433,8 +4650,8 @@ fn build_directive_payload_schema(name: &str) -> PayloadSchema {
         "cachelastmodifiedfactor" => PayloadValueSchema::UnitFloat,
         "sslstaplingforceurl" => PayloadValueSchema::OcspResponderUrl,
         "aliasmatch" | "scriptaliasmatch" => PayloadValueSchema::AliasRegex,
-        "proxypass" => PayloadValueSchema::ProxyPass,
-        "proxypassreverse" => PayloadValueSchema::ProxyPassReverse,
+        "proxypass" | "httpdrsrouteproxypass" => PayloadValueSchema::ProxyPass,
+        "proxypassreverse" | "httpdrsrouteproxypassreverse" => PayloadValueSchema::ProxyPassReverse,
         "proxypassmatch" => PayloadValueSchema::ProxyPassMatch,
         "httpdrscapability" => PayloadValueSchema::Validated(PayloadValidation::Capability),
         "httpdrsfastcgistablepath" => {
@@ -4974,6 +5191,12 @@ fn core_directive_exists(name: &str) -> bool {
             | "httpdrsmaxfastcgioutput"
             | "httpdrsmaxspoolbytes"
             | "httpdrsmaxspoolfiles"
+            | "httpdrsproxysetheader"
+            | "httpdrsfastcgiparam"
+            | "httpdrsscopedroot"
+            | "httpdrsnginxreturn"
+            | "httpdrsrouteproxypass"
+            | "httpdrsrouteproxypassreverse"
     )
 }
 
@@ -5336,6 +5559,21 @@ impl ParserState {
                     name: cmd,
                     args: raw_args,
                 } => {
+                    if matches!(
+                        cmd.as_str(),
+                        "httpdrsproxysetheader"
+                            | "httpdrsfastcgiparam"
+                            | "httpdrsscopedroot"
+                            | "httpdrsnginxreturn"
+                            | "httpdrsrouteproxypass"
+                            | "httpdrsrouteproxypassreverse"
+                    ) {
+                        self.error(
+                            &loc,
+                            "directive is private to the source-neutral frontend compiler",
+                        );
+                        continue;
+                    }
                     let args = match self.expand_vars(&raw_args, &loc) {
                         Some(a) => a,
                         None => continue,
@@ -5786,6 +6024,7 @@ impl Compile {
             vhost_index: Arc::new(VHostIndex::default()),
             global: Scope::default(),
             global_rules: Vec::new(),
+            route_program: crate::config_ir::RouteProgram::Apache,
             global_directory_index: DirectoryRuleIndex::default(),
             proxy_containers: Vec::new(),
             mime: MimeMap::new(),
@@ -5968,6 +6207,10 @@ impl Compile {
             line: loc.line,
             msg: msg.into(),
         });
+    }
+
+    fn compile_ir(self) -> Result<crate::config_ir::ConfigIr, ConfigError> {
+        self.compile().map(crate::config_ir::ConfigIr::apache)
     }
 
     fn compile(mut self) -> Result<Config, ConfigError> {
@@ -6950,6 +7193,69 @@ impl Compile {
                     _ => unreachable!(),
                 }
             }
+            "httpdrsproxysetheader" => {
+                let transform = match crate::config_ir::ProxyHeaderTransform::new(
+                    &args[0], &args[1],
+                ) {
+                    Ok(transform) => transform,
+                    Err(error) => {
+                        self.directive_error(loc, error);
+                        return;
+                    }
+                };
+                let transforms = scope
+                    .proxy_policy
+                    .request_headers
+                    .get_or_insert_with(Vec::new);
+                if transforms.len() >= crate::config_ir::MAX_TRANSFORMS_PER_SCOPE {
+                    self.directive_error(loc, "too many proxy header transformations in one scope");
+                    return;
+                }
+                transforms.retain(|existing| existing.name != transform.name);
+                transforms.push(transform);
+            }
+            "httpdrsfastcgiparam" => {
+                let only_if_not_empty = match args.get(2).map(String::as_str) {
+                    None => false,
+                    Some("if_not_empty") => true,
+                    Some(other) => {
+                        self.directive_error(
+                            loc,
+                            format!("unsupported FastCGI parameter modifier '{other}'"),
+                        );
+                        return;
+                    }
+                };
+                let transform = match crate::config_ir::FastCgiParamTransform::new(
+                    &args[0],
+                    &args[1],
+                    only_if_not_empty,
+                ) {
+                    Ok(transform) => transform,
+                    Err(error) => {
+                        self.directive_error(loc, error);
+                        return;
+                    }
+                };
+                let transforms = scope
+                    .proxy_policy
+                    .fastcgi_params
+                    .get_or_insert_with(Vec::new);
+                if transforms.len() >= crate::config_ir::MAX_TRANSFORMS_PER_SCOPE {
+                    self.directive_error(loc, "too many FastCGI parameters in one scope");
+                    return;
+                }
+                transforms.retain(|existing| existing.name != transform.name);
+                transforms.push(transform);
+            }
+            "httpdrsscopedroot" => {
+                let path = PathBuf::from(first());
+                scope.content_policy.document_root = Some(if path.is_absolute() {
+                    clean_path(&path)
+                } else {
+                    clean_path(&self.cfg.server_root.join(path))
+                });
+            }
             "protocols" => {
                 if !matches!(section, SectionKind::Server | SectionKind::VirtualHost) {
                     self.errors.push(ConfigError {
@@ -7239,13 +7545,15 @@ impl Compile {
                         .clone(),
                 );
             }
-            "redirect" | "redirectpermanent" | "redirecttemp" => {
-                scope.mapping_policy.redirects.push(
-                    payload
-                        .redirect()
-                        .expect("Redirect is compiled while sealing")
-                        .clone(),
-                );
+            "redirect" | "redirectpermanent" | "redirecttemp" | "httpdrsnginxreturn" => {
+                let mut redirect = payload
+                    .redirect()
+                    .expect("Redirect is compiled while sealing")
+                    .clone();
+                if name == "httpdrsnginxreturn" {
+                    redirect.projection = RedirectProjection::Exact;
+                }
+                scope.mapping_policy.redirects.push(redirect);
             }
             "rewritemap" => {
                 let sealed = payload
@@ -7760,7 +8068,7 @@ impl Compile {
                     .unit_float()
                     .expect("CacheLastModifiedFactor is compiled while sealing");
             }
-            "proxypass" => {
+            "proxypass" | "httpdrsrouteproxypass" => {
                 let sealed = payload
                     .proxy_pass()
                     .expect("ProxyPass is compiled while sealing");
@@ -7777,7 +8085,7 @@ impl Compile {
                 self.next_route += 1;
                 scope.proxy_policy.proxy_passes.push(rule);
             }
-            "proxypassreverse" => {
+            "proxypassreverse" | "httpdrsrouteproxypassreverse" => {
                 let sealed = payload
                     .proxy_pass_reverse()
                     .expect("ProxyPassReverse is compiled while sealing");
@@ -11446,10 +11754,16 @@ fn known_directives() -> Vec<&'static str> {
         "userdir",
         "userdirnegotiation",
         "httpdrsfastcgistablepath",
+        "httpdrsfastcgiparam",
+        "httpdrsscopedroot",
+        "httpdrsnginxreturn",
+        "httpdrsrouteproxypass",
+        "httpdrsrouteproxypassreverse",
         "httpdrsmaxdynamicrequests",
         "httpdrsmaxfastcgioutput",
         "httpdrsmaxspoolbytes",
         "httpdrsmaxspoolfiles",
+        "httpdrsproxysetheader",
         "httpdrscapability",
         "variantname",
         "virtualhost",
@@ -17528,9 +17842,13 @@ impl Config {
                     .get(&VHostBucketKey { address, port: 0 })
             })
         {
-            return bucket
-                .select(&self.vhosts, host)
-                .and_then(|index| self.vhosts.get(index));
+            let selected = if self.route_program.is_nginx() {
+                self.route_program
+                    .select_nginx_server(&bucket.candidates, host)
+            } else {
+                bucket.select(&self.vhosts, host)
+            };
+            return selected.and_then(|index| self.vhosts.get(index));
         }
         // Public Config fields are retained for source compatibility with
         // embedders and tests that construct/mutate a Config manually. Normal
@@ -17847,10 +18165,36 @@ impl Config {
         self.server_software.clone()
     }
 
+    pub(crate) fn base_scope_with_route(&self, vhost: Option<&VHost>, url_path: &str) -> Scope {
+        let mut scope = vhost.map(|v| &v.scope).unwrap_or(&self.global).clone();
+        if let Some(index) = vhost.and_then(|value| self.vhost_position(value)) {
+            if let Some(route) = self.route_program.select(index, url_path) {
+                scope.merge(route);
+            }
+        }
+        scope
+    }
+
+    fn base_scope_with_route_req(
+        &self,
+        vhost: Option<&VHost>,
+        url_path: &str,
+        req: &crate::http::Request,
+    ) -> Scope {
+        let mut scope = vhost.map(|v| &v.scope).unwrap_or(&self.global).clone();
+        if let Some(index) = vhost.and_then(|value| self.vhost_position(value)) {
+            match self.route_program.select_metered(index, url_path, req) {
+                Ok(Some(route)) => scope.merge(route),
+                Ok(None) => {}
+                Err(_) => scope.conditional_error = true,
+            }
+        }
+        scope
+    }
+
     /// Compute the effective scope for a filesystem path and URL path.
     pub fn effective_scope(&self, vhost: Option<&VHost>, fs_path: &Path, url_path: &str) -> Scope {
-        let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
-        let mut s = base.clone();
+        let mut s = self.base_scope_with_route(vhost, url_path);
         let rules: &[ScopeRule] = vhost
             .map(|v| v.rules.as_slice())
             .unwrap_or(self.global_rules.as_slice());
@@ -17913,8 +18257,7 @@ impl Config {
                 return Ok(scope);
             }
         }
-        let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
-        let mut scope = base.clone();
+        let mut scope = self.base_scope_with_route_req(vhost, url_path, req);
         let rules: &[ScopeRule] = vhost
             .map(|v| v.rules.as_slice())
             .unwrap_or(self.global_rules.as_slice());
@@ -18092,8 +18435,7 @@ impl Config {
                 return (Arc::clone(&cached.scope), Arc::clone(&cached.conditionals));
             }
         }
-        let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
-        let mut scope = base.clone();
+        let mut scope = self.base_scope_with_route_req(vhost, url_path, req);
         let rules: &[ScopeRule] = vhost
             .map(|v| v.rules.as_slice())
             .unwrap_or(self.global_rules.as_slice());
@@ -18206,7 +18548,8 @@ impl Config {
             })
         }
 
-        let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
+        let selected_base = self.base_scope_with_route(vhost, url_path);
+        let base = &selected_base;
         let rules = vhost
             .map(|v| v.rules.as_slice())
             .unwrap_or(self.global_rules.as_slice());
@@ -18263,8 +18606,7 @@ impl Config {
         locations: &mut Vec<ScopeRule>,
         conditionals: &mut Vec<ScopeRule>,
     ) -> Scope {
-        let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
-        let mut s = base.clone();
+        let mut s = self.base_scope_with_route_req(vhost, url_path, req);
         let rules: &[ScopeRule] = vhost
             .map(|v| v.rules.as_slice())
             .unwrap_or(self.global_rules.as_slice());

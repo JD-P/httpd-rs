@@ -1,5 +1,5 @@
-use crate::tracing;
 use crate::frame::{Error, Frame, Head, Kind, StreamId};
+use crate::tracing;
 use bytes::BufMut;
 
 const ACK_FLAG: u8 = 0x1;

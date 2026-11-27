@@ -1,6 +1,6 @@
-use crate::tracing;
 use super::{header::BytesStr, huffman, Header};
 use crate::frame;
+use crate::tracing;
 
 use bytes::{Buf, Bytes, BytesMut};
 use http::header;

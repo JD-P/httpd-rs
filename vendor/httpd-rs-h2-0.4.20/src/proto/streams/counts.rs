@@ -1,5 +1,5 @@
-use crate::tracing;
 use super::*;
+use crate::tracing;
 use std::collections::VecDeque;
 
 const MAX_FORGOTTEN_STREAMS: usize = 1024;
@@ -135,21 +135,14 @@ impl Counts {
         }
     }
 
-    pub fn forgotten_phase(
-        &self,
-        id: StreamId,
-    ) -> Option<httpd_rs_verified::H2PeerStreamPhase> {
+    pub fn forgotten_phase(&self, id: StreamId) -> Option<httpd_rs_verified::H2PeerStreamPhase> {
         self.forgotten_index
             .binary_search_by_key(&id, |(stream, _)| *stream)
             .ok()
             .map(|index| self.forgotten_index[index].1)
     }
 
-    fn remember_forgotten(
-        &mut self,
-        id: StreamId,
-        phase: httpd_rs_verified::H2PeerStreamPhase,
-    ) {
+    fn remember_forgotten(&mut self, id: StreamId, phase: httpd_rs_verified::H2PeerStreamPhase) {
         // A stream is normally released exactly once. If a future state-machine
         // change reports it twice, update the existing cause without creating
         // a duplicate FIFO entry that could later evict the live index value.

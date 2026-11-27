@@ -1,6 +1,6 @@
-use crate::tracing;
 use crate::frame::Reason;
 use crate::proto::WindowSize;
+use crate::tracing;
 
 use std::fmt;
 

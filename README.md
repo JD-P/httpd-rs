@@ -2,7 +2,8 @@
 
 A memory-safe, (partially) formally verified, drop-in-compatible Apache HTTP Server
 replacement written in Rust. `httpd-rs` is **not** endorsed by the Apache Software
-Foundation and will eventually support nginx configuration too.
+Foundation. It reads Apache 2.4 configuration by default and also provides an
+explicit, fail-closed [nginx HTTP configuration subset](docs/reference/nginx-configuration.md).
 
 The [httpd-rs documentation](https://jd-p.github.io/httpd-rs/) covers migration,
 intentional Apache differences, security expectations, and contributor guidelines.

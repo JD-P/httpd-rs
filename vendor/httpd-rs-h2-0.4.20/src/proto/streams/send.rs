@@ -1,4 +1,3 @@
-use crate::tracing;
 use super::{
     store, Buffer, BufferStatus, Codec, Config, Counts, Frame, Prioritize, Prioritized, Store,
     Stream, StreamId, StreamIdOverflow, WindowSize,
@@ -6,6 +5,7 @@ use super::{
 use crate::codec::UserError;
 use crate::frame::{self, Reason};
 use crate::proto::{self, Error, Initiator};
+use crate::tracing;
 
 use bytes::Buf;
 use tokio::io::AsyncWrite;

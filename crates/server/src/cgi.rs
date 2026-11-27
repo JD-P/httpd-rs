@@ -214,7 +214,7 @@ fn sanitize_env_value(v: &[u8]) -> String {
 /// authenticated identity.  A `SetEnv`/rewrite environment entry must not
 /// replace them: that is the CVE-2025-65082 boundary.  `HTTP_*` covers all
 /// request-derived CGI header variables.
-fn reserved_cgi_env(name: &str) -> bool {
+pub(crate) fn reserved_cgi_env(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
     matches!(
         name.as_str(),
@@ -254,6 +254,19 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
         OsString::from("QUERY_STRING"),
         OsString::from_vec(ctx.req.query.clone()),
     ));
+    // Apache's CGI REQUEST_URI is the canonical public URL path, without the
+    // query string. nginx's conventional `$request_uri` FastCGI parameter
+    // includes the original query. Both retain the canonical public path
+    // across internal rewrites and never export an unvalidated raw target.
+    let mut request_uri = ctx.request_uri.as_bytes().to_vec();
+    if ctx.cfg.route_program.is_nginx() && !ctx.req.query.is_empty() {
+        request_uri.push(b'?');
+        request_uri.extend_from_slice(&ctx.req.query);
+    }
+    env.push((
+        OsString::from("REQUEST_URI"),
+        OsString::from_vec(request_uri),
+    ));
     let mut put = |k: &str, v: String| env.push((OsString::from(k), OsString::from(v)));
     put("GATEWAY_INTERFACE", "CGI/1.1".into());
     put("SERVER_SOFTWARE", ctx.cfg.server_header());
@@ -269,11 +282,6 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
     );
     put("DOCUMENT_ROOT", ctx.docroot.to_string_lossy().into_owned());
     put("REQUEST_METHOD", ctx.req.method.clone());
-    // Apache's CGI REQUEST_URI is the canonical public URL path, without the
-    // query string.  It must survive an internal rewrite to a different
-    // script (for example WordPress `/hello-world/` -> `/index.php`).  Never
-    // export the raw request-line target here (F57).
-    put("REQUEST_URI", ctx.request_uri.to_string());
     put("SCRIPT_NAME", ctx.script_name.to_string());
     put(
         "SCRIPT_FILENAME",
@@ -2048,6 +2056,25 @@ mod tests {
                 .find(|(key, _)| key == "QUERY_STRING")
                 .map(|(_, value)| value.as_os_str().as_bytes()),
             Some(b"x=\xff".as_slice())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nginx_cgi_request_uri_includes_the_original_query() {
+        let dir = tempdir("nginx-request-uri");
+        let mut cfg = config(&dir);
+        cfg.route_program = crate::config_ir::RouteProgram::nginx(Vec::new(), Vec::new()).unwrap();
+        let mut req = request("/test?name=value", Vec::new());
+        req.query = b"name=value".to_vec();
+        let ctx = test_ctx(&cfg, &req, &dir, Path::new("test"), None);
+        let env = build_env(&ctx);
+        assert_eq!(
+            env.iter()
+                .find(|(name, _)| name == "REQUEST_URI")
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+                .as_deref(),
+            Some("/test?name=value")
         );
         let _ = fs::remove_dir_all(&dir);
     }

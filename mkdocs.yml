@@ -108,6 +108,7 @@ nav:
       - Evaluate an Apache CVE: how-to/evaluate-apache-cve.md
   - Reference:
       - Apache compatibility: reference/apache-compatibility.md
+      - nginx configuration subset: reference/nginx-configuration.md
       - Tested deployments: deployments/README.md
       - Deployment coverage: deployments/coverage.md
   - Architecture and security:
@@ -127,6 +128,7 @@ nav:
           - Coverage strengthening: cve/not-covered-strengthening.md
       - Apache source warrant: apache-warrant.md
       - nginx corpus census: nginx-corpus-census.md
+      - HPACK interoperability corpus: hpack-interoperability-corpus.md
       - Apache access parity: apache-access-parity.md
       - Configuration semantics: config-semantics.md
       - Adversarial closure: adversarial-closure.md

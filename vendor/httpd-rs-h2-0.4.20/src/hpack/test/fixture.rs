@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::io::Cursor;
 use std::ops::ControlFlow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str;
 
 fn test_fixture(path: &Path) {
@@ -130,6 +130,16 @@ struct Case {
     header_table_size: Option<usize>,
 }
 
+fn fixture_root() -> PathBuf {
+    std::env::var_os("HTTPD_RS_HPACK_FIXTURES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join("hpack")
+        })
+}
+
 fn key_str(e: &Header) -> &str {
     match *e {
         Header::Field { ref name, .. } => name.as_str(),
@@ -164,9 +174,7 @@ macro_rules! fixture_mod {
             $(
                 #[test]
                 fn $fn() {
-                    let path = ::std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("fixtures/hpack")
-                        .join($path);
+                    let path = super::fixture_root().join($path);
 
                     super::test_fixture(path.as_ref());
                 }

@@ -6324,8 +6324,8 @@ fn authorize_url_phase_original(
 /// Apache's URL redirects append the client's query string when the configured
 /// destination does not supply one. An explicitly empty query (`/path?`) is
 /// still a query and must survive as a trailing `?` in `Location`.
-fn append_redirect_query(location: String, req: &Request) -> String {
-    if location.contains('?') {
+fn append_redirect_query(location: String, req: &Request, append_original: bool) -> String {
+    if !append_original || location.contains('?') {
         return location;
     }
     let query_present = req.target.contains(&b'?') || !req.query.is_empty();
@@ -7034,11 +7034,18 @@ fn run_url_translation_phase(
         }
 
         let current_req = owned_req.as_ref().unwrap_or(req);
-        if let Some((redirect_status, location)) =
-            match_redirect(&scope, &target.url_path, Some(current_req))
-                .map(|(redirect, location)| (redirect.status, location))
+        if let Some((redirect_status, location, append_query)) =
+            match_redirect(&scope, &target.url_path, Some(current_req)).map(
+                |(redirect, location)| {
+                    (
+                        redirect.status,
+                        location,
+                        redirect.projection == crate::config::RedirectProjection::Apache,
+                    )
+                },
+            )
         {
-            let location = append_redirect_query(location, current_req);
+            let location = append_redirect_query(location, current_req, append_query);
             let mut redirect_scope = scope.as_ref().clone();
             if let Some(original) = original.as_ref().filter(|(url, _, _)| {
                 url != &target.url_path || !effects.is_empty() || owned_req.is_some()
@@ -8156,7 +8163,11 @@ fn dispatch_inner(
     // Redirects are evaluated after rewrites but before access control and
     // filesystem mapping, matching Apache's URL translation order.
     if let Some((red, loc)) = match_redirect(&scope, &url_path, Some(req)) {
-        let loc = append_redirect_query(loc, req);
+        let loc = append_redirect_query(
+            loc,
+            req,
+            red.projection == crate::config::RedirectProjection::Apache,
+        );
         let authorization = match authorize_redirect_outcome(
             cfg,
             vhost,
@@ -9413,7 +9424,18 @@ pub fn map_path(
     norm: &[u8],
 ) -> Option<(PathBuf, PathBuf, bool)> {
     let url = String::from_utf8_lossy(norm);
-    let base_scope = vhost.map(|v| &v.scope).unwrap_or(&cfg.global);
+    // nginx `root` and any future source-neutral URL mapping operations are
+    // properties of the winning route.  Keep Apache's hot path borrowed, but
+    // materialize the selected nginx scope before mapping so filesystem
+    // identity and the later authorization scope are derived from the same
+    // route winner.
+    let routed_scope = cfg
+        .route_program
+        .is_nginx()
+        .then(|| cfg.base_scope_with_route(vhost, &url));
+    let base_scope = routed_scope
+        .as_ref()
+        .unwrap_or_else(|| vhost.map(|v| &v.scope).unwrap_or(&cfg.global));
     // Apache's alias table is ordered: the first matching `Alias`,
     // `ScriptAlias`, `AliasMatch` or `ScriptAliasMatch` wins.  A later, more
     // specific alias that overlaps an earlier one never matches.
@@ -9488,7 +9510,11 @@ pub fn map_path(
         }
         return Some((a.fs_path.clone(), rel, a.script));
     }
-    let root = cfg.documentation_root_for(vhost);
+    let root = base_scope
+        .content_policy
+        .document_root
+        .clone()
+        .unwrap_or_else(|| cfg.documentation_root_for(vhost));
     let rel = PathBuf::from(OsStr::from_bytes(&norm[1..]));
     Some((root, rel, false))
 }
@@ -9543,6 +9569,9 @@ fn match_redirect<'a>(
     // Redirect and RedirectMatch share one ordered table, matching Apache's
     // first-match behavior (a later overlapping redirect is unreachable).
     for r in &scope.mapping_policy.redirects {
+        if r.projection == crate::config::RedirectProjection::Exact {
+            return Some((r, r.to.clone()));
+        }
         if let Some(regex) = &r.regex {
             let Some(caps) = regex.captures(url.as_bytes()) else {
                 continue;
@@ -11258,6 +11287,7 @@ mod tests {
                 to: "/never".into(),
                 status: 301,
                 regex: Some(Arc::new(crate::config::compile_regex("^/nope$").unwrap())),
+                projection: crate::config::RedirectProjection::Apache,
             });
         scope
             .mapping_policy
@@ -11267,6 +11297,7 @@ mod tests {
                 to: "/dest".into(),
                 status: 302,
                 regex: None,
+                projection: crate::config::RedirectProjection::Apache,
             });
         let (red, loc) = match_redirect(&scope, "/plain", None).unwrap();
         assert_eq!(red.status, 302);
@@ -11280,6 +11311,7 @@ mod tests {
                 to: "/to/".into(),
                 status: 301,
                 regex: None,
+                projection: crate::config::RedirectProjection::Apache,
             });
         let (_, loc) = match_redirect(&scope, "/d/x", None).unwrap();
         assert_eq!(loc, "/to/x");
@@ -11294,6 +11326,7 @@ mod tests {
                 to: "/to".into(),
                 status: 302,
                 regex: None,
+                projection: crate::config::RedirectProjection::Apache,
             });
         let (_, loc) = match_redirect(&scope, "/exact", None).unwrap();
         assert_eq!(loc, "/to");
@@ -11307,6 +11340,7 @@ mod tests {
                 to: String::new(),
                 status: 404,
                 regex: Some(Arc::new(crate::config::compile_regex("^/empty$").unwrap())),
+                projection: crate::config::RedirectProjection::Apache,
             });
         let (_, loc) = match_redirect(&scope, "/empty", None).unwrap();
         assert!(loc.is_empty());
@@ -14158,6 +14192,7 @@ mod tests {
                 to: String::new(),
                 status: 404,
                 regex: None,
+                projection: crate::config::RedirectProjection::Apache,
             });
         manual
             .global
@@ -14168,6 +14203,7 @@ mod tests {
                 to: "relative-target".into(),
                 status: 302,
                 regex: None,
+                projection: crate::config::RedirectProjection::Apache,
             });
         let empty = cov_dispatch(&manual, "GET", "/directempty");
         assert_eq!(empty.status, 404);

@@ -1604,6 +1604,82 @@ fn append_proxy_header(head: &mut Vec<u8>, name: &[u8], value: &[u8]) {
     head.extend_from_slice(b"\r\n");
 }
 
+fn evaluated_proxy_headers(
+    scope: &Scope,
+    req: &Request,
+    canonical_path: &str,
+    peer: SocketAddr,
+    https: bool,
+    authority: &str,
+    configured_server_name: &str,
+    backend_authority: &str,
+) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let Some(transforms) = scope.proxy_policy.request_headers.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let default_port = if https { 443 } else { 80 };
+    let (host_name, server_port) =
+        crate::util::parse_http_authority(authority.as_bytes(), default_port)
+            .unwrap_or_else(|| (authority.to_string(), default_port));
+    let mut result = Vec::with_capacity(transforms.len());
+    for transform in transforms {
+        let value = transform
+            .value
+            .evaluate(|variable| {
+                if matches!(
+                    variable,
+                    crate::config_ir::ValueVariable::Uri
+                        | crate::config_ir::ValueVariable::DocumentUri
+                ) {
+                    return Some(canonical_path.as_bytes().to_vec());
+                }
+                if matches!(variable, crate::config_ir::ValueVariable::ProxyHost) {
+                    return Some(backend_authority.as_bytes().to_vec());
+                }
+                crate::config_ir::request_value(
+                    variable,
+                    req,
+                    peer.ip(),
+                    https,
+                    &host_name,
+                    configured_server_name,
+                    server_port,
+                )
+            })
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        if value.is_empty() {
+            // nginx uses an empty proxy_set_header value to suppress a field.
+            result.push((transform.name.clone(), value));
+            continue;
+        }
+        if !crate::verified::proxy_header_admit(transform.name.as_bytes(), &value) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "proxy header transformation produced invalid bytes",
+            ));
+        }
+        if transform.name == "host"
+            && std::str::from_utf8(&value)
+                .ok()
+                .is_none_or(|host| !valid_forwarded_host(host))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "proxy Host transformation produced an invalid authority",
+            ));
+        }
+        result.push((transform.name.clone(), value));
+    }
+    Ok(result)
+}
+
+fn transformed_header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
+    headers
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_slice())
+}
+
 fn hop_by_hop(name: &str) -> bool {
     name.eq_ignore_ascii_case("connection")
         || name.eq_ignore_ascii_case("proxy-connection")
@@ -3044,35 +3120,69 @@ where
         path.push(b'?');
         path.extend_from_slice(&req.query);
     }
-    if !host.is_empty() && !valid_forwarded_host(host) {
+    let forwarded_authority = request_authority(req, host);
+    if !forwarded_authority.is_empty() && !valid_forwarded_host(forwarded_authority) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "unsafe X-Forwarded-Host",
         ));
     }
-    let upstream_host = if scope.proxy_policy.preserve_host == Some(true) {
-        if host.is_empty() {
+    let backend_authority = format!("{}:{}", target.backend.host, target.backend.port);
+    let transformed = evaluated_proxy_headers(
+        scope,
+        req,
+        &resource.url_path,
+        peer,
+        https,
+        forwarded_authority,
+        host,
+        &backend_authority,
+    )?;
+    let transformed_host = transformed_header(&transformed, "host");
+    let upstream_host = if let Some(value) = transformed_host {
+        if value.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "proxy Host transformation may not be empty",
+            ));
+        }
+        std::str::from_utf8(value)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "proxy Host transformation is not UTF-8",
+                )
+            })?
+            .to_string()
+    } else if scope.proxy_policy.preserve_host == Some(true) {
+        if forwarded_authority.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "ProxyPreserveHost requires a request authority",
             ));
         }
-        host.to_string()
+        forwarded_authority.to_string()
     } else {
         format!("{}:{}", target.backend.host, target.backend.port)
     };
     let mut head = b"GET ".to_vec();
     head.extend_from_slice(&path);
-    head.extend_from_slice(
-        format!(
-            " HTTP/1.1\r\nHost: {upstream_host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        )
-        .as_bytes(),
-    );
+    head.extend_from_slice(format!(" HTTP/1.1\r\nHost: {upstream_host}\r\n").as_bytes());
+    let upgrade = transformed_header(&transformed, "upgrade").unwrap_or(b"websocket");
+    let connection = transformed_header(&transformed, "connection").unwrap_or(b"Upgrade");
+    if !upgrade.is_empty() {
+        append_proxy_header(&mut head, b"Upgrade", upgrade);
+    }
+    if !connection.is_empty() {
+        append_proxy_header(&mut head, b"Connection", connection);
+    }
     let request_tokens = request_connection_tokens(req);
     for (name, value) in req.headers.iter() {
         if hop_by_hop(name)
             || forwarded_header(name)
+            || transformed
+                .iter()
+                .any(|(configured, _)| configured.eq_ignore_ascii_case(name))
             || request_tokens
                 .iter()
                 .any(|token| token == &name.to_ascii_lowercase())
@@ -3082,24 +3192,44 @@ where
         }
         append_proxy_header(&mut head, name.as_bytes(), value);
     }
-    append_proxy_header(
-        &mut head,
-        b"X-Forwarded-For",
-        peer.ip().to_string().as_bytes(),
-    );
-    append_proxy_header(
-        &mut head,
-        b"X-Forwarded-Proto",
-        if https { b"https" } else { b"http" },
-    );
-    if !host.is_empty() {
-        append_proxy_header(&mut head, b"X-Forwarded-Host", host.as_bytes());
+    if transformed_header(&transformed, "x-forwarded-for").is_none() {
+        append_proxy_header(
+            &mut head,
+            b"X-Forwarded-For",
+            peer.ip().to_string().as_bytes(),
+        );
+    }
+    if transformed_header(&transformed, "x-forwarded-proto").is_none() {
+        append_proxy_header(
+            &mut head,
+            b"X-Forwarded-Proto",
+            if https { b"https" } else { b"http" },
+        );
+    }
+    if !forwarded_authority.is_empty()
+        && transformed_header(&transformed, "x-forwarded-host").is_none()
+    {
+        append_proxy_header(
+            &mut head,
+            b"X-Forwarded-Host",
+            forwarded_authority.as_bytes(),
+        );
+    }
+    for (name, value) in &transformed {
+        if matches!(name.as_str(), "host" | "upgrade" | "connection") || value.is_empty() {
+            continue;
+        }
+        append_proxy_header(&mut head, name.as_bytes(), value);
     }
     head.extend_from_slice(b"\r\n");
     let head = ValidatedProxyHead::new(
         head,
         &target.backend,
-        if host.is_empty() { None } else { Some(host) },
+        if forwarded_authority.is_empty() {
+            None
+        } else {
+            Some(forwarded_authority)
+        },
     )?;
     tokio::time::timeout(timeout, upstream.write_all(head.as_bytes()))
         .await
@@ -3609,7 +3739,34 @@ fn proxy_once_budgeted(
             "unsafe X-Forwarded-Host",
         ));
     }
-    let upstream_host = if scope.proxy_policy.preserve_host == Some(true) {
+    let backend_authority = format!("{}:{}", target.backend.host, target.backend.port);
+    let transformed = evaluated_proxy_headers(
+        scope,
+        req,
+        url_path,
+        peer,
+        https,
+        forwarded_host,
+        host,
+        &backend_authority,
+    )?;
+    let transformed_host = transformed_header(&transformed, "host");
+    let upstream_host = if let Some(value) = transformed_host {
+        if value.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "proxy Host transformation may not be empty",
+            ));
+        }
+        std::str::from_utf8(value)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "proxy Host transformation is not UTF-8",
+                )
+            })?
+            .to_string()
+    } else if scope.proxy_policy.preserve_host == Some(true) {
         if forwarded_host.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -3637,6 +3794,9 @@ fn proxy_once_budgeted(
     for (name, value) in req.headers.iter() {
         if hop_by_hop(name)
             || forwarded_header(name)
+            || transformed
+                .iter()
+                .any(|(configured, _)| configured.eq_ignore_ascii_case(name))
             || request_tokens
                 .iter()
                 .any(|token| token == &name.to_ascii_lowercase())
@@ -3646,18 +3806,29 @@ fn proxy_once_budgeted(
         }
         append_proxy_header(&mut head, name.as_bytes(), value);
     }
-    append_proxy_header(
-        &mut head,
-        b"X-Forwarded-For",
-        peer.ip().to_string().as_bytes(),
-    );
-    append_proxy_header(
-        &mut head,
-        b"X-Forwarded-Proto",
-        if https { b"https" } else { b"http" },
-    );
-    if !forwarded_host.is_empty() {
+    if transformed_header(&transformed, "x-forwarded-for").is_none() {
+        append_proxy_header(
+            &mut head,
+            b"X-Forwarded-For",
+            peer.ip().to_string().as_bytes(),
+        );
+    }
+    if transformed_header(&transformed, "x-forwarded-proto").is_none() {
+        append_proxy_header(
+            &mut head,
+            b"X-Forwarded-Proto",
+            if https { b"https" } else { b"http" },
+        );
+    }
+    if !forwarded_host.is_empty() && transformed_header(&transformed, "x-forwarded-host").is_none()
+    {
         append_proxy_header(&mut head, b"X-Forwarded-Host", forwarded_host.as_bytes());
+    }
+    for (name, value) in &transformed {
+        if name == "host" || value.is_empty() {
+            continue;
+        }
+        append_proxy_header(&mut head, name.as_bytes(), value);
     }
     head.extend_from_slice(b"\r\n");
     let head = ValidatedProxyHead::new(
@@ -5044,6 +5215,88 @@ mod tests {
             expect_continue: false,
             framing: crate::verified::BodyFraming::None,
         }
+    }
+
+    #[test]
+    fn closed_proxy_header_transforms_are_evaluated_and_revalidated() {
+        let mut request = req("/search");
+        request.target = b"/search?q=rust".to_vec();
+        request.raw_path = b"/raw/%73earch".to_vec();
+        request.query = b"q=rust".to_vec();
+        request.headers.insert("host", b"client.example".to_vec());
+        request.headers.insert("upgrade", b"websocket".to_vec());
+        let mut scope = Scope::default();
+        scope.proxy_policy.request_headers = Some(vec![
+            crate::config_ir::ProxyHeaderTransform::new("Host", "$host").unwrap(),
+            crate::config_ir::ProxyHeaderTransform::new("X-Original-URI", "$request_uri").unwrap(),
+            crate::config_ir::ProxyHeaderTransform::new("X-Normalized-URI", "$uri").unwrap(),
+            crate::config_ir::ProxyHeaderTransform::new("X-Proxy-Host", "$proxy_host").unwrap(),
+            crate::config_ir::ProxyHeaderTransform::new(
+                "X-Forwarded-For",
+                "$proxy_add_x_forwarded_for",
+            )
+            .unwrap(),
+            crate::config_ir::ProxyHeaderTransform::new("Connection", "$connection_upgrade")
+                .unwrap(),
+            crate::config_ir::ProxyHeaderTransform::new("X-Suppressed", "").unwrap(),
+        ]);
+        let headers = evaluated_proxy_headers(
+            &scope,
+            &request,
+            "/search",
+            "192.0.2.4:4321".parse().unwrap(),
+            true,
+            "public.example:8443",
+            "configured.example",
+            "backend.example:9000",
+        )
+        .unwrap();
+        assert_eq!(
+            transformed_header(&headers, "host"),
+            Some(&b"public.example"[..])
+        );
+        assert_eq!(
+            transformed_header(&headers, "x-original-uri"),
+            Some(&b"/search?q=rust"[..])
+        );
+        assert_eq!(
+            transformed_header(&headers, "x-normalized-uri"),
+            Some(&b"/search"[..])
+        );
+        assert_eq!(
+            transformed_header(&headers, "x-forwarded-for"),
+            Some(&b"192.0.2.4"[..])
+        );
+        assert_eq!(
+            transformed_header(&headers, "x-proxy-host"),
+            Some(&b"backend.example:9000"[..])
+        );
+        assert_eq!(
+            transformed_header(&headers, "connection"),
+            Some(&b"upgrade"[..])
+        );
+        assert_eq!(transformed_header(&headers, "x-suppressed"), Some(&b""[..]));
+
+        request
+            .headers
+            .insert("x-tainted", b"safe\r\ninjected: yes".to_vec());
+        scope.proxy_policy.request_headers =
+            Some(vec![crate::config_ir::ProxyHeaderTransform::new(
+                "X-Copy",
+                "$http_x_tainted",
+            )
+            .unwrap()]);
+        assert!(evaluated_proxy_headers(
+            &scope,
+            &request,
+            "/search",
+            "192.0.2.4:4321".parse().unwrap(),
+            false,
+            "public.example",
+            "configured.example",
+            "backend.example:9000",
+        )
+        .is_err());
     }
 
     #[test]

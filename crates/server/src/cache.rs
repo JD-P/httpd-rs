@@ -3630,6 +3630,7 @@ AddHandler cgi-script .cgi\n\
                     to: "/y".into(),
                     status: 302,
                     regex: None,
+                    projection: crate::config::RedirectProjection::Apache,
                 })
             }),
             ("mapping.handlers", |s| {

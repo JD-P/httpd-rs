@@ -1,8 +1,8 @@
-use crate::tracing;
 use super::*;
 use crate::codec::UserError;
 use crate::frame::{PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
 use crate::proto;
+use crate::tracing;
 
 #[cfg(any(test, feature = "client"))]
 use http::Response;

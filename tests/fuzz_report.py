@@ -334,6 +334,19 @@ def classify_declared(target: str, data: bytes, groups: dict[str, SemanticGroup]
         for label, present in families.items():
             if present:
                 observe(groups, "grammar", label)
+    elif target == "nginx_config":
+        families = {
+            "http_block": b"HTTP" in upper and b"{" in data,
+            "server_block": b"SERVER" in upper and b"{" in data,
+            "location": b"LOCATION" in upper,
+            "proxy": b"PROXY_PASS" in upper or b"PROXY_SET_HEADER" in upper,
+            "fastcgi": b"FASTCGI_PASS" in upper or b"FASTCGI_PARAM" in upper,
+            "include": b"INCLUDE" in upper,
+            "malformed": not data or data.count(b"{") != data.count(b"}") or b"\x00" in data,
+        }
+        for label, present in families.items():
+            if present:
+                observe(groups, "grammar", label)
     elif target == "htaccess_walk":
         if not data:
             return
@@ -501,6 +514,7 @@ DECLARED_SPECS: dict[str, dict[str, set[str]]] = {
     "config_sections": {"form": {"directive", "section_open", "section_close", "nested", "continuation", "malformed"}},
     "config_compile": {"strict": {"0", "1"}, "directive_family": {"listener", "authorization", "rewrite", "backend", "cache", "tls", "remoteip", "unknown_reject"}},
     "config_grammars": {"grammar": {"listen", "read_timeout", "rewrite_rule", "rewrite_condition", "proxy_backend", "template", "malformed"}},
+    "nginx_config": {"grammar": {"http_block", "server_block", "location", "proxy", "fastcgi", "include", "malformed"}},
     "htaccess_walk": {"depth": {"0", "1", "2", "3"}, "directive_family": {"authorization", "mapping", "handler", "environment", "malformed"}},
     "rewrite_expr": {"expression_family": {"comparison", "boolean", "regex", "request_variable", "environment_variable", "filesystem_test", "malformed"}},
     "cgi_response": {"delimiter": {"crlf", "lf", "absent"}, "header_family": {"status", "location", "content_length", "content_type", "malformed"}},
@@ -533,6 +547,7 @@ def declared_seeds(target: str) -> list[bytes]:
         "config_sections": [b"Listen 8080\n", b"<Directory /tmp>\n", b"</Directory>\n", b"<Directory /tmp>\n<Files x>\n</Files>\n</Directory>\n", b"Listen \\\n8080\n", b"<Directory\n"],
         "config_compile": [b"Listen 8080\n", b"ServerName example.test\n", b"Require all granted\n", b"RewriteRule ^a$ b [L]\n", b"ProxyPass / http://127.0.0.1/\n", b"CacheEnable disk /\n", b"SSLEngine On\n", b"RemoteIPHeader X-Forwarded-For\n", b"NotADirective x\n"],
         "config_grammars": [b"127.0.0.1:8080", b"header=20,MinRate=500 body=30", b"^a$ b [L]", b"%{REQUEST_URI} -f", b"http://127.0.0.1:8080/", b"/x/$1", b"\x00"],
+        "nginx_config": [b"http {}", b"http { server {} }", b"http { server { location / {} } }", b"http { server { proxy_pass http://127.0.0.1; proxy_set_header Host $host; } }", b"http { server { fastcgi_pass 127.0.0.1:9000; fastcgi_param SCRIPT_FILENAME $request_filename; } }", b"include conf.d/*.conf;", b"http {\x00"],
         "rewrite_expr": [b"%{REQUEST_URI} == '/x'", b"true && false", b"%{REQUEST_URI} =~ m#^/x$#", b"%{HTTP_HOST} == 'x'", b"%{ENV:FUZZ} == '1'", b"-f '/tmp/fuzz'", b"("],
         "cgi_response": [b"Content-Type: text/plain\r\n\r\nbody", b"Content-Type: text/plain\n\nbody", b"Status: 201 Created\r\n\r\n", b"Location: /next\r\n\r\n", b"Content-Length: 0\r\n\r\n", b"broken\x00"],
         "proxy_response": [b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx", b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n", b"HTTP/1.0 200 OK\r\n\r\nx", b"HTTP/1.1 204 No Content\r\n\r\n", b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", b"broken"],

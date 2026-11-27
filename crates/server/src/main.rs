@@ -10,6 +10,7 @@
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use httpd_rs::config::{Config, EncodedSlashes};
+use httpd_rs::config_ir::ConfigFormat;
 use httpd_rs::http::{BodyFraming, Headers, Request, Version};
 use httpd_rs::log::Logger;
 use httpd_rs::server::{self, Server};
@@ -59,13 +60,14 @@ struct Args {
     explain_port: Option<u16>,
     explain_headers: Vec<(String, String)>,
     audit_capabilities: bool,
+    config_format: ConfigFormat,
 }
 
 fn usage() -> ! {
     eprintln!(
         "Usage: httpd-rs [-d serverroot] [-f config] [-D name] [-k start|stop|restart|graceful|status]\n\
          \x20                [-t] [-T] [-M] [-S] [-v] [-V] [-l] [-X] [--strict-config]\n\
-         \x20                [--audit-capabilities]\n\
+         \x20                [--audit-capabilities] [--config-format apache|nginx]\n\
          \x20                [--explain PATH [--explain-method M] [--explain-host H] [--explain-port P]\n\
          \x20                 [--explain-header 'Name: value']]"
     );
@@ -93,6 +95,7 @@ fn parse_args_from(args: &[String], default_server_root: PathBuf) -> Result<Args
         explain_port: None,
         explain_headers: Vec::new(),
         audit_capabilities: false,
+        config_format: ConfigFormat::Apache,
     };
     let mut i = 0;
     while i < args.len() {
@@ -138,6 +141,14 @@ fn parse_args_from(args: &[String], default_server_root: PathBuf) -> Result<Args
             "-l" => a.show_modules_compiled = true,
             "--strict-config" => a.strict = true,
             "--audit-capabilities" => a.audit_capabilities = true,
+            "--config-format" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--config-format requires apache or nginx".to_string())?;
+                a.config_format = ConfigFormat::parse(value)
+                    .ok_or_else(|| format!("unsupported configuration format '{value}'"))?;
+            }
             "--no-envvars" => a.no_envvars = true,
             "--explain" => {
                 i += 1;
@@ -965,10 +976,12 @@ fn main() {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(&args.server_root)
     };
-    let config_path = args
-        .config
-        .clone()
-        .unwrap_or_else(|| server_root.join("apache2.conf"));
+    let config_path = args.config.clone().unwrap_or_else(|| {
+        server_root.join(match args.config_format {
+            ConfigFormat::Apache => "apache2.conf",
+            ConfigFormat::Nginx => "nginx.conf",
+        })
+    });
 
     let mut env = if args.no_envvars {
         std::env::vars().collect()
@@ -980,12 +993,25 @@ fn main() {
     env.entry("SERVER_ROOT".into())
         .or_insert_with(|| server_root.to_string_lossy().into_owned());
 
-    let loader = if args.audit_capabilities {
-        Config::load_capability_audit
+    let mut cfg = match if args.audit_capabilities {
+        Config::load_capability_audit_format(
+            args.config_format,
+            &config_path,
+            &server_root,
+            &env,
+            &args.defines,
+            args.strict,
+        )
     } else {
-        Config::load
-    };
-    let mut cfg = match loader(&config_path, &server_root, &env, &args.defines, args.strict) {
+        Config::load_format(
+            args.config_format,
+            &config_path,
+            &server_root,
+            &env,
+            &args.defines,
+            args.strict,
+        )
+    } {
         Ok(c) => c,
         Err(errors) => {
             for e in errors {
@@ -1266,7 +1292,8 @@ fn main() {
             break; // coverage:ignore-line - external fd failure
         }
         logger.info("SIGHUP received; reloading configuration");
-        let mut new_cfg = match Config::load_for_reload(
+        let mut new_cfg = match Config::load_for_reload_format(
+            args.config_format,
             &config_path,
             &server_root,
             &env,
@@ -1532,6 +1559,8 @@ mod tests {
             "-v",
             "-V",
             "-l",
+            "--config-format",
+            "nginx",
             "--strict-config",
             "--audit-capabilities",
             "--no-envvars",
@@ -1561,6 +1590,7 @@ mod tests {
         assert_eq!(parsed.server_root, PathBuf::from("relative-root"));
         assert!(parsed.foreground && parsed.test && parsed.strict && parsed.no_envvars);
         assert!(parsed.audit_capabilities);
+        assert_eq!(parsed.config_format, ConfigFormat::Nginx);
         assert!(parsed.dump_modules && parsed.dump_vhosts);
         assert!(parsed.show_version && parsed.show_build && parsed.show_modules_compiled);
         assert_eq!(parsed.explain_port, Some(8080));
@@ -1581,6 +1611,7 @@ mod tests {
             "--explain-host",
             "--explain-port",
             "--explain-header",
+            "--config-format",
             "-C",
             "-c",
         ] {

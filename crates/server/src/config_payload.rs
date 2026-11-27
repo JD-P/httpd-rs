@@ -566,6 +566,7 @@ impl SealedPayload {
                         to,
                         status,
                         regex: Some(std::sync::Arc::new(compiled)),
+                        projection: crate::config::RedirectProjection::Apache,
                     }
                 } else {
                     crate::config::Redirect {
@@ -573,6 +574,7 @@ impl SealedPayload {
                         to,
                         status,
                         regex: None,
+                        projection: crate::config::RedirectProjection::Apache,
                     }
                 };
                 SealedValue::Redirect(redirect)
@@ -701,7 +703,8 @@ impl SealedPayload {
                 if args[0].starts_with('!') {
                     return Err("ProxyPass path cannot start with '!'; exclusions use '!' as the backend argument".into());
                 }
-                if !crate::config::supported_proxy_backend(&args[1], false) {
+                let allow_fastcgi = directive == "httpdrsrouteproxypass";
+                if !crate::config::supported_proxy_backend(&args[1], allow_fastcgi) {
                     return Err(format!("unsupported ProxyPass backend '{}'", args[1]));
                 }
                 let mut sticky_cookie = None;

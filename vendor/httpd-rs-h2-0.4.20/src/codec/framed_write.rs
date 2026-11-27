@@ -1,8 +1,8 @@
-use crate::tracing;
 use crate::codec::UserError;
 use crate::codec::UserError::*;
 use crate::frame::{self, Frame, FrameSize};
 use crate::hpack;
+use crate::tracing;
 
 use bytes::{Buf, BufMut, BytesMut};
 use std::pin::Pin;

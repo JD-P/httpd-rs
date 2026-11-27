@@ -1,7 +1,7 @@
-use crate::tracing;
 use crate::codec::UserError;
 use crate::error::Reason;
 use crate::proto::*;
+use crate::tracing;
 use std::task::{Context, Poll};
 
 #[derive(Debug)]

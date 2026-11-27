@@ -1,9 +1,9 @@
-use crate::tracing;
 #[cfg(any(test, feature = "client"))]
 use crate::client;
 use crate::codec::UserError;
 use crate::frame::{Reason, StreamId};
 use crate::server;
+use crate::tracing;
 
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
 use crate::proto::*;

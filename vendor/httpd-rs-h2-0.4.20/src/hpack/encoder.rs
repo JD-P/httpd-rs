@@ -1,6 +1,6 @@
-use crate::tracing;
 use super::table::{Index, Table};
 use super::{huffman, Header};
+use crate::tracing;
 
 use bytes::{BufMut, BytesMut};
 use http::header::{HeaderName, HeaderValue};
@@ -718,7 +718,8 @@ mod test {
         let values = [0usize, 1, 30, 31, 127, 128, 1337, 1 << 20, (1 << 28) - 1];
         for prefix in 1..=8 {
             for value in values {
-                let mut encoded = httpd_rs_verified::hpack_encode_integer(value, prefix, 0).unwrap();
+                let mut encoded =
+                    httpd_rs_verified::hpack_encode_integer(value, prefix, 0).unwrap();
                 let mut bytes = Vec::with_capacity(encoded.len as usize);
                 for _ in 0..encoded.len {
                     bytes.push(encoded.packed as u8);
