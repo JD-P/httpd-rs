@@ -1,0 +1,114 @@
+name: ring-reproducibility
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - supply-chain/ring-reproducibility.toml
+      - tests/ring_reproducibility.py
+      - .github/workflows/ring-reproducibility.yml
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - supply-chain/ring-reproducibility.toml
+      - tests/ring_reproducibility.py
+      - .github/workflows/ring-reproducibility.yml
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Verification scope
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - linux
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ring-reproducibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      fast: ${{ steps.plan.outputs.fast }}
+      full: ${{ steps.plan.outputs.full }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Select verification scopes
+        id: plan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          REQUESTED_SCOPE: ${{ inputs.scope }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fast=false
+          full=false
+
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            fast=true
+            if [[ "$REQUESTED_SCOPE" == full ]]; then
+              full=true
+            fi
+          elif [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] \
+              || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+            fast=true
+            full=true
+          else
+            current=$(python3 tests/ring_reproducibility.py lock-record Cargo.lock)
+            previous=$(git show "${BASE_SHA}:Cargo.lock" \
+              | python3 tests/ring_reproducibility.py lock-record - 2>/dev/null || true)
+            if [[ -z "$previous" || "$previous" != "$current" ]]; then
+              fast=true
+              full=true
+            fi
+            if ! git diff --quiet "$BASE_SHA" "$GITHUB_SHA" -- \
+                supply-chain/ring-reproducibility.toml \
+                tests/ring_reproducibility.py \
+                .github/workflows/ring-reproducibility.yml; then
+              fast=true
+              full=true
+            fi
+          fi
+
+          {
+            echo "fast=$fast"
+            echo "full=$full"
+          } >>"$GITHUB_OUTPUT"
+
+  linux-assembly:
+    needs: plan
+    if: needs.plan.outputs.fast == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Reconstruct Linux ring assembly
+        run: >-
+          python3 tests/ring_reproducibility.py verify --scope linux
+          --cache-dir "$RUNNER_TEMP/ring-reproducibility"
+
+  complete-artifacts:
+    needs: plan
+    if: needs.plan.outputs.full == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Restore pinned NASM build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ring-reproducibility
+          key: ring-reproducibility-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('supply-chain/ring-reproducibility.toml', 'tests/ring_reproducibility.py') }}
+      - name: Reconstruct all ring release artifacts
+        run: >-
+          python3 tests/ring_reproducibility.py verify --scope full
+          --cache-dir "$RUNNER_TEMP/ring-reproducibility"

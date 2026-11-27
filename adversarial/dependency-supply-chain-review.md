@@ -15,8 +15,10 @@ substantially in this follow-up: all 86 generated assembly files reproduce
 byte-for-byte from the published generators, and all 50 loadable sections plus
 the disassembly and runtime relocations in the 17 Windows object files match an
 independent NASM 2.13.03 rebuild. The objects are not selected by Linux builds.
-The remaining `ring` concerns are release-tool pinning and concentrated
-publication authority, not an unexplained binary payload.
+httpd-rs now pins the reviewed release-tool inputs and reconstructs these
+artifacts on dependency changes and releases. The remaining `ring` concerns
+are the upstream mutable bootstrap reference and concentrated publication
+authority, not an unexplained binary payload.
 
 The deeper pass found one latent code defect worth tracking. The locked
 `brotli-decompressor@5.0.3` predates an upstream validation fix for malformed
@@ -173,7 +175,7 @@ relevant trust boundary for those changes. This component is therefore kept in
 the code inventory for completeness and removed from the dependency
 supply-chain priority order.
 
-### DEP-SC-02 — `ring` artifacts reconstruct; release-tool pinning remains
+### DEP-SC-02 — `ring` artifacts reconstruct; local update/release gates installed
 
 **Code-review priority: high. Supply-chain risk: moderate.**
 
@@ -202,9 +204,20 @@ Windows setup script clones the mutable `windows` branch of `ring-toolchain`
 and even contains a TODO to pin a commit. That branch currently resolves to
 `65116b2c43a86962d0bc135e8ce2740689c50776`, where the NASM download and
 executable are checksum-pinned, and it has not shown a suspicious burst of
-changes. `ring` should nevertheless pin that commit directly and automate the
-artifact comparison so a future branch movement cannot silently change a
-release.
+changes. `ring` should nevertheless pin that commit directly.
+
+httpd-rs now independently pins that commit, the crate checksum and source
+commit, and the NASM 2.13.03 source archive in
+`supply-chain/ring-reproducibility.toml`. The update workflow regenerates all
+35 Linux assembly outputs as a fast check and, when the locked `ring` record or
+the verifier changes, regenerates all 86 assembly files and compares the 50
+loadable PE/COFF sections, disassembly, and 31 loadable-section relocation
+tables. The verifier also rejects unexpected object sections and compares
+normalized link-visible symbols. The dependency-update workflow caches NASM
+by the complete verifier/pin digest.
+Tagged and explicitly selected releases instead rebuild the pinned NASM source
+before artifact construction. Ordinary builds only perform a local lock-to-pin
+comparison and do not build NASM or regenerate assembly.
 
 Brian Smith is publicly identifiable and is the sole crates.io publisher for
 both `ring` and `untrusted`. Their enormous ecosystem use and his long public
@@ -443,7 +456,7 @@ new downloader, binary payload, archive trick, or advisory match was found.
 | M18 | `proptest@1.12.0`, `rusty-fork@0.3.1`, `unarray@0.1.4` | D | Test-only. `proptest` is large and input/generator-complex but mostly safe; `rusty-fork` intentionally controls subprocesses and signals; `unarray` uses unsafe array initialization/conversion. No anomaly was found, though compromised test tooling could affect CI. |
 | M19 | `borsh@1.8.1`, `borsh-derive@1.8.1` | D/B | Borsh has a small build script and a roughly 5k-line procedural macro. Serialization parsing and macro generation are conventional, with no external tool/network behavior. Non-production exposure here makes it a secondary review target. |
 | M20 | `libmimalloc-sys@0.1.49`, `mimalloc@0.1.52` | M/B | **High impact, explained provenance.** A thin unsafe wrapper locally compiles 78 bundled C/header files and becomes the musl global allocator. The enabled v3 tree matches Microsoft mimalloc 3.3.2 byte-for-byte, and the Rust FFI surface is four conventional allocation operations. Later audit fixes require a feature/API-scoped delta review, but no defect was demonstrated in the locked default path. |
-| M21 | `ring@0.17.14`, `untrusted@0.9.0` | P/B | **High impact, artifacts reconstructed.** `untrusted` is a small safe input cursor; `ring` is cryptographic C/Rust/assembly with extensive unsafe FFI. All 86 assembly outputs reproduce exactly, and all loadable sections, disassembly, and runtime relocations in the 17 Windows objects match a NASM 2.13.03 rebuild. The remaining review surface is the cryptographic implementation and an unpinned release-tool branch, not opaque executable content. |
+| M21 | `ring@0.17.14`, `untrusted@0.9.0` | P/B | **High impact, artifacts reconstructed.** `untrusted` is a small safe input cursor; `ring` is cryptographic C/Rust/assembly with extensive unsafe FFI. All 86 assembly outputs reproduce exactly, and all loadable sections, disassembly, and runtime relocations in the 17 Windows objects match a NASM 2.13.03 rebuild. The remaining review surface is the cryptographic implementation and upstream's mutable release-tool branch; httpd-rs now independently pins and checks that toolchain boundary. |
 | M22 | `smallvec@1.16.4` | D | **Low while development-only.** About 4k lines have concentrated unsafe storage/capacity/drop invariants. The production PCRE2 wrapper no longer uses it; the remaining default-feature path is through tracing test infrastructure. The exact delta has a local audit and the locked source includes Miri/fuzz CI definitions. Extend the audit before upgrading past 1.16.4. |
 | M23 | `zlib-rs@0.6.8`, `zlib-rs@0.6.9` | P, F | **High for the production 0.6.8.** Roughly 18k Rust lines contain hundreds of unsafe/intrinsic/pointer operations in a performance-critical decompressor. Code is organized and externally audited, with no build script or blob, but malformed-stream and memory-model review remains warranted. The 0.6.9 delta is fuzz-only and received a shallow unsafe/delta scan. |
 | M24 | `toml_datetime@1.1.2+spec-1.1.0`, `toml_edit@0.25.17+spec-1.1.0`, `toml_parser@1.1.5+spec-1.1.0`, `winnow@1.0.4` | D | Parser-heavy development transitive code. `winnow` is about 46k lines and `toml_parser` contains optimized unsafe scanning; the edit/datetime layers are more conventional. No build/native payload was found. Low production priority, but relevant to compromised build/config tooling. |
@@ -487,12 +500,16 @@ new downloader, binary payload, archive trick, or advisory match was found.
 - GitHub Actions are commit-pinned; Rust and auxiliary Cargo tools are version
   pinned; containers are digest-pinned; downloaded Verus/h2spec archives have
   SHA-256 pins; and Debian tooling is exact-version pinned.
-- Release builds run a two-build reproducibility check without network access,
-  and GitHub artifacts receive OIDC-backed build-provenance attestations.
-- The independent `ring` reconstruction performed for this review ties the
-  locked generated assembly and every loadable object section to published
-  source. Retaining that check as automation would turn one-time evidence into
-  an update gate.
+- The two actual release builds run without network access and are compared for
+  reproducibility; GitHub artifacts receive OIDC-backed build-provenance
+  attestations. The preceding `ring` reconstruction downloads only
+  size-and-SHA-256-pinned archives over HTTPS.
+- The automated `ring` reconstruction ties the locked generated assembly and
+  every loadable object section, relocation, and link-visible symbol to
+  published source. It runs a fast Linux scope and a cached full scope when
+  `ring` or the verifier changes. Tagged/selected releases rebuild the pinned
+  tool and run the full scope before constructing artifacts. Normal quality
+  builds only validate the lock record against reviewed pins.
 - Application-level bounds and adversarial tests reduce the exploitability of
   compression, regex, protocol, and password-hashing resource behavior even
   when an upstream implementation is complex.
@@ -507,11 +524,11 @@ intrinsically trustworthy.
    enabled Linux-musl API/configuration. Add a CI assertion for the embedded
    upstream version and benchmark the `secure` feature before choosing an
    upgrade, replacement, or explicit acceptance.
-2. Pin `ring-toolchain` commit
-   `65116b2c43a86962d0bc135e8ce2740689c50776` (or a reviewed successor) in the
-   release tooling. Automate exact assembly comparison and normalized
-   PE/COFF loadable-section/relocation comparison with a pinned NASM; raw
-   whole-file equality is not useful until CodeView build paths are normalized.
+2. Keep the local `ring` reconstruction gate required on dependency changes and
+   releases. Review any successor before changing the pinned `ring-toolchain`
+   commit or NASM source hash. Upstream should still replace its mutable branch
+   reference with an immutable commit; raw PE/COFF equality remains unsuitable
+   until CodeView build paths are normalized.
 3. Keep untrusted Brotli decompression outside production. Backport or otherwise
    account for the malformed single-block-type switch validation before that
    boundary changes, and continue the existing metered encoder/resource
@@ -542,6 +559,8 @@ crates.io archives, their `.cargo_vcs_info.json` records, upstream commit
 archives for the two dirty publications, and the local files
 [`supply-chain/config.toml`](../supply-chain/config.toml),
 [`supply-chain/audits.toml`](../supply-chain/audits.toml),
+[`supply-chain/ring-reproducibility.toml`](../supply-chain/ring-reproducibility.toml),
+[`tests/ring_reproducibility.py`](../tests/ring_reproducibility.py),
 [`docs/dependency-unsafe.json`](../docs/dependency-unsafe.json), and
 [`deny.toml`](../deny.toml).
 

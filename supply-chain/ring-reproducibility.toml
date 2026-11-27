@@ -1,0 +1,29 @@
+# Reviewed inputs for reconstructing ring's packaged generated artifacts.
+# Updating any value requires rerunning both verification scopes.
+
+[ring]
+name = "ring"
+version = "0.17.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+crate_url = "https://static.crates.io/crates/ring/ring-0.17.14.crate"
+crate_sha256 = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
+crate_size = 1502610
+source_commit = "2723abbca9e83347d82b056d5b239c6604f786df"
+source_dirty = true
+expected_pregenerated_files = 106
+expected_text_assembly = 86
+expected_linux_assembly = 35
+expected_windows_objects = 17
+expected_loadable_sections = 50
+expected_loadable_relocation_tables = 31
+
+[release_toolchain]
+# This is the reviewed commit currently reached by ring's mutable `windows`
+# branch reference. The independent verifier below uses the corresponding NASM
+# release's source rather than trusting a downloaded executable.
+ring_toolchain_commit = "65116b2c43a86962d0bc135e8ce2740689c50776"
+nasm_version = "2.13.03"
+nasm_source_url = "https://www.nasm.us/pub/nasm/releasebuilds/2.13.03/nasm-2.13.03.tar.xz"
+nasm_source_sha256 = "812ecfb0dcbc5bd409aaa8f61c7de94c5b8752a7b00c632883d15b2ed6452573"
+nasm_source_size = 806636
+nasm_windows_executable_sha256 = "d8a933bf5cc3597c56193135cb78b225ab225e1f611d2fdb51ef6e3f555b21e3"

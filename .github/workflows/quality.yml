@@ -150,4 +150,5 @@ jobs:
         run: |
           python3 tests/dependency_audit_policy.py
           python3 tests/dependency_unsafe.py
+          python3 tests/ring_reproducibility.py check-lock
           cargo vet --locked

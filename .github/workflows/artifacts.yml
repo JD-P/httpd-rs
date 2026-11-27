@@ -41,6 +41,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y binutils file rpm
 
+      - name: Reconstruct ring release artifacts
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+        run: >-
+          python3 tests/ring_reproducibility.py verify --scope full
+          --cache-dir "$RUNNER_TEMP/ring-reproducibility" --rebuild-nasm
+
       - name: Build and reproduce the complete release
         id: package
         shell: bash
