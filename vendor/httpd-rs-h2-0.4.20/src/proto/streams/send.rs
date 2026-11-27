@@ -66,6 +66,7 @@ impl Send {
         self.init_window_sz
     }
 
+    #[cfg(any(test, feature = "client"))]
     pub fn open(&mut self) -> Result<StreamId, UserError> {
         let stream_id = self.ensure_next_stream_id()?;
         self.next_stream_id = stream_id.next_id();
@@ -685,6 +686,7 @@ impl Send {
         }
     }
 
+    #[cfg(any(test, feature = "client"))]
     pub(crate) fn is_extended_connect_protocol_enabled(&self) -> bool {
         self.is_extended_connect_protocol_enabled
     }

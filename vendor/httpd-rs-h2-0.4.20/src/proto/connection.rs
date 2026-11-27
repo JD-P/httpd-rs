@@ -1,7 +1,9 @@
 use crate::tracing;
+#[cfg(any(test, feature = "client"))]
+use crate::client;
 use crate::codec::UserError;
 use crate::frame::{Reason, StreamId};
-use crate::{client, server};
+use crate::server;
 
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
 use crate::proto::*;
@@ -361,6 +363,7 @@ where
 
     /// Closes the connection by transitioning to a GOAWAY state
     /// iff there are no streams or references
+    #[cfg(any(test, feature = "client"))]
     pub fn maybe_close_connection_if_no_streams(&mut self) {
         // If we poll() and realize that there are no streams or references
         // then we can close the connection by transitioning to GOAWAY
@@ -375,6 +378,7 @@ where
     }
 
     /// Checks if there are any streams or references left
+    #[cfg(any(test, feature = "client"))]
     pub fn has_streams_or_other_references(&self) -> bool {
         // If we poll() and realize that there are no streams or references
         // then we can close the connection by transitioning to GOAWAY
@@ -751,6 +755,7 @@ enum ReceivedFrame {
     Done,
 }
 
+#[cfg(any(test, feature = "client"))]
 impl<T, B> Connection<T, client::Peer, B>
 where
     T: AsyncRead + AsyncWrite,

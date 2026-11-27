@@ -165,6 +165,11 @@ mod frame;
 #[allow(missing_docs)]
 pub mod frame;
 
+// httpd-rs only acts as an HTTP/2 server in production. Keep the client
+// implementation out of production builds while retaining it as an explicit
+// feature for differential fuzzing, integration tests, and downstream users
+// that deliberately opt into the client API.
+#[cfg(any(test, feature = "client"))]
 pub mod client;
 pub mod ext;
 pub mod server;

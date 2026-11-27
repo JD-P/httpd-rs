@@ -106,6 +106,7 @@ impl Settings {
         self.enable_push.map(|val| val != 0)
     }
 
+    #[cfg(any(test, feature = "client"))]
     pub fn set_enable_push(&mut self, enable: bool) {
         self.enable_push = Some(enable as u32);
     }

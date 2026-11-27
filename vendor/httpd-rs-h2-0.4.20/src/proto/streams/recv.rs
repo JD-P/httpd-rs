@@ -4,7 +4,9 @@ use crate::codec::UserError;
 use crate::frame::{PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
 use crate::proto;
 
-use http::{HeaderMap, Request, Response};
+#[cfg(any(test, feature = "client"))]
+use http::Response;
+use http::{HeaderMap, Request};
 
 use std::cmp::Ordering;
 use std::io;
@@ -64,6 +66,7 @@ pub(super) enum Event {
     Headers(peer::PollMessage),
     Data(DataEvent),
     Trailers(HeaderMap),
+    #[cfg(any(test, feature = "client"))]
     InformationalHeaders(peer::PollMessage),
 }
 
@@ -274,20 +277,29 @@ impl Recv {
                 self.pending_accept.push(stream);
             }
         } else {
-            // This is an informational response (1xx status code)
-            // Convert to response and store it for polling
-            let message = counts
-                .peer()
-                .convert_poll_message(pseudo, fields, stream_id)?;
+            #[cfg(any(test, feature = "client"))]
+            {
+                // This is an informational response (1xx status code)
+                // Convert to response and store it for polling
+                let message = counts
+                    .peer()
+                    .convert_poll_message(pseudo, fields, stream_id)?;
 
-            tracing::trace!("Received informational response: stream_id={:?}", stream_id);
+                tracing::trace!("Received informational response: stream_id={:?}", stream_id);
 
-            // Push the informational response onto the stream's recv buffer
-            // with a special event type so it can be polled separately
-            stream
-                .pending_recv
-                .push_back(&mut self.buffer, Event::InformationalHeaders(message));
-            stream.notify_recv();
+                // Push the informational response onto the stream's recv buffer
+                // with a special event type so it can be polled separately
+                stream
+                    .pending_recv
+                    .push_back(&mut self.buffer, Event::InformationalHeaders(message));
+                stream.notify_recv();
+            }
+            #[cfg(not(any(test, feature = "client")))]
+            {
+                // A server peer rejected `:status` above, so this branch is
+                // unreachable for accepted input in a server-only build.
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR).into());
+            }
         }
 
         Ok(())
@@ -309,6 +321,7 @@ impl Recv {
     }
 
     /// Called by the client to get pushed response
+    #[cfg(any(test, feature = "client"))]
     pub fn poll_pushed(
         &mut self,
         cx: &Context,
@@ -341,6 +354,7 @@ impl Recv {
     }
 
     /// Called by the client to get the response
+    #[cfg(any(test, feature = "client"))]
     pub fn poll_response(
         &mut self,
         cx: &Context,
@@ -374,6 +388,7 @@ impl Recv {
     }
 
     /// Called by the client to get informational responses (1xx status codes)
+    #[cfg(any(test, feature = "client"))]
     pub fn poll_informational(
         &mut self,
         cx: &Context,

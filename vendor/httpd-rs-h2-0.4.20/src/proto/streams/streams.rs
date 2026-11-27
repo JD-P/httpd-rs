@@ -2,11 +2,16 @@ use crate::tracing;
 use super::recv::RecvHeaderBlockError;
 use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
-use crate::codec::{Codec, SendError, UserError};
+#[cfg(any(test, feature = "client"))]
+use crate::client;
+#[cfg(any(test, feature = "client"))]
+use crate::codec::SendError;
+use crate::codec::{Codec, UserError};
+#[cfg(any(test, feature = "client"))]
 use crate::ext::Protocol;
 use crate::frame::{self, Frame, Reason};
 use crate::proto::{peer, Error, Initiator, Open, Peer, WindowSize};
-use crate::{client, proto, server};
+use crate::{proto, server};
 
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Request, Response};
@@ -274,6 +279,7 @@ where
         me.actions.recv.apply_local_settings(frame, &mut me.store)
     }
 
+    #[cfg(any(test, feature = "client"))]
     pub fn send_request(
         &mut self,
         mut request: Request<()>,
@@ -371,6 +377,7 @@ where
         ))
     }
 
+    #[cfg(any(test, feature = "client"))]
     pub(crate) fn is_extended_connect_protocol_enabled(&self) -> bool {
         self.inner
             .lock()
@@ -380,11 +387,13 @@ where
             .is_extended_connect_protocol_enabled()
     }
 
+    #[cfg(any(test, feature = "client"))]
     pub fn current_max_send_streams(&self) -> usize {
         let me = self.inner.lock().unwrap();
         me.counts.max_send_streams()
     }
 
+    #[cfg(any(test, feature = "client"))]
     pub fn current_max_recv_streams(&self) -> usize {
         let me = self.inner.lock().unwrap();
         me.counts.max_recv_streams()
@@ -1212,6 +1221,7 @@ impl Inner {
     }
 }
 
+#[cfg(any(test, feature = "client"))]
 impl<B> Streams<B, client::Peer>
 where
     B: Buf,
@@ -1282,6 +1292,7 @@ where
         me.counts.has_streams()
     }
 
+    #[cfg(any(test, feature = "client"))]
     pub fn has_streams_or_other_references(&self) -> bool {
         let me = self.inner.lock().unwrap();
         me.counts.has_streams() || me.refs > 1
@@ -1529,6 +1540,7 @@ impl<B> StreamRef<B> {
     }
 
     /// Called by a client to see if the current stream is pending open
+    #[cfg(any(test, feature = "client"))]
     pub fn is_pending_open(&self) -> bool {
         let mut me = self.opaque.inner.lock().unwrap();
         me.store.resolve(self.opaque.key).is_pending_open
@@ -1609,6 +1621,7 @@ impl OpaqueStreamRef {
         }
     }
     /// Called by a client to check for a received response.
+    #[cfg(any(test, feature = "client"))]
     pub fn poll_response(&mut self, cx: &Context) -> Poll<Result<Response<()>, proto::Error>> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
@@ -1619,6 +1632,7 @@ impl OpaqueStreamRef {
     }
 
     /// Called by a client to check for informational responses (1xx status codes)
+    #[cfg(any(test, feature = "client"))]
     pub fn poll_informational(
         &mut self,
         cx: &Context,
@@ -1631,6 +1645,7 @@ impl OpaqueStreamRef {
         me.actions.recv.poll_informational(cx, &mut stream)
     }
     /// Called by a client to check for a pushed request.
+    #[cfg(any(test, feature = "client"))]
     pub fn poll_pushed(
         &mut self,
         cx: &Context,
@@ -1984,6 +1999,7 @@ impl Actions {
         }
     }
 
+    #[cfg(any(test, feature = "client"))]
     fn ensure_no_conn_error(&self) -> Result<(), proto::Error> {
         if let Some(ref err) = self.conn_error {
             Err(err.clone())

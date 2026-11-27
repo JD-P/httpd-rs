@@ -3,7 +3,9 @@ use crate::frame::{Pseudo, StreamId};
 use crate::proto::{Error, Open};
 use crate::tracing;
 
-use http::{HeaderMap, Request, Response};
+#[cfg(any(test, feature = "client"))]
+use http::Response;
+use http::{HeaderMap, Request};
 
 use std::fmt;
 
@@ -34,12 +36,14 @@ pub(crate) trait Peer {
 /// This is used internally to avoid incurring a generic on all internal types.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum Dyn {
+    #[cfg(any(test, feature = "client"))]
     Client,
     Server,
 }
 
 #[derive(Debug)]
 pub enum PollMessage {
+    #[cfg(any(test, feature = "client"))]
     Client(Response<()>),
     Server(Request<()>),
 }
@@ -48,7 +52,11 @@ pub enum PollMessage {
 
 impl Dyn {
     pub fn is_server(&self) -> bool {
-        *self == Dyn::Server
+        match self {
+            #[cfg(any(test, feature = "client"))]
+            Dyn::Client => false,
+            Dyn::Server => true,
+        }
     }
 
     pub fn is_local_init(&self, id: StreamId) -> bool {
@@ -62,33 +70,34 @@ impl Dyn {
         fields: HeaderMap,
         stream_id: StreamId,
     ) -> Result<PollMessage, Error> {
-        if self.is_server() {
-            crate::server::Peer::convert_poll_message(pseudo, fields, stream_id)
-                .map(PollMessage::Server)
-        } else {
-            crate::client::Peer::convert_poll_message(pseudo, fields, stream_id)
-                .map(PollMessage::Client)
+        match self {
+            Dyn::Server => crate::server::Peer::convert_poll_message(pseudo, fields, stream_id)
+                .map(PollMessage::Server),
+            #[cfg(any(test, feature = "client"))]
+            Dyn::Client => crate::client::Peer::convert_poll_message(pseudo, fields, stream_id)
+                .map(PollMessage::Client),
         }
     }
 
     /// Returns true if the remote peer can initiate a stream with the given ID.
     pub fn ensure_can_open(&self, id: StreamId, mode: Open) -> Result<(), Error> {
-        if self.is_server() {
-            // Ensure that the ID is a valid client initiated ID
-            if mode.is_push_promise() || !id.is_client_initiated() {
-                proto_err!(conn: "cannot open stream {:?} - not client initiated", id);
-                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        match self {
+            Dyn::Server => {
+                // Ensure that the ID is a valid client initiated ID
+                if mode.is_push_promise() || !id.is_client_initiated() {
+                    proto_err!(conn: "cannot open stream {:?} - not client initiated", id);
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+                }
             }
-
-            Ok(())
-        } else {
-            // Ensure that the ID is a valid server initiated ID
-            if !mode.is_push_promise() || !id.is_server_initiated() {
-                proto_err!(conn: "cannot open stream {:?} - not server initiated", id);
-                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            #[cfg(any(test, feature = "client"))]
+            Dyn::Client => {
+                // Ensure that the ID is a valid server initiated ID
+                if !mode.is_push_promise() || !id.is_server_initiated() {
+                    proto_err!(conn: "cannot open stream {:?} - not server initiated", id);
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+                }
             }
-
-            Ok(())
         }
+        Ok(())
     }
 }

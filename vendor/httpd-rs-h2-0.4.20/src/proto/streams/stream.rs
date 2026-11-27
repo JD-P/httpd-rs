@@ -124,6 +124,7 @@ pub(super) struct Stream {
 #[derive(Debug)]
 pub enum ContentLength {
     Omitted,
+    #[cfg(any(test, feature = "client"))]
     Head,
     Remaining(u64),
 }
@@ -346,6 +347,7 @@ impl Stream {
                 Some(val) => *rem = val,
                 None => return Err(()),
             },
+            #[cfg(any(test, feature = "client"))]
             ContentLength::Head if len != 0 => {
                 return Err(());
             }
@@ -608,7 +610,14 @@ impl store::Next for NextResetExpire {
 
 impl ContentLength {
     pub fn is_head(&self) -> bool {
-        matches!(*self, Self::Head)
+        #[cfg(any(test, feature = "client"))]
+        {
+            matches!(*self, Self::Head)
+        }
+        #[cfg(not(any(test, feature = "client")))]
+        {
+            false
+        }
     }
 }
 

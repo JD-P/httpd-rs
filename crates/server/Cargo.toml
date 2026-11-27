@@ -47,5 +47,6 @@ unsafe_code = "warn"
 unsafe_op_in_unsafe_fn = "deny"
 
 [dev-dependencies]
+h2 = { package = "httpd-rs-h2", path = "../../vendor/httpd-rs-h2-0.4.20", version = "=0.4.20", features = ["client"] }
 loom = "0.7"
 proptest = "1.9"

@@ -46,10 +46,14 @@ license = "MIT"
 repository = "https://github.com/hyperium/h2"
 
 [package.metadata.docs.rs]
-features = ["stream"]
+features = [
+    "client",
+    "stream",
+]
 
 [features]
-fuzzing = []
+client = []
+fuzzing = ["client"]
 stream = []
 unstable = []
 
