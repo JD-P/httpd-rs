@@ -202,7 +202,8 @@ Remove `/tmp/gitea-example` and `/tmp/gitea-check` after the test succeeds.
 <!--
 Deployment contract only; not operator instructions.
 --scenario gitea-proxy
-Documentation case: `mount=subpath`, `reload=before-transfer`, `benchmark=repository`.
+Documentation case: `frontend=apache`, `mount=subpath`, `reload=before-transfer`,
+`benchmark=repository`.
 Scenario storage budget: 1536 MiB.
 [Scenario](../../tests/deployments/scenarios/gitea-proxy/scenario.toml)
 [Driver](../../tests/deployments/scenarios/gitea-proxy/driver.py)

@@ -15,6 +15,7 @@ from lib import (
     DeploymentError,
     common_apache_config,
     common_httpd_rs_config,
+    common_nginx_config,
     differential_benchmark,
     free_port,
     request,
@@ -159,11 +160,75 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
 ProxyPass {route} {backend_route}
 ProxyPassReverse {route} {backend_route}
 """
-    config, pid_file = common_httpd_rs_config(
-        context.run_dir, frontend_port, empty_docroot, extra=extra
+    if variant["frontend"] == "nginx":
+        websocket_route = f"{prefix}/api/live/" if prefix else "/api/live/"
+        nginx_upstream = f"""
+upstream grafana_app {{
+    server {backend_host}:3000;
+}}
+"""
+        nginx_location = f"""
+location {websocket_route} {{
+    proxy_http_version 1.1;
+    proxy_read_timeout 30s;
+    proxy_set_header Host $http_host;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_pass http://grafana_app{websocket_route};
+}}
+location {route} {{
+    add_header X-httpd-rs-Frontend nginx always;
+    client_max_body_size 64k;
+    proxy_http_version 1.1;
+    proxy_read_timeout 30s;
+    proxy_set_header Host $http_host;
+    proxy_pass http://grafana_app{route};
+}}
+"""
+        config, pid_file = common_nginx_config(
+            context.run_dir,
+            frontend_port,
+            empty_docroot,
+            http_extra=f"""
+map $http_upgrade $connection_upgrade {{
+    default upgrade;
+    '' close;
+}}
+{nginx_upstream}
+""",
+            server_extra=f"""
+add_header X-httpd-rs-Frontend parent always;
+{nginx_location}
+""",
+        )
+    else:
+        config, pid_file = common_httpd_rs_config(
+            context.run_dir, frontend_port, empty_docroot, extra=extra
+        )
+    server = start_httpd_rs(
+        context,
+        config,
+        pid_file,
+        frontend_port,
+        config_format=variant["frontend"],
     )
-    server = start_httpd_rs(context, config, pid_file, frontend_port)
     require_healthy(frontend_port, f"{prefix}/api/health")
+    if variant["frontend"] == "nginx":
+        frontend_headers, _ = require_response(frontend_port, f"{prefix}/api/health")
+        if frontend_headers.get("x-httpd-rs-frontend") != "nginx":
+            raise DeploymentError(
+                "nginx child add_header did not replace the inherited server header"
+            )
+        status, rejected_headers, _ = request(
+            frontend_port,
+            f"{prefix}/api/health",
+            method="POST",
+            body=b"x" * (64 * 1024 + 1),
+        )
+        if status != 413 or rejected_headers.get("x-httpd-rs-frontend") != "nginx":
+            raise DeploymentError(
+                f"nginx scoped body admission mismatch: {status} {rejected_headers}"
+            )
     root_status, root_headers, root_body = request(frontend_port, f"{prefix}/")
     if root_status in (301, 302, 303, 307, 308):
         location = root_headers.get("location", "")

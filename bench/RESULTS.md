@@ -366,3 +366,13 @@ history but are not comparable with strict runs.
 | hello.txt (1.1KB, keepalive) | 37936 | 39738 | 1.05x | 0.21 | 1 |
 | 10k.bin (10KB, keepalive) | 37248 | 37651 | 1.01x | 0.22 | 1 |
 | 1m.bin (1MB, keepalive) | 6566 | 10495 | 1.60x | 0.72 | 2 |
+
+
+## 2026-11-27T22:37:22.772647+00:00
+
+| scenario | Apache | nginx | httpd-rs Apache config | httpd-rs nginx config | nginx/Apache-config mode |
+|---|---:|---:|---:|---:|---:|
+| index.html (small, keepalive) | 44914 | 110147 | 34262 | 40363 | 1.18x |
+| hello.txt (1.1KB, keepalive) | 42843 | 102120 | 38981 | 36516 | 0.94x |
+| 10k.bin (10KB, keepalive) | 43613 | 83934 | 40319 | 40156 | 1.00x |
+| 1m.bin (1MB, keepalive) | 8612 | 2500 | 10174 | 10032 | 0.99x |

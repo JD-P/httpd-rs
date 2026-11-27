@@ -62,7 +62,7 @@ pub(crate) fn load(
     if !loader.errors.is_empty() {
         return Err(loader.errors);
     }
-    match lower(nodes) {
+    match lower(nodes, &server_root.join("html")) {
         Ok(mut lowered) => {
             lowered.admin_inputs = loader.admin_inputs;
             Ok(lowered)
@@ -548,7 +548,7 @@ struct Lowerer {
     upstreams: HashSet<String>,
 }
 
-fn lower(nodes: Vec<Node>) -> Result<LoweredNginx, Vec<NginxError>> {
+fn lower(nodes: Vec<Node>, default_document_root: &Path) -> Result<LoweredNginx, Vec<NginxError>> {
     let mut lowerer = Lowerer {
         events: Vec::new(),
         routes: Vec::new(),
@@ -585,6 +585,17 @@ fn lower(nodes: Vec<Node>) -> Result<LoweredNginx, Vec<NginxError>> {
         });
         return Err(lowerer.errors);
     };
+    // These are nginx HTTP defaults, not Apache compiler defaults. Emitting
+    // them as ordinary typed IR operations keeps the shared runtime neutral
+    // and also makes an omitted directive behave like stock nginx.
+    lowerer.directive(
+        http,
+        "DocumentRoot",
+        vec![default_document_root.display().to_string()],
+    );
+    lowerer.directive(http, "LimitRequestBody", vec![(1024 * 1024).to_string()]);
+    lowerer.directive(http, "KeepAliveTimeout", vec!["75".into()]);
+    lowerer.directive(http, "MaxKeepAliveRequests", vec!["1000".into()]);
     lowerer.lower_http(http);
     if !lowerer.errors.is_empty() {
         return Err(lowerer.errors);
@@ -736,7 +747,7 @@ impl Lowerer {
             self.error(node, "http must be a block");
             return;
         };
-        self.validate_add_header_inheritance(node);
+        let http_has_headers = children.iter().any(|node| node.name == "add_header");
         for child in children {
             match child.name.as_str() {
                 "server" | "upstream" | "map" => {}
@@ -802,39 +813,7 @@ impl Lowerer {
                 .any(|listen| listen.default_server)
         });
         for server in servers {
-            self.lower_server(server);
-        }
-    }
-
-    fn validate_add_header_inheritance(&mut self, http: &Node) {
-        let children = http.children.as_deref().unwrap_or_default();
-        let http_has = children.iter().any(|node| node.name == "add_header");
-        for server in children.iter().filter(|node| node.name == "server") {
-            let server_children = server.children.as_deref().unwrap_or_default();
-            let server_has = server_children.iter().any(|node| node.name == "add_header");
-            if http_has && server_has {
-                self.error(
-                    server,
-                    "add_header at both http and server scope has nginx replacement semantics not yet represented by the shared IR",
-                );
-            }
-            for location in server_children
-                .iter()
-                .filter(|node| node.name == "location")
-            {
-                let location_has = location
-                    .children
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|node| node.name == "add_header");
-                if location_has && (http_has || server_has) {
-                    self.error(
-                        location,
-                        "add_header at an inherited and location scope has nginx replacement semantics not yet represented by the shared IR",
-                    );
-                }
-            }
+            self.lower_server(server, http_has_headers);
         }
     }
 
@@ -956,7 +935,7 @@ impl Lowerer {
         }
     }
 
-    fn lower_server(&mut self, node: &Node) {
+    fn lower_server(&mut self, node: &Node, inherited_headers: bool) {
         if !node.args.is_empty() || node.children.is_none() {
             self.error(node, "server requires a block and no arguments");
             return;
@@ -973,6 +952,15 @@ impl Lowerer {
             active: true,
             transparent: false,
         });
+        let server_has_headers = node
+            .children
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|child| child.name == "add_header");
+        if inherited_headers && server_has_headers {
+            self.directive(node, "HttpdRsNginxResetHeaders", Vec::new());
+        }
         let mut server_names = Vec::new();
         for child in node.children.as_deref().unwrap_or_default() {
             match child.name.as_str() {
@@ -1019,7 +1007,11 @@ impl Lowerer {
             .iter()
             .filter(|child| child.name == "location")
         {
-            self.lower_location(location, &mut route_matchers);
+            self.lower_location(
+                location,
+                &mut route_matchers,
+                inherited_headers || server_has_headers,
+            );
         }
         self.events.push(Event::SectionEnd {
             loc: node.loc.clone(),
@@ -1027,7 +1019,12 @@ impl Lowerer {
         self.routes.push(route_matchers);
     }
 
-    fn lower_location(&mut self, node: &Node, routes: &mut Vec<RouteMatcher>) {
+    fn lower_location(
+        &mut self,
+        node: &Node,
+        routes: &mut Vec<RouteMatcher>,
+        inherited_headers: bool,
+    ) {
         let Some(children) = node.children.as_deref() else {
             self.error(node, "location requires a block");
             return;
@@ -1037,6 +1034,12 @@ impl Lowerer {
                 node,
                 "nested nginx locations are not supported; refusing ambiguous winner selection",
             );
+            return;
+        }
+        if children.iter().any(|child| child.name == "root")
+            && children.iter().any(|child| child.name == "alias")
+        {
+            self.error(node, "a location cannot declare both root and alias");
             return;
         }
         let (matcher, section, path) = match parse_location(node) {
@@ -1059,6 +1062,11 @@ impl Lowerer {
             return;
         }
         let route_is_regex = matches!(matcher, RouteMatcher::Regex { .. });
+        let proxy_redirect_off = children
+            .iter()
+            .find(|child| child.name == "proxy_redirect")
+            .and_then(|child| child.args.first())
+            .is_some_and(|value| value == "off");
         routes.push(matcher);
         self.events.push(Event::SectionStart {
             name: section.to_ascii_lowercase(),
@@ -1067,10 +1075,17 @@ impl Lowerer {
             active: true,
             transparent: false,
         });
+        if inherited_headers && children.iter().any(|child| child.name == "add_header") {
+            self.directive(node, "HttpdRsNginxResetHeaders", Vec::new());
+        }
         for child in children {
             match child.name.as_str() {
                 "access_log" => self.lower_access_log(child),
                 "error_log" => self.lower_error_log(child),
+                "proxy_pass" => {
+                    self.lower_proxy_pass(child, &path, route_is_regex, proxy_redirect_off)
+                }
+                "proxy_redirect" => self.lower_proxy_redirect(child),
                 name if location_operational_noop(name) => self.noop(child),
                 _ => self.lower_policy_directive(child, &path, route_is_regex, Context::Location),
             }
@@ -1104,22 +1119,38 @@ impl Lowerer {
             ),
             "index" => self.simple_literal(node, "DirectoryIndex", 1, 128),
             "sendfile" => self.simple_on_off(node, "EnableSendfile"),
-            "keepalive_timeout" if context == Context::Http => {
-                if let Some(value) = node.args.first() { self.directive(node, "KeepAliveTimeout", vec![nginx_time_seconds(value)]); }
-                else { self.error(node, "keepalive_timeout requires a value"); }
-            }
+            "keepalive_timeout" if context == Context::Http => match node.args.as_slice() {
+                [value] => match nginx_duration_seconds(value) {
+                    Some(seconds) => {
+                        self.directive(node, "KeepAliveTimeout", vec![seconds.to_string()])
+                    }
+                    None => self.error(node, "keepalive_timeout requires one bounded time value"),
+                },
+                _ => self.error(node, "keepalive_timeout requires one bounded time value"),
+            },
             "keepalive_requests" if context == Context::Http => self.simple(node, "MaxKeepAliveRequests", 1, 1),
-            "client_max_body_size" if context == Context::Http => match node.args.as_slice() {
+            "client_max_body_size" => match node.args.as_slice() {
                 [value] => match nginx_size(value) {
-                    Ok(value) => self.directive(node, "LimitRequestBody", vec![value.to_string()]),
+                    Ok(value) => self.directive(
+                        node,
+                        if context == Context::Http {
+                            "LimitRequestBody"
+                        } else {
+                            "HttpdRsScopedBodyLimit"
+                        },
+                        // nginx uses zero to disable only this semantic body
+                        // ceiling. The independent spool/resident/throughput
+                        // resource budgets remain in force.
+                        vec![if value == 0 {
+                            u64::MAX.to_string()
+                        } else {
+                            value.to_string()
+                        }],
+                    ),
                     Err(message) => self.error(node, message),
                 },
                 _ => self.error(node, "client_max_body_size requires one value"),
             },
-            "client_max_body_size" => self.error(
-                node,
-                "scoped client_max_body_size is not supported because request-body admission currently precedes route selection",
-            ),
             "server_tokens" if context == Context::Http => {
                 if node.args.as_slice() == ["off"] { self.directive(node, "ServerTokens", vec!["Prod".into()]); }
                 else if node.args.as_slice() == ["on"] { self.directive(node, "ServerTokens", vec!["Full".into()]); }
@@ -1139,18 +1170,46 @@ impl Lowerer {
                 if node.args.is_empty() { self.error(node, "gzip_types requires MIME types"); }
                 else { let mut args = vec!["DEFLATE".into()]; args.extend(node.args.clone()); self.directive(node, "AddOutputFilterByType", args); }
             }
+            "gzip_comp_level" => match node.args.as_slice() {
+                [level] if level.parse::<u8>().is_ok_and(|value| (1..=9).contains(&value)) => {
+                    self.directive(node, "DeflateCompressionLevel", vec![level.clone()]);
+                }
+                _ => self.error(node, "gzip_comp_level requires an integer from 1 through 9"),
+            },
+            "gzip_vary" => {
+                if node.args.len() == 1 && matches!(node.args[0].as_str(), "on" | "off") {
+                    // httpd-rs always emits Vary when a representation is
+                    // negotiable; allowing `off` to remove it would make a
+                    // shared cache unsound. Normalize both values explicitly.
+                    self.noop(node);
+                } else {
+                    self.error(node, "gzip_vary accepts on or off");
+                }
+            }
+            "proxy_connect_timeout" | "proxy_read_timeout" | "proxy_send_timeout"
+            | "fastcgi_connect_timeout" | "fastcgi_read_timeout" | "fastcgi_send_timeout"
+            | "client_body_timeout" | "client_header_timeout" | "send_timeout" => {
+                self.lower_runtime_timeout(node)
+            }
             "proxy_http_version" => {
                 if node.args.as_slice() != ["1.1"] { self.error(node, "only proxy_http_version 1.1 is supported"); }
             }
             "proxy_set_header" => self.simple(node, "HttpdRsProxySetHeader", 2, 2),
             "proxy_pass" if context == Context::Location => {
-                self.lower_proxy_pass(node, route, route_is_regex)
+                self.lower_proxy_pass(node, route, route_is_regex, false)
             }
             "proxy_pass" => self.error(node, "proxy_pass is only valid in a location block"),
             "fastcgi_pass" if context == Context::Location => self.lower_fastcgi_pass(node),
             "fastcgi_pass" => self.error(node, "fastcgi_pass is only valid in a location block"),
             "fastcgi_param" => self.simple(node, "HttpdRsFastCgiParam", 2, 3),
+            "fastcgi_index" => self.simple_literal(node, "DirectoryIndex", 1, 1),
+            "fastcgi_split_path_info" => self.lower_fastcgi_split_path_info(node),
+            "alias" if context == Context::Location => {
+                self.lower_alias(node, route, route_is_regex)
+            }
+            "alias" => self.error(node, "alias is only valid in a location block"),
             "add_header" => self.lower_add_header(node),
+            "expires" => self.lower_expires(node),
             "auth_basic" => {
                 if node.args.iter().any(|arg| arg.contains('$')) {
                     self.error(node, "auth_basic variables are not supported");
@@ -1164,15 +1223,13 @@ impl Lowerer {
                 self.directive(node, "Require", vec!["valid-user".into()]);
             }
             "try_files" if context != Context::Http => {
-                if node.args.as_slice() != ["$uri", "$uri/", "=404"] && node.args.as_slice() != ["$uri", "=404"] {
-                    self.error(node, "only bounded static try_files '$uri $uri/ =404' is supported");
-                }
+                self.lower_try_files(node)
             }
             "try_files" => self.error(node, "try_files is only valid in server or location context"),
             "return" if context != Context::Http => self.lower_return(node),
             "return" => self.error(node, "return is only valid in server or location context"),
             "allow" | "deny" => self.error(node, "nginx ordered allow/deny rules require an explicit ACL compiler and are not silently approximated"),
-            "error_page" => self.error(node, "nginx error_page URI projection is not yet in the source-neutral terminal-outcome IR"),
+            "error_page" => self.lower_error_page(node),
             _ => self.unsupported(node),
         }
     }
@@ -1189,7 +1246,192 @@ impl Lowerer {
         }
     }
 
-    fn lower_proxy_pass(&mut self, node: &Node, route: &str, route_is_regex: bool) {
+    fn lower_alias(&mut self, node: &Node, route: &str, route_is_regex: bool) {
+        if node.children.is_some() || node.args.len() != 1 {
+            self.error(node, "alias requires one literal filesystem path");
+            return;
+        }
+        if route_is_regex {
+            self.error(
+                node,
+                "regex-location alias requires capture substitution outside the finite path-mapping IR",
+            );
+            return;
+        }
+        if node.args[0].contains('$') || node.args[0].as_bytes().contains(&0) {
+            self.error(node, "alias path must be literal and contain no NUL byte");
+            return;
+        }
+        self.directive(
+            node,
+            "HttpdRsNginxAlias",
+            vec![route.to_string(), node.args[0].clone()],
+        );
+    }
+
+    fn lower_try_files(&mut self, node: &Node) {
+        if node.children.is_some() || node.args.len() < 2 {
+            self.error(
+                node,
+                "try_files requires bounded candidates and one fallback",
+            );
+            return;
+        }
+        let candidates = &node.args[..node.args.len() - 1];
+        let candidate_mode = match candidates {
+            [uri] if uri == "$uri" => "file",
+            [uri, directory] if uri == "$uri" && directory == "$uri/" => "file-directory",
+            _ => {
+                self.error(
+                    node,
+                    "try_files candidates are limited to '$uri' or '$uri $uri/'",
+                );
+                return;
+            }
+        };
+        let fallback = node.args.last().expect("length checked");
+        if fallback == "=404" {
+            if candidate_mode == "file" {
+                // The common static handler also recognizes directories. It
+                // therefore cannot exactly encode `$uri =404`, where nginx
+                // requires the explicit `$uri/` candidate before admitting a
+                // directory. Reject that shape instead of silently widening
+                // what can be served.
+                self.error(
+                    node,
+                    "try_files '$uri =404' is ambiguous; include the explicit '$uri/' candidate",
+                );
+            }
+            // The ordinary static path already returns 404 after the same
+            // file/directory probes for `$uri $uri/ =404`, so no synthetic
+            // transition is needed.
+            return;
+        }
+        if !fallback.starts_with('/') || fallback.contains('#') {
+            self.error(
+                node,
+                "try_files fallback must be =404 or an absolute local URI",
+            );
+            return;
+        }
+        let fallback = if let Some(path) = fallback.strip_suffix("?$args") {
+            path
+        } else if let Some(path) = fallback.strip_suffix("?$query_string") {
+            path
+        } else if fallback.contains('$') {
+            self.error(
+                node,
+                "try_files fallback permits only the complete $args/$query_string suffix",
+            );
+            return;
+        } else {
+            fallback.as_str()
+        };
+        if crate::request_plan::CanonicalTarget::from_url_path(
+            fallback
+                .split_once('?')
+                .map(|(path, _)| path)
+                .unwrap_or(fallback),
+        )
+        .is_none()
+        {
+            self.error(node, "try_files fallback is not a canonical local URI");
+            return;
+        }
+        self.directive(
+            node,
+            "HttpdRsNginxTryFiles",
+            vec![fallback.to_string(), candidate_mode.into()],
+        );
+    }
+
+    fn lower_error_page(&mut self, node: &Node) {
+        if node.children.is_some() || node.args.len() < 2 {
+            self.error(
+                node,
+                "error_page requires one or more statuses and a target URI",
+            );
+            return;
+        }
+        let target = node.args.last().expect("length checked");
+        if target.starts_with('=') || target.starts_with('@') || target.contains('$') {
+            self.error(
+                node,
+                "error_page status overrides, named locations, and variable targets are outside the finite terminal projection",
+            );
+            return;
+        }
+        let local = target.starts_with('/');
+        let external = target.starts_with("http://") || target.starts_with("https://");
+        if (!local && !external)
+            || (local && crate::util::split_internal_request_target(target).is_none())
+        {
+            self.error(
+                node,
+                "error_page target must be an unambiguous local or HTTP(S) URI",
+            );
+            return;
+        }
+        for status in &node.args[..node.args.len() - 1] {
+            if status
+                .parse::<u16>()
+                .ok()
+                .is_none_or(|status| !(400..=599).contains(&status))
+            {
+                self.error(
+                    node,
+                    "error_page statuses are limited to HTTP errors from 400 through 599",
+                );
+                return;
+            }
+        }
+        for status in &node.args[..node.args.len() - 1] {
+            self.directive(node, "ErrorDocument", vec![status.clone(), target.clone()]);
+        }
+    }
+
+    fn lower_expires(&mut self, node: &Node) {
+        if node.children.is_some() || node.args.is_empty() || node.args.len() > 2 {
+            self.error(node, "expires requires a time or 'modified' plus a time");
+            return;
+        }
+        if node.args.as_slice() == ["off"] {
+            self.directive(node, "ExpiresActive", vec!["Off".into()]);
+            return;
+        }
+        let (base, value) = match node.args.as_slice() {
+            [value] => ("access", value.as_str()),
+            [modified, value] if modified == "modified" => ("modification", value.as_str()),
+            _ => {
+                self.error(
+                    node,
+                    "expires supports only a duration or 'modified duration'",
+                );
+                return;
+            }
+        };
+        let Some(seconds) = nginx_duration_seconds(value) else {
+            self.error(
+                node,
+                "expires duration must be a non-negative bounded nginx time value",
+            );
+            return;
+        };
+        self.directive(node, "ExpiresActive", vec!["On".into()]);
+        self.directive(
+            node,
+            "ExpiresDefault",
+            vec![format!("{base} plus {seconds} seconds")],
+        );
+    }
+
+    fn lower_proxy_pass(
+        &mut self,
+        node: &Node,
+        route: &str,
+        route_is_regex: bool,
+        proxy_redirect_off: bool,
+    ) {
         if node.args.len() != 1 {
             self.error(node, "proxy_pass requires one literal backend");
             return;
@@ -1202,22 +1444,16 @@ impl Lowerer {
             );
             return;
         }
-        let Some((authority, has_uri)) = proxy_pass_authority_and_uri(&backend) else {
+        let Some((authority, uri)) = proxy_pass_authority_and_uri(&backend) else {
             self.error(
                 node,
                 "proxy_pass backend must be http:// or https:// with a literal authority",
             );
             return;
         };
+        let has_uri = uri.is_some();
         if self.upstreams.contains(authority) {
-            if has_uri {
-                self.error(
-                    node,
-                    "a URI suffix on a named upstream is not yet represented by the bounded balancer IR",
-                );
-                return;
-            }
-            backend = format!("balancer://{authority}");
+            backend = format!("balancer://{authority}{}", uri.unwrap_or(""));
         }
         if route_is_regex && has_uri {
             self.error(
@@ -1248,11 +1484,65 @@ impl Lowerer {
             "HttpdRsRouteProxyPass",
             vec![dispatch_prefix.into(), backend.clone()],
         );
-        if backend.starts_with("http://") || backend.starts_with("https://") {
+        if !proxy_redirect_off
+            && (backend.starts_with("http://") || backend.starts_with("https://"))
+        {
             self.directive(
                 node,
                 "HttpdRsRouteProxyPassReverse",
                 vec![route.into(), backend],
+            );
+        }
+    }
+
+    fn lower_proxy_redirect(&mut self, node: &Node) {
+        if node.children.is_some()
+            || node.args.len() != 1
+            || !matches!(node.args[0].as_str(), "off" | "default")
+        {
+            self.error(
+                node,
+                "proxy_redirect supports only the finite 'off' or 'default' forms",
+            );
+        }
+    }
+
+    fn lower_runtime_timeout(&mut self, node: &Node) {
+        if node.children.is_some()
+            || node.args.len() != 1
+            || nginx_duration_seconds(&node.args[0]).is_none()
+        {
+            self.error(
+                node,
+                format!("{} requires one bounded nginx time value", node.name),
+            );
+            return;
+        }
+        // Dependency I/O is protected by httpd-rs's own bounded cancellation
+        // deadlines. Retaining an arbitrary nginx timeout would widen that
+        // resource budget, so accepted values are deliberately normalized and
+        // surfaced as a load warning through the ordinary operational path.
+        self.noop(node);
+    }
+
+    fn lower_fastcgi_split_path_info(&mut self, node: &Node) {
+        const CONVENTIONAL: &[&str] = &[
+            "^(.+[.]php)(/.+)$",
+            "^(.+\\.php)(/.+)$",
+            "^(.+[.]php)(/.*)$",
+            "^(.+\\.php)(/.*)$",
+        ];
+        if node.children.is_none()
+            && node.args.len() == 1
+            && CONVENTIONAL.contains(&node.args[0].as_str())
+        {
+            // The runtime derives the longest existing script prefix and
+            // bounded PATH_INFO, which refines these conventional PHP splits.
+            self.noop(node);
+        } else {
+            self.error(
+                node,
+                "fastcgi_split_path_info supports only the conventional PHP script/path-info split",
             );
         }
     }
@@ -1302,7 +1592,11 @@ impl Lowerer {
         if node.args.len() == 3 {
             args.push("always".into());
         }
-        args.extend(["set".into(), node.args[0].clone(), node.args[1].clone()]);
+        // nginx appends response fields; it does not replace an identically
+        // named field supplied by the content handler. `Header add` is the
+        // exact shared-IR operation, while the separate reset marker models
+        // nginx's array inheritance between configuration scopes.
+        args.extend(["add".into(), node.args[0].clone(), node.args[1].clone()]);
         self.directive(node, "Header", args);
     }
 
@@ -1527,15 +1821,17 @@ fn valid_server_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':'))
 }
 
-fn proxy_pass_authority_and_uri(value: &str) -> Option<(&str, bool)> {
+fn proxy_pass_authority_and_uri(value: &str) -> Option<(&str, Option<&str>)> {
     let rest = value
         .strip_prefix("http://")
         .or_else(|| value.strip_prefix("https://"))?;
-    let (authority, has_uri) = match rest.split_once('/') {
-        Some((authority, _)) => (authority, true),
-        None => (rest, false),
+    let (authority, uri) = match rest.split_once('/') {
+        Some((authority, _path)) => (authority, Some(&rest[authority.len()..])),
+        None => (rest, None),
     };
-    (!authority.is_empty()).then_some((authority, has_uri))
+    (!authority.is_empty()
+        && uri.is_none_or(|uri| !uri.contains(['?', '#']) && !uri.contains("..")))
+    .then_some((authority, uri))
 }
 
 fn valid_symbol(value: &str) -> bool {
@@ -1568,14 +1864,29 @@ fn nginx_size(value: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("invalid or overflowing nginx size '{value}'"))
 }
 
-fn nginx_time_seconds(value: &str) -> String {
-    value
-        .strip_suffix('s')
-        .unwrap_or(value)
-        .split('.')
-        .next()
-        .unwrap_or(value)
-        .to_string()
+fn nginx_duration_seconds(value: &str) -> Option<u64> {
+    if value.is_empty() || value.starts_with('-') || value.starts_with('+') {
+        return None;
+    }
+    let split = value
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map(|(index, _)| index)
+        .unwrap_or(value.len());
+    let amount = value[..split].parse::<u64>().ok()?;
+    let multiplier = match &value[split..] {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        "w" => 7 * 24 * 60 * 60,
+        "M" => 30 * 24 * 60 * 60,
+        "y" => 365 * 24 * 60 * 60,
+        _ => return None,
+    };
+    amount
+        .checked_mul(multiplier)
+        .filter(|seconds| *seconds <= i64::MAX as u64)
 }
 
 fn main_operational_noop(name: &str) -> bool {
@@ -1646,12 +1957,23 @@ pub fn fuzz_nginx_frontend(data: &[u8]) {
     if data.len() > 1024 * 1024 {
         return;
     }
-    let Ok(text) = std::str::from_utf8(data) else {
-        return;
-    };
-    if let Ok(nodes) = Parser::new(text, Path::new("fuzz-nginx.conf")).parse() {
+    // Raw bytes exercise the lexer, parser and fail-closed rejection surface.
+    // A second, structured projection keeps the semantic compiler and route
+    // machine reachable even after libFuzzer mutates delimiters in the raw
+    // configuration.  The selector grammar is deliberately byte-oriented so
+    // every input, including non-UTF-8 input, reaches a valid nginx program.
+    if let Ok(text) = std::str::from_utf8(data) {
+        fuzz_nginx_text(text, data, "raw-nginx.conf");
+    }
+    let structured = structured_nginx_config(data);
+    fuzz_nginx_text(&structured, structured.as_bytes(), "structured-nginx.conf");
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_nginx_text(text: &str, bytes: &[u8], name: &str) {
+    if let Ok(nodes) = Parser::new(text, Path::new(name)).parse() {
         let has_include = nodes_contain_include(&nodes);
-        let _ = lower(nodes);
+        let _ = lower(nodes, Path::new("/tmp/httpd-rs-nginx-default/html"));
         if !has_include {
             use std::collections::HashMap;
             use std::sync::OnceLock;
@@ -1662,18 +1984,126 @@ pub fn fuzz_nginx_frontend(data: &[u8]) {
                 std::fs::create_dir_all(&root).expect("create nginx fuzz root");
                 root
             });
-            let path = root.join("nginx.conf");
-            std::fs::write(&path, data).expect("write nginx fuzz configuration");
-            let _ = crate::config::Config::load_format(
+            let path = root.join(name);
+            std::fs::write(&path, bytes).expect("write nginx fuzz configuration");
+            if let Ok(config) = crate::config::Config::load_format(
                 crate::config_ir::ConfigFormat::Nginx,
                 &path,
                 root,
                 &HashMap::new(),
                 &HashMap::new(),
                 false,
-            );
+            ) {
+                for request_path in [
+                    "/",
+                    "/exact",
+                    "/assets/item.txt",
+                    "/api/item",
+                    "/script.php",
+                    "/missing/deep/path",
+                ] {
+                    if let Some(vhost) = config.select_vhost(None, 18080, Some("fuzz.example")) {
+                        let scope = config.base_scope_with_route(Some(vhost), request_path);
+                        let _ = crate::proxy::match_target(&config, &scope, request_path);
+                    }
+                }
+            }
         }
     }
+}
+
+#[cfg(feature = "fuzzing")]
+fn structured_nginx_config(data: &[u8]) -> String {
+    fn byte(data: &[u8], index: usize) -> u8 {
+        data.get(index).copied().unwrap_or(index as u8)
+    }
+    fn pick<'a>(data: &[u8], index: usize, values: &'a [&'a str]) -> &'a str {
+        values[byte(data, index) as usize % values.len()]
+    }
+
+    let server_name = pick(data, 0, &["fuzz.example", "*.fuzz.example", "api.*", "_"]);
+    let body_limit = pick(data, 1, &["0", "1", "1k", "64k", "1m", "1g"]);
+    let expiry = pick(data, 2, &["off", "0", "30s", "10m", "1h", "modified 1d"]);
+    let compression = pick(data, 3, &["off", "on"]);
+    let parent_header = pick(data, 4, &["parent", "root", "fixed"]);
+    let proxy_value = pick(
+        data,
+        5,
+        &[
+            "$host",
+            "$http_host",
+            "$request_uri",
+            "$proxy_add_x_forwarded_for",
+            "literal-$scheme-$server_port",
+            "$http_x_fuzz",
+        ],
+    );
+    let try_files = pick(
+        data,
+        6,
+        &[
+            "$uri =404",
+            "$uri $uri/ =404",
+            "$uri /index.html",
+            "$uri $uri/ /index.html?$args",
+        ],
+    );
+    let error_code = pick(data, 7, &["400", "403", "404", "500", "502"]);
+    let upstream = if byte(data, 8) & 1 == 0 {
+        "http://127.0.0.1:19001"
+    } else {
+        "http://app/base/"
+    };
+    let mut locations = String::new();
+    let count = 3 + usize::from(byte(data, 9) % 8);
+    for index in 0..count {
+        let selector = byte(data, 10 + index * 2) % 8;
+        let action = byte(data, 11 + index * 2) % 8;
+        let (modifier, path, regex) = match selector {
+            0 => ("= ", "/exact", false),
+            1 => ("^~ ", "/assets/", false),
+            2 => ("", "/api/", false),
+            3 => ("~ ", "[.]php$", true),
+            4 => ("~* ", "[.]JPEG$", true),
+            5 => ("", "/nested/deep/", false),
+            6 => ("", "/missing/", false),
+            _ => ("", "/", false),
+        };
+        let body = match action {
+            0 => format!("add_header X-Fuzz child-{index} always;"),
+            1 if !regex => format!("try_files {try_files};"),
+            2 if !regex => format!("alias /tmp/httpd-rs-nginx-alias-{index}/;"),
+            3 => format!(
+                "proxy_set_header X-Fuzz {proxy_value}; proxy_pass {upstream};"
+            ),
+            4 => "fastcgi_param SCRIPT_FILENAME $request_filename; fastcgi_param REQUEST_URI $request_uri; fastcgi_pass 127.0.0.1:19002;".into(),
+            5 => format!("client_max_body_size {body_limit};"),
+            6 => format!("expires {expiry};"),
+            _ => format!("error_page {error_code} /index.html;"),
+        };
+        locations.push_str(&format!("location {modifier}{path} {{ {body} }}\n"));
+    }
+
+    format!(
+        "user nobody nogroup;\n\
+         events {{ worker_connections 64; }}\n\
+         http {{\n\
+           httpd_rs_capability FastCgi On;\n\
+           httpd_rs_capability UnstableFastCgiPaths On;\n\
+           client_max_body_size {body_limit};\n\
+           add_header X-Parent {parent_header} always;\n\
+           gzip {compression};\n\
+           upstream app {{ server 127.0.0.1:19001; server 127.0.0.1:19003; }}\n\
+           server {{\n\
+             listen 127.0.0.1:18080 default_server;\n\
+             server_name {server_name};\n\
+             root /tmp;\n\
+             index index.html index.htm;\n\
+             error_page {error_code} /index.html;\n\
+             {locations}\
+           }}\n\
+         }}\n"
+    )
 }
 
 #[cfg(feature = "fuzzing")]
@@ -1749,7 +2179,7 @@ mod tests {
         )
         .parse()
         .unwrap();
-        let errors = lower(parsed).unwrap_err();
+        let errors = lower(parsed, Path::new("/tmp/httpd-rs-nginx-default/html")).unwrap_err();
         assert!(errors
             .iter()
             .any(|error| error.message.contains("conventional finite")));
@@ -1929,7 +2359,7 @@ mod tests {
                  DocumentRoot {}\n\
                  DirectoryIndex index.html index.htm\n\
                  <Location /assets/>\n\
-                 Header set X-Route assets\n\
+                 Header add X-Route assets\n\
                  </Location>\n\
                  </VirtualHost>\n",
                 root.display()
@@ -1977,8 +2407,8 @@ mod tests {
             nginx_scope.content_policy.directory_index
         );
         assert_eq!(
-            apache_scope.header_policy.set_headers,
-            nginx_scope.header_policy.set_headers
+            apache_scope.header_policy.add_headers,
+            nginx_scope.header_policy.add_headers
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2022,6 +2452,159 @@ mod tests {
                 .and_then(|vhost| vhost.server_name.as_deref()),
             Some("*.deep.example.test")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn nginx_specific_policy_compiles_into_route_deltas() {
+        let dir = tempdir("nginx-policy");
+        let root = dir.join("www");
+        let assets = dir.join("assets");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&assets).unwrap();
+        let config = dir.join("nginx.conf");
+        std::fs::write(
+            &config,
+            format!(
+                "events {{ worker_connections 64; }}\n\
+                 http {{\n\
+                   add_header X-Http inherited;\n\
+                   server {{\n\
+                     listen 127.0.0.1:18083;\n\
+                     root {};\n\
+                     client_max_body_size 8k;\n\
+                     add_header X-Server server;\n\
+                     error_page 404 /error.html;\n\
+                     location /assets/ {{\n\
+                       alias {}/;\n\
+                       client_max_body_size 1k;\n\
+                       add_header X-Location location always;\n\
+                       expires 1h;\n\
+                       try_files $uri $uri/ /index.php?$args;\n\
+                     }}\n\
+                   }}\n\
+                 }}\n",
+                root.display(),
+                assets.display(),
+            ),
+        )
+        .unwrap();
+        let empty = std::collections::HashMap::new();
+        let cfg = crate::config::Config::load_format(
+            crate::config_ir::ConfigFormat::Nginx,
+            &config,
+            &dir,
+            &empty,
+            &empty,
+            false,
+        )
+        .unwrap_or_else(|errors| panic!("{errors:#?}"));
+        let vhost = cfg.select_vhost(None, 18083, None).unwrap();
+        assert_eq!(vhost.scope.content_policy.request_body_limit, Some(8192));
+        assert_eq!(
+            vhost.scope.header_policy.add_headers,
+            vec![("X-Server".into(), "server".into())]
+        );
+        assert!(matches!(
+            vhost.scope.error_document(404),
+            Some(crate::config::ErrorDoc::Local(target)) if target == "/error.html"
+        ));
+        let scope = cfg.base_scope_with_route(Some(vhost), "/assets/site.css");
+        assert_eq!(scope.content_policy.request_body_limit, Some(1024));
+        assert!(scope.header_policy.add_headers.is_empty());
+        assert_eq!(
+            scope.header_policy.always_add_headers,
+            vec![("X-Location".into(), "location".into())]
+        );
+        assert_eq!(scope.header_policy.expires_active, Some(true));
+        assert_eq!(
+            scope.header_policy.expires_default.as_deref(),
+            Some("access plus 3600 seconds")
+        );
+        assert_eq!(scope.mapping_policy.aliases[0].fs_path, assets);
+        assert!(scope
+            .rewrite_policy
+            .rewrite_rules
+            .iter()
+            .any(|rule| rule.filesystem_context && rule.substitution == "/index.php"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn nginx_defaults_and_zero_body_limit_survive_the_shared_compiler() {
+        let dir = tempdir("nginx-defaults");
+        let config = dir.join("nginx.conf");
+        std::fs::write(
+            &config,
+            "events { worker_connections 64; }\n\
+             http {\n\
+               server {\n\
+                 listen 127.0.0.1:18084;\n\
+                 location /unlimited/ { client_max_body_size 0; }\n\
+               }\n\
+             }\n",
+        )
+        .unwrap();
+        let empty = std::collections::HashMap::new();
+        let cfg = crate::config::Config::load_format(
+            crate::config_ir::ConfigFormat::Nginx,
+            &config,
+            &dir,
+            &empty,
+            &empty,
+            false,
+        )
+        .unwrap_or_else(|errors| panic!("{errors:#?}"));
+        assert_eq!(cfg.document_root, dir.join("html"));
+        assert_eq!(cfg.limit_request_body, 1024 * 1024);
+        assert_eq!(cfg.keep_alive_timeout, std::time::Duration::from_secs(75));
+        assert_eq!(cfg.max_keep_alive_requests, 1000);
+        let vhost = cfg.select_vhost(None, 18084, None).unwrap();
+        assert_eq!(
+            cfg.route_request_body_limit(Some(vhost), "/ordinary"),
+            1024 * 1024
+        );
+        assert_eq!(
+            cfg.route_request_body_limit(Some(vhost), "/unlimited/body"),
+            u64::MAX
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn named_upstream_uri_projection_is_retained() {
+        let dir = tempdir("upstream-uri");
+        let config = dir.join("nginx.conf");
+        std::fs::write(
+            &config,
+            "events { worker_connections 64; }\n\
+             http {\n\
+               upstream app { server 127.0.0.1:19001; }\n\
+               server {\n\
+                 listen 127.0.0.1:18084;\n\
+                 location /api/ { proxy_pass http://app/base/; }\n\
+               }\n\
+             }\n",
+        )
+        .unwrap();
+        let empty = std::collections::HashMap::new();
+        let cfg = crate::config::Config::load_format(
+            crate::config_ir::ConfigFormat::Nginx,
+            &config,
+            &dir,
+            &empty,
+            &empty,
+            false,
+        )
+        .unwrap_or_else(|errors| panic!("{errors:#?}"));
+        let vhost = cfg.select_vhost(None, 18084, None).unwrap();
+        let scope = cfg.base_scope_with_route(Some(vhost), "/api/item");
+        assert_eq!(
+            scope.proxy_policy.proxy_passes[0].backend,
+            "balancer://app/base/"
+        );
+        let target = crate::proxy::match_target(&cfg, &scope, "/api/item").unwrap();
+        assert_eq!(target.proxy_url, "http://127.0.0.1:19001/base/item");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

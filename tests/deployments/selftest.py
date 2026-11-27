@@ -136,9 +136,17 @@ class DeploymentHarnessTests(unittest.TestCase):
                 )
             )
             harness.write_benchmark_summary(
-                artifact_root, [{"case": "case-id", "scenario": "example"}]
+                artifact_root,
+                [
+                    {
+                        "case": "case-id",
+                        "scenario": "example",
+                        "variant": {"frontend": "nginx"},
+                    }
+                ],
             )
             summary = json.loads((artifact_root / "benchmark-summary.json").read_text())
+            self.assertEqual(summary["benchmarks"][0]["frontend"], "nginx")
             self.assertEqual(summary["benchmarks"][0]["apache_p99_latency_ms"], 3.0)
             self.assertEqual(summary["benchmarks"][0]["httpd_rs_p99_latency_ms"], 4.0)
 

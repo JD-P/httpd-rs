@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from datetime import datetime, timezone
 import http.client
+import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
@@ -24,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import re
 
 
 STATIC_CASES = {
@@ -37,6 +40,7 @@ STATIC_CASES = {
 PROXY_CASES = {
     "/keep/item?x=1": "/keep/item?x=1",
     "/replace/item?x=1": "/base/item?x=1",
+    "/balanced/item?x=1": "/base/item?x=1",
 }
 
 
@@ -50,6 +54,16 @@ class EchoBackend(BaseHTTPRequestHandler):
             f"x-uri={self.headers.get('X-URI', '')}\n"
             f"x-peer={self.headers.get('X-Peer', '')}\n"
         ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = self.rfile.read(length)
+        body = f"path={self.path}\nlength={len(payload)}\n".encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
@@ -182,15 +196,23 @@ def wait_ready(process: subprocess.Popen[bytes], port: int) -> None:
 
 
 def request(
-    port: int, path: str, host: str = "differential.test"
-) -> tuple[int, str | None, str | None, bytes]:
+    port: int,
+    path: str,
+    host: str = "differential.test",
+    *,
+    method: str = "GET",
+    body: bytes | None = None,
+) -> tuple[int, str | None, str | None, str | None, str | None, str | None, bytes]:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
-    connection.request("GET", path, headers={"Host": host})
+    connection.request(method, path, body=body, headers={"Host": host})
     response = connection.getresponse()
     result = (
         response.status,
         response.getheader("X-Route"),
         response.getheader("Location"),
+        response.getheader("X-Inherited"),
+        response.getheader("X-Child"),
+        response.getheader("Cache-Control"),
         response.read(),
     )
     connection.close()
@@ -204,6 +226,7 @@ def config_text(
     error: Path,
     backend_port: int,
     fastcgi_port: int,
+    alias_root: Path,
     httpd_extensions: bool,
     nginx_temp: Path | None = None,
 ) -> str:
@@ -233,6 +256,8 @@ events {{ worker_connections 64; }}
 http {{
   {temp_directives}
   access_log off;
+  add_header X-Inherited parent always;
+  upstream app {{ server 127.0.0.1:{backend_port}; }}
   server {{
     listen 127.0.0.1:{port};
     server_name differential.test;
@@ -254,6 +279,28 @@ http {{
       proxy_set_header X-Peer $proxy_add_x_forwarded_for;
       proxy_pass http://127.0.0.1:{backend_port}/base/;
     }}
+    location /balanced/ {{
+      proxy_set_header Host $host;
+      proxy_set_header X-URI $request_uri;
+      proxy_set_header X-Peer $proxy_add_x_forwarded_for;
+      proxy_pass http://app/base/;
+    }}
+    location /headers/ {{
+      add_header X-Child child always;
+      add_header X-Child sibling always;
+    }}
+    location /alias/ {{ alias {alias_root}/; }}
+    location /fallback/ {{ try_files $uri $uri/ /fallback.html?$args; }}
+    location /errors/ {{ error_page 404 /404.html; }}
+    location /expiring/ {{ expires 1h; }}
+    location /small-body/ {{
+      client_max_body_size 4;
+      proxy_pass http://127.0.0.1:{backend_port}/upload/;
+    }}
+    location /unlimited-body/ {{
+      client_max_body_size 0;
+      proxy_pass http://127.0.0.1:{backend_port}/upload/;
+    }}
     location = /moved {{ return 301 https://example.test/final; }}
     location ~ '[.]fcgi$' {{
       fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
@@ -267,6 +314,95 @@ http {{
 """.strip() + "\n"
 
 
+def apache_frontend_config(
+    port: int,
+    root: Path,
+    server_root: Path,
+    backend_port: int,
+) -> str:
+    logs = server_root / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    identity = os.environ.get("USER", "nobody")
+    return f"""
+ServerRoot "{server_root}"
+Listen 127.0.0.1:{port}
+User {identity}
+Group {identity}
+PidFile "{logs / 'httpd.pid'}"
+ErrorLog "{logs / 'error.log'}"
+LogLevel warn
+ServerName differential.test
+KeepAlive On
+MaxKeepAliveRequests 10000
+KeepAliveTimeout 3
+DocumentRoot "{root}"
+<Directory />
+  AllowOverride None
+  Require all denied
+</Directory>
+<Directory "{root}">
+  Options FollowSymLinks
+  AllowOverride None
+  Require all granted
+</Directory>
+DirectoryIndex index.html
+ProxyPass /keep/ http://127.0.0.1:{backend_port}/keep/
+ProxyPassReverse /keep/ http://127.0.0.1:{backend_port}/keep/
+""".strip() + "\n"
+
+
+def benchmark_frontends(
+    wrk: str,
+    ports: dict[str, int],
+    output: Path,
+    *,
+    duration: int = 2,
+) -> None:
+    scenarios = {"static": "/other.txt", "proxy": "/keep/item?x=1"}
+    report: dict[str, object] = {
+        "version": 1,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scenarios": {},
+    }
+    for scenario, path in scenarios.items():
+        samples: dict[str, list[float]] = {name: [] for name in ports}
+        for port in ports.values():
+            subprocess.run(
+                [wrk, "-t2", "-c8", "-d1s", f"http://127.0.0.1:{port}{path}"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+        order = list(ports.items())
+        for sample in range(3):
+            for name, port in (order if sample % 2 == 0 else list(reversed(order))):
+                run = subprocess.run(
+                    [wrk, "-t2", "-c8", f"-d{duration}s", f"http://127.0.0.1:{port}{path}"],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                match = re.search(r"Requests/sec:\s+([0-9.]+)", run.stdout)
+                if match is None:
+                    raise RuntimeError(f"wrk omitted throughput for {name}: {run.stdout}")
+                samples[name].append(float(match.group(1)))
+        medians = {name: sorted(values)[len(values) // 2] for name, values in samples.items()}
+        apache_mode = medians["httpd-rs-apache-config"]
+        nginx_mode = medians["httpd-rs-nginx-config"]
+        report["scenarios"][scenario] = {
+            "path": path,
+            "samples": samples,
+            "median_requests_per_second": medians,
+            "nginx_to_apache_config_ratio": nginx_mode / apache_mode,
+        }
+        print(
+            f"benchmark {scenario}: Apache-config={apache_mode:.0f} req/s, "
+            f"nginx-config={nginx_mode:.0f} req/s, ratio={nginx_mode / apache_mode:.3f}x"
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    print(f"nginx deployment benchmark: {output}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -274,6 +410,12 @@ def main() -> int:
         type=Path,
         default=Path(os.environ.get("HTTPD_RS_BIN", "target/debug/httpd-rs")),
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="benchmark the same deployment through Apache- and nginx-syntax httpd-rs configs",
+    )
+    parser.add_argument("--benchmark-output", type=Path)
     args = parser.parse_args()
     nginx = shutil.which("nginx")
     if nginx is None:
@@ -292,8 +434,18 @@ def main() -> int:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(marker + "\n", encoding="utf-8")
         (root / "echo.fcgi").write_text("FastCGI fixture\n", encoding="utf-8")
+        (root / "headers/index.html").parent.mkdir(parents=True, exist_ok=True)
+        (root / "headers/index.html").write_text("headers\n", encoding="utf-8")
+        (root / "fallback.html").write_text("fallback\n", encoding="utf-8")
+        (root / "404.html").write_text("custom-error\n", encoding="utf-8")
+        (root / "expiring/index.html").parent.mkdir(parents=True, exist_ok=True)
+        (root / "expiring/index.html").write_text("expiring\n", encoding="utf-8")
+        alias_root = temp / "alias-root"
+        alias_root.mkdir()
+        (alias_root / "fixture.txt").write_text("aliased\n", encoding="utf-8")
 
-        nginx_port, httpd_port, backend_port, fastcgi_port = (
+        nginx_port, httpd_port, apache_mode_port, backend_port, fastcgi_port = (
+            free_port(),
             free_port(),
             free_port(),
             free_port(),
@@ -315,6 +467,7 @@ def main() -> int:
                 temp / "nginx-error.log",
                 backend_port,
                 fastcgi_port,
+                alias_root,
                 False,
                 nginx_prefix,
             ),
@@ -328,7 +481,18 @@ def main() -> int:
                 temp / "httpd-rs-error.log",
                 backend_port,
                 fastcgi_port,
+                alias_root,
                 True,
+            ),
+            encoding="utf-8",
+        )
+        apache_mode_config = temp / "httpd-rs-apache.conf"
+        apache_mode_config.write_text(
+            apache_frontend_config(
+                apache_mode_port,
+                root,
+                temp / "httpd-rs-apache",
+                backend_port,
             ),
             encoding="utf-8",
         )
@@ -352,9 +516,27 @@ def main() -> int:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        ours_apache = None
+        if args.benchmark:
+            ours_apache = subprocess.Popen(
+                [
+                    str(httpd_rs),
+                    "-d",
+                    str(temp),
+                    "-f",
+                    str(apache_mode_config),
+                    "--config-format",
+                    "apache",
+                    "-X",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
         try:
             wait_ready(stock, nginx_port)
             wait_ready(ours, httpd_port)
+            if ours_apache is not None:
+                wait_ready(ours_apache, apache_mode_port)
             failures = []
             for path, expected_route in STATIC_CASES.items():
                 stock_result = request(nginx_port, path)
@@ -365,7 +547,7 @@ def main() -> int:
                 stock_result = request(nginx_port, path, f"differential.test:{nginx_port}")
                 ours_result = request(httpd_port, path, f"differential.test:{httpd_port}")
                 expected_line = f"path={expected_path}\n".encode()
-                if stock_result != ours_result or not stock_result[3].startswith(expected_line):
+                if stock_result != ours_result or not stock_result[6].startswith(expected_line):
                     failures.append((path, expected_path, stock_result, ours_result))
             stock_redirect = request(nginx_port, "/moved?x=1")
             ours_redirect = request(httpd_port, "/moved?x=1")
@@ -380,18 +562,96 @@ def main() -> int:
             ours_fastcgi = request(httpd_port, "/echo.fcgi?x=1")
             if stock_fastcgi != ours_fastcgi:
                 failures.append(("/echo.fcgi?x=1", "FastCGI parameters", stock_fastcgi, ours_fastcgi))
+            feature_cases = (
+                ("/alias/fixture.txt", b"aliased\n", None),
+                ("/fallback/deep/path?x=1", b"fallback\n", None),
+                ("/errors/missing", b"custom-error\n", None),
+                ("/headers/", b"headers\n", "child-replaces-parent"),
+                ("/expiring/", b"expiring\n", "expires"),
+            )
+            for path, expected_body, property_name in feature_cases:
+                stock_result = request(nginx_port, path)
+                ours_result = request(httpd_port, path)
+                if stock_result != ours_result or stock_result[6] != expected_body:
+                    failures.append((path, property_name or "static projection", stock_result, ours_result))
+                    continue
+                if property_name == "child-replaces-parent" and (
+                    stock_result[3] is not None
+                    or stock_result[4] != "child, sibling"
+                ):
+                    failures.append((path, property_name, stock_result, ours_result))
+                if property_name == "expires" and stock_result[5] != "max-age=3600":
+                    failures.append((path, property_name, stock_result, ours_result))
+            for size, expected_status in ((4, 200), (5, 413)):
+                stock_result = request(
+                    nginx_port, "/small-body/item", method="POST", body=b"x" * size
+                )
+                ours_result = request(
+                    httpd_port, "/small-body/item", method="POST", body=b"x" * size
+                )
+                same = (
+                    stock_result == ours_result
+                    if expected_status == 200
+                    else stock_result[:6] == ours_result[:6]
+                )
+                if not same or stock_result[0] != expected_status:
+                    failures.append((f"POST /small-body/item ({size})", expected_status, stock_result, ours_result))
+            stock_unlimited = request(
+                nginx_port, "/unlimited-body/item", method="POST", body=b"x" * 1024
+            )
+            ours_unlimited = request(
+                httpd_port, "/unlimited-body/item", method="POST", body=b"x" * 1024
+            )
+            if stock_unlimited != ours_unlimited or stock_unlimited[0] != 200:
+                failures.append(
+                    (
+                        "POST /unlimited-body/item (client_max_body_size 0)",
+                        200,
+                        stock_unlimited,
+                        ours_unlimited,
+                    )
+                )
             if failures:
                 for failure in failures:
                     print(f"mismatch: {failure!r}", file=sys.stderr)
                 return 1
-            count = len(STATIC_CASES) + len(PROXY_CASES) + 2
-            print(f"nginx differential OK ({count} route/proxy/redirect cases)")
+            if ours_apache is not None:
+                apache_static = request(apache_mode_port, "/other.txt")
+                apache_proxy = request(apache_mode_port, "/keep/item?x=1")
+                if apache_static[0] != 200 or apache_static[6] != b"root\n":
+                    print(f"Apache-config deployment static mismatch: {apache_static!r}", file=sys.stderr)
+                    return 1
+                if apache_proxy[0] != 200 or not apache_proxy[6].startswith(b"path=/keep/item?x=1\n"):
+                    print(f"Apache-config deployment proxy mismatch: {apache_proxy!r}", file=sys.stderr)
+                    return 1
+                wrk = shutil.which("wrk")
+                if wrk is None:
+                    print("error: --benchmark requires wrk", file=sys.stderr)
+                    return 2
+                output = args.benchmark_output
+                if output is None:
+                    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    output = Path("bench/results") / f"nginx-deployment-{stamp}.json"
+                benchmark_frontends(
+                    wrk,
+                    {
+                        "stock-nginx": nginx_port,
+                        "httpd-rs-apache-config": apache_mode_port,
+                        "httpd-rs-nginx-config": httpd_port,
+                    },
+                    output,
+                )
+            count = len(STATIC_CASES) + len(PROXY_CASES) + len(feature_cases) + 5
+            print(f"nginx differential OK ({count} routing, policy, backend and body-admission cases)")
             return 0
         finally:
-            for process in (ours, stock):
+            processes = [ours, stock]
+            if ours_apache is not None:
+                processes.append(ours_apache)
+            for process in processes:
                 if process.poll() is None:
                     process.terminate()
-            for process in (ours, stock):
+            for process in processes:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=3)
                 if process.poll() is None:

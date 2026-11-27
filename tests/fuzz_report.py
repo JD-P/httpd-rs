@@ -24,9 +24,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 STATUS = re.compile(
-    r"#(?P<run>\d+)\s+(?P<action>[A-Z]+)\s+"
+    # Ordinary libFuzzer prints `#123 NEW ... rss: 42Mb`; fork mode prints
+    # `#123: cov: ... oom/timeout/crash: 0/0/0` and omits both fields.  Long
+    # campaigns use fork mode so one crashing child cannot end the campaign.
+    r"#(?P<run>\d+):?\s+(?:(?P<action>[A-Z]+)\s+)?"
     r"cov:\s*(?P<cov>\d+)\s+ft:\s*(?P<ft>\d+).*?"
-    r"exec/s:\s*(?P<exec>\d+).*?rss:\s*(?P<rss>\d+)Mb"
+    r"exec/s:\s*(?P<exec>\d+)(?:.*?rss:\s*(?P<rss>\d+)Mb)?"
 )
 
 
@@ -86,11 +89,26 @@ def summarize_logs(directory: Path) -> LogSummary:
         summary.max_features = max(
             summary.max_features, *(int(match.group("ft")) for match in matches)
         )
-        summary.peak_rss_mb = max(
-            summary.peak_rss_mb, *(int(match.group("rss")) for match in matches)
-        )
+        rss_values = [int(match.group("rss")) for match in matches if match.group("rss")]
+        if rss_values:
+            summary.peak_rss_mb = max(summary.peak_rss_mb, *rss_values)
         summary.final_exec_per_second = int(final.group("exec"))
         new_runs = [int(match.group("run")) for match in matches if match.group("action") == "NEW"]
+        # Fork-mode status lines have no action label. Treat a strict edge or
+        # feature increase as the corresponding discovery event so the
+        # staleness signal remains meaningful instead of reporting the whole
+        # campaign as runs-since-new.
+        previous_cov = int(first.group("cov"))
+        previous_features = int(first.group("ft"))
+        for match in matches[1:]:
+            cov = int(match.group("cov"))
+            features = int(match.group("ft"))
+            if match.group("action") is None and (
+                cov > previous_cov or features > previous_features
+            ):
+                new_runs.append(int(match.group("run")))
+            previous_cov = max(previous_cov, cov)
+            previous_features = max(previous_features, features)
         summary.new_events += len(new_runs)
         if log_index == len(logs) - 1:
             last_new = max(new_runs, default=0)
@@ -339,14 +357,33 @@ def classify_declared(target: str, data: bytes, groups: dict[str, SemanticGroup]
             "http_block": b"HTTP" in upper and b"{" in data,
             "server_block": b"SERVER" in upper and b"{" in data,
             "location": b"LOCATION" in upper,
+            "route_selection": any(token in upper for token in (b"LOCATION =", b"LOCATION ^~", b"LOCATION ~")),
+            "static_mapping": b"ROOT" in upper or b"ALIAS" in upper or b"TRY_FILES" in upper,
+            "scoped_policy": b"CLIENT_MAX_BODY_SIZE" in upper or b"ADD_HEADER" in upper or b"EXPIRES" in upper,
+            "terminal": b"ERROR_PAGE" in upper or b"RETURN" in upper,
             "proxy": b"PROXY_PASS" in upper or b"PROXY_SET_HEADER" in upper,
+            "upstream": b"UPSTREAM" in upper,
             "fastcgi": b"FASTCGI_PASS" in upper or b"FASTCGI_PARAM" in upper,
             "include": b"INCLUDE" in upper,
+            "unsupported_reject": b"LOCATION @" in upper or b"IF (" in upper or b"PROXY_PASS $" in upper,
             "malformed": not data or data.count(b"{") != data.count(b"}") or b"\x00" in data,
         }
         for label, present in families.items():
             if present:
                 observe(groups, "grammar", label)
+        # Every byte string also drives the target's guaranteed-valid
+        # structured projection.  Track those selector families separately
+        # from lexical edge coverage so a long run can prove it exercised the
+        # semantic compiler even when most mutated raw configs are malformed.
+        byte = lambda index: data[index] if index < len(data) else index & 0xFF
+        observe(groups, "server_name_mode", byte(0) % 4)
+        observe(groups, "body_limit_mode", byte(1) % 6)
+        observe(groups, "expiry_mode", byte(2) % 6)
+        observe(groups, "compression_mode", byte(3) % 2)
+        route_count = 3 + byte(9) % 8
+        for index in range(route_count):
+            observe(groups, "route_matcher", byte(10 + index * 2) % 8)
+            observe(groups, "route_action", byte(11 + index * 2) % 8)
     elif target == "htaccess_walk":
         if not data:
             return
@@ -514,7 +551,19 @@ DECLARED_SPECS: dict[str, dict[str, set[str]]] = {
     "config_sections": {"form": {"directive", "section_open", "section_close", "nested", "continuation", "malformed"}},
     "config_compile": {"strict": {"0", "1"}, "directive_family": {"listener", "authorization", "rewrite", "backend", "cache", "tls", "remoteip", "unknown_reject"}},
     "config_grammars": {"grammar": {"listen", "read_timeout", "rewrite_rule", "rewrite_condition", "proxy_backend", "template", "malformed"}},
-    "nginx_config": {"grammar": {"http_block", "server_block", "location", "proxy", "fastcgi", "include", "malformed"}},
+    "nginx_config": {
+        "grammar": {
+            "http_block", "server_block", "location", "route_selection",
+            "static_mapping", "scoped_policy", "terminal", "proxy", "upstream",
+            "fastcgi", "include", "unsupported_reject", "malformed",
+        },
+        "server_name_mode": {str(i) for i in range(4)},
+        "body_limit_mode": {str(i) for i in range(6)},
+        "expiry_mode": {str(i) for i in range(6)},
+        "compression_mode": {str(i) for i in range(2)},
+        "route_matcher": {str(i) for i in range(8)},
+        "route_action": {str(i) for i in range(8)},
+    },
     "htaccess_walk": {"depth": {"0", "1", "2", "3"}, "directive_family": {"authorization", "mapping", "handler", "environment", "malformed"}},
     "rewrite_expr": {"expression_family": {"comparison", "boolean", "regex", "request_variable", "environment_variable", "filesystem_test", "malformed"}},
     "cgi_response": {"delimiter": {"crlf", "lf", "absent"}, "header_family": {"status", "location", "content_length", "content_type", "malformed"}},
@@ -547,7 +596,19 @@ def declared_seeds(target: str) -> list[bytes]:
         "config_sections": [b"Listen 8080\n", b"<Directory /tmp>\n", b"</Directory>\n", b"<Directory /tmp>\n<Files x>\n</Files>\n</Directory>\n", b"Listen \\\n8080\n", b"<Directory\n"],
         "config_compile": [b"Listen 8080\n", b"ServerName example.test\n", b"Require all granted\n", b"RewriteRule ^a$ b [L]\n", b"ProxyPass / http://127.0.0.1/\n", b"CacheEnable disk /\n", b"SSLEngine On\n", b"RemoteIPHeader X-Forwarded-For\n", b"NotADirective x\n"],
         "config_grammars": [b"127.0.0.1:8080", b"header=20,MinRate=500 body=30", b"^a$ b [L]", b"%{REQUEST_URI} -f", b"http://127.0.0.1:8080/", b"/x/$1", b"\x00"],
-        "nginx_config": [b"http {}", b"http { server {} }", b"http { server { location / {} } }", b"http { server { proxy_pass http://127.0.0.1; proxy_set_header Host $host; } }", b"http { server { fastcgi_pass 127.0.0.1:9000; fastcgi_param SCRIPT_FILENAME $request_filename; } }", b"include conf.d/*.conf;", b"http {\x00"],
+        "nginx_config": [
+            b"http {}",
+            b"http { server {} }",
+            b"http { server { location = /exact {} location ^~ /assets/ {} location ~ '[.]php$' {} } }",
+            b"http { server { root /tmp; location /a/ { alias /tmp/a/; } location / { try_files $uri /index.html; } } }",
+            b"http { client_max_body_size 1m; add_header X-Parent parent; server { location / { expires 1h; add_header X-Child child; } } }",
+            b"http { server { error_page 404 /404.html; location = /old { return 302 https://example.test/new; } } }",
+            b"http { upstream app { server 127.0.0.1:9000; } server { proxy_pass http://app/base/; proxy_set_header Host $host; } }",
+            b"http { server { fastcgi_pass 127.0.0.1:9000; fastcgi_param SCRIPT_FILENAME $request_filename; } }",
+            b"include conf.d/*.conf;",
+            b"http { server { location @named {} location / { if ($uri) {} proxy_pass $backend; } } }",
+            b"http {\x00",
+        ] + [bytes([selector]) * 32 for selector in range(24)],
         "rewrite_expr": [b"%{REQUEST_URI} == '/x'", b"true && false", b"%{REQUEST_URI} =~ m#^/x$#", b"%{HTTP_HOST} == 'x'", b"%{ENV:FUZZ} == '1'", b"-f '/tmp/fuzz'", b"("],
         "cgi_response": [b"Content-Type: text/plain\r\n\r\nbody", b"Content-Type: text/plain\n\nbody", b"Status: 201 Created\r\n\r\n", b"Location: /next\r\n\r\n", b"Content-Length: 0\r\n\r\n", b"broken\x00"],
         "proxy_response": [b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx", b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n", b"HTTP/1.0 200 OK\r\n\r\nx", b"HTTP/1.1 204 No Content\r\n\r\n", b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", b"broken"],

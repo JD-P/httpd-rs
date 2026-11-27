@@ -2698,6 +2698,8 @@ pub fn error_response(
     peer: std::net::IpAddr,
     local_ip: &str,
 ) -> Response {
+    let nginx_internal_error = cfg.route_program.is_nginx()
+        && matches!(scope.error_document(status), Some(ErrorDoc::Local(_)));
     let mut r = error_response_inner(
         cfg, vhost, scope, status, req, url_path, port, host, peer, local_ip,
     );
@@ -2714,17 +2716,21 @@ pub fn error_response(
             host: host.to_string(),
         });
     }
-    // Only `Header always` applies to error responses.
-    if scope.header_policy.apply(&mut r.headers, false).is_err() {
-        return Response::policy_error();
+    if !nginx_internal_error {
+        // Only `Header always` applies to error responses. A local nginx
+        // `error_page` is an internal redirect and was already finalized
+        // using the target location's policy.
+        if scope.header_policy.apply(&mut r.headers, false).is_err() {
+            return Response::policy_error();
+        }
+        crate::compression::finalize_budgeted(
+            scope,
+            req,
+            &mut r,
+            url_path.as_bytes(),
+            &cfg.resource_budget,
+        );
     }
-    crate::compression::finalize_budgeted(
-        scope,
-        req,
-        &mut r,
-        url_path.as_bytes(),
-        &cfg.resource_budget,
-    );
     r
 }
 
@@ -2772,20 +2778,28 @@ pub(crate) fn finalize_prepared_error_document(
     // cache-store boundaries. A thread-local marker can be reset by another
     // request and is unnecessary when the response already owns this bit.
     response.forbid_shared_cache();
-    if scope
-        .header_policy
-        .apply(&mut response.headers, false)
-        .is_err()
-    {
-        return Response::policy_error();
+    // Apache applies the failing request's error-response header/compression
+    // policy after the local ErrorDocument handler completes. nginx performs
+    // an internal redirect instead: the selected error-page location owns the
+    // final response policy. The inner response is already finalized, so
+    // applying the outer scope here would resurrect inherited `add_header`
+    // values that nginx deliberately replaced.
+    if !cfg.route_program.is_nginx() {
+        if scope
+            .header_policy
+            .apply(&mut response.headers, false)
+            .is_err()
+        {
+            return Response::policy_error();
+        }
+        crate::compression::finalize_budgeted(
+            scope,
+            req,
+            &mut response,
+            url_path.as_bytes(),
+            &cfg.resource_budget,
+        );
     }
-    crate::compression::finalize_budgeted(
-        scope,
-        req,
-        &mut response,
-        url_path.as_bytes(),
-        &cfg.resource_budget,
-    );
     response
 }
 

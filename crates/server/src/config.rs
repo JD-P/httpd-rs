@@ -1771,6 +1771,7 @@ const MAX_REWRITEMAP_PROGRAM: u64 = 64 * 1024 * 1024;
 #[cfg(debug_assertions)]
 #[derive(Debug, PartialEq, Eq)]
 struct ContainerSnapshot {
+    replace_response_headers: bool,
     error_documents: Vec<(u16, u64)>,
     aliases: Vec<u64>,
     redirects: Vec<u64>,
@@ -1822,6 +1823,7 @@ fn hash_vec<T: std::fmt::Debug>(values: &[T]) -> Vec<u64> {
 impl Scope {
     fn container_snapshot(&self) -> ContainerSnapshot {
         ContainerSnapshot {
+            replace_response_headers: self.header_policy.replace_response_headers,
             error_documents: self
                 .error_policy
                 .documents
@@ -1912,6 +1914,9 @@ impl Scope {
             out
         };
         ContainerSnapshot {
+            // This bit is a merge instruction carried by a delta, not an
+            // inherited policy property.
+            replace_response_headers: parent.replace_response_headers,
             error_documents,
             aliases: append(&parent.aliases, &child.aliases),
             redirects: append(&parent.redirects, &child.redirects),
@@ -1919,12 +1924,36 @@ impl Scope {
             unsupported_filters: append(&parent.unsupported_filters, &child.unsupported_filters),
             add_types: append(&parent.add_types, &child.add_types),
             remove_types: append(&parent.remove_types, &child.remove_types),
-            add_headers: append(&parent.add_headers, &child.add_headers),
-            set_headers: merge_set(&parent.set_headers, &child.set_headers),
-            unset_headers: append(&parent.unset_headers, &child.unset_headers),
-            always_add_headers: append(&parent.always_add_headers, &child.always_add_headers),
-            always_set_headers: merge_set(&parent.always_set_headers, &child.always_set_headers),
-            always_unset_headers: append(&parent.always_unset_headers, &child.always_unset_headers),
+            add_headers: if child.replace_response_headers {
+                child.add_headers.clone()
+            } else {
+                append(&parent.add_headers, &child.add_headers)
+            },
+            set_headers: if child.replace_response_headers {
+                child.set_headers.clone()
+            } else {
+                merge_set(&parent.set_headers, &child.set_headers)
+            },
+            unset_headers: if child.replace_response_headers {
+                child.unset_headers.clone()
+            } else {
+                append(&parent.unset_headers, &child.unset_headers)
+            },
+            always_add_headers: if child.replace_response_headers {
+                child.always_add_headers.clone()
+            } else {
+                append(&parent.always_add_headers, &child.always_add_headers)
+            },
+            always_set_headers: if child.replace_response_headers {
+                child.always_set_headers.clone()
+            } else {
+                merge_set(&parent.always_set_headers, &child.always_set_headers)
+            },
+            always_unset_headers: if child.replace_response_headers {
+                child.always_unset_headers.clone()
+            } else {
+                append(&parent.always_unset_headers, &child.always_unset_headers)
+            },
             expires_by_type: append(&parent.expires_by_type, &child.expires_by_type),
             rewrite_env: append(&parent.rewrite_env, &child.rewrite_env),
             rewrite_unset_env: append(&parent.rewrite_unset_env, &child.rewrite_unset_env),
@@ -2370,11 +2399,19 @@ impl Scope {
         // target to add its own restrictions.  Unsets from either identity are
         // retained; target sets override lexical values only when the lexical
         // scope did not explicitly unset the header.
-        let mut headers = base.header_policy.clone();
-        if !headers.merge_child(&self.header_policy) {
-            self.conditional_error = true;
+        // Transform-selected targets are commonly three spellings of the
+        // same policy identity (public URL, lexical target and canonical
+        // file).  Replaying an identical additive policy for every spelling
+        // turns one `Header add` into two or three response fields.  The meet
+        // must be idempotent for equal policies; genuinely distinct target
+        // policy is still composed in the established URL-then-target order.
+        if self.header_policy != base.header_policy {
+            let mut headers = base.header_policy.clone();
+            if !headers.merge_child(&self.header_policy) {
+                self.conditional_error = true;
+            }
+            self.header_policy = headers;
         }
-        self.header_policy = headers;
 
         for filter in &base.mapping_policy.unsupported_filters {
             if !self
@@ -4131,13 +4168,20 @@ impl Config {
                     .into_iter()
                     .zip(deltas.into_iter().map(|(_, delta)| delta))
                     .enumerate()
-                    .map(
-                        |(declaration_order, (matcher, policy))| crate::config_ir::Route {
+                    .map(|(declaration_order, (matcher, delta))| {
+                        // nginx selects exactly one location. Pre-merge its
+                        // immutable server policy once at configuration load
+                        // instead of rebuilding and reallocating a large
+                        // Scope at every request phase (translation,
+                        // authorization, backend selection and finalization).
+                        let mut policy = vhost.scope.clone();
+                        policy.merge(&delta);
+                        crate::config_ir::Route {
                             matcher,
                             policy,
                             declaration_order,
-                        },
-                    )
+                        }
+                    })
                     .collect(),
             );
         }
@@ -4272,6 +4316,12 @@ fn directive_arity(name: &str) -> PayloadArity {
         "httpdrsproxysetheader" => PayloadArity::TWO,
         "httpdrsfastcgiparam" => PayloadArity::between(2, 3),
         "httpdrsscopedroot" => PayloadArity::ONE,
+        "httpdrsscopedbodylimit" => PayloadArity::ONE,
+        "httpdrsnginxresetheaders" => PayloadArity {
+            min: 0,
+            max: Some(0),
+        },
+        "httpdrsnginxalias" | "httpdrsnginxtryfiles" => PayloadArity::TWO,
         "httpdrsnginxreturn" => PayloadArity::between(2, 3),
         "httpdrsrouteproxypass" => PayloadArity::at_least(2),
         "httpdrsrouteproxypassreverse" => PayloadArity::TWO,
@@ -4484,6 +4534,8 @@ fn directive_rejects_empty(name: &str) -> bool {
             | "httpdrscapability"
             | "httpdrsfastcgistablepath"
             | "httpdrsscopedroot"
+            | "httpdrsscopedbodylimit"
+            | "httpdrsnginxalias"
             | "serveralias"
             | "allowoverride"
             | "allowoverridelist"
@@ -4596,6 +4648,10 @@ fn build_directive_payload_schema(name: &str) -> PayloadSchema {
         | "cacheminsize"
         | "limitrequestbody"
         | "maxconnectionsperchild" => PayloadValueSchema::Unsigned {
+            min: 0,
+            max: u64::MAX,
+        },
+        "httpdrsscopedbodylimit" => PayloadValueSchema::Unsigned {
             min: 0,
             max: u64::MAX,
         },
@@ -5194,6 +5250,10 @@ fn core_directive_exists(name: &str) -> bool {
             | "httpdrsproxysetheader"
             | "httpdrsfastcgiparam"
             | "httpdrsscopedroot"
+            | "httpdrsscopedbodylimit"
+            | "httpdrsnginxresetheaders"
+            | "httpdrsnginxalias"
+            | "httpdrsnginxtryfiles"
             | "httpdrsnginxreturn"
             | "httpdrsrouteproxypass"
             | "httpdrsrouteproxypassreverse"
@@ -5564,6 +5624,10 @@ impl ParserState {
                         "httpdrsproxysetheader"
                             | "httpdrsfastcgiparam"
                             | "httpdrsscopedroot"
+                            | "httpdrsscopedbodylimit"
+                            | "httpdrsnginxresetheaders"
+                            | "httpdrsnginxalias"
+                            | "httpdrsnginxtryfiles"
                             | "httpdrsnginxreturn"
                             | "httpdrsrouteproxypass"
                             | "httpdrsrouteproxypassreverse"
@@ -7255,6 +7319,65 @@ impl Compile {
                 } else {
                     clean_path(&self.cfg.server_root.join(path))
                 });
+            }
+            "httpdrsscopedbodylimit" => {
+                scope.content_policy.request_body_limit = Some(
+                    payload
+                        .unsigned()
+                        .expect("scoped body limit is typed while sealing"),
+                );
+            }
+            "httpdrsnginxresetheaders" => {
+                scope.header_policy.replace_response_headers = true;
+            }
+            "httpdrsnginxalias" => {
+                let mut path = PathBuf::from(&args[1]);
+                if !path.is_absolute() {
+                    path = self.cfg.server_root.join(path);
+                }
+                scope.mapping_policy.aliases.push(Alias::prefix(
+                    args[0].clone(),
+                    clean_path(&path),
+                    false,
+                ));
+            }
+            "httpdrsnginxtryfiles" => {
+                let fallback = &args[0];
+                let check_directory = match args[1].as_str() {
+                    "file" => false,
+                    "file-directory" => true,
+                    other => {
+                        self.directive_error(
+                            loc,
+                            format!("invalid nginx try_files candidate mode '{other}'"),
+                        );
+                        return;
+                    }
+                };
+                let mut conditions = Vec::with_capacity(if check_directory { 2 } else { 1 });
+                for pattern in if check_directory {
+                    ["!-f", "!-d"].as_slice()
+                } else {
+                    ["!-f"].as_slice()
+                } {
+                    conditions.push(
+                        parse_rewrite_cond(&[
+                            "%{REQUEST_FILENAME}".into(),
+                            (*pattern).into(),
+                        ])
+                        .expect("private nginx try_files condition is static"),
+                    );
+                }
+                let mut rule = parse_rewrite_rule(
+                    &["^".into(), fallback.clone(), "[L]".into()],
+                    "/",
+                    true,
+                )
+                .expect("private nginx try_files rule is statically valid");
+                rule.conditions = conditions;
+                rule.filesystem_context = true;
+                scope.rewrite_policy.rewrite_engine = Some(true);
+                scope.rewrite_policy.rewrite_rules.push(rule);
             }
             "protocols" => {
                 if !matches!(section, SectionKind::Server | SectionKind::VirtualHost) {
@@ -11174,12 +11297,8 @@ pub(crate) fn supported_proxy_backend(value: &str, allow_fastcgi: bool) -> bool 
     if crate::proxy::valid_http_backend(value) {
         return true;
     }
-    if let Some(name) = value.strip_prefix("balancer://") {
-        let name = name.strip_suffix('/').unwrap_or(name);
-        return !name.is_empty()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    if value.starts_with("balancer://") {
+        return crate::proxy::valid_balancer_backend(value);
     }
     allow_fastcgi && crate::fastcgi::valid_backend_syntax(value)
 }
@@ -11756,6 +11875,10 @@ fn known_directives() -> Vec<&'static str> {
         "httpdrsfastcgistablepath",
         "httpdrsfastcgiparam",
         "httpdrsscopedroot",
+        "httpdrsscopedbodylimit",
+        "httpdrsnginxresetheaders",
+        "httpdrsnginxalias",
+        "httpdrsnginxtryfiles",
         "httpdrsnginxreturn",
         "httpdrsrouteproxypass",
         "httpdrsrouteproxypassreverse",
@@ -14180,6 +14303,32 @@ SSLOptions +StrictRequire\n";
         assert_eq!(
             parent.header_policy.always_unset_headers,
             vec!["X-Old".to_string()]
+        );
+    }
+
+    #[test]
+    fn equal_transform_identities_do_not_replay_additive_headers() {
+        let mut scope = Scope::default();
+        scope
+            .header_policy
+            .add_headers
+            .push(("X-Route".into(), "one".into()));
+        scope
+            .header_policy
+            .always_add_headers
+            .push(("X-Always".into(), "two".into()));
+        let same_identity = scope.clone();
+
+        scope.restrict_with(&same_identity);
+        scope.restrict_policy_with(&same_identity);
+
+        assert_eq!(
+            scope.header_policy.add_headers,
+            vec![("X-Route".into(), "one".into())]
+        );
+        assert_eq!(
+            scope.header_policy.always_add_headers,
+            vec![("X-Always".into(), "two".into())]
         );
     }
 
@@ -18166,13 +18315,54 @@ impl Config {
     }
 
     pub(crate) fn base_scope_with_route(&self, vhost: Option<&VHost>, url_path: &str) -> Scope {
-        let mut scope = vhost.map(|v| &v.scope).unwrap_or(&self.global).clone();
         if let Some(index) = vhost.and_then(|value| self.vhost_position(value)) {
             if let Some(route) = self.route_program.select(index, url_path) {
-                scope.merge(route);
+                return route.clone();
             }
         }
-        scope
+        vhost.map(|v| &v.scope).unwrap_or(&self.global).clone()
+    }
+
+    /// Body admission happens after the request head and nginx route winner
+    /// are known but before any body byte is accepted. This projection is
+    /// intentionally limited to server/location policy: filesystem and
+    /// access-file configuration cannot influence a pre-body decision.
+    pub(crate) fn route_request_body_limit(&self, vhost: Option<&VHost>, url_path: &str) -> u64 {
+        self.base_scope_with_route(vhost, url_path)
+            .content_policy
+            .request_body_limit
+            .unwrap_or(self.limit_request_body)
+    }
+
+    pub(crate) fn request_body_limit_for(
+        &self,
+        req: &crate::http::Request,
+        local_ip: Option<IpAddr>,
+        local_port: u16,
+    ) -> Result<u64, crate::request_plan::CanonicalError> {
+        let target = crate::request_plan::CanonicalTarget::from_request(
+            req,
+            self.encoded_slashes == EncodedSlashes::On,
+        )?;
+        let vhost = self.select_vhost(local_ip, local_port, req.header_str("host"));
+        Ok(self.route_request_body_limit(vhost, &target.url_path))
+    }
+
+    /// Resolve only the server/location policy known from a validated request
+    /// head. Early body-admission failures happen before the ordinary
+    /// dispatcher, but nginx `add_header ... always` still applies to them.
+    pub(crate) fn request_route_scope_for(
+        &self,
+        req: &crate::http::Request,
+        local_ip: Option<IpAddr>,
+        local_port: u16,
+    ) -> Result<Scope, crate::request_plan::CanonicalError> {
+        let target = crate::request_plan::CanonicalTarget::from_request(
+            req,
+            self.encoded_slashes == EncodedSlashes::On,
+        )?;
+        let vhost = self.select_vhost(local_ip, local_port, req.header_str("host"));
+        Ok(self.base_scope_with_route(vhost, &target.url_path))
     }
 
     fn base_scope_with_route_req(
@@ -18181,12 +18371,16 @@ impl Config {
         url_path: &str,
         req: &crate::http::Request,
     ) -> Scope {
-        let mut scope = vhost.map(|v| &v.scope).unwrap_or(&self.global).clone();
+        let scope = vhost.map(|v| &v.scope).unwrap_or(&self.global).clone();
         if let Some(index) = vhost.and_then(|value| self.vhost_position(value)) {
             match self.route_program.select_metered(index, url_path, req) {
-                Ok(Some(route)) => scope.merge(route),
+                Ok(Some(route)) => return route.clone(),
                 Ok(None) => {}
-                Err(_) => scope.conditional_error = true,
+                Err(_) => {
+                    let mut scope = scope;
+                    scope.conditional_error = true;
+                    return scope;
+                }
             }
         }
         scope

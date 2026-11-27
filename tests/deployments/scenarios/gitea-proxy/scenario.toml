@@ -9,16 +9,19 @@ images = ["gitea/gitea@sha256:af07b88edbb2173d20932f9c75ebcf4e61d7d5c2d6a7ab5cc6
 prerequisites = ["docker", "git"]
 
 [dimensions]
+frontend = ["apache", "nginx"]
 mount = ["root", "subpath"]
 reload = ["none", "before-transfer"]
 benchmark = ["version", "repository"]
 
 [canonical]
+frontend = "nginx"
 mount = "subpath"
 reload = "before-transfer"
 benchmark = "repository"
 
 [documentation]
+frontend = "apache"
 mount = "subpath"
 reload = "before-transfer"
 benchmark = "repository"

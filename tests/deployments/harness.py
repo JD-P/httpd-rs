@@ -294,6 +294,7 @@ def write_benchmark_summary(artifact_root: Path, results: list[dict[str, Any]]) 
             {
                 "case": case,
                 "scenario": result.get("scenario"),
+                "frontend": (result.get("variant") or {}).get("frontend", "apache"),
                 "path": data.get("path"),
                 "apache_requests_per_second": data["median_requests_per_second"]["apache"],
                 "httpd_rs_requests_per_second": data["median_requests_per_second"]["httpd-rs"],
@@ -309,8 +310,8 @@ def write_benchmark_summary(artifact_root: Path, results: list[dict[str, Any]]) 
     lines = [
         "# Canonical application benchmark summary",
         "",
-        "| scenario | path | Apache req/s | httpd-rs req/s | ratio | Apache p99 ms | httpd-rs p99 ms |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "| scenario | config frontend | path | Apache req/s | httpd-rs req/s | ratio | Apache p99 ms | httpd-rs p99 ms |",
+        "|---|---|---|---:|---:|---:|---:|---:|",
     ]
     def metric(value: float | None, digits: int) -> str:
         return f"{value:.{digits}f}" if value is not None else "n/a"
@@ -321,12 +322,12 @@ def write_benchmark_summary(artifact_root: Path, results: list[dict[str, Any]]) 
         httpd_rs_p99 = row["httpd_rs_p99_latency_ms"]
         ratio_text = f"{ratio:.3f}x" if ratio is not None else "n/a"
         lines.append(
-            f"| {row['scenario']} | `{row['path']}` | "
+            f"| {row['scenario']} | {row['frontend']} | `{row['path']}` | "
             f"{row['apache_requests_per_second']:.2f} | {row['httpd_rs_requests_per_second']:.2f} | "
             f"{ratio_text} | {metric(apache_p99, 3)} | {metric(httpd_rs_p99, 3)} |"
         )
     if not rows:
-        lines.append("| _no completed differential benchmarks_ | | | | | | |")
+        lines.append("| _no completed differential benchmarks_ | | | | | | | |")
     (artifact_root / "benchmark-summary.md").write_text("\n".join(lines) + "\n")
 
 

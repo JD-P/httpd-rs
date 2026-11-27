@@ -430,6 +430,11 @@ mod authorization_tests {
 /// monolithic `Scope` struct.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HeaderPolicy {
+    /// nginx array-directive inheritance: the first `add_header` in a child
+    /// scope replaces the inherited response-header action set instead of
+    /// appending to it. Apache scopes leave this false and retain their
+    /// ordinary merge behavior.
+    pub replace_response_headers: bool,
     pub add_headers: Vec<(String, String)>,
     pub set_headers: Vec<(String, String)>,
     pub unset_headers: Vec<String>,
@@ -507,13 +512,29 @@ impl HeaderPolicy {
     pub fn merge_child(&mut self, child: &HeaderPolicy) -> bool {
         let (parent_count, parent_bytes) = self.configured_usage();
         let (child_count, child_bytes) = child.configured_usage();
+        let (merged_count, merged_bytes) = if child.replace_response_headers {
+            (child_count, child_bytes)
+        } else {
+            (
+                parent_count.saturating_add(child_count),
+                parent_bytes.saturating_add(child_bytes),
+            )
+        };
         if !httpd_rs_verified::response_header_budget_admit(
-            parent_count.saturating_add(child_count) as u64,
-            parent_bytes.saturating_add(child_bytes) as u64,
+            merged_count as u64,
+            merged_bytes as u64,
             MAX_CONFIGURED_RESPONSE_HEADERS as u64,
             MAX_CONFIGURED_RESPONSE_HEADER_BYTES as u64,
         ) {
             return false;
+        }
+        if child.replace_response_headers {
+            self.add_headers.clear();
+            self.set_headers.clear();
+            self.unset_headers.clear();
+            self.always_add_headers.clear();
+            self.always_set_headers.clear();
+            self.always_unset_headers.clear();
         }
         crate::verified::append_vec(&mut self.add_headers, &child.add_headers);
         merge_set_headers(&mut self.set_headers, &child.set_headers);
@@ -844,6 +865,9 @@ pub struct ContentPolicy {
     pub remove_types: Vec<String>,
     pub force_type: Option<String>,
     pub access_file_names: Option<Vec<String>>,
+    /// Route-selected request-body ceiling. `None` inherits the process-wide
+    /// default; nginx server/location declarations set an exact child value.
+    pub request_body_limit: Option<u64>,
 }
 
 impl ContentPolicy {
@@ -881,6 +905,9 @@ impl ContentPolicy {
         }
         if child.access_file_names.is_some() {
             self.access_file_names = child.access_file_names.clone();
+        }
+        if child.request_body_limit.is_some() {
+            self.request_body_limit = child.request_body_limit;
         }
     }
 }

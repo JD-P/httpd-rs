@@ -1133,6 +1133,18 @@ fn next_balancer_member(
             .and_then(|set| parse_http_url(&m.url).map(|b| set.contains(&backend_key(&b))))
             .unwrap_or(false)
     };
+    // A one-member upstream is the overwhelmingly common nginx spelling for
+    // a stable backend identity. Round-robin state cannot affect its result,
+    // so preserve active-health and failover exclusion checks without the
+    // general path's temporary vectors or process-wide selection mutex.
+    if let [member] = balancer.members.as_slice() {
+        if (active && !member_is_healthy(generation, &balancer.name, &member.url))
+            || is_excluded(member)
+        {
+            return None;
+        }
+        return parse_http_url(&member.url);
+    }
     let available = |m: &&BalancerMember| {
         (!active || member_is_healthy(generation, &balancer.name, &m.url)) && !is_excluded(m)
     };
@@ -1179,6 +1191,29 @@ fn next_balancer_member(
     parse_http_url(&viable[index].url)
 }
 
+fn balancer_reference(raw: &str) -> Option<(&str, &str)> {
+    let value = raw.trim().strip_prefix("balancer://")?;
+    let (name, path) = value
+        .split_once('/')
+        .map(|(name, path)| (name, path))
+        .unwrap_or((value, ""));
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        || path.starts_with('/')
+        || path.contains(['?', '#'])
+        || path.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return None;
+    }
+    Some((name, path))
+}
+
+pub(crate) fn valid_balancer_backend(raw: &str) -> bool {
+    balancer_reference(raw).is_some()
+}
+
 fn resolve_backend(
     cfg: &Config,
     raw: &str,
@@ -1186,11 +1221,11 @@ fn resolve_backend(
     req: Option<&Request>,
     sticky_override: Option<&str>,
 ) -> Option<(HttpBackend, String)> {
-    if let Some(name) = raw.trim().strip_prefix("balancer://") {
-        let name = name.trim_end_matches('/');
+    if let Some((name, configured_path)) = balancer_reference(raw) {
         let balancer = cfg.balancers.iter().find(|b| b.name == name)?;
         let backend = next_balancer_member(cfg.generation, balancer, req, None, sticky_override)?;
-        let path = join_path(&backend.base, suffix);
+        let projected = join_path(&backend.base, configured_path);
+        let path = join_path(&projected, suffix);
         return Some((backend, path));
     }
     let backend = parse_http_url(raw)?;
@@ -1223,10 +1258,7 @@ fn prefix_suffix<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
 pub fn target_from_url(cfg: &Config, scope: &Scope, url: &str, req: &Request) -> Option<Target> {
     let path_part = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
     let (backend, path) = resolve_backend(cfg, path_part, "", Some(req), None)?;
-    let balancer = path_part
-        .trim()
-        .strip_prefix("balancer://")
-        .map(|name| name.trim_end_matches('/').to_string());
+    let balancer = balancer_reference(path_part).map(|(name, _)| name.to_string());
     let fail_on_status = balancer
         .as_ref()
         .and_then(|name| cfg.balancers.iter().find(|b| b.name == *name))
@@ -1353,10 +1385,7 @@ pub fn match_target_req(
             continue;
         };
         {
-            let balancer = rule
-                .backend
-                .strip_prefix("balancer://")
-                .map(|n| n.trim_end_matches('/').to_string());
+            let balancer = balancer_reference(&rule.backend).map(|(name, _)| name.to_string());
             let fail_on_status = balancer
                 .as_ref()
                 .and_then(|name| cfg.balancers.iter().find(|b| b.name == *name))
@@ -1428,10 +1457,7 @@ pub fn match_target_req(
             } else {
                 path
             };
-            let balancer = rule
-                .backend
-                .strip_prefix("balancer://")
-                .map(|n| n.trim_end_matches('/').to_string());
+            let balancer = balancer_reference(&rule.backend).map(|(name, _)| name.to_string());
             let fail_on_status = balancer
                 .as_ref()
                 .and_then(|name| cfg.balancers.iter().find(|b| b.name == *name))

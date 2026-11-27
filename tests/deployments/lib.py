@@ -305,6 +305,8 @@ class HttpdRsProcess:
     config: Path
     log: Path
     pid_file: Path
+    server_root: Path
+    config_format: str = "apache"
     process: subprocess.Popen[bytes] | None = None
     _log_handle: object | None = None
 
@@ -319,12 +321,33 @@ class HttpdRsProcess:
             command([*prefix, "chmod", "0644", os.fspath(self.config)], timeout=30)
             command([*prefix, "chown", "0:0", os.fspath(self.pid_file.parent)], timeout=30)
             command([*prefix, "chmod", "0755", os.fspath(self.pid_file.parent)], timeout=30)
-        check = [*prefix, os.fspath(self.binary), "-f", os.fspath(self.config), "-t", "--strict-config"]
+        if self.config_format not in {"apache", "nginx"}:
+            raise DeploymentError(f"unsupported httpd-rs configuration format: {self.config_format}")
+        format_args = ["--config-format", self.config_format]
+        root_args = ["-d", os.fspath(self.server_root)]
+        check = [
+            *prefix,
+            os.fspath(self.binary),
+            *root_args,
+            "-f",
+            os.fspath(self.config),
+            *format_args,
+            "-t",
+            "--strict-config",
+        ]
         command(check, timeout=timeout)
         self.log.parent.mkdir(parents=True, exist_ok=True)
         self._log_handle = self.log.open("ab")
         self.process = subprocess.Popen(
-            [*prefix, os.fspath(self.binary), "-f", os.fspath(self.config), "-DFOREGROUND"],
+            [
+                *prefix,
+                os.fspath(self.binary),
+                *root_args,
+                "-f",
+                os.fspath(self.config),
+                *format_args,
+                "-DFOREGROUND",
+            ],
             stdout=self._log_handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -985,6 +1008,62 @@ TypesConfig /etc/mime.types
     return config, pid_file
 
 
+def common_nginx_config(
+    run_dir: Path,
+    port: int,
+    document_root: Path,
+    *,
+    capabilities: Iterable[str] = (),
+    http_extra: str = "",
+    server_extra: str = "",
+) -> tuple[str, Path]:
+    """Build the bounded nginx frontend's deployment-test configuration."""
+    server_root = run_dir / "httpd-rs-nginx"
+    logs = server_root / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    os.chmod(logs, 0o777)
+    document_root.mkdir(parents=True, exist_ok=True)
+    user, group = service_identity()
+    pid_file = logs / "httpd-rs.pid"
+    capability_lines = "".join(
+        f"httpd_rs_capability {name} On;\n" for name in capabilities
+    )
+    current_user = pwd.getpwuid(os.geteuid()).pw_name
+    current_group = grp.getgrgid(os.getegid()).gr_name
+    if user == current_user and group == current_group:
+        capability_lines += "httpd_rs_capability MutableAuthFiles On;\n"
+        capability_lines += "httpd_rs_capability UnstableFastCgiPaths On;\n"
+        server_extra = "".join(
+            line
+            for line in server_extra.splitlines(keepends=True)
+            if not line.lstrip().startswith("httpd_rs_fastcgi_stable_path ")
+        )
+    return (
+        f"""user {user} {group};
+pid {pid_file};
+error_log {logs / 'error.log'} warn;
+{capability_lines}events {{
+    worker_connections 512;
+}}
+http {{
+    access_log off;
+    keepalive_timeout 3;
+    keepalive_requests 100;
+    client_max_body_size 1g;
+    {http_extra.strip()}
+    server {{
+        listen 127.0.0.1:{port} default_server;
+        server_name deployment.test;
+        root {document_root};
+        index index.html;
+        {server_extra.strip()}
+    }}
+}}
+""",
+        pid_file,
+    )
+
+
 def start_httpd_rs(
     context: CaseContext,
     config_text: str,
@@ -992,15 +1071,18 @@ def start_httpd_rs(
     port: int,
     *,
     tls: bool = False,
+    config_format: str = "apache",
 ) -> HttpdRsProcess:
-    config = context.run_dir / "httpd-rs.conf"
+    config = context.run_dir / f"httpd-rs-{config_format}.conf"
     config.write_text(config_text)
-    shutil.copy2(config, context.artifact_dir / "httpd-rs.conf")
+    shutil.copy2(config, context.artifact_dir / f"httpd-rs-{config_format}.conf")
     process = HttpdRsProcess(
         binary=context.httpd_rs,
         config=config,
         log=context.artifact_dir / "httpd-rs.log",
         pid_file=pid_file,
+        server_root=pid_file.parent.parent,
+        config_format=config_format,
     )
     context.add_cleanup(process.stop)
     process.start()

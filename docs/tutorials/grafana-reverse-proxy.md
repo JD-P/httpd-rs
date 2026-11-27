@@ -138,7 +138,8 @@ updates.
 <!--
 Deployment contract only; not operator instructions.
 --scenario grafana-proxy
-Documentation case: `mount=subpath`, `reload=after-start`, `websocket=message`.
+Documentation case: `frontend=apache`, `mount=subpath`, `reload=after-start`,
+`websocket=message`.
 Scenario storage budget: 1024 MiB.
 [Scenario](../../tests/deployments/scenarios/grafana-proxy/scenario.toml)
 [Driver](../../tests/deployments/scenarios/grafana-proxy/driver.py)

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Differential benchmark: httpd-rs vs. the real Apache httpd.
+"""Four-way static benchmark: both httpd-rs frontends and their reference servers.
 
-Both servers serve the exact same DocumentRoot on the loopback interface with
-identical keep-alive settings.  Results are written to bench/results/ and a
-summary is appended to bench/RESULTS.md.
+Apache, nginx, httpd-rs with Apache syntax, and httpd-rs with nginx syntax
+serve the exact same DocumentRoot on loopback with equivalent keep-alive
+settings. Results are written to bench/results/ and a summary is appended to
+bench/RESULTS.md. Stock nginx is optional; the httpd-rs nginx frontend is
+always measured.
 
 Usage: python3 bench/bench.py [--quick] [--requests N] [--concurrency N]
 
@@ -30,6 +32,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench"
 RUN = Path("/tmp/httpd-rs-bench")
 APACHE = os.environ.get("APACHE") or shutil.which("apache2") or "/usr/sbin/apache2"
+NGINX = os.environ.get("NGINX") or shutil.which("nginx")
 HTTPD_RS = Path(os.environ.get("HTTPD_RS", ROOT / "target" / "release" / "httpd-rs"))
 AB = os.environ.get("AB") or shutil.which("ab")
 WRK = os.environ.get("WRK") or shutil.which("wrk")
@@ -130,6 +133,44 @@ CustomLog /dev/null common
     return cfg
 
 
+def nginx_config(port, *, stock):
+    label = "nginx" if stock else "httpd-rs-nginx"
+    d = RUN / label
+    (d / "logs").mkdir(parents=True, exist_ok=True)
+    for name in ("client-body", "proxy", "fastcgi", "uwsgi", "scgi"):
+        (d / name).mkdir(parents=True, exist_ok=True)
+    cfg = d / "nginx.conf"
+    tuning = (
+        f"client_body_temp_path {d}/client-body;\n"
+        f"    proxy_temp_path {d}/proxy;\n"
+        f"    fastcgi_temp_path {d}/fastcgi;\n"
+        f"    uwsgi_temp_path {d}/uwsgi;\n"
+        f"    scgi_temp_path {d}/scgi;"
+        if stock
+        else ""
+    )
+    cfg.write_text(
+        f"""user {BENCH_USER} {BENCH_GROUP};
+pid {d}/logs/server.pid;
+error_log {d}/logs/error.log warn;
+events {{ worker_connections 1024; }}
+http {{
+    access_log off;
+    keepalive_timeout 5;
+    keepalive_requests 10000;
+    {tuning}
+    server {{
+        listen 127.0.0.1:{port} default_server;
+        server_name bench.local;
+        root {RUN}/www;
+        index index.html;
+    }}
+}}
+"""
+    )
+    return cfg
+
+
 def wait_port(port, timeout=10):
     import socket
 
@@ -143,9 +184,15 @@ def wait_port(port, timeout=10):
     return False
 
 
-def start(cmd, log):
+def start(cmd, log, *, env=None):
     f = open(log, "ab")
-    p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
+    p = subprocess.Popen(
+        cmd,
+        stdout=f,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=env,
+    )
     return p, f
 
 
@@ -256,16 +303,54 @@ def main():
         sys.exit(f"{HTTPD_RS} missing; run cargo build --release first")
 
     make_tree()
-    apache_port, httpd_rs_port = 8080, 8081
+    apache_port, httpd_rs_apache_port, httpd_rs_nginx_port, nginx_port = (
+        18080,
+        18081,
+        18082,
+        18083,
+    )
     acfg = apache_config(apache_port)
-    vcfg = httpd_rs_config(httpd_rs_port)
+    vcfg = httpd_rs_config(httpd_rs_apache_port)
+    nvcfg = nginx_config(httpd_rs_nginx_port, stock=False)
+    ncfg = nginx_config(nginx_port, stock=True) if NGINX else None
     (RUN / "logs").mkdir(exist_ok=True)
     apache, alog = start([APACHE, "-f", str(acfg), "-DFOREGROUND"], RUN / "logs" / "apache.out")
-    vap, vlog = start([str(HTTPD_RS), "-f", str(vcfg), "-DFOREGROUND"], RUN / "logs" / "httpd-rs.out")
+    vap, vlog = start(
+        [str(HTTPD_RS), "-f", str(vcfg), "--config-format", "apache", "-DFOREGROUND"],
+        RUN / "logs" / "httpd-rs-apache.out",
+    )
+    nvp, nvlog = start(
+        [
+            str(HTTPD_RS),
+            "-d",
+            str(RUN / "httpd-rs-nginx"),
+            "-f",
+            str(nvcfg),
+            "--config-format",
+            "nginx",
+            "-DFOREGROUND",
+        ],
+        RUN / "logs" / "httpd-rs-nginx.out",
+    )
+    nginx_process = nginx_log = None
+    if NGINX and ncfg is not None:
+        nginx_environment = os.environ.copy()
+        # nginx reserves NGINX for its inherited-listener handoff protocol;
+        # the benchmark's executable override must not leak into the child.
+        nginx_environment.pop("NGINX", None)
+        nginx_process, nginx_log = start(
+            [NGINX, "-p", str(RUN / "nginx"), "-c", str(ncfg), "-g", "daemon off;"],
+            RUN / "logs" / "nginx.out",
+            env=nginx_environment,
+        )
     try:
-        if not wait_port(apache_port) or not wait_port(httpd_rs_port):
-            print(open(RUN / "logs" / "apache.out").read())
-            print(open(RUN / "logs" / "httpd-rs.out").read())
+        required = [apache_port, httpd_rs_apache_port, httpd_rs_nginx_port]
+        if nginx_process is not None:
+            required.append(nginx_port)
+        if not all(wait_port(port) for port in required):
+            for log in sorted((RUN / "logs").glob("*.out")):
+                print(f"--- {log.name} ---")
+                print(log.read_text(errors="replace"))
             sys.exit("server failed to start")
         scenarios = [
             ("index.html (small, keepalive)", "/index.html"),
@@ -277,12 +362,12 @@ def main():
             # wrk opens its cohort simultaneously from one loopback identity.
             # Stay within httpd-rs's per-client pending-connection ceiling so
             # this measures serving rather than overload rejection.
-            tests = [(n, p, 3000, 8) for n, p in scenarios[:3]] + [
-                (scenarios[3][0], scenarios[3][1], 300, 8)
+            tests = [(n, p, 3000, 6) for n, p in scenarios[:3]] + [
+                (scenarios[3][0], scenarios[3][1], 300, 6)
             ]
         else:
             req = args.requests or 20000
-            conc = args.concurrency or 8
+            conc = args.concurrency or 6
             tests = [(n, p, req, conc) for n, p in scenarios[:3]] + [
                 (
                     scenarios[3][0],
@@ -296,10 +381,17 @@ def main():
             "tool": "wrk" if WRK else "ab",
             "scenarios": [],
         }
-        print(f"{'scenario':38} {'server':10} {'req/s':>10} {'mean ms':>9} {'p99 ms':>8} {'MB/s':>8}")
+        print(f"{'scenario':38} {'server':18} {'req/s':>10} {'mean ms':>9} {'p99 ms':>8} {'MB/s':>8}")
         for name, path, req, conc in tests:
             row = {"name": name, "path": path, "requests": req, "concurrency": conc, "servers": {}}
-            endpoints = (("apache", apache_port), ("httpd-rs", httpd_rs_port))
+            endpoints = [
+                ("apache", apache_port),
+                ("httpd-rs-apache", httpd_rs_apache_port),
+                ("httpd-rs-nginx", httpd_rs_nginx_port),
+            ]
+            if nginx_process is not None:
+                endpoints.insert(1, ("nginx", nginx_port))
+            endpoints = tuple(endpoints)
             collected = {server: [] for server, _ in endpoints}
             duration = args.duration or (1.0 if args.quick else 3.0)
             for _, port in endpoints:
@@ -325,7 +417,7 @@ def main():
                 best = samples[len(samples) // 2]
                 row["servers"][server] = best
                 print(
-                    f"{name:38} {server:10} {best['rps'] or 0:10.0f} "
+                    f"{name:38} {server:18} {best['rps'] or 0:10.0f} "
                     f"{best['mean_ms'] or 0:9.2f} {best['p99_ms'] or 0:8.0f} "
                     f"{(best['transferred_kbps'] or 0)/1024:8.1f}"
                 )
@@ -333,34 +425,55 @@ def main():
                     print(f"  !! failed={best['failed']} non2xx={best['non2xx']}")
                     if best["raw"]:
                         print(best["raw"][-2000:])
+                    raise RuntimeError(f"invalid benchmark responses from {server}")
                 errs = best.get("socket_errors") or {}
                 if any(errs.values()):
                     print(f"  !! socket errors={errs}")
+                    raise RuntimeError(f"benchmark socket errors from {server}: {errs}")
             a = row["servers"]["apache"]["rps"] or 0
-            v = row["servers"]["httpd-rs"]["rps"] or 0
-            row["ratio"] = (v / a) if a else None
-            print(f"{'  httpd-rs/apache ratio':38} {'':10} {row['ratio'] or 0:10.2f}x")
+            va = row["servers"]["httpd-rs-apache"]["rps"] or 0
+            vn = row["servers"]["httpd-rs-nginx"]["rps"] or 0
+            n = row["servers"].get("nginx", {}).get("rps") or 0
+            row["ratios"] = {
+                "httpd-rs-apache/apache": (va / a) if a else None,
+                "httpd-rs-nginx/nginx": (vn / n) if n else None,
+                "httpd-rs-nginx/httpd-rs-apache": (vn / va) if va else None,
+            }
+            for label, ratio in row["ratios"].items():
+                print(f"  {label:36} {'':18} {ratio or 0:10.2f}x")
             results["scenarios"].append(row)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         (BENCH / "results").mkdir(parents=True, exist_ok=True)
         out = BENCH / "results" / f"{stamp}.json"
         out.write_text(json.dumps(results, indent=2))
-        lines = [f"\n## {results['timestamp']}\n", "| scenario | apache req/s | httpd-rs req/s | ratio | mean ms (v) | p99 ms (v) |", "|---|---:|---:|---:|---:|---:|"]
+        lines = [
+            f"\n## {results['timestamp']}\n",
+            "| scenario | Apache | nginx | httpd-rs Apache config | httpd-rs nginx config | nginx/Apache-config mode |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
         for row in results["scenarios"]:
             a = row["servers"]["apache"]["rps"] or 0
-            v = row["servers"]["httpd-rs"]["rps"] or 0
+            n = row["servers"].get("nginx", {}).get("rps") or 0
+            va = row["servers"]["httpd-rs-apache"]["rps"] or 0
+            vn = row["servers"]["httpd-rs-nginx"]["rps"] or 0
             lines.append(
-                f"| {row['name']} | {a:.0f} | {v:.0f} | {row['ratio'] or 0:.2f}x | "
-                f"{row['servers']['httpd-rs']['mean_ms'] or 0:.2f} | {row['servers']['httpd-rs']['p99_ms'] or 0:.0f} |"
+                f"| {row['name']} | {a:.0f} | {n:.0f} | {va:.0f} | {vn:.0f} | "
+                f"{row['ratios']['httpd-rs-nginx/httpd-rs-apache'] or 0:.2f}x |"
             )
         with open(BENCH / "RESULTS.md", "a") as f:
             f.write("\n".join(lines) + "\n")
         print(f"\nresults: {out}")
     finally:
         stop(vap)
+        stop(nvp)
         stop(apache)
+        if nginx_process is not None:
+            stop(nginx_process)
         alog.close()
         vlog.close()
+        nvlog.close()
+        if nginx_log is not None:
+            nginx_log.close()
 
 
 if __name__ == "__main__":

@@ -1731,12 +1731,24 @@ async fn handle_stream(
         return true;
     }
 
+    let body_limit = cfg
+        .request_body_limit_for(&req, local_ip.parse().ok(), local_port)
+        .unwrap_or(cfg.limit_request_body);
+
     let has_body = declared.unwrap_or(0) > 0 || !recv.is_end_stream();
-    if declared.is_some_and(|length| length > cfg.limit_request_body) {
+    if declared.is_some_and(|length| length > body_limit) {
+        let mut response = bad(413, "request body too large");
+        crate::server::apply_early_route_error_policy(
+            &cfg,
+            &req,
+            local_ip.parse().ok(),
+            local_port,
+            &mut response,
+        );
         return send_response_with_admission(
             respond,
             &cfg,
-            bad(413, "request body too large"),
+            response,
             req.is_head(),
             &mut output_admission,
         )
@@ -1995,7 +2007,7 @@ async fn handle_stream(
                         .expect("streaming route retained receive stream"),
                     sender,
                     length,
-                    cfg.limit_request_body,
+                    body_limit,
                     body_timeout,
                     cfg.request_body_min_rate,
                     cfg.capability_enabled(crate::config::Capability::RequestTrailers),
@@ -2100,7 +2112,7 @@ async fn handle_stream(
     }
 
     if has_body && early.is_none() && streamed.is_none() {
-        let max_body = cfg.limit_request_body.min(crate::http::MAX_BODY_BUFFERED);
+        let max_body = body_limit.min(crate::http::MAX_BODY_BUFFERED);
         let body_timeout = cfg
             .request_body_timeout
             .max(std::time::Duration::from_secs(1));

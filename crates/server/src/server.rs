@@ -977,11 +977,15 @@ fn write_ws_response<C: ResponseWrite>(
 }
 
 fn request_limits(cfg: &Config, tls: bool) -> Limits {
+    request_limits_with_body(cfg, tls, cfg.limit_request_body)
+}
+
+fn request_limits_with_body(cfg: &Config, tls: bool, body: u64) -> Limits {
     Limits {
         request_line: cfg.limit_request_line,
         fields: cfg.limit_request_fields,
         field_size: cfg.limit_request_field_size,
-        body: cfg.limit_request_body,
+        body,
         header_timeout: cfg.request_header_timeout.max(Duration::from_secs(1)),
         body_timeout: cfg.request_body_timeout.max(Duration::from_secs(1)),
         header_min_rate: cfg.request_header_min_rate,
@@ -2050,6 +2054,7 @@ async fn reject_h1_body_phase<S>(
 enum H1WorkerPhase {
     NeedBody {
         head: ParsedRequestHead,
+        body_limit: u64,
         body_guard: BodyWorkerGuard,
         handler: PreparedHandler,
         remote_user: Option<String>,
@@ -2059,6 +2064,7 @@ enum H1WorkerPhase {
     },
     DrainBody {
         head: ParsedRequestHead,
+        body_limit: u64,
         body_guard: BodyWorkerGuard,
         response: Response,
         remote_user: Option<String>,
@@ -2169,6 +2175,40 @@ fn process_h1_request_phase<C: Read + Write>(
     let dispatch_peer = cfg.client_addr(peer, head.request());
     let mut phase = RequestPhaseToken::head();
     if request_has_body(head.request()) {
+        let body_limit = cfg
+            .request_body_limit_for(head.request(), local_ip.parse().ok(), local_port)
+            .unwrap_or(cfg.limit_request_body);
+        if matches!(
+            head.request().framing,
+            crate::verified::BodyFraming::Length(length) if length > body_limit
+        ) {
+            phase.advance(httpd_rs_verified::RequestPhaseEvent::EarlyResponse);
+            let mut response = Response::bytes(
+                413,
+                "text/plain; charset=UTF-8",
+                b"Request body too large\n".to_vec(),
+            );
+            apply_early_route_error_policy(
+                cfg,
+                head.request(),
+                local_ip.parse().ok(),
+                local_port,
+                &mut response,
+            );
+            let request = head.finish_without_body();
+            return Ok(H1WorkerPhase::Response(finish_h1_response(
+                cfg,
+                request,
+                response,
+                None,
+                peer,
+                started,
+                served,
+                true,
+                scope_guard,
+                phase,
+            )));
+        }
         match probe_request_body(
             cfg,
             head.request_mut(),
@@ -2190,6 +2230,7 @@ fn process_h1_request_phase<C: Read + Write>(
                 phase.advance(httpd_rs_verified::RequestPhaseEvent::RouteNeedsBody);
                 return Ok(H1WorkerPhase::NeedBody {
                     head,
+                    body_limit,
                     body_guard,
                     handler,
                     remote_user,
@@ -2208,6 +2249,7 @@ fn process_h1_request_phase<C: Read + Write>(
                 phase.advance(httpd_rs_verified::RequestPhaseEvent::RouteNeedsDrain);
                 return Ok(H1WorkerPhase::DrainBody {
                     head,
+                    body_limit,
                     body_guard,
                     response,
                     remote_user,
@@ -2268,6 +2310,29 @@ fn process_h1_request_phase<C: Read + Write>(
                 phase,
             )))
         }
+    }
+}
+
+/// Apply route-visible error headers to a response emitted before ordinary
+/// dispatch. This is intentionally limited to header policy: executing a
+/// local ErrorDocument here would enter a backend before the rejected request
+/// body has been drained or the connection has been closed.
+pub(crate) fn apply_early_route_error_policy(
+    cfg: &Config,
+    req: &Request,
+    local_ip: Option<IpAddr>,
+    local_port: u16,
+    response: &mut Response,
+) {
+    let Ok(scope) = cfg.request_route_scope_for(req, local_ip, local_port) else {
+        return;
+    };
+    if scope
+        .header_policy
+        .apply(&mut response.headers, false)
+        .is_err()
+    {
+        *response = Response::policy_error();
     }
 }
 
@@ -2389,13 +2454,21 @@ async fn read_h1_body_phase<S>(
     buffered: &mut Vec<u8>,
     cfg: &Config,
     tls: bool,
+    body_limit: u64,
     head: ParsedRequestHead,
     phase: &mut RequestPhaseToken,
 ) -> io::Result<Option<Request>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    match read_request_body_async(stream, buffered, &request_limits(cfg, tls), head).await {
+    match read_request_body_async(
+        stream,
+        buffered,
+        &request_limits_with_body(cfg, tls, body_limit),
+        head,
+    )
+    .await
+    {
         Ok(request) => Ok(Some(request)),
         Err(ReadError::Parse(error)) => {
             reject_h1_body_phase(stream, cfg, error.status(), phase).await;
@@ -2431,6 +2504,7 @@ async fn dispatch_streaming_h1_body_phase<S>(
     peer: SocketAddr,
     local_port: u16,
     tls: bool,
+    body_limit: u64,
     started: Instant,
     served: usize,
     handler: PreparedHandler,
@@ -2441,7 +2515,7 @@ async fn dispatch_streaming_h1_body_phase<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let limits = request_limits(cfg, tls);
+    let limits = request_limits_with_body(cfg, tls, body_limit);
     let (request, pump) = match prepare_streaming_request_body(head, &limits) {
         Ok(prepared) => prepared,
         Err((request, error)) => {
@@ -2962,6 +3036,7 @@ async fn admit_plain_connection(
             }
             Ok(H1WorkerPhase::DrainBody {
                 head,
+                body_limit,
                 body_guard,
                 response,
                 remote_user,
@@ -2969,9 +3044,16 @@ async fn admit_plain_connection(
                 started,
                 mut phase,
             }) => {
-                let Some(request) =
-                    read_h1_body_phase(&mut stream, &mut buffered, &cfg, false, head, &mut phase)
-                        .await?
+                let Some(request) = read_h1_body_phase(
+                    &mut stream,
+                    &mut buffered,
+                    &cfg,
+                    false,
+                    body_limit,
+                    head,
+                    &mut phase,
+                )
+                .await?
                 else {
                     return Ok(());
                 };
@@ -2990,6 +3072,7 @@ async fn admit_plain_connection(
             }
             Ok(H1WorkerPhase::NeedBody {
                 head,
+                body_limit,
                 body_guard,
                 handler,
                 remote_user,
@@ -3011,6 +3094,7 @@ async fn admit_plain_connection(
                         peer,
                         local_port,
                         false,
+                        body_limit,
                         started,
                         served,
                         handler,
@@ -3023,7 +3107,7 @@ async fn admit_plain_connection(
                     let request = match read_request_body_async(
                         &mut stream,
                         &mut buffered,
-                        &request_limits(&cfg, false),
+                        &request_limits_with_body(&cfg, false, body_limit),
                         head,
                     )
                     .await
@@ -3450,6 +3534,7 @@ async fn admit_tls_connection(
             }
             Ok(H1WorkerPhase::DrainBody {
                 head,
+                body_limit,
                 body_guard,
                 response,
                 remote_user,
@@ -3457,9 +3542,16 @@ async fn admit_tls_connection(
                 started,
                 mut phase,
             }) => {
-                let Some(request) =
-                    read_h1_body_phase(&mut tls, &mut buffered, &cfg, true, head, &mut phase)
-                        .await?
+                let Some(request) = read_h1_body_phase(
+                    &mut tls,
+                    &mut buffered,
+                    &cfg,
+                    true,
+                    body_limit,
+                    head,
+                    &mut phase,
+                )
+                .await?
                 else {
                     return Ok(());
                 };
@@ -3478,6 +3570,7 @@ async fn admit_tls_connection(
             }
             Ok(H1WorkerPhase::NeedBody {
                 head,
+                body_limit,
                 body_guard,
                 handler,
                 remote_user,
@@ -3499,6 +3592,7 @@ async fn admit_tls_connection(
                         peer,
                         local_port,
                         true,
+                        body_limit,
                         started,
                         served,
                         handler,
@@ -3511,7 +3605,7 @@ async fn admit_tls_connection(
                     let request = match read_request_body_async(
                         &mut tls,
                         &mut buffered,
-                        &request_limits(&cfg, true),
+                        &request_limits_with_body(&cfg, true, body_limit),
                         head,
                     )
                     .await
@@ -6542,7 +6636,14 @@ fn dispatch_url_proxy(
         ) {
             return response;
         }
-        scope.restrict_policy_with(prior);
+        // Apache retains lexical Location response/content policy across an
+        // internal rewrite. nginx re-runs location selection and the target
+        // location owns response policy, although both source and target
+        // authorization checks still run. Keep that source-language
+        // distinction out of the common authorization gate.
+        if !cfg.route_program.is_nginx() {
+            scope.restrict_policy_with(prior);
+        }
     }
     if let Some(response) = helper_method_not_allowed(
         cfg,
@@ -6852,7 +6953,9 @@ fn run_url_translation_phase(
                             Ok(scope) => scope,
                             Err(response) => return UrlPhaseResult::Terminal(response),
                         };
-                        redirect_scope.restrict_policy_with(&original_scope);
+                        if !cfg.route_program.is_nginx() {
+                            redirect_scope.restrict_policy_with(&original_scope);
+                        }
                     }
                     let authorization = match authorize_redirect_outcome(
                         cfg,
@@ -7064,7 +7167,9 @@ fn run_url_translation_phase(
                     Ok(scope) => scope,
                     Err(response) => return UrlPhaseResult::Terminal(response),
                 };
-                redirect_scope.restrict_policy_with(&original_scope);
+                if !cfg.route_program.is_nginx() {
+                    redirect_scope.restrict_policy_with(&original_scope);
+                }
             }
             let authorization = match authorize_redirect_outcome(
                 cfg,
@@ -8117,7 +8222,9 @@ fn dispatch_inner(
         // handler map, because the rewrite may legitimately select a new
         // extension) with the final target scope; the target bind later meets
         // the canonical scope too (F60/I61).
-        scope.restrict_policy_with(&original_scope);
+        if !cfg.route_program.is_nginx() {
+            scope.restrict_policy_with(&original_scope);
+        }
     }
 
     // A server/Location internal rewrite may select a local filesystem
@@ -8156,7 +8263,9 @@ fn dispatch_inner(
         // policy. Conjoining its server/vhost-default Options would strip
         // `ExecCGI` or `Indexes` granted by the selected target's directory.
         let target_options = scope.options.clone();
-        scope.restrict_policy_with(&original_scope);
+        if !cfg.route_program.is_nginx() {
+            scope.restrict_policy_with(&original_scope);
+        }
         scope.options = target_options;
     }
 

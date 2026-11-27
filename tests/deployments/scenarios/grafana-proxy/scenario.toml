@@ -9,16 +9,19 @@ images = ["grafana/grafana@sha256:74144189b38447facf737dfd0f3906e42e0776212bf575
 prerequisites = ["docker"]
 
 [dimensions]
+frontend = ["apache", "nginx"]
 mount = ["root", "subpath"]
 reload = ["none", "after-start"]
 websocket = ["handshake", "message"]
 
 [canonical]
+frontend = "nginx"
 mount = "subpath"
 reload = "after-start"
 websocket = "message"
 
 [documentation]
+frontend = "apache"
 mount = "subpath"
 reload = "after-start"
 websocket = "message"

@@ -15,6 +15,7 @@ from lib import (
     command,
     common_apache_config,
     common_httpd_rs_config,
+    common_nginx_config,
     differential_benchmark,
     free_port,
     request,
@@ -192,10 +193,36 @@ def run(context: CaseContext, variant: dict[str, str]) -> None:
 ProxyPass {route} {backend_route}
 ProxyPassReverse {route} {backend_route}
 """
-    config, pid_file = common_httpd_rs_config(
-        context.run_dir, frontend_port, empty_docroot, extra=extra
+    if variant["frontend"] == "nginx":
+        config, pid_file = common_nginx_config(
+            context.run_dir,
+            frontend_port,
+            empty_docroot,
+            http_extra=f"""
+upstream gitea_app {{
+    server {backend_host}:3000;
+}}
+""",
+            server_extra=f"""
+location {route} {{
+    proxy_connect_timeout 10s;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_pass http://gitea_app/;
+}}
+""",
+        )
+    else:
+        config, pid_file = common_httpd_rs_config(
+            context.run_dir, frontend_port, empty_docroot, extra=extra
+        )
+    server = start_httpd_rs(
+        context,
+        config,
+        pid_file,
+        frontend_port,
+        config_format=variant["frontend"],
     )
-    server = start_httpd_rs(context, config, pid_file, frontend_port)
     require_response(frontend_port, f"{prefix}/api/v1/version", contains=b"version")
     root_status, root_headers, root_body = request(frontend_port, f"{prefix}/")
     if root_status in (301, 302, 303, 307, 308):

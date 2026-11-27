@@ -20,6 +20,7 @@ RSS_LIMIT_MB=${LONG_FUZZ_RSS_LIMIT_MB:-4096}
 MINIMIZE=${LONG_FUZZ_MINIMIZE:-0}
 GENERATE_COVERAGE=${LONG_FUZZ_COVERAGE:-0}
 STRICT_SEMANTIC=${LONG_FUZZ_STRICT_SEMANTIC:-0}
+NGINX_CORPUS_DIR=${LONG_FUZZ_NGINX_CORPUS_DIR:-}
 NIGHTLY_IMPORT=${LONG_FUZZ_NIGHTLY_RUN:-}
 IMPORT_DIRS=()
 [[ -z ${LONG_FUZZ_IMPORT_DIR:-} ]] || IMPORT_DIRS+=("$LONG_FUZZ_IMPORT_DIR")
@@ -40,6 +41,7 @@ Usage: tests/long_fuzz.sh [options]
   --targets "A B"    explicit space-separated target list
   --state DIR        persistent corpus/log directory
   --import DIR       merge a downloaded fuzz artifact tree; may be repeated
+  --nginx-corpus DIR seed nginx_config from an external configuration corpus
   --nightly RUN      import fuzz artifacts from a GitHub run ID, or "latest"
   --minimize         minimize each accumulated corpus after a clean run
   --coverage         generate per-target LLVM line/branch reports afterward
@@ -51,7 +53,8 @@ Environment equivalents: LONG_FUZZ_SECONDS, LONG_FUZZ_QUANTUM,
 LONG_FUZZ_JOBS, LONG_FUZZ_PROFILE, LONG_FUZZ_TARGETS,
 LONG_FUZZ_STATE_DIR, LONG_FUZZ_RSS_LIMIT_MB, LONG_FUZZ_MINIMIZE, and
 LONG_FUZZ_IMPORT_DIR, LONG_FUZZ_NIGHTLY_RUN, LONG_FUZZ_COVERAGE,
-LONG_FUZZ_STRICT_SEMANTIC, and HTTPD_RS_NIGHTLY_TOOLCHAIN.
+LONG_FUZZ_STRICT_SEMANTIC, LONG_FUZZ_NGINX_CORPUS_DIR, and
+HTTPD_RS_NIGHTLY_TOOLCHAIN.
 
 Fuzz findings are always retained by target under
 adversarial/long_fuzz_findings. A finding does not stop the campaign.
@@ -115,6 +118,11 @@ while (($#)); do
         --import)
             need_value "$@"
             IMPORT_DIRS+=("$2")
+            shift 2
+            ;;
+        --nginx-corpus)
+            need_value "$@"
+            NGINX_CORPUS_DIR=$2
             shift 2
             ;;
         --nightly)
@@ -270,6 +278,26 @@ import_seeds() {
         [[ -e $destination/$digest ]] || cp "$seed" "$destination/$digest"
     done
     shopt -u nullglob
+}
+
+import_nginx_corpus() {
+    local root=$1 destination=$STATE_DIR/corpus/nginx_config source imported=0
+    [[ -n $root && -n ${SEEN[nginx_config]:-} ]] || return 0
+    if [[ ! -d $root ]]; then
+        echo "long-fuzz: nginx corpus directory does not exist: $root" >&2
+        return 1
+    fi
+    root=$(cd "$root" && pwd)
+    if ((DRY_RUN)); then
+        echo "long-fuzz: would import external nginx corpus from $root"
+        return 0
+    fi
+    echo "long-fuzz: importing external nginx corpus from $root"
+    while IFS= read -r -d '' source; do
+        copy_content_addressed "$source" "$destination"
+        imported=$((imported + 1))
+    done < <(find "$root" -type f ! -type l -size -4194305c -print0)
+    echo "long-fuzz: considered $imported external nginx configuration files"
 }
 
 copy_content_addressed() {
@@ -511,6 +539,7 @@ fi
 for target in "${TARGETS[@]}"; do
     import_seeds "$target"
 done
+import_nginx_corpus "$NGINX_CORPUS_DIR"
 if ((DRY_RUN == 0)); then
     migrate_artifact_tree "$STATE_DIR/artifacts"
     migrate_artifact_tree "$REPO_ROOT/fuzz/artifacts"
