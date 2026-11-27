@@ -1,0 +1,30 @@
+diff --git a/corpus_tools/collect_github_nginx_corpus.py b/corpus_tools/collect_github_nginx_corpus.py
+index 7cbd543..dd4f7ca 100755
+--- a/corpus_tools/collect_github_nginx_corpus.py
++++ b/corpus_tools/collect_github_nginx_corpus.py
+@@ -354 +354,6 @@ def github_search(session: requests.Session, query: str, page: int, per_page: in
+-        r = session.get(API_SEARCH, params={"q": query, "per_page": per_page, "page": page}, timeout=45)
++        try:
++            r = session.get(API_SEARCH, params={"q": query, "per_page": per_page, "page": page}, timeout=45)
++        except requests.RequestException as error:
++            print(f"  transient search transport error {type(error).__name__}; sleeping 10s")
++            time.sleep(10)
++            continue
+@@ -383 +388 @@ def github_search(session: requests.Session, query: str, page: int, per_page: in
+-        if r.status_code >= 500:
++        if r.status_code in (408, 425, 500, 502, 503, 504):
+diff --git a/parser/main.c b/parser/main.c
+index e5f693c..5678330 100644
+--- a/parser/main.c
++++ b/parser/main.c
+@@ -16,3 +15,0 @@ ngx_uint_t             ngx_dump_config = 0;
+-ngx_uint_t             ngx_pagesize;
+-ngx_uint_t             ngx_pagesize_shift;
+-ngx_uint_t             ngx_cacheline_size;
+diff --git a/parser/ngx_auto_config.h b/parser/ngx_auto_config.h
+index f87d9de..455d23d 100644
+--- a/parser/ngx_auto_config.h
++++ b/parser/ngx_auto_config.h
+@@ -99 +99 @@
+-#define NGX_HAVE_D_NAMLEN  1
++#define NGX_HAVE_D_NAMLEN  0

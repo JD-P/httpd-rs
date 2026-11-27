@@ -126,6 +126,7 @@ nav:
           - Cross-server CVE matrix: cve/cross-server-cve-matrix.md
           - Coverage strengthening: cve/not-covered-strengthening.md
       - Apache source warrant: apache-warrant.md
+      - nginx corpus census: nginx-corpus-census.md
       - Apache access parity: apache-access-parity.md
       - Configuration semantics: config-semantics.md
       - Adversarial closure: adversarial-closure.md

@@ -1,0 +1,17 @@
+name,classification,stock_source_files,occurrences,config_count,config_percent,repository_count_observed,repository_percent_of_observed,neutral_occurrences,neutral_config_count,neutral_config_percent,neutral_repository_count_observed,neutral_repository_percent_of_observed
+routing and URI selection,,,272401,22407,94.7722,19287,95.8741,72919,6474,93.7853,5462,94.5146
+static files and indexes,,,42909,16402,69.3736,14710,73.1222,12821,5109,74.0113,4551,78.7506
+HTTP reverse proxy,,,233567,15149,64.0739,13425,66.7346,46529,3671,53.1798,3171,54.8711
+logging and observability,,,30341,10937,46.2589,9397,46.7117,8682,3293,47.7039,2696,46.6517
+"rate, connection, and request limits",,,24708,9863,41.7164,9010,44.788,5607,2559,37.0708,2318,40.1107
+"headers, cookies, and CORS",,,59036,9395,39.7369,8498,42.2429,12976,2604,37.7227,2295,39.7128
+TLS and certificates,,,40095,6917,29.256,6040,30.0244,8616,1910,27.6691,1542,26.6828
+compression and transforms,,,26438,5606,23.711,5301,26.3508,5411,1282,18.5716,1221,21.1282
+authentication and authorization,,,17769,5425,22.9455,4767,23.6964,3578,1494,21.6428,1256,21.7339
+FastCGI,,,21302,3929,16.618,3537,17.5821,9819,1645,23.8302,1466,25.3677
+caching,,,9811,2927,12.38,2703,13.4364,1525,611,8.8512,546,9.448
+"uWSGI, SCGI, memcached, or gRPC",,,8721,2045,8.6495,1852,9.2061,360,155,2.2454,148,2.561
+"HTTP/2, HTTP/3, and QUIC",,,1556,1065,4.5045,925,4.5981,367,254,3.6796,223,3.8588
+embedded scripting,,,3383,447,1.8906,381,1.8939,368,102,1.4776,88,1.5228
+stream subsystem,,,254,251,1.0616,227,1.1284,38,38,0.5505,35,0.6056
+mail subsystem,,,18,10,0.0423,10,0.0497,7,3,0.0435,3,0.0519

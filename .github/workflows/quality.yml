@@ -48,7 +48,9 @@ jobs:
           cargo build --locked -p httpd-rs
           python3 tests/native_dependency_policy.py --binary target/debug/httpd-rs
       - name: Executable documentation
-        run: python3 tests/docs.py
+        run: |
+          python3 tests/docs.py
+          python3 -m unittest tests.test_nginx_corpus_census
       - name: Generated transform and secrecy campaigns
         run: |
           python3 tests/transform_differential.py --check
