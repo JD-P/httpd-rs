@@ -237,7 +237,7 @@ compare two isolated release-build hashes.
 build-script, and native-source exposure of the locked Linux production graph
 in `docs/dependency-unsafe.json`. The main concentrations are generated syscall
 bindings and wrappers (`linux-raw-sys`, `libc`, `rustix`), async/storage
-primitives (`tokio`, `mio`, `bytes`, `hashbrown`, `smallvec`), and `ring`.
+primitives (`tokio`, `mio`, `bytes`, `hashbrown`), and `ring`.
 `ring` is the only runtime dependency in that graph with a material native-code
 implementation; `cc` is present as its build tool. This inventory is an
 update-review ratchet, while cargo-vet supplies the source-review evidence.

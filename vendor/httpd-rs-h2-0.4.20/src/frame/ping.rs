@@ -1,3 +1,4 @@
+use crate::tracing;
 use crate::frame::{Error, Frame, Head, Kind, StreamId};
 use bytes::BufMut;
 

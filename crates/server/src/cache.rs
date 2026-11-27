@@ -10,10 +10,10 @@
 use crate::access::AccessGrant;
 use crate::config::{CacheConfig, Config, Scope, VHost};
 use crate::http::{Body, Request, Response};
+use crate::legacy_sha1::Context as Sha1Context;
 use crate::util::{parse_http_date, unix_now};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use sha1::{Digest, Sha1};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -1869,10 +1869,10 @@ pub fn prepare(cfg: &Config) {
 
 fn cache_stem(cfg: &Config, key: &str) -> Option<std::path::PathBuf> {
     let root = cfg.cache.root.as_ref()?;
-    let mut hasher = Sha1::new();
+    let mut hasher = Sha1Context::new();
     hasher.update(key.as_bytes());
     let name: String = hasher
-        .finalize()
+        .finish()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();

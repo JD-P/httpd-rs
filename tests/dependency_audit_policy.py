@@ -9,7 +9,7 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "supply-chain" / "config.toml"
 AUDITS = ROOT / "supply-chain" / "audits.toml"
-MAX_EXEMPTIONS = 105
+MAX_EXEMPTIONS = 104
 REQUIRED_IMPORTS = {
     "actix",
     "ariel-os",

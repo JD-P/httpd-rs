@@ -1,3 +1,4 @@
+use crate::tracing;
 use crate::frame::{self, Frame, Kind, Reason};
 use crate::frame::{
     DEFAULT_MAX_FRAME_SIZE, DEFAULT_SETTINGS_HEADER_TABLE_SIZE, MAX_MAX_FRAME_SIZE,
@@ -335,8 +336,8 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
                     // `PROTOCOL_ERROR`.
                     return Err(Error::library_reset($head.stream_id(), Reason::PROTOCOL_ERROR));
                 },
-                Err(e) => {
-                    proto_err!(conn: "failed to load frame; err={:?}", e);
+                Err(_e) => {
+                    proto_err!(conn: "failed to load frame; err={:?}", _e);
                     return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
             };
@@ -359,8 +360,8 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
                         "header_list_way_too_large",
                     ));
                 },
-                Err(e) => {
-                    proto_err!(conn: "failed HPACK decoding; err={:?}", e);
+                Err(_e) => {
+                    proto_err!(conn: "failed HPACK decoding; err={:?}", _e);
                     return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
             }
@@ -385,8 +386,8 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
         Kind::Settings => {
             let res = frame::Settings::load(head, &bytes[frame::HEADER_LEN..]);
 
-            res.map_err(|e| {
-                proto_err!(conn: "failed to load SETTINGS frame; err={:?}", e);
+            res.map_err(|_e| {
+                proto_err!(conn: "failed to load SETTINGS frame; err={:?}", _e);
                 Error::library_go_away(Reason::PROTOCOL_ERROR)
             })?
             .into()
@@ -394,8 +395,8 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
         Kind::Ping => {
             let res = frame::Ping::load(head, &bytes[frame::HEADER_LEN..]);
 
-            res.map_err(|e| {
-                proto_err!(conn: "failed to load PING frame; err={:?}", e);
+            res.map_err(|_e| {
+                proto_err!(conn: "failed to load PING frame; err={:?}", _e);
                 Error::library_go_away(Reason::PROTOCOL_ERROR)
             })?
             .into()
@@ -403,8 +404,8 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
         Kind::WindowUpdate => {
             let res = frame::WindowUpdate::load(head, &bytes[frame::HEADER_LEN..]);
 
-            res.map_err(|e| {
-                proto_err!(conn: "failed to load WINDOW_UPDATE frame; err={:?}", e);
+            res.map_err(|_e| {
+                proto_err!(conn: "failed to load WINDOW_UPDATE frame; err={:?}", _e);
                 Error::library_go_away(Reason::PROTOCOL_ERROR)
             })?
             .into()
@@ -414,8 +415,8 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
             let res = frame::Data::load(head, bytes.freeze());
 
             // TODO: Should this always be connection level? Probably not...
-            res.map_err(|e| {
-                proto_err!(conn: "failed to load DATA frame; err={:?}", e);
+            res.map_err(|_e| {
+                proto_err!(conn: "failed to load DATA frame; err={:?}", _e);
                 Error::library_go_away(Reason::PROTOCOL_ERROR)
             })?
             .into()
@@ -423,16 +424,16 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
         Kind::Headers => header_block!(Headers, head, bytes),
         Kind::Reset => {
             let res = frame::Reset::load(head, &bytes[frame::HEADER_LEN..]);
-            res.map_err(|e| {
-                proto_err!(conn: "failed to load RESET frame; err={:?}", e);
+            res.map_err(|_e| {
+                proto_err!(conn: "failed to load RESET frame; err={:?}", _e);
                 Error::library_go_away(Reason::PROTOCOL_ERROR)
             })?
             .into()
         }
         Kind::GoAway => {
             let res = frame::GoAway::load(head, &bytes[frame::HEADER_LEN..]);
-            res.map_err(|e| {
-                proto_err!(conn: "failed to load GO_AWAY frame; err={:?}", e);
+            res.map_err(|_e| {
+                proto_err!(conn: "failed to load GO_AWAY frame; err={:?}", _e);
                 Error::library_go_away(Reason::PROTOCOL_ERROR)
             })?
             .into()
@@ -455,8 +456,8 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
                     proto_err!(stream: "PRIORITY invalid dependency ID; stream={:?}", id);
                     return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
                 }
-                Err(e) => {
-                    proto_err!(conn: "failed to load PRIORITY frame; err={:?};", e);
+                Err(_e) => {
+                    proto_err!(conn: "failed to load PRIORITY frame; err={:?};", _e);
                     return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
             }
@@ -523,8 +524,8 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
                         "header_list_way_too_large",
                     ));
                 }
-                Err(e) => {
-                    proto_err!(conn: "failed HPACK decoding; err={:?}", e);
+                Err(_e) => {
+                    proto_err!(conn: "failed HPACK decoding; err={:?}", _e);
                     return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
             }

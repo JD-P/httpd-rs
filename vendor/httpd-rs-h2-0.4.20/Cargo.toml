@@ -109,11 +109,6 @@ features = [
     "io",
 ]
 
-[dependencies.tracing]
-version = "0.1.35"
-features = ["std"]
-default-features = false
-
 [dependencies.httpd-rs-verified]
 version = "0.2.3"
 path = "../../crates/verified"

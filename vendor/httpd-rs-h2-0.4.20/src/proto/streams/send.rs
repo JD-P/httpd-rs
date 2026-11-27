@@ -1,3 +1,4 @@
+use crate::tracing;
 use super::{
     store, Buffer, BufferStatus, Codec, Config, Counts, Frame, Prioritize, Prioritized, Store,
     Stream, StreamId, StreamIdOverflow, WindowSize,
@@ -212,7 +213,7 @@ impl Send {
         let is_reset = stream.state.is_reset();
         let is_closed = stream.state.is_closed();
         let is_empty = stream.pending_send.is_empty();
-        let stream_id = stream.id;
+        let _stream_id = stream.id;
 
         tracing::trace!(
             "send_reset(..., reason={:?}, initiator={:?}, stream={:?}, ..., \
@@ -221,7 +222,7 @@ impl Send {
              ",
             reason,
             initiator,
-            stream_id,
+            _stream_id,
             is_reset,
             is_closed,
             is_empty,
@@ -232,7 +233,7 @@ impl Send {
             // Don't double reset
             tracing::trace!(
                 " -> not sending RST_STREAM ({:?} is already reset)",
-                stream_id
+                _stream_id
             );
             return;
         }
@@ -246,7 +247,7 @@ impl Send {
             tracing::trace!(
                 " -> not sending explicit RST_STREAM ({:?} was closed \
                  and send queue was flushed)",
-                stream_id
+                _stream_id
             );
             return;
         }
@@ -592,7 +593,7 @@ impl Send {
                         // and reassign it to other streams.
                         let window_size = stream.send_flow.window_size();
                         let available = stream.send_flow.available().as_size();
-                        let reclaimed = if available > window_size {
+                        let _reclaimed = if available > window_size {
                             // Drop down to `window_size`.
                             let reclaim = available - window_size;
                             stream
@@ -609,7 +610,7 @@ impl Send {
                             "decremented stream window; id={:?}; decr={}; reclaimed={}; flow={:?}",
                             stream.id,
                             dec,
-                            reclaimed,
+                            _reclaimed,
                             stream.send_flow
                         );
 

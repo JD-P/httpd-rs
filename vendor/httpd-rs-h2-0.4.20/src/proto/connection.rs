@@ -1,3 +1,4 @@
+use crate::tracing;
 use crate::codec::UserError;
 use crate::frame::{Reason, StreamId};
 use crate::{client, server};
@@ -723,8 +724,8 @@ where
                 }
                 self.streams.recv_window_update(frame)?;
             }
-            Some(Priority(frame)) => {
-                tracing::trace!(?frame, "recv PRIORITY");
+            Some(Priority(_frame)) => {
+                tracing::trace!(?_frame, "recv PRIORITY");
                 if !self
                     .control_frame_budget
                     .consume(httpd_rs_verified::H2ControlEvent::Priority)

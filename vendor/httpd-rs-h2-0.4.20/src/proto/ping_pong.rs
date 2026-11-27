@@ -1,3 +1,4 @@
+use crate::tracing;
 use crate::codec::Codec;
 use crate::frame::Ping;
 use crate::proto::{self, PingPayload};

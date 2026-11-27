@@ -9,7 +9,6 @@ repository.workspace = true
 [dependencies]
 regex-automata = "0.4"
 regex-syntax = "0.8"
-smallvec = "1.15"
 httpd-rs-verified = { path = "../verified", version = "0.2.3" }
 
 [dev-dependencies]

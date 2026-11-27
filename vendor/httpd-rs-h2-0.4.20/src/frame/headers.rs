@@ -1,3 +1,4 @@
+use crate::tracing;
 use super::{util, StreamDependency, StreamId};
 use crate::ext::Protocol;
 use crate::frame::{Error, Frame, Head, Kind};

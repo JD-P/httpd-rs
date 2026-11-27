@@ -1,6 +1,7 @@
 use crate::error::Reason;
 use crate::frame::{Pseudo, StreamId};
 use crate::proto::{Error, Open};
+use crate::tracing;
 
 use http::{HeaderMap, Request, Response};
 
@@ -10,8 +11,6 @@ use std::fmt;
 pub(crate) trait Peer {
     /// Message type polled from the transport
     type Poll: fmt::Debug;
-    const NAME: &'static str;
-
     fn r#dyn() -> Dyn;
 
     //fn is_server() -> bool;

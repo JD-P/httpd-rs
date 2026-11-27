@@ -1,6 +1,6 @@
 {
   "kind": "httpd-rs-static-resource-effects",
-  "policy_sha256": "7e0f64525a1fb033936c95a941019c1b5bda5892aaad2bd3363a72da06d19f57",
+  "policy_sha256": "46650e2e8d1afb3fccd799f577222e685e624eceff9a9928b0d78e8f61633d0f",
   "schema": 1,
   "sites": [
     {
@@ -4717,6 +4717,24 @@
         "glob_match_resource_admit",
         "bounded_expansion_append_admit"
       ],
+      "code": "spans: vec![None; self.captures_len()],",
+      "effect": "heap-allocation",
+      "function": "capture_locations",
+      "id": "1de6ff948969829935de",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
       "code": "let (minimum, maximum) = match body.iter().position(|&byte| byte == b',') {",
       "effect": "cpu-iteration",
       "function": "capture_quantifier_repeats",
@@ -4883,6 +4901,24 @@
       "effect": "cpu-iteration",
       "function": "decimal_escape",
       "id": "b820a0eef7a29f97a91b",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": "let mut slots = vec![None; engine.group_info().slot_len()];",
+      "effect": "heap-allocation",
+      "function": "engine_captures_at",
+      "id": "a11cd585eeee2c76db60",
       "path": "crates/pcre2/src/lib.rs",
       "status": "review-required"
     },
@@ -8102,11 +8138,12 @@
     },
     {
       "accounting_evidence": [
+        "MAX_",
         "admit"
       ],
       "closure_contract": "inferred-accounted-context",
       "closure_disposition": "typed-lease",
-      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (admit)",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (MAX_, admit)",
       "closure_verification_targets": [
         "resource_budget_admit",
         "request_resource_effect_closure"
@@ -25894,10 +25931,10 @@
         "request_resource_effect_closure",
         "terminal_sink_gate"
       ],
-      "code": "h.finalize().iter().map(|b| format!(\"{b:02x}\")).collect()",
+      "code": "h.finish().iter().map(|b| format!(\"{b:02x}\")).collect()",
       "effect": "heap-allocation",
       "function": "sha1_hex",
-      "id": "2369d543bd51a45e4de3",
+      "id": "218db90636ef03ae2d72",
       "path": "crates/server/src/expr.rs",
       "status": "review-required"
     },
@@ -41092,6 +41129,102 @@
       "function": "weekday_short",
       "id": "a5a093f3204de56f4476",
       "path": "crates/server/src/http_fields.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "legacy-sha1-fixed-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "the private Ring SHA-1 compatibility wrapper produces a fixed 20-byte output and is reachable only through callers whose password record, certificate, request target, WebSocket key, expression value, or cache key input is already hard-bounded; its CPU work is linear in those admitted byte ceilings and it allocates no attacker-sized output or retained workspace",
+      "closure_verification_targets": [
+        "dependency_call_admit",
+        "request_resource_effect_closure"
+      ],
+      "code": "copy_digest(ring::digest::digest(",
+      "effect": "compression-regex-crypto",
+      "function": "<module>",
+      "id": "2a30153c737417c03b2d",
+      "path": "crates/server/src/legacy_sha1.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "legacy-sha1-fixed-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "the private Ring SHA-1 compatibility wrapper produces a fixed 20-byte output and is reachable only through callers whose password record, certificate, request target, WebSocket key, expression value, or cache key input is already hard-bounded; its CPU work is linear in those admitted byte ceilings and it allocates no attacker-sized output or retained workspace",
+      "closure_verification_targets": [
+        "dependency_call_admit",
+        "request_resource_effect_closure"
+      ],
+      "code": "fn copy_digest(digest: ring::digest::Digest) -> [u8; OUTPUT_LEN] {",
+      "effect": "compression-regex-crypto",
+      "function": "<module>",
+      "id": "4ff7c72c51b25175a291",
+      "path": "crates/server/src/legacy_sha1.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "legacy-sha1-fixed-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "the private Ring SHA-1 compatibility wrapper produces a fixed 20-byte output and is reachable only through callers whose password record, certificate, request target, WebSocket key, expression value, or cache key input is already hard-bounded; its CPU work is linear in those admitted byte ceilings and it allocates no attacker-sized output or retained workspace",
+      "closure_verification_targets": [
+        "dependency_call_admit",
+        "request_resource_effect_closure"
+      ],
+      "code": "pub(crate) struct Context(ring::digest::Context);",
+      "effect": "compression-regex-crypto",
+      "function": "<module>",
+      "id": "5c490f269eae9800078d",
+      "path": "crates/server/src/legacy_sha1.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "legacy-sha1-fixed-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "the private Ring SHA-1 compatibility wrapper produces a fixed 20-byte output and is reachable only through callers whose password record, certificate, request target, WebSocket key, expression value, or cache key input is already hard-bounded; its CPU work is linear in those admitted byte ceilings and it allocates no attacker-sized output or retained workspace",
+      "closure_verification_targets": [
+        "dependency_call_admit",
+        "request_resource_effect_closure"
+      ],
+      "code": "&ring::digest::SHA1_FOR_LEGACY_USE_ONLY,",
+      "effect": "compression-regex-crypto",
+      "function": "<module>",
+      "id": "c484d28e63418b7bc68f",
+      "path": "crates/server/src/legacy_sha1.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "legacy-sha1-fixed-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "the private Ring SHA-1 compatibility wrapper produces a fixed 20-byte output and is reachable only through callers whose password record, certificate, request target, WebSocket key, expression value, or cache key input is already hard-bounded; its CPU work is linear in those admitted byte ceilings and it allocates no attacker-sized output or retained workspace",
+      "closure_verification_targets": [
+        "dependency_call_admit",
+        "request_resource_effect_closure"
+      ],
+      "code": "&ring::digest::SHA1_FOR_LEGACY_USE_ONLY,",
+      "effect": "compression-regex-crypto",
+      "function": "new",
+      "id": "2bc604fb30a52202d72a",
+      "path": "crates/server/src/legacy_sha1.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "legacy-sha1-fixed-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "the private Ring SHA-1 compatibility wrapper produces a fixed 20-byte output and is reachable only through callers whose password record, certificate, request target, WebSocket key, expression value, or cache key input is already hard-bounded; its CPU work is linear in those admitted byte ceilings and it allocates no attacker-sized output or retained workspace",
+      "closure_verification_targets": [
+        "dependency_call_admit",
+        "request_resource_effect_closure"
+      ],
+      "code": "Self(ring::digest::Context::new(",
+      "effect": "compression-regex-crypto",
+      "function": "new",
+      "id": "7659664ef0435490381c",
+      "path": "crates/server/src/legacy_sha1.rs",
       "status": "review-required"
     },
     {
@@ -62330,8 +62463,8 @@
       "code": "io.write_all(msg).await.map_err(crate::Error::from_io)?;",
       "effect": "data-growth",
       "function": "bind_connection",
-      "id": "b888d2ddb8055fd8c3c0",
-      "path": "vendor/h2-0.4.20/src/client.rs",
+      "id": "f312e1b8193a915145a1",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/client.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62347,8 +62480,8 @@
       "code": "partial.buf.extend_from_slice(&bytes[frame::HEADER_LEN..]);",
       "effect": "data-growth",
       "function": "decode_frame",
-      "id": "ea155cbf1e8cdfc6aa60",
-      "path": "vendor/h2-0.4.20/src/codec/framed_read.rs",
+      "id": "6d59c6117bb727fe8262",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/codec/framed_read.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62364,25 +62497,8 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "poll_next",
-      "id": "0c3330af59edc86f363f",
-      "path": "vendor/h2-0.4.20/src/codec/framed_read.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "loop {",
-      "effect": "cpu-iteration",
-      "function": "flush",
-      "id": "0b6cd173940cd3a4f4be",
-      "path": "vendor/h2-0.4.20/src/codec/framed_write.rs",
+      "id": "5392e9420041b69098af",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/codec/framed_read.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62398,8 +62514,25 @@
       "code": "while !self.encoder.is_empty() {",
       "effect": "cpu-iteration",
       "function": "flush",
-      "id": "b106ac50aa59eb021a65",
-      "path": "vendor/h2-0.4.20/src/codec/framed_write.rs",
+      "id": "3169660c2dbeb60186f3",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/codec/framed_write.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "loop {",
+      "effect": "cpu-iteration",
+      "function": "flush",
+      "id": "bc44bb3a11449e5be56d",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/codec/framed_write.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62415,8 +62548,8 @@
       "code": "buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),",
       "effect": "heap-allocation",
       "function": "new",
-      "id": "4eadfc14a3ff0eff50bb",
-      "path": "vendor/h2-0.4.20/src/codec/framed_write.rs",
+      "id": "64ce63f4b56df9438111",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/codec/framed_write.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62432,8 +62565,8 @@
       "code": "for &d in src {",
       "effect": "cpu-iteration",
       "function": "parse_u64",
-      "id": "ca320f46e36bb7549152",
-      "path": "vendor/h2-0.4.20/src/frame/headers.rs",
+      "id": "a4d06cc5d95c7e1ca14d",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/frame/headers.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62449,8 +62582,8 @@
       "code": "for content_length in req.headers().get_all(header::CONTENT_LENGTH) {",
       "effect": "cpu-iteration",
       "function": "validate_request",
-      "id": "6331f07e0359a18402d1",
-      "path": "vendor/h2-0.4.20/src/frame/headers.rs",
+      "id": "39358397a253acc2b235",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/frame/headers.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62466,8 +62599,8 @@
       "code": "self.for_each(|setting| {",
       "effect": "cpu-iteration",
       "function": "encode",
-      "id": "29cb090bb0b20e7f889f",
-      "path": "vendor/h2-0.4.20/src/frame/settings.rs",
+      "id": "15b0180414b234f56292",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/frame/settings.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62483,8 +62616,8 @@
       "code": "self.for_each(|setting| match setting {",
       "effect": "cpu-iteration",
       "function": "fmt",
-      "id": "e1ea84c66b3e23c1ce72",
-      "path": "vendor/h2-0.4.20/src/frame/settings.rs",
+      "id": "f93bd709e698cb1b489e",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/frame/settings.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62500,8 +62633,8 @@
       "code": "for raw in payload.chunks(6) {",
       "effect": "cpu-iteration",
       "function": "load",
-      "id": "12909b464bfddcac8ab2",
-      "path": "vendor/h2-0.4.20/src/frame/settings.rs",
+      "id": "30ecb26208124b6fb4e3",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/frame/settings.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62517,8 +62650,8 @@
       "code": "self.for_each(|_| len += 6);",
       "effect": "cpu-iteration",
       "function": "payload_len",
-      "id": "3cfd638f59f6d5c391f6",
-      "path": "vendor/h2-0.4.20/src/frame/settings.rs",
+      "id": "e798f4a975cb612fe771",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/frame/settings.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62534,25 +62667,8 @@
       "code": "let mut dst = BytesMut::with_capacity(1024);",
       "effect": "heap-allocation",
       "function": "encode",
-      "id": "70bc9c74ed3a05b5fa9d",
-      "path": "vendor/h2-0.4.20/src/fuzz_bridge.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "for prefix in 1..=8 {",
-      "effect": "cpu-iteration",
-      "function": "fuzz_hpack",
-      "id": "a585b5d4c12c0feec9e9",
-      "path": "vendor/h2-0.4.20/src/fuzz_bridge.rs",
+      "id": "02190ff53b6b27c44c93",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/fuzz_bridge.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62568,8 +62684,25 @@
       "code": "for table_size in [0, hpack::MAX_DYNAMIC_TABLE_SIZE] {",
       "effect": "cpu-iteration",
       "function": "fuzz_hpack",
-      "id": "c8963884d1de5cd2133b",
-      "path": "vendor/h2-0.4.20/src/fuzz_bridge.rs",
+      "id": "049c90c22428ee39f6a7",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/fuzz_bridge.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "for prefix in 1..=8 {",
+      "effect": "cpu-iteration",
+      "function": "fuzz_hpack",
+      "id": "6405ce32614a25ea2e84",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/fuzz_bridge.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62585,25 +62718,8 @@
       "code": "buf.extend(data_);",
       "effect": "data-growth",
       "function": "fuzz_hpack",
-      "id": "48f08190449c2fc038c0",
-      "path": "vendor/h2-0.4.20/src/fuzz_bridge.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "let _res = encode(&mut stateless, vec![m_.clone()]);",
-      "effect": "heap-allocation",
-      "function": "fuzz_hpack",
-      "id": "0edafd00d65f790f4066",
-      "path": "vendor/h2-0.4.20/src/fuzz_bridge.rs",
+      "id": "da79a5fd21390fd70939",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/fuzz_bridge.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62619,8 +62735,8 @@
       "code": "let _res = encode(&mut dynamic, vec![m_.clone(), m_]);",
       "effect": "heap-allocation",
       "function": "fuzz_hpack",
-      "id": "a79751457dc4c80f2f82",
-      "path": "vendor/h2-0.4.20/src/fuzz_bridge.rs",
+      "id": "07cb21547d7159ed892a",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/fuzz_bridge.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62636,8 +62752,25 @@
       "code": "let mut buf = BytesMut::new();",
       "effect": "heap-allocation",
       "function": "fuzz_hpack",
-      "id": "d157a951269055708ab5",
-      "path": "vendor/h2-0.4.20/src/fuzz_bridge.rs",
+      "id": "5d6aace0e13c59103029",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/fuzz_bridge.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "let _res = encode(&mut stateless, vec![m_.clone()]);",
+      "effect": "heap-allocation",
+      "function": "fuzz_hpack",
+      "id": "af313156f9ebd71deded",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/fuzz_bridge.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62653,8 +62786,8 @@
       "code": "while let Some(ty) = peek_u8(src) {",
       "effect": "cpu-iteration",
       "function": "decode",
-      "id": "aa2cad8ebd2b1a055ad4",
-      "path": "vendor/h2-0.4.20/src/hpack/decoder.rs",
+      "id": "9f139e22b42631027f5f",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/decoder.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62670,8 +62803,8 @@
       "code": "let old_pos = buf.position();",
       "effect": "cpu-iteration",
       "function": "decode_literal",
-      "id": "b9a120b9aa2632824500",
-      "path": "vendor/h2-0.4.20/src/hpack/decoder.rs",
+      "id": "2f07ee970edd9382bcf7",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/decoder.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62687,8 +62820,8 @@
       "code": "let old_pos = buf.position();",
       "effect": "cpu-iteration",
       "function": "decode_string",
-      "id": "b695f247e2bb435b2853",
-      "path": "vendor/h2-0.4.20/src/hpack/decoder.rs",
+      "id": "44f5db4a85771d37f93a",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/decoder.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62704,25 +62837,8 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "insert",
-      "id": "17b3d81200c02f13f77f",
-      "path": "vendor/h2-0.4.20/src/hpack/decoder.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "buffer: BytesMut::with_capacity(4096),",
-      "effect": "heap-allocation",
-      "function": "new",
-      "id": "4ffa7cb72111f318c62e",
-      "path": "vendor/h2-0.4.20/src/hpack/decoder.rs",
+      "id": "c6a50105d476c19ed0e3",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/decoder.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62738,8 +62854,25 @@
       "code": "entries: VecDeque::new(),",
       "effect": "heap-allocation",
       "function": "new",
-      "id": "99e0e727c5943cec8e8f",
-      "path": "vendor/h2-0.4.20/src/hpack/decoder.rs",
+      "id": "74612f4ec691acd70765",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/decoder.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "buffer: BytesMut::with_capacity(4096),",
+      "effect": "heap-allocation",
+      "function": "new",
+      "id": "a6d7d3c9f8325bcb3560",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/decoder.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62755,8 +62888,8 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "set_max_size",
-      "id": "fc24294152f22eb6287e",
-      "path": "vendor/h2-0.4.20/src/hpack/decoder.rs",
+      "id": "c28406a95e530d59849a",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/decoder.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62772,25 +62905,8 @@
       "code": "let pos = buf.position() as usize;",
       "effect": "cpu-iteration",
       "function": "take",
-      "id": "73c03d16c862ff4c5245",
-      "path": "vendor/h2-0.4.20/src/hpack/decoder.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "let offset = (buf.position() - old_pos) as usize;",
-      "effect": "cpu-iteration",
-      "function": "try_decode_string",
-      "id": "30d04bd942fe5bb7ae73",
-      "path": "vendor/h2-0.4.20/src/hpack/decoder.rs",
+      "id": "d6a6514cb3f30699e740",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/decoder.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62806,8 +62922,25 @@
       "code": "let old_pos = buf.position();",
       "effect": "cpu-iteration",
       "function": "try_decode_string",
-      "id": "fcd09e95daa18d8b465d",
-      "path": "vendor/h2-0.4.20/src/hpack/decoder.rs",
+      "id": "71333d53bf338c4de990",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/decoder.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "let offset = (buf.position() - old_pos) as usize;",
+      "effect": "cpu-iteration",
+      "function": "try_decode_string",
+      "id": "e8abe7af37809113c5f2",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/decoder.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62823,8 +62956,8 @@
       "code": "for header in headers {",
       "effect": "cpu-iteration",
       "function": "encode",
-      "id": "fcb26f7f4b78d6a7611c",
-      "path": "vendor/h2-0.4.20/src/hpack/encoder.rs",
+      "id": "219ab1d068929b4d38af",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/encoder.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62840,8 +62973,8 @@
       "code": "for _ in 0..encoded.len {",
       "effect": "cpu-iteration",
       "function": "encode_int",
-      "id": "c1682faba55961b45bc3",
-      "path": "vendor/h2-0.4.20/src/hpack/encoder.rs",
+      "id": "d8fffeff3c1f0d611b98",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/encoder.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62857,25 +62990,8 @@
       "code": "self.table.resize(val);",
       "effect": "data-growth",
       "function": "encode_size_updates",
-      "id": "5522f02ffe27539da442",
-      "path": "vendor/h2-0.4.20/src/hpack/encoder.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "self.table.resize(max);",
-      "effect": "data-growth",
-      "function": "encode_size_updates",
-      "id": "94c3b9da7499b2628aa8",
-      "path": "vendor/h2-0.4.20/src/hpack/encoder.rs",
+      "id": "164b3305020b45a3f41f",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/encoder.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62891,8 +63007,25 @@
       "code": "self.table.resize(min);",
       "effect": "data-growth",
       "function": "encode_size_updates",
-      "id": "e299a11c734aad1bdf0b",
-      "path": "vendor/h2-0.4.20/src/hpack/encoder.rs",
+      "id": "1728377676cef67b2ea0",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/encoder.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "self.table.resize(max);",
+      "effect": "data-growth",
+      "function": "encode_size_updates",
+      "id": "26c24aece31c757dfba1",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/encoder.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62908,42 +63041,8 @@
       "code": "scratch: BytesMut::new(),",
       "effect": "heap-allocation",
       "function": "new",
-      "id": "bc2f802d74f7dd05570d",
-      "path": "vendor/h2-0.4.20/src/hpack/encoder.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "while a < 256 {",
-      "effect": "cpu-iteration",
-      "function": "<module>",
-      "id": "70beec5b8800cd0f6329",
-      "path": "vendor/h2-0.4.20/src/hpack/huffman/decode.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "while b < 256 {",
-      "effect": "cpu-iteration",
-      "function": "<module>",
-      "id": "86ce788c80ee1ea8d5fb",
-      "path": "vendor/h2-0.4.20/src/hpack/huffman/decode.rs",
+      "id": "af40c8ad20d462880f09",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/encoder.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62959,8 +63058,8 @@
       "code": "while i < (1 << rem) {",
       "effect": "cpu-iteration",
       "function": "<module>",
-      "id": "d29d27a38d9665bf46ba",
-      "path": "vendor/h2-0.4.20/src/hpack/huffman/decode.rs",
+      "id": "0f8ae95e509465d635bf",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/decode.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62973,11 +63072,11 @@
       "closure_verification_targets": [
         "request_resource_effect_closure"
       ],
-      "code": "while a < 256 {",
+      "code": "while b < 256 {",
       "effect": "cpu-iteration",
       "function": "<module>",
-      "id": "f5dd7c0bc71cc0429bbd",
-      "path": "vendor/h2-0.4.20/src/hpack/huffman/decode.rs",
+      "id": "22aad27bb624ee899924",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/decode.rs",
       "status": "external-source-inventory"
     },
     {
@@ -62993,8 +63092,8 @@
       "code": "while i < (1 << rem2) {",
       "effect": "cpu-iteration",
       "function": "<module>",
-      "id": "f8bedb400da688413ced",
-      "path": "vendor/h2-0.4.20/src/hpack/huffman/decode.rs",
+      "id": "5b87b1e3aebf485800ac",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/decode.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63007,11 +63106,11 @@
       "closure_verification_targets": [
         "request_resource_effect_closure"
       ],
-      "code": "while bits <= 56 && pos < len {",
+      "code": "while a < 256 {",
       "effect": "cpu-iteration",
-      "function": "decode",
-      "id": "0daa0c7e28827c345682",
-      "path": "vendor/h2-0.4.20/src/hpack/huffman/decode.rs",
+      "function": "<module>",
+      "id": "b4e9f2d7a0bede8d046c",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/decode.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63024,28 +63123,11 @@
       "closure_verification_targets": [
         "request_resource_effect_closure"
       ],
-      "code": "while bits > 0 {",
+      "code": "while a < 256 {",
       "effect": "cpu-iteration",
-      "function": "decode",
-      "id": "26d295047e087e59bfc4",
-      "path": "vendor/h2-0.4.20/src/hpack/huffman/decode.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "while bits >= FAST_BITS {",
-      "effect": "cpu-iteration",
-      "function": "decode",
-      "id": "564fa3ac86458e1fd899",
-      "path": "vendor/h2-0.4.20/src/hpack/huffman/decode.rs",
+      "function": "<module>",
+      "id": "d13e4c2a0d983c694416",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/decode.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63061,8 +63143,59 @@
       "code": "'outer: loop {",
       "effect": "cpu-iteration",
       "function": "decode",
-      "id": "f962af1a1e84c3491ec6",
-      "path": "vendor/h2-0.4.20/src/hpack/huffman/decode.rs",
+      "id": "7d47ccc5759f022cbc1a",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/decode.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "while bits <= 56 && pos < len {",
+      "effect": "cpu-iteration",
+      "function": "decode",
+      "id": "812c8cb065fb18bf48af",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/decode.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "while bits >= FAST_BITS {",
+      "effect": "cpu-iteration",
+      "function": "decode",
+      "id": "8231c3a72a4ea582d488",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/decode.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "while bits > 0 {",
+      "effect": "cpu-iteration",
+      "function": "decode",
+      "id": "91b298374d1f021327ff",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/decode.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63078,8 +63211,8 @@
       "code": "buf.resize(bounds.total_len, 0);",
       "effect": "data-growth",
       "function": "decode",
-      "id": "405495ab13f5d86c7d12",
-      "path": "vendor/h2-0.4.20/src/hpack/huffman/decode.rs",
+      "id": "a762fd9e1dd259c1799c",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/decode.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63095,8 +63228,8 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "decode_code_slow",
-      "id": "23c5f6ac34a1bfd3bfd2",
-      "path": "vendor/h2-0.4.20/src/hpack/huffman/decode.rs",
+      "id": "6251b17ffc1564efa515",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/decode.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63112,8 +63245,8 @@
       "code": "while bits_len != 0 {",
       "effect": "cpu-iteration",
       "function": "encode",
-      "id": "8e6ae152af6d6621a257",
-      "path": "vendor/h2-0.4.20/src/hpack/huffman/encode.rs",
+      "id": "38c8441477b504aecb2e",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/encode.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63129,8 +63262,8 @@
       "code": "for &b in src {",
       "effect": "cpu-iteration",
       "function": "encode",
-      "id": "b4d171313fd0052ed93e",
-      "path": "vendor/h2-0.4.20/src/hpack/huffman/encode.rs",
+      "id": "b0d477da29466b299594",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/encode.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63146,8 +63279,8 @@
       "code": "for (position, entry) in self.slots.iter().enumerate() {",
       "effect": "cpu-iteration",
       "function": "index_dynamic",
-      "id": "c4a8753ce79cb952bdbd",
-      "path": "vendor/h2-0.4.20/src/hpack/table.rs",
+      "id": "8658375d2b34615bd7e1",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/table.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63163,8 +63296,8 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "insert",
-      "id": "9fe11adc7543c199c1e3",
-      "path": "vendor/h2-0.4.20/src/hpack/table.rs",
+      "id": "03b319f693ce7e60526f",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/table.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63180,8 +63313,8 @@
       "code": "slots: VecDeque::with_capacity(capacity),",
       "effect": "heap-allocation",
       "function": "new",
-      "id": "c8205e4efc6da3ae5918",
-      "path": "vendor/h2-0.4.20/src/hpack/table.rs",
+      "id": "bb2eddc5225061ede62b",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/table.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63197,8 +63330,8 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "resize",
-      "id": "8acc85367c963055a08b",
-      "path": "vendor/h2-0.4.20/src/hpack/table.rs",
+      "id": "70a4d3fff8e28a82839d",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/table.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63214,8 +63347,8 @@
       "code": ".try_fold(0usize, |size, entry| size.checked_add(entry.len()))",
       "effect": "cpu-iteration",
       "function": "valid",
-      "id": "a4a8f346b1bfc9a84ad3",
-      "path": "vendor/h2-0.4.20/src/hpack/table.rs",
+      "id": "eb9b03e30b9ff68858af",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/table.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63231,8 +63364,8 @@
       "code": "file.read_to_string(&mut data).unwrap();",
       "effect": "data-growth",
       "function": "test_fixture",
-      "id": "2a2a275e01a27cbd5b01",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fixture.rs",
+      "id": "5b6728911043f2fd5d09",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fixture.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63248,8 +63381,8 @@
       "code": "let mut file = File::open(path).unwrap();",
       "effect": "filesystem",
       "function": "test_fixture",
-      "id": "ec543dc4fca1a6909a4f",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fixture.rs",
+      "id": "b82b259afd5d7936e8c1",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fixture.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63265,8 +63398,8 @@
       "code": "let mut data = String::new();",
       "effect": "heap-allocation",
       "function": "test_fixture",
-      "id": "2286999ebbbdf455f445",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fixture.rs",
+      "id": "4393b70b806cedec1851",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fixture.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63282,8 +63415,8 @@
       "code": "for case in &cases {",
       "effect": "cpu-iteration",
       "function": "test_story",
-      "id": "c9de28bb03d286c73e5d",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fixture.rs",
+      "id": "73b4e937dd586fbe58e1",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fixture.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63299,8 +63432,8 @@
       "code": "for case in &cases {",
       "effect": "cpu-iteration",
       "function": "test_story",
-      "id": "ef2bf074a3470e947293",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fixture.rs",
+      "id": "f82a093145ac655afcd3",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fixture.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63316,8 +63449,8 @@
       "code": "buf.extend_from_slice(&case.wire);",
       "effect": "data-growth",
       "function": "test_story",
-      "id": "51d567549ea08a218907",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fixture.rs",
+      "id": "f2990570259c3965d1c1",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fixture.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63333,25 +63466,8 @@
       "code": ".collect();",
       "effect": "heap-allocation",
       "function": "test_story",
-      "id": "1581bd68e21206414c2a",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fixture.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": ".collect();",
-      "effect": "heap-allocation",
-      "function": "test_story",
-      "id": "5a2b4d0948f21657d72e",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fixture.rs",
+      "id": "1da14fa9671d7509b582",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fixture.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63367,8 +63483,8 @@
       "code": "let mut buf = BytesMut::with_capacity(case.wire.len());",
       "effect": "heap-allocation",
       "function": "test_story",
-      "id": "815b1919e947eaf42abf",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fixture.rs",
+      "id": "212b0ca390d93956d803",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fixture.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63384,8 +63500,25 @@
       "code": ".collect();",
       "effect": "heap-allocation",
       "function": "test_story",
-      "id": "c0ac703bdda9b399c9ee",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fixture.rs",
+      "id": "c8d28e4393c5de7afc18",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fixture.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": ".collect();",
+      "effect": "heap-allocation",
+      "function": "test_story",
+      "id": "edcfe060783ae1799211",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fixture.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63401,25 +63534,8 @@
       "code": "let mut buf = BytesMut::with_capacity(limit);",
       "effect": "heap-allocation",
       "function": "test_story",
-      "id": "cefe6b8afe32895f4903",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fixture.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "while added < num {",
-      "effect": "cpu-iteration",
-      "function": "<module>",
-      "id": "0c8cd6548b64713b880a",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
+      "id": "f86d63c857ad707fef24",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fixture.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63435,8 +63551,8 @@
       "code": "for _ in 0..2000 {",
       "effect": "cpu-iteration",
       "function": "<module>",
-      "id": "7abd9120534f0b062dfd",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
+      "id": "346fc0ad32958c618bcf",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63452,8 +63568,25 @@
       "code": "for _ in 0..rng.gen_range(1..(num - added) + 1) {",
       "effect": "cpu-iteration",
       "function": "<module>",
-      "id": "c7ba762d9a4af04926fa",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
+      "id": "7c614782ebde7de19c63",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "while added < num {",
+      "effect": "cpu-iteration",
+      "function": "<module>",
+      "id": "bdc135b3b7140b9fafe0",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63469,8 +63602,8 @@
       "code": "frame.resizes.extend([low, high]);",
       "effect": "data-growth",
       "function": "<module>",
-      "id": "60e8e978e971665c623d",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
+      "id": "2225ae29c7b8ea838e57",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63486,42 +63619,8 @@
       "code": "let mut frames: Vec<HeaderFrame> = vec![];",
       "effect": "heap-allocation",
       "function": "<module>",
-      "id": "258098a3b546cf77e4d9",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "let mut source: Vec<Header<Option<HeaderName>>> = vec![];",
-      "effect": "heap-allocation",
-      "function": "<module>",
-      "id": "92a758efb558994aed8a",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "resizes: vec![],",
-      "effect": "heap-allocation",
-      "function": "<module>",
-      "id": "ceef4b90636d35964460",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
+      "id": "0727dfd1ea9bac8bbd7a",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63537,8 +63636,42 @@
       "code": "headers: vec![],",
       "effect": "heap-allocation",
       "function": "<module>",
-      "id": "f63426f26495df68b720",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
+      "id": "64d0842421c69b0047e0",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "resizes: vec![],",
+      "effect": "heap-allocation",
+      "function": "<module>",
+      "id": "e6b4dd61a7c9aa1dc1b9",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "let mut source: Vec<Header<Option<HeaderName>>> = vec![];",
+      "effect": "heap-allocation",
+      "function": "<module>",
+      "id": "ebcd2a27355cef669646",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63554,8 +63687,8 @@
       "code": ".collect();",
       "effect": "heap-allocation",
       "function": "gen_header",
-      "id": "37442bc2572ac8e6f948",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
+      "id": "6d96c376f18413029baa",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63571,8 +63704,8 @@
       "code": ".collect();",
       "effect": "heap-allocation",
       "function": "gen_string",
-      "id": "7267dc3859b8b0239b38",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
+      "id": "6d68002bc74f2cda7f6b",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63588,8 +63721,8 @@
       "code": "String::from_utf8(bytes).unwrap()",
       "effect": "heap-allocation",
       "function": "gen_string",
-      "id": "d037007ce896768bd259",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
+      "id": "f69782d39072329458b7",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63605,25 +63738,8 @@
       "code": "for resize in &frame.resizes {",
       "effect": "cpu-iteration",
       "function": "run",
-      "id": "0b3e33944ce72a80c54f",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "for frame in frames {",
-      "effect": "cpu-iteration",
-      "function": "run",
-      "id": "c82e7cae73bef26af037",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
+      "id": "582cd4137a76ee69d9d8",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63639,8 +63755,8 @@
       "code": "for header in &frame.headers {",
       "effect": "cpu-iteration",
       "function": "run",
-      "id": "f34a3404dae2fa558a4d",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
+      "id": "a3b30aa66ee87f98bc21",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63653,11 +63769,11 @@
       "closure_verification_targets": [
         "request_resource_effect_closure"
       ],
-      "code": "let mut buf = BytesMut::new();",
-      "effect": "heap-allocation",
+      "code": "for frame in frames {",
+      "effect": "cpu-iteration",
       "function": "run",
-      "id": "7ca8922aea87581e766c",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
+      "id": "b2d3b97e066bd4b50c82",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63673,8 +63789,25 @@
       "code": "let mut expect = vec![];",
       "effect": "heap-allocation",
       "function": "run",
-      "id": "f25ae84c8da82812d701",
-      "path": "vendor/h2-0.4.20/src/hpack/test/fuzz.rs",
+      "id": "5fb22145cadf668b8cfd",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "let mut buf = BytesMut::new();",
+      "effect": "heap-allocation",
+      "function": "run",
+      "id": "bd89e0280c784b8c0c1d",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/hpack/test/fuzz.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63690,8 +63823,8 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "poll",
-      "id": "8aca1071a9b1f73d5461",
-      "path": "vendor/h2-0.4.20/src/proto/connection.rs",
+      "id": "f457529af7f14808c86c",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/connection.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63707,8 +63840,8 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "poll2",
-      "id": "ae03461c1ff348559b73",
-      "path": "vendor/h2-0.4.20/src/proto/connection.rs",
+      "id": "65a489c9922bd41cab2b",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/connection.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63724,8 +63857,8 @@
       "code": "let user_pings = Arc::new(UserPingsInner {",
       "effect": "heap-allocation",
       "function": "take_user_pings",
-      "id": "8fc3b27f581b84397d79",
-      "path": "vendor/h2-0.4.20/src/proto/ping_pong.rs",
+      "id": "79e9dd696c3e1cc82c92",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/ping_pong.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63741,25 +63874,8 @@
       "code": ".binary_search_by_key(&id, |(stream, _)| *stream)",
       "effect": "cpu-iteration",
       "function": "forgotten_phase",
-      "id": "95210e0c83dc29d45cdb",
-      "path": "vendor/h2-0.4.20/src/proto/streams/counts.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "forgotten_order: VecDeque::with_capacity(max_forgotten),",
-      "effect": "heap-allocation",
-      "function": "new",
-      "id": "dc3bf50422f086eaa96a",
-      "path": "vendor/h2-0.4.20/src/proto/streams/counts.rs",
+      "id": "40b7b9893b922716d0d2",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/counts.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63775,8 +63891,8 @@
       "code": "forgotten_index: Vec::with_capacity(max_forgotten),",
       "effect": "heap-allocation",
       "function": "new",
-      "id": "e883820d94800f6bcf5c",
-      "path": "vendor/h2-0.4.20/src/proto/streams/counts.rs",
+      "id": "24d652ed96ee5ad9ed5f",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/counts.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63789,28 +63905,11 @@
       "closure_verification_targets": [
         "request_resource_effect_closure"
       ],
-      "code": ".binary_search_by_key(&id, |(stream, _)| *stream)",
-      "effect": "cpu-iteration",
-      "function": "remember_forgotten",
-      "id": "3e6511c57cadbadde125",
-      "path": "vendor/h2-0.4.20/src/proto/streams/counts.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": ".binary_search_by_key(&id, |(stream, _)| *stream)",
-      "effect": "cpu-iteration",
-      "function": "remember_forgotten",
-      "id": "9ee4289d72c93760a9c1",
-      "path": "vendor/h2-0.4.20/src/proto/streams/counts.rs",
+      "code": "forgotten_order: VecDeque::with_capacity(max_forgotten),",
+      "effect": "heap-allocation",
+      "function": "new",
+      "id": "91e23db528eae9e2eb0e",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/counts.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63826,8 +63925,42 @@
       "code": ".binary_search_by_key(&oldest, |(stream, _)| *stream)",
       "effect": "cpu-iteration",
       "function": "remember_forgotten",
-      "id": "fbb7917b9967dbfe436a",
-      "path": "vendor/h2-0.4.20/src/proto/streams/counts.rs",
+      "id": "57e06dc42aa52ccf4e03",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/counts.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": ".binary_search_by_key(&id, |(stream, _)| *stream)",
+      "effect": "cpu-iteration",
+      "function": "remember_forgotten",
+      "id": "7b9a50ff72d842f1ea17",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/counts.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": ".binary_search_by_key(&id, |(stream, _)| *stream)",
+      "effect": "cpu-iteration",
+      "function": "remember_forgotten",
+      "id": "a17c540e9a621d9c596a",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/counts.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63843,8 +63976,8 @@
       "code": "while self.flow.available() > 0 {",
       "effect": "cpu-iteration",
       "function": "assign_connection_capacity",
-      "id": "37aaf820551c1036882f",
-      "path": "vendor/h2-0.4.20/src/proto/streams/prioritize.rs",
+      "id": "806e67f387309c09a930",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/prioritize.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63860,8 +63993,8 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "buffer_pending",
-      "id": "24c37bf0771957620147",
-      "path": "vendor/h2-0.4.20/src/proto/streams/prioritize.rs",
+      "id": "c28e91af7bb0e9558e8f",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/prioritize.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63877,8 +64010,8 @@
       "code": "while let Some(stream) = self.pending_capacity.pop(store) {",
       "effect": "cpu-iteration",
       "function": "clear_pending_capacity",
-      "id": "9843039458acc03555ef",
-      "path": "vendor/h2-0.4.20/src/proto/streams/prioritize.rs",
+      "id": "d51391a2242eebf17191",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/prioritize.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63894,8 +64027,8 @@
       "code": "while let Some(stream) = self.pending_open.pop(store) {",
       "effect": "cpu-iteration",
       "function": "clear_pending_open",
-      "id": "426a8acb4309289aba07",
-      "path": "vendor/h2-0.4.20/src/proto/streams/prioritize.rs",
+      "id": "ace54311793b47022eee",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/prioritize.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63911,8 +64044,8 @@
       "code": "while let Some(mut stream) = self.pending_send.pop(store) {",
       "effect": "cpu-iteration",
       "function": "clear_pending_send",
-      "id": "c98a2840ddecec5f5b09",
-      "path": "vendor/h2-0.4.20/src/proto/streams/prioritize.rs",
+      "id": "4cb3abd6025e19a11f75",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/prioritize.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63925,11 +64058,11 @@
       "closure_verification_targets": [
         "request_resource_effect_closure"
       ],
-      "code": "while let Some(frame) = stream.pending_send.pop_front(buffer) {",
+      "code": "while let Some(_frame) = stream.pending_send.pop_front(buffer) {",
       "effect": "cpu-iteration",
       "function": "clear_queue",
-      "id": "4d823737692c8e1083b1",
-      "path": "vendor/h2-0.4.20/src/proto/streams/prioritize.rs",
+      "id": "752a5fc4614a26dd7dae",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/prioritize.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63945,8 +64078,8 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "pop_frame",
-      "id": "41a398145b791736ca8f",
-      "path": "vendor/h2-0.4.20/src/proto/streams/prioritize.rs",
+      "id": "b5f01d3df9da5d055198",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/prioritize.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63962,8 +64095,8 @@
       "code": "while let Some(stream) = self.pending_accept.pop(store) {",
       "effect": "cpu-iteration",
       "function": "clear_all_pending_accept",
-      "id": "661f39847c175d2dc461",
-      "path": "vendor/h2-0.4.20/src/proto/streams/recv.rs",
+      "id": "6cd6c5e051f3511441da",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/recv.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63979,8 +64112,8 @@
       "code": "while let Some(stream) = self.pending_reset_expired.pop(store) {",
       "effect": "cpu-iteration",
       "function": "clear_all_reset_streams",
-      "id": "7d3480b2f7ebb11aacea",
-      "path": "vendor/h2-0.4.20/src/proto/streams/recv.rs",
+      "id": "cf2a87d096c1dcbe0bc5",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/recv.rs",
       "status": "external-source-inventory"
     },
     {
@@ -63996,8 +64129,8 @@
       "code": "while let Some(stream) = self.pending_reset_expired.pop_if(store, |stream| {",
       "effect": "cpu-iteration",
       "function": "clear_expired_reset_streams",
-      "id": "87e1e63b95c8aa98d12b",
-      "path": "vendor/h2-0.4.20/src/proto/streams/recv.rs",
+      "id": "2046c15a529196791f0f",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/recv.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64013,8 +64146,8 @@
       "code": "while let Some(event) = stream.pending_recv.pop_front(&mut self.buffer) {",
       "effect": "cpu-iteration",
       "function": "clear_recv_buffer",
-      "id": "86228629e1189153751b",
-      "path": "vendor/h2-0.4.20/src/proto/streams/recv.rs",
+      "id": "afe705fd318388c9d490",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/recv.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64030,8 +64163,8 @@
       "code": "while let Some(stream) = self.pending_window_updates.pop(store) {",
       "effect": "cpu-iteration",
       "function": "clear_stream_window_update_queue",
-      "id": "1f2191add30689e38728",
-      "path": "vendor/h2-0.4.20/src/proto/streams/recv.rs",
+      "id": "887c5e83d704a1a9e035",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/recv.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64047,8 +64180,8 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "poll_response",
-      "id": "ef2a6863494b43d46494",
-      "path": "vendor/h2-0.4.20/src/proto/streams/recv.rs",
+      "id": "5a52ffe60c7600428faa",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/recv.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64064,8 +64197,8 @@
       "code": "for content_length in frame.fields().get_all(header::CONTENT_LENGTH) {",
       "effect": "cpu-iteration",
       "function": "recv_headers",
-      "id": "66c3250dbdf1578d8f1d",
-      "path": "vendor/h2-0.4.20/src/proto/streams/recv.rs",
+      "id": "3a35f15edabd6306da89",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/recv.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64081,8 +64214,8 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "send_stream_window_updates",
-      "id": "0b0923693393b6bce8f5",
-      "path": "vendor/h2-0.4.20/src/proto/streams/recv.rs",
+      "id": "37f17ae2712d7e31b2ea",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/recv.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64098,8 +64231,8 @@
       "code": "while i < len {",
       "effect": "cpu-iteration",
       "function": "try_for_each",
-      "id": "7cf8fd7fa5380775b09b",
-      "path": "vendor/h2-0.4.20/src/proto/streams/store.rs",
+      "id": "d9eb7d16ed6e670bdfe8",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/store.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64115,25 +64248,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "apply_local_settings",
-      "id": "67c52a4359a4426506ef",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "let mut me = self.inner.lock().unwrap();",
-      "effect": "synchronization",
-      "function": "apply_remote_settings",
-      "id": "89dbbd7970433bfcbf04",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "b2fb4a498188434fd50a",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64149,8 +64265,25 @@
       "code": "let mut send_buffer = self.send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "apply_remote_settings",
-      "id": "d6d06aafa221b03e9a09",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "22e54af5c4ed1d2e159b",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "let mut me = self.inner.lock().unwrap();",
+      "effect": "synchronization",
+      "function": "apply_remote_settings",
+      "id": "d4b2e99f31dc18f9d4c6",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64166,8 +64299,8 @@
       "code": "let me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "available_recv_capacity",
-      "id": "52bff384179452724dc1",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "bc056f504cea6837580c",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64183,8 +64316,8 @@
       "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "buffer_pending",
-      "id": "154ffb7d241bbbde19ad",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "02009717ad1d094b754c",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64200,8 +64333,8 @@
       "code": "let mut me = self.opaque.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "capacity",
-      "id": "7d23adb569f9e288cc65",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "4fa747e40a376a6df63c",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64217,8 +64350,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "clear_expired_reset_streams",
-      "id": "73735d160e53b66f00a1",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "b89954e151d9e2143996",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64234,8 +64367,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "clear_recv_buffer",
-      "id": "151af044dd0632a27079",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "34677be9bd0ed81505af",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64251,8 +64384,8 @@
       "code": "self.inner.lock().unwrap().refs += 1;",
       "effect": "synchronization",
       "function": "clone",
-      "id": "aa54fbe424a58501adda",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "339b2912e8e024934e66",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64268,8 +64401,8 @@
       "code": "let mut inner = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "clone",
-      "id": "edb72f545309cd40e883",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "ca1e08d0471b24e52cbf",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64285,8 +64418,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "count_pending_refusal",
-      "id": "8fefe6e3be843237b418",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "bebcb2e55272629c5f18",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64302,8 +64435,8 @@
       "code": "let me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "current_max_recv_streams",
-      "id": "638c6fd56918dd28fdfb",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "8901be4767659fcc7cba",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64319,8 +64452,8 @@
       "code": "let me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "current_max_send_streams",
-      "id": "69df751a3b82055759f6",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "ed3986569b1ba7bcb409",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64336,8 +64469,8 @@
       "code": "if let Ok(mut inner) = self.inner.lock() {",
       "effect": "synchronization",
       "function": "drop",
-      "id": "b9176eebb3e53cf7fd12",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "d8e956a51442d07a1458",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64353,8 +64486,8 @@
       "code": "while let Some(promise) = ppp.pop(stream.store_mut()) {",
       "effect": "cpu-iteration",
       "function": "drop_stream_ref",
-      "id": "b91d5ef37c6a7a314613",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "b50b1e6ab0c56dd2a06c",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64370,8 +64503,8 @@
       "code": "let mut me = match inner.lock() {",
       "effect": "synchronization",
       "function": "drop_stream_ref",
-      "id": "443d4eab20b81914887b",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "6faf10492739b664722f",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64387,8 +64520,8 @@
       "code": "self.store.for_each(|stream| {",
       "effect": "cpu-iteration",
       "function": "handle_error",
-      "id": "6d6a9981014a0ba92d1b",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "35d1025516654c6327d5",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64404,8 +64537,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "handle_error",
-      "id": "96afcc35433f92aa2bcc",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "2476e66602abeaf5b911",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64421,8 +64554,8 @@
       "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "handle_error",
-      "id": "e6bf07c940cc9c2dea86",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "e1689eb73c97fa48f1ae",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64438,8 +64571,8 @@
       "code": "let me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "has_streams",
-      "id": "cae98f573dc226aafb01",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "fda94d58d2491fc5c4fc",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64455,8 +64588,8 @@
       "code": "let me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "has_streams_or_other_references",
-      "id": "97ff3a909b4363716cd7",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "eb74e2f9afd8019bdfbf",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64472,8 +64605,8 @@
       "code": "let buf = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "is_empty",
-      "id": "36a85e5541b2efb648bc",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "c82111a20646e3e3cd02",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64489,8 +64622,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "is_end_stream",
-      "id": "aca64e8ea7cddc33f930",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "ddc8df659e822e559b76",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64506,8 +64639,8 @@
       "code": ".lock()",
       "effect": "synchronization",
       "function": "is_extended_connect_protocol_enabled",
-      "id": "e5d5bb77471276f75731",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "287a37e3006f141775ff",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64523,8 +64656,8 @@
       "code": "let mut me = self.opaque.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "is_pending_open",
-      "id": "3fe51cba61f0970eaef8",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "a0ecdd2c9cda29357918",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64540,8 +64673,8 @@
       "code": "self.inner.lock().unwrap().actions.recv.last_processed_id()",
       "effect": "synchronization",
       "function": "last_processed_id",
-      "id": "6f5f94e8d64c920317c5",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "fdca78eb1650ba400d7b",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64557,8 +64690,8 @@
       "code": "self.inner.lock().unwrap().counts.max_recv_streams()",
       "effect": "synchronization",
       "function": "max_recv_streams",
-      "id": "029035d8b49cc39b6064",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "b5b95b98288531996cc8",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64574,25 +64707,8 @@
       "code": "self.inner.lock().unwrap().counts.max_send_streams()",
       "effect": "synchronization",
       "function": "max_send_streams",
-      "id": "c51f3e4a27e8603df1be",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "Arc::new(Mutex::new(Inner {",
-      "effect": "heap-allocation",
-      "function": "new",
-      "id": "8c1de8fb7a2ca3b16df7",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "f7a685ea2c95a13ff129",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64608,8 +64724,25 @@
       "code": "send_buffer: Arc::new(SendBuffer::new()),",
       "effect": "heap-allocation",
       "function": "new",
-      "id": "fe16444886462f769daf",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "82ee074e936789870b78",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "Arc::new(Mutex::new(Inner {",
+      "effect": "heap-allocation",
+      "function": "new",
+      "id": "affda102329c90881a28",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64625,8 +64758,8 @@
       "code": "let inner = Mutex::new(Buffer::new());",
       "effect": "synchronization",
       "function": "new",
-      "id": "38c6996d6d5d4f56f994",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "87af9b268f5b0a164fa0",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64642,8 +64775,8 @@
       "code": "Arc::new(Mutex::new(Inner {",
       "effect": "synchronization",
       "function": "new",
-      "id": "bc9a0c40b23b7cdc3028",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "c7fac2e7e659f772a0db",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64659,8 +64792,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "next_incoming",
-      "id": "2873a5af12e5004df09b",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "aea4e7f9f5fe3bf831d4",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64676,8 +64809,8 @@
       "code": "let me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "num_active_streams",
-      "id": "5f793b07d49dca99ca53",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "eb13b8fa21b7861de8e7",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64693,8 +64826,8 @@
       "code": "let me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "num_wired_streams",
-      "id": "f6ee0a31c6fb21c5db10",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "cb529355e243fa78c67d",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64710,8 +64843,8 @@
       "code": "let mut me = self.opaque.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "poll_capacity",
-      "id": "caa9911edee9554dc29c",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "a7a661d4ea253c2b47c7",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64727,8 +64860,8 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "poll_complete",
-      "id": "50a1736e17c2b05b46f2",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "1748911c5c0daada158b",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64744,8 +64877,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "poll_complete",
-      "id": "8ffbfe2639b408779071",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "df92e37de16fb1df509f",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64761,8 +64894,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "poll_complete",
-      "id": "d120aa88fd93e289624e",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "fe4a0cb21340c122be04",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64778,8 +64911,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "poll_data",
-      "id": "c5d52acabf1df515bfc3",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "3c51ba5da8ed7bc03a51",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64795,8 +64928,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "poll_informational",
-      "id": "1123517fcb6e64cb2385",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "79f781f0b46c5bd55fbe",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64812,8 +64945,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "poll_pending_open",
-      "id": "7d70a63aeceba5aedfd5",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "5265bfc1e70e8fb3ee61",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64829,8 +64962,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "poll_pushed",
-      "id": "146afc876c2d19a6ce54",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "303cfddf5c98b37f07f3",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64846,8 +64979,8 @@
       "code": "let mut me = self.opaque.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "poll_reset",
-      "id": "66d69d673419cd749117",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "33842e03420156a12fee",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64863,8 +64996,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "poll_response",
-      "id": "a29c914b27fed5ad3057",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "d5223df62062cf55acd3",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64880,8 +65013,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "poll_trailers",
-      "id": "53616415b87663cd4f84",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "e907c66476a586b17138",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64897,25 +65030,8 @@
       "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "reclaim_written_frame",
-      "id": "aa8eb4b29978056366fa",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "let mut buffer = send_buffer.inner.lock().unwrap();",
-      "effect": "synchronization",
-      "function": "recv_data",
-      "id": "46474d42f0e69ed69a91",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "50f7436a9e8f657b8be8",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64931,8 +65047,25 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "recv_data",
-      "id": "f3eda98b435e89d7a2e7",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "a8c0cb546898de1f4ea1",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "let mut buffer = send_buffer.inner.lock().unwrap();",
+      "effect": "synchronization",
+      "function": "recv_data",
+      "id": "d835622d3ed31085ec62",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64948,8 +65081,8 @@
       "code": "self.store.for_each(|stream| {",
       "effect": "cpu-iteration",
       "function": "recv_eof",
-      "id": "fc87c34fd2dab808a320",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "250fa8657a6b94868b72",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64965,8 +65098,8 @@
       "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "recv_eof",
-      "id": "d4aec2f6ea86cef0bbdc",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "70b8933f99fd2bff29c9",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64982,8 +65115,8 @@
       "code": "let mut me = self.inner.lock().map_err(|_| ())?;",
       "effect": "synchronization",
       "function": "recv_eof",
-      "id": "f79b3d4e07d2ff7ca3f2",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "9a7ec21a76d973b39e1f",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -64999,8 +65132,8 @@
       "code": "self.store.for_each(|stream| {",
       "effect": "cpu-iteration",
       "function": "recv_go_away",
-      "id": "c107a514cf60b5fe2aa4",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "edbdeb38c06512dfaf13",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65016,8 +65149,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "recv_go_away",
-      "id": "00f4a22040bdfa732bec",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "08d754b443de374ed352",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65033,8 +65166,25 @@
       "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "recv_go_away",
-      "id": "af9f3a94aee352ff80ac",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "f8f2d8b6ee964a1e5e7c",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "let mut me = self.inner.lock().unwrap();",
+      "effect": "synchronization",
+      "function": "recv_headers",
+      "id": "1832ef5d477b9c6cc530",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65050,8 +65200,8 @@
       "code": "let mut buffer = send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "recv_headers",
-      "id": "1dc1e4134652e002d6dd",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "2382f41b43faa4ede59b",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65064,11 +65214,11 @@
       "closure_verification_targets": [
         "request_resource_effect_closure"
       ],
-      "code": "let mut me = self.inner.lock().unwrap();",
+      "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "recv_headers",
-      "id": "7c650928f677aefb8a3e",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "7ccec541e52c96b7f321",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65084,42 +65234,8 @@
       "code": "let mut buffer = send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "recv_headers",
-      "id": "a4919c64a0868827a296",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
-      "effect": "synchronization",
-      "function": "recv_headers",
-      "id": "d4525940d74530449f36",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
-      "effect": "synchronization",
-      "function": "recv_push_promise",
-      "id": "53676a8276078fd62a46",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "c54b36b9207ae4043dcf",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65135,8 +65251,25 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "recv_push_promise",
-      "id": "552c4456cc9fc8f46ffd",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "318d0ab4777f96d9dc26",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
+      "effect": "synchronization",
+      "function": "recv_push_promise",
+      "id": "ab552dce611165e06b69",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65152,8 +65285,8 @@
       "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "recv_reset",
-      "id": "7d4c3ce455ddf63dfa17",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "9769d66eab6a7b2c897b",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65169,25 +65302,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "recv_reset",
-      "id": "8dd9e6c091f53c3a6b2c",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
-      "effect": "synchronization",
-      "function": "recv_window_update",
-      "id": "5ee7f45d9380b0a44bc8",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "e133f091cfc6f274d5cf",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65203,8 +65319,25 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "recv_window_update",
-      "id": "68ec80d7bfddf3a02460",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "1503e036112b61e1d25c",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
+      "effect": "synchronization",
+      "function": "recv_window_update",
+      "id": "3864a1a21c0e548a0a53",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65220,8 +65353,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "release_capacity",
-      "id": "5d233247b3cc602fc125",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "bb0ff2a6e64807b73326",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65237,8 +65370,8 @@
       "code": "let mut me = self.opaque.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "reserve_capacity",
-      "id": "f9628508df4149c9a84e",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "40ea241840fada2385ff",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65254,25 +65387,8 @@
       "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "reset_on_recv_stream_err_deferred",
-      "id": "c1d5fbfccd864d55d130",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "let mut send_buffer = self.send_buffer.inner.lock().unwrap();",
-      "effect": "synchronization",
-      "function": "send_data",
-      "id": "19182c5b7356a93ff096",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "0dde089d5fa9e45a5d79",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65288,8 +65404,25 @@
       "code": "let mut me = self.opaque.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_data",
-      "id": "36188beda5b6bbccc473",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "4db442ee433743aa3f5e",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "let mut send_buffer = self.send_buffer.inner.lock().unwrap();",
+      "effect": "synchronization",
+      "function": "send_data",
+      "id": "e4923335593980dfd03a",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65305,8 +65438,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_go_away",
-      "id": "9001d0cf9d475f81f85b",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "1bf5c678b89daa3158c7",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65322,8 +65455,8 @@
       "code": "let mut me = self.opaque.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_informational_headers",
-      "id": "17ecc4a417b1f14939cb",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "90f078367d98c591042c",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65339,8 +65472,8 @@
       "code": "let mut send_buffer = self.send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_informational_headers",
-      "id": "2cde664ed320125282f8",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "a185a1eb77d37ee5268e",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65356,8 +65489,8 @@
       "code": "let mut me = self.opaque.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_push_promise",
-      "id": "29e580494476d203f534",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "2fd15297c1bbb6bd48c7",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65373,25 +65506,8 @@
       "code": "let mut send_buffer = self.send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_push_promise",
-      "id": "ed5b7221c9dc51956455",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
-      "status": "external-source-inventory"
-    },
-    {
-      "accounting_evidence": [
-        "vendored source is scanned; adapter bounds remain separate"
-      ],
-      "closure_contract": "vendored-source-contract",
-      "closure_disposition": "external-assumption",
-      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
-      "closure_verification_targets": [
-        "request_resource_effect_closure"
-      ],
-      "code": "let mut send_buffer = self.send_buffer.inner.lock().unwrap();",
-      "effect": "synchronization",
-      "function": "send_request",
-      "id": "416e4486e810be4b0401",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "7790235b259958b5c665",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65407,8 +65523,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_request",
-      "id": "cfa80edc4fa3a8cad0bf",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "3c568e69f87e19dcb2f3",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65423,9 +65539,9 @@
       ],
       "code": "let mut send_buffer = self.send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
-      "function": "send_reset",
-      "id": "0a70a6e4f25c2ebc4fad",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "function": "send_request",
+      "id": "58b11107c7d19688873e",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65441,8 +65557,25 @@
       "code": "let mut send_buffer = send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_reset",
-      "id": "1aaad249e0d18bfe5d5e",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "1dfe4b514b00dfe0e39e",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
+      "status": "external-source-inventory"
+    },
+    {
+      "accounting_evidence": [
+        "vendored source is scanned; adapter bounds remain separate"
+      ],
+      "closure_contract": "vendored-source-contract",
+      "closure_disposition": "external-assumption",
+      "closure_evidence": "vendored source is inventoried; adapter leases, pinned version and OS backstops bound effects below the local type boundary",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": "let mut send_buffer = self.send_buffer.inner.lock().unwrap();",
+      "effect": "synchronization",
+      "function": "send_reset",
+      "id": "3013c5a947a25cbc0b17",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65458,8 +65591,8 @@
       "code": "let mut me = self.opaque.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_reset",
-      "id": "651a0a2dfed62f6a0d2d",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "72bccc4390d8e5265605",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65475,8 +65608,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_reset",
-      "id": "c87ab720be81b2f3e9c0",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "9d5a779c3ed6ed6fd523",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65492,8 +65625,8 @@
       "code": "let mut send_buffer = self.send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_response",
-      "id": "93743baf7b46fadc3bea",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "165804943b5e88c6be75",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65509,8 +65642,8 @@
       "code": "let mut me = self.opaque.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_response",
-      "id": "97c73a396a7277c879f7",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "b1fb255836d5ff9bad40",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65526,8 +65659,8 @@
       "code": "let mut me = self.opaque.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_trailers",
-      "id": "2208d8b239a2a2f29456",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "0059365777fbdd2dc30b",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65543,8 +65676,8 @@
       "code": "let mut send_buffer = self.send_buffer.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "send_trailers",
-      "id": "9ffe34c2047bd2a64eff",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "e92b770703f635f9d9ab",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65560,8 +65693,8 @@
       "code": "let mut me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "set_target_connection_window_size",
-      "id": "ade8635106442431db95",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "cdd0b84e875e4f1fabc2",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65577,8 +65710,8 @@
       "code": "self.inner.lock().unwrap().store[self.key].id",
       "effect": "synchronization",
       "function": "stream_id",
-      "id": "a09c106308dfb9215f70",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "8f73078262419e163a0f",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65594,8 +65727,8 @@
       "code": "let mut me = self.opaque.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "take_request",
-      "id": "f712cef548c50d3d874c",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "2373099935fdbf950825",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65611,8 +65744,8 @@
       "code": "let me = self.inner.lock().unwrap();",
       "effect": "synchronization",
       "function": "used_recv_capacity",
-      "id": "781b4a41bcd6a22a2ad5",
-      "path": "vendor/h2-0.4.20/src/proto/streams/streams.rs",
+      "id": "dad629fe8ecfb3cc9111",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/proto/streams/streams.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65628,8 +65761,8 @@
       "code": "while rem > 0 {",
       "effect": "cpu-iteration",
       "function": "poll",
-      "id": "4effa11145402b474af6",
-      "path": "vendor/h2-0.4.20/src/server.rs",
+      "id": "9a9df0562b158c193e9f",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/server.rs",
       "status": "external-source-inventory"
     },
     {
@@ -65645,24 +65778,24 @@
       "code": "loop {",
       "effect": "cpu-iteration",
       "function": "poll",
-      "id": "c3ad03b878a525bc92b3",
-      "path": "vendor/h2-0.4.20/src/server.rs",
+      "id": "a4c5ed0de4d165188250",
+      "path": "vendor/httpd-rs-h2-0.4.20/src/server.rs",
       "status": "external-source-inventory"
     }
   ],
-  "source_sha256": "651e7e97169563a987ee96f784d57f5497210ecc12f4f0de46a7ae5f325c5753",
+  "source_sha256": "c2169d0ba03145ee77b11aa5231c2dfb777989a7c22813849664f988380e01a4",
   "summary": {
     "by_closure_disposition": {
       "external-assumption": 448,
-      "proved-constant-bound": 671,
+      "proved-constant-bound": 679,
       "typed-lease": 2241
     },
     "by_effect": {
-      "compression-regex-crypto": 69,
+      "compression-regex-crypto": 75,
       "cpu-iteration": 922,
       "data-growth": 441,
       "filesystem": 135,
-      "heap-allocation": 1070,
+      "heap-allocation": 1072,
       "network": 35,
       "synchronization": 281,
       "task-process": 46,
@@ -65674,10 +65807,10 @@
       "audited-gateway": 325,
       "external-source-inventory": 196,
       "local-bound-candidate": 14,
-      "review-required": 2062
+      "review-required": 2070
     },
-    "effect_sites": 3360,
-    "files": 56,
+    "effect_sites": 3368,
+    "files": 57,
     "unclassified_effect_sites": 0
   }
 }

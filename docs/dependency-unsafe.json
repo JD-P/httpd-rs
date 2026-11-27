@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "scope": "locked non-workspace x86_64-unknown-linux-gnu production dependency graph",
-  "package_count": 87,
-  "packages_with_unsafe": 63,
+  "package_count": 76,
+  "packages_with_unsafe": 54,
   "packages_with_build_scripts": 10,
   "packages_with_native_code": 2,
   "packages": {
@@ -43,14 +43,6 @@
       "unsafe_blocks": 2,
       "unsafe_declarations": 2,
       "rust_files": 1,
-      "build_script": false,
-      "native_files": 0
-    },
-    "base64@0.22.1": {
-      "unsafe_tokens": 0,
-      "unsafe_blocks": 0,
-      "unsafe_declarations": 0,
-      "rust_files": 21,
       "build_script": false,
       "native_files": 0
     },
@@ -166,14 +158,6 @@
       "build_script": false,
       "native_files": 0
     },
-    "cpufeatures@0.3.1": {
-      "unsafe_tokens": 11,
-      "unsafe_blocks": 8,
-      "unsafe_declarations": 3,
-      "rust_files": 5,
-      "build_script": false,
-      "native_files": 0
-    },
     "crc32fast@1.5.3": {
       "unsafe_tokens": 15,
       "unsafe_blocks": 2,
@@ -203,14 +187,6 @@
       "unsafe_blocks": 0,
       "unsafe_declarations": 0,
       "rust_files": 1,
-      "build_script": false,
-      "native_files": 0
-    },
-    "errno@0.3.14": {
-      "unsafe_tokens": 12,
-      "unsafe_blocks": 12,
-      "unsafe_declarations": 0,
-      "rust_files": 6,
       "build_script": false,
       "native_files": 0
     },
@@ -262,14 +238,6 @@
       "build_script": true,
       "native_files": 0
     },
-    "h2@0.4.20": {
-      "unsafe_tokens": 0,
-      "unsafe_blocks": 0,
-      "unsafe_declarations": 0,
-      "rust_files": 54,
-      "build_script": false,
-      "native_files": 0
-    },
     "hashbrown@0.17.1": {
       "unsafe_tokens": 454,
       "unsafe_blocks": 321,
@@ -283,6 +251,14 @@
       "unsafe_blocks": 51,
       "unsafe_declarations": 13,
       "rust_files": 21,
+      "build_script": false,
+      "native_files": 0
+    },
+    "httpd-rs-h2@0.4.20": {
+      "unsafe_tokens": 0,
+      "unsafe_blocks": 0,
+      "unsafe_declarations": 0,
+      "rust_files": 54,
       "build_script": false,
       "native_files": 0
     },
@@ -318,14 +294,6 @@
       "build_script": false,
       "native_files": 0
     },
-    "jobserver@0.1.35": {
-      "unsafe_tokens": 32,
-      "unsafe_blocks": 20,
-      "unsafe_declarations": 12,
-      "rust_files": 5,
-      "build_script": false,
-      "native_files": 0
-    },
     "libc@0.2.191": {
       "unsafe_tokens": 800,
       "unsafe_blocks": 159,
@@ -339,14 +307,6 @@
       "unsafe_blocks": 4541,
       "unsafe_declarations": 2296,
       "rust_files": 462,
-      "build_script": false,
-      "native_files": 0
-    },
-    "log@0.4.34": {
-      "unsafe_tokens": 6,
-      "unsafe_blocks": 3,
-      "unsafe_declarations": 3,
-      "rust_files": 9,
       "build_script": false,
       "native_files": 0
     },
@@ -414,14 +374,6 @@
       "build_script": true,
       "native_files": 0
     },
-    "rand_core@0.10.1": {
-      "unsafe_tokens": 0,
-      "unsafe_blocks": 0,
-      "unsafe_declarations": 0,
-      "rust_files": 6,
-      "build_script": false,
-      "native_files": 0
-    },
     "regex-automata@0.4.18": {
       "unsafe_tokens": 55,
       "unsafe_blocks": 35,
@@ -478,14 +430,6 @@
       "build_script": true,
       "native_files": 0
     },
-    "sha1@0.11.0": {
-      "unsafe_tokens": 7,
-      "unsafe_blocks": 5,
-      "unsafe_declarations": 2,
-      "rust_files": 8,
-      "build_script": false,
-      "native_files": 0
-    },
     "shlex@2.0.1": {
       "unsafe_tokens": 6,
       "unsafe_blocks": 4,
@@ -507,14 +451,6 @@
       "unsafe_blocks": 3,
       "unsafe_declarations": 3,
       "rust_files": 3,
-      "build_script": false,
-      "native_files": 0
-    },
-    "smallvec@1.16.4": {
-      "unsafe_tokens": 80,
-      "unsafe_blocks": 56,
-      "unsafe_declarations": 24,
-      "rust_files": 4,
       "build_script": false,
       "native_files": 0
     },
@@ -587,22 +523,6 @@
       "unsafe_blocks": 734,
       "unsafe_declarations": 330,
       "rust_files": 380,
-      "build_script": false,
-      "native_files": 0
-    },
-    "tracing-core@0.1.36": {
-      "unsafe_tokens": 28,
-      "unsafe_blocks": 20,
-      "unsafe_declarations": 8,
-      "rust_files": 14,
-      "build_script": false,
-      "native_files": 0
-    },
-    "tracing@0.1.44": {
-      "unsafe_tokens": 7,
-      "unsafe_blocks": 6,
-      "unsafe_declarations": 1,
-      "rust_files": 8,
       "build_script": false,
       "native_files": 0
     },
@@ -691,14 +611,6 @@
       "unsafe_blocks": 15,
       "unsafe_declarations": 2,
       "rust_files": 5,
-      "build_script": false,
-      "native_files": 0
-    },
-    "zlib-rs@0.6.8": {
-      "unsafe_tokens": 453,
-      "unsafe_blocks": 354,
-      "unsafe_declarations": 81,
-      "rust_files": 45,
       "build_script": false,
       "native_files": 0
     }

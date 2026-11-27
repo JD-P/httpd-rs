@@ -116,6 +116,7 @@
 //! [`TcpListener`]: https://docs.rs/tokio-core/0.1/tokio_core/net/struct.TcpListener.html
 
 use crate::codec::{Codec, UserError};
+use crate::tracing;
 use crate::frame::{self, Pseudo, PushPromiseHeaderError, Reason, Settings, StreamId};
 use crate::proto::{self, Config, Error, Prioritized};
 use crate::{FlowControl, PingPong, RecvStream, SendStream};
@@ -128,7 +129,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::instrument::{Instrument, Instrumented};
 
 /// In progress HTTP/2 connection handshake future.
 ///
@@ -317,9 +317,9 @@ impl<B: Buf + fmt::Debug> fmt::Debug for SendPushedResponse<B> {
 /// Stages of an in-progress handshake.
 enum Handshaking<T, B: Buf> {
     /// State 1. Connection is flushing pending SETTINGS frame.
-    Flushing(Instrumented<Flush<T, Prioritized<B>>>),
+    Flushing(Flush<T, Prioritized<B>>),
     /// State 2. Connection is waiting for the client preface.
-    ReadingPreface(Instrumented<ReadPreface<T, Prioritized<B>>>),
+    ReadingPreface(ReadPreface<T, Prioritized<B>>),
     /// State 3. Handshake is done, polling again would panic.
     Done,
 }
@@ -387,7 +387,7 @@ where
 {
     fn handshake2(io: T, builder: Builder) -> Handshake<T, B> {
         let span = tracing::trace_span!("server_handshake");
-        let entered = span.enter();
+        let _entered = span.enter();
 
         // Create the codec.
         let mut codec = Codec::new(io);
@@ -408,10 +408,7 @@ where
             .expect("invalid SETTINGS frame");
 
         // Create the handshake future.
-        let state =
-            Handshaking::Flushing(Flush::new(codec).instrument(tracing::trace_span!("flush")));
-
-        drop(entered);
+        let state = Handshaking::Flushing(Flush::new(codec));
 
         Handshake {
             builder,
@@ -1210,11 +1207,11 @@ impl<B: Buf> SendResponse<B> {
     /// - There is a connection-level error
     pub fn send_informational(&mut self, response: Response<()>) -> Result<(), crate::Error> {
         let stream_id = self.inner.stream_id();
-        let status = response.status();
+        let _status = response.status();
 
         tracing::trace!(
             "send_informational called with status: {} on stream: {:?}",
-            status,
+            _status,
             stream_id
         );
 
@@ -1222,7 +1219,7 @@ impl<B: Buf> SendResponse<B> {
         if !response.status().is_informational() {
             tracing::trace!(
                 "invalid informational status code: {} on stream: {:?}",
-                status,
+                _status,
                 stream_id
             );
             return Err(crate::Error::from(
@@ -1256,10 +1253,10 @@ impl<B: Buf> SendResponse<B> {
                 "Successfully sent informational headers for stream: {:?}",
                 stream_id
             ),
-            Err(e) => tracing::trace!(
+            Err(_e) => tracing::trace!(
                 "Failed to send informational headers for stream: {:?}: {:?}",
                 stream_id,
-                e
+                _e
             ),
         }
 
@@ -1531,9 +1528,7 @@ where
                             flushed
                         }
                     };
-                    self.state = Handshaking::ReadingPreface(
-                        ReadPreface::new(codec).instrument(tracing::trace_span!("read_preface")),
-                    );
+                    self.state = Handshaking::ReadingPreface(ReadPreface::new(codec));
                 }
                 Handshaking::ReadingPreface(read) => {
                     let codec = ready!(Pin::new(read).poll(cx)?);
@@ -1629,10 +1624,10 @@ impl Peer {
                     "convert_push_message: method {} is not safe and cacheable",
                     request.method(),
                 ),
-                InvalidContentLength(e) => tracing::debug!(
+                InvalidContentLength(_e) => tracing::debug!(
                     ?promised_id,
                     "convert_push_message; promised request has invalid content-length {:?}",
-                    e,
+                    _e,
                 ),
             }
             return Err(UserError::MalformedHeaders);
@@ -1662,8 +1657,6 @@ impl Peer {
 
 impl proto::Peer for Peer {
     type Poll = Request<()>;
-
-    const NAME: &'static str = "Server";
 
     /*
     fn is_server() -> bool {
@@ -1722,11 +1715,11 @@ impl proto::Peer for Peer {
         // header
         if let Some(authority) = pseudo.authority {
             let maybe_authority = uri::Authority::from_maybe_shared(authority.clone().into_inner());
-            parts.authority = Some(maybe_authority.or_else(|why| {
+            parts.authority = Some(maybe_authority.or_else(|_why| {
                 malformed!(
                     "malformed headers: malformed authority ({:?}): {}",
                     authority,
-                    why,
+                    _why,
                 )
             })?);
         }
@@ -1737,11 +1730,11 @@ impl proto::Peer for Peer {
                 malformed!("malformed headers: :scheme in CONNECT");
             }
             let maybe_scheme = scheme.parse();
-            let scheme = maybe_scheme.or_else(|why| {
+            let scheme = maybe_scheme.or_else(|_why| {
                 malformed!(
                     "malformed headers: malformed scheme ({:?}): {}",
                     scheme,
-                    why,
+                    _why,
                 )
             })?;
 
@@ -1774,8 +1767,8 @@ impl proto::Peer for Peer {
             }
 
             let maybe_path = uri::PathAndQuery::from_maybe_shared(path.clone().into_inner());
-            parts.path_and_query = Some(maybe_path.or_else(|why| {
-                malformed!("malformed headers: malformed path ({:?}): {}", path, why,)
+            parts.path_and_query = Some(maybe_path.or_else(|_why| {
+                malformed!("malformed headers: malformed path ({:?}): {}", path, _why,)
             })?);
         } else if is_connect && has_protocol {
             malformed!("malformed headers: missing path in extended CONNECT");
@@ -1788,10 +1781,10 @@ impl proto::Peer for Peer {
 
         let mut request = match b.body(()) {
             Ok(request) => request,
-            Err(e) => {
+            Err(_e) => {
                 // TODO: Should there be more specialized handling for different
                 // kinds of errors
-                proto_err!(stream: "error building request: {}; stream={:?}", e, stream_id);
+                proto_err!(stream: "error building request: {}; stream={:?}", _e, stream_id);
                 return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
             }
         };

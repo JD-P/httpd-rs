@@ -29,8 +29,6 @@ DEPENDENCY_CLASSES = {
     "ring": "bounded-crypto",
     "rustix": "audited-os-boundary",
     "rustls": "bounded-crypto-protocol",
-    "sha1": "bounded-linear-crypto",
-    "smallvec": "bounded-protocol-storage",
     "subtle": "constant-time-primitive",
     "tokio": "bounded-runtime",
     "tokio-rustls": "bounded-crypto-protocol",
@@ -43,11 +41,11 @@ EXPECTED_MANIFEST_DEPENDENCIES = {
     "crates/os/Cargo.toml": {"libc", "rustix"},
     "crates/verified/Cargo.toml": {"vstd"},
     "crates/pcre2/Cargo.toml": {
-        "httpd-rs-verified", "regex-automata", "regex-syntax", "smallvec",
+        "httpd-rs-verified", "regex-automata", "regex-syntax",
     },
     "crates/server/Cargo.toml": {
         "httpd-rs-os", "httpd-rs-verified", "httpd-rs-pcre2", "libc", "rustix",
-        "rustls", "tokio", "tokio-rustls", "h2", "bytes", "http", "sha1",
+        "rustls", "tokio", "tokio-rustls", "h2", "bytes", "http",
         "subtle", "ring", "md-5", "base64", "bcrypt", "flate2", "brotli",
         "webpki-roots", "webpki", "mimalloc",
     },
@@ -75,7 +73,6 @@ VARIABLE_DEPENDENCY_NAMESPACES = {
     ("crates/server/src/whole_request_fuzz.rs", "h2"): 2,
     ("crates/pcre2/src/lib.rs", "regex_automata"): 1,
     ("crates/pcre2/src/lib.rs", "regex_syntax"): 6,
-    ("crates/pcre2/src/lib.rs", "smallvec"): 1,
 }
 
 # Each remotely or backend influenced variable-cost library entry point names

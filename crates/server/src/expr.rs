@@ -1013,10 +1013,9 @@ impl Expr {
 }
 
 fn sha1_hex(s: &str) -> String {
-    use sha1::{Digest, Sha1};
-    let mut h = Sha1::new();
+    let mut h = crate::legacy_sha1::Context::new();
     h.update(s.as_bytes());
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    h.finish().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn md5_hex(s: &str) -> String {

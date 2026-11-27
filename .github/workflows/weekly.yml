@@ -105,7 +105,7 @@ jobs:
         # The vendored production tree intentionally omits upstream's large
         # JSON fixture corpus; strict h2spec exercises those wire behaviors.
         run: >-
-          cargo test --manifest-path vendor/h2-0.4.20/Cargo.toml --lib --
+          cargo test --manifest-path vendor/httpd-rs-h2-0.4.20/Cargo.toml --lib --
           --skip hpack::test::fixture
       - name: Unsafe inventory
         run: python3 tests/unsafe_inventory.py

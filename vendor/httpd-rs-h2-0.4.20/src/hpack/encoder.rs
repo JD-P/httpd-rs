@@ -1,3 +1,4 @@
+use crate::tracing;
 use super::table::{Index, Table};
 use super::{huffman, Header};
 

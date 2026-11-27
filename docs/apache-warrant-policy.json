@@ -605,7 +605,7 @@
       "evidence": [
         "tests/protocol_conformance.py",
         "crates/server/src/h2.rs",
-        "vendor/h2-0.4.20/src"
+        "vendor/httpd-rs-h2-0.4.20/src"
       ],
       "families": [
         "protocol-state"

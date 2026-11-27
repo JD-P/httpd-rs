@@ -23,7 +23,6 @@ use regex_automata::{
     util::primitives::NonMaxUsize,
     Input, MatchKind, PatternID,
 };
-use smallvec::SmallVec;
 
 const DEFAULT_PATTERN_LIMIT: usize = 64 * 1024;
 const DEFAULT_SUBJECT_LIMIT: usize = 64 * 1024;
@@ -117,12 +116,8 @@ impl std::error::Error for Error {}
 pub mod bytes {
     use super::*;
 
-    // The common no-explicit-capture case stays inline without making the
-    // by-value `Captures` result expensive to move. Patterns with explicit
-    // groups retain a bounded heap fallback.
-    type CaptureSpans = SmallVec<[Option<(usize, usize)>; 1]>;
-    // Four slots cover group zero plus the synthetic group used for `\K`.
-    type EngineSlots = SmallVec<[Option<NonMaxUsize>; 4]>;
+    type CaptureSpans = Vec<Option<(usize, usize)>>;
+    type EngineSlots = Vec<Option<NonMaxUsize>>;
 
     /// A byte range in a matched subject.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -844,7 +839,7 @@ pub mod bytes {
             subject: &[u8],
             start: usize,
         ) -> Option<EngineSlots> {
-            let mut slots = EngineSlots::from_elem(None, engine.group_info().slot_len());
+            let mut slots = vec![None; engine.group_info().slot_len()];
             engine.search_slots_with(
                 cache,
                 &Input::new(subject).span(start..subject.len()),
@@ -924,7 +919,7 @@ pub mod bytes {
 
         pub fn capture_locations(&self) -> CaptureLocations {
             CaptureLocations {
-                spans: CaptureSpans::from_elem(None, self.captures_len()),
+                spans: vec![None; self.captures_len()],
             }
         }
     }

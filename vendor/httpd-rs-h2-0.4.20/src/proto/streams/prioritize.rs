@@ -1,3 +1,4 @@
+use crate::tracing;
 use super::store::Resolve;
 use super::*;
 
@@ -361,8 +362,8 @@ impl Prioritize {
         let span = tracing::trace_span!("clear_pending_capacity");
         let _e = span.enter();
         while let Some(stream) = self.pending_capacity.pop(store) {
-            counts.transition(stream, |_, stream| {
-                tracing::trace!(?stream.id, "clear_pending_capacity");
+            counts.transition(stream, |_, _stream| {
+                tracing::trace!(?_stream.id, "clear_pending_capacity");
             })
         }
     }
@@ -669,8 +670,8 @@ impl Prioritize {
         let _e = span.enter();
 
         // TODO: make this more efficient?
-        while let Some(frame) = stream.pending_send.pop_front(buffer) {
-            tracing::trace!(?frame, "dropping");
+        while let Some(_frame) = stream.pending_send.pop_front(buffer) {
+            tracing::trace!(?_frame, "dropping");
         }
 
         stream.buffered_send_data = 0;

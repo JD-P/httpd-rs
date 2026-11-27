@@ -6,7 +6,7 @@
       "crates/server/src",
       "crates/pcre2/src",
       "crates/os/src",
-      "vendor/h2-0.4.20/src"
+      "vendor/httpd-rs-h2-0.4.20/src"
     ],
     "excluded_paths": [
       "crates/server/src/whole_request_fuzz.rs"
@@ -119,6 +119,15 @@
       ],
       "evidence": "these helpers are absent from ordinary release builds or consume fixed-size fuzz inputs and closed resource enums; deterministic terminal checks require every synthetic lease to return to zero",
       "verification_targets": ["resource_budget_admit", "slow_output_phase_step", "h2_input_phase_step"]
+    },
+    {
+      "id": "legacy-sha1-fixed-bounds",
+      "disposition": "proved-constant-bound",
+      "paths": [
+        "crates/server/src/legacy_sha1.rs"
+      ],
+      "evidence": "the private Ring SHA-1 compatibility wrapper produces a fixed 20-byte output and is reachable only through callers whose password record, certificate, request target, WebSocket key, expression value, or cache key input is already hard-bounded; its CPU work is linear in those admitted byte ceilings and it allocates no attacker-sized output or retained workspace",
+      "verification_targets": ["dependency_call_admit", "request_resource_effect_closure"]
     }
   ],
   "resources": [

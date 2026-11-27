@@ -39,23 +39,36 @@ def metadata() -> dict[str, object]:
     return json.loads(result.stdout)
 
 
-def production_ids(data: dict[str, object]) -> set[str]:
-    packages = {package["name"]: package["id"] for package in data["packages"]}
-    root = packages.get("httpd-rs")
-    if root is None:
+def production_packages() -> set[tuple[str, str]]:
+    """Return Cargo's feature-resolved normal/build graph for the release target."""
+    result = subprocess.run(
+        [
+            "cargo",
+            "tree",
+            "--locked",
+            "--package",
+            "httpd-rs",
+            "--edges",
+            "normal,build",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--prefix",
+            "none",
+            "--format",
+            "{p}",
+        ],
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    found: set[tuple[str, str]] = set()
+    for line in result.stdout.splitlines():
+        match = re.match(r"^([^ ]+) v([^ ]+)", line)
+        if match is not None:
+            found.add((match.group(1), match.group(2)))
+    if not any(name == "httpd-rs" for name, _ in found):
         raise SystemExit("dependency-unsafe: httpd-rs package is missing")
-    nodes = {node["id"]: node for node in data["resolve"]["nodes"]}
-    found: set[str] = set()
-    pending = [root]
-    while pending:
-        package_id = pending.pop()
-        if package_id in found:
-            continue
-        found.add(package_id)
-        for dependency in nodes[package_id]["deps"]:
-            kinds = dependency.get("dep_kinds", [])
-            if any(kind.get("kind") != "dev" for kind in kinds):
-                pending.append(dependency["pkg"])
     return found
 
 
@@ -112,14 +125,15 @@ def inspect(package: dict[str, object]) -> dict[str, object]:
 
 def inventory() -> dict[str, object]:
     data = metadata()
-    production = production_ids(data)
+    production = production_packages()
     workspace = set(data["workspace_members"])
     packages: dict[str, dict[str, object]] = {}
     for package in data["packages"]:
-        if package["id"] not in production or package["id"] in workspace:
+        key = (package["name"], package["version"])
+        if key not in production or package["id"] in workspace:
             continue
-        key = f"{package['name']}@{package['version']}"
-        packages[key] = inspect(package)
+        package_key = f"{package['name']}@{package['version']}"
+        packages[package_key] = inspect(package)
     packages = dict(sorted(packages.items()))
     return {
         "schema": 1,

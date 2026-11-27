@@ -204,7 +204,7 @@ def verify_compile_guards() -> None:
     for manifest in (
         ROOT / "crates/pcre2/Cargo.toml",
         ROOT / "crates/verified/Cargo.toml",
-        ROOT / "vendor/h2-0.4.20/Cargo.toml",
+        ROOT / "vendor/httpd-rs-h2-0.4.20/Cargo.toml",
     ):
         text = manifest.read_text(encoding="utf-8")
         if "unsafe_code" not in text or "forbid" not in text:

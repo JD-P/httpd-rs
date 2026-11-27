@@ -6,8 +6,8 @@
 //! common HTTP responder case synchronously at startup; failures are soft
 //! (the certificate is still served) unless the caller decides otherwise.
 
+use crate::legacy_sha1::{digest as sha1_digest, Context as Sha1Context};
 use rustls::pki_types::{CertificateDer, UnixTime};
-use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -384,12 +384,12 @@ fn parse_cert(der_bytes: &[u8]) -> Option<CertInfo> {
 }
 
 fn build_request(leaf: &CertInfo, issuer: &CertInfo) -> Option<Vec<u8>> {
-    let mut name_hasher = Sha1::new();
+    let mut name_hasher = Sha1Context::new();
     name_hasher.update(&issuer.subject_name);
-    let name_hash = name_hasher.finalize();
-    let mut key_hasher = Sha1::new();
+    let name_hash = name_hasher.finish();
+    let mut key_hasher = Sha1Context::new();
     key_hasher.update(&issuer.issuer_key);
-    let key_hash = key_hasher.finalize();
+    let key_hash = key_hasher.finish();
     let sha1_oid = [0x2b, 0x0e, 0x03, 0x02, 0x1a];
     let alg = der(0x30, &[der(0x06, &sha1_oid), der(0x05, &[])].concat());
     let cert_id = der(
@@ -873,8 +873,8 @@ fn cert_id_matches(data: &[u8], cert_id: Tlv, leaf: &CertInfo, issuer: &CertInfo
     {
         return None;
     }
-    let expected_name = Sha1::digest(&issuer.subject_name);
-    let expected_key = Sha1::digest(&issuer.issuer_key);
+    let expected_name = sha1_digest(&issuer.subject_name);
+    let expected_key = sha1_digest(&issuer.issuer_key);
     Some(
         &data[issuer_name_hash.content_start..issuer_name_hash.content_end]
             == expected_name.as_slice()
@@ -964,12 +964,12 @@ fn responder_matches(data: &[u8], responder: Tlv, signer: &CertInfo) -> bool {
             key_hash.tag == 0x04
                 && key_hash.end == responder.content_end
                 && &data[key_hash.content_start..key_hash.content_end]
-                    == Sha1::digest(&signer.issuer_key).as_slice()
+                    == sha1_digest(&signer.issuer_key).as_slice()
         }),
         // Accept the IMPLICIT form emitted by older responders as well.
         0x82 => {
             &data[responder.content_start..responder.content_end]
-                == Sha1::digest(&signer.issuer_key).as_slice()
+                == sha1_digest(&signer.issuer_key).as_slice()
         }
         _ => false,
     }
@@ -1223,8 +1223,8 @@ pub(crate) fn test_valid_response(
         0x30,
         &[
             sha1_algorithm,
-            der(0x04, Sha1::digest(&issuer.subject_name).as_slice()),
-            der(0x04, Sha1::digest(&issuer.issuer_key).as_slice()),
+            der(0x04, sha1_digest(&issuer.subject_name).as_slice()),
+            der(0x04, sha1_digest(&issuer.issuer_key).as_slice()),
             leaf.serial,
         ]
         .concat(),
@@ -1413,10 +1413,10 @@ pub fn cache_path(
     force_url: Option<&str>,
 ) -> std::path::PathBuf {
     let key = response_key(chain, force_url);
-    let mut hasher = Sha1::new();
+    let mut hasher = Sha1Context::new();
     hasher.update(&key);
     let digest: String = hasher
-        .finalize()
+        .finish()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
@@ -1883,8 +1883,8 @@ mod tests {
                     0x30,
                     &[der(0x06, &[0x2b, 0x0e, 0x03, 0x02, 0x1a]), der(0x05, &[])].concat(),
                 ),
-                der(0x04, Sha1::digest(&issuer.subject_name).as_slice()),
-                der(0x04, Sha1::digest(&issuer.issuer_key).as_slice()),
+                der(0x04, sha1_digest(&issuer.subject_name).as_slice()),
+                der(0x04, sha1_digest(&issuer.issuer_key).as_slice()),
                 leaf.serial.clone(),
             ]
             .concat(),

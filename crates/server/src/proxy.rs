@@ -10,6 +10,7 @@ use crate::config::{
     Balancer, BalancerMember, Config, HealthTemplate, ProxyReverseRule, Scope, VHost,
 };
 use crate::http::{Body, Request, Response, Version};
+use crate::legacy_sha1::Context as Sha1Context;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -20,7 +21,6 @@ use rustls::{
     ClientConnection, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
     StreamOwned,
 };
-use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -1839,10 +1839,10 @@ fn websocket_accept(key: &str) -> Option<String> {
         return None;
     }
     // RFC 6455 hashes the base64 text of the client key, not its decoded bytes.
-    let mut hasher = Sha1::new();
+    let mut hasher = Sha1Context::new();
     hasher.update(key.as_bytes());
     hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    Some(STANDARD.encode(hasher.finalize()))
+    Some(STANDARD.encode(hasher.finish()))
 }
 
 struct AsyncResponseHead {
@@ -8450,9 +8450,9 @@ mod coverage_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let password = dir.join("htpasswd");
-        let mut hasher = Sha1::new();
+        let mut hasher = Sha1Context::new();
         hasher.update(b"secret");
-        let digest = STANDARD.encode(hasher.finalize());
+        let digest = STANDARD.encode(hasher.finish());
         std::fs::write(&password, format!("alice:{{SHA}}{digest}\n")).unwrap();
         let port = 9;
         let config_path = dir.join("httpd.conf");
@@ -8618,9 +8618,9 @@ mod coverage_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let password = dir.join("htpasswd");
-        let mut hasher = Sha1::new();
+        let mut hasher = Sha1Context::new();
         hasher.update(b"secret");
-        let digest = STANDARD.encode(hasher.finalize());
+        let digest = STANDARD.encode(hasher.finish());
         std::fs::write(&password, format!("alice:{{SHA}}{digest}\n")).unwrap();
 
         let dead = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -1,3 +1,4 @@
+use crate::tracing;
 use super::*;
 use std::collections::VecDeque;
 
@@ -259,10 +260,6 @@ impl Counts {
         self.num_local_error_reset_streams += 1;
     }
 
-    pub(crate) fn max_local_error_resets(&self) -> Option<usize> {
-        self.max_local_error_reset_streams
-    }
-
     /// Returns true if the receive stream concurrency can be incremented
     pub fn can_inc_num_recv_streams(&self) -> bool {
         self.max_recv_streams > self.num_recv_streams
@@ -315,10 +312,6 @@ impl Counts {
         assert!(self.can_inc_num_reset_streams());
 
         self.num_local_reset_streams += 1;
-    }
-
-    pub(crate) fn max_remote_reset_streams(&self) -> usize {
-        self.max_remote_reset_streams
     }
 
     /// Returns true if the number of pending REMOTE reset streams can be

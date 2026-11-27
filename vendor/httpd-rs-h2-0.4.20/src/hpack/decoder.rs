@@ -1,3 +1,4 @@
+use crate::tracing;
 use super::{header::BytesStr, huffman, Header};
 use crate::frame;
 
@@ -462,6 +463,7 @@ impl Table {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn size(&self) -> usize {
         self.size
     }

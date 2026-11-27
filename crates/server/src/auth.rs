@@ -8,10 +8,10 @@
 use crate::access::Identity;
 use crate::config::Scope;
 use crate::http::Request;
+use crate::legacy_sha1::{digest as sha1_digest, Context as Sha1Context};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
-use md5::Md5;
-use sha1::{Digest, Sha1};
+use md5::{Digest as _, Md5};
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -268,13 +268,13 @@ impl PasswordVerifier {
         PASSWORD_VERIFY_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
         match self {
             Self::Sha(expected) => {
-                bool::from(Sha1::digest(password).as_slice().ct_eq(expected.as_slice()))
+                bool::from(sha1_digest(password).as_slice().ct_eq(expected.as_slice()))
             }
             Self::SaltedSha { digest, salt } => {
-                let mut h = Sha1::new();
+                let mut h = Sha1Context::new();
                 h.update(password);
                 h.update(salt);
-                bool::from(h.finalize().as_slice().ct_eq(digest.as_slice()))
+                bool::from(h.finish().as_slice().ct_eq(digest.as_slice()))
             }
             Self::Md5Crypt {
                 stored,
@@ -1173,7 +1173,7 @@ mod tests {
             "{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g="
         ));
         // Salted SHA variant: 20-byte digest followed by "salt".
-        let mut raw = Sha1::digest(b"passwordsalt").to_vec();
+        let mut raw = sha1_digest(b"passwordsalt").to_vec();
         raw.extend_from_slice(b"salt");
         let encoded = STANDARD.encode(raw);
         assert!(verify_password(b"password", &format!("{{SSHA}}{encoded}")));
@@ -1183,7 +1183,7 @@ mod tests {
     #[test]
     fn ssha_salt_is_bounded_before_request_reachability() {
         fn record(password: &[u8], salt: &[u8]) -> String {
-            let mut raw = Sha1::digest([password, salt].concat()).to_vec();
+            let mut raw = sha1_digest([password, salt].concat()).to_vec();
             raw.extend_from_slice(salt);
             format!("{{SSHA}}{}", STANDARD.encode(raw))
         }

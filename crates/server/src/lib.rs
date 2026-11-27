@@ -50,6 +50,7 @@ pub mod h2;
 pub mod htaccess;
 pub mod http;
 pub mod http_fields;
+mod legacy_sha1;
 pub mod log;
 pub mod ocsp;
 pub mod policy_ref;

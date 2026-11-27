@@ -1,3 +1,4 @@
+use crate::tracing;
 use std::fmt;
 use std::io;
 
@@ -221,9 +222,9 @@ impl State {
                     HalfClosedLocal(Streaming)
                 }
             }
-            ref state => {
+            ref _state => {
                 // All other transitions result in a protocol error
-                proto_err!(conn: "recv_open: in unexpected state {:?}", state);
+                proto_err!(conn: "recv_open: in unexpected state {:?}", _state);
                 return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
             }
         };
@@ -238,8 +239,8 @@ impl State {
                 self.inner = ReservedRemote;
                 Ok(())
             }
-            ref state => {
-                proto_err!(conn: "reserve_remote: in unexpected state {:?}", state);
+            ref _state => {
+                proto_err!(conn: "reserve_remote: in unexpected state {:?}", _state);
                 Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
             }
         }
@@ -270,8 +271,8 @@ impl State {
                 self.inner = Closed(Cause::EndStream);
                 Ok(())
             }
-            ref state => {
-                proto_err!(conn: "recv_close: in unexpected state {:?}", state);
+            ref _state => {
+                proto_err!(conn: "recv_close: in unexpected state {:?}", _state);
                 Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
             }
         }
@@ -282,7 +283,7 @@ impl State {
     /// # Arguments
     /// - `frame`: the received RST_STREAM frame.
     /// - `queued`: true if this stream has frames in the pending send queue.
-    pub fn recv_reset(&mut self, frame: frame::Reset, queued: bool) {
+    pub fn recv_reset(&mut self, frame: frame::Reset, _queued: bool) {
         let recv_end_stream = self.is_recv_end_stream();
         match self.inner {
             // A notionally `Closed` stream may still have queued frames in
@@ -303,12 +304,12 @@ impl State {
             // 9113 gives later non-PRIORITY frames stream-local STREAM_CLOSED
             // semantics specifically *after receiving* RST_STREAM, so losing
             // this cause changes the required error scope.
-            ref state => {
+            ref _state => {
                 tracing::trace!(
                     "recv_reset; frame={:?}; state={:?}; queued={:?}",
                     frame,
-                    state,
-                    queued
+                    _state,
+                    _queued
                 );
                 let error = Error::remote_reset(frame.stream_id(), frame.reason());
                 // Preserve the received EOS while retaining the reset for the send half.
@@ -335,8 +336,8 @@ impl State {
     pub fn recv_eof(&mut self) {
         match self.inner {
             Closed(..) => {}
-            ref state => {
-                tracing::trace!("recv_eof; state={:?}", state);
+            ref _state => {
+                tracing::trace!("recv_eof; state={:?}", _state);
                 self.inner = Closed(Cause::Error(
                     io::Error::new(
                         io::ErrorKind::BrokenPipe,

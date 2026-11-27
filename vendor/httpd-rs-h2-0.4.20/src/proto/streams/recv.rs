@@ -1,3 +1,4 @@
+use crate::tracing;
 use super::*;
 use crate::codec::UserError;
 use crate::frame::{PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
@@ -864,10 +865,10 @@ impl Recv {
                     req.method(),
                     promised_id,
                 ),
-                InvalidContentLength(e) => proto_err!(
+                InvalidContentLength(_e) => proto_err!(
                     stream:
                     "recv_push_promise; promised request has invalid content-length {:?}; promised_id={:?}",
-                    e,
+                    _e,
                     promised_id,
                 ),
             }
@@ -1092,8 +1093,8 @@ impl Recv {
 
     fn clear_stream_window_update_queue(&mut self, store: &mut Store, counts: &mut Counts) {
         while let Some(stream) = self.pending_window_updates.pop(store) {
-            counts.transition(stream, |_, stream| {
-                tracing::trace!("clear_stream_window_update_queue; stream={:?}", stream.id);
+            counts.transition(stream, |_, _stream| {
+                tracing::trace!("clear_stream_window_update_queue; stream={:?}", _stream.id);
             })
         }
     }

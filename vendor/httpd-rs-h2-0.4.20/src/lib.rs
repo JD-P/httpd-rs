@@ -88,6 +88,45 @@
 // uncomment me to run benchmarks
 //#![cfg_attr(test, feature(test))]
 #![cfg_attr(test, deny(warnings))]
+// httpd-rs does not install a tracing subscriber. Keep the fork's existing
+// diagnostic call sites as compile-time no-ops without retaining tracing and
+// tracing-core in the production dependency graph.
+mod tracing {
+    macro_rules! event {
+        ($($arg:tt)*) => {
+            ()
+        };
+    }
+
+    macro_rules! span {
+        ($($arg:tt)*) => {
+            $crate::tracing::Span
+        };
+    }
+
+    pub(crate) use event as debug;
+    pub(crate) use event as trace;
+    pub(crate) use event as warn;
+    pub(crate) use span as debug_span;
+    pub(crate) use span as trace_span;
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Span;
+
+    impl Span {
+        pub(crate) fn current() -> Self {
+            Self
+        }
+
+        pub(crate) fn enter(&self) {}
+
+        pub(crate) fn follows_from(&self, _from: Self) {}
+
+        pub(crate) fn in_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+            operation()
+        }
+    }
+}
 
 macro_rules! proto_err {
     (conn: $($msg:tt)+) => {

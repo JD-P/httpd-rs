@@ -136,6 +136,7 @@
 //! [`Error`]: ../struct.Error.html
 
 use crate::codec::{Codec, SendError, UserError};
+use crate::tracing;
 use crate::ext::Protocol;
 use crate::frame::{Headers, Pseudo, Reason, Settings, StreamId};
 use crate::proto::{self, Error};
@@ -149,7 +150,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tracing::Instrument;
 
 /// Initializes new HTTP/2 streams on a connection by sending a request.
 ///
@@ -1307,10 +1307,7 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let builder = Builder::new();
-    builder
-        .handshake(io)
-        .instrument(tracing::trace_span!("client_handshake"))
-        .await
+    builder.handshake(io).await
 }
 
 // ===== impl Connection =====
@@ -1705,8 +1702,6 @@ impl Peer {
 
 impl proto::Peer for Peer {
     type Poll = Response<()>;
-
-    const NAME: &'static str = "Client";
 
     fn r#dyn() -> proto::DynPeer {
         proto::DynPeer::Client

@@ -12457,14 +12457,14 @@ mod tests {
 
     #[test]
     fn dispatch_returns_authenticated_identity_for_access_logging() {
+        use crate::legacy_sha1::Context as Sha1Context;
         use base64::Engine as _;
-        use sha1::{Digest, Sha1};
 
         let dir = cov_dir("access-log-identity");
         std::fs::write(dir.join("www/file.txt"), "ok\n").unwrap();
-        let mut hasher = Sha1::new();
+        let mut hasher = Sha1Context::new();
         hasher.update(b"secret");
-        let digest = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let digest = base64::engine::general_purpose::STANDARD.encode(hasher.finish());
         let htpasswd = dir.join(".htpasswd");
         std::fs::write(&htpasswd, format!("alice:{{SHA}}{digest}\n")).unwrap();
         let cfg = cov_config(
@@ -14203,14 +14203,14 @@ mod tests {
 
     #[test]
     fn coverage_run_fastcgi_pathinfo_and_auth() {
+        use crate::legacy_sha1::Context as Sha1Context;
         use base64::Engine as _;
-        use sha1::{Digest, Sha1};
         let dir = cov_dir("fastcgi-direct");
         let script = dir.join("www/script.php");
         std::fs::write(&script, "<?php\n").unwrap();
-        let mut hasher = Sha1::new();
+        let mut hasher = Sha1Context::new();
         hasher.update(b"secret");
-        let digest = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let digest = base64::engine::general_purpose::STANDARD.encode(hasher.finish());
         let htpasswd = dir.join(".htpasswd");
         std::fs::write(&htpasswd, format!("alice:{{SHA}}{digest}\n")).unwrap();
         let cfg = cov_config(

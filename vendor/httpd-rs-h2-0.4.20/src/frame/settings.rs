@@ -1,3 +1,4 @@
+use crate::tracing;
 use std::fmt;
 
 use crate::frame::{util, Error, Frame, FrameSize, Head, Kind, StreamId};
