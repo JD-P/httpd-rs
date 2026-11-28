@@ -359,6 +359,12 @@ pub struct RequestPlan {
     preopened_target: Option<PreopenedTarget>,
     precomputed_scope: Option<EvaluatedScope>,
     skip_url_translation: bool,
+    /// URL/vhost/route/mapping provenance returned atomically with `root` and
+    /// `rel`. This is private so no consumer can pair plan fields with a
+    /// separately reconstructed winner.
+    provenance: crate::server::MappingProvenance,
+    /// Executable Verus certificate for the complete construction chain.
+    construction: httpd_rs_verified::RequestPlanConstructionState,
 }
 
 #[derive(Debug, Clone)]
@@ -389,9 +395,9 @@ impl RequestPlan {
         vhost: Option<&VHost>,
         target: CanonicalTarget,
     ) -> Result<Self, PlanError> {
-        let (root, rel, script_alias) =
-            crate::server::map_path(cfg, vhost, &target.norm).ok_or(PlanError::Unmapped)?;
-        Self::build(cfg, vhost, target, root, rel, script_alias, None)
+        let mapped = crate::server::map_path_with_provenance(cfg, vhost, &target.norm)
+            .ok_or(PlanError::Unmapped)?;
+        Self::build(cfg, vhost, target, mapped, None)
     }
 
     pub fn resolve_for_request(
@@ -400,9 +406,9 @@ impl RequestPlan {
         target: CanonicalTarget,
         req: &Request,
     ) -> Result<Self, PlanError> {
-        let (root, rel, script_alias) =
-            crate::server::map_path(cfg, vhost, &target.norm).ok_or(PlanError::Unmapped)?;
-        Self::build(cfg, vhost, target, root, rel, script_alias, Some(req))
+        let mapped = crate::server::map_path_with_provenance(cfg, vhost, &target.norm)
+            .ok_or(PlanError::Unmapped)?;
+        Self::build(cfg, vhost, target, mapped, Some(req))
     }
 
     /// Build a plan for an explicit filesystem target that may differ from
@@ -413,9 +419,8 @@ impl RequestPlan {
         target: CanonicalTarget,
         root: PathBuf,
         fs_path: PathBuf,
-        script_alias: bool,
     ) -> Result<Self, PlanError> {
-        Self::from_fs_target_inner(cfg, vhost, target, root, fs_path, script_alias, None)
+        Self::from_fs_target_inner(cfg, vhost, target, root, fs_path, None)
     }
 
     pub fn from_fs_target_for_request(
@@ -424,10 +429,9 @@ impl RequestPlan {
         target: CanonicalTarget,
         root: PathBuf,
         fs_path: PathBuf,
-        script_alias: bool,
         req: &Request,
     ) -> Result<Self, PlanError> {
-        Self::from_fs_target_inner(cfg, vhost, target, root, fs_path, script_alias, Some(req))
+        Self::from_fs_target_inner(cfg, vhost, target, root, fs_path, Some(req))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -437,9 +441,19 @@ impl RequestPlan {
         target: CanonicalTarget,
         root: PathBuf,
         fs_path: PathBuf,
-        script_alias: bool,
         req: Option<&Request>,
     ) -> Result<Self, PlanError> {
+        // An explicit/canonical filesystem target must inherit the URL
+        // mapping provenance for this exact canonical target. Bare caller
+        // roots are accepted only when they equal that winner; this closes
+        // the old constructor hole where a caller could self-assert an alias
+        // root. The ScriptAlias class is no longer a constructor argument at
+        // all and comes only from this selected mapping.
+        let mapped = crate::server::map_path_with_provenance(cfg, vhost, &target.norm)
+            .ok_or(PlanError::Unmapped)?;
+        if mapped.root != root {
+            return Err(PlanError::Unmapped);
+        }
         let rel = fs_path
             .strip_prefix(&root)
             .map(Path::to_path_buf)
@@ -462,20 +476,46 @@ impl RequestPlan {
                         .unwrap_or_default(),
                 )
             });
-        Self::build_with_fs_path(cfg, vhost, target, root, rel, fs_path, script_alias, req)
+        Self::build_with_fs_path(
+            cfg,
+            vhost,
+            target,
+            root,
+            rel,
+            fs_path,
+            mapped.script_alias,
+            mapped.provenance,
+            true,
+            req,
+        )
     }
 
     fn build(
         cfg: &Config,
         vhost: Option<&VHost>,
         target: CanonicalTarget,
-        root: PathBuf,
-        rel: PathBuf,
-        script_alias: bool,
+        mapped: crate::server::MappedPath,
         req: Option<&Request>,
     ) -> Result<Self, PlanError> {
+        let crate::server::MappedPath {
+            root,
+            rel,
+            script_alias,
+            provenance,
+        } = mapped;
         let fs_path = root.join(&rel);
-        Self::build_with_fs_path(cfg, vhost, target, root, rel, fs_path, script_alias, req)
+        Self::build_with_fs_path(
+            cfg,
+            vhost,
+            target,
+            root,
+            rel,
+            fs_path,
+            script_alias,
+            provenance,
+            false,
+            req,
+        )
     }
 
     /// Build a plan around one explicit filesystem target.  The target path,
@@ -490,6 +530,8 @@ impl RequestPlan {
         rel: PathBuf,
         fs_path: PathBuf,
         script_alias: bool,
+        provenance: crate::server::MappingProvenance,
+        explicit_target: bool,
         req: Option<&Request>,
     ) -> Result<Self, PlanError> {
         // Enforce this before checking whether `.htaccess` happens to apply.
@@ -566,6 +608,19 @@ impl RequestPlan {
             )));
             // coverage:ignore-stop
         }
+        let construction = Self::construction_certificate(
+            cfg,
+            provenance,
+            explicit_target,
+            textual_identity,
+            layers_match_target,
+        )
+        .ok_or_else(|| {
+            PlanError::AccessFiles(format!(
+                "{}: request-plan construction refinement failed",
+                fs_path.display()
+            ))
+        })?;
         Ok(Self {
             target,
             root,
@@ -577,7 +632,60 @@ impl RequestPlan {
             preopened_target: None,
             precomputed_scope: None,
             skip_url_translation: false,
+            provenance,
+            construction,
         })
+    }
+
+    fn construction_certificate(
+        cfg: &Config,
+        provenance: crate::server::MappingProvenance,
+        explicit_target: bool,
+        textual_identity: bool,
+        layers_match_target: bool,
+    ) -> Option<httpd_rs_verified::RequestPlanConstructionState> {
+        let mut state = httpd_rs_verified::request_plan_construction_start(
+            provenance.source,
+            cfg.authorization_generation().identity(),
+            true,
+            cfg.route_program.is_refined(),
+        )?;
+        state = httpd_rs_verified::request_plan_bind_vhost(state, provenance.vhost_slot, true)?;
+        state = httpd_rs_verified::request_plan_bind_mapping(
+            state,
+            provenance.route_slot,
+            provenance.mapping_slot,
+            provenance.mapping_kind,
+            provenance.mapping_scan,
+            true,
+            true,
+        )?;
+        state = httpd_rs_verified::request_plan_bind_root(state, true, false)?;
+        state = httpd_rs_verified::request_plan_bind_target(
+            state,
+            explicit_target,
+            !explicit_target,
+            explicit_target,
+        )?;
+        state = httpd_rs_verified::request_plan_bind_access_walk(
+            state,
+            true,
+            true,
+            layers_match_target,
+        )?;
+        httpd_rs_verified::request_plan_construction_seal(state, textual_identity)
+    }
+
+    pub(crate) fn admits_consumer(
+        &self,
+        cfg: &Config,
+        consumer: httpd_rs_verified::RequestPlanConsumer,
+    ) -> bool {
+        httpd_rs_verified::request_plan_consumer_admit(
+            self.construction,
+            cfg.authorization_generation().identity(),
+            consumer,
+        )
     }
 
     pub fn target(&self) -> &CanonicalTarget {
@@ -624,6 +732,9 @@ impl RequestPlan {
         preopened_target: Option<(File, Metadata, bool, bool)>,
         reusable_scope: Option<Scope>,
     ) -> Option<Self> {
+        if !self.admits_consumer(cfg, httpd_rs_verified::RequestPlanConsumer::Authorization) {
+            return None;
+        }
         let parent_url = self.target.url_path.trim_end_matches('/');
         let child_url = target.url_path.as_str();
         let child_name = child_url.strip_prefix(parent_url)?.strip_prefix('/')?;
@@ -640,9 +751,11 @@ impl RequestPlan {
         // is lexically below the directory URL. Reuse is valid only when the
         // normal URL mapper selects the exact same root, relative target and
         // execution class as the descriptor selected by mod_dir semantics.
-        let (mapped_root, mapped_rel, mapped_script_alias) =
-            crate::server::map_path(cfg, vhost, &target.norm)?;
-        if mapped_root != self.root || mapped_rel != rel || mapped_script_alias != self.script_alias
+        let mapped = crate::server::map_path_with_provenance(cfg, vhost, &target.norm)?;
+        if mapped.root != self.root
+            || mapped.rel != rel
+            || mapped.script_alias != self.script_alias
+            || mapped.provenance != self.provenance
         {
             return None;
         }
@@ -662,6 +775,18 @@ impl RequestPlan {
             });
         let skip_url_translation =
             precomputed_scope.is_some() && !cfg.url_translation_may_terminate(vhost, child_url);
+        let construction = httpd_rs_verified::request_plan_retarget(
+            self.construction,
+            true,
+            mapped.provenance == self.provenance,
+            mapped.root == self.root,
+            true,
+            identities_match,
+            self.root.to_str().is_some()
+                && rel.to_str().is_some()
+                && fs_path.to_str().is_some()
+                && std::str::from_utf8(&target.norm).is_ok(),
+        )?;
         Some(Self {
             target,
             root: self.root.clone(),
@@ -684,6 +809,8 @@ impl RequestPlan {
             ),
             precomputed_scope,
             skip_url_translation,
+            provenance: mapped.provenance,
+            construction,
         })
     }
 
@@ -702,8 +829,17 @@ impl RequestPlan {
         vhost: Option<&VHost>,
         target: CanonicalTarget,
     ) -> Option<Self> {
-        let (root, rel, script_alias) = crate::server::map_path(cfg, vhost, &target.norm)?;
-        if root != self.root || script_alias != self.script_alias {
+        if !self.admits_consumer(cfg, httpd_rs_verified::RequestPlanConsumer::Rewrite) {
+            return None;
+        }
+        let mapped = crate::server::map_path_with_provenance(cfg, vhost, &target.norm)?;
+        let root = mapped.root;
+        let rel = mapped.rel;
+        let script_alias = mapped.script_alias;
+        if root != self.root
+            || script_alias != self.script_alias
+            || mapped.provenance != self.provenance
+        {
             return None;
         }
         let fs_path = root.join(&rel);
@@ -727,6 +863,15 @@ impl RequestPlan {
         if !identities_match {
             return None;
         }
+        let construction = httpd_rs_verified::request_plan_retarget(
+            self.construction,
+            true,
+            mapped.provenance == self.provenance,
+            root == self.root,
+            source_walk_dir == target_walk_dir,
+            identities_match,
+            root.to_str().is_some() && rel.to_str().is_some() && fs_path.to_str().is_some(),
+        )?;
         Some(Self {
             target,
             root,
@@ -738,6 +883,8 @@ impl RequestPlan {
             preopened_target: None,
             precomputed_scope: None,
             skip_url_translation: false,
+            provenance: mapped.provenance,
+            construction,
         })
     }
 
@@ -822,6 +969,15 @@ impl RequestPlan {
         req: &Request,
         peer: std::net::IpAddr,
     ) -> EvaluatedScope {
+        if !self.admits_consumer(cfg, httpd_rs_verified::RequestPlanConsumer::Authorization) {
+            let mut scope = Scope::default();
+            scope.conditional_error = true;
+            return EvaluatedScope {
+                scope,
+                config_conditionals: Arc::new(Vec::new()),
+                access_conditionals: Arc::new(Vec::new()),
+            };
+        }
         // A nonempty layer set already proves that access files apply.  Never
         // fall back to the configuration-only path merely because the target
         // path is outside the lexical `AllowOverride` prefix (F59/I60).
@@ -870,6 +1026,9 @@ impl RequestPlan {
         req: &Request,
         peer: std::net::IpAddr,
     ) -> EvaluatedScope {
+        if !self.admits_consumer(cfg, httpd_rs_verified::RequestPlanConsumer::Authorization) {
+            return self.evaluate_scope(cfg, vhost, req, peer);
+        }
         self.precomputed_scope
             .take()
             .unwrap_or_else(|| self.evaluate_scope(cfg, vhost, req, peer))
@@ -887,6 +1046,15 @@ impl RequestPlan {
         peer: std::net::IpAddr,
         file_name: &str,
     ) -> EvaluatedScope {
+        if !self.admits_consumer(cfg, httpd_rs_verified::RequestPlanConsumer::Authorization) {
+            let mut scope = Scope::default();
+            scope.conditional_error = true;
+            return EvaluatedScope {
+                scope,
+                config_conditionals: Arc::new(Vec::new()),
+                access_conditionals: Arc::new(Vec::new()),
+            };
+        }
         let (scope, config_conditionals, access_conditionals) =
             crate::policy_ref::effective_scope_with_layers_and_file_name(
                 cfg,
@@ -1125,7 +1293,96 @@ mod tests {
     }
 
     #[test]
+    fn construction_certificate_binds_first_mapping_and_generation() {
+        let cfg = load_config(
+            "Listen 127.0.0.1:0\n\
+             DocumentRoot /srv/default\n\
+             Alias /pub /srv/first\n\
+             Alias /pub/private /srv/second\n\
+             ScriptAlias /run /srv/cgi\n",
+        );
+        let plan = RequestPlan::resolve(
+            &cfg,
+            None,
+            CanonicalTarget::from_url_path("/pub/private/wallet.dat").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plan.root(), Path::new("/srv/first"));
+        assert_eq!(plan.rel(), Path::new("private/wallet.dat"));
+        assert_eq!(plan.provenance.mapping_slot, 1);
+        assert_eq!(plan.provenance.mapping_scan.winner, 0);
+        assert_eq!(plan.provenance.mapping_scan.examined, 1);
+        assert_eq!(
+            plan.construction.phase,
+            httpd_rs_verified::RequestPlanConstructionPhase::Complete
+        );
+        for consumer in [
+            httpd_rs_verified::RequestPlanConsumer::Authorization,
+            httpd_rs_verified::RequestPlanConsumer::Cache,
+            httpd_rs_verified::RequestPlanConsumer::Rewrite,
+            httpd_rs_verified::RequestPlanConsumer::Sink,
+        ] {
+            assert!(plan.admits_consumer(&cfg, consumer));
+        }
+
+        let next_generation = load_config(
+            "Listen 127.0.0.1:0\n\
+             DocumentRoot /srv/default\n\
+             Alias /pub /srv/first\n\
+             Alias /pub/private /srv/second\n",
+        );
+        assert!(!plan.admits_consumer(
+            &next_generation,
+            httpd_rs_verified::RequestPlanConsumer::Authorization,
+        ));
+
+        let script_plan = RequestPlan::from_fs_target(
+            &cfg,
+            None,
+            CanonicalTarget::from_url_path("/run/task.cgi").unwrap(),
+            PathBuf::from("/srv/cgi"),
+            PathBuf::from("/srv/cgi/task.cgi"),
+        )
+        .unwrap();
+        assert!(script_plan.script_alias());
+        assert_eq!(script_plan.provenance.mapping_slot, 3);
+    }
+
+    #[test]
+    fn construction_certificate_binds_nginx_location_winner() {
+        let cfg = load_nginx_config(
+            "events { worker_connections 64; }\n\
+             http { server { listen 127.0.0.1:18080; server_name plan.test;\n\
+               root /srv/default;\n\
+               location = /exact { root /srv/exact; }\n\
+               location ^~ /assets/ { root /srv/assets; }\n\
+               location ~ '[.]php$' { root /srv/php; }\n\
+             } }\n",
+        );
+        let vhost = &cfg.vhosts[0];
+        let target = CanonicalTarget::from_url_path("/assets/app.js").unwrap();
+        let expected_route = cfg
+            .route_program
+            .select_with_identity(0, target.url_path.as_str())
+            .unwrap()
+            .1 as u64
+            + 1;
+        let plan = RequestPlan::resolve(&cfg, Some(vhost), target).unwrap();
+        assert_eq!(plan.root(), Path::new("/srv/assets"));
+        assert_eq!(plan.rel(), Path::new("assets/app.js"));
+        assert_eq!(
+            plan.provenance.source,
+            httpd_rs_verified::ConfigIrSource::Nginx
+        );
+        assert_eq!(plan.provenance.vhost_slot, 1);
+        assert_eq!(plan.provenance.route_slot, expected_route);
+        assert_ne!(plan.provenance.route_slot, 0);
+        assert!(plan.admits_consumer(&cfg, httpd_rs_verified::RequestPlanConsumer::Authorization,));
+    }
+
+    #[test]
     fn directory_index_retargets_same_directory_access_snapshot() {
+        let cfg = load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n");
         let root = PathBuf::from("/srv/www");
         let layer = AccessLayer {
             identity: LayerIdentity::new(&root, &root, &root, "/"),
@@ -1133,19 +1390,10 @@ mod tests {
             files: Vec::new(),
             conditionals: Vec::new(),
         };
-        let plan = RequestPlan {
-            target: CanonicalTarget::from_url_path("/").unwrap(),
-            root: root.clone(),
-            rel: PathBuf::new(),
-            fs_path: root.clone(),
-            script_alias: false,
-            layers: vec![layer],
-            access_may_apply: true,
-            preopened_target: None,
-            precomputed_scope: None,
-            skip_url_translation: false,
-        };
-        let cfg = load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n");
+        let mut plan =
+            RequestPlan::resolve(&cfg, None, CanonicalTarget::from_url_path("/").unwrap()).unwrap();
+        plan.layers = vec![layer];
+        plan.access_may_apply = true;
         let reusable = Scope::default();
         let index = plan
             .retarget_directory_index(
@@ -1159,6 +1407,10 @@ mod tests {
         assert_eq!(index.rel(), Path::new("index.html"));
         assert_eq!(index.fs_path(), Path::new("/srv/www/index.html"));
         assert_eq!(index.url_path(), "/index.html");
+        assert_eq!(
+            index.construction.target_revision,
+            plan.construction.target_revision + 1
+        );
         assert!(Arc::ptr_eq(&plan.layers[0].scope, &index.layers[0].scope));
         assert!(index.precomputed_scope.is_some());
         assert!(index.skips_url_translation());
@@ -1214,6 +1466,7 @@ mod tests {
 
     #[test]
     fn rewrite_retargets_same_directory_access_snapshot() {
+        let cfg = load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n");
         let root = PathBuf::from("/srv/www");
         let source_path = root.join("dir/old.html");
         let layer = AccessLayer {
@@ -1222,19 +1475,15 @@ mod tests {
             files: Vec::new(),
             conditionals: Vec::new(),
         };
-        let plan = RequestPlan {
-            target: CanonicalTarget::from_url_path("/dir/old.html").unwrap(),
-            root: root.clone(),
-            rel: PathBuf::from("dir/old.html"),
-            fs_path: source_path,
-            script_alias: false,
-            layers: vec![layer],
-            access_may_apply: true,
-            preopened_target: None,
-            precomputed_scope: None,
-            skip_url_translation: false,
-        };
-        let cfg = load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n");
+        let mut plan = RequestPlan::resolve(
+            &cfg,
+            None,
+            CanonicalTarget::from_url_path("/dir/old.html").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plan.fs_path, source_path);
+        plan.layers = vec![layer];
+        plan.access_may_apply = true;
         let target = plan
             .retarget_same_directory_rewrite(
                 &cfg,
@@ -1243,6 +1492,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(target.fs_path(), Path::new("/srv/www/dir/new.html"));
+        assert_eq!(
+            target.construction.target_revision,
+            plan.construction.target_revision + 1
+        );
         assert!(Arc::ptr_eq(&plan.layers[0].scope, &target.layers[0].scope));
         assert!(plan
             .retarget_same_directory_rewrite(
@@ -1256,22 +1509,18 @@ mod tests {
     #[test]
     fn directory_index_scope_reuse_rejects_context_sensitive_policy() {
         let root = PathBuf::from("/srv/www");
-        let base_plan = || RequestPlan {
-            target: CanonicalTarget::from_url_path("/").unwrap(),
-            root: root.clone(),
-            rel: PathBuf::new(),
-            fs_path: root.clone(),
-            script_alias: false,
-            layers: vec![AccessLayer {
+        let base_plan = |cfg: &Config| {
+            let mut plan =
+                RequestPlan::resolve(cfg, None, CanonicalTarget::from_url_path("/").unwrap())
+                    .unwrap();
+            plan.layers = vec![AccessLayer {
                 identity: LayerIdentity::new(&root, &root, &root, "/"),
                 scope: Arc::new(Scope::default()),
                 files: Vec::new(),
                 conditionals: Vec::new(),
-            }],
-            access_may_apply: true,
-            preopened_target: None,
-            precomputed_scope: None,
-            skip_url_translation: false,
+            }];
+            plan.access_may_apply = true;
+            plan
         };
         let reusable = Scope::default();
         for policy in [
@@ -1285,7 +1534,7 @@ mod tests {
             let cfg = load_config(&format!(
                 "Listen 127.0.0.1:0\nDocumentRoot /srv/www\n{policy}"
             ));
-            let child = base_plan()
+            let child = base_plan(&cfg)
                 .retarget_directory_index(
                     &cfg,
                     None,
@@ -1301,13 +1550,13 @@ mod tests {
         }
 
         let files_cfg = load_config(
-            "Listen 127.0.0.1:0\n<Files \"index.html\">\nRequire all denied\n</Files>\n",
+            "Listen 127.0.0.1:0\nDocumentRoot /srv/www\n<Files \"index.html\">\nRequire all denied\n</Files>\n",
         );
-        let mut access_sensitive = base_plan();
+        let mut access_sensitive = base_plan(&files_cfg);
         access_sensitive.layers[0].files = files_cfg.global_rules.clone();
         let child = access_sensitive
             .retarget_directory_index(
-                &load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n"),
+                &files_cfg,
                 None,
                 CanonicalTarget::from_url_path("/index.html").unwrap(),
                 None,
@@ -1318,7 +1567,7 @@ mod tests {
 
         let redirect_cfg =
             load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\nRedirect /index.html /next\n");
-        let child = base_plan()
+        let child = base_plan(&redirect_cfg)
             .retarget_directory_index(
                 &redirect_cfg,
                 None,
@@ -1334,18 +1583,10 @@ mod tests {
     #[test]
     fn directory_index_preopened_target_requires_identical_symlink_policy() {
         let root = PathBuf::from("/srv/www");
-        let plan = RequestPlan {
-            target: CanonicalTarget::from_url_path("/").unwrap(),
-            root: root.clone(),
-            rel: PathBuf::new(),
-            fs_path: root,
-            script_alias: false,
-            layers: Vec::new(),
-            access_may_apply: false,
-            preopened_target: None,
-            precomputed_scope: None,
-            skip_url_translation: false,
-        };
+        let cfg = load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n");
+        let plan =
+            RequestPlan::resolve(&cfg, None, CanonicalTarget::from_url_path("/").unwrap()).unwrap();
+        assert_eq!(plan.fs_path(), root);
         let fixture =
             std::env::temp_dir().join(format!("httpd-rs-plan-index-fd-{}", std::process::id()));
         std::fs::write(&fixture, b"index").unwrap();
@@ -1353,7 +1594,7 @@ mod tests {
         let meta = file.metadata().unwrap();
         let child = plan
             .retarget_directory_index(
-                &load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n"),
+                &cfg,
                 None,
                 CanonicalTarget::from_url_path("/index.html").unwrap(),
                 Some((file, meta, true, false)),
@@ -1367,7 +1608,7 @@ mod tests {
         let meta = file.metadata().unwrap();
         let mut matching = plan
             .retarget_directory_index(
-                &load_config("Listen 127.0.0.1:0\nDocumentRoot /srv/www\n"),
+                &cfg,
                 None,
                 CanonicalTarget::from_url_path("/index.html").unwrap(),
                 Some((file, meta, true, false)),
@@ -1384,6 +1625,9 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let cfg = load_config("Listen 127.0.0.1:0\n");
+        let provenance = crate::server::map_path_with_provenance(&cfg, None, b"/file.txt")
+            .unwrap()
+            .provenance;
         let root = PathBuf::from(OsString::from_vec(b"/tmp/httpd-rs-root-\xff".to_vec()));
         let error = RequestPlan::build_with_fs_path(
             &cfg,
@@ -1392,6 +1636,8 @@ mod tests {
             root.clone(),
             PathBuf::from("file.txt"),
             root.join("file.txt"),
+            false,
+            provenance,
             false,
             None,
         )
@@ -1402,6 +1648,9 @@ mod tests {
     #[test]
     fn filesystem_policy_paths_have_a_universal_component_bound() {
         let cfg = load_config("Listen 127.0.0.1:0\n");
+        let provenance = crate::server::map_path_with_provenance(&cfg, None, b"/file.txt")
+            .unwrap()
+            .provenance;
         let root = PathBuf::from("/srv/www");
         let mut rel = PathBuf::new();
         for _ in 0..crate::util::MAX_POLICY_PATH_COMPONENTS {
@@ -1414,6 +1663,8 @@ mod tests {
             root.clone(),
             rel.clone(),
             root.join(rel),
+            false,
+            provenance,
             false,
             None,
         )
@@ -1474,6 +1725,28 @@ mod tests {
         .unwrap_or_else(|errors| panic!("{errors:?}"))
     }
 
+    fn load_nginx_config(text: &str) -> Config {
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let fixture = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "httpd-rs-plan-nginx-{}-{fixture}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nginx.conf");
+        std::fs::write(&path, text).unwrap();
+        Config::load_format(
+            crate::config_ir::ConfigFormat::Nginx,
+            &path,
+            &dir,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            false,
+        )
+        .unwrap_or_else(|errors| panic!("{errors:?}"))
+    }
+
     #[test]
     fn fs_target_outside_mapping_root_reads_explicit_target_layers() {
         use std::os::unix::fs::symlink;
@@ -1489,18 +1762,19 @@ mod tests {
         std::fs::write(admin.join("sh.cgi"), "#!/bin/sh\n").unwrap();
         let cfg = load_config(&format!(
             "Listen 127.0.0.1:0\n\
+             DocumentRoot \"{}\"\n\
              Options +ExecCGI\n\
              <Directory \"{}\">\n\
                  AllowOverride All\n\
                  Require all granted\n\
              </Directory>\n",
+            root.display(),
             root.display()
         ));
         let fs_path = std::fs::canonicalize(admin.join("sh.cgi")).unwrap();
         let target = CanonicalTarget::from_url_path("/admin/sh.cgi").unwrap();
         let plan =
-            RequestPlan::from_fs_target(&cfg, None, target, root.clone(), fs_path.clone(), false)
-                .unwrap();
+            RequestPlan::from_fs_target(&cfg, None, target, root.clone(), fs_path.clone()).unwrap();
         assert_eq!(plan.fs_path(), fs_path);
         assert_eq!(plan.rel(), Path::new("admin/sh.cgi"));
         assert_eq!(
@@ -1536,18 +1810,16 @@ mod tests {
             .effective_options()
             .contains(crate::config::Options::EXEC_CGI));
 
-        // A target outside both the lexical and canonical root keeps the
-        // basename fallback instead of fabricating a relative path.
-        let basename_plan = RequestPlan::from_fs_target(
+        // A caller can no longer replace the URL-selected mapping root with
+        // an unrelated directory and obtain a basename-only plan.
+        let unrelated_root = RequestPlan::from_fs_target(
             &cfg,
             None,
             CanonicalTarget::from_url_path("/admin/sh.cgi").unwrap(),
             base.join("absent-root"),
             fs_path.clone(),
-            false,
-        )
-        .unwrap();
-        assert_eq!(basename_plan.rel(), Path::new("sh.cgi"));
+        );
+        assert!(matches!(unrelated_root, Err(PlanError::Unmapped)));
         let _ = std::fs::remove_dir_all(&base);
     }
 

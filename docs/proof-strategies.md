@@ -20,13 +20,13 @@ A low score does **not** mean Verus failed to prove the stated formula. It means
 
 ## Inventory summary
 
-The source currently contains **300** explicit proof functions (**283 public**, **17 private lemmas**). **242** have empty proof bodies: SMT discharges them by unfolding definitions and using their preconditions. That is legitimate automation, but it is usually a shallow model-consistency result rather than an end-to-end implementation proof. The crate contains no accepted `assume`, `assume_specification`, or `external_body` escape hatch.
+The source currently contains **305** explicit proof functions (**288 public**, **17 private lemmas**). **247** have empty proof bodies: SMT discharges them by unfolding definitions and using their preconditions. That is legitimate automation, but it is usually a shallow model-consistency result rather than an end-to-end implementation proof. The crate contains no accepted `assume`, `assume_specification`, or `external_body` escape hatch.
 
 | Proof basis | Rows | Default score |
 | --- | ---: | ---: |
 | Definitional SMT consequence | 63 | 4/10 |
 | Finite case split over the model | 91 | 6/10 |
-| Finite-state invariant/case analysis | 48 | 7/10 |
+| Finite-state invariant/case analysis | 53 | 7/10 |
 | HTTP/2 executable state-machine refinement | 25 | 7/10 |
 | Structural induction over a mathematical sequence | 10 | 7/10 |
 | Structural induction plus executable refinement | 12 | 8/10 |
@@ -44,7 +44,7 @@ The source currently contains **300** explicit proof functions (**283 public**, 
 | 3/10 | 4 |
 | 4/10 | 85 |
 | 6/10 | 91 |
-| 7/10 | 94 |
+| 7/10 | 99 |
 | 8/10 | 22 |
 
 ## Strategy definitions
@@ -372,6 +372,11 @@ The property wording follows the theorem name; the linked source is authoritativ
 | Hierarchical lease transactions | [`hierarchical_lease_release_zeroes_every_level`](../crates/verified/src/lib.rs#L25406) | Terminal release zeroes the owned, process, optional child, file-descriptor, task, and resident-memory parent charges. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
 | Hierarchical lease transactions | [`hierarchical_lease_terminal_release_is_exactly_once`](../crates/verified/src/lib.rs#L25424) | A released hierarchical lease rejects every later resize, rebind, and second release. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
 | Hierarchical lease transactions | [`hierarchical_lease_pair_resize_is_atomic`](../crates/verified/src/lib.rs#L25443) | The two dimensions of a live paired resize produce invariant next certificates together, with each dimension equal to its requested owned quantity. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
+| RequestPlan construction | [`request_mapping_scan_selects_current_first_candidate`](../crates/verified/src/lib.rs#L25547) | An unmatched ordered mapping scan that accepts its current candidate records that exact slot as the first winner and advances by one slot. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
+| RequestPlan construction | [`request_mapping_scan_cannot_replace_a_winner`](../crates/verified/src/lib.rs#L25563) | Once an ordered mapping scan has selected a winner, no later candidate can replace it. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
+| RequestPlan construction | [`complete_request_plan_has_one_coherent_identity`](../crates/verified/src/lib.rs#L26111) | A sealed RequestPlan construction certificate retains one canonical source, generation, vhost, route, mapping winner, selected root, resolved target, access-walk domain and textual identity through every construction phase. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
+| RequestPlan construction | [`complete_request_plan_is_admitted_by_every_consumer`](../crates/verified/src/lib.rs#L26134) | Authorization, cache, rewrite and sink consumers all admit the same sealed RequestPlan certificate only for its exact configuration generation. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
+| RequestPlan construction | [`request_plan_retarget_preserves_mapping_and_generation`](../crates/verified/src/lib.rs#L26148) | A DirectoryIndex or same-directory rewrite retarget can advance the target revision only while retaining the exact generation, vhost, route, mapping winner, root and access-walk identity. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
 
 ## What this inventory does not prove
 

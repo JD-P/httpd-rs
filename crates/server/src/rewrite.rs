@@ -21,8 +21,8 @@
 //! remediation), with a load-time warning in the main config.
 
 use crate::config::{
-    RequestEnvironment, RewriteCond, RewriteMap, RewriteNamePart, RewriteProgram, RewriteRule,
-    RewriteTemplate, RewriteTemplatePart, Scope,
+    Config, RequestEnvironment, RewriteCond, RewriteMap, RewriteNamePart, RewriteProgram,
+    RewriteRule, RewriteTemplate, RewriteTemplatePart, Scope,
 };
 use crate::http::Request;
 use crate::scope_policy::Originated;
@@ -158,24 +158,27 @@ impl<'a> Context<'a> {
     /// for mapping and access-file collection.
     pub fn for_plan(
         plan: &'a crate::request_plan::RequestPlan,
-        server_root: &'a Path,
+        cfg: &'a Config,
         query: &'a [u8],
         peer: IpAddr,
         port: u16,
         https: bool,
         server_name: &'a str,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        if !plan.admits_consumer(cfg, httpd_rs_verified::RequestPlanConsumer::Rewrite) {
+            return None;
+        }
+        Some(Self {
             url_path: plan.url_path(),
             fs_path: plan.fs_path(),
             docroot: plan.root(),
-            server_root,
+            server_root: &cfg.server_root,
             query,
             peer,
             port,
             https,
             server_name,
-        }
+        })
     }
 }
 

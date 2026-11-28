@@ -3555,6 +3555,10 @@ impl Capabilities {
 pub(crate) struct ConfigurationGeneration(u64);
 
 impl ConfigurationGeneration {
+    pub(crate) const fn identity(self) -> u64 {
+        self.0
+    }
+
     #[cfg(test)]
     pub(crate) const fn for_test() -> Self {
         Self(u64::MAX)
@@ -18561,12 +18565,29 @@ impl Config {
     }
 
     pub(crate) fn base_scope_with_route(&self, vhost: Option<&VHost>, url_path: &str) -> Scope {
+        self.base_scope_with_route_identity(vhost, url_path).0
+    }
+
+    /// Return the effective server/location scope and the exact nginx source
+    /// declaration that won. Apache has no source-neutral route winner here,
+    /// so its identity is `None`. RequestPlan stores this provenance beside
+    /// the root selected from the scope.
+    pub(crate) fn base_scope_with_route_identity(
+        &self,
+        vhost: Option<&VHost>,
+        url_path: &str,
+    ) -> (Scope, Option<usize>) {
         if let Some(index) = vhost.and_then(|value| self.vhost_position(value)) {
-            if let Some(route) = self.route_program.select(index, url_path) {
-                return route.clone();
+            if let Some((route, declaration_order)) =
+                self.route_program.select_with_identity(index, url_path)
+            {
+                return (route.clone(), Some(declaration_order));
             }
         }
-        vhost.map(|v| &v.scope).unwrap_or(&self.global).clone()
+        (
+            vhost.map(|v| &v.scope).unwrap_or(&self.global).clone(),
+            None,
+        )
     }
 
     /// Body admission happens after the request head and nginx route winner

@@ -59402,10 +59402,76 @@
         "request_resource_effect_closure",
         "terminal_sink_gate"
       ],
+      "code": "config_conditionals: Arc::new(Vec::new()),",
+      "effect": "heap-allocation",
+      "function": "evaluate_scope",
+      "id": "99d4289f9b946f094002",
+      "path": "crates/server/src/request_plan.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "request-runtime-typed-leases",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "shared_map_insert_admit",
+        "shared_queue_push_admit",
+        "dependency_call_admit",
+        "async_work_handoff_admit",
+        "blocking_io_start_admit",
+        "request_resource_effect_closure",
+        "terminal_sink_gate"
+      ],
+      "code": "access_conditionals: Arc::new(Vec::new()),",
+      "effect": "heap-allocation",
+      "function": "evaluate_scope",
+      "id": "9c891623858d9a6765cf",
+      "path": "crates/server/src/request_plan.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "request-runtime-typed-leases",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "shared_map_insert_admit",
+        "shared_queue_push_admit",
+        "dependency_call_admit",
+        "async_work_handoff_admit",
+        "blocking_io_start_admit",
+        "request_resource_effect_closure",
+        "terminal_sink_gate"
+      ],
       "code": "access_conditionals: Arc::new(Vec::new()),",
       "effect": "heap-allocation",
       "function": "evaluate_scope",
       "id": "b40f0ec9a8d5908e5ec2",
+      "path": "crates/server/src/request_plan.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "request-runtime-typed-leases",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "shared_map_insert_admit",
+        "shared_queue_push_admit",
+        "dependency_call_admit",
+        "async_work_handoff_admit",
+        "blocking_io_start_admit",
+        "request_resource_effect_closure",
+        "terminal_sink_gate"
+      ],
+      "code": "access_conditionals: Arc::new(Vec::new()),",
+      "effect": "heap-allocation",
+      "function": "evaluate_scope_with_file_name",
+      "id": "45dfaeef7aa9d30987f0",
       "path": "crates/server/src/request_plan.rs",
       "status": "review-required"
     },
@@ -59450,6 +59516,28 @@
       "effect": "heap-allocation",
       "function": "evaluate_scope_with_file_name",
       "id": "65b373a261d602738688",
+      "path": "crates/server/src/request_plan.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "request-runtime-typed-leases",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "shared_map_insert_admit",
+        "shared_queue_push_admit",
+        "dependency_call_admit",
+        "async_work_handoff_admit",
+        "blocking_io_start_admit",
+        "request_resource_effect_closure",
+        "terminal_sink_gate"
+      ],
+      "code": "config_conditionals: Arc::new(Vec::new()),",
+      "effect": "heap-allocation",
+      "function": "evaluate_scope_with_file_name",
+      "id": "c67786d5a6e2b9f9c395",
       "path": "crates/server/src/request_plan.rs",
       "status": "review-required"
     },
@@ -66968,8 +67056,8 @@
       ],
       "code": "let Some(caps) = regex.captures(url.as_bytes()) else {",
       "effect": "compression-regex-crypto",
-      "function": "map_path",
-      "id": "facf241f47ff977e4374",
+      "function": "map_path_with_provenance",
+      "id": "529ee66dac5a87f48f3d",
       "path": "crates/server/src/server.rs",
       "status": "review-required"
     },
@@ -66990,8 +67078,8 @@
       ],
       "code": "for a in &base_scope.mapping_policy.aliases {",
       "effect": "cpu-iteration",
-      "function": "map_path",
-      "id": "dc27c7e9e3cc9deaa402",
+      "function": "map_path_with_provenance",
+      "id": "1c804ad7a4a5b2e3d7a6",
       "path": "crates/server/src/server.rs",
       "status": "review-required"
     },
@@ -67012,8 +67100,8 @@
       ],
       "code": "let url = String::from_utf8_lossy(norm);",
       "effect": "heap-allocation",
-      "function": "map_path",
-      "id": "5fd78b0764b48997b7c2",
+      "function": "map_path_with_provenance",
+      "id": "6759988f017592d35cc8",
       "path": "crates/server/src/server.rs",
       "status": "review-required"
     },
@@ -75394,19 +75482,19 @@
       "status": "external-source-inventory"
     }
   ],
-  "source_sha256": "030086159f664802138f9975fc553312f79e7110429884a93ca372bca77c574e",
+  "source_sha256": "153b5aad24ae701890bbc6407d74161c51df45f02ab65f03dea6973ca61d77c2",
   "summary": {
     "by_closure_disposition": {
       "external-assumption": 408,
       "proved-constant-bound": 1140,
-      "typed-lease": 2096
+      "typed-lease": 2100
     },
     "by_effect": {
       "compression-regex-crypto": 77,
       "cpu-iteration": 982,
       "data-growth": 452,
       "filesystem": 152,
-      "heap-allocation": 1252,
+      "heap-allocation": 1256,
       "network": 37,
       "synchronization": 285,
       "task-process": 46,
@@ -75418,9 +75506,9 @@
       "audited-gateway": 326,
       "external-source-inventory": 199,
       "local-bound-candidate": 15,
-      "review-required": 2304
+      "review-required": 2308
     },
-    "effect_sites": 3644,
+    "effect_sites": 3648,
     "files": 59,
     "unclassified_effect_sites": 0
   }

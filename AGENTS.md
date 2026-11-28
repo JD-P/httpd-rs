@@ -329,7 +329,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p httpd-rs-verified
 ```
 
-Current result: **1083 verified functions, 0 errors** (percent-decoding,
+Current result: **1105 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
@@ -358,6 +358,8 @@ rule-classification kernels used by the dispatcher, plus route-prefix matching, 
 selection and authorization-configuration admission, the pass-6 ancestor
 access-walk, URL-selected
 alias mapping-root, `DirectoryIndex` cache-target/query-isolation predicates,
+the executable canonical-request/vhost/mapping/root/target/access-walk
+RequestPlan construction certificate and generation-bound consumer gates,
 and the MultiViews public/selected-URL/resolved-inode authorization meet plus
 selected cache binding, and the pass-10 I61 Options/handler/`AllowOverride` meet and
 rewrite-scope-retention kernels, plus pass-12 admission proofs for exact
@@ -435,12 +437,12 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus   # include the Verus gate
 ```
 
-Current ledger: **70.5% weighted obligations**, **6/6 proof debt**,
+Current ledger: **71.0% weighted obligations**, **6/6 proof debt**,
 **11/11 grant-required sinks**, **11/11 path-target-bound sinks**, **6/11
 inode-bound sinks**, **3/11 backend-target-bound sinks**, **3/11
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **109 adversarial replay cases** covering the findings classes,
-and **1083 Verus functions with 0 errors** (including the I3 fast-path
+and **1105 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -721,7 +723,7 @@ current instrumented suite is 691 Rust library tests, 8 CLI unit tests, 31 Rust
 integration/property tests, 168 conformance tests and 333 fixed configuration
 cases. The module-by-module reason for the remaining debt and the intended test
 mechanism for each major module are tracked in `docs/coverage-debt.md`.
-The separate Verus gate proves 856 functions with 0 errors; proof-only code is
+The separate Verus gate proves 1105 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Real-application integration lives under [`tests/deployments`](tests/deployments/README.md).

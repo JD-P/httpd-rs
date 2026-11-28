@@ -135,6 +135,11 @@ COMPONENT_OVERRIDES = {
     "hierarchical_lease_release_zeroes_every_level": "Hierarchical lease transactions",
     "hierarchical_lease_terminal_release_is_exactly_once": "Hierarchical lease transactions",
     "hierarchical_lease_pair_resize_is_atomic": "Hierarchical lease transactions",
+    "request_mapping_scan_selects_current_first_candidate": "RequestPlan construction",
+    "request_mapping_scan_cannot_replace_a_winner": "RequestPlan construction",
+    "complete_request_plan_has_one_coherent_identity": "RequestPlan construction",
+    "complete_request_plan_is_admitted_by_every_consumer": "RequestPlan construction",
+    "request_plan_retarget_preserves_mapping_and_generation": "RequestPlan construction",
 }
 
 
@@ -319,6 +324,7 @@ STATE_MACHINE_COMPONENTS = {
     "Policy compilation fold",
     "Nginx lexer and parser refinement",
     "Hierarchical lease transactions",
+    "RequestPlan construction",
 }
 
 FINITE_CASE_COMPONENTS = {
@@ -527,6 +533,27 @@ PROPERTY_OVERRIDES = {
     "hierarchical_lease_pair_resize_is_atomic": (
         "The two dimensions of a live paired resize produce invariant next certificates together, "
         "with each dimension equal to its requested owned quantity."
+    ),
+    "request_mapping_scan_selects_current_first_candidate": (
+        "An unmatched ordered mapping scan that accepts its current candidate records that exact "
+        "slot as the first winner and advances by one slot."
+    ),
+    "request_mapping_scan_cannot_replace_a_winner": (
+        "Once an ordered mapping scan has selected a winner, no later candidate can replace it."
+    ),
+    "complete_request_plan_has_one_coherent_identity": (
+        "A sealed RequestPlan construction certificate retains one canonical source, generation, "
+        "vhost, route, mapping winner, selected root, resolved target, access-walk domain and "
+        "textual identity through every construction phase."
+    ),
+    "complete_request_plan_is_admitted_by_every_consumer": (
+        "Authorization, cache, rewrite and sink consumers all admit the same sealed RequestPlan "
+        "certificate only for its exact configuration generation."
+    ),
+    "request_plan_retarget_preserves_mapping_and_generation": (
+        "A DirectoryIndex or same-directory rewrite retarget can advance the target revision only "
+        "while retaining the exact generation, vhost, route, mapping winner, root and access-walk "
+        "identity."
     ),
 }
 

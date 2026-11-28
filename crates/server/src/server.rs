@@ -5304,12 +5304,11 @@ fn evaluate_scope_identities_for_path(
         target,
         mapping_root.to_path_buf(),
         fs_path.to_path_buf(),
-        false,
         req,
     )
     .map_err(|error| match error {
-        // from_fs_target() never performs URL mapping, so only AccessFiles
-        // can occur here.
+        // Explicit-target construction re-runs URL mapping and rejects a
+        // root that does not belong to this exact canonical URL.
         crate::request_plan::PlanError::Unmapped => "target has no URL mapping".to_string(), // coverage:ignore-line
         crate::request_plan::PlanError::AccessFiles(e)
         | crate::request_plan::PlanError::PolicyLimit(e) => e,
@@ -7542,6 +7541,9 @@ fn dispatch_inner(
             }
         },
     };
+    if !plan.admits_consumer(cfg, httpd_rs_verified::RequestPlanConsumer::Sink) {
+        return Response::policy_error();
+    }
     // Filesystem rewrites use the URL phase's final request as their original
     // identity. Keep an owned snapshot because later per-directory rounds may
     // replace `owned_req` again.
@@ -7594,15 +7596,17 @@ fn dispatch_inner(
             break;
         }
         let current_req = owned_req.as_ref().unwrap_or(req);
-        let rewrite_ctx = crate::rewrite::Context::for_plan(
+        let Some(rewrite_ctx) = crate::rewrite::Context::for_plan(
             &plan,
-            &cfg.server_root,
+            cfg,
             &current_req.query,
             peer.ip(),
             local_port,
             https,
             &server_name,
-        );
+        ) else {
+            return Response::policy_error();
+        };
         match crate::rewrite::process(&scope, current_req, &rewrite_ctx) {
             crate::rewrite::Outcome::None => break,
             crate::rewrite::Outcome::Forbidden => {
@@ -9531,30 +9535,88 @@ fn dispatch_inner(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MappingProvenance {
+    pub source: httpd_rs_verified::ConfigIrSource,
+    /// Zero is the global server; configured vhosts use their slot plus one.
+    pub vhost_slot: u64,
+    /// Zero is the server scope/no nginx location; a location uses its source
+    /// declaration order plus one.
+    pub route_slot: u64,
+    /// Zero is DocumentRoot; an alias uses its ordered table slot plus one.
+    pub mapping_slot: u64,
+    pub mapping_kind: httpd_rs_verified::RequestMappingWinnerKind,
+    pub mapping_scan: httpd_rs_verified::RequestMappingScanState,
+}
+
+#[derive(Debug)]
+pub(crate) struct MappedPath {
+    pub root: PathBuf,
+    pub rel: PathBuf,
+    pub script_alias: bool,
+    pub provenance: MappingProvenance,
+}
+
+/// Compatibility projection for embedders and mapping tests. Security-
+/// sensitive RequestPlan construction consumes `map_path_with_provenance`
+/// instead, retaining the winner identity beside these three values.
 pub fn map_path(
     cfg: &Config,
     vhost: Option<&VHost>,
     norm: &[u8],
 ) -> Option<(PathBuf, PathBuf, bool)> {
+    let mapped = map_path_with_provenance(cfg, vhost, norm)?;
+    Some((mapped.root, mapped.rel, mapped.script_alias))
+}
+
+pub(crate) fn map_path_with_provenance(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    norm: &[u8],
+) -> Option<MappedPath> {
     let url = String::from_utf8_lossy(norm);
+    let vhost_slot = match vhost {
+        Some(vhost) => u64::try_from(cfg.vhost_position(vhost)?)
+            .ok()?
+            .checked_add(1)?,
+        None => 0,
+    };
     // nginx `root` and any future source-neutral URL mapping operations are
     // properties of the winning route.  Keep Apache's hot path borrowed, but
     // materialize the selected nginx scope before mapping so filesystem
     // identity and the later authorization scope are derived from the same
     // route winner.
-    let routed_scope = cfg
-        .route_program
-        .is_nginx()
-        .then(|| cfg.base_scope_with_route(vhost, &url));
-    let base_scope = routed_scope
-        .as_ref()
-        .unwrap_or_else(|| vhost.map(|v| &v.scope).unwrap_or(&cfg.global));
+    let routed_scope = if cfg.route_program.is_nginx() {
+        let (scope, route) = cfg.base_scope_with_route_identity(vhost, &url);
+        let route_slot = match route {
+            Some(order) => u64::try_from(order).ok()?.checked_add(1)?,
+            None => 0,
+        };
+        Some((scope, route_slot))
+    } else {
+        None
+    };
+    let (base_scope, route_slot) = match routed_scope.as_ref() {
+        Some((scope, route_slot)) => (scope, *route_slot),
+        None => (vhost.map(|v| &v.scope).unwrap_or(&cfg.global), 0),
+    };
+    let mut mapping_scan = httpd_rs_verified::request_mapping_scan_start();
     // Apache's alias table is ordered: the first matching `Alias`,
     // `ScriptAlias`, `AliasMatch` or `ScriptAliasMatch` wins.  A later, more
     // specific alias that overlaps an earlier one never matches.
     for a in &base_scope.mapping_policy.aliases {
         if a.regex.is_none() {
             if let Some(rest) = alias_remainder(&a.virtual_path, &url) {
+                mapping_scan = httpd_rs_verified::request_mapping_scan_step(mapping_scan, true)?;
+                let mapping_slot = mapping_scan.winner.checked_add(1)?;
+                let provenance = MappingProvenance {
+                    source: cfg.route_program.source_kind(),
+                    vhost_slot,
+                    route_slot,
+                    mapping_slot,
+                    mapping_kind: httpd_rs_verified::RequestMappingWinnerKind::PrefixAlias,
+                    mapping_scan,
+                };
                 let rest_rel = PathBuf::from(rest.trim_start_matches('/'));
                 // A prefix Alias/ScriptAlias may name a single regular file.
                 // Using the file itself as the root and an empty `rel` hid the
@@ -9568,21 +9630,47 @@ pub fn map_path(
                     if !rest_rel.as_os_str().is_empty() {
                         rel.push(rest_rel);
                     }
-                    return Some((parent.to_path_buf(), rel, a.script));
+                    return Some(MappedPath {
+                        root: parent.to_path_buf(),
+                        rel,
+                        script_alias: a.script,
+                        provenance,
+                    });
                 }
-                return Some((a.fs_path.clone(), rest_rel, a.script));
+                return Some(MappedPath {
+                    root: a.fs_path.clone(),
+                    rel: rest_rel,
+                    script_alias: a.script,
+                    provenance,
+                });
             }
+            mapping_scan = httpd_rs_verified::request_mapping_scan_step(mapping_scan, false)?;
             continue;
         }
         let regex = a
             .regex
             .as_ref()
             .expect("regex alias was checked before the prefix branch");
-        let Some(caps) = regex.captures(url.as_bytes()) else {
+        let Some(template) = &a.target_template else {
+            // Direct Config embedders can construct an incomplete alias.
+            // It has no executable mapping and therefore is not a candidate
+            // in the first-winner scan.
+            mapping_scan = httpd_rs_verified::request_mapping_scan_step(mapping_scan, false)?;
             continue;
         };
-        let Some(template) = &a.target_template else {
+        let Some(caps) = regex.captures(url.as_bytes()) else {
+            mapping_scan = httpd_rs_verified::request_mapping_scan_step(mapping_scan, false)?;
             continue;
+        };
+        mapping_scan = httpd_rs_verified::request_mapping_scan_step(mapping_scan, true)?;
+        let mapping_slot = mapping_scan.winner.checked_add(1)?;
+        let provenance = MappingProvenance {
+            source: cfg.route_program.source_kind(),
+            vhost_slot,
+            route_slot,
+            mapping_slot,
+            mapping_kind: httpd_rs_verified::RequestMappingWinnerKind::RegexAlias,
+            mapping_scan,
         };
         let expanded = crate::util::expand_regex_captures(template, &caps)?;
         let target = PathBuf::from(&expanded);
@@ -9619,9 +9707,19 @@ pub fn map_path(
         if rel.as_os_str().is_empty() && target.is_file() {
             let name = target.file_name().unwrap_or(OsStr::new(""));
             let parent = target.parent().unwrap_or(Path::new("/"));
-            return Some((parent.to_path_buf(), PathBuf::from(name), a.script));
+            return Some(MappedPath {
+                root: parent.to_path_buf(),
+                rel: PathBuf::from(name),
+                script_alias: a.script,
+                provenance,
+            });
         }
-        return Some((a.fs_path.clone(), rel, a.script));
+        return Some(MappedPath {
+            root: a.fs_path.clone(),
+            rel,
+            script_alias: a.script,
+            provenance,
+        });
     }
     let root = base_scope
         .content_policy
@@ -9629,7 +9727,20 @@ pub fn map_path(
         .clone()
         .unwrap_or_else(|| cfg.documentation_root_for(vhost));
     let rel = PathBuf::from(OsStr::from_bytes(&norm[1..]));
-    Some((root, rel, false))
+    let provenance = MappingProvenance {
+        source: cfg.route_program.source_kind(),
+        vhost_slot,
+        route_slot,
+        mapping_slot: 0,
+        mapping_kind: httpd_rs_verified::RequestMappingWinnerKind::DocumentRoot,
+        mapping_scan,
+    };
+    Some(MappedPath {
+        root,
+        rel,
+        script_alias: false,
+        provenance,
+    })
 }
 
 fn clean_alias_path(p: &Path) -> PathBuf {

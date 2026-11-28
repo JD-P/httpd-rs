@@ -521,6 +521,15 @@ impl<T> RouteProgram<T> {
     }
 
     pub fn select(&self, server: usize, path: &str) -> Option<&T> {
+        self.select_with_identity(server, path)
+            .map(|(policy, _)| policy)
+    }
+
+    /// Select one nginx route together with its source declaration identity.
+    /// Keeping these in one return value prevents request-plan construction
+    /// from recomputing (and potentially disagreeing about) the winning
+    /// location after its policy has supplied the mapping root.
+    pub(crate) fn select_with_identity(&self, server: usize, path: &str) -> Option<(&T, usize)> {
         let Self::Nginx {
             servers,
             route_indexes,
@@ -532,7 +541,7 @@ impl<T> RouteProgram<T> {
         route_indexes
             .get(server)?
             .select(servers.get(server)?, path)
-            .map(|route| &route.policy)
+            .map(|route| (&route.policy, route.declaration_order))
     }
 
     pub fn policies(&self) -> impl Iterator<Item = &T> {

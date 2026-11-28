@@ -25471,4 +25471,700 @@ pub proof fn hierarchical_lease_pair_resize_is_atomic(
 {
 }
 
+// ---------------------------------------------------------------------------
+// Immutable RequestPlan construction
+// ---------------------------------------------------------------------------
+
+/// No-allocation accumulator for an ordered Alias/ScriptAlias table.  The
+/// runtime calls `request_mapping_scan_step` once per candidate, in source
+/// order, and stops on the first `selected` state.  Therefore a winner can be
+/// installed only after every previously examined candidate reported false.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RequestMappingScanState {
+    pub examined: u64,
+    pub selected: bool,
+    pub winner: u64,
+}
+
+pub open spec fn request_mapping_scan_inv(state: RequestMappingScanState) -> bool {
+    if state.selected {
+        state.winner < state.examined
+    } else {
+        state.winner == 0
+    }
+}
+
+pub fn request_mapping_scan_start() -> (state: RequestMappingScanState)
+    ensures
+        request_mapping_scan_inv(state),
+        state.examined == 0,
+        !state.selected,
+{
+    RequestMappingScanState { examined: 0, selected: false, winner: 0 }
+}
+
+pub open spec fn request_mapping_scan_step_spec(
+    state: RequestMappingScanState,
+    candidate_matches: bool,
+) -> Option<RequestMappingScanState> {
+    if state.selected || state.examined == u64::MAX {
+        None
+    } else {
+        Some(RequestMappingScanState {
+            examined: (state.examined as int + 1) as u64,
+            selected: candidate_matches,
+            winner: if candidate_matches { state.examined } else { 0 },
+        })
+    }
+}
+
+#[inline]
+pub fn request_mapping_scan_step(
+    state: RequestMappingScanState,
+    candidate_matches: bool,
+) -> (next: Option<RequestMappingScanState>)
+    requires request_mapping_scan_inv(state),
+    ensures
+        next == request_mapping_scan_step_spec(state, candidate_matches),
+        match next {
+            Some(value) => request_mapping_scan_inv(value),
+            None => true,
+        },
+{
+    if state.selected {
+        None
+    } else {
+        match state.examined.checked_add(1) {
+            None => None,
+            Some(examined) => Some(RequestMappingScanState {
+                examined,
+                selected: candidate_matches,
+                winner: if candidate_matches { state.examined } else { 0 },
+            }),
+        }
+    }
+}
+
+pub proof fn request_mapping_scan_selects_current_first_candidate(
+    state: RequestMappingScanState,
+)
+    requires
+        request_mapping_scan_inv(state),
+        !state.selected,
+        state.examined < u64::MAX,
+    ensures {
+        let next = request_mapping_scan_step_spec(state, true).unwrap();
+        &&& next.selected
+        &&& next.winner == state.examined
+        &&& next.examined == (state.examined as int + 1) as u64
+    },
+{
+}
+
+pub proof fn request_mapping_scan_cannot_replace_a_winner(
+    state: RequestMappingScanState,
+    candidate_matches: bool,
+)
+    requires
+        request_mapping_scan_inv(state),
+        state.selected,
+    ensures request_mapping_scan_step_spec(state, candidate_matches).is_none(),
+{
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RequestMappingWinnerKind {
+    DocumentRoot,
+    PrefixAlias,
+    RegexAlias,
+}
+
+pub open spec fn request_mapping_selection_spec(
+    kind: RequestMappingWinnerKind,
+    mapping_slot: u64,
+    scan: RequestMappingScanState,
+) -> bool {
+    request_mapping_scan_inv(scan) && match kind {
+        RequestMappingWinnerKind::DocumentRoot => !scan.selected && mapping_slot == 0,
+        RequestMappingWinnerKind::PrefixAlias | RequestMappingWinnerKind::RegexAlias => {
+            &&& scan.selected
+            &&& scan.winner < u64::MAX
+            &&& mapping_slot == (scan.winner as int + 1) as u64
+        }
+    }
+}
+
+pub fn request_mapping_selection_admit(
+    kind: RequestMappingWinnerKind,
+    mapping_slot: u64,
+    scan: RequestMappingScanState,
+) -> (admit: bool)
+    requires request_mapping_scan_inv(scan),
+    ensures admit == request_mapping_selection_spec(kind, mapping_slot, scan),
+{
+    match kind {
+        RequestMappingWinnerKind::DocumentRoot => !scan.selected && mapping_slot == 0,
+        RequestMappingWinnerKind::PrefixAlias | RequestMappingWinnerKind::RegexAlias => {
+            scan.selected
+                && scan.winner < u64::MAX
+                && mapping_slot == scan.winner + 1
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RequestPlanConstructionPhase {
+    Canonical,
+    Vhost,
+    Mapping,
+    Root,
+    Target,
+    AccessWalk,
+    Complete,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RequestPlanConsumer {
+    Authorization,
+    Cache,
+    Rewrite,
+    Sink,
+}
+
+/// Executable certificate carried by every runtime RequestPlan.  Numeric
+/// slots are provenance identities, not hashes: zero denotes the global or
+/// fallback case and a nonzero value is the selected vector slot plus one.
+/// The actual URL/path bytes remain owned by the private Rust RequestPlan;
+/// its constructors supply the facts at the exact operation that creates
+/// each value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RequestPlanConstructionState {
+    pub phase: RequestPlanConstructionPhase,
+    pub source: ConfigIrSource,
+    pub generation: u64,
+    pub vhost_slot: u64,
+    pub route_slot: u64,
+    pub mapping_slot: u64,
+    pub mapping_kind: RequestMappingWinnerKind,
+    pub mapping_scan: RequestMappingScanState,
+    pub target_revision: u64,
+    pub canonical_bound: bool,
+    pub route_program_refined: bool,
+    pub vhost_bound: bool,
+    pub mapping_bound: bool,
+    pub root_bound: bool,
+    pub target_bound: bool,
+    pub access_walk_bound: bool,
+    pub textual_identity: bool,
+}
+
+pub open spec fn request_plan_phase_rank(phase: RequestPlanConstructionPhase) -> u8 {
+    match phase {
+        RequestPlanConstructionPhase::Canonical => 0,
+        RequestPlanConstructionPhase::Vhost => 1,
+        RequestPlanConstructionPhase::Mapping => 2,
+        RequestPlanConstructionPhase::Root => 3,
+        RequestPlanConstructionPhase::Target => 4,
+        RequestPlanConstructionPhase::AccessWalk => 5,
+        RequestPlanConstructionPhase::Complete => 6,
+    }
+}
+
+pub open spec fn request_plan_construction_inv(state: RequestPlanConstructionState) -> bool {
+    &&& state.canonical_bound
+    &&& state.route_program_refined
+    &&& request_mapping_scan_inv(state.mapping_scan)
+    &&& match state.phase {
+        RequestPlanConstructionPhase::Canonical => {
+            &&& !state.vhost_bound
+            &&& !state.mapping_bound
+            &&& !state.root_bound
+            &&& !state.target_bound
+            &&& !state.access_walk_bound
+            &&& !state.textual_identity
+        }
+        RequestPlanConstructionPhase::Vhost => {
+            &&& state.vhost_bound
+            &&& !state.mapping_bound
+            &&& !state.root_bound
+            &&& !state.target_bound
+            &&& !state.access_walk_bound
+            &&& !state.textual_identity
+        }
+        RequestPlanConstructionPhase::Mapping => {
+            &&& state.vhost_bound
+            &&& state.mapping_bound
+            &&& !state.root_bound
+            &&& !state.target_bound
+            &&& !state.access_walk_bound
+            &&& !state.textual_identity
+            &&& request_mapping_selection_spec(
+                state.mapping_kind, state.mapping_slot, state.mapping_scan,
+            )
+        }
+        RequestPlanConstructionPhase::Root => {
+            &&& state.vhost_bound
+            &&& state.mapping_bound
+            &&& state.root_bound
+            &&& !state.target_bound
+            &&& !state.access_walk_bound
+            &&& !state.textual_identity
+            &&& request_mapping_selection_spec(
+                state.mapping_kind, state.mapping_slot, state.mapping_scan,
+            )
+        }
+        RequestPlanConstructionPhase::Target => {
+            &&& state.vhost_bound
+            &&& state.mapping_bound
+            &&& state.root_bound
+            &&& state.target_bound
+            &&& !state.access_walk_bound
+            &&& !state.textual_identity
+            &&& request_mapping_selection_spec(
+                state.mapping_kind, state.mapping_slot, state.mapping_scan,
+            )
+        }
+        RequestPlanConstructionPhase::AccessWalk => {
+            &&& state.vhost_bound
+            &&& state.mapping_bound
+            &&& state.root_bound
+            &&& state.target_bound
+            &&& state.access_walk_bound
+            &&& !state.textual_identity
+            &&& request_mapping_selection_spec(
+                state.mapping_kind, state.mapping_slot, state.mapping_scan,
+            )
+        }
+        RequestPlanConstructionPhase::Complete => {
+            &&& state.vhost_bound
+            &&& state.mapping_bound
+            &&& state.root_bound
+            &&& state.target_bound
+            &&& state.access_walk_bound
+            &&& state.textual_identity
+            &&& request_mapping_selection_spec(
+                state.mapping_kind, state.mapping_slot, state.mapping_scan,
+            )
+        }
+    }
+}
+
+pub fn request_plan_construction_start(
+    source: ConfigIrSource,
+    generation: u64,
+    canonical_bound: bool,
+    route_program_refined: bool,
+) -> (state: Option<RequestPlanConstructionState>)
+    ensures match state {
+        Some(value) => {
+            &&& request_plan_construction_inv(value)
+            &&& value.phase == RequestPlanConstructionPhase::Canonical
+            &&& value.source == source
+            &&& value.generation == generation
+        }
+        None => !canonical_bound || !route_program_refined,
+    },
+{
+    if !canonical_bound || !route_program_refined {
+        return None;
+    }
+    Some(RequestPlanConstructionState {
+        phase: RequestPlanConstructionPhase::Canonical,
+        source,
+        generation,
+        vhost_slot: 0,
+        route_slot: 0,
+        mapping_slot: 0,
+        mapping_kind: RequestMappingWinnerKind::DocumentRoot,
+        mapping_scan: request_mapping_scan_start(),
+        target_revision: 0,
+        canonical_bound: true,
+        route_program_refined: true,
+        vhost_bound: false,
+        mapping_bound: false,
+        root_bound: false,
+        target_bound: false,
+        access_walk_bound: false,
+        textual_identity: false,
+    })
+}
+
+pub fn request_plan_bind_vhost(
+    state: RequestPlanConstructionState,
+    vhost_slot: u64,
+    vhost_is_configuration_member: bool,
+) -> (next: Option<RequestPlanConstructionState>)
+    requires request_plan_construction_inv(state),
+    ensures match next {
+        Some(value) => {
+            &&& request_plan_construction_inv(value)
+            &&& value.phase == RequestPlanConstructionPhase::Vhost
+            &&& value.vhost_slot == vhost_slot
+            &&& value.generation == state.generation
+        }
+        None => true,
+    },
+{
+    reveal(request_plan_construction_inv);
+    reveal(request_plan_phase_rank);
+    match state.phase {
+        RequestPlanConstructionPhase::Canonical if vhost_is_configuration_member => {
+            Some(RequestPlanConstructionState {
+                phase: RequestPlanConstructionPhase::Vhost,
+                vhost_slot,
+                vhost_bound: true,
+                ..state
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn request_plan_bind_mapping(
+    state: RequestPlanConstructionState,
+    route_slot: u64,
+    mapping_slot: u64,
+    mapping_kind: RequestMappingWinnerKind,
+    mapping_scan: RequestMappingScanState,
+    mapping_uses_canonical_target: bool,
+    route_scope_bound: bool,
+) -> (next: Option<RequestPlanConstructionState>)
+    requires
+        request_plan_construction_inv(state),
+        request_mapping_scan_inv(mapping_scan),
+    ensures match next {
+        Some(value) => {
+            &&& request_plan_construction_inv(value)
+            &&& value.phase == RequestPlanConstructionPhase::Mapping
+            &&& value.route_slot == route_slot
+            &&& value.mapping_slot == mapping_slot
+            &&& value.mapping_kind == mapping_kind
+            &&& value.mapping_scan == mapping_scan
+        }
+        None => true,
+    },
+{
+    reveal(request_plan_construction_inv);
+    reveal(request_plan_phase_rank);
+    reveal(request_mapping_selection_spec);
+    match state.phase {
+        RequestPlanConstructionPhase::Vhost
+            if mapping_uses_canonical_target
+                && route_scope_bound
+                && request_mapping_selection_admit(
+                    mapping_kind, mapping_slot, mapping_scan,
+                ) => {
+            Some(RequestPlanConstructionState {
+                phase: RequestPlanConstructionPhase::Mapping,
+                route_slot,
+                mapping_slot,
+                mapping_kind,
+                mapping_scan,
+                mapping_bound: true,
+                ..state
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn request_plan_bind_root(
+    state: RequestPlanConstructionState,
+    root_selected_by_mapping: bool,
+    root_inferred_from_containment: bool,
+) -> (next: Option<RequestPlanConstructionState>)
+    requires request_plan_construction_inv(state),
+    ensures match next {
+        Some(value) => {
+            &&& request_plan_construction_inv(value)
+            &&& value.phase == RequestPlanConstructionPhase::Root
+            &&& value.mapping_slot == state.mapping_slot
+            &&& value.vhost_slot == state.vhost_slot
+        }
+        None => true,
+    },
+{
+    reveal(request_plan_construction_inv);
+    reveal(request_plan_phase_rank);
+    match state.phase {
+        RequestPlanConstructionPhase::Mapping
+            if root_selected_by_mapping && !root_inferred_from_containment => {
+            Some(RequestPlanConstructionState {
+                phase: RequestPlanConstructionPhase::Root,
+                root_bound: true,
+                ..state
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn request_plan_bind_target(
+    state: RequestPlanConstructionState,
+    explicit_target: bool,
+    target_is_root_join: bool,
+    target_inherits_mapping: bool,
+) -> (next: Option<RequestPlanConstructionState>)
+    requires request_plan_construction_inv(state),
+    ensures match next {
+        Some(value) => {
+            &&& request_plan_construction_inv(value)
+            &&& value.phase == RequestPlanConstructionPhase::Target
+            &&& value.target_revision == state.target_revision
+        }
+        None => true,
+    },
+{
+    reveal(request_plan_construction_inv);
+    reveal(request_plan_phase_rank);
+    let target_bound = if explicit_target {
+        target_inherits_mapping
+    } else {
+        target_is_root_join
+    };
+    match state.phase {
+        RequestPlanConstructionPhase::Root if target_bound => {
+            Some(RequestPlanConstructionState {
+                phase: RequestPlanConstructionPhase::Target,
+                target_bound: true,
+                ..state
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn request_plan_bind_access_walk(
+    state: RequestPlanConstructionState,
+    walk_uses_exact_target: bool,
+    ancestor_walk_complete: bool,
+    layers_are_target_ancestors: bool,
+) -> (next: Option<RequestPlanConstructionState>)
+    requires request_plan_construction_inv(state),
+    ensures match next {
+        Some(value) => {
+            &&& request_plan_construction_inv(value)
+            &&& value.phase == RequestPlanConstructionPhase::AccessWalk
+            &&& value.mapping_slot == state.mapping_slot
+            &&& value.target_revision == state.target_revision
+        }
+        None => true,
+    },
+{
+    reveal(request_plan_construction_inv);
+    reveal(request_plan_phase_rank);
+    match state.phase {
+        RequestPlanConstructionPhase::Target
+            if walk_uses_exact_target
+                && ancestor_walk_complete
+                && layers_are_target_ancestors => {
+            Some(RequestPlanConstructionState {
+                phase: RequestPlanConstructionPhase::AccessWalk,
+                access_walk_bound: true,
+                ..state
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn request_plan_construction_seal(
+    state: RequestPlanConstructionState,
+    textual_identity: bool,
+) -> (next: Option<RequestPlanConstructionState>)
+    requires request_plan_construction_inv(state),
+    ensures match next {
+        Some(value) => {
+            &&& request_plan_construction_inv(value)
+            &&& value.phase == RequestPlanConstructionPhase::Complete
+            &&& value.textual_identity
+            &&& value.generation == state.generation
+        }
+        None => true,
+    },
+{
+    reveal(request_plan_construction_inv);
+    reveal(request_plan_phase_rank);
+    match state.phase {
+        RequestPlanConstructionPhase::AccessWalk if textual_identity => {
+            Some(RequestPlanConstructionState {
+                phase: RequestPlanConstructionPhase::Complete,
+                textual_identity: true,
+                ..state
+            })
+        }
+        _ => None,
+    }
+}
+
+pub open spec fn request_plan_consumer_spec(
+    state: RequestPlanConstructionState,
+    generation: u64,
+    _consumer: RequestPlanConsumer,
+) -> bool {
+    request_plan_construction_inv(state)
+        && state.phase == RequestPlanConstructionPhase::Complete
+        && state.generation == generation
+}
+
+#[inline]
+pub fn request_plan_consumer_admit(
+    state: RequestPlanConstructionState,
+    generation: u64,
+    _consumer: RequestPlanConsumer,
+) -> (admit: bool)
+    requires request_plan_construction_inv(state),
+    ensures admit == request_plan_consumer_spec(state, generation, _consumer),
+{
+    reveal(request_plan_consumer_spec);
+    match state.phase {
+        RequestPlanConstructionPhase::Complete => state.generation == generation,
+        _ => false,
+    }
+}
+
+/// DirectoryIndex and same-directory rewrite reuse are the only transitions
+/// that preserve a layer snapshot.  They must retain the exact configuration,
+/// vhost/route/mapping winner, mapping root and walk domain.  Incrementing the
+/// revision makes the target change explicit in the carried certificate.
+pub open spec fn request_plan_retarget_spec(
+    state: RequestPlanConstructionState,
+    canonical_target: bool,
+    same_mapping_provenance: bool,
+    same_mapping_root: bool,
+    same_access_walk_domain: bool,
+    same_access_layers: bool,
+    textual_identity: bool,
+) -> Option<RequestPlanConstructionState> {
+    if state.phase != RequestPlanConstructionPhase::Complete
+        || !canonical_target
+        || !same_mapping_provenance
+        || !same_mapping_root
+        || !same_access_walk_domain
+        || !same_access_layers
+        || !textual_identity
+        || state.target_revision == u64::MAX
+    {
+        None
+    } else {
+        Some(RequestPlanConstructionState {
+            target_revision: (state.target_revision as int + 1) as u64,
+            ..state
+        })
+    }
+}
+
+pub fn request_plan_retarget(
+    state: RequestPlanConstructionState,
+    canonical_target: bool,
+    same_mapping_provenance: bool,
+    same_mapping_root: bool,
+    same_access_walk_domain: bool,
+    same_access_layers: bool,
+    textual_identity: bool,
+) -> (next: Option<RequestPlanConstructionState>)
+    requires request_plan_construction_inv(state),
+    ensures
+        next == request_plan_retarget_spec(
+            state,
+            canonical_target,
+            same_mapping_provenance,
+            same_mapping_root,
+            same_access_walk_domain,
+            same_access_layers,
+            textual_identity,
+        ),
+        match next {
+        Some(value) => {
+            &&& request_plan_construction_inv(value)
+            &&& value.phase == RequestPlanConstructionPhase::Complete
+            &&& value.generation == state.generation
+            &&& value.vhost_slot == state.vhost_slot
+            &&& value.route_slot == state.route_slot
+            &&& value.mapping_slot == state.mapping_slot
+            &&& value.mapping_kind == state.mapping_kind
+            &&& value.target_revision == (state.target_revision as int + 1) as u64
+        }
+        None => true,
+    },
+{
+    reveal(request_plan_retarget_spec);
+    reveal(request_plan_construction_inv);
+    reveal(request_plan_phase_rank);
+    match state.phase {
+        RequestPlanConstructionPhase::Complete
+            if canonical_target
+                && same_mapping_provenance
+                && same_mapping_root
+                && same_access_walk_domain
+                && same_access_layers
+                && textual_identity
+                && state.target_revision != u64::MAX => {
+            Some(RequestPlanConstructionState {
+                target_revision: state.target_revision + 1,
+                ..state
+            })
+        }
+        _ => None,
+    }
+}
+
+pub proof fn complete_request_plan_has_one_coherent_identity(
+    state: RequestPlanConstructionState,
+)
+    requires
+        request_plan_construction_inv(state),
+        state.phase == RequestPlanConstructionPhase::Complete,
+    ensures
+        state.canonical_bound,
+        state.route_program_refined,
+        state.vhost_bound,
+        state.mapping_bound,
+        state.root_bound,
+        state.target_bound,
+        state.access_walk_bound,
+        state.textual_identity,
+        request_mapping_selection_spec(
+            state.mapping_kind,
+            state.mapping_slot,
+            state.mapping_scan,
+        ),
+{
+}
+
+pub proof fn complete_request_plan_is_admitted_by_every_consumer(
+    state: RequestPlanConstructionState,
+)
+    requires
+        request_plan_construction_inv(state),
+        state.phase == RequestPlanConstructionPhase::Complete,
+    ensures forall|consumer: RequestPlanConsumer| request_plan_consumer_spec(
+        state,
+        state.generation,
+        consumer,
+    ),
+{
+}
+
+pub proof fn request_plan_retarget_preserves_mapping_and_generation(
+    state: RequestPlanConstructionState,
+)
+    requires
+        request_plan_construction_inv(state),
+        state.phase == RequestPlanConstructionPhase::Complete,
+        state.target_revision < u64::MAX,
+    ensures {
+        let next = request_plan_retarget_spec(
+            state, true, true, true, true, true, true,
+        ).unwrap();
+        &&& next.generation == state.generation
+        &&& next.vhost_slot == state.vhost_slot
+        &&& next.route_slot == state.route_slot
+        &&& next.mapping_slot == state.mapping_slot
+        &&& next.mapping_kind == state.mapping_kind
+        &&& next.target_revision == (state.target_revision as int + 1) as u64
+    },
+{
+}
+
 } // verus!

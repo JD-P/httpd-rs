@@ -1582,6 +1582,26 @@ rounds build a new plan from the rewritten canonical URL, and that plan is the
 input to the next scope evaluation.  `--explain` prints the plan’s canonical
 path, mapping, layer directories, URL mounts and filesystem subjects.
 
+The plan now also carries an executable `RequestPlanConstructionState`.  Its
+only successful sequence is:
+
+```text
+Canonical -> Vhost -> Mapping -> Root -> Target -> AccessWalk -> Complete
+```
+
+The mapping transition records the exact source kind, configuration
+generation, vhost slot, nginx route declaration and first winning
+Alias/ScriptAlias slot.  The root, resolved target and ancestor walk are then
+bound without permitting a phase to be skipped or repeated.  Authorization,
+cache, rewrite and terminal dispatch all require the same `Complete`
+certificate for the current generation.  A DirectoryIndex or same-directory
+rewrite can only increment the target revision while retaining the mapping
+winner, root and access-walk identity; otherwise it constructs a fresh plan.
+The Verus theorem is exact for this provenance state machine.  Correspondence
+between its path facts and the private ordinary-Rust `PathBuf`/`String` fields,
+plus ancestor enumeration and regex expansion, remains an explicit
+implementation-refinement boundary rather than a Verus heap/path theorem.
+
 ### I60 — Explicit-target access-layer binding
 
 ```text
@@ -1991,7 +2011,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **1083 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **1105 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `CacheTransactionState` closes lookup, current-generation reauthorization,
   hit/miss, store, publication, reload retirement and targeted invalidation.
@@ -2011,6 +2031,12 @@ construction: there is no second production interleaver.
   transaction.
   Rust atomic/Mutex linearizability and source/destination identity remain the
   explicitly tested runtime-refinement boundary rather than a Verus heap proof.
+- `RequestPlanConstructionState` is the executable seven-phase canonical
+  request/vhost/mapping/root/target/access-walk certificate. The runtime alias
+  loop consumes the verified first-winner scan, every plan privately retains
+  the selected provenance, all four security consumers require `Complete` for
+  the exact configuration generation, and the retarget transition proves that
+  DirectoryIndex/rewrite reuse cannot change the mapping or walk identity.
 - The PCRE positive parser now certifies each contiguous source span and grammar
   event, the production rolling-row fnmatch implementation is proved equal to
   its recursive specification for arbitrary patterns and values, and the
@@ -2667,7 +2693,7 @@ python3 tests/verification_status.py --run-verus
 
 The current ledger (2026-11-28) is:
 
-- weighted obligations: **57.5 / 88.0 (65.3%)** if partial obligations receive
+- weighted obligations: **71.0 / 100.0 (71.0%)** if partial obligations receive
   half credit;
 - proof debt: **6 / 6** — 0 named unverified security components, 0 partially
   bound sinks, 6 assumptions and 0 accepted unmodeled security-directive
@@ -2676,7 +2702,7 @@ The current ledger (2026-11-28) is:
   inode-bound, **3/11** backend-target-bound, **3/11** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **856 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **1105 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

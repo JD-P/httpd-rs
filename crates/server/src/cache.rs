@@ -708,6 +708,9 @@ pub fn request_scope_with_plan(
     host: &str,
     local_ip: &str,
 ) -> Option<CacheContext> {
+    if !plan.admits_consumer(cfg, httpd_rs_verified::RequestPlanConsumer::Cache) {
+        return None;
+    }
     if !httpd_rs_verified::cache_lookup_request_admit(
         matches!(req.method.as_str(), "GET" | "HEAD"),
         matches!(req.framing, crate::verified::BodyFraming::None),
@@ -759,13 +762,13 @@ pub fn request_scope_with_plan(
     // normal dispatcher instead of serving a stale representation.
     let rewrite_ctx = crate::rewrite::Context::for_plan(
         plan,
-        &cfg.server_root,
+        cfg,
         &req.query,
         peer.ip(),
         local_port,
         https,
         server_name,
-    );
+    )?;
     if !matches!(
         crate::rewrite::process(&scope, req, &rewrite_ctx),
         crate::rewrite::Outcome::None
@@ -814,7 +817,6 @@ pub fn request_scope_with_plan(
                     target,
                     root.clone(),
                     fs_path.clone(),
-                    script_alias,
                     req,
                 )
                 .ok()?;
@@ -879,7 +881,6 @@ pub fn request_scope_with_plan(
                     index_target.clone(),
                     root.clone(),
                     index_fs.clone(),
-                    script_alias,
                     req,
                 )
                 .ok()?;
@@ -994,7 +995,6 @@ pub fn request_scope_with_plan(
                 target,
                 root.clone(),
                 actual.clone(),
-                script_alias,
                 req,
             )
             .ok()?;
