@@ -4627,6 +4627,24 @@
         "glob_match_resource_admit",
         "bounded_expansion_append_admit"
       ],
+      "code": "semantic_ast: Arc::new(program.ast),",
+      "effect": "heap-allocation",
+      "function": "build",
+      "id": "ae1a587cf535766523e4",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
       "code": "capture_names: Arc::new(capture_names),",
       "effect": "heap-allocation",
       "function": "build",
@@ -4735,6 +4753,24 @@
         "glob_match_resource_admit",
         "bounded_expansion_append_admit"
       ],
+      "code": "children.iter().try_fold(0usize, |total, child| {",
+      "effect": "cpu-iteration",
+      "function": "capture_name_bytes",
+      "id": "3de21aeb5ad9096fac31",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
       "code": "let (minimum, maximum) = match body.iter().position(|&byte| byte == b',') {",
       "effect": "cpu-iteration",
       "function": "capture_quantifier_repeats",
@@ -4777,6 +4813,42 @@
       "id": "3724981deacfe277fa00",
       "path": "crates/pcre2/src/lib.rs",
       "status": "review-required"
+    },
+    {
+      "accounting_evidence": [
+        "limit"
+      ],
+      "closure_contract": "inferred-accounted-context",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (limit)",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "request_resource_effect_closure"
+      ],
+      "code": "for child in children {",
+      "effect": "cpu-iteration",
+      "function": "certify_postorder",
+      "id": "3efd7d710e171ed23fc0",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "accounted-context"
+    },
+    {
+      "accounting_evidence": [
+        "limit"
+      ],
+      "closure_contract": "inferred-accounted-context",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (limit)",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "request_resource_effect_closure"
+      ],
+      "code": "for child in children {",
+      "effect": "cpu-iteration",
+      "function": "certify_postorder",
+      "id": "45efc27cc3b681789972",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "accounted-context"
     },
     {
       "accounting_evidence": [],
@@ -4849,6 +4921,21 @@
       "id": "b7a6bd73bffbe1f20aea",
       "path": "crates/pcre2/src/lib.rs",
       "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "checked-local-arithmetic",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "the effect expression carries a checked/saturating or explicit maximum operation and remains subject to its module's closed input ceiling",
+      "closure_verification_targets": [
+        "request_resource_effect_closure"
+      ],
+      "code": ".fold(1u64, |sum, child| sum.saturating_add(child.complexity())),",
+      "effect": "cpu-iteration",
+      "function": "complexity",
+      "id": "a148559e2e206aa42ccb",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "local-bound-candidate"
     },
     {
       "accounting_evidence": [],
@@ -5117,6 +5204,132 @@
       "effect": "synchronization",
       "function": "for_search",
       "id": "852aac1defe3340feee3",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": "child: Box::new(Self::from_hir(&repetition.sub)?),",
+      "effect": "heap-allocation",
+      "function": "from_hir",
+      "id": "47c11f77c912362272d7",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": "HirKind::Literal(literal) => Self::Literal(literal.0.to_vec()),",
+      "effect": "heap-allocation",
+      "function": "from_hir",
+      "id": "5a9034bc6a91a2ad268d",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": ".collect(),",
+      "effect": "heap-allocation",
+      "function": "from_hir",
+      "id": "8a2e4ed746842a8b2f64",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": "child: Box::new(Self::from_hir(&capture.sub)?),",
+      "effect": "heap-allocation",
+      "function": "from_hir",
+      "id": "ae11ce0d2762518d4cfc",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": ".collect::<Result<Vec<_>, _>>()?,",
+      "effect": "heap-allocation",
+      "function": "from_hir",
+      "id": "b75c98e2446c9bafe8a4",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": ".collect::<Result<Vec<_>, _>>()?,",
+      "effect": "heap-allocation",
+      "function": "from_hir",
+      "id": "f0f430c41dac74f2b5f1",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": ".collect(),",
+      "effect": "heap-allocation",
+      "function": "from_hir",
+      "id": "fa9f3ecfac37c9dbb2ee",
       "path": "crates/pcre2/src/lib.rs",
       "status": "review-required"
     },
@@ -5963,6 +6176,78 @@
       "effect": "cpu-iteration",
       "function": "render_class_members",
       "id": "8a85d309c0e31313d863",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": "sub: Box::new(child.to_hir()),",
+      "effect": "heap-allocation",
+      "function": "to_hir",
+      "id": "5ac629cbecd94d55f5e4",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": "Hir::alternation(children.iter().map(Self::to_hir).collect())",
+      "effect": "heap-allocation",
+      "function": "to_hir",
+      "id": "bb7ae7b624ea2d0bcd2c",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": "sub: Box::new(child.to_hir()),",
+      "effect": "heap-allocation",
+      "function": "to_hir",
+      "id": "c35ad22d90f95ee32723",
+      "path": "crates/pcre2/src/lib.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "closed-input-grammar-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "closed grammars, bounded input records and executable checked-arithmetic/iteration kernels give every accepted parse/compile operation a finite implementation ceiling; request-time regex/glob consumers additionally acquire their CPU and expansion budgets",
+      "closure_verification_targets": [
+        "configuration_payload_refinement",
+        "pcre2_grammar_refinement",
+        "glob_match_resource_admit",
+        "bounded_expansion_append_admit"
+      ],
+      "code": "Self::Concat(children) => Hir::concat(children.iter().map(Self::to_hir).collect()),",
+      "effect": "heap-allocation",
+      "function": "to_hir",
+      "id": "c85faad413da7036096c",
       "path": "crates/pcre2/src/lib.rs",
       "status": "review-required"
     },
@@ -7819,6 +8104,28 @@
       "effect": "compression-regex-crypto",
       "function": "is_match",
       "id": "aca6b2187e7a8d801835",
+      "path": "crates/server/src/apache_regex.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "request-runtime-typed-leases",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "shared_map_insert_admit",
+        "shared_queue_push_admit",
+        "dependency_call_admit",
+        "async_work_handoff_admit",
+        "blocking_io_start_admit",
+        "request_resource_effect_closure",
+        "terminal_sink_gate"
+      ],
+      "code": ".is_match(normalized_uri.as_bytes())",
+      "effect": "compression-regex-crypto",
+      "function": "is_nginx_match",
+      "id": "7825b4163da43be7a4e4",
       "path": "crates/server/src/apache_regex.rs",
       "status": "review-required"
     },
@@ -24705,15 +25012,32 @@
       "status": "review-required"
     },
     {
-      "accounting_evidence": [],
-      "closure_contract": "nginx-frontend-and-ir-bounds",
-      "closure_disposition": "proved-constant-bound",
-      "closure_evidence": "the nginx loader has hard per-file, aggregate-byte, include-depth/count/directory-entry, syntax-node, argument and token ceilings; lowering additionally caps servers, names, routes, transformation segments/bytes and total source-derived structure. The 64 MiB derived-policy estimate is a conservative operational rejection threshold rather than an exact allocator proof; the finite source/node/route ceilings provide the underlying constant-bound warrant. Request-time route selection consumes the verified matcher/path work charge, transformation output is capped at 16 KiB, and indexed route/name winners are differentially checked against independent linear references",
+      "accounting_evidence": [
+        "admit"
+      ],
+      "closure_contract": "inferred-accounted-context",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (admit)",
       "closure_verification_targets": [
-        "nginx_literal_candidate_better",
-        "nginx_route_winner_class",
-        "nginx_server_name_winner_class",
-        "nginx_route_selection_work",
+        "resource_budget_admit",
+        "request_resource_effect_closure"
+      ],
+      "code": "for index in exact_routes",
+      "effect": "cpu-iteration",
+      "function": "build",
+      "id": "0c3139c93250dad77af5",
+      "path": "crates/server/src/config_ir.rs",
+      "status": "accounted-context"
+    },
+    {
+      "accounting_evidence": [
+        "admit"
+      ],
+      "closure_contract": "inferred-accounted-context",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (admit)",
+      "closure_verification_targets": [
+        "resource_budget_admit",
         "request_resource_effect_closure"
       ],
       "code": "for (index, route) in routes.iter().enumerate() {",
@@ -24721,7 +25045,7 @@
       "function": "build",
       "id": "258a19d677ac7b8eac99",
       "path": "crates/server/src/config_ir.rs",
-      "status": "review-required"
+      "status": "accounted-context"
     },
     {
       "accounting_evidence": [],
@@ -24754,10 +25078,67 @@
         "nginx_route_selection_work",
         "request_resource_effect_closure"
       ],
+      "code": "let mut declaration_orders = HashSet::with_capacity(routes.len());",
+      "effect": "heap-allocation",
+      "function": "build",
+      "id": "316a08853a9eeb1c7eef",
+      "path": "crates/server/src/config_ir.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "nginx-frontend-and-ir-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "the nginx loader has hard per-file, aggregate-byte, include-depth/count/directory-entry, syntax-node, argument and token ceilings; lowering additionally caps servers, names, routes, transformation segments/bytes and total source-derived structure. The 64 MiB derived-policy estimate is a conservative operational rejection threshold rather than an exact allocator proof; the finite source/node/route ceilings provide the underlying constant-bound warrant. Request-time route selection consumes the verified matcher/path work charge, transformation output is capped at 16 KiB, and indexed route/name winners are differentially checked against independent linear references",
+      "closure_verification_targets": [
+        "nginx_literal_candidate_better",
+        "nginx_route_winner_class",
+        "nginx_server_name_winner_class",
+        "nginx_route_selection_work",
+        "request_resource_effect_closure"
+      ],
+      "code": "let mut seen = vec![false; routes.len()];",
+      "effect": "heap-allocation",
+      "function": "build",
+      "id": "72193b78922a74c0424f",
+      "path": "crates/server/src/config_ir.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "nginx-frontend-and-ir-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "the nginx loader has hard per-file, aggregate-byte, include-depth/count/directory-entry, syntax-node, argument and token ceilings; lowering additionally caps servers, names, routes, transformation segments/bytes and total source-derived structure. The 64 MiB derived-policy estimate is a conservative operational rejection threshold rather than an exact allocator proof; the finite source/node/route ceilings provide the underlying constant-bound warrant. Request-time route selection consumes the verified matcher/path work charge, transformation output is capped at 16 KiB, and indexed route/name winners are differentially checked against independent linear references",
+      "closure_verification_targets": [
+        "nginx_literal_candidate_better",
+        "nginx_route_winner_class",
+        "nginx_server_name_winner_class",
+        "nginx_route_selection_work",
+        "request_resource_effect_closure"
+      ],
       "code": "let mut exact = HashMap::new();",
       "effect": "heap-allocation",
       "function": "build",
       "id": "9a8b43ef2d0d3a39ee0a",
+      "path": "crates/server/src/config_ir.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "nginx-frontend-and-ir-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "the nginx loader has hard per-file, aggregate-byte, include-depth/count/directory-entry, syntax-node, argument and token ceilings; lowering additionally caps servers, names, routes, transformation segments/bytes and total source-derived structure. The 64 MiB derived-policy estimate is a conservative operational rejection threshold rather than an exact allocator proof; the finite source/node/route ceilings provide the underlying constant-bound warrant. Request-time route selection consumes the verified matcher/path work charge, transformation output is capped at 16 KiB, and indexed route/name winners are differentially checked against independent linear references",
+      "closure_verification_targets": [
+        "nginx_literal_candidate_better",
+        "nginx_route_winner_class",
+        "nginx_server_name_winner_class",
+        "nginx_route_selection_work",
+        "request_resource_effect_closure"
+      ],
+      "code": "let mut exact_routes = Vec::new();",
+      "effect": "heap-allocation",
+      "function": "build",
+      "id": "bc34b1faf6e2c48174c0",
       "path": "crates/server/src/config_ir.rs",
       "status": "review-required"
     },
@@ -25110,10 +25491,10 @@
         "nginx_route_selection_work",
         "request_resource_effect_closure"
       ],
-      "code": ".collect();",
+      "code": ".collect::<Result<Vec<_>, _>>()?;",
       "effect": "heap-allocation",
       "function": "nginx",
-      "id": "abfe18d43d0034ac91a9",
+      "id": "efe730e46e2b313e162f",
       "path": "crates/server/src/config_ir.rs",
       "status": "review-required"
     },
@@ -25411,48 +25792,10 @@
         "nginx_route_selection_work",
         "request_resource_effect_closure"
       ],
-      "code": "regex.is_match(path.as_bytes()).then_some(route)",
-      "effect": "compression-regex-crypto",
-      "function": "select",
-      "id": "b74477e1eadaacbf1675",
-      "path": "crates/server/src/config_ir.rs",
-      "status": "review-required"
-    },
-    {
-      "accounting_evidence": [],
-      "closure_contract": "nginx-frontend-and-ir-bounds",
-      "closure_disposition": "proved-constant-bound",
-      "closure_evidence": "the nginx loader has hard per-file, aggregate-byte, include-depth/count/directory-entry, syntax-node, argument and token ceilings; lowering additionally caps servers, names, routes, transformation segments/bytes and total source-derived structure. The 64 MiB derived-policy estimate is a conservative operational rejection threshold rather than an exact allocator proof; the finite source/node/route ceilings provide the underlying constant-bound warrant. Request-time route selection consumes the verified matcher/path work charge, transformation output is capped at 16 KiB, and indexed route/name winners are differentially checked against independent linear references",
-      "closure_verification_targets": [
-        "nginx_literal_candidate_better",
-        "nginx_route_winner_class",
-        "nginx_server_name_winner_class",
-        "nginx_route_selection_work",
-        "request_resource_effect_closure"
-      ],
-      "code": "if regex.is_match(path.as_bytes())",
-      "effect": "compression-regex-crypto",
-      "function": "select_nginx_route",
-      "id": "0142568c28d761da37d1",
-      "path": "crates/server/src/config_ir.rs",
-      "status": "review-required"
-    },
-    {
-      "accounting_evidence": [],
-      "closure_contract": "nginx-frontend-and-ir-bounds",
-      "closure_disposition": "proved-constant-bound",
-      "closure_evidence": "the nginx loader has hard per-file, aggregate-byte, include-depth/count/directory-entry, syntax-node, argument and token ceilings; lowering additionally caps servers, names, routes, transformation segments/bytes and total source-derived structure. The 64 MiB derived-policy estimate is a conservative operational rejection threshold rather than an exact allocator proof; the finite source/node/route ceilings provide the underlying constant-bound warrant. Request-time route selection consumes the verified matcher/path work charge, transformation output is capped at 16 KiB, and indexed route/name winners are differentially checked against independent linear references",
-      "closure_verification_targets": [
-        "nginx_literal_candidate_better",
-        "nginx_route_winner_class",
-        "nginx_server_name_winner_class",
-        "nginx_route_selection_work",
-        "request_resource_effect_closure"
-      ],
-      "code": "for route in routes {",
+      "code": "for (kind, route) in [",
       "effect": "cpu-iteration",
-      "function": "select_nginx_route",
-      "id": "7da23f1aa8e9ed020038",
+      "function": "select_accumulated_route",
+      "id": "af0da726e74b9fc92366",
       "path": "crates/server/src/config_ir.rs",
       "status": "review-required"
     },
@@ -46285,12 +46628,11 @@
     },
     {
       "accounting_evidence": [
-        "MAX_",
-        "limit"
+        "MAX_"
       ],
       "closure_contract": "inferred-accounted-context",
       "closure_disposition": "typed-lease",
-      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (MAX_, limit)",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (MAX_)",
       "closure_verification_targets": [
         "resource_budget_admit",
         "request_resource_effect_closure"
@@ -46304,12 +46646,11 @@
     },
     {
       "accounting_evidence": [
-        "MAX_",
-        "limit"
+        "MAX_"
       ],
       "closure_contract": "inferred-accounted-context",
       "closure_disposition": "typed-lease",
-      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (MAX_, limit)",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (MAX_)",
       "closure_verification_targets": [
         "resource_budget_admit",
         "request_resource_effect_closure"
@@ -46323,12 +46664,11 @@
     },
     {
       "accounting_evidence": [
-        "MAX_",
-        "limit"
+        "MAX_"
       ],
       "closure_contract": "inferred-accounted-context",
       "closure_disposition": "typed-lease",
-      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (MAX_, limit)",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (MAX_)",
       "closure_verification_targets": [
         "resource_budget_admit",
         "request_resource_effect_closure"
@@ -46342,12 +46682,11 @@
     },
     {
       "accounting_evidence": [
-        "MAX_",
-        "limit"
+        "MAX_"
       ],
       "closure_contract": "inferred-accounted-context",
       "closure_disposition": "typed-lease",
-      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (MAX_, limit)",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (MAX_)",
       "closure_verification_targets": [
         "resource_budget_admit",
         "request_resource_effect_closure"
@@ -48270,26 +48609,8 @@
       ],
       "code": "loop {",
       "effect": "cpu-iteration",
-      "function": "parse_block",
-      "id": "824187ed67b007d1a94b",
-      "path": "crates/server/src/nginx_frontend.rs",
-      "status": "accounted-context"
-    },
-    {
-      "accounting_evidence": [
-        "MAX_"
-      ],
-      "closure_contract": "inferred-accounted-context",
-      "closure_disposition": "typed-lease",
-      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (MAX_)",
-      "closure_verification_targets": [
-        "resource_budget_admit",
-        "request_resource_effect_closure"
-      ],
-      "code": "loop {",
-      "effect": "cpu-iteration",
-      "function": "parse_block",
-      "id": "a36b4b7eb696fb438035",
+      "function": "parse",
+      "id": "4d6157227f7ac87314a2",
       "path": "crates/server/src/nginx_frontend.rs",
       "status": "accounted-context"
     },
@@ -48305,10 +48626,29 @@
         "nginx_route_selection_work",
         "request_resource_effect_closure"
       ],
-      "code": "let mut args = Vec::new();",
+      "code": "let mut frames: Vec<BlockFrame> = Vec::new();",
       "effect": "heap-allocation",
-      "function": "parse_block",
-      "id": "2aa2f5f361a8557a1b41",
+      "function": "parse",
+      "id": "27831995a1453c7d93fb",
+      "path": "crates/server/src/nginx_frontend.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "nginx-frontend-and-ir-bounds",
+      "closure_disposition": "proved-constant-bound",
+      "closure_evidence": "the nginx loader has hard per-file, aggregate-byte, include-depth/count/directory-entry, syntax-node, argument and token ceilings; lowering additionally caps servers, names, routes, transformation segments/bytes and total source-derived structure. The 64 MiB derived-policy estimate is a conservative operational rejection threshold rather than an exact allocator proof; the finite source/node/route ceilings provide the underlying constant-bound warrant. Request-time route selection consumes the verified matcher/path work charge, transformation output is capped at 16 KiB, and indexed route/name winners are differentially checked against independent linear references",
+      "closure_verification_targets": [
+        "nginx_literal_candidate_better",
+        "nginx_route_winner_class",
+        "nginx_server_name_winner_class",
+        "nginx_route_selection_work",
+        "request_resource_effect_closure"
+      ],
+      "code": "Vec::new(),",
+      "effect": "heap-allocation",
+      "function": "parse",
+      "id": "cf6117a840cd7dfe8fb6",
       "path": "crates/server/src/nginx_frontend.rs",
       "status": "review-required"
     },
@@ -48326,8 +48666,8 @@
       ],
       "code": "let mut nodes = Vec::new();",
       "effect": "heap-allocation",
-      "function": "parse_block",
-      "id": "aef4b31e02612423e0fa",
+      "function": "parse",
+      "id": "dfd1680cc6f75481285a",
       "path": "crates/server/src/nginx_frontend.rs",
       "status": "review-required"
     },
@@ -48362,10 +48702,10 @@
         "nginx_route_selection_work",
         "request_resource_effect_closure"
       ],
-      "code": "let regex = crate::apache_regex::Regex::compile(value, modifier == \"~*\")",
+      "code": "let regex = crate::apache_regex::Regex::compile_nginx(value, regex_modifier)",
       "effect": "compression-regex-crypto",
       "function": "parse_location",
-      "id": "6d149ead0b9521926400",
+      "id": "3753c05b0b30b0e487f7",
       "path": "crates/server/src/nginx_frontend.rs",
       "status": "review-required"
     },
@@ -70757,33 +71097,33 @@
       "status": "external-source-inventory"
     }
   ],
-  "source_sha256": "d5ee42b825fcc73f2885846f811007dabc57226026e737dd528da8de98d61525",
+  "source_sha256": "81eff1b62a61666e7583ad22737dd93179fc47773f33820420e45104d64fb1d3",
   "summary": {
     "by_closure_disposition": {
       "external-assumption": 448,
-      "proved-constant-bound": 884,
-      "typed-lease": 2296
+      "proved-constant-bound": 899,
+      "typed-lease": 2300
     },
     "by_effect": {
-      "compression-regex-crypto": 78,
-      "cpu-iteration": 984,
+      "compression-regex-crypto": 77,
+      "cpu-iteration": 988,
       "data-growth": 451,
       "filesystem": 152,
-      "heap-allocation": 1236,
+      "heap-allocation": 1252,
       "network": 37,
       "synchronization": 283,
       "task-process": 46,
       "unsafe-ffi-syscall": 361
     },
     "by_status": {
-      "accounted-context": 734,
+      "accounted-context": 737,
       "accounting-boundary": 63,
       "audited-gateway": 325,
       "external-source-inventory": 196,
-      "local-bound-candidate": 14,
-      "review-required": 2296
+      "local-bound-candidate": 15,
+      "review-required": 2311
     },
-    "effect_sites": 3628,
+    "effect_sites": 3647,
     "files": 59,
     "unclassified_effect_sites": 0
   }

@@ -1922,11 +1922,14 @@ The first Verus model should cover:
 
 The following remain assumptions or separate proofs:
 
-- the safe-Rust regex automata backend implements its documented regular
-  language and capture semantics; the PCRE2 positive grammar carries a
-  verified option-scope and exact-source certificate into translation, while
-  byte-to-event completeness and matching equivalence are checked against the
-  test-only PCRE2 10.46 oracle;
+- the safe-Rust regex automata backend implements its documented HIR,
+  leftmost-first and capture semantics. The PCRE2 positive grammar carries a
+  verified option-scope and exact-source certificate into translation; the
+  complete normalized semantic AST is structurally certified and must
+  round-trip exactly before the private matcher capability can be constructed.
+  Byte-to-event completeness, stock-PCRE2 source equivalence and the
+  dependency engine's internals remain checked by contract plus the test-only
+  PCRE2 10.46 oracle;
 - the filesystem contents match what the access-file walk sees;
 - path canonicalization and `openat` containment (already separately
   verified in `crates/verified`);
@@ -1975,7 +1978,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **864 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **969 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - The forked h2 HPACK path calls the executable verified kernel for integer
   encoding/decoding, overflow-free entry sizing, dynamic-table admission,
@@ -2227,12 +2230,20 @@ construction: there is no second production interleaver.
   compatibility frontend. Its positive, stack-bounded grammar must consume
   every literal, class, escape, group, option and quantifier before an
   unforgeable admitted-pattern witness can reach translation; directive
-  patterns are never parsed by Rust `regex` directly. Unknown syntax,
+  patterns are never parsed by Rust `regex` directly. The normalized
+  `SemanticAst` closes the executable vocabulary to empty/literal/class/look/
+  repeat/capture/concat/alternation nodes. Every concrete node is consumed by
+  `pcre_ast_step`; one-root certification, an exact AST-to-HIR round trip and
+  fixed leftmost-first/non-backtracking policy are required before the private
+  `CertifiedMatcherProgram` can enter `regex-automata`. Unknown syntax,
   backreferences, recursion, look-around and other recursive-backtracking
   constructs fail at configuration load. `regex_match_resource_admit` proves
   the overflow-free pattern-times-subject work bound and `expr_regex_result`
   proves that an evaluation error cannot grant even through negation. The Rust
-  automata backend still supplies matching semantics for the accepted bytecode.
+  automata backend still supplies matching semantics for the accepted HIR.
+  nginx `location ~` and `~*` retain a verified shared-matcher profile: the
+  only dialect difference is the initial case bit, UTF/UCP remain disabled,
+  and route matching rejects any regex that did not cross that nginx bridge.
 - `directive_disposition`. The configuration fallback uses a verified
   three-way fail-closed disposition for security-sensitive, known-but-
   unimplemented, and unknown directives. This is the executable form of I9;
@@ -2591,12 +2602,12 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus
 ```
 
-The current ledger (2026-11-12) is:
+The current ledger (2026-11-28) is:
 
-- weighted obligations: **42.5 / 72.0 (59.0%)** if partial obligations receive
+- weighted obligations: **57.5 / 88.0 (65.3%)** if partial obligations receive
   half credit;
-- proof debt: **5 / 6** — 0 named unverified security components, 0 partially
-  bound sinks, 5 assumptions and 0 accepted unmodeled security-directive
+- proof debt: **6 / 6** — 0 named unverified security components, 0 partially
+  bound sinks, 6 assumptions and 0 accepted unmodeled security-directive
   classes;
 - sinks: **11/11** grant-required, **11/11** path/target-bound, **6/11**
   inode-bound, **3/11** backend-target-bound, **3/11** policy-key-bound;

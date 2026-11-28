@@ -119,6 +119,7 @@ fn release_compile_workspace(bytes: usize) {
 #[derive(Clone, Debug)]
 pub struct Regex {
     inner: httpd_rs_pcre2::bytes::Regex,
+    nginx_profile: Option<httpd_rs_verified::NginxRegexProfile>,
 }
 
 impl Regex {
@@ -135,7 +136,7 @@ impl Regex {
             .max_pattern_size(APACHE_REGEX_PATTERN_LIMIT)
             .size_limit(APACHE_REGEX_AUTOMATA_LIMIT);
         let workspace = builder
-            .dependency_workspace_bound()
+            .dependency_workspace_bound_for_pattern(pattern.len())
             .ok_or_else(|| "regex dependency workspace bound overflow".to_string())?;
         reserve_compile_workspace(workspace)?;
         match builder.build(pattern) {
@@ -146,7 +147,10 @@ impl Regex {
                     return Err("regex retained workspace exceeds compilation boundary".into());
                 }
                 release_compile_workspace(workspace - retained);
-                Ok(Self { inner })
+                Ok(Self {
+                    inner,
+                    nginx_profile: None,
+                })
             }
             Err(error) => {
                 release_compile_workspace(workspace);
@@ -155,12 +159,65 @@ impl Regex {
         }
     }
 
+    /// Compile an nginx `location ~`/`~*` expression through the same closed
+    /// PCRE AST used by Apache, retaining the verified modifier profile for
+    /// every later subject match.
+    pub(crate) fn compile_nginx(
+        pattern: &str,
+        modifier: httpd_rs_verified::NginxRegexModifier,
+    ) -> Result<Self, String> {
+        let profile = httpd_rs_verified::nginx_regex_profile(modifier);
+        let mut regex = Self::compile(pattern, profile.caseless)?;
+        if !httpd_rs_verified::nginx_regex_compile_bridge_admit(
+            profile,
+            regex.caseless(),
+            regex.utf(),
+            regex.ucp(),
+        ) {
+            return Err("nginx regex modifier did not refine the shared PCRE profile".into());
+        }
+        regex.nginx_profile = Some(profile);
+        Ok(regex)
+    }
+
     pub fn as_str(&self) -> &str {
         self.inner.as_str()
     }
 
+    pub(crate) fn caseless(&self) -> bool {
+        self.inner.caseless()
+    }
+
+    pub(crate) fn utf(&self) -> bool {
+        self.inner.utf()
+    }
+
+    pub(crate) fn ucp(&self) -> bool {
+        self.inner.ucp()
+    }
+
     pub fn is_match(&self, subject: &[u8]) -> bool {
         self.inner.is_match(subject).unwrap_or(false)
+    }
+
+    pub(crate) fn is_nginx_match(&self, normalized_uri: &str) -> bool {
+        let Some(profile) = self.nginx_profile else {
+            return false;
+        };
+        // The exact byte slice inspected by the matcher is derived directly
+        // from the already-canonical URL path passed to route selection.
+        if !httpd_rs_verified::nginx_regex_bridge_admit(
+            profile,
+            self.caseless(),
+            self.utf(),
+            self.ucp(),
+            true,
+        ) {
+            return false;
+        }
+        self.inner
+            .is_match(normalized_uri.as_bytes())
+            .unwrap_or(false)
     }
 
     pub fn captures<'s>(&self, subject: &'s [u8]) -> Option<httpd_rs_pcre2::bytes::Captures<'s>> {
@@ -226,5 +283,22 @@ mod tests {
         let (_, used) = with_compile_budget(8 * 1024 * 1024, || Regex::new("literal")).unwrap();
         assert!(used > 0);
         assert!(Regex::new("after").is_ok());
+    }
+
+    #[test]
+    fn nginx_modifiers_are_retained_at_the_shared_match_boundary() {
+        let sensitive =
+            Regex::compile_nginx("^/Admin$", httpd_rs_verified::NginxRegexModifier::Sensitive)
+                .unwrap();
+        let caseless =
+            Regex::compile_nginx("^/Admin$", httpd_rs_verified::NginxRegexModifier::Caseless)
+                .unwrap();
+        assert!(sensitive.is_nginx_match("/Admin"));
+        assert!(!sensitive.is_nginx_match("/admin"));
+        assert!(caseless.is_nginx_match("/admin"));
+
+        // An ordinary Apache expression cannot accidentally enter the nginx
+        // route path without the modifier/subject bridge certificate.
+        assert!(!Regex::new(".*").unwrap().is_nginx_match("/anything"));
     }
 }

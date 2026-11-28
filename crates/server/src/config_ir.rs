@@ -5,7 +5,7 @@
 //! in this module; everything else is rejected while loading configuration.
 
 use crate::apache_regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 pub const MAX_ROUTES_PER_SERVER: usize = 512;
@@ -111,11 +111,13 @@ pub struct NginxRouteIndex {
     prefixes: Vec<usize>,
     regexes: Vec<usize>,
     matcher_bytes: u64,
+    certified: bool,
 }
 
 impl NginxRouteIndex {
-    fn build<T>(routes: &[Route<T>]) -> Self {
+    fn build<T>(routes: &[Route<T>]) -> Result<Self, String> {
         let mut exact = HashMap::new();
+        let mut exact_routes = Vec::new();
         let mut prefixes = Vec::new();
         let mut regexes = Vec::new();
         let mut matcher_bytes = 0u64;
@@ -128,6 +130,7 @@ impl NginxRouteIndex {
             matcher_bytes = matcher_bytes.saturating_add(width as u64);
             match &route.matcher {
                 RouteMatcher::Exact(value) => {
+                    exact_routes.push(index);
                     let replace = exact.get(value).is_none_or(|current: &usize| {
                         route.declaration_order < routes[*current].declaration_order
                     });
@@ -149,17 +152,79 @@ impl NginxRouteIndex {
             )
         });
         regexes.sort_by_key(|index| routes[*index].declaration_order);
-        Self {
+
+        // Certify the derived index before it can become request-reachable.
+        // `exact` deliberately coalesces duplicate strings for lookup, while
+        // `exact_routes` retains every source route for the partition proof.
+        let mut seen = vec![false; routes.len()];
+        let mut unique_and_complete = true;
+        let mut declaration_orders = HashSet::with_capacity(routes.len());
+        for index in exact_routes
+            .iter()
+            .chain(prefixes.iter())
+            .chain(regexes.iter())
+        {
+            if *index >= seen.len() || seen[*index] {
+                unique_and_complete = false;
+                break;
+            }
+            seen[*index] = true;
+        }
+        unique_and_complete &= seen.iter().all(|seen| *seen);
+        unique_and_complete &= routes
+            .iter()
+            .all(|route| declaration_orders.insert(route.declaration_order));
+        let prefix_sorted = prefixes.windows(2).all(|pair| {
+            let RouteMatcher::Prefix {
+                value: previous, ..
+            } = &routes[pair[0]].matcher
+            else {
+                return false;
+            };
+            let RouteMatcher::Prefix { value: next, .. } = &routes[pair[1]].matcher else {
+                return false;
+            };
+            httpd_rs_verified::nginx_prefix_index_pair_admit(
+                previous.len() as u64,
+                routes[pair[0]].declaration_order as u64,
+                next.len() as u64,
+                routes[pair[1]].declaration_order as u64,
+            )
+        });
+        let regex_sorted = regexes.windows(2).all(|pair| {
+            httpd_rs_verified::nginx_regex_index_pair_admit(
+                routes[pair[0]].declaration_order as u64,
+                routes[pair[1]].declaration_order as u64,
+            )
+        });
+        let certified = httpd_rs_verified::nginx_index_partition_admit(
+            routes.len() as u64,
+            exact_routes.len() as u64,
+            prefixes.len() as u64,
+            regexes.len() as u64,
+            unique_and_complete,
+            prefix_sorted,
+            regex_sorted,
+        );
+        if !certified {
+            return Err("nginx route index failed its refinement certificate".into());
+        }
+        Ok(Self {
             exact,
             prefixes,
             regexes,
             matcher_bytes,
-        }
+            certified,
+        })
     }
 
     fn select<'a, T>(&self, routes: &'a [Route<T>], path: &str) -> Option<&'a Route<T>> {
-        if let Some(index) = self.exact.get(path) {
-            return routes.get(*index);
+        if !self.certified {
+            return None;
+        }
+        let exact = self.exact.get(path).and_then(|index| routes.get(*index));
+        if exact.is_some() {
+            return exact;
         }
         let prefix = self.prefixes.iter().find_map(|index| {
             let route = routes.get(*index)?;
@@ -179,16 +244,14 @@ impl NginxRouteIndex {
         }) {
             return prefix;
         }
-        self.regexes
-            .iter()
-            .find_map(|index| {
-                let route = routes.get(*index)?;
-                let RouteMatcher::Regex { regex, .. } = &route.matcher else {
-                    return None;
-                };
-                regex.is_match(path.as_bytes()).then_some(route)
-            })
-            .or(prefix)
+        let regex_match = self.regexes.iter().find_map(|index| {
+            let route = routes.get(*index)?;
+            let RouteMatcher::Regex { regex, .. } = &route.matcher else {
+                return None;
+            };
+            regex.is_nginx_match(path).then_some(route)
+        });
+        select_accumulated_route(exact, prefix, regex_match)
     }
 }
 
@@ -427,7 +490,7 @@ impl<T> RouteProgram<T> {
         let route_indexes = servers
             .iter()
             .map(|routes| NginxRouteIndex::build(routes))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         let server_names = NginxServerNameTable::new(server_names)?;
         Ok(Self::Nginx {
             servers,
@@ -438,6 +501,23 @@ impl<T> RouteProgram<T> {
 
     pub fn is_nginx(&self) -> bool {
         matches!(self, Self::Nginx { .. })
+    }
+
+    pub(crate) fn source_kind(&self) -> httpd_rs_verified::ConfigIrSource {
+        match self {
+            Self::Apache => httpd_rs_verified::ConfigIrSource::Apache,
+            Self::Nginx { .. } => httpd_rs_verified::ConfigIrSource::Nginx,
+        }
+    }
+
+    /// Construction is the proof boundary: nginx programs contain only
+    /// indexes accepted by the verified partition/order checker. Apache uses
+    /// its existing linear rule program and is refined by construction.
+    pub(crate) fn is_refined(&self) -> bool {
+        match self {
+            Self::Apache => true,
+            Self::Nginx { route_indexes, .. } => route_indexes.iter().all(|index| index.certified),
+        }
     }
 
     pub fn select(&self, server: usize, path: &str) -> Option<&T> {
@@ -541,74 +621,90 @@ impl<T> RouteProgram<T> {
 /// prefix; a `^~` prefix suppresses regex evaluation; otherwise the first
 /// matching regex in declaration order wins; finally use the longest prefix.
 pub fn select_nginx_route<'a, T>(routes: &'a [Route<T>], path: &str) -> Option<&'a Route<T>> {
-    let mut exact: Option<&Route<T>> = None;
-    let mut prefix: Option<&Route<T>> = None;
+    let mut state = httpd_rs_verified::nginx_route_accumulator_empty();
+    let mut exact = None;
+    let mut prefix = None;
+    let mut regex = None;
     for route in routes {
-        match &route.matcher {
-            RouteMatcher::Exact(value) if value == path => {
-                if exact
-                    .as_ref()
-                    .is_none_or(|current| route.declaration_order < current.declaration_order)
-                {
-                    exact = Some(route);
-                }
-            }
-            RouteMatcher::Prefix { value, .. } if path.starts_with(value) => {
-                let (current_width, current_order) = prefix
-                    .as_ref()
-                    .and_then(|current| match &current.matcher {
-                        RouteMatcher::Prefix { value, .. } => {
-                            Some((value.len(), current.declaration_order))
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or((0, 0));
-                let replace = httpd_rs_verified::nginx_literal_candidate_better(
-                    prefix.is_some(),
-                    value.len() as u64,
-                    route.declaration_order as u64,
-                    current_width as u64,
-                    current_order as u64,
-                );
-                if replace {
-                    prefix = Some(route);
-                }
-            }
-            _ => {}
-        }
-    }
-    let suppressing_prefix = prefix.is_some_and(|route| {
-        matches!(
-            route.matcher,
+        let next = match &route.matcher {
+            RouteMatcher::Exact(value) => httpd_rs_verified::nginx_route_accumulate(
+                state,
+                httpd_rs_verified::NginxRouteCandidateKind::Exact,
+                value == path,
+                value.len() as u64,
+                route.declaration_order as u64,
+                false,
+            ),
             RouteMatcher::Prefix {
-                suppress_regex: true,
-                ..
-            }
-        )
-    });
-    let mut regex_match: Option<&Route<T>> = None;
-    for route in routes {
-        let RouteMatcher::Regex { regex, .. } = &route.matcher else {
-            continue;
+                value,
+                suppress_regex,
+            } => httpd_rs_verified::nginx_route_accumulate(
+                state,
+                httpd_rs_verified::NginxRouteCandidateKind::Prefix,
+                path.starts_with(value),
+                value.len() as u64,
+                route.declaration_order as u64,
+                *suppress_regex,
+            ),
+            RouteMatcher::Regex { value, regex } => httpd_rs_verified::nginx_route_accumulate(
+                state,
+                httpd_rs_verified::NginxRouteCandidateKind::Regex,
+                regex.is_nginx_match(path),
+                value.len() as u64,
+                route.declaration_order as u64,
+                false,
+            ),
         };
-        if regex.is_match(path.as_bytes())
-            && regex_match
-                .as_ref()
-                .is_none_or(|current| route.declaration_order < current.declaration_order)
-        {
-            regex_match = Some(route);
+        if next.exact != state.exact || next.exact_order != state.exact_order {
+            exact = Some(route);
         }
+        if next.prefix != state.prefix
+            || next.prefix_width != state.prefix_width
+            || next.prefix_order != state.prefix_order
+        {
+            prefix = Some(route);
+        }
+        if next.regex != state.regex || next.regex_order != state.regex_order {
+            regex = Some(route);
+        }
+        state = next;
     }
-    match httpd_rs_verified::nginx_route_winner_class(
-        exact.is_some(),
-        suppressing_prefix,
-        regex_match.is_some(),
-        prefix.is_some(),
-    ) {
+    select_accumulated_route(exact, prefix, regex)
+}
+
+fn select_accumulated_route<'a, T>(
+    exact: Option<&'a Route<T>>,
+    prefix: Option<&'a Route<T>>,
+    regex: Option<&'a Route<T>>,
+) -> Option<&'a Route<T>> {
+    let mut state = httpd_rs_verified::nginx_route_accumulator_empty();
+    for (kind, route) in [
+        (httpd_rs_verified::NginxRouteCandidateKind::Exact, exact),
+        (httpd_rs_verified::NginxRouteCandidateKind::Prefix, prefix),
+        (httpd_rs_verified::NginxRouteCandidateKind::Regex, regex),
+    ] {
+        let Some(route) = route else { continue };
+        let (width, suppresses_regex) = match &route.matcher {
+            RouteMatcher::Prefix {
+                value,
+                suppress_regex,
+            } => (value.len(), *suppress_regex),
+            RouteMatcher::Exact(value) | RouteMatcher::Regex { value, .. } => (value.len(), false),
+        };
+        state = httpd_rs_verified::nginx_route_accumulate(
+            state,
+            kind,
+            true,
+            width as u64,
+            route.declaration_order as u64,
+            suppresses_regex,
+        );
+    }
+    let winner = httpd_rs_verified::nginx_route_accumulator_winner(state);
+    match winner.class {
         1 => exact,
-        2 => prefix,
-        3 => regex_match,
-        4 => prefix,
+        2 | 4 => prefix,
+        3 => regex,
         _ => None,
     }
 }
@@ -646,6 +742,50 @@ pub enum ValueVariable {
     HttpHeader(String),
     Cookie(String),
     Argument(String),
+}
+
+impl ValueVariable {
+    fn provenance(&self) -> httpd_rs_verified::TransformValueClass {
+        use httpd_rs_verified::TransformValueClass as Class;
+        match self {
+            // `$http_host` is the exact wire spelling, but both H1 and H2
+            // adapters validate it as an HTTP authority before constructing
+            // Request. It may therefore retain spelling/port while sharing
+            // the authority provenance class with the normalized `$host`.
+            Self::Host | Self::HttpHost | Self::ProxyHost | Self::ServerName => {
+                Class::CanonicalAuthority
+            }
+            Self::RemoteAddr | Self::ProxyAddXForwardedFor => Class::TrustedPeer,
+            Self::DocumentRoot
+            | Self::RealPathRoot
+            | Self::FastCgiScriptName
+            | Self::RequestFilename => Class::AuthorizedPath,
+            Self::Scheme
+            | Self::ConnectionUpgrade
+            | Self::ServerPort
+            | Self::RequestMethod
+            | Self::ServerProtocol
+            | Self::Https
+            | Self::RemotePort
+            | Self::ServerAddr
+            | Self::GatewayInterface
+            | Self::ServerSoftware => Class::ProtocolMetadata,
+            Self::HttpHeader(name) if name.eq_ignore_ascii_case("x-forwarded-for") => {
+                Class::ClientForwardedFor
+            }
+            Self::HttpUpgrade
+            | Self::RequestUri
+            | Self::Uri
+            | Self::DocumentUri
+            | Self::QueryString
+            | Self::ContentType
+            | Self::ContentLength
+            | Self::FastCgiPathInfo
+            | Self::HttpHeader(_)
+            | Self::Cookie(_)
+            | Self::Argument(_) => Class::RequestBytes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -730,6 +870,16 @@ impl ValueExpr {
         &self.segments
     }
 
+    fn admitted_for(&self, sink: httpd_rs_verified::TransformValueSink) -> bool {
+        self.segments.iter().all(|segment| {
+            let class = match segment {
+                ValueSegment::Literal(_) => httpd_rs_verified::TransformValueClass::Literal,
+                ValueSegment::Variable(variable) => variable.provenance(),
+            };
+            httpd_rs_verified::transform_value_class_admit(sink, class)
+        })
+    }
+
     pub fn evaluate(
         &self,
         mut resolve: impl FnMut(&ValueVariable) -> Option<Vec<u8>>,
@@ -742,13 +892,15 @@ impl ValueExpr {
                     resolve(variable).ok_or("transformation variable is unavailable")?
                 }
             };
-            let Some(next) = output.len().checked_add(value.len()) else {
-                return Err("transformation value length overflow");
-            };
-            if next > MAX_TRANSFORM_VALUE_BYTES {
+            let Some(next) = httpd_rs_verified::transform_output_append(
+                output.len() as u64,
+                value.len() as u64,
+                MAX_TRANSFORM_VALUE_BYTES as u64,
+            ) else {
                 return Err("transformation value exceeds its runtime byte bound");
-            }
+            };
             output.extend_from_slice(&value);
+            debug_assert_eq!(output.len() as u64, next);
         }
         Ok(output)
     }
@@ -819,6 +971,18 @@ impl ProxyHeaderTransform {
             return Err("proxy Content-Length is owned by the serializer".into());
         }
         let expression = ValueExpr::parse(value)?;
+        let sink = match lower.as_str() {
+            "host" => httpd_rs_verified::TransformValueSink::HostHeader,
+            "x-forwarded-for" => httpd_rs_verified::TransformValueSink::ForwardedForHeader,
+            "connection" => httpd_rs_verified::TransformValueSink::ConnectionHeader,
+            "upgrade" => httpd_rs_verified::TransformValueSink::UpgradeHeader,
+            _ => httpd_rs_verified::TransformValueSink::OrdinaryHeader,
+        };
+        if !expression.admitted_for(sink) {
+            return Err(format!(
+                "proxy header '{name}' uses a transformation source that is not admitted for that sink"
+            ));
+        }
         if lower == "connection" {
             let allowed = matches!(
                 expression.segments(),
@@ -843,29 +1007,6 @@ impl ProxyHeaderTransform {
             )
         {
             return Err("Upgrade may only be empty or $http_upgrade".into());
-        }
-        if lower == "host"
-            && expression.segments().iter().any(|segment| {
-                matches!(
-                    segment,
-                    ValueSegment::Variable(
-                        ValueVariable::RemoteAddr
-                            | ValueVariable::HttpUpgrade
-                            | ValueVariable::HttpHeader(_)
-                            | ValueVariable::Cookie(_)
-                            | ValueVariable::Argument(_)
-                    )
-                )
-            })
-        {
-            return Err("Host may only use canonical authority variables or literals".into());
-        }
-        if lower == "x-forwarded-for"
-            && expression.segments().iter().any(|segment| {
-                matches!(segment, ValueSegment::Variable(ValueVariable::HttpHeader(name)) if name.eq_ignore_ascii_case("x-forwarded-for"))
-            })
-        {
-            return Err("client-asserted X-Forwarded-For cannot become a trusted proxy assertion".into());
         }
         Ok(Self {
             name: lower,
@@ -893,33 +1034,20 @@ impl FastCgiParamTransform {
         }
         let expression = ValueExpr::parse(value)?;
         let upper = name.to_ascii_uppercase();
-        if upper == "SCRIPT_FILENAME" {
-            let safe = expression.segments().iter().all(|segment| {
-                matches!(
-                    segment,
-                    ValueSegment::Literal(_)
-                        | ValueSegment::Variable(ValueVariable::DocumentRoot)
-                        | ValueSegment::Variable(ValueVariable::RealPathRoot)
-                        | ValueSegment::Variable(ValueVariable::FastCgiScriptName)
-                        | ValueSegment::Variable(ValueVariable::RequestFilename)
-                )
-            });
-            if !safe {
-                return Err(
-                    "SCRIPT_FILENAME must be derived only from an authorized script identity"
-                        .into(),
-                );
-            }
-        }
-        if matches!(
+        let sink = if upper == "SCRIPT_FILENAME" {
+            httpd_rs_verified::TransformValueSink::FastCgiScriptFilename
+        } else if matches!(
             upper.as_str(),
             "PHP_VALUE" | "PHP_ADMIN_VALUE" | "PHP_FLAG" | "PHP_ADMIN_FLAG"
-        ) && expression
-            .segments()
-            .iter()
-            .any(|segment| matches!(segment, ValueSegment::Variable(_)))
-        {
-            return Err("PHP configuration parameters must be root-controlled literals".into());
+        ) {
+            httpd_rs_verified::TransformValueSink::PhpConfiguration
+        } else {
+            httpd_rs_verified::TransformValueSink::FastCgiOrdinary
+        };
+        if !expression.admitted_for(sink) {
+            return Err(format!(
+                "FastCGI parameter '{name}' uses a transformation source that is not admitted for that sink"
+            ));
         }
         Ok(Self {
             name: upper,
@@ -1039,6 +1167,18 @@ mod tests {
         }
     }
 
+    fn nginx_regex(pattern: &str, caseless: bool) -> Regex {
+        Regex::compile_nginx(
+            pattern,
+            if caseless {
+                httpd_rs_verified::NginxRegexModifier::Caseless
+            } else {
+                httpd_rs_verified::NginxRegexModifier::Sensitive
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn nginx_location_selection_is_exact_prefix_then_regex() {
         let routes = vec![
@@ -1061,7 +1201,7 @@ mod tests {
             route(
                 RouteMatcher::Regex {
                     value: "[.]php$".into(),
-                    regex: Regex::compile("[.]php$", false).unwrap(),
+                    regex: nginx_regex("[.]php$", false),
                 },
                 "php",
                 2,
@@ -1099,7 +1239,7 @@ mod tests {
             route(
                 RouteMatcher::Regex {
                     value: "[.]php$".into(),
-                    regex: Regex::compile("[.]php$", false).unwrap(),
+                    regex: nginx_regex("[.]php$", false),
                 },
                 "php",
                 1,
@@ -1173,7 +1313,7 @@ mod tests {
             route(
                 RouteMatcher::Regex {
                     value: "[.]php$".into(),
-                    regex: Regex::compile("[.]php$", false).unwrap(),
+                    regex: nginx_regex("[.]php$", false),
                 },
                 1,
                 3,
@@ -1198,7 +1338,7 @@ mod tests {
             route(
                 RouteMatcher::Regex {
                     value: "^/images/".into(),
-                    regex: Regex::compile("^/images/", false).unwrap(),
+                    regex: nginx_regex("^/images/", false),
                 },
                 5,
                 4,
@@ -1227,6 +1367,47 @@ mod tests {
     }
 
     #[test]
+    fn nginx_route_index_rejects_ambiguous_source_identity() {
+        let routes = vec![
+            route(RouteMatcher::Exact("/exact".into()), 1usize, 4),
+            route(
+                RouteMatcher::Prefix {
+                    value: "/".into(),
+                    suppress_regex: false,
+                },
+                2usize,
+                4,
+            ),
+        ];
+        assert!(RouteProgram::nginx(vec![routes], vec![vec!["_".into()]]).is_err());
+    }
+
+    #[test]
+    fn common_ir_plan_gate_is_source_neutral_after_route_certification() {
+        let apache = RouteProgram::<()>::Apache;
+        let nginx = RouteProgram::<()>::nginx(vec![Vec::new()], vec![vec!["_".into()]])
+            .expect("empty nginx route index is a complete certified partition");
+        assert!(apache.is_refined());
+        assert!(nginx.is_refined());
+        let apache_admit = httpd_rs_verified::common_ir_request_plan_admit(
+            apache.source_kind(),
+            true,
+            apache.is_refined(),
+            true,
+            true,
+        );
+        let nginx_admit = httpd_rs_verified::common_ir_request_plan_admit(
+            nginx.source_kind(),
+            true,
+            nginx.is_refined(),
+            true,
+            true,
+        );
+        assert_eq!(apache_admit, nginx_admit);
+        assert!(apache_admit);
+    }
+
+    #[test]
     fn nginx_name_table_enforces_configuration_resource_bounds() {
         let too_many = vec![Vec::<String>::new(); MAX_NGINX_SERVERS + 1];
         assert!(NginxServerNameTable::new(too_many).is_err());
@@ -1247,6 +1428,11 @@ mod tests {
         assert!(ValueExpr::parse("$arbitrary_module_variable").is_err());
         assert!(ProxyHeaderTransform::new("Connection", "$http_connection").is_err());
         assert!(ProxyHeaderTransform::new("Connection", "$connection_upgrade").is_ok());
+        assert!(ProxyHeaderTransform::new("Host", "$host").is_ok());
+        assert!(ProxyHeaderTransform::new("Host", "$http_host").is_ok());
+        assert!(ProxyHeaderTransform::new("Host", "$request_uri").is_err());
+        assert!(ProxyHeaderTransform::new("X-Forwarded-For", "$proxy_add_x_forwarded_for").is_ok());
+        assert!(ProxyHeaderTransform::new("X-Forwarded-For", "$http_x_forwarded_for").is_err());
         assert!(ProxyHeaderTransform::new("Transfer-Encoding", "chunked").is_err());
         assert!(ProxyHeaderTransform::new("Content-Length", "").is_err());
         assert!(ValueExpr::parse("bad\0value").is_err());
@@ -1259,5 +1445,15 @@ mod tests {
         assert!(
             FastCgiParamTransform::new("SCRIPT_FILENAME", "$document_root$uri", false).is_err()
         );
+        assert!(FastCgiParamTransform::new("PHP_VALUE", "memory_limit=64M", false).is_ok());
+        assert!(FastCgiParamTransform::new("PHP_VALUE", "$arg_override", false).is_err());
+
+        let bounded = ValueExpr::parse("$request_uri").unwrap();
+        assert!(bounded
+            .evaluate(|_| Some(vec![b'x'; MAX_TRANSFORM_VALUE_BYTES]))
+            .is_ok());
+        assert!(bounded
+            .evaluate(|_| Some(vec![b'x'; MAX_TRANSFORM_VALUE_BYTES + 1]))
+            .is_err());
     }
 }

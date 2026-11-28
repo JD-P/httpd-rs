@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-11-28",
   "verus": {
-    "verified_functions": 896,
+    "verified_functions": 969,
     "errors": 0
   },
   "obligations": [
@@ -32,7 +32,56 @@
       "title": "Bounded nginx frontend preserves route, identity and response semantics in the shared IR",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "nginx_literal_candidate_better and nginx_route_winner_class are executable closed winner kernels with proofs that wider prefixes dominate declaration order and exact/^~ classes precede regex. nginx_server_name_winner_class proves exact, leading-wildcard, trailing-wildcard and default precedence; one compiled exact/suffix/prefix table is consumed by both HTTP Host routing and TLS SNI. Every indexed winner is fuzz-differenced against an independent linear evaluator. nginx_route_selection_work is the production work-charge formula and proves admitted arithmetic includes all matcher bytes; the 512-per-server/8,192-total route bounds and 64-MiB conservatively estimated derived-policy cap fail closed before multiplicative policy cloning. Nginx response-header/expiry status eligibility is carried as an explicit IR bit, and the stock-nginx differential covers its complete finite status matrix plus server-name precedence. The no-op table records an owner/rationale for every normalized directive and rejects process/module/TLS semantics. Include-topology and composed nginx whole-request fuzzers cover glob/cycle/symlink/reload and H1/H2 plan/outcome/resource parity. Full lexer/parser-to-IR refinement, regex matching equivalence, exact allocator accounting, and complete equivalence to stock nginx remain oracle evidence rather than mechanized theorems."
+      "evidence": "Seven narrower nginx obligations are now separately mechanized below: syntax transition safety, structural route-index certification, lowering vocabulary closure, transformation provenance/size admission, nginx-specific merge algebra, source-neutral request-plan admission, and the small nginx-to-shared-PCRE profile bridge. nginx_server_name_winner_class proves exact, leading-wildcard, trailing-wildcard and default precedence; one compiled exact/suffix/prefix table is consumed by both HTTP Host routing and TLS SNI. Every indexed winner is also fuzz-differenced against an independent linear evaluator. nginx_route_selection_work is the production work-charge formula and proves admitted arithmetic includes all matcher bytes; the 512-per-server/8,192-total route bounds and 64-MiB conservatively estimated derived-policy cap fail closed before multiplicative policy cloning. The stock-nginx differential covers response-status, server-name precedence and regex behavior, while include-topology and composed nginx whole-request fuzzers cover glob/cycle/symlink/reload and H1/H2 plan/outcome/resource parity. This umbrella remains partial because byte-stream-to-complete-AST equivalence, the third-party automata implementation's internal matching correctness, server-name-table construction refinement, filesystem include discovery, exact allocator accounting, and complete equivalence to stock nginx remain compiler/type-system, test, fuzz, dependency-contract or external-oracle evidence rather than end-to-end Verus theorems."
+    },
+    {
+      "id": "nginx_syntax_state_machine",
+      "title": "nginx lexer and parser transitions fail closed with balanced, bounded structure",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "NginxLexState/NginxLexAction and nginx_lex_step are the executable per-byte quote/escape machine consumed directly by nginx_frontend::lex; its exact spec rejects trailing escapes and nginx_lex_finish admits only balanced Bare state. NginxParseState and nginx_parse_step are the sole iterative AST transition kernel consumed by Parser::parse. nginx_parse_step_preserves_invariant proves the NeedDirective/Complete/Rejected shape invariant for every token class; complete implies depth zero, rejected is absorbing, argument count is bounded at 128, and block depth at 64. Regression tests exercise quoted values, unterminated quote/escape, the exact width ceiling and excessive nesting. UTF-8 decoding and the outer Rust loop's construction of the complete token/AST vectors remain trusted Rust/library semantics, so the claim is transition safety rather than stock-nginx grammar equivalence."
+    },
+    {
+      "id": "nginx_route_index_refinement",
+      "title": "nginx location indexes are complete, ordered and use the same winner reducer as the linear oracle",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "NginxRouteAccumulator is the executable exact/prefix/regex summary reducer used by both select_nginx_route and NginxRouteIndex::select. Its winner function closes nginx's exact, suppressing-prefix, first-regex and ordinary-prefix precedence. Index construction retains every source route for a unique/complete partition check, requires unique declaration identities, checks adjacent prefix width/order and regex declaration order with verified predicates, and consumes nginx_index_partition_admit before the index becomes request-reachable; failure aborts configuration loading. nginx_equal_route_summaries_choose_equal_winners and nginx_certified_index_covers_every_route prove the local model consequences, while unit/fuzz refinement compares indexed and linear results. Regexes now enter through the separately certified common semantic AST and nginx profile bridge. The dependency automaton's internal matching semantics and the Rust sort/HashMap implementations remain outside Verus, so this obligation covers structural certification and the common winner algebra rather than those libraries."
+    },
+    {
+      "id": "nginx_regex_bridge_refinement",
+      "title": "nginx regex modifiers and canonical subjects refine the shared PCRE matcher profile",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "NginxRegexModifier has exactly Sensitive and Caseless forms. nginx_regex_profile maps them to the shared byte-oriented matcher with UTF/UCP disabled; nginx_regex_compile_bridge_preserves_modifier proves the compiled case bit is exactly the source modifier and the other mode bits remain false. nginx location parsing must construct Regex through compile_nginx, which consumes that executable gate and retains the resulting profile. Route matching uses is_nginx_match, which rejects an ordinary/unprofiled Apache Regex and consumes nginx_regex_bridge_admit before passing the exact normalized URI byte slice to the matcher. nginx_regex_bridge_uses_the_exact_normalized_subject proves the combined compile/subject facts. CanonicalTarget and the common request-plan obligation establish that production supplies a canonical URL path; equivalence to stock nginx's C adapter and regex-automata's internal execution remain differential and dependency-contract evidence."
+    },
+    {
+      "id": "nginx_lowering_closure",
+      "title": "nginx lowering emits only a finite typed IR operation vocabulary with bounded arity",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "NginxIrOperation enumerates every directive operation the frontend may emit and nginx_ir_operation_arg_admit is an executable exact arity specification with a proved global bound of 129 arguments and zero-argument admission only for the two marker operations. Lowerer::directive maps every emitted name to that enum, consumes the verified arity gate, and records an error instead of emitting an unknown or malformed operation. A direct emitter regression proves unknown vocabulary and wrong arity cannot enter Event::Directive. Section structure is supplied only by the separately bounded parser; semantic correctness of each common compiler consumer remains under configuration_semantic_refinement and the partial umbrella obligation."
+    },
+    {
+      "id": "nginx_transform_language",
+      "title": "nginx proxy-header and FastCGI transformations obey sink-specific provenance and output bounds",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "Every ValueVariable is exhaustively classified as literal, validated authority, trusted peer, authorized path, protocol metadata, request bytes or client-supplied Forwarded-For. transform_value_class_admit is the executable sink matrix consumed when ProxyHeaderTransform and FastCgiParamTransform are constructed: Host accepts only authority/protocol/literal classes, SCRIPT_FILENAME only authorized-path/literal classes, PHP configuration only literals, and a raw client X-Forwarded-For cannot become a trusted forwarding assertion. The Connection and Upgrade finite shape checks remain additional restrictions. ValueExpr::evaluate consumes transform_output_append for each segment; its proof gives exact checked addition and a 16-KiB result ceiling. Tests cover the positive conventional forms and negative provenance substitutions. Correct provenance depends on the request adapters' existing authority validation and the authorized-path resolver, which are separate obligations."
+    },
+    {
+      "id": "source_neutral_scope_merge",
+      "title": "nginx header reset and transform-array inheritance refine explicit common merge algebra",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "source_neutral_header_merge_plan is consumed by HeaderPolicy::merge_child before mutation. It proves a child reset discards parent action/byte bounds, ordinary composition uses checked addition, nginx status semantics are monotonic, and the inherited reset instruction is retained. The result is then checked against the configured header count/byte budget. source_neutral_optional_merge is consumed for proxy-header and FastCGI-parameter arrays and proves child presence replaces the complete inherited list while child absence preserves it, including the meaningful Some(empty) case. Regression tests cover reset/status behavior and absent, nonempty and empty child arrays. This is deliberately narrower than the still-partial proof of every Scope field's full merge algebra."
+    },
+    {
+      "id": "common_ir_request_refinement",
+      "title": "Apache and nginx ConfigIr requests share the same plan and terminal fact gates",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "ConfigIrSource names Apache and nginx but common_ir_request_plan_spec intentionally depends only on canonical target, certified route program, exact textual identity and target-bound access layers. common_ir_request_plan_is_source_neutral proves equal facts yield equal admission, and RequestPlan::build_with_fs_path consumes this gate after canonical construction and access-layer binding. RouteProgram::is_refined is true for the existing Apache rule program and only for nginx indexes accepted by their construction certificate. common_ir_terminal_outcome_spec and common_ir_equal_facts_have_equal_terminal_outcomes prove the corresponding source-independence of authorization/backend/cache/finalization/sink facts; those facts are supplied by the already mechanized request-policy and dynamic-outcome machines. The theorem does not itself prove Apache/nginx configurations produce equal facts—that cross-frontend semantic equivalence remains differential evidence under the umbrella obligation."
     },
     {
       "id": "htaccess_interleave",
@@ -53,7 +102,14 @@
       "title": "PCRE2 positive grammar carries a verified admission certificate into translation",
       "status": "mechanized",
       "weight": 1.0,
-      "evidence": "PcreGrammarState is the executable option-scope machine consumed directly by the positive parser. pcre_grammar_step_refines is the independent sequence-based transition relation: Open records the exact parent x/m option state, Close restores it, empty Close and excessive nesting reject, AtomicLineEscape has no admitted transition, and StartAnchor has no admitted transition while multiline is effective. The executable step is proved to refine that relation and preserve the stack invariant. A complete parse can call pcre_grammar_finish only with an empty scope stack; the resulting PcreGrammarCertificate binds the exact source length and the balanced/atomic-line-free/multiline-start-free facts, and translation rechecks that certificate before lowering. Regression tests cover scope restoration, unbalanced input, forbidden events and source substitution. Byte-to-event parser completeness and matching equivalence remain continuously checked against the test-only PCRE2 10.46 differential oracle; the safe-Rust automata backend remains an explicit ledger assumption."
+      "evidence": "PcreGrammarState is the executable option-scope machine consumed directly by the positive parser. pcre_grammar_step_refines is the independent sequence-based transition relation: Open records the exact parent x/m option state, Close restores it, empty Close and excessive nesting reject, AtomicLineEscape has no admitted transition, and StartAnchor has no admitted transition while multiline is effective. The executable step is proved to refine that relation and preserve the stack invariant. A complete parse can call pcre_grammar_finish only with an empty scope stack; the resulting PcreGrammarCertificate binds the exact source length and the balanced/atomic-line-free/multiline-start-free facts, and translation rechecks that certificate before lowering. Regression tests cover scope restoration, unbalanced input, forbidden events and source substitution. Byte-to-event parser completeness and PCRE2 source compatibility remain continuously checked against the test-only PCRE2 10.46 differential oracle; normalized AST-to-matcher refinement is the separate mechanized obligation below."
+    },
+    {
+      "id": "pcre2_semantic_ast_refinement",
+      "title": "Apache PCRE expressions refine one closed semantic AST and matcher program",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "SemanticAst is the complete normalized node vocabulary: empty, literal, byte/Unicode class, look, repeat, capture, concatenation and alternation. RegexBuilder converts dependency HIR into this owned AST, then walks every concrete node post-order through pcre_ast_step. The verified transition rejects an unknown shape, bad arity, malformed repetition, capture zero, dangling child, multiple roots or structural/payload overflow; pcre_ast_finish seals one nonempty root against the original admitted source length. The AST is reconstructed into HIR and exact structural equality with the parsed normalized HIR is required by pcre_ast_lowering_admit together with leftmost-first selection and disabled backtracking. Only the private CertifiedMatcherProgram capability can cross into build_automata, so no raw HIR call path bypasses the certificate. The compiled Regex retains the immutable AST and certificate, and tests compare concrete node counts, source substitution rejection, capture behavior and the PCRE2 10.46 oracle. This is a full refinement of httpd-rs's AST-to-matcher adapter relative to regex-automata's HIR/matcher contract; it deliberately does not claim a Verus proof of that third-party engine's internal implementation or of all stock-PCRE2 source semantics, which remain dependency and differential-oracle assumptions."
     },
     {
       "id": "require_none_never_grants",
@@ -581,7 +637,7 @@
       "evidence": "backend_resolution_binding_admit requires a validated resolver result to belong to the consuming immutable generation, backend_connected_endpoint_admit requires the kernel peer to equal the selected bound endpoint, and fastcgi_peer_identity_admit rejects a Unix listener outside the configured worker/endpoint-owner or uid-0 trust set. Runtime stores the first bounded DNS answer in an Arc-owned per-Config registry shared by proxy, WebSocket, health, TCP FastCGI and OCSP paths; concurrent first answers converge on one map entry, the map has no in-generation expiry, reload creates a distinct registry, and structural Arc lifetime prevents retirement cleanup from racing an in-flight background insertion. Linux strict Unix FastCGI additionally consumes SO_PEERCRED independently of before/after socket pathname metadata. Unit tests cover rebinding, generation separation, structural cleanup, invalid resolver ports, endpoint mismatch and peer uid mismatch; complete workspace tests cover every integrated consumer."
     }
   ],
-  "minimum_weighted_score": 44.5,
+  "minimum_weighted_score": 57.5,
   "proof_debt": {
     "max_total": 6,
     "unverified_security_components": [],

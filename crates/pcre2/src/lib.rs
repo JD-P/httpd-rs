@@ -119,6 +119,367 @@ pub mod bytes {
     type CaptureSpans = Vec<Option<(usize, usize)>>;
     type EngineSlots = Vec<Option<NonMaxUsize>>;
 
+    /// The normalized, source-language-neutral regex program shared by the
+    /// Apache and nginx frontends. PCRE-only surface spellings are resolved
+    /// before this tree is constructed; production automata are built only
+    /// from a round-tripped instance of this type.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum SemanticAst {
+        Empty,
+        Literal(Vec<u8>),
+        ByteClass(Vec<(u8, u8)>),
+        UnicodeClass(Vec<(char, char)>),
+        Look(SemanticLook),
+        Repeat {
+            min: u32,
+            max: Option<u32>,
+            greedy: bool,
+            child: Box<SemanticAst>,
+        },
+        Capture {
+            index: u32,
+            name: Option<String>,
+            child: Box<SemanticAst>,
+        },
+        Concat(Vec<SemanticAst>),
+        Alternation(Vec<SemanticAst>),
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum SemanticLook {
+        Start,
+        End,
+        StartLf,
+        EndLf,
+        StartCrlf,
+        EndCrlf,
+        WordAscii,
+        WordAsciiNegate,
+        WordUnicode,
+        WordUnicodeNegate,
+        WordStartAscii,
+        WordEndAscii,
+        WordStartUnicode,
+        WordEndUnicode,
+        WordStartHalfAscii,
+        WordEndHalfAscii,
+        WordStartHalfUnicode,
+        WordEndHalfUnicode,
+    }
+
+    impl SemanticLook {
+        fn from_hir(look: regex_syntax::hir::Look) -> Result<Self, Error> {
+            use regex_syntax::hir::Look;
+            Ok(match look {
+                Look::Start => Self::Start,
+                Look::End => Self::End,
+                Look::StartLF => Self::StartLf,
+                Look::EndLF => Self::EndLf,
+                Look::StartCRLF => Self::StartCrlf,
+                Look::EndCRLF => Self::EndCrlf,
+                Look::WordAscii => Self::WordAscii,
+                Look::WordAsciiNegate => Self::WordAsciiNegate,
+                Look::WordUnicode => Self::WordUnicode,
+                Look::WordUnicodeNegate => Self::WordUnicodeNegate,
+                Look::WordStartAscii => Self::WordStartAscii,
+                Look::WordEndAscii => Self::WordEndAscii,
+                Look::WordStartUnicode => Self::WordStartUnicode,
+                Look::WordEndUnicode => Self::WordEndUnicode,
+                Look::WordStartHalfAscii => Self::WordStartHalfAscii,
+                Look::WordEndHalfAscii => Self::WordEndHalfAscii,
+                Look::WordStartHalfUnicode => Self::WordStartHalfUnicode,
+                Look::WordEndHalfUnicode => Self::WordEndHalfUnicode,
+            })
+        }
+
+        fn to_hir(self) -> regex_syntax::hir::Look {
+            use regex_syntax::hir::Look;
+            match self {
+                Self::Start => Look::Start,
+                Self::End => Look::End,
+                Self::StartLf => Look::StartLF,
+                Self::EndLf => Look::EndLF,
+                Self::StartCrlf => Look::StartCRLF,
+                Self::EndCrlf => Look::EndCRLF,
+                Self::WordAscii => Look::WordAscii,
+                Self::WordAsciiNegate => Look::WordAsciiNegate,
+                Self::WordUnicode => Look::WordUnicode,
+                Self::WordUnicodeNegate => Look::WordUnicodeNegate,
+                Self::WordStartAscii => Look::WordStartAscii,
+                Self::WordEndAscii => Look::WordEndAscii,
+                Self::WordStartUnicode => Look::WordStartUnicode,
+                Self::WordEndUnicode => Look::WordEndUnicode,
+                Self::WordStartHalfAscii => Look::WordStartHalfAscii,
+                Self::WordEndHalfAscii => Look::WordEndHalfAscii,
+                Self::WordStartHalfUnicode => Look::WordStartHalfUnicode,
+                Self::WordEndHalfUnicode => Look::WordEndHalfUnicode,
+            }
+        }
+    }
+
+    impl SemanticAst {
+        fn from_hir(hir: &regex_syntax::hir::Hir) -> Result<Self, Error> {
+            use regex_syntax::hir::{Class, HirKind};
+            Ok(match hir.kind() {
+                HirKind::Empty => Self::Empty,
+                HirKind::Literal(literal) => Self::Literal(literal.0.to_vec()),
+                HirKind::Class(Class::Bytes(class)) => Self::ByteClass(
+                    class
+                        .ranges()
+                        .iter()
+                        .map(|range| (range.start(), range.end()))
+                        .collect(),
+                ),
+                HirKind::Class(Class::Unicode(class)) => Self::UnicodeClass(
+                    class
+                        .ranges()
+                        .iter()
+                        .map(|range| (range.start(), range.end()))
+                        .collect(),
+                ),
+                HirKind::Look(look) => Self::Look(SemanticLook::from_hir(*look)?),
+                HirKind::Repetition(repetition) => Self::Repeat {
+                    min: repetition.min,
+                    max: repetition.max,
+                    greedy: repetition.greedy,
+                    child: Box::new(Self::from_hir(&repetition.sub)?),
+                },
+                HirKind::Capture(capture) => Self::Capture {
+                    index: capture.index,
+                    name: capture.name.as_deref().map(ToOwned::to_owned),
+                    child: Box::new(Self::from_hir(&capture.sub)?),
+                },
+                HirKind::Concat(children) => Self::Concat(
+                    children
+                        .iter()
+                        .map(Self::from_hir)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+                HirKind::Alternation(children) => Self::Alternation(
+                    children
+                        .iter()
+                        .map(Self::from_hir)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            })
+        }
+
+        fn to_hir(&self) -> regex_syntax::hir::Hir {
+            use regex_syntax::hir::{
+                Capture, Class, ClassBytes, ClassBytesRange, ClassUnicode, ClassUnicodeRange, Hir,
+                Repetition,
+            };
+            match self {
+                Self::Empty => Hir::empty(),
+                Self::Literal(bytes) => Hir::literal(bytes.clone()),
+                Self::ByteClass(ranges) => Hir::class(Class::Bytes(ClassBytes::new(
+                    ranges
+                        .iter()
+                        .map(|&(start, end)| ClassBytesRange::new(start, end)),
+                ))),
+                Self::UnicodeClass(ranges) => Hir::class(Class::Unicode(ClassUnicode::new(
+                    ranges
+                        .iter()
+                        .map(|&(start, end)| ClassUnicodeRange::new(start, end)),
+                ))),
+                Self::Look(look) => Hir::look(look.to_hir()),
+                Self::Repeat {
+                    min,
+                    max,
+                    greedy,
+                    child,
+                } => Hir::repetition(Repetition {
+                    min: *min,
+                    max: *max,
+                    greedy: *greedy,
+                    sub: Box::new(child.to_hir()),
+                }),
+                Self::Capture { index, name, child } => Hir::capture(Capture {
+                    index: *index,
+                    name: name.as_deref().map(Into::into),
+                    sub: Box::new(child.to_hir()),
+                }),
+                Self::Concat(children) => Hir::concat(children.iter().map(Self::to_hir).collect()),
+                Self::Alternation(children) => {
+                    Hir::alternation(children.iter().map(Self::to_hir).collect())
+                }
+            }
+        }
+
+        fn certify(
+            &self,
+            source_len: usize,
+            node_limit: usize,
+            payload_limit: usize,
+        ) -> Result<httpd_rs_verified::PcreAstCertificate, Error> {
+            let mut state = httpd_rs_verified::pcre_ast_start(source_len as u64);
+            self.certify_postorder(&mut state, node_limit as u64, payload_limit as u64)?;
+            let certificate = httpd_rs_verified::pcre_ast_finish(state, source_len as u64)
+                .ok_or_else(|| Error::syntax("normalized PCRE AST has no unique root"))?;
+            if !httpd_rs_verified::pcre_ast_certificate_admit(certificate, source_len as u64) {
+                return Err(Error::syntax("invalid normalized PCRE AST certificate"));
+            }
+            Ok(certificate)
+        }
+
+        fn certify_postorder(
+            &self,
+            state: &mut httpd_rs_verified::PcreAstBuildState,
+            node_limit: u64,
+            payload_limit: u64,
+        ) -> Result<(), Error> {
+            use httpd_rs_verified::PcreAstNodeKind as Kind;
+            let (kind, arity, payload, minimum, maximum, capture) = match self {
+                Self::Empty => (Kind::Empty, 0, 0, 0, None, 0),
+                Self::Literal(bytes) => (Kind::Literal, 0, bytes.len(), 0, None, 0),
+                Self::ByteClass(ranges) => (Kind::ByteClass, 0, ranges.len(), 0, None, 0),
+                Self::UnicodeClass(ranges) => (Kind::UnicodeClass, 0, ranges.len(), 0, None, 0),
+                Self::Look(_) => (Kind::Look, 0, 0, 0, None, 0),
+                Self::Repeat {
+                    min, max, child, ..
+                } => {
+                    child.certify_postorder(state, node_limit, payload_limit)?;
+                    (Kind::Repeat, 1, 0, *min, *max, 0)
+                }
+                Self::Capture { index, child, .. } => {
+                    child.certify_postorder(state, node_limit, payload_limit)?;
+                    (Kind::Capture, 1, 0, 0, None, *index)
+                }
+                Self::Concat(children) => {
+                    for child in children {
+                        child.certify_postorder(state, node_limit, payload_limit)?;
+                    }
+                    (Kind::Concat, children.len(), 0, 0, None, 0)
+                }
+                Self::Alternation(children) => {
+                    for child in children {
+                        child.certify_postorder(state, node_limit, payload_limit)?;
+                    }
+                    (Kind::Alternation, children.len(), 0, 0, None, 0)
+                }
+            };
+            *state = httpd_rs_verified::pcre_ast_step(
+                *state,
+                kind,
+                arity as u64,
+                payload as u64,
+                minimum,
+                maximum.is_some(),
+                maximum.unwrap_or(0),
+                capture,
+                node_limit,
+                payload_limit,
+            )
+            .ok_or_else(|| Error::resource("normalized PCRE AST exceeds its structural bound"))?;
+            Ok(())
+        }
+
+        fn complexity(&self) -> u64 {
+            match self {
+                Self::Empty | Self::ByteClass(_) | Self::UnicodeClass(_) | Self::Look(_) => 1,
+                Self::Literal(bytes) => (bytes.len() as u64).max(1),
+                Self::Capture { child, .. } => child.complexity().saturating_add(1),
+                Self::Concat(children) | Self::Alternation(children) => children
+                    .iter()
+                    .fold(1u64, |sum, child| sum.saturating_add(child.complexity())),
+                Self::Repeat {
+                    min, max, child, ..
+                } => {
+                    let min = u64::from(*min);
+                    let (copies, active_set_factor) = match max.map(u64::from) {
+                        Some(max) if max == min => (max.max(1), 1),
+                        Some(max) => (max.saturating_add(1).max(1), PIKE_VM_ACTIVE_SET_FACTOR),
+                        None => (min.saturating_add(1).max(1), PIKE_VM_ACTIVE_SET_FACTOR),
+                    };
+                    child
+                        .complexity()
+                        .saturating_mul(copies)
+                        .saturating_mul(active_set_factor)
+                }
+            }
+        }
+
+        fn capture_name_bytes(&self) -> Option<usize> {
+            match self {
+                Self::Repeat { child, .. } => child.capture_name_bytes(),
+                Self::Capture { name, child, .. } => name
+                    .as_ref()
+                    .map_or(0, String::len)
+                    .checked_add(child.capture_name_bytes()?),
+                Self::Concat(children) | Self::Alternation(children) => {
+                    children.iter().try_fold(0usize, |total, child| {
+                        total.checked_add(child.capture_name_bytes()?)
+                    })
+                }
+                _ => Some(0),
+            }
+        }
+
+        /// Conservative bytes retained by the owned normalized tree. Every
+        /// node is charged at the full enum width, and each payload unit at
+        /// the widest range representation. The fixed dependency allowance
+        /// covers Arc/allocator headers.
+        fn retained_bytes(
+            &self,
+            certificate: httpd_rs_verified::PcreAstCertificate,
+        ) -> Option<usize> {
+            let node_bytes = std::mem::size_of::<Self>()
+                .checked_add(std::mem::size_of::<usize>().checked_mul(2)?)?;
+            usize::try_from(certificate.nodes)
+                .ok()?
+                .checked_mul(node_bytes)?
+                .checked_add(
+                    usize::try_from(certificate.payload_units)
+                        .ok()?
+                        .checked_mul(std::mem::size_of::<(char, char)>())?,
+                )?
+                .checked_add(self.capture_name_bytes()?)
+        }
+    }
+
+    /// Capability object for the only HIR accepted by the matcher builder.
+    /// Its fields are private and construction succeeds only after the
+    /// positive grammar certificate, complete semantic AST certificate,
+    /// exact AST-to-HIR round trip, and fixed matcher policy all agree.
+    struct CertifiedMatcherProgram {
+        ast: SemanticAst,
+        certificate: httpd_rs_verified::PcreAstCertificate,
+        hir: regex_syntax::hir::Hir,
+    }
+
+    impl CertifiedMatcherProgram {
+        fn refine(
+            parsed_hir: regex_syntax::hir::Hir,
+            grammar: httpd_rs_verified::PcreGrammarCertificate,
+            source_len: usize,
+            structural_limit: usize,
+            backtracking_disabled: bool,
+        ) -> Result<Self, Error> {
+            let ast = SemanticAst::from_hir(&parsed_hir)?;
+            let certificate = ast.certify(source_len, structural_limit, structural_limit)?;
+            let hir = ast.to_hir();
+            let roundtrip_equal = hir == parsed_hir;
+            debug_assert_eq!(ast.complexity(), hir_complexity(&parsed_hir));
+            if !httpd_rs_verified::pcre_ast_lowering_admit(
+                grammar,
+                certificate,
+                source_len as u64,
+                roundtrip_equal,
+                true,
+                backtracking_disabled,
+            ) {
+                return Err(Error::syntax(
+                    "normalized PCRE AST did not refine the matcher program",
+                ));
+            }
+            Ok(Self {
+                ast,
+                certificate,
+                hir,
+            })
+        }
+    }
+
     /// A byte range in a matched subject.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct Match<'s> {
@@ -228,8 +589,29 @@ pub mod bytes {
                 ));
             }
 
-            let hir = parse_hir(&translation.pattern, &self.config)?;
-            let complexity = hir_complexity(&hir)
+            // `parse_hir` is a dependency parser, not the executable program
+            // boundary.  Immediately project it into our closed semantic AST,
+            // certify the complete post-order tree, and reconstruct the exact
+            // HIR that will be handed to regex-automata.  Thus production can
+            // never compile a dependency node that the httpd-rs AST and its
+            // Verus certificate did not enumerate.
+            let parsed_hir = parse_hir(&translation.pattern, &self.config)?;
+            let structural_limit = self
+                .config
+                .pattern_limit
+                .checked_mul(16)
+                .map(|limit| limit.max(1))
+                .ok_or_else(|| Error::resource("normalized PCRE AST bound overflow"))?;
+            let program = CertifiedMatcherProgram::refine(
+                parsed_hir,
+                admitted.certificate,
+                pattern.len(),
+                structural_limit,
+                !self.config.backtracking,
+            )?;
+            let complexity = program
+                .ast
+                .complexity()
                 .max(translation.pattern.len() as u64)
                 .max(1)
                 .saturating_mul(if translation.final_newline_fallback {
@@ -239,7 +621,7 @@ pub mod bytes {
                 });
 
             let workspace_bound = self
-                .dependency_workspace_bound()
+                .dependency_workspace_bound_for_pattern(pattern.len())
                 .ok_or_else(|| Error::resource("regex dependency workspace bound overflow"))?;
             if !httpd_rs_verified::dependency_call_admit(
                 true,
@@ -261,8 +643,8 @@ pub mod bytes {
             // duplicated NFA construction and retained state without serving
             // any request. Fall back to Pike-only only when hybrid construction
             // itself is unavailable for an otherwise admitted expression.
-            let engine = build_automata(&hir, self.config.size_limit, true)
-                .or_else(|_| build_automata(&hir, self.config.size_limit, false))?;
+            let engine = build_automata(&program, self.config.size_limit, true)
+                .or_else(|_| build_automata(&program, self.config.size_limit, false))?;
 
             let inner_names: Vec<Option<String>> = engine
                 .group_info()
@@ -301,6 +683,12 @@ pub mod bytes {
                         .len()
                         .checked_mul(DEPENDENCY_CAPTURE_OVERHEAD)
                         .and_then(|capture_bytes| bytes.checked_add(capture_bytes))
+                })
+                .and_then(|bytes| {
+                    program
+                        .ast
+                        .retained_bytes(program.certificate)
+                        .and_then(|ast_bytes| bytes.checked_add(ast_bytes))
                 })
                 .and_then(|bytes| bytes.checked_add(DEPENDENCY_FIXED_OVERHEAD))
                 .ok_or_else(|| Error::resource("regex retained workspace bound overflow"))?;
@@ -344,6 +732,8 @@ pub mod bytes {
                 config: Arc::new(self.config.clone()),
                 pattern: pattern.to_owned(),
                 translated_pattern: translation.pattern,
+                semantic_ast: Arc::new(program.ast),
+                semantic_certificate: program.certificate,
                 complexity,
                 retained_workspace_bound,
                 final_newline_fallback: translation.final_newline_fallback,
@@ -456,6 +846,42 @@ pub mod bytes {
         /// internal forward/reverse strategies; it no longer represents two
         /// separately retained meta engines.
         pub fn dependency_workspace_bound(&self) -> Option<usize> {
+            self.dependency_workspace_bound_for_capacity(self.config.pattern_limit)
+        }
+
+        /// The same conservative ceiling specialized to one already-sized
+        /// source pattern. Configuration compilers use this form so a short
+        /// regex does not temporarily reserve the worst-case 64-KiB AST while
+        /// still reserving before dependency entry.
+        pub fn dependency_workspace_bound_for_pattern(
+            &self,
+            pattern_bytes: usize,
+        ) -> Option<usize> {
+            if pattern_bytes > self.config.pattern_limit {
+                return None;
+            }
+            self.dependency_workspace_bound_for_capacity(pattern_bytes)
+        }
+
+        fn dependency_workspace_bound_for_capacity(
+            &self,
+            pattern_capacity: usize,
+        ) -> Option<usize> {
+            // At the semantic boundary the parsed HIR, owned AST and lowered
+            // HIR can coexist briefly. Charge every possible normalized node
+            // at the actual in-process widths of all three trees, and charge
+            // the widest range payload for each copy. This derives the bound
+            // from the same 16x structural ceiling enforced by `build`
+            // instead of relying on a profiled bytes-per-pattern estimate.
+            let structural_units = pattern_capacity.checked_mul(16)?.max(1);
+            let semantic_unit_bytes = std::mem::size_of::<SemanticAst>()
+                .checked_add(std::mem::size_of::<regex_syntax::hir::Hir>().checked_mul(2)?)?
+                .checked_add(std::mem::size_of::<(char, char)>().checked_mul(3)?)?
+                // Worst-case allocator metadata for boxed/tree nodes in all
+                // three transient representations, plus copied name bytes.
+                .checked_add(std::mem::size_of::<usize>().checked_mul(6)?)?
+                .checked_add(3)?;
+            let semantic_workspace = structural_units.checked_mul(semantic_unit_bytes)?;
             self.config
                 .size_limit
                 .checked_mul(2)?
@@ -466,11 +892,8 @@ pub mod bytes {
                         .checked_add(HYBRID_CACHE_CAPACITY)?
                         .checked_mul(SEARCH_CACHE_POOL_CAPACITY)?,
                 )?
-                .checked_add(
-                    self.config
-                        .pattern_limit
-                        .checked_mul(DEPENDENCY_PATTERN_EXPANSION_FACTOR)?,
-                )?
+                .checked_add(pattern_capacity.checked_mul(DEPENDENCY_PATTERN_EXPANSION_FACTOR)?)?
+                .checked_add(semantic_workspace)?
                 .checked_add(
                     self.config
                         .capture_limit
@@ -481,7 +904,7 @@ pub mod bytes {
     }
 
     fn build_automata(
-        hir: &regex_syntax::hir::Hir,
+        program: &CertifiedMatcherProgram,
         size_limit: usize,
         hybrid: bool,
     ) -> Result<AutomataRegex, Error> {
@@ -497,7 +920,7 @@ pub mod bytes {
                     .onepass(false)
                     .backtrack(false),
             )
-            .build_from_hir(hir)
+            .build_from_hir(&program.hir)
             .map_err(|error| Error::syntax(error.to_string()))
     }
 
@@ -507,6 +930,10 @@ pub mod bytes {
         config: Arc<Config>,
         pattern: String,
         translated_pattern: String,
+        #[allow(dead_code)] // retained proof artifact; inspected in test/audit builds
+        semantic_ast: Arc<SemanticAst>,
+        #[allow(dead_code)] // binds the retained tree to its admitted source
+        semantic_certificate: httpd_rs_verified::PcreAstCertificate,
         complexity: u64,
         retained_workspace_bound: usize,
         final_newline_fallback: bool,
@@ -907,6 +1334,33 @@ pub mod bytes {
         /// differential-test diagnostics.
         pub fn translated_pattern(&self) -> &str {
             &self.translated_pattern
+        }
+
+        /// The sole normalized program from which the dependency matcher was
+        /// constructed. This is exposed for audit and differential tests; it
+        /// cannot be mutated after compilation.
+        #[cfg(test)]
+        pub(crate) fn semantic_ast(&self) -> &SemanticAst {
+            &self.semantic_ast
+        }
+
+        /// The Verus-checked structural certificate attached to
+        /// [`Self::semantic_ast`].
+        #[cfg(test)]
+        pub(crate) fn semantic_certificate(&self) -> httpd_rs_verified::PcreAstCertificate {
+            self.semantic_certificate
+        }
+
+        pub fn caseless(&self) -> bool {
+            self.config.caseless
+        }
+
+        pub fn utf(&self) -> bool {
+            self.config.utf
+        }
+
+        pub fn ucp(&self) -> bool {
+            self.config.ucp
         }
 
         pub fn capture_names(&self) -> &[Option<String>] {
@@ -3382,7 +3836,7 @@ pub mod bytes {
 
 #[cfg(test)]
 mod tests {
-    use super::bytes::{Regex, RegexBuilder};
+    use super::bytes::{Regex, RegexBuilder, SemanticAst};
     use super::ErrorKind;
 
     #[test]
@@ -3442,9 +3896,58 @@ mod tests {
         let mut builder = RegexBuilder::new();
         builder.max_pattern_size(8190).size_limit(256 * 1024);
         let precompile = builder.dependency_workspace_bound().unwrap();
-        let regex = builder.build(r"^(?<name>[a-z]+)\.txt$").unwrap();
+        let pattern = r"^(?<name>[a-z]+)\.txt$";
+        let specialized = builder
+            .dependency_workspace_bound_for_pattern(pattern.len())
+            .unwrap();
+        let regex = builder.build(pattern).unwrap();
+        assert!(regex.dependency_workspace_bound() <= specialized);
+        assert!(specialized < precompile);
         assert!(regex.dependency_workspace_bound() <= precompile);
         assert!(regex.dependency_workspace_bound() < precompile / 2);
+    }
+
+    #[test]
+    fn every_matcher_is_built_from_one_certified_semantic_ast() {
+        fn node_count(ast: &SemanticAst) -> u64 {
+            match ast {
+                SemanticAst::Repeat { child, .. } | SemanticAst::Capture { child, .. } => {
+                    1 + node_count(child)
+                }
+                SemanticAst::Concat(children) | SemanticAst::Alternation(children) => {
+                    1 + children.iter().map(node_count).sum::<u64>()
+                }
+                _ => 1,
+            }
+        }
+
+        for pattern in [
+            "",
+            "literal",
+            "[A-Z]",
+            "^prefix$",
+            "a+",
+            "(?<name>x)",
+            "ab[0-9]",
+            "ab|cd",
+            r"\A\Qliteral.*\E\z",
+            r"pre\Kvalue",
+        ] {
+            let regex = Regex::new(pattern)
+                .unwrap_or_else(|error| panic!("semantic AST rejected {pattern:?}: {error}"));
+            let certificate = regex.semantic_certificate();
+            assert_eq!(certificate.source_len, pattern.len() as u64);
+            assert_eq!(certificate.nodes, node_count(regex.semantic_ast()));
+            assert!(certificate.exactly_one_root);
+            assert!(httpd_rs_verified::pcre_ast_certificate_admit(
+                certificate,
+                pattern.len() as u64
+            ));
+            assert!(!httpd_rs_verified::pcre_ast_certificate_admit(
+                certificate,
+                pattern.len().saturating_add(1) as u64
+            ));
+        }
     }
 
     #[test]

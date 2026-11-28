@@ -19,6 +19,7 @@ const MAX_INCLUDE_DIRECTORY_ENTRIES: usize = 10_000;
 const MAX_NODES: usize = 65_536;
 const MAX_ARGS: usize = 128;
 const MAX_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_BLOCK_DEPTH: usize = 64;
 
 #[derive(Debug, Clone)]
 pub(crate) struct NginxError {
@@ -363,79 +364,152 @@ impl<'a> Parser<'a> {
 
     fn parse(mut self) -> Result<Vec<Node>, NginxError> {
         self.tokens = lex(self.text, &self.file)?;
-        let nodes = self.parse_block(false)?;
-        if self.position != self.tokens.len() {
-            return Err(self.error(0, "trailing nginx parser state"));
+        struct BlockFrame {
+            name: String,
+            args: Vec<String>,
+            loc: SourceLoc,
+            parent: Vec<Node>,
         }
-        Ok(nodes)
-    }
 
-    fn parse_block(&mut self, nested: bool) -> Result<Vec<Node>, NginxError> {
+        let mut state = httpd_rs_verified::nginx_parse_start();
         let mut nodes = Vec::new();
+        let mut frames: Vec<BlockFrame> = Vec::new();
+        let mut directive: Option<(String, Vec<String>, SourceLoc)> = None;
         loop {
-            let Some(token) = self.tokens.get(self.position).cloned() else {
-                return if nested {
-                    Err(self.error(0, "unclosed nginx configuration block"))
-                } else {
-                    Ok(nodes)
-                };
+            let token = self.tokens.get(self.position).cloned();
+            let class = match token.as_ref().map(|token| &token.kind) {
+                Some(TokenKind::Word(_)) => httpd_rs_verified::NginxTokenClass::Word,
+                Some(TokenKind::Semi) => httpd_rs_verified::NginxTokenClass::Semi,
+                Some(TokenKind::Open) => httpd_rs_verified::NginxTokenClass::Open,
+                Some(TokenKind::Close) => httpd_rs_verified::NginxTokenClass::Close,
+                None => httpd_rs_verified::NginxTokenClass::Eof,
             };
-            if token.kind == TokenKind::Close {
-                if !nested {
-                    return Err(self.error(token.line, "unexpected '}'"));
-                }
-                self.position += 1;
-                return Ok(nodes);
-            }
-            let TokenKind::Word(name) = token.kind else {
-                return Err(self.error(token.line, "expected nginx directive name"));
-            };
-            self.position += 1;
-            let mut args = Vec::new();
-            loop {
-                let Some(next) = self.tokens.get(self.position).cloned() else {
-                    return Err(self.error(token.line, "unterminated nginx directive"));
+            let step = httpd_rs_verified::nginx_parse_step(
+                state,
+                class,
+                MAX_ARGS as u64,
+                MAX_BLOCK_DEPTH as u64,
+            );
+            if step.action == httpd_rs_verified::NginxParseAction::Reject {
+                let line = token.as_ref().map_or_else(
+                    || directive.as_ref().map_or(0, |(_, _, loc)| loc.line),
+                    |token| token.line,
+                );
+                let message = match (state.phase, class) {
+                    (
+                        httpd_rs_verified::NginxParsePhase::NeedDirective,
+                        httpd_rs_verified::NginxTokenClass::Close,
+                    ) if state.depth == 0 => "unexpected '}'",
+                    (
+                        httpd_rs_verified::NginxParsePhase::NeedDirective,
+                        httpd_rs_verified::NginxTokenClass::Eof,
+                    ) => "unclosed nginx configuration block",
+                    (
+                        httpd_rs_verified::NginxParsePhase::Arguments,
+                        httpd_rs_verified::NginxTokenClass::Word,
+                    ) => "too many nginx directive arguments",
+                    (
+                        httpd_rs_verified::NginxParsePhase::Arguments,
+                        httpd_rs_verified::NginxTokenClass::Open,
+                    ) => "nginx configuration block nesting is too deep",
+                    (
+                        httpd_rs_verified::NginxParsePhase::Arguments,
+                        httpd_rs_verified::NginxTokenClass::Close,
+                    ) => "directive is missing ';' or '{'",
+                    (
+                        httpd_rs_verified::NginxParsePhase::Arguments,
+                        httpd_rs_verified::NginxTokenClass::Eof,
+                    ) => "unterminated nginx directive",
+                    _ => "expected nginx directive name",
                 };
-                match next.kind {
-                    TokenKind::Word(value) => {
-                        if args.len() >= MAX_ARGS {
-                            return Err(self.error(next.line, "too many nginx directive arguments"));
-                        }
-                        args.push(value);
-                        self.position += 1;
-                    }
-                    TokenKind::Semi => {
-                        self.position += 1;
-                        nodes.push(Node {
-                            name: name.to_ascii_lowercase(),
-                            args,
-                            children: None,
-                            loc: SourceLoc {
-                                file: self.file.clone(),
-                                line: token.line,
-                            },
-                        });
-                        break;
-                    }
-                    TokenKind::Open => {
-                        self.position += 1;
-                        let children = self.parse_block(true)?;
-                        nodes.push(Node {
-                            name: name.to_ascii_lowercase(),
-                            args,
-                            children: Some(children),
-                            loc: SourceLoc {
-                                file: self.file.clone(),
-                                line: token.line,
-                            },
-                        });
-                        break;
-                    }
-                    TokenKind::Close => {
-                        return Err(self.error(next.line, "directive is missing ';' or '{'"));
-                    }
-                }
+                return Err(self.error(line, message));
             }
+            match step.action {
+                httpd_rs_verified::NginxParseAction::StartDirective => {
+                    let Some(Token {
+                        kind: TokenKind::Word(name),
+                        line,
+                    }) = token
+                    else {
+                        unreachable!("verified parser starts only on a word")
+                    };
+                    directive = Some((
+                        name.to_ascii_lowercase(),
+                        Vec::new(),
+                        SourceLoc {
+                            file: self.file.clone(),
+                            line,
+                        },
+                    ));
+                    self.position += 1;
+                }
+                httpd_rs_verified::NginxParseAction::PushArgument => {
+                    let Some(Token {
+                        kind: TokenKind::Word(value),
+                        ..
+                    }) = token
+                    else {
+                        unreachable!("verified parser arguments are words")
+                    };
+                    directive
+                        .as_mut()
+                        .expect("verified argument state owns a directive")
+                        .1
+                        .push(value);
+                    self.position += 1;
+                }
+                httpd_rs_verified::NginxParseAction::EmitLeaf => {
+                    let (name, args, loc) = directive
+                        .take()
+                        .expect("verified leaf state owns a directive");
+                    nodes.push(Node {
+                        name,
+                        args,
+                        children: None,
+                        loc,
+                    });
+                    self.position += 1;
+                }
+                httpd_rs_verified::NginxParseAction::OpenBlock => {
+                    let (name, args, loc) = directive
+                        .take()
+                        .expect("verified block state owns a directive");
+                    frames.push(BlockFrame {
+                        name,
+                        args,
+                        loc,
+                        parent: std::mem::take(&mut nodes),
+                    });
+                    self.position += 1;
+                }
+                httpd_rs_verified::NginxParseAction::CloseBlock => {
+                    let frame = frames
+                        .pop()
+                        .expect("verified close state has a parent block");
+                    let children = std::mem::take(&mut nodes);
+                    nodes = frame.parent;
+                    nodes.push(Node {
+                        name: frame.name,
+                        args: frame.args,
+                        children: Some(children),
+                        loc: frame.loc,
+                    });
+                    self.position += 1;
+                }
+                httpd_rs_verified::NginxParseAction::Complete => {
+                    debug_assert!(frames.is_empty());
+                    debug_assert!(directive.is_none());
+                    debug_assert_eq!(self.position, self.tokens.len());
+                    return Ok(nodes);
+                }
+                httpd_rs_verified::NginxParseAction::Reject => unreachable!(),
+            }
+            state = step.state;
+            debug_assert_eq!(state.depth as usize, frames.len());
+            debug_assert_eq!(
+                state.phase == httpd_rs_verified::NginxParsePhase::Arguments,
+                directive.is_some()
+            );
         }
     }
 
@@ -501,57 +575,48 @@ fn lex(text: &str, file: &str) -> Result<Vec<Token>, NginxError> {
             _ => {
                 let start_line = line;
                 let mut word = Vec::new();
-                let mut quote = None;
+                let mut state = httpd_rs_verified::NginxLexState::Bare;
                 let mut token_started = false;
                 while index < bytes.len() {
                     let byte = bytes[index];
-                    if let Some(delimiter) = quote {
-                        if byte == delimiter {
-                            quote = None;
-                            index += 1;
-                        } else if byte == b'\\' {
-                            index += 1;
-                            let Some(escaped) = bytes.get(index).copied() else {
-                                return Err(NginxError {
-                                    file: file.into(),
-                                    line,
-                                    message: "trailing escape in quoted nginx token".into(),
-                                });
-                            };
-                            word.push(escaped);
-                            index += 1;
-                        } else {
+                    let step = httpd_rs_verified::nginx_lex_step(
+                        state,
+                        byte,
+                        bytes.get(index + 1).is_some(),
+                    );
+                    match step.action {
+                        httpd_rs_verified::NginxLexAction::Push => {
+                            token_started = true;
                             if byte == b'\n' {
                                 line += 1;
                             }
                             word.push(byte);
-                            index += 1;
+                            index += step.advance as usize;
                         }
-                    } else if matches!(byte, b'\'' | b'"') {
-                        token_started = true;
-                        quote = Some(byte);
-                        index += 1;
-                    } else if byte == b'\\' {
-                        token_started = true;
-                        index += 1;
-                        let Some(escaped) = bytes.get(index).copied() else {
+                        httpd_rs_verified::NginxLexAction::PushNext => {
+                            token_started = true;
+                            word.push(bytes[index + 1]);
+                            index += step.advance as usize;
+                        }
+                        httpd_rs_verified::NginxLexAction::Skip => {
+                            token_started = true;
+                            index += step.advance as usize;
+                        }
+                        httpd_rs_verified::NginxLexAction::Finish => break,
+                        httpd_rs_verified::NginxLexAction::Reject => {
+                            let quoted = state != httpd_rs_verified::NginxLexState::Bare;
                             return Err(NginxError {
                                 file: file.into(),
                                 line,
-                                message: "trailing escape in nginx token".into(),
+                                message: if quoted {
+                                    "trailing escape in quoted nginx token".into()
+                                } else {
+                                    "trailing escape in nginx token".into()
+                                },
                             });
-                        };
-                        word.push(escaped);
-                        index += 1;
-                    } else if byte.is_ascii_whitespace()
-                        || matches!(byte, b';' | b'{' | b'}' | b'#')
-                    {
-                        break;
-                    } else {
-                        token_started = true;
-                        word.push(byte);
-                        index += 1;
+                        }
                     }
+                    state = step.state;
                     if word.len() > MAX_TOKEN_BYTES {
                         return Err(NginxError {
                             file: file.into(),
@@ -560,7 +625,7 @@ fn lex(text: &str, file: &str) -> Result<Vec<Token>, NginxError> {
                         });
                     }
                 }
-                if quote.is_some() {
+                if !httpd_rs_verified::nginx_lex_finish(state) {
                     return Err(NginxError {
                         file: file.into(),
                         line: start_line,
@@ -603,6 +668,65 @@ struct Lowerer {
     errors: Vec<NginxError>,
     listeners: HashSet<String>,
     upstreams: HashSet<String>,
+}
+
+/// The only source-neutral operations the nginx frontend may emit. Keeping
+/// this map beside the emitter makes additions fail closed until their arity
+/// has also been represented in the verified lowering vocabulary.
+fn nginx_ir_operation(name: &str) -> Option<httpd_rs_verified::NginxIrOperation> {
+    use httpd_rs_verified::NginxIrOperation as Op;
+    Some(match name {
+        "user" | "group" => Op::ProcessIdentity,
+        "pidfile" => Op::PidFile,
+        "errorlog" => Op::ErrorLog,
+        "loglevel" => Op::LogLevel,
+        "httpdrscapability" => Op::Capability,
+        "httpdrsfastcgistablepath" => Op::StableFastCgiPath,
+        "documentroot" => Op::DocumentRoot,
+        "httpdrsscopedroot" => Op::ScopedRoot,
+        "limitrequestbody" => Op::RequestBodyLimit,
+        "httpdrsscopedbodylimit" => Op::ScopedBodyLimit,
+        "keepalivetimeout" => Op::KeepAliveTimeout,
+        "maxkeepaliverequests" => Op::KeepAliveRequests,
+        "httpdrsnginxresponsesemantics" => Op::ResponseSemantics,
+        "httpdrsnginxresetheaders" => Op::ResetResponseHeaders,
+        "listen" => Op::Listen,
+        "servername" => Op::ServerName,
+        "serveralias" => Op::ServerAlias,
+        "addtype" => Op::MimeType,
+        "customlog" => Op::AccessLog,
+        "balancermember" => Op::BalancerMember,
+        "sslcertificatefile" => Op::Certificate,
+        "sslcertificatekeyfile" => Op::CertificateKey,
+        "sslciphersuite" => Op::CipherSuite,
+        "sslengine" => Op::TlsEngine,
+        "sslprotocol" => Op::TlsProtocol,
+        "protocols" => Op::Protocols,
+        "directoryindex" => Op::DirectoryIndex,
+        "enablesendfile" => Op::Sendfile,
+        "servertokens" => Op::ServerTokens,
+        "options" => Op::Options,
+        "setoutputfilter" => Op::OutputFilter,
+        "addoutputfilterbytype" => Op::OutputFilterByType,
+        "deflatecompressionlevel" => Op::CompressionLevel,
+        "httpdrsproxysetheader" => Op::ProxyHeader,
+        "httpdrsfastcgiparam" => Op::FastCgiParam,
+        "authtype" => Op::AuthType,
+        "authname" => Op::AuthName,
+        "authuserfile" => Op::AuthUserFile,
+        "require" => Op::Require,
+        "proxypreservehost" => Op::PreserveHost,
+        "httpdrsnginxalias" => Op::Alias,
+        "httpdrsnginxtryfiles" => Op::TryFiles,
+        "errordocument" => Op::ErrorDocument,
+        "expiresactive" => Op::ExpiresActive,
+        "expiresdefault" => Op::ExpiresDefault,
+        "httpdrsrouteproxypass" => Op::RouteProxyPass,
+        "httpdrsrouteproxypassreverse" => Op::RouteProxyReverse,
+        "header" => Op::ResponseHeader,
+        "httpdrsnginxreturn" => Op::Return,
+        _ => return None,
+    })
 }
 
 fn lower(nodes: Vec<Node>, default_document_root: &Path) -> Result<LoweredNginx, Vec<NginxError>> {
@@ -679,8 +803,26 @@ impl Lowerer {
     }
 
     fn directive(&mut self, node: &Node, name: &str, args: Vec<String>) {
+        let name = name.to_ascii_lowercase();
+        let Some(operation) = nginx_ir_operation(&name) else {
+            self.error(
+                node,
+                format!("internal nginx lowering emitted unknown IR operation '{name}'"),
+            );
+            return;
+        };
+        if !httpd_rs_verified::nginx_ir_operation_arg_admit(operation, args.len() as u64) {
+            self.error(
+                node,
+                format!(
+                    "internal nginx lowering emitted invalid arity {} for IR operation '{name}'",
+                    args.len()
+                ),
+            );
+            return;
+        }
         self.events.push(Event::Directive {
-            name: name.to_ascii_lowercase(),
+            name,
             args,
             loc: node.loc.clone(),
         });
@@ -1839,7 +1981,12 @@ fn parse_location(node: &Node) -> Result<(RouteMatcher, &'static str, String), S
             ))
         }
         "~" | "~*" => {
-            let regex = crate::apache_regex::Regex::compile(value, modifier == "~*")
+            let regex_modifier = if modifier == "~*" {
+                httpd_rs_verified::NginxRegexModifier::Caseless
+            } else {
+                httpd_rs_verified::NginxRegexModifier::Sensitive
+            };
+            let regex = crate::apache_regex::Regex::compile_nginx(value, regex_modifier)
                 .map_err(|error| format!("unsupported nginx location regex: {error}"))?;
             Ok((
                 RouteMatcher::Regex {
@@ -2710,6 +2857,78 @@ mod tests {
     }
 
     #[test]
+    fn verified_lexer_and_parser_fail_closed_at_their_bounds() {
+        for text in ["http { x 'unterminated; }", "http { x trailing\\"] {
+            assert!(Parser::new(text, Path::new("nginx.conf")).parse().is_err());
+        }
+
+        let mut nested = String::new();
+        for _ in 0..=MAX_BLOCK_DEPTH {
+            nested.push_str("block {");
+        }
+        assert!(Parser::new(&nested, Path::new("nginx.conf"))
+            .parse()
+            .unwrap_err()
+            .message
+            .contains("nesting is too deep"));
+
+        let arguments = (0..=MAX_ARGS)
+            .map(|index| format!("arg{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let wide = format!("directive {arguments};");
+        assert!(Parser::new(&wide, Path::new("nginx.conf"))
+            .parse()
+            .unwrap_err()
+            .message
+            .contains("too many"));
+    }
+
+    #[test]
+    fn lowering_emitter_accepts_only_the_verified_vocabulary_and_arity() {
+        let node = Node {
+            name: "test".into(),
+            args: Vec::new(),
+            children: None,
+            loc: SourceLoc {
+                file: "nginx.conf".into(),
+                line: 1,
+            },
+        };
+        let mut lowerer = Lowerer {
+            events: Vec::new(),
+            routes: Vec::new(),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+            listeners: HashSet::new(),
+            upstreams: HashSet::new(),
+        };
+        lowerer.directive(&node, "RawUnsealedDirective", Vec::new());
+        lowerer.directive(
+            &node,
+            "HttpdRsNginxResponseSemantics",
+            vec!["unexpected".into()],
+        );
+        lowerer.directive(&node, "HttpdRsNginxResponseSemantics", Vec::new());
+        assert_eq!(lowerer.errors.len(), 2);
+        assert_eq!(lowerer.events.len(), 1);
+
+        let protocols = Node {
+            name: "ssl_protocols".into(),
+            args: vec!["TLSv1.2".into(), "TLSv1.3".into()],
+            children: None,
+            loc: node.loc.clone(),
+        };
+        lowerer.lower_ssl_protocols(&protocols);
+        assert_eq!(lowerer.errors.len(), 2);
+        assert!(matches!(
+            lowerer.events.last(),
+            Some(Event::Directive { name, args, .. })
+                if name == "sslprotocol" && args == &["-all", "+TLSv1.2", "+TLSv1.3"]
+        ));
+    }
+
+    #[test]
     fn control_bytes_and_unusable_upstreams_fail_configuration_loading() {
         let control = Parser::new(
             "events { worker_connections 64; }\nhttp { upstream app { server 127.0.\u{1f}.0.1:9000; } }",
@@ -2894,6 +3113,13 @@ mod tests {
         let mut named = node.clone();
         named.args = vec!["@fallback".into()];
         assert!(parse_location(&named).is_err());
+
+        let mut caseless = node;
+        caseless.args = vec!["~*".into(), "^/Admin$".into()];
+        let RouteMatcher::Regex { regex, .. } = parse_location(&caseless).unwrap().0 else {
+            panic!("~* did not compile to a regex location");
+        };
+        assert!(regex.is_nginx_match("/admin"));
     }
 
     #[test]

@@ -41,56 +41,63 @@ COMPONENT_RANGES = (
     (1941, 2200, "Transform capability and terminal sink admission"),
     (2201, 2280, "Descriptor and inode stability"),
     (2281, 2438, "Rewrite query, restart, map and backreference policy"),
-    (2439, 2679, "PCRE2 positive grammar"),
-    (2680, 2794, "Cache invalidation and disk identity"),
-    (2795, 2900, "Configured input-size gates"),
-    (2901, 3050, "Request resource admission"),
-    (3051, 3260, "MultiViews admission and authorization"),
-    (3261, 3410, "Access-program and regex work accounting"),
-    (3411, 3650, "Rewrite filesystem containment"),
-    (3651, 3824, "Expression and path matching"),
-    (3825, 3930, "Shared memory, maps and queues"),
-    (3931, 4185, "Dependency and TLS call boundaries"),
-    (4186, 4230, "Generic resource-budget admission"),
-    (4231, 4310, "Cancellation boundaries"),
-    (4311, 4540, "Hierarchical resource accounting"),
-    (4541, 4800, "Worker and output ownership"),
-    (4801, 4950, "Request body phase machine"),
-    (4951, 5350, "Dynamic outcome lifecycle"),
-    (5351, 5950, "Internal requests, redirects and recovery"),
-    (5951, 6050, "Body, retry and expression-file admission"),
-    (6051, 6440, "Rewrite rule transitions"),
-    (6441, 7190, "Rewrite program machine"),
-    (7191, 7292, "Access-file selection"),
-    (7293, 7390, "Policy-bit meet"),
-    (7391, 7500, "Options, handler and authorization configuration"),
-    (7501, 7600, "Authentication identity and cache"),
-    (7601, 7680, "Authorization providers and override categories"),
-    (7681, 7840, ".htaccess admission"),
-    (7841, 8500, "Cache-key and lookup identity"),
-    (8501, 8662, "Header and token syntax"),
-    (8663, 9050, "HTTP/1 framing and byte ranges"),
-    (9051, 9760, "Proxy request serialization"),
-    (9761, 10300, "Header and range parsing"),
-    (10301, 10912, "CGI and mapping bounds"),
-    (10913, 11210, "Compression resource policy"),
-    (11211, 11240, "Client quota identity"),
-    (11241, 11320, "Service and process identity"),
-    (11321, 11465, "CGI/backend response admission"),
-    (11466, 11750, "CGI environment and regex admission"),
-    (11751, 11996, "Cache lookup and expression authorization"),
-    (11997, 12188, "Proxy identity and authorization algebra"),
-    (12189, 12715, "Configuration phase ordering"),
-    (12716, 13828, "Whole request-policy state machine"),
-    (13829, 14473, "Configuration merge helpers"),
-    (14474, 14802, "RemoteIP and virtual-host identity"),
-    (14803, 16049, "Configuration front-end refinement"),
-    (16050, 16237, "Container-field merge"),
-    (16238, 18591, "HTTP/2 admission and lifecycle"),
-    (18592, 18844, "Access/cache prefilters and mapping order"),
-    (18845, 19480, "fnmatch semantics"),
-    (19481, 19650, "Handler and CGI capability admission"),
-    (19651, 19776, "Authentication-file and FastCGI path immutability"),
+    (2439, 2667, "PCRE2 positive grammar"),
+    (2668, 3218, "PCRE2 semantic AST and nginx regex bridge"),
+    (3219, 3333, "Cache invalidation and disk identity"),
+    (3334, 3439, "Configured input-size gates"),
+    (3440, 3589, "Request resource admission"),
+    (3590, 3799, "MultiViews admission and authorization"),
+    (3800, 3949, "Access-program and regex work accounting"),
+    (3950, 4189, "Rewrite filesystem containment"),
+    (4190, 4363, "Expression and path matching"),
+    (4364, 4469, "Shared memory, maps and queues"),
+    (4470, 4724, "Dependency and TLS call boundaries"),
+    (4725, 4769, "Generic resource-budget admission"),
+    (4770, 4849, "Cancellation boundaries"),
+    (4850, 5079, "Hierarchical resource accounting"),
+    (5080, 5339, "Worker and output ownership"),
+    (5340, 5489, "Request body phase machine"),
+    (5490, 5889, "Dynamic outcome lifecycle"),
+    (5890, 6489, "Internal requests, redirects and recovery"),
+    (6490, 6589, "Body, retry and expression-file admission"),
+    (6590, 6979, "Rewrite rule transitions"),
+    (6980, 7729, "Rewrite program machine"),
+    (7730, 7831, "Access-file selection"),
+    (7832, 7929, "Policy-bit meet"),
+    (7930, 8039, "Options, handler and authorization configuration"),
+    (8040, 8139, "Authentication identity and cache"),
+    (8140, 8219, "Authorization providers and override categories"),
+    (8220, 8379, ".htaccess admission"),
+    (8380, 9039, "Cache-key and lookup identity"),
+    (9040, 9201, "Header and token syntax"),
+    (9202, 9589, "HTTP/1 framing and byte ranges"),
+    (9590, 10299, "Proxy request serialization"),
+    (10300, 10839, "Header and range parsing"),
+    (10840, 11451, "CGI and mapping bounds"),
+    (11452, 11749, "Compression resource policy"),
+    (11750, 11779, "Client quota identity"),
+    (11780, 11859, "Service and process identity"),
+    (11860, 12004, "CGI/backend response admission"),
+    (12005, 12289, "CGI environment and regex admission"),
+    (12290, 12535, "Cache lookup and expression authorization"),
+    (12536, 12727, "Proxy identity and authorization algebra"),
+    (12728, 13254, "Configuration phase ordering"),
+    (13255, 14367, "Whole request-policy state machine"),
+    (14368, 15012, "Configuration merge helpers"),
+    (15013, 15341, "RemoteIP and virtual-host identity"),
+    (15342, 16588, "Configuration front-end refinement"),
+    (16589, 16776, "Container-field merge"),
+    (16777, 19130, "HTTP/2 admission and lifecycle"),
+    (19131, 19383, "Access/cache prefilters and mapping order"),
+    (19384, 20019, "fnmatch semantics"),
+    (20020, 20189, "Handler and CGI capability admission"),
+    (20190, 20315, "Authentication-file and FastCGI path immutability"),
+    (20316, 20789, "Nginx lexer and parser refinement"),
+    (20790, 21068, "Nginx route-index refinement"),
+    (21069, 21196, "Nginx lowering closure"),
+    (21197, 21374, "Nginx transformation language"),
+    (21375, 21584, "Source-neutral scope merge"),
+    (21585, 21739, "Common-IR request refinement"),
 )
 
 
@@ -224,6 +231,7 @@ ARITHMETIC_GATE_PROOFS = {
     "inline_dynamic_worker_preserves_static_reserve",
     "request_body_memory_admission_is_bounded",
     "expr_file_read_admission_is_bounded",
+    "admitted_transform_append_is_bounded",
 }
 
 COST_MODEL_PROOFS = {
@@ -266,6 +274,7 @@ STATE_MACHINE_COMPONENTS = {
     "Rewrite rule transitions",
     "Rewrite program machine",
     "Whole request-policy state machine",
+    "Nginx lexer and parser refinement",
 }
 
 FINITE_CASE_COMPONENTS = {
@@ -286,6 +295,11 @@ FINITE_CASE_COMPONENTS = {
     "RemoteIP and virtual-host identity",
     "Handler and CGI capability admission",
     "Authentication-file and FastCGI path immutability",
+    "Nginx route-index refinement",
+    "Nginx lowering closure",
+    "Nginx transformation language",
+    "Source-neutral scope merge",
+    "Common-IR request refinement",
 }
 
 REFINED_INDUCTION_PROOFS = {
@@ -305,6 +319,7 @@ REFINED_INDUCTION_PROOFS = {
 
 ACRONYMS = {
     "acl": "ACL",
+    "ast": "AST",
     "ascii": "ASCII",
     "bcrypt": "bcrypt",
     "cgi": "CGI",
@@ -312,8 +327,11 @@ ACRONYMS = {
     "fnmatch": "fnmatch",
     "h2": "HTTP/2",
     "htaccess": ".htaccess",
+    "hir": "HIR",
     "ipv6": "IPv6",
     "mtls": "mTLS",
+    "nginx": "nginx",
+    "pcre": "PCRE",
     "pcre2": "PCRE2",
     "pid": "PID",
     "posix": "POSIX",
@@ -326,6 +344,14 @@ ACRONYMS = {
 
 
 PROPERTY_OVERRIDES = {
+    "admitted_pcre_ast_has_one_closed_root": (
+        "An admitted normalized PCRE AST certificate is bound to the source, nonempty, "
+        "single-rooted, and cannot report more captures than nodes."
+    ),
+    "admitted_pcre_ast_lowering_uses_only_the_declared_match_policy": (
+        "An admitted AST lowering exactly round-trips the normalized HIR and selects "
+        "leftmost-first matching with backtracking disabled."
+    ),
     "lemma_all_path_bytes_concat": (
         "Concatenating two all-path-byte sequences preserves the all-path-byte predicate."
     ),
@@ -356,6 +382,18 @@ PROPERTY_OVERRIDES = {
     ),
     "classify_access_rule_properties": (
         "Access rules are classified as conditional, Files, or other from the modeled flags."
+    ),
+    "nginx_regex_modifiers_are_the_shared_pcre_modes": (
+        "nginx `~` and `~*` select only the shared PCRE matcher's case bit; UTF/UCP stay off "
+        "and the subject is the normalized URI."
+    ),
+    "nginx_regex_compile_bridge_preserves_modifier": (
+        "A compiled nginx regex profile preserves the source modifier's case bit and keeps "
+        "UTF/UCP disabled."
+    ),
+    "nginx_regex_bridge_uses_the_exact_normalized_subject": (
+        "A successful nginx regex bridge includes both the compiled-mode refinement and the "
+        "fact that the matcher receives the exact normalized URI bytes."
     ),
 }
 

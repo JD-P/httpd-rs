@@ -2665,6 +2665,557 @@ pub fn pcre_grammar_certificate_admit(
         && certificate.multiline_start_free
 }
 
+// ---------------------------------------------------------------------------
+// Shared PCRE2 semantic-AST refinement
+// ---------------------------------------------------------------------------
+
+/// The normalized semantic vocabulary accepted by the production matcher.
+/// Source-only PCRE spellings (`\Q`, comments, option groups, `\K`, and so
+/// on) must be lowered into this closed vocabulary before an automaton can be
+/// built.  Apache and nginx consume the same program type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PcreAstNodeKind {
+    Empty,
+    Literal,
+    ByteClass,
+    UnicodeClass,
+    Look,
+    Repeat,
+    Capture,
+    Concat,
+    Alternation,
+}
+
+/// Post-order construction state for one normalized AST. `roots` is the
+/// number of complete subtrees currently on the construction stack. Keeping
+/// this as a counter is sufficient because each node declares its exact
+/// arity and the concrete Rust AST owns the corresponding child values.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PcreAstBuildState {
+    pub source_len: u64,
+    pub roots: u64,
+    pub nodes: u64,
+    pub payload_units: u64,
+    pub captures: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PcreAstCertificate {
+    pub source_len: u64,
+    pub nodes: u64,
+    pub payload_units: u64,
+    pub captures: u64,
+    pub exactly_one_root: bool,
+}
+
+pub open spec fn pcre_ast_node_shape_spec(
+    kind: PcreAstNodeKind,
+    arity: u64,
+    payload_units: u64,
+    repeat_min: u32,
+    repeat_has_max: bool,
+    repeat_max: u32,
+    capture_index: u32,
+) -> bool {
+    match kind {
+        PcreAstNodeKind::Empty => arity == 0 && payload_units == 0,
+        PcreAstNodeKind::Literal => arity == 0 && payload_units > 0,
+        PcreAstNodeKind::ByteClass | PcreAstNodeKind::UnicodeClass => arity == 0,
+        PcreAstNodeKind::Look => arity == 0 && payload_units == 0,
+        PcreAstNodeKind::Repeat => {
+            arity == 1 && payload_units == 0
+                && (!repeat_has_max || repeat_min <= repeat_max)
+        },
+        PcreAstNodeKind::Capture => {
+            arity == 1 && payload_units == 0 && capture_index > 0
+        },
+        PcreAstNodeKind::Concat | PcreAstNodeKind::Alternation => {
+            arity >= 2 && payload_units == 0
+        },
+    }
+}
+
+pub fn pcre_ast_node_shape_admit(
+    kind: PcreAstNodeKind,
+    arity: u64,
+    payload_units: u64,
+    repeat_min: u32,
+    repeat_has_max: bool,
+    repeat_max: u32,
+    capture_index: u32,
+) -> (ok: bool)
+    ensures ok == pcre_ast_node_shape_spec(
+        kind,
+        arity,
+        payload_units,
+        repeat_min,
+        repeat_has_max,
+        repeat_max,
+        capture_index,
+    ),
+{
+    match kind {
+        PcreAstNodeKind::Empty => arity == 0 && payload_units == 0,
+        PcreAstNodeKind::Literal => arity == 0 && payload_units > 0,
+        PcreAstNodeKind::ByteClass | PcreAstNodeKind::UnicodeClass => arity == 0,
+        PcreAstNodeKind::Look => arity == 0 && payload_units == 0,
+        PcreAstNodeKind::Repeat => {
+            arity == 1 && payload_units == 0
+                && (!repeat_has_max || repeat_min <= repeat_max)
+        },
+        PcreAstNodeKind::Capture => {
+            arity == 1 && payload_units == 0 && capture_index > 0
+        },
+        PcreAstNodeKind::Concat | PcreAstNodeKind::Alternation => {
+            arity >= 2 && payload_units == 0
+        },
+    }
+}
+
+pub open spec fn pcre_ast_capture_delta_spec(kind: PcreAstNodeKind) -> u64 {
+    match kind {
+        PcreAstNodeKind::Capture => 1,
+        _ => 0,
+    }
+}
+
+pub fn pcre_ast_capture_delta(kind: PcreAstNodeKind) -> (delta: u64)
+    ensures delta == pcre_ast_capture_delta_spec(kind),
+{
+    match kind {
+        PcreAstNodeKind::Capture => 1,
+        _ => 0,
+    }
+}
+
+pub open spec fn pcre_ast_build_state_inv(
+    state: PcreAstBuildState,
+    node_limit: u64,
+    payload_limit: u64,
+) -> bool {
+    &&& state.nodes <= node_limit
+    &&& state.payload_units <= payload_limit
+    &&& state.roots <= state.nodes
+    &&& state.captures <= state.nodes
+}
+
+pub fn pcre_ast_start(source_len: u64) -> (state: PcreAstBuildState)
+    ensures
+        state.source_len == source_len,
+        state.roots == 0,
+        state.nodes == 0,
+        state.payload_units == 0,
+        state.captures == 0,
+{
+    PcreAstBuildState {
+        source_len,
+        roots: 0,
+        nodes: 0,
+        payload_units: 0,
+        captures: 0,
+    }
+}
+
+/// Admit one post-order AST node. The executable compiler calls this for
+/// every concrete node before reconstructing the HIR handed to the automata
+/// dependency, so an unknown node family, malformed repetition, dangling
+/// child or over-budget payload cannot cross the semantic boundary.
+pub fn pcre_ast_step(
+    state: PcreAstBuildState,
+    kind: PcreAstNodeKind,
+    arity: u64,
+    payload_units: u64,
+    repeat_min: u32,
+    repeat_has_max: bool,
+    repeat_max: u32,
+    capture_index: u32,
+    node_limit: u64,
+    payload_limit: u64,
+) -> (out: Option<PcreAstBuildState>)
+    requires pcre_ast_build_state_inv(state, node_limit, payload_limit),
+    ensures match out {
+        Some(next) => {
+            &&& pcre_ast_node_shape_spec(
+                kind,
+                arity,
+                payload_units,
+                repeat_min,
+                repeat_has_max,
+                repeat_max,
+                capture_index,
+            )
+            &&& arity <= state.roots
+            &&& next.source_len == state.source_len
+            &&& next.roots == state.roots - arity + 1
+            &&& next.nodes == state.nodes + 1
+            &&& next.payload_units == state.payload_units + payload_units
+            &&& next.captures == state.captures + pcre_ast_capture_delta_spec(kind)
+            &&& pcre_ast_build_state_inv(next, node_limit, payload_limit)
+        },
+        None => true,
+    },
+{
+    if !pcre_ast_node_shape_admit(
+        kind,
+        arity,
+        payload_units,
+        repeat_min,
+        repeat_has_max,
+        repeat_max,
+        capture_index,
+    ) || arity > state.roots {
+        return None;
+    }
+    let nodes = match state.nodes.checked_add(1) {
+        Some(value) if value <= node_limit => value,
+        _ => return None,
+    };
+    let payload = match state.payload_units.checked_add(payload_units) {
+        Some(value) if value <= payload_limit => value,
+        _ => return None,
+    };
+    let roots = match state.roots.checked_sub(arity) {
+        Some(value) => match value.checked_add(1) {
+            Some(value) => value,
+            None => return None,
+        },
+        None => return None,
+    };
+    let capture_increment = pcre_ast_capture_delta(kind);
+    let captures = match state.captures.checked_add(capture_increment) {
+        Some(value) => value,
+        None => return None,
+    };
+    let next = PcreAstBuildState {
+        source_len: state.source_len,
+        roots,
+        nodes,
+        payload_units: payload,
+        captures,
+    };
+    proof {
+        assert(pcre_ast_node_shape_spec(
+            kind,
+            arity,
+            payload_units,
+            repeat_min,
+            repeat_has_max,
+            repeat_max,
+            capture_index,
+        ));
+        assert(next.roots <= next.nodes);
+        assert(next.captures <= next.nodes);
+        assert(pcre_ast_build_state_inv(next, node_limit, payload_limit));
+        assert(next.source_len == state.source_len);
+        assert(next.roots == state.roots - arity + 1);
+        assert(next.nodes == state.nodes + 1);
+        assert(next.payload_units == state.payload_units + payload_units);
+        assert(next.captures == state.captures + pcre_ast_capture_delta_spec(kind));
+    }
+    Some(next)
+}
+
+pub fn pcre_ast_finish(
+    state: PcreAstBuildState,
+    source_len: u64,
+) -> (certificate: Option<PcreAstCertificate>)
+    ensures match certificate {
+        Some(value) => {
+            &&& state.source_len == source_len
+            &&& state.roots == 1
+            &&& state.nodes > 0
+            &&& value.source_len == source_len
+            &&& value.nodes == state.nodes
+            &&& value.payload_units == state.payload_units
+            &&& value.captures == state.captures
+            &&& value.exactly_one_root
+        },
+        None => true,
+    },
+{
+    if state.source_len != source_len || state.roots != 1 || state.nodes == 0 {
+        None
+    } else {
+        Some(PcreAstCertificate {
+            source_len,
+            nodes: state.nodes,
+            payload_units: state.payload_units,
+            captures: state.captures,
+            exactly_one_root: true,
+        })
+    }
+}
+
+pub open spec fn pcre_ast_certificate_spec(
+    certificate: PcreAstCertificate,
+    source_len: u64,
+) -> bool {
+    certificate.source_len == source_len
+        && certificate.nodes > 0
+        && certificate.exactly_one_root
+        && certificate.captures <= certificate.nodes
+}
+
+pub fn pcre_ast_certificate_admit(
+    certificate: PcreAstCertificate,
+    source_len: u64,
+) -> (ok: bool)
+    ensures ok == pcre_ast_certificate_spec(certificate, source_len),
+{
+    certificate.source_len == source_len
+        && certificate.nodes > 0
+        && certificate.exactly_one_root
+        && certificate.captures <= certificate.nodes
+}
+
+/// The last compiler boundary before dependency entry. `roundtrip_equal`
+/// means lowering the owned semantic AST reconstructed the exact normalized
+/// HIR from which it was built; the other two facts pin the only production
+/// matching policy admitted by httpd-rs.
+pub open spec fn pcre_ast_lowering_spec(
+    grammar: PcreGrammarCertificate,
+    ast: PcreAstCertificate,
+    source_len: u64,
+    roundtrip_equal: bool,
+    leftmost_first: bool,
+    backtracking_disabled: bool,
+) -> bool {
+    &&& pcre_grammar_certificate_spec(grammar, source_len)
+    &&& pcre_ast_certificate_spec(ast, source_len)
+    &&& roundtrip_equal
+    &&& leftmost_first
+    &&& backtracking_disabled
+}
+
+pub fn pcre_ast_lowering_admit(
+    grammar: PcreGrammarCertificate,
+    ast: PcreAstCertificate,
+    source_len: u64,
+    roundtrip_equal: bool,
+    leftmost_first: bool,
+    backtracking_disabled: bool,
+) -> (ok: bool)
+    ensures ok == pcre_ast_lowering_spec(
+        grammar,
+        ast,
+        source_len,
+        roundtrip_equal,
+        leftmost_first,
+        backtracking_disabled,
+    ),
+{
+    pcre_grammar_certificate_admit(grammar, source_len)
+        && pcre_ast_certificate_admit(ast, source_len)
+        && roundtrip_equal
+        && leftmost_first
+        && backtracking_disabled
+}
+
+pub proof fn admitted_pcre_ast_has_one_closed_root(
+    certificate: PcreAstCertificate,
+    source_len: u64,
+)
+    requires pcre_ast_certificate_spec(certificate, source_len),
+    ensures
+        certificate.source_len == source_len,
+        certificate.nodes > 0,
+        certificate.exactly_one_root,
+        certificate.captures <= certificate.nodes,
+{
+}
+
+pub proof fn admitted_pcre_ast_lowering_uses_only_the_declared_match_policy(
+    grammar: PcreGrammarCertificate,
+    ast: PcreAstCertificate,
+    source_len: u64,
+    roundtrip_equal: bool,
+    leftmost_first: bool,
+    backtracking_disabled: bool,
+)
+    requires pcre_ast_lowering_spec(
+        grammar,
+        ast,
+        source_len,
+        roundtrip_equal,
+        leftmost_first,
+        backtracking_disabled,
+    ),
+    ensures roundtrip_equal && leftmost_first && backtracking_disabled,
+{
+}
+
+/// nginx adds no regex dialect. Its two location modifiers select only the
+/// initial case-folding bit of the shared byte-oriented PCRE program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NginxRegexModifier {
+    Sensitive,
+    Caseless,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NginxRegexProfile {
+    pub caseless: bool,
+    pub utf: bool,
+    pub ucp: bool,
+    pub normalized_uri_subject: bool,
+}
+
+pub open spec fn nginx_regex_profile_spec(
+    modifier: NginxRegexModifier,
+) -> NginxRegexProfile {
+    NginxRegexProfile {
+        caseless: modifier == NginxRegexModifier::Caseless,
+        utf: false,
+        ucp: false,
+        normalized_uri_subject: true,
+    }
+}
+
+pub fn nginx_regex_profile(
+    modifier: NginxRegexModifier,
+) -> (profile: NginxRegexProfile)
+    ensures profile == nginx_regex_profile_spec(modifier),
+{
+    match modifier {
+        NginxRegexModifier::Sensitive => NginxRegexProfile {
+            caseless: false,
+            utf: false,
+            ucp: false,
+            normalized_uri_subject: true,
+        },
+        NginxRegexModifier::Caseless => NginxRegexProfile {
+            caseless: true,
+            utf: false,
+            ucp: false,
+            normalized_uri_subject: true,
+        },
+    }
+}
+
+pub open spec fn nginx_regex_compile_bridge_spec(
+    profile: NginxRegexProfile,
+    compiled_caseless: bool,
+    compiled_utf: bool,
+    compiled_ucp: bool,
+) -> bool {
+    &&& profile.normalized_uri_subject
+    &&& compiled_caseless == profile.caseless
+    &&& compiled_utf == profile.utf
+    &&& compiled_ucp == profile.ucp
+}
+
+pub fn nginx_regex_compile_bridge_admit(
+    profile: NginxRegexProfile,
+    compiled_caseless: bool,
+    compiled_utf: bool,
+    compiled_ucp: bool,
+) -> (ok: bool)
+    ensures ok == nginx_regex_compile_bridge_spec(
+        profile,
+        compiled_caseless,
+        compiled_utf,
+        compiled_ucp,
+    ),
+{
+    profile.normalized_uri_subject
+        && compiled_caseless == profile.caseless
+        && compiled_utf == profile.utf
+        && compiled_ucp == profile.ucp
+}
+
+pub open spec fn nginx_regex_bridge_spec(
+    profile: NginxRegexProfile,
+    compiled_caseless: bool,
+    compiled_utf: bool,
+    compiled_ucp: bool,
+    exact_subject_bytes: bool,
+) -> bool {
+    &&& profile.normalized_uri_subject
+    &&& compiled_caseless == profile.caseless
+    &&& compiled_utf == profile.utf
+    &&& compiled_ucp == profile.ucp
+    &&& exact_subject_bytes
+}
+
+pub fn nginx_regex_bridge_admit(
+    profile: NginxRegexProfile,
+    compiled_caseless: bool,
+    compiled_utf: bool,
+    compiled_ucp: bool,
+    exact_subject_bytes: bool,
+) -> (ok: bool)
+    ensures ok == nginx_regex_bridge_spec(
+        profile,
+        compiled_caseless,
+        compiled_utf,
+        compiled_ucp,
+        exact_subject_bytes,
+    ),
+{
+    profile.normalized_uri_subject
+        && compiled_caseless == profile.caseless
+        && compiled_utf == profile.utf
+        && compiled_ucp == profile.ucp
+        && exact_subject_bytes
+}
+
+pub proof fn nginx_regex_modifiers_are_the_shared_pcre_modes(
+    modifier: NginxRegexModifier,
+)
+    ensures
+        nginx_regex_profile_spec(modifier).utf == false,
+        nginx_regex_profile_spec(modifier).ucp == false,
+        nginx_regex_profile_spec(modifier).normalized_uri_subject,
+        nginx_regex_profile_spec(modifier).caseless
+            == (modifier == NginxRegexModifier::Caseless),
+{
+}
+
+pub proof fn nginx_regex_compile_bridge_preserves_modifier(
+    modifier: NginxRegexModifier,
+    compiled_caseless: bool,
+    compiled_utf: bool,
+    compiled_ucp: bool,
+)
+    requires nginx_regex_compile_bridge_spec(
+        nginx_regex_profile_spec(modifier),
+        compiled_caseless,
+        compiled_utf,
+        compiled_ucp,
+    ),
+    ensures
+        compiled_caseless == (modifier == NginxRegexModifier::Caseless),
+        !compiled_utf,
+        !compiled_ucp,
+{
+}
+
+pub proof fn nginx_regex_bridge_uses_the_exact_normalized_subject(
+    profile: NginxRegexProfile,
+    compiled_caseless: bool,
+    compiled_utf: bool,
+    compiled_ucp: bool,
+    exact_subject_bytes: bool,
+)
+    requires nginx_regex_bridge_spec(
+        profile,
+        compiled_caseless,
+        compiled_utf,
+        compiled_ucp,
+        exact_subject_bytes,
+    ),
+    ensures
+        nginx_regex_compile_bridge_spec(
+            profile,
+            compiled_caseless,
+            compiled_utf,
+            compiled_ucp,
+        ),
+        profile.normalized_uri_subject,
+        exact_subject_bytes,
+{
+}
+
 /// A persisted cache entry is usable only when its metadata carries the
 /// complete cache key and that key is exactly the one requested.  The digest
 /// filename is an index, not an authority for cache identity.
@@ -19769,6 +20320,1397 @@ pub proof fn fastcgi_stable_component_rejects_posix_acl(
         group_or_other_writable,
         symlink,
         true,
+    ),
+{
+}
+
+// ---------------------------------------------------------------------------
+// nginx frontend and source-neutral IR refinement
+// ---------------------------------------------------------------------------
+
+/// The nginx word scanner has only three live states. Delimiter handling is
+/// intentionally outside quoted strings, and a backslash consumes exactly
+/// one following byte in every state. The production lexer consumes this
+/// transition directly rather than maintaining a second copy of the rules.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NginxLexState {
+    Bare,
+    SingleQuoted,
+    DoubleQuoted,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NginxLexAction {
+    Push,
+    PushNext,
+    Skip,
+    Finish,
+    Reject,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NginxLexStep {
+    pub state: NginxLexState,
+    pub action: NginxLexAction,
+    pub advance: u8,
+}
+
+pub open spec fn nginx_word_delimiter_spec(byte: u8) -> bool {
+    byte == b' ' || byte == b'\t' || byte == b'\r' || byte == b'\n'
+        || byte == b';' || byte == b'{' || byte == b'}' || byte == b'#'
+}
+
+pub open spec fn nginx_lex_step_spec(
+    state: NginxLexState,
+    byte: u8,
+    next_present: bool,
+) -> NginxLexStep {
+    match state {
+        NginxLexState::Bare => {
+            if nginx_word_delimiter_spec(byte) {
+                NginxLexStep { state, action: NginxLexAction::Finish, advance: 0 }
+            } else if byte == b'\'' {
+                NginxLexStep {
+                    state: NginxLexState::SingleQuoted,
+                    action: NginxLexAction::Skip,
+                    advance: 1,
+                }
+            } else if byte == b'"' {
+                NginxLexStep {
+                    state: NginxLexState::DoubleQuoted,
+                    action: NginxLexAction::Skip,
+                    advance: 1,
+                }
+            } else if byte == b'\\' {
+                if next_present {
+                    NginxLexStep { state, action: NginxLexAction::PushNext, advance: 2 }
+                } else {
+                    NginxLexStep { state, action: NginxLexAction::Reject, advance: 0 }
+                }
+            } else {
+                NginxLexStep { state, action: NginxLexAction::Push, advance: 1 }
+            }
+        }
+        NginxLexState::SingleQuoted => {
+            if byte == b'\'' {
+                NginxLexStep {
+                    state: NginxLexState::Bare,
+                    action: NginxLexAction::Skip,
+                    advance: 1,
+                }
+            } else if byte == b'\\' {
+                if next_present {
+                    NginxLexStep { state, action: NginxLexAction::PushNext, advance: 2 }
+                } else {
+                    NginxLexStep { state, action: NginxLexAction::Reject, advance: 0 }
+                }
+            } else {
+                NginxLexStep { state, action: NginxLexAction::Push, advance: 1 }
+            }
+        }
+        NginxLexState::DoubleQuoted => {
+            if byte == b'"' {
+                NginxLexStep {
+                    state: NginxLexState::Bare,
+                    action: NginxLexAction::Skip,
+                    advance: 1,
+                }
+            } else if byte == b'\\' {
+                if next_present {
+                    NginxLexStep { state, action: NginxLexAction::PushNext, advance: 2 }
+                } else {
+                    NginxLexStep { state, action: NginxLexAction::Reject, advance: 0 }
+                }
+            } else {
+                NginxLexStep { state, action: NginxLexAction::Push, advance: 1 }
+            }
+        }
+    }
+}
+
+pub fn nginx_lex_step(
+    state: NginxLexState,
+    byte: u8,
+    next_present: bool,
+) -> (step: NginxLexStep)
+    ensures step == nginx_lex_step_spec(state, byte, next_present),
+{
+    match state {
+        NginxLexState::Bare => {
+            let delimiter = byte == b' ' || byte == b'\t' || byte == b'\r' || byte == b'\n'
+                || byte == b';' || byte == b'{' || byte == b'}' || byte == b'#';
+            if delimiter {
+                NginxLexStep { state, action: NginxLexAction::Finish, advance: 0 }
+            } else if byte == b'\'' {
+                NginxLexStep {
+                    state: NginxLexState::SingleQuoted,
+                    action: NginxLexAction::Skip,
+                    advance: 1,
+                }
+            } else if byte == b'"' {
+                NginxLexStep {
+                    state: NginxLexState::DoubleQuoted,
+                    action: NginxLexAction::Skip,
+                    advance: 1,
+                }
+            } else if byte == b'\\' {
+                if next_present {
+                    NginxLexStep { state, action: NginxLexAction::PushNext, advance: 2 }
+                } else {
+                    NginxLexStep { state, action: NginxLexAction::Reject, advance: 0 }
+                }
+            } else {
+                NginxLexStep { state, action: NginxLexAction::Push, advance: 1 }
+            }
+        }
+        NginxLexState::SingleQuoted => {
+            if byte == b'\'' {
+                NginxLexStep {
+                    state: NginxLexState::Bare,
+                    action: NginxLexAction::Skip,
+                    advance: 1,
+                }
+            } else if byte == b'\\' {
+                if next_present {
+                    NginxLexStep { state, action: NginxLexAction::PushNext, advance: 2 }
+                } else {
+                    NginxLexStep { state, action: NginxLexAction::Reject, advance: 0 }
+                }
+            } else {
+                NginxLexStep { state, action: NginxLexAction::Push, advance: 1 }
+            }
+        }
+        NginxLexState::DoubleQuoted => {
+            if byte == b'"' {
+                NginxLexStep {
+                    state: NginxLexState::Bare,
+                    action: NginxLexAction::Skip,
+                    advance: 1,
+                }
+            } else if byte == b'\\' {
+                if next_present {
+                    NginxLexStep { state, action: NginxLexAction::PushNext, advance: 2 }
+                } else {
+                    NginxLexStep { state, action: NginxLexAction::Reject, advance: 0 }
+                }
+            } else {
+                NginxLexStep { state, action: NginxLexAction::Push, advance: 1 }
+            }
+        }
+    }
+}
+
+pub open spec fn nginx_lex_finish_spec(state: NginxLexState) -> bool {
+    state == NginxLexState::Bare
+}
+
+pub fn nginx_lex_finish(state: NginxLexState) -> (ok: bool)
+    ensures ok == nginx_lex_finish_spec(state),
+{
+    reveal(nginx_lex_finish_spec);
+    match state {
+        NginxLexState::Bare => true,
+        NginxLexState::SingleQuoted | NginxLexState::DoubleQuoted => false,
+    }
+}
+
+pub proof fn nginx_lex_finish_requires_balanced_quotes(state: NginxLexState)
+    requires nginx_lex_finish_spec(state),
+    ensures state == NginxLexState::Bare,
+{
+}
+
+pub proof fn nginx_lex_trailing_escape_is_rejected(state: NginxLexState)
+    ensures nginx_lex_step_spec(state, b'\\', false).action == NginxLexAction::Reject,
+{
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NginxParsePhase {
+    NeedDirective,
+    Arguments,
+    Complete,
+    Rejected,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NginxTokenClass {
+    Word,
+    Semi,
+    Open,
+    Close,
+    Eof,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NginxParseAction {
+    StartDirective,
+    PushArgument,
+    EmitLeaf,
+    OpenBlock,
+    CloseBlock,
+    Complete,
+    Reject,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NginxParseState {
+    pub phase: NginxParsePhase,
+    pub depth: u64,
+    pub arguments: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NginxParseStep {
+    pub state: NginxParseState,
+    pub action: NginxParseAction,
+}
+
+pub open spec fn nginx_parse_start_spec() -> NginxParseState {
+    NginxParseState { phase: NginxParsePhase::NeedDirective, depth: 0, arguments: 0 }
+}
+
+pub fn nginx_parse_start() -> (state: NginxParseState)
+    ensures state == nginx_parse_start_spec(),
+{
+    NginxParseState { phase: NginxParsePhase::NeedDirective, depth: 0, arguments: 0 }
+}
+
+pub open spec fn nginx_parse_rejected_spec() -> NginxParseStep {
+    NginxParseStep {
+        state: NginxParseState { phase: NginxParsePhase::Rejected, depth: 0, arguments: 0 },
+        action: NginxParseAction::Reject,
+    }
+}
+
+pub open spec fn nginx_parse_step_spec(
+    state: NginxParseState,
+    token: NginxTokenClass,
+    max_arguments: u64,
+    max_depth: u64,
+) -> NginxParseStep {
+    match state.phase {
+        NginxParsePhase::Rejected => nginx_parse_rejected_spec(),
+        NginxParsePhase::Complete => {
+            match token {
+                NginxTokenClass::Eof => {
+                    NginxParseStep { state, action: NginxParseAction::Complete }
+                }
+                _ => nginx_parse_rejected_spec(),
+            }
+        }
+        NginxParsePhase::NeedDirective => {
+            match token {
+                NginxTokenClass::Word => NginxParseStep {
+                    state: NginxParseState {
+                        phase: NginxParsePhase::Arguments,
+                        depth: state.depth,
+                        arguments: 0,
+                    },
+                    action: NginxParseAction::StartDirective,
+                },
+                NginxTokenClass::Close if state.depth > 0 => NginxParseStep {
+                    state: NginxParseState {
+                        phase: NginxParsePhase::NeedDirective,
+                        depth: (state.depth - 1) as u64,
+                        arguments: 0,
+                    },
+                    action: NginxParseAction::CloseBlock,
+                },
+                NginxTokenClass::Eof if state.depth == 0 => NginxParseStep {
+                    state: NginxParseState {
+                        phase: NginxParsePhase::Complete,
+                        depth: 0,
+                        arguments: 0,
+                    },
+                    action: NginxParseAction::Complete,
+                },
+                _ => nginx_parse_rejected_spec(),
+            }
+        }
+        NginxParsePhase::Arguments => {
+            match token {
+                NginxTokenClass::Word if state.arguments < max_arguments => NginxParseStep {
+                    state: NginxParseState {
+                        phase: NginxParsePhase::Arguments,
+                        depth: state.depth,
+                        arguments: (state.arguments + 1) as u64,
+                    },
+                    action: NginxParseAction::PushArgument,
+                },
+                NginxTokenClass::Semi => NginxParseStep {
+                    state: NginxParseState {
+                        phase: NginxParsePhase::NeedDirective,
+                        depth: state.depth,
+                        arguments: 0,
+                    },
+                    action: NginxParseAction::EmitLeaf,
+                },
+                NginxTokenClass::Open if state.depth < max_depth => NginxParseStep {
+                    state: NginxParseState {
+                        phase: NginxParsePhase::NeedDirective,
+                        depth: (state.depth + 1) as u64,
+                        arguments: 0,
+                    },
+                    action: NginxParseAction::OpenBlock,
+                },
+                _ => nginx_parse_rejected_spec(),
+            }
+        }
+    }
+}
+
+pub fn nginx_parse_step(
+    state: NginxParseState,
+    token: NginxTokenClass,
+    max_arguments: u64,
+    max_depth: u64,
+) -> (step: NginxParseStep)
+    ensures step == nginx_parse_step_spec(state, token, max_arguments, max_depth),
+{
+    reveal(nginx_parse_step_spec);
+    reveal(nginx_parse_rejected_spec);
+    match state.phase {
+        NginxParsePhase::Rejected => NginxParseStep {
+            state: NginxParseState { phase: NginxParsePhase::Rejected, depth: 0, arguments: 0 },
+            action: NginxParseAction::Reject,
+        },
+        NginxParsePhase::Complete => {
+            match token {
+                NginxTokenClass::Eof => {
+                    NginxParseStep { state, action: NginxParseAction::Complete }
+                }
+                _ => NginxParseStep {
+                    state: NginxParseState { phase: NginxParsePhase::Rejected, depth: 0, arguments: 0 },
+                    action: NginxParseAction::Reject,
+                },
+            }
+        }
+        NginxParsePhase::NeedDirective => {
+            match token {
+                NginxTokenClass::Word => NginxParseStep {
+                    state: NginxParseState {
+                        phase: NginxParsePhase::Arguments,
+                        depth: state.depth,
+                        arguments: 0,
+                    },
+                    action: NginxParseAction::StartDirective,
+                },
+                NginxTokenClass::Close if state.depth > 0 => NginxParseStep {
+                    state: NginxParseState {
+                        phase: NginxParsePhase::NeedDirective,
+                        depth: state.depth - 1,
+                        arguments: 0,
+                    },
+                    action: NginxParseAction::CloseBlock,
+                },
+                NginxTokenClass::Eof if state.depth == 0 => NginxParseStep {
+                    state: NginxParseState {
+                        phase: NginxParsePhase::Complete,
+                        depth: 0,
+                        arguments: 0,
+                    },
+                    action: NginxParseAction::Complete,
+                },
+                _ => NginxParseStep {
+                    state: NginxParseState { phase: NginxParsePhase::Rejected, depth: 0, arguments: 0 },
+                    action: NginxParseAction::Reject,
+                },
+            }
+        }
+        NginxParsePhase::Arguments => {
+            match token {
+                NginxTokenClass::Word if state.arguments < max_arguments => NginxParseStep {
+                    state: NginxParseState {
+                        phase: NginxParsePhase::Arguments,
+                        depth: state.depth,
+                        arguments: state.arguments + 1,
+                    },
+                    action: NginxParseAction::PushArgument,
+                },
+                NginxTokenClass::Semi => NginxParseStep {
+                    state: NginxParseState {
+                        phase: NginxParsePhase::NeedDirective,
+                        depth: state.depth,
+                        arguments: 0,
+                    },
+                    action: NginxParseAction::EmitLeaf,
+                },
+                NginxTokenClass::Open if state.depth < max_depth => NginxParseStep {
+                    state: NginxParseState {
+                        phase: NginxParsePhase::NeedDirective,
+                        depth: state.depth + 1,
+                        arguments: 0,
+                    },
+                    action: NginxParseAction::OpenBlock,
+                },
+                _ => NginxParseStep {
+                    state: NginxParseState { phase: NginxParsePhase::Rejected, depth: 0, arguments: 0 },
+                    action: NginxParseAction::Reject,
+                },
+            }
+        }
+    }
+}
+
+pub open spec fn nginx_parse_invariant(state: NginxParseState) -> bool {
+    &&& (state.phase == NginxParsePhase::NeedDirective ==> state.arguments == 0)
+    &&& (state.phase == NginxParsePhase::Complete ==> state.depth == 0 && state.arguments == 0)
+    &&& (state.phase == NginxParsePhase::Rejected ==> state.depth == 0 && state.arguments == 0)
+}
+
+pub proof fn nginx_parse_start_satisfies_invariant()
+    ensures nginx_parse_invariant(nginx_parse_start_spec()),
+{
+}
+
+pub proof fn nginx_parse_step_preserves_invariant(
+    state: NginxParseState,
+    token: NginxTokenClass,
+    max_arguments: u64,
+    max_depth: u64,
+)
+    requires nginx_parse_invariant(state),
+    ensures nginx_parse_invariant(
+        nginx_parse_step_spec(state, token, max_arguments, max_depth).state,
+    ),
+{
+}
+
+pub proof fn nginx_parse_complete_is_balanced(state: NginxParseState)
+    requires nginx_parse_invariant(state), state.phase == NginxParsePhase::Complete,
+    ensures state.depth == 0 && state.arguments == 0,
+{
+}
+
+pub proof fn nginx_parse_rejected_is_absorbing(
+    state: NginxParseState,
+    token: NginxTokenClass,
+    max_arguments: u64,
+    max_depth: u64,
+)
+    requires state.phase == NginxParsePhase::Rejected,
+    ensures nginx_parse_step_spec(state, token, max_arguments, max_depth).state.phase
+        == NginxParsePhase::Rejected,
+{
+}
+
+/// Reducer shared by the linear nginx location oracle and the indexed
+/// selector's result certificate. It records the earliest exact/regex match
+/// and the widest (then earliest) literal prefix independently of traversal
+/// order; the final class decision is a separate closed function.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NginxRouteCandidateKind {
+    Exact,
+    Prefix,
+    Regex,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NginxRouteAccumulator {
+    pub exact: bool,
+    pub exact_order: u64,
+    pub prefix: bool,
+    pub prefix_width: u64,
+    pub prefix_order: u64,
+    pub prefix_suppresses_regex: bool,
+    pub regex: bool,
+    pub regex_order: u64,
+}
+
+pub open spec fn nginx_route_accumulator_empty_spec() -> NginxRouteAccumulator {
+    NginxRouteAccumulator {
+        exact: false,
+        exact_order: 0,
+        prefix: false,
+        prefix_width: 0,
+        prefix_order: 0,
+        prefix_suppresses_regex: false,
+        regex: false,
+        regex_order: 0,
+    }
+}
+
+pub fn nginx_route_accumulator_empty() -> (state: NginxRouteAccumulator)
+    ensures state == nginx_route_accumulator_empty_spec(),
+{
+    NginxRouteAccumulator {
+        exact: false,
+        exact_order: 0,
+        prefix: false,
+        prefix_width: 0,
+        prefix_order: 0,
+        prefix_suppresses_regex: false,
+        regex: false,
+        regex_order: 0,
+    }
+}
+
+pub open spec fn nginx_route_accumulate_spec(
+    state: NginxRouteAccumulator,
+    kind: NginxRouteCandidateKind,
+    matched: bool,
+    width: u64,
+    order: u64,
+    suppresses_regex: bool,
+) -> NginxRouteAccumulator {
+    if !matched {
+        state
+    } else {
+        match kind {
+            NginxRouteCandidateKind::Exact => {
+                if !state.exact || order < state.exact_order {
+                    NginxRouteAccumulator { exact: true, exact_order: order, ..state }
+                } else {
+                    state
+                }
+            }
+            NginxRouteCandidateKind::Prefix => {
+                if nginx_literal_candidate_better_spec(
+                    state.prefix,
+                    width,
+                    order,
+                    state.prefix_width,
+                    state.prefix_order,
+                ) {
+                    NginxRouteAccumulator {
+                        prefix: true,
+                        prefix_width: width,
+                        prefix_order: order,
+                        prefix_suppresses_regex: suppresses_regex,
+                        ..state
+                    }
+                } else {
+                    state
+                }
+            }
+            NginxRouteCandidateKind::Regex => {
+                if !state.regex || order < state.regex_order {
+                    NginxRouteAccumulator { regex: true, regex_order: order, ..state }
+                } else {
+                    state
+                }
+            }
+        }
+    }
+}
+
+pub fn nginx_route_accumulate(
+    state: NginxRouteAccumulator,
+    kind: NginxRouteCandidateKind,
+    matched: bool,
+    width: u64,
+    order: u64,
+    suppresses_regex: bool,
+) -> (next: NginxRouteAccumulator)
+    ensures next == nginx_route_accumulate_spec(
+        state, kind, matched, width, order, suppresses_regex,
+    ),
+{
+    if !matched {
+        state
+    } else {
+        match kind {
+            NginxRouteCandidateKind::Exact => {
+                if !state.exact || order < state.exact_order {
+                    NginxRouteAccumulator { exact: true, exact_order: order, ..state }
+                } else {
+                    state
+                }
+            }
+            NginxRouteCandidateKind::Prefix => {
+                if nginx_literal_candidate_better(
+                    state.prefix,
+                    width,
+                    order,
+                    state.prefix_width,
+                    state.prefix_order,
+                ) {
+                    NginxRouteAccumulator {
+                        prefix: true,
+                        prefix_width: width,
+                        prefix_order: order,
+                        prefix_suppresses_regex: suppresses_regex,
+                        ..state
+                    }
+                } else {
+                    state
+                }
+            }
+            NginxRouteCandidateKind::Regex => {
+                if !state.regex || order < state.regex_order {
+                    NginxRouteAccumulator { regex: true, regex_order: order, ..state }
+                } else {
+                    state
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NginxRouteWinner {
+    /// 0 none, 1 exact, 2 suppressing prefix, 3 regex, 4 ordinary prefix.
+    pub class: u8,
+    pub order: u64,
+}
+
+pub open spec fn nginx_route_accumulator_winner_spec(
+    state: NginxRouteAccumulator,
+) -> NginxRouteWinner {
+    if state.exact {
+        NginxRouteWinner { class: 1, order: state.exact_order }
+    } else if state.prefix && state.prefix_suppresses_regex {
+        NginxRouteWinner { class: 2, order: state.prefix_order }
+    } else if state.regex {
+        NginxRouteWinner { class: 3, order: state.regex_order }
+    } else if state.prefix {
+        NginxRouteWinner { class: 4, order: state.prefix_order }
+    } else {
+        NginxRouteWinner { class: 0, order: 0 }
+    }
+}
+
+pub fn nginx_route_accumulator_winner(
+    state: NginxRouteAccumulator,
+) -> (winner: NginxRouteWinner)
+    ensures winner == nginx_route_accumulator_winner_spec(state),
+{
+    if state.exact {
+        NginxRouteWinner { class: 1, order: state.exact_order }
+    } else if state.prefix && state.prefix_suppresses_regex {
+        NginxRouteWinner { class: 2, order: state.prefix_order }
+    } else if state.regex {
+        NginxRouteWinner { class: 3, order: state.regex_order }
+    } else if state.prefix {
+        NginxRouteWinner { class: 4, order: state.prefix_order }
+    } else {
+        NginxRouteWinner { class: 0, order: 0 }
+    }
+}
+
+pub proof fn nginx_equal_route_summaries_choose_equal_winners(
+    indexed: NginxRouteAccumulator,
+    linear: NginxRouteAccumulator,
+)
+    requires indexed == linear,
+    ensures nginx_route_accumulator_winner_spec(indexed)
+        == nginx_route_accumulator_winner_spec(linear),
+{
+}
+
+pub fn nginx_prefix_index_pair_admit(
+    previous_width: u64,
+    previous_order: u64,
+    next_width: u64,
+    next_order: u64,
+) -> (admit: bool)
+    ensures admit == (
+        previous_width > next_width
+            || (previous_width == next_width && previous_order <= next_order)
+    ),
+{
+    previous_width > next_width
+        || (previous_width == next_width && previous_order <= next_order)
+}
+
+pub fn nginx_regex_index_pair_admit(
+    previous_order: u64,
+    next_order: u64,
+) -> (admit: bool)
+    ensures admit == (previous_order <= next_order),
+{
+    previous_order <= next_order
+}
+
+pub open spec fn nginx_index_partition_spec(
+    total: u64,
+    exact: u64,
+    prefix: u64,
+    regex: u64,
+    unique_and_complete: bool,
+    prefix_sorted: bool,
+    regex_sorted: bool,
+) -> bool {
+    unique_and_complete && prefix_sorted && regex_sorted
+        && exact as nat + prefix as nat + regex as nat == total as nat
+}
+
+pub fn nginx_index_partition_admit(
+    total: u64,
+    exact: u64,
+    prefix: u64,
+    regex: u64,
+    unique_and_complete: bool,
+    prefix_sorted: bool,
+    regex_sorted: bool,
+) -> (admit: bool)
+    ensures admit == nginx_index_partition_spec(
+        total, exact, prefix, regex, unique_and_complete, prefix_sorted, regex_sorted,
+    ),
+{
+    reveal(nginx_index_partition_spec);
+    if !unique_and_complete || !prefix_sorted || !regex_sorted {
+        false
+    } else {
+        let subtotal = match exact.checked_add(prefix) {
+            Some(value) => value,
+            None => return false,
+        };
+        let count = match subtotal.checked_add(regex) {
+            Some(value) => value,
+            None => return false,
+        };
+        count == total
+    }
+}
+
+pub proof fn nginx_certified_index_covers_every_route(
+    total: u64,
+    exact: u64,
+    prefix: u64,
+    regex: u64,
+    unique_and_complete: bool,
+    prefix_sorted: bool,
+    regex_sorted: bool,
+)
+    requires nginx_index_partition_spec(
+        total, exact, prefix, regex, unique_and_complete, prefix_sorted, regex_sorted,
+    ),
+    ensures exact as nat + prefix as nat + regex as nat == total as nat,
+{
+}
+
+/// The lowering output is a closed vocabulary. Values remain typed and are
+/// sealed by the common compiler; this enum prevents the nginx frontend from
+/// manufacturing a raw directive outside that compiler's audited schema.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NginxIrOperation {
+    ProcessIdentity,
+    PidFile,
+    ErrorLog,
+    LogLevel,
+    Capability,
+    StableFastCgiPath,
+    DocumentRoot,
+    ScopedRoot,
+    RequestBodyLimit,
+    ScopedBodyLimit,
+    KeepAliveTimeout,
+    KeepAliveRequests,
+    ResponseSemantics,
+    ResetResponseHeaders,
+    Listen,
+    ServerName,
+    ServerAlias,
+    MimeType,
+    AccessLog,
+    BalancerMember,
+    Certificate,
+    CertificateKey,
+    CipherSuite,
+    TlsEngine,
+    TlsProtocol,
+    Protocols,
+    DirectoryIndex,
+    Sendfile,
+    ServerTokens,
+    Options,
+    OutputFilter,
+    OutputFilterByType,
+    CompressionLevel,
+    ProxyHeader,
+    FastCgiParam,
+    AuthType,
+    AuthName,
+    AuthUserFile,
+    Require,
+    PreserveHost,
+    Alias,
+    TryFiles,
+    ErrorDocument,
+    ExpiresActive,
+    ExpiresDefault,
+    RouteProxyPass,
+    RouteProxyReverse,
+    ResponseHeader,
+    Return,
+}
+
+pub open spec fn nginx_ir_operation_arg_spec(op: NginxIrOperation, args: u64) -> bool {
+    match op {
+        NginxIrOperation::ResponseSemantics | NginxIrOperation::ResetResponseHeaders => args == 0,
+        NginxIrOperation::Capability | NginxIrOperation::Alias
+            | NginxIrOperation::TryFiles | NginxIrOperation::ErrorDocument
+            | NginxIrOperation::RouteProxyPass | NginxIrOperation::RouteProxyReverse
+            | NginxIrOperation::ProxyHeader => args == 2,
+        NginxIrOperation::FastCgiParam => 2 <= args && args <= 3,
+        NginxIrOperation::Return => args == 3,
+        NginxIrOperation::ResponseHeader => 3 <= args && args <= 4,
+        NginxIrOperation::Protocols | NginxIrOperation::AccessLog => 1 <= args && args <= 2,
+        NginxIrOperation::TlsProtocol => 1 <= args && args <= 3,
+        NginxIrOperation::StableFastCgiPath => 1 <= args && args <= 32,
+        NginxIrOperation::ServerAlias | NginxIrOperation::DirectoryIndex => {
+            1 <= args && args <= 128
+        }
+        NginxIrOperation::MimeType | NginxIrOperation::OutputFilterByType => {
+            2 <= args && args <= 129
+        }
+        _ => args == 1,
+    }
+}
+
+pub fn nginx_ir_operation_arg_admit(
+    op: NginxIrOperation,
+    args: u64,
+) -> (admit: bool)
+    ensures admit == nginx_ir_operation_arg_spec(op, args),
+{
+    match op {
+        NginxIrOperation::ResponseSemantics | NginxIrOperation::ResetResponseHeaders => args == 0,
+        NginxIrOperation::Capability | NginxIrOperation::Alias
+            | NginxIrOperation::TryFiles | NginxIrOperation::ErrorDocument
+            | NginxIrOperation::RouteProxyPass | NginxIrOperation::RouteProxyReverse
+            | NginxIrOperation::ProxyHeader => args == 2,
+        NginxIrOperation::FastCgiParam => 2 <= args && args <= 3,
+        NginxIrOperation::Return => args == 3,
+        NginxIrOperation::ResponseHeader => 3 <= args && args <= 4,
+        NginxIrOperation::Protocols | NginxIrOperation::AccessLog => 1 <= args && args <= 2,
+        NginxIrOperation::TlsProtocol => 1 <= args && args <= 3,
+        NginxIrOperation::StableFastCgiPath => 1 <= args && args <= 32,
+        NginxIrOperation::ServerAlias | NginxIrOperation::DirectoryIndex => {
+            1 <= args && args <= 128
+        }
+        NginxIrOperation::MimeType | NginxIrOperation::OutputFilterByType => {
+            2 <= args && args <= 129
+        }
+        _ => args == 1,
+    }
+}
+
+pub proof fn nginx_lowering_vocabulary_has_a_finite_argument_bound(
+    op: NginxIrOperation,
+    args: u64,
+)
+    requires nginx_ir_operation_arg_spec(op, args),
+    ensures args <= 129,
+{
+}
+
+pub proof fn nginx_zero_argument_operations_are_only_markers(
+    op: NginxIrOperation,
+)
+    requires nginx_ir_operation_arg_spec(op, 0),
+    ensures op == NginxIrOperation::ResponseSemantics
+        || op == NginxIrOperation::ResetResponseHeaders,
+{
+}
+
+/// Provenance classes for the finite nginx value-expression language. The
+/// runtime maps every admitted variable to exactly one class and uses the
+/// sink gate before retaining a transformation in ConfigIr.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransformValueClass {
+    Literal,
+    CanonicalAuthority,
+    TrustedPeer,
+    AuthorizedPath,
+    ProtocolMetadata,
+    RequestBytes,
+    ClientForwardedFor,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransformValueSink {
+    OrdinaryHeader,
+    HostHeader,
+    ForwardedForHeader,
+    ConnectionHeader,
+    UpgradeHeader,
+    FastCgiOrdinary,
+    FastCgiScriptFilename,
+    PhpConfiguration,
+}
+
+pub open spec fn transform_value_class_admit_spec(
+    sink: TransformValueSink,
+    class: TransformValueClass,
+) -> bool {
+    match sink {
+        TransformValueSink::OrdinaryHeader | TransformValueSink::FastCgiOrdinary => true,
+        TransformValueSink::HostHeader => match class {
+            TransformValueClass::Literal | TransformValueClass::CanonicalAuthority
+                | TransformValueClass::ProtocolMetadata => true,
+            _ => false,
+        },
+        TransformValueSink::ForwardedForHeader => match class {
+            TransformValueClass::ClientForwardedFor => false,
+            _ => true,
+        },
+        TransformValueSink::ConnectionHeader => match class {
+            TransformValueClass::Literal | TransformValueClass::ProtocolMetadata => true,
+            _ => false,
+        },
+        TransformValueSink::UpgradeHeader => match class {
+            TransformValueClass::Literal | TransformValueClass::RequestBytes => true,
+            _ => false,
+        },
+        TransformValueSink::FastCgiScriptFilename => match class {
+            TransformValueClass::Literal | TransformValueClass::AuthorizedPath => true,
+            _ => false,
+        },
+        TransformValueSink::PhpConfiguration => match class {
+            TransformValueClass::Literal => true,
+            _ => false,
+        },
+    }
+}
+
+pub fn transform_value_class_admit(
+    sink: TransformValueSink,
+    class: TransformValueClass,
+) -> (admit: bool)
+    ensures admit == transform_value_class_admit_spec(sink, class),
+{
+    reveal(transform_value_class_admit_spec);
+    match sink {
+        TransformValueSink::OrdinaryHeader | TransformValueSink::FastCgiOrdinary => true,
+        TransformValueSink::HostHeader => match class {
+            TransformValueClass::Literal | TransformValueClass::CanonicalAuthority
+                | TransformValueClass::ProtocolMetadata => true,
+            _ => false,
+        },
+        TransformValueSink::ForwardedForHeader => match class {
+            TransformValueClass::ClientForwardedFor => false,
+            _ => true,
+        },
+        TransformValueSink::ConnectionHeader => match class {
+            TransformValueClass::Literal | TransformValueClass::ProtocolMetadata => true,
+            _ => false,
+        },
+        TransformValueSink::UpgradeHeader => match class {
+            TransformValueClass::Literal | TransformValueClass::RequestBytes => true,
+            _ => false,
+        },
+        TransformValueSink::FastCgiScriptFilename => match class {
+            TransformValueClass::Literal | TransformValueClass::AuthorizedPath => true,
+            _ => false,
+        },
+        TransformValueSink::PhpConfiguration => match class {
+            TransformValueClass::Literal => true,
+            _ => false,
+        },
+    }
+}
+
+pub proof fn nginx_script_filename_rejects_untrusted_request_bytes(
+    class: TransformValueClass,
+)
+    requires class != TransformValueClass::Literal,
+        class != TransformValueClass::AuthorizedPath,
+    ensures !transform_value_class_admit_spec(
+        TransformValueSink::FastCgiScriptFilename,
+        class,
+    ),
+{
+}
+
+pub proof fn nginx_php_configuration_is_literal_only(class: TransformValueClass)
+    ensures transform_value_class_admit_spec(TransformValueSink::PhpConfiguration, class)
+        <==> class == TransformValueClass::Literal,
+{
+}
+
+pub proof fn nginx_forwarded_for_rejects_client_assertion()
+    ensures !transform_value_class_admit_spec(
+        TransformValueSink::ForwardedForHeader,
+        TransformValueClass::ClientForwardedFor,
+    ),
+{
+}
+
+pub open spec fn transform_output_append_spec(
+    current: u64,
+    addition: u64,
+    limit: u64,
+) -> Option<u64> {
+    if current as nat + addition as nat <= limit as nat
+        && current as nat + addition as nat <= u64::MAX as nat
+    {
+        Some((current as nat + addition as nat) as u64)
+    } else {
+        None
+    }
+}
+
+pub fn transform_output_append(
+    current: u64,
+    addition: u64,
+    limit: u64,
+) -> (next: Option<u64>)
+    ensures
+        next == transform_output_append_spec(current, addition, limit),
+        match next {
+        Some(value) => value as nat == current as nat + addition as nat && value <= limit,
+        None => current as nat + addition as nat > limit as nat || current as nat + addition as nat > u64::MAX as nat,
+        },
+{
+    match current.checked_add(addition) {
+        Some(value) if value <= limit => Some(value),
+        _ => None,
+    }
+}
+
+pub proof fn admitted_transform_append_is_bounded(
+    current: u64,
+    addition: u64,
+    limit: u64,
+    value: u64,
+)
+    requires transform_output_append_spec(current, addition, limit) == Some(value),
+    ensures value <= limit,
+{
+}
+
+/// Security-relevant projection of a source-neutral response-policy merge.
+/// Counts/bytes are conservative upper bounds because a child `set` can
+/// replace an inherited field; reset semantics discard the inherited bound.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SourceNeutralHeaderMergePlan {
+    pub action_upper_bound: u64,
+    pub byte_upper_bound: u64,
+    pub nginx_status_semantics: bool,
+    pub replace_instruction: bool,
+}
+
+pub open spec fn source_neutral_header_merge_plan_spec(
+    parent_actions: u64,
+    parent_bytes: u64,
+    parent_nginx_status: bool,
+    parent_replace_instruction: bool,
+    child_actions: u64,
+    child_bytes: u64,
+    child_nginx_status: bool,
+    child_replaces_headers: bool,
+) -> Option<SourceNeutralHeaderMergePlan> {
+    if !child_replaces_headers && (
+        parent_actions as nat + child_actions as nat > u64::MAX as nat
+            || parent_bytes as nat + child_bytes as nat > u64::MAX as nat
+    ) {
+        None
+    } else {
+        Some(SourceNeutralHeaderMergePlan {
+            action_upper_bound: if child_replaces_headers {
+                child_actions
+            } else {
+                (parent_actions as nat + child_actions as nat) as u64
+            },
+            byte_upper_bound: if child_replaces_headers {
+                child_bytes
+            } else {
+                (parent_bytes as nat + child_bytes as nat) as u64
+            },
+            nginx_status_semantics: parent_nginx_status || child_nginx_status,
+            replace_instruction: parent_replace_instruction,
+        })
+    }
+}
+
+pub fn source_neutral_header_merge_plan(
+    parent_actions: u64,
+    parent_bytes: u64,
+    parent_nginx_status: bool,
+    parent_replace_instruction: bool,
+    child_actions: u64,
+    child_bytes: u64,
+    child_nginx_status: bool,
+    child_replaces_headers: bool,
+) -> (plan: Option<SourceNeutralHeaderMergePlan>)
+    ensures
+        plan == source_neutral_header_merge_plan_spec(
+            parent_actions,
+            parent_bytes,
+            parent_nginx_status,
+            parent_replace_instruction,
+            child_actions,
+            child_bytes,
+            child_nginx_status,
+            child_replaces_headers,
+        ),
+        match plan {
+        Some(value) => {
+            &&& value.action_upper_bound as nat == if child_replaces_headers {
+                child_actions as nat
+            } else {
+                parent_actions as nat + child_actions as nat
+            }
+            &&& value.byte_upper_bound as nat == if child_replaces_headers {
+                child_bytes as nat
+            } else {
+                parent_bytes as nat + child_bytes as nat
+            }
+            &&& value.nginx_status_semantics == (parent_nginx_status || child_nginx_status)
+            &&& value.replace_instruction == parent_replace_instruction
+        },
+        None => !child_replaces_headers && (
+            parent_actions as nat + child_actions as nat > u64::MAX as nat
+                || parent_bytes as nat + child_bytes as nat > u64::MAX as nat
+        ),
+    },
+{
+    let (actions, bytes) = if child_replaces_headers {
+        (child_actions, child_bytes)
+    } else {
+        let actions = match parent_actions.checked_add(child_actions) {
+            Some(value) => value,
+            None => return None,
+        };
+        let bytes = match parent_bytes.checked_add(child_bytes) {
+            Some(value) => value,
+            None => return None,
+        };
+        (actions, bytes)
+    };
+    Some(SourceNeutralHeaderMergePlan {
+        action_upper_bound: actions,
+        byte_upper_bound: bytes,
+        nginx_status_semantics: parent_nginx_status || child_nginx_status,
+        replace_instruction: parent_replace_instruction,
+    })
+}
+
+pub proof fn nginx_header_reset_discards_parent_bounds(
+    parent_actions: u64,
+    parent_bytes: u64,
+    parent_status: bool,
+    parent_replace: bool,
+    child_actions: u64,
+    child_bytes: u64,
+    child_status: bool,
+)
+    ensures source_neutral_header_merge_plan_spec(
+        parent_actions,
+        parent_bytes,
+        parent_status,
+        parent_replace,
+        child_actions,
+        child_bytes,
+        child_status,
+        true,
+    ) == Some(SourceNeutralHeaderMergePlan {
+        action_upper_bound: child_actions,
+        byte_upper_bound: child_bytes,
+        nginx_status_semantics: parent_status || child_status,
+        replace_instruction: parent_replace,
+    }),
+{
+}
+
+pub proof fn nginx_status_semantics_is_monotonic_through_merge(
+    parent_actions: u64,
+    parent_bytes: u64,
+    parent_status: bool,
+    parent_replace: bool,
+    child_actions: u64,
+    child_bytes: u64,
+    child_status: bool,
+    child_replaces: bool,
+    plan: SourceNeutralHeaderMergePlan,
+)
+    requires source_neutral_header_merge_plan_spec(
+        parent_actions,
+        parent_bytes,
+        parent_status,
+        parent_replace,
+        child_actions,
+        child_bytes,
+        child_status,
+        child_replaces,
+    ) == Some(plan),
+    ensures parent_status ==> plan.nginx_status_semantics,
+        child_status ==> plan.nginx_status_semantics,
+{
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SourceNeutralOptionalMerge {
+    pub present: bool,
+    pub count: u64,
+}
+
+pub open spec fn source_neutral_optional_merge_spec(
+    parent_present: bool,
+    parent_count: u64,
+    child_present: bool,
+    child_count: u64,
+) -> SourceNeutralOptionalMerge {
+    if child_present {
+        SourceNeutralOptionalMerge { present: true, count: child_count }
+    } else {
+        SourceNeutralOptionalMerge { present: parent_present, count: parent_count }
+    }
+}
+
+pub fn source_neutral_optional_merge(
+    parent_present: bool,
+    parent_count: u64,
+    child_present: bool,
+    child_count: u64,
+) -> (out: SourceNeutralOptionalMerge)
+    ensures
+        out == source_neutral_optional_merge_spec(
+            parent_present, parent_count, child_present, child_count,
+        ),
+        child_present ==> out == (SourceNeutralOptionalMerge { present: true, count: child_count }),
+        !child_present ==> out == (SourceNeutralOptionalMerge {
+            present: parent_present,
+            count: parent_count,
+        }),
+{
+    if child_present {
+        SourceNeutralOptionalMerge { present: true, count: child_count }
+    } else {
+        SourceNeutralOptionalMerge { present: parent_present, count: parent_count }
+    }
+}
+
+pub proof fn child_transform_list_replaces_parent(
+    parent_present: bool,
+    parent_count: u64,
+    child_count: u64,
+)
+    ensures source_neutral_optional_merge_spec(
+        parent_present, parent_count, true, child_count,
+    ) == (SourceNeutralOptionalMerge { present: true, count: child_count }),
+{
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigIrSource {
+    Apache,
+    Nginx,
+}
+
+pub open spec fn common_ir_request_plan_spec(
+    source: ConfigIrSource,
+    canonical_target: bool,
+    route_program_refined: bool,
+    textual_identity: bool,
+    access_layers_bound: bool,
+) -> bool {
+    // `source` is deliberately not consulted: once either frontend has
+    // produced ConfigIr, request admission is a property of the IR facts.
+    canonical_target && route_program_refined && textual_identity && access_layers_bound
+}
+
+pub fn common_ir_request_plan_admit(
+    source: ConfigIrSource,
+    canonical_target: bool,
+    route_program_refined: bool,
+    textual_identity: bool,
+    access_layers_bound: bool,
+) -> (admit: bool)
+    ensures admit == common_ir_request_plan_spec(
+        source,
+        canonical_target,
+        route_program_refined,
+        textual_identity,
+        access_layers_bound,
+    ),
+{
+    match source {
+        ConfigIrSource::Apache | ConfigIrSource::Nginx => {
+            canonical_target && route_program_refined && textual_identity && access_layers_bound
+        }
+    }
+}
+
+pub proof fn common_ir_request_plan_is_source_neutral(
+    canonical_target: bool,
+    route_program_refined: bool,
+    textual_identity: bool,
+    access_layers_bound: bool,
+)
+    ensures common_ir_request_plan_spec(
+        ConfigIrSource::Apache,
+        canonical_target,
+        route_program_refined,
+        textual_identity,
+        access_layers_bound,
+    ) == common_ir_request_plan_spec(
+        ConfigIrSource::Nginx,
+        canonical_target,
+        route_program_refined,
+        textual_identity,
+        access_layers_bound,
+    ),
+{
+}
+
+pub open spec fn common_ir_terminal_outcome_spec(
+    source: ConfigIrSource,
+    plan_admitted: bool,
+    authorization_bound: bool,
+    backend_identity_bound: bool,
+    cache_classified: bool,
+    response_finalized: bool,
+    sink_admitted: bool,
+) -> bool {
+    plan_admitted && authorization_bound && backend_identity_bound
+        && cache_classified && response_finalized && sink_admitted
+}
+
+pub fn common_ir_terminal_outcome_admit(
+    source: ConfigIrSource,
+    plan_admitted: bool,
+    authorization_bound: bool,
+    backend_identity_bound: bool,
+    cache_classified: bool,
+    response_finalized: bool,
+    sink_admitted: bool,
+) -> (admit: bool)
+    ensures admit == common_ir_terminal_outcome_spec(
+        source,
+        plan_admitted,
+        authorization_bound,
+        backend_identity_bound,
+        cache_classified,
+        response_finalized,
+        sink_admitted,
+    ),
+{
+    match source {
+        ConfigIrSource::Apache | ConfigIrSource::Nginx => {
+            plan_admitted && authorization_bound && backend_identity_bound
+                && cache_classified && response_finalized && sink_admitted
+        }
+    }
+}
+
+pub proof fn common_ir_equal_facts_have_equal_terminal_outcomes(
+    plan_admitted: bool,
+    authorization_bound: bool,
+    backend_identity_bound: bool,
+    cache_classified: bool,
+    response_finalized: bool,
+    sink_admitted: bool,
+)
+    ensures common_ir_terminal_outcome_spec(
+        ConfigIrSource::Apache,
+        plan_admitted,
+        authorization_bound,
+        backend_identity_bound,
+        cache_classified,
+        response_finalized,
+        sink_admitted,
+    ) == common_ir_terminal_outcome_spec(
+        ConfigIrSource::Nginx,
+        plan_admitted,
+        authorization_bound,
+        backend_identity_bound,
+        cache_classified,
+        response_finalized,
+        sink_admitted,
     ),
 {
 }

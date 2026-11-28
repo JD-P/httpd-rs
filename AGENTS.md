@@ -329,7 +329,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p httpd-rs-verified
 ```
 
-Current result: **886 verified functions, 0 errors** (percent-decoding,
+Current result: **969 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
@@ -343,7 +343,8 @@ target
 classification/internal-join/same-host authority model, component-aware
 filesystem containment for alias/rewrite/FastCGI targets, the expression
 truthiness/comparison/glob/condition-chain model, the regex dialect admission
-guard, directive disposition, access-layer slot translation, config front-end
+guard, certified semantic-AST-to-matcher boundary and nginx modifier/subject
+bridge, directive disposition, access-layer slot translation, config front-end
 quote/escape/tag state machines, bounded argument schemas, line-kind IR and
 sealed section-context transitions, rewrite backreference encoding
 and filesystem-target admission, and the configuration access-plan,

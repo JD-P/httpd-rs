@@ -548,6 +548,24 @@ impl RequestPlan {
             )));
             // coverage:ignore-stop
         }
+        // `CanonicalTarget` is private and can only be constructed through
+        // normalization above. The source-neutral gate additionally binds
+        // this request plan to a route program whose frontend-specific index
+        // was certified when configuration loading completed.
+        if !httpd_rs_verified::common_ir_request_plan_admit(
+            cfg.route_program.source_kind(),
+            true,
+            cfg.route_program.is_refined(),
+            textual_identity,
+            layers_match_target,
+        ) {
+            // coverage:ignore-start
+            return Err(PlanError::AccessFiles(format!(
+                "{}: source-neutral request-plan refinement failed",
+                fs_path.display()
+            )));
+            // coverage:ignore-stop
+        }
         Ok(Self {
             target,
             root,

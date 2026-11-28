@@ -539,17 +539,21 @@ impl HeaderPolicy {
     pub fn merge_child(&mut self, child: &HeaderPolicy) -> bool {
         let (parent_count, parent_bytes) = self.configured_usage();
         let (child_count, child_bytes) = child.configured_usage();
-        let (merged_count, merged_bytes) = if child.replace_response_headers {
-            (child_count, child_bytes)
-        } else {
-            (
-                parent_count.saturating_add(child_count),
-                parent_bytes.saturating_add(child_bytes),
-            )
+        let Some(plan) = httpd_rs_verified::source_neutral_header_merge_plan(
+            parent_count as u64,
+            parent_bytes as u64,
+            self.nginx_status_semantics,
+            self.replace_response_headers,
+            child_count as u64,
+            child_bytes as u64,
+            child.nginx_status_semantics,
+            child.replace_response_headers,
+        ) else {
+            return false;
         };
         if !httpd_rs_verified::response_header_budget_admit(
-            merged_count as u64,
-            merged_bytes as u64,
+            plan.action_upper_bound,
+            plan.byte_upper_bound,
             MAX_CONFIGURED_RESPONSE_HEADERS as u64,
             MAX_CONFIGURED_RESPONSE_HEADER_BYTES as u64,
         ) {
@@ -563,9 +567,8 @@ impl HeaderPolicy {
             self.always_set_headers.clear();
             self.always_unset_headers.clear();
         }
-        if child.nginx_status_semantics {
-            self.nginx_status_semantics = true;
-        }
+        self.nginx_status_semantics = plan.nginx_status_semantics;
+        self.replace_response_headers = plan.replace_instruction;
         crate::verified::append_vec(&mut self.add_headers, &child.add_headers);
         merge_set_headers(&mut self.set_headers, &child.set_headers);
         crate::verified::append_vec(&mut self.unset_headers, &child.unset_headers);
@@ -755,6 +758,25 @@ mod header_tests {
         assert_eq!(parent.add_headers, vec![("X-B".into(), "2".into())]);
         assert_eq!(parent.expires_active, Some(true));
         assert_eq!(parent.expires_by_type.len(), 2);
+    }
+
+    #[test]
+    fn nginx_header_reset_uses_child_bounds_and_preserves_status_semantics() {
+        let mut parent = HeaderPolicy {
+            nginx_status_semantics: true,
+            replace_response_headers: true,
+            ..HeaderPolicy::default()
+        };
+        parent.add_headers.push(("X-Parent".into(), "one".into()));
+        let mut child = HeaderPolicy {
+            replace_response_headers: true,
+            ..HeaderPolicy::default()
+        };
+        child.add_headers.push(("X-Child".into(), "two".into()));
+        assert!(parent.merge_child(&child));
+        assert_eq!(parent.add_headers, vec![("X-Child".into(), "two".into())]);
+        assert!(parent.nginx_status_semantics);
+        assert!(parent.replace_response_headers);
     }
 
     #[test]
@@ -1408,12 +1430,39 @@ impl ProxyPolicy {
         if child.preserve_host.is_some() {
             self.preserve_host = child.preserve_host;
         }
+        let request_header_plan = httpd_rs_verified::source_neutral_optional_merge(
+            self.request_headers.is_some(),
+            self.request_headers.as_ref().map_or(0, Vec::len) as u64,
+            child.request_headers.is_some(),
+            child.request_headers.as_ref().map_or(0, Vec::len) as u64,
+        );
         if child.request_headers.is_some() {
             self.request_headers = child.request_headers.clone();
+        } else if !request_header_plan.present {
+            self.request_headers = None;
         }
+        debug_assert_eq!(self.request_headers.is_some(), request_header_plan.present);
+        debug_assert_eq!(
+            self.request_headers.as_ref().map_or(0, Vec::len) as u64,
+            request_header_plan.count
+        );
+
+        let fastcgi_param_plan = httpd_rs_verified::source_neutral_optional_merge(
+            self.fastcgi_params.is_some(),
+            self.fastcgi_params.as_ref().map_or(0, Vec::len) as u64,
+            child.fastcgi_params.is_some(),
+            child.fastcgi_params.as_ref().map_or(0, Vec::len) as u64,
+        );
         if child.fastcgi_params.is_some() {
             self.fastcgi_params = child.fastcgi_params.clone();
+        } else if !fastcgi_param_plan.present {
+            self.fastcgi_params = None;
         }
+        debug_assert_eq!(self.fastcgi_params.is_some(), fastcgi_param_plan.present);
+        debug_assert_eq!(
+            self.fastcgi_params.as_ref().map_or(0, Vec::len) as u64,
+            fastcgi_param_plan.count
+        );
         if child.proxy_ca_file.is_some() {
             self.proxy_ca_file = child.proxy_ca_file.clone();
             self.proxy_ca_trust = child.proxy_ca_trust;
@@ -1528,6 +1577,32 @@ mod final_policy_tests {
             Some(std::path::Path::new("/new-ca.pem"))
         );
         assert_eq!(proxy.preserve_host, Some(true));
+    }
+
+    #[test]
+    fn nginx_transform_arrays_replace_only_when_the_child_is_present() {
+        let header = || crate::config_ir::ProxyHeaderTransform::new("Host", "$host").unwrap();
+        let param = || {
+            crate::config_ir::FastCgiParamTransform::new("QUERY_STRING", "$query_string", false)
+                .unwrap()
+        };
+        let mut proxy = ProxyPolicy {
+            request_headers: Some(vec![header(), header()]),
+            fastcgi_params: Some(vec![param()]),
+            ..ProxyPolicy::default()
+        };
+        proxy.merge_child(&ProxyPolicy::default());
+        assert_eq!(proxy.request_headers.as_ref().map(Vec::len), Some(2));
+        assert_eq!(proxy.fastcgi_params.as_ref().map(Vec::len), Some(1));
+
+        let child = ProxyPolicy {
+            request_headers: Some(vec![header()]),
+            fastcgi_params: Some(Vec::new()),
+            ..ProxyPolicy::default()
+        };
+        proxy.merge_child(&child);
+        assert_eq!(proxy.request_headers.as_ref().map(Vec::len), Some(1));
+        assert_eq!(proxy.fastcgi_params.as_ref().map(Vec::len), Some(0));
     }
 
     #[test]
