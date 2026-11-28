@@ -72,6 +72,22 @@ still reachable from a queue, task or transport. The atomic representation is
 itself verified to decode only valid ownership states and rejects a second
 release.
 
+The amount held by a lease also carries a verified hierarchical transition
+certificate. `HierarchicalLeaseState` records the owned quantity, mandatory
+process charge, optional client/filesystem and request charges, and distinct
+file-descriptor, task and resident-memory parent charges. Adjustable byte
+leases preview the verified vector before reserve, partial release,
+sibling-pool transfer or request-context reattribution; slots pair it with the
+lifecycle machine above;
+disk leases preview byte and inode dimensions together across aggregate and
+per-filesystem ledgers; descriptor and transport leases consume the same
+terminal-release transition. The shadow is committed only after all concrete
+counter mutations succeed, so rejected operations retain their prior
+certificate. Verus proves the vector transition algebra. Complete concrete
+rollback is additionally checked against whole-ledger snapshots by unit and
+fuzz tests because Rust atomics, mutexes and `Drop` are not modeled as a Verus
+heap/concurrency semantics.
+
 Synchronous filesystem ownership is projected through the same request scope.
 The complete local filesystem phase acquires one re-entrant guard; URL-space
 authentication, expression and rewrite probes acquire it at their individual

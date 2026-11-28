@@ -73,7 +73,15 @@ does not promote a partial cost-refinement or external-semantics claim to
 mechanized status. Acquisition dominance, queue/task/output handoff,
 cancellation retention and exactly-once terminal release for central typed
 slots now reduce through the verified `LeaseOwnershipState` machine; Rust
-move/Drop and OS scheduling remain explicit runtime boundaries.
+move/Drop and OS scheduling remain explicit runtime boundaries. The amount
+dimension separately reduces through `HierarchicalLeaseState`: process,
+client/filesystem, request and separate file-descriptor/task/resident-memory
+parent charges are previewed as one verified resize/rebind/release vector and
+committed only after the concrete transaction succeeds. This is consumed by
+byte, slot, disk, descriptor and transport leases. Verus proves the vector
+algebra; atomic and mutex linearizability, source/destination identity during
+rebind and kernel resource semantics remain tested or external refinement
+assumptions.
 
 ## Dynamic collection
 

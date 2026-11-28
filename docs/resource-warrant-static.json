@@ -60275,8 +60275,8 @@
       ],
       "code": ".lock()",
       "effect": "synchronization",
-      "function": "release",
-      "id": "840e55652ed469117e04",
+      "function": "release_counters",
+      "id": "d6f023dc397497d404c0",
       "path": "crates/server/src/resource.rs",
       "status": "audited-gateway"
     },
@@ -60317,24 +60317,6 @@
     },
     {
       "accounting_evidence": [
-        "reserve"
-      ],
-      "closure_contract": "inferred-audited-gateway",
-      "closure_disposition": "typed-lease",
-      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (reserve)",
-      "closure_verification_targets": [
-        "resource_budget_admit",
-        "request_resource_effect_closure"
-      ],
-      "code": "self.resize(self.bytes.saturating_add(amount), self.files)",
-      "effect": "data-growth",
-      "function": "reserve",
-      "id": "659ee1cc20debf058509",
-      "path": "crates/server/src/resource.rs",
-      "status": "audited-gateway"
-    },
-    {
-      "accounting_evidence": [
         "reserve",
         "limit"
       ],
@@ -60367,6 +60349,24 @@
       "effect": "data-growth",
       "function": "reserve",
       "id": "95d05f454c207dc3c899",
+      "path": "crates/server/src/resource.rs",
+      "status": "audited-gateway"
+    },
+    {
+      "accounting_evidence": [
+        "reserve"
+      ],
+      "closure_contract": "inferred-audited-gateway",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "the effect is at or inside a reviewed typed accounting boundary (reserve)",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "request_resource_effect_closure"
+      ],
+      "code": "self.resize(bytes, self.files)",
+      "effect": "data-growth",
+      "function": "reserve",
+      "id": "9cfa99c81bab281ade29",
       "path": "crates/server/src/resource.rs",
       "status": "audited-gateway"
     },
@@ -75394,7 +75394,7 @@
       "status": "external-source-inventory"
     }
   ],
-  "source_sha256": "e19d8204b939ed4eff5105f1fd8a76235305da3babb8357549b9fdaf8ee863c2",
+  "source_sha256": "030086159f664802138f9975fc553312f79e7110429884a93ca372bca77c574e",
   "summary": {
     "by_closure_disposition": {
       "external-assumption": 408,

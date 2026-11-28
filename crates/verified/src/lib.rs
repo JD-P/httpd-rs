@@ -25100,4 +25100,375 @@ pub proof fn common_ir_equal_facts_have_equal_terminal_outcomes(
 {
 }
 
+// ---------------------------------------------------------------------------
+// Hierarchical lease-balance transactions
+// ---------------------------------------------------------------------------
+
+/// A lease-local certificate for one conserved resource quantity. `primary`
+/// is the process-wide charge, `secondary` and `tertiary` are the optional
+/// client/filesystem and request charges, and `physical` is the independently
+/// weighted descriptor/task/resident-memory parent vector. Runtime counter
+/// mutation is permitted only after this executable machine has produced the
+/// complete next vector.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HierarchicalLeasePhase {
+    Live,
+    Released,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HierarchicalPhysicalCharge {
+    pub file_descriptors: u64,
+    pub tasks: u64,
+    pub resident_memory: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HierarchicalLeaseEvent {
+    Resize {
+        owned: u64,
+        physical: HierarchicalPhysicalCharge,
+    },
+    Rebind {
+        secondary_enabled: bool,
+        tertiary_enabled: bool,
+    },
+    Release,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HierarchicalLeaseState {
+    pub phase: HierarchicalLeasePhase,
+    pub owned: u64,
+    pub primary: u64,
+    pub secondary: u64,
+    pub tertiary: u64,
+    pub physical: HierarchicalPhysicalCharge,
+    pub secondary_enabled: bool,
+    pub tertiary_enabled: bool,
+}
+
+pub open spec fn hierarchical_lease_inv(state: HierarchicalLeaseState) -> bool {
+    match state.phase {
+        HierarchicalLeasePhase::Live => {
+            &&& state.primary == state.owned
+            &&& state.secondary == if state.secondary_enabled { state.owned } else { 0 }
+            &&& state.tertiary == if state.tertiary_enabled { state.owned } else { 0 }
+        }
+        HierarchicalLeasePhase::Released => {
+            &&& state.owned == 0
+            &&& state.primary == 0
+            &&& state.secondary == 0
+            &&& state.tertiary == 0
+            &&& state.physical.file_descriptors == 0
+            &&& state.physical.tasks == 0
+            &&& state.physical.resident_memory == 0
+        }
+    }
+}
+
+#[inline]
+pub fn hierarchical_lease_start(
+    owned: u64,
+    secondary_enabled: bool,
+    tertiary_enabled: bool,
+    physical: HierarchicalPhysicalCharge,
+) -> (state: HierarchicalLeaseState)
+    ensures
+        hierarchical_lease_inv(state),
+        state.phase == HierarchicalLeasePhase::Live,
+        state.owned == owned,
+        state.primary == owned,
+        state.secondary == if secondary_enabled { owned } else { 0 },
+        state.tertiary == if tertiary_enabled { owned } else { 0 },
+        state.physical == physical,
+{
+    HierarchicalLeaseState {
+        phase: HierarchicalLeasePhase::Live,
+        owned,
+        primary: owned,
+        secondary: if secondary_enabled { owned } else { 0 },
+        tertiary: if tertiary_enabled { owned } else { 0 },
+        physical,
+        secondary_enabled,
+        tertiary_enabled,
+    }
+}
+
+pub open spec fn hierarchical_lease_step_spec(
+    state: HierarchicalLeaseState,
+    event: HierarchicalLeaseEvent,
+) -> Option<HierarchicalLeaseState> {
+    match (state.phase, event) {
+        (HierarchicalLeasePhase::Live, HierarchicalLeaseEvent::Resize { owned, physical }) => {
+            Some(HierarchicalLeaseState {
+                owned,
+                primary: owned,
+                secondary: if state.secondary_enabled { owned } else { 0 },
+                tertiary: if state.tertiary_enabled { owned } else { 0 },
+                physical,
+                ..state
+            })
+        }
+        (HierarchicalLeasePhase::Live, HierarchicalLeaseEvent::Rebind {
+            secondary_enabled,
+            tertiary_enabled,
+        }) => {
+            Some(HierarchicalLeaseState {
+                secondary: if secondary_enabled { state.owned } else { 0 },
+                tertiary: if tertiary_enabled { state.owned } else { 0 },
+                secondary_enabled,
+                tertiary_enabled,
+                ..state
+            })
+        }
+        (HierarchicalLeasePhase::Live, HierarchicalLeaseEvent::Release) => {
+            Some(HierarchicalLeaseState {
+                phase: HierarchicalLeasePhase::Released,
+                owned: 0,
+                primary: 0,
+                secondary: 0,
+                tertiary: 0,
+                physical: HierarchicalPhysicalCharge {
+                    file_descriptors: 0,
+                    tasks: 0,
+                    resident_memory: 0,
+                },
+                ..state
+            })
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+pub fn hierarchical_lease_step(
+    state: HierarchicalLeaseState,
+    event: HierarchicalLeaseEvent,
+) -> (next: Option<HierarchicalLeaseState>)
+    requires hierarchical_lease_inv(state),
+    ensures
+        next == hierarchical_lease_step_spec(state, event),
+        match next {
+            Some(value) => hierarchical_lease_inv(value),
+            None => true,
+        },
+{
+    match (state.phase, event) {
+        (HierarchicalLeasePhase::Live, HierarchicalLeaseEvent::Resize { owned, physical }) => {
+            Some(HierarchicalLeaseState {
+                owned,
+                primary: owned,
+                secondary: if state.secondary_enabled { owned } else { 0 },
+                tertiary: if state.tertiary_enabled { owned } else { 0 },
+                physical,
+                ..state
+            })
+        }
+        (HierarchicalLeasePhase::Live, HierarchicalLeaseEvent::Rebind {
+            secondary_enabled,
+            tertiary_enabled,
+        }) => {
+            Some(HierarchicalLeaseState {
+                secondary: if secondary_enabled { state.owned } else { 0 },
+                tertiary: if tertiary_enabled { state.owned } else { 0 },
+                secondary_enabled,
+                tertiary_enabled,
+                ..state
+            })
+        }
+        (HierarchicalLeasePhase::Live, HierarchicalLeaseEvent::Release) => {
+            Some(HierarchicalLeaseState {
+                phase: HierarchicalLeasePhase::Released,
+                owned: 0,
+                primary: 0,
+                secondary: 0,
+                tertiary: 0,
+                physical: HierarchicalPhysicalCharge {
+                    file_descriptors: 0,
+                    tasks: 0,
+                    resident_memory: 0,
+                },
+                ..state
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Preview both dimensions of a disk resize as one transaction. Neither
+/// returned certificate exists unless both source leases are still live.
+#[inline]
+pub fn hierarchical_lease_pair_resize(
+    first: HierarchicalLeaseState,
+    first_owned: u64,
+    first_physical: HierarchicalPhysicalCharge,
+    second: HierarchicalLeaseState,
+    second_owned: u64,
+    second_physical: HierarchicalPhysicalCharge,
+) -> (next: Option<(HierarchicalLeaseState, HierarchicalLeaseState)>)
+    requires
+        hierarchical_lease_inv(first),
+        hierarchical_lease_inv(second),
+    ensures
+        next == match (
+            hierarchical_lease_step_spec(
+                first,
+                HierarchicalLeaseEvent::Resize {
+                    owned: first_owned,
+                    physical: first_physical,
+                },
+            ),
+            hierarchical_lease_step_spec(
+                second,
+                HierarchicalLeaseEvent::Resize {
+                    owned: second_owned,
+                    physical: second_physical,
+                },
+            ),
+        ) {
+            (Some(first_next), Some(second_next)) => Some((first_next, second_next)),
+            _ => None,
+        },
+{
+    let first_next = match hierarchical_lease_step(
+        first,
+        HierarchicalLeaseEvent::Resize { owned: first_owned, physical: first_physical },
+    ) {
+        Some(value) => value,
+        None => return None,
+    };
+    let second_next = match hierarchical_lease_step(
+        second,
+        HierarchicalLeaseEvent::Resize { owned: second_owned, physical: second_physical },
+    ) {
+        Some(value) => value,
+        None => return None,
+    };
+    Some((first_next, second_next))
+}
+
+pub proof fn hierarchical_lease_step_preserves_invariant(
+    state: HierarchicalLeaseState,
+    event: HierarchicalLeaseEvent,
+)
+    requires hierarchical_lease_inv(state),
+    ensures match hierarchical_lease_step_spec(state, event) {
+        Some(next) => hierarchical_lease_inv(next),
+        None => true,
+    },
+{
+}
+
+pub proof fn hierarchical_lease_resize_updates_every_enabled_level(
+    state: HierarchicalLeaseState,
+    owned: u64,
+    physical: HierarchicalPhysicalCharge,
+)
+    requires
+        hierarchical_lease_inv(state),
+        state.phase == HierarchicalLeasePhase::Live,
+    ensures {
+        let next = hierarchical_lease_step_spec(
+            state,
+            HierarchicalLeaseEvent::Resize { owned, physical },
+        ).unwrap();
+        &&& next.owned == owned
+        &&& next.primary == owned
+        &&& next.secondary == if state.secondary_enabled { owned } else { 0 }
+        &&& next.tertiary == if state.tertiary_enabled { owned } else { 0 }
+        &&& next.physical == physical
+    },
+{
+}
+
+pub proof fn hierarchical_lease_rebind_preserves_owned_primary_and_physical(
+    state: HierarchicalLeaseState,
+    secondary_enabled: bool,
+    tertiary_enabled: bool,
+)
+    requires
+        hierarchical_lease_inv(state),
+        state.phase == HierarchicalLeasePhase::Live,
+    ensures {
+        let next = hierarchical_lease_step_spec(
+            state,
+            HierarchicalLeaseEvent::Rebind { secondary_enabled, tertiary_enabled },
+        ).unwrap();
+        &&& next.owned == state.owned
+        &&& next.primary == state.primary
+        &&& next.physical == state.physical
+        &&& next.secondary == if secondary_enabled { state.owned } else { 0 }
+        &&& next.tertiary == if tertiary_enabled { state.owned } else { 0 }
+    },
+{
+}
+
+pub proof fn hierarchical_lease_release_zeroes_every_level(state: HierarchicalLeaseState)
+    requires
+        hierarchical_lease_inv(state),
+        state.phase == HierarchicalLeasePhase::Live,
+    ensures {
+        let next = hierarchical_lease_step_spec(state, HierarchicalLeaseEvent::Release).unwrap();
+        &&& next.phase == HierarchicalLeasePhase::Released
+        &&& next.owned == 0
+        &&& next.primary == 0
+        &&& next.secondary == 0
+        &&& next.tertiary == 0
+        &&& next.physical.file_descriptors == 0
+        &&& next.physical.tasks == 0
+        &&& next.physical.resident_memory == 0
+    },
+{
+}
+
+pub proof fn hierarchical_lease_terminal_release_is_exactly_once(
+    state: HierarchicalLeaseState,
+)
+    requires
+        hierarchical_lease_inv(state),
+        state.phase == HierarchicalLeasePhase::Released,
+    ensures
+        hierarchical_lease_step_spec(state, HierarchicalLeaseEvent::Release).is_none(),
+        forall|owned: u64, physical: HierarchicalPhysicalCharge| hierarchical_lease_step_spec(
+            state,
+            HierarchicalLeaseEvent::Resize { owned, physical },
+        ).is_none(),
+        forall|secondary_enabled: bool, tertiary_enabled: bool| hierarchical_lease_step_spec(
+            state,
+            HierarchicalLeaseEvent::Rebind { secondary_enabled, tertiary_enabled },
+        ).is_none(),
+{
+}
+
+pub proof fn hierarchical_lease_pair_resize_is_atomic(
+    first: HierarchicalLeaseState,
+    second: HierarchicalLeaseState,
+    first_owned: u64,
+    first_physical: HierarchicalPhysicalCharge,
+    second_owned: u64,
+    second_physical: HierarchicalPhysicalCharge,
+)
+    requires
+        hierarchical_lease_inv(first),
+        hierarchical_lease_inv(second),
+        first.phase == HierarchicalLeasePhase::Live,
+        second.phase == HierarchicalLeasePhase::Live,
+    ensures {
+        let first_next = hierarchical_lease_step_spec(
+            first,
+            HierarchicalLeaseEvent::Resize { owned: first_owned, physical: first_physical },
+        ).unwrap();
+        let second_next = hierarchical_lease_step_spec(
+            second,
+            HierarchicalLeaseEvent::Resize { owned: second_owned, physical: second_physical },
+        ).unwrap();
+        &&& hierarchical_lease_inv(first_next)
+        &&& hierarchical_lease_inv(second_next)
+        &&& first_next.owned == first_owned
+        &&& second_next.owned == second_owned
+    },
+{
+}
+
 } // verus!

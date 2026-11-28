@@ -102,6 +102,7 @@ COMPONENT_RANGES = (
     (24562, 24711, "Nginx transformation language"),
     (24712, 24911, "Source-neutral scope merge"),
     (24912, 25103, "Common-IR request refinement"),
+    (25104, 25474, "Hierarchical lease transactions"),
 )
 
 
@@ -128,6 +129,12 @@ COMPONENT_OVERRIDES = {
     "fnmatch_tokens_refine_recursive_at": "fnmatch iterative refinement",
     "fnmatch_token_spec_unfold": "fnmatch iterative refinement",
     "fnmatch_tokens_refine_recursive_spec": "fnmatch iterative refinement",
+    "hierarchical_lease_step_preserves_invariant": "Hierarchical lease transactions",
+    "hierarchical_lease_resize_updates_every_enabled_level": "Hierarchical lease transactions",
+    "hierarchical_lease_rebind_preserves_owned_primary_and_physical": "Hierarchical lease transactions",
+    "hierarchical_lease_release_zeroes_every_level": "Hierarchical lease transactions",
+    "hierarchical_lease_terminal_release_is_exactly_once": "Hierarchical lease transactions",
+    "hierarchical_lease_pair_resize_is_atomic": "Hierarchical lease transactions",
 }
 
 
@@ -311,6 +318,7 @@ STATE_MACHINE_COMPONENTS = {
     "Whole request-policy state machine",
     "Policy compilation fold",
     "Nginx lexer and parser refinement",
+    "Hierarchical lease transactions",
 }
 
 FINITE_CASE_COMPONENTS = {
@@ -495,6 +503,30 @@ PROPERTY_OVERRIDES = {
     "nginx_regex_bridge_uses_the_exact_normalized_subject": (
         "A successful nginx regex bridge includes both the compiled-mode refinement and the "
         "fact that the matcher receives the exact normalized URI bytes."
+    ),
+    "hierarchical_lease_step_preserves_invariant": (
+        "Every admitted resize, scope rebind, and terminal release preserves the lease-local "
+        "hierarchical counter-vector invariant."
+    ),
+    "hierarchical_lease_resize_updates_every_enabled_level": (
+        "A resize assigns the new owned quantity to the process level and every enabled client, "
+        "filesystem, or request level, while assigning the declared file-descriptor, task, and "
+        "resident-memory parent vector."
+    ),
+    "hierarchical_lease_rebind_preserves_owned_primary_and_physical": (
+        "Moving a lease between optional client/request scopes preserves its owned, process, and "
+        "physical quantities and changes only the enabled child charges."
+    ),
+    "hierarchical_lease_release_zeroes_every_level": (
+        "Terminal release zeroes the owned, process, optional child, file-descriptor, task, and "
+        "resident-memory parent charges."
+    ),
+    "hierarchical_lease_terminal_release_is_exactly_once": (
+        "A released hierarchical lease rejects every later resize, rebind, and second release."
+    ),
+    "hierarchical_lease_pair_resize_is_atomic": (
+        "The two dimensions of a live paired resize produce invariant next certificates together, "
+        "with each dimension equal to its requested owned quantity."
     ),
 }
 

@@ -329,7 +329,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p httpd-rs-verified
 ```
 
-Current result: **1070 verified functions, 0 errors** (percent-decoding,
+Current result: **1083 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
@@ -349,7 +349,8 @@ quote/escape/tag state machines, bounded argument schemas, line-kind IR and
 sealed section-context transitions, rewrite backreference encoding
 and filesystem-target admission, and the configuration access-plan,
 the complete 11-component policy-compilation fold, the generation-linearized
-cache transaction machine, unified move-only resource-lease ownership, exact
+cache transaction machine, unified move-only resource-lease ownership,
+hierarchical lease resize/rebind/release counter-vector conservation, exact
 PCRE source-event accounting, expression-parser cursor progress and the
 iterative-fnmatch refinement, authorization tree/list
 evaluator, authorization-merge, Options-merge and `.htaccess`
@@ -434,12 +435,12 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus   # include the Verus gate
 ```
 
-Current ledger: **70.2% weighted obligations**, **6/6 proof debt**,
+Current ledger: **70.5% weighted obligations**, **6/6 proof debt**,
 **11/11 grant-required sinks**, **11/11 path-target-bound sinks**, **6/11
 inode-bound sinks**, **3/11 backend-target-bound sinks**, **3/11
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **109 adversarial replay cases** covering the findings classes,
-and **1070 Verus functions with 0 errors** (including the I3 fast-path
+and **1083 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -459,7 +460,7 @@ freshness, disk-accounting and SHA-256 policy-binding proofs for I51/I54).
 
 The ledger lives in `docs/verification-status.json`. It records:
 
-- weighted progress on the ninety-nine proof obligations,
+- weighted progress on the one hundred proof obligations,
 - named unverified security components,
 - sinks that need stronger resource binding,
 - explicit assumptions and unmodeled directive classes,

@@ -20,13 +20,13 @@ A low score does **not** mean Verus failed to prove the stated formula. It means
 
 ## Inventory summary
 
-The source currently contains **294** explicit proof functions (**277 public**, **17 private lemmas**). **236** have empty proof bodies: SMT discharges them by unfolding definitions and using their preconditions. That is legitimate automation, but it is usually a shallow model-consistency result rather than an end-to-end implementation proof. The crate contains no accepted `assume`, `assume_specification`, or `external_body` escape hatch.
+The source currently contains **300** explicit proof functions (**283 public**, **17 private lemmas**). **242** have empty proof bodies: SMT discharges them by unfolding definitions and using their preconditions. That is legitimate automation, but it is usually a shallow model-consistency result rather than an end-to-end implementation proof. The crate contains no accepted `assume`, `assume_specification`, or `external_body` escape hatch.
 
 | Proof basis | Rows | Default score |
 | --- | ---: | ---: |
 | Definitional SMT consequence | 63 | 4/10 |
 | Finite case split over the model | 91 | 6/10 |
-| Finite-state invariant/case analysis | 42 | 7/10 |
+| Finite-state invariant/case analysis | 48 | 7/10 |
 | HTTP/2 executable state-machine refinement | 25 | 7/10 |
 | Structural induction over a mathematical sequence | 10 | 7/10 |
 | Structural induction plus executable refinement | 12 | 8/10 |
@@ -44,7 +44,7 @@ The source currently contains **294** explicit proof functions (**277 public**, 
 | 3/10 | 4 |
 | 4/10 | 85 |
 | 6/10 | 91 |
-| 7/10 | 88 |
+| 7/10 | 94 |
 | 8/10 | 22 |
 
 ## Strategy definitions
@@ -366,6 +366,12 @@ The property wording follows the theorem name; the linked source is authoritativ
 | Common-IR request refinement | [`child_transform_list_replaces_parent`](../crates/verified/src/lib.rs#L24961) | Child transform list replaces parent. | **Finite case split over the model.** SMT and/or an explicit `match` exhaust the modeled enum/Boolean cases. This is exact for the declared transition or projection, but runtime representation and call-site coverage remain separate obligations. | 6/10 |
 | Common-IR request refinement | [`common_ir_request_plan_is_source_neutral`](../crates/verified/src/lib.rs#L25012) | Common ir request plan is source neutral. | **Finite case split over the model.** SMT and/or an explicit `match` exhaust the modeled enum/Boolean cases. This is exact for the declared transition or projection, but runtime representation and call-site coverage remain separate obligations. | 6/10 |
 | Common-IR request refinement | [`common_ir_equal_facts_have_equal_terminal_outcomes`](../crates/verified/src/lib.rs#L25074) | Common ir equal facts have equal terminal outcomes. | **Finite case split over the model.** SMT and/or an explicit `match` exhaust the modeled enum/Boolean cases. This is exact for the declared transition or projection, but runtime representation and call-site coverage remain separate obligations. | 6/10 |
+| Hierarchical lease transactions | [`hierarchical_lease_step_preserves_invariant`](../crates/verified/src/lib.rs#L25350) | Every admitted resize, scope rebind, and terminal release preserves the lease-local hierarchical counter-vector invariant. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
+| Hierarchical lease transactions | [`hierarchical_lease_resize_updates_every_enabled_level`](../crates/verified/src/lib.rs#L25362) | A resize assigns the new owned quantity to the process level and every enabled client, filesystem, or request level, while assigning the declared file-descriptor, task, and resident-memory parent vector. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
+| Hierarchical lease transactions | [`hierarchical_lease_rebind_preserves_owned_primary_and_physical`](../crates/verified/src/lib.rs#L25384) | Moving a lease between optional client/request scopes preserves its owned, process, and physical quantities and changes only the enabled child charges. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
+| Hierarchical lease transactions | [`hierarchical_lease_release_zeroes_every_level`](../crates/verified/src/lib.rs#L25406) | Terminal release zeroes the owned, process, optional child, file-descriptor, task, and resident-memory parent charges. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
+| Hierarchical lease transactions | [`hierarchical_lease_terminal_release_is_exactly_once`](../crates/verified/src/lib.rs#L25424) | A released hierarchical lease rejects every later resize, rebind, and second release. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
+| Hierarchical lease transactions | [`hierarchical_lease_pair_resize_is_atomic`](../crates/verified/src/lib.rs#L25443) | The two dimensions of a live paired resize produce invariant next certificates together, with each dimension equal to its requested owned quantity. | **Finite-state invariant/case analysis.** The transition relation is a closed enum/record model and Verus proves an invariant, an absorbing state, or a gate-order consequence by exhaustive symbolic cases. Strong within the model; only as strong in production as the executable refinement and event coverage. | 7/10 |
 
 ## What this inventory does not prove
 

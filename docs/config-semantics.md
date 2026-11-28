@@ -1991,7 +1991,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **1070 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **1083 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `CacheTransactionState` closes lookup, current-generation reauthorization,
   hit/miss, store, publication, reload retirement and targeted invalidation.
@@ -2002,6 +2002,15 @@ construction: there is no second production interleaver.
   machine used by every `SlotLease`. Verified atomic encoding makes acquisition
   dominate every handoff, cancellation retain its live owner, and terminal
   release happen at most once before runtime counters are decremented.
+- `HierarchicalLeaseState` is the executable process/optional-child/physical
+  counter-vector machine used by adjustable byte leases, slots, disk
+  byte/inode pairs, descriptors and transport buffers. It proves resize,
+  rebind and terminal-release conservation, with file-descriptor, task and
+  resident-memory parents kept as distinct coordinates; production previews
+  the verified vector before mutation and commits it only after the complete
+  transaction.
+  Rust atomic/Mutex linearizability and source/destination identity remain the
+  explicitly tested runtime-refinement boundary rather than a Verus heap proof.
 - The PCRE positive parser now certifies each contiguous source span and grammar
   event, the production rolling-row fnmatch implementation is proved equal to
   its recursive specification for arbitrary patterns and values, and the

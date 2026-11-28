@@ -1375,6 +1375,149 @@ fn try_add_counter<C: BudgetCounter>(counter: &C, amount: u64, limit: u64) -> bo
     }
 }
 
+/// Executable shadow of the hierarchical counter vector owned by one RAII
+/// lease. The Verus transition is previewed before any runtime counter is
+/// changed and committed only after the complete multi-level mutation
+/// succeeds. Consequently a rejected acquisition or rebind leaves both the
+/// concrete counters and this certificate at the old state.
+#[derive(Clone, Copy, Debug)]
+struct HierarchicalLeaseTracker {
+    state: httpd_rs_verified::HierarchicalLeaseState,
+}
+
+impl HierarchicalLeaseTracker {
+    fn new(
+        owned: u64,
+        secondary_enabled: bool,
+        tertiary_enabled: bool,
+        physical: [u64; PhysicalKind::COUNT],
+    ) -> Self {
+        Self {
+            state: httpd_rs_verified::hierarchical_lease_start(
+                owned,
+                secondary_enabled,
+                tertiary_enabled,
+                verified_physical_charge(physical),
+            ),
+        }
+    }
+
+    fn live_matches(
+        &self,
+        owned: u64,
+        secondary_enabled: bool,
+        tertiary_enabled: bool,
+        physical: [u64; PhysicalKind::COUNT],
+    ) -> bool {
+        let state = self.state;
+        state.phase == httpd_rs_verified::HierarchicalLeasePhase::Live
+            && state.owned == owned
+            && state.primary == owned
+            && state.secondary == if secondary_enabled { owned } else { 0 }
+            && state.tertiary == if tertiary_enabled { owned } else { 0 }
+            && state.physical == verified_physical_charge(physical)
+            && state.secondary_enabled == secondary_enabled
+            && state.tertiary_enabled == tertiary_enabled
+    }
+
+    fn require_live(
+        &self,
+        owned: u64,
+        secondary_enabled: bool,
+        tertiary_enabled: bool,
+        physical: [u64; PhysicalKind::COUNT],
+    ) {
+        if !self.live_matches(owned, secondary_enabled, tertiary_enabled, physical) {
+            // A divergent shadow means decrementing the concrete hierarchy
+            // could manufacture capacity. There is no safe recovery path.
+            std::process::abort();
+        }
+    }
+
+    fn preview_resize(
+        &self,
+        owned: u64,
+        secondary_enabled: bool,
+        tertiary_enabled: bool,
+        physical: [u64; PhysicalKind::COUNT],
+        next_owned: u64,
+        next_physical: [u64; PhysicalKind::COUNT],
+    ) -> httpd_rs_verified::HierarchicalLeaseState {
+        self.require_live(owned, secondary_enabled, tertiary_enabled, physical);
+        httpd_rs_verified::hierarchical_lease_step(
+            self.state,
+            httpd_rs_verified::HierarchicalLeaseEvent::Resize {
+                owned: next_owned,
+                physical: verified_physical_charge(next_physical),
+            },
+        )
+        .unwrap_or_else(|| std::process::abort())
+    }
+
+    fn preview_rebind(
+        &self,
+        owned: u64,
+        secondary_enabled: bool,
+        tertiary_enabled: bool,
+        physical: [u64; PhysicalKind::COUNT],
+        next_secondary_enabled: bool,
+        next_tertiary_enabled: bool,
+    ) -> httpd_rs_verified::HierarchicalLeaseState {
+        self.require_live(owned, secondary_enabled, tertiary_enabled, physical);
+        httpd_rs_verified::hierarchical_lease_step(
+            self.state,
+            httpd_rs_verified::HierarchicalLeaseEvent::Rebind {
+                secondary_enabled: next_secondary_enabled,
+                tertiary_enabled: next_tertiary_enabled,
+            },
+        )
+        .unwrap_or_else(|| std::process::abort())
+    }
+
+    fn preview_release(
+        &self,
+        owned: u64,
+        secondary_enabled: bool,
+        tertiary_enabled: bool,
+        physical: [u64; PhysicalKind::COUNT],
+    ) -> httpd_rs_verified::HierarchicalLeaseState {
+        self.require_live(owned, secondary_enabled, tertiary_enabled, physical);
+        httpd_rs_verified::hierarchical_lease_step(
+            self.state,
+            httpd_rs_verified::HierarchicalLeaseEvent::Release,
+        )
+        .unwrap_or_else(|| std::process::abort())
+    }
+
+    fn commit(&mut self, state: httpd_rs_verified::HierarchicalLeaseState) {
+        self.state = state;
+    }
+}
+
+fn verified_physical_charge(
+    charge: [u64; PhysicalKind::COUNT],
+) -> httpd_rs_verified::HierarchicalPhysicalCharge {
+    httpd_rs_verified::HierarchicalPhysicalCharge {
+        file_descriptors: charge[PhysicalKind::FileDescriptor.index()],
+        tasks: charge[PhysicalKind::Task.index()],
+        resident_memory: charge[PhysicalKind::ResidentMemory.index()],
+    }
+}
+
+const fn one_physical_charge(kind: PhysicalKind, amount: u64) -> [u64; PhysicalKind::COUNT] {
+    match kind {
+        PhysicalKind::FileDescriptor => [amount, 0, 0],
+        PhysicalKind::Task => [0, amount, 0],
+        PhysicalKind::ResidentMemory => [0, 0, amount],
+    }
+}
+
+fn byte_physical_charge(kind: ByteKind, amount: u64) -> [u64; PhysicalKind::COUNT] {
+    byte_physical_kind(kind)
+        .map(|physical| one_physical_charge(physical, amount))
+        .unwrap_or([0; PhysicalKind::COUNT])
+}
+
 /// Exact ownership permit for one open descriptor.  Slot weights describe
 /// scheduler and memory pressure; descriptors are charged at the point the
 /// kernel object is actually acquired so ownership transfers cannot double
@@ -1383,6 +1526,7 @@ fn try_add_counter<C: BudgetCounter>(counter: &C, amount: u64, limit: u64) -> bo
 pub(crate) struct DescriptorLease {
     budget: Arc<ResourceBudget>,
     amount: u64,
+    hierarchy: HierarchicalLeaseTracker,
 }
 
 /// Exact ownership of attacker-influenced persistent/spooled filesystem
@@ -1394,11 +1538,19 @@ pub(crate) struct DiskLease {
     ledger: Arc<DiskLedger>,
     bytes: u64,
     files: u64,
+    byte_hierarchy: HierarchicalLeaseTracker,
+    file_hierarchy: HierarchicalLeaseTracker,
 }
 
 impl DiskLease {
     pub(crate) fn reserve(&mut self, amount: u64) -> io::Result<()> {
-        self.resize(self.bytes.saturating_add(amount), self.files)
+        let bytes = self.bytes.checked_add(amount).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::StorageFull,
+                "writable-disk lease byte count overflow",
+            )
+        })?;
+        self.resize(bytes, self.files)
     }
 
     pub(crate) fn release(&mut self, amount: u64) {
@@ -1406,6 +1558,22 @@ impl DiskLease {
     }
 
     pub(crate) fn resize(&mut self, bytes: u64, files: u64) -> io::Result<()> {
+        self.byte_hierarchy
+            .require_live(self.bytes, true, false, [0; PhysicalKind::COUNT]);
+        self.file_hierarchy
+            .require_live(self.files, true, false, [0; PhysicalKind::COUNT]);
+        let Some((next_byte_hierarchy, next_file_hierarchy)) =
+            httpd_rs_verified::hierarchical_lease_pair_resize(
+                self.byte_hierarchy.state,
+                bytes,
+                verified_physical_charge([0; PhysicalKind::COUNT]),
+                self.file_hierarchy.state,
+                files,
+                verified_physical_charge([0; PhysicalKind::COUNT]),
+            )
+        else {
+            std::process::abort();
+        };
         let add_bytes = bytes.saturating_sub(self.bytes);
         let add_files = files.saturating_sub(self.files);
         if add_bytes > 0 {
@@ -1498,6 +1666,8 @@ impl DiskLease {
         }
         self.bytes = bytes;
         self.files = files;
+        self.byte_hierarchy.commit(next_byte_hierarchy);
+        self.file_hierarchy.commit(next_file_hierarchy);
         observe_high_water(
             &self.budget.disk_byte_high_water,
             self.budget.disk_bytes.load(Ordering::Acquire),
@@ -1512,6 +1682,12 @@ impl DiskLease {
 
 impl Drop for DiskLease {
     fn drop(&mut self) {
+        let next_byte_hierarchy =
+            self.byte_hierarchy
+                .preview_release(self.bytes, true, false, [0; PhysicalKind::COUNT]);
+        let next_file_hierarchy =
+            self.file_hierarchy
+                .preview_release(self.files, true, false, [0; PhysicalKind::COUNT]);
         self.ledger.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
         self.ledger.files.fetch_sub(self.files, Ordering::AcqRel);
         self.budget
@@ -1520,6 +1696,10 @@ impl Drop for DiskLease {
         self.budget
             .disk_files
             .fetch_sub(self.files, Ordering::AcqRel);
+        self.bytes = 0;
+        self.files = 0;
+        self.byte_hierarchy.commit(next_byte_hierarchy);
+        self.file_hierarchy.commit(next_file_hierarchy);
     }
 }
 
@@ -1527,13 +1707,19 @@ impl Drop for DiskLease {
 pub(crate) struct TransportBufferLease {
     budget: Arc<ResourceBudget>,
     bytes: u64,
+    hierarchy: HierarchicalLeaseTracker,
 }
 
 impl Drop for TransportBufferLease {
     fn drop(&mut self) {
+        let next_hierarchy =
+            self.hierarchy
+                .preview_release(self.bytes, false, false, [0; PhysicalKind::COUNT]);
         self.budget
             .transport_bytes
             .fetch_sub(self.bytes, Ordering::AcqRel);
+        self.bytes = 0;
+        self.hierarchy.commit(next_hierarchy);
     }
 }
 
@@ -1576,8 +1762,16 @@ pub(crate) struct ResourceTelemetry {
 
 impl Drop for DescriptorLease {
     fn drop(&mut self) {
+        let next_hierarchy = self.hierarchy.preview_release(
+            self.amount,
+            false,
+            false,
+            one_physical_charge(PhysicalKind::FileDescriptor, self.amount),
+        );
         self.budget
             .release_physical_one(PhysicalKind::FileDescriptor, self.amount);
+        self.amount = 0;
+        self.hierarchy.commit(next_hierarchy);
     }
 }
 
@@ -1594,6 +1788,7 @@ pub(crate) struct SlotLease {
     physical: [u64; PhysicalKind::COUNT],
     active: bool,
     ownership: AtomicU8,
+    hierarchy: HierarchicalLeaseTracker,
 }
 
 impl SlotLease {
@@ -1653,6 +1848,16 @@ impl SlotLease {
         if self.context.scope_id == context.scope_id {
             return Ok(());
         }
+        let target_client_expected = self.client_limit.is_some() && context.client.is_some();
+        let target_request_expected = self.request_limit.is_some();
+        let next_hierarchy = self.hierarchy.preview_rebind(
+            self.amount,
+            self.charged_client,
+            self.charged_request,
+            self.physical,
+            target_client_expected,
+            target_request_expected,
+        );
         let index = self.kind.index();
         let target_request = if let Some(limit) = self.request_limit {
             if !try_add(&context.local.slots[index], self.amount, limit) {
@@ -1695,6 +1900,9 @@ impl SlotLease {
         } else {
             false
         };
+        if target_client != target_client_expected || target_request != target_request_expected {
+            std::process::abort();
+        }
         if self.charged_client && !unchanged_client {
             if let Some(old) = self.context.client {
                 if let Some(usage) = clients.get_mut(&old) {
@@ -1712,6 +1920,7 @@ impl SlotLease {
         self.context = context;
         self.charged_client = target_client;
         self.charged_request = target_request;
+        self.hierarchy.commit(next_hierarchy);
         Ok(())
     }
 }
@@ -1721,6 +1930,12 @@ impl Drop for SlotLease {
         if !self.active {
             return;
         }
+        let next_hierarchy = self.hierarchy.preview_release(
+            self.amount,
+            self.charged_client,
+            self.charged_request,
+            self.physical,
+        );
         let ownership_released =
             self.ownership_event(httpd_rs_verified::LeaseOwnershipEvent::Release);
         if !ownership_released {
@@ -1751,6 +1966,11 @@ impl Drop for SlotLease {
         if self.charged_request {
             self.context.local.slots[index].fetch_sub(self.amount, Ordering::AcqRel);
         }
+        self.amount = 0;
+        self.physical = [0; PhysicalKind::COUNT];
+        self.charged_client = false;
+        self.charged_request = false;
+        self.hierarchy.commit(next_hierarchy);
         self.active = false;
     }
 }
@@ -1763,6 +1983,7 @@ struct ByteLease {
     process_limit: u64,
     client_limit: Option<u64>,
     request_limit: Option<u64>,
+    hierarchy: HierarchicalLeaseTracker,
 }
 
 impl ByteLease {
@@ -1773,6 +1994,8 @@ impl ByteLease {
         client_limit: Option<u64>,
         request_limit: Option<u64>,
     ) -> Self {
+        let secondary_enabled = client_limit.is_some() && context.client.is_some();
+        let tertiary_enabled = request_limit.is_some();
         Self {
             context,
             kind,
@@ -1780,6 +2003,12 @@ impl ByteLease {
             process_limit,
             client_limit,
             request_limit,
+            hierarchy: HierarchicalLeaseTracker::new(
+                0,
+                secondary_enabled,
+                tertiary_enabled,
+                [0; PhysicalKind::COUNT],
+            ),
         }
     }
 
@@ -1787,6 +2016,20 @@ impl ByteLease {
         if amount == 0 {
             return Ok(());
         }
+        let next_bytes = self
+            .bytes
+            .checked_add(amount)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, message))?;
+        let secondary_enabled = self.client_limit.is_some() && self.context.client.is_some();
+        let tertiary_enabled = self.request_limit.is_some();
+        let next_hierarchy = self.hierarchy.preview_resize(
+            self.bytes,
+            secondary_enabled,
+            tertiary_enabled,
+            byte_physical_charge(self.kind, self.bytes),
+            next_bytes,
+            byte_physical_charge(self.kind, next_bytes),
+        );
         let index = self.kind.index();
         observe_limit(&self.context.budget.byte_limits[index], self.process_limit);
         let charged_request = if let Some(limit) = self.request_limit {
@@ -1871,7 +2114,8 @@ impl ByteLease {
             }
         }
         drop(clients);
-        self.bytes += amount;
+        self.bytes = next_bytes;
+        self.hierarchy.commit(next_hierarchy);
         observe_high_water(
             &self.context.budget.byte_high_water[index],
             self.context.budget.byte_process[index].load(Ordering::Acquire),
@@ -1893,13 +2137,31 @@ impl ByteLease {
         if self.kind == kind {
             return Ok(());
         }
-        debug_assert_eq!(byte_physical_kind(self.kind), byte_physical_kind(kind));
+        if byte_physical_kind(self.kind) != byte_physical_kind(kind) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "byte-lease transfer changed its physical resource class",
+            ));
+        }
         let amount = self.bytes;
+        let secondary_enabled = self.client_limit.is_some() && self.context.client.is_some();
+        let tertiary_enabled = self.request_limit.is_some();
+        let next_secondary_enabled = client_limit.is_some() && self.context.client.is_some();
+        let next_tertiary_enabled = request_limit.is_some();
+        let next_hierarchy = self.hierarchy.preview_rebind(
+            amount,
+            secondary_enabled,
+            tertiary_enabled,
+            byte_physical_charge(self.kind, amount),
+            next_secondary_enabled,
+            next_tertiary_enabled,
+        );
         if amount == 0 {
             self.kind = kind;
             self.process_limit = process_limit;
             self.client_limit = client_limit;
             self.request_limit = request_limit;
+            self.hierarchy.commit(next_hierarchy);
             return Ok(());
         }
         let old_index = self.kind.index();
@@ -1966,6 +2228,9 @@ impl ByteLease {
         if let (Some(client), Some(_)) = (self.context.client, self.client_limit) {
             if let Some(usage) = clients.get_mut(&client) {
                 usage[old_index] = usage[old_index].saturating_sub(amount);
+                if usage.iter().all(|value| *value == 0) {
+                    clients.remove(&client);
+                }
             }
         }
         drop(clients);
@@ -1976,6 +2241,7 @@ impl ByteLease {
         self.process_limit = process_limit;
         self.client_limit = client_limit;
         self.request_limit = request_limit;
+        self.hierarchy.commit(next_hierarchy);
         observe_high_water(
             &self.context.budget.byte_high_water[new_index],
             self.context.budget.byte_process[new_index].load(Ordering::Acquire),
@@ -1988,6 +2254,23 @@ impl ByteLease {
         if amount == 0 {
             return;
         }
+        let next_bytes = self.bytes - amount;
+        let secondary_enabled = self.client_limit.is_some() && self.context.client.is_some();
+        let tertiary_enabled = self.request_limit.is_some();
+        let next_hierarchy = self.hierarchy.preview_resize(
+            self.bytes,
+            secondary_enabled,
+            tertiary_enabled,
+            byte_physical_charge(self.kind, self.bytes),
+            next_bytes,
+            byte_physical_charge(self.kind, next_bytes),
+        );
+        self.release_counters(amount);
+        self.bytes = next_bytes;
+        self.hierarchy.commit(next_hierarchy);
+    }
+
+    fn release_counters(&self, amount: u64) {
         let index = self.kind.index();
         self.context.budget.byte_process[index].fetch_sub(amount, Ordering::AcqRel);
         if let Some(kind) = byte_physical_kind(self.kind) {
@@ -2010,7 +2293,6 @@ impl ByteLease {
         if self.request_limit.is_some() {
             self.context.local.bytes[index].fetch_sub(amount, Ordering::AcqRel);
         }
-        self.bytes -= amount;
     }
 
     fn attribute_context(&mut self, context: ResourceContext) -> io::Result<()> {
@@ -2023,8 +2305,20 @@ impl ByteLease {
         if self.context.scope_id == context.scope_id {
             return Ok(());
         }
+        let secondary_enabled = self.client_limit.is_some() && self.context.client.is_some();
+        let tertiary_enabled = self.request_limit.is_some();
+        let next_secondary_enabled = self.client_limit.is_some() && context.client.is_some();
+        let next_hierarchy = self.hierarchy.preview_rebind(
+            self.bytes,
+            secondary_enabled,
+            tertiary_enabled,
+            byte_physical_charge(self.kind, self.bytes),
+            next_secondary_enabled,
+            tertiary_enabled,
+        );
         if self.bytes == 0 {
             self.context = context;
+            self.hierarchy.commit(next_hierarchy);
             return Ok(());
         }
         let index = self.kind.index();
@@ -2077,13 +2371,27 @@ impl ByteLease {
             self.context.local.bytes[index].fetch_sub(self.bytes, Ordering::AcqRel);
         }
         self.context = context;
+        self.hierarchy.commit(next_hierarchy);
         Ok(())
     }
 }
 
 impl Drop for ByteLease {
     fn drop(&mut self) {
-        self.release(self.bytes);
+        let secondary_enabled = self.client_limit.is_some() && self.context.client.is_some();
+        let tertiary_enabled = self.request_limit.is_some();
+        let next_hierarchy = self.hierarchy.preview_release(
+            self.bytes,
+            secondary_enabled,
+            tertiary_enabled,
+            byte_physical_charge(self.kind, self.bytes),
+        );
+        let bytes = self.bytes;
+        if bytes > 0 {
+            self.release_counters(bytes);
+        }
+        self.bytes = 0;
+        self.hierarchy.commit(next_hierarchy);
     }
 }
 
@@ -2134,6 +2442,8 @@ impl ResourceBudget {
             ledger,
             bytes: 0,
             files: 0,
+            byte_hierarchy: HierarchicalLeaseTracker::new(0, true, false, [0; PhysicalKind::COUNT]),
+            file_hierarchy: HierarchicalLeaseTracker::new(0, true, false, [0; PhysicalKind::COUNT]),
         };
         lease.resize(bytes, files)?;
         Ok(lease)
@@ -2202,6 +2512,12 @@ impl ResourceBudget {
         Ok(DescriptorLease {
             budget: self.clone(),
             amount,
+            hierarchy: HierarchicalLeaseTracker::new(
+                amount,
+                false,
+                false,
+                one_physical_charge(PhysicalKind::FileDescriptor, amount),
+            ),
         })
     }
 
@@ -2246,6 +2562,7 @@ impl ResourceBudget {
         Ok(TransportBufferLease {
             budget: self.clone(),
             bytes,
+            hierarchy: HierarchicalLeaseTracker::new(bytes, false, false, [0; PhysicalKind::COUNT]),
         })
     }
 
@@ -2590,6 +2907,12 @@ impl ResourceBudget {
             ownership: AtomicU8::new(httpd_rs_verified::lease_ownership_encode(
                 httpd_rs_verified::lease_ownership_start(),
             )),
+            hierarchy: HierarchicalLeaseTracker::new(
+                amount,
+                charged_client,
+                charged_request,
+                physical,
+            ),
         })
     }
 
@@ -4586,6 +4909,137 @@ mod tests {
         assert_eq!(telemetry.disk_bytes, 0);
         assert_eq!(telemetry.disk_files, 0);
         assert_eq!(telemetry.transport_bytes, 0);
+    }
+
+    #[test]
+    fn hierarchical_lease_transactions_commit_or_rollback_atomically() {
+        let budget = Arc::new(ResourceBudget {
+            physical_limits: [64, 64, 16 * 1024 * 1024],
+            disk_byte_limit: 8,
+            disk_file_limit: 1,
+            transport_byte_limit: 8,
+            ..ResourceBudget::default()
+        });
+        let first = budget.context(IpAddr::from([192, 0, 2, 70]));
+        let second = budget.context(IpAddr::from([198, 51, 100, 70]));
+
+        let mut bytes = ByteLease::new(
+            first.clone(),
+            ByteKind::RequestResident,
+            8,
+            Some(8),
+            Some(8),
+        );
+        bytes.reserve(6, "full").unwrap();
+        assert!(bytes.hierarchy.live_matches(
+            6,
+            true,
+            true,
+            one_physical_charge(PhysicalKind::ResidentMemory, 6)
+        ));
+        let byte_state_before_rejection = bytes.hierarchy.state;
+        let counters_before_rejection = budget.transition_snapshot();
+        assert!(bytes.reserve(3, "full").is_err());
+        assert_eq!(bytes.hierarchy.state, byte_state_before_rejection);
+        assert_eq!(budget.transition_snapshot(), counters_before_rejection);
+
+        bytes.release(2);
+        assert!(bytes.hierarchy.live_matches(
+            4,
+            true,
+            true,
+            one_physical_charge(PhysicalKind::ResidentMemory, 4)
+        ));
+        bytes.attribute_context(second.clone()).unwrap();
+        assert!(bytes.hierarchy.live_matches(
+            4,
+            true,
+            true,
+            one_physical_charge(PhysicalKind::ResidentMemory, 4)
+        ));
+        assert_eq!(
+            first.local.bytes[ByteKind::RequestResident.index()].load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            second.local.bytes[ByteKind::RequestResident.index()].load(Ordering::Acquire),
+            4
+        );
+        bytes
+            .transfer_kind(ByteKind::ResponseResident, 8, Some(8), Some(8), "full")
+            .unwrap();
+        assert!(bytes.hierarchy.live_matches(
+            4,
+            true,
+            true,
+            one_physical_charge(PhysicalKind::ResidentMemory, 4)
+        ));
+
+        let occupied = second
+            .slot(SlotKind::DynamicBackend, 2, Some(2), Some(1), "full")
+            .unwrap();
+        let mut slot = first
+            .slot(SlotKind::DynamicBackend, 2, Some(2), Some(1), "full")
+            .unwrap();
+        let slot_state_before_rejection = slot.hierarchy.state;
+        let counters_before_rejection = budget.transition_snapshot();
+        assert!(slot.attribute_context(second.clone()).is_err());
+        assert_eq!(slot.hierarchy.state, slot_state_before_rejection);
+        assert_eq!(budget.transition_snapshot(), counters_before_rejection);
+        drop(occupied);
+        slot.attribute_context(second).unwrap();
+        assert!(slot.hierarchy.live_matches(1, true, true, slot.physical));
+
+        let ledger = Arc::new(DiskLedger::new(70, 8, 1));
+        let mut disk = budget.try_disk_on_ledger(ledger.clone(), 4, 0).unwrap();
+        let disk_byte_state_before_rejection = disk.byte_hierarchy.state;
+        let disk_file_state_before_rejection = disk.file_hierarchy.state;
+        let counters_before_rejection = budget.transition_snapshot();
+        assert!(disk.resize(8, 2).is_err());
+        assert_eq!(disk.byte_hierarchy.state, disk_byte_state_before_rejection);
+        assert_eq!(disk.file_hierarchy.state, disk_file_state_before_rejection);
+        assert_eq!(budget.transition_snapshot(), counters_before_rejection);
+        disk.resize(6, 1).unwrap();
+        assert!(disk
+            .byte_hierarchy
+            .live_matches(6, true, false, [0; PhysicalKind::COUNT]));
+        assert!(disk
+            .file_hierarchy
+            .live_matches(1, true, false, [0; PhysicalKind::COUNT]));
+
+        let descriptor = budget.try_descriptor().unwrap();
+        let descriptor_release = descriptor.hierarchy.preview_release(
+            1,
+            false,
+            false,
+            one_physical_charge(PhysicalKind::FileDescriptor, 1),
+        );
+        assert_eq!(
+            descriptor_release.phase,
+            httpd_rs_verified::HierarchicalLeasePhase::Released
+        );
+        let transport = budget.try_transport_buffer_bytes(8).unwrap();
+        let transport_release =
+            transport
+                .hierarchy
+                .preview_release(8, false, false, [0; PhysicalKind::COUNT]);
+        assert_eq!(
+            transport_release.phase,
+            httpd_rs_verified::HierarchicalLeasePhase::Released
+        );
+
+        drop((bytes, slot, disk, descriptor, transport));
+        let released = budget.transition_snapshot();
+        assert!(released.slots.iter().all(|value| *value == 0));
+        assert!(released.bytes.iter().all(|value| *value == 0));
+        assert!(released.physical.iter().all(|value| *value == 0));
+        assert_eq!(released.disk_bytes, 0);
+        assert_eq!(released.disk_files, 0);
+        assert_eq!(released.filesystem_bytes, 0);
+        assert_eq!(released.filesystem_files, 0);
+        assert_eq!(released.transport_bytes, 0);
+        assert!(budget.slot_clients.lock().unwrap().is_empty());
+        assert!(budget.byte_clients.lock().unwrap().is_empty());
     }
 
     #[test]
