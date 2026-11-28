@@ -3346,9 +3346,19 @@ mod tests {
             false,
         )
         .unwrap();
+        assert_eq!(
+            cfg.global.merge_source(),
+            httpd_rs_verified::ConfigIrSource::Nginx
+        );
+        assert!(cfg.vhosts.iter().all(|vhost| vhost
+            .scope
+            .merge_refined_for(httpd_rs_verified::ConfigIrSource::Nginx)));
         let crate::config_ir::RouteProgram::Nginx { servers, .. } = &cfg.route_program else {
             panic!("nginx route program missing");
         };
+        assert!(servers.iter().flatten().all(|route| route
+            .policy
+            .merge_refined_for(httpd_rs_verified::ConfigIrSource::Nginx)));
         assert_eq!(
             servers[0][0].policy.proxy_policy.proxy_passes[0].prefix,
             "/"

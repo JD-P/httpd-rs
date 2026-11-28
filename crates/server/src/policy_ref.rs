@@ -319,7 +319,7 @@ pub fn effective_scope_with_layers_and_file_name(
                     .iter()
                     .find(|layer| layer.identity.dir == *dir)
                     .expect("verified access step was derived from the same layer set");
-                scope.merge(&layer.scope);
+                Scope::fold_child_into(&mut scope, &layer.scope);
                 access_file_layers[depth] = layer.files.clone();
                 htaccess_conditionals.extend(layer.conditionals.iter().cloned());
             }

@@ -3823,8 +3823,7 @@ mod tests {
             negate: false,
             names: vec!["alice".into()],
         }]);
-        let mut merged = parent.clone();
-        merged.merge(&child);
+        let merged = parent.clone().merged(&child);
         assert_eq!(
             check(&merged, &req, peer_inside, Some(&alice), "/x", None),
             Access::Allowed
@@ -3844,8 +3843,7 @@ mod tests {
             negate: false,
             names: vec!["alice".into()],
         }]);
-        let mut merged = parent.clone();
-        merged.merge(&child);
+        let merged = parent.clone().merged(&child);
         assert_eq!(
             check(&merged, &req, peer_outside, Some(&alice), "/x", None),
             Access::Allowed
@@ -3866,7 +3864,7 @@ mod tests {
             negate: false,
             names: vec!["alice".into()],
         }]);
-        merged.merge(&child);
+        merged = merged.merged(&child);
         assert_eq!(
             check(&merged, &req, peer_inside, None, "/x", None),
             Access::AuthRequired

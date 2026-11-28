@@ -202,7 +202,10 @@ one pass because there is no access file to interleave.
 
 ## 5. Scope merge
 
-`Scope::merge(child)` is a per-field operation, not a textual replacement:
+`Scope::merged(child)` is an immutable, consuming per-field fold, not a
+textual replacement. The parent is moved into the fold and a successor is
+returned only after every component completes, so callers cannot observe or
+reuse a partially merged value:
 
 - scalar overrides (`document_root`, `allow_override`, `auth_type`, ...)
   replace when present;
@@ -221,12 +224,32 @@ one pass because there is no access file to interleave.
 - `RewriteRule`/`RewriteCond` lists append;
 - `.htaccess` top-level directives merge in the same way.
 
-The production merge is wrapped by the executable verified
-`PolicyCompilationState` fold. It admits exactly the sequence Content,
+The production fold is wrapped by the executable verified
+`PolicyCompilationState` machine. It admits exactly the sequence Content,
 Options, Override, Authorization, Mapping, ErrorDocument, Header, Environment,
 RewriteCache, Compression and Proxy, and reaches `Complete` only after all 11
 components have been visited exactly once. Header-budget rejection is carried
 as a fail-closed conditional error through the remainder of the fold.
+
+An outer `ScopeMergeFoldState` then admits only the next emitted source
+ordinal. Its invariant equates that ordinal with the number of complete
+eleven-component rounds; sealing proves that every emitted delta caused one
+complete round, and a separate theorem rejects skipped, duplicated or
+reordered ordinals. Each `Scope` carries the resulting source-tagged
+certificate. Apache and nginx construct their scopes with distinct source
+tags, and the common `ConfigIr` publication gate recursively checks the
+global scope, virtual-host scopes and deltas, nested rules, proxy containers,
+and nginx route policies before any configuration becomes request-reachable.
+
+`Options` has the deliberately stronger order statement. The frontend retains
+the complete `Set`/`Add`/`Remove` operation trace. The executable
+`options_fold` loop refines a recursive prefix specification over that exact
+trace. `Set` resets the evaluated bit value but does not erase earlier source
+events. Verus proves a concrete counterexample for every nonzero mask:
+`Set 0; Add mask` differs from `Add mask; Set 0`. Consequently there is no
+global associativity, commutativity, regrouping or permutation theorem for
+Scope merge; correctness is the exact left fold in the order emitted by the
+frontend and selected by the already verified phase machine.
 
 Every `Scope` and component policy has an exhaustive Rust destructuring
 inventory with no `..` rest pattern. Adding a field therefore fails compilation
@@ -234,9 +257,10 @@ until the field is deliberately classified. Optional scalar fields use the
 verified child-wins reducers; append-only fields use `append_vec`; Options,
 authorization and header replacement use their dedicated reducers; and
 pending rewrite conditions are explicitly classified as parser-local rather
-than inherited. The remaining wider `merge_assoc` obligation concerns opaque
-value construction/equality and deliberately non-associative operations, not
-whether a production field can silently fall outside the fold.
+than inherited. These proofs establish the production fold and its ordering;
+source-language compatibility of the individual values remains tracked by the
+Apache/nginx frontend and differential obligations rather than being smuggled
+in as an associativity assumption.
 
 ## 6. Override gating
 
@@ -1974,8 +1998,9 @@ The following remain assumptions or separate proofs:
 
 Suggested order:
 
-1. `merge_assoc` where fields are associative, and explicit counterexamples
-   for fields that are not (e.g. `Options Set`).
+1. Exact immutable `Scope` left-fold refinement, including explicit
+   counterexamples to associativity/permutation for `Options Set` (mechanized;
+   no global `merge_assoc` theorem is claimed).
 2. `phase_order`: folding phases in `Directory < Files < Location <
    Condition` order is equivalent to the reference interpreter.
 3. `htaccess_interleave`: the per-directory fold matches the reference
@@ -2011,7 +2036,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **1105 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **1122 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `CacheTransactionState` closes lookup, current-generation reauthorization,
   hit/miss, store, publication, reload retirement and targeted invalidation.
@@ -2693,7 +2718,7 @@ python3 tests/verification_status.py --run-verus
 
 The current ledger (2026-11-28) is:
 
-- weighted obligations: **71.0 / 100.0 (71.0%)** if partial obligations receive
+- weighted obligations: **71.5 / 100.0 (71.5%)** if partial obligations receive
   half credit;
 - proof debt: **6 / 6** — 0 named unverified security components, 0 partially
   bound sinks, 6 assumptions and 0 accepted unmodeled security-directive
@@ -2702,7 +2727,7 @@ The current ledger (2026-11-28) is:
   inode-bound, **3/11** backend-target-bound, **3/11** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **1105 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **1122 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

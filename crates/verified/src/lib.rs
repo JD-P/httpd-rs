@@ -16243,6 +16243,311 @@ pub proof fn complete_policy_compilation_visits_every_component_once(
 {
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigIrSource {
+    Apache,
+    Nginx,
+}
+
+pub open spec fn config_ir_source_eq_spec(
+    left: ConfigIrSource,
+    right: ConfigIrSource,
+) -> bool {
+    match (left, right) {
+        (ConfigIrSource::Apache, ConfigIrSource::Apache)
+        | (ConfigIrSource::Nginx, ConfigIrSource::Nginx) => true,
+        _ => false,
+    }
+}
+
+pub fn config_ir_source_eq(
+    left: ConfigIrSource,
+    right: ConfigIrSource,
+) -> (equal: bool)
+    ensures equal == config_ir_source_eq_spec(left, right),
+{
+    match (left, right) {
+        (ConfigIrSource::Apache, ConfigIrSource::Apache)
+        | (ConfigIrSource::Nginx, ConfigIrSource::Nginx) => true,
+        _ => false,
+    }
+}
+
+/// Source-tagged certificate for the immutable left fold of complete Scope
+/// deltas.  One outer step is admitted only after the existing component
+/// machine has visited all eleven policy components.  `next_source_order` is
+/// both the next accepted frontend ordinal and the number of complete
+/// component rounds, so a caller cannot skip, duplicate, regroup, or reorder
+/// a child delta while retaining a valid certificate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ScopeMergeFoldState {
+    pub source: ConfigIrSource,
+    pub next_source_order: u64,
+    pub component_rounds: u64,
+    pub conditional_error: bool,
+}
+
+pub open spec fn scope_merge_fold_invariant_spec(state: ScopeMergeFoldState) -> bool {
+    state.next_source_order == state.component_rounds
+}
+
+pub fn scope_merge_fold_start(
+    source: ConfigIrSource,
+    conditional_error: bool,
+) -> (state: ScopeMergeFoldState)
+    ensures
+        scope_merge_fold_invariant_spec(state),
+        state.source == source,
+        state.next_source_order == 0,
+        state.conditional_error == conditional_error,
+{
+    ScopeMergeFoldState {
+        source,
+        next_source_order: 0,
+        component_rounds: 0,
+        conditional_error,
+    }
+}
+
+pub open spec fn scope_merge_fold_step_spec(
+    state: ScopeMergeFoldState,
+    source: ConfigIrSource,
+    source_order: u64,
+    component: PolicyCompilationState,
+) -> Option<ScopeMergeFoldState> {
+    if !config_ir_source_eq_spec(source, state.source)
+        || source_order != state.next_source_order
+        || state.next_source_order == u64::MAX
+        || component.phase != PolicyCompilationPhase::Complete
+        || component.components_merged != 11
+    {
+        None
+    } else {
+        Some(ScopeMergeFoldState {
+            source: state.source,
+            next_source_order: (state.next_source_order as int + 1) as u64,
+            component_rounds: (state.component_rounds as int + 1) as u64,
+            conditional_error: component.conditional_error,
+        })
+    }
+}
+
+#[inline]
+pub fn scope_merge_fold_step(
+    state: ScopeMergeFoldState,
+    source: ConfigIrSource,
+    source_order: u64,
+    component: PolicyCompilationState,
+) -> (next: Option<ScopeMergeFoldState>)
+    requires
+        scope_merge_fold_invariant_spec(state),
+        policy_compilation_invariant_spec(component),
+    ensures
+        next == scope_merge_fold_step_spec(state, source, source_order, component),
+        match next {
+            Some(value) => {
+                &&& scope_merge_fold_invariant_spec(value)
+                &&& value.source == state.source
+                &&& value.next_source_order == state.next_source_order + 1
+                &&& value.component_rounds == state.component_rounds + 1
+                &&& value.conditional_error == component.conditional_error
+            }
+            None => true,
+        },
+{
+    reveal(scope_merge_fold_step_spec);
+    reveal(scope_merge_fold_invariant_spec);
+    reveal(policy_compilation_invariant_spec);
+    reveal(policy_compilation_phase_rank_spec);
+    let component_complete = policy_compilation_complete(component);
+    if !config_ir_source_eq(source, state.source)
+        || source_order != state.next_source_order
+        || state.next_source_order == u64::MAX
+        || !component_complete
+        || component.components_merged != 11
+    {
+        None
+    } else {
+        assert(state.next_source_order < u64::MAX);
+        assert(state.component_rounds == state.next_source_order);
+        assert(state.component_rounds < u64::MAX);
+        assert(((state.next_source_order as int + 1) as u64)
+            == state.next_source_order + 1);
+        assert(((state.component_rounds as int + 1) as u64)
+            == state.component_rounds + 1);
+        Some(ScopeMergeFoldState {
+            source: state.source,
+            next_source_order: state.next_source_order + 1,
+            component_rounds: state.component_rounds + 1,
+            conditional_error: component.conditional_error,
+        })
+    }
+}
+
+/// Frontend publication gate.  `emitted_steps` is obtained from the emitted
+/// immutable program rather than supplied by the merge algebra, so sealing
+/// proves that the complete program—not an arbitrary prefix—was folded.
+pub open spec fn scope_merge_fold_seal_spec(
+    state: ScopeMergeFoldState,
+    source: ConfigIrSource,
+    emitted_steps: u64,
+) -> bool {
+    scope_merge_fold_invariant_spec(state)
+        && config_ir_source_eq_spec(state.source, source)
+        && state.next_source_order == emitted_steps
+}
+
+pub fn scope_merge_fold_seal(
+    state: ScopeMergeFoldState,
+    source: ConfigIrSource,
+    emitted_steps: u64,
+) -> (sealed: bool)
+    ensures sealed == scope_merge_fold_seal_spec(state, source, emitted_steps),
+{
+    reveal(scope_merge_fold_seal_spec);
+    reveal(scope_merge_fold_invariant_spec);
+    state.next_source_order == state.component_rounds
+        && config_ir_source_eq(state.source, source)
+        && state.next_source_order == emitted_steps
+}
+
+pub proof fn complete_scope_merge_fold_visits_every_component_per_source_delta(
+    state: ScopeMergeFoldState,
+    emitted_steps: u64,
+)
+    requires
+        scope_merge_fold_invariant_spec(state),
+        scope_merge_fold_seal_spec(state, state.source, emitted_steps),
+    ensures
+        state.next_source_order == emitted_steps,
+        state.component_rounds == emitted_steps,
+{
+}
+
+pub proof fn scope_merge_fold_rejects_reordered_source_delta(
+    state: ScopeMergeFoldState,
+    source_order: u64,
+    component: PolicyCompilationState,
+)
+    requires
+        scope_merge_fold_invariant_spec(state),
+        policy_compilation_invariant_spec(component),
+        source_order != state.next_source_order,
+    ensures scope_merge_fold_step_spec(
+        state,
+        state.source,
+        source_order,
+        component,
+    ).is_none(),
+{
+}
+
+/// Exact source-order certificate for the operation stream inside one
+/// Options component.  It deliberately proves a left fold only; it exposes no
+/// operation for regrouping child policies and therefore makes no global
+/// associativity claim about `Options Set`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OptionsSourceFoldState {
+    pub next_source_order: u64,
+    pub output_len: u64,
+    pub reset_seen: bool,
+}
+
+pub fn options_source_fold_start(parent_len: u64) -> (state: OptionsSourceFoldState)
+    ensures
+        state.next_source_order == 0,
+        state.output_len == parent_len,
+        !state.reset_seen,
+{
+    OptionsSourceFoldState {
+        next_source_order: 0,
+        output_len: parent_len,
+        reset_seen: false,
+    }
+}
+
+pub open spec fn options_source_fold_step_spec(
+    state: OptionsSourceFoldState,
+    source_order: u64,
+    op: u8,
+) -> Option<OptionsSourceFoldState> {
+    if source_order != state.next_source_order
+        || state.next_source_order == u64::MAX
+        || op > 2
+        || state.output_len == u64::MAX
+    {
+        None
+    } else {
+        Some(OptionsSourceFoldState {
+            next_source_order: (state.next_source_order as int + 1) as u64,
+            output_len: (state.output_len as int + 1) as u64,
+            reset_seen: state.reset_seen || op == 0,
+        })
+    }
+}
+
+#[inline]
+pub fn options_source_fold_step(
+    state: OptionsSourceFoldState,
+    source_order: u64,
+    op: u8,
+) -> (next: Option<OptionsSourceFoldState>)
+    ensures next == options_source_fold_step_spec(state, source_order, op),
+{
+    if source_order != state.next_source_order
+        || state.next_source_order == u64::MAX
+        || op > 2
+        || state.output_len == u64::MAX
+    {
+        None
+    } else {
+        Some(OptionsSourceFoldState {
+            next_source_order: state.next_source_order + 1,
+            output_len: state.output_len + 1,
+            reset_seen: state.reset_seen || op == 0,
+        })
+    }
+}
+
+pub proof fn options_source_fold_rejects_reordered_operation(
+    state: OptionsSourceFoldState,
+    source_order: u64,
+    op: u8,
+)
+    requires source_order != state.next_source_order,
+    ensures options_source_fold_step_spec(state, source_order, op).is_none(),
+{
+}
+
+pub proof fn options_set_marks_reset_without_erasing_source_trace(
+    state: OptionsSourceFoldState,
+)
+    requires
+        state.next_source_order < u64::MAX,
+        state.output_len < u64::MAX,
+    ensures {
+        let next = options_source_fold_step_spec(state, state.next_source_order, 0).unwrap();
+        &&& next.output_len == state.output_len + 1
+        &&& next.reset_seen
+    },
+{
+}
+
+/// A concrete order-sensitivity witness.  `Set 0; Add mask` yields `mask`,
+/// while `Add mask; Set 0` yields zero.  The complete merge theorem therefore
+/// fixes source order instead of attempting an invalid permutation or
+/// regrouping theorem.
+pub proof fn options_set_and_add_are_source_order_sensitive(mask: u32)
+    requires mask != 0,
+    ensures
+        options_apply_spec(options_apply_spec(0, 0, 0), 1, mask)
+            != options_apply_spec(options_apply_spec(0, 1, mask), 0, 0),
+{
+    reveal(options_apply_spec);
+    assert((0u32 | mask) == mask) by (bit_vector);
+    assert(mask != 0u32);
+}
+
 /// How a child `Require` policy combines with an inherited policy.  This is
 /// the decision `Scope::merge` makes from `AuthMerging`; keeping it in the
 /// verified crate makes the security-relevant branch explicit.
@@ -16502,6 +16807,52 @@ pub fn options_apply(bits: u32, op: u8, mask: u32) -> (out: u32)
     } else {
         bits & !mask
     }
+}
+
+/// The mathematical left fold of the first `end` Options operations.  It is
+/// intentionally indexed from the front of the source stream: no theorem
+/// permits permutation or regrouping, because `Set` makes those operations
+/// unsound in general.
+pub open spec fn options_fold_prefix_spec(
+    initial: u32,
+    changes: Seq<(u8, u32)>,
+    end: int,
+) -> u32
+    recommends 0 <= end <= changes.len(),
+    decreases end,
+{
+    if end <= 0 {
+        initial
+    } else {
+        let change = changes[end - 1];
+        options_apply_spec(
+            options_fold_prefix_spec(initial, changes, end - 1),
+            change.0,
+            change.1,
+        )
+    }
+}
+
+/// Executable exact-source-order Options fold consumed by production Scope
+/// evaluation.  The loop invariant is the recursive prefix specification, so
+/// the result is about the actual ordered operation values—not just their
+/// count or a claimed associative summary.
+pub fn options_fold(initial: u32, changes: &[(u8, u32)]) -> (bits: u32)
+    ensures bits == options_fold_prefix_spec(initial, changes@, changes@.len() as int),
+{
+    let mut bits = initial;
+    let mut i: usize = 0;
+    while i < changes.len()
+        invariant
+            i <= changes.len(),
+            bits == options_fold_prefix_spec(initial, changes@, i as int),
+        decreases changes.len() - i,
+    {
+        let change = changes[i];
+        bits = options_apply(bits, change.0, change.1);
+        i = i + 1;
+    }
+    bits
 }
 
 pub proof fn options_set_replaces_parent(bits: u32, mask: u32)
@@ -24968,12 +25319,6 @@ pub proof fn child_transform_list_replaces_parent(
         parent_present, parent_count, true, child_count,
     ) == (SourceNeutralOptionalMerge { present: true, count: child_count }),
 {
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ConfigIrSource {
-    Apache,
-    Nginx,
 }
 
 pub open spec fn common_ir_request_plan_spec(

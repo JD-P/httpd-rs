@@ -19,9 +19,10 @@ impl OptionsPolicy {
 
     /// Apache operation codes: 0 = set, 1 = add, 2 = remove.
     pub fn push(&mut self, op: u8, bits: u32) {
-        if op == 0 {
-            self.changes.clear();
-        }
+        assert!(op <= 2, "sealed Options operation code");
+        // Retain the complete source trace. `Set` resets the evaluated value,
+        // not the history: this lets the verified left fold state the exact
+        // source-order theorem instead of relying on a normalization lemma.
         self.changes.push((op, bits));
     }
 
@@ -39,13 +40,27 @@ impl OptionsPolicy {
 
     /// Merge a child policy: child changes run after the inherited sequence,
     /// and a child `Set` resets the inherited sequence exactly as the previous
-    /// `Scope::merge` loop did.
+    /// `Scope::merge` loop did.  The executable certificate consumes the
+    /// child's immutable operation vector strictly from index zero upward;
+    /// `Set` is intentionally an order-sensitive reset, not an associative
+    /// shortcut over pre-combined policies.
     pub fn merge_child(&mut self, child: &OptionsPolicy) {
         self.assert_merge_inventory();
         child.assert_merge_inventory();
-        for &(op, bits) in &child.changes {
+        let mut fold = httpd_rs_verified::options_source_fold_start(
+            u64::try_from(self.changes.len()).expect("Options policy is configuration-bounded"),
+        );
+        for (source_order, &(op, bits)) in child.changes.iter().enumerate() {
+            fold = httpd_rs_verified::options_source_fold_step(
+                fold,
+                u64::try_from(source_order).expect("Options policy is configuration-bounded"),
+                op,
+            )
+            .expect("Options operations are sealed and emitted in exact source order");
             self.push(op, bits);
+            debug_assert_eq!(self.changes.len() as u64, fold.output_len);
         }
+        debug_assert_eq!(fold.next_source_order, child.changes.len() as u64);
     }
 
     pub fn changes(&self) -> &[(u8, u32)] {
@@ -54,11 +69,7 @@ impl OptionsPolicy {
 
     /// Evaluate from the caller-supplied Apache default bits.
     pub fn effective_bits(&self, base: u32) -> u32 {
-        let mut bits = base;
-        for &(op, value) in &self.changes {
-            bits = crate::verified::options_apply(bits, op, value);
-        }
-        bits
+        crate::verified::options_fold(base, &self.changes)
     }
 }
 
@@ -75,7 +86,7 @@ mod tests {
         assert_eq!(p.effective_bits(0b1), 0b1);
         p.push_remove(0b1);
         assert_eq!(p.effective_bits(0b1), 0);
-        assert_eq!(p.changes(), &[(0, 0b1), (2, 0b1)]);
+        assert_eq!(p.changes(), &[(1, 0b10), (1, 0b100), (0, 0b1), (2, 0b1)]);
     }
 
     #[test]

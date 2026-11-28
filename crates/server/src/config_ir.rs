@@ -35,17 +35,29 @@ pub struct ConfigIr {
 }
 
 impl ConfigIr {
-    pub(crate) fn apache(config: crate::config::Config) -> Self {
-        Self {
+    pub(crate) fn apache(config: crate::config::Config) -> Result<Self, String> {
+        let source = httpd_rs_verified::ConfigIrSource::Apache;
+        if !config_scope_program_is_refined(&config, source) {
+            return Err("Apache frontend emitted a Scope outside the verified merge fold".into());
+        }
+        Ok(Self {
             config,
             routes: RouteProgram::Apache,
-        }
+        })
     }
 
     pub(crate) fn nginx(
         config: crate::config::Config,
         servers: Vec<Vec<Route<crate::config::Scope>>>,
     ) -> Result<Self, String> {
+        let source = httpd_rs_verified::ConfigIrSource::Nginx;
+        if !config_scope_program_is_refined(&config, source)
+            || !servers.iter().flatten().all(|route| {
+                route.policy.merge_refined_for(source) && route.policy.merge_source() == source
+            })
+        {
+            return Err("nginx frontend emitted a Scope outside the verified merge fold".into());
+        }
         let server_names = config
             .vhosts
             .iter()
@@ -63,6 +75,64 @@ impl ConfigIr {
             routes: RouteProgram::nginx(servers, server_names)?,
         })
     }
+}
+
+fn scope_rule_is_refined(
+    rule: &crate::config::ScopeRule,
+    source: httpd_rs_verified::ConfigIrSource,
+) -> bool {
+    rule.delta.merge_refined_for(source)
+        && rule.delta.merge_source() == source
+        && rule
+            .nested
+            .iter()
+            .all(|nested| scope_rule_is_refined(nested, source))
+}
+
+fn proxy_container_is_refined(
+    container: &crate::config::ProxyContainer,
+    source: httpd_rs_verified::ConfigIrSource,
+) -> bool {
+    container.delta.merge_refined_for(source)
+        && container.delta.merge_source() == source
+        && container
+            .rules
+            .iter()
+            .all(|rule| scope_rule_is_refined(rule, source))
+}
+
+/// Publication-time refinement gate shared by both configuration frontends.
+/// Every policy-bearing Scope, including nested conditionals and proxy
+/// containers, must carry the frontend's source tag and a valid certificate
+/// from the same immutable component fold before it can become ConfigIr.
+fn config_scope_program_is_refined(
+    config: &crate::config::Config,
+    source: httpd_rs_verified::ConfigIrSource,
+) -> bool {
+    config.global.merge_refined_for(source)
+        && config.global.merge_source() == source
+        && config
+            .global_rules
+            .iter()
+            .all(|rule| scope_rule_is_refined(rule, source))
+        && config
+            .proxy_containers
+            .iter()
+            .all(|container| proxy_container_is_refined(container, source))
+        && config.vhosts.iter().all(|vhost| {
+            vhost.scope.merge_refined_for(source)
+                && vhost.scope.merge_source() == source
+                && vhost.delta.merge_refined_for(source)
+                && vhost.delta.merge_source() == source
+                && vhost
+                    .rules
+                    .iter()
+                    .all(|rule| scope_rule_is_refined(rule, source))
+                && vhost
+                    .proxy_containers
+                    .iter()
+                    .all(|container| proxy_container_is_refined(container, source))
+        })
 }
 
 impl ConfigFormat {

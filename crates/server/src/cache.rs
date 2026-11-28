@@ -1260,6 +1260,7 @@ fn cache_policy_material(scope: &Scope) -> String {
         rewrite_policy,
         compression_policy,
         proxy_policy,
+        merge_fold: _,
     } = scope;
     let crate::scope_policy::RewriteCachePolicy {
         rewrite_engine,

@@ -140,6 +140,12 @@ COMPONENT_OVERRIDES = {
     "complete_request_plan_has_one_coherent_identity": "RequestPlan construction",
     "complete_request_plan_is_admitted_by_every_consumer": "RequestPlan construction",
     "request_plan_retarget_preserves_mapping_and_generation": "RequestPlan construction",
+    "complete_policy_compilation_visits_every_component_once": "Complete configuration merge",
+    "complete_scope_merge_fold_visits_every_component_per_source_delta": "Complete configuration merge",
+    "scope_merge_fold_rejects_reordered_source_delta": "Complete configuration merge",
+    "options_source_fold_rejects_reordered_operation": "Complete configuration merge",
+    "options_set_marks_reset_without_erasing_source_trace": "Complete configuration merge",
+    "options_set_and_add_are_source_order_sensitive": "Complete configuration merge",
 }
 
 
@@ -250,6 +256,7 @@ BITVECTOR_PROOFS = {
     "options_remove_never_grants_and_clears",
     "client_quota_ipv6_key_has_zero_host",
     "client_quota_ipv6_key_preserves_prefix",
+    "options_set_and_add_are_source_order_sensitive",
 }
 
 ARITHMETIC_GATE_PROOFS = {
@@ -325,6 +332,7 @@ STATE_MACHINE_COMPONENTS = {
     "Nginx lexer and parser refinement",
     "Hierarchical lease transactions",
     "RequestPlan construction",
+    "Complete configuration merge",
 }
 
 FINITE_CASE_COMPONENTS = {
@@ -554,6 +562,25 @@ PROPERTY_OVERRIDES = {
         "A DirectoryIndex or same-directory rewrite retarget can advance the target revision only "
         "while retaining the exact generation, vhost, route, mapping winner, root and access-walk "
         "identity."
+    ),
+    "complete_scope_merge_fold_visits_every_component_per_source_delta": (
+        "Sealing an emitted Scope-delta fold proves that every source delta caused exactly one "
+        "complete eleven-component merge round."
+    ),
+    "scope_merge_fold_rejects_reordered_source_delta": (
+        "The Scope fold rejects any emitted delta ordinal other than the exact next source ordinal."
+    ),
+    "options_source_fold_rejects_reordered_operation": (
+        "The Options trace fold rejects any Set/Add/Remove operation whose ordinal is not the exact "
+        "next source position."
+    ),
+    "options_set_marks_reset_without_erasing_source_trace": (
+        "An Options Set marks value reset while retaining and counting the complete source operation "
+        "trace."
+    ),
+    "options_set_and_add_are_source_order_sensitive": (
+        "For every nonzero mask, Set-then-Add and Add-then-Set produce different values; therefore "
+        "the complete merge may not assume permutation or global associativity."
     ),
 }
 

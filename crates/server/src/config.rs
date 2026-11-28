@@ -1748,6 +1748,11 @@ pub struct Scope {
     pub rewrite_policy: RewriteCachePolicy,
     pub compression_policy: CompressionPolicy,
     pub proxy_policy: ProxyPolicy,
+    /// Source-tagged certificate for the immutable sequence of child deltas
+    /// folded into this value.  It is policy-construction metadata, not a
+    /// request-visible policy field, and is deliberately excluded from cache
+    /// fingerprints and directive semantics.
+    pub(crate) merge_fold: httpd_rs_verified::ScopeMergeFoldState,
 }
 
 impl Default for Scope {
@@ -1765,6 +1770,10 @@ impl Default for Scope {
             proxy_policy: ProxyPolicy::default(),
             error_policy: ErrorDocumentPolicy::default(),
             environment_policy: EnvironmentPolicy::default(),
+            merge_fold: httpd_rs_verified::scope_merge_fold_start(
+                httpd_rs_verified::ConfigIrSource::Apache,
+                false,
+            ),
         }
     }
 }
@@ -1830,6 +1839,31 @@ fn hash_item<T: std::fmt::Debug>(value: &T) -> u64 {
 #[cfg(debug_assertions)]
 fn hash_vec<T: std::fmt::Debug>(values: &[T]) -> Vec<u64> {
     values.iter().map(hash_item).collect()
+}
+
+impl Scope {
+    pub(crate) fn for_source(source: httpd_rs_verified::ConfigIrSource) -> Self {
+        let mut scope = Self::default();
+        scope.merge_fold = httpd_rs_verified::scope_merge_fold_start(source, false);
+        scope
+    }
+
+    pub(crate) fn merge_source(&self) -> httpd_rs_verified::ConfigIrSource {
+        self.merge_fold.source
+    }
+
+    pub(crate) fn merge_refined_for(&self, source: httpd_rs_verified::ConfigIrSource) -> bool {
+        httpd_rs_verified::scope_merge_fold_seal(
+            self.merge_fold,
+            source,
+            self.merge_fold.next_source_order,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn merged_delta_count(&self) -> u64 {
+        self.merge_fold.next_source_order
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -2301,24 +2335,56 @@ impl Scope {
             rewrite_policy: _,
             compression_policy: _,
             proxy_policy: _,
+            // Construction provenance is advanced only after all policy
+            // components above complete one verified merge round.
+            merge_fold: _,
         } = self;
     }
 
-    /// Apply a (possibly partial) child scope over this one.
-    pub fn merge(&mut self, child: &Scope) {
-        self.merge_inner(child, None);
+    /// Return the immutable left-fold successor for one child scope.  The
+    /// parent value is consumed, so no alias can observe a partially merged
+    /// Scope; every policy component completes before the successor is
+    /// returned.
+    pub fn merged(self, child: &Scope) -> Self {
+        self.merge_inner(child, None)
+    }
+
+    /// Adapter for evaluators that already own a mutable slot.  The old value
+    /// is moved out and the slot is replaced only with the fully constructed
+    /// successor; component-by-component mutation is not observable through
+    /// the caller's reference.
+    pub(crate) fn fold_child_into(slot: &mut Self, child: &Scope) {
+        let placeholder = Self::for_source(slot.merge_source());
+        let parent = std::mem::replace(slot, placeholder);
+        *slot = parent.merged(child);
     }
 
     /// Merge a rule delta while substituting a pre-transformed rewrite-rule
     /// list.  Used for per-directory rewrite rules so the hot path does not
     /// clone the whole `Scope`.
-    pub fn merge_with_rewrite_rules(&mut self, child: &Scope, rules: &[RewriteRule]) {
-        self.merge_inner(child, Some(rules));
+    pub fn merged_with_rewrite_rules(self, child: &Scope, rules: &[RewriteRule]) -> Self {
+        self.merge_inner(child, Some(rules))
     }
 
-    fn merge_inner(&mut self, child: &Scope, rewrite_rules: Option<&[RewriteRule]>) {
+    pub(crate) fn fold_child_with_rewrite_rules_into(
+        slot: &mut Self,
+        child: &Scope,
+        rules: &[RewriteRule],
+    ) {
+        let placeholder = Self::for_source(slot.merge_source());
+        let parent = std::mem::replace(slot, placeholder);
+        *slot = parent.merged_with_rewrite_rules(child, rules);
+    }
+
+    fn merge_inner(mut self, child: &Scope, rewrite_rules: Option<&[RewriteRule]>) -> Self {
         self.assert_policy_compilation_inventory();
         child.assert_policy_compilation_inventory();
+        let source = self.merge_fold.source;
+        assert_eq!(
+            child.merge_fold.source, source,
+            "configuration frontends may fold only source-consistent Scope deltas"
+        );
+        let source_order = self.merge_fold.next_source_order;
         #[cfg(debug_assertions)]
         let audit_parent = self.container_snapshot();
         #[cfg(debug_assertions)]
@@ -2417,6 +2483,9 @@ impl Scope {
             "verified policy compilation fold did not reach Complete"
         );
         self.conditional_error = fold.conditional_error;
+        self.merge_fold =
+            crate::verified::scope_merge_fold_step(self.merge_fold, source, source_order, fold)
+                .expect("Scope deltas are folded once in exact emitted source order");
         // Pending conditions are parser-local and must never leak from one
         // scope into the next.
         #[cfg(debug_assertions)]
@@ -2425,6 +2494,7 @@ impl Scope {
             Scope::merge_container_snapshots(&audit_parent, &audit_child),
             "Scope::merge container-field audit failed"
         );
+        self
     }
 
     /// Restrict `self` (a canonical-target or rewritten-target scope) with the
@@ -4255,9 +4325,15 @@ impl Config {
                 msg,
             }]
         })?;
-        let mut config = Compile::new(parser, program, strict, capability_audit)
-            .compile()
-            .map_err(|error| vec![error])?;
+        let mut config = Compile::new(
+            parser,
+            program,
+            strict,
+            capability_audit,
+            httpd_rs_verified::ConfigIrSource::Nginx,
+        )
+        .compile()
+        .map_err(|error| vec![error])?;
         if config.vhosts.len() != lowered.routes.len() {
             return Err(vec![ConfigError {
                 file: path.display().to_string(),
@@ -4339,8 +4415,7 @@ impl Config {
                         // instead of rebuilding and reallocating a large
                         // Scope at every request phase (translation,
                         // authorization, backend selection and finalization).
-                        let mut policy = vhost.scope.clone();
-                        policy.merge(&delta);
+                        let policy = vhost.scope.clone().merged(&delta);
                         crate::config_ir::Route {
                             matcher,
                             policy,
@@ -4411,7 +4486,15 @@ impl Config {
                 }]);
             }
         };
-        match Compile::new(p, program, strict, capability_audit).compile_ir() {
+        match Compile::new(
+            p,
+            program,
+            strict,
+            capability_audit,
+            httpd_rs_verified::ConfigIrSource::Apache,
+        )
+        .compile_ir()
+        {
             Ok(ir) => Ok(ir.finalize()),
             Err(e) => Err(vec![e]),
         }
@@ -6196,10 +6279,17 @@ struct Compile {
     capability_audit: bool,
     server_limit: Option<usize>,
     max_request_workers_set: bool,
+    source: httpd_rs_verified::ConfigIrSource,
 }
 
 impl Compile {
-    fn new(p: ParserState, program: ConfigProgram, strict: bool, capability_audit: bool) -> Self {
+    fn new(
+        p: ParserState,
+        program: ConfigProgram,
+        strict: bool,
+        capability_audit: bool,
+        source: httpd_rs_verified::ConfigIrSource,
+    ) -> Self {
         let server_root = p.initial_server_root.clone();
         let admin_file_trust = p.admin_file_trust;
         let admin_input_targets = p.admin_input_targets.clone();
@@ -6253,7 +6343,7 @@ impl Compile {
             encoded_slashes: EncodedSlashes::Off,
             vhosts: Vec::new(),
             vhost_index: Arc::new(VHostIndex::default()),
-            global: Scope::default(),
+            global: Scope::for_source(source),
             global_rules: Vec::new(),
             route_program: crate::config_ir::RouteProgram::Apache,
             global_directory_index: DirectoryRuleIndex::default(),
@@ -6319,6 +6409,7 @@ impl Compile {
             capability_audit,
             server_limit: None,
             max_request_workers_set: false,
+            source,
         }
     }
 
@@ -6441,7 +6532,12 @@ impl Compile {
     }
 
     fn compile_ir(self) -> Result<crate::config_ir::ConfigIr, ConfigError> {
-        self.compile().map(crate::config_ir::ConfigIr::apache)
+        let config = self.compile()?;
+        crate::config_ir::ConfigIr::apache(config).map_err(|msg| ConfigError {
+            file: "<Apache frontend>".into(),
+            line: 0,
+            msg,
+        })
     }
 
     fn compile(mut self) -> Result<Config, ConfigError> {
@@ -6496,7 +6592,7 @@ impl Compile {
                 v.scope.rewrite_policy.rewrite_base = None;
                 v.scope.rewrite_policy.rewrite_match_base = None;
             }
-            v.scope.merge(&v.delta);
+            Scope::fold_child_into(&mut v.scope, &v.delta);
             v.scope.mapping_policy.prefer_virtual_host_routes(
                 global_scope.mapping_policy.aliases.len(),
                 global_scope.mapping_policy.redirects.len(),
@@ -6760,7 +6856,7 @@ impl Compile {
                                     (ConditionBranch::Else, Some(chain), None)
                                 }
                             };
-                            let mut inner = Scope::default();
+                            let mut inner = Scope::for_source(self.source);
                             let mut inner_rules = Vec::new();
                             self.walk(
                                 &mut inner,
@@ -6801,8 +6897,8 @@ impl Compile {
                                 ports: Vec::new(),
                                 server_name: None,
                                 aliases: Vec::new(),
-                                scope: Scope::default(),
-                                delta: Scope::default(),
+                                scope: Scope::for_source(self.source),
+                                delta: Scope::for_source(self.source),
                                 rules: Vec::new(),
                                 directory_index: DirectoryRuleIndex::default(),
                                 proxy_containers: Vec::new(),
@@ -6816,7 +6912,7 @@ impl Compile {
                             };
                             self.vhosts_raw.push(vh);
                             let idx = self.vhosts_raw.len() - 1;
-                            let mut vdelta = Scope::default();
+                            let mut vdelta = Scope::for_source(self.source);
                             let mut vrules = Vec::new();
                             let prev = self.current_vhost.replace(idx);
                             self.walk(
@@ -6846,7 +6942,7 @@ impl Compile {
                                 }
                                 _ => unreachable!("sealed match section"),
                             };
-                            let mut delta = Scope::default();
+                            let mut delta = Scope::for_source(self.source);
                             let mut nested = Vec::new();
                             let child_section = match name.as_str() {
                                 "directorymatch" => SectionKind::DirectoryMatch,
@@ -6894,7 +6990,7 @@ impl Compile {
                                 self.skip_section();
                                 continue;
                             }
-                            let mut inner = Scope::default();
+                            let mut inner = Scope::for_source(self.source);
                             let mut inner_rules = Vec::new();
                             self.walk(
                                 &mut inner,
@@ -7060,7 +7156,7 @@ impl Compile {
                                     balancer_prev = self.current_balancer.replace(idx);
                                 }
                             }
-                            let mut delta = Scope::default();
+                            let mut delta = Scope::for_source(self.source);
                             let mut inner_rules = Vec::new();
                             self.walk(
                                 &mut delta,
@@ -9991,8 +10087,8 @@ fn mark_filesystem_rewrite_context(scope: &mut Scope, nested: &mut [ScopeRule]) 
 
 fn merge_rule_delta(s: &mut Scope, rule: &ScopeRule, fs_path: &Path, url_path: &str) {
     match transformed_rewrite_rules(rule, fs_path, url_path) {
-        Some(rules) => s.merge_with_rewrite_rules(&rule.delta, &rules),
-        None => s.merge(&rule.delta),
+        Some(rules) => Scope::fold_child_with_rewrite_rules_into(s, &rule.delta, &rules),
+        None => Scope::fold_child_into(s, &rule.delta),
     }
 }
 
@@ -11538,6 +11634,7 @@ pub(crate) fn fuzz_config(server_root: &Path) -> Config {
         },
         false,
         false,
+        httpd_rs_verified::ConfigIrSource::Apache,
     )
     .cfg
 }
@@ -14422,7 +14519,7 @@ SSLOptions +StrictRequire\n";
             .push(Originated::main(("CHILD".into(), "2".into())));
         child.content_policy.document_root = Some("/child".into());
 
-        parent.merge(&child);
+        parent = parent.merged(&child);
         assert_eq!(
             parent.content_policy.add_types,
             vec![
@@ -14436,6 +14533,43 @@ SSLOptions +StrictRequire\n";
         );
         assert_eq!(parent.header_policy.set_headers.len(), 2);
         assert_eq!(parent.environment_policy.set_env.len(), 2);
+        assert_eq!(parent.merged_delta_count(), 1);
+        assert!(parent.merge_refined_for(httpd_rs_verified::ConfigIrSource::Apache));
+
+        let mut malformed = parent.clone();
+        malformed.merge_fold.component_rounds += 1;
+        assert!(!malformed.merge_refined_for(httpd_rs_verified::ConfigIrSource::Apache));
+        assert!(!parent.merge_refined_for(httpd_rs_verified::ConfigIrSource::Nginx));
+    }
+
+    #[test]
+    fn scope_merge_is_an_immutable_exact_order_fold_not_an_associative_summary() {
+        let mut parent = Scope::default();
+        parent.options.push_add(0b0001);
+        let original = parent.clone();
+
+        let mut set = Scope::default();
+        set.options.push_set(0b0010);
+        let mut add = Scope::default();
+        add.options.push_add(0b0100);
+
+        let source_order = parent.clone().merged(&set).merged(&add);
+        let reordered = parent.merged(&add).merged(&set);
+
+        // Consuming merge leaves the aliased input value untouched and the
+        // retained operation stream records the frontend's exact order.
+        assert_eq!(original.options.effective_bits(0), 0b0001);
+        assert_eq!(source_order.options.effective_bits(0), 0b0110);
+        assert_eq!(reordered.options.effective_bits(0), 0b0010);
+        assert_eq!(
+            source_order.options.changes(),
+            &[(1, 0b0001), (0, 0b0010), (1, 0b0100)]
+        );
+        assert_eq!(source_order.merged_delta_count(), 2);
+        assert_ne!(
+            source_order.options.effective_bits(0),
+            reordered.options.effective_bits(0)
+        );
     }
 
     #[test]
@@ -14462,7 +14596,7 @@ SSLOptions +StrictRequire\n";
             .header_policy
             .always_unset_headers
             .push("X-Old".into());
-        parent.merge(&child);
+        parent = parent.merged(&child);
         assert_eq!(
             parent.header_policy.set_headers,
             vec![("X-Set".into(), "two".into())]
@@ -18826,7 +18960,7 @@ impl Config {
             {
                 delta.authorization.auth_merging = Some(crate::config::AuthMerging::And);
             }
-            scope.merge(&delta);
+            Scope::fold_child_into(scope, &delta);
             let mut chain_state: HashMap<usize, bool> = HashMap::new();
             apply_rules_req(
                 &container.rules,

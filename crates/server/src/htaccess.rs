@@ -240,7 +240,7 @@ pub fn apply_req_deferred_with_root(
             }
             access_layers += 1;
             access_instructions += delta.instruction_count;
-            scope.merge(&delta.scope);
+            Scope::fold_child_into(scope, &delta.scope);
             let fname = fs_path
                 .file_name()
                 .map(|f| f.to_string_lossy().to_string())
@@ -491,7 +491,7 @@ fn collect_layers_with_root_inner(
         let identity = crate::request_plan::LayerIdentity::new(&root, &dir, fs_path, url_path);
         let mut layer = crate::policy_ref::AccessLayer {
             identity: identity.clone(),
-            scope: Arc::new(Scope::default()),
+            scope: Arc::new(Scope::for_source(cfg.global.merge_source())),
             files: Vec::new(),
             conditionals: Vec::new(),
         };
@@ -1156,7 +1156,7 @@ fn parse_access_bytes_inner(
     }
     let program = AccessProgram::seal(&lines)?;
     let instruction_count = program.instructions.len();
-    let mut scope = Scope::default();
+    let mut scope = Scope::for_source(cfg.global.merge_source());
     let mut rules = Vec::new();
     scope.rewrite_policy.rewrite_base = Some(identity.url_mount.clone());
     scope.rewrite_policy.rewrite_match_base = Some(identity.url_mount.clone());
@@ -1667,7 +1667,7 @@ fn parse_block(
                         // into the enclosing phase.  In particular a nested
                         // <Files> remains a Files-phase rule instead of being
                         // collapsed into the final conditional phase.
-                        let mut inner = Scope::default();
+                        let mut inner = Scope::for_source(cfg.global.merge_source());
                         let mut inner_rules = Vec::new();
                         parse_block(
                             cfg,
@@ -1684,7 +1684,7 @@ fn parse_block(
                             None,
                         )?;
                         if selected {
-                            scope.merge(&inner);
+                            Scope::fold_child_into(scope, &inner);
                             for mut rule in inner_rules {
                                 rule.order = rules.len();
                                 rules.push(rule);
@@ -1728,7 +1728,7 @@ fn parse_block(
                                 (ConditionBranch::Else, Some(chain), None)
                             }
                         };
-                        let mut inner = Scope::default();
+                        let mut inner = Scope::for_source(cfg.global.merge_source());
                         let mut inner_rules = Vec::new();
                         parse_block(
                             cfg,
@@ -1765,7 +1765,7 @@ fn parse_block(
                     AccessSectionKind::RequireAll
                     | AccessSectionKind::RequireAny
                     | AccessSectionKind::RequireNone => {
-                        let mut inner = Scope::default();
+                        let mut inner = Scope::for_source(cfg.global.merge_source());
                         let mut inner_rules = Vec::new();
                         parse_block(
                             cfg,
@@ -1868,7 +1868,7 @@ fn parse_block(
                         let AccessSectionPayload::Files(kind) = payload else {
                             unreachable!("sealed Files section")
                         };
-                        let mut inner = Scope::default();
+                        let mut inner = Scope::for_source(cfg.global.merge_source());
                         let mut inner_rules = Vec::new();
                         parse_block(
                             cfg,
