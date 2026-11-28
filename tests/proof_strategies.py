@@ -31,78 +31,104 @@ class Proof:
 
 
 COMPONENT_RANGES = (
-    (1, 100, "Configuration and cache generations"),
-    (101, 247, "Backend endpoint identity"),
-    (248, 665, "URI path canonicalization"),
-    (666, 850, "Percent encoding"),
-    (851, 1100, "Authority parsing"),
-    (1101, 1700, "Rewrite target and sink classification"),
-    (1701, 1940, "Authorized plan and FastCGI identity"),
-    (1941, 2200, "Transform capability and terminal sink admission"),
-    (2201, 2280, "Descriptor and inode stability"),
-    (2281, 2438, "Rewrite query, restart, map and backreference policy"),
-    (2439, 2667, "PCRE2 positive grammar"),
-    (2668, 3218, "PCRE2 semantic AST and nginx regex bridge"),
-    (3219, 3333, "Cache invalidation and disk identity"),
-    (3334, 3439, "Configured input-size gates"),
-    (3440, 3589, "Request resource admission"),
-    (3590, 3799, "MultiViews admission and authorization"),
-    (3800, 3949, "Access-program and regex work accounting"),
-    (3950, 4189, "Rewrite filesystem containment"),
-    (4190, 4363, "Expression and path matching"),
-    (4364, 4469, "Shared memory, maps and queues"),
-    (4470, 4724, "Dependency and TLS call boundaries"),
-    (4725, 4769, "Generic resource-budget admission"),
-    (4770, 4849, "Cancellation boundaries"),
-    (4850, 5079, "Hierarchical resource accounting"),
-    (5080, 5339, "Worker and output ownership"),
-    (5340, 5489, "Request body phase machine"),
-    (5490, 5889, "Dynamic outcome lifecycle"),
-    (5890, 6489, "Internal requests, redirects and recovery"),
-    (6490, 6589, "Body, retry and expression-file admission"),
-    (6590, 6979, "Rewrite rule transitions"),
-    (6980, 7729, "Rewrite program machine"),
-    (7730, 7831, "Access-file selection"),
-    (7832, 7929, "Policy-bit meet"),
-    (7930, 8039, "Options, handler and authorization configuration"),
-    (8040, 8139, "Authentication identity and cache"),
-    (8140, 8219, "Authorization providers and override categories"),
-    (8220, 8379, ".htaccess admission"),
-    (8380, 9039, "Cache-key and lookup identity"),
-    (9040, 9201, "Header and token syntax"),
-    (9202, 9589, "HTTP/1 framing and byte ranges"),
-    (9590, 10299, "Proxy request serialization"),
-    (10300, 10839, "Header and range parsing"),
-    (10840, 11451, "CGI and mapping bounds"),
-    (11452, 11749, "Compression resource policy"),
-    (11750, 11779, "Client quota identity"),
-    (11780, 11859, "Service and process identity"),
-    (11860, 12004, "CGI/backend response admission"),
-    (12005, 12289, "CGI environment and regex admission"),
-    (12290, 12535, "Cache lookup and expression authorization"),
-    (12536, 12740, "Proxy identity and authorization algebra"),
-    (12741, 12993, "Authorization evaluator"),
-    (12994, 13520, "Configuration phase ordering"),
-    (13521, 14633, "Whole request-policy state machine"),
-    (14634, 14900, "Policy compilation fold"),
-    (14901, 15530, "Configuration merge helpers"),
-    (15531, 15859, "RemoteIP and virtual-host identity"),
-    (15860, 16084, "Nginx route-index refinement"),
-    (16085, 16165, "Dependency and TLS call boundaries"),
-    (16166, 17107, "Configuration front-end refinement"),
-    (17108, 17295, "Container-field merge"),
-    (17296, 20250, "HTTP/2 admission and lifecycle"),
-    (20251, 20503, "Access/cache prefilters and mapping order"),
-    (20504, 21100, "fnmatch semantics"),
-    (21101, 21299, "Handler and CGI capability admission"),
-    (21300, 21434, "Authentication-file and FastCGI path immutability"),
-    (21435, 21899, "Nginx lexer and parser refinement"),
-    (21900, 22210, "Nginx route-index refinement"),
-    (22211, 22350, "Nginx lowering closure"),
-    (22351, 22500, "Nginx transformation language"),
-    (22501, 22700, "Source-neutral scope merge"),
-    (22701, 23000, "Common-IR request refinement"),
+    (1, 541, "Configuration and cache generations"),
+    (542, 688, "Backend endpoint identity"),
+    (689, 1106, "URI path canonicalization"),
+    (1107, 1291, "Percent encoding"),
+    (1292, 1541, "Authority parsing"),
+    (1542, 2141, "Rewrite target and sink classification"),
+    (2142, 2381, "Authorized plan and FastCGI identity"),
+    (2382, 2641, "Transform capability and terminal sink admission"),
+    (2642, 2721, "Descriptor and inode stability"),
+    (2722, 2879, "Rewrite query, restart, map and backreference policy"),
+    (2880, 3612, "PCRE2 positive grammar"),
+    (3613, 4163, "PCRE2 semantic AST and nginx regex bridge"),
+    (4164, 4278, "Cache invalidation and disk identity"),
+    (4279, 4384, "Configured input-size gates"),
+    (4385, 4534, "Request resource admission"),
+    (4535, 4744, "MultiViews admission and authorization"),
+    (4745, 4894, "Access-program and regex work accounting"),
+    (4895, 5134, "Rewrite filesystem containment"),
+    (5135, 5308, "Expression and path matching"),
+    (5309, 5414, "Shared memory, maps and queues"),
+    (5415, 5669, "Dependency and TLS call boundaries"),
+    (5670, 6076, "Generic resource-budget admission"),
+    (6077, 6156, "Cancellation boundaries"),
+    (6157, 6386, "Hierarchical resource accounting"),
+    (6387, 6646, "Worker and output ownership"),
+    (6647, 6796, "Request body phase machine"),
+    (6797, 7196, "Dynamic outcome lifecycle"),
+    (7197, 7796, "Internal requests, redirects and recovery"),
+    (7797, 7896, "Body, retry and expression-file admission"),
+    (7897, 8286, "Rewrite rule transitions"),
+    (8287, 9036, "Rewrite program machine"),
+    (9037, 9138, "Access-file selection"),
+    (9139, 9236, "Policy-bit meet"),
+    (9237, 9346, "Options, handler and authorization configuration"),
+    (9347, 9446, "Authentication identity and cache"),
+    (9447, 9526, "Authorization providers and override categories"),
+    (9527, 9686, ".htaccess admission"),
+    (9687, 10346, "Cache-key and lookup identity"),
+    (10347, 10508, "Header and token syntax"),
+    (10509, 10896, "HTTP/1 framing and byte ranges"),
+    (10897, 11606, "Proxy request serialization"),
+    (11607, 12146, "Header and range parsing"),
+    (12147, 12758, "CGI and mapping bounds"),
+    (12759, 13056, "Compression resource policy"),
+    (13057, 13086, "Client quota identity"),
+    (13087, 13166, "Service and process identity"),
+    (13167, 13311, "CGI/backend response admission"),
+    (13312, 13596, "CGI environment and regex admission"),
+    (13597, 13842, "Cache lookup and expression authorization"),
+    (13843, 14047, "Proxy identity and authorization algebra"),
+    (14048, 14300, "Authorization evaluator"),
+    (14301, 14827, "Configuration phase ordering"),
+    (14828, 15940, "Whole request-policy state machine"),
+    (15941, 16207, "Policy compilation fold"),
+    (16208, 16837, "Configuration merge helpers"),
+    (16838, 17166, "RemoteIP and virtual-host identity"),
+    (17167, 17391, "Nginx route-index refinement"),
+    (17392, 17472, "Dependency and TLS call boundaries"),
+    (17473, 18414, "Configuration front-end refinement"),
+    (18415, 18602, "Container-field merge"),
+    (18603, 21557, "HTTP/2 admission and lifecycle"),
+    (21558, 21810, "Access/cache prefilters and mapping order"),
+    (21811, 23311, "fnmatch semantics"),
+    (23312, 23510, "Handler and CGI capability admission"),
+    (23511, 23645, "Authentication-file and FastCGI path immutability"),
+    (23646, 24110, "Nginx lexer and parser refinement"),
+    (24111, 24421, "Nginx route-index refinement"),
+    (24422, 24561, "Nginx lowering closure"),
+    (24562, 24711, "Nginx transformation language"),
+    (24712, 24911, "Source-neutral scope merge"),
+    (24912, 25103, "Common-IR request refinement"),
 )
+
+
+# Line ranges preserve the established broad inventory.  New composition
+# projects deliberately override them by theorem name so their review rows do
+# not disappear into the older neighboring component when source moves.
+COMPONENT_OVERRIDES = {
+    "cache_transaction_step_preserves_invariant": "Cache transaction state machine",
+    "retired_cache_transaction_cannot_serve_or_publish": "Cache transaction state machine",
+    "invalidated_cache_transaction_cannot_serve_or_publish": "Cache transaction state machine",
+    "cache_hit_requires_current_reauthorized_generation": "Cache transaction state machine",
+    "cache_publication_requires_current_reauthorized_generation": "Cache transaction state machine",
+    "pcre_source_certificate_covers_every_byte_and_event": "PCRE2 source grammar refinement",
+    "lease_ownership_step_preserves_invariant": "Resource lease ownership",
+    "lease_queue_task_and_output_require_acquisition": "Resource lease ownership",
+    "lease_cancellation_preserves_live_owner": "Resource lease ownership",
+    "lease_terminal_release_is_exactly_once": "Resource lease ownership",
+    "expression_cursor_advance_strictly_decreases_remaining": "Expression parser cursor",
+    "expression_cursor_depth_is_bounded": "Expression parser cursor",
+    "expression_cursor_nonterminal_event_strictly_decreases_work_rank": "Expression parser cursor",
+    "expression_cursor_finish_is_total_only_at_terminal_cursor": "Expression parser cursor",
+    "fnmatch_class_body_start_subrange": "fnmatch iterative refinement",
+    "fnmatch_class_end_subrange": "fnmatch iterative refinement",
+    "fnmatch_tokens_refine_recursive_at": "fnmatch iterative refinement",
+    "fnmatch_token_spec_unfold": "fnmatch iterative refinement",
+    "fnmatch_tokens_refine_recursive_spec": "fnmatch iterative refinement",
+}
 
 
 STRATEGIES = {
@@ -275,7 +301,10 @@ SEQUENCE_ALGEBRA_PROOFS = {
 
 STATE_MACHINE_COMPONENTS = {
     "Authorization evaluator",
+    "Cache transaction state machine",
+    "Expression parser cursor",
     "Request body phase machine",
+    "Resource lease ownership",
     "Dynamic outcome lifecycle",
     "Rewrite rule transitions",
     "Rewrite program machine",
@@ -321,6 +350,7 @@ REFINED_INDUCTION_PROOFS = {
     "cache_key_hex_spec_head",
     "cache_key_hex_spec_tail",
     "cache_key_hex_spec_injective",
+    "fnmatch_tokens_refine_recursive_spec",
 }
 
 
@@ -351,6 +381,59 @@ ACRONYMS = {
 
 
 PROPERTY_OVERRIDES = {
+    "cache_transaction_step_preserves_invariant": (
+        "Every admitted cache lookup, reauthorization, hit/miss, store, publication, reload, "
+        "invalidation, abandonment, and completion transition preserves the transaction invariant."
+    ),
+    "retired_cache_transaction_cannot_serve_or_publish": (
+        "A cache transaction retired by a reload admits no later serving or publication event."
+    ),
+    "invalidated_cache_transaction_cannot_serve_or_publish": (
+        "A transaction fenced by targeted invalidation admits no later serving or publication event."
+    ),
+    "cache_hit_requires_current_reauthorized_generation": (
+        "A cache hit can reach Served only after current-generation reauthorization and an entry "
+        "from that same generation."
+    ),
+    "cache_publication_requires_current_reauthorized_generation": (
+        "Publication can reach Published only for the request's current generation and targeted-"
+        "invalidation serial."
+    ),
+    "pcre_source_certificate_covers_every_byte_and_event": (
+        "A finished PCRE source certificate covers the exact admitted source length and exactly "
+        "one grammar event per contiguous lexer event."
+    ),
+    "lease_ownership_step_preserves_invariant": (
+        "Every admitted acquisition, queue, task, output, cancellation, and release transition "
+        "preserves the move-only lease invariant."
+    ),
+    "lease_queue_task_and_output_require_acquisition": (
+        "Queued, running, output, and queued-output phases all retain an acquired unreleased owner."
+    ),
+    "lease_cancellation_preserves_live_owner": (
+        "Cancellation marks a live lease without releasing the capacity still owned by its work."
+    ),
+    "lease_terminal_release_is_exactly_once": (
+        "A released lease has exactly one release and rejects a second release transition."
+    ),
+    "expression_cursor_advance_strictly_decreases_remaining": (
+        "Every admitted expression-parser byte advance strictly reduces the remaining source."
+    ),
+    "expression_cursor_depth_is_bounded": (
+        "Every admitted recursive parser entry remains within the configured depth limit."
+    ),
+    "expression_cursor_nonterminal_event_strictly_decreases_work_rank": (
+        "Every admitted nonterminal parser event consumes finite work rank, including a backward "
+        "speculative restore."
+    ),
+    "expression_cursor_finish_is_total_only_at_terminal_cursor": (
+        "The parser accepts Finish exactly when every source byte is consumed and recursion depth "
+        "has returned to zero."
+    ),
+    "fnmatch_tokens_refine_recursive_spec": (
+        "For arbitrary patterns and values, the token semantics used by the iterative matcher "
+        "equals the original recursive fnmatch specification."
+    ),
     "admitted_pcre_ast_has_one_closed_root": (
         "An admitted normalized PCRE AST certificate is bound to the source, nonempty, "
         "single-rooted, and cannot report more captures than nodes."
@@ -450,11 +533,13 @@ def parse_proofs(text: str) -> list[Proof]:
     return proofs
 
 
-def component_for(line: int) -> str:
+def component_for(proof: Proof) -> str:
+    if proof.name in COMPONENT_OVERRIDES:
+        return COMPONENT_OVERRIDES[proof.name]
     for start, end, component in COMPONENT_RANGES:
-        if start <= line <= end:
+        if start <= proof.line <= end:
             return component
-    raise ValueError(f"no component classification for source line {line}")
+    raise ValueError(f"no component classification for source line {proof.line}")
 
 
 def strategy_for(proof: Proof, component: str) -> str:
@@ -505,7 +590,7 @@ def escape_cell(text: str) -> str:
 def render(proofs: list[Proof]) -> str:
     classified: list[tuple[Proof, str, str]] = []
     for proof in proofs:
-        component = component_for(proof.line)
+        component = component_for(proof)
         classified.append((proof, component, strategy_for(proof, component)))
 
     strategy_counts = Counter(strategy for _, _, strategy in classified)

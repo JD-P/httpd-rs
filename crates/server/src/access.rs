@@ -1636,6 +1636,12 @@ fn reverse_dns_matches_cancellable(
     }
 
     impl DnsJob {
+        fn mark_running(&self) -> bool {
+            self.async_work
+                .as_ref()
+                .is_none_or(|lease| lease.mark_running().is_ok())
+        }
+
         fn is_cancelled(&self) -> bool {
             self.async_work
                 .as_ref()
@@ -1740,6 +1746,10 @@ fn reverse_dns_matches_cancellable(
                             let Ok(job) = job else {
                                 break;
                             };
+                            if !job.mark_running() {
+                                let _ = job.reply.try_send(None);
+                                continue;
+                            }
                             let result = isolated_lookup(&job, &mut unreaped);
                             let _ = job.reply.try_send(result);
                         }
@@ -1767,6 +1777,12 @@ fn reverse_dns_matches_cancellable(
         Ok(work) => work,
         Err(_) => return false,
     };
+    if async_work
+        .as_ref()
+        .is_some_and(|lease| lease.mark_queued().is_err())
+    {
+        return false;
+    }
 
     let (reply, result) = mpsc::sync_channel(1);
     let deadline = Instant::now() + Duration::from_secs(2);

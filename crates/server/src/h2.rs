@@ -1521,7 +1521,11 @@ where
     T: Send + 'static,
 {
     let async_work = scope.try_async_work()?;
+    async_work.mark_queued()?;
     Ok(crate::fault::spawn_blocking(move || {
+        async_work
+            .mark_running()
+            .expect("queued HTTP/2 worker retained its ownership lease");
         let _async_work = async_work;
         work()
     }))

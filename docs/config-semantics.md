@@ -1940,9 +1940,9 @@ The following remain assumptions or separate proofs:
   verified option-scope and exact-source certificate into translation; the
   complete normalized semantic AST is structurally certified and must
   round-trip exactly before the private matcher capability can be constructed.
-  Byte-to-event completeness, stock-PCRE2 source equivalence and the
-  dependency engine's internals remain checked by contract plus the test-only
-  PCRE2 10.46 oracle;
+  Contiguous byte-to-event coverage is now the executable verified source
+  machine. Stock-PCRE2 language equivalence and the dependency engine's
+  internals remain checked by contract plus the test-only PCRE2 10.46 oracle;
 - the filesystem contents match what the access-file walk sees;
 - path canonicalization and `openat` containment (already separately
   verified in `crates/verified`);
@@ -1991,7 +1991,21 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **1012 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **1070 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+
+- `CacheTransactionState` closes lookup, current-generation reauthorization,
+  hit/miss, store, publication, reload retirement and targeted invalidation.
+  The production cache advances this executable machine while one publication
+  barrier linearizes serving and publication against reload/invalidation; a
+  nonwrapping invalidation serial prevents an older miss from republishing.
+- `LeaseOwnershipState` is the central acquire/queue/task/output/cancel/release
+  machine used by every `SlotLease`. Verified atomic encoding makes acquisition
+  dominate every handoff, cancellation retain its live owner, and terminal
+  release happen at most once before runtime counters are decremented.
+- The PCRE positive parser now certifies each contiguous source span and grammar
+  event, the production rolling-row fnmatch implementation is proved equal to
+  its recursive specification for arbitrary patterns and values, and the
+  expression parser consumes a verified bounded cursor/depth/work machine.
 
 - The forked h2 HPACK path calls executable verified kernels for the total
   five-family representation classifier, header-block phase (including the

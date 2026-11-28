@@ -2437,6 +2437,12 @@ struct DnsJob {
 }
 
 impl DnsJob {
+    fn mark_running(&self) -> bool {
+        self.async_work
+            .as_ref()
+            .is_none_or(|lease| lease.mark_running().is_ok())
+    }
+
     fn is_cancelled(&self) -> bool {
         self.async_work
             .as_ref()
@@ -2567,6 +2573,12 @@ fn dns_sender() -> &'static SyncSender<DnsJob> {
                         let Ok(job) = job else {
                             break;
                         };
+                        if !job.mark_running() {
+                            let _ = job.reply.send(Err(std::io::Error::other(
+                                "proxy DNS job lost queue ownership",
+                            )));
+                            continue;
+                        }
                         let result = isolated_dns_lookup(&job, &mut unreaped);
                         let _ = job.reply.send(result);
                     }
@@ -2599,6 +2611,9 @@ fn submit_dns(
     let async_work = request_scope
         .map(crate::resource::RequestScope::try_async_work)
         .transpose()?;
+    if let Some(lease) = &async_work {
+        lease.mark_queued()?;
+    }
     // A DNS job has exactly one terminal result. Keep that ownership bound in
     // the channel type instead of relying on the worker's send convention.
     let (reply, rx) = mpsc::sync_channel(1);

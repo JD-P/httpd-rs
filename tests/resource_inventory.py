@@ -72,7 +72,7 @@ VARIABLE_DEPENDENCY_NAMESPACES = {
     ("crates/server/src/tls.rs", "rustls"): 14,
     ("crates/server/src/whole_request_fuzz.rs", "h2"): 2,
     ("crates/pcre2/src/lib.rs", "regex_automata"): 1,
-    ("crates/pcre2/src/lib.rs", "regex_syntax"): 6,
+    ("crates/pcre2/src/lib.rs", "regex_syntax"): 16,
 }
 
 # Each remotely or backend influenced variable-cost library entry point names
@@ -156,7 +156,8 @@ ALLOWED_MUTABLE_STATICS = {
     ("apache_regex.rs", "COMPILE_BUDGET"),
     ("auth.rs", "CACHE"), ("auth.rs", "NEXT_TEMP"),
     ("auth.rs", "PASSWORD_VERIFY_CALLS"),
-    ("cache.rs", "CACHE_EPOCH"), ("cache.rs", "BARRIER"),
+    ("cache.rs", "CACHE_EPOCH"), ("cache.rs", "CACHE_INVALIDATION_SERIAL"),
+    ("cache.rs", "BARRIER"),
     ("cache.rs", "CACHE"),
     ("cache.rs", "USAGE"), ("cache.rs", "SCAN"), ("cache.rs", "LOCKS"),
     ("cgi.rs", "POOL"),

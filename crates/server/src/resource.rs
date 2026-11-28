@@ -11,7 +11,7 @@ use std::net::IpAddr;
 use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -963,6 +963,11 @@ impl RequestScope {
                 "request scope cancelled during blocking I/O admission",
             ));
         }
+        if !slot.mark_running() {
+            return Err(io::Error::other(
+                "blocking I/O lease failed to enter running ownership",
+            ));
+        }
         Ok(BlockingIoLease {
             _slot: slot,
             _scope: Some(self.clone()),
@@ -987,8 +992,31 @@ pub(crate) struct AsyncWorkLease {
 }
 
 impl AsyncWorkLease {
+    /// Record the queue insertion before the lease is moved into the queued
+    /// object. A failed insertion simply drops a `Queued` owner, which is an
+    /// admitted terminal release in the same machine.
+    pub(crate) fn mark_queued(&self) -> io::Result<()> {
+        self._slot.mark_queued().then_some(()).ok_or_else(|| {
+            io::Error::other("async work lease was queued from an invalid ownership phase")
+        })
+    }
+
+    /// Called by the consumer immediately after removing the owned item from
+    /// its queue and before touching request state.
+    pub(crate) fn mark_running(&self) -> io::Result<()> {
+        self._slot.mark_running().then_some(()).ok_or_else(|| {
+            io::Error::other("async work lease started from an invalid ownership phase")
+        })
+    }
+
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.scope.is_cancelled()
+        let cancelled = self.scope.is_cancelled();
+        if cancelled {
+            // Cancellation marks, but deliberately does not release, the
+            // queued/running owner. Drop remains the sole terminal release.
+            let _ = self._slot.mark_cancelled();
+        }
+        cancelled
     }
 }
 
@@ -1565,9 +1593,56 @@ pub(crate) struct SlotLease {
     request_limit: Option<u64>,
     physical: [u64; PhysicalKind::COUNT],
     active: bool,
+    ownership: AtomicU8,
 }
 
 impl SlotLease {
+    fn ownership_event(&self, event: httpd_rs_verified::LeaseOwnershipEvent) -> bool {
+        let mut raw = self.ownership.load(Ordering::Acquire);
+        loop {
+            let Some(state) = httpd_rs_verified::lease_ownership_decode(raw) else {
+                return false;
+            };
+            let Some(next) = httpd_rs_verified::lease_ownership_step(state, event) else {
+                return false;
+            };
+            let next_raw = httpd_rs_verified::lease_ownership_encode(next);
+            match self.ownership.compare_exchange_weak(
+                raw,
+                next_raw,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => raw = observed,
+            }
+        }
+    }
+
+    fn mark_queued(&self) -> bool {
+        self.ownership_event(httpd_rs_verified::LeaseOwnershipEvent::Queue)
+    }
+
+    fn mark_running(&self) -> bool {
+        self.ownership_event(httpd_rs_verified::LeaseOwnershipEvent::Start)
+    }
+
+    fn mark_output(&self) -> bool {
+        self.ownership_event(httpd_rs_verified::LeaseOwnershipEvent::BeginOutput)
+    }
+
+    fn mark_output_complete(&self) -> bool {
+        self.ownership_event(httpd_rs_verified::LeaseOwnershipEvent::FinishOutput)
+    }
+
+    fn mark_output_queued(&self) -> bool {
+        self.ownership_event(httpd_rs_verified::LeaseOwnershipEvent::QueueOutput)
+    }
+
+    fn mark_cancelled(&self) -> bool {
+        self.ownership_event(httpd_rs_verified::LeaseOwnershipEvent::Cancel)
+    }
+
     fn attribute_context(&mut self, context: ResourceContext) -> io::Result<()> {
         if !Arc::ptr_eq(&self.context.budget, &context.budget) {
             return Err(io::Error::new(
@@ -1645,6 +1720,14 @@ impl Drop for SlotLease {
     fn drop(&mut self) {
         if !self.active {
             return;
+        }
+        let ownership_released =
+            self.ownership_event(httpd_rs_verified::LeaseOwnershipEvent::Release);
+        if !ownership_released {
+            // Decrementing the physical counters without a live verified
+            // owner could underflow them and manufacture capacity. Treat an
+            // impossible ownership-state corruption as unrecoverable.
+            std::process::abort();
         }
         let index = self.kind.index();
         self.context.budget.slot_process[index].fetch_sub(self.amount, Ordering::AcqRel);
@@ -2504,6 +2587,9 @@ impl ResourceBudget {
             request_limit,
             physical,
             active: true,
+            ownership: AtomicU8::new(httpd_rs_verified::lease_ownership_encode(
+                httpd_rs_verified::lease_ownership_start(),
+            )),
         })
     }
 
@@ -2750,6 +2836,11 @@ impl ResourceBudget {
             Some(MAX_BLOCKING_IO_PER_REQUEST),
             "blocking I/O limit reached",
         )?;
+        if !slot.mark_running() {
+            return Err(io::Error::other(
+                "blocking I/O lease failed to enter running ownership",
+            ));
+        }
         Ok(BlockingIoLease {
             _slot: slot,
             _scope: None,
@@ -3476,6 +3567,16 @@ pub struct CombinedH2Lease {
     _slot: SlotLease,
 }
 
+impl CombinedH2Lease {
+    fn mark_output(&self) -> bool {
+        self._slot.mark_output()
+    }
+
+    fn mark_output_queued(&self) -> bool {
+        self._slot.mark_output_queued()
+    }
+}
+
 /// Keeps adapter-side stream admission alive while the h2 state machine owns
 /// the final queued objects for a response. The application task has finished
 /// at that point, but h2 may still retain a decoded `HeaderMap`, DATA buffer,
@@ -3506,6 +3607,16 @@ pub(crate) struct SlowInputLease {
 #[derive(Debug)]
 pub(crate) struct SlowOutputLease {
     _slot: SlotLease,
+}
+
+impl SlowOutputLease {
+    fn mark_output(&self) -> bool {
+        self._slot.mark_output()
+    }
+
+    fn mark_output_queued(&self) -> bool {
+        self._slot.mark_output_queued()
+    }
 }
 
 #[derive(Debug)]
@@ -3802,6 +3913,8 @@ pub(crate) struct SlowOutputAdmission {
 
 impl SlowOutputAdmission {
     pub(crate) fn tracked_h1(context: ResourceContext, general: SlotLease) -> Self {
+        let ownership_started = general.mark_output();
+        assert!(ownership_started, "HTTP/1 output lost its resource owner");
         Self {
             context,
             general: Some(GeneralOutputLease::H1(general)),
@@ -3813,6 +3926,8 @@ impl SlowOutputAdmission {
     }
 
     pub(crate) fn tracked_h2(context: ResourceContext, general: CombinedH2Lease) -> Self {
+        let ownership_started = general.mark_output();
+        assert!(ownership_started, "HTTP/2 output lost its resource owner");
         Self {
             context,
             general: Some(GeneralOutputLease::H2 { _lease: general }),
@@ -3865,6 +3980,15 @@ impl SlowOutputAdmission {
             ));
         }
         let admission = if self.is_slow() {
+            if !self
+                .slow
+                .as_ref()
+                .is_some_and(SlowOutputLease::mark_output_queued)
+            {
+                return Err(io::Error::other(
+                    "queued HTTP/2 response has an invalid slow-output owner",
+                ));
+            }
             let slow = self.slow.take().ok_or_else(|| {
                 io::Error::other("queued HTTP/2 response lost slow-output ownership")
             })?;
@@ -3876,6 +4000,14 @@ impl SlowOutputAdmission {
             }
             QueuedH2Admission::Slow { _lease: slow }
         } else {
+            if !self.general.as_ref().is_some_and(|general| match general {
+                GeneralOutputLease::H2 { _lease } => _lease.mark_output_queued(),
+                GeneralOutputLease::H1(_) => false,
+            }) {
+                return Err(io::Error::other(
+                    "queued HTTP/2 response has an invalid general owner",
+                ));
+            }
             match self.general.take() {
                 Some(GeneralOutputLease::H2 { _lease }) => QueuedH2Admission::General { _lease },
                 other => {
@@ -3955,6 +4087,11 @@ impl SlowOutputAdmission {
                     "HTTP/2 stream capacity exhausted after request body",
                 )
             })?;
+        if !general.mark_output() {
+            return Err(io::Error::other(
+                "reacquired HTTP/2 stream lost output ownership",
+            ));
+        }
         self.general = Some(GeneralOutputLease::H2 { _lease: general });
         self.input_phase = Some(next);
         drop(self.slow_input.take());
@@ -3993,6 +4130,11 @@ impl SlowOutputAdmission {
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::WouldBlock, "slow-output capacity exhausted")
             })?;
+        if !slow.mark_output() {
+            return Err(io::Error::other(
+                "slow-output lease could not enter output ownership",
+            ));
+        }
         transfer()?;
         self.phase = next;
         self.slow = Some(slow);
@@ -4028,7 +4170,13 @@ impl SlowOutputAdmission {
             None
         } else {
             match self.general.take() {
-                Some(GeneralOutputLease::H1(lease)) => Some(lease),
+                Some(GeneralOutputLease::H1(lease)) => {
+                    assert!(
+                        lease.mark_output_complete(),
+                        "completed HTTP/1 output lost its reusable connection owner"
+                    );
+                    Some(lease)
+                }
                 _ => None,
             }
         };
@@ -4255,8 +4403,11 @@ mod tests {
         assert_eq!(gauge.current, 1);
         assert_eq!(gauge.high_water, 1);
 
+        work.mark_queued().unwrap();
+        assert!(work.mark_queued().is_err());
         scope.cancel();
         assert!(work.is_cancelled());
+        work.mark_running().unwrap();
         assert!(scope.try_async_work().is_err());
         assert_eq!(
             budget

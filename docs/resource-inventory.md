@@ -17,10 +17,12 @@ HTTP/1 keep-alive, H2 streams and WebSocket tunnels cannot create new work
 under old policy. Rejected candidates do not retire the still-current state.
 Admission decisions hold the generation gate's read side; reload commit takes
 the write side, so a request is ordered entirely before or after retirement.
-One process-wide read/write barrier covers only final cache publication and
-administrative generation cleanup, ensuring a retired request cannot recreate
-an old-root entry after reload without serializing ordinary cache reads or
-response construction.
+One process-wide read/write barrier covers final cache publication, cache-hit
+linearization and administrative generation cleanup. A nonwrapping targeted-
+invalidation serial is captured with each cache transaction and advanced under
+the write side. A retired request therefore cannot recreate an old-root entry
+after reload, and a pre-invalidation miss cannot republish its entry after the
+targeted removal, without serializing ordinary response construction.
 
 The slot ledger covers pending connections, HTTP/1 workers, slow-body workers,
 TLS handshakes, HTTP/2 connections, ordinary streams and a shared source-fair
@@ -58,6 +60,17 @@ The process/client/request ceilings are 512/64/4. HTTP/1 backend/dispatch
 handoffs, HTTP/2 policy/backend blocking work, proxy DNS, and `Require host`
 reverse DNS use this boundary. Response file/stream reads retain their more
 specific move-only `ResponseBodyReadLease` and output-ownership state instead.
+
+Every central slot now carries the same verified ownership machine. The lease
+starts in `Held`, queue insertion advances it to `Queued`, the consumer advances
+it to `Running`, and response paths advance through `Output`/`OutputQueued`.
+Fast HTTP/1 completion explicitly returns `Output` to reusable `Held`; an HTTP/2
+stream reacquired after request-body wait re-enters `Output` before it can emit.
+`Drop` performs the only `Released` transition before decrementing the typed and
+physical counters. Cancellation is an orthogonal mark and cannot release work
+still reachable from a queue, task or transport. The atomic representation is
+itself verified to decode only valid ownership states and rejects a second
+release.
 
 Synchronous filesystem ownership is projected through the same request scope.
 The complete local filesystem phase acquires one re-entrant guard; URL-space

@@ -53,6 +53,10 @@ type PolicyFingerprint = [u8; 32];
 /// value; entries from an older generation are never served, even if their
 /// body/meta files survived the reload cleanup.
 static CACHE_EPOCH: AtomicU64 = AtomicU64::new(1);
+/// Monotonic publication fence for unsafe-method/targeted invalidation. It is
+/// separate from the representation epoch so unrelated resident entries stay
+/// usable while in-flight writers from before an invalidation are retired.
+static CACHE_INVALIDATION_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 fn current_epoch() -> u64 {
     CACHE_EPOCH.load(Ordering::SeqCst)
@@ -63,7 +67,40 @@ pub(crate) fn active_epoch() -> u64 {
 }
 
 fn bump_epoch() -> u64 {
-    CACHE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1
+    let mut current = CACHE_EPOCH.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = current.checked_add(1) else {
+            // Generation identity must never wrap and make a retired request
+            // equal to a future configuration. Exhaustion is unrecoverable.
+            std::process::abort();
+        };
+        match CACHE_EPOCH.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn current_invalidation_serial() -> u64 {
+    CACHE_INVALIDATION_SERIAL.load(Ordering::SeqCst)
+}
+
+fn bump_invalidation_serial() -> u64 {
+    let mut current = CACHE_INVALIDATION_SERIAL.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = current.checked_add(1) else {
+            std::process::abort();
+        };
+        match CACHE_INVALIDATION_SERIAL.compare_exchange_weak(
+            current,
+            next,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// Linearizes the final publication of a cache entry with administrative
@@ -571,6 +608,9 @@ pub struct CacheContext {
     /// Epoch captured when this request's policy/cache plan was compiled.
     /// It must never be replaced with the process-global epoch at completion.
     epoch: u64,
+    /// Targeted-invalidation serial captured with the plan. Unlike `epoch`,
+    /// changing this value retires only pending publishers, not extant entries.
+    invalidation_serial: u64,
     authorization: crate::access::AuthorizedOutcome,
     /// Fully qualified cache key binding listener, vhost, URL, mapped target
     /// and policy.  Lookup and store must use this exact key.
@@ -579,6 +619,10 @@ pub struct CacheContext {
     /// REMOTE_PORT. Static representations cannot, and retaining this bit
     /// keeps their cache entries reusable across client connections.
     backend_transport_visible: bool,
+    /// Move-only request-local cache transaction.  The executable transition
+    /// is verified and is advanced only while the generation barrier gives
+    /// lookup/publication a concrete order with reload and invalidation.
+    transaction: httpd_rs_verified::CacheTransactionState,
 }
 
 impl CacheContext {
@@ -603,6 +647,14 @@ impl CacheContext {
             .identity()
             .resolved_fs_path()
             .expect("a cache authorization always retains its resolved target")
+    }
+
+    fn transition(&mut self, event: httpd_rs_verified::CacheTransactionEvent) -> bool {
+        let Some(next) = httpd_rs_verified::cache_transaction_step(self.transaction, event) else {
+            return false;
+        };
+        self.transaction = next;
+        true
     }
 }
 
@@ -1097,11 +1149,15 @@ pub fn request_scope_with_plan(
             httpd_rs_verified::TransformSink::Cache,
         )
     })?;
+    let epoch = cfg.cache_epoch();
+    let invalidation_serial = current_invalidation_serial();
     Some(CacheContext {
-        epoch: cfg.cache_epoch(),
+        epoch,
+        invalidation_serial,
         authorization,
         key,
         backend_transport_visible,
+        transaction: httpd_rs_verified::cache_transaction_start(epoch, invalidation_serial),
     })
 }
 
@@ -1429,29 +1485,68 @@ pub fn lookup_authorized(
     req: &Request,
     host: &str,
     peer: SocketAddr,
-    context: &CacheContext,
+    context: &mut CacheContext,
 ) -> Option<Response> {
-    let authorization = context.authorization();
-    if !authorization.require_sink(
-        cfg.authorization_generation(),
-        httpd_rs_verified::TransformSink::Cache,
-    ) {
+    let active_epoch = cfg.cache_epoch();
+    if !context.transition(httpd_rs_verified::CacheTransactionEvent::BeginLookup { active_epoch })
+        || context.transaction.phase == httpd_rs_verified::CacheTransactionPhase::Retired
+    {
         return None;
     }
-    lookup(
+
+    // A cache hit is a serving decision, not merely a map read.  Hold the
+    // same barrier used by publication and generation retirement until that
+    // decision is recorded in the verified transaction.  Consequently a
+    // reload/invalidation is either wholly before the hit (and rejects it) or
+    // wholly after it (and removes the representation for future requests).
+    let _generation = generation_barrier()
+        .read()
+        .unwrap_or_else(|error| error.into_inner());
+    let active_epoch = cfg.cache_epoch();
+    let authorization_current = context.authorization.require_sink(
+        cfg.authorization_generation(),
+        httpd_rs_verified::TransformSink::Cache,
+    );
+    if !context.transition(httpd_rs_verified::CacheTransactionEvent::Reauthorize {
+        active_epoch,
+        authorization_current,
+    }) || context.transaction.phase != httpd_rs_verified::CacheTransactionPhase::Reauthorized
+    {
+        return None;
+    }
+    let response = lookup(
         cfg,
         vhost,
         req,
         host,
         context.path(),
-        authorization.scope(),
+        context.authorization.scope(),
         peer,
-        authorization.grant(),
+        context.authorization.grant(),
         &context.key,
         context.target(),
         context.backend_transport_visible,
         context.epoch,
-    )
+    );
+    let event = if response.is_some() {
+        httpd_rs_verified::CacheTransactionEvent::Hit {
+            active_epoch: cfg.cache_epoch(),
+            entry_epoch: context.epoch,
+            binding_current: true,
+        }
+    } else {
+        httpd_rs_verified::CacheTransactionEvent::Miss {
+            active_epoch: cfg.cache_epoch(),
+        }
+    };
+    if !context.transition(event) {
+        return None;
+    }
+    if context.transaction.phase == httpd_rs_verified::CacheTransactionPhase::Served {
+        response
+    } else {
+        None
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2544,30 +2639,56 @@ pub fn store_authorized(
     host: &str,
     peer: SocketAddr,
     resp: &mut Response,
-    context: &CacheContext,
+    context: &mut CacheContext,
 ) {
-    let authorization = context.authorization();
-    if !authorization.require_sink(
+    if !context.authorization.require_sink(
         cfg.authorization_generation(),
         httpd_rs_verified::TransformSink::Cache,
     ) {
+        let _ = context.transition(httpd_rs_verified::CacheTransactionEvent::Abandon);
         return;
     }
-    store(
+    let active_epoch = cfg.cache_epoch();
+    if !context.transition(httpd_rs_verified::CacheTransactionEvent::BeginStore {
+        active_epoch,
+        active_invalidation_serial: current_invalidation_serial(),
+    }) || context.transaction.phase != httpd_rs_verified::CacheTransactionPhase::Store
+    {
+        return;
+    }
+    let CacheContext {
+        epoch,
+        invalidation_serial,
+        authorization,
+        key,
+        backend_transport_visible,
+        transaction,
+    } = context;
+    let path = authorization.identity().selected_url_path();
+    let target = authorization
+        .identity()
+        .resolved_fs_path()
+        .expect("a cache authorization always retains its resolved target");
+    store_inner(
         cfg,
         vhost,
         req,
         host,
-        context.path(),
+        path,
         authorization.scope(),
         peer,
         resp,
         authorization.grant(),
-        &context.key,
-        context.target(),
-        context.backend_transport_visible,
-        context.epoch,
+        key,
+        target,
+        *backend_transport_visible,
+        *epoch,
+        *invalidation_serial,
+        Some(transaction),
     );
+    if context.transaction.phase == httpd_rs_verified::CacheTransactionPhase::Store {
+        let _ = context.transition(httpd_rs_verified::CacheTransactionEvent::Abandon);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2585,6 +2706,43 @@ pub fn store(
     target: &std::path::Path,
     backend_transport_visible: bool,
     request_epoch: u64,
+) {
+    store_inner(
+        cfg,
+        vhost,
+        req,
+        host,
+        path,
+        scope,
+        peer,
+        resp,
+        grant,
+        cache_key,
+        target,
+        backend_transport_visible,
+        request_epoch,
+        current_invalidation_serial(),
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_inner(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
+    host: &str,
+    path: &str,
+    scope: &Scope,
+    peer: SocketAddr,
+    resp: &mut Response,
+    grant: &AccessGrant,
+    cache_key: &str,
+    target: &std::path::Path,
+    backend_transport_visible: bool,
+    request_epoch: u64,
+    request_invalidation_serial: u64,
+    mut transaction: Option<&mut httpd_rs_verified::CacheTransactionState>,
 ) {
     if !httpd_rs_verified::cache_generation_admit(request_epoch, cfg.cache_epoch()) {
         return;
@@ -2752,11 +2910,50 @@ pub fn store(
     let _generation = generation_barrier()
         .read()
         .unwrap_or_else(|error| error.into_inner());
+    let active_invalidation_serial = current_invalidation_serial();
+    if transaction.is_some() && request_invalidation_serial != active_invalidation_serial {
+        if let Some(transaction) = transaction.as_deref_mut() {
+            if let Some(next) = httpd_rs_verified::cache_transaction_step(
+                *transaction,
+                httpd_rs_verified::CacheTransactionEvent::Invalidate,
+            ) {
+                *transaction = next;
+            }
+        }
+        return;
+    }
     if !httpd_rs_verified::cache_generation_admit(request_epoch, cfg.cache_epoch()) {
+        if let Some(transaction) = transaction.as_deref_mut() {
+            if let Some(next) = httpd_rs_verified::cache_transaction_step(
+                *transaction,
+                httpd_rs_verified::CacheTransactionEvent::Retire {
+                    active_epoch: cfg.cache_epoch(),
+                },
+            ) {
+                *transaction = next;
+            }
+        }
         return;
     }
     if crate::fault::hit("transition.cache.store.commit").is_err() {
         return;
+    }
+    if let Some(transaction) = transaction.as_deref_mut() {
+        let Some(next) = httpd_rs_verified::cache_transaction_step(
+            *transaction,
+            httpd_rs_verified::CacheTransactionEvent::Publish {
+                active_epoch: cfg.cache_epoch(),
+                entry_epoch: entry.epoch,
+                active_invalidation_serial,
+            },
+        ) else {
+            return;
+        };
+        if next.phase != httpd_rs_verified::CacheTransactionPhase::Published {
+            *transaction = next;
+            return;
+        }
+        *transaction = next;
     }
     disk_store(cfg, &key, &entry);
     insert_memory(cfg, &key, Arc::new(entry));
@@ -2856,7 +3053,10 @@ fn invalidate_disk(cfg: &Config) {
 /// Remove only disk entries whose embedded, complete key has the selected
 /// canonical request-URI prefix.  Unkeyed legacy/corrupt metadata and orphan
 /// temporary/body files are removed conservatively during the same scan.
-fn invalidate_disk_prefix(cfg: &Config, prefix: &[u8]) {
+/// The caller owns the write side of `generation_barrier`.  This makes removal
+/// one transaction with in-memory invalidation and prevents a hit from being
+/// linearized after invalidation has completed.
+fn invalidate_disk_prefix_locked(cfg: &Config, prefix: &[u8]) {
     let Some(root) = &cfg.cache.root else {
         return;
     };
@@ -2867,9 +3067,6 @@ fn invalidate_disk_prefix(cfg: &Config, prefix: &[u8]) {
         // A bounded scan could not establish which persisted entries are
         // affected. Advance the generation so none of them can be served,
         // and release the bounded in-memory cache as the fail-closed path.
-        let _generation = generation_barrier()
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
         cfg.set_cache_epoch(bump_epoch());
         *entries().lock().unwrap_or_else(|e| e.into_inner()) = MemoryCache::default();
         return;
@@ -2909,6 +3106,13 @@ fn invalidate_disk_prefix(cfg: &Config, prefix: &[u8]) {
 }
 
 pub fn invalidate(cfg: &Config, host: &str, path: &str) {
+    let _generation = generation_barrier()
+        .write()
+        .unwrap_or_else(|error| error.into_inner());
+    // A publisher which already held the read side finishes before this
+    // point and is removed below. A publisher which acquires it later sees a
+    // different serial and cannot recreate the invalidated representation.
+    bump_invalidation_serial();
     // Keep the prefix in the same lossless encoding as `base_key`; a lossy
     // `display()` prefix no longer matches keys and would leave stale entries
     // after an unsafe method (F55/I51).
@@ -2934,7 +3138,7 @@ pub fn invalidate(cfg: &Config, host: &str, path: &str) {
         }
     }
     drop(cache);
-    invalidate_disk_prefix(cfg, prefix.as_bytes());
+    invalidate_disk_prefix_locked(cfg, prefix.as_bytes());
 }
 
 fn invalidation_location_path(
@@ -3109,6 +3313,61 @@ mod tests {
     }
 
     #[test]
+    fn targeted_invalidation_retires_preexisting_cache_transaction() {
+        use httpd_rs_verified::{CacheTransactionEvent as Event, CacheTransactionPhase as Phase};
+
+        let (dir, cfg) = disk_test_config("invalidation-transaction");
+        let epoch = cfg.cache_epoch();
+        let serial = current_invalidation_serial();
+        let mut transaction = httpd_rs_verified::cache_transaction_start(epoch, serial);
+        transaction = httpd_rs_verified::cache_transaction_step(
+            transaction,
+            Event::BeginLookup {
+                active_epoch: epoch,
+            },
+        )
+        .unwrap();
+        transaction = httpd_rs_verified::cache_transaction_step(
+            transaction,
+            Event::Reauthorize {
+                active_epoch: epoch,
+                authorization_current: true,
+            },
+        )
+        .unwrap();
+        transaction = httpd_rs_verified::cache_transaction_step(
+            transaction,
+            Event::Miss {
+                active_epoch: epoch,
+            },
+        )
+        .unwrap();
+
+        invalidate(&cfg, "example.test", "/stale");
+        let active_serial = current_invalidation_serial();
+        assert_ne!(serial, active_serial);
+        transaction = httpd_rs_verified::cache_transaction_step(
+            transaction,
+            Event::BeginStore {
+                active_epoch: epoch,
+                active_invalidation_serial: active_serial,
+            },
+        )
+        .unwrap();
+        assert_eq!(transaction.phase, Phase::Invalidated);
+        assert!(httpd_rs_verified::cache_transaction_step(
+            transaction,
+            Event::Publish {
+                active_epoch: epoch,
+                entry_epoch: epoch,
+                active_invalidation_serial: active_serial,
+            },
+        )
+        .is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn authorized_entry_points_reject_another_configuration_generation() {
         let (dir, cfg) = disk_test_config("stale-authorization");
         let request = test_request();
@@ -3138,17 +3397,30 @@ mod tests {
         .and_then(|plan| plan.into_outcome(generation, httpd_rs_verified::TransformSink::Cache))
         .expect("cache outcome for the old generation");
         let key = format!("stale-authorization-{}", std::process::id());
-        let context = CacheContext {
+        let mut context = CacheContext {
             epoch: cfg.cache_epoch(),
+            invalidation_serial: current_invalidation_serial(),
             authorization,
             key: key.clone(),
             backend_transport_visible: false,
+            transaction: httpd_rs_verified::cache_transaction_start(
+                cfg.cache_epoch(),
+                current_invalidation_serial(),
+            ),
         };
         let peer = "127.0.0.1:12345".parse().unwrap();
 
-        assert!(lookup_authorized(&cfg, None, &request, "host", peer, &context).is_none());
+        assert!(lookup_authorized(&cfg, None, &request, "host", peer, &mut context).is_none());
         let mut response = Response::bytes(200, "text/plain", b"must not cache".to_vec());
-        store_authorized(&cfg, None, &request, "host", peer, &mut response, &context);
+        store_authorized(
+            &cfg,
+            None,
+            &request,
+            "host",
+            peer,
+            &mut response,
+            &mut context,
+        );
         assert!(!entries()
             .lock()
             .unwrap_or_else(|error| error.into_inner())

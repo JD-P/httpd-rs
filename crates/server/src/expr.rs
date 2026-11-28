@@ -1054,7 +1054,7 @@ const MAX_EXPR_DEPTH: usize = 64;
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
-    depth: usize,
+    cursor: httpd_rs_verified::ExpressionParserCursor,
 }
 
 impl<'a> Parser<'a> {
@@ -1062,13 +1062,58 @@ impl<'a> Parser<'a> {
         Self {
             input,
             pos: 0,
-            depth: 0,
+            cursor: httpd_rs_verified::expression_parser_cursor_start(input.len() as u64),
         }
+    }
+
+    fn advance(&mut self, bytes: usize) {
+        let next = httpd_rs_verified::expression_parser_cursor_step(
+            self.cursor,
+            httpd_rs_verified::ExpressionParserCursorEvent::Advance {
+                bytes: bytes as u64,
+            },
+        )
+        .expect("expression parser advanced only within its checked source bounds");
+        self.cursor = next;
+        self.pos = next.pos as usize;
+    }
+
+    fn restore(&mut self, checkpoint: usize) {
+        let next = httpd_rs_verified::expression_parser_cursor_step(
+            self.cursor,
+            httpd_rs_verified::ExpressionParserCursorEvent::Restore {
+                checkpoint: checkpoint as u64,
+            },
+        )
+        .expect("expression parser restored only a previously visited checkpoint");
+        self.cursor = next;
+        self.pos = next.pos as usize;
+    }
+
+    fn enter_depth(&mut self) -> bool {
+        let Some(next) = httpd_rs_verified::expression_parser_cursor_step(
+            self.cursor,
+            httpd_rs_verified::ExpressionParserCursorEvent::Enter {
+                depth_limit: MAX_EXPR_DEPTH as u64,
+            },
+        ) else {
+            return false;
+        };
+        self.cursor = next;
+        true
+    }
+
+    fn exit_depth(&mut self) {
+        self.cursor = httpd_rs_verified::expression_parser_cursor_step(
+            self.cursor,
+            httpd_rs_verified::ExpressionParserCursorEvent::Exit,
+        )
+        .expect("every expression parser recursion entry has one exit");
     }
 
     fn skip(&mut self) {
         while self.pos < self.input.len() && self.input.as_bytes()[self.pos].is_ascii_whitespace() {
-            self.pos += 1;
+            self.advance(1);
         }
     }
 
@@ -1079,7 +1124,7 @@ impl<'a> Parser<'a> {
 
     fn take(&mut self, c: u8) -> bool {
         if self.peek() == Some(c) {
-            self.pos += 1;
+            self.advance(1);
             true
         } else {
             false
@@ -1094,28 +1139,28 @@ impl<'a> Parser<'a> {
             if b.is_ascii_whitespace() || b"()[]{},.'\"=!<>&|".contains(&b) {
                 break;
             }
-            self.pos += 1;
+            self.advance(1);
         }
         self.input[start..self.pos].to_string()
     }
 
     fn string(&mut self) -> Result<String, String> {
         let quote = self.input.as_bytes()[self.pos];
-        self.pos += 1;
+        self.advance(1);
         // Accumulate the original UTF-8 bytes instead of widening each byte
         // to a Unicode scalar. The latter turned `é` into `Ã©` and made an
         // escaped non-ASCII character particularly easy to corrupt.
         let mut out = Vec::new();
         while self.pos < self.input.len() {
             let b = self.input.as_bytes()[self.pos];
-            self.pos += 1;
+            self.advance(1);
             if b == quote {
                 return String::from_utf8(out)
                     .map_err(|_| "expression string is not valid UTF-8".to_string());
             }
             if b == b'\\' && self.pos < self.input.len() {
                 let n = self.input.as_bytes()[self.pos];
-                self.pos += 1;
+                self.advance(1);
                 out.push(match n {
                     b'n' => b'\n',
                     b'r' => b'\r',
@@ -1130,7 +1175,7 @@ impl<'a> Parser<'a> {
     }
 
     fn variable(&mut self) -> Result<Expr, String> {
-        self.pos += 2; // %{
+        self.advance(2); // %{
         let start = self.pos;
         let mut depth = 1;
         while self.pos < self.input.len() {
@@ -1140,13 +1185,13 @@ impl<'a> Parser<'a> {
                     depth -= 1;
                     if depth == 0 {
                         let name = self.input[start..self.pos].to_string();
-                        self.pos += 1;
+                        self.advance(1);
                         return Ok(Expr::Var(name));
                     }
                 }
                 _ => {}
             }
-            self.pos += 1;
+            self.advance(1);
         }
         Err("unterminated %{...}".into())
     }
@@ -1163,11 +1208,11 @@ impl<'a> Parser<'a> {
         if !delim.is_ascii() {
             return Err("regex delimiter must be ASCII".into());
         }
-        self.pos += 1;
+        self.advance(1);
         let mut out = Vec::new();
         while self.pos < self.input.len() {
             let b = self.input.as_bytes()[self.pos];
-            self.pos += 1;
+            self.advance(1);
             if b == delim {
                 let mut nocase = false;
                 while self.pos < self.input.len()
@@ -1184,7 +1229,7 @@ impl<'a> Parser<'a> {
                         return Err("duplicate expression regex modifier 'i'".into());
                     }
                     nocase = true;
-                    self.pos += 1;
+                    self.advance(1);
                 }
                 let out = String::from_utf8(out)
                     .map_err(|_| "expression regex is not valid UTF-8".to_string())?;
@@ -1193,7 +1238,7 @@ impl<'a> Parser<'a> {
             if b == b'\\' && self.pos < self.input.len() {
                 out.push(b'\\');
                 out.push(self.input.as_bytes()[self.pos]);
-                self.pos += 1;
+                self.advance(1);
             } else {
                 out.push(b);
             }
@@ -1202,13 +1247,11 @@ impl<'a> Parser<'a> {
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
-        self.depth += 1;
-        if self.depth > MAX_EXPR_DEPTH {
-            self.depth -= 1;
+        if !self.enter_depth() {
             return Err("expression exceeds maximum parse depth".into());
         }
         let r = self.primary_inner();
-        self.depth -= 1;
+        self.exit_depth();
         r
     }
 
@@ -1218,7 +1261,7 @@ impl<'a> Parser<'a> {
             return Err("unexpected end of expression".into());
         };
         if c == b'(' {
-            self.pos += 1;
+            self.advance(1);
             let e = self.or()?;
             if !self.take(b')') {
                 return Err("missing ')'".into());
@@ -1232,10 +1275,10 @@ impl<'a> Parser<'a> {
             return self.variable();
         }
         if c == b'$' {
-            self.pos += 1;
+            self.advance(1);
             let start = self.pos;
             while self.pos < self.input.len() && self.input.as_bytes()[self.pos].is_ascii_digit() {
-                self.pos += 1;
+                self.advance(1);
             }
             let idx = self.input[start..self.pos]
                 .parse::<usize>()
@@ -1243,7 +1286,7 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Capture(idx));
         }
         if c == b'{' {
-            self.pos += 1;
+            self.advance(1);
             let mut list = Vec::new();
             loop {
                 self.skip();
@@ -1265,16 +1308,16 @@ impl<'a> Parser<'a> {
         if c == b'-' {
             if let Some(rest) = self.input[self.pos..].strip_prefix("-in") {
                 if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-                    self.pos += 3;
+                    self.advance(3);
                     return Ok(Expr::Str("-in".into()));
                 }
             }
-            self.pos += 1;
+            self.advance(1);
             let start = self.pos;
             while self.pos < self.input.len()
                 && self.input.as_bytes()[self.pos].is_ascii_alphabetic()
             {
-                self.pos += 1;
+                self.advance(1);
             }
             let word = &self.input[start..self.pos];
             if !word.is_empty() {
@@ -1287,7 +1330,7 @@ impl<'a> Parser<'a> {
         if c.is_ascii_digit() {
             let start = self.pos;
             while self.pos < self.input.len() && self.input.as_bytes()[self.pos].is_ascii_digit() {
-                self.pos += 1;
+                self.advance(1);
             }
             return Ok(Expr::Int(self.input[start..self.pos].parse().unwrap_or(0)));
         }
@@ -1302,7 +1345,7 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Bool(false));
         }
         if self.peek() == Some(b'(') {
-            self.pos += 1;
+            self.advance(1);
             let mut args = Vec::new();
             loop {
                 self.skip();
@@ -1325,31 +1368,29 @@ impl<'a> Parser<'a> {
     }
 
     fn unary(&mut self) -> Result<Expr, String> {
-        self.depth += 1;
-        if self.depth > MAX_EXPR_DEPTH {
-            self.depth -= 1;
+        if !self.enter_depth() {
             return Err("expression exceeds maximum parse depth".into());
         }
         let r = self.unary_inner();
-        self.depth -= 1;
+        self.exit_depth();
         r
     }
 
     fn unary_inner(&mut self) -> Result<Expr, String> {
         self.skip();
         if self.peek() == Some(b'!') && self.input.as_bytes().get(self.pos + 1) != Some(&b'=') {
-            self.pos += 1;
+            self.advance(1);
             return Ok(Expr::Not(Box::new(self.unary()?)));
         }
         if let Some(c) = self.peek() {
             if c == b'-' {
                 let save = self.pos;
-                self.pos += 1;
+                self.advance(1);
                 let start = self.pos;
                 while self.pos < self.input.len()
                     && self.input.as_bytes()[self.pos].is_ascii_alphabetic()
                 {
-                    self.pos += 1;
+                    self.advance(1);
                 }
                 let op = &self.input[start..self.pos];
                 if matches!(op, "f" | "d" | "e" | "s" | "F" | "U" | "R") {
@@ -1358,7 +1399,7 @@ impl<'a> Parser<'a> {
                 if op == "n" || op == "z" {
                     return Ok(Expr::StrTest(Box::new(self.primary()?), op == "n"));
                 }
-                self.pos = save;
+                self.restore(save);
             }
         }
         self.primary()
@@ -1367,7 +1408,7 @@ impl<'a> Parser<'a> {
     fn concat(&mut self) -> Result<Expr, String> {
         let mut parts = vec![self.unary()?];
         while self.peek() == Some(b'.') {
-            self.pos += 1;
+            self.advance(1);
             parts.push(self.unary()?);
         }
         if parts.len() == 1 {
@@ -1404,7 +1445,7 @@ impl<'a> Parser<'a> {
         ];
         for op in ops {
             if self.input[self.pos..].starts_with(op) {
-                self.pos += op.len();
+                self.advance(op.len());
                 if op == "=~" || op == "!~" {
                     self.skip();
                     let (pat, nocase) = self.regex()?;
@@ -1450,7 +1491,7 @@ impl<'a> Parser<'a> {
         loop {
             self.skip();
             if self.input[self.pos..].starts_with("&&") {
-                self.pos += 2;
+                self.advance(2);
                 items.push(self.compare()?);
             } else {
                 break;
@@ -1468,7 +1509,7 @@ impl<'a> Parser<'a> {
         loop {
             self.skip();
             if self.input[self.pos..].starts_with("||") {
-                self.pos += 2;
+                self.advance(2);
                 items.push(self.and()?);
             } else {
                 break;
@@ -1494,6 +1535,11 @@ pub fn parse(input: &str) -> Result<Expr, String> {
     if p.pos != input.len() {
         return Err(format!("trailing expression input '{}'", &input[p.pos..]));
     }
+    let _terminal_cursor = httpd_rs_verified::expression_parser_cursor_step(
+        p.cursor,
+        httpd_rs_verified::ExpressionParserCursorEvent::Finish,
+    )
+    .ok_or_else(|| "expression parser did not reach a terminal cursor".to_string())?;
     Ok(e)
 }
 

@@ -817,7 +817,11 @@ where
     T: Send + 'static,
 {
     let async_work = scope.try_async_work()?;
+    async_work.mark_queued()?;
     spawn_connection_worker(move || {
+        async_work
+            .mark_running()
+            .expect("queued request worker retained its ownership lease");
         let _async_work = async_work;
         work()
     })
@@ -4447,7 +4451,7 @@ impl PreparedHandler {
                     .unwrap_or_else(|| cfg.resource_budget.context(peer.ip()));
                 if let Ok(_filesystem_work) = cfg.resource_budget.try_filesystem_phase_in(&context)
                 {
-                    if let Some(cache) = cache {
+                    if let Some(mut cache) = cache {
                         if cache.generation_is_current(cfg) {
                             if !outcome.consider_cache(true) {
                                 outcome.abort();
@@ -4460,7 +4464,7 @@ impl PreparedHandler {
                                 &host,
                                 peer,
                                 &mut response,
-                                &cache,
+                                &mut cache,
                             );
                         }
                     }
@@ -4881,7 +4885,7 @@ fn dispatch_inner_request(
             cache_scope = None;
         }
     }
-    if let Some(cache_ctx) = &cache_scope {
+    if let Some(cache_ctx) = &mut cache_scope {
         if let Some(resp) = crate::cache::lookup_authorized(cfg, vhost, req, host, peer, cache_ctx)
         {
             return resp;
@@ -4914,8 +4918,8 @@ fn dispatch_inner_request(
         };
         resp = Response::prepared_handler(finalizer);
     } else {
-        if let Some(cache_ctx) = cache_scope {
-            crate::cache::store_authorized(cfg, vhost, req, host, peer, &mut resp, &cache_ctx);
+        if let Some(mut cache_ctx) = cache_scope {
+            crate::cache::store_authorized(cfg, vhost, req, host, peer, &mut resp, &mut cache_ctx);
         }
         let unsafe_method = !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
         if httpd_rs_verified::cache_invalidation_status_admit(unsafe_method, resp.status) {

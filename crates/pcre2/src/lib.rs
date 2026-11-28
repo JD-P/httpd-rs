@@ -1680,17 +1680,30 @@ pub mod bytes {
             unicode_pattern: bool,
         ) -> Result<Self, Error> {
             let bytes = source.as_bytes();
-            let mut grammar =
-                httpd_rs_verified::pcre_grammar_start(initial_extended, initial_multiline);
+            let mut refinement = httpd_rs_verified::pcre_source_grammar_start(
+                bytes.len() as u64,
+                initial_extended,
+                initial_multiline,
+            );
             let mut i = 0usize;
             let mut repeatable = false;
             let mut branch_start = true;
 
             while i < bytes.len() {
-                let extended = grammar.options.extended;
-                let multiline = grammar.options.multiline;
+                let extended = refinement.grammar.options.extended;
+                let multiline = refinement.grammar.options.multiline;
                 if extended && pcre_extended_ascii_whitespace(bytes[i]) {
-                    i += 1;
+                    let end = i + 1;
+                    refinement = httpd_rs_verified::pcre_source_grammar_step(
+                        bytes,
+                        refinement,
+                        end,
+                        httpd_rs_verified::PcreSourceLexeme::Ignored,
+                        httpd_rs_verified::PcreGrammarEvent::Token,
+                        nest_limit,
+                    )
+                    .ok_or_else(|| Error::syntax_at(i, "invalid extended whitespace event"))?;
+                    i = end;
                     continue;
                 }
                 if extended && bytes[i] == b'#' {
@@ -1713,10 +1726,20 @@ pub mod bytes {
                             ));
                         }
                     }
-                    i = bytes[i..]
+                    let end = bytes[i..]
                         .iter()
                         .position(|&byte| byte == b'\n')
                         .map_or(bytes.len(), |relative| i + relative + 1);
+                    refinement = httpd_rs_verified::pcre_source_grammar_step(
+                        bytes,
+                        refinement,
+                        end,
+                        httpd_rs_verified::PcreSourceLexeme::Ignored,
+                        httpd_rs_verified::PcreGrammarEvent::Token,
+                        nest_limit,
+                    )
+                    .ok_or_else(|| Error::syntax_at(i, "invalid extended comment event"))?;
+                    i = end;
                     continue;
                 }
                 if extended
@@ -1737,14 +1760,27 @@ pub mod bytes {
 
                 match bytes[i] {
                     b'[' => {
-                        i = byte_class_end(source, i, crlf)?;
+                        let end = byte_class_end(source, i, crlf)?;
+                        refinement = httpd_rs_verified::pcre_source_grammar_step(
+                            bytes,
+                            refinement,
+                            end,
+                            httpd_rs_verified::PcreSourceLexeme::Class,
+                            httpd_rs_verified::PcreGrammarEvent::Token,
+                            nest_limit,
+                        )
+                        .ok_or_else(|| Error::syntax_at(i, "invalid class grammar event"))?;
+                        i = end;
                         repeatable = true;
                         branch_start = false;
                     }
                     b'\\' => {
                         if bytes.get(i + 1) == Some(&b'R') {
-                            let denied = httpd_rs_verified::pcre_grammar_step(
-                                grammar,
+                            let denied = httpd_rs_verified::pcre_source_grammar_step(
+                                bytes,
+                                refinement,
+                                i + 2,
+                                httpd_rs_verified::PcreSourceLexeme::AtomicLineEscape,
                                 httpd_rs_verified::PcreGrammarEvent::AtomicLineEscape,
                                 nest_limit,
                             );
@@ -1752,6 +1788,15 @@ pub mod bytes {
                             return Err(Error::unsupported(i, "atomic CRLF line sequence"));
                         }
                         let (end, can_repeat) = admitted_escape(bytes, i)?;
+                        refinement = httpd_rs_verified::pcre_source_grammar_step(
+                            bytes,
+                            refinement,
+                            end,
+                            httpd_rs_verified::PcreSourceLexeme::Escape,
+                            httpd_rs_verified::PcreGrammarEvent::Token,
+                            nest_limit,
+                        )
+                        .ok_or_else(|| Error::syntax_at(i, "invalid escape grammar event"))?;
                         i = end;
                         repeatable = can_repeat;
                         branch_start = false;
@@ -1761,15 +1806,30 @@ pub mod bytes {
                     }
                     b'(' if bytes.get(i + 1) == Some(&b'?') => {
                         match admitted_special_group(bytes, i, extended, multiline, branch_start)? {
-                            SpecialGroup::Comment { end } => i = end,
+                            SpecialGroup::Comment { end } => {
+                                refinement = httpd_rs_verified::pcre_source_grammar_step(
+                                    bytes,
+                                    refinement,
+                                    end,
+                                    httpd_rs_verified::PcreSourceLexeme::CommentGroup,
+                                    httpd_rs_verified::PcreGrammarEvent::Token,
+                                    nest_limit,
+                                )
+                                .ok_or_else(|| {
+                                    Error::syntax_at(i, "invalid PCRE comment grammar event")
+                                })?;
+                                i = end;
+                            }
                             SpecialGroup::GlobalOptions {
                                 end,
                                 extended: next_extended,
                                 multiline: next_multiline,
                             } => {
-                                i = end;
-                                grammar = httpd_rs_verified::pcre_grammar_step(
-                                    grammar,
+                                refinement = httpd_rs_verified::pcre_source_grammar_step(
+                                    bytes,
+                                    refinement,
+                                    end,
+                                    httpd_rs_verified::PcreSourceLexeme::GlobalOptions,
                                     httpd_rs_verified::PcreGrammarEvent::GlobalOptions {
                                         extended: next_extended,
                                         multiline: next_multiline,
@@ -1779,14 +1839,18 @@ pub mod bytes {
                                 .ok_or_else(|| {
                                     Error::syntax_at(i, "invalid global option transition")
                                 })?;
+                                i = end;
                             }
                             SpecialGroup::Open {
                                 body,
                                 extended: next_extended,
                                 multiline: next_multiline,
                             } => {
-                                grammar = httpd_rs_verified::pcre_grammar_step(
-                                    grammar,
+                                refinement = httpd_rs_verified::pcre_source_grammar_step(
+                                    bytes,
+                                    refinement,
+                                    body,
+                                    httpd_rs_verified::PcreSourceLexeme::GroupOpen,
                                     httpd_rs_verified::PcreGrammarEvent::Open {
                                         extended: next_extended,
                                         multiline: next_multiline,
@@ -1803,8 +1867,11 @@ pub mod bytes {
                         }
                     }
                     b'(' => {
-                        grammar = httpd_rs_verified::pcre_grammar_step(
-                            grammar,
+                        refinement = httpd_rs_verified::pcre_source_grammar_step(
+                            bytes,
+                            refinement,
+                            i + 1,
+                            httpd_rs_verified::PcreSourceLexeme::GroupOpen,
                             httpd_rs_verified::PcreGrammarEvent::Open {
                                 extended,
                                 multiline,
@@ -1819,8 +1886,11 @@ pub mod bytes {
                         branch_start = true;
                     }
                     b')' => {
-                        grammar = httpd_rs_verified::pcre_grammar_step(
-                            grammar,
+                        refinement = httpd_rs_verified::pcre_source_grammar_step(
+                            bytes,
+                            refinement,
+                            i + 1,
+                            httpd_rs_verified::PcreSourceLexeme::GroupClose,
                             httpd_rs_verified::PcreGrammarEvent::Close,
                             nest_limit,
                         )
@@ -1830,13 +1900,25 @@ pub mod bytes {
                         branch_start = false;
                     }
                     b'|' => {
+                        refinement = httpd_rs_verified::pcre_source_grammar_step(
+                            bytes,
+                            refinement,
+                            i + 1,
+                            httpd_rs_verified::PcreSourceLexeme::Alternation,
+                            httpd_rs_verified::PcreGrammarEvent::Token,
+                            nest_limit,
+                        )
+                        .ok_or_else(|| Error::syntax_at(i, "invalid alternation grammar event"))?;
                         i += 1;
                         repeatable = false;
                         branch_start = true;
                     }
                     b'^' => {
-                        grammar = httpd_rs_verified::pcre_grammar_step(
-                            grammar,
+                        refinement = httpd_rs_verified::pcre_source_grammar_step(
+                            bytes,
+                            refinement,
+                            i + 1,
+                            httpd_rs_verified::PcreSourceLexeme::StartAnchor,
                             httpd_rs_verified::PcreGrammarEvent::StartAnchor,
                             nest_limit,
                         )
@@ -1846,11 +1928,21 @@ pub mod bytes {
                         branch_start = false;
                     }
                     b'$' => {
+                        refinement = httpd_rs_verified::pcre_source_grammar_step(
+                            bytes,
+                            refinement,
+                            i + 1,
+                            httpd_rs_verified::PcreSourceLexeme::EndAnchor,
+                            httpd_rs_verified::PcreGrammarEvent::Token,
+                            nest_limit,
+                        )
+                        .ok_or_else(|| Error::syntax_at(i, "invalid end-anchor grammar event"))?;
                         i += 1;
                         repeatable = false;
                         branch_start = false;
                     }
                     b'*' | b'+' | b'?' => {
+                        let start = i;
                         if !repeatable {
                             return Err(Error::syntax_at(
                                 i,
@@ -1865,10 +1957,22 @@ pub mod bytes {
                             }
                             _ => {}
                         }
+                        refinement = httpd_rs_verified::pcre_source_grammar_step(
+                            bytes,
+                            refinement,
+                            i,
+                            httpd_rs_verified::PcreSourceLexeme::Quantifier,
+                            httpd_rs_verified::PcreGrammarEvent::Token,
+                            nest_limit,
+                        )
+                        .ok_or_else(|| {
+                            Error::syntax_at(start, "invalid quantifier grammar event")
+                        })?;
                         repeatable = false;
                         branch_start = false;
                     }
                     b'{' => {
+                        let start = i;
                         let Some(end) = quantifier_end(&bytes[i..]) else {
                             return Err(Error::syntax_at(i, "unescaped opening brace"));
                         };
@@ -1886,6 +1990,15 @@ pub mod bytes {
                             }
                             _ => {}
                         }
+                        refinement = httpd_rs_verified::pcre_source_grammar_step(
+                            bytes,
+                            refinement,
+                            i,
+                            httpd_rs_verified::PcreSourceLexeme::Quantifier,
+                            httpd_rs_verified::PcreGrammarEvent::Token,
+                            nest_limit,
+                        )
+                        .ok_or_else(|| Error::syntax_at(start, "invalid counted grammar event"))?;
                         repeatable = false;
                         branch_start = false;
                     }
@@ -1893,17 +2006,47 @@ pub mod bytes {
                         return Err(Error::syntax_at(i, "unescaped closing delimiter"));
                     }
                     b'.' => {
+                        refinement = httpd_rs_verified::pcre_source_grammar_step(
+                            bytes,
+                            refinement,
+                            i + 1,
+                            httpd_rs_verified::PcreSourceLexeme::Literal,
+                            httpd_rs_verified::PcreGrammarEvent::Token,
+                            nest_limit,
+                        )
+                        .ok_or_else(|| Error::syntax_at(i, "invalid dot grammar event"))?;
                         i += 1;
                         repeatable = true;
                         branch_start = false;
                     }
                     byte if byte >= 0x80 => {
                         let ch = source[i..].chars().next().expect("source is valid UTF-8");
-                        i += ch.len_utf8();
+                        let end = i + ch.len_utf8();
+                        refinement = httpd_rs_verified::pcre_source_grammar_step(
+                            bytes,
+                            refinement,
+                            end,
+                            httpd_rs_verified::PcreSourceLexeme::Literal,
+                            httpd_rs_verified::PcreGrammarEvent::Token,
+                            nest_limit,
+                        )
+                        .ok_or_else(|| {
+                            Error::syntax_at(i, "invalid UTF-8 literal grammar event")
+                        })?;
+                        i = end;
                         repeatable = true;
                         branch_start = false;
                     }
                     _ => {
+                        refinement = httpd_rs_verified::pcre_source_grammar_step(
+                            bytes,
+                            refinement,
+                            i + 1,
+                            httpd_rs_verified::PcreSourceLexeme::Literal,
+                            httpd_rs_verified::PcreGrammarEvent::Token,
+                            nest_limit,
+                        )
+                        .ok_or_else(|| Error::syntax_at(i, "invalid literal grammar event"))?;
                         i += 1;
                         repeatable = true;
                         branch_start = false;
@@ -1911,7 +2054,7 @@ pub mod bytes {
                 }
             }
 
-            let certificate = httpd_rs_verified::pcre_grammar_finish(grammar, source.len() as u64)
+            let certificate = httpd_rs_verified::pcre_source_grammar_finish(refinement, nest_limit)
                 .ok_or_else(|| Error::syntax("unterminated group"))?;
             if !httpd_rs_verified::pcre_grammar_certificate_admit(certificate, source.len() as u64)
             {

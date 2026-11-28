@@ -71,6 +71,447 @@ pub proof fn stale_cache_generation_rejects_work(request_epoch: u64, current_epo
 {
 }
 
+// ---------------------------------------------------------------------------
+// Cache transaction refinement
+// ---------------------------------------------------------------------------
+
+/// The request-local cache transaction.  Reload and targeted invalidation are
+/// modeled as events in the same order in which the runtime's generation
+/// barrier linearizes lookup and publication.  A hit is not an observation:
+/// it is the point at which the response becomes eligible to leave the cache
+/// sink, after the current authorization and entry generation have both been
+/// checked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CacheTransactionPhase {
+    Planned,
+    Lookup,
+    Reauthorized,
+    Miss,
+    Store,
+    Served,
+    Published,
+    Complete,
+    Denied,
+    Retired,
+    Invalidated,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CacheTransactionEvent {
+    BeginLookup { active_epoch: u64 },
+    Reauthorize {
+        active_epoch: u64,
+        authorization_current: bool,
+    },
+    Hit {
+        active_epoch: u64,
+        entry_epoch: u64,
+        binding_current: bool,
+    },
+    Miss { active_epoch: u64 },
+    BeginStore {
+        active_epoch: u64,
+        active_invalidation_serial: u64,
+    },
+    Publish {
+        active_epoch: u64,
+        entry_epoch: u64,
+        active_invalidation_serial: u64,
+    },
+    Abandon,
+    Retire { active_epoch: u64 },
+    Invalidate,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CacheTransactionState {
+    pub phase: CacheTransactionPhase,
+    pub request_epoch: u64,
+    pub request_invalidation_serial: u64,
+    pub authorized: bool,
+    pub served: bool,
+    pub published: bool,
+}
+
+pub open spec fn cache_transaction_inv(state: CacheTransactionState) -> bool {
+    &&& (state.served ==> state.authorized)
+    &&& (state.published ==> state.authorized)
+    &&& (state.phase == CacheTransactionPhase::Served ==> state.served)
+    &&& (state.phase == CacheTransactionPhase::Published ==> state.published)
+    &&& ((state.phase == CacheTransactionPhase::Reauthorized
+        || state.phase == CacheTransactionPhase::Miss
+        || state.phase == CacheTransactionPhase::Store
+        || state.phase == CacheTransactionPhase::Served
+        || state.phase == CacheTransactionPhase::Published
+        || state.phase == CacheTransactionPhase::Complete) ==> state.authorized)
+    &&& ((state.phase == CacheTransactionPhase::Planned
+        || state.phase == CacheTransactionPhase::Lookup) ==> !state.authorized)
+    &&& ((state.phase == CacheTransactionPhase::Planned
+        || state.phase == CacheTransactionPhase::Lookup
+        || state.phase == CacheTransactionPhase::Reauthorized
+        || state.phase == CacheTransactionPhase::Miss
+        || state.phase == CacheTransactionPhase::Store
+        || state.phase == CacheTransactionPhase::Complete
+        || state.phase == CacheTransactionPhase::Denied)
+        ==> !state.served && !state.published)
+}
+
+pub fn cache_transaction_start(
+    request_epoch: u64,
+    request_invalidation_serial: u64,
+) -> (state: CacheTransactionState)
+    ensures
+        cache_transaction_inv(state),
+        state.phase == CacheTransactionPhase::Planned,
+        state.request_epoch == request_epoch,
+        state.request_invalidation_serial == request_invalidation_serial,
+        !state.authorized,
+        !state.served,
+        !state.published,
+{
+    CacheTransactionState {
+        phase: CacheTransactionPhase::Planned,
+        request_epoch,
+        request_invalidation_serial,
+        authorized: false,
+        served: false,
+        published: false,
+    }
+}
+
+/// Closed transition relation for lookup, reauthorization, publication and
+/// generation retirement.  `Retire` and `Invalidate` are absorbing with
+/// respect to cache effects: neither a later hit nor a later publication has
+/// an admitted transition.
+pub open spec fn cache_transaction_step_spec(
+    state: CacheTransactionState,
+    event: CacheTransactionEvent,
+) -> Option<CacheTransactionState> {
+    match (state.phase, event) {
+        (CacheTransactionPhase::Planned, CacheTransactionEvent::BeginLookup { active_epoch }) => {
+            if state.request_epoch == active_epoch {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Lookup, ..state })
+            } else {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+            }
+        }
+        (CacheTransactionPhase::Lookup, CacheTransactionEvent::Reauthorize {
+            active_epoch,
+            authorization_current,
+        }) => {
+            if state.request_epoch != active_epoch {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+            } else if !authorization_current {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Denied, ..state })
+            } else {
+                Some(CacheTransactionState {
+                    phase: CacheTransactionPhase::Reauthorized,
+                    authorized: true,
+                    ..state
+                })
+            }
+        }
+        (CacheTransactionPhase::Reauthorized, CacheTransactionEvent::Hit {
+            active_epoch,
+            entry_epoch,
+            binding_current,
+        }) => {
+            if state.request_epoch == active_epoch
+                && entry_epoch == state.request_epoch
+                && binding_current
+            {
+                Some(CacheTransactionState {
+                    phase: CacheTransactionPhase::Served,
+                    served: true,
+                    ..state
+                })
+            } else if state.request_epoch != active_epoch {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+            } else {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Denied, ..state })
+            }
+        }
+        (CacheTransactionPhase::Reauthorized, CacheTransactionEvent::Miss { active_epoch }) => {
+            if state.request_epoch == active_epoch {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Miss, ..state })
+            } else {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+            }
+        }
+        (CacheTransactionPhase::Miss, CacheTransactionEvent::BeginStore {
+            active_epoch,
+            active_invalidation_serial,
+        }) => {
+            if state.request_epoch == active_epoch
+                && state.request_invalidation_serial == active_invalidation_serial
+            {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Store, ..state })
+            } else if state.request_invalidation_serial != active_invalidation_serial {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Invalidated, ..state })
+            } else {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+            }
+        }
+        (CacheTransactionPhase::Store, CacheTransactionEvent::Publish {
+            active_epoch,
+            entry_epoch,
+            active_invalidation_serial,
+        }) => {
+            if state.request_epoch == active_epoch
+                && entry_epoch == state.request_epoch
+                && state.request_invalidation_serial == active_invalidation_serial
+            {
+                Some(CacheTransactionState {
+                    phase: CacheTransactionPhase::Published,
+                    published: true,
+                    ..state
+                })
+            } else if state.request_invalidation_serial != active_invalidation_serial {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Invalidated, ..state })
+            } else {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+            }
+        }
+        (CacheTransactionPhase::Miss, CacheTransactionEvent::Abandon)
+        | (CacheTransactionPhase::Store, CacheTransactionEvent::Abandon) => {
+            Some(CacheTransactionState { phase: CacheTransactionPhase::Complete, ..state })
+        }
+        (CacheTransactionPhase::Planned, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Lookup, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Reauthorized, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Miss, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Store, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Served, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Published, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Complete, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Denied, CacheTransactionEvent::Retire { .. }) => {
+            Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+        }
+        (CacheTransactionPhase::Planned, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Lookup, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Reauthorized, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Miss, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Store, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Served, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Published, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Complete, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Denied, CacheTransactionEvent::Invalidate) => {
+            Some(CacheTransactionState { phase: CacheTransactionPhase::Invalidated, ..state })
+        }
+        _ => None,
+    }
+}
+
+pub fn cache_transaction_step(
+    state: CacheTransactionState,
+    event: CacheTransactionEvent,
+) -> (next: Option<CacheTransactionState>)
+    requires cache_transaction_inv(state),
+    ensures
+        next == cache_transaction_step_spec(state, event),
+        match next {
+            Some(value) => cache_transaction_inv(value),
+            None => true,
+        },
+{
+    match (state.phase, event) {
+        (CacheTransactionPhase::Planned, CacheTransactionEvent::BeginLookup { active_epoch }) => {
+            if state.request_epoch == active_epoch {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Lookup, ..state })
+            } else {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+            }
+        }
+        (CacheTransactionPhase::Lookup, CacheTransactionEvent::Reauthorize {
+            active_epoch,
+            authorization_current,
+        }) => {
+            if state.request_epoch != active_epoch {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+            } else if !authorization_current {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Denied, ..state })
+            } else {
+                Some(CacheTransactionState {
+                    phase: CacheTransactionPhase::Reauthorized,
+                    authorized: true,
+                    ..state
+                })
+            }
+        }
+        (CacheTransactionPhase::Reauthorized, CacheTransactionEvent::Hit {
+            active_epoch,
+            entry_epoch,
+            binding_current,
+        }) => {
+            if state.request_epoch == active_epoch
+                && entry_epoch == state.request_epoch
+                && binding_current
+            {
+                Some(CacheTransactionState {
+                    phase: CacheTransactionPhase::Served,
+                    served: true,
+                    ..state
+                })
+            } else if state.request_epoch != active_epoch {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+            } else {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Denied, ..state })
+            }
+        }
+        (CacheTransactionPhase::Reauthorized, CacheTransactionEvent::Miss { active_epoch }) => {
+            if state.request_epoch == active_epoch {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Miss, ..state })
+            } else {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+            }
+        }
+        (CacheTransactionPhase::Miss, CacheTransactionEvent::BeginStore {
+            active_epoch,
+            active_invalidation_serial,
+        }) => {
+            if state.request_epoch == active_epoch
+                && state.request_invalidation_serial == active_invalidation_serial
+            {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Store, ..state })
+            } else if state.request_invalidation_serial != active_invalidation_serial {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Invalidated, ..state })
+            } else {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+            }
+        }
+        (CacheTransactionPhase::Store, CacheTransactionEvent::Publish {
+            active_epoch,
+            entry_epoch,
+            active_invalidation_serial,
+        }) => {
+            if state.request_epoch == active_epoch
+                && entry_epoch == state.request_epoch
+                && state.request_invalidation_serial == active_invalidation_serial
+            {
+                Some(CacheTransactionState {
+                    phase: CacheTransactionPhase::Published,
+                    published: true,
+                    ..state
+                })
+            } else if state.request_invalidation_serial != active_invalidation_serial {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Invalidated, ..state })
+            } else {
+                Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+            }
+        }
+        (CacheTransactionPhase::Miss, CacheTransactionEvent::Abandon)
+        | (CacheTransactionPhase::Store, CacheTransactionEvent::Abandon) => {
+            Some(CacheTransactionState { phase: CacheTransactionPhase::Complete, ..state })
+        }
+        (CacheTransactionPhase::Planned, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Lookup, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Reauthorized, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Miss, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Store, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Served, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Published, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Complete, CacheTransactionEvent::Retire { .. })
+        | (CacheTransactionPhase::Denied, CacheTransactionEvent::Retire { .. }) => {
+            Some(CacheTransactionState { phase: CacheTransactionPhase::Retired, ..state })
+        }
+        (CacheTransactionPhase::Planned, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Lookup, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Reauthorized, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Miss, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Store, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Served, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Published, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Complete, CacheTransactionEvent::Invalidate)
+        | (CacheTransactionPhase::Denied, CacheTransactionEvent::Invalidate) => {
+            Some(CacheTransactionState { phase: CacheTransactionPhase::Invalidated, ..state })
+        }
+        _ => None,
+    }
+}
+
+pub proof fn cache_transaction_step_preserves_invariant(
+    state: CacheTransactionState,
+    event: CacheTransactionEvent,
+)
+    requires cache_transaction_inv(state),
+    ensures
+        match cache_transaction_step_spec(state, event) {
+            Some(next) => cache_transaction_inv(next),
+            None => true,
+        },
+{
+}
+
+pub proof fn retired_cache_transaction_cannot_serve_or_publish(
+    state: CacheTransactionState,
+    event: CacheTransactionEvent,
+)
+    requires state.phase == CacheTransactionPhase::Retired,
+    ensures cache_transaction_step_spec(state, event).is_none(),
+{
+}
+
+pub proof fn invalidated_cache_transaction_cannot_serve_or_publish(
+    state: CacheTransactionState,
+    event: CacheTransactionEvent,
+)
+    requires state.phase == CacheTransactionPhase::Invalidated,
+    ensures cache_transaction_step_spec(state, event).is_none(),
+{
+}
+
+pub proof fn cache_hit_requires_current_reauthorized_generation(
+    state: CacheTransactionState,
+    active_epoch: u64,
+    entry_epoch: u64,
+    binding_current: bool,
+)
+    requires
+        cache_transaction_inv(state),
+        state.phase == CacheTransactionPhase::Reauthorized,
+        match cache_transaction_step_spec(
+            state,
+            CacheTransactionEvent::Hit { active_epoch, entry_epoch, binding_current },
+        ) {
+            Some(next) => next.phase == CacheTransactionPhase::Served,
+            None => false,
+        },
+    ensures
+        state.authorized,
+        state.request_epoch == active_epoch,
+        entry_epoch == state.request_epoch,
+        binding_current,
+{
+}
+
+pub proof fn cache_publication_requires_current_reauthorized_generation(
+    state: CacheTransactionState,
+    active_epoch: u64,
+    entry_epoch: u64,
+    active_invalidation_serial: u64,
+)
+    requires
+        cache_transaction_inv(state),
+        state.phase == CacheTransactionPhase::Store,
+        match cache_transaction_step_spec(
+            state,
+            CacheTransactionEvent::Publish {
+                active_epoch,
+                entry_epoch,
+                active_invalidation_serial,
+            },
+        ) {
+            Some(next) => next.phase == CacheTransactionPhase::Published,
+            None => false,
+        },
+    ensures
+        state.authorized,
+        state.request_epoch == active_epoch,
+        entry_epoch == state.request_epoch,
+        state.request_invalidation_serial == active_invalidation_serial,
+{
+}
+
 /// A dynamic backend resolution is policy state, not a per-request hint.  A
 /// resolver result can authorize a transport endpoint only for the immutable
 /// configuration generation which established it, and only after the result
@@ -2475,6 +2916,7 @@ pub enum PcreGrammarEvent {
 pub struct PcreGrammarState {
     pub options: PcreGrammarOptions,
     pub frames: Vec<PcreGrammarOptions>,
+    pub events: u64,
 }
 
 pub open spec fn pcre_grammar_state_inv(state: PcreGrammarState, nest_limit: u32) -> bool {
@@ -2490,7 +2932,10 @@ pub open spec fn pcre_grammar_step_refines(
     nest_limit: u32,
     out: Option<PcreGrammarState>,
 ) -> bool {
-    match event {
+    (match out {
+        Some(next) => next.events == state.events + 1,
+        None => true,
+    }) && match event {
         PcreGrammarEvent::Token => match out {
             Some(next) => next.options == state.options && next.frames@ == state.frames@,
             None => false,
@@ -2546,10 +2991,12 @@ pub fn pcre_grammar_start(
         pcre_grammar_state_inv(state, 0),
         state.options == (PcreGrammarOptions { extended, multiline }),
         state.frames@.len() == 0,
+        state.events == 0,
 {
     PcreGrammarState {
         options: PcreGrammarOptions { extended, multiline },
         frames: Vec::new(),
+        events: 0,
     }
 }
 
@@ -2558,7 +3005,9 @@ pub fn pcre_grammar_step(
     event: PcreGrammarEvent,
     nest_limit: u32,
 ) -> (out: Option<PcreGrammarState>)
-    requires pcre_grammar_state_inv(state, nest_limit),
+    requires
+        pcre_grammar_state_inv(state, nest_limit),
+        state.events < 0xffff_ffff_ffff_ffffu64,
     ensures
         pcre_grammar_step_refines(state, event, nest_limit, out),
         match out {
@@ -2570,17 +3019,22 @@ pub fn pcre_grammar_step(
         event == PcreGrammarEvent::Close && state.frames@.len() == 0 ==> out.is_none(),
 {
     match event {
-        PcreGrammarEvent::Token => Some(state),
+        PcreGrammarEvent::Token => {
+            state.events += 1;
+            Some(state)
+        }
         PcreGrammarEvent::StartAnchor => {
             if state.options.multiline {
                 None
             } else {
+                state.events += 1;
                 Some(state)
             }
         }
         PcreGrammarEvent::AtomicLineEscape => None,
         PcreGrammarEvent::GlobalOptions { extended, multiline } => {
             state.options = PcreGrammarOptions { extended, multiline };
+            state.events += 1;
             Some(state)
         }
         PcreGrammarEvent::Open { extended, multiline } => {
@@ -2590,6 +3044,7 @@ pub fn pcre_grammar_step(
                 let parent = state.options;
                 state.frames.push(parent);
                 state.options = PcreGrammarOptions { extended, multiline };
+                state.events += 1;
                 Some(state)
             }
         }
@@ -2597,6 +3052,7 @@ pub fn pcre_grammar_step(
             match state.frames.pop() {
                 Some(parent) => {
                     state.options = parent;
+                    state.events += 1;
                     Some(state)
                 }
                 None => None,
@@ -2611,6 +3067,7 @@ pub fn pcre_grammar_step(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PcreGrammarCertificate {
     pub source_len: u64,
+    pub source_events: u64,
     pub balanced: bool,
     pub atomic_line_free: bool,
     pub multiline_start_free: bool,
@@ -2625,6 +3082,7 @@ pub fn pcre_grammar_finish(
         match certificate {
             Some(value) =>
                 value.source_len == source_len
+                    && value.source_events == state.events
                     && value.balanced
                     && value.atomic_line_free
                     && value.multiline_start_free,
@@ -2634,6 +3092,7 @@ pub fn pcre_grammar_finish(
     if state.frames.len() == 0 {
         Some(PcreGrammarCertificate {
             source_len,
+            source_events: state.events,
             balanced: true,
             atomic_line_free: true,
             multiline_start_free: true,
@@ -2648,6 +3107,7 @@ pub open spec fn pcre_grammar_certificate_spec(
     source_len: u64,
 ) -> bool {
     certificate.source_len == source_len
+        && (certificate.source_events > 0 || source_len == 0)
         && certificate.balanced
         && certificate.atomic_line_free
         && certificate.multiline_start_free
@@ -2660,9 +3120,494 @@ pub fn pcre_grammar_certificate_admit(
     ensures ok == pcre_grammar_certificate_spec(certificate, source_len),
 {
     certificate.source_len == source_len
+        && (certificate.source_events > 0 || source_len == 0)
         && certificate.balanced
         && certificate.atomic_line_free
         && certificate.multiline_start_free
+}
+
+/// Complete lexical alphabet of the positive PCRE frontend.  Every admitted
+/// source byte belongs to exactly one contiguous lexeme passed through
+/// `pcre_source_grammar_step`; no translator input can be skipped between
+/// certified grammar events.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PcreSourceLexeme {
+    Ignored,
+    Class,
+    Escape,
+    AtomicLineEscape,
+    GroupOpen,
+    GroupClose,
+    CommentGroup,
+    GlobalOptions,
+    Alternation,
+    StartAnchor,
+    EndAnchor,
+    Quantifier,
+    Literal,
+}
+
+fn pcre_event_is_token(event: PcreGrammarEvent) -> (out: bool)
+    ensures out == (event == PcreGrammarEvent::Token),
+{
+    match event {
+        PcreGrammarEvent::Token => true,
+        _ => false,
+    }
+}
+
+fn pcre_event_is_atomic_line_escape(event: PcreGrammarEvent) -> (out: bool)
+    ensures out == (event == PcreGrammarEvent::AtomicLineEscape),
+{
+    match event {
+        PcreGrammarEvent::AtomicLineEscape => true,
+        _ => false,
+    }
+}
+
+fn pcre_event_is_close(event: PcreGrammarEvent) -> (out: bool)
+    ensures out == (event == PcreGrammarEvent::Close),
+{
+    match event {
+        PcreGrammarEvent::Close => true,
+        _ => false,
+    }
+}
+
+fn pcre_event_is_start_anchor(event: PcreGrammarEvent) -> (out: bool)
+    ensures out == (event == PcreGrammarEvent::StartAnchor),
+{
+    match event {
+        PcreGrammarEvent::StartAnchor => true,
+        _ => false,
+    }
+}
+
+pub struct PcreSourceGrammarState {
+    pub offset: u64,
+    pub source_len: u64,
+    pub lexemes: u64,
+    pub grammar: PcreGrammarState,
+}
+
+pub open spec fn pcre_source_grammar_inv(
+    state: PcreSourceGrammarState,
+    nest_limit: u32,
+) -> bool {
+    &&& state.offset <= state.source_len
+    &&& state.lexemes == state.grammar.events
+    &&& (state.offset == 0 <==> state.lexemes == 0)
+    &&& pcre_grammar_state_inv(state.grammar, nest_limit)
+}
+
+pub open spec fn pcre_source_lexeme_spec(
+    source: Seq<u8>,
+    start: int,
+    end: int,
+    extended: bool,
+    lexeme: PcreSourceLexeme,
+    event: PcreGrammarEvent,
+) -> bool {
+    &&& 0 <= start < end <= source.len()
+    &&& match lexeme {
+        PcreSourceLexeme::Ignored => {
+            &&& event == PcreGrammarEvent::Token
+            &&& extended
+            &&& (source[start] == b' ' || source[start] == b'\t'
+                || source[start] == b'\r' || source[start] == b'\n'
+                || source[start] == 0x0b || source[start] == 0x0c
+                || source[start] == b'#')
+        }
+        PcreSourceLexeme::Class => {
+            &&& event == PcreGrammarEvent::Token
+            &&& source[start] == b'['
+            &&& source[end - 1] == b']'
+        }
+        PcreSourceLexeme::Escape => {
+            &&& event == PcreGrammarEvent::Token
+            &&& start + 2 <= end
+            &&& source[start] == b'\\'
+            &&& source[start + 1] != b'R'
+        }
+        PcreSourceLexeme::AtomicLineEscape => {
+            &&& event == PcreGrammarEvent::AtomicLineEscape
+            &&& end == start + 2
+            &&& source[start] == b'\\'
+            &&& source[start + 1] == b'R'
+        }
+        PcreSourceLexeme::GroupOpen => {
+            &&& source[start] == b'('
+            &&& match event {
+                PcreGrammarEvent::Open { .. } => true,
+                _ => false,
+            }
+        }
+        PcreSourceLexeme::GroupClose => {
+            &&& event == PcreGrammarEvent::Close
+            &&& end == start + 1
+            &&& source[start] == b')'
+        }
+        PcreSourceLexeme::CommentGroup => {
+            &&& event == PcreGrammarEvent::Token
+            &&& start + 4 <= end
+            &&& source[start] == b'('
+            &&& source[start + 1] == b'?'
+            &&& source[start + 2] == b'#'
+            &&& source[end - 1] == b')'
+        }
+        PcreSourceLexeme::GlobalOptions => {
+            &&& start + 4 <= end
+            &&& source[start] == b'('
+            &&& source[start + 1] == b'?'
+            &&& source[end - 1] == b')'
+            &&& match event {
+                PcreGrammarEvent::GlobalOptions { .. } => true,
+                _ => false,
+            }
+        }
+        PcreSourceLexeme::Alternation => {
+            &&& event == PcreGrammarEvent::Token
+            &&& end == start + 1
+            &&& source[start] == b'|'
+        }
+        PcreSourceLexeme::StartAnchor => {
+            &&& event == PcreGrammarEvent::StartAnchor
+            &&& end == start + 1
+            &&& source[start] == b'^'
+        }
+        PcreSourceLexeme::EndAnchor => {
+            &&& event == PcreGrammarEvent::Token
+            &&& end == start + 1
+            &&& source[start] == b'$'
+        }
+        PcreSourceLexeme::Quantifier => {
+            &&& event == PcreGrammarEvent::Token
+            &&& (source[start] == b'*' || source[start] == b'+'
+                || source[start] == b'?' || source[start] == b'{')
+        }
+        PcreSourceLexeme::Literal => {
+            &&& event == PcreGrammarEvent::Token
+            &&& source[start] != b'\\' && source[start] != b'['
+            &&& source[start] != b']' && source[start] != b'('
+            &&& source[start] != b')' && source[start] != b'|'
+            &&& source[start] != b'^' && source[start] != b'$'
+            &&& source[start] != b'*' && source[start] != b'+'
+            &&& source[start] != b'?' && source[start] != b'{'
+            &&& source[start] != b'}'
+        }
+    }
+}
+
+pub fn pcre_source_grammar_start(
+    source_len: u64,
+    extended: bool,
+    multiline: bool,
+) -> (state: PcreSourceGrammarState)
+    ensures
+        state.offset == 0,
+        state.source_len == source_len,
+        state.lexemes == 0,
+        state.grammar.options == (PcreGrammarOptions { extended, multiline }),
+        pcre_source_grammar_inv(state, 0),
+{
+    PcreSourceGrammarState {
+        offset: 0,
+        source_len,
+        lexemes: 0,
+        grammar: pcre_grammar_start(extended, multiline),
+    }
+}
+
+pub fn pcre_source_lexeme_admit(
+    source: &[u8],
+    start: usize,
+    end: usize,
+    extended: bool,
+    lexeme: PcreSourceLexeme,
+    event: PcreGrammarEvent,
+) -> (ok: bool)
+    requires start <= source.len(), end <= source.len(),
+    ensures ok ==> pcre_source_lexeme_spec(
+        source@,
+        start as int,
+        end as int,
+        extended,
+        lexeme,
+        event,
+    ),
+{
+    if start >= end {
+        return false;
+    }
+    proof {
+        assert(0 <= (start as int));
+        assert((start as int) < (end as int));
+        assert((end as int) <= source@.len());
+    }
+    let ok = match lexeme {
+        PcreSourceLexeme::Ignored => {
+            pcre_event_is_token(event)
+                && extended
+                && (source[start] == b' ' || source[start] == b'\t'
+                    || source[start] == b'\r' || source[start] == b'\n'
+                    || source[start] == 0x0b || source[start] == 0x0c
+                    || source[start] == b'#')
+        }
+        PcreSourceLexeme::Class => {
+            pcre_event_is_token(event)
+                && source[start] == b'['
+                && source[end - 1] == b']'
+        }
+        PcreSourceLexeme::Escape => {
+            pcre_event_is_token(event)
+                && end - start >= 2
+                && source[start] == b'\\'
+                && source[start + 1] != b'R'
+        }
+        PcreSourceLexeme::AtomicLineEscape => {
+            pcre_event_is_atomic_line_escape(event)
+                && end - start == 2
+                && source[start] == b'\\'
+                && source[start + 1] == b'R'
+        }
+        PcreSourceLexeme::GroupOpen => {
+            source[start] == b'('
+                && match event { PcreGrammarEvent::Open { .. } => true, _ => false }
+        }
+        PcreSourceLexeme::GroupClose => {
+            pcre_event_is_close(event) && end == start + 1 && source[start] == b')'
+        }
+        PcreSourceLexeme::CommentGroup => {
+            pcre_event_is_token(event)
+                && end - start >= 4
+                && source[start] == b'('
+                && source[start + 1] == b'?'
+                && source[start + 2] == b'#'
+                && source[end - 1] == b')'
+        }
+        PcreSourceLexeme::GlobalOptions => {
+            end - start >= 4
+                && source[start] == b'('
+                && source[start + 1] == b'?'
+                && source[end - 1] == b')'
+                && match event { PcreGrammarEvent::GlobalOptions { .. } => true, _ => false }
+        }
+        PcreSourceLexeme::Alternation => {
+            pcre_event_is_token(event) && end == start + 1 && source[start] == b'|'
+        }
+        PcreSourceLexeme::StartAnchor => {
+            pcre_event_is_start_anchor(event) && end == start + 1 && source[start] == b'^'
+        }
+        PcreSourceLexeme::EndAnchor => {
+            pcre_event_is_token(event) && end == start + 1 && source[start] == b'$'
+        }
+        PcreSourceLexeme::Quantifier => {
+            pcre_event_is_token(event)
+                && matches!(source[start], b'*' | b'+' | b'?' | b'{')
+        }
+        PcreSourceLexeme::Literal => {
+            pcre_event_is_token(event)
+                && source[start] != b'\\' && source[start] != b'['
+                && source[start] != b']' && source[start] != b'('
+                && source[start] != b')' && source[start] != b'|'
+                && source[start] != b'^' && source[start] != b'$'
+                && source[start] != b'*' && source[start] != b'+'
+                && source[start] != b'?' && source[start] != b'{'
+                && source[start] != b'}'
+        }
+    };
+    proof {
+        if ok {
+            assert(0 <= start as int);
+            assert((start as int) < (end as int));
+            assert((end as int) <= source@.len());
+            match lexeme {
+                PcreSourceLexeme::Ignored => {
+                    assert(event == PcreGrammarEvent::Token);
+                    assert(extended);
+                    assert(source@[start as int] == b' '
+                        || source@[start as int] == b'\t'
+                        || source@[start as int] == b'\r'
+                        || source@[start as int] == b'\n'
+                        || source@[start as int] == 0x0b
+                        || source@[start as int] == 0x0c
+                        || source@[start as int] == b'#');
+                }
+                PcreSourceLexeme::Class => {
+                    assert(event == PcreGrammarEvent::Token);
+                    assert(source@[start as int] == b'[');
+                    assert(source@[end as int - 1] == b']');
+                }
+                PcreSourceLexeme::Escape => {
+                    assert(event == PcreGrammarEvent::Token);
+                    assert((start as int) + 2 <= end as int);
+                    assert(source@[start as int] == b'\\');
+                    assert(source@[start as int + 1] != b'R');
+                }
+                PcreSourceLexeme::AtomicLineEscape => {
+                    assert(event == PcreGrammarEvent::AtomicLineEscape);
+                    assert(end as int == start as int + 2);
+                    assert(source@[start as int] == b'\\');
+                    assert(source@[start as int + 1] == b'R');
+                }
+                PcreSourceLexeme::GroupOpen => {
+                    assert(source@[start as int] == b'(');
+                    assert(match event { PcreGrammarEvent::Open { .. } => true, _ => false });
+                }
+                PcreSourceLexeme::GroupClose => {
+                    assert(event == PcreGrammarEvent::Close);
+                    assert(end as int == start as int + 1);
+                    assert(source@[start as int] == b')');
+                }
+                PcreSourceLexeme::CommentGroup => {
+                    assert(event == PcreGrammarEvent::Token);
+                    assert(start as int + 4 <= end as int);
+                    assert(source@[start as int] == b'(');
+                    assert(source@[start as int + 1] == b'?');
+                    assert(source@[start as int + 2] == b'#');
+                    assert(source@[end as int - 1] == b')');
+                }
+                PcreSourceLexeme::GlobalOptions => {
+                    assert(start as int + 4 <= end as int);
+                    assert(source@[start as int] == b'(');
+                    assert(source@[start as int + 1] == b'?');
+                    assert(source@[end as int - 1] == b')');
+                    assert(match event {
+                        PcreGrammarEvent::GlobalOptions { .. } => true,
+                        _ => false,
+                    });
+                }
+                PcreSourceLexeme::Alternation => {
+                    assert(event == PcreGrammarEvent::Token);
+                    assert(end as int == start as int + 1);
+                    assert(source@[start as int] == b'|');
+                }
+                PcreSourceLexeme::StartAnchor => {
+                    assert(event == PcreGrammarEvent::StartAnchor);
+                    assert(end as int == start as int + 1);
+                    assert(source@[start as int] == b'^');
+                }
+                PcreSourceLexeme::EndAnchor => {
+                    assert(event == PcreGrammarEvent::Token);
+                    assert(end as int == start as int + 1);
+                    assert(source@[start as int] == b'$');
+                }
+                PcreSourceLexeme::Quantifier => {
+                    assert(event == PcreGrammarEvent::Token);
+                    assert(source@[start as int] == b'*' || source@[start as int] == b'+'
+                        || source@[start as int] == b'?' || source@[start as int] == b'{');
+                }
+                PcreSourceLexeme::Literal => {
+                    assert(event == PcreGrammarEvent::Token);
+                    assert(source@[start as int] != b'\\' && source@[start as int] != b'['
+                        && source@[start as int] != b']' && source@[start as int] != b'('
+                        && source@[start as int] != b')' && source@[start as int] != b'|'
+                        && source@[start as int] != b'^' && source@[start as int] != b'$'
+                        && source@[start as int] != b'*' && source@[start as int] != b'+'
+                        && source@[start as int] != b'?' && source@[start as int] != b'{'
+                        && source@[start as int] != b'}');
+                }
+            }
+            reveal(pcre_source_lexeme_spec);
+        }
+    }
+    ok
+}
+
+pub fn pcre_source_grammar_step(
+    source: &[u8],
+    state: PcreSourceGrammarState,
+    end: usize,
+    lexeme: PcreSourceLexeme,
+    event: PcreGrammarEvent,
+    nest_limit: u32,
+) -> (next: Option<PcreSourceGrammarState>)
+    requires
+        source.len() == state.source_len,
+        pcre_source_grammar_inv(state, nest_limit),
+        state.grammar.events < 0xffff_ffff_ffff_ffffu64,
+    ensures
+        match next {
+            Some(value) => {
+                &&& pcre_source_grammar_inv(value, nest_limit)
+                &&& value.offset == end
+                &&& value.lexemes == state.lexemes + 1
+                &&& pcre_source_lexeme_spec(
+                    source@,
+                    state.offset as int,
+                    end as int,
+                    state.grammar.options.extended,
+                    lexeme,
+                    event,
+                )
+            }
+            None => true,
+        },
+{
+    if end > source.len() || !pcre_source_lexeme_admit(
+        source,
+        state.offset as usize,
+        end,
+        state.grammar.options.extended,
+        lexeme,
+        event,
+    ) {
+        return None;
+    }
+    let grammar = match pcre_grammar_step(state.grammar, event, nest_limit) {
+        Some(grammar) => grammar,
+        None => return None,
+    };
+    Some(PcreSourceGrammarState {
+        offset: end as u64,
+        source_len: state.source_len,
+        lexemes: state.lexemes + 1,
+        grammar,
+    })
+}
+
+pub fn pcre_source_grammar_finish(
+    state: PcreSourceGrammarState,
+    _nest_limit: u32,
+) -> (certificate: Option<PcreGrammarCertificate>)
+    requires pcre_source_grammar_inv(state, _nest_limit),
+    ensures
+        match certificate {
+            Some(value) => {
+                &&& state.offset == state.source_len
+                &&& value.source_len == state.source_len
+                &&& value.source_events == state.lexemes
+                &&& pcre_grammar_certificate_spec(value, state.source_len)
+            }
+            None => true,
+        },
+{
+    if state.offset != state.source_len {
+        return None;
+    }
+    let certificate = match pcre_grammar_finish(state.grammar, state.source_len) {
+        Some(certificate) => certificate,
+        None => return None,
+    };
+    if !pcre_grammar_certificate_admit(certificate, state.source_len) {
+        return None;
+    }
+    Some(certificate)
+}
+
+pub proof fn pcre_source_certificate_covers_every_byte_and_event(
+    state: PcreSourceGrammarState,
+    certificate: PcreGrammarCertificate,
+)
+    requires
+        state.offset == state.source_len,
+        state.lexemes == state.grammar.events,
+        certificate.source_len == state.source_len,
+        certificate.source_events == state.grammar.events,
+    ensures
+        certificate.source_len == state.offset,
+        certificate.source_events == state.lexemes,
+{
 }
 
 // ---------------------------------------------------------------------------
@@ -4752,6 +5697,368 @@ pub proof fn resource_budget_admission_is_bounded(used: u64, incoming: u64, limi
 pub proof fn resource_budget_rejects_exhausted(used: u64, incoming: u64)
     requires incoming > 0,
     ensures !resource_budget_spec(used, incoming, used),
+{
+}
+
+// ---------------------------------------------------------------------------
+// Unified resource-lease ownership
+// ---------------------------------------------------------------------------
+
+/// Every move-only runtime slot has exactly one of these owners.  Feature
+/// specific leases may remain `Held`, or refine the ownership through queue,
+/// task and output phases.  Cancellation is orthogonal: it marks the owner
+/// but cannot release capacity still reachable by queued/running work.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LeaseOwnershipPhase {
+    Unacquired,
+    Held,
+    Queued,
+    Running,
+    Output,
+    OutputQueued,
+    Released,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LeaseOwnershipEvent {
+    Acquire,
+    Queue,
+    Start,
+    BeginOutput,
+    FinishOutput,
+    QueueOutput,
+    Cancel,
+    Release,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LeaseOwnershipState {
+    pub phase: LeaseOwnershipPhase,
+    pub acquired: bool,
+    pub cancelled: bool,
+    pub releases: u8,
+}
+
+pub open spec fn lease_ownership_inv(state: LeaseOwnershipState) -> bool {
+    &&& state.releases <= 1
+    &&& (state.phase == LeaseOwnershipPhase::Unacquired
+        ==> !state.acquired && !state.cancelled && state.releases == 0)
+    &&& (state.phase == LeaseOwnershipPhase::Released
+        ==> !state.acquired && state.releases == 1)
+    &&& ((state.phase == LeaseOwnershipPhase::Held
+        || state.phase == LeaseOwnershipPhase::Queued
+        || state.phase == LeaseOwnershipPhase::Running
+        || state.phase == LeaseOwnershipPhase::Output
+        || state.phase == LeaseOwnershipPhase::OutputQueued)
+        ==> state.acquired && state.releases == 0)
+}
+
+pub open spec fn lease_ownership_step_spec(
+    state: LeaseOwnershipState,
+    event: LeaseOwnershipEvent,
+) -> Option<LeaseOwnershipState> {
+    match (state.phase, event) {
+        (LeaseOwnershipPhase::Unacquired, LeaseOwnershipEvent::Acquire) => {
+            Some(LeaseOwnershipState {
+                phase: LeaseOwnershipPhase::Held,
+                acquired: true,
+                ..state
+            })
+        }
+        (LeaseOwnershipPhase::Held, LeaseOwnershipEvent::Queue) => {
+            Some(LeaseOwnershipState { phase: LeaseOwnershipPhase::Queued, ..state })
+        }
+        (LeaseOwnershipPhase::Queued, LeaseOwnershipEvent::Start) => {
+            Some(LeaseOwnershipState { phase: LeaseOwnershipPhase::Running, ..state })
+        }
+        (LeaseOwnershipPhase::Held, LeaseOwnershipEvent::Start) => {
+            Some(LeaseOwnershipState { phase: LeaseOwnershipPhase::Running, ..state })
+        }
+        (LeaseOwnershipPhase::Held, LeaseOwnershipEvent::BeginOutput)
+        | (LeaseOwnershipPhase::Running, LeaseOwnershipEvent::BeginOutput) => {
+            Some(LeaseOwnershipState { phase: LeaseOwnershipPhase::Output, ..state })
+        }
+        (LeaseOwnershipPhase::Output, LeaseOwnershipEvent::FinishOutput) => {
+            Some(LeaseOwnershipState { phase: LeaseOwnershipPhase::Held, ..state })
+        }
+        (LeaseOwnershipPhase::Output, LeaseOwnershipEvent::QueueOutput) => {
+            Some(LeaseOwnershipState { phase: LeaseOwnershipPhase::OutputQueued, ..state })
+        }
+        (LeaseOwnershipPhase::Held, LeaseOwnershipEvent::Cancel)
+        | (LeaseOwnershipPhase::Queued, LeaseOwnershipEvent::Cancel)
+        | (LeaseOwnershipPhase::Running, LeaseOwnershipEvent::Cancel)
+        | (LeaseOwnershipPhase::Output, LeaseOwnershipEvent::Cancel)
+        | (LeaseOwnershipPhase::OutputQueued, LeaseOwnershipEvent::Cancel) => {
+            Some(LeaseOwnershipState { cancelled: true, ..state })
+        }
+        (LeaseOwnershipPhase::Held, LeaseOwnershipEvent::Release)
+        | (LeaseOwnershipPhase::Queued, LeaseOwnershipEvent::Release)
+        | (LeaseOwnershipPhase::Running, LeaseOwnershipEvent::Release)
+        | (LeaseOwnershipPhase::Output, LeaseOwnershipEvent::Release)
+        | (LeaseOwnershipPhase::OutputQueued, LeaseOwnershipEvent::Release) => {
+            Some(LeaseOwnershipState {
+                phase: LeaseOwnershipPhase::Released,
+                acquired: false,
+                releases: 1,
+                ..state
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn lease_ownership_unacquired() -> (state: LeaseOwnershipState)
+    ensures
+        lease_ownership_inv(state),
+        state.phase == LeaseOwnershipPhase::Unacquired,
+{
+    LeaseOwnershipState {
+        phase: LeaseOwnershipPhase::Unacquired,
+        acquired: false,
+        cancelled: false,
+        releases: 0,
+    }
+}
+
+pub fn lease_ownership_step(
+    state: LeaseOwnershipState,
+    event: LeaseOwnershipEvent,
+) -> (next: Option<LeaseOwnershipState>)
+    requires lease_ownership_inv(state),
+    ensures
+        next == lease_ownership_step_spec(state, event),
+        match next {
+            Some(value) => lease_ownership_inv(value),
+            None => true,
+        },
+{
+    match (state.phase, event) {
+        (LeaseOwnershipPhase::Unacquired, LeaseOwnershipEvent::Acquire) => {
+            Some(LeaseOwnershipState {
+                phase: LeaseOwnershipPhase::Held,
+                acquired: true,
+                ..state
+            })
+        }
+        (LeaseOwnershipPhase::Held, LeaseOwnershipEvent::Queue) => {
+            Some(LeaseOwnershipState { phase: LeaseOwnershipPhase::Queued, ..state })
+        }
+        (LeaseOwnershipPhase::Queued, LeaseOwnershipEvent::Start) => {
+            Some(LeaseOwnershipState { phase: LeaseOwnershipPhase::Running, ..state })
+        }
+        (LeaseOwnershipPhase::Held, LeaseOwnershipEvent::Start) => {
+            Some(LeaseOwnershipState { phase: LeaseOwnershipPhase::Running, ..state })
+        }
+        (LeaseOwnershipPhase::Held, LeaseOwnershipEvent::BeginOutput)
+        | (LeaseOwnershipPhase::Running, LeaseOwnershipEvent::BeginOutput) => {
+            Some(LeaseOwnershipState { phase: LeaseOwnershipPhase::Output, ..state })
+        }
+        (LeaseOwnershipPhase::Output, LeaseOwnershipEvent::FinishOutput) => {
+            Some(LeaseOwnershipState { phase: LeaseOwnershipPhase::Held, ..state })
+        }
+        (LeaseOwnershipPhase::Output, LeaseOwnershipEvent::QueueOutput) => {
+            Some(LeaseOwnershipState { phase: LeaseOwnershipPhase::OutputQueued, ..state })
+        }
+        (LeaseOwnershipPhase::Held, LeaseOwnershipEvent::Cancel)
+        | (LeaseOwnershipPhase::Queued, LeaseOwnershipEvent::Cancel)
+        | (LeaseOwnershipPhase::Running, LeaseOwnershipEvent::Cancel)
+        | (LeaseOwnershipPhase::Output, LeaseOwnershipEvent::Cancel)
+        | (LeaseOwnershipPhase::OutputQueued, LeaseOwnershipEvent::Cancel) => {
+            Some(LeaseOwnershipState { cancelled: true, ..state })
+        }
+        (LeaseOwnershipPhase::Held, LeaseOwnershipEvent::Release)
+        | (LeaseOwnershipPhase::Queued, LeaseOwnershipEvent::Release)
+        | (LeaseOwnershipPhase::Running, LeaseOwnershipEvent::Release)
+        | (LeaseOwnershipPhase::Output, LeaseOwnershipEvent::Release)
+        | (LeaseOwnershipPhase::OutputQueued, LeaseOwnershipEvent::Release) => {
+            Some(LeaseOwnershipState {
+                phase: LeaseOwnershipPhase::Released,
+                acquired: false,
+                releases: 1,
+                ..state
+            })
+        }
+        _ => None,
+    }
+}
+
+pub open spec fn lease_ownership_decode_spec(raw: u8) -> Option<LeaseOwnershipState> {
+    match raw {
+        0 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::Unacquired,
+            acquired: false,
+            cancelled: false,
+            releases: 0,
+        }),
+        1 | 0x81 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::Held,
+            acquired: true,
+            cancelled: raw == 0x81,
+            releases: 0,
+        }),
+        2 | 0x82 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::Queued,
+            acquired: true,
+            cancelled: raw == 0x82,
+            releases: 0,
+        }),
+        3 | 0x83 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::Running,
+            acquired: true,
+            cancelled: raw == 0x83,
+            releases: 0,
+        }),
+        4 | 0x84 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::Output,
+            acquired: true,
+            cancelled: raw == 0x84,
+            releases: 0,
+        }),
+        5 | 0x85 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::OutputQueued,
+            acquired: true,
+            cancelled: raw == 0x85,
+            releases: 0,
+        }),
+        6 | 0x86 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::Released,
+            acquired: false,
+            cancelled: raw == 0x86,
+            releases: 1,
+        }),
+        _ => None,
+    }
+}
+
+/// Verified representation boundary used by the atomic runtime owner. Only
+/// the fourteen encodings above can become an ownership state; corrupted or
+/// future values fail closed instead of being interpreted as Released.
+pub fn lease_ownership_decode(raw: u8) -> (state: Option<LeaseOwnershipState>)
+    ensures
+        state == lease_ownership_decode_spec(raw),
+        match state {
+            Some(value) => lease_ownership_inv(value),
+            None => true,
+        },
+{
+    match raw {
+        0 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::Unacquired,
+            acquired: false,
+            cancelled: false,
+            releases: 0,
+        }),
+        1 | 0x81 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::Held,
+            acquired: true,
+            cancelled: raw == 0x81,
+            releases: 0,
+        }),
+        2 | 0x82 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::Queued,
+            acquired: true,
+            cancelled: raw == 0x82,
+            releases: 0,
+        }),
+        3 | 0x83 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::Running,
+            acquired: true,
+            cancelled: raw == 0x83,
+            releases: 0,
+        }),
+        4 | 0x84 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::Output,
+            acquired: true,
+            cancelled: raw == 0x84,
+            releases: 0,
+        }),
+        5 | 0x85 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::OutputQueued,
+            acquired: true,
+            cancelled: raw == 0x85,
+            releases: 0,
+        }),
+        6 | 0x86 => Some(LeaseOwnershipState {
+            phase: LeaseOwnershipPhase::Released,
+            acquired: false,
+            cancelled: raw == 0x86,
+            releases: 1,
+        }),
+        _ => None,
+    }
+}
+
+pub fn lease_ownership_encode(state: LeaseOwnershipState) -> (raw: u8)
+    requires lease_ownership_inv(state),
+    ensures lease_ownership_decode_spec(raw) == Some(state),
+{
+    match state.phase {
+        LeaseOwnershipPhase::Unacquired => 0,
+        LeaseOwnershipPhase::Held => if state.cancelled { 0x81 } else { 1 },
+        LeaseOwnershipPhase::Queued => if state.cancelled { 0x82 } else { 2 },
+        LeaseOwnershipPhase::Running => if state.cancelled { 0x83 } else { 3 },
+        LeaseOwnershipPhase::Output => if state.cancelled { 0x84 } else { 4 },
+        LeaseOwnershipPhase::OutputQueued => if state.cancelled { 0x85 } else { 5 },
+        LeaseOwnershipPhase::Released => if state.cancelled { 0x86 } else { 6 },
+    }
+}
+
+pub fn lease_ownership_start() -> (state: LeaseOwnershipState)
+    ensures
+        lease_ownership_inv(state),
+        state.phase == LeaseOwnershipPhase::Held,
+        state.acquired,
+        state.releases == 0,
+{
+    let initial = lease_ownership_unacquired();
+    lease_ownership_step(initial, LeaseOwnershipEvent::Acquire).unwrap()
+}
+
+pub proof fn lease_ownership_step_preserves_invariant(
+    state: LeaseOwnershipState,
+    event: LeaseOwnershipEvent,
+)
+    requires lease_ownership_inv(state),
+    ensures
+        match lease_ownership_step_spec(state, event) {
+            Some(next) => lease_ownership_inv(next),
+            None => true,
+        },
+{
+}
+
+pub proof fn lease_queue_task_and_output_require_acquisition(state: LeaseOwnershipState)
+    requires
+        lease_ownership_inv(state),
+        state.phase == LeaseOwnershipPhase::Queued
+            || state.phase == LeaseOwnershipPhase::Running
+            || state.phase == LeaseOwnershipPhase::Output
+            || state.phase == LeaseOwnershipPhase::OutputQueued,
+    ensures state.acquired && state.releases == 0,
+{
+}
+
+pub proof fn lease_cancellation_preserves_live_owner(state: LeaseOwnershipState)
+    requires
+        lease_ownership_inv(state),
+        state.acquired,
+        state.phase != LeaseOwnershipPhase::Unacquired,
+        state.phase != LeaseOwnershipPhase::Released,
+    ensures
+        lease_ownership_step_spec(state, LeaseOwnershipEvent::Cancel).is_some(),
+        lease_ownership_step_spec(state, LeaseOwnershipEvent::Cancel).unwrap().acquired,
+        lease_ownership_step_spec(state, LeaseOwnershipEvent::Cancel).unwrap().releases == 0,
+{
+}
+
+pub proof fn lease_terminal_release_is_exactly_once(state: LeaseOwnershipState)
+    requires
+        lease_ownership_inv(state),
+        state.phase == LeaseOwnershipPhase::Released,
+    ensures
+        !state.acquired,
+        state.releases == 1,
+        lease_ownership_step_spec(state, LeaseOwnershipEvent::Release).is_none(),
 {
 }
 
@@ -20574,6 +21881,251 @@ pub proof fn prefilter_sound(
 // (F69).
 // ---------------------------------------------------------------------------
 
+/// Cursor/fuel state for the `ap_expr` recursive-descent parser.  Every source
+/// movement, speculative restore and recursion entry is an event.  The Rust
+/// parser consumes this state directly, so its byte loops cannot move outside
+/// the source and its recursive calls cannot exceed the declared depth.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExpressionParserCursor {
+    pub pos: u64,
+    pub len: u64,
+    pub depth: u64,
+    pub work: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExpressionParserCursorEvent {
+    Advance { bytes: u64 },
+    Restore { checkpoint: u64 },
+    Enter { depth_limit: u64 },
+    Exit,
+    Finish,
+}
+
+pub open spec fn expression_parser_cursor_inv(state: ExpressionParserCursor) -> bool {
+    state.pos <= state.len && state.work <= 0xffff_ffff_ffff_ffffu64
+}
+
+pub open spec fn expression_parser_cursor_step_spec(
+    state: ExpressionParserCursor,
+    event: ExpressionParserCursorEvent,
+) -> Option<ExpressionParserCursor> {
+    match event {
+        ExpressionParserCursorEvent::Advance { bytes } => {
+            if bytes > 0
+                && state.pos <= state.len
+                && bytes <= state.len - state.pos
+                && state.work <= 0xffff_ffff_ffff_ffffu64 - bytes
+            {
+                Some(ExpressionParserCursor {
+                    pos: (state.pos + bytes) as u64,
+                    work: (state.work + bytes) as u64,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        ExpressionParserCursorEvent::Restore { checkpoint } => {
+            if checkpoint <= state.pos && state.work < 0xffff_ffff_ffff_ffffu64 {
+                Some(ExpressionParserCursor {
+                    pos: checkpoint,
+                    work: (state.work + 1) as u64,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        ExpressionParserCursorEvent::Enter { depth_limit } => {
+            if state.depth < depth_limit && state.work < 0xffff_ffff_ffff_ffffu64 {
+                Some(ExpressionParserCursor {
+                    depth: (state.depth + 1) as u64,
+                    work: (state.work + 1) as u64,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        ExpressionParserCursorEvent::Exit => {
+            if state.depth > 0 && state.work < 0xffff_ffff_ffff_ffffu64 {
+                Some(ExpressionParserCursor {
+                    depth: (state.depth - 1) as u64,
+                    work: (state.work + 1) as u64,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        ExpressionParserCursorEvent::Finish => {
+            if state.pos == state.len && state.depth == 0 {
+                Some(state)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+pub fn expression_parser_cursor_start(len: u64) -> (state: ExpressionParserCursor)
+    ensures
+        expression_parser_cursor_inv(state),
+        state.pos == 0,
+        state.len == len,
+        state.depth == 0,
+        state.work == 0,
+{
+    ExpressionParserCursor { pos: 0, len, depth: 0, work: 0 }
+}
+
+pub fn expression_parser_cursor_step(
+    state: ExpressionParserCursor,
+    event: ExpressionParserCursorEvent,
+) -> (next: Option<ExpressionParserCursor>)
+    requires expression_parser_cursor_inv(state),
+    ensures
+        next == expression_parser_cursor_step_spec(state, event),
+        match next {
+            Some(value) => expression_parser_cursor_inv(value),
+            None => true,
+        },
+{
+    match event {
+        ExpressionParserCursorEvent::Advance { bytes } => {
+            if bytes > 0
+                && state.pos <= state.len
+                && bytes <= state.len - state.pos
+                && state.work <= u64::MAX - bytes
+            {
+                Some(ExpressionParserCursor {
+                    pos: state.pos + bytes,
+                    work: state.work + bytes,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        ExpressionParserCursorEvent::Restore { checkpoint } => {
+            if checkpoint <= state.pos && state.work < u64::MAX {
+                Some(ExpressionParserCursor {
+                    pos: checkpoint,
+                    work: state.work + 1,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        ExpressionParserCursorEvent::Enter { depth_limit } => {
+            if state.depth < depth_limit && state.work < u64::MAX {
+                Some(ExpressionParserCursor {
+                    depth: state.depth + 1,
+                    work: state.work + 1,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        ExpressionParserCursorEvent::Exit => {
+            if state.depth > 0 && state.work < u64::MAX {
+                Some(ExpressionParserCursor {
+                    depth: state.depth - 1,
+                    work: state.work + 1,
+                    ..state
+                })
+            } else {
+                None
+            }
+        }
+        ExpressionParserCursorEvent::Finish => {
+            if state.pos == state.len && state.depth == 0 {
+                Some(state)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+pub proof fn expression_cursor_advance_strictly_decreases_remaining(
+    state: ExpressionParserCursor,
+    bytes: u64,
+)
+    requires
+        expression_parser_cursor_inv(state),
+        expression_parser_cursor_step_spec(
+            state,
+            ExpressionParserCursorEvent::Advance { bytes },
+        ).is_some(),
+    ensures
+        expression_parser_cursor_step_spec(
+            state,
+            ExpressionParserCursorEvent::Advance { bytes },
+        ).unwrap().pos > state.pos,
+        expression_parser_cursor_step_spec(
+            state,
+            ExpressionParserCursorEvent::Advance { bytes },
+        ).unwrap().len
+            - expression_parser_cursor_step_spec(
+                state,
+                ExpressionParserCursorEvent::Advance { bytes },
+            ).unwrap().pos
+            < state.len - state.pos,
+{
+}
+
+pub proof fn expression_cursor_depth_is_bounded(
+    state: ExpressionParserCursor,
+    depth_limit: u64,
+)
+    requires
+        expression_parser_cursor_inv(state),
+        expression_parser_cursor_step_spec(
+            state,
+            ExpressionParserCursorEvent::Enter { depth_limit },
+        ).is_some(),
+    ensures
+        expression_parser_cursor_step_spec(
+            state,
+            ExpressionParserCursorEvent::Enter { depth_limit },
+        ).unwrap().depth <= depth_limit,
+{
+}
+
+/// Every nonterminal parser event consumes a strictly positive unit of the
+/// finite work rank. This supplies the well-founded measure for speculative
+/// restore and recursion events even when the byte cursor itself moves
+/// backwards; an admitted event trace cannot cycle forever.
+pub proof fn expression_cursor_nonterminal_event_strictly_decreases_work_rank(
+    state: ExpressionParserCursor,
+    event: ExpressionParserCursorEvent,
+)
+    requires
+        expression_parser_cursor_inv(state),
+        event != ExpressionParserCursorEvent::Finish,
+        expression_parser_cursor_step_spec(state, event).is_some(),
+    ensures
+        expression_parser_cursor_step_spec(state, event).unwrap().work > state.work,
+        0xffff_ffff_ffff_ffffu64
+            - expression_parser_cursor_step_spec(state, event).unwrap().work
+            < 0xffff_ffff_ffff_ffffu64 - state.work,
+{
+}
+
+pub proof fn expression_cursor_finish_is_total_only_at_terminal_cursor(
+    state: ExpressionParserCursor,
+)
+    requires expression_parser_cursor_inv(state),
+    ensures
+        expression_parser_cursor_step_spec(state, ExpressionParserCursorEvent::Finish).is_some()
+            <==> state.pos == state.len && state.depth == 0,
+{
+}
+
 /// Byte membership in a sequence, stated recursively so the executable
 /// matcher and its specification share one definition.
 pub open spec fn bytes_contains_spec(bytes: Seq<u8>, byte: u8) -> bool
@@ -20924,6 +22476,665 @@ pub fn fnmatch_match(pattern: &[u8], value: &[u8], path_mode: bool) -> (out: boo
         return value[0] == pattern[1] && fnmatch_match(&pattern[2..], &value[1..], path_mode);
     }
     pattern[0] == value[0] && fnmatch_match(&pattern[1..], &value[1..], path_mode)
+}
+
+/// Token vocabulary used by the stack-safe bottom-up matcher. Class offsets
+/// refer to the original pattern, so tokenization itself allocates no class
+/// payload and the DP retains two Boolean rows only.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FnmatchDpToken {
+    Star,
+    Any,
+    Literal(u8),
+    Class {
+        body_start: usize,
+        body_end: usize,
+        negated: bool,
+    },
+}
+
+pub open spec fn fnmatch_tokens_from_spec(
+    pattern: Seq<u8>,
+    offset: int,
+) -> Seq<FnmatchDpToken>
+    decreases pattern.len() - offset,
+{
+    if offset < 0 || offset >= pattern.len() {
+        Seq::empty()
+    } else if pattern[offset] == b'*' {
+        seq![FnmatchDpToken::Star] + fnmatch_tokens_from_spec(pattern, offset + 1)
+    } else if pattern[offset] == b'?' {
+        seq![FnmatchDpToken::Any] + fnmatch_tokens_from_spec(pattern, offset + 1)
+    } else if pattern[offset] == b'[' && offset + 1 < pattern.len() {
+        let body_start = fnmatch_class_body_start_spec(pattern, offset);
+        let end = fnmatch_class_end_spec(pattern, body_start);
+        if offset < end && end < pattern.len() {
+            seq![FnmatchDpToken::Class {
+                body_start: body_start as usize,
+                body_end: end as usize,
+                negated: fnmatch_class_negated_spec(pattern, offset),
+            }] + fnmatch_tokens_from_spec(pattern, end + 1)
+        } else {
+            seq![FnmatchDpToken::Literal(b'[')]
+                + fnmatch_tokens_from_spec(pattern, offset + 1)
+        }
+    } else if pattern[offset] == b'\\' && offset + 1 < pattern.len() {
+        seq![FnmatchDpToken::Literal(pattern[offset + 1])]
+            + fnmatch_tokens_from_spec(pattern, offset + 2)
+    } else {
+        seq![FnmatchDpToken::Literal(pattern[offset])]
+            + fnmatch_tokens_from_spec(pattern, offset + 1)
+    }
+}
+
+pub struct FnmatchTokenizeState {
+    pub offset: u64,
+    pub tokens: Vec<FnmatchDpToken>,
+}
+
+pub open spec fn fnmatch_tokenize_inv(
+    pattern: Seq<u8>,
+    state: FnmatchTokenizeState,
+) -> bool {
+    &&& state.offset <= pattern.len()
+    &&& state.tokens@ + fnmatch_tokens_from_spec(pattern, state.offset as int)
+        == fnmatch_tokens_from_spec(pattern, 0)
+}
+
+pub fn fnmatch_tokenize_start(_pattern: &[u8]) -> (state: FnmatchTokenizeState)
+    ensures
+        state.offset == 0,
+        state.tokens@.len() == 0,
+        fnmatch_tokenize_inv(_pattern@, state),
+{
+    FnmatchTokenizeState { offset: 0, tokens: Vec::new() }
+}
+
+pub fn fnmatch_tokenize_step(
+    pattern: &[u8],
+    mut state: FnmatchTokenizeState,
+) -> (next: FnmatchTokenizeState)
+    requires
+        fnmatch_tokenize_inv(pattern@, state),
+        state.offset < pattern.len(),
+    ensures
+        fnmatch_tokenize_inv(pattern@, next),
+        next.offset > state.offset,
+        next.offset <= pattern.len(),
+        next.tokens@.len() == state.tokens@.len() + 1,
+{
+    let ghost old_offset = state.offset;
+    let ghost old_tokens = state.tokens@;
+    let ghost complete = fnmatch_tokens_from_spec(pattern@, 0);
+    let i = state.offset as usize;
+    let token;
+    let end;
+    if pattern[i] == b'*' {
+        token = FnmatchDpToken::Star;
+        end = i + 1;
+    } else if pattern[i] == b'?' {
+        token = FnmatchDpToken::Any;
+        end = i + 1;
+    } else if pattern[i] == b'[' && i + 1 < pattern.len() {
+        let body_start = fnmatch_class_body_start(pattern, i);
+        match fnmatch_class_end(pattern, body_start) {
+            Some(body_end) => {
+                token = FnmatchDpToken::Class {
+                    body_start,
+                    body_end,
+                    negated: fnmatch_class_negated(pattern, i),
+                };
+                end = body_end + 1;
+            }
+            None => {
+                token = FnmatchDpToken::Literal(b'[');
+                end = i + 1;
+            }
+        }
+    } else if pattern[i] == b'\\' && i + 1 < pattern.len() {
+        token = FnmatchDpToken::Literal(pattern[i + 1]);
+        end = i + 2;
+    } else {
+        token = FnmatchDpToken::Literal(pattern[i]);
+        end = i + 1;
+    }
+    proof {
+        reveal(fnmatch_tokens_from_spec);
+        assert(fnmatch_tokens_from_spec(pattern@, old_offset as int)
+            == seq![token] + fnmatch_tokens_from_spec(pattern@, end as int));
+    }
+    state.tokens.push(token);
+    state.offset = end as u64;
+    proof {
+        assert(state.tokens@ == old_tokens.push(token));
+        assert(old_tokens.push(token) == old_tokens + seq![token]);
+        assert(old_tokens + fnmatch_tokens_from_spec(pattern@, old_offset as int) == complete);
+        assert(state.tokens@ + fnmatch_tokens_from_spec(pattern@, state.offset as int) == complete);
+    }
+    state
+}
+
+pub fn fnmatch_tokenize(pattern: &[u8]) -> (tokens: Vec<FnmatchDpToken>)
+    ensures tokens@ == fnmatch_tokens_from_spec(pattern@, 0),
+{
+    let mut state = fnmatch_tokenize_start(pattern);
+    while state.offset < pattern.len() as u64
+        invariant
+            fnmatch_tokenize_inv(pattern@, state),
+            state.offset <= pattern.len(),
+        decreases pattern.len() - state.offset,
+    {
+        state = fnmatch_tokenize_step(pattern, state);
+    }
+    assert(fnmatch_tokens_from_spec(pattern@, state.offset as int).len() == 0);
+    state.tokens
+}
+
+pub open spec fn fnmatch_token_spec(
+    pattern: Seq<u8>,
+    tokens: Seq<FnmatchDpToken>,
+    value: Seq<u8>,
+    path_mode: bool,
+) -> bool
+    decreases tokens.len() + value.len(),
+{
+    if tokens.len() == 0 {
+        value.len() == 0
+    } else {
+        match tokens[0] {
+            FnmatchDpToken::Star => {
+                fnmatch_token_spec(pattern, tokens.skip(1), value, path_mode)
+                    || (value.len() > 0
+                        && (!path_mode || value[0] != b'/')
+                        && fnmatch_token_spec(pattern, tokens, value.skip(1), path_mode))
+            }
+            FnmatchDpToken::Any => {
+                value.len() > 0
+                    && (!path_mode || value[0] != b'/')
+                    && fnmatch_token_spec(
+                        pattern,
+                        tokens.skip(1),
+                        value.skip(1),
+                        path_mode,
+                    )
+            }
+            FnmatchDpToken::Literal(byte) => {
+                value.len() > 0
+                    && value[0] == byte
+                    && fnmatch_token_spec(
+                        pattern,
+                        tokens.skip(1),
+                        value.skip(1),
+                        path_mode,
+                    )
+            }
+            FnmatchDpToken::Class { body_start, body_end, negated } => {
+                value.len() > 0
+                    && body_start <= body_end
+                    && body_end <= pattern.len()
+                    && (!path_mode || value[0] != b'/')
+                    && fnmatch_class_body_spec(
+                        pattern.subrange(body_start as int, body_end as int),
+                        0,
+                        value[0],
+                        path_mode,
+                    ) != negated
+                    && fnmatch_token_spec(
+                        pattern,
+                        tokens.skip(1),
+                        value.skip(1),
+                        path_mode,
+                    )
+            }
+        }
+    }
+}
+
+proof fn fnmatch_class_body_start_subrange(pattern: Seq<u8>, offset: int)
+    requires 0 <= offset < pattern.len(),
+    ensures
+        fnmatch_class_body_start_spec(
+            pattern.subrange(offset, pattern.len() as int),
+            0,
+        ) + offset == fnmatch_class_body_start_spec(pattern, offset),
+{
+}
+
+proof fn fnmatch_class_end_subrange(
+    pattern: Seq<u8>,
+    offset: int,
+    from: int,
+)
+    requires 0 <= offset <= from <= pattern.len(),
+    ensures
+        fnmatch_class_end_spec(
+            pattern.subrange(offset, pattern.len() as int),
+            from - offset,
+        ) + offset == fnmatch_class_end_spec(pattern, from),
+    decreases pattern.len() - from,
+{
+    let suffix = pattern.subrange(offset, pattern.len() as int);
+    if from >= pattern.len() {
+    } else {
+        assert(suffix[from - offset] == pattern[from]);
+        if pattern[from] == b']' {
+        } else if pattern[from] == b'\\' && from + 1 < pattern.len() {
+            fnmatch_class_end_subrange(pattern, offset, from + 2);
+        } else {
+            fnmatch_class_end_subrange(pattern, offset, from + 1);
+        }
+    }
+}
+
+#[verifier::rlimit(20)]
+proof fn fnmatch_tokens_refine_recursive_at(
+    pattern: Seq<u8>,
+    offset: int,
+    value: Seq<u8>,
+    path_mode: bool,
+)
+    requires
+        0 <= offset <= pattern.len(),
+        pattern.len() <= usize::MAX,
+    ensures
+        fnmatch_token_spec(
+            pattern,
+            fnmatch_tokens_from_spec(pattern, offset),
+            value,
+            path_mode,
+        ) == fnmatch_spec(
+            pattern.subrange(offset, pattern.len() as int),
+            value,
+            path_mode,
+        ),
+    decreases (pattern.len() - offset) + value.len(),
+{
+    reveal_with_fuel(fnmatch_tokens_from_spec, 2);
+    reveal_with_fuel(fnmatch_token_spec, 2);
+    reveal_with_fuel(fnmatch_spec, 2);
+    if offset >= pattern.len() {
+        assert(pattern.subrange(offset, pattern.len() as int).len() == 0);
+        return;
+    }
+    let suffix = pattern.subrange(offset, pattern.len() as int);
+    assert(suffix.len() == pattern.len() - offset);
+    assert(suffix[0] == pattern[offset]);
+    if pattern[offset] == b'*' {
+        let rest = fnmatch_tokens_from_spec(pattern, offset + 1);
+        assert(fnmatch_tokens_from_spec(pattern, offset) == seq![FnmatchDpToken::Star] + rest);
+        assert((seq![FnmatchDpToken::Star] + rest).skip(1) == rest);
+        assert(suffix.skip(1) == pattern.subrange(offset + 1, pattern.len() as int));
+        fnmatch_tokens_refine_recursive_at(pattern, offset + 1, value, path_mode);
+        if value.len() > 0 && (!path_mode || value[0] != b'/') {
+            fnmatch_tokens_refine_recursive_at(pattern, offset, value.skip(1), path_mode);
+        }
+    } else if pattern[offset] == b'?' {
+        let rest = fnmatch_tokens_from_spec(pattern, offset + 1);
+        assert(fnmatch_tokens_from_spec(pattern, offset) == seq![FnmatchDpToken::Any] + rest);
+        assert((seq![FnmatchDpToken::Any] + rest).skip(1) == rest);
+        if value.len() > 0 {
+            assert(suffix.skip(1) == pattern.subrange(offset + 1, pattern.len() as int));
+            fnmatch_tokens_refine_recursive_at(
+                pattern,
+                offset + 1,
+                value.skip(1),
+                path_mode,
+            );
+        }
+    } else if value.len() == 0 {
+    } else if pattern[offset] == b'[' && offset + 1 < pattern.len() {
+        let body_start = fnmatch_class_body_start_spec(pattern, offset);
+        let end = fnmatch_class_end_spec(pattern, body_start);
+        fnmatch_class_end_bounds(pattern, body_start);
+        fnmatch_class_body_start_subrange(pattern, offset);
+        fnmatch_class_end_subrange(pattern, offset, body_start);
+        assert(fnmatch_class_negated_spec(suffix, 0)
+            == fnmatch_class_negated_spec(pattern, offset));
+        if end == pattern.len() {
+            let rest = fnmatch_tokens_from_spec(pattern, offset + 1);
+            assert(fnmatch_tokens_from_spec(pattern, offset)
+                == seq![FnmatchDpToken::Literal(b'[')] + rest);
+            assert((seq![FnmatchDpToken::Literal(b'[')] + rest).skip(1) == rest);
+            assert(suffix.skip(1) == pattern.subrange(offset + 1, pattern.len() as int));
+            fnmatch_tokens_refine_recursive_at(
+                pattern,
+                offset + 1,
+                value.skip(1),
+                path_mode,
+            );
+        } else {
+            assert(offset < end);
+            assert(end + 1 <= pattern.len());
+            let class_token = FnmatchDpToken::Class {
+                body_start: body_start as usize,
+                body_end: end as usize,
+                negated: fnmatch_class_negated_spec(pattern, offset),
+            };
+            let rest = fnmatch_tokens_from_spec(pattern, end + 1);
+            assert(fnmatch_tokens_from_spec(pattern, offset) == seq![class_token] + rest);
+            assert((seq![class_token] + rest).skip(1) == rest);
+            assert(suffix.subrange(body_start - offset, end - offset)
+                == pattern.subrange(body_start, end));
+            assert(suffix.subrange(end - offset + 1, suffix.len() as int)
+                == pattern.subrange(end + 1, pattern.len() as int));
+            fnmatch_tokens_refine_recursive_at(
+                pattern,
+                end + 1,
+                value.skip(1),
+                path_mode,
+            );
+        }
+    } else if pattern[offset] == b'\\' && offset + 1 < pattern.len() {
+        let rest = fnmatch_tokens_from_spec(pattern, offset + 2);
+        assert(fnmatch_tokens_from_spec(pattern, offset)
+            == seq![FnmatchDpToken::Literal(pattern[offset + 1])] + rest);
+        assert((seq![FnmatchDpToken::Literal(pattern[offset + 1])] + rest).skip(1) == rest);
+        assert(suffix[1] == pattern[offset + 1]);
+        assert(suffix.subrange(2, suffix.len() as int)
+            == pattern.subrange(offset + 2, pattern.len() as int));
+        fnmatch_tokens_refine_recursive_at(
+            pattern,
+            offset + 2,
+            value.skip(1),
+            path_mode,
+        );
+    } else {
+        let rest = fnmatch_tokens_from_spec(pattern, offset + 1);
+        assert(fnmatch_tokens_from_spec(pattern, offset)
+            == seq![FnmatchDpToken::Literal(pattern[offset])] + rest);
+        assert((seq![FnmatchDpToken::Literal(pattern[offset])] + rest).skip(1) == rest);
+        assert(suffix.skip(1) == pattern.subrange(offset + 1, pattern.len() as int));
+        fnmatch_tokens_refine_recursive_at(
+            pattern,
+            offset + 1,
+            value.skip(1),
+            path_mode,
+        );
+    }
+}
+
+proof fn fnmatch_token_spec_unfold(
+    pattern: Seq<u8>,
+    tokens: Seq<FnmatchDpToken>,
+    value: Seq<u8>,
+    path_mode: bool,
+)
+    requires tokens.len() > 0,
+    ensures
+        fnmatch_token_spec(pattern, tokens, value, path_mode) == match tokens[0] {
+            FnmatchDpToken::Star => {
+                fnmatch_token_spec(pattern, tokens.skip(1), value, path_mode)
+                    || (value.len() > 0
+                        && (!path_mode || value[0] != b'/')
+                        && fnmatch_token_spec(pattern, tokens, value.skip(1), path_mode))
+            }
+            FnmatchDpToken::Any => {
+                value.len() > 0
+                    && (!path_mode || value[0] != b'/')
+                    && fnmatch_token_spec(pattern, tokens.skip(1), value.skip(1), path_mode)
+            }
+            FnmatchDpToken::Literal(byte) => {
+                value.len() > 0
+                    && value[0] == byte
+                    && fnmatch_token_spec(pattern, tokens.skip(1), value.skip(1), path_mode)
+            }
+            FnmatchDpToken::Class { body_start, body_end, negated } => {
+                value.len() > 0
+                    && body_start <= body_end
+                    && body_end <= pattern.len()
+                    && (!path_mode || value[0] != b'/')
+                    && fnmatch_class_body_spec(
+                        pattern.subrange(body_start as int, body_end as int),
+                        0,
+                        value[0],
+                        path_mode,
+                    ) != negated
+                    && fnmatch_token_spec(pattern, tokens.skip(1), value.skip(1), path_mode)
+            }
+        },
+{
+    reveal(fnmatch_token_spec);
+}
+
+/// Exact semantic bridge from the verified token stream to the original
+/// recursive shell-pattern specification.  This is independent of the DP
+/// implementation below: it proves that tokenization did not change the
+/// language before the rolling rows are considered.
+pub proof fn fnmatch_tokens_refine_recursive_spec(
+    pattern: Seq<u8>,
+    value: Seq<u8>,
+    path_mode: bool,
+)
+    requires pattern.len() <= usize::MAX,
+    ensures
+        fnmatch_token_spec(
+            pattern,
+            fnmatch_tokens_from_spec(pattern, 0),
+            value,
+            path_mode,
+        ) == fnmatch_spec(pattern, value, path_mode),
+{
+    fnmatch_tokens_refine_recursive_at(pattern, 0, value, path_mode);
+    assert(pattern.subrange(0, pattern.len() as int) == pattern);
+}
+
+fn fnmatch_dp_tokens(
+    pattern: &[u8],
+    tokens: &[FnmatchDpToken],
+    value: &[u8],
+    path_mode: bool,
+) -> (out: bool)
+    requires value.len() < usize::MAX,
+    ensures out == fnmatch_token_spec(pattern@, tokens@, value@, path_mode),
+{
+    let row_len = value.len() + 1;
+    let mut next: Vec<bool> = Vec::new();
+    let mut j = 0usize;
+    while j < row_len
+        invariant
+            row_len == value.len() + 1,
+            j <= row_len,
+            next@.len() == j,
+            forall|k: int| 0 <= k < j ==> #[trigger] next@[k] == (k == value@.len()),
+        decreases row_len - j,
+    {
+        next.push(j == value.len());
+        j += 1;
+    }
+
+    let mut current: Vec<bool> = Vec::new();
+    let mut fill = 0usize;
+    while fill < row_len
+        invariant row_len == value.len() + 1, fill <= row_len, current@.len() == fill,
+        decreases row_len - fill,
+    {
+        current.push(false);
+        fill += 1;
+    }
+    proof {
+        assert forall|k: int| 0 <= k <= value@.len() implies #[trigger] next@[k]
+            == fnmatch_token_spec(
+                pattern@,
+                tokens@.subrange(tokens@.len() as int, tokens@.len() as int),
+                value@.subrange(k, value@.len() as int),
+                path_mode,
+            ) by {
+            reveal(fnmatch_token_spec);
+        }
+    }
+
+    let mut token_index = tokens.len();
+    while token_index > 0
+        invariant
+            token_index <= tokens.len(),
+            row_len == value.len() + 1,
+            next@.len() == value@.len() + 1,
+            current@.len() == value@.len() + 1,
+            forall|k: int| 0 <= k <= value@.len() ==> #[trigger] next@[k]
+                == fnmatch_token_spec(
+                    pattern@,
+                    tokens@.subrange(token_index as int, tokens@.len() as int),
+                    value@.subrange(k, value@.len() as int),
+                    path_mode,
+                ),
+        decreases token_index,
+    {
+        token_index -= 1;
+        let token = tokens[token_index];
+        proof {
+            assert(token == tokens@[token_index as int]);
+        }
+        let mut remaining = row_len;
+        while remaining > 0
+            invariant
+                token_index < tokens.len(),
+                token == tokens@[token_index as int],
+                row_len == value.len() + 1,
+                remaining <= row_len,
+                current@.len() == value@.len() + 1,
+                next@.len() == value@.len() + 1,
+                forall|k: int| 0 <= k <= value@.len() ==> #[trigger] next@[k]
+                    == fnmatch_token_spec(
+                        pattern@,
+                        tokens@.subrange((token_index + 1) as int, tokens@.len() as int),
+                        value@.subrange(k, value@.len() as int),
+                        path_mode,
+                    ),
+                forall|k: int| remaining as int <= k <= value@.len()
+                    ==> #[trigger] current@[k] == fnmatch_token_spec(
+                        pattern@,
+                        tokens@.subrange(token_index as int, tokens@.len() as int),
+                        value@.subrange(k, value@.len() as int),
+                        path_mode,
+                    ),
+            decreases remaining,
+        {
+            let index = remaining - 1;
+            let computed = match token {
+                FnmatchDpToken::Star => {
+                    next[index]
+                        || (index < value.len()
+                            && (!path_mode || value[index] != b'/')
+                            && current[index + 1])
+                }
+                FnmatchDpToken::Any => {
+                    index < value.len()
+                        && (!path_mode || value[index] != b'/')
+                        && next[index + 1]
+                }
+                FnmatchDpToken::Literal(byte) => {
+                    index < value.len() && value[index] == byte && next[index + 1]
+                }
+                FnmatchDpToken::Class { body_start, body_end, negated } => {
+                    if index >= value.len()
+                        || body_start > body_end
+                        || body_end > pattern.len()
+                    {
+                        false
+                    } else {
+                        let hit = fnmatch_class_body(
+                            &pattern[body_start..body_end],
+                            0,
+                            value[index],
+                            path_mode,
+                        );
+                        proof {
+                            assert(pattern@[body_start as int..body_end as int]
+                                == pattern@.subrange(body_start as int, body_end as int));
+                        }
+                        (!path_mode || value[index] != b'/')
+                            && hit != negated
+                            && next[index + 1]
+                    }
+                }
+            };
+            proof {
+                let suffix = tokens@.subrange(token_index as int, tokens@.len() as int);
+                let value_suffix = value@.subrange(index as int, value@.len() as int);
+                assert(suffix.len() > 0);
+                assert(tokens@[token_index as int] == token);
+                assert(suffix[0] == tokens@[token_index as int]);
+                assert(suffix[0] == token);
+                assert(suffix.skip(1) == tokens@.subrange(
+                    (token_index + 1) as int,
+                    tokens@.len() as int,
+                ));
+                if index < value.len() {
+                    assert(value_suffix.len() > 0);
+                    assert(value_suffix[0] == value@[index as int]);
+                    assert(value_suffix.skip(1) == value@.subrange(
+                        (index + 1) as int,
+                        value@.len() as int,
+                    ));
+                } else {
+                    assert(value_suffix.len() == 0);
+                }
+                fnmatch_token_spec_unfold(pattern@, suffix, value_suffix, path_mode);
+                match token {
+                    FnmatchDpToken::Star => {},
+                    FnmatchDpToken::Any => {},
+                    FnmatchDpToken::Literal(_) => {},
+                    FnmatchDpToken::Class { body_start, body_end, negated: _ } => {
+                        if index < value.len()
+                            && body_start <= body_end
+                            && body_end <= pattern.len()
+                        {
+                            assert(pattern@[body_start as int..body_end as int]
+                                == pattern@.subrange(body_start as int, body_end as int));
+                        }
+                    }
+                }
+                assert(computed == fnmatch_token_spec(
+                    pattern@,
+                    suffix,
+                    value_suffix,
+                    path_mode,
+                ));
+            }
+            current[index] = computed;
+            remaining = index;
+        }
+        assert forall|k: int| 0 <= k <= value@.len() implies #[trigger] current@[k]
+            == fnmatch_token_spec(
+                pattern@,
+                tokens@.subrange(token_index as int, tokens@.len() as int),
+                value@.subrange(k, value@.len() as int),
+                path_mode,
+            ) by {}
+        std::mem::swap(&mut current, &mut next);
+    }
+    assert(token_index == 0);
+    assert(tokens@.subrange(0, tokens@.len() as int) == tokens@);
+    assert(value@.subrange(0, value@.len() as int) == value@);
+    assert(next@[0] == fnmatch_token_spec(
+        pattern@,
+        tokens@.subrange(0, tokens@.len() as int),
+        value@.subrange(0, value@.len() as int),
+        path_mode,
+    ));
+    assert(next@[0] == fnmatch_token_spec(pattern@, tokens@, value@, path_mode));
+    next[0]
+}
+
+/// Stack-safe, polynomial implementation used by every production fnmatch
+/// surface.  The two rolling rows are proved equal to the recursive token
+/// semantics, and the independent token-refinement theorem above connects
+/// that semantics to `fnmatch_spec`.
+#[inline]
+pub fn fnmatch_dp_match(pattern: &[u8], value: &[u8], path_mode: bool) -> (out: bool)
+    ensures out == fnmatch_spec(pattern@, value@, path_mode),
+{
+    if value.len() == usize::MAX {
+        return fnmatch_match(pattern, value, path_mode);
+    }
+    let tokens = fnmatch_tokenize(pattern);
+    let out = fnmatch_dp_tokens(pattern, &tokens, value, path_mode);
+    proof {
+        assert(pattern@.len() == pattern.len());
+        assert(pattern.len() <= usize::MAX);
+        fnmatch_tokens_refine_recursive_spec(pattern@, value@, path_mode);
+    }
+    out
 }
 
 /// In path mode no wildcard can consume a `/`: only literal characters and

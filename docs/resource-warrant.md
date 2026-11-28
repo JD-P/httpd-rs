@@ -67,9 +67,13 @@ Every site also has one independent closure disposition:
 `closure_contracts` in the policy supply module-level evidence where a local
 expression does not itself name the owning lease. CI requires exactly one
 disposition for every effect and fails if `unclassified_effect_sites` is not
-zero. The current closure is 2,236 typed-lease sites, 665 constant-bound sites
-and 448 external/kernel sites. Classification closes discovery debt; it does
-not promote a partial dominance or cost-refinement proof to mechanized status.
+zero. The current closure is 2,096 typed-lease sites, 1,140 constant-bound
+sites and 408 external/kernel sites. Classification closes discovery debt; it
+does not promote a partial cost-refinement or external-semantics claim to
+mechanized status. Acquisition dominance, queue/task/output handoff,
+cancellation retention and exactly-once terminal release for central typed
+slots now reduce through the verified `LeaseOwnershipState` machine; Rust
+move/Drop and OS scheduling remain explicit runtime boundaries.
 
 ## Dynamic collection
 
