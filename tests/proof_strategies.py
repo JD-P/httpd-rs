@@ -80,24 +80,28 @@ COMPONENT_RANGES = (
     (11860, 12004, "CGI/backend response admission"),
     (12005, 12289, "CGI environment and regex admission"),
     (12290, 12535, "Cache lookup and expression authorization"),
-    (12536, 12727, "Proxy identity and authorization algebra"),
-    (12728, 13254, "Configuration phase ordering"),
-    (13255, 14367, "Whole request-policy state machine"),
-    (14368, 15012, "Configuration merge helpers"),
-    (15013, 15341, "RemoteIP and virtual-host identity"),
-    (15342, 16588, "Configuration front-end refinement"),
-    (16589, 16776, "Container-field merge"),
-    (16777, 19766, "HTTP/2 admission and lifecycle"),
-    (19767, 20019, "Access/cache prefilters and mapping order"),
-    (20020, 20655, "fnmatch semantics"),
-    (20656, 20825, "Handler and CGI capability admission"),
-    (20826, 20951, "Authentication-file and FastCGI path immutability"),
-    (20952, 21425, "Nginx lexer and parser refinement"),
-    (21426, 21704, "Nginx route-index refinement"),
-    (21705, 21832, "Nginx lowering closure"),
-    (21833, 22010, "Nginx transformation language"),
-    (22011, 22220, "Source-neutral scope merge"),
-    (22221, 22375, "Common-IR request refinement"),
+    (12536, 12740, "Proxy identity and authorization algebra"),
+    (12741, 12993, "Authorization evaluator"),
+    (12994, 13520, "Configuration phase ordering"),
+    (13521, 14633, "Whole request-policy state machine"),
+    (14634, 14900, "Policy compilation fold"),
+    (14901, 15530, "Configuration merge helpers"),
+    (15531, 15859, "RemoteIP and virtual-host identity"),
+    (15860, 16084, "Nginx route-index refinement"),
+    (16085, 16165, "Dependency and TLS call boundaries"),
+    (16166, 17107, "Configuration front-end refinement"),
+    (17108, 17295, "Container-field merge"),
+    (17296, 20250, "HTTP/2 admission and lifecycle"),
+    (20251, 20503, "Access/cache prefilters and mapping order"),
+    (20504, 21100, "fnmatch semantics"),
+    (21101, 21299, "Handler and CGI capability admission"),
+    (21300, 21434, "Authentication-file and FastCGI path immutability"),
+    (21435, 21899, "Nginx lexer and parser refinement"),
+    (21900, 22210, "Nginx route-index refinement"),
+    (22211, 22350, "Nginx lowering closure"),
+    (22351, 22500, "Nginx transformation language"),
+    (22501, 22700, "Source-neutral scope merge"),
+    (22701, 23000, "Common-IR request refinement"),
 )
 
 
@@ -270,11 +274,13 @@ SEQUENCE_ALGEBRA_PROOFS = {
 }
 
 STATE_MACHINE_COMPONENTS = {
+    "Authorization evaluator",
     "Request body phase machine",
     "Dynamic outcome lifecycle",
     "Rewrite rule transitions",
     "Rewrite program machine",
     "Whole request-policy state machine",
+    "Policy compilation fold",
     "Nginx lexer and parser refinement",
 }
 
@@ -378,6 +384,17 @@ PROPERTY_OVERRIDES = {
     "lemma_split_root_ok": "The root path `/` satisfies the path-splitting invariants.",
     "combine_and_commutative": "Authorization AND-combination is commutative in the model.",
     "combine_or_commutative": "Authorization OR-combination is commutative in the model.",
+    "authorization_terminal_prefix_is_absorbing": (
+        "Once an authorization fold reaches its kind-specific terminal result, no later active "
+        "or inactive child can change the completed decision."
+    ),
+    "require_none_fold_never_grants": (
+        "Completing any invariant-preserving RequireNone fold cannot return Granted."
+    ),
+    "complete_policy_compilation_visits_every_component_once": (
+        "A complete policy-compilation state has traversed all eleven components and retains "
+        "exactly the parent, child, or header-admission error condition."
+    ),
     "auth_merge_kind_properties": (
         "Authorization merge mode selects AND/OR only with a parent and otherwise selects replacement."
     ),

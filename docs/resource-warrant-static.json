@@ -7201,50 +7201,6 @@
         "request_resource_effect_closure",
         "terminal_sink_gate"
       ],
-      "code": "for item in items {",
-      "effect": "cpu-iteration",
-      "function": "eval_node",
-      "id": "767bef4906ba3e560d75",
-      "path": "crates/server/src/access.rs",
-      "status": "review-required"
-    },
-    {
-      "accounting_evidence": [],
-      "closure_contract": "request-runtime-typed-leases",
-      "closure_disposition": "typed-lease",
-      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
-      "closure_verification_targets": [
-        "resource_budget_admit",
-        "shared_map_insert_admit",
-        "shared_queue_push_admit",
-        "dependency_call_admit",
-        "async_work_handoff_admit",
-        "blocking_io_start_admit",
-        "request_resource_effect_closure",
-        "terminal_sink_gate"
-      ],
-      "code": ".collect();",
-      "effect": "heap-allocation",
-      "function": "eval_node",
-      "id": "92962f6c79e2b057c03d",
-      "path": "crates/server/src/access.rs",
-      "status": "review-required"
-    },
-    {
-      "accounting_evidence": [],
-      "closure_contract": "request-runtime-typed-leases",
-      "closure_disposition": "typed-lease",
-      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
-      "closure_verification_targets": [
-        "resource_budget_admit",
-        "shared_map_insert_admit",
-        "shared_queue_push_admit",
-        "dependency_call_admit",
-        "async_work_handoff_admit",
-        "blocking_io_start_admit",
-        "request_resource_effect_closure",
-        "terminal_sink_gate"
-      ],
       "code": "for entry in entries {",
       "effect": "cpu-iteration",
       "function": "eval_policy",
@@ -7450,6 +7406,50 @@
       "effect": "heap-allocation",
       "function": "from_error_document",
       "id": "02c48359518a6c36a0f4",
+      "path": "crates/server/src/access.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "request-runtime-typed-leases",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "shared_map_insert_admit",
+        "shared_queue_push_admit",
+        "dependency_call_admit",
+        "async_work_handoff_admit",
+        "blocking_io_start_admit",
+        "request_resource_effect_closure",
+        "terminal_sink_gate"
+      ],
+      "code": "for &byte in program {",
+      "effect": "cpu-iteration",
+      "function": "fuzz_authorization_fold",
+      "id": "02d0fbb466b017d511af",
+      "path": "crates/server/src/access.rs",
+      "status": "review-required"
+    },
+    {
+      "accounting_evidence": [],
+      "closure_contract": "request-runtime-typed-leases",
+      "closure_disposition": "typed-lease",
+      "closure_evidence": "request-reachable entrypoints carry ResourceContext and consume the module's typed slot/byte/disk/transport/rate lease before variable work; request-controlled queue and blocking-task handoffs move an AsyncWorkLease into the child so cancellation of the waiter cannot release accounting before child exit; synchronous filesystem and dependency calls without a narrower response/backend/helper contract acquire a re-entrant BlockingIoLease under the same request lineage and reject new calls after cancellation; shared maps and caches combine cardinality and byte ceilings through one verified insertion predicate and queues are physically bounded and ownership-carrying; every direct dependency belongs to a closed manifest class and request/backend-influenced variable-cost entry points consume one input/work/workspace dependency predicate under their typed owner; tests/resource_inventory.py rejects unbounded channels, lost shared-state evidence, manifest drift and new unreviewed dependency namespace occurrences; bounded pure projections remain covered by that owning request phase",
+      "closure_verification_targets": [
+        "resource_budget_admit",
+        "shared_map_insert_admit",
+        "shared_queue_push_admit",
+        "dependency_call_admit",
+        "async_work_handoff_admit",
+        "blocking_io_start_admit",
+        "request_resource_effect_closure",
+        "terminal_sink_gate"
+      ],
+      "code": "for &byte in program {",
+      "effect": "cpu-iteration",
+      "function": "fuzz_authorization_fold",
+      "id": "777b141a7ec004008038",
       "path": "crates/server/src/access.rs",
       "status": "review-required"
     },
@@ -75487,7 +75487,7 @@
       "status": "external-source-inventory"
     }
   ],
-  "source_sha256": "33303a9d608dc1f86a3e940632f8cd2d676b48cd34c214a08468eecb795c73a9",
+  "source_sha256": "67804722b7e9dcc92950a805629b8dc553fda25843537a1e6aad526b6bb890a5",
   "summary": {
     "by_closure_disposition": {
       "external-assumption": 408,
@@ -75496,10 +75496,10 @@
     },
     "by_effect": {
       "compression-regex-crypto": 77,
-      "cpu-iteration": 986,
+      "cpu-iteration": 987,
       "data-growth": 452,
       "filesystem": 152,
-      "heap-allocation": 1256,
+      "heap-allocation": 1255,
       "network": 37,
       "synchronization": 283,
       "task-process": 46,

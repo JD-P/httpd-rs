@@ -12682,6 +12682,7 @@ pub fn require_none_multi(rs: &[PolicyResult]) -> (out: PolicyResult)
 }
 
 /// `<RequireAll>` combination.
+#[inline]
 pub fn combine_and(a: PolicyResult, b: PolicyResult) -> (r: PolicyResult)
     ensures r == combine_and_spec(a, b)
 {
@@ -12697,6 +12698,7 @@ pub fn combine_and(a: PolicyResult, b: PolicyResult) -> (r: PolicyResult)
 }
 
 /// `<RequireAny>` combination.
+#[inline]
 pub fn combine_or(a: PolicyResult, b: PolicyResult) -> (r: PolicyResult)
     ensures r == combine_or_spec(a, b)
 {
@@ -12713,6 +12715,7 @@ pub fn combine_or(a: PolicyResult, b: PolicyResult) -> (r: PolicyResult)
 
 /// A `<RequireNone>` group cannot grant authorization.  A granted child
 /// becomes denied; denied/auth-required children are neutral.
+#[inline]
 pub fn require_none_result(r: PolicyResult) -> (out: PolicyResult)
     ensures
         out == require_none_result_spec(r),
@@ -12733,6 +12736,305 @@ proof fn combine_and_commutative(a: PolicyResult, b: PolicyResult)
 proof fn combine_or_commutative(a: PolicyResult, b: PolicyResult)
     ensures combine_or_spec(a, b) == combine_or_spec(b, a)
 {
+}
+
+/// The five folds used by the complete authorization evaluator. A policy
+/// `List` is an OR of the entries that apply to the request method; if at
+/// least one entry applied but every result stayed neutral, the list denies
+/// because a negated provider cannot authorize by itself. A list with no
+/// applicable entry is granted under an AND parent and neutral under an OR
+/// parent. Keeping those two contexts explicit avoids the former hand-written
+/// `parent_and` special case in the runtime.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AuthorizationFoldKind {
+    RequireAll,
+    RequireAny,
+    RequireNone,
+    PolicyListAndParent,
+    PolicyListOrParent,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AuthorizationFoldState {
+    pub kind: AuthorizationFoldKind,
+    pub aggregate: PolicyResult,
+    pub matched: bool,
+}
+
+pub open spec fn authorization_fold_invariant_spec(state: AuthorizationFoldState) -> bool {
+    !state.matched ==> state.aggregate == PolicyResult::Neutral
+}
+
+#[inline]
+pub fn authorization_fold_start(kind: AuthorizationFoldKind) -> (state: AuthorizationFoldState)
+    ensures
+        authorization_fold_invariant_spec(state),
+        state.kind == kind,
+        state.aggregate == PolicyResult::Neutral,
+        !state.matched,
+{
+    AuthorizationFoldState {
+        kind,
+        aggregate: PolicyResult::Neutral,
+        matched: false,
+    }
+}
+
+pub open spec fn authorization_fold_step_spec(
+    state: AuthorizationFoldState,
+    active: bool,
+    child: PolicyResult,
+) -> AuthorizationFoldState {
+    if !active {
+        state
+    } else {
+        let aggregate = match state.kind {
+            AuthorizationFoldKind::RequireAll => combine_and_spec(state.aggregate, child),
+            AuthorizationFoldKind::RequireAny
+            | AuthorizationFoldKind::RequireNone
+            | AuthorizationFoldKind::PolicyListAndParent
+            | AuthorizationFoldKind::PolicyListOrParent => {
+                combine_or_spec(state.aggregate, child)
+            }
+        };
+        AuthorizationFoldState {
+            kind: state.kind,
+            aggregate,
+            matched: true,
+        }
+    }
+}
+
+/// Consume one lazily evaluated child.  `active == false` is the exact
+/// method-limited-list case: the provider is not evaluated and its placeholder
+/// result cannot affect the aggregate.
+#[inline]
+pub fn authorization_fold_step(
+    state: AuthorizationFoldState,
+    active: bool,
+    child: PolicyResult,
+) -> (next: AuthorizationFoldState)
+    requires authorization_fold_invariant_spec(state),
+    ensures
+        next == authorization_fold_step_spec(state, active, child),
+        authorization_fold_invariant_spec(next),
+        next.kind == state.kind,
+        !active ==> next == state,
+        active ==> next.matched,
+{
+    if !active {
+        state
+    } else {
+        let aggregate = match state.kind {
+            AuthorizationFoldKind::RequireAll => combine_and(state.aggregate, child),
+            AuthorizationFoldKind::RequireAny
+            | AuthorizationFoldKind::RequireNone
+            | AuthorizationFoldKind::PolicyListAndParent
+            | AuthorizationFoldKind::PolicyListOrParent => {
+                combine_or(state.aggregate, child)
+            }
+        };
+        AuthorizationFoldState {
+            kind: state.kind,
+            aggregate,
+            matched: true,
+        }
+    }
+}
+
+pub open spec fn authorization_fold_finish_spec(state: AuthorizationFoldState) -> PolicyResult {
+    match state.kind {
+        AuthorizationFoldKind::RequireNone => require_none_result_spec(state.aggregate),
+        AuthorizationFoldKind::PolicyListAndParent => {
+            if !state.matched {
+                PolicyResult::Granted
+            } else {
+                match state.aggregate {
+                    PolicyResult::Neutral => PolicyResult::Denied,
+                    _ => state.aggregate,
+                }
+            }
+        }
+        AuthorizationFoldKind::PolicyListOrParent => {
+            if !state.matched {
+                PolicyResult::Neutral
+            } else {
+                match state.aggregate {
+                    PolicyResult::Neutral => PolicyResult::Denied,
+                    _ => state.aggregate,
+                }
+            }
+        }
+        _ => state.aggregate,
+    }
+}
+
+#[inline]
+pub fn authorization_fold_finish(state: AuthorizationFoldState) -> (result: PolicyResult)
+    requires authorization_fold_invariant_spec(state),
+    ensures
+        result == authorization_fold_finish_spec(state),
+        state.kind == AuthorizationFoldKind::RequireNone
+            ==> result != PolicyResult::Granted,
+{
+    match state.kind {
+        AuthorizationFoldKind::RequireNone => require_none_result(state.aggregate),
+        AuthorizationFoldKind::PolicyListAndParent => {
+            if !state.matched {
+                PolicyResult::Granted
+            } else {
+                match state.aggregate {
+                    PolicyResult::Neutral => PolicyResult::Denied,
+                    _ => state.aggregate,
+                }
+            }
+        }
+        AuthorizationFoldKind::PolicyListOrParent => {
+            if !state.matched {
+                PolicyResult::Neutral
+            } else {
+                match state.aggregate {
+                    PolicyResult::Neutral => PolicyResult::Denied,
+                    _ => state.aggregate,
+                }
+            }
+        }
+        _ => state.aggregate,
+    }
+}
+
+pub open spec fn authorization_fold_terminal_spec(state: AuthorizationFoldState) -> bool {
+    match state.kind {
+        AuthorizationFoldKind::RequireAll => state.aggregate == PolicyResult::Denied,
+        AuthorizationFoldKind::RequireAny => state.aggregate == PolicyResult::Granted,
+        AuthorizationFoldKind::RequireNone => state.aggregate == PolicyResult::Granted,
+        AuthorizationFoldKind::PolicyListAndParent => state.aggregate == PolicyResult::Granted,
+        AuthorizationFoldKind::PolicyListOrParent => state.aggregate == PolicyResult::Granted,
+    }
+}
+
+/// A terminal prefix cannot be changed by any later active or inactive child.
+/// This is the warrant for retaining Apache's lazy short-circuit behavior
+/// while using the same fold as the complete symbolic evaluator.
+#[inline]
+pub fn authorization_fold_terminal(state: AuthorizationFoldState) -> (terminal: bool)
+    requires authorization_fold_invariant_spec(state),
+    ensures terminal == authorization_fold_terminal_spec(state),
+{
+    match state.kind {
+        AuthorizationFoldKind::RequireAll => match state.aggregate {
+            PolicyResult::Denied => true,
+            _ => false,
+        },
+        _ => match state.aggregate {
+            PolicyResult::Granted => true,
+            _ => false,
+        },
+    }
+}
+
+pub proof fn authorization_terminal_prefix_is_absorbing(
+    state: AuthorizationFoldState,
+    active: bool,
+    child: PolicyResult,
+)
+    requires
+        authorization_fold_invariant_spec(state),
+        authorization_fold_terminal_spec(state),
+    ensures
+        authorization_fold_finish_spec(
+            authorization_fold_step_spec(state, active, child),
+        ) == authorization_fold_finish_spec(state),
+{
+}
+
+pub proof fn require_none_fold_never_grants(state: AuthorizationFoldState)
+    requires
+        authorization_fold_invariant_spec(state),
+        state.kind == AuthorizationFoldKind::RequireNone,
+    ensures authorization_fold_finish_spec(state) != PolicyResult::Granted,
+{
+}
+
+/// Provider leaf semantics shared by IP/local/host/method/env/expression and
+/// already-authenticated user/group providers.  Negation is deliberately
+/// three-valued: a miss is neutral, never an independent grant.
+pub open spec fn authorization_boolean_provider_spec(
+    hit: bool,
+    negated: bool,
+) -> PolicyResult {
+    if negated {
+        if hit { PolicyResult::Denied } else { PolicyResult::Neutral }
+    } else if hit {
+        PolicyResult::Granted
+    } else {
+        PolicyResult::Denied
+    }
+}
+
+#[inline]
+pub fn authorization_boolean_provider(hit: bool, negated: bool) -> (result: PolicyResult)
+    ensures
+        result == authorization_boolean_provider_spec(hit, negated),
+        negated ==> result != PolicyResult::Granted,
+{
+    if negated {
+        if hit { PolicyResult::Denied } else { PolicyResult::Neutral }
+    } else if hit {
+        PolicyResult::Granted
+    } else {
+        PolicyResult::Denied
+    }
+}
+
+/// A provider that requires an authenticated identity cannot turn absence or
+/// an evaluation failure into a grant.  `missing_is_auth_required` captures
+/// the intentional distinction between `valid-user` under negation and the
+/// user/group providers, which must challenge before comparing operands.
+pub open spec fn authorization_identity_provider_spec(
+    identity_present: bool,
+    member: bool,
+    negated: bool,
+    missing_is_auth_required: bool,
+) -> PolicyResult {
+    if !identity_present {
+        if missing_is_auth_required {
+            PolicyResult::AuthRequired
+        } else {
+            authorization_boolean_provider_spec(false, negated)
+        }
+    } else {
+        authorization_boolean_provider_spec(member, negated)
+    }
+}
+
+#[inline]
+pub fn authorization_identity_provider(
+    identity_present: bool,
+    member: bool,
+    negated: bool,
+    missing_is_auth_required: bool,
+) -> (result: PolicyResult)
+    ensures
+        result == authorization_identity_provider_spec(
+            identity_present,
+            member,
+            negated,
+            missing_is_auth_required,
+        ),
+        !identity_present && missing_is_auth_required
+            ==> result == PolicyResult::AuthRequired,
+        identity_present && negated ==> result != PolicyResult::Granted,
+{
+    if !identity_present {
+        if missing_is_auth_required {
+            PolicyResult::AuthRequired
+        } else {
+            authorization_boolean_provider(false, negated)
+        }
+    } else {
+        authorization_boolean_provider(member, negated)
+    }
 }
 
 
@@ -14380,6 +14682,260 @@ pub fn policy_path_work_admit(
 // Merge-phase helpers used by the runtime
 // ---------------------------------------------------------------------------
 
+/// Exhaustive top-level fold for compiling one child `Scope` over its
+/// inherited parent.  The concrete policy values remain in the server crate;
+/// this state machine makes omission, duplication, or reordering of a policy
+/// component an invalid transition.  Rust-side exhaustive field inventories
+/// tie every `Scope` and component field to this fold at compile time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PolicyCompilationPhase {
+    Content,
+    Options,
+    Override,
+    Authorization,
+    Mapping,
+    ErrorDocument,
+    Header,
+    Environment,
+    RewriteCache,
+    Compression,
+    Proxy,
+    Complete,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PolicyCompilationEvent {
+    MergeContent,
+    MergeOptions,
+    MergeOverride,
+    MergeAuthorization,
+    MergeMapping,
+    MergeErrorDocument,
+    MergeHeader { admitted: bool },
+    MergeEnvironment,
+    MergeRewriteCache,
+    MergeCompression,
+    MergeProxy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PolicyCompilationState {
+    pub phase: PolicyCompilationPhase,
+    pub components_merged: u8,
+    pub conditional_error: bool,
+    pub parent_conditional_error: bool,
+    pub child_conditional_error: bool,
+    pub header_admitted: bool,
+}
+
+pub open spec fn policy_compilation_phase_rank_spec(phase: PolicyCompilationPhase) -> u8 {
+    match phase {
+        PolicyCompilationPhase::Content => 0,
+        PolicyCompilationPhase::Options => 1,
+        PolicyCompilationPhase::Override => 2,
+        PolicyCompilationPhase::Authorization => 3,
+        PolicyCompilationPhase::Mapping => 4,
+        PolicyCompilationPhase::ErrorDocument => 5,
+        PolicyCompilationPhase::Header => 6,
+        PolicyCompilationPhase::Environment => 7,
+        PolicyCompilationPhase::RewriteCache => 8,
+        PolicyCompilationPhase::Compression => 9,
+        PolicyCompilationPhase::Proxy => 10,
+        PolicyCompilationPhase::Complete => 11,
+    }
+}
+
+pub open spec fn policy_compilation_invariant_spec(state: PolicyCompilationState) -> bool {
+    state.components_merged == policy_compilation_phase_rank_spec(state.phase)
+        && state.conditional_error
+            == (state.parent_conditional_error
+                || state.child_conditional_error
+                || !state.header_admitted)
+        && (state.components_merged <= 6 ==> state.header_admitted)
+}
+
+#[inline]
+pub fn policy_compilation_start(
+    parent_conditional_error: bool,
+    child_conditional_error: bool,
+) -> (state: PolicyCompilationState)
+    ensures
+        policy_compilation_invariant_spec(state),
+        state.phase == PolicyCompilationPhase::Content,
+        state.components_merged == 0,
+{
+    PolicyCompilationState {
+        phase: PolicyCompilationPhase::Content,
+        components_merged: 0,
+        conditional_error: parent_conditional_error || child_conditional_error,
+        parent_conditional_error,
+        child_conditional_error,
+        header_admitted: true,
+    }
+}
+
+pub open spec fn policy_compilation_step_spec(
+    state: PolicyCompilationState,
+    event: PolicyCompilationEvent,
+) -> Option<PolicyCompilationState> {
+    let transition = match (state.phase, event) {
+        (PolicyCompilationPhase::Content, PolicyCompilationEvent::MergeContent) => {
+            Some((PolicyCompilationPhase::Options, true))
+        }
+        (PolicyCompilationPhase::Options, PolicyCompilationEvent::MergeOptions) => {
+            Some((PolicyCompilationPhase::Override, true))
+        }
+        (PolicyCompilationPhase::Override, PolicyCompilationEvent::MergeOverride) => {
+            Some((PolicyCompilationPhase::Authorization, true))
+        }
+        (
+            PolicyCompilationPhase::Authorization,
+            PolicyCompilationEvent::MergeAuthorization,
+        ) => Some((PolicyCompilationPhase::Mapping, true)),
+        (PolicyCompilationPhase::Mapping, PolicyCompilationEvent::MergeMapping) => {
+            Some((PolicyCompilationPhase::ErrorDocument, true))
+        }
+        (
+            PolicyCompilationPhase::ErrorDocument,
+            PolicyCompilationEvent::MergeErrorDocument,
+        ) => Some((PolicyCompilationPhase::Header, true)),
+        (
+            PolicyCompilationPhase::Header,
+            PolicyCompilationEvent::MergeHeader { admitted },
+        ) => Some((PolicyCompilationPhase::Environment, admitted)),
+        (
+            PolicyCompilationPhase::Environment,
+            PolicyCompilationEvent::MergeEnvironment,
+        ) => Some((PolicyCompilationPhase::RewriteCache, state.header_admitted)),
+        (
+            PolicyCompilationPhase::RewriteCache,
+            PolicyCompilationEvent::MergeRewriteCache,
+        ) => Some((PolicyCompilationPhase::Compression, state.header_admitted)),
+        (
+            PolicyCompilationPhase::Compression,
+            PolicyCompilationEvent::MergeCompression,
+        ) => Some((PolicyCompilationPhase::Proxy, state.header_admitted)),
+        (PolicyCompilationPhase::Proxy, PolicyCompilationEvent::MergeProxy) => {
+            Some((PolicyCompilationPhase::Complete, state.header_admitted))
+        }
+        _ => None,
+    };
+    match transition {
+        None => None,
+        Some((phase, header_admitted)) => Some(PolicyCompilationState {
+            phase,
+            components_merged: (state.components_merged as int + 1) as u8,
+            conditional_error: state.parent_conditional_error
+                || state.child_conditional_error
+                || !header_admitted,
+            parent_conditional_error: state.parent_conditional_error,
+            child_conditional_error: state.child_conditional_error,
+            header_admitted,
+        }),
+    }
+}
+
+#[inline]
+pub fn policy_compilation_step(
+    state: PolicyCompilationState,
+    event: PolicyCompilationEvent,
+) -> (next: Option<PolicyCompilationState>)
+    requires policy_compilation_invariant_spec(state),
+    ensures
+        next == policy_compilation_step_spec(state, event),
+        match next {
+            Some(value) => policy_compilation_invariant_spec(value)
+                && value.components_merged == state.components_merged + 1,
+            None => true,
+        },
+{
+    let transition = match (state.phase, event) {
+        (PolicyCompilationPhase::Content, PolicyCompilationEvent::MergeContent) => {
+            Some((PolicyCompilationPhase::Options, true))
+        }
+        (PolicyCompilationPhase::Options, PolicyCompilationEvent::MergeOptions) => {
+            Some((PolicyCompilationPhase::Override, true))
+        }
+        (PolicyCompilationPhase::Override, PolicyCompilationEvent::MergeOverride) => {
+            Some((PolicyCompilationPhase::Authorization, true))
+        }
+        (
+            PolicyCompilationPhase::Authorization,
+            PolicyCompilationEvent::MergeAuthorization,
+        ) => Some((PolicyCompilationPhase::Mapping, true)),
+        (PolicyCompilationPhase::Mapping, PolicyCompilationEvent::MergeMapping) => {
+            Some((PolicyCompilationPhase::ErrorDocument, true))
+        }
+        (
+            PolicyCompilationPhase::ErrorDocument,
+            PolicyCompilationEvent::MergeErrorDocument,
+        ) => Some((PolicyCompilationPhase::Header, true)),
+        (
+            PolicyCompilationPhase::Header,
+            PolicyCompilationEvent::MergeHeader { admitted },
+        ) => Some((PolicyCompilationPhase::Environment, admitted)),
+        (
+            PolicyCompilationPhase::Environment,
+            PolicyCompilationEvent::MergeEnvironment,
+        ) => Some((PolicyCompilationPhase::RewriteCache, state.header_admitted)),
+        (
+            PolicyCompilationPhase::RewriteCache,
+            PolicyCompilationEvent::MergeRewriteCache,
+        ) => Some((PolicyCompilationPhase::Compression, state.header_admitted)),
+        (
+            PolicyCompilationPhase::Compression,
+            PolicyCompilationEvent::MergeCompression,
+        ) => Some((PolicyCompilationPhase::Proxy, state.header_admitted)),
+        (PolicyCompilationPhase::Proxy, PolicyCompilationEvent::MergeProxy) => {
+            Some((PolicyCompilationPhase::Complete, state.header_admitted))
+        }
+        _ => None,
+    };
+    match transition {
+        None => None,
+        Some((phase, header_admitted)) => Some(PolicyCompilationState {
+            phase,
+            components_merged: state.components_merged + 1,
+            conditional_error: state.parent_conditional_error
+                || state.child_conditional_error
+                || !header_admitted,
+            parent_conditional_error: state.parent_conditional_error,
+            child_conditional_error: state.child_conditional_error,
+            header_admitted,
+        }),
+    }
+}
+
+#[inline]
+pub fn policy_compilation_complete(state: PolicyCompilationState) -> (complete: bool)
+    requires policy_compilation_invariant_spec(state),
+    ensures
+        complete == (state.phase == PolicyCompilationPhase::Complete),
+        complete ==> state.components_merged == 11,
+{
+    reveal(policy_compilation_invariant_spec);
+    reveal(policy_compilation_phase_rank_spec);
+    match state.phase {
+        PolicyCompilationPhase::Complete => true,
+        _ => false,
+    }
+}
+
+pub proof fn complete_policy_compilation_visits_every_component_once(
+    state: PolicyCompilationState,
+)
+    requires
+        policy_compilation_invariant_spec(state),
+        state.phase == PolicyCompilationPhase::Complete,
+    ensures
+        state.components_merged == 11,
+        state.conditional_error
+            == (state.parent_conditional_error
+                || state.child_conditional_error
+                || !state.header_admitted),
+{
+}
+
 /// How a child `Require` policy combines with an inherited policy.  This is
 /// the decision `Scope::merge` makes from `AuthMerging`; keeping it in the
 /// verified crate makes the security-relevant branch explicit.
@@ -15005,6 +15561,7 @@ proof fn classify_access_rule_properties(
 }
 
 /// Scalar child-overrides-parent merge used for optional scope fields.
+#[inline]
 pub fn option_child_wins<T: Copy + PartialEq>(
     parent: Option<T>,
     child: Option<T>,
@@ -15572,6 +16129,21 @@ pub fn option_child_presence<T: Clone>(
         child.clone()
     } else {
         parent.clone()
+    }
+}
+
+/// Allocation-preserving form of `option_child_presence` for hot scope
+/// folds. An absent child is an exact no-op on the inherited value; a present
+/// child is cloned into the parent. This prevents proof integration from
+/// cloning inherited strings, paths, or vectors at every unmatched layer.
+#[inline]
+pub fn option_child_assign<T: Clone>(parent: &mut Option<T>, child: &Option<T>)
+    ensures
+        child.is_some() ==> (*final(parent)).is_some(),
+        child.is_none() ==> *final(parent) == *old(parent),
+{
+    if child.is_some() {
+        *parent = child.clone();
     }
 }
 

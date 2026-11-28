@@ -2284,6 +2284,26 @@ impl Scope {
         });
     }
 
+    /// Compile-time exhaustiveness guard for the verified policy-compilation
+    /// fold. Adding a field to `Scope` must update this destructuring pattern
+    /// and therefore must be assigned to a fold component deliberately.
+    fn assert_policy_compilation_inventory(&self) {
+        let Scope {
+            conditional_error: _,
+            options: _,
+            override_policy: _,
+            authorization: _,
+            header_policy: _,
+            content_policy: _,
+            mapping_policy: _,
+            error_policy: _,
+            environment_policy: _,
+            rewrite_policy: _,
+            compression_policy: _,
+            proxy_policy: _,
+        } = self;
+    }
+
     /// Apply a (possibly partial) child scope over this one.
     pub fn merge(&mut self, child: &Scope) {
         self.merge_inner(child, None);
@@ -2297,27 +2317,106 @@ impl Scope {
     }
 
     fn merge_inner(&mut self, child: &Scope, rewrite_rules: Option<&[RewriteRule]>) {
+        self.assert_policy_compilation_inventory();
+        child.assert_policy_compilation_inventory();
         #[cfg(debug_assertions)]
         let audit_parent = self.container_snapshot();
         #[cfg(debug_assertions)]
         let audit_child = child.container_snapshot_with_rewrite(rewrite_rules);
-        self.conditional_error |= child.conditional_error;
+
+        let mut fold = crate::verified::policy_compilation_start(
+            self.conditional_error,
+            child.conditional_error,
+        );
+        self.conditional_error = fold.conditional_error;
+
         self.content_policy.merge_child(&child.content_policy);
+        fold = crate::verified::policy_compilation_step(
+            fold,
+            crate::verified::PolicyCompilationEvent::MergeContent,
+        )
+        .expect("static policy compilation order: content");
+
         self.options.merge_child(&child.options);
+        fold = crate::verified::policy_compilation_step(
+            fold,
+            crate::verified::PolicyCompilationEvent::MergeOptions,
+        )
+        .expect("static policy compilation order: options");
+
         self.override_policy.merge_child(&child.override_policy);
+        fold = crate::verified::policy_compilation_step(
+            fold,
+            crate::verified::PolicyCompilationEvent::MergeOverride,
+        )
+        .expect("static policy compilation order: override");
+
         self.authorization.merge_child(&child.authorization);
+        fold = crate::verified::policy_compilation_step(
+            fold,
+            crate::verified::PolicyCompilationEvent::MergeAuthorization,
+        )
+        .expect("static policy compilation order: authorization");
+
         self.mapping_policy.merge_child(&child.mapping_policy);
+        fold = crate::verified::policy_compilation_step(
+            fold,
+            crate::verified::PolicyCompilationEvent::MergeMapping,
+        )
+        .expect("static policy compilation order: mapping");
+
         self.error_policy.merge_child(&child.error_policy);
-        if !self.header_policy.merge_child(&child.header_policy) {
-            self.conditional_error = true;
-        }
+        fold = crate::verified::policy_compilation_step(
+            fold,
+            crate::verified::PolicyCompilationEvent::MergeErrorDocument,
+        )
+        .expect("static policy compilation order: error document");
+
+        let header_admitted = self.header_policy.merge_child(&child.header_policy);
+        fold = crate::verified::policy_compilation_step(
+            fold,
+            crate::verified::PolicyCompilationEvent::MergeHeader {
+                admitted: header_admitted,
+            },
+        )
+        .expect("static policy compilation order: header");
+
         self.environment_policy
             .merge_child(&child.environment_policy);
+        fold = crate::verified::policy_compilation_step(
+            fold,
+            crate::verified::PolicyCompilationEvent::MergeEnvironment,
+        )
+        .expect("static policy compilation order: environment");
+
         self.rewrite_policy
             .merge_child_with_rules(&child.rewrite_policy, rewrite_rules);
+        fold = crate::verified::policy_compilation_step(
+            fold,
+            crate::verified::PolicyCompilationEvent::MergeRewriteCache,
+        )
+        .expect("static policy compilation order: rewrite/cache");
+
         self.compression_policy
             .merge_child(&child.compression_policy);
+        fold = crate::verified::policy_compilation_step(
+            fold,
+            crate::verified::PolicyCompilationEvent::MergeCompression,
+        )
+        .expect("static policy compilation order: compression");
+
         self.proxy_policy.merge_child(&child.proxy_policy);
+        fold = crate::verified::policy_compilation_step(
+            fold,
+            crate::verified::PolicyCompilationEvent::MergeProxy,
+        )
+        .expect("static policy compilation order: proxy");
+
+        assert!(
+            crate::verified::policy_compilation_complete(fold),
+            "verified policy compilation fold did not reach Complete"
+        );
+        self.conditional_error = fold.conditional_error;
         // Pending conditions are parser-local and must never leak from one
         // scope into the next.
         #[cfg(debug_assertions)]

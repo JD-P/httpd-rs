@@ -13,6 +13,10 @@ pub struct OptionsPolicy {
 }
 
 impl OptionsPolicy {
+    fn assert_merge_inventory(&self) {
+        let Self { changes: _ } = self;
+    }
+
     /// Apache operation codes: 0 = set, 1 = add, 2 = remove.
     pub fn push(&mut self, op: u8, bits: u32) {
         if op == 0 {
@@ -37,6 +41,8 @@ impl OptionsPolicy {
     /// and a child `Set` resets the inherited sequence exactly as the previous
     /// `Scope::merge` loop did.
     pub fn merge_child(&mut self, child: &OptionsPolicy) {
+        self.assert_merge_inventory();
+        child.assert_merge_inventory();
         for &(op, bits) in &child.changes {
             self.push(op, bits);
         }
@@ -94,6 +100,14 @@ pub struct OverridePolicy {
 }
 
 impl OverridePolicy {
+    fn assert_merge_inventory(&self) {
+        let Self {
+            mode: _,
+            allow_list: _,
+            nonfatal: _,
+        } = self;
+    }
+
     pub fn set_mode(&mut self, mode: crate::config::OverrideMode) {
         self.mode = Some(mode);
     }
@@ -204,15 +218,11 @@ impl OverridePolicy {
     }
 
     pub fn merge_child(&mut self, child: &OverridePolicy) {
-        if child.mode.is_some() {
-            self.mode = child.mode;
-        }
-        if child.allow_list.is_some() {
-            self.allow_list = child.allow_list.clone();
-        }
-        if child.nonfatal.is_some() {
-            self.nonfatal = child.nonfatal;
-        }
+        self.assert_merge_inventory();
+        child.assert_merge_inventory();
+        self.mode = crate::verified::option_child_wins(self.mode, child.mode);
+        crate::verified::option_child_assign(&mut self.allow_list, &child.allow_list);
+        self.nonfatal = crate::verified::option_child_wins(self.nonfatal, child.nonfatal);
     }
 }
 
@@ -300,6 +310,19 @@ pub struct AuthorizationPolicy {
 }
 
 impl AuthorizationPolicy {
+    fn assert_merge_inventory(&self) {
+        let Self {
+            requires: _,
+            auth_merging: _,
+            allow_methods: _,
+            legacy: _,
+            auth_type: _,
+            auth_name: _,
+            auth_user_file: _,
+            auth_group_file: _,
+        } = self;
+    }
+
     pub fn add_require(
         &mut self,
         node: crate::config::RequireNode,
@@ -341,6 +364,8 @@ impl AuthorizationPolicy {
     }
 
     pub fn merge_child(&mut self, child: &AuthorizationPolicy) {
+        self.assert_merge_inventory();
+        child.assert_merge_inventory();
         if let Some(r) = &child.requires {
             let kind = crate::verified::auth_merge_kind(
                 child.auth_merging == Some(crate::config::AuthMerging::And),
@@ -359,24 +384,12 @@ impl AuthorizationPolicy {
                 crate::verified::AuthMergeKind::Replace => r.clone(),
             });
         }
-        if child.allow_methods.is_some() {
-            self.allow_methods = child.allow_methods.clone();
-        }
-        if child.legacy.is_some() {
-            self.legacy = child.legacy.clone();
-        }
-        if child.auth_type.is_some() {
-            self.auth_type = child.auth_type.clone();
-        }
-        if child.auth_name.is_some() {
-            self.auth_name = child.auth_name.clone();
-        }
-        if child.auth_user_file.is_some() {
-            self.auth_user_file = child.auth_user_file.clone();
-        }
-        if child.auth_group_file.is_some() {
-            self.auth_group_file = child.auth_group_file.clone();
-        }
+        crate::verified::option_child_assign(&mut self.allow_methods, &child.allow_methods);
+        crate::verified::option_child_assign(&mut self.legacy, &child.legacy);
+        crate::verified::option_child_assign(&mut self.auth_type, &child.auth_type);
+        crate::verified::option_child_assign(&mut self.auth_name, &child.auth_name);
+        crate::verified::option_child_assign(&mut self.auth_user_file, &child.auth_user_file);
+        crate::verified::option_child_assign(&mut self.auth_group_file, &child.auth_group_file);
         // `auth_merging` is local to the section that declares it; it is not
         // inherited by later siblings.
     }
@@ -385,7 +398,7 @@ impl AuthorizationPolicy {
 #[cfg(test)]
 mod authorization_tests {
     use super::*;
-    use crate::config::{AuthMerging, AuthPolicy, MethodSet, Require, RequireEntry, RequireNode};
+    use crate::config::{AuthMerging, AuthPolicy, Require, RequireEntry, RequireNode};
 
     fn entry() -> RequireEntry {
         RequireEntry {
@@ -484,6 +497,24 @@ fn identity_join<T: Clone + PartialEq>(first: &[T], second: &[T]) -> Vec<T> {
 }
 
 impl HeaderPolicy {
+    fn assert_merge_inventory(&self) {
+        let Self {
+            replace_response_headers: _,
+            nginx_status_semantics: _,
+            add_headers: _,
+            set_headers: _,
+            unset_headers: _,
+            always_add_headers: _,
+            always_set_headers: _,
+            always_unset_headers: _,
+            expires_active: _,
+            expires_default: _,
+            expires_by_type: _,
+            cookies: _,
+            vary: _,
+        } = self;
+    }
+
     fn configured_usage(&self) -> (usize, usize) {
         let pairs = self
             .add_headers
@@ -537,6 +568,8 @@ fn merge_set_headers(parent: &mut Vec<(String, String)>, child: &[(String, Strin
 
 impl HeaderPolicy {
     pub fn merge_child(&mut self, child: &HeaderPolicy) -> bool {
+        self.assert_merge_inventory();
+        child.assert_merge_inventory();
         let (parent_count, parent_bytes) = self.configured_usage();
         let (child_count, child_bytes) = child.configured_usage();
         let Some(plan) = httpd_rs_verified::source_neutral_header_merge_plan(
@@ -575,12 +608,9 @@ impl HeaderPolicy {
         crate::verified::append_vec(&mut self.always_add_headers, &child.always_add_headers);
         merge_set_headers(&mut self.always_set_headers, &child.always_set_headers);
         crate::verified::append_vec(&mut self.always_unset_headers, &child.always_unset_headers);
-        if child.expires_active.is_some() {
-            self.expires_active = child.expires_active;
-        }
-        if child.expires_default.is_some() {
-            self.expires_default = child.expires_default.clone();
-        }
+        self.expires_active =
+            crate::verified::option_child_wins(self.expires_active, child.expires_active);
+        crate::verified::option_child_assign(&mut self.expires_default, &child.expires_default);
         crate::verified::append_vec(&mut self.expires_by_type, &child.expires_by_type);
         crate::verified::append_vec(&mut self.cookies, &child.cookies);
         crate::verified::append_vec(&mut self.vary, &child.vary);
@@ -897,10 +927,25 @@ pub struct EnvironmentPolicy {
 }
 
 impl EnvironmentPolicy {
+    fn assert_merge_inventory(&self) {
+        let Self {
+            cgi_pass_auth: _,
+            rewrite_env: _,
+            rewrite_unset_env: _,
+            rewrite_late_env: _,
+            rewrite_late_unset_env: _,
+            set_env: _,
+            unset_env: _,
+            pass_env: _,
+            set_env_if: _,
+        } = self;
+    }
+
     pub fn merge_child(&mut self, child: &EnvironmentPolicy) {
-        if child.cgi_pass_auth.is_some() {
-            self.cgi_pass_auth = child.cgi_pass_auth;
-        }
+        self.assert_merge_inventory();
+        child.assert_merge_inventory();
+        self.cgi_pass_auth =
+            crate::verified::option_child_wins(self.cgi_pass_auth, child.cgi_pass_auth);
         crate::verified::append_vec(&mut self.rewrite_env, &child.rewrite_env);
         crate::verified::append_vec(&mut self.rewrite_unset_env, &child.rewrite_unset_env);
         crate::verified::append_vec(&mut self.rewrite_late_env, &child.rewrite_late_env);
@@ -1015,20 +1060,25 @@ pub struct AutoIndexPolicy {
 }
 
 impl AutoIndexPolicy {
+    fn assert_merge_inventory(&self) {
+        let Self {
+            version_sort: _,
+            icon_rules: _,
+            default_icon: _,
+            header_name: _,
+            readme_name: _,
+        } = self;
+    }
+
     fn merge_child(&mut self, child: &AutoIndexPolicy) {
-        if child.version_sort.is_some() {
-            self.version_sort = child.version_sort;
-        }
+        self.assert_merge_inventory();
+        child.assert_merge_inventory();
+        self.version_sort =
+            crate::verified::option_child_wins(self.version_sort, child.version_sort);
         crate::verified::append_vec(&mut self.icon_rules, &child.icon_rules);
-        if child.default_icon.is_some() {
-            self.default_icon = child.default_icon.clone();
-        }
-        if child.header_name.is_some() {
-            self.header_name = child.header_name.clone();
-        }
-        if child.readme_name.is_some() {
-            self.readme_name = child.readme_name.clone();
-        }
+        crate::verified::option_child_assign(&mut self.default_icon, &child.default_icon);
+        crate::verified::option_child_assign(&mut self.header_name, &child.header_name);
+        crate::verified::option_child_assign(&mut self.readme_name, &child.readme_name);
     }
 }
 
@@ -1054,44 +1104,50 @@ pub struct ContentPolicy {
 }
 
 impl ContentPolicy {
+    fn assert_merge_inventory(&self) {
+        let Self {
+            document_root: _,
+            directory_index: _,
+            index_ignore: _,
+            autoindex: _,
+            language_priority: _,
+            force_language_priority: _,
+            default_charset: _,
+            file_etag: _,
+            enable_sendfile: _,
+            directory_slash: _,
+            add_types: _,
+            remove_types: _,
+            force_type: _,
+            access_file_names: _,
+            request_body_limit: _,
+        } = self;
+    }
+
     pub fn merge_child(&mut self, child: &ContentPolicy) {
-        if child.document_root.is_some() {
-            self.document_root = child.document_root.clone();
-        }
-        if child.directory_index.is_some() {
-            self.directory_index = child.directory_index.clone();
-        }
+        self.assert_merge_inventory();
+        child.assert_merge_inventory();
+        crate::verified::option_child_assign(&mut self.document_root, &child.document_root);
+        crate::verified::option_child_assign(&mut self.directory_index, &child.directory_index);
         crate::verified::append_vec(&mut self.index_ignore, &child.index_ignore);
         self.autoindex.merge_child(&child.autoindex);
-        if child.language_priority.is_some() {
-            self.language_priority = child.language_priority.clone();
-        }
-        if child.force_language_priority.is_some() {
-            self.force_language_priority = child.force_language_priority;
-        }
-        if child.default_charset.is_some() {
-            self.default_charset = child.default_charset.clone();
-        }
-        if child.file_etag.is_some() {
-            self.file_etag = child.file_etag;
-        }
-        if child.enable_sendfile.is_some() {
-            self.enable_sendfile = child.enable_sendfile;
-        }
-        if child.directory_slash.is_some() {
-            self.directory_slash = child.directory_slash;
-        }
+        crate::verified::option_child_assign(&mut self.language_priority, &child.language_priority);
+        self.force_language_priority = crate::verified::option_child_wins(
+            self.force_language_priority,
+            child.force_language_priority,
+        );
+        crate::verified::option_child_assign(&mut self.default_charset, &child.default_charset);
+        self.file_etag = crate::verified::option_child_wins(self.file_etag, child.file_etag);
+        self.enable_sendfile =
+            crate::verified::option_child_wins(self.enable_sendfile, child.enable_sendfile);
+        self.directory_slash =
+            crate::verified::option_child_wins(self.directory_slash, child.directory_slash);
         crate::verified::append_vec(&mut self.add_types, &child.add_types);
         crate::verified::append_vec(&mut self.remove_types, &child.remove_types);
-        if child.force_type.is_some() {
-            self.force_type = child.force_type.clone();
-        }
-        if child.access_file_names.is_some() {
-            self.access_file_names = child.access_file_names.clone();
-        }
-        if child.request_body_limit.is_some() {
-            self.request_body_limit = child.request_body_limit;
-        }
+        crate::verified::option_child_assign(&mut self.force_type, &child.force_type);
+        crate::verified::option_child_assign(&mut self.access_file_names, &child.access_file_names);
+        self.request_body_limit =
+            crate::verified::option_child_wins(self.request_body_limit, child.request_body_limit);
     }
 
     pub fn meet_identity(&mut self, base: &ContentPolicy) {
@@ -1120,15 +1176,25 @@ pub struct MappingPolicy {
 }
 
 impl MappingPolicy {
+    fn assert_merge_inventory(&self) {
+        let Self {
+            aliases: _,
+            redirects: _,
+            handlers: _,
+            set_handler: _,
+            unsupported_filters: _,
+        } = self;
+    }
+
     pub fn merge_child(&mut self, child: &MappingPolicy) {
+        self.assert_merge_inventory();
+        child.assert_merge_inventory();
         crate::verified::append_vec(&mut self.aliases, &child.aliases);
         crate::verified::append_vec(&mut self.redirects, &child.redirects);
         crate::verified::append_vec(&mut self.handlers, &child.handlers);
         // A child that configured `SetHandler` (including `SetHandler None`)
         // wins; a child with no directive keeps the inherited force.
-        if child.set_handler.is_some() {
-            self.set_handler = child.set_handler.clone();
-        }
+        crate::verified::option_child_assign(&mut self.set_handler, &child.set_handler);
         crate::verified::append_vec(&mut self.unsupported_filters, &child.unsupported_filters);
     }
 
@@ -1232,6 +1298,10 @@ pub struct ErrorDocumentPolicy {
 }
 
 impl ErrorDocumentPolicy {
+    fn assert_merge_inventory(&self) {
+        let Self { documents: _ } = self;
+    }
+
     pub fn push(&mut self, code: u16, doc: crate::config::ErrorDoc) {
         self.documents.push((code, doc));
     }
@@ -1245,6 +1315,8 @@ impl ErrorDocumentPolicy {
     }
 
     pub fn merge_child(&mut self, child: &ErrorDocumentPolicy) {
+        self.assert_merge_inventory();
+        child.assert_merge_inventory();
         crate::verified::append_vec(&mut self.documents, &child.documents);
     }
 }
@@ -1265,6 +1337,22 @@ pub struct RewriteCachePolicy {
 }
 
 impl RewriteCachePolicy {
+    fn assert_merge_inventory(&self) {
+        let Self {
+            rewrite_engine: _,
+            rewrite_maps: _,
+            cache_enable: _,
+            cache_disable: _,
+            rewrite_inherit: _,
+            rewrite_base: _,
+            rewrite_match_base: _,
+            rewrite_rules: _,
+            // This is deliberately parser-local and is classified here so a
+            // future field addition cannot silently inherit by omission.
+            pending_rewrite_conds: _,
+        } = self;
+    }
+
     pub fn merge_child(&mut self, child: &RewriteCachePolicy) {
         self.merge_child_with_rules(child, None);
     }
@@ -1277,21 +1365,20 @@ impl RewriteCachePolicy {
         child: &RewriteCachePolicy,
         transformed_rules: Option<&[crate::config::RewriteRule]>,
     ) {
-        if child.rewrite_engine.is_some() {
-            self.rewrite_engine = child.rewrite_engine;
-        }
+        self.assert_merge_inventory();
+        child.assert_merge_inventory();
+        self.rewrite_engine =
+            crate::verified::option_child_wins(self.rewrite_engine, child.rewrite_engine);
         crate::verified::append_vec(&mut self.rewrite_maps, &child.rewrite_maps);
         crate::verified::append_vec(&mut self.cache_enable, &child.cache_enable);
         crate::verified::append_vec(&mut self.cache_disable, &child.cache_disable);
-        if child.rewrite_inherit.is_some() {
-            self.rewrite_inherit = child.rewrite_inherit;
-        }
-        if child.rewrite_base.is_some() {
-            self.rewrite_base = child.rewrite_base.clone();
-        }
-        if child.rewrite_match_base.is_some() {
-            self.rewrite_match_base = child.rewrite_match_base.clone();
-        }
+        self.rewrite_inherit =
+            crate::verified::option_child_wins(self.rewrite_inherit, child.rewrite_inherit);
+        crate::verified::option_child_assign(&mut self.rewrite_base, &child.rewrite_base);
+        crate::verified::option_child_assign(
+            &mut self.rewrite_match_base,
+            &child.rewrite_match_base,
+        );
         match transformed_rules {
             Some(rules) => crate::verified::append_vec(&mut self.rewrite_rules, rules),
             None => crate::verified::append_vec(&mut self.rewrite_rules, &child.rewrite_rules),
@@ -1350,24 +1437,33 @@ pub struct CompressionPolicy {
 }
 
 impl CompressionPolicy {
+    fn assert_merge_inventory(&self) {
+        let Self {
+            compression_rules: _,
+            unsupported_filter_rules: _,
+            deflate_level: _,
+            brotli_quality: _,
+            deflate_alter_etag: _,
+            brotli_alter_etag: _,
+        } = self;
+    }
+
     pub fn merge_child(&mut self, child: &CompressionPolicy) {
+        self.assert_merge_inventory();
+        child.assert_merge_inventory();
         crate::verified::append_vec(&mut self.compression_rules, &child.compression_rules);
         crate::verified::append_vec(
             &mut self.unsupported_filter_rules,
             &child.unsupported_filter_rules,
         );
-        if child.deflate_level.is_some() {
-            self.deflate_level = child.deflate_level;
-        }
-        if child.brotli_quality.is_some() {
-            self.brotli_quality = child.brotli_quality;
-        }
-        if child.deflate_alter_etag.is_some() {
-            self.deflate_alter_etag = child.deflate_alter_etag;
-        }
-        if child.brotli_alter_etag.is_some() {
-            self.brotli_alter_etag = child.brotli_alter_etag;
-        }
+        self.deflate_level =
+            crate::verified::option_child_wins(self.deflate_level, child.deflate_level);
+        self.brotli_quality =
+            crate::verified::option_child_wins(self.brotli_quality, child.brotli_quality);
+        self.deflate_alter_etag =
+            crate::verified::option_child_wins(self.deflate_alter_etag, child.deflate_alter_etag);
+        self.brotli_alter_etag =
+            crate::verified::option_child_wins(self.brotli_alter_etag, child.brotli_alter_etag);
     }
 }
 
@@ -1423,13 +1519,28 @@ pub struct ProxyPolicy {
 }
 
 impl ProxyPolicy {
+    fn assert_merge_inventory(&self) {
+        let Self {
+            proxy_rules: _,
+            proxy_passes: _,
+            proxy_reverses: _,
+            preserve_host: _,
+            request_headers: _,
+            fastcgi_params: _,
+            proxy_ca_file: _,
+            proxy_ca_trust: _,
+            tls_config_cache: _,
+        } = self;
+    }
+
     pub fn merge_child(&mut self, child: &ProxyPolicy) {
+        self.assert_merge_inventory();
+        child.assert_merge_inventory();
         crate::verified::append_vec(&mut self.proxy_rules, &child.proxy_rules);
         crate::verified::append_vec(&mut self.proxy_passes, &child.proxy_passes);
         crate::verified::append_vec(&mut self.proxy_reverses, &child.proxy_reverses);
-        if child.preserve_host.is_some() {
-            self.preserve_host = child.preserve_host;
-        }
+        self.preserve_host =
+            crate::verified::option_child_wins(self.preserve_host, child.preserve_host);
         let request_header_plan = httpd_rs_verified::source_neutral_optional_merge(
             self.request_headers.is_some(),
             self.request_headers.as_ref().map_or(0, Vec::len) as u64,
@@ -1627,5 +1738,36 @@ mod final_policy_tests {
         parent.order_virtual_host_routes_after(&inherited);
         assert_eq!(parent.proxy_passes[0].route_order, 9);
         assert_eq!(parent.proxy_passes[1].route_order, 10);
+    }
+
+    #[test]
+    fn verified_policy_compilation_fold_is_ordered_and_fail_closed() {
+        use crate::verified::PolicyCompilationEvent as Event;
+
+        let start = crate::verified::policy_compilation_start(false, false);
+        assert!(crate::verified::policy_compilation_step(start, Event::MergeOptions).is_none());
+
+        let mut state = start;
+        for event in [
+            Event::MergeContent,
+            Event::MergeOptions,
+            Event::MergeOverride,
+            Event::MergeAuthorization,
+            Event::MergeMapping,
+            Event::MergeErrorDocument,
+            Event::MergeHeader { admitted: false },
+            Event::MergeEnvironment,
+            Event::MergeRewriteCache,
+            Event::MergeCompression,
+            Event::MergeProxy,
+        ] {
+            state = crate::verified::policy_compilation_step(state, event)
+                .expect("canonical policy compilation sequence");
+        }
+        assert!(crate::verified::policy_compilation_complete(state));
+        assert_eq!(state.components_merged, 11);
+        assert!(state.conditional_error);
+        assert!(!state.header_admitted);
+        assert!(crate::verified::policy_compilation_step(state, Event::MergeProxy).is_none());
     }
 }

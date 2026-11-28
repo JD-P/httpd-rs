@@ -6,9 +6,7 @@
 
 use crate::config::{AuthPolicy, ErrorDoc, Order, Require, RequireNode, Satisfy, Scope};
 use crate::http::Request;
-use crate::verified::{
-    combine_and, combine_or, ipv4_in_net, ipv6_in_net, require_none_multi, PolicyResult,
-};
+use crate::verified::{ipv4_in_net, ipv6_in_net, AuthorizationFoldKind, PolicyResult};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -972,14 +970,23 @@ fn eval_policy(
 ) -> PolicyResult {
     match policy {
         AuthPolicy::List(entries) => {
-            let mut matched = false;
-            let mut auth_required = false;
+            let kind = if parent_and {
+                AuthorizationFoldKind::PolicyListAndParent
+            } else {
+                AuthorizationFoldKind::PolicyListOrParent
+            };
+            let mut fold = crate::verified::authorization_fold_start(kind);
             for entry in entries {
-                if !entry.applies(&req.method) {
+                let applies = entry.applies(&req.method);
+                if !applies {
+                    fold = crate::verified::authorization_fold_step(
+                        fold,
+                        false,
+                        PolicyResult::Neutral,
+                    );
                     continue;
                 }
-                matched = true;
-                match eval_node(
+                let child = eval_node(
                     &entry.node,
                     req,
                     peer,
@@ -988,42 +995,52 @@ fn eval_policy(
                     docroot,
                     url_path,
                     fs_path,
-                ) {
-                    PolicyResult::Granted => return PolicyResult::Granted,
-                    PolicyResult::Denied => {}
-                    PolicyResult::AuthRequired => auth_required = true,
-                    PolicyResult::Neutral => {}
+                );
+                fold = crate::verified::authorization_fold_step(fold, true, child);
+                if crate::verified::authorization_fold_terminal(fold) {
+                    break;
                 }
             }
-            if !matched {
-                return if parent_and {
-                    PolicyResult::Granted
-                } else {
-                    PolicyResult::Neutral
-                };
-            }
-            if auth_required {
-                PolicyResult::AuthRequired
-            } else {
-                PolicyResult::Denied
-            }
+            crate::verified::authorization_fold_finish(fold)
         }
-        AuthPolicy::And(a, b) => combine_and(
-            eval_policy(
-                a, req, peer, identity, env, true, docroot, url_path, fs_path,
-            ),
-            eval_policy(
-                b, req, peer, identity, env, true, docroot, url_path, fs_path,
-            ),
-        ),
-        AuthPolicy::Or(a, b) => combine_or(
-            eval_policy(
-                a, req, peer, identity, env, false, docroot, url_path, fs_path,
-            ),
-            eval_policy(
-                b, req, peer, identity, env, false, docroot, url_path, fs_path,
-            ),
-        ),
+        AuthPolicy::And(a, b) | AuthPolicy::Or(a, b) => {
+            let (kind, child_parent_and) = if matches!(policy, AuthPolicy::And(_, _)) {
+                (AuthorizationFoldKind::RequireAll, true)
+            } else {
+                (AuthorizationFoldKind::RequireAny, false)
+            };
+            let mut fold = crate::verified::authorization_fold_start(kind);
+            let left = eval_policy(
+                a,
+                req,
+                peer,
+                identity,
+                env,
+                child_parent_and,
+                docroot,
+                url_path,
+                fs_path,
+            );
+            fold = crate::verified::authorization_fold_step(fold, true, left);
+            // The fold's absorbing-prefix theorem permits lazy evaluation and
+            // prevents an unreachable sibling from consuming DNS/expression
+            // work after the decision is already final.
+            if !crate::verified::authorization_fold_terminal(fold) {
+                let right = eval_policy(
+                    b,
+                    req,
+                    peer,
+                    identity,
+                    env,
+                    child_parent_and,
+                    docroot,
+                    url_path,
+                    fs_path,
+                );
+                fold = crate::verified::authorization_fold_step(fold, true, right);
+            }
+            crate::verified::authorization_fold_finish(fold)
+        }
     }
 }
 
@@ -1082,43 +1099,22 @@ fn eval_node(
         RequireNode::Provider(r) => {
             eval_require(r, req, peer, identity, env, docroot, url_path, fs_path)
         }
-        RequireNode::All(items) => {
-            // RequireAll: all children must pass, and at least one must grant.
-            let mut result = PolicyResult::Neutral;
+        RequireNode::All(items) | RequireNode::Any(items) | RequireNode::None(items) => {
+            let kind = match node {
+                RequireNode::All(_) => AuthorizationFoldKind::RequireAll,
+                RequireNode::Any(_) => AuthorizationFoldKind::RequireAny,
+                RequireNode::None(_) => AuthorizationFoldKind::RequireNone,
+                RequireNode::Provider(_) => unreachable!("provider handled above"),
+            };
+            let mut fold = crate::verified::authorization_fold_start(kind);
             for item in items {
-                result = combine_and(
-                    result,
-                    eval_node(item, req, peer, identity, env, docroot, url_path, fs_path),
-                );
-                if result == PolicyResult::Denied {
-                    return PolicyResult::Denied;
+                let child = eval_node(item, req, peer, identity, env, docroot, url_path, fs_path);
+                fold = crate::verified::authorization_fold_step(fold, true, child);
+                if crate::verified::authorization_fold_terminal(fold) {
+                    break;
                 }
             }
-            result
-        }
-        RequireNode::Any(items) => {
-            let mut result = PolicyResult::Neutral;
-            for item in items {
-                result = combine_or(
-                    result,
-                    eval_node(item, req, peer, identity, env, docroot, url_path, fs_path),
-                );
-                if result == PolicyResult::Granted {
-                    return PolicyResult::Granted;
-                }
-            }
-            result
-        }
-        RequireNode::None(items) => {
-            // Apache's <RequireNone> fails when *any* child provider is
-            // satisfied.  Aggregate the children as an OR of positive hits
-            // first; combining them with AND let one denied sibling erase a
-            // granted child and turned the group into an allow (F46/I43).
-            let results: Vec<PolicyResult> = items
-                .iter()
-                .map(|item| eval_node(item, req, peer, identity, env, docroot, url_path, fs_path))
-                .collect();
-            require_none_multi(&results)
+            crate::verified::authorization_fold_finish(fold)
         }
     }
 }
@@ -1133,21 +1129,6 @@ fn eval_require(
     url_path: &str,
     fs_path: Option<&Path>,
 ) -> PolicyResult {
-    // Apache's negated providers can deny or stay neutral, but can never
-    // independently grant access.
-    fn decide(hit: bool, negate: bool) -> PolicyResult {
-        if negate {
-            if hit {
-                PolicyResult::Denied
-            } else {
-                PolicyResult::Neutral
-            }
-        } else if hit {
-            PolicyResult::Granted
-        } else {
-            PolicyResult::Denied
-        }
-    }
     fn expand_operand(
         operand: &str,
         req: &Request,
@@ -1232,42 +1213,47 @@ fn eval_require(
         Require::AllDenied => PolicyResult::Denied,
         Require::Ip { negate, nets } => {
             let hit = nets.iter().any(|(n, b)| ip_in_net(peer, *n, *b));
-            decide(hit, *negate)
+            crate::verified::authorization_boolean_provider(hit, *negate)
         }
-        Require::Local { negate } => decide(canonical_ip(peer).is_loopback(), *negate),
+        Require::Local { negate } => crate::verified::authorization_boolean_provider(
+            canonical_ip(peer).is_loopback(),
+            *negate,
+        ),
         Require::Host { negate, names } => {
             let Ok(names) = expanded_words(names, req, env, peer, url_path) else {
                 return PolicyResult::Denied;
             };
-            decide(
+            crate::verified::authorization_boolean_provider(
                 reverse_dns_matches_cancellable(peer, &names, req.request_scope()),
                 *negate,
             )
         }
-        Require::Method { negate, methods } => {
-            decide(methods.iter().any(|m| same_method(m, &req.method)), *negate)
-        }
+        Require::Method { negate, methods } => crate::verified::authorization_boolean_provider(
+            methods.iter().any(|m| same_method(m, &req.method)),
+            *negate,
+        ),
         Require::ValidUser { negate } => {
             // `Require not valid-user` must carry its negation.  Like every
             // other negated provider it can deny or stay neutral, but cannot
             // independently grant access.
             let hit = identity.is_some();
-            if *negate {
-                decide(hit, true)
-            } else if hit {
-                PolicyResult::Granted
-            } else {
-                PolicyResult::AuthRequired
-            }
+            crate::verified::authorization_identity_provider(hit, hit, *negate, !*negate)
         }
         Require::User { negate, names } => {
             let Some(identity) = identity else {
-                return PolicyResult::AuthRequired;
+                return crate::verified::authorization_identity_provider(
+                    false, false, *negate, true,
+                );
             };
             let Ok(names) = expanded_words(names, req, env, peer, url_path) else {
                 return PolicyResult::Denied;
             };
-            decide(names.iter().any(|n| n == &identity.user), *negate)
+            crate::verified::authorization_identity_provider(
+                true,
+                names.iter().any(|n| n == &identity.user),
+                *negate,
+                true,
+            )
         }
         Require::Group { negate, names } => {
             let Some(identity) = identity else {
@@ -1291,7 +1277,7 @@ fn eval_require(
                     .rev()
                     .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
             });
-            decide(hit, *negate)
+            crate::verified::authorization_boolean_provider(hit, *negate)
         }
         Require::Expr { negate, expr } => {
             // F63/I63: the filesystem path binds `%{REQUEST_FILENAME}`/
@@ -1300,7 +1286,9 @@ fn eval_require(
             let mut ctx =
                 crate::expr::Context::new(req, env, peer, docroot, url_path).with_fs_path(fs_path);
             match expr.eval(&mut ctx) {
-                Ok(value) => decide(value.truthy(), *negate),
+                Ok(value) => {
+                    crate::verified::authorization_boolean_provider(value.truthy(), *negate)
+                }
                 // An engine/context error is a deny, not a boolean false:
                 // `Require not expr` must never grant because evaluation
                 // failed (P15-C).
@@ -1855,10 +1843,227 @@ fn reverse_dns(ip: IpAddr) -> Result<String, std::io::Error> {
     httpd_rs_os::reverse_dns(ip)
 }
 
+/// Exercise arbitrary symbolic authorization programs without invoking an
+/// effectful provider. The complete and production-lazy folds must agree for
+/// every suffix length, activity mask and PolicyResult sequence.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_authorization_fold(data: &[u8]) {
+    let Some((&selector, program)) = data.split_first() else {
+        return;
+    };
+    let kind = match selector % 5 {
+        0 => AuthorizationFoldKind::RequireAll,
+        1 => AuthorizationFoldKind::RequireAny,
+        2 => AuthorizationFoldKind::RequireNone,
+        3 => AuthorizationFoldKind::PolicyListAndParent,
+        _ => AuthorizationFoldKind::PolicyListOrParent,
+    };
+    let result = |byte: u8| match (byte >> 1) & 3 {
+        0 => PolicyResult::Granted,
+        1 => PolicyResult::Denied,
+        2 => PolicyResult::AuthRequired,
+        _ => PolicyResult::Neutral,
+    };
+
+    let mut complete = crate::verified::authorization_fold_start(kind);
+    for &byte in program {
+        complete = crate::verified::authorization_fold_step(complete, byte & 1 != 0, result(byte));
+    }
+    let expected = crate::verified::authorization_fold_finish(complete);
+
+    let mut lazy = crate::verified::authorization_fold_start(kind);
+    for &byte in program {
+        lazy = crate::verified::authorization_fold_step(lazy, byte & 1 != 0, result(byte));
+        if crate::verified::authorization_fold_terminal(lazy) {
+            break;
+        }
+    }
+    assert_eq!(crate::verified::authorization_fold_finish(lazy), expected);
+
+    let hit = selector & 0x20 != 0;
+    let negated = selector & 0x40 != 0;
+    let provider = crate::verified::authorization_boolean_provider(hit, negated);
+    assert!(!negated || provider != PolicyResult::Granted);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{AuthPolicy, RequireEntry};
+
+    fn reference_or(left: PolicyResult, right: PolicyResult) -> PolicyResult {
+        match (left, right) {
+            (PolicyResult::Granted, _) | (_, PolicyResult::Granted) => PolicyResult::Granted,
+            (PolicyResult::AuthRequired, _) | (_, PolicyResult::AuthRequired) => {
+                PolicyResult::AuthRequired
+            }
+            (PolicyResult::Denied, _) | (_, PolicyResult::Denied) => PolicyResult::Denied,
+            _ => PolicyResult::Neutral,
+        }
+    }
+
+    fn reference_and(left: PolicyResult, right: PolicyResult) -> PolicyResult {
+        match (left, right) {
+            (PolicyResult::Denied, _) | (_, PolicyResult::Denied) => PolicyResult::Denied,
+            (PolicyResult::AuthRequired, _) | (_, PolicyResult::AuthRequired) => {
+                PolicyResult::AuthRequired
+            }
+            (PolicyResult::Granted, _) | (_, PolicyResult::Granted) => PolicyResult::Granted,
+            _ => PolicyResult::Neutral,
+        }
+    }
+
+    fn reference_fold(
+        kind: AuthorizationFoldKind,
+        active: &[bool],
+        results: &[PolicyResult],
+    ) -> PolicyResult {
+        let mut aggregate = PolicyResult::Neutral;
+        let mut matched = false;
+        for (&active, &result) in active.iter().zip(results) {
+            if !active {
+                continue;
+            }
+            matched = true;
+            aggregate = match kind {
+                AuthorizationFoldKind::RequireAll => reference_and(aggregate, result),
+                _ => reference_or(aggregate, result),
+            };
+        }
+        match kind {
+            AuthorizationFoldKind::RequireNone => match aggregate {
+                PolicyResult::Granted => PolicyResult::Denied,
+                _ => PolicyResult::Neutral,
+            },
+            AuthorizationFoldKind::PolicyListAndParent if !matched => PolicyResult::Granted,
+            AuthorizationFoldKind::PolicyListOrParent if !matched => PolicyResult::Neutral,
+            AuthorizationFoldKind::PolicyListAndParent
+            | AuthorizationFoldKind::PolicyListOrParent
+                if aggregate == PolicyResult::Neutral =>
+            {
+                PolicyResult::Denied
+            }
+            _ => aggregate,
+        }
+    }
+
+    #[test]
+    fn verified_authorization_fold_exhausts_small_symbolic_programs() {
+        const RESULTS: [PolicyResult; 4] = [
+            PolicyResult::Granted,
+            PolicyResult::Denied,
+            PolicyResult::AuthRequired,
+            PolicyResult::Neutral,
+        ];
+        const KINDS: [AuthorizationFoldKind; 5] = [
+            AuthorizationFoldKind::RequireAll,
+            AuthorizationFoldKind::RequireAny,
+            AuthorizationFoldKind::RequireNone,
+            AuthorizationFoldKind::PolicyListAndParent,
+            AuthorizationFoldKind::PolicyListOrParent,
+        ];
+
+        // Every result triple and every active/inactive method mask. Compare
+        // both a complete fold and the production short-circuited fold with
+        // an independent truth-table implementation.
+        for kind in KINDS {
+            for encoded in 0u16..64 {
+                let results = [
+                    RESULTS[(encoded & 3) as usize],
+                    RESULTS[((encoded >> 2) & 3) as usize],
+                    RESULTS[((encoded >> 4) & 3) as usize],
+                ];
+                for mask in 0u8..8 {
+                    let active = [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0];
+                    let expected = reference_fold(kind, &active, &results);
+
+                    let mut complete = crate::verified::authorization_fold_start(kind);
+                    for index in 0..3 {
+                        complete = crate::verified::authorization_fold_step(
+                            complete,
+                            active[index],
+                            results[index],
+                        );
+                    }
+                    assert_eq!(
+                        crate::verified::authorization_fold_finish(complete),
+                        expected
+                    );
+
+                    let mut lazy = crate::verified::authorization_fold_start(kind);
+                    for index in 0..3 {
+                        lazy = crate::verified::authorization_fold_step(
+                            lazy,
+                            active[index],
+                            results[index],
+                        );
+                        if crate::verified::authorization_fold_terminal(lazy) {
+                            break;
+                        }
+                    }
+                    assert_eq!(crate::verified::authorization_fold_finish(lazy), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn applicable_neutral_policy_list_denies_but_inapplicable_list_keeps_parent_identity() {
+        let active = [true];
+        let inactive = [false];
+        let neutral = [PolicyResult::Neutral];
+
+        for kind in [
+            AuthorizationFoldKind::PolicyListAndParent,
+            AuthorizationFoldKind::PolicyListOrParent,
+        ] {
+            assert_eq!(
+                reference_fold(kind, &active, &neutral),
+                PolicyResult::Denied
+            );
+        }
+        assert_eq!(
+            reference_fold(
+                AuthorizationFoldKind::PolicyListAndParent,
+                &inactive,
+                &neutral,
+            ),
+            PolicyResult::Granted
+        );
+        assert_eq!(
+            reference_fold(
+                AuthorizationFoldKind::PolicyListOrParent,
+                &inactive,
+                &neutral,
+            ),
+            PolicyResult::Neutral
+        );
+
+        let policy = AuthPolicy::And(
+            Box::new(AuthPolicy::List(vec![RequireEntry {
+                node: RequireNode::Provider(Require::AllGranted),
+                limit: None,
+            }])),
+            Box::new(AuthPolicy::List(vec![RequireEntry {
+                node: RequireNode::Provider(Require::ValidUser { negate: true }),
+                limit: None,
+            }])),
+        );
+        assert_eq!(
+            eval_policy(
+                &policy,
+                &req("GET"),
+                "127.0.0.1".parse().unwrap(),
+                None,
+                &[],
+                true,
+                Path::new("/"),
+                "/x",
+                None,
+            ),
+            PolicyResult::Denied
+        );
+    }
 
     fn generation() -> crate::config::ConfigurationGeneration {
         crate::config::ConfigurationGeneration::for_test()

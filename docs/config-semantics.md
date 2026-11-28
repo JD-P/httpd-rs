@@ -221,9 +221,22 @@ one pass because there is no access file to interleave.
 - `RewriteRule`/`RewriteCond` lists append;
 - `.htaccess` top-level directives merge in the same way.
 
-The formal model should define `merge : Scope × Scope → Scope` as the
-composition of these per-field operations and prove the ordering lemmas used
-by the phases above.
+The production merge is wrapped by the executable verified
+`PolicyCompilationState` fold. It admits exactly the sequence Content,
+Options, Override, Authorization, Mapping, ErrorDocument, Header, Environment,
+RewriteCache, Compression and Proxy, and reaches `Complete` only after all 11
+components have been visited exactly once. Header-budget rejection is carried
+as a fail-closed conditional error through the remainder of the fold.
+
+Every `Scope` and component policy has an exhaustive Rust destructuring
+inventory with no `..` rest pattern. Adding a field therefore fails compilation
+until the field is deliberately classified. Optional scalar fields use the
+verified child-wins reducers; append-only fields use `append_vec`; Options,
+authorization and header replacement use their dedicated reducers; and
+pending rewrite conditions are explicitly classified as parser-local rather
+than inherited. The remaining wider `merge_assoc` obligation concerns opaque
+value construction/equality and deliberately non-associative operations, not
+whether a production field can silently fall outside the fold.
 
 ## 6. Override gating
 
@@ -1978,7 +1991,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **994 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **1012 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - The forked h2 HPACK path calls executable verified kernels for the total
   five-family representation classifier, header-block phase (including the
@@ -1999,11 +2012,17 @@ construction: there is no second production interleaver.
   table limits by default; a peer SETTINGS frame cannot raise the local send
   cap.
 
-- `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
-  `require_none_result`, `require_none_multi`, `require_none_multi_result`.
-  `crates/server/src/access.rs` calls these for
-  `<RequireAll>`/`<RequireAny>`/`<RequireNone>`; the multi-provider
-  `<RequireNone>` path aggregates positive hits with OR before negation.
+- `AuthorizationFoldKind`, `AuthorizationFoldState`,
+  `authorization_fold_start/step/finish/terminal`, and the Boolean/identity
+  provider reducers. `crates/server/src/access.rs` uses this one evaluator for
+  policy lists and every `<RequireAll>`/`<RequireAny>`/`<RequireNone>` tree.
+  Method-inapplicable entries cannot affect the fold; unmatched list semantics
+  retain the AND/OR parent distinction; an applicable list containing only
+  neutral negative providers denies; `<RequireNone>` cannot grant; and the
+  absorbing-prefix theorem justifies lazy short circuit without changing the
+  final result. An independent unit oracle exhausts all five fold kinds over
+  every three-result tuple and method-activity mask. IP/DNS/expression and
+  credential provider facts remain separate leaf-refinement obligations.
 - `RequestPhase`, `RequestPhaseEvent` and `request_phase_step`, consumed by
   both protocol adapters.  The transition proof makes body acquisition
   reachable only after routing selects a body-consuming sink; early policy
@@ -2077,10 +2096,18 @@ construction: there is no second production interleaver.
   (`Replace`/`And`/`Or`) before constructing the authorization tree.
   `auth_merge_kind_properties` proves that `And`/`Or` are impossible without
   an inherited parent policy.
-- `option_child_wins` / `option_child_presence`.  Scalar and
-  clone-based optional security fields in `Scope::merge` use verified
-  child-wins combinators.  Presence is proved exact; the underlying clone is a
-  standard-library primitive.
+- `PolicyCompilationPhase`, `PolicyCompilationEvent` and
+  `policy_compilation_step`. `Scope::merge_inner` consumes the exact
+  11-component transition sequence and requires `Complete`; the invariant
+  equates the current phase with the component count and retains parent,
+  child, and header-admission errors. Exhaustive Rust field inventories bind
+  the closed transition vocabulary to every current `Scope` component and
+  every component field.
+- `option_child_wins` / `option_child_assign`. Scalar and clone-based optional
+  security fields in `Scope::merge` use verified child-wins combinators. The
+  in-place form proves an absent child leaves the inherited option exactly
+  unchanged, avoiding allocations on unmatched request-time layers; the
+  underlying present-child clone is a standard-library primitive.
 - `append_vec`, `merge_containers`, `container_append_preserves_parent`,
   `container_lookup_pair` and `container_append_child_lookup_wins`.  Every
   append-only container/list field in `Scope::merge` appends through the
