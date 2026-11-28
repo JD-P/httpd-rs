@@ -38,13 +38,13 @@ impl Head {
 
     /// Parse an HTTP/2 frame header
     pub fn parse(header: &[u8]) -> Head {
-        let (stream_id, _) = StreamId::parse(&header[5..]);
-
-        Head {
-            kind: Kind::new(header[3]),
-            flag: header[4],
-            stream_id,
-        }
+        let parsed = httpd_rs_verified::h2_parse_wire_header(header)
+            .expect("HTTP/2 frame head parser requires nine bytes");
+        Head::new(
+            Kind::new(parsed.raw_kind),
+            parsed.flags,
+            parsed.stream_id.into(),
+        )
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -64,7 +64,19 @@ impl Head {
     }
 
     pub fn encode<T: BufMut>(&self, payload_len: usize, dst: &mut T) {
-        debug_assert!(self.encode_len() <= dst.remaining_mut());
+        assert!(self.encode_len() <= dst.remaining_mut());
+        let payload_len_u32 = u32::try_from(payload_len)
+            .expect("HTTP/2 payload length must fit the 24-bit wire field");
+        assert!(matches!(
+            httpd_rs_verified::h2_frame_header_admit(
+                self.kind as u8,
+                self.flag,
+                self.stream_id.into(),
+                payload_len_u32,
+                0x00ff_ffff,
+            ),
+            httpd_rs_verified::H2FrameHeaderDecision::Accept
+        ));
 
         dst.put_uint(payload_len as u64, 3);
         dst.put_u8(self.kind as u8);

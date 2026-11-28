@@ -106,34 +106,29 @@ fn decode_code_slow(
 ) -> Result<(), DecoderError> {
     let mut table = 0;
     loop {
-        if *work == 0 {
-            return Err(DecoderError::InvalidHuffmanCode);
-        }
-        *work -= 1;
+        *work = httpd_rs_verified::hpack_huffman_work_step(*work)
+            .ok_or(DecoderError::InvalidHuffmanCode)?;
         let e = DECODE_TABLE[table * TABLE_WIDTH + (*acc >> 56) as usize];
         if e & BRANCH == 0 {
             let used = (e >> 8) as usize;
-            if used > *bits {
-                return Err(DecoderError::InvalidHuffmanCode);
-            }
-            if *o >= dst.len() {
-                return Err(DecoderError::InvalidHuffmanCode);
-            }
+            let remaining_bits = httpd_rs_verified::hpack_huffman_bits_step(*bits, used)
+                .ok_or(DecoderError::InvalidHuffmanCode)?;
+            let next_o = httpd_rs_verified::hpack_huffman_output_step(*o, 1, dst.len())
+                .ok_or(DecoderError::InvalidHuffmanCode)?;
             dst[*o] = e as u8;
-            *o += 1;
+            *o = next_o;
             *acc <<= used;
-            *bits -= used;
+            *bits = remaining_bits;
             return Ok(());
         }
-        if *bits < 8 {
-            return Err(DecoderError::InvalidHuffmanCode);
-        }
+        let remaining_bits = httpd_rs_verified::hpack_huffman_bits_step(*bits, 8)
+            .ok_or(DecoderError::InvalidHuffmanCode)?;
         table = ((e & TABLE_INDEX_MASK) >> 8) as usize;
         if table == 0 {
             return Err(DecoderError::InvalidHuffmanCode);
         }
         *acc <<= 8;
-        *bits -= 8;
+        *bits = remaining_bits;
     }
 }
 
@@ -156,10 +151,8 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
     let mut pos: usize = 0;
 
     'outer: loop {
-        if work == 0 {
-            return Err(DecoderError::InvalidHuffmanCode);
-        }
-        work -= 1;
+        work = httpd_rs_verified::hpack_huffman_work_step(work)
+            .ok_or(DecoderError::InvalidHuffmanCode)?;
         // Fill the bit buffer. While 8 or more input bytes remain, load
         // the next 8 in one go and count as many whole bytes as fit under
         // the bits already in the buffer (bringing it to 56-63 bits). The
@@ -179,10 +172,8 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
         }
 
         while bits >= FAST_BITS {
-            if work == 0 {
-                return Err(DecoderError::InvalidHuffmanCode);
-            }
-            work -= 1;
+            work = httpd_rs_verified::hpack_huffman_work_step(work)
+                .ok_or(DecoderError::InvalidHuffmanCode)?;
             let entry = FAST_DECODE_TABLE[(acc >> (64 - FAST_BITS)) as usize];
             let count = (entry >> 16) & 0xff;
             if count == 0 {
@@ -196,14 +187,18 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
                 continue;
             }
             let consumed = (entry >> 24) as usize;
-            if o.checked_add(1).is_none_or(|last| last >= dst.len()) {
-                return Err(DecoderError::InvalidHuffmanCode);
-            }
+            let count = count as usize;
+            let next_o = httpd_rs_verified::hpack_huffman_output_step(o, count, dst.len())
+                .ok_or(DecoderError::InvalidHuffmanCode)?;
+            let remaining_bits = httpd_rs_verified::hpack_huffman_bits_step(bits, consumed)
+                .ok_or(DecoderError::InvalidHuffmanCode)?;
             dst[o] = entry as u8;
-            dst[o + 1] = (entry >> 8) as u8;
-            o += count as usize;
+            if count == 2 {
+                dst[o + 1] = (entry >> 8) as u8;
+            }
+            o = next_o;
             acc <<= consumed;
-            bits -= consumed;
+            bits = remaining_bits;
         }
 
         if pos >= len {
@@ -213,13 +208,11 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
 
     // Tail: the input is exhausted and fewer than 12 bits remain.
     while bits > 0 {
-        if work == 0 {
-            return Err(DecoderError::InvalidHuffmanCode);
-        }
-        work -= 1;
+        work = httpd_rs_verified::hpack_huffman_work_step(work)
+            .ok_or(DecoderError::InvalidHuffmanCode)?;
         // The encoder pads the last byte with up to 7 one-bits, which are
         // valid only between symbols. Anything else must decode.
-        if bits < 8 && (acc >> (64 - bits)) == (1 << bits) - 1 {
+        if httpd_rs_verified::hpack_huffman_tail_is_padding(acc, bits) {
             break;
         }
         decode_code_slow(&mut acc, &mut bits, dst, &mut o, &mut work)?;

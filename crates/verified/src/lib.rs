@@ -17151,8 +17151,25 @@ pub enum H2WireFrameKind {
     Unknown,
 }
 
+pub open spec fn h2_wire_frame_kind_spec(raw: u8) -> H2WireFrameKind {
+    match raw {
+        0 => H2WireFrameKind::Data,
+        1 => H2WireFrameKind::Headers,
+        2 => H2WireFrameKind::Priority,
+        3 => H2WireFrameKind::Reset,
+        4 => H2WireFrameKind::Settings,
+        5 => H2WireFrameKind::PushPromise,
+        6 => H2WireFrameKind::Ping,
+        7 => H2WireFrameKind::GoAway,
+        8 => H2WireFrameKind::WindowUpdate,
+        9 => H2WireFrameKind::Continuation,
+        _ => H2WireFrameKind::Unknown,
+    }
+}
+
 pub fn h2_wire_frame_kind(raw: u8) -> (kind: H2WireFrameKind)
     ensures
+        kind == h2_wire_frame_kind_spec(raw),
         raw == 0 ==> kind == H2WireFrameKind::Data,
         raw == 1 ==> kind == H2WireFrameKind::Headers,
         raw == 2 ==> kind == H2WireFrameKind::Priority,
@@ -17178,6 +17195,59 @@ pub fn h2_wire_frame_kind(raw: u8) -> (kind: H2WireFrameKind)
         9 => H2WireFrameKind::Continuation,
         _ => H2WireFrameKind::Unknown,
     }
+}
+
+/// The complete nine-octet HTTP/2 wire header, parsed before any payload
+/// allocation.  `reserved` records the high bit of the on-wire stream word;
+/// `stream_id` is the RFC 9113 31-bit identifier used by the state machine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct H2WireHeader {
+    pub payload_len: u32,
+    pub kind: H2WireFrameKind,
+    pub raw_kind: u8,
+    pub flags: u8,
+    pub stream_id: u32,
+    pub reserved: bool,
+}
+
+/// Parse exactly the fields whose offsets are fixed by RFC 9113 section 4.1.
+/// A short slice is rejected without indexing it.  The returned length and ID
+/// are constructionally limited to 24 and 31 bits respectively.
+pub fn h2_parse_wire_header(input: &[u8]) -> (out: Option<H2WireHeader>)
+    ensures
+        match out {
+            Some(header) => {
+                &&& input@.len() >= 9
+                &&& header.payload_len <= 0x00ff_ffff
+                &&& header.stream_id <= 0x7fff_ffff
+                &&& header.raw_kind == input@[3]
+                &&& header.flags == input@[4]
+                &&& header.kind == h2_wire_frame_kind_spec(input@[3])
+            }
+            None => input@.len() < 9,
+        },
+{
+    if input.len() < 9 {
+        return None;
+    }
+    let payload_len = (input[0] as u32) * 65_536
+        + (input[1] as u32) * 256
+        + input[2] as u32;
+    let stream_word = (input[5] as u32) * 16_777_216
+        + (input[6] as u32) * 65_536
+        + (input[7] as u32) * 256
+        + input[8] as u32;
+    assert(payload_len <= 0x00ff_ffff);
+    assert((stream_word & 0x7fff_ffff) <= 0x7fff_ffff) by (bit_vector);
+    let kind = h2_wire_frame_kind(input[3]);
+    Some(H2WireHeader {
+        payload_len,
+        kind,
+        raw_kind: input[3],
+        flags: input[4],
+        stream_id: stream_word & 0x7fff_ffff,
+        reserved: (stream_word & 0x8000_0000) != 0,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -17545,6 +17615,87 @@ pub fn h2_header_admit(
 /// conforming projection: active streams and pending resets never exceed the
 /// configured maxima, and every transition is total (it returns `None` rather
 /// than underflowing).
+/// The five disjoint HPACK wire representations from RFC 7541 section 6.
+/// Classification lives here instead of in an ad-hoc mask cascade in the
+/// decoder, so every possible first octet has one proved interpretation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HpackRepresentation {
+    Indexed,
+    LiteralWithIndexing,
+    LiteralWithoutIndexing,
+    LiteralNeverIndexed,
+    SizeUpdate,
+}
+
+pub open spec fn hpack_representation_spec(byte: u8) -> HpackRepresentation {
+    if byte & 0x80 == 0x80 {
+        HpackRepresentation::Indexed
+    } else if byte & 0x40 == 0x40 {
+        HpackRepresentation::LiteralWithIndexing
+    } else if byte & 0xf0 == 0x00 {
+        HpackRepresentation::LiteralWithoutIndexing
+    } else if byte & 0xf0 == 0x10 {
+        HpackRepresentation::LiteralNeverIndexed
+    } else {
+        HpackRepresentation::SizeUpdate
+    }
+}
+
+pub fn hpack_representation(byte: u8) -> (out: HpackRepresentation)
+    ensures out == hpack_representation_spec(byte),
+{
+    if byte & 0x80 == 0x80 {
+        HpackRepresentation::Indexed
+    } else if byte & 0x40 == 0x40 {
+        HpackRepresentation::LiteralWithIndexing
+    } else if byte & 0xf0 == 0x00 {
+        HpackRepresentation::LiteralWithoutIndexing
+    } else if byte & 0xf0 == 0x10 {
+        HpackRepresentation::LiteralNeverIndexed
+    } else {
+        // The remaining prefix is necessarily 001xxxxx: all 256 octets are
+        // covered by the five HPACK representation families.
+        HpackRepresentation::SizeUpdate
+    }
+}
+
+/// Decoder-block phase needed by HPACK's dynamic-table-size rule.  Size
+/// updates are legal only before the first field representation; once a field
+/// is observed the state is absorbing for the rest of that header block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HpackBlockPhase {
+    Start,
+    Fields,
+}
+
+pub fn hpack_block_step(
+    phase: HpackBlockPhase,
+    representation: HpackRepresentation,
+) -> (next: Option<HpackBlockPhase>)
+    ensures
+        match next {
+            Some(HpackBlockPhase::Start) => {
+                phase == HpackBlockPhase::Start
+                    && representation == HpackRepresentation::SizeUpdate
+            }
+            Some(HpackBlockPhase::Fields) => {
+                representation != HpackRepresentation::SizeUpdate
+            }
+            None => {
+                phase == HpackBlockPhase::Fields
+                    && representation == HpackRepresentation::SizeUpdate
+            }
+        },
+{
+    match (phase, representation) {
+        (HpackBlockPhase::Start, HpackRepresentation::SizeUpdate) => {
+            Some(HpackBlockPhase::Start)
+        }
+        (HpackBlockPhase::Fields, HpackRepresentation::SizeUpdate) => None,
+        (_, _) => Some(HpackBlockPhase::Fields),
+    }
+}
+
 /// Result of decoding one HPACK integer. `consumed` is part of the verified
 /// result so the wire decoder never has to reconstruct cursor movement from
 /// untrusted continuation bytes.
@@ -17633,6 +17784,67 @@ pub fn hpack_decode_integer(
         HpackIntegerDecode::Overflow
     } else {
         HpackIntegerDecode::Underflow
+    }
+}
+
+/// Complete admission result for one HPACK string literal.  `prefix_len`
+/// includes the first H bit/length octet and any integer continuation octets;
+/// `encoded_len` is the exact number of following string octets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HpackStringPreflight {
+    Ready {
+        huffman: bool,
+        prefix_len: usize,
+        encoded_len: usize,
+    },
+    Empty,
+    IntegerUnderflow,
+    StringUnderflow,
+    Overflow,
+}
+
+/// Parse and bounds-check a complete HPACK string before the concrete decoder
+/// advances its cursor or allocates Huffman output storage.
+pub fn hpack_string_preflight(input: &[u8]) -> (out: HpackStringPreflight)
+    ensures
+        match out {
+            HpackStringPreflight::Ready {
+                huffman: _,
+                prefix_len,
+                encoded_len,
+            } => {
+                &&& prefix_len >= 1
+                &&& prefix_len <= 5
+                &&& prefix_len <= input@.len()
+                &&& encoded_len <= input@.len() - prefix_len
+            }
+            HpackStringPreflight::Empty
+            | HpackStringPreflight::IntegerUnderflow
+            | HpackStringPreflight::StringUnderflow
+            | HpackStringPreflight::Overflow => true,
+        },
+{
+    if input.len() == 0 {
+        return HpackStringPreflight::Empty;
+    }
+    let huffman = (input[0] & 0x80) != 0;
+    match hpack_decode_integer(input, 7) {
+        HpackIntegerDecode::Value { value, consumed } => {
+            let encoded_len = value as usize;
+            if encoded_len > input.len() - consumed {
+                HpackStringPreflight::StringUnderflow
+            } else {
+                HpackStringPreflight::Ready {
+                    huffman,
+                    prefix_len: consumed,
+                    encoded_len,
+                }
+            }
+        }
+        HpackIntegerDecode::Underflow => HpackStringPreflight::IntegerUnderflow,
+        HpackIntegerDecode::Overflow | HpackIntegerDecode::InvalidPrefix => {
+            HpackStringPreflight::Overflow
+        }
     }
 }
 
@@ -17935,6 +18147,138 @@ pub fn hpack_huffman_decode_bounds(
         None => return None,
     };
     Some(HpackHuffmanDecodeBounds { total_len, work })
+}
+
+/// Consume one unit from the decoder's linear work budget.  Every fast-table
+/// lookup, refill iteration, tail iteration and slow-table edge goes through
+/// this transition, so a malformed code cannot create an unmetered loop.
+pub fn hpack_huffman_work_step(work: usize) -> (next: Option<usize>)
+    ensures
+        match next {
+            Some(remaining) => work > 0 && remaining + 1 == work,
+            None => work == 0,
+        },
+{
+    if work == 0 {
+        None
+    } else {
+        Some(work - 1)
+    }
+}
+
+/// Admit an output write of `count` symbols.  The returned cursor is the only
+/// cursor the concrete decoder may install after writing those symbols.
+pub fn hpack_huffman_output_step(
+    produced: usize,
+    count: usize,
+    capacity: usize,
+) -> (next: Option<usize>)
+    ensures
+        match next {
+            Some(cursor) => {
+                &&& cursor == produced + count
+                &&& cursor <= capacity
+            }
+            None => produced > capacity || count > capacity - produced,
+        },
+{
+    if produced > capacity || count > capacity - produced {
+        None
+    } else {
+        Some(produced + count)
+    }
+}
+
+/// Consume decoded bits without an unsigned underflow.
+pub fn hpack_huffman_bits_step(bits: usize, used: usize) -> (next: Option<usize>)
+    ensures
+        match next {
+            Some(remaining) => used <= bits && remaining + used == bits,
+            None => used > bits,
+        },
+{
+    if used > bits {
+        None
+    } else {
+        Some(bits - used)
+    }
+}
+
+/// RFC 7541 section 5.2 admits only a prefix of EOS as tail padding: fewer
+/// than eight high-order bits, all set to one.  This is the executable gate
+/// used by the optimized decoder after the input has been exhausted.
+pub fn hpack_huffman_tail_is_padding(acc: u64, bits: usize) -> (ok: bool)
+    ensures
+        ok ==> bits > 0 && bits < 8,
+{
+    if bits == 0 || bits >= 8 {
+        return false;
+    }
+    let mask: u64 = match bits {
+        1 => 0x01,
+        2 => 0x03,
+        3 => 0x07,
+        4 => 0x0f,
+        5 => 0x1f,
+        6 => 0x3f,
+        _ => 0x7f,
+    };
+    (acc >> (64 - bits)) == mask
+}
+
+/// Generic total bounded-counter transitions used by every h2 stream/reset
+/// ledger.  Unlike the dependency's former debug assertions, these remain
+/// active in release builds and report exhaustion or underflow to the caller.
+pub fn h2_bounded_count_increment(current: usize, maximum: usize) -> (next: Option<usize>)
+    ensures
+        match next {
+            Some(value) => current < maximum && value == current + 1 && value <= maximum,
+            None => current >= maximum,
+        },
+{
+    if current >= maximum {
+        None
+    } else {
+        Some(current + 1)
+    }
+}
+
+pub fn h2_bounded_count_decrement(current: usize) -> (next: Option<usize>)
+    ensures
+        match next {
+            Some(value) => current > 0 && value + 1 == current,
+            None => current == 0,
+        },
+{
+    if current == 0 {
+        None
+    } else {
+        Some(current - 1)
+    }
+}
+
+pub fn h2_budget_spend(spent: usize, maximum: usize, amount: usize) -> (next: Option<usize>)
+    ensures
+        match next {
+            Some(value) => value == spent + amount && value <= maximum,
+            None => spent > maximum || amount > maximum - spent,
+        },
+{
+    if spent > maximum || amount > maximum - spent {
+        None
+    } else {
+        Some(spent + amount)
+    }
+}
+
+pub fn h2_budget_replenish(spent: usize, amount: usize) -> (next: usize)
+    ensures next <= spent,
+{
+    if amount >= spent {
+        0
+    } else {
+        spent - amount
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -18342,6 +18686,46 @@ pub fn h2_signed_window_decrease(encoded: u64, amount: u32) -> (out: Option<u64>
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct H2SignedWindowPair {
+    pub first: u64,
+    pub second: u64,
+}
+
+/// Atomically decrease two related flow-control windows.  The concrete h2
+/// code commits neither value unless both transitions are valid, preventing a
+/// failed second subtraction from leaving the connection half-mutated.
+pub fn h2_signed_window_pair_decrease(
+    first: u64,
+    second: u64,
+    amount: u32,
+) -> (out: Option<H2SignedWindowPair>)
+    requires first <= u32::MAX as u64, second <= u32::MAX as u64,
+    ensures
+        match out {
+            Some(next) => {
+                &&& next.first + amount as u64 == first
+                &&& next.second + amount as u64 == second
+                &&& next.first <= u32::MAX as u64
+                &&& next.second <= u32::MAX as u64
+            }
+            None => amount as u64 > first || amount as u64 > second,
+        },
+{
+    let next_first = match h2_signed_window_decrease(first, amount) {
+        Some(value) => value,
+        None => return None,
+    };
+    let next_second = match h2_signed_window_decrease(second, amount) {
+        Some(value) => value,
+        None => return None,
+    };
+    Some(H2SignedWindowPair {
+        first: next_first,
+        second: next_second,
+    })
+}
+
 /// Abstract HTTP/2 flow-control state.  The h2 crate owns the wire windows;
 /// this model records the bound the adapter/config contract expects:
 /// connection and stream windows stay within their maxima, and the send
@@ -18527,6 +18911,224 @@ pub fn h2_purge_contains_exec(ids: &[u64], id: u64) -> (found: bool)
     assert forall|j: int| 0 <= j < ids@.len() ==> ids@[j] != id by {
     }
     false
+}
+
+/// Lossless control-state model of RFC 9113 section 5.1.  Error payloads and
+/// stream IDs remain in the dependency, but every state-changing operation is
+/// admitted here and the dependency checks that its concrete projection is
+/// exactly the returned phase in release builds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2RfcPeerPhase {
+    AwaitingHeaders,
+    Streaming,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2RfcStreamPhase {
+    Idle,
+    ReservedLocal,
+    ReservedRemote,
+    Open {
+        local: H2RfcPeerPhase,
+        remote: H2RfcPeerPhase,
+    },
+    HalfClosedLocal {
+        remote: H2RfcPeerPhase,
+    },
+    HalfClosedRemote {
+        local: H2RfcPeerPhase,
+    },
+    Closed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H2RfcStreamEvent {
+    SendHeaders { end_stream: bool },
+    ReceiveHeaders { end_stream: bool, informational: bool },
+    ReserveLocal,
+    ReserveRemote,
+    SendEndStream,
+    ReceiveEndStream,
+    Reset,
+    ConnectionError,
+}
+
+pub open spec fn h2_rfc_stream_step_spec(
+    phase: H2RfcStreamPhase,
+    event: H2RfcStreamEvent,
+) -> Option<H2RfcStreamPhase> {
+    use H2RfcPeerPhase::*;
+    use H2RfcStreamEvent::*;
+    use H2RfcStreamPhase::*;
+    match (phase, event) {
+        (Idle, SendHeaders { end_stream }) => {
+            if end_stream {
+                Some(HalfClosedLocal { remote: AwaitingHeaders })
+            } else {
+                Some(Open { local: Streaming, remote: AwaitingHeaders })
+            }
+        }
+        (Open { local: AwaitingHeaders, remote }, SendHeaders { end_stream }) => {
+            if end_stream {
+                Some(HalfClosedLocal { remote })
+            } else {
+                Some(Open { local: Streaming, remote })
+            }
+        }
+        (HalfClosedRemote { local: AwaitingHeaders }, SendHeaders { end_stream })
+        | (ReservedLocal, SendHeaders { end_stream }) => {
+            if end_stream {
+                Some(Closed)
+            } else {
+                Some(HalfClosedRemote { local: Streaming })
+            }
+        }
+        (Idle, ReceiveHeaders { end_stream, informational }) => {
+            if end_stream {
+                Some(HalfClosedRemote { local: AwaitingHeaders })
+            } else {
+                Some(Open {
+                    local: AwaitingHeaders,
+                    remote: if informational { AwaitingHeaders } else { Streaming },
+                })
+            }
+        }
+        (ReservedRemote, ReceiveHeaders { end_stream, informational }) => {
+            if end_stream {
+                Some(Closed)
+            } else if informational {
+                Some(ReservedRemote)
+            } else {
+                Some(HalfClosedLocal { remote: Streaming })
+            }
+        }
+        (Open { local, remote: AwaitingHeaders }, ReceiveHeaders { end_stream, informational }) => {
+            if end_stream {
+                Some(HalfClosedRemote { local })
+            } else {
+                Some(Open {
+                    local,
+                    remote: if informational { AwaitingHeaders } else { Streaming },
+                })
+            }
+        }
+        (HalfClosedLocal { remote: AwaitingHeaders }, ReceiveHeaders { end_stream, informational }) => {
+            if end_stream {
+                Some(Closed)
+            } else if informational {
+                Some(HalfClosedLocal { remote: AwaitingHeaders })
+            } else {
+                Some(HalfClosedLocal { remote: Streaming })
+            }
+        }
+        (Idle, ReserveLocal) => Some(ReservedLocal),
+        (Idle, ReserveRemote) => Some(ReservedRemote),
+        (Open { local, remote: _ }, ReceiveEndStream) => Some(HalfClosedRemote { local }),
+        (HalfClosedLocal { remote: _ }, ReceiveEndStream) => Some(Closed),
+        (Open { local: _, remote }, SendEndStream) => Some(HalfClosedLocal { remote }),
+        (HalfClosedRemote { local: _ }, SendEndStream) => Some(Closed),
+        (_, Reset) | (_, ConnectionError) => Some(Closed),
+        _ => None,
+    }
+}
+
+pub fn h2_rfc_stream_step(
+    phase: H2RfcStreamPhase,
+    event: H2RfcStreamEvent,
+) -> (next: Option<H2RfcStreamPhase>)
+    ensures next == h2_rfc_stream_step_spec(phase, event),
+{
+    use H2RfcPeerPhase::*;
+    use H2RfcStreamEvent::*;
+    use H2RfcStreamPhase::*;
+    match (phase, event) {
+        (Idle, SendHeaders { end_stream }) => {
+            if end_stream {
+                Some(HalfClosedLocal { remote: AwaitingHeaders })
+            } else {
+                Some(Open { local: Streaming, remote: AwaitingHeaders })
+            }
+        }
+        (Open { local: AwaitingHeaders, remote }, SendHeaders { end_stream }) => {
+            if end_stream {
+                Some(HalfClosedLocal { remote })
+            } else {
+                Some(Open { local: Streaming, remote })
+            }
+        }
+        (HalfClosedRemote { local: AwaitingHeaders }, SendHeaders { end_stream })
+        | (ReservedLocal, SendHeaders { end_stream }) => {
+            if end_stream {
+                Some(Closed)
+            } else {
+                Some(HalfClosedRemote { local: Streaming })
+            }
+        }
+        (Idle, ReceiveHeaders { end_stream, informational }) => {
+            if end_stream {
+                Some(HalfClosedRemote { local: AwaitingHeaders })
+            } else {
+                Some(Open {
+                    local: AwaitingHeaders,
+                    remote: if informational { AwaitingHeaders } else { Streaming },
+                })
+            }
+        }
+        (ReservedRemote, ReceiveHeaders { end_stream, informational }) => {
+            if end_stream {
+                Some(Closed)
+            } else if informational {
+                Some(ReservedRemote)
+            } else {
+                Some(HalfClosedLocal { remote: Streaming })
+            }
+        }
+        (Open { local, remote: AwaitingHeaders }, ReceiveHeaders { end_stream, informational }) => {
+            if end_stream {
+                Some(HalfClosedRemote { local })
+            } else {
+                Some(Open {
+                    local,
+                    remote: if informational { AwaitingHeaders } else { Streaming },
+                })
+            }
+        }
+        (HalfClosedLocal { remote: AwaitingHeaders }, ReceiveHeaders { end_stream, informational }) => {
+            if end_stream {
+                Some(Closed)
+            } else if informational {
+                Some(HalfClosedLocal { remote: AwaitingHeaders })
+            } else {
+                Some(HalfClosedLocal { remote: Streaming })
+            }
+        }
+        (Idle, ReserveLocal) => Some(ReservedLocal),
+        (Idle, ReserveRemote) => Some(ReservedRemote),
+        (Open { local, remote: _ }, ReceiveEndStream) => Some(HalfClosedRemote { local }),
+        (HalfClosedLocal { remote: _ }, ReceiveEndStream) => Some(Closed),
+        (Open { local: _, remote }, SendEndStream) => Some(HalfClosedLocal { remote }),
+        (HalfClosedRemote { local: _ }, SendEndStream) => Some(Closed),
+        (_, Reset) | (_, ConnectionError) => Some(Closed),
+        _ => None,
+    }
+}
+
+pub proof fn h2_rfc_closed_cannot_reopen(event: H2RfcStreamEvent)
+    ensures
+        match h2_rfc_stream_step_spec(H2RfcStreamPhase::Closed, event) {
+            Some(next) => next == H2RfcStreamPhase::Closed,
+            None => true,
+        },
+{
+}
+
+pub proof fn h2_rfc_terminal_events_close(phase: H2RfcStreamPhase)
+    ensures
+        h2_rfc_stream_step_spec(phase, H2RfcStreamEvent::Reset)
+            == Some(H2RfcStreamPhase::Closed),
+        h2_rfc_stream_step_spec(phase, H2RfcStreamEvent::ConnectionError)
+            == Some(H2RfcStreamPhase::Closed),
+{
 }
 
 /// Invariant for the adapter-side stream table: active and pending-reset

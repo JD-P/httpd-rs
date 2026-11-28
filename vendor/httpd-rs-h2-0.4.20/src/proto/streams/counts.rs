@@ -19,16 +19,13 @@ impl Budget {
     }
 
     fn consume(&mut self, amount: usize) -> Result<(), BudgetExhausted> {
-        let spent = self.spent.checked_add(amount).ok_or(BudgetExhausted)?;
-        if spent > self.max {
-            return Err(BudgetExhausted);
-        }
-        self.spent = spent;
+        self.spent = httpd_rs_verified::h2_budget_spend(self.spent, self.max, amount)
+            .ok_or(BudgetExhausted)?;
         Ok(())
     }
 
     fn replenish(&mut self, amount: usize) {
-        self.spent = self.spent.saturating_sub(amount);
+        self.spent = httpd_rs_verified::h2_budget_replenish(self.spent, amount);
     }
 
     fn set_max(&mut self, max: usize) {
@@ -193,13 +190,11 @@ impl Counts {
     /// Records the framing overhead of a DATA frame.
     pub fn record_data_frame(&mut self, payload_len: usize) -> Result<(), BudgetExhausted> {
         if payload_len == 0 {
-            self.num_recv_empty_data_frames = self
-                .num_recv_empty_data_frames
-                .checked_add(1)
-                .ok_or(BudgetExhausted)?;
-            if self.num_recv_empty_data_frames > MAX_RECV_EMPTY_DATA_FRAMES {
-                return Err(BudgetExhausted);
-            }
+            self.num_recv_empty_data_frames = httpd_rs_verified::h2_bounded_count_increment(
+                self.num_recv_empty_data_frames,
+                MAX_RECV_EMPTY_DATA_FRAMES,
+            )
+            .ok_or(BudgetExhausted)?;
             Ok(())
         } else if payload_len < DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD {
             self.data_frame_budget
@@ -241,22 +236,30 @@ impl Counts {
     /// Returns true if we can issue another local reset due to protocol error.
     pub fn can_inc_num_local_error_resets(&self) -> bool {
         if let Some(max) = self.max_local_error_reset_streams {
-            max > self.num_local_error_reset_streams
+            httpd_rs_verified::h2_bounded_count_increment(self.num_local_error_reset_streams, max)
+                .is_some()
         } else {
-            true
+            httpd_rs_verified::h2_bounded_count_increment(
+                self.num_local_error_reset_streams,
+                usize::MAX,
+            )
+            .is_some()
         }
     }
 
     pub fn inc_num_local_error_resets(&mut self) {
-        assert!(self.can_inc_num_local_error_resets());
-
-        // Increment the number of remote initiated streams
-        self.num_local_error_reset_streams += 1;
+        let maximum = self.max_local_error_reset_streams.unwrap_or(usize::MAX);
+        self.num_local_error_reset_streams = httpd_rs_verified::h2_bounded_count_increment(
+            self.num_local_error_reset_streams,
+            maximum,
+        )
+        .expect("local error reset count must be admitted before increment");
     }
 
     /// Returns true if the receive stream concurrency can be incremented
     pub fn can_inc_num_recv_streams(&self) -> bool {
-        self.max_recv_streams > self.num_recv_streams
+        httpd_rs_verified::h2_bounded_count_increment(self.num_recv_streams, self.max_recv_streams)
+            .is_some()
     }
 
     /// Increments the number of concurrent receive streams.
@@ -265,17 +268,19 @@ impl Counts {
     ///
     /// Panics on failure as this should have been validated before hand.
     pub fn inc_num_recv_streams(&mut self, stream: &mut store::Ptr) {
-        assert!(self.can_inc_num_recv_streams());
         assert!(!stream.is_counted);
-
-        // Increment the number of remote initiated streams
-        self.num_recv_streams += 1;
+        self.num_recv_streams = httpd_rs_verified::h2_bounded_count_increment(
+            self.num_recv_streams,
+            self.max_recv_streams,
+        )
+        .expect("receive stream count must be admitted before increment");
         stream.is_counted = true;
     }
 
     /// Returns true if the send stream concurrency can be incremented
     pub fn can_inc_num_send_streams(&self) -> bool {
-        self.max_send_streams > self.num_send_streams
+        httpd_rs_verified::h2_bounded_count_increment(self.num_send_streams, self.max_send_streams)
+            .is_some()
     }
 
     /// Increments the number of concurrent send streams.
@@ -284,17 +289,22 @@ impl Counts {
     ///
     /// Panics on failure as this should have been validated before hand.
     pub fn inc_num_send_streams(&mut self, stream: &mut store::Ptr) {
-        assert!(self.can_inc_num_send_streams());
         assert!(!stream.is_counted);
-
-        // Increment the number of remote initiated streams
-        self.num_send_streams += 1;
+        self.num_send_streams = httpd_rs_verified::h2_bounded_count_increment(
+            self.num_send_streams,
+            self.max_send_streams,
+        )
+        .expect("send stream count must be admitted before increment");
         stream.is_counted = true;
     }
 
     /// Returns true if the number of pending reset streams can be incremented.
     pub fn can_inc_num_reset_streams(&self) -> bool {
-        self.max_local_reset_streams > self.num_local_reset_streams
+        httpd_rs_verified::h2_bounded_count_increment(
+            self.num_local_reset_streams,
+            self.max_local_reset_streams,
+        )
+        .is_some()
     }
 
     /// Increments the number of pending reset streams.
@@ -303,15 +313,21 @@ impl Counts {
     ///
     /// Panics on failure as this should have been validated before hand.
     pub fn inc_num_reset_streams(&mut self) {
-        assert!(self.can_inc_num_reset_streams());
-
-        self.num_local_reset_streams += 1;
+        self.num_local_reset_streams = httpd_rs_verified::h2_bounded_count_increment(
+            self.num_local_reset_streams,
+            self.max_local_reset_streams,
+        )
+        .expect("local reset count must be admitted before increment");
     }
 
     /// Returns true if the number of pending REMOTE reset streams can be
     /// incremented.
     pub(crate) fn can_inc_num_remote_reset_streams(&self) -> bool {
-        self.max_remote_reset_streams > self.num_remote_reset_streams
+        httpd_rs_verified::h2_bounded_count_increment(
+            self.num_remote_reset_streams,
+            self.max_remote_reset_streams,
+        )
+        .is_some()
     }
 
     /// Increments the number of pending REMOTE reset streams.
@@ -320,15 +336,17 @@ impl Counts {
     ///
     /// Panics on failure as this should have been validated before hand.
     pub(crate) fn inc_num_remote_reset_streams(&mut self) {
-        assert!(self.can_inc_num_remote_reset_streams());
-
-        self.num_remote_reset_streams += 1;
+        self.num_remote_reset_streams = httpd_rs_verified::h2_bounded_count_increment(
+            self.num_remote_reset_streams,
+            self.max_remote_reset_streams,
+        )
+        .expect("remote reset count must be admitted before increment");
     }
 
     pub(crate) fn dec_num_remote_reset_streams(&mut self) {
-        assert!(self.num_remote_reset_streams > 0);
-
-        self.num_remote_reset_streams -= 1;
+        self.num_remote_reset_streams =
+            httpd_rs_verified::h2_bounded_count_decrement(self.num_remote_reset_streams)
+                .expect("remote reset count cannot underflow");
     }
 
     pub fn apply_remote_settings(&mut self, settings: &frame::Settings, is_initial: bool) {
@@ -413,19 +431,22 @@ impl Counts {
         assert!(stream.is_counted);
 
         if self.peer.is_local_init(stream.id) {
-            assert!(self.num_send_streams > 0);
-            self.num_send_streams -= 1;
+            self.num_send_streams =
+                httpd_rs_verified::h2_bounded_count_decrement(self.num_send_streams)
+                    .expect("send stream count cannot underflow");
             stream.is_counted = false;
         } else {
-            assert!(self.num_recv_streams > 0);
-            self.num_recv_streams -= 1;
+            self.num_recv_streams =
+                httpd_rs_verified::h2_bounded_count_decrement(self.num_recv_streams)
+                    .expect("receive stream count cannot underflow");
             stream.is_counted = false;
         }
     }
 
     fn dec_num_reset_streams(&mut self) {
-        assert!(self.num_local_reset_streams > 0);
-        self.num_local_reset_streams -= 1;
+        self.num_local_reset_streams =
+            httpd_rs_verified::h2_bounded_count_decrement(self.num_local_reset_streams)
+                .expect("local reset count cannot underflow");
     }
 }
 

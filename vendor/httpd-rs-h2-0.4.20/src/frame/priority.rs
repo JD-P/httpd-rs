@@ -33,6 +33,11 @@ impl Priority {
             dependency,
         })
     }
+
+    pub fn encode<B: bytes::BufMut>(&self, dst: &mut B) {
+        Head::new(Kind::Priority, 0, self.stream_id).encode(5, dst);
+        self.dependency.encode(dst);
+    }
 }
 
 impl<B> From<Priority> for Frame<B> {
@@ -68,5 +73,36 @@ impl StreamDependency {
 
     pub fn dependency_id(&self) -> StreamId {
         self.dependency_id
+    }
+
+    fn encode<B: bytes::BufMut>(&self, dst: &mut B) {
+        let mut dependency: u32 = self.dependency_id.into();
+        if self.is_exclusive {
+            dependency |= 0x8000_0000;
+        }
+        dst.put_u32(dependency);
+        dst.put_u8(self.weight);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+
+    #[test]
+    fn priority_encode_round_trips_exclusive_dependency_and_weight() {
+        let priority = Priority {
+            stream_id: StreamId::from(3),
+            dependency: StreamDependency::new(StreamId::from(1), 255, true),
+        };
+        let mut wire = BytesMut::new();
+        priority.encode(&mut wire);
+
+        assert_eq!(wire.len(), HEADER_LEN + 5);
+        let head = Head::parse(&wire[..HEADER_LEN]);
+        assert_eq!(head.kind(), Kind::Priority);
+        assert_eq!(head.stream_id(), StreamId::from(3));
+        assert_eq!(Priority::load(head, &wire[HEADER_LEN..]).unwrap(), priority);
     }
 }

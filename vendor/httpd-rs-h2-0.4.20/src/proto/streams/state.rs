@@ -116,44 +116,64 @@ impl State {
         }
     }
 
+    fn rfc_phase(&self) -> httpd_rs_verified::H2RfcStreamPhase {
+        use httpd_rs_verified::{H2RfcPeerPhase as VerifiedPeer, H2RfcStreamPhase as Phase};
+
+        fn peer(peer: Peer) -> VerifiedPeer {
+            match peer {
+                AwaitingHeaders => VerifiedPeer::AwaitingHeaders,
+                Streaming => VerifiedPeer::Streaming,
+            }
+        }
+
+        match self.inner {
+            Idle => Phase::Idle,
+            ReservedLocal => Phase::ReservedLocal,
+            ReservedRemote => Phase::ReservedRemote,
+            Open { local, remote } => Phase::Open {
+                local: peer(local),
+                remote: peer(remote),
+            },
+            HalfClosedLocal(remote) => Phase::HalfClosedLocal {
+                remote: peer(remote),
+            },
+            HalfClosedRemote(local) => Phase::HalfClosedRemote { local: peer(local) },
+            Closed(_) => Phase::Closed,
+        }
+    }
+
+    fn install_rfc_phase(&mut self, phase: httpd_rs_verified::H2RfcStreamPhase) {
+        use httpd_rs_verified::{H2RfcPeerPhase as VerifiedPeer, H2RfcStreamPhase as Phase};
+
+        fn peer(peer: VerifiedPeer) -> Peer {
+            match peer {
+                VerifiedPeer::AwaitingHeaders => AwaitingHeaders,
+                VerifiedPeer::Streaming => Streaming,
+            }
+        }
+
+        self.inner = match phase {
+            Phase::Idle => Idle,
+            Phase::ReservedLocal => ReservedLocal,
+            Phase::ReservedRemote => ReservedRemote,
+            Phase::Open { local, remote } => Open {
+                local: peer(local),
+                remote: peer(remote),
+            },
+            Phase::HalfClosedLocal { remote } => HalfClosedLocal(peer(remote)),
+            Phase::HalfClosedRemote { local } => HalfClosedRemote(peer(local)),
+            Phase::Closed => Closed(Cause::EndStream),
+        };
+    }
+
     /// Opens the send-half of a stream if it is not already open.
     pub fn send_open(&mut self, eos: bool) -> Result<(), UserError> {
-        let local = Streaming;
-
-        self.inner = match self.inner {
-            Idle => {
-                if eos {
-                    HalfClosedLocal(AwaitingHeaders)
-                } else {
-                    Open {
-                        local,
-                        remote: AwaitingHeaders,
-                    }
-                }
-            }
-            Open {
-                local: AwaitingHeaders,
-                remote,
-            } => {
-                if eos {
-                    HalfClosedLocal(remote)
-                } else {
-                    Open { local, remote }
-                }
-            }
-            HalfClosedRemote(AwaitingHeaders) | ReservedLocal => {
-                if eos {
-                    Closed(Cause::EndStream)
-                } else {
-                    HalfClosedRemote(local)
-                }
-            }
-            _ => {
-                // All other transitions result in a protocol error
-                return Err(UserError::UnexpectedFrameType);
-            }
-        };
-
+        let next = httpd_rs_verified::h2_rfc_stream_step(
+            self.rfc_phase(),
+            httpd_rs_verified::H2RfcStreamEvent::SendHeaders { end_stream: eos },
+        )
+        .ok_or(UserError::UnexpectedFrameType)?;
+        self.install_rfc_phase(next);
         Ok(())
     }
 
@@ -161,121 +181,55 @@ impl State {
     ///
     /// Returns true if this transitions the state to Open.
     pub fn recv_open(&mut self, frame: &frame::Headers) -> Result<bool, Error> {
-        let mut initial = false;
+        let initial = matches!(self.inner, Idle | ReservedRemote);
         let eos = frame.is_end_stream();
-
-        self.inner = match self.inner {
-            Idle => {
-                initial = true;
-
-                if eos {
-                    HalfClosedRemote(AwaitingHeaders)
-                } else {
-                    Open {
-                        local: AwaitingHeaders,
-                        remote: if frame.is_informational() {
-                            tracing::trace!("skipping 1xx response headers");
-                            AwaitingHeaders
-                        } else {
-                            Streaming
-                        },
-                    }
-                }
-            }
-            ReservedRemote => {
-                initial = true;
-
-                if eos {
-                    Closed(Cause::EndStream)
-                } else if frame.is_informational() {
-                    tracing::trace!("skipping 1xx response headers");
-                    ReservedRemote
-                } else {
-                    HalfClosedLocal(Streaming)
-                }
-            }
-            Open {
-                local,
-                remote: AwaitingHeaders,
-            } => {
-                if eos {
-                    HalfClosedRemote(local)
-                } else {
-                    Open {
-                        local,
-                        remote: if frame.is_informational() {
-                            tracing::trace!("skipping 1xx response headers");
-                            AwaitingHeaders
-                        } else {
-                            Streaming
-                        },
-                    }
-                }
-            }
-            HalfClosedLocal(AwaitingHeaders) => {
-                if eos {
-                    Closed(Cause::EndStream)
-                } else if frame.is_informational() {
-                    tracing::trace!("skipping 1xx response headers");
-                    HalfClosedLocal(AwaitingHeaders)
-                } else {
-                    HalfClosedLocal(Streaming)
-                }
-            }
-            ref _state => {
-                // All other transitions result in a protocol error
-                proto_err!(conn: "recv_open: in unexpected state {:?}", _state);
-                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
-            }
-        };
-
+        let informational = frame.is_informational();
+        if informational {
+            tracing::trace!("skipping 1xx response headers");
+        }
+        let next = httpd_rs_verified::h2_rfc_stream_step(
+            self.rfc_phase(),
+            httpd_rs_verified::H2RfcStreamEvent::ReceiveHeaders {
+                end_stream: eos,
+                informational,
+            },
+        )
+        .ok_or_else(|| Error::library_go_away(Reason::PROTOCOL_ERROR))?;
+        self.install_rfc_phase(next);
         Ok(initial)
     }
 
     /// Transition from Idle -> ReservedRemote
     pub fn reserve_remote(&mut self) -> Result<(), Error> {
-        match self.inner {
-            Idle => {
-                self.inner = ReservedRemote;
-                Ok(())
-            }
-            ref _state => {
-                proto_err!(conn: "reserve_remote: in unexpected state {:?}", _state);
-                Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
-            }
-        }
+        let next = httpd_rs_verified::h2_rfc_stream_step(
+            self.rfc_phase(),
+            httpd_rs_verified::H2RfcStreamEvent::ReserveRemote,
+        )
+        .ok_or_else(|| Error::library_go_away(Reason::PROTOCOL_ERROR))?;
+        self.install_rfc_phase(next);
+        Ok(())
     }
 
     /// Transition from Idle -> ReservedLocal
     pub fn reserve_local(&mut self) -> Result<(), UserError> {
-        match self.inner {
-            Idle => {
-                self.inner = ReservedLocal;
-                Ok(())
-            }
-            _ => Err(UserError::UnexpectedFrameType),
-        }
+        let next = httpd_rs_verified::h2_rfc_stream_step(
+            self.rfc_phase(),
+            httpd_rs_verified::H2RfcStreamEvent::ReserveLocal,
+        )
+        .ok_or(UserError::UnexpectedFrameType)?;
+        self.install_rfc_phase(next);
+        Ok(())
     }
 
     /// Indicates that the remote side will not send more data to the local.
     pub fn recv_close(&mut self) -> Result<(), Error> {
-        match self.inner {
-            Open { local, .. } => {
-                // The remote side will continue to receive data.
-                tracing::trace!("recv_close: Open => HalfClosedRemote({:?})", local);
-                self.inner = HalfClosedRemote(local);
-                Ok(())
-            }
-            HalfClosedLocal(..) => {
-                tracing::trace!("recv_close: HalfClosedLocal => Closed");
-                self.inner = Closed(Cause::EndStream);
-                Ok(())
-            }
-            ref _state => {
-                proto_err!(conn: "recv_close: in unexpected state {:?}", _state);
-                Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
-            }
-        }
+        let next = httpd_rs_verified::h2_rfc_stream_step(
+            self.rfc_phase(),
+            httpd_rs_verified::H2RfcStreamEvent::ReceiveEndStream,
+        )
+        .ok_or_else(|| Error::library_go_away(Reason::PROTOCOL_ERROR))?;
+        self.install_rfc_phase(next);
+        Ok(())
     }
 
     /// The remote explicitly sent a RST_STREAM.
@@ -285,6 +239,13 @@ impl State {
     /// - `queued`: true if this stream has frames in the pending send queue.
     pub fn recv_reset(&mut self, frame: frame::Reset, _queued: bool) {
         let recv_end_stream = self.is_recv_end_stream();
+        let next = httpd_rs_verified::h2_rfc_stream_step(
+            self.rfc_phase(),
+            httpd_rs_verified::H2RfcStreamEvent::Reset,
+        );
+        if next != Some(httpd_rs_verified::H2RfcStreamPhase::Closed) {
+            return;
+        }
         match self.inner {
             // A notionally `Closed` stream may still have queued frames in
             // the following cases:
@@ -324,6 +285,13 @@ impl State {
 
     /// Handle a connection-level error.
     pub fn handle_error(&mut self, err: &proto::Error) {
+        let next = httpd_rs_verified::h2_rfc_stream_step(
+            self.rfc_phase(),
+            httpd_rs_verified::H2RfcStreamEvent::ConnectionError,
+        );
+        if next != Some(httpd_rs_verified::H2RfcStreamPhase::Closed) {
+            return;
+        }
         match self.inner {
             Closed(..) => {}
             _ => {
@@ -334,6 +302,13 @@ impl State {
     }
 
     pub fn recv_eof(&mut self) {
+        let next = httpd_rs_verified::h2_rfc_stream_step(
+            self.rfc_phase(),
+            httpd_rs_verified::H2RfcStreamEvent::ConnectionError,
+        );
+        if next != Some(httpd_rs_verified::H2RfcStreamPhase::Closed) {
+            return;
+        }
         match self.inner {
             Closed(..) => {}
             ref _state => {
@@ -350,29 +325,38 @@ impl State {
     }
 
     /// Indicates that the local side will not send more data to the local.
-    pub fn send_close(&mut self) {
-        match self.inner {
-            Open { remote, .. } => {
-                // The remote side will continue to receive data.
-                tracing::trace!("send_close: Open => HalfClosedLocal({:?})", remote);
-                self.inner = HalfClosedLocal(remote);
-            }
-            HalfClosedRemote(..) => {
-                tracing::trace!("send_close: HalfClosedRemote => Closed");
-                self.inner = Closed(Cause::EndStream);
-            }
-            ref state => panic!("send_close: unexpected state {:?}", state),
-        }
+    pub fn send_close(&mut self) -> Result<(), UserError> {
+        let next = httpd_rs_verified::h2_rfc_stream_step(
+            self.rfc_phase(),
+            httpd_rs_verified::H2RfcStreamEvent::SendEndStream,
+        )
+        .ok_or(UserError::UnexpectedFrameType)?;
+        self.install_rfc_phase(next);
+        Ok(())
     }
 
     /// Set the stream state to reset locally.
     pub fn set_reset(&mut self, stream_id: StreamId, reason: Reason, initiator: Initiator) {
+        if httpd_rs_verified::h2_rfc_stream_step(
+            self.rfc_phase(),
+            httpd_rs_verified::H2RfcStreamEvent::Reset,
+        ) != Some(httpd_rs_verified::H2RfcStreamPhase::Closed)
+        {
+            return;
+        }
         self.inner = Closed(Cause::Error(Error::Reset(stream_id, reason, initiator)));
     }
 
     /// Set the stream state to a scheduled reset.
     pub fn set_scheduled_reset(&mut self, reason: Reason) {
-        debug_assert!(!self.is_closed());
+        if self.is_closed()
+            || httpd_rs_verified::h2_rfc_stream_step(
+                self.rfc_phase(),
+                httpd_rs_verified::H2RfcStreamEvent::Reset,
+            ) != Some(httpd_rs_verified::H2RfcStreamPhase::Closed)
+        {
+            return;
+        }
         self.inner = Closed(Cause::ScheduledLibraryReset(reason));
     }
 
@@ -525,6 +509,49 @@ impl fmt::Debug for State {
 mod tests {
     use super::*;
     use http::HeaderMap;
+
+    #[test]
+    fn verified_rfc_machine_is_authoritative_for_full_lifecycle() {
+        use httpd_rs_verified::{H2RfcPeerPhase::*, H2RfcStreamPhase::*};
+
+        let stream_id = StreamId::from(1);
+        let mut state = State::default();
+        assert_eq!(state.rfc_phase(), Idle);
+
+        state.send_open(false).unwrap();
+        assert_eq!(
+            state.rfc_phase(),
+            Open {
+                local: Streaming,
+                remote: AwaitingHeaders,
+            }
+        );
+
+        let headers = frame::Headers::new(stream_id, Default::default(), HeaderMap::new());
+        assert!(!state.recv_open(&headers).unwrap());
+        assert_eq!(
+            state.rfc_phase(),
+            Open {
+                local: Streaming,
+                remote: Streaming,
+            }
+        );
+
+        state.recv_close().unwrap();
+        assert_eq!(state.rfc_phase(), HalfClosedRemote { local: Streaming });
+        state.send_close().unwrap();
+        assert_eq!(state.rfc_phase(), Closed);
+    }
+
+    #[test]
+    fn invalid_rfc_transition_rejects_without_mutation() {
+        let mut state = State::default();
+        assert!(matches!(
+            state.send_close(),
+            Err(UserError::UnexpectedFrameType)
+        ));
+        assert_eq!(state.rfc_phase(), httpd_rs_verified::H2RfcStreamPhase::Idle);
+    }
 
     #[test]
     fn recv_reset_preserves_received_end_stream() {

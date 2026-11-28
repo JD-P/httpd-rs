@@ -73,14 +73,17 @@ impl Decoder for WireFrameCodec {
         if src.len() < frame::HEADER_LEN {
             return Ok(None);
         }
-        let payload_len = ((src[0] as u32) << 16) | ((src[1] as u32) << 8) | src[2] as u32;
-        let stream_id = u32::from_be_bytes([src[5], src[6], src[7], src[8]]) & 0x7fff_ffff;
+        let header = match httpd_rs_verified::h2_parse_wire_header(&src[..frame::HEADER_LEN]) {
+            Some(header) => header,
+            None => return Ok(None),
+        };
+        let max_frame = u32::try_from(self.max_frame_length()).unwrap_or(u32::MAX);
         let decision = httpd_rs_verified::h2_frame_header_admit(
-            src[3],
-            src[4],
-            stream_id,
-            payload_len,
-            self.max_frame_length() as u32,
+            header.raw_kind,
+            header.flags,
+            header.stream_id,
+            header.payload_len,
+            max_frame,
         );
         let reason = match decision {
             httpd_rs_verified::H2FrameHeaderDecision::Accept => None,
@@ -274,11 +277,24 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
     tracing::trace!("decoding frame from {}B", bytes.len());
 
     // Parse the head
-    let head = frame::Head::parse(&bytes);
+    let wire_head = httpd_rs_verified::h2_parse_wire_header(&bytes)
+        .ok_or_else(|| Error::library_go_away(Reason::FRAME_SIZE_ERROR))?;
+    let head = frame::Head::new(
+        Kind::new(wire_head.raw_kind),
+        wire_head.flags,
+        wire_head.stream_id.into(),
+    );
     let kind = head.kind();
-    let payload_len = (bytes.len() - frame::HEADER_LEN) as u32;
-    let wire_kind = httpd_rs_verified::h2_wire_frame_kind(bytes[3]);
-    if !decoder.frame_work_budget.consume(wire_kind, payload_len) {
+    let actual_payload_len = bytes.len() - frame::HEADER_LEN;
+    if actual_payload_len != wire_head.payload_len as usize {
+        proto_err!(conn: "wire frame length changed after admission");
+        return Err(Error::library_go_away(Reason::FRAME_SIZE_ERROR));
+    }
+    let payload_len = wire_head.payload_len;
+    if !decoder
+        .frame_work_budget
+        .consume(wire_head.kind, payload_len)
+    {
         proto_err!(conn: "HTTP/2 frame work budget exhausted");
         return Err(Error::library_go_away(Reason::ENHANCE_YOUR_CALM));
     }
@@ -298,8 +314,8 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
         .saturating_add(1);
     let next_header_block = match httpd_rs_verified::h2_header_block_step(
         current_header_block,
-        bytes[3],
-        bytes[4],
+        wire_head.raw_kind,
+        wire_head.flags,
         u32::from(head.stream_id()),
         payload_len,
         decoder.max_header_list_size as u64,
@@ -509,6 +525,7 @@ fn decode_frame(decoder: &mut FrameDecoder, mut bytes: BytesMut) -> Result<Optio
                 &mut partial.buf,
                 decoder.max_header_list_size,
                 &mut decoder.hpack,
+                is_end_headers,
             ) {
                 Ok(_) => {}
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {}
@@ -618,6 +635,20 @@ mod tests {
     }
 
     #[test]
+    fn verified_wire_header_parser_is_exact_and_short_input_is_total() {
+        assert_eq!(httpd_rs_verified::h2_parse_wire_header(&[0; 8]), None);
+
+        let mut head = wire_head(0x12_3456, 1, 5, 0x0123_4567);
+        head[5] |= 0x80;
+        let parsed = httpd_rs_verified::h2_parse_wire_header(&head).unwrap();
+        assert_eq!(parsed.payload_len, 0x12_3456);
+        assert_eq!(parsed.kind, httpd_rs_verified::H2WireFrameKind::Headers);
+        assert_eq!(parsed.flags, 5);
+        assert_eq!(parsed.stream_id, 0x0123_4567);
+        assert!(parsed.reserved);
+    }
+
+    #[test]
     fn admitted_fixed_frame_is_delimited_normally() {
         let mut codec = WireFrameCodec::new();
         codec.set_max_frame_length(frame::DEFAULT_MAX_FRAME_SIZE as usize);
@@ -705,10 +736,15 @@ impl Continuable {
         src: &mut BytesMut,
         max_header_list_size: usize,
         decoder: &mut hpack::Decoder,
+        end_headers: bool,
     ) -> Result<(), frame::Error> {
         match *self {
-            Continuable::Headers(ref mut h) => h.load_hpack(src, max_header_list_size, decoder),
-            Continuable::PushPromise(ref mut p) => p.load_hpack(src, max_header_list_size, decoder),
+            Continuable::Headers(ref mut h) => {
+                h.load_hpack_fragment(src, max_header_list_size, decoder, end_headers)
+            }
+            Continuable::PushPromise(ref mut p) => {
+                p.load_hpack_fragment(src, max_header_list_size, decoder, end_headers)
+            }
         }
     }
 }

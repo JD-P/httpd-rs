@@ -87,17 +87,17 @@ COMPONENT_RANGES = (
     (15013, 15341, "RemoteIP and virtual-host identity"),
     (15342, 16588, "Configuration front-end refinement"),
     (16589, 16776, "Container-field merge"),
-    (16777, 19130, "HTTP/2 admission and lifecycle"),
-    (19131, 19383, "Access/cache prefilters and mapping order"),
-    (19384, 20019, "fnmatch semantics"),
-    (20020, 20189, "Handler and CGI capability admission"),
-    (20190, 20315, "Authentication-file and FastCGI path immutability"),
-    (20316, 20789, "Nginx lexer and parser refinement"),
-    (20790, 21068, "Nginx route-index refinement"),
-    (21069, 21196, "Nginx lowering closure"),
-    (21197, 21374, "Nginx transformation language"),
-    (21375, 21584, "Source-neutral scope merge"),
-    (21585, 21739, "Common-IR request refinement"),
+    (16777, 19766, "HTTP/2 admission and lifecycle"),
+    (19767, 20019, "Access/cache prefilters and mapping order"),
+    (20020, 20655, "fnmatch semantics"),
+    (20656, 20825, "Handler and CGI capability admission"),
+    (20826, 20951, "Authentication-file and FastCGI path immutability"),
+    (20952, 21425, "Nginx lexer and parser refinement"),
+    (21426, 21704, "Nginx route-index refinement"),
+    (21705, 21832, "Nginx lowering closure"),
+    (21833, 22010, "Nginx transformation language"),
+    (22011, 22220, "Source-neutral scope merge"),
+    (22221, 22375, "Common-IR request refinement"),
 )
 
 
@@ -124,11 +124,12 @@ STRATEGIES = {
         7,
     ),
     "h2_state_machine": (
-        "HTTP/2 model invariant/case analysis",
-        "The closed HTTP/2 model is checked across its admitted events, sometimes inductively. The "
-        "vendored h2 implementation is not wholly refined to this model, so this is a strong local "
-        "protocol lemma rather than an end-to-end implementation proof.",
-        6,
+        "HTTP/2 executable state-machine refinement",
+        "The closed HTTP/2 model is checked across its admitted events and its executable reducers "
+        "are consumed by the vendored frame, HPACK, stream, counter and flow-control paths. This is "
+        "strong implementation evidence for those transitions; generated Huffman tables, container "
+        "library semantics, async scheduling and kernel I/O remain outside the theorem.",
+        7,
     ),
     "induction": (
         "Structural induction over a mathematical sequence",

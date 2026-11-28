@@ -13,6 +13,8 @@ use std::io::Cursor;
 use std::ops::ControlFlow;
 use std::str::Utf8Error;
 
+use httpd_rs_verified::{HpackBlockPhase, HpackRepresentation as Representation};
+
 /// Decodes headers using HPACK
 #[derive(Debug)]
 pub struct Decoder {
@@ -21,13 +23,14 @@ pub struct Decoder {
     last_max_update: usize,
     table: Table,
     buffer: BytesMut,
+    block_phase: HpackBlockPhase,
+    block_open: bool,
 }
 
 /// Represents all errors that can be encountered while performing the decoding
 /// of an HPACK header set.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DecoderError {
-    InvalidRepresentation,
     InvalidIntegerPrefix,
     InvalidTableIndex,
     InvalidHuffmanCode,
@@ -44,97 +47,6 @@ pub enum NeedMore {
     UnexpectedEndOfStream,
     IntegerUnderflow,
     StringUnderflow,
-}
-
-enum Representation {
-    /// Indexed header field representation
-    ///
-    /// An indexed header field representation identifies an entry in either the
-    /// static table or the dynamic table (see Section 2.3).
-    ///
-    /// # Header encoding
-    ///
-    /// ```text
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 1 |        Index (7+)         |
-    /// +---+---------------------------+
-    /// ```
-    Indexed,
-
-    /// Literal Header Field with Incremental Indexing
-    ///
-    /// A literal header field with incremental indexing representation results
-    /// in appending a header field to the decoded header list and inserting it
-    /// as a new entry into the dynamic table.
-    ///
-    /// # Header encoding
-    ///
-    /// ```text
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 0 | 1 |      Index (6+)       |
-    /// +---+---+-----------------------+
-    /// | H |     Value Length (7+)     |
-    /// +---+---------------------------+
-    /// | Value String (Length octets)  |
-    /// +-------------------------------+
-    /// ```
-    LiteralWithIndexing,
-
-    /// Literal Header Field without Indexing
-    ///
-    /// A literal header field without indexing representation results in
-    /// appending a header field to the decoded header list without altering the
-    /// dynamic table.
-    ///
-    /// # Header encoding
-    ///
-    /// ```text
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 0 | 0 | 0 | 0 |  Index (4+)   |
-    /// +---+---+-----------------------+
-    /// | H |     Value Length (7+)     |
-    /// +---+---------------------------+
-    /// | Value String (Length octets)  |
-    /// +-------------------------------+
-    /// ```
-    LiteralWithoutIndexing,
-
-    /// Literal Header Field Never Indexed
-    ///
-    /// A literal header field never-indexed representation results in appending
-    /// a header field to the decoded header list without altering the dynamic
-    /// table. Intermediaries MUST use the same representation for encoding this
-    /// header field.
-    ///
-    /// ```text
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 0 | 0 | 0 | 1 |  Index (4+)   |
-    /// +---+---+-----------------------+
-    /// | H |     Value Length (7+)     |
-    /// +---+---------------------------+
-    /// | Value String (Length octets)  |
-    /// +-------------------------------+
-    /// ```
-    LiteralNeverIndexed,
-
-    /// Dynamic Table Size Update
-    ///
-    /// A dynamic table size update signals a change to the size of the dynamic
-    /// table.
-    ///
-    /// # Header encoding
-    ///
-    /// ```text
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 0 | 0 | 1 |   Max size (5+)   |
-    /// +---+---------------------------+
-    /// ```
-    SizeUpdate,
 }
 
 #[derive(Debug)]
@@ -161,6 +73,8 @@ impl Decoder {
             last_max_update: size,
             table: Table::new(size),
             buffer: BytesMut::with_capacity(4096),
+            block_phase: HpackBlockPhase::Start,
+            block_open: false,
         }
     }
 
@@ -177,17 +91,28 @@ impl Decoder {
     }
 
     /// Decodes the headers found in the given buffer.
-    pub fn decode<F>(
+    pub fn decode<F>(&mut self, src: &mut Cursor<&mut BytesMut>, f: F) -> Result<(), DecoderError>
+    where
+        F: FnMut(Header) -> ControlFlow<()>,
+    {
+        self.decode_fragment(src, true, f)
+    }
+
+    pub(crate) fn decode_fragment<F>(
         &mut self,
         src: &mut Cursor<&mut BytesMut>,
+        end_headers: bool,
         mut f: F,
     ) -> Result<(), DecoderError>
     where
         F: FnMut(Header) -> ControlFlow<()>,
     {
-        use self::Representation::*;
+        use Representation::*;
 
-        let mut can_resize = true;
+        if !self.block_open {
+            self.block_phase = HpackBlockPhase::Start;
+            self.block_open = true;
+        }
 
         if let Some(size) = self.max_size_update.take() {
             self.last_max_update = size;
@@ -202,10 +127,13 @@ impl Decoder {
             // At this point we are always at the beginning of the next block
             // within the HPACK data. The type of the block can always be
             // determined from the first byte.
-            match Representation::load(ty)? {
+            let representation = httpd_rs_verified::hpack_representation(ty);
+            self.block_phase =
+                httpd_rs_verified::hpack_block_step(self.block_phase, representation)
+                    .ok_or(DecoderError::InvalidMaxDynamicSize)?;
+            match representation {
                 Indexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"Indexed");
-                    can_resize = false;
                     let entry = self.decode_indexed(src)?;
                     consume(src);
                     if f(entry).is_break() {
@@ -214,7 +142,6 @@ impl Decoder {
                 }
                 LiteralWithIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithIndexing");
-                    can_resize = false;
                     let entry = self.decode_literal(src, true)?;
 
                     // Insert the header into the table
@@ -227,7 +154,6 @@ impl Decoder {
                 }
                 LiteralWithoutIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithoutIndexing");
-                    can_resize = false;
                     let entry = self.decode_literal(src, false)?;
                     consume(src);
                     if f(entry).is_break() {
@@ -236,7 +162,6 @@ impl Decoder {
                 }
                 LiteralNeverIndexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
-                    can_resize = false;
                     let entry = self.decode_literal(src, false)?;
                     consume(src);
 
@@ -248,10 +173,6 @@ impl Decoder {
                 }
                 SizeUpdate => {
                     tracing::trace!(rem = src.remaining(), kind = %"SizeUpdate");
-                    if !can_resize {
-                        return Err(DecoderError::InvalidMaxDynamicSize);
-                    }
-
                     // Handle the dynamic table size update
                     self.process_size_update(src)?;
                     consume(src);
@@ -259,6 +180,10 @@ impl Decoder {
             }
         }
 
+        if end_headers {
+            self.block_open = false;
+            self.block_phase = HpackBlockPhase::Start;
+        }
         Ok(())
     }
 
@@ -317,24 +242,26 @@ impl Decoder {
         &mut self,
         buf: &mut Cursor<&mut BytesMut>,
     ) -> Result<StringMarker, DecoderError> {
-        let old_pos = buf.position();
-        const HUFF_FLAG: u8 = 0b1000_0000;
-
-        // The first bit in the first byte contains the huffman encoded flag.
-        let huff = match peek_u8(buf) {
-            Some(hdr) => (hdr & HUFF_FLAG) == HUFF_FLAG,
-            None => return Err(DecoderError::NeedMore(NeedMore::UnexpectedEndOfStream)),
+        let (huff, offset, len) = match httpd_rs_verified::hpack_string_preflight(buf.chunk()) {
+            httpd_rs_verified::HpackStringPreflight::Ready {
+                huffman,
+                prefix_len,
+                encoded_len,
+            } => (huffman, prefix_len, encoded_len),
+            httpd_rs_verified::HpackStringPreflight::Empty => {
+                return Err(DecoderError::NeedMore(NeedMore::UnexpectedEndOfStream));
+            }
+            httpd_rs_verified::HpackStringPreflight::IntegerUnderflow => {
+                return Err(DecoderError::NeedMore(NeedMore::IntegerUnderflow));
+            }
+            httpd_rs_verified::HpackStringPreflight::StringUnderflow => {
+                return Err(DecoderError::NeedMore(NeedMore::StringUnderflow));
+            }
+            httpd_rs_verified::HpackStringPreflight::Overflow => {
+                return Err(DecoderError::IntegerOverflow);
+            }
         };
-
-        // Decode the string length using 7 bit prefix
-        let len = decode_int(buf, 7)?;
-
-        if len > buf.remaining() {
-            tracing::trace!(len, remaining = buf.remaining(), "decode_string underflow",);
-            return Err(DecoderError::NeedMore(NeedMore::StringUnderflow));
-        }
-
-        let offset = (buf.position() - old_pos) as usize;
+        buf.advance(offset);
         if huff {
             let ret = {
                 let raw = &buf.chunk()[..len];
@@ -368,35 +295,6 @@ impl Decoder {
 impl Default for Decoder {
     fn default() -> Decoder {
         Decoder::new(4096)
-    }
-}
-
-// ===== impl Representation =====
-
-impl Representation {
-    pub fn load(byte: u8) -> Result<Representation, DecoderError> {
-        const INDEXED: u8 = 0b1000_0000;
-        const LITERAL_WITH_INDEXING: u8 = 0b0100_0000;
-        const LITERAL_WITHOUT_INDEXING: u8 = 0b1111_0000;
-        const LITERAL_NEVER_INDEXED: u8 = 0b0001_0000;
-        const SIZE_UPDATE_MASK: u8 = 0b1110_0000;
-        const SIZE_UPDATE: u8 = 0b0010_0000;
-
-        // TODO: What did I even write here?
-
-        if byte & INDEXED == INDEXED {
-            Ok(Representation::Indexed)
-        } else if byte & LITERAL_WITH_INDEXING == LITERAL_WITH_INDEXING {
-            Ok(Representation::LiteralWithIndexing)
-        } else if byte & LITERAL_WITHOUT_INDEXING == 0 {
-            Ok(Representation::LiteralWithoutIndexing)
-        } else if byte & LITERAL_WITHOUT_INDEXING == LITERAL_NEVER_INDEXED {
-            Ok(Representation::LiteralNeverIndexed)
-        } else if byte & SIZE_UPDATE_MASK == SIZE_UPDATE {
-            Ok(Representation::SizeUpdate)
-        } else {
-            Err(DecoderError::InvalidRepresentation)
-        }
     }
 }
 
@@ -797,6 +695,47 @@ pub fn get_static(idx: usize) -> Header {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn representation_classifier_is_total_and_matches_rfc_prefixes() {
+        for byte in 0u8..=u8::MAX {
+            let representation = httpd_rs_verified::hpack_representation(byte);
+            let expected = if byte & 0x80 != 0 {
+                Representation::Indexed
+            } else if byte & 0x40 != 0 {
+                Representation::LiteralWithIndexing
+            } else if byte & 0xf0 == 0 {
+                Representation::LiteralWithoutIndexing
+            } else if byte & 0xf0 == 0x10 {
+                Representation::LiteralNeverIndexed
+            } else {
+                Representation::SizeUpdate
+            };
+            assert_eq!(representation, expected, "byte={byte:#04x}");
+        }
+    }
+
+    #[test]
+    fn size_update_after_field_across_fragment_boundary_is_rejected() {
+        let mut decoder = Decoder::new(4096);
+        let mut first = BytesMut::from(&[0x82][..]); // indexed :method GET
+        let mut headers = Vec::new();
+        decoder
+            .decode_fragment(&mut Cursor::new(&mut first), false, |header| {
+                headers.push(header);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(headers.len(), 1);
+
+        let mut continuation = BytesMut::from(&[0x20][..]); // table size = 0
+        assert_eq!(
+            decoder.decode_fragment(&mut Cursor::new(&mut continuation), true, |_| {
+                ControlFlow::Continue(())
+            },),
+            Err(DecoderError::InvalidMaxDynamicSize),
+        );
+    }
 
     #[test]
     fn test_peek_u8() {

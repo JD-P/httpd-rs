@@ -355,7 +355,7 @@ impl Send {
             return Err(UserError::UnexpectedFrameType);
         }
 
-        stream.state.send_close();
+        stream.state.send_close()?;
 
         tracing::trace!("send_trailers -- queuing; frame={:?}", frame);
         self.prioritize

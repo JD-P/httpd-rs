@@ -1978,13 +1978,18 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **969 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **994 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
-- The forked h2 HPACK path calls the executable verified kernel for integer
+- The forked h2 HPACK path calls executable verified kernels for the total
+  five-family representation classifier, header-block phase (including the
+  rule that a dynamic-table update cannot follow a field across a physical
+  CONTINUATION boundary), string preflight/cursor bounds, integer
   encoding/decoding, overflow-free entry sizing, dynamic-table admission,
   eviction and resize accounting, dynamic wire-index conversion, and exact
-  Huffman encoded-length calculation. Huffman decoding also establishes a
-  maximum output allocation and a linear loop-work allowance before decoding.
+  Huffman encoded-length calculation. Huffman decoding establishes a maximum
+  output allocation and a linear loop-work allowance before decoding; every
+  work decrement, output write, bit consumption and final padding decision
+  consumes a verified total reducer.
   Integer encoding returns a fixed-capacity,
   stack-packed encoding of up to 16 bytes rather than allocating for every
   encoded header integer. The Huffman length result refines a recursive bit-length
@@ -2125,13 +2130,21 @@ construction: there is no second production interleaver.
   grammar; accepted hexadecimal bytes are tied to their mathematical value,
   framing/routing trailers are excluded, and the count/framing-byte transition
   is overflow-free.
-- `h2_header_field_admit`, `h2_frame_header_admit`,
-  `h2_header_block_step`, `h2_frame_work_step` and `h2_control_event_step`.
-  The vendored codec rejects invalid lengths, fixed frame shapes and stream
-  identifiers before payload allocation, then charges every wire frame
+- `h2_parse_wire_header`, `h2_header_field_admit`,
+  `h2_frame_header_admit`, `h2_header_block_step`, `h2_frame_work_step`,
+  `h2_rfc_stream_step`, `h2_signed_window_pair_decrease`,
+  `h2_bounded_count_increment`/`decrement`, and `h2_control_event_step`.
+  The vendored codec parses the complete nine-byte header through one exact
+  verified projection and rejects invalid lengths, fixed frame shapes and
+  stream identifiers before payload allocation, then charges every wire frame
   (including unknown and incomplete-continuation traffic) against one
-  connection work budget. The HTTP/2 adapter rechecks connection-specific
-  fields at its downgrade boundary.
+  connection work budget. The fork's concrete stream open/reserve/half-close/
+  close/reset transitions consume the detailed RFC reducer; paired flow
+  windows and every active/reset/error/empty-frame counter consume total
+  checked reducers rather than debug-only arithmetic. The HTTP/2 adapter
+  rechecks connection-specific fields at its downgrade boundary. Generated
+  Huffman table correctness, standard collection semantics, async scheduling
+  and kernel I/O remain explicit assumptions rather than proof claims.
 - `resource_budget_admit`, `connection_admit`, `h2_process_slot_admit`,
   `minimum_progress_rate_admit` and `response_body_read_lease_admit`.
   Aggregate/per-client counters use overflow-free admission; the H2 order

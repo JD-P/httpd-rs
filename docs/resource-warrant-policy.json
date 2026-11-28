@@ -138,6 +138,26 @@
       ],
       "evidence": "the private Ring SHA-1 compatibility wrapper produces a fixed 20-byte output and is reachable only through callers whose password record, certificate, request target, WebSocket key, expression value, or cache key input is already hard-bounded; its CPU work is linear in those admitted byte ceilings and it allocates no attacker-sized output or retained workspace",
       "verification_targets": ["dependency_call_admit", "request_resource_effect_closure"]
+    },
+    {
+      "id": "verified-h2-codec-and-hpack-bounds",
+      "disposition": "proved-constant-bound",
+      "paths": [
+        "vendor/httpd-rs-h2-0.4.20/src/codec/framed_read.rs",
+        "vendor/httpd-rs-h2-0.4.20/src/codec/framed_write.rs",
+        "vendor/httpd-rs-h2-0.4.20/src/frame/head.rs",
+        "vendor/httpd-rs-h2-0.4.20/src/hpack/decoder.rs",
+        "vendor/httpd-rs-h2-0.4.20/src/hpack/encoder.rs",
+        "vendor/httpd-rs-h2-0.4.20/src/hpack/header.rs",
+        "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/decode.rs",
+        "vendor/httpd-rs-h2-0.4.20/src/hpack/huffman/encode.rs",
+        "vendor/httpd-rs-h2-0.4.20/src/hpack/table.rs",
+        "vendor/httpd-rs-h2-0.4.20/src/proto/streams/counts.rs",
+        "vendor/httpd-rs-h2-0.4.20/src/proto/streams/flow_control.rs",
+        "vendor/httpd-rs-h2-0.4.20/src/proto/streams/state.rs"
+      ],
+      "evidence": "these fork paths consume executable Verus reducers for pre-allocation frame shape, logical continuation bytes/frames, HPACK representation and string cursor admission, bounded dynamic-table arithmetic, Huffman output/work/bit transitions, complete stream phases, signed flow windows, framing spend and every stream/reset counter. Concrete buffers retain negotiated/configured hard byte ceilings. Generated Huffman codebook semantics, Rust collection implementation and async scheduling remain external semantic assumptions, but cannot relax these resource ceilings",
+      "verification_targets": ["h2_parse_wire_header", "h2_header_block_step", "hpack_block_step", "hpack_string_preflight", "hpack_huffman_decode_bounds", "hpack_huffman_work_step", "h2_rfc_stream_step", "h2_signed_window_pair_decrease", "h2_bounded_count_increment", "request_resource_effect_closure"]
     }
   ],
   "resources": [
@@ -332,7 +352,7 @@
     {
       "component": "vendored h2 0.4.20 fork",
       "resource": "stream/HPACK/codec CPU and memory",
-      "warrant": "source is included in static closure; adapter and fork limits are typed and fuzzed; transport buffers retain a physical-parent lease"
+      "warrant": "source is included in static closure; frame/HPACK/stream/flow/counter hot paths listed in verified-h2-codec-and-hpack-bounds consume executable verified ceilings; residual container, generated-codebook and async paths remain pinned/fuzzed, and transport buffers retain a physical-parent lease"
     },
     {
       "component": "Cargo.lock third-party graph",

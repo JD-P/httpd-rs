@@ -152,9 +152,14 @@ impl FlowControl {
             self.window_size,
             self.available
         );
-        // This should not be able to overflow `window_size` from the bottom.
-        self.window_size.decrease_by(sz)?;
-        self.available.decrease_by(sz)?;
+        let next = httpd_rs_verified::h2_signed_window_pair_decrease(
+            self.window_size.verified_encoding(),
+            self.available.verified_encoding(),
+            sz,
+        )
+        .ok_or(Reason::FLOW_CONTROL_ERROR)?;
+        self.window_size = Window::from_verified_encoding(next.first);
+        self.available = Window::from_verified_encoding(next.second);
         Ok(())
     }
 
@@ -170,12 +175,14 @@ impl FlowControl {
 
         // If send size is zero it's meaningless to update flow control window
         if sz > 0 {
-            // Ensure that the argument is correct
-            assert!(self.window_size.0 >= sz as i32);
-
-            // Update values
-            self.window_size.decrease_by(sz)?;
-            self.available.decrease_by(sz)?;
+            let next = httpd_rs_verified::h2_signed_window_pair_decrease(
+                self.window_size.verified_encoding(),
+                self.available.verified_encoding(),
+                sz,
+            )
+            .ok_or(Reason::FLOW_CONTROL_ERROR)?;
+            self.window_size = Window::from_verified_encoding(next.first);
+            self.available = Window::from_verified_encoding(next.second);
         }
         Ok(())
     }
@@ -255,6 +262,19 @@ mod verified_window_tests {
         assert_eq!(crossed, Window(-i32::MAX));
         crossed.increase_by(i32::MAX as u32).unwrap();
         assert_eq!(crossed, Window(0));
+    }
+
+    #[test]
+    fn paired_window_update_is_atomic_on_second_window_failure() {
+        let mut flow = FlowControl {
+            window_size: Window(100),
+            available: Window(i32::MIN),
+        };
+        let before = flow;
+
+        assert_eq!(flow.dec_recv_window(1), Err(Reason::FLOW_CONTROL_ERROR));
+        assert_eq!(flow.window_size, before.window_size);
+        assert_eq!(flow.available, before.available);
     }
 }
 

@@ -329,7 +329,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p httpd-rs-verified
 ```
 
-Current result: **969 verified functions, 0 errors** (percent-decoding,
+Current result: **994 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, the lazy request-body/dispatch/output
@@ -430,12 +430,12 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus   # include the Verus gate
 ```
 
-Current ledger: **59.0% weighted obligations**, **5/6 proof debt**,
+Current ledger: **67.9% weighted obligations**, **6/6 proof debt**,
 **11/11 grant-required sinks**, **11/11 path-target-bound sinks**, **6/11
 inode-bound sinks**, **3/11 backend-target-bound sinks**, **3/11
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **109 adversarial replay cases** covering the findings classes,
-and **856 Verus functions with 0 errors** (including the I3 fast-path
+and **994 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -455,7 +455,7 @@ freshness, disk-accounting and SHA-256 policy-binding proofs for I51/I54).
 
 The ledger lives in `docs/verification-status.json`. It records:
 
-- weighted progress on the seventy-two proof obligations,
+- weighted progress on the ninety-five proof obligations,
 - named unverified security components,
 - sinks that need stronger resource binding,
 - explicit assumptions and unmodeled directive classes,

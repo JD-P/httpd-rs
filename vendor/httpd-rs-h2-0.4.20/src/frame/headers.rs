@@ -222,7 +222,20 @@ impl Headers {
         max_header_list_size: usize,
         decoder: &mut hpack::Decoder,
     ) -> Result<(), Error> {
-        self.header_block.load(src, max_header_list_size, decoder)
+        let end_headers = self.is_end_headers();
+        self.header_block
+            .load(src, max_header_list_size, decoder, end_headers)
+    }
+
+    pub(crate) fn load_hpack_fragment(
+        &mut self,
+        src: &mut BytesMut,
+        max_header_list_size: usize,
+        decoder: &mut hpack::Decoder,
+        end_headers: bool,
+    ) -> Result<(), Error> {
+        self.header_block
+            .load(src, max_header_list_size, decoder, end_headers)
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -473,7 +486,20 @@ impl PushPromise {
         max_header_list_size: usize,
         decoder: &mut hpack::Decoder,
     ) -> Result<(), Error> {
-        self.header_block.load(src, max_header_list_size, decoder)
+        let end_headers = self.is_end_headers();
+        self.header_block
+            .load(src, max_header_list_size, decoder, end_headers)
+    }
+
+    pub(crate) fn load_hpack_fragment(
+        &mut self,
+        src: &mut BytesMut,
+        max_header_list_size: usize,
+        decoder: &mut hpack::Decoder,
+        end_headers: bool,
+    ) -> Result<(), Error> {
+        self.header_block
+            .load(src, max_header_list_size, decoder, end_headers)
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -865,6 +891,7 @@ impl HeaderBlock {
         src: &mut BytesMut,
         max_header_list_size: usize,
         decoder: &mut hpack::Decoder,
+        end_headers: bool,
     ) -> Result<(), Error> {
         let mut reg = !self.fields.is_empty();
         let mut malformed = false;
@@ -917,7 +944,7 @@ impl HeaderBlock {
         // the headers. A malformed header frame is a stream level error, but
         // the hpack state is connection level. In order to maintain correct
         // state for other streams, the hpack decoding process must complete.
-        let res = decoder.decode(&mut cursor, |header| {
+        let res = decoder.decode_fragment(&mut cursor, end_headers, |header| {
             use crate::hpack::Header::*;
 
             match header {
@@ -1052,7 +1079,7 @@ mod test {
         let mut dst = BytesMut::new();
 
         let headers = Headers::new(
-            StreamId::ZERO,
+            StreamId::from(1),
             Default::default(),
             HeaderMap::from_iter(vec![
                 (
@@ -1075,7 +1102,7 @@ mod test {
             .unwrap();
 
         assert_eq!(17, dst.len());
-        assert_eq!([0, 0, 8, 1, 0, 0, 0, 0, 0], &dst[0..9]);
+        assert_eq!([0, 0, 8, 1, 0, 0, 0, 0, 1], &dst[0..9]);
         assert_eq!(&[0x40, 0x80 | 4], &dst[9..11]);
         assert_eq!("hello", huff_decode(&dst[11..15]));
         assert_eq!(0x80 | 4, dst[15]);
@@ -1092,7 +1119,7 @@ mod test {
         assert_eq!("world", huff_decode(&world));
 
         assert_eq!(24, dst.len());
-        assert_eq!([0, 0, 15, 9, 4, 0, 0, 0, 0], &dst[0..9]);
+        assert_eq!([0, 0, 15, 9, 4, 0, 0, 0, 1], &dst[0..9]);
 
         // // Next is not indexed
         assert_eq!(&[15, 47, 0x80 | 3], &dst[12..15]);

@@ -360,6 +360,18 @@ def close_site(
     accounting_evidence: list[str],
     policy: dict[str, Any],
 ) -> dict[str, Any]:
+    # Explicitly reviewed closure contracts are more specific than the
+    # blanket vendor/kernel fallbacks below.  This lets a verified fork path
+    # graduate without pretending that every file in the dependency has the
+    # same warrant.
+    for contract in policy.get("closure_contracts", []):
+        if relative in contract.get("paths", []):
+            return {
+                "disposition": contract["disposition"],
+                "contract": contract["id"],
+                "evidence": contract["evidence"],
+                "verification_targets": contract["verification_targets"],
+            }
     if relative.startswith("vendor/"):
         return {
             "disposition": "external-assumption",
@@ -389,14 +401,6 @@ def close_site(
             "evidence": "the effect expression carries a checked/saturating or explicit maximum operation and remains subject to its module's closed input ceiling",
             "verification_targets": ["request_resource_effect_closure"],
         }
-    for contract in policy.get("closure_contracts", []):
-        if relative in contract.get("paths", []):
-            return {
-                "disposition": contract["disposition"],
-                "contract": contract["id"],
-                "evidence": contract["evidence"],
-                "verification_targets": contract["verification_targets"],
-            }
     return {
         "disposition": "unclassified",
         "contract": None,
