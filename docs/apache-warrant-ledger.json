@@ -518,6 +518,41 @@
         "whole_request_differential",
         "multi_request_state"
       ]
+    },
+    {
+      "authorities": [
+        "upstream-reference-oracle",
+        "internal-security-invariant",
+        "historical-adversarial-finding"
+      ],
+      "evidence": [
+        "crates/server/src/nginx_frontend.rs",
+        "crates/server/src/config_ir.rs",
+        "tests/nginx_differential.py",
+        "docs/reference/nginx-configuration.md"
+      ],
+      "families": [
+        "authorization",
+        "backend-and-sinks",
+        "configuration-and-merge",
+        "mapping-and-transforms",
+        "terminal-response",
+        "tls-and-peer-identity"
+      ],
+      "id": "nginx-frontend-and-composed-request",
+      "state_dimensions": [
+        "closed lexer, parser and lowering grammar",
+        "include glob, cycle, symlink and replacement topology",
+        "location and server-name winner precedence",
+        "proxy, FastCGI, response-header and status projection",
+        "H1 and H2 plan, authorization, sink and response equivalence",
+        "reload, cancellation, retirement and zero resource ownership"
+      ],
+      "targets": [
+        "nginx_config",
+        "nginx_include_tree",
+        "nginx_whole_request"
+      ]
     }
   ],
   "guardrail": "Source discovery is evidence only. Only compatibility_claims can assert support; all other items remain unsupported, warrant-only, or outside the claimed surface.",
@@ -16498,8 +16533,8 @@
       "source": "server/vhost.c"
     }
   ],
-  "ledger_sha256": "f61eaf828c3d41cfa6918833190279e97893f826d80c7d0733db5a76278ec987",
-  "policy_sha256": "29771809ae104df688b0d45592f7c14a7fe6878a6e7d66a9031c730ef78a8bb0",
+  "ledger_sha256": "68c7e106f54dc26c6eaf81f97e17f2671dd8762d8721c49f387fe76a42b9e658",
+  "policy_sha256": "c8453620870d98531b8c5cd10fbad7b4e26ecea1523c41c55dac0471b2fb938c",
   "schema": 1,
   "source_files": [
     {
@@ -20045,8 +20080,8 @@
     "external_httpd_test_files": 1221,
     "external_httpd_test_status": "pinned-inventory",
     "families": 8,
-    "fuzz_targets_with_warrants": 30,
-    "httpd_rs_registry_names_absent_from_pinned_apache": 168,
+    "fuzz_targets_with_warrants": 33,
+    "httpd_rs_registry_names_absent_from_pinned_apache": 179,
     "runtime_source_files": 460,
     "source_components": 159,
     "source_file_dispositions": {

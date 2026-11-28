@@ -14800,6 +14800,211 @@ pub fn first_true_index(flags: &[bool]) -> (out: Option<usize>)
 }
 
 
+// ---------------------------------------------------------------------------
+// nginx server/location winner kernels
+// ---------------------------------------------------------------------------
+
+/// Local ordering relation used while reducing matching nginx literal
+/// locations. A wider prefix wins; equal-width declarations retain the first
+/// source declaration. The runtime's indexed selector is differentially
+/// checked against the linear reducer which consumes this function.
+pub open spec fn nginx_literal_candidate_better_spec(
+    current_exists: bool,
+    candidate_width: u64,
+    candidate_order: u64,
+    current_width: u64,
+    current_order: u64,
+) -> bool {
+    !current_exists
+        || candidate_width > current_width
+        || (candidate_width == current_width && candidate_order < current_order)
+}
+
+pub fn nginx_literal_candidate_better(
+    current_exists: bool,
+    candidate_width: u64,
+    candidate_order: u64,
+    current_width: u64,
+    current_order: u64,
+) -> (better: bool)
+    ensures better == nginx_literal_candidate_better_spec(
+        current_exists,
+        candidate_width,
+        candidate_order,
+        current_width,
+        current_order,
+    )
+{
+    !current_exists
+        || candidate_width > current_width
+        || (candidate_width == current_width && candidate_order < current_order)
+}
+
+pub proof fn nginx_longer_literal_prefix_dominates_source_order(
+    candidate_width: u64,
+    candidate_order: u64,
+    current_width: u64,
+    current_order: u64,
+)
+    requires candidate_width > current_width,
+    ensures nginx_literal_candidate_better_spec(
+        true,
+        candidate_width,
+        candidate_order,
+        current_width,
+        current_order,
+    )
+{
+}
+
+/// Final nginx location class: exact, `^~` prefix, first regex, ordinary
+/// prefix, or no location. Encoding the precedence as a closed function makes
+/// it impossible for a later frontend change to accidentally put regex ahead
+/// of an exact or suppressing prefix.
+pub open spec fn nginx_route_winner_class_spec(
+    exact: bool,
+    suppressing_prefix: bool,
+    regex: bool,
+    prefix: bool,
+) -> u8 {
+    if exact { 1 }
+    else if suppressing_prefix { 2 }
+    else if regex { 3 }
+    else if prefix { 4 }
+    else { 0 }
+}
+
+pub fn nginx_route_winner_class(
+    exact: bool,
+    suppressing_prefix: bool,
+    regex: bool,
+    prefix: bool,
+) -> (winner: u8)
+    ensures winner == nginx_route_winner_class_spec(
+        exact,
+        suppressing_prefix,
+        regex,
+        prefix,
+    )
+{
+    if exact { 1 }
+    else if suppressing_prefix { 2 }
+    else if regex { 3 }
+    else if prefix { 4 }
+    else { 0 }
+}
+
+pub proof fn nginx_exact_and_suppressing_prefix_precede_regex(
+    exact: bool,
+    suppressing_prefix: bool,
+    regex: bool,
+    prefix: bool,
+)
+    requires exact || suppressing_prefix,
+    ensures nginx_route_winner_class_spec(exact, suppressing_prefix, regex, prefix) ==
+        (if exact { 1u8 } else { 2u8 })
+{
+}
+
+/// nginx server names use three disjoint precedence classes. Width/order
+/// selection happens inside a class; no trailing wildcard can overtake a
+/// matching leading wildcard and the default is reachable only after all
+/// named classes fail.
+pub open spec fn nginx_server_name_winner_class_spec(
+    exact: bool,
+    leading_wildcard: bool,
+    trailing_wildcard: bool,
+) -> u8 {
+    if exact { 1 }
+    else if leading_wildcard { 2 }
+    else if trailing_wildcard { 3 }
+    else { 0 }
+}
+
+pub fn nginx_server_name_winner_class(
+    exact: bool,
+    leading_wildcard: bool,
+    trailing_wildcard: bool,
+) -> (winner: u8)
+    ensures winner == nginx_server_name_winner_class_spec(
+        exact,
+        leading_wildcard,
+        trailing_wildcard,
+    )
+{
+    if exact { 1 }
+    else if leading_wildcard { 2 }
+    else if trailing_wildcard { 3 }
+    else { 0 }
+}
+
+pub proof fn nginx_server_name_classes_are_fail_closed(
+    exact: bool,
+    leading_wildcard: bool,
+    trailing_wildcard: bool,
+)
+    ensures
+        nginx_server_name_winner_class_spec(exact, leading_wildcard, trailing_wildcard) == 0
+            <==> !exact && !leading_wildcard && !trailing_wildcard,
+{
+}
+
+/// Conservative request-time charge for nginx location selection. The
+/// concrete selector indexes exact and literal-prefix locations, but regexes
+/// remain ordered and a future index implementation may legitimately fall
+/// back to a scan. Charging every configured matcher byte plus every route's
+/// comparison against the request path therefore dominates either strategy.
+/// Overflow is fail-closed at the caller by charging `u64::MAX`.
+pub open spec fn nginx_route_selection_work_spec(
+    route_count: nat,
+    matcher_bytes: nat,
+    path_bytes: nat,
+) -> nat {
+    1 + matcher_bytes + route_count * (path_bytes + 1)
+}
+
+pub fn nginx_route_selection_work(
+    route_count: u64,
+    matcher_bytes: u64,
+    path_bytes: u64,
+) -> (work: Option<u64>)
+    ensures match work {
+        Some(value) => {
+            value as nat == nginx_route_selection_work_spec(
+                route_count as nat,
+                matcher_bytes as nat,
+                path_bytes as nat,
+            ) && value >= 1 && value >= matcher_bytes
+        },
+        None => true,
+    },
+{
+    let per_route = match path_bytes.checked_add(1) {
+        Some(value) => value,
+        None => return None,
+    };
+    let path_work = match route_count.checked_mul(per_route) {
+        Some(value) => value,
+        None => return None,
+    };
+    let subtotal = match matcher_bytes.checked_add(path_work) {
+        Some(value) => value,
+        None => return None,
+    };
+    subtotal.checked_add(1)
+}
+
+pub proof fn nginx_route_selection_charge_includes_matcher_bytes(
+    route_count: nat,
+    matcher_bytes: nat,
+    path_bytes: nat,
+)
+    ensures nginx_route_selection_work_spec(route_count, matcher_bytes, path_bytes)
+        >= matcher_bytes,
+{
+}
+
+
 /// Child-overrides-parent for fields that are not `Copy`.  The value clone
 /// itself is the Rust standard-library primitive; the verified contract is
 /// that presence is preserved exactly, so a child field can never be lost by
@@ -15961,6 +16166,41 @@ pub proof fn container_append_preserves_parent(
     ensures
         (parent + child).subrange(0, parent.len() as int) == parent,
         (parent + child).len() == parent.len() + child.len(),
+{
+}
+
+/// Abstract identity-meet used for independently selected URL/target policy
+/// branches. `shared` is the length of their equal inherited prefix, computed
+/// by the executable Rust helper over the concrete action type.
+pub open spec fn identity_action_meet(
+    first: Seq<u64>,
+    second: Seq<u64>,
+    shared: int,
+) -> Seq<u64>
+    recommends 0 <= shared <= first.len(), shared <= second.len(),
+{
+    first + second.subrange(shared, second.len() as int)
+}
+
+pub proof fn equal_identity_action_meet_is_idempotent(actions: Seq<u64>)
+    ensures identity_action_meet(actions, actions, actions.len() as int) == actions,
+{
+    assert(actions.subrange(actions.len() as int, actions.len() as int).len() == 0);
+}
+
+pub proof fn identity_action_meet_retains_both_branch_suffixes(
+    first: Seq<u64>,
+    second: Seq<u64>,
+    shared: int,
+)
+    requires
+        0 <= shared <= first.len(),
+        shared <= second.len(),
+        first.subrange(0, shared) == second.subrange(0, shared),
+    ensures
+        identity_action_meet(first, second, shared).len()
+            == first.len() + second.len() - shared,
+        identity_action_meet(first, second, shared).subrange(0, first.len() as int) == first,
 {
 }
 

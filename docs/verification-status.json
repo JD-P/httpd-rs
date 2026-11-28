@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "updated": "2026-11-15",
+  "updated": "2026-11-28",
   "verus": {
-    "verified_functions": 886,
+    "verified_functions": 896,
     "errors": 0
   },
   "obligations": [
@@ -11,7 +11,7 @@
       "title": "field-wise Scope merge",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "auth_merge_kind, option_child_wins/option_child_presence, options_apply and append_vec are mechanized/used; append-only container/list fields merge through the verified helper; environment_origin_merge_preserves_tags models every environment value and its main/access origin as one tuple, matching runtime Originated<T>, so append cannot detach or upgrade provenance. Resolved-target restriction now merges tagged environment and content policy with the URL identity last, retaining both identities' remove/unset lists. Header set uses ordered child replacement audited by the debug container snapshot; ErrorDocument and RewriteMap are list-backed with reverse child-wins lookup; parser and Options-list construction remain outside this obligation"
+      "evidence": "auth_merge_kind, option_child_wins/option_child_presence, options_apply and append_vec are mechanized/used; append-only container/list fields merge through the verified helper; environment_origin_merge_preserves_tags models every environment value and its main/access origin as one tuple, matching runtime Originated<T>, so append cannot detach or upgrade provenance. Resolved-target restriction now uses an explicit identity meet for header, environment and content action lists: the common inherited prefix is retained once and the URL/target suffixes remain ordered. equal_identity_action_meet_is_idempotent and identity_action_meet_retains_both_branch_suffixes prove that list algebra, while divergent-branch tests cover concrete header/type/environment policies. EnvRule identity compares the attribute, source regex, flags and actions so inherited SetEnvIf prefixes are also retained once. Header set uses ordered child replacement audited by the debug container snapshot; ErrorDocument and RewriteMap are list-backed with reverse child-wins lookup; parser and Options-list construction remain outside this obligation"
     },
     {
       "id": "phase_order",
@@ -26,6 +26,13 @@
       "status": "mechanized",
       "weight": 1.0,
       "evidence": "ConfigSemanticKind closes all 46 payload domains. config_semantic_kind_code_is_injective proves its executable encoding is lossless; config_semantic_seal_admit requires schema/IR kind identity and complete argument-count preservation; config_semantic_projection_admit gates every main/access compiler entry and typed getter; config_semantic_refinement_is_transitive proves actual schema, sealed-value and consumer kind equality, while substitution is rejected. Production sealing consumes exact verified On/Off, decimal/range and first-keyword constructors. Capability, stable FastCGI identity, AllowOverride, proxy/balancer health, ServerAlias, LogLevel, SSLSessionCache and RewriteMap effect payloads compile once before mutation; an exhaustive access/main table test rejects effectful schema drift. P38 pins Apache's exact physical continuation in the shared main/access logical-line assembler: only one final backslash followed by LF/CRLF is removed, no separator is inserted, indentation is preserved, and trailing whitespace/backslash runs/EOF remain literal. config_physical_lines continuously compares production with an independent byte-oriented oracle and requires equivalent physical encodings to preserve the parsed ConfigLine IR. A deterministic matrix exhausts every insertion boundary, LF/CRLF, ordered split pair, continuation chain, one-to-three-backslash run, whitespace near miss and EOF form before the long-running mutation campaign begins. Apache compatibility of complex constructors remains a differential oracle rather than an internal refinement assumption."
+    },
+    {
+      "id": "nginx_frontend_refinement",
+      "title": "Bounded nginx frontend preserves route, identity and response semantics in the shared IR",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "nginx_literal_candidate_better and nginx_route_winner_class are executable closed winner kernels with proofs that wider prefixes dominate declaration order and exact/^~ classes precede regex. nginx_server_name_winner_class proves exact, leading-wildcard, trailing-wildcard and default precedence; one compiled exact/suffix/prefix table is consumed by both HTTP Host routing and TLS SNI. Every indexed winner is fuzz-differenced against an independent linear evaluator. nginx_route_selection_work is the production work-charge formula and proves admitted arithmetic includes all matcher bytes; the 512-per-server/8,192-total route bounds and 64-MiB conservatively estimated derived-policy cap fail closed before multiplicative policy cloning. Nginx response-header/expiry status eligibility is carried as an explicit IR bit, and the stock-nginx differential covers its complete finite status matrix plus server-name precedence. The no-op table records an owner/rationale for every normalized directive and rejects process/module/TLS semantics. Include-topology and composed nginx whole-request fuzzers cover glob/cycle/symlink/reload and H1/H2 plan/outcome/resource parity. Full lexer/parser-to-IR refinement, regex matching equivalence, exact allocator accounting, and complete equivalence to stock nginx remain oracle evidence rather than mechanized theorems."
     },
     {
       "id": "htaccess_interleave",

@@ -487,6 +487,9 @@ struct SniResolver {
     default: SharedKey,
     names: HashMap<String, (usize, SharedKey)>,
     wildcards: Vec<(usize, String, SharedKey)>,
+    nginx_names: Option<crate::config_ir::NginxServerNameTable>,
+    nginx_keys: Vec<SharedKey>,
+    nginx_candidates: Vec<usize>,
 }
 
 /// Security identity fixed by a completed TLS handshake.  It is immutable
@@ -624,6 +627,13 @@ impl SniResolver {
     }
 
     fn select_key(&self, name: Option<&str>) -> Arc<CertifiedKey> {
+        if let Some(names) = &self.nginx_names {
+            return names
+                .select(&self.nginx_candidates, name)
+                .and_then(|index| self.nginx_keys.get(index))
+                .map(current_key)
+                .unwrap_or_else(|| current_key(&self.default));
+        }
         let Some(name) = name else {
             return current_key(&self.default);
         };
@@ -1722,7 +1732,12 @@ pub(crate) fn prepare_server_config(
         default: default_key.clone(),
         names: HashMap::new(),
         wildcards: Vec::new(),
+        nginx_names: None,
+        nginx_keys: Vec::new(),
+        nginx_candidates: Vec::new(),
     };
+    let nginx_mode = cfg.route_program.is_nginx();
+    let mut nginx_source_names = Vec::new();
     if global_only {
         // No SNI names are known; the global certificate is the only key.
     } else {
@@ -1749,14 +1764,33 @@ pub(crate) fn prepare_server_config(
                 }
                 shared
             };
-            if let Some(n) = &v.server_name {
-                // Apache treats ServerName literally even when it contains a
-                // wildcard metacharacter. Only ServerAlias is pattern-aware.
-                resolver.add_name(n, order, key.clone(), false);
+            if nginx_mode {
+                nginx_source_names.push(
+                    v.server_name
+                        .iter()
+                        .chain(v.aliases.iter())
+                        .cloned()
+                        .collect(),
+                );
+                resolver.nginx_keys.push(key);
+                resolver.nginx_candidates.push(order);
+            } else {
+                if let Some(n) = &v.server_name {
+                    // Apache treats ServerName literally even when it contains
+                    // a wildcard metacharacter. Only ServerAlias is pattern-aware.
+                    resolver.add_name(n, order, key.clone(), false);
+                }
+                for alias in &v.aliases {
+                    resolver.add_name(alias, order, key.clone(), true);
+                }
             }
-            for alias in &v.aliases {
-                resolver.add_name(alias, order, key.clone(), true);
-            }
+        }
+        if nginx_mode {
+            resolver.nginx_names = Some(
+                crate::config_ir::NginxServerNameTable::new(nginx_source_names).map_err(
+                    |error| format!("cannot build nginx TLS server-name index: {error}"),
+                )?,
+            );
         }
     }
 
@@ -2900,6 +2934,9 @@ mod tests {
             default: first.clone(),
             names: HashMap::from([("exact.test".to_string(), (1, second.clone()))]),
             wildcards: vec![(1, "*.example.test".to_string(), second.clone())],
+            nginx_names: None,
+            nginx_keys: Vec::new(),
+            nginx_candidates: Vec::new(),
         };
         let default_key = current_key(&first);
         let second_key = current_key(&second);
@@ -2925,6 +2962,9 @@ mod tests {
             default: first.clone(),
             names: HashMap::new(),
             wildcards: Vec::new(),
+            nginx_names: None,
+            nginx_keys: Vec::new(),
+            nginx_candidates: Vec::new(),
         };
         duplicates.add_name("duplicate.test", 0, first.clone(), false);
         duplicates.add_name("DUPLICATE.TEST.", 1, second.clone(), false);
@@ -2949,6 +2989,9 @@ mod tests {
             default: first.clone(),
             names: HashMap::new(),
             wildcards: Vec::new(),
+            nginx_names: None,
+            nginx_keys: Vec::new(),
+            nginx_candidates: Vec::new(),
         };
         patterns.add_name("api-?.example", 1, second.clone(), true);
         patterns.add_name("literal-?.example", 1, second.clone(), false);
@@ -2963,6 +3006,41 @@ mod tests {
         assert!(Arc::ptr_eq(
             &patterns.select_key(Some("literal-?.example")),
             &second_key
+        ));
+
+        let nginx_names = crate::config_ir::NginxServerNameTable::new(vec![
+            vec!["default.test".into()],
+            vec!["*.example.test".into(), "api.*".into()],
+            vec!["*.deep.example.test".into()],
+            vec!["exact.deep.example.test".into()],
+        ])
+        .unwrap();
+        let nginx = SniResolver {
+            default: first.clone(),
+            names: HashMap::new(),
+            wildcards: Vec::new(),
+            nginx_names: Some(nginx_names),
+            nginx_keys: vec![first.clone(), second.clone(), first.clone(), second.clone()],
+            nginx_candidates: vec![0, 1, 2, 3],
+        };
+        assert!(Arc::ptr_eq(
+            &nginx.select_key(Some("exact.deep.example.test")),
+            &second_key
+        ));
+        assert!(
+            Arc::ptr_eq(
+                &nginx.select_key(Some("www.deep.example.test")),
+                &default_key
+            ),
+            "the longest leading wildcard must win"
+        );
+        assert!(
+            Arc::ptr_eq(&nginx.select_key(Some("api.invalid")), &second_key),
+            "trailing wildcards use the same nginx table as HTTP routing"
+        );
+        assert!(Arc::ptr_eq(
+            &nginx.select_key(Some("unmatched.invalid")),
+            &default_key
         ));
 
         assert_eq!(client_policy_mode(&SslConfig::default()), 0);

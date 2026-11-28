@@ -2329,7 +2329,7 @@ pub(crate) fn apply_early_route_error_policy(
     };
     if scope
         .header_policy
-        .apply(&mut response.headers, false)
+        .apply(&mut response.headers, response.status)
         .is_err()
     {
         *response = Response::policy_error();
@@ -3828,7 +3828,7 @@ fn options_response(cfg: &Config, scope: &Scope, mime: Option<String>) -> Respon
     if let Some(mime) = mime {
         r.headers.push(("Content-Type".into(), mime.into_bytes()));
     }
-    if scope.header_policy.apply(&mut r.headers, true).is_err() {
+    if scope.header_policy.apply(&mut r.headers, r.status).is_err() {
         return Response::policy_error();
     }
     crate::compression::finalize_metadata(scope, &mut r);
@@ -6546,7 +6546,7 @@ fn url_redirect_response(
     if authorization
         .scope()
         .header_policy
-        .apply(&mut response.headers, response.status < 400)
+        .apply(&mut response.headers, response.status)
         .is_err()
     {
         return Response::policy_error();
@@ -10015,11 +10015,7 @@ fn run_fastcgi_with_public_url(
         script_file: None,
     };
     let mut r = fastcgi::execute_bound(&ctx, scope, &target, &script_binding);
-    if scope
-        .header_policy
-        .apply(&mut r.headers, r.status < 400)
-        .is_err()
-    {
+    if scope.header_policy.apply(&mut r.headers, r.status).is_err() {
         return Response::policy_error();
     }
     r
@@ -10258,11 +10254,7 @@ fn run_cgi(
         script_file: Some(script_file),
     };
     let mut r = cgi::execute(&ctx);
-    if scope
-        .header_policy
-        .apply(&mut r.headers, r.status < 400)
-        .is_err()
-    {
+    if scope.header_policy.apply(&mut r.headers, r.status).is_err() {
         return Response::policy_error();
     }
     crate::compression::finalize_budgeted(

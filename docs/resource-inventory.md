@@ -251,8 +251,9 @@ Some mutable state is intentionally process-owned rather than request-owned:
   file-broker state;
 - telemetry counters, thread-local formatting buffers, request-local metadata
   memoization, collision-resistant temporary-name counters, and the
-  deterministic task/thread fault plans and once-initialized whole-request
-  fixture compiled only for fuzz/fault-injection testing. Authentication tests
+  deterministic task/thread fault plans, once-initialized whole-request
+  fixtures, and serialized nginx-include scratch roots compiled only for
+  fuzz/fault-injection testing. Authentication tests
   also use one thread-local verifier-call counter to assert that known and
   unknown usernames each cross the verification boundary exactly once.
 

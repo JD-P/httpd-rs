@@ -1628,6 +1628,18 @@ pub struct EnvRule {
     pub actions: Vec<(String, Option<String>)>,
 }
 
+impl PartialEq for EnvRule {
+    fn eq(&self, other: &Self) -> bool {
+        self.attribute == other.attribute
+            && self.pattern.as_str() == other.pattern.as_str()
+            && self.negate == other.negate
+            && self.nocase == other.nocase
+            && self.actions == other.actions
+    }
+}
+
+impl Eq for EnvRule {}
+
 /// Byte-exact request environment used by authorization, rewrite evaluation,
 /// CGI and FastCGI. Text conversion is deferred until a consumer explicitly
 /// requires UTF-8, so chained captures cannot collapse attacker-controlled
@@ -1772,6 +1784,7 @@ const MAX_REWRITEMAP_PROGRAM: u64 = 64 * 1024 * 1024;
 #[derive(Debug, PartialEq, Eq)]
 struct ContainerSnapshot {
     replace_response_headers: bool,
+    nginx_status_semantics: bool,
     error_documents: Vec<(u16, u64)>,
     aliases: Vec<u64>,
     redirects: Vec<u64>,
@@ -1824,6 +1837,7 @@ impl Scope {
     fn container_snapshot(&self) -> ContainerSnapshot {
         ContainerSnapshot {
             replace_response_headers: self.header_policy.replace_response_headers,
+            nginx_status_semantics: self.header_policy.nginx_status_semantics,
             error_documents: self
                 .error_policy
                 .documents
@@ -1917,6 +1931,7 @@ impl Scope {
             // This bit is a merge instruction carried by a delta, not an
             // inherited policy property.
             replace_response_headers: parent.replace_response_headers,
+            nginx_status_semantics: parent.nginx_status_semantics || child.nginx_status_semantics,
             error_documents,
             aliases: append(&parent.aliases, &child.aliases),
             redirects: append(&parent.redirects, &child.redirects),
@@ -2391,26 +2406,21 @@ impl Scope {
         // scalar content decisions and duplicate environment values cannot
         // silently discard the policy attached to the requested URL, while
         // RemoveType/UnsetEnv from either side remain effective.
-        self.content_policy.merge_child(&base.content_policy);
+        self.content_policy.meet_identity(&base.content_policy);
         self.environment_policy
-            .merge_child(&base.environment_policy);
+            .meet_identity(&base.environment_policy);
 
         // Preserve lexical response-header policy while still allowing the
         // target to add its own restrictions.  Unsets from either identity are
         // retained; target sets override lexical values only when the lexical
         // scope did not explicitly unset the header.
-        // Transform-selected targets are commonly three spellings of the
-        // same policy identity (public URL, lexical target and canonical
-        // file).  Replaying an identical additive policy for every spelling
-        // turns one `Header add` into two or three response fields.  The meet
-        // must be idempotent for equal policies; genuinely distinct target
-        // policy is still composed in the established URL-then-target order.
-        if self.header_policy != base.header_policy {
-            let mut headers = base.header_policy.clone();
-            if !headers.merge_child(&self.header_policy) {
-                self.conditional_error = true;
-            }
-            self.header_policy = headers;
+        // Transform-selected targets are commonly divergent descendants of
+        // one inherited policy identity. The explicit identity meet retains
+        // the common action prefix once, then composes the URL and target
+        // suffixes in their established order. This remains idempotent even
+        // when an unrelated field differs between the branches.
+        if !self.header_policy.meet_identity(&base.header_policy) {
+            self.conditional_error = true;
         }
 
         for filter in &base.mapping_policy.unsupported_filters {
@@ -4103,6 +4113,20 @@ impl Config {
                         })
                         .collect::<Vec<_>>()
                 })?;
+        let total_routes = lowered
+            .routes
+            .iter()
+            .try_fold(0usize, |total, routes| total.checked_add(routes.len()));
+        if total_routes.is_none_or(|total| total > crate::config_ir::MAX_NGINX_ROUTES) {
+            return Err(vec![ConfigError {
+                file: path.display().to_string(),
+                line: 0,
+                msg: format!(
+                    "nginx configuration exceeds the {}-location aggregate bound",
+                    crate::config_ir::MAX_NGINX_ROUTES
+                ),
+            }]);
+        }
         let mut parser = ParserState {
             events: lowered.events,
             section_stack: Vec::new(),
@@ -4139,6 +4163,7 @@ impl Config {
             }]);
         }
         let mut servers = Vec::with_capacity(config.vhosts.len());
+        let mut derived_policy_bytes = 0usize;
         for (vhost, matchers) in config.vhosts.iter_mut().zip(lowered.routes) {
             let mut deltas = Vec::new();
             vhost.rules.retain(|rule| {
@@ -4160,6 +4185,43 @@ impl Config {
                     file: path.display().to_string(),
                     line: 0,
                     msg: "nginx frontend/compiler location cardinality mismatch".into(),
+                }]);
+            }
+            // Each nginx location stores a pre-merged immutable Scope. Bound
+            // the otherwise multiplicative server-policy x location shape
+            // before cloning it. Debug serialization contains every owned
+            // policy value; the 4x factor covers Vec/String spare capacity,
+            // map buckets and struct storage. This is deliberately a
+            // conservative configuration-load estimate, not an allocator
+            // identity claim.
+            let scope_weight = |scope: &Scope| {
+                std::mem::size_of::<Scope>()
+                    .saturating_add(format!("{scope:?}").len().saturating_mul(4))
+            };
+            let projected = scope_weight(&vhost.scope)
+                .checked_mul(matchers.len())
+                .and_then(|base| {
+                    deltas.iter().try_fold(base, |total, (_, delta)| {
+                        total.checked_add(scope_weight(delta))
+                    })
+                });
+            derived_policy_bytes = projected
+                .and_then(|projected| derived_policy_bytes.checked_add(projected))
+                .ok_or_else(|| {
+                    vec![ConfigError {
+                        file: path.display().to_string(),
+                        line: 0,
+                        msg: "nginx derived policy size overflow".into(),
+                    }]
+                })?;
+            if derived_policy_bytes > crate::config_ir::MAX_NGINX_DERIVED_POLICY_BYTES {
+                return Err(vec![ConfigError {
+                    file: path.display().to_string(),
+                    line: 0,
+                    msg: format!(
+                        "nginx derived policies exceed the {}-byte configuration memory bound",
+                        crate::config_ir::MAX_NGINX_DERIVED_POLICY_BYTES
+                    ),
                 }]);
             }
             vhost.directory_index = DirectoryRuleIndex::build(&vhost.rules);
@@ -4317,7 +4379,7 @@ fn directive_arity(name: &str) -> PayloadArity {
         "httpdrsfastcgiparam" => PayloadArity::between(2, 3),
         "httpdrsscopedroot" => PayloadArity::ONE,
         "httpdrsscopedbodylimit" => PayloadArity::ONE,
-        "httpdrsnginxresetheaders" => PayloadArity {
+        "httpdrsnginxresetheaders" | "httpdrsnginxresponsesemantics" => PayloadArity {
             min: 0,
             max: Some(0),
         },
@@ -5252,6 +5314,7 @@ fn core_directive_exists(name: &str) -> bool {
             | "httpdrsscopedroot"
             | "httpdrsscopedbodylimit"
             | "httpdrsnginxresetheaders"
+            | "httpdrsnginxresponsesemantics"
             | "httpdrsnginxalias"
             | "httpdrsnginxtryfiles"
             | "httpdrsnginxreturn"
@@ -5626,6 +5689,7 @@ impl ParserState {
                             | "httpdrsscopedroot"
                             | "httpdrsscopedbodylimit"
                             | "httpdrsnginxresetheaders"
+                            | "httpdrsnginxresponsesemantics"
                             | "httpdrsnginxalias"
                             | "httpdrsnginxtryfiles"
                             | "httpdrsnginxreturn"
@@ -7329,6 +7393,9 @@ impl Compile {
             }
             "httpdrsnginxresetheaders" => {
                 scope.header_policy.replace_response_headers = true;
+            }
+            "httpdrsnginxresponsesemantics" => {
+                scope.header_policy.nginx_status_semantics = true;
             }
             "httpdrsnginxalias" => {
                 let mut path = PathBuf::from(&args[1]);
@@ -11877,6 +11944,7 @@ fn known_directives() -> Vec<&'static str> {
         "httpdrsscopedroot",
         "httpdrsscopedbodylimit",
         "httpdrsnginxresetheaders",
+        "httpdrsnginxresponsesemantics",
         "httpdrsnginxalias",
         "httpdrsnginxtryfiles",
         "httpdrsnginxreturn",
@@ -14329,6 +14397,80 @@ SSLOptions +StrictRequire\n";
         assert_eq!(
             scope.header_policy.always_add_headers,
             vec![("X-Always".into(), "two".into())]
+        );
+    }
+
+    #[test]
+    fn divergent_transform_identities_do_not_replay_shared_effect_prefixes() {
+        let mut inherited = Scope::default();
+        inherited
+            .header_policy
+            .add_headers
+            .push(("X-Common".into(), "once".into()));
+        inherited
+            .content_policy
+            .add_types
+            .push(("text/common".into(), ".common".into()));
+        inherited
+            .environment_policy
+            .set_env
+            .push(crate::scope_policy::Originated::main((
+                "COMMON".into(),
+                "once".into(),
+            )));
+
+        let mut url = inherited.clone();
+        url.header_policy
+            .add_headers
+            .push(("X-Url".into(), "url".into()));
+        url.content_policy
+            .add_types
+            .push(("text/url".into(), ".url".into()));
+        url.environment_policy
+            .set_env
+            .push(crate::scope_policy::Originated::main((
+                "URL".into(),
+                "url".into(),
+            )));
+
+        let mut target = inherited;
+        target
+            .header_policy
+            .add_headers
+            .push(("X-Target".into(), "target".into()));
+        target
+            .content_policy
+            .add_types
+            .push(("text/target".into(), ".target".into()));
+        target
+            .environment_policy
+            .set_env
+            .push(crate::scope_policy::Originated::main((
+                "TARGET".into(),
+                "target".into(),
+            )));
+
+        target.restrict_policy_with(&url);
+        assert_eq!(target.header_policy.add_headers.len(), 3);
+        assert_eq!(target.content_policy.add_types.len(), 3);
+        assert_eq!(target.environment_policy.set_env.len(), 3);
+        assert_eq!(
+            target
+                .header_policy
+                .add_headers
+                .iter()
+                .filter(|(name, _)| name == "X-Common")
+                .count(),
+            1
+        );
+        assert_eq!(
+            target
+                .environment_policy
+                .set_env
+                .iter()
+                .filter(|entry| entry.value.0 == "COMMON")
+                .count(),
+            1
         );
     }
 
@@ -17899,7 +18041,12 @@ impl Config {
 
     fn vhost_address_is_wildcard(addr: &str) -> bool {
         let host = Self::vhost_address_text(addr);
-        host.is_empty() || host == "*" || host.starts_with("_default_")
+        host.is_empty()
+            || host == "*"
+            || host.starts_with("_default_")
+            || host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_unspecified())
     }
 
     pub(crate) fn vhost_address_is_specific(v: &VHost, local_ip: IpAddr, port: u16) -> bool {

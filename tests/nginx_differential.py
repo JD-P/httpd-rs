@@ -48,15 +48,23 @@ class EchoBackend(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
+        status_match = re.fullmatch(r"/status/([1-5][0-9][0-9])(?:\?.*)?", self.path)
+        status = int(status_match.group(1)) if status_match else 200
         body = (
             f"path={self.path}\n"
             f"host={self.headers.get('Host', '')}\n"
             f"x-uri={self.headers.get('X-URI', '')}\n"
             f"x-peer={self.headers.get('X-Peer', '')}\n"
         ).encode()
-        self.send_response(200)
+        if status in (204, 205, 304):
+            body = b""
+        self.send_response(status)
         self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(body)))
+        # RFC 9110 forbids Content-Length on 204; 205 is bodyless but uses an
+        # explicit zero length. Keep the oracle input valid so this matrix
+        # tests nginx status policy rather than tolerant backend framing.
+        if status != 204:
+            self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -202,7 +210,18 @@ def request(
     *,
     method: str = "GET",
     body: bytes | None = None,
-) -> tuple[int, str | None, str | None, str | None, str | None, str | None, bytes]:
+) -> tuple[
+    int,
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+    bytes,
+    str | None,
+    str | None,
+    str | None,
+]:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
     connection.request(method, path, body=body, headers={"Host": host})
     response = connection.getresponse()
@@ -214,6 +233,9 @@ def request(
         response.getheader("X-Child"),
         response.getheader("Cache-Control"),
         response.read(),
+        response.getheader("X-Normal"),
+        response.getheader("X-Always"),
+        response.getheader("X-Server"),
     )
     connection.close()
     return result
@@ -301,6 +323,11 @@ http {{
       client_max_body_size 0;
       proxy_pass http://127.0.0.1:{backend_port}/upload/;
     }}
+    location /status/ {{
+      add_header X-Normal normal;
+      add_header X-Always always always;
+      proxy_pass http://127.0.0.1:{backend_port};
+    }}
     location = /moved {{ return 301 https://example.test/final; }}
     location ~ '[.]fcgi$' {{
       fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
@@ -309,6 +336,30 @@ http {{
       fastcgi_param APP_ENV production;
       fastcgi_pass 127.0.0.1:{fastcgi_port};
     }}
+  }}
+  server {{
+    listen 127.0.0.1:{port};
+    server_name exact.test;
+    root {root};
+    add_header X-Server exact always;
+  }}
+  server {{
+    listen 127.0.0.1:{port};
+    server_name *.example.test;
+    root {root};
+    add_header X-Server leading always;
+  }}
+  server {{
+    listen 127.0.0.1:{port};
+    server_name *.deep.example.test;
+    root {root};
+    add_header X-Server deep always;
+  }}
+  server {{
+    listen 127.0.0.1:{port};
+    server_name api.*;
+    root {root};
+    add_header X-Server trailing always;
   }}
 }}
 """.strip() + "\n"
@@ -562,6 +613,61 @@ def main() -> int:
             ours_fastcgi = request(httpd_port, "/echo.fcgi?x=1")
             if stock_fastcgi != ours_fastcgi:
                 failures.append(("/echo.fcgi?x=1", "FastCGI parameters", stock_fastcgi, ours_fastcgi))
+            ordinary_header_statuses = {
+                200,
+                201,
+                204,
+                206,
+                301,
+                302,
+                303,
+                304,
+                307,
+                308,
+            }
+            status_matrix = (
+                200,
+                201,
+                202,
+                204,
+                205,
+                206,
+                301,
+                302,
+                303,
+                304,
+                305,
+                306,
+                307,
+                308,
+                400,
+                404,
+                500,
+            )
+            for status in status_matrix:
+                path = f"/status/{status}"
+                stock_result = request(nginx_port, path)
+                ours_result = request(httpd_port, path)
+                expected_normal = "normal" if status in ordinary_header_statuses else None
+                if (
+                    stock_result != ours_result
+                    or stock_result[0] != status
+                    or stock_result[7] != expected_normal
+                    or stock_result[8] != "always"
+                ):
+                    failures.append((path, "nginx add_header status matrix", stock_result, ours_result))
+            name_matrix = (
+                ("exact.test", "exact"),
+                ("www.example.test", "leading"),
+                ("www.deep.example.test", "deep"),
+                ("api.invalid", "trailing"),
+                ("unknown.invalid", None),
+            )
+            for host, expected_server in name_matrix:
+                stock_result = request(nginx_port, "/other.txt", host)
+                ours_result = request(httpd_port, "/other.txt", host)
+                if stock_result != ours_result or stock_result[9] != expected_server:
+                    failures.append((host, "nginx server_name precedence", stock_result, ours_result))
             feature_cases = (
                 ("/alias/fixture.txt", b"aliased\n", None),
                 ("/fallback/deep/path?x=1", b"fallback\n", None),
@@ -641,7 +747,14 @@ def main() -> int:
                     },
                     output,
                 )
-            count = len(STATIC_CASES) + len(PROXY_CASES) + len(feature_cases) + 5
+            count = (
+                len(STATIC_CASES)
+                + len(PROXY_CASES)
+                + len(feature_cases)
+                + len(status_matrix)
+                + len(name_matrix)
+                + 5
+            )
             print(f"nginx differential OK ({count} routing, policy, backend and body-admission cases)")
             return 0
         finally:

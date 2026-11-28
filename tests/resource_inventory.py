@@ -179,6 +179,7 @@ ALLOWED_MUTABLE_STATICS = {
     ("log.rs", "TEST_GATE"),
     ("main.rs", "STOP"), ("main.rs", "RELOAD"), ("main.rs", "REOPEN"),
     ("main.rs", "GLOBAL_ALLOCATOR"),
+    ("nginx_frontend.rs", "LOCK"), ("nginx_frontend.rs", "ROOT"),
     ("ocsp.rs", "CACHE"), ("ocsp.rs", "NEXT_TEMP"), ("ocsp.rs", "DISK"),
     ("proxy.rs", "DEAD"), ("proxy.rs", "HEALTH"),
     ("proxy.rs", "GENERATION"), ("proxy.rs", "COUNTERS"),

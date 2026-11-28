@@ -35,6 +35,8 @@ jobs:
           - config_compile
           - config_grammars
           - nginx_config
+          - nginx_include_tree
+          - nginx_whole_request
           - htaccess_walk
           - rewrite_expr
           - cgi_response

@@ -72,7 +72,11 @@ pub fn apply(scope: &Scope, resp: &mut Response) {
     if scope.header_policy.expires_active != Some(true) {
         return;
     }
-    if resp.status == 204 || resp.status == 205 || (100..200).contains(&resp.status) {
+    if scope.header_policy.nginx_status_semantics {
+        if !scope.header_policy.ordinary_response_status(resp.status) {
+            return;
+        }
+    } else if resp.status == 204 || resp.status == 205 || (100..200).contains(&resp.status) {
         return;
     }
     let media = header(resp, "content-type").map(|v| {

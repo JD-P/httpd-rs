@@ -5,9 +5,16 @@
 //! in this module; everything else is rejected while loading configuration.
 
 use crate::apache_regex::Regex;
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 pub const MAX_ROUTES_PER_SERVER: usize = 512;
+pub const MAX_NGINX_ROUTES: usize = 8_192;
+pub const MAX_NGINX_DERIVED_POLICY_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_NGINX_SERVERS: usize = 1024;
+pub const MAX_SERVER_NAMES: usize = 4096;
+pub const MAX_SERVER_NAME_BYTES: usize = 256 * 1024;
+pub const MAX_NGINX_AUTHORITY_NAME_BYTES: usize = 253;
 pub const MAX_VALUE_SEGMENTS: usize = 32;
 pub const MAX_TRANSFORMS_PER_SCOPE: usize = 128;
 pub const MAX_TRANSFORM_VALUE_BYTES: usize = 16 * 1024;
@@ -89,8 +96,297 @@ pub enum RouteProgram<T> {
     Apache,
     Nginx {
         servers: Vec<Vec<Route<T>>>,
-        server_names: Vec<Vec<String>>,
+        route_indexes: Vec<NginxRouteIndex>,
+        server_names: NginxServerNameTable,
     },
+}
+
+/// Precomputed literal indexes for nginx's request-time location winner
+/// machine. Regexes remain in declaration order because that order is part of
+/// nginx semantics; exact locations do not need a linear scan and literal
+/// prefixes are visited longest-first.
+#[derive(Debug, Clone)]
+pub struct NginxRouteIndex {
+    exact: HashMap<String, usize>,
+    prefixes: Vec<usize>,
+    regexes: Vec<usize>,
+    matcher_bytes: u64,
+}
+
+impl NginxRouteIndex {
+    fn build<T>(routes: &[Route<T>]) -> Self {
+        let mut exact = HashMap::new();
+        let mut prefixes = Vec::new();
+        let mut regexes = Vec::new();
+        let mut matcher_bytes = 0u64;
+        for (index, route) in routes.iter().enumerate() {
+            let width = match &route.matcher {
+                RouteMatcher::Exact(value)
+                | RouteMatcher::Prefix { value, .. }
+                | RouteMatcher::Regex { value, .. } => value.len(),
+            };
+            matcher_bytes = matcher_bytes.saturating_add(width as u64);
+            match &route.matcher {
+                RouteMatcher::Exact(value) => {
+                    let replace = exact.get(value).is_none_or(|current: &usize| {
+                        route.declaration_order < routes[*current].declaration_order
+                    });
+                    if replace {
+                        exact.insert(value.clone(), index);
+                    }
+                }
+                RouteMatcher::Prefix { .. } => prefixes.push(index),
+                RouteMatcher::Regex { .. } => regexes.push(index),
+            }
+        }
+        prefixes.sort_by_key(|index| {
+            let RouteMatcher::Prefix { value, .. } = &routes[*index].matcher else {
+                unreachable!("prefix index contains only prefix locations")
+            };
+            (
+                std::cmp::Reverse(value.len()),
+                routes[*index].declaration_order,
+            )
+        });
+        regexes.sort_by_key(|index| routes[*index].declaration_order);
+        Self {
+            exact,
+            prefixes,
+            regexes,
+            matcher_bytes,
+        }
+    }
+
+    fn select<'a, T>(&self, routes: &'a [Route<T>], path: &str) -> Option<&'a Route<T>> {
+        if let Some(index) = self.exact.get(path) {
+            return routes.get(*index);
+        }
+        let prefix = self.prefixes.iter().find_map(|index| {
+            let route = routes.get(*index)?;
+            let RouteMatcher::Prefix { value, .. } = &route.matcher else {
+                return None;
+            };
+            path.starts_with(value).then_some(route)
+        });
+        if prefix.is_some_and(|route| {
+            matches!(
+                route.matcher,
+                RouteMatcher::Prefix {
+                    suppress_regex: true,
+                    ..
+                }
+            )
+        }) {
+            return prefix;
+        }
+        self.regexes
+            .iter()
+            .find_map(|index| {
+                let route = routes.get(*index)?;
+                let RouteMatcher::Regex { regex, .. } = &route.matcher else {
+                    return None;
+                };
+                regex.is_match(path.as_bytes()).then_some(route)
+            })
+            .or(prefix)
+    }
+}
+
+/// One compiled nginx server-name program is shared by HTTP Host routing and
+/// TLS SNI certificate selection. This prevents the transport identity from
+/// applying a subtly different wildcard or tie-breaking policy.
+#[derive(Debug, Clone)]
+pub struct NginxServerNameTable {
+    #[allow(dead_code)]
+    source_names: Vec<Vec<String>>,
+    exact: HashMap<String, Vec<usize>>,
+    leading: HashMap<String, Vec<usize>>,
+    trailing: HashMap<String, Vec<usize>>,
+}
+
+fn first_sorted_intersection(left: &[usize], right: &[usize]) -> Option<usize> {
+    debug_assert!(left.windows(2).all(|pair| pair[0] < pair[1]));
+    debug_assert!(right.windows(2).all(|pair| pair[0] < pair[1]));
+    let (mut left_index, mut right_index) = (0, 0);
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => return Some(left[left_index]),
+        }
+    }
+    None
+}
+
+impl NginxServerNameTable {
+    pub(crate) fn new(server_names: Vec<Vec<String>>) -> Result<Self, String> {
+        if server_names.len() > MAX_NGINX_SERVERS {
+            return Err(format!(
+                "nginx configuration exceeds the {MAX_NGINX_SERVERS}-server bound"
+            ));
+        }
+        let count = server_names.iter().map(Vec::len).sum::<usize>();
+        let bytes = server_names
+            .iter()
+            .flatten()
+            .map(String::len)
+            .sum::<usize>();
+        if count > MAX_SERVER_NAMES || bytes > MAX_SERVER_NAME_BYTES {
+            return Err(format!(
+                "nginx server names exceed the {MAX_SERVER_NAMES}-name/{MAX_SERVER_NAME_BYTES}-byte bound"
+            ));
+        }
+        let source_names = server_names.clone();
+        let mut exact: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut leading: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut trailing: HashMap<String, Vec<usize>> = HashMap::new();
+        for (server, raw_names) in server_names.into_iter().enumerate() {
+            for raw in raw_names {
+                let name = normalize_nginx_authority(&raw);
+                if let Some(suffix) = name.strip_prefix('*') {
+                    let matches = leading.entry(suffix.to_string()).or_default();
+                    if matches.last() != Some(&server) {
+                        matches.push(server);
+                    }
+                } else if let Some(prefix) = name.strip_suffix('*') {
+                    let matches = trailing.entry(prefix.to_string()).or_default();
+                    if matches.last() != Some(&server) {
+                        matches.push(server);
+                    }
+                } else {
+                    let matches = exact.entry(name).or_default();
+                    if matches.last() != Some(&server) {
+                        matches.push(server);
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            source_names,
+            exact,
+            leading,
+            trailing,
+        })
+    }
+
+    pub(crate) fn select(&self, candidates: &[usize], host: Option<&str>) -> Option<usize> {
+        let default = *candidates.first()?;
+        let Some(host) = host else {
+            return Some(default);
+        };
+        let bare = normalize_nginx_authority(host);
+        // Configured names are bounded to the DNS presentation ceiling. A
+        // longer RFC 3986 reg-name cannot equal one and admitting it to the
+        // suffix probes would make a dot-heavy Host perform quadratic hash
+        // work. Treat it as an unmatched name and retain the listener's
+        // deterministic default server.
+        if bare.len() > MAX_NGINX_AUTHORITY_NAME_BYTES {
+            return Some(default);
+        }
+        let exact_server = self
+            .exact
+            .get(&bare)
+            .and_then(|exact| first_sorted_intersection(candidates, exact));
+        // A supported leading wildcard is always `*.suffix`, so every
+        // possible match begins at a dot in the normalized authority. Walk
+        // left-to-right to query the longest suffix first. Trailing `prefix.*`
+        // candidates are the mirror image and are queried longest-first.
+        let leading_server = bare.match_indices('.').find_map(|(index, _)| {
+            self.leading
+                .get(&bare[index..])
+                .and_then(|matches| first_sorted_intersection(candidates, matches))
+        });
+        let trailing_server = bare.rmatch_indices('.').find_map(|(index, _)| {
+            self.trailing
+                .get(&bare[..=index])
+                .and_then(|matches| first_sorted_intersection(candidates, matches))
+        });
+        match httpd_rs_verified::nginx_server_name_winner_class(
+            exact_server.is_some(),
+            leading_server.is_some(),
+            trailing_server.is_some(),
+        ) {
+            1 => exact_server,
+            2 => leading_server,
+            3 => trailing_server,
+            _ => Some(default),
+        }
+    }
+
+    #[cfg(any(test, feature = "fuzzing"))]
+    fn select_reference(&self, candidates: &[usize], host: Option<&str>) -> Option<usize> {
+        let default = *candidates.first()?;
+        let Some(host) = host else {
+            return Some(default);
+        };
+        let bare = normalize_nginx_authority(host);
+        if bare.len() > MAX_NGINX_AUTHORITY_NAME_BYTES {
+            return Some(default);
+        }
+        for &index in candidates {
+            if self.source_names.get(index).is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|name| !name.contains('*') && normalize_nginx_authority(name) == bare)
+            }) {
+                return Some(index);
+            }
+        }
+        let mut leading: Option<(usize, usize, usize)> = None;
+        let mut trailing: Option<(usize, usize, usize)> = None;
+        for (rank, &index) in candidates.iter().enumerate() {
+            let Some(names) = self.source_names.get(index) else {
+                continue;
+            };
+            for name in names {
+                let name = normalize_nginx_authority(name);
+                if let Some(suffix) = name.strip_prefix('*') {
+                    if bare.len() > suffix.len()
+                        && bare.ends_with(suffix)
+                        && leading.is_none_or(|(_, width, current_rank)| {
+                            suffix.len() > width || (suffix.len() == width && rank < current_rank)
+                        })
+                    {
+                        leading = Some((index, suffix.len(), rank));
+                    }
+                } else if let Some(prefix) = name.strip_suffix('*') {
+                    if bare.len() > prefix.len()
+                        && bare.starts_with(prefix)
+                        && trailing.is_none_or(|(_, width, current_rank)| {
+                            prefix.len() > width || (prefix.len() == width && rank < current_rank)
+                        })
+                    {
+                        trailing = Some((index, prefix.len(), rank));
+                    }
+                }
+            }
+        }
+        leading
+            .or(trailing)
+            .map(|(index, _, _)| index)
+            .or(Some(default))
+    }
+}
+
+pub(crate) fn normalize_nginx_authority(authority: &str) -> String {
+    let authority = authority.trim();
+    let bare = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split_once(']').map(|(value, _)| value).unwrap_or(rest)
+    } else if authority
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b':')
+        .count()
+        == 1
+    {
+        authority
+            .split_once(':')
+            .map(|(value, _)| value)
+            .unwrap_or(authority)
+    } else {
+        authority
+    };
+    bare.trim_end_matches('.').to_ascii_lowercase()
 }
 
 impl<T> Default for RouteProgram<T> {
@@ -115,8 +411,27 @@ impl<T> RouteProgram<T> {
                 "nginx server exceeds the {MAX_ROUTES_PER_SERVER}-location bound"
             ));
         }
+        let total_routes = servers
+            .iter()
+            .try_fold(0usize, |total, routes| total.checked_add(routes.len()));
+        if total_routes.is_none_or(|total| total > MAX_NGINX_ROUTES) {
+            return Err(format!(
+                "nginx configuration exceeds the {MAX_NGINX_ROUTES}-location aggregate bound"
+            ));
+        }
+        if servers.len() > MAX_NGINX_SERVERS {
+            return Err(format!(
+                "nginx configuration exceeds the {MAX_NGINX_SERVERS}-server bound"
+            ));
+        }
+        let route_indexes = servers
+            .iter()
+            .map(|routes| NginxRouteIndex::build(routes))
+            .collect();
+        let server_names = NginxServerNameTable::new(server_names)?;
         Ok(Self::Nginx {
             servers,
+            route_indexes,
             server_names,
         })
     }
@@ -126,10 +441,18 @@ impl<T> RouteProgram<T> {
     }
 
     pub fn select(&self, server: usize, path: &str) -> Option<&T> {
-        let Self::Nginx { servers, .. } = self else {
+        let Self::Nginx {
+            servers,
+            route_indexes,
+            ..
+        } = self
+        else {
             return None;
         };
-        select_nginx_route(servers.get(server)?, path).map(|route| &route.policy)
+        route_indexes
+            .get(server)?
+            .select(servers.get(server)?, path)
+            .map(|route| &route.policy)
     }
 
     pub fn policies(&self) -> impl Iterator<Item = &T> {
@@ -148,24 +471,28 @@ impl<T> RouteProgram<T> {
         path: &str,
         req: &crate::http::Request,
     ) -> Result<Option<&T>, &'static str> {
-        let Self::Nginx { servers, .. } = self else {
+        let Self::Nginx {
+            servers,
+            route_indexes,
+            ..
+        } = self
+        else {
             return Ok(None);
         };
         let Some(routes) = servers.get(server) else {
             return Ok(None);
         };
-        let work = routes.iter().fold(1u64, |total, route| {
-            let matcher = match &route.matcher {
-                RouteMatcher::Exact(value) | RouteMatcher::Prefix { value, .. } => value.len(),
-                RouteMatcher::Regex { value, .. } => value.len(),
-            };
-            total
-                .saturating_add(matcher as u64)
-                .saturating_add(path.len() as u64)
-                .saturating_add(1)
-        });
+        let Some(index) = route_indexes.get(server) else {
+            return Ok(None);
+        };
+        let work = httpd_rs_verified::nginx_route_selection_work(
+            routes.len() as u64,
+            index.matcher_bytes,
+            path.len() as u64,
+        )
+        .unwrap_or(u64::MAX);
         req.charge_policy_work(work)?;
-        Ok(select_nginx_route(routes, path).map(|route| &route.policy))
+        Ok(index.select(routes, path).map(|route| &route.policy))
     }
 
     /// Select an nginx virtual server from the address-bucket candidates.
@@ -176,66 +503,37 @@ impl<T> RouteProgram<T> {
         let Self::Nginx { server_names, .. } = self else {
             return None;
         };
-        let default = *candidates.first()?;
-        let Some(host) = host else {
-            return Some(default);
+        server_names.select(candidates, host)
+    }
+
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub(crate) fn assert_nginx_refinement(&self, paths: &[&str], hosts: &[&str]) {
+        let Self::Nginx {
+            servers,
+            route_indexes,
+            server_names,
+        } = self
+        else {
+            return;
         };
-        let authority = host.trim();
-        let bare = if let Some(rest) = authority.strip_prefix('[') {
-            rest.split_once(']').map(|(value, _)| value).unwrap_or(rest)
-        } else if authority
-            .as_bytes()
-            .iter()
-            .filter(|byte| **byte == b':')
-            .count()
-            == 1
-        {
-            authority
-                .split_once(':')
-                .map(|(value, _)| value)
-                .unwrap_or(authority)
-        } else {
-            authority
-        }
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-        for &index in candidates {
-            if server_names.get(index).is_some_and(|names| {
-                names.iter().any(|name| {
-                    !name.contains('*') && name.trim_end_matches('.').eq_ignore_ascii_case(&bare)
-                })
-            }) {
-                return Some(index);
+        for (server, routes) in servers.iter().enumerate() {
+            for path in paths {
+                let indexed = route_indexes[server]
+                    .select(routes, path)
+                    .map(|route| route.declaration_order);
+                let reference =
+                    select_nginx_route(routes, path).map(|route| route.declaration_order);
+                assert_eq!(indexed, reference, "nginx route-index refinement failed");
             }
         }
-        let mut leading: Option<(usize, usize)> = None;
-        let mut trailing: Option<(usize, usize)> = None;
-        for &index in candidates {
-            let Some(names) = server_names.get(index) else {
-                continue;
-            };
-            for name in names {
-                if let Some(suffix) = name.strip_prefix('*') {
-                    if bare.len() > suffix.len()
-                        && bare.ends_with(suffix)
-                        && leading.is_none_or(|(_, width)| suffix.len() > width)
-                    {
-                        leading = Some((index, suffix.len()));
-                    }
-                } else if let Some(prefix) = name.strip_suffix('*') {
-                    if bare.len() > prefix.len()
-                        && bare.starts_with(prefix)
-                        && trailing.is_none_or(|(_, width)| prefix.len() > width)
-                    {
-                        trailing = Some((index, prefix.len()));
-                    }
-                }
-            }
+        let candidates: Vec<usize> = (0..servers.len()).collect();
+        for host in hosts {
+            assert_eq!(
+                server_names.select(&candidates, Some(host)),
+                server_names.select_reference(&candidates, Some(host)),
+                "nginx server-name index refinement failed"
+            );
         }
-        leading
-            .or(trailing)
-            .map(|(index, _)| index)
-            .or(Some(default))
     }
 }
 
@@ -256,18 +554,22 @@ pub fn select_nginx_route<'a, T>(routes: &'a [Route<T>], path: &str) -> Option<&
                 }
             }
             RouteMatcher::Prefix { value, .. } if path.starts_with(value) => {
-                let replace = prefix.as_ref().is_none_or(|current| {
-                    let RouteMatcher::Prefix {
-                        value: current_value,
-                        ..
-                    } = &current.matcher
-                    else {
-                        return true;
-                    };
-                    value.len() > current_value.len()
-                        || (value.len() == current_value.len()
-                            && route.declaration_order < current.declaration_order)
-                });
+                let (current_width, current_order) = prefix
+                    .as_ref()
+                    .and_then(|current| match &current.matcher {
+                        RouteMatcher::Prefix { value, .. } => {
+                            Some((value.len(), current.declaration_order))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or((0, 0));
+                let replace = httpd_rs_verified::nginx_literal_candidate_better(
+                    prefix.is_some(),
+                    value.len() as u64,
+                    route.declaration_order as u64,
+                    current_width as u64,
+                    current_order as u64,
+                );
                 if replace {
                     prefix = Some(route);
                 }
@@ -275,10 +577,7 @@ pub fn select_nginx_route<'a, T>(routes: &'a [Route<T>], path: &str) -> Option<&
             _ => {}
         }
     }
-    if exact.is_some() {
-        return exact;
-    }
-    if prefix.is_some_and(|route| {
+    let suppressing_prefix = prefix.is_some_and(|route| {
         matches!(
             route.matcher,
             RouteMatcher::Prefix {
@@ -286,9 +585,7 @@ pub fn select_nginx_route<'a, T>(routes: &'a [Route<T>], path: &str) -> Option<&
                 ..
             }
         )
-    }) {
-        return prefix;
-    }
+    });
     let mut regex_match: Option<&Route<T>> = None;
     for route in routes {
         let RouteMatcher::Regex { regex, .. } = &route.matcher else {
@@ -302,7 +599,18 @@ pub fn select_nginx_route<'a, T>(routes: &'a [Route<T>], path: &str) -> Option<&
             regex_match = Some(route);
         }
     }
-    regex_match.or(prefix)
+    match httpd_rs_verified::nginx_route_winner_class(
+        exact.is_some(),
+        suppressing_prefix,
+        regex_match.is_some(),
+        prefix.is_some(),
+    ) {
+        1 => exact,
+        2 => prefix,
+        3 => regex_match,
+        4 => prefix,
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -832,6 +1140,105 @@ mod tests {
             program.select_nginx_server(&candidates, Some("unmatched.invalid")),
             Some(0)
         );
+        let dot_heavy = format!("mail.{}", "x.".repeat(200));
+        assert!(dot_heavy.len() > MAX_NGINX_AUTHORITY_NAME_BYTES);
+        assert_eq!(
+            program.select_nginx_server(&candidates, Some(&dot_heavy)),
+            Some(0),
+            "oversized reg-names must not enter wildcard suffix hashing"
+        );
+        program.assert_nginx_refinement(
+            &[],
+            &[
+                "api.deep.example.test:443",
+                "www.deep.example.test",
+                "mail.invalid",
+                "unmatched.invalid",
+                &dot_heavy,
+            ],
+        );
+    }
+
+    #[test]
+    fn indexed_location_machine_refines_the_linear_reference() {
+        let routes = vec![
+            route(
+                RouteMatcher::Prefix {
+                    value: "/".into(),
+                    suppress_regex: false,
+                },
+                0usize,
+                7,
+            ),
+            route(
+                RouteMatcher::Regex {
+                    value: "[.]php$".into(),
+                    regex: Regex::compile("[.]php$", false).unwrap(),
+                },
+                1,
+                3,
+            ),
+            route(
+                RouteMatcher::Prefix {
+                    value: "/assets/".into(),
+                    suppress_regex: true,
+                },
+                2,
+                2,
+            ),
+            route(RouteMatcher::Exact("/exact".into()), 3, 9),
+            route(
+                RouteMatcher::Prefix {
+                    value: "/images/deep/".into(),
+                    suppress_regex: false,
+                },
+                4,
+                1,
+            ),
+            route(
+                RouteMatcher::Regex {
+                    value: "^/images/".into(),
+                    regex: Regex::compile("^/images/", false).unwrap(),
+                },
+                5,
+                4,
+            ),
+        ];
+        let expected = [
+            "/",
+            "/exact",
+            "/exact/child",
+            "/assets/x.php",
+            "/images/x.txt",
+            "/images/deep/x.php",
+            "/other.php",
+            "/missing",
+        ];
+        let program = RouteProgram::nginx(vec![routes.clone()], vec![vec!["_".into()]])
+            .expect("bounded route program");
+        for path in expected {
+            assert_eq!(
+                program.select(0, path),
+                select_nginx_route(&routes, path).map(|route| &route.policy),
+                "indexed and reference selectors diverged for {path}"
+            );
+        }
+        program.assert_nginx_refinement(&expected, &[]);
+    }
+
+    #[test]
+    fn nginx_name_table_enforces_configuration_resource_bounds() {
+        let too_many = vec![Vec::<String>::new(); MAX_NGINX_SERVERS + 1];
+        assert!(NginxServerNameTable::new(too_many).is_err());
+        let oversized = vec![vec!["x".repeat(MAX_SERVER_NAME_BYTES + 1)]];
+        assert!(NginxServerNameTable::new(oversized).is_err());
+
+        let one_server = (0..MAX_ROUTES_PER_SERVER)
+            .map(|index| route(RouteMatcher::Exact(format!("/route-{index}")), index, index))
+            .collect::<Vec<_>>();
+        let servers = vec![one_server; MAX_NGINX_ROUTES / MAX_ROUTES_PER_SERVER + 1];
+        let names = vec![vec!["bounded.test".to_string()]; servers.len()];
+        assert!(RouteProgram::nginx(servers, names).is_err());
     }
 
     #[test]

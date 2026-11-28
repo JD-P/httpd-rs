@@ -4040,7 +4040,7 @@ fn proxy_once_budgeted(
             };
             if scope
                 .header_policy
-                .apply(&mut response.headers, response.status < 400)
+                .apply(&mut response.headers, response.status)
                 .is_err()
             {
                 return Ok((Response::policy_error(), None));
@@ -4122,7 +4122,7 @@ fn proxy_once_budgeted(
     }
     if scope
         .header_policy
-        .apply(&mut response.headers, response.status < 400)
+        .apply(&mut response.headers, response.status)
         .is_err()
     {
         return Ok((Response::policy_error(), None));

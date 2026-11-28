@@ -101,6 +101,16 @@
       "verification_targets": ["configuration_payload_refinement", "pcre2_grammar_refinement", "glob_match_resource_admit", "bounded_expansion_append_admit"]
     },
     {
+      "id": "nginx-frontend-and-ir-bounds",
+      "disposition": "proved-constant-bound",
+      "paths": [
+        "crates/server/src/config_ir.rs",
+        "crates/server/src/nginx_frontend.rs"
+      ],
+      "evidence": "the nginx loader has hard per-file, aggregate-byte, include-depth/count/directory-entry, syntax-node, argument and token ceilings; lowering additionally caps servers, names, routes, transformation segments/bytes and total source-derived structure. The 64 MiB derived-policy estimate is a conservative operational rejection threshold rather than an exact allocator proof; the finite source/node/route ceilings provide the underlying constant-bound warrant. Request-time route selection consumes the verified matcher/path work charge, transformation output is capped at 16 KiB, and indexed route/name winners are differentially checked against independent linear references",
+      "verification_targets": ["nginx_literal_candidate_better", "nginx_route_winner_class", "nginx_server_name_winner_class", "nginx_route_selection_work", "request_resource_effect_closure"]
+    },
+    {
       "id": "fixed-cardinality-administration",
       "disposition": "proved-constant-bound",
       "paths": [

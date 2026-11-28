@@ -174,6 +174,8 @@ struct Fixture {
     root: PathBuf,
     old_config_path: PathBuf,
     next_config_path: PathBuf,
+    nginx_config_path: PathBuf,
+    nginx_next_config_path: PathBuf,
     balancer_members: [String; 2],
     proxy_exchanges: Arc<Mutex<VecDeque<BackendExchangeSnapshot>>>,
     fastcgi_exchanges: Arc<Mutex<VecDeque<BackendExchangeSnapshot>>>,
@@ -521,6 +523,8 @@ fn fixture() -> &'static Fixture {
             .expect("write FastCGI index fixture");
         std::fs::write(root.join("www/proxy-dir/index.txt"), b"proxy index selection\n")
             .expect("write proxy index fixture");
+        std::fs::write(root.join("www/errors/404.html"), b"nginx local error\n")
+            .expect("write nginx ErrorDocument fixture");
         let cgi_index = root.join("www/app/index.cgi");
         std::fs::write(
             &cgi_index,
@@ -645,10 +649,39 @@ fn fixture() -> &'static Fixture {
             ),
         )
         .expect("write reload whole-request config");
+        let nginx_config_path = root.join("nginx.conf");
+        let nginx_next_config_path = root.join("nginx-next.conf");
+        let nginx_text = format!(
+            "events {{ worker_connections 64; }}\n\
+             http {{\n\
+               server {{\n\
+                 listen 127.0.0.1:{LOCAL_PORT} default_server;\n\
+                 server_name localhost fuzz.example;\n\
+                 root {};\n\
+                 error_page 404 /errors/404.html;\n\
+                 location = /redirect {{ return 302 /public.txt; }}\n\
+                 location /proxy/ {{ proxy_pass http://127.0.0.1:{proxy_port}/upstream/; }}\n\
+                 location / {{ try_files $uri $uri/ =404; }}\n\
+               }}\n\
+             }}\n",
+            root.join("www").display(),
+        );
+        std::fs::write(&nginx_config_path, &nginx_text)
+            .expect("write nginx whole-request config");
+        std::fs::write(
+            &nginx_next_config_path,
+            nginx_text.replace(
+                "server_name localhost fuzz.example;",
+                "server_name localhost fuzz.example; add_header X-Generation next always;",
+            ),
+        )
+        .expect("write nginx reload whole-request config");
         Fixture {
             root,
             old_config_path: config_path,
             next_config_path,
+            nginx_config_path,
+            nginx_next_config_path,
             balancer_members,
             proxy_exchanges,
             fastcgi_exchanges,
@@ -1359,7 +1392,25 @@ fn load_fixture_config(fixture: &Fixture) -> Config {
     cfg
 }
 
+fn load_nginx_fixture_config(fixture: &Fixture) -> Config {
+    let cfg = Config::load_format(
+        crate::config_ir::ConfigFormat::Nginx,
+        &fixture.nginx_config_path,
+        &fixture.root,
+        &Default::default(),
+        &Default::default(),
+        false,
+    )
+    .unwrap_or_else(|errors| panic!("nginx whole-request config: {errors:?}"));
+    assert!(cfg.resource_budget.transition_usage_is_zero());
+    cfg
+}
+
 fn compare_protocols(data: &[u8]) -> WholeRequestSnapshot {
+    compare_protocols_format(data, false)
+}
+
+fn compare_protocols_format(data: &[u8], nginx: bool) -> WholeRequestSnapshot {
     let fixture = fixture();
     let _stateful_guard = fixture
         .stateful_lock
@@ -1368,7 +1419,11 @@ fn compare_protocols(data: &[u8]) -> WholeRequestSnapshot {
     let logical = logical_request(data);
     drain_backend_exchanges(fixture);
 
-    let h1_cfg = load_fixture_config(fixture);
+    let h1_cfg = if nginx {
+        load_nginx_fixture_config(fixture)
+    } else {
+        load_fixture_config(fixture)
+    };
     let h1_baseline = h1_cfg.resource_budget.transition_snapshot();
 
     let mut h1 = evaluate(
@@ -1394,7 +1449,11 @@ fn compare_protocols(data: &[u8]) -> WholeRequestSnapshot {
     drop(h1_cfg);
     drain_backend_exchanges(fixture);
 
-    let h2_cfg = load_fixture_config(fixture);
+    let h2_cfg = if nginx {
+        load_nginx_fixture_config(fixture)
+    } else {
+        load_fixture_config(fixture)
+    };
     let h2_baseline = h2_cfg.resource_budget.transition_snapshot();
 
     let decode_h2 = || {
@@ -1425,7 +1484,7 @@ fn compare_protocols(data: &[u8]) -> WholeRequestSnapshot {
         h1_warm, h2_warm,
         "warm-cache protocol projections diverged for {logical:?}"
     );
-    if logical.denied_route {
+    if !nginx && logical.denied_route {
         assert!(matches!(h1.authorization, AuthorizationSnapshot::Denied(_)));
         assert_eq!(h1.sink, SinkSnapshot::None);
         assert!(h1.backend.is_none());
@@ -1491,6 +1550,34 @@ fn load_stateful_configs(fixture: &Fixture) -> [Config; 2] {
     crate::cache::prepare(&old);
     crate::cache::prepare(&candidate);
     crate::cache::clear(&old);
+    assert!(old.resource_budget.transition_usage_is_zero());
+    [old, candidate]
+}
+
+fn load_nginx_stateful_configs(fixture: &Fixture) -> [Config; 2] {
+    let empty = Default::default();
+    let old = Config::load_format(
+        crate::config_ir::ConfigFormat::Nginx,
+        &fixture.nginx_config_path,
+        &fixture.root,
+        &empty,
+        &empty,
+        false,
+    )
+    .unwrap_or_else(|errors| panic!("stateful nginx old config: {errors:?}"));
+    let mut candidate = Config::load_format(
+        crate::config_ir::ConfigFormat::Nginx,
+        &fixture.nginx_next_config_path,
+        &fixture.root,
+        &empty,
+        &empty,
+        false,
+    )
+    .unwrap_or_else(|errors| panic!("stateful nginx candidate config: {errors:?}"));
+    candidate
+        .validate_reload_from(&old)
+        .expect("stateful nginx reload candidate must be compatible");
+    candidate.resource_budget = old.resource_budget.clone();
     assert!(old.resource_budget.transition_usage_is_zero());
     [old, candidate]
 }
@@ -1775,6 +1862,85 @@ fn compare_stateful_steps(steps: &[StatefulStep]) -> StatefulTrace {
     h1
 }
 
+fn run_nginx_stateful_protocol(
+    fixture: &Fixture,
+    steps: &[StatefulStep],
+    protocol: WireProtocol,
+) -> StatefulTrace {
+    let configs = load_nginx_stateful_configs(fixture);
+    let baseline = configs[0].resource_budget.transition_snapshot();
+    let mut h1 = H1SequenceDecoder::new(steps);
+    let mut active_generation = 0usize;
+    let mut connection_generation = 0usize;
+    let mut snapshots = Vec::with_capacity(steps.len());
+
+    for step in steps {
+        if step.reload_before {
+            commit_stateful_reload(&configs, &mut active_generation);
+        }
+        if step.reconnect_before {
+            connection_generation = active_generation;
+        }
+        let cfg = &configs[connection_generation];
+        let request = decode_stateful_request(protocol, &mut h1, cfg, &step.logical);
+        let refused_canonical = canonical_snapshot(&request);
+        let admitted = cfg.admit_generation_work(|| prepare_evaluation(cfg, request));
+        assert_eq!(
+            admitted.is_some(),
+            connection_generation == active_generation,
+            "nginx generation admission disagreed with the connection binding"
+        );
+        let outcome = if let Some(prepared) = admitted {
+            if step.reload_after_prepare {
+                commit_stateful_reload(&configs, &mut active_generation);
+            }
+            let mut completed =
+                finish_evaluation(fixture, cfg, prepared, step.logical.cancel_before_sink);
+            normalize_whole_request(&mut completed);
+            if matches!(completed.authorization, AuthorizationSnapshot::Denied(_)) {
+                assert_eq!(completed.sink, SinkSnapshot::None);
+                assert!(completed.backend.is_none());
+                assert!(!completed.backend_effect);
+            }
+            StatefulOutcomeSnapshot::Completed(completed)
+        } else {
+            StatefulOutcomeSnapshot::Refused(refused_canonical)
+        };
+        snapshots.push(StatefulStepSnapshot {
+            active_generation,
+            connection_generation,
+            outcome,
+        });
+        if step.reconnect_after {
+            connection_generation = active_generation;
+        }
+    }
+
+    crate::cache::clear(&configs[0]);
+    crate::cache::clear(&configs[1]);
+    drain_backend_exchanges(fixture);
+    assert_eq!(configs[0].resource_budget.transition_snapshot(), baseline);
+    assert!(configs[0].resource_budget.transition_usage_is_zero());
+    StatefulTrace { steps: snapshots }
+}
+
+fn compare_nginx_stateful_steps(steps: &[StatefulStep]) -> StatefulTrace {
+    let fixture = fixture();
+    let _stateful_guard = fixture
+        .stateful_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    drain_backend_exchanges(fixture);
+    let h1 = run_nginx_stateful_protocol(fixture, steps, WireProtocol::H1);
+    drain_backend_exchanges(fixture);
+    let h2 = run_nginx_stateful_protocol(fixture, steps, WireProtocol::H2);
+    assert_eq!(
+        h1, h2,
+        "nginx stateful protocol projections diverged: {steps:#?}"
+    );
+    h1
+}
+
 /// Run a bounded sequence through reload, access-file, health and connection
 /// transitions, then require HTTP/1 and HTTP/2 to agree on every outcome.
 pub fn run_stateful(data: &[u8]) {
@@ -1785,6 +1951,16 @@ pub fn run_stateful(data: &[u8]) {
 /// Run one bounded logical request through both complete protocol paths.
 pub fn run(data: &[u8]) {
     let _ = compare_protocols(data);
+}
+
+/// Run the same composed H1/H2 evaluator through the nginx frontend. This
+/// covers routing, local errors, redirects, proxy serialization, response
+/// finalization, cancellation and terminal resource release rather than
+/// stopping at configuration parsing.
+pub fn run_nginx(data: &[u8]) {
+    let _ = compare_protocols_format(data, true);
+    let steps = parse_stateful_steps(data);
+    let _ = compare_nginx_stateful_steps(&steps);
 }
 
 #[cfg(test)]

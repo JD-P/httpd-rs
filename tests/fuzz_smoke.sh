@@ -27,7 +27,7 @@ whole_request_runs=${FUZZ_WHOLE_REQUEST_RUNS:-1024}
 multi_request_runs=${FUZZ_MULTI_REQUEST_RUNS:-1024}
 corpus_root=$(mktemp -d /tmp/httpd-rs-fuzz-smoke.XXXXXX)
 trap 'rm -rf "$corpus_root"' EXIT INT TERM
-targets=${FUZZ_TARGETS:-"http_request http_connection http_fields request_identity config_physical_lines config_sections config_compile config_grammars nginx_config htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames h2_output h2_stateful cache_metadata cache_stateful tls_policy tls_identity_reload ocsp_der pcre2_differential pcre2_grammar pcre2_resource resource_transitions brotli_resource policy_path whole_request_differential multi_request_state"}
+targets=${FUZZ_TARGETS:-"http_request http_connection http_fields request_identity config_physical_lines config_sections config_compile config_grammars nginx_config nginx_include_tree nginx_whole_request htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response websocket_negotiation h2_frames h2_output h2_stateful cache_metadata cache_stateful tls_policy tls_identity_reload ocsp_der pcre2_differential pcre2_grammar pcre2_resource resource_transitions brotli_resource policy_path whole_request_differential multi_request_state"}
 
 for target in $targets; do
     mkdir "$corpus_root/$target"
@@ -53,10 +53,11 @@ for target in $targets; do
             target_runs=$brotli_runs
             target_max_len=262144
             ;;
-        whole_request_differential)
+        whole_request_differential|nginx_whole_request)
             target_runs=$whole_request_runs
             target_max_len=256
             ;;
+        nginx_include_tree) target_max_len=256 ;;
         multi_request_state)
             target_runs=$multi_request_runs
             target_max_len=96

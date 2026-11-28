@@ -769,6 +769,41 @@
         "whole_request_differential",
         "multi_request_state"
       ]
+    },
+    {
+      "authorities": [
+        "upstream-reference-oracle",
+        "internal-security-invariant",
+        "historical-adversarial-finding"
+      ],
+      "evidence": [
+        "crates/server/src/nginx_frontend.rs",
+        "crates/server/src/config_ir.rs",
+        "tests/nginx_differential.py",
+        "docs/reference/nginx-configuration.md"
+      ],
+      "families": [
+        "authorization",
+        "backend-and-sinks",
+        "configuration-and-merge",
+        "mapping-and-transforms",
+        "terminal-response",
+        "tls-and-peer-identity"
+      ],
+      "id": "nginx-frontend-and-composed-request",
+      "state_dimensions": [
+        "closed lexer, parser and lowering grammar",
+        "include glob, cycle, symlink and replacement topology",
+        "location and server-name winner precedence",
+        "proxy, FastCGI, response-header and status projection",
+        "H1 and H2 plan, authorization, sink and response equivalence",
+        "reload, cancellation, retirement and zero resource ownership"
+      ],
+      "targets": [
+        "nginx_config",
+        "nginx_include_tree",
+        "nginx_whole_request"
+      ]
     }
   ],
   "oracle_build": {

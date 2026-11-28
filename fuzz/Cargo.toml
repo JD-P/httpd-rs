@@ -120,6 +120,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "nginx_include_tree"
+path = "fuzz_targets/nginx_include_tree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nginx_whole_request"
+path = "fuzz_targets/nginx_whole_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "h2_frames"
 path = "fuzz_targets/h2_frames.rs"
 test = false

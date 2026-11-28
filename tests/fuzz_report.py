@@ -198,16 +198,16 @@ def classify_multi(data: bytes, groups: dict[str, SemanticGroup]) -> None:
         record = data[index * 16 : (index + 1) * 16].ljust(16, b"\0")
         classify_whole(record, groups)
         for offset, bit, name in names:
-            if record[offset] & bit:
+            if record[offset] & bit and name in groups["transition"].expected:
                 observe(groups, "transition", name)
                 ordered_transitions.append(name)
-        if record[8] & 0x04:
+        if "access_value" in groups and record[8] & 0x04:
             observe(groups, "access_value", int(record[9] & 0x01 != 0))
-        if record[8] & 0x08:
+        if "health_value" in groups and record[8] & 0x08:
             observe(groups, "health_value", int(record[9] & 0x02 != 0))
-        if record[10] & 0x02:
+        if "access_value" in groups and record[10] & 0x02:
             observe(groups, "access_value", int(record[11] & 0x01 != 0))
-        if record[10] & 0x04:
+        if "health_value" in groups and record[10] & 0x04:
             observe(groups, "health_value", int(record[11] & 0x02 != 0))
     for left, right in zip(ordered_transitions, ordered_transitions[1:]):
         observe(groups, "transition_pair", f"{left}>{right}")
@@ -384,6 +384,14 @@ def classify_declared(target: str, data: bytes, groups: dict[str, SemanticGroup]
         for index in range(route_count):
             observe(groups, "route_matcher", byte(10 + index * 2) % 8)
             observe(groups, "route_action", byte(11 + index * 2) % 8)
+    elif target == "nginx_include_tree":
+        byte = lambda index: data[index] if index < len(data) else index & 0xFF
+        observe(groups, "topology", "glob")
+        observe(groups, "topology", "empty_glob" if byte(0) & 1 == 0 else "single_include")
+        observe(groups, "topology", "nested_glob" if byte(1) & 1 == 0 else "nested_single")
+        observe(groups, "topology", "cycle" if byte(3) & 1 else "acyclic")
+        observe(groups, "topology", "symlink" if byte(4) & 1 else "regular")
+        observe(groups, "topology", "reload_replace" if byte(5) & 1 else "single_generation")
     elif target == "htaccess_walk":
         if not data:
             return
@@ -564,6 +572,12 @@ DECLARED_SPECS: dict[str, dict[str, set[str]]] = {
         "route_matcher": {str(i) for i in range(8)},
         "route_action": {str(i) for i in range(8)},
     },
+    "nginx_include_tree": {
+        "topology": {
+            "glob", "empty_glob", "single_include", "nested_glob", "nested_single",
+            "cycle", "acyclic", "symlink", "regular", "reload_replace", "single_generation",
+        },
+    },
     "htaccess_walk": {"depth": {"0", "1", "2", "3"}, "directive_family": {"authorization", "mapping", "handler", "environment", "malformed"}},
     "rewrite_expr": {"expression_family": {"comparison", "boolean", "regex", "request_variable", "environment_variable", "filesystem_test", "malformed"}},
     "cgi_response": {"delimiter": {"crlf", "lf", "absent"}, "header_family": {"status", "location", "content_length", "content_type", "malformed"}},
@@ -609,6 +623,12 @@ def declared_seeds(target: str) -> list[bytes]:
             b"http { server { location @named {} location / { if ($uri) {} proxy_pass $backend; } } }",
             b"http {\x00",
         ] + [bytes([selector]) * 32 for selector in range(24)],
+        "nginx_include_tree": [
+            bytes([0, 0, 0, 0, 0, 0]),
+            bytes([1, 1, 1, 1, 1, 1]),
+            bytes([0, 1, 0, 1, 0, 1]),
+            bytes([1, 0, 1, 0, 1, 0]),
+        ],
         "rewrite_expr": [b"%{REQUEST_URI} == '/x'", b"true && false", b"%{REQUEST_URI} =~ m#^/x$#", b"%{HTTP_HOST} == 'x'", b"%{ENV:FUZZ} == '1'", b"-f '/tmp/fuzz'", b"("],
         "cgi_response": [b"Content-Type: text/plain\r\n\r\nbody", b"Content-Type: text/plain\n\nbody", b"Status: 201 Created\r\n\r\n", b"Location: /next\r\n\r\n", b"Content-Length: 0\r\n\r\n", b"broken\x00"],
         "proxy_response": [b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx", b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n", b"HTTP/1.0 200 OK\r\n\r\nx", b"HTTP/1.1 204 No Content\r\n\r\n", b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", b"broken"],
@@ -701,7 +721,7 @@ def semantic_spec(target: str) -> tuple[dict[str, SemanticGroup], object | None]
             },
             classify_config_physical,
         )
-    if target in {"whole_request_differential", "multi_request_state"}:
+    if target in {"whole_request_differential", "multi_request_state", "nginx_whole_request"}:
         groups = {
             "route": group(range(20)),
             "method": group(range(6)),
@@ -710,28 +730,25 @@ def semantic_spec(target: str) -> tuple[dict[str, SemanticGroup], object | None]
             "cancel": group(range(2)),
             "route_method_pairs": group({f"{route}:{method}" for route in range(20) for method in range(6)}),
         }
-        if target == "multi_request_state":
-            transitions = {
-                "reload_before",
-                "reconnect_before",
-                "access_before",
-                "health_before",
-                "reload_after_prepare",
-                "access_after_prepare",
-                "health_after_prepare",
-                "reconnect_after",
-            }
-            groups.update(
-                {
-                    "step_count": group(range(2, 7)),
-                    "transition": group(transitions),
-                    "transition_pair": group(
-                        {f"{left}>{right}" for left in transitions for right in transitions}
-                    ),
-                    "access_value": group(range(2)),
-                    "health_value": group(range(2)),
+        if target in {"multi_request_state", "nginx_whole_request"}:
+            transitions = (
+                {"reload_before", "reconnect_before", "reload_after_prepare", "reconnect_after"}
+                if target == "nginx_whole_request"
+                else {
+                    "reload_before", "reconnect_before", "access_before", "health_before",
+                    "reload_after_prepare", "access_after_prepare", "health_after_prepare",
+                    "reconnect_after",
                 }
             )
+            groups.update({
+                "step_count": group(range(2, 7)),
+                "transition": group(transitions),
+                "transition_pair": group(
+                    {f"{left}>{right}" for left in transitions for right in transitions}
+                ),
+            })
+            if target == "multi_request_state":
+                groups.update({"access_value": group(range(2)), "health_value": group(range(2))})
             return groups, classify_multi
         return groups, classify_whole
     if target == "h2_stateful":
@@ -808,7 +825,7 @@ def seed_semantic_matrix(state: Path, targets: set[str]) -> int:
         ):
             created += store_seed(state, "config_physical_lines", data)
 
-    if "whole_request_differential" in targets:
+    if "whole_request_differential" in targets or "nginx_whole_request" in targets:
         for route in range(20):
             for method in range(6):
                 control = bytearray(16)
@@ -820,9 +837,11 @@ def seed_semantic_matrix(state: Path, targets: set[str]) -> int:
                 if (route + method) & 4:
                     control[7] |= 0x80
                 control[8:] = b"semantic"
-                created += store_seed(state, "whole_request_differential", bytes(control))
+                for target in ("whole_request_differential", "nginx_whole_request"):
+                    if target in targets:
+                        created += store_seed(state, target, bytes(control))
 
-    if "multi_request_state" in targets:
+    if "multi_request_state" in targets or "nginx_whole_request" in targets:
         transition_before = (0x01, 0x02, 0x04, 0x08)
         transition_after = (0x01, 0x02, 0x04, 0x08)
         pair_index = 0
@@ -840,15 +859,19 @@ def seed_semantic_matrix(state: Path, targets: set[str]) -> int:
                 records[11] = (pair_index // 2) & 3
                 records[16] = (route + 1) % 20
                 records[19] = (method + 1) % 6
-                created += store_seed(state, "multi_request_state", bytes(records))
+                for target in ("multi_request_state", "nginx_whole_request"):
+                    if target in targets:
+                        created += store_seed(state, target, bytes(records))
                 pair_index += 1
         for step_count in range(2, 7):
             # div_ceil(len, 16) selects the requested count.
-            created += store_seed(
-                state,
-                "multi_request_state",
-                bytes(16 * (step_count - 1) + 1),
-            )
+            for target in ("multi_request_state", "nginx_whole_request"):
+                if target in targets:
+                    created += store_seed(
+                        state,
+                        target,
+                        bytes(16 * (step_count - 1) + 1),
+                    )
         transitions = (
             (8, 0x01),
             (8, 0x02),
@@ -864,7 +887,9 @@ def seed_semantic_matrix(state: Path, targets: set[str]) -> int:
                 records = bytearray(32)
                 records[left_offset] = left_bit
                 records[16 + right_offset] = right_bit
-                created += store_seed(state, "multi_request_state", bytes(records))
+                for target in ("multi_request_state", "nginx_whole_request"):
+                    if target in targets:
+                        created += store_seed(state, target, bytes(records))
 
     if "h2_stateful" in targets:
         data = bytearray()

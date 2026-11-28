@@ -1494,7 +1494,7 @@ fn not_modified_response(
     }
     if scope
         .header_policy
-        .apply(&mut response.headers, true)
+        .apply(&mut response.headers, response.status)
         .is_err()
     {
         return Response::policy_error();
@@ -1547,7 +1547,7 @@ fn serve_file_inner(
     representation.headers = headers.clone();
     if scope
         .header_policy
-        .apply(&mut representation.headers, true)
+        .apply(&mut representation.headers, representation.status)
         .is_err()
     {
         return Response::policy_error();
@@ -1648,7 +1648,7 @@ fn serve_file_inner(
     if let Some(cr) = content_range {
         r.headers.push(("Content-Range".into(), cr.into_bytes()));
     }
-    if scope.header_policy.apply(&mut r.headers, true).is_err() {
+    if scope.header_policy.apply(&mut r.headers, r.status).is_err() {
         return Response::policy_error();
     }
     if req.is_head() {
@@ -2251,11 +2251,7 @@ pub fn serve_directory(
     let mut r = serve_directory_inner(
         cfg, vhost, scope, req, dir, url_path, raw_path, host, port, peer, local_ip, None,
     );
-    if scope
-        .header_policy
-        .apply(&mut r.headers, r.status < 400)
-        .is_err()
-    {
+    if scope.header_policy.apply(&mut r.headers, r.status).is_err() {
         return Response::policy_error();
     }
     crate::compression::finalize_budgeted(
@@ -2322,7 +2318,7 @@ pub fn serve_authorized_directory(
     );
     if scope
         .header_policy
-        .apply(&mut response.headers, response.status < 400)
+        .apply(&mut response.headers, response.status)
         .is_err()
     {
         return Response::policy_error();
@@ -2720,7 +2716,7 @@ pub fn error_response(
         // Only `Header always` applies to error responses. A local nginx
         // `error_page` is an internal redirect and was already finalized
         // using the target location's policy.
-        if scope.header_policy.apply(&mut r.headers, false).is_err() {
+        if scope.header_policy.apply(&mut r.headers, r.status).is_err() {
             return Response::policy_error();
         }
         crate::compression::finalize_budgeted(
@@ -2787,7 +2783,7 @@ pub(crate) fn finalize_prepared_error_document(
     if !cfg.route_program.is_nginx() {
         if scope
             .header_policy
-            .apply(&mut response.headers, false)
+            .apply(&mut response.headers, response.status)
             .is_err()
         {
             return Response::policy_error();

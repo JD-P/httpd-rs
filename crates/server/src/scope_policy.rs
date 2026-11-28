@@ -435,6 +435,11 @@ pub struct HeaderPolicy {
     /// appending to it. Apache scopes leave this false and retain their
     /// ordinary merge behavior.
     pub replace_response_headers: bool,
+    /// nginx applies ordinary `add_header` and `expires` only to its explicit
+    /// status whitelist. Apache's `Header onsuccess` instead follows the
+    /// broad non-error response class. The frontend records the distinction
+    /// in the common IR rather than approximating it at response time.
+    pub nginx_status_semantics: bool,
     pub add_headers: Vec<(String, String)>,
     pub set_headers: Vec<(String, String)>,
     pub unset_headers: Vec<String>,
@@ -454,6 +459,28 @@ pub const MAX_CONFIGURED_RESPONSE_HEADER_BYTES: usize = 128 * 1024;
 
 fn header_bytes(name: &str, value: &str) -> usize {
     name.len().saturating_add(value.len()).saturating_add(4)
+}
+
+/// Policy identities commonly share one inherited prefix and then diverge
+/// (public URL versus lexical/canonical target). A meet retains that prefix
+/// once while preserving every deliberately repeated declaration within each
+/// branch. This is stronger than an equality shortcut: unrelated changes in
+/// either branch cannot cause the shared prefix to be replayed.
+fn identity_join<T: Clone + PartialEq>(first: &[T], second: &[T]) -> Vec<T> {
+    let shared = first
+        .iter()
+        .zip(second.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut joined = Vec::with_capacity(
+        first
+            .len()
+            .saturating_add(second.len())
+            .saturating_sub(shared),
+    );
+    joined.extend_from_slice(first);
+    joined.extend_from_slice(&second[shared..]);
+    joined
 }
 
 impl HeaderPolicy {
@@ -536,6 +563,9 @@ impl HeaderPolicy {
             self.always_set_headers.clear();
             self.always_unset_headers.clear();
         }
+        if child.nginx_status_semantics {
+            self.nginx_status_semantics = true;
+        }
         crate::verified::append_vec(&mut self.add_headers, &child.add_headers);
         merge_set_headers(&mut self.set_headers, &child.set_headers);
         crate::verified::append_vec(&mut self.unset_headers, &child.unset_headers);
@@ -554,13 +584,77 @@ impl HeaderPolicy {
         true
     }
 
-    /// Apply configured response headers in Apache order: set/add first, then
-    /// unset removes any field with that name.  `include_onsuccess` is false
-    /// for error responses, where only `Header always` applies.
+    /// Meet two independently selected policy identities. `self` is the
+    /// target identity and `base` is the client-visible URL identity. nginx
+    /// and Apache hierarchy merging has already happened in each branch; this
+    /// operation composes the branches without replaying their common
+    /// inherited action prefix.
+    pub fn meet_identity(&mut self, base: &HeaderPolicy) -> bool {
+        let target = self.clone();
+        let mut out = base.clone();
+
+        let shared_set = base
+            .set_headers
+            .iter()
+            .zip(target.set_headers.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let shared_always_set = base
+            .always_set_headers
+            .iter()
+            .zip(target.always_set_headers.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+
+        out.add_headers = identity_join(&base.add_headers, &target.add_headers);
+        out.unset_headers = identity_join(&base.unset_headers, &target.unset_headers);
+        out.always_add_headers =
+            identity_join(&base.always_add_headers, &target.always_add_headers);
+        out.always_unset_headers =
+            identity_join(&base.always_unset_headers, &target.always_unset_headers);
+        out.expires_by_type = identity_join(&base.expires_by_type, &target.expires_by_type);
+        out.cookies = identity_join(&base.cookies, &target.cookies);
+        out.vary = identity_join(&base.vary, &target.vary);
+
+        merge_set_headers(&mut out.set_headers, &target.set_headers[shared_set..]);
+        merge_set_headers(
+            &mut out.always_set_headers,
+            &target.always_set_headers[shared_always_set..],
+        );
+        if target.expires_active.is_some() {
+            out.expires_active = target.expires_active;
+        }
+        if target.expires_default.is_some() {
+            out.expires_default = target.expires_default;
+        }
+        out.nginx_status_semantics |= target.nginx_status_semantics;
+        out.replace_response_headers = false;
+        if !out.within_limits() {
+            return false;
+        }
+        *self = out;
+        true
+    }
+
+    pub fn ordinary_response_status(&self, status: u16) -> bool {
+        if self.nginx_status_semantics {
+            matches!(
+                status,
+                200 | 201 | 204 | 206 | 301 | 302 | 303 | 304 | 307 | 308
+            )
+        } else {
+            status < 400
+        }
+    }
+
+    /// Apply configured response headers in source-language order: set/add
+    /// first, then unset removes any field with that name. nginx's ordinary
+    /// `add_header` status whitelist and Apache's broad `onsuccess` class are
+    /// represented explicitly; `always` applies to every status.
     pub fn apply(
         &self,
         headers: &mut Vec<(std::borrow::Cow<'static, str>, Vec<u8>)>,
-        include_onsuccess: bool,
+        status: u16,
     ) -> Result<(), &'static str> {
         let mut unset: Vec<&str> = self
             .always_unset_headers
@@ -569,7 +663,7 @@ impl HeaderPolicy {
             .collect();
         let mut set: Vec<&(String, String)> = self.always_set_headers.iter().collect();
         let mut add: Vec<&(String, String)> = self.always_add_headers.iter().collect();
-        if include_onsuccess {
+        if self.ordinary_response_status(status) {
             unset.extend(self.unset_headers.iter().map(String::as_str));
             set.extend(self.set_headers.iter());
             add.extend(self.add_headers.iter());
@@ -630,7 +724,7 @@ mod header_tests {
             (std::borrow::Cow::Borrowed("X-Old"), b"leak".to_vec()),
             (std::borrow::Cow::Borrowed("X-Set"), b"one".to_vec()),
         ];
-        parent.apply(&mut headers, true).unwrap();
+        parent.apply(&mut headers, 200).unwrap();
         assert!(!headers.iter().any(|(n, _)| n == "X-Old"));
         assert_eq!(
             headers
@@ -681,7 +775,56 @@ mod header_tests {
             std::borrow::Cow::Borrowed("X-Large"),
             vec![b'x'; MAX_CONFIGURED_RESPONSE_HEADER_BYTES],
         )];
-        assert!(child.apply(&mut headers, true).is_err());
+        assert!(child.apply(&mut headers, 200).is_err());
+    }
+
+    #[test]
+    fn nginx_ordinary_headers_use_the_documented_status_whitelist() {
+        let mut policy = HeaderPolicy {
+            nginx_status_semantics: true,
+            ..HeaderPolicy::default()
+        };
+        policy.add_headers.push(("X-Normal".into(), "yes".into()));
+        policy
+            .always_add_headers
+            .push(("X-Always".into(), "yes".into()));
+        for status in [200, 201, 204, 206, 301, 302, 303, 304, 307, 308] {
+            let mut headers = Vec::new();
+            policy.apply(&mut headers, status).unwrap();
+            assert!(headers.iter().any(|(name, _)| name == "X-Normal"));
+            assert!(headers.iter().any(|(name, _)| name == "X-Always"));
+        }
+        for status in [100, 202, 205, 305, 306, 400, 500] {
+            let mut headers = Vec::new();
+            policy.apply(&mut headers, status).unwrap();
+            assert!(!headers.iter().any(|(name, _)| name == "X-Normal"));
+            assert!(headers.iter().any(|(name, _)| name == "X-Always"));
+        }
+    }
+
+    #[test]
+    fn identity_meet_retains_shared_prefix_once_and_branch_suffixes() {
+        let inherited = ("X-Common".to_string(), "once".to_string());
+        let mut url = HeaderPolicy::default();
+        url.add_headers.push(inherited.clone());
+        url.add_headers.push(("X-Url".into(), "url".into()));
+        let mut target = HeaderPolicy::default();
+        target.add_headers.push(inherited.clone());
+        target
+            .add_headers
+            .push(("X-Target".into(), "target".into()));
+        assert!(target.meet_identity(&url));
+        assert_eq!(
+            target.add_headers,
+            vec![
+                inherited,
+                ("X-Url".into(), "url".into()),
+                ("X-Target".into(), "target".into())
+            ]
+        );
+        let snapshot = target.clone();
+        assert!(target.meet_identity(&snapshot));
+        assert_eq!(target, snapshot, "identity meet must be idempotent");
     }
 }
 
@@ -712,7 +855,7 @@ impl<T> Originated<T> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvironmentPolicy {
     /// Whether the raw request Authorization field may become
     /// HTTP_AUTHORIZATION for CGI/FastCGI. Apache defaults CGIPassAuth off.
@@ -747,6 +890,24 @@ impl EnvironmentPolicy {
         crate::verified::append_vec(&mut self.unset_env, &child.unset_env);
         crate::verified::append_vec(&mut self.pass_env, &child.pass_env);
         crate::verified::append_vec(&mut self.set_env_if, &child.set_env_if);
+    }
+
+    pub fn meet_identity(&mut self, base: &EnvironmentPolicy) {
+        let target = self.clone();
+        // URL effects retain their established last-writer position while a
+        // common inherited prefix is represented once.
+        self.rewrite_env = identity_join(&target.rewrite_env, &base.rewrite_env);
+        self.rewrite_unset_env = identity_join(&target.rewrite_unset_env, &base.rewrite_unset_env);
+        self.rewrite_late_env = identity_join(&target.rewrite_late_env, &base.rewrite_late_env);
+        self.rewrite_late_unset_env =
+            identity_join(&target.rewrite_late_unset_env, &base.rewrite_late_unset_env);
+        self.set_env = identity_join(&target.set_env, &base.set_env);
+        self.unset_env = identity_join(&target.unset_env, &base.unset_env);
+        self.pass_env = identity_join(&target.pass_env, &base.pass_env);
+        self.set_env_if = identity_join(&target.set_env_if, &base.set_env_if);
+        if base.cgi_pass_auth.is_some() {
+            self.cgi_pass_auth = base.cgi_pass_auth;
+        }
     }
 }
 
@@ -909,6 +1070,16 @@ impl ContentPolicy {
         if child.request_body_limit.is_some() {
             self.request_body_limit = child.request_body_limit;
         }
+    }
+
+    pub fn meet_identity(&mut self, base: &ContentPolicy) {
+        let target = self.clone();
+        self.merge_child(base);
+        self.index_ignore = identity_join(&target.index_ignore, &base.index_ignore);
+        self.autoindex.icon_rules =
+            identity_join(&target.autoindex.icon_rules, &base.autoindex.icon_rules);
+        self.add_types = identity_join(&target.add_types, &base.add_types);
+        self.remove_types = identity_join(&target.remove_types, &base.remove_types);
     }
 }
 

@@ -83,14 +83,14 @@ COMPONENT_RANGES = (
     (12189, 12715, "Configuration phase ordering"),
     (12716, 13828, "Whole request-policy state machine"),
     (13829, 14473, "Configuration merge helpers"),
-    (14474, 14823, "RemoteIP and virtual-host identity"),
-    (14824, 15845, "Configuration front-end refinement"),
-    (15846, 15998, "Container-field merge"),
-    (15999, 18351, "HTTP/2 admission and lifecycle"),
-    (18352, 18604, "Access/cache prefilters and mapping order"),
-    (18605, 19240, "fnmatch semantics"),
-    (19241, 19410, "Handler and CGI capability admission"),
-    (19411, 19536, "Authentication-file and FastCGI path immutability"),
+    (14474, 14802, "RemoteIP and virtual-host identity"),
+    (14803, 16049, "Configuration front-end refinement"),
+    (16050, 16237, "Container-field merge"),
+    (16238, 18591, "HTTP/2 admission and lifecycle"),
+    (18592, 18844, "Access/cache prefilters and mapping order"),
+    (18845, 19480, "fnmatch semantics"),
+    (19481, 19650, "Handler and CGI capability admission"),
+    (19651, 19776, "Authentication-file and FastCGI path immutability"),
 )
 
 
@@ -227,6 +227,7 @@ ARITHMETIC_GATE_PROOFS = {
 }
 
 COST_MODEL_PROOFS = {
+    "nginx_route_selection_charge_includes_matcher_bytes",
     "regex_expanded_charge_bounds_counted_repetition",
     "regex_optional_repeat_charge_bounds_pike_work",
     "regex_multipass_charge_bounds_all_passes",

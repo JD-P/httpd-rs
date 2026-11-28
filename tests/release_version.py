@@ -40,6 +40,21 @@ def package_version(manifest: dict[str, Any], workspace_version: str) -> str | N
     return None
 
 
+def exact_requirement_version(requirement: str) -> str:
+    """Return the version named by Cargo's plain or explicit exact syntax.
+
+    Repository-local dependencies use either Cargo's ordinary bare version
+    spelling or an explicit ``=`` pin.  Both name the local package version
+    for this consistency check; preserving the operator in the comparison
+    would incorrectly report ``=1.2.3`` as stale beside package version
+    ``1.2.3``.
+    """
+    requirement = requirement.strip()
+    if requirement.startswith("="):
+        return requirement[1:].strip()
+    return requirement
+
+
 def main() -> int:
     root_manifest = read_manifest(ROOT / "Cargo.toml")
     workspace_version = root_manifest["workspace"]["package"]["version"]
@@ -68,7 +83,11 @@ def main() -> int:
                 dependency_manifest = read_manifest(dependency_manifest_path)
                 actual = package_version(dependency_manifest, workspace_version)
                 required = spec.get("version")
-                if actual is not None and isinstance(required, str) and required != actual:
+                if (
+                    actual is not None
+                    and isinstance(required, str)
+                    and exact_requirement_version(required) != actual
+                ):
                     errors.append(
                         f"{manifest_path.relative_to(ROOT)}: {dependency} requires "
                         f"{required}, but {dependency_manifest_path.relative_to(ROOT)} is {actual}"
